@@ -50,6 +50,7 @@ impl<'a> ImageStore<'a> {
         let final_dir = self.paths.image_dir(digest);
         let staging_path = staging.keep();
         if let Err(err) = fs::rename(&staging_path, &final_dir) {
+            // Best-effort cleanup; a leaked staging dir is harmless debris.
             let _ = fs::remove_dir_all(&staging_path);
             // A concurrent builder may have published first; that is fine.
             if !final_dir.is_dir() {
@@ -155,6 +156,9 @@ mod tests {
 
     #[test]
     fn publish_tolerates_existing_target() {
+        // Models only the losing side of a publish race: the pre-existing dir
+        // here holds a marker file, not a real rootfs.erofs, so this verifies
+        // staging cleanup — a real winner would have left is_cached() == true.
         let (_tmp, paths) = setup();
         let store = ImageStore::new(&paths);
 
