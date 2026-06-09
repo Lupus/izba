@@ -104,8 +104,10 @@ fi
 # 2. virtiofsd
 # ---------------------------------------------------------------------------
 echo "=== virtiofsd ==="
-# Permalink to the latest static amd64 build from the upstream GitLab CI.
-VIRTIOFSD_URL="https://gitlab.com/virtio-fs/virtiofsd/-/releases/permalink/latest/downloads/virtiofsd-x86_64"
+# Pinned release for reproducibility (same pattern as cloud-hypervisor above);
+# bump deliberately. Releases: https://gitlab.com/virtio-fs/virtiofsd/-/releases
+VIRTIOFSD_VERSION="${VIRTIOFSD_VERSION:-v1.13.2}"  # override with VIRTIOFSD_VERSION env var
+VIRTIOFSD_URL="https://gitlab.com/virtio-fs/virtiofsd/-/releases/${VIRTIOFSD_VERSION}/downloads/virtiofsd-x86_64"
 
 if command -v virtiofsd >/dev/null 2>&1; then
     echo "  present: $(command -v virtiofsd)"
@@ -133,9 +135,6 @@ if command -v passt >/dev/null 2>&1; then
 else
     echo "  missing"
     need_install "passt" "sudo apt-get install -y passt"
-    if [ "$CHECK_ONLY" -eq 0 ]; then
-        echo "  Install with:  sudo apt-get install -y passt"
-    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -148,9 +147,6 @@ if command -v mkfs.erofs >/dev/null 2>&1; then
 else
     echo "  missing"
     need_install "mkfs.erofs" "sudo apt-get install -y erofs-utils"
-    if [ "$CHECK_ONLY" -eq 0 ]; then
-        echo "  Install with:  sudo apt-get install -y erofs-utils"
-    fi
 fi
 
 # ---------------------------------------------------------------------------

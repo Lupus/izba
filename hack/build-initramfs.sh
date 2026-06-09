@@ -39,6 +39,7 @@ fi
 
 # Build the initramfs tree in a temp directory; clean up on exit.
 WORK="$(mktemp -d)"
+chmod 755 "$WORK"  # mktemp creates 700; initramfs root must be world-traversable
 trap 'rm -rf "$WORK"' EXIT
 
 # Minimal directory skeleton that izba-init expects to find at boot.

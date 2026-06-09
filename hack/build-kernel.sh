@@ -19,6 +19,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+REPO_ROOT="$(pwd)"
 
 VERSION="${1:-6.12.30}"
 OUTPUT="${2:-dist/vmlinux}"
@@ -107,8 +108,11 @@ make -j"$(nproc)" vmlinux
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
-mkdir -p "$(dirname "$(cd - && pwd)")/${OUTPUT%/*}"  # ensure dist/ exists
-DEST="$(cd - && pwd)/$OUTPUT"
+# Resolve OUTPUT against the repo root unless it is absolute.
+case "$OUTPUT" in
+    /*) DEST="$OUTPUT" ;;
+    *) DEST="$REPO_ROOT/$OUTPUT" ;;
+esac
 mkdir -p "$(dirname "$DEST")"
 cp vmlinux "$DEST"
 
@@ -119,4 +123,4 @@ echo "vmlinux written to: $DEST"
 echo "  size:   $SIZE"
 echo "  sha256: $SHA"
 echo ""
-echo "Hint: export IZBA_KERNEL=$(cd - && pwd)/dist/vmlinux"
+echo "Hint: export IZBA_KERNEL=$DEST"

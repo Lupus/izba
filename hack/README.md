@@ -166,3 +166,5 @@ cargo build --release -p izba-cli
 | `IZBA_INITRAMFS` | Absolute path to an `initramfs.cpio.gz`. Must be set together with `IZBA_KERNEL`. |
 | `IZBA_BIN_DIR` | Directory where `fetch-artifacts.sh` installs host binaries. Defaults to `$HOME/.local/bin`. |
 | `IZBA_DATA_DIR` | Root data directory. Defaults to `$HOME/.local/share/izba`. |
+| `IZBA_MKE2FS` | Optional path to a static `mke2fs` binary to embed in the initramfs at `/sbin/mke2fs` (enables in-guest first-boot rw formatting). |
+| `VIRTIOFSD_VERSION` | virtiofsd release tag for `fetch-artifacts.sh`. Defaults to a pinned known-good version. |
