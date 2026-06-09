@@ -433,7 +433,12 @@ fn stop_locked(
         name,
     };
     let state = match (assess(state.as_ref(), &probes), state) {
-        (Liveness::Stopped, _) | (_, None) => return cleanup_runtime(paths, name),
+        (Liveness::Stopped, _) | (_, None) => {
+            // VMM is already dead; sidecars (virtiofsd/passt) usually self-exit
+            // with their vhost-user peer, but not always — best-effort kill them.
+            kill_sidecars_from_state(paths, name);
+            return cleanup_runtime(paths, name);
+        }
         (_, Some(s)) => s,
     };
 
@@ -480,6 +485,25 @@ fn stop_locked(
     }
 
     cleanup_runtime(paths, name)
+}
+
+/// Best-effort kill every sidecar recorded in state.json.
+///
+/// Called before wiping state.json so orphaned virtiofsd / passt processes
+/// (which normally self-exit when their vhost-user peer dies but sometimes
+/// do not) are reaped.  Errors are ignored — the cleanup must proceed
+/// regardless.
+fn kill_sidecars_from_state(paths: &Paths, name: &str) {
+    let state_path = paths.sandbox_dir(name).join(STATE_FILE);
+    let state: Option<RunState> = match load_json(&state_path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if let Some(s) = state {
+        for (_, id) in &s.sidecar_pids {
+            let _ = procmgr::kill_pid(id);
+        }
+    }
 }
 
 /// Remove state.json and everything inside the run dir (sockets, pid files).
@@ -583,9 +607,12 @@ pub fn list(paths: &Paths, connector: Connector) -> anyhow::Result<Vec<SandboxIn
             // Correct stale state left behind by a VMM that died on its own —
             // but only if no concurrent operation (e.g. start) holds the lock,
             // otherwise we could delete the state.json it just wrote.
+            // Also best-effort kill any sidecars (virtiofsd/passt) that may
+            // still be alive even though the VMM is gone.
             let state_path = entry.path().join(STATE_FILE);
             if state_path.exists() {
                 if let Ok(_lock) = lock_sandbox(paths, &name) {
+                    kill_sidecars_from_state(paths, &name);
                     let _ = fs::remove_file(&state_path);
                 }
             }
@@ -684,6 +711,23 @@ mod tests {
             &RunState {
                 vmm_pid: vmm,
                 sidecar_pids: vec![],
+                started_unix_ms: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    fn write_state_with_sidecars(
+        paths: &Paths,
+        name: &str,
+        vmm: PidIdentity,
+        sidecars: Vec<(String, PidIdentity)>,
+    ) {
+        save_json(
+            &paths.sandbox_dir(name).join(STATE_FILE),
+            &RunState {
+                vmm_pid: vmm,
+                sidecar_pids: sidecars,
                 started_unix_ms: 0,
             },
         )
@@ -1258,6 +1302,50 @@ mod tests {
         assert!(
             msg.contains("busy") || msg.contains("already running"),
             "loser error should be busy/already running, got: {msg}"
+        );
+    }
+
+    /// Verify that `stop` reaps sidecar processes (e.g. virtiofsd/passt) that
+    /// are still alive when the VMM has already died on its own.
+    ///
+    /// Scenario: state.json records a dead VMM identity and one live sidecar
+    /// (`sleep 30`).  `stop()` must kill the sidecar and remove state.json.
+    #[test]
+    fn stop_reaps_orphaned_sidecars() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        // Sidecar is a real live process.
+        let sidecar_id = spawn_sleep(dir.path());
+        assert!(
+            procmgr::pid_alive(&sidecar_id),
+            "sidecar must be alive initially"
+        );
+
+        // VMM identity is forged-dead (starttime mismatch).
+        write_state_with_sidecars(
+            &paths,
+            "web",
+            dead_identity(),
+            vec![("virtiofsd:workspace".to_string(), sidecar_id.clone())],
+        );
+
+        // Connector will not be called because the VMM is already dead.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log, None);
+        stop(&paths, "web", &conn, Duration::from_secs(5)).unwrap();
+
+        // state.json must be gone.
+        assert!(
+            !paths.sandbox_dir("web").join(STATE_FILE).exists(),
+            "state.json must be removed after stop"
+        );
+        // Sidecar must be dead within 2 s.
+        assert!(
+            wait_dead(&sidecar_id),
+            "orphaned sidecar must be killed by stop()"
         );
     }
 
