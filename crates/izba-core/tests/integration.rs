@@ -301,14 +301,17 @@ fn exec_collect(
 
     let out = attach(paths, name, exec_id, StreamKind::Stdout);
     let err = attach(paths, name, exec_id, StreamKind::Stderr);
+    // Pumps must run BEFORE the stdin write: a guest producing more output
+    // than the socket buffers hold would block, never read stdin, and
+    // deadlock against our synchronous write below.
+    let out_t = std::thread::spawn(move || slurp(out));
+    let err_t = std::thread::spawn(move || slurp(err));
     if let Some(data) = stdin {
         let mut sin = attach(paths, name, exec_id, StreamKind::Stdin);
         sin.write_all(data).expect("writing stdin");
         // Half-close → guest pump sees EOF → child's stdin sees EOF.
         sin.shutdown(Shutdown::Write).expect("half-closing stdin");
     }
-    let out_t = std::thread::spawn(move || slurp(out));
-    let err_t = std::thread::spawn(move || slurp(err));
 
     // Wait gets its own control connection: the guest serves one request at
     // a time per connection and Wait blocks until the workload exits.
