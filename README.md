@@ -1,0 +1,106 @@
+# izba
+
+> *izba* — a small self-contained log cabin; cozy, isolated, ownable.
+
+Open-source per-project microVM sandboxes for AI coding agents, inspired by
+Docker Desktop's agent sandboxes (`sbx`). Each sandbox is a lightweight KVM
+virtual machine: your project directory is shared in live, the guest
+environment is any OCI image, and everything outside that boundary is isolated.
+Background on izba's architecture and where each piece comes from: [`docs/design-lineage.md`](docs/design-lineage.md).
+
+## Status
+
+v1 in active development. Linux/KVM (including WSL2 nested virtualization)
+works end-to-end and is pending full integration validation. Windows/WHP via
+OpenVMM is planned — see the
+[v1 design doc §8 spike S1](docs/superpowers/specs/2026-06-10-izba-v1-design.md)
+for the spike details.
+
+## How it works
+
+```
+ izba CLI ──spawns──► cloud-hypervisor (per sandbox)     ┌─ microVM ──────────────┐
+          ──spawns──► virtiofsd  (workspace share)  ◄────┤ izba-init (PID 1)      │
+          ──spawns──► passt      (user-mode NAT)    ◄────┤  ├ overlay rootfs      │
+          ──connects─► vsock port 1025 (control RPC) ◄───┤  ├ /workspace virtiofs │
+                       vsock port 1026 (stdio streams)◄──┤  └ spawns workloads    │
+                                                         └────────────────────────┘
+```
+
+Key properties:
+
+- **Daemonless.** The CLI spawns the VMM detached and exits. A running sandbox
+  is fully described by its state directory
+  (`~/.local/share/izba/sandboxes/<name>/`); any later invocation reconstructs
+  everything from disk — no background service required.
+- **Disk-state as source of truth.** `state.json` records every PID with its
+  `starttime` field from `/proc/<pid>/stat` to defeat PID reuse.
+- **Two vsock ports.** Port 1025 carries length-prefixed JSON control RPCs
+  (Health, Exec, Wait, Resize, Shutdown). Port 1026 carries raw stdio/tty
+  streams.
+- **Unprivileged user-mode networking.** `passt --vhost-user` provides NAT
+  with no TAP device, no bridge, and no root on the host.
+- **OCI → erofs + overlay rootfs.** Images are pulled, flattened to a single
+  erofs image (read-only), and combined with a sparse ext4 rw disk via
+  overlayfs inside the guest. The erofs is content-addressed and shared across
+  sandboxes.
+
+## Quickstart
+
+**1. Install runtime dependencies**
+
+```sh
+hack/fetch-artifacts.sh
+```
+
+This fetches `cloud-hypervisor` and `virtiofsd` static binaries into
+`~/.local/bin` and checks for `passt` and `mkfs.erofs` (install via your
+distro package manager if missing).
+
+**2. Build the kernel and initramfs**
+
+```sh
+hack/build-kernel.sh
+hack/build-initramfs.sh
+```
+
+**3. Run a sandbox**
+
+```sh
+izba run --image alpine:3.20 .
+```
+
+This creates (if needed), starts, and drops you into a shell inside the
+sandbox, with your current directory shared at `/workspace`.
+
+See [`docs/testing.md`](docs/testing.md) for the full runbook and the
+integration test suite.
+
+## Commands
+
+```
+izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [DIR]
+izba run    [--image IMG] [NAME_OR_DIR] [-- CMD...]
+izba exec   NAME [-it] [-- CMD...]
+izba ls
+izba stop   NAME
+izba rm     [--force] NAME
+```
+
+## Project layout
+
+```
+crates/
+  izba-core/   # sandbox lifecycle, VMM driver trait + Cloud Hypervisor driver,
+               #   OCI image → rootfs pipeline, guest control-plane client
+  izba-cli/    # `izba` binary — thin, daemonless wrapper over izba-core
+  izba-init/   # guest PID 1 agent (static musl x86_64); boots, mounts,
+               #   and serves the control + stream ports
+  izba-proto/  # host↔guest protocol types shared by core and init
+hack/          # scripts to fetch binaries and build the kernel/initramfs
+docs/          # architecture notes, design spec, testing runbook
+```
+
+## License
+
+Apache-2.0 — see [`Cargo.toml`](Cargo.toml).
