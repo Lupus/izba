@@ -4,3 +4,4 @@ pub mod paths;
 pub mod procmgr;
 pub mod state;
 pub mod vmm;
+pub mod vsock;
