@@ -501,6 +501,11 @@ pub fn list(paths: &Paths, connector: Connector) -> anyhow::Result<Vec<SandboxIn
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
+        // Tombstones from interrupted `remove` final-deletes are inert debris,
+        // not sandboxes.
+        if name.contains(".removing-") {
+            continue;
+        }
         let config: SandboxConfig = match load_json(&entry.path().join(CONFIG_FILE)) {
             Ok(Some(c)) => c,
             Ok(None) => {
