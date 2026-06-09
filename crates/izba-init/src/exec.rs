@@ -47,6 +47,20 @@ struct ExecProc {
     pty_master: Option<OwnedFd>,
 }
 
+/// Execution engine: spawns, signals, streams and waits on guest workloads.
+///
+/// # Entry retention (v1 trade-off)
+///
+/// Entries in `procs` are **never pruned**. This is intentional: `wait()` must
+/// remain callable any number of times after an exec exits (idempotent status
+/// reads), so removing the entry on first wait would break repeated callers.
+///
+/// Downside: a long-lived guest that starts many short-lived execs accumulates
+/// one `ExecProc` per exec, each holding the reaper thread's resources and any
+/// un-taken `OwnedFd`s until the engine is dropped. For v1 workloads (bounded
+/// number of execs per guest lifetime) this is fine. A v2 protocol extension
+/// can introduce an explicit `Release` RPC to let the host signal that it will
+/// never call `Wait` again, at which point the entry can be removed safely.
 pub struct ExecEngine {
     /// Chroot for workloads: `Some("/rootfs")` in the guest, `None` in tests.
     root: Option<PathBuf>,
@@ -99,6 +113,13 @@ impl ExecEngine {
             // Keep the master out of the child (fork inherits it; exec must
             // close it or master EOF never arrives after the child exits).
             set_cloexec(&pty.master).map_err(internal)?;
+            // Set CLOEXEC on the slave immediately: without it the slave fd is
+            // inherited by every child spawned concurrently from this process.
+            // Those children hold the slave open across their own exec, keeping
+            // the pty alive beyond this tty job and preventing master EOF.
+            // std's child-side dup2(slave, 0/1/2) clears CLOEXEC on the dup'd
+            // descriptors, so the actual tty child is unaffected.
+            set_cloexec(&pty.slave).map_err(internal)?;
             let slave_in = pty.slave.try_clone().map_err(internal)?;
             let slave_out = pty.slave.try_clone().map_err(internal)?;
             cmd.stdin(Stdio::from(slave_in));
@@ -118,6 +139,20 @@ impl ExecEngine {
             cmd.stderr(Stdio::piped());
             (None, Streams::default())
         };
+
+        // Pre-validate the working directory so a nonexistent cwd surfaces as
+        // BadRequest rather than being misclassified as CommandNotFound (both
+        // produce ENOENT from the child-side chdir in pre_exec).
+        let host_cwd = match &self.root {
+            Some(r) => r.join(req.cwd.trim_start_matches('/')),
+            None => PathBuf::from(&req.cwd),
+        };
+        if !host_cwd.is_dir() {
+            return Err((
+                ErrorKind::BadRequest,
+                format!("cwd {} does not exist in the sandbox", req.cwd),
+            ));
+        }
 
         let root = self.root.clone();
         let cwd = req.cwd.clone();
@@ -145,6 +180,12 @@ impl ExecEngine {
                 nix::unistd::chdir(Path::new(&cwd)).map_err(std::io::Error::from)?;
                 // Drop privileges last (gid before uid, or setgid fails).
                 // Skip no-op changes so unprivileged test runs work.
+                //
+                // Clear supplementary groups to exactly {gid} before setgid.
+                // setgroups may fail with EPERM in unprivileged test runs;
+                // ignore that — root inside a guest will succeed, and tests
+                // run as the invoking user (which has no extra groups to drop).
+                let _ = nix::unistd::setgroups(&[nix::unistd::Gid::from_raw(gid)]);
                 if gid != nix::unistd::getegid().as_raw() {
                     nix::unistd::setgid(nix::unistd::Gid::from_raw(gid))
                         .map_err(std::io::Error::from)?;
@@ -230,7 +271,13 @@ impl ExecEngine {
     pub fn kill(&self, id: u32, sig: i32) -> Result<(), ExecError> {
         let pid = {
             let procs = self.procs.lock().unwrap();
-            procs.get(&id).ok_or_else(|| not_found(id))?.pid
+            let proc = procs.get(&id).ok_or_else(|| not_found(id))?;
+            // If the process has already been reaped, return Ok immediately.
+            // Sending a signal to a reaped pgid risks hitting a recycled pid.
+            if proc.status.0.lock().unwrap().is_some() {
+                return Ok(());
+            }
+            proc.pid
         };
         let signal = Signal::try_from(sig)
             .map_err(|e| (ErrorKind::BadRequest, format!("bad signal {sig}: {e}")))?;
@@ -471,6 +518,24 @@ mod tests {
         let out = String::from_utf8_lossy(&out);
         assert!(out.contains("24 80"), "tty output: {out:?}");
         assert_eq!(e.wait(id).unwrap(), ExitStatus::Code(0));
+    }
+
+    #[test]
+    fn bad_cwd_is_bad_request() {
+        let e = engine();
+        let mut r = req(&["true"]);
+        r.cwd = "/nonexistent-dir-xyz".into();
+        let (kind, _msg) = e.exec(&r).unwrap_err();
+        assert_eq!(kind, ErrorKind::BadRequest);
+    }
+
+    #[test]
+    fn kill_after_exit_is_ok() {
+        let e = engine();
+        let id = e.exec(&req(&["true"])).unwrap();
+        e.wait(id).unwrap();
+        // Process has been reaped; kill should return Ok without signaling.
+        e.kill(id, 15).unwrap();
     }
 
     #[test]

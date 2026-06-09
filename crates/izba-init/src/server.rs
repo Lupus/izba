@@ -42,6 +42,9 @@ pub fn serve_control<L: Listener>(l: L, engine: Arc<ExecEngine>, shutdown: Arc<A
                 if shutdown.load(Ordering::SeqCst) {
                     return;
                 }
+                // Brief backoff to avoid a tight spin on persistent errors
+                // (e.g. EMFILE when the fd table is exhausted).
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
         };
@@ -98,12 +101,17 @@ fn control_conn<C: Read + Write>(mut conn: C, engine: Arc<ExecEngine>, shutdown:
 }
 
 /// Serves stream attachments; never returns under normal operation
-/// (run as a daemon thread). Returns on accept error.
+/// (run as a daemon thread). Logs and retries on accept errors.
 pub fn serve_streams<L: Listener>(l: L, engine: Arc<ExecEngine>) {
     loop {
         let conn = match l.accept() {
             Ok(c) => c,
-            Err(_) => return,
+            Err(_) => {
+                // Brief backoff to avoid a tight spin on persistent errors
+                // (e.g. EMFILE when the fd table is exhausted).
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
         };
         let engine = Arc::clone(&engine);
         std::thread::spawn(move || stream_conn(conn, engine));
