@@ -9,7 +9,7 @@ use std::fs::{self, File};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use izba_proto::{read_frame, write_frame, Request, Response, CONTROL_PORT};
+use izba_proto::{read_frame, write_frame, Request, Response, CONTROL_PORT, STREAM_PORT};
 use nix::fcntl::{Flock, FlockArg};
 
 use crate::image::store::ImageStore;
@@ -60,6 +60,20 @@ pub fn default_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn Io
         let sock = paths.run_dir(name).join("vsock.sock");
         let s = crate::vsock::hybrid_connect(&sock, CONTROL_PORT)?;
         Ok(Box::new(s) as Box<dyn IoStream>)
+    }
+}
+
+/// The production stream-port connector: hybrid-vsock through `run/vsock.sock`
+/// to [`STREAM_PORT`].
+///
+/// Returns a concrete [`std::os::unix::net::UnixStream`] (not `Box<dyn
+/// IoStream>`) because stream pumps need `try_clone` for the second direction
+/// and `shutdown` to signal half-close — neither is expressible on the trait.
+pub fn default_stream_connector(
+) -> impl Fn(&Paths, &str) -> anyhow::Result<std::os::unix::net::UnixStream> {
+    |paths: &Paths, name: &str| {
+        let sock = paths.run_dir(name).join("vsock.sock");
+        crate::vsock::hybrid_connect(&sock, STREAM_PORT)
     }
 }
 
