@@ -24,6 +24,11 @@ struct Node {
 /// Each reader yields one layer: gzipped tar OR plain tar (detected by the
 /// gzip magic `0x1f 0x8b`). Layer data is staged in unlinked temp files;
 /// nothing is ever unpacked onto the host filesystem.
+///
+/// **Known v1 limitation**: PAX extended attributes (e.g. `SCHILY.xattr.*`
+/// / file capabilities carried via `security.capability`) are currently
+/// dropped. PAX `x`/`g` headers are consumed transparently by the `tar`
+/// reader but their attribute payloads are not forwarded to the output tar.
 pub fn flatten_layers<W: Write>(layers: Vec<Box<dyn Read>>, out: W) -> Result<()> {
     let staged = stage_layers(layers)?;
     let map = index_layers(&staged)?;
@@ -99,6 +104,12 @@ fn index_layers(staged: &[File]) -> Result<BTreeMap<String, Node>> {
             if is_metadata(ty) {
                 continue;
             }
+            // GNU old-style sparse entries cannot be re-emitted faithfully;
+            // fail closed rather than silently corrupting the output.
+            if ty == EntryType::GNUSparse {
+                let path = entry.path().unwrap_or_default();
+                bail!("GNU sparse entries are not supported (entry {:?})", path);
+            }
             let Some(path) = normalize(&entry.path()?)? else {
                 continue;
             };
@@ -106,6 +117,22 @@ fn index_layers(staged: &[File]) -> Result<BTreeMap<String, Node>> {
             if base.starts_with(".wh.") {
                 continue; // consumed in sub-pass (a)
             }
+            // Normalize hardlink link targets the same way we normalize entry
+            // paths: strip leading `./` / `/`, reject `..` components.
+            // Symlink targets are left raw — absolute paths and `..` are
+            // legitimate filesystem semantics for symlinks.
+            let link_name = if ty == EntryType::Link {
+                entry
+                    .link_name()?
+                    .map(|raw| -> Result<PathBuf> {
+                        normalize(&raw)?.map(PathBuf::from).ok_or_else(|| {
+                            anyhow::anyhow!("hardlink in layer {i} has an empty link target")
+                        })
+                    })
+                    .transpose()?
+            } else {
+                entry.link_name()?.map(|c| c.into_owned())
+            };
             // A non-dir replacing anything hides everything that was under
             // that path (dir replaced by file drops the subtree). A dir over
             // a dir just replaces the node and keeps children.
@@ -119,7 +146,7 @@ fn index_layers(staged: &[File]) -> Result<BTreeMap<String, Node>> {
                     offset: entry.raw_file_position(),
                     size: entry.size(),
                     header: entry.header().clone(),
-                    link_name: entry.link_name()?.map(|c| c.into_owned()),
+                    link_name,
                 },
             );
         }
@@ -492,6 +519,141 @@ mod tests {
         );
         assert!(!map.contains_key("x/f"));
     }
+
+    // ---------- new tests: hardlink normalization and GNU sparse rejection ----------
+
+    /// Build a raw (non-gzipped) tar containing one regular file.
+    /// Returns the raw bytes WITHOUT the trailing end-of-archive marker so the
+    /// caller can splice in additional raw header blocks before finishing.
+    fn raw_regular_block(path: &str, content: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut b = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(content.len() as u64);
+        h.set_mode(0o644);
+        h.set_entry_type(EntryType::Regular);
+        b.append_data(&mut h, path, content).unwrap();
+        let gz_bytes = b.into_inner().unwrap().finish().unwrap();
+        // Decompress to get the raw tar bytes, then strip the 1024-byte
+        // end-of-archive marker so additional entries can be appended.
+        let mut dec = flate2::read::GzDecoder::new(std::io::Cursor::new(gz_bytes));
+        std::io::copy(&mut dec, &mut out).unwrap();
+        out.truncate(out.len() - 1024);
+        out
+    }
+
+    /// Build a raw 512-byte GNU header block for a hardlink entry.
+    /// The linkname field is filled with the raw bytes supplied by the caller,
+    /// bypassing any `tar::Builder` path sanitization.
+    fn raw_hardlink_header(link_path: &str, linkname_bytes: &[u8]) -> [u8; 512] {
+        let mut hdr = [0u8; 512];
+        // name field (offset 0, 100 bytes)
+        let name_bytes = link_path.as_bytes();
+        hdr[..name_bytes.len().min(100)].copy_from_slice(&name_bytes[..name_bytes.len().min(100)]);
+        // linkname field (offset 157, 100 bytes)
+        let ln_len = linkname_bytes.len().min(100);
+        hdr[157..157 + ln_len].copy_from_slice(&linkname_bytes[..ln_len]);
+        // mode / uid / gid (octal-with-NUL)
+        hdr[100..108].copy_from_slice(b"0000644\0");
+        hdr[108..116].copy_from_slice(b"0000000\0");
+        hdr[116..124].copy_from_slice(b"0000000\0");
+        // size = 0, mtime = 0
+        hdr[124..136].copy_from_slice(b"00000000000\0");
+        hdr[136..148].copy_from_slice(b"00000000000\0");
+        // typeflag = '1' (hardlink)
+        hdr[156] = b'1';
+        // magic = "ustar  \0" (GNU)
+        hdr[257..265].copy_from_slice(b"ustar  \0");
+        // Checksum: sum of all bytes with checksum field treated as 8 ASCII spaces.
+        // hdr[148..156] are still 0, so cksum = sum_of_all + 8*32.
+        let sum: u32 = hdr.iter().map(|&b| b as u32).sum();
+        let cksum = sum + 8 * 32;
+        let cksum_str = format!("{cksum:06o}\0 ");
+        hdr[148..156].copy_from_slice(cksum_str.as_bytes());
+        hdr
+    }
+
+    /// Build a raw (non-gzipped) layer tar: a regular file followed by a
+    /// hardlink whose linkname field contains the given raw bytes.
+    ///
+    /// `tar::Builder` would strip `./` prefixes and refuse `..` components in
+    /// link targets; writing the header bytes directly bypasses that.
+    fn raw_hardlink_layer(file_path: &str, link_path: &str, linkname_bytes: &[u8]) -> Vec<u8> {
+        let mut buf = raw_regular_block(file_path, b"data");
+        buf.extend_from_slice(&raw_hardlink_header(link_path, linkname_bytes));
+        buf.extend_from_slice(&[0u8; 1024]); // end-of-archive
+        buf
+    }
+
+    /// Test A: a hardlink whose link target carries a `./` prefix in the raw
+    /// header must have that prefix stripped in the flattened output.
+    #[test]
+    fn hardlink_linkname_normalized() {
+        // tar::Builder preserves the ./ in the linkname field verbatim, so we
+        // use a raw header to inject exactly "./zzz.bin" into the layer.
+        let bytes = raw_hardlink_layer("zzz.bin", "aaa.link", b"./zzz.bin");
+
+        let layers: Vec<Box<dyn Read>> = vec![Box::new(Cursor::new(bytes))];
+        let mut out = Vec::new();
+        flatten_layers(layers, &mut out).expect("flatten should succeed");
+
+        let mut found = false;
+        let mut ar = tar::Archive::new(Cursor::new(out));
+        for entry in ar.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.header().entry_type() == EntryType::Link {
+                found = true;
+                let link = entry
+                    .link_name()
+                    .unwrap()
+                    .expect("hardlink must have target");
+                let s = link.to_string_lossy();
+                assert_eq!(s, "zzz.bin", "link target must drop ./ prefix; got {s:?}");
+            }
+        }
+        assert!(found, "output must contain a hardlink entry");
+    }
+
+    /// Test B: a hardlink whose link target is `../evil` must be rejected.
+    #[test]
+    fn rejects_hardlink_traversal() {
+        let bytes = raw_hardlink_layer("innocuous", "bad.link", b"../evil");
+        let layers: Vec<Box<dyn Read>> = vec![Box::new(Cursor::new(bytes))];
+        assert!(
+            flatten_layers(layers, &mut Vec::new()).is_err(),
+            "hardlink with traversal target must be rejected"
+        );
+    }
+
+    /// Test C: GNU old-style sparse entries must be rejected rather than
+    /// re-emitted (which would corrupt the output tar).
+    ///
+    /// `tar::Builder::append_data` refuses to produce a well-formed GNUSparse
+    /// entry, so we set the typeflag via `set_entry_type` and use `append`
+    /// directly — the same technique as `rejects_path_traversal`.
+    #[test]
+    fn rejects_gnu_sparse() {
+        let gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut b = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        let name = b"sparse_file";
+        h.as_old_mut().name[..name.len()].copy_from_slice(name);
+        h.set_size(0);
+        h.set_mode(0o644);
+        h.set_entry_type(EntryType::GNUSparse);
+        h.set_cksum();
+        b.append(&h, std::io::empty()).unwrap();
+        let bytes = b.into_inner().unwrap().finish().unwrap();
+
+        let layers: Vec<Box<dyn Read>> = vec![Box::new(Cursor::new(bytes))];
+        assert!(
+            flatten_layers(layers, &mut Vec::new()).is_err(),
+            "GNU sparse entries must be rejected"
+        );
+    }
+
+    // ---------- end new tests ----------
 
     #[test]
     fn rejects_path_traversal() {
