@@ -19,3 +19,5 @@ sha2 = "0.10"
 hex = "0.4"
 which = "7"
 futures-util = "0.3"
+nix = { version = "0.29", features = ["process", "signal"] }
+libc = "0.2"
