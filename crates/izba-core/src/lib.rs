@@ -2,6 +2,7 @@ pub mod image;
 pub mod liveness;
 pub mod paths;
 pub mod procmgr;
+pub mod sandbox;
 pub mod state;
 pub mod vmm;
 pub mod vsock;

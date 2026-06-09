@@ -1,8 +1,15 @@
-//! Pure argv construction for a cloud-hypervisor microVM plus its sidecars
-//! (one virtiofsd per shared dir, optional passt for user-mode networking).
-//! No process is spawned here; see the launch driver for that.
+//! Cloud-hypervisor backend: pure argv construction for a microVM plus its
+//! sidecars (one virtiofsd per shared dir, optional passt for user-mode
+//! networking), and the [`CloudHypervisorDriver`] that spawns them.
 
 use super::spec::{CommandSpec, VmSpec};
+use super::{IoStream, VmHandle, VmmDriver};
+use crate::procmgr::{kill_pid, pid_alive, spawn_detached};
+use crate::state::PidIdentity;
+use crate::vsock::hybrid_connect;
+use anyhow::{bail, Context};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// The set of commands needed to boot one VM.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +113,141 @@ pub fn build_invocations(spec: &VmSpec) -> Invocations {
         virtiofsd,
         passt,
         vmm: CommandSpec { argv: vmm },
+    }
+}
+
+/// Spawns cloud-hypervisor and its sidecars as detached processes.
+///
+/// Integration-tested on real hosts (requires the cloud-hypervisor, virtiofsd
+/// and passt binaries); not unit-tested.
+pub struct CloudHypervisorDriver;
+
+const SOCKET_WAIT: Duration = Duration::from_secs(3);
+const SOCKET_POLL: Duration = Duration::from_millis(50);
+
+impl VmmDriver for CloudHypervisorDriver {
+    fn launch(&self, spec: &VmSpec) -> anyhow::Result<Box<dyn VmHandle>> {
+        std::fs::create_dir_all(&spec.run_dir)
+            .with_context(|| format!("creating {}", spec.run_dir.display()))?;
+        let log_dir = spec
+            .console_log
+            .parent()
+            .context("console_log has no parent directory")?;
+        std::fs::create_dir_all(log_dir)
+            .with_context(|| format!("creating {}", log_dir.display()))?;
+
+        let inv = build_invocations(spec);
+
+        // Sidecars first: cloud-hypervisor connects to their sockets at boot.
+        let mut sidecars: Vec<(String, PidIdentity)> = Vec::new();
+        // (role, socket the sidecar must create before CH may start)
+        let mut expected_socks: Vec<(String, PathBuf)> = Vec::new();
+
+        let kill_all = |pids: &[(String, PidIdentity)]| {
+            for (_, id) in pids {
+                let _ = kill_pid(id);
+            }
+        };
+
+        for (share, cmd) in spec.shares.iter().zip(&inv.virtiofsd) {
+            let role = format!("virtiofsd:{}", share.tag);
+            let log = log_dir.join(format!("virtiofsd-{}.log", share.tag));
+            let id = match spawn_detached(cmd, &log) {
+                Ok(id) => id,
+                Err(e) => {
+                    kill_all(&sidecars);
+                    return Err(e).with_context(|| format!("spawning {role}"));
+                }
+            };
+            sidecars.push((role.clone(), id));
+            expected_socks.push((role, spec.run_dir.join(format!("fs-{}.sock", share.tag))));
+        }
+
+        if let Some(cmd) = &inv.passt {
+            let id = match spawn_detached(cmd, &log_dir.join("passt.log")) {
+                Ok(id) => id,
+                Err(e) => {
+                    kill_all(&sidecars);
+                    return Err(e).context("spawning passt");
+                }
+            };
+            sidecars.push(("passt".to_string(), id));
+            expected_socks.push(("passt".to_string(), spec.run_dir.join("net.sock")));
+        }
+
+        // Each sidecar must create its listening socket before CH starts.
+        for (role, sock) in &expected_socks {
+            let deadline = Instant::now() + SOCKET_WAIT;
+            while !sock.exists() {
+                if Instant::now() >= deadline {
+                    kill_all(&sidecars);
+                    bail!(
+                        "{role} did not create {} within {SOCKET_WAIT:?}",
+                        sock.display()
+                    );
+                }
+                std::thread::sleep(SOCKET_POLL);
+            }
+        }
+
+        // The guest serial console goes to spec.console_log (--serial file=);
+        // the CH process's own stdout/stderr go to a sibling vmm.log.
+        let vmm_id = match spawn_detached(&inv.vmm, &log_dir.join("vmm.log")) {
+            Ok(id) => id,
+            Err(e) => {
+                kill_all(&sidecars);
+                return Err(e).context("spawning cloud-hypervisor");
+            }
+        };
+
+        let mut pids = vec![("vmm".to_string(), vmm_id)];
+        pids.extend(sidecars);
+        Ok(Box::new(ChHandle {
+            vsock_sock: spec.run_dir.join("vsock.sock"),
+            pids,
+        }))
+    }
+}
+
+/// Handle to a launched cloud-hypervisor VM. `pids[0]` is always `"vmm"`.
+struct ChHandle {
+    vsock_sock: PathBuf,
+    pids: Vec<(String, PidIdentity)>,
+}
+
+impl ChHandle {
+    fn vmm_pid(&self) -> &PidIdentity {
+        &self.pids[0].1
+    }
+}
+
+impl VmHandle for ChHandle {
+    fn connect(&self, port: u32) -> anyhow::Result<Box<dyn IoStream>> {
+        let s = hybrid_connect(&self.vsock_sock, port)?;
+        Ok(Box::new(s))
+    }
+
+    fn pids(&self) -> Vec<(String, PidIdentity)> {
+        self.pids.clone()
+    }
+
+    fn is_alive(&self) -> bool {
+        pid_alive(self.vmm_pid())
+    }
+
+    fn kill(&mut self) -> anyhow::Result<()> {
+        // In order: vmm first (it is pids[0]), then sidecars — killing the
+        // backends first would leave the VMM running on dead devices.
+        let mut last_err = None;
+        for (role, id) in &self.pids {
+            if let Err(e) = kill_pid(id) {
+                last_err = Some(e.context(format!("killing {role}")));
+            }
+        }
+        match last_err {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
     }
 }
 
