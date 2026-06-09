@@ -4,9 +4,23 @@ pub use spec::*;
 
 use crate::state::PidIdentity;
 use std::io::{Read, Write};
+use std::time::Duration;
 
-pub trait IoStream: Read + Write + Send {}
-impl<T: Read + Write + Send> IoStream for T {}
+/// A bidirectional byte stream to the guest that supports bounded I/O.
+///
+/// Control-plane RPCs must never block forever on a wedged-but-accepting
+/// guest, so every stream must be able to enforce a read/write deadline.
+pub trait IoStream: Read + Write + Send {
+    /// Apply (or clear, with `None`) a timeout to subsequent reads and writes.
+    fn set_io_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl IoStream for std::os::unix::net::UnixStream {
+    fn set_io_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(t)?;
+        self.set_write_timeout(t)
+    }
+}
 
 pub trait VmHandle: Send {
     /// Open a byte stream to the given guest vsock port.

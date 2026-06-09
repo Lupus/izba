@@ -138,6 +138,30 @@ impl VmmDriver for CloudHypervisorDriver {
 
         let inv = build_invocations(spec);
 
+        // A previous crashed run may have left sockets/pid files behind; the
+        // socket-wait below would then "succeed" against a dead socket. Clear
+        // every path we are about to create or wait on.
+        let mut stale: Vec<PathBuf> = spec
+            .shares
+            .iter()
+            .map(|s| spec.run_dir.join(format!("fs-{}.sock", s.tag)))
+            .collect();
+        if spec.net {
+            stale.push(spec.run_dir.join("net.sock"));
+        }
+        stale.push(spec.run_dir.join("vsock.sock"));
+        stale.push(spec.run_dir.join("ch-api.sock"));
+        stale.push(spec.run_dir.join("passt.pid"));
+        for path in &stale {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("removing stale {}", path.display()))
+                }
+            }
+        }
+
         // Sidecars first: cloud-hypervisor connects to their sockets at boot.
         let mut sidecars: Vec<(String, PidIdentity)> = Vec::new();
         // (role, socket the sidecar must create before CH may start)

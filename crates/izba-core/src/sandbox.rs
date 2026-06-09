@@ -21,6 +21,8 @@ use crate::vmm::{BlockDisk, FsShare, IoStream, VmSpec, VmmDriver};
 
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BOOT_POLL: Duration = Duration::from_millis(200);
+/// Per-attempt deadline for any single control-plane request/response.
+const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct CreateOpts {
@@ -61,30 +63,91 @@ pub fn default_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn Io
     }
 }
 
+/// Validate a sandbox name: `[a-z0-9][a-z0-9_.-]*`, at most 64 characters.
+///
+/// Names become path components, so this also blocks traversal (`../evil`).
+pub fn validate_name(name: &str) -> anyhow::Result<()> {
+    let head_ok = name
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    let tail_ok = name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-'));
+    if !head_ok || !tail_ok || name.len() > 64 {
+        bail!("invalid sandbox name '{name}' (allowed: [a-z0-9][a-z0-9_.-]*, max 64 chars)");
+    }
+    Ok(())
+}
+
+/// One bounded control-plane round trip: apply `timeout` to the stream, send
+/// `req`, read the reply, clear the timeout. A deadline miss is mapped to a
+/// clear "control plane timed out" error instead of a raw I/O error.
+fn rpc(
+    stream: &mut Box<dyn IoStream>,
+    req: &Request,
+    timeout: Duration,
+) -> anyhow::Result<Response> {
+    stream.set_io_timeout(Some(timeout))?;
+    let result = (|| -> anyhow::Result<Response> {
+        write_frame(stream, req)?;
+        Ok(read_frame::<_, Response>(stream)?)
+    })();
+    let _ = stream.set_io_timeout(None);
+    result.map_err(|e| {
+        if is_timeout(&e) {
+            e.context(format!("control plane timed out after {timeout:?}"))
+        } else {
+            e
+        }
+    })
+}
+
+fn is_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        })
+    })
+}
+
 pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()> {
+    validate_name(name)?;
     let dir = paths.sandbox_dir(name);
     if dir.exists() {
         bail!("sandbox '{name}' already exists");
     }
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    fs::create_dir_all(paths.logs_dir(name))?;
-    fs::create_dir_all(paths.run_dir(name))?;
 
-    let config = SandboxConfig {
-        image_digest: opts.image_digest.clone(),
-        image_ref: opts.image_ref.clone(),
-        cpus: opts.cpus,
-        mem_mb: opts.mem_mb,
-        workspace: opts.workspace.clone(),
+    // Anything failing past this point leaves a partial sandbox — clean it up.
+    let populate = || -> anyhow::Result<()> {
+        fs::create_dir_all(paths.logs_dir(name))?;
+        fs::create_dir_all(paths.run_dir(name))?;
+
+        let config = SandboxConfig {
+            image_digest: opts.image_digest.clone(),
+            image_ref: opts.image_ref.clone(),
+            cpus: opts.cpus,
+            mem_mb: opts.mem_mb,
+            workspace: opts.workspace.clone(),
+        };
+        save_json(&dir.join(CONFIG_FILE), &config)?;
+
+        // Sparse scratch disk: apparent size only, no blocks allocated.
+        let rw = dir.join("rw.img");
+        let f = File::create(&rw).with_context(|| format!("creating {}", rw.display()))?;
+        f.set_len(opts.rw_size_gb * 1024 * 1024 * 1024)
+            .with_context(|| format!("sizing {}", rw.display()))?;
+        Ok(())
     };
-    save_json(&dir.join(CONFIG_FILE), &config)?;
-
-    // Sparse scratch disk: apparent size only, no blocks allocated.
-    let rw = dir.join("rw.img");
-    let f = File::create(&rw).with_context(|| format!("creating {}", rw.display()))?;
-    f.set_len(opts.rw_size_gb * 1024 * 1024 * 1024)
-        .with_context(|| format!("sizing {}", rw.display()))?;
-    Ok(())
+    let result = populate();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    result
 }
 
 /// Take the per-sandbox exclusive lock (released on drop).
@@ -126,8 +189,7 @@ impl Probes for RealProbes<'_> {
     fn control_answers(&self) -> bool {
         let attempt = || -> anyhow::Result<()> {
             let mut s = (self.connector)(self.paths, self.name)?;
-            write_frame(&mut s, &Request::Health)?;
-            match read_frame::<_, Response>(&mut s)? {
+            match rpc(&mut s, &Request::Health, CONTROL_RPC_TIMEOUT)? {
                 Response::Health(_) => Ok(()),
                 other => bail!("unexpected health reply: {other:?}"),
             }
@@ -170,6 +232,7 @@ pub fn start_with_timeouts(
     boot_timeout: Duration,
     poll: Duration,
 ) -> anyhow::Result<()> {
+    validate_name(name)?;
     let _lock = lock_sandbox(paths, name)?;
 
     let config: SandboxConfig = load_json(&paths.sandbox_dir(name).join(CONFIG_FILE))?
@@ -208,48 +271,77 @@ pub fn start_with_timeouts(
 
     let mut handle = driver.launch(&spec)?;
 
-    // Boot-wait: poll the guest control port until Health answers.
-    let deadline = Instant::now() + boot_timeout;
-    loop {
-        let healthy = (|| -> anyhow::Result<bool> {
-            let mut s = handle.connect(CONTROL_PORT)?;
-            write_frame(&mut s, &Request::Health)?;
-            Ok(matches!(
-                read_frame::<_, Response>(&mut s)?,
-                Response::Health(_)
-            ))
-        })()
-        .unwrap_or(false);
-        if healthy {
-            break;
+    // Everything after launch must kill the handle on failure, or the VMM
+    // would be orphaned with no state.json pointing at it.
+    let booted = (|| -> anyhow::Result<()> {
+        // Boot-wait: poll the guest control port until Health answers. Each
+        // attempt is individually bounded so a wedged-but-accepting guest
+        // cannot stall past the boot budget.
+        let deadline = Instant::now() + boot_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempt_timeout = CONTROL_RPC_TIMEOUT
+                .min(remaining)
+                .max(Duration::from_millis(10));
+            let healthy = (|| -> anyhow::Result<bool> {
+                let mut s = handle.connect(CONTROL_PORT)?;
+                Ok(matches!(
+                    rpc(&mut s, &Request::Health, attempt_timeout)?,
+                    Response::Health(_)
+                ))
+            })()
+            .unwrap_or(false);
+            if healthy {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "sandbox '{name}' did not become healthy within {boot_timeout:?}; \
+                     check {} for boot output",
+                    console_log.display()
+                );
+            }
+            std::thread::sleep(poll);
         }
-        if Instant::now() >= deadline {
-            let _ = handle.kill();
-            bail!(
-                "sandbox '{name}' did not become healthy within {boot_timeout:?}; \
-                 check {} for boot output",
-                console_log.display()
-            );
-        }
-        std::thread::sleep(poll);
-    }
 
-    let mut pids = handle.pids();
-    let vmm_idx = pids
-        .iter()
-        .position(|(role, _)| role == "vmm")
-        .context("driver returned no 'vmm' pid")?;
-    let (_, vmm_pid) = pids.remove(vmm_idx);
-    let state = RunState {
-        vmm_pid,
-        sidecar_pids: pids,
-        started_unix_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
-    };
-    save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)?;
+        let mut pids = handle.pids();
+        let vmm_idx = pids
+            .iter()
+            .position(|(role, _)| role == "vmm")
+            .context("driver returned no 'vmm' pid")?;
+        let (_, vmm_pid) = pids.remove(vmm_idx);
+        let state = RunState {
+            vmm_pid,
+            sidecar_pids: pids,
+            started_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)?;
+        Ok(())
+    })();
+
+    if let Err(e) = booted {
+        let _ = handle.kill();
+        // Best-effort: clear stale sockets/pid files so a retry starts clean.
+        clear_run_dir_files(paths, name);
+        return Err(e);
+    }
     Ok(())
+}
+
+/// Best-effort removal of regular files in the run dir (sockets, pid files).
+fn clear_run_dir_files(paths: &Paths, name: &str) {
+    let run = paths.run_dir(name);
+    let Ok(entries) = fs::read_dir(&run) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| !t.is_dir()).unwrap_or(false) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Open a control-port stream to a running (or degraded) sandbox.
@@ -258,6 +350,7 @@ pub fn control(
     name: &str,
     connector: Connector,
 ) -> anyhow::Result<Box<dyn IoStream>> {
+    validate_name(name)?;
     match liveness_of(paths, name, connector)? {
         Liveness::Running | Liveness::Degraded(_) => connector(paths, name),
         Liveness::Stopped => bail!("sandbox '{name}' is not running"),
@@ -270,6 +363,7 @@ pub fn stop(
     connector: Connector,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    validate_name(name)?;
     let _lock = lock_sandbox(paths, name)?;
     stop_locked(paths, name, connector, timeout, true)
 }
@@ -298,11 +392,11 @@ fn stop_locked(
     };
 
     if graceful {
-        // Best-effort: the guest may die mid-reply, which is fine.
+        // Best-effort: the guest may die mid-reply or hang, which is fine —
+        // the bounded RPC guarantees we reach the escalation path below.
         let _ = (|| -> anyhow::Result<()> {
             let mut s = connector(paths, name)?;
-            write_frame(&mut s, &Request::Shutdown)?;
-            let _ = read_frame::<_, Response>(&mut s);
+            let _ = rpc(&mut s, &Request::Shutdown, CONTROL_RPC_TIMEOUT);
             Ok(())
         })();
         let deadline = Instant::now() + timeout;
@@ -326,6 +420,16 @@ fn stop_locked(
         let deadline = Instant::now() + Duration::from_secs(2);
         while procmgr::pid_alive(&state.vmm_pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
+        }
+        // A VMM that survives SIGKILL (e.g. stuck in uninterruptible sleep)
+        // must keep its state.json, or a later start would double-boot.
+        // Integration-covered; not unit-tested (would require an unkillable
+        // process).
+        if procmgr::pid_alive(&state.vmm_pid) {
+            bail!(
+                "VMM survived SIGKILL (pid {}); state preserved — retry stop",
+                state.vmm_pid.pid
+            );
         }
     }
 
@@ -355,10 +459,17 @@ fn cleanup_runtime(paths: &Paths, name: &str) -> anyhow::Result<()> {
 }
 
 pub fn remove(paths: &Paths, name: &str, connector: Connector, force: bool) -> anyhow::Result<()> {
+    validate_name(name)?;
     let dir = paths.sandbox_dir(name);
     if !dir.exists() {
         bail!("no such sandbox '{name}'");
     }
+    // Rename to a sibling tombstone *while holding the lock*, so a concurrent
+    // start cannot slip in between liveness check and deletion: once renamed,
+    // the old name has no config.json and start fails with "no such sandbox".
+    let tombstone = paths
+        .sandboxes_dir()
+        .join(format!("{name}.removing-{}", std::process::id()));
     {
         let _lock = lock_sandbox(paths, name)?;
         match liveness_of(paths, name, connector)? {
@@ -366,8 +477,15 @@ pub fn remove(paths: &Paths, name: &str, connector: Connector, force: bool) -> a
             _ if !force => bail!("sandbox '{name}' is running (use force to remove)"),
             _ => stop_locked(paths, name, connector, Duration::ZERO, false)?,
         }
-    } // release the lock before deleting the file backing it
-    fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+        fs::rename(&dir, &tombstone)
+            .with_context(|| format!("renaming {} for removal", dir.display()))?;
+    } // the lock file moved with the dir; release before deleting it
+    if let Err(e) = fs::remove_dir_all(&tombstone) {
+        eprintln!(
+            "warning: sandbox '{name}' renamed to {} but final deletion failed: {e}",
+            tombstone.display()
+        );
+    }
     Ok(())
 }
 
@@ -394,12 +512,31 @@ pub fn list(paths: &Paths, connector: Connector) -> anyhow::Result<Vec<SandboxIn
                 continue;
             }
         };
-        let liveness = liveness_of(paths, &name, connector)?;
+        let liveness = match liveness_of(paths, &name, connector) {
+            Ok(l) => l,
+            Err(e) => {
+                // Corrupt state.json must not abort the whole listing; report
+                // the sandbox as stopped and leave the file for inspection.
+                eprintln!(
+                    "warning: sandbox '{name}' has unreadable state ({e:#}); showing as stopped"
+                );
+                out.push(SandboxInfo {
+                    name,
+                    image_ref: config.image_ref,
+                    liveness: Liveness::Stopped,
+                });
+                continue;
+            }
+        };
         if liveness == Liveness::Stopped {
-            // Correct stale state left behind by a VMM that died on its own.
+            // Correct stale state left behind by a VMM that died on its own —
+            // but only if no concurrent operation (e.g. start) holds the lock,
+            // otherwise we could delete the state.json it just wrote.
             let state_path = entry.path().join(STATE_FILE);
             if state_path.exists() {
-                let _ = fs::remove_file(&state_path);
+                if let Ok(_lock) = lock_sandbox(paths, &name) {
+                    let _ = fs::remove_file(&state_path);
+                }
             }
         }
         out.push(SandboxInfo {
@@ -510,6 +647,7 @@ mod tests {
         captured: Mutex<Option<VmSpec>>,
         health_delay: Duration,
         answer_health: bool,
+        omit_vmm_pid: bool,
         /// `killed` flag of the most recently launched handle.
         last_killed: Mutex<Option<Arc<AtomicBool>>>,
     }
@@ -524,7 +662,16 @@ mod tests {
                 captured: Mutex::new(None),
                 health_delay,
                 answer_health,
+                omit_vmm_pid: false,
                 last_killed: Mutex::new(None),
+            }
+        }
+
+        /// A driver whose handle reports no "vmm" pid (driver bug simulation).
+        fn without_vmm_pid() -> Self {
+            Self {
+                omit_vmm_pid: true,
+                ..Self::new()
             }
         }
     }
@@ -534,12 +681,17 @@ mod tests {
             *self.captured.lock().unwrap() = Some(spec.clone());
             let killed = Arc::new(AtomicBool::new(false));
             *self.last_killed.lock().unwrap() = Some(killed.clone());
+            let pids = if self.omit_vmm_pid {
+                vec![]
+            } else {
+                vec![("vmm".to_string(), live_identity())]
+            };
             Ok(Box::new(MockHandle {
                 alive: Arc::new(AtomicBool::new(true)),
                 killed,
                 health_delay: self.health_delay,
                 answer_health: self.answer_health,
-                pids: vec![("vmm".to_string(), live_identity())],
+                pids,
             }))
         }
     }
@@ -624,6 +776,21 @@ mod tests {
                     log.lock().unwrap().push(req);
                     let _ = write_frame(&mut s, &resp);
                 }
+            });
+            Ok(Box::new(client) as Box<dyn IoStream>)
+        }
+    }
+
+    /// Connector to a guest that accepts the request but never replies —
+    /// simulates a wedged-but-accepting control plane.
+    fn hanging_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn IoStream>> {
+        |_paths: &Paths, _name: &str| {
+            let (client, server) = UnixStream::pair()?;
+            std::thread::spawn(move || {
+                let mut s = server;
+                let _ = read_frame::<_, Request>(&mut s);
+                // Keep the socket open so the client cannot see EOF.
+                std::thread::sleep(Duration::from_secs(10));
             });
             Ok(Box::new(client) as Box<dyn IoStream>)
         }
@@ -749,6 +916,9 @@ mod tests {
         fs::create_dir_all(&ws).unwrap();
         create(&paths, "web", &opts(&ws)).unwrap();
 
+        // Debris from a previous failed run; the failure path must clear it.
+        fs::write(paths.run_dir("web").join("stale.sock"), b"").unwrap();
+
         let driver = MockDriver::with(Duration::ZERO, false);
         let err = start_with_timeouts(
             &paths,
@@ -774,6 +944,41 @@ mod tests {
         assert!(
             !paths.sandbox_dir("web").join(STATE_FILE).exists(),
             "state.json must not be written on boot failure"
+        );
+        let leftovers: Vec<_> = fs::read_dir(paths.run_dir("web"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "run/ must be cleared on boot failure, found: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn start_kills_on_missing_vmm_pid() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let driver = MockDriver::without_vmm_pid();
+        let err = start(&paths, "web", &driver, &arts()).unwrap_err();
+
+        assert!(err.to_string().contains("vmm"), "got: {err:#}");
+        let killed = driver
+            .last_killed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handle launched");
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "handle must be killed when no 'vmm' pid is reported"
+        );
+        assert!(
+            !paths.sandbox_dir("web").join(STATE_FILE).exists(),
+            "state.json must not be written when start fails"
         );
     }
 
@@ -884,6 +1089,82 @@ mod tests {
             !paths.sandbox_dir("web").join(STATE_FILE).exists(),
             "stale state.json must be corrected (deleted)"
         );
+    }
+
+    #[test]
+    fn control_timeout_is_bounded() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        // vmm "alive" (this test process), guest accepts but never replies.
+        write_state(&paths, "web", live_identity());
+
+        let conn = hanging_connector();
+        let t0 = Instant::now();
+        let infos = list(&paths, &conn).unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "liveness must be bounded by the RPC timeout, took {elapsed:?}"
+        );
+        assert_eq!(infos.len(), 1);
+        assert!(
+            matches!(infos[0].liveness, Liveness::Degraded(_)),
+            "wedged control plane must report Degraded, got {:?}",
+            infos[0].liveness
+        );
+    }
+
+    #[test]
+    fn ls_tolerates_corrupt_state() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "bad", &opts(&ws)).unwrap();
+        create(&paths, "good", &opts(&ws)).unwrap();
+        fs::write(paths.sandbox_dir("bad").join(STATE_FILE), b"{garbage").unwrap();
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log, None);
+        let infos = list(&paths, &conn).unwrap();
+
+        assert_eq!(infos.len(), 2, "corrupt sandbox must not abort the listing");
+        assert_eq!(infos[0].name, "bad");
+        assert_eq!(infos[0].liveness, Liveness::Stopped);
+        assert_eq!(infos[1].name, "good");
+        assert!(
+            paths.sandbox_dir("bad").join(STATE_FILE).exists(),
+            "corrupt state.json must be left for inspection, not auto-deleted"
+        );
+    }
+
+    #[test]
+    fn name_validation() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        let err = create(&paths, "../evil", &opts(&ws)).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid sandbox name"),
+            "got: {err:#}"
+        );
+        assert!(
+            !paths.sandboxes_dir().join("../evil").exists(),
+            "nothing may be created outside sandboxes/"
+        );
+
+        assert!(validate_name("ok-name.1").is_ok());
+        assert!(validate_name("web").is_ok());
+        assert!(validate_name("").is_err());
+        assert!(validate_name("-leading-dash").is_err());
+        assert!(validate_name(".hidden").is_err());
+        assert!(validate_name("UPPER").is_err());
+        assert!(validate_name("has space").is_err());
+        assert!(validate_name(&"a".repeat(65)).is_err());
+        assert!(validate_name(&"a".repeat(64)).is_ok());
     }
 
     #[test]
