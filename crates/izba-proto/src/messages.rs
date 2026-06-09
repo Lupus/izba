@@ -7,6 +7,8 @@ pub struct ExecRequest {
     pub cwd: String,
     pub tty: bool,
     pub uid: u32,
+    /// Group id for the spawned process; typically matches uid.
+    pub gid: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +87,7 @@ mod tests {
                 cwd: "/workspace".into(),
                 tty: true,
                 uid: 0,
+                gid: 0,
             }),
             Request::Wait { exec_id: 7 },
             Request::Kill {
@@ -113,5 +116,46 @@ mod tests {
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("exec_not_found"), "{s}");
+
+        let r2 = Response::Error {
+            kind: ErrorKind::CommandNotFound,
+            message: "not found".into(),
+        };
+        let s2 = serde_json::to_string(&r2).unwrap();
+        assert!(s2.contains("command_not_found"), "{s2}");
+
+        let r3 = Response::Error {
+            kind: ErrorKind::BadRequest,
+            message: "bad".into(),
+        };
+        let s3 = serde_json::to_string(&r3).unwrap();
+        assert!(s3.contains("bad_request"), "{s3}");
+    }
+
+    #[test]
+    fn response_roundtrip() {
+        for resp in [
+            Response::Health(HealthInfo {
+                version: "0.1.0".into(),
+                uptime_ms: 1234,
+            }),
+            Response::ExecStarted { exec_id: 42 },
+            Response::Wait {
+                status: ExitStatus::Code(0),
+            },
+            Response::Wait {
+                status: ExitStatus::Signal(15),
+            },
+            Response::Ok,
+            Response::Error {
+                kind: ErrorKind::CommandNotFound,
+                message: "not found".into(),
+            },
+        ] {
+            let mut buf = Vec::new();
+            crate::write_frame(&mut buf, &resp).unwrap();
+            let back: Response = crate::read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
+            assert_eq!(format!("{resp:?}"), format!("{back:?}"));
+        }
     }
 }

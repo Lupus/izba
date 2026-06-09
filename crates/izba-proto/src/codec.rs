@@ -101,4 +101,17 @@ mod tests {
         let r = read_frame::<_, u32>(&mut Cursor::new(Vec::new()));
         assert!(matches!(r, Err(FrameError::Eof)));
     }
+
+    #[test]
+    fn truncated_mid_payload_is_distinguishable_from_eof() {
+        // Complete length header claiming 10 bytes, but only 4 bytes of payload follow.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]);
+        let r = read_frame::<_, serde_json::Value>(&mut Cursor::new(&buf));
+        assert!(
+            matches!(r, Err(FrameError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "expected UnexpectedEof, got {r:?}"
+        );
+    }
 }
