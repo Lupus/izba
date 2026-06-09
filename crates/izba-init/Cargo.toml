@@ -1,0 +1,9 @@
+[package]
+name = "izba-init"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+izba-proto = { path = "../izba-proto" }
+anyhow.workspace = true
