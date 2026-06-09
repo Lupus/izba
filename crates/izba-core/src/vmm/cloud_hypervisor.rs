@@ -222,8 +222,35 @@ mod tests {
         let inv = build_invocations(&spec);
 
         assert!(inv.passt.is_none());
-        assert!(!inv.vmm.argv.iter().any(|a| a == "--net"));
-        assert!(!inv.vmm.argv.iter().any(|a| a.contains("net.sock")));
+        assert_eq!(
+            inv.vmm.argv,
+            argv(&[
+                "cloud-hypervisor",
+                "--kernel",
+                "/img/vmlinux",
+                "--initramfs",
+                "/img/initramfs.img",
+                "--cmdline",
+                "console=ttyS0 init=/init",
+                "--cpus",
+                "boot=2",
+                "--memory",
+                "size=4096M,shared=on",
+                "--disk",
+                "path=/img/rootfs.img,readonly=on",
+                "path=/sbx/scratch.img",
+                "--fs",
+                "tag=workspace,socket=/sbx/run/fs-workspace.sock",
+                "--vsock",
+                "cid=3,socket=/sbx/run/vsock.sock",
+                "--serial",
+                "file=/sbx/console.log",
+                "--console",
+                "off",
+                "--api-socket",
+                "/sbx/run/ch-api.sock",
+            ])
+        );
     }
 
     #[test]
@@ -271,21 +298,37 @@ mod tests {
             ])
         );
 
-        let fs_values: Vec<&String> = inv
-            .vmm
-            .argv
-            .iter()
-            .skip_while(|a| *a != "--fs")
-            .skip(1)
-            .take_while(|a| !a.starts_with("--"))
-            .collect();
         assert_eq!(
-            fs_values,
-            vec![
+            inv.vmm.argv,
+            argv(&[
+                "cloud-hypervisor",
+                "--kernel",
+                "/img/vmlinux",
+                "--initramfs",
+                "/img/initramfs.img",
+                "--cmdline",
+                "console=ttyS0 init=/init",
+                "--cpus",
+                "boot=2",
+                "--memory",
+                "size=4096M,shared=on",
+                "--disk",
+                "path=/img/rootfs.img,readonly=on",
+                "path=/sbx/scratch.img",
+                "--fs",
                 "tag=workspace,socket=/sbx/run/fs-workspace.sock",
                 "tag=cache,socket=/sbx/run/fs-cache.sock",
-            ]
+                "--net",
+                "vhost_user=true,socket=/sbx/run/net.sock",
+                "--vsock",
+                "cid=3,socket=/sbx/run/vsock.sock",
+                "--serial",
+                "file=/sbx/console.log",
+                "--console",
+                "off",
+                "--api-socket",
+                "/sbx/run/ch-api.sock",
+            ])
         );
-        assert_eq!(inv.vmm.argv.iter().filter(|a| *a == "--fs").count(), 1);
     }
 }
