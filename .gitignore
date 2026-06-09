@@ -1,3 +1,4 @@
 /target
 /.toolchain
 /.cargo-env
+/dist

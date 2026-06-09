@@ -155,6 +155,38 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
         let f = File::create(&rw).with_context(|| format!("creating {}", rw.display()))?;
         f.set_len(opts.rw_size_gb * 1024 * 1024 * 1024)
             .with_context(|| format!("sizing {}", rw.display()))?;
+        drop(f); // release the file handle before running mkfs on it
+
+        // Best-effort: pre-format the scratch disk on the host so the guest
+        // does not need an embedded mke2fs.  Failure is non-fatal — if
+        // mkfs.ext4 is absent or fails, the guest-side mke2fs (if present in
+        // the initramfs) will handle it; if neither works, init exits with a
+        // clear error.
+        match which::which("mkfs.ext4") {
+            Err(_) => {
+                // mkfs.ext4 not on PATH — guest must handle formatting.
+            }
+            Ok(mkfs) => {
+                let out = std::process::Command::new(&mkfs)
+                    .args(["-q", "-F"])
+                    .arg(&rw)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => {}
+                    Ok(o) => {
+                        eprintln!(
+                            "warning: mkfs.ext4 on {} failed ({}): {}",
+                            rw.display(),
+                            o.status,
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("warning: failed to run {}: {e}", mkfs.display());
+                    }
+                }
+            }
+        }
         Ok(())
     };
     let result = populate();
@@ -1226,6 +1258,40 @@ mod tests {
         assert!(
             msg.contains("busy") || msg.contains("already running"),
             "loser error should be busy/already running, got: {msg}"
+        );
+    }
+
+    /// Verify that `create` pre-formats rw.img with ext4 when `mkfs.ext4` is
+    /// available on PATH.  Skipped (with a note) when mkfs.ext4 is absent so
+    /// the test suite stays green in minimal CI environments.
+    #[test]
+    fn create_preformats_rw_when_mkfs_available() {
+        if which::which("mkfs.ext4").is_err() {
+            eprintln!("SKIP create_preformats_rw_when_mkfs_available: mkfs.ext4 not on PATH");
+            return;
+        }
+
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let rw = paths.sandbox_dir("web").join("rw.img");
+        assert!(rw.is_file(), "rw.img must exist after create()");
+
+        // The ext4 superblock starts at byte offset 1024.  If mkfs.ext4 ran
+        // successfully the magic bytes 0x53EF will be at offsets 1080-1081
+        // (within the superblock at +56).  Reading the first 64 KiB and
+        // checking for any non-zero byte past offset 1024 is a quick proxy.
+        let mut f = fs::File::open(&rw).unwrap();
+        let mut buf = vec![0u8; 65536];
+        use std::io::Read as _;
+        let n = f.read(&mut buf).unwrap();
+        let superblock_region = &buf[1024..n.min(2048)];
+        let nonzero = superblock_region.iter().any(|&b| b != 0);
+        assert!(
+            nonzero,
+            "rw.img superblock region must be non-zero after mkfs.ext4 pre-format"
         );
     }
 }
