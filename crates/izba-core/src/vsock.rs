@@ -13,14 +13,18 @@ use std::time::Duration;
 ///      bytes past the `\n` belong to the stream data).
 ///   4. If the response starts with `OK `, the handshake succeeded and the stream
 ///      is raw guest-vsock data. Otherwise return an error containing the response.
+pub fn hybrid_connect(socket: &Path, port: u32) -> anyhow::Result<UnixStream> {
+    let s = UnixStream::connect(socket)
+        .with_context(|| format!("connecting to {}", socket.display()))?;
+    hybrid_handshake(s, port)
+}
+
+/// The handshake half of [`hybrid_connect`], on an already-connected stream.
+/// Split out so it can be exercised on a socketpair in tests.
 ///
 /// A read timeout of 5 s is applied during the handshake and cleared afterwards
 /// so that a hung VMM cannot block the caller forever.
-pub fn hybrid_connect(socket: &Path, port: u32) -> anyhow::Result<UnixStream> {
-    let mut s = UnixStream::connect(socket)
-        .with_context(|| format!("connecting to {}", socket.display()))?;
-
-    // Apply handshake timeout so a hung VMM can't block forever.
+fn hybrid_handshake(mut s: UnixStream, port: u32) -> anyhow::Result<UnixStream> {
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
 
     s.write_all(format!("CONNECT {port}\n").as_bytes())?;
@@ -59,20 +63,17 @@ mod tests {
 
     #[test]
     fn handshake() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("vsock.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let (client, mut server) = UnixStream::pair().unwrap();
         let t = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
             let mut line = String::new();
-            std::io::BufReader::new(s.try_clone().unwrap())
+            std::io::BufReader::new(server.try_clone().unwrap())
                 .read_line(&mut line)
                 .unwrap();
             assert_eq!(line, "CONNECT 1025\n");
-            s.write_all(b"OK 1073741824\n").unwrap();
-            s.write_all(b"ping").unwrap();
+            server.write_all(b"OK 1073741824\n").unwrap();
+            server.write_all(b"ping").unwrap();
         });
-        let mut c = hybrid_connect(&sock, 1025).unwrap();
+        let mut c = hybrid_handshake(client, 1025).unwrap();
         let mut buf = [0u8; 4];
         c.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"ping");
@@ -81,20 +82,17 @@ mod tests {
 
     #[test]
     fn refused_port() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("vsock.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let (client, mut server) = UnixStream::pair().unwrap();
         let t = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
             // Read and discard the CONNECT line.
             let mut line = String::new();
-            std::io::BufReader::new(s.try_clone().unwrap())
+            std::io::BufReader::new(server.try_clone().unwrap())
                 .read_line(&mut line)
                 .unwrap();
             // Respond with an error.
-            s.write_all(b"ERR\n").unwrap();
+            server.write_all(b"ERR\n").unwrap();
         });
-        let result = hybrid_connect(&sock, 9999);
+        let result = hybrid_handshake(client, 9999);
         assert!(result.is_err(), "should fail on ERR response");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -110,5 +108,37 @@ mod tests {
         let sock = dir.path().join("nonexistent.sock");
         let result = hybrid_connect(&sock, 1025);
         assert!(result.is_err(), "should error when socket does not exist");
+    }
+
+    /// End-to-end through a real listening socket. Some sandboxes deny
+    /// `UnixListener::bind` (EPERM); skip there — socketpair tests above
+    /// cover the handshake logic, and the integration suite covers this path.
+    #[test]
+    fn full_connect_via_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let listener = match std::os::unix::net::UnixListener::bind(&sock) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP: sandbox denies UnixListener::bind: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected bind failure: {e}"),
+        };
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(s.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "CONNECT 1025\n");
+            s.write_all(b"OK 1073741824\n").unwrap();
+            s.write_all(b"pong").unwrap();
+        });
+        let mut c = hybrid_connect(&sock, 1025).unwrap();
+        let mut buf = [0u8; 4];
+        c.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
+        t.join().unwrap();
     }
 }
