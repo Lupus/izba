@@ -6,7 +6,7 @@ use std::path::Path;
 pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32> {
     let workspace = super::ensure_workspace(dir)?;
     let name = super::name_for(opts, &workspace)?;
-    eprintln!("pulling {}...", opts.image);
+    eprintln!("resolving {} (pulls if not cached)...", opts.image);
     let digest = image::ensure_image(paths, &opts.image)?;
     sandbox::create(paths, &name, &super::create_opts(opts, digest, workspace))?;
     println!("{name}");

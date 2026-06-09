@@ -28,6 +28,9 @@ pub fn run(
     tty: bool,
     argv: Vec<String>,
 ) -> anyhow::Result<i32> {
+    if tty && !terminal::is_tty(libc::STDIN_FILENO) {
+        anyhow::bail!("exec -t requires a terminal on stdin");
+    }
     let connector = sandbox::default_connector();
     let mut control = sandbox::control(paths, name, &connector)?;
 
