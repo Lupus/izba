@@ -891,7 +891,6 @@ dependencies = [
  "futures-util",
  "hex",
  "izba-proto",
- "libc",
  "nix",
  "oci-client",
  "serde",
