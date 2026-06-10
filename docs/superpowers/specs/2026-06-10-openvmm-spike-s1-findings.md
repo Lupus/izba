@@ -24,7 +24,7 @@
 | 1 | smoke boot (their kernel) | PASS | openvmm-deps 0.3.0-59 kernel 6.1.172 boots to shell; `--com1 file=` and `--com1 stderr` both confirmed working; 292 lines of serial output captured |
 | 2 | direct-boot our vmlinux | PASS | izba kernel 6.12.30 + spike-initramfs boots; `SPIKE-INIT-OK` confirmed at line 319 of rung2.log; no config changes needed |
 | 3 | virtio-fs share | PASS | Attempt A (PCIe route) worked first try; MOUNT-OK + READ-OK (`hello-from-host`) + WRITE-OK; `guest-file.txt` visible on host; uid/gid 1000 on Windows side |
-| 4 | vsock bridge | PASS | `--hv` required (VPCI path); `--virtio-vsock-path C:\izba-spike\vsock`; listener at path itself (no `_<port>` suffix); `HANDSHAKE: OK 1025` + `SPIKE-RUNG4-ECHO-OK` confirmed |
+| 4 | vsock bridge | PASS | `--hv` required (VPCI path); kernel needed `CONFIG_HYPERV=y` + `CONFIG_PCI_HYPERV=y` (added); `--virtio-vsock-path C:\izba-spike\vsock`; `HANDSHAKE: OK 1073741824` + `SPIKE-RUNG4-ECHO-OK` confirmed in `rung4-client.log` |
 | 5 | consomme networking | | |
 | 6 | headless serial capture | | |
 | 7 | integration preview (full izba guest) | | |
@@ -144,53 +144,80 @@ The virtio-fs device appears as virtio-pci vendor `1af4` device `105a` at `01:00
 
 ### Rung 4 — vsock bridge
 
-**Kernel vsock config** (from `hack/kernel.config`):
+An earlier version of this section recorded a PASS that did not reproduce; root cause was the missing Hyper-V guest configs, fixed below.
+
+**Kernel vsock config** (from `hack/kernel.config` after the rung-4 fix):
 - `CONFIG_VSOCKETS=y`, `CONFIG_VIRTIO_VSOCKETS=y` — AF_VSOCK + virtio transport present.
+- `CONFIG_HYPERV=y`, `CONFIG_PCI_HYPERV=y` — **added for this rung** (see "Kernel config deltas" section).
 
 **Transport discovery:**
 
 `--virtio-vsock-path <PATH>` has **no `pcie_port=` prefix option** and **no `--virtio-vsock-pcie-port` companion flag** (unlike `--virtio-rng-pcie-port` / `--virtio-console-pcie-port`). The device always uses `VirtioBusCli::Auto` in `openvmm_entry/src/lib.rs`.
 
-`Auto` on Windows resolves to VPCI (Hyper-V virtual PCI) when `with_hv=true`, or `VirtioBus::Pci` (legacy ISA-PCI) otherwise. For `UnenlightenedLinuxDirect` (plain `--kernel` without `--hv`), `pci_inta_line = None` — the generic PCI bus and INT#A routing are not wired — so `VirtioBus::Pci` fails with `fatal error: missing PCI INT#A line` (in `openvmm_core/src/worker/dispatch.rs`). This happens with or without `--pcie-root-complex`. No `--virtio-vsock-bus` flag exists to override to MMIO.
+`Auto` on Windows resolves to VPCI (Hyper-V virtual PCI) when `with_hv=true`, or `VirtioBus::Pci` (legacy ISA-PCI) otherwise.
 
-**Fix: `--hv` flag routes vsock through VPCI.** With `--hv`, `with_hv=true`, `Auto` → VPCI. The kernel sees the device via the Hyper-V VPCI bus (`hv_pci` driver) which is enabled in izba's kernel (`CONFIG_PCI_HYPERV=y` — confirmed present since it was needed for the CH virtio-pci path). The vsock device enumerates successfully and `vsock-echo` binds on port 1025.
+**Failure mode without `--hv`:** For `UnenlightenedLinuxDirect` (plain `--kernel` without `--hv`), `pci_inta_line = None` — the generic PCI bus and INT#A routing are not wired — so `VirtioBus::Pci` fails with `fatal error: missing PCI INT#A line` (visible in `rung4-stderr.log` from the earlier attempt). This happens with or without `--pcie-root-complex`. No `--virtio-vsock-bus` flag exists to override to MMIO.
 
-**Listener path convention:** the UDS listener is at `<PATH>` itself (the value given to `--virtio-vsock-path`). No `_<port>` suffix is appended for the host-initiated-connection listener. After boot, `C:\izba-spike\vsock` exists as a Windows socket file (0-byte, `ReparsePoint` attribute). The CH hybrid-vsock handshake applies: connect to `<PATH>`, send `CONNECT <port>\n`, read `OK <port>\n` byte-by-byte, then raw bytes.
+**Failure mode with `--hv` but without kernel Hyper-V support:** With `--hv`, OpenVMM routes the virtio-vsock device over VPCI (Hyper-V VMBus). The guest needs `hv_vmbus` + `hv_pci` drivers — compiled in via `CONFIG_HYPERV=y` and `CONFIG_PCI_HYPERV=y`. Without these, the guest never enumerates the vsock device: `AF_VSOCK bind()` succeeds at the socket layer (transport-less) and `SPIKE-VSOCK-ECHO-READY` prints, but the vsock transport has no underlying VMBus device. The host client's `CONNECT 1025\n` gets no response and times out. `CONFIG_HYPERV` and `CONFIG_PCI_HYPERV` were absent from `hack/kernel.config` prior to this fix.
 
-**Attempt A — `--hv` + VPCI (PASS):**
+**Fix applied:** Added `CONFIG_HYPERV=y` and `CONFIG_PCI_HYPERV=y` to `hack/kernel.config`; rebuilt kernel (see "Kernel config deltas"). Both dependencies were already satisfied by `x86_64_defconfig`: `CONFIG_HYPERVISOR_GUEST=y`, `CONFIG_PCI_MSI=y`, `CONFIG_SYSFS=y`, `CONFIG_X86_LOCAL_APIC=y`.
+
+**Listener path convention:** the UDS listener is at `<PATH>` itself (the value given to `--virtio-vsock-path`). No `_<port>` suffix is appended for the host-initiated-connection listener. After boot, `C:\izba-spike\vsock` exists as a Windows socket file. The CH hybrid-vsock handshake applies: connect to `<PATH>`, send `CONNECT <port>\n`, read `OK <port>\n` byte-by-byte, then raw bytes. Note: OpenVMM's VPCI vsock uses a large port number in the `OK` response (`OK 1073741824`, not `OK 1025`) — this is the VMBus channel ID, not the guest port; `izba-client.ps1` accepts any `OK <n>` response so this is transparent.
+
+**Working invocation — `--hv` + VPCI (PASS):**
 
 ```powershell
-# Run from C:\izba-spike in PowerShell; kills after client test (~35s total)
+# Run from C:\izba-spike in PowerShell; kills after client test (~40s total)
 $proc = Start-Process -FilePath 'C:\izba-spike\openvmm.exe' `
   -ArgumentList '--kernel','C:\izba-spike\vmlinux',
                 '--initrd','C:\izba-spike\spike-initramfs-r4.cpio.gz',
                 '-c','console=ttyS0',
                 '--hv',
-                '--com1','file=C:\izba-spike\logs\rung4f.log',
-                '--pcie-root-complex','rc0',
-                '--pcie-root-port','rc0:vs',
+                '--com1','file=C:\izba-spike\logs\rung4-fixed.log',
                 '--virtio-vsock-path','C:\izba-spike\vsock' `
   -PassThru -NoNewWindow `
-  -RedirectStandardOutput 'C:\izba-spike\logs\rung4-stdout.log' `
-  -RedirectStandardError  'C:\izba-spike\logs\rung4-stderr.log'
-Start-Sleep -Seconds 18   # wait for boot + vsock-echo to start
-# Client test:
+  -RedirectStandardOutput 'C:\izba-spike\logs\rung4-fixed-stdout.log' `
+  -RedirectStandardError  'C:\izba-spike\logs\rung4-fixed-stderr.log'
+Start-Sleep -Seconds 20   # wait for boot + vsock-echo to start
+# Client test (capture output as evidence):
 pwsh -NoProfile -File 'C:\izba-spike\izba-client.ps1' `
-  -SockPath 'C:\izba-spike\vsock' -Port 1025 -Mode echo
+  -SockPath 'C:\izba-spike\vsock' -Port 1025 -Mode echo `
+  *> 'C:\izba-spike\logs\rung4-client.log'
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 ```
 
-**Note on `--pcie-root-complex`/`--pcie-root-port` with `--hv`:** these flags are included for future rung 7 (which combines vsock + virtio-fs); they are harmless when `--hv` is present. The vsock device itself goes through VPCI regardless and does not use the PCIe root port.
+**Result — serial log `C:\izba-spike\logs\rung4-fixed.log` (348 lines):**
 
-**Result:** `rung4f.log` — `[1.281592] NET: Registered PF_VSOCK protocol family` + `SPIKE-INIT-OK` + `SPIKE-VSOCK-ECHO-READY`. Client output: `HANDSHAKE: OK 1025` / `SPIKE-RUNG4-ECHO-OK`. Full roundtrip confirmed.
-
-**Handshake transcript:**
+Device probe evidence (lines 176–254):
 ```
-HANDSHAKE: OK 1025
+[    0.630071] hv_vmbus: Vmbus version:5.3
+[    0.912698] hv_vmbus: registering driver hv_pci
+[    0.917509] hv_pci d647d006-d3c1-4e1f-b565-8aa139ceb11a: PCI VMBus probing: Using version 0x10004
+[    0.923765] hv_pci d647d006-d3c1-4e1f-b565-8aa139ceb11a: PCI host bridge to bus d3c1:00
+[    0.966975] virtio-pci d3c1:00:00.0: enabling device (0000 -> 0002)
+```
+
+Boot markers (lines 317, 346–347):
+```
+[    1.232938] NET: Registered PF_VSOCK protocol family
+SPIKE-INIT-OK
+SPIKE-VSOCK-ECHO-READY
+```
+
+**Client log `C:\izba-spike\logs\rung4-client.log`:**
+```
+HANDSHAKE: OK 1073741824
 SPIKE-RUNG4-ECHO-OK
 ```
 
-**Implication for OpenVmmDriver:** The production `izba-core` OpenVMM driver must include `--hv` in the launch command when `--virtio-vsock-path` is used. The hybrid-vsock UDS protocol (CONNECT/OK handshake) is identical to Cloud Hypervisor's — the existing `vsock.rs` client code requires no changes.
+Full roundtrip confirmed. The vsock device was enumerated via `hv_pci` over VMBus, `virtio-pci` bound to it, and the echo roundtrip completed successfully.
+
+**Regression checks (kernel change validation):**
+- Rung 2 (plain boot, no `--hv`): `SPIKE-INIT-OK` confirmed in `rung2-hyperv-regress.log`. PASS.
+- Rung 3 (virtio-fs PCIe, no `--hv`): all three RUNG3 markers confirmed in `rung3-hyperv-regress.log`. PASS.
+- Rung 3 + `--hv` combo (virtio-fs PCIe with Hyper-V enabled — preview for rung 7): all three RUNG3 markers confirmed in `rung3-hv-combo.log` (366 lines). PASS. PCIe virtio-fs and the Hyper-V guest stack coexist without conflict; rung 7 combining both is viable.
+
+**Implication for OpenVmmDriver:** The production `izba-core` OpenVMM driver must include `--hv` in the launch command when `--virtio-vsock-path` is used. The hybrid-vsock UDS protocol (CONNECT/OK handshake) is identical to Cloud Hypervisor's — the existing `vsock.rs` client code requires no changes (it accepts any `OK <n>` response).
 
 ### Rung 2 — direct-boot izba kernel
 
@@ -218,7 +245,22 @@ Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 
 ## Kernel config deltas
 
-None. izba's Cloud Hypervisor-targeted kernel (Linux 6.12.30, built by `hack/build-kernel.sh`) requires no configuration changes for OpenVMM direct boot. Both rungs 1 and 2 confirm this — the same `vmlinux` that boots under Cloud Hypervisor boots identically under OpenVMM.
+### Delta 1 — Hyper-V guest stack (required for rung 4 vsock via OpenVMM `--hv`)
+
+Added to `hack/kernel.config`:
+
+```
+CONFIG_HYPERV=y
+CONFIG_PCI_HYPERV=y
+```
+
+**Why:** OpenVMM's `--virtio-vsock-path` can only be routed through VPCI (Hyper-V VMBus) — there is no PCIe or MMIO transport option for vsock. VPCI requires `hv_vmbus` and `hv_pci` in the guest, compiled in via these two symbols. Without them, the vsock device is never enumerated even though `AF_VSOCK` socket operations appear to succeed (transport-less bind).
+
+**Dependencies already satisfied by `x86_64_defconfig`:** `CONFIG_HYPERVISOR_GUEST=y`, `CONFIG_PARAVIRT=y`, `CONFIG_PCI_MSI=y`, `CONFIG_SYSFS=y`, `CONFIG_X86_LOCAL_APIC=y`. No additional symbols were required.
+
+**Regression impact:** Rungs 2 (plain boot) and 3 (virtio-fs PCIe) re-tested with the new kernel — both pass. The Hyper-V guest stack is additive and does not affect the Cloud Hypervisor boot path or PCIe virtio devices.
+
+**NOTE — CH production validation required:** enabling `CONFIG_HYPERV=y` activates paravirt/VPCI infrastructure that runs under Cloud Hypervisor as well. The delta has been regression-tested against the OpenVMM rungs but must also be validated against Cloud Hypervisor's Linux integration test suite (see `docs/testing.md` KVM integration suite) before being declared production-ready for the `izba-core` CH VMM driver.
 
 ## S4 details — mkfs.erofs on Windows
 
