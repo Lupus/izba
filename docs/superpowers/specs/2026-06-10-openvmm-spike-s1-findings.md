@@ -1,14 +1,16 @@
 # Spike S1+ findings: OpenVMM on the Windows host
 
-**Status:** in progress
+**Status:** complete
 **Spec:** [2026-06-10-openvmm-spike-s1-design.md](2026-06-10-openvmm-spike-s1-design.md)
 
 ## Environment
 
 - Windows version: 10.0.26100 (Windows 11 24H2)
 - OpenVMM binary provenance: CI artifact `x64-windows-openvmm` from workflow `openvmm-ci.yaml`, run id `27240809751`, branch `main`, date 2026-06-10. Artifact commit: `7872712037c6ce3a03087a76207bd73cec9784a2`. Contains `openvmm.exe` (20 MB) + `openvmm.pdb` (268 MB). No DLLs required — exe is self-contained. Staged to `C:\izba-spike\openvmm.exe`.
-- Windows-side installs performed: PowerShell 7.6.2 (installed via `winget install --id Microsoft.PowerShell` during Task 3)
-- S4 MSYS2 packages installed (Task 12): `pacman -S git base-devel autoconf automake libtool pkg-config mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-lz4` — installs gcc 16.1.0, lz4 1.10.0, and ~110 dependency packages (~1 GiB)
+- Windows-side installs performed:
+  - PowerShell 7.6.2: `winget install --id Microsoft.PowerShell` (Task 3)
+  - MSYS2 (Task 12): fresh install from https://www.msys2.org/
+  - MSYS2 packages (Task 12): `pacman -S git base-devel autoconf automake libtool pkg-config mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-lz4` — installs gcc 16.1.0, lz4 1.10.0, and ~110 dependency packages (~1 GiB)
 
 **Interop notes (affects all later tasks):**
 - WSL interop (`powershell.exe`) fails inside the default Claude Code sandbox (`UtilConnectUnix: socket failed 1`). All `powershell.exe` / `/mnt/c` commands require `dangerouslyDisableSandbox: true`.
@@ -576,4 +578,125 @@ uname-out: [Linux spike-win 6.12.30 #4 SMP PREEMPT_DYNAMIC Wed Jun 10 16:46:30 +
 
 ## Go/no-go recommendation
 
-(pending)
+**Verdict: GO.**
+
+Rungs 2 (direct-boot our kernel), 3 (virtio-fs share), and 4 (vsock bridge) all
+passed — the three criteria that the spike spec (§6) defines as sufficient for a
+go verdict. Rungs 5 (consomme networking), 6 (headless serial capture), and 7
+(full izba guest integration preview) also passed. The only partial result is S4
+(`mkfs.erofs` on Windows), which is non-blocking: the v1 design already specs a
+fallback, and WSL2 interop is a fully workable path (see S4 details).
+
+### v1-design §4.1 OpenVmmDriver assumptions that held
+
+| Assumption | Verdict |
+| --- | --- |
+| Spawns `openvmm` with a virtio-fs share and vsock bridge | **Held.** `--virtio-fs pcie_port=ws:workspace,<path>` + `--virtio-vsock-path <path>` confirmed working in rung 7. |
+| Hybrid-vsock CONNECT/OK handshake compatible with izba's `vsock.rs` | **Held.** The wire protocol is identical to Cloud Hypervisor's. OpenVMM replies `OK 1073741824` (the VMBus channel ID, not the guest port number) rather than `OK 1025`, but `vsock.rs`'s `hybrid_handshake` already accepts any `OK <n>` response — its unit test even uses `OK 1073741824` as the expected reply. No changes to `vsock.rs` required. |
+| consomme provides guest DHCP + DNS + outbound TCP | **Held** — but via `--net consomme` (a separate flag from `--virtio-net`), not `--virtio-net pcie_port=net:consomme` as the pre-spike spec sketched. The NIC model is netvsp (VMBus/Hyper-V) rather than virtio-net. `ip=dhcp` kernel autoconfig path works correctly; `/proc/net/pnp` is populated, confirming the same resolv.conf path izba-init uses. |
+| Single kernel artifact serves both VMMs | **Held — with two config deltas.** The existing izba kernel booted under OpenVMM without any config changes at rung 2. Two symbols were added to `hack/kernel.config` to enable vsock (rung 4) and networking (rung 5): `CONFIG_HYPERV=y + CONFIG_PCI_HYPERV=y` (Delta 1) and `CONFIG_HYPERV_NET=y` (Delta 2). These additions are inert under Cloud Hypervisor — the Hyper-V guest stack simply goes unclaimed with no effect — but must be validated against the CH integration suite before the deltas are declared production-ready. |
+
+### What the OpenVmmDriver design must handle differently than assumed
+
+**(a) `--hv` is mandatory.**
+All VPCI/VMBus-routed devices require `--hv` in the launch invocation. Without
+it, `--virtio-vsock-path` fails with a missing `pci_inta_line` error, and
+`--net consomme` fails with a "failed to find vmbus for vtl0" error. The driver
+must always include `--hv`.
+
+**(b) Consomme is `--net consomme`, not a virtio-net backend.**
+The `--net` flag is a separate flag with its own backends (`consomme | dio | tap
+| none`). It rejects `pcie_port=` prefixes at runtime. The NIC it exposes is
+netvsp (VMBus), not virtio-net — `CONFIG_HYPERV_NET=y` is required in the kernel
+to enumerate it. The driver must use `--hv --net consomme` and must not attempt
+to route networking via `--virtio-net`.
+
+**(c) No virtiofsd or passt sidecars.**
+OpenVMM's virtio-fs server is in-process; there is no `virtiofsd` sidecar to
+spawn, manage, or monitor. Similarly, consomme is built into the openvmm binary
+— no `passt` process. This simplifies the `OpenVmmDriver::launch()` side
+relative to `CloudHypervisorDriver`: no sidecar process management, no vhost-user
+sockets to set up, no sidecar PIDs to store in `run/`. The procmgr machinery for
+sidecar choreography is simply not needed on the Windows path.
+
+**(d) The virtiofs FUSE_INIT scheduling issue (tech debt).**
+Under OpenVMM, the virtiofs mount in `mounts::apply()` hung indefinitely until
+serial I/O was emitted between the preceding ext4 mount and the virtiofs mount.
+Root cause: OpenVMM's in-process virtiofs server thread was not scheduled when
+the guest issued `FUSE_INIT`; serial I/O triggered kernel interrupt processing
+which caused OpenVMM to drain the pending FUSE_INIT. The current fix — per-mount
+`eprintln!` lines in `mounts::apply()` — is a crutch documented as a DO NOT
+REMOVE constraint for the OpenVMM target. The `OpenVmmDriver` plan must include
+a follow-up task to either investigate the scheduling root cause upstream (an
+OpenVMM bug) or replace the serial-I/O trigger with an explicit mount-retry loop
+(more robust: retry with backoff on ENOENT/ETIMEDOUT, independent of serial
+timing).
+
+**(e) Rust `std` has no AF_UNIX on Windows.**
+The existing `vsock.rs` client uses `UnixStream::connect()` from Rust's standard
+library. On Windows, `std::os::unix` is gated behind `#[cfg(unix)]` — this code
+does not compile on the Windows-native side. The `OpenVmmDriver` will need a
+Windows-compatible UDS client, most likely the `uds_windows` crate (which wraps
+the Windows 10 1803+ AF_UNIX support in `ws2_32.dll`) or an equivalent. The spike
+validated the vsock bridge with a PowerShell script client; the Rust host-side
+fix is a driver implementation task.
+
+**(f) virtio-blk disks must be routed via PCIe, not VPCI.**
+With `--hv` active, `VirtioBusCli::Auto` resolves to VPCI for all virtio devices.
+Two `--virtio-blk` devices on VPCI both receive the same VMBus device ID
+(`2766621520`), causing an ID collision and silent misconfiguration of the second
+disk. Fix confirmed in rung 7: route each virtio-blk via a named PCIe port using
+`file:<path>,ro,pcie_port=<name>` and adding a corresponding `--pcie-root-port
+rc0:<name>` for each disk. The driver must assign distinct PCIe root port names
+(e.g., `vda`, `vdb`) and use the `pcie_port=` prefix on each `--virtio-blk`
+argument; it must not rely on VPCI auto-routing for block devices when `--hv` is
+active.
+
+**(g) `mkfs.erofs` on Windows: PARTIAL — recommend WSL2 interop (Path B).**
+A native Windows `.exe` build fails due to fundamental POSIX API gaps in MinGW/UCRT64
+(`lstat`, `readlink`, `pread`/`pwrite`, `getuid`/`getgid`, `DT_*` constants,
+`st_blksize` — not shimable without a substantial port effort, estimated 3–5
+person-days). Three paths forward:
+
+- **Path B — WSL2 interop (recommended for v1):** invoke `mkfs.erofs` from the
+  izba CLI via `wsl.exe mkfs.erofs ...`. WSL2 is always present on any system
+  capable of running OpenVMM (WHP requires the same Windows 10+ foundation that
+  enables WSL2). No porting required; the binary is stable, lz4-enabled, and
+  readily available via `apt install erofs-utils`. Estimated effort: ~0.5
+  person-days to wire up the subprocess call and test.
+- **Path C — pre-built static Linux binary (v2 distribution improvement):**
+  cross-compile a static musl `mkfs.erofs` on Linux and ship it with the Windows
+  installer; invoke via WSL2 interop. Pins the version, requires no user apt
+  install, no root in the user's WSL distro. Still requires WSL2 — a static Linux
+  ELF cannot run on native Windows. Effort: ~1 day. Recommended as the v2
+  distribution story once izba ships a standalone Windows installer.
+- **Path A′ — Cygwin build (niche use case only):** Cygwin's POSIX emulation
+  layer provides exactly the missing APIs and might make erofs-utils compile
+  without full porting. Estimated 0.5–1 day to attempt. Result is a `.exe` that
+  depends on `cygwin1.dll` — not standalone Win32. Worth a short investigation
+  only if a WSL2-free Windows deployment is ever required; not a v1 priority.
+
+**Recommendation for v1:** implement Path B.
+
+### Required follow-ups before the OpenVmmDriver driver plan
+
+1. **Re-run the Linux/KVM integration suite with the updated kernel** (the two
+   config deltas — `CONFIG_HYPERV=y + CONFIG_PCI_HYPERV=y + CONFIG_HYPERV_NET=y`
+   — must not regress Cloud Hypervisor). The Hyper-V guest symbols are additive
+   and inert under KVM (the `hv_vmbus` driver simply finds no VMBus root, loads
+   silently, and exits); no regression is expected, but the CH integration suite
+   must confirm this before the new `hack/kernel.config` is declared
+   production-ready. See `docs/testing.md` for the KVM integration suite
+   setup.
+
+2. **Decide and implement the erofs path for Windows.** Path B (WSL2 interop)
+   is recommended; the implementation task should be scoped into the
+   `OpenVmmDriver` plan alongside the disk attachment logic, since both are
+   needed before `izba create` can work end-to-end on Windows.
+
+3. **Investigate the virtiofs FUSE_INIT scheduling issue.** The current
+   `mounts::apply()` workaround is fragile (any optimization that removes the
+   serial writes — e.g., a future `--log-level none` mode — would silently
+   reintroduce the hang). Before or during the `OpenVmmDriver` plan, file an
+   upstream OpenVMM issue and add a mount-retry fallback in `mounts::apply()` as
+   a defensive measure.
