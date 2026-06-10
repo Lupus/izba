@@ -680,14 +680,15 @@ person-days). Three paths forward:
 
 ### Required follow-ups before the OpenVmmDriver driver plan
 
-1. **Re-run the Linux/KVM integration suite with the updated kernel** (the two
-   config deltas — `CONFIG_HYPERV=y + CONFIG_PCI_HYPERV=y + CONFIG_HYPERV_NET=y`
-   — must not regress Cloud Hypervisor). The Hyper-V guest symbols are additive
-   and inert under KVM (the `hv_vmbus` driver simply finds no VMBus root, loads
-   silently, and exits); no regression is expected, but the CH integration suite
-   must confirm this before the new `hack/kernel.config` is declared
-   production-ready. See `docs/testing.md` for the KVM integration suite
-   setup.
+1. ~~**Re-run the Linux/KVM integration suite with the updated kernel**~~
+   **DONE (2026-06-10):** the full 11-test KVM integration suite passed (92 s,
+   `--test-threads=1`) against the delta'd kernel (`dist/vmlinux`, sha matching
+   Delta 1+2 config) and the rebuilt production initramfs containing the
+   `mounts::apply()` workaround (`IZBA_KERNEL`/`IZBA_INITRAMFS` overrides). The
+   Hyper-V guest symbols are confirmed inert under Cloud Hypervisor/KVM — the
+   new `hack/kernel.config` does not regress the Linux driver. (The staged
+   artifacts under `~/.local/share/izba/artifacts/` are still the pre-delta
+   builds; refresh them from `dist/` when promoting the new kernel.)
 
 2. **Decide and implement the erofs path for Windows.** Path B (WSL2 interop)
    is recommended; the implementation task should be scoped into the
