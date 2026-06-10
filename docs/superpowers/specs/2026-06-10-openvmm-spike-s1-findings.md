@@ -12,7 +12,7 @@
 
 **Interop notes (affects all later tasks):**
 - WSL interop (`powershell.exe`) fails inside the default Claude Code sandbox (`UtilConnectUnix: socket failed 1`). All `powershell.exe` / `/mnt/c` commands require `dangerouslyDisableSandbox: true`.
-- WHP (HypervisorPlatform): **functional** — empirically verified by booting a VM with openvmm.exe (guest vCPUs executed, PIO traces in openvmm output). The earlier non-admin CIM probe (`Win32_OptionalFeature` → `InstallState=2`, "disabled") was WRONG — do not trust that class for WHP state; an actual openvmm boot attempt is the reliable non-admin check (sbx working on this host was the tell). Probe boot note: with `--kernel/--initrd --com1 file=`, the VM ran but the serial log stayed empty — rung 1/2 territory.
+- WHP (HypervisorPlatform): **functional** — empirically verified by booting a VM with openvmm.exe (guest vCPUs executed, PIO traces in openvmm output). The earlier non-admin CIM probe (`Win32_OptionalFeature` → `InstallState=2`, "disabled") was WRONG — do not trust that class for WHP state; an actual openvmm boot attempt is the reliable non-admin check (sbx working on this host was the tell). Probe boot note: the earlier whp-probe left `--com1 file=` log empty due to a shell quoting/invocation issue in that session (backslash escaping in the command string caused the `file=` argument to be malformed); the `file=` mechanism itself is confirmed working — rung 1 established this conclusively. Both `--com1 file=<path>` and `--com1 stderr` produce full serial output when the command is structured correctly via PowerShell `Start-Process`.
 - pwsh (PowerShell 7): was missing; installed 7.6.2 via winget during this task. Confirmed working.
 - gh auth: authenticated as `Lupus` on github.com (token scopes: gist, read:org, repo). Ready for artifact download in Task 4.
 
@@ -21,7 +21,7 @@
 | # | Rung | Verdict | Notes |
 | --- | --- | --- | --- |
 | 0 | acquire openvmm.exe | PASS | Artifact `x64-windows-openvmm` from CI run 27240809751; `openvmm.exe --help` runs; all 7 expected flags confirmed |
-| 1 | smoke boot (their kernel) | | |
+| 1 | smoke boot (their kernel) | PASS | openvmm-deps 0.3.0-59 kernel 6.1.172 boots to shell; `--com1 file=` and `--com1 stderr` both confirmed working; 292 lines of serial output captured |
 | 2 | direct-boot our vmlinux | | |
 | 3 | virtio-fs share | | |
 | 4 | vsock bridge | | |
@@ -46,6 +46,55 @@ All flags match the spec design. Key notes for later rungs:
 - `--virtio-net <VIRTIO_NET>` — backends: `dio | vmnic | tap | none` (no consomme here)
 - `--net <NET>` — **separate flag** with backends: `consomme | dio | tap | none`; consomme supports `hostfwd=` port-forwarding syntax (rung 5). Example: `--net consomme` or `--net consomme:hostfwd=tcp::8080-:80`
 - `--pcie-root-complex <PCIE_ROOT_COMPLEX>` — needed to wire virtio devices over PCIe
+
+### Rung 1 — smoke boot (their kernel)
+
+**Artifacts:** `openvmm-deps` release `0.3.0-59` from `microsoft/openvmm-deps`.
+- Kernel: `openvmm-test-linux-6.1.x86_64.0.3.0-59.tar.gz` → extracted `vmlinux`
+  (ELF 64-bit, uncompressed, `Linux version 6.1.172`, 60 MB). Staged to `C:\izba-spike\their-vmlinux`.
+- Initrd: `openvmm-test-initrd.x86_64.0.3.0-59.tar.gz` → extracted `initrd`
+  (gzip cpio, 1.4 MB). Staged to `C:\izba-spike\their-initrd`.
+
+Note: the `.cargo/config.toml` in the openvmm repo (`X86_64_OPENVMM_LINUX_DIRECT_KERNEL` env var) points to `.packages/underhill-deps-private/x64/vmlinux` from the full `openvmm-deps.x86_64.tar.gz` (~165 MB, the private Underhill kernel). The `openvmm-test-linux-6.1` tarball is separate and is the OSS test kernel used by their integration test suite; it is equivalent for our smoke-boot purposes.
+
+**Invocation (file capture mode):**
+
+```powershell
+# Run from C:\izba-spike in PowerShell; kills after 20s
+$proc = Start-Process -FilePath './openvmm.exe' `
+  -ArgumentList '--kernel','C:\izba-spike\their-vmlinux',
+                '--initrd','C:\izba-spike\their-initrd',
+                '-c','console=ttyS0',
+                '--com1','file=C:\izba-spike\logs\rung1-file.log' `
+  -PassThru -NoNewWindow `
+  -RedirectStandardOutput 'C:\izba-spike\logs\rung1-stdout.log' `
+  -RedirectStandardError  'C:\izba-spike\logs\rung1-stderr.log'
+Start-Sleep -Seconds 20
+Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+```
+
+**Result:** `C:\izba-spike\logs\rung1-file.log` — 18 360 bytes, 292 lines of kernel serial output. Guest booted kernel 6.1.172, ran initrd, reached interactive busybox shell (`~ # `). Log ends with `tsc: Refined TSC clocksource calibration: 2304.007 MHz` after the shell prompt.
+
+**Invocation (stderr mode):**
+
+```powershell
+$proc = Start-Process -FilePath './openvmm.exe' `
+  -ArgumentList '--kernel','C:\izba-spike\their-vmlinux',
+                '--initrd','C:\izba-spike\their-initrd',
+                '-c','console=ttyS0',
+                '--com1','stderr' `
+  -PassThru -NoNewWindow `
+  -RedirectStandardOutput 'C:\izba-spike\logs\rung1-stderr-test-stdout.log' `
+  -RedirectStandardError  'C:\izba-spike\logs\rung1-stderr-test-stderr.log'
+Start-Sleep -Seconds 15
+Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+```
+
+**Result:** stderr log 34 822 bytes — openvmm PIO traces interleaved with 290 kernel serial lines. Both modes reliable.
+
+**Whp-probe empty-log mystery — resolution:**
+- Root cause: The earlier probe session used shell interpolation that malformed the `file=C:\...` argument (backslash escaping issue in the command string; the argument was passed as a single shell word rather than via `Start-Process -ArgumentList`). The `file=` mechanism itself is fully functional.
+- Confirmation: our izba kernel (`vmlinux` + `spike-initramfs.cpio.gz`) also produces full serial output in both `file=` and `stderr` modes — `izba-kernel-file.log` is 20 291 bytes, 320+ kernel lines, boots to busybox shell.
 
 ## Kernel config deltas
 
