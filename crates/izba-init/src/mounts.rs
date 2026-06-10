@@ -121,22 +121,28 @@ fn flags_to_ms(flags: &[String]) -> anyhow::Result<MsFlags> {
     Ok(ms)
 }
 
+/// Pause required before mounting `op`, if any.
+///
+/// OpenVMM runs all in-process virtio device workers on a single shared host
+/// thread, and the virtiofs worker only arms its queue-notification wait on
+/// its first poll. If the guest never yields the CPU between DRIVER_OK and
+/// FUSE_INIT (this mount loop runs back-to-back), that thread may not have
+/// been scheduled yet and the guest blocks indefinitely in
+/// `mount(virtiofs, ...)`. Any guest pause — experimentally as little as a
+/// silent 20 ms sleep — lets the host schedule the worker, which then services
+/// the already-enqueued (never lost) FUSE_INIT. Cloud Hypervisor's external
+/// virtiofsd is polling before the guest boots, so it is unaffected by the
+/// extra 50 ms. Full analysis + upstream-issue draft:
+/// docs/superpowers/specs/2026-06-10-openvmm-virtiofs-hang-rca.md
+pub fn pre_mount_pause(op: &MountOp) -> Option<std::time::Duration> {
+    (op.fstype == "virtiofs").then(|| std::time::Duration::from_millis(50))
+}
+
 /// Executes a mount plan in order, creating target directories first.
 /// Guest-only: requires CAP_SYS_ADMIN.
 ///
-/// # OpenVMM virtiofs scheduling note
-///
-/// The `eprintln!` calls before and after each mount write to the serial console
-/// (ttyS0). This I/O causes the kernel to service pending device interrupts,
-/// which in turn schedules the OpenVMM virtiofs server thread in time for the
-/// guest's FUSE_INIT exchange. Without serial output between the ext4 mount and
-/// the virtiofs mount, the guest blocks indefinitely in `mount(virtiofs, ...)` —
-/// the FUSE_INIT response never arrives because OpenVMM's virtiofs worker thread
-/// has not been scheduled yet. Cloud Hypervisor does not exhibit this behaviour.
-/// Do NOT remove these prints when targeting OpenVMM.
-/// This is a timing workaround, not a principled fix — the OpenVmmDriver work
-/// should investigate the OpenVMM virtiofs thread-scheduling lag (and consider
-/// an explicit mount-retry) before shipping.
+/// The per-mount `eprintln!` lines are boot diagnostics on the serial console;
+/// the OpenVMM-readiness accommodation is [`pre_mount_pause`], not the prints.
 pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
     for op in ops {
         std::fs::create_dir_all(&op.target)
@@ -153,6 +159,9 @@ pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
             op.fstype,
             op.target.display()
         );
+        if let Some(pause) = pre_mount_pause(op) {
+            std::thread::sleep(pause);
+        }
         nix::mount::mount(
             Some(op.source.as_str()),
             &op.target,
@@ -307,6 +316,22 @@ mod tests {
         let overlay = &rootfs_mount_plan()[2];
         assert!(overlay.data.contains("upperdir=/upper/data"));
         assert!(overlay.data.contains("workdir=/upper/work"));
+    }
+
+    #[test]
+    fn virtiofs_gets_pre_mount_pause() {
+        let plan = rootfs_mount_plan();
+        for op in &plan {
+            let pause = pre_mount_pause(op);
+            if op.fstype == "virtiofs" {
+                assert!(
+                    pause.is_some_and(|d| d >= std::time::Duration::from_millis(20)),
+                    "virtiofs mounts need >= 20ms pause (OpenVMM scheduling lag)"
+                );
+            } else {
+                assert_eq!(pause, None, "{} must not pause", op.fstype);
+            }
+        }
     }
 
     #[test]
