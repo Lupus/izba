@@ -1,3 +1,4 @@
+mod discover;
 pub mod image;
 pub mod liveness;
 pub mod paths;
