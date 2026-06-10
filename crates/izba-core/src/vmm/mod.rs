@@ -1,4 +1,5 @@
 pub mod cloud_hypervisor;
+pub mod openvmm;
 pub mod spec;
 pub use spec::*;
 
