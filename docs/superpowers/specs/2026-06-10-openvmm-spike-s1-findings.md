@@ -12,7 +12,7 @@
 
 **Interop notes (affects all later tasks):**
 - WSL interop (`powershell.exe`) fails inside the default Claude Code sandbox (`UtilConnectUnix: socket failed 1`). All `powershell.exe` / `/mnt/c` commands require `dangerouslyDisableSandbox: true`.
-- WHP (HypervisorPlatform): `Get-WindowsOptionalFeature` requires elevation; non-admin CIM probe returned `InstallState=2` (disabled). WHP must be enabled before OpenVMM can use WHP — requires elevation + reboot. **User action needed.**
+- WHP (HypervisorPlatform): **functional** — empirically verified by booting a VM with openvmm.exe (guest vCPUs executed, PIO traces in openvmm output). The earlier non-admin CIM probe (`Win32_OptionalFeature` → `InstallState=2`, "disabled") was WRONG — do not trust that class for WHP state; an actual openvmm boot attempt is the reliable non-admin check (sbx working on this host was the tell). Probe boot note: with `--kernel/--initrd --com1 file=`, the VM ran but the serial log stayed empty — rung 1/2 territory.
 - pwsh (PowerShell 7): was missing; installed 7.6.2 via winget during this task. Confirmed working.
 - gh auth: authenticated as `Lupus` on github.com (token scopes: gist, read:org, repo). Ready for artifact download in Task 4.
 
