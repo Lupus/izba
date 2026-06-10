@@ -29,6 +29,8 @@ trap 'rm -rf "$WORK"' EXIT
 # ---------------------------------------------------------------------------
 # Deterministic fixture: regular/empty/8KiB files, symlink, hardlink, nested
 # dirs, mode variety — every ustar field class izba's flattened images use.
+# Two batches with different uid/gid ownership (0:0 and 1000:100) so a Windows
+# bug that substitutes the process uid for the ustar-header uid stays visible.
 # ---------------------------------------------------------------------------
 FIX="$WORK/fixture"
 mkdir -p "$FIX/bin" "$FIX/deep/a/b/c"
@@ -41,13 +43,26 @@ ln "$FIX/hello.txt"             "$FIX/hardlink-hello"
 chmod 755 "$FIX/bin/big8k.bin"
 chmod 600 "$FIX/deep/a/b/c/leaf"
 tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
-    --mtime=@0 -C "$FIX" -cf "$WORK/fixture.tar" .
+    --mtime=@0 -C "$FIX" -cf "$WORK/fixture.tar" . \
+    || { echo "error: fixture tar (batch 1) failed" >&2; exit 1; }
+
+# Batch 2: nonzero uid/gid — files land under owned/ (distinct paths avoid
+# duplicate-entry ambiguity; later entries win in mkfs tar-mode anyway).
+FIX2="$WORK/fixture2"
+mkdir -p "$FIX2/owned"
+printf 'owned file\n'  > "$FIX2/owned/owned.txt"
+printf 'owned other\n' > "$FIX2/owned/other.txt"
+tar --format=ustar --sort=name --owner=1000 --group=100 --numeric-owner \
+    --mtime=@0 -C "$FIX2" -rf "$WORK/fixture.tar" . \
+    || { echo "error: fixture tar (batch 2) failed" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Reference image (Linux binary) + fsck
 # ---------------------------------------------------------------------------
-"$LINUX_MKFS" "${MKFS_FLAGS[@]}" "$WORK/ref.erofs" "$WORK/fixture.tar"
-"$LINUX_FSCK" "$WORK/ref.erofs"
+"$LINUX_MKFS" "${MKFS_FLAGS[@]}" "$WORK/ref.erofs" "$WORK/fixture.tar" \
+    || { echo "error: Linux mkfs.erofs failed" >&2; exit 1; }
+"$LINUX_FSCK" "$WORK/ref.erofs" \
+    || { echo "error: Linux fsck.erofs failed" >&2; exit 1; }
 REF_SHA="$(sha256sum "$WORK/ref.erofs" | cut -d' ' -f1)"
 echo "reference: sha256=$REF_SHA ($(stat -c%s "$WORK/ref.erofs") bytes)"
 
@@ -57,14 +72,16 @@ echo "reference: sha256=$REF_SHA ($(stat -c%s "$WORK/ref.erofs") bytes)"
 if ! command -v wine >/dev/null 2>&1; then
     BUNDLE=dist/erofs-parity-bundle
     rm -rf "$BUNDLE" && mkdir -p "$BUNDLE"
-    cp "$EXE" "$WORK/fixture.tar" "$BUNDLE/"
+    cp "$EXE" "$BUNDLE/mkfs.erofs.exe"
+    cp "$WORK/fixture.tar" "$BUNDLE/"
     echo "$REF_SHA" > "$BUNDLE/reference.sha256"
     printf '%s\n' "${MKFS_FLAGS[@]}" > "$BUNDLE/mkfs-flags.txt"
     echo "SKIP: wine not installed — bundle at $BUNDLE/;"
     echo "  run hack/spike/verify-mkfs-erofs-parity.ps1 on the Windows host."
     exit 2
 fi
-WINEDEBUG=-all wine "$EXE" "${MKFS_FLAGS[@]}" "$WORK/win.erofs" "$WORK/fixture.tar"
+WINEDEBUG=-all wine "$EXE" "${MKFS_FLAGS[@]}" "$WORK/win.erofs" "$WORK/fixture.tar" \
+    || { echo "error: wine mkfs.erofs.exe failed" >&2; exit 1; }
 if cmp -s "$WORK/ref.erofs" "$WORK/win.erofs"; then
     echo "PASS: byte-identical images from Linux and Windows binaries"
 else
