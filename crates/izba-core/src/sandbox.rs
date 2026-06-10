@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use izba_proto::{read_frame, write_frame, Request, Response, CONTROL_PORT, STREAM_PORT};
-use nix::fcntl::{Flock, FlockArg};
 
 use crate::image::store::ImageStore;
 use crate::liveness::{assess, Liveness, Probes};
@@ -214,8 +213,9 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
     result
 }
 
-/// Take the per-sandbox exclusive lock (released on drop).
-fn lock_sandbox(paths: &Paths, name: &str) -> anyhow::Result<Flock<File>> {
+/// Take the per-sandbox exclusive lock (released when the returned `File`
+/// drops — std file locks are tied to the open handle).
+fn lock_sandbox(paths: &Paths, name: &str) -> anyhow::Result<File> {
     let lock_path = paths.sandbox_dir(name).join("lock");
     let f = match File::options()
         .create(true)
@@ -229,12 +229,14 @@ fn lock_sandbox(paths: &Paths, name: &str) -> anyhow::Result<Flock<File>> {
         }
         Err(e) => return Err(e).with_context(|| format!("opening {}", lock_path.display())),
     };
-    match Flock::lock(f, FlockArg::LockExclusiveNonblock) {
-        Ok(l) => Ok(l),
-        Err((_, nix::errno::Errno::EWOULDBLOCK)) => {
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => {
             bail!("sandbox '{name}' is busy (another operation in progress)")
         }
-        Err((_, e)) => Err(e).with_context(|| format!("locking {}", lock_path.display())),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking {}", lock_path.display()))
+        }
     }
 }
 
