@@ -116,6 +116,12 @@ fn wait_plain(
             // Stdin EOF → half-close so the child's stdin sees EOF too.
             let _ = in_stream.shutdown(Shutdown::Write);
         });
+    } else {
+        // Without -i the child must still see stdin EOF rather than a pipe
+        // held open forever by the guest's untaken stream: attach and
+        // immediately half-close.
+        let in_stream = attach(paths, name, exec_id, StreamKind::Stdin)?;
+        let _ = in_stream.shutdown(Shutdown::Write);
     }
     let out = std::thread::spawn(move || pump(out_stream, io::stdout()));
     let err = std::thread::spawn(move || pump(err_stream, io::stderr()));

@@ -128,6 +128,24 @@ fn is_timeout(err: &anyhow::Error) -> bool {
     })
 }
 
+/// Last `n` lines of the guest serial console, formatted for appending to a
+/// boot-failure error. Empty string when the log is missing or unreadable.
+fn console_tail(log: &std::path::Path, n: usize) -> String {
+    let Ok(text) = fs::read_to_string(log) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let tail = &lines[lines.len().saturating_sub(n)..];
+    format!(
+        "\n--- console.log (last {} lines) ---\n{}",
+        tail.len(),
+        tail.join("\n")
+    )
+}
+
 pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()> {
     validate_name(name)?;
     let dir = paths.sandbox_dir(name);
@@ -293,7 +311,7 @@ pub fn start_with_timeouts(
     let spec = VmSpec {
         kernel: art.kernel.clone(),
         initramfs: art.initramfs.clone(),
-        cmdline: "console=ttyS0 ip=dhcp".to_string(),
+        cmdline: format!("console=ttyS0 ip=dhcp izba.hostname={name}"),
         cpus: config.cpus,
         mem_mb: config.mem_mb,
         disks: vec![
@@ -343,8 +361,9 @@ pub fn start_with_timeouts(
             if Instant::now() >= deadline {
                 bail!(
                     "sandbox '{name}' did not become healthy within {boot_timeout:?}; \
-                     check {} for boot output",
-                    console_log.display()
+                     check {} for boot output{}",
+                    console_log.display(),
+                    console_tail(&console_log, 15)
                 );
             }
             std::thread::sleep(poll);
