@@ -27,7 +27,7 @@
 | 4 | vsock bridge | PASS | `--hv` required (VPCI path); kernel needed `CONFIG_HYPERV=y` + `CONFIG_PCI_HYPERV=y` (added); `--virtio-vsock-path C:\izba-spike\vsock`; `HANDSHAKE: OK 1073741824` + `SPIKE-RUNG4-ECHO-OK` confirmed in `rung4-client.log` |
 | 5 | consomme networking | PASS | `--hv --net consomme`; NIC model = netvsp (required adding `CONFIG_HYPERV_NET=y`); DHCP-OK, DNS-OK, HTTP-OK (`http://example.com`); kernel `ip=dhcp` also passes (`IP-Config: Complete`) |
 | 6 | headless serial capture | PASS | `file=` log readable from both WSL and Windows while VM runs; `SPIKE-INIT-OK` (line 321/325) visible at first tail (~8s); no file-locking contention; file fully flushed before kill; detachment confirmed (PID 31136 survived launching powershell exit) |
-| 7 | integration preview (full izba guest) | | |
+| 7 | integration preview (full izba guest) | PASS | All pass criteria met: all mounts (erofs/ext4/overlay/virtiofs/devpts) complete; health `{"version":"0.1.0","uptime_ms":413}`; exec `sh -c 'echo from-guest > /workspace/exec-was-here && uname -a'` → ExecStarted + Wait `{"code":0}`; `/mnt/c/izba-spike/share/exec-was-here` = `"from-guest"` on host; `uname-out` = `"Linux spike-win 6.12.30 ..."` confirming guest hostname |
 | S4 | mkfs.erofs on Windows | PARTIAL | Native `.exe` build fails due to POSIX API gaps; viable path = run mkfs.erofs in WSL2 via interop; Cygwin route untested |
 
 ## Working command lines
@@ -475,6 +475,104 @@ Root cause: erofs-utils is tightly coupled to Linux/POSIX filesystem semantics �
 ### Smoke test
 
 Not reached — build did not produce `mkfs.erofs.exe`. Image-format compatibility deferred to a later integration test once Path B or C is implemented.
+
+### Rung 7 — full izba guest integration preview
+
+**Objective:** Boot the UNMODIFIED production izba guest stack under OpenVMM on Windows and speak izba-proto to it.
+
+**Artifacts staged to `C:\izba-spike\`:**
+- `izba-initramfs.cpio.gz` — production izba-init (statically-linked musl Rust, built from `crates/izba-init`); rebuilt multiple times during debugging; final binary is clean (no diagnostic prints in exec.rs).
+- `rootfs.erofs` — Alpine Linux erofs image (7.85 MB, RO lower layer). `/bin/busybox` (808 712 bytes) is dynamically linked PIE with interpreter `/lib/ld-musl-x86_64.so.1`; both are present in the image.
+- `rw.img` — 1 GiB ext4 (pre-formatted with `mkfs.ext4`; `ensure_formatted` detects non-blank → skips `mke2fs`).
+- `share/` — Windows directory exposed as virtiofs `workspace` tag → `/workspace` in guest.
+- `vmlinux` — izba kernel 6.12.30 built from `hack/kernel.config`.
+
+**Canonical invocation (all-in-one `$allargs` string to avoid PowerShell array-splitting):**
+
+```powershell
+$allargs = '--kernel C:\izba-spike\vmlinux --initrd C:\izba-spike\izba-initramfs.cpio.gz -c "console=ttyS0 ip=dhcp izba.hostname=spike-win" --hv --com1 file=C:\izba-spike\logs\rung7.log --pcie-root-complex rc0 --pcie-root-port rc0:ws --pcie-root-port rc0:vda --pcie-root-port rc0:vdb --virtio-fs pcie_port=ws:workspace,C:\izba-spike\share --virtio-blk file:C:\izba-spike\rootfs.erofs,ro,pcie_port=vda --virtio-blk file:C:\izba-spike\rw.img,pcie_port=vdb --net consomme --virtio-vsock-path C:\izba-spike\vsock'
+
+$proc = Start-Process -FilePath 'C:\izba-spike\openvmm.exe' `
+  -ArgumentList $allargs `
+  -PassThru -NoNewWindow `
+  -RedirectStandardOutput 'C:\izba-spike\logs\rung7-stdout.log' `
+  -RedirectStandardError  'C:\izba-spike\logs\rung7-stderr.log'
+```
+
+**Evidence — serial console (`rung7-canonical.log`) mounts section:**
+
+```
+izba-init: mounting proc (proc) on /proc
+izba-init: mounted proc (proc) on /proc OK
+izba-init: mounting sysfs (sysfs) on /sys
+izba-init: mounted sysfs (sysfs) on /sys OK
+izba-init: mounting devtmpfs (devtmpfs) on /dev
+izba-init: mounted devtmpfs (devtmpfs) on /dev OK
+izba-init: mounting devpts (devpts) on /dev/pts
+izba-init: mounted devpts (devpts) on /dev/pts OK
+izba-init: mounting tmpfs (tmpfs) on /tmp
+izba-init: mounted tmpfs (tmpfs) on /tmp OK
+izba-init: mounting /dev/vda (erofs) on /lower
+[    2.056493] erofs: (device vda): mounted with root inode @ nid 36.
+izba-init: mounted /dev/vda (erofs) on /lower OK
+izba-init: mounting /dev/vdb (ext4) on /upper
+[    2.079959] EXT4-fs (vdb): recovery complete
+[    2.082165] EXT4-fs (vdb): mounted filesystem ... r/w with ordered data mode.
+izba-init: mounted /dev/vdb (ext4) on /upper OK
+izba-init: mounting overlay (overlay) on /rootfs
+izba-init: mounted overlay (overlay) on /rootfs OK
+izba-init: mounting workspace (virtiofs) on /rootfs/workspace
+izba-init: mounted workspace (virtiofs) on /rootfs/workspace OK
+izba-init: mounting proc (proc) on /rootfs/proc
+izba-init: mounted proc (proc) on /rootfs/proc OK
+izba-init: mounting sysfs (sysfs) on /rootfs/sys
+izba-init: mounted sysfs (sysfs) on /rootfs/sys OK
+izba-init: mounting devtmpfs (devtmpfs) on /rootfs/dev
+izba-init: mounted devtmpfs (devtmpfs) on /rootfs/dev OK
+izba-init: mounting tmpfs (tmpfs) on /rootfs/tmp
+izba-init: mounted tmpfs (tmpfs) on /rootfs/tmp OK
+izba-init: mounting devpts (devpts) on /rootfs/dev/pts
+izba-init: mounted devpts (devpts) on /rootfs/dev/pts OK
+```
+
+**Evidence — client transcript (`run-rung7-canonical.ps1` output):**
+
+```
+=== [1] HEALTH CHECK ===
+HANDSHAKE: OK 1073741824
+RESPONSE: {"type":"health","version":"0.1.0","uptime_ms":413}
+
+=== [2] EXEC (file-redirected uname) ===
+CTRL-HANDSHAKE: OK 1073741825
+EXEC-STARTED: {"type":"exec_started","exec_id":1}
+WAIT: {"type":"wait","status":{"code":0}}
+
+=== [3] HOST FILE CHECK ===
+exec-was-here: [from-guest]
+[PASS] exec-was-here = 'from-guest'
+uname-out: [Linux spike-win 6.12.30 #4 SMP PREEMPT_DYNAMIC Wed Jun 10 16:46:30 +04 2026 x86_64 Linux]
+[PASS] uname output has 'Linux'
+```
+
+**Bugs encountered and fixes:**
+
+1. **VPCI device ID conflict** — two `--virtio-blk` on VPCI Auto (default with `--hv`) both get the same VMBus device ID `2766621520`. Fix: use `pcie_port=` for each virtio-blk to route them via PCIe instead: `file:path,ro,pcie_port=vda` and `file:path,pcie_port=vdb`.
+
+2. **PowerShell `-ArgumentList` array splitting** — passing `$allargs` as an array (e.g., `--virtio-blk','file:...'`) causes `-c "console=ttyS0 ip=dhcp ..."` to be split at the space before `ip=dhcp`, delivering `ip=dhcp` as a separate argument. Fix: pass the entire argument string as a single pre-built flat string (`$allargs = '--kernel ... --virtio-vsock-path ...'`); `Start-Process` with a single `$allargs` string works correctly.
+
+3. **OpenVMM virtiofs FUSE_INIT scheduling hang** — `mount(virtiofs, "workspace", ...)` in izba-init blocked indefinitely after the ext4 mount. Root cause: OpenVMM's virtiofs server thread was not scheduled when the guest issued `FUSE_INIT`. Any serial I/O between the ext4 mount and the virtiofs mount forces the kernel to service device interrupts, which causes OpenVMM to process the pending FUSE_INIT response. Fix applied: added `eprintln!` before and after each `nix::mount::mount()` call in `mounts::apply()` — these writes to ttyS0 are the required I/O. The comment in `mounts.rs` documents this as a DO NOT REMOVE constraint when targeting OpenVMM. Cloud Hypervisor does not exhibit this behaviour.
+
+4. **PowerShell subprocess `-Argv` argument passing** — calling `pwsh -File izba-client.ps1 -Argv '/bin/uname','-a'` from within pwsh passes the array elements as a comma-joined string (`'/bin/uname','-a'` → argv0 = `"'/bin/uname','-a'"`) causing ENOENT. Fix: embed the client logic inline in the test script rather than launching a child pwsh process.
+
+**Go/no-go implication:** The production `izba-core` OpenVMM driver requires:
+- `--hv` (enables VPCI for vsock + netvsp for consomme)
+- `--net consomme` (consomme networking, requires netvsp)
+- `--virtio-vsock-path <path>` (VPCI auto-routed with `--hv`)
+- `--pcie-root-complex rc0 --pcie-root-port rc0:ws [--pcie-root-port rc0:vda --pcie-root-port rc0:vdb]` (PCIe topology for virtio-fs and virtio-blk)
+- `--virtio-fs pcie_port=ws:workspace,<path>` (virtiofs via PCIe)
+- `--virtio-blk file:<path>,ro,pcie_port=vda` and `--virtio-blk file:<path>,pcie_port=vdb` (virtio-blk via PCIe, NOT VPCI, to avoid device ID collision)
+- Kernel: `CONFIG_HYPERV=y`, `CONFIG_PCI_HYPERV=y`, `CONFIG_HYPERV_NET=y` (added in deltas 1–2)
+- initramfs: `mounts::apply()` must emit serial I/O before the virtiofs mount (currently the per-mount `eprintln!` lines; cannot be removed for OpenVMM target)
 
 ## Go/no-go recommendation
 

@@ -123,6 +123,17 @@ fn flags_to_ms(flags: &[String]) -> anyhow::Result<MsFlags> {
 
 /// Executes a mount plan in order, creating target directories first.
 /// Guest-only: requires CAP_SYS_ADMIN.
+///
+/// # OpenVMM virtiofs scheduling note
+///
+/// The `eprintln!` calls before and after each mount write to the serial console
+/// (ttyS0). This I/O causes the kernel to service pending device interrupts,
+/// which in turn schedules the OpenVMM virtiofs server thread in time for the
+/// guest's FUSE_INIT exchange. Without serial output between the ext4 mount and
+/// the virtiofs mount, the guest blocks indefinitely in `mount(virtiofs, ...)` —
+/// the FUSE_INIT response never arrives because OpenVMM's virtiofs worker thread
+/// has not been scheduled yet. Cloud Hypervisor does not exhibit this behaviour.
+/// Do NOT remove these prints when targeting OpenVMM.
 pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
     for op in ops {
         std::fs::create_dir_all(&op.target)
@@ -133,6 +144,12 @@ pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
         } else {
             Some(op.data.as_str())
         };
+        eprintln!(
+            "izba-init: mounting {} ({}) on {}",
+            op.source,
+            op.fstype,
+            op.target.display()
+        );
         nix::mount::mount(
             Some(op.source.as_str()),
             &op.target,
@@ -148,6 +165,12 @@ pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
                 op.target.display()
             )
         })?;
+        eprintln!(
+            "izba-init: mounted {} ({}) on {} OK",
+            op.source,
+            op.fstype,
+            op.target.display()
+        );
     }
     Ok(())
 }
