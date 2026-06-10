@@ -1,7 +1,7 @@
 # mkfs.erofs on Windows: native MinGW tar-mode port — design
 
 **Date:** 2026-06-10
-**Status:** approved design, pre-implementation
+**Status:** implemented, merged to main 2026-06-10 (§3.4 deferred — see section)
 **Resolves:** follow-up #2 from
 [2026-06-10-openvmm-spike-s1-findings.md](2026-06-10-openvmm-spike-s1-findings.md)
 (§A2 "erofs on Windows") — the erofs creation path for the future Windows/WHP
@@ -105,6 +105,12 @@ fsck+content-compare requires a documented justification in this spec.
 On the Windows spike host: build the spike Alpine `rootfs.erofs` with the
 Windows binary, boot the rung-7 OpenVMM stack with it, confirm all guest
 mounts complete and exec round-trips. Result recorded in the findings doc.
+
+**DEFERRED (2026-06-10):** the parity gate passed under wine (byte-identical
+images vs the same-source Linux build), which was accepted as sufficient
+evidence for now. Run this gate as part of the OpenVmmDriver bring-up
+checklist instead — first via `hack/spike/verify-mkfs-erofs-parity.ps1` on
+the real Windows host, then the rung-7 boot with a Windows-built rootfs.
 
 ### 3.5 izba-core discovery shim
 

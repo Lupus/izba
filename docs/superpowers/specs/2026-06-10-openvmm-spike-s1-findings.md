@@ -695,14 +695,23 @@ erofs-utils both make a WSL2-free path realistic; see addendum before deciding.)
    artifacts under `~/.local/share/izba/artifacts/` are still the pre-delta
    builds; refresh them from `dist/` when promoting the new kernel.)
 
-2. **Decide and implement the erofs path for Windows.** Path B (WSL2 interop)
-   is recommended; the implementation task should be scoped into the
-   `OpenVmmDriver` plan alongside the disk attachment logic, since both are
-   needed before `izba create` can work end-to-end on Windows.
+2. **Decide and implement the erofs path for Windows.** ~~Path B (WSL2
+   interop) is recommended.~~
    **UPDATE (2026-06-10, post-spike):** new research (see addendum) found that
    Docker ships a *native MinGW-w64* `mkfs.erofs.exe` driven in tar-mode, and
    that a maintained prebuilt *Cygwin* erofs-utils exists — the decision space
    is now wider and WSL2 is no longer the only realistic route.
+   **DONE (2026-06-10, merged to main):** chose and implemented the MinGW
+   tar-mode route (Docker's) — see
+   [2026-06-10-mkfs-erofs-windows-design.md](2026-06-10-mkfs-erofs-windows-design.md).
+   Native `mkfs.erofs.exe` (erofs-utils v1.9.1, kernel32+msvcrt only, no
+   Cygwin/WSL2) cross-built by `hack/build-mkfs-erofs-windows.sh`; parity gate
+   `hack/verify-mkfs-erofs-parity.sh` proves byte-identical images vs the
+   same-source Linux build (verified under wine); izba-core discovers the
+   binary via `$IZBA_MKFS_EROFS` → exe-adjacent `libexec/` → `PATH`. The
+   real-Windows-host leg (`hack/spike/verify-mkfs-erofs-parity.ps1` + a rung-7
+   boot with a Windows-built rootfs.erofs) is **deferred** on the strength of
+   the wine parity result — fold it into the OpenVmmDriver bring-up checklist.
 
 3. **Investigate the virtiofs FUSE_INIT scheduling issue.** ~~The current
    `mounts::apply()` workaround is fragile.~~ **DONE (2026-06-10, post-spike):**
