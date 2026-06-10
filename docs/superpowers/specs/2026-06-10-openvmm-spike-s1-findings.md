@@ -26,7 +26,7 @@
 | 3 | virtio-fs share | PASS | Attempt A (PCIe route) worked first try; MOUNT-OK + READ-OK (`hello-from-host`) + WRITE-OK; `guest-file.txt` visible on host; uid/gid 1000 on Windows side |
 | 4 | vsock bridge | PASS | `--hv` required (VPCI path); kernel needed `CONFIG_HYPERV=y` + `CONFIG_PCI_HYPERV=y` (added); `--virtio-vsock-path C:\izba-spike\vsock`; `HANDSHAKE: OK 1073741824` + `SPIKE-RUNG4-ECHO-OK` confirmed in `rung4-client.log` |
 | 5 | consomme networking | PASS | `--hv --net consomme`; NIC model = netvsp (required adding `CONFIG_HYPERV_NET=y`); DHCP-OK, DNS-OK, HTTP-OK (`http://example.com`); kernel `ip=dhcp` also passes (`IP-Config: Complete`) |
-| 6 | headless serial capture | | |
+| 6 | headless serial capture | PASS | `file=` log readable from both WSL and Windows while VM runs; `SPIKE-INIT-OK` (line 321/325) visible at first tail (~8s); no file-locking contention; file fully flushed before kill; detachment confirmed (PID 31136 survived launching powershell exit) |
 | 7 | integration preview (full izba guest) | | |
 | S4 | mkfs.erofs on Windows | PARTIAL | Native `.exe` build fails due to POSIX API gaps; viable path = run mkfs.erofs in WSL2 via interop; Cygwin route untested |
 
@@ -326,6 +326,54 @@ Tested with `-c "console=ttyS0 ip=dhcp"` (note: PowerShell's `Start-Process -Arg
 - Rung 4 (vsock bridge, `--hv`): `HANDSHAKE: OK 1073741824` + `SPIKE-RUNG4-ECHO-OK` confirmed in `rung4-hyperv-net-regress-client.log`. PASS.
 
 **Implication for OpenVmmDriver:** The production izba-core OpenVMM driver must include `--hv --net consomme` in the launch command for networking. The NIC model is netvsp (VMBus), requiring `CONFIG_HYPERV_NET=y` in the kernel. The kernel `ip=dhcp` path works correctly with consomme, confirming the same boot-time network configuration path used by CH (via `/proc/net/pnp`) will work on OpenVMM.
+
+### Rung 6 — headless serial capture
+
+**Objective:** confirm that `--com1 file=<path>` logs are readable from WSL and Windows while the VM is alive (live-tail for boot-failure diagnostics in izba), and verify fully detached operation.
+
+**Invocation (base spike-initramfs, no rc):**
+
+```powershell
+# Run from C:\izba-spike in PowerShell; capture PID and tail while alive
+$proc = Start-Process -FilePath 'C:\izba-spike\openvmm.exe' `
+  -ArgumentList '--kernel','C:\izba-spike\vmlinux',
+                '--initrd','C:\izba-spike\spike-initramfs.cpio.gz',
+                '-c','console=ttyS0',
+                '--com1','file=C:\izba-spike\logs\rung6.log' `
+  -PassThru -NoNewWindow `
+  -RedirectStandardOutput 'C:\izba-spike\logs\rung6-stdout.log' `
+  -RedirectStandardError  'C:\izba-spike\logs\rung6-stderr.log'
+# ... (powershell exits; openvmm continues running) ...
+# ~8s later, tail while VM is alive:
+# WSL:     tail -5 /mnt/c/izba-spike/logs/rung6.log
+# Windows: Get-Content C:\izba-spike\logs\rung6.log -Tail 5
+Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+```
+
+**Live-tail results (~8 seconds after launch, VM running):**
+
+WSL side (`tail -5 /mnt/c/izba-spike/logs/rung6.log`):
+```
+SPIKE-INIT-OK
+sh: can't access tty; job control turned off
+~ # [    1.423022] tsc: Refined TSC clocksource calibration: 2304.002 MHz
+[    1.424623] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x2135f9f0f74, max_idle_ns: 440795301392 ns
+[    1.427006] clocksource: Switched to clocksource tsc
+```
+
+Windows side (`Get-Content ... -Tail 5`): identical output.
+
+**Growth check (5 seconds after first tail):** line count = 325, same as first tail. The guest had reached its idle `sleep infinity` PID-1 state — no new serial output was generated post-boot. The file was not growing because there was nothing left to emit, not because of buffering lag.
+
+**Flush behavior:** `SPIKE-INIT-OK` (line 321 of 325) was present at first tail (~8s). The boot completed in under 8 seconds and all output was flushed to the file before the tail. No buffering delay was observed; the file= sink appears to flush promptly.
+
+**Windows file-locking:** no `Get-Content` errors or access-denied conditions were observed. Windows NTFS does not lock files opened for sequential write against concurrent reads — both WSL (`tail`) and Windows (`Get-Content`) read the file without contention while openvmm.exe held it open for writing.
+
+**Final state after kill:** 325 lines, 20 462 bytes — identical to live state. No data loss on `Stop-Process -Force`.
+
+**Detachment:** openvmm.exe (PID 31136) survived the launching `powershell.exe` process exiting. `Get-Process -Id 31136` returned the process ~13 seconds after the launcher returned, confirming `Start-Process` creates an independent process on Windows (no session/job-object coupling that would kill children). The VM ran autonomously until `Stop-Process` was issued. No console window was created (`-NoNewWindow`); the process is fully headless.
+
+**Verdict for izba's boot-failure UX:** The `file=` capture mode is the correct `console.log` implementation for the OpenVMM driver. izba can open the file for reading at any point after `Start-Process` returns and tail it in real time without any Windows-specific synchronization concerns. For boot failures, all kernel output including late-boot lines will be present in the file before any reasonable timeout fires.
 
 ## Kernel config deltas
 
