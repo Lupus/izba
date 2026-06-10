@@ -213,9 +213,24 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
     result
 }
 
-/// Take the per-sandbox exclusive lock (released when the returned `File`
-/// drops — std file locks are tied to the open handle).
-fn lock_sandbox(paths: &Paths, name: &str) -> anyhow::Result<File> {
+/// Holds the per-sandbox exclusive lock; explicitly unlocks on drop.
+///
+/// The explicit `unlock` (flock LOCK_UN) matters: dropping the `File` alone
+/// releases a flock only when the LAST fd to the open file description
+/// closes, and forked children (VMM/sidecar spawns, including from other
+/// threads in parallel tests) momentarily inherit the fd until their exec.
+/// An explicit unlock releases the lock immediately regardless.
+struct SandboxLock(File);
+
+impl Drop for SandboxLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Take the per-sandbox exclusive lock (released eagerly when the returned
+/// guard drops).
+fn lock_sandbox(paths: &Paths, name: &str) -> anyhow::Result<SandboxLock> {
     let lock_path = paths.sandbox_dir(name).join("lock");
     let f = match File::options()
         .create(true)
@@ -230,7 +245,7 @@ fn lock_sandbox(paths: &Paths, name: &str) -> anyhow::Result<File> {
         Err(e) => return Err(e).with_context(|| format!("opening {}", lock_path.display())),
     };
     match f.try_lock() {
-        Ok(()) => Ok(f),
+        Ok(()) => Ok(SandboxLock(f)),
         Err(std::fs::TryLockError::WouldBlock) => {
             bail!("sandbox '{name}' is busy (another operation in progress)")
         }
