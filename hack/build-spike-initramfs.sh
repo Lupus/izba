@@ -18,6 +18,13 @@ cd "$(dirname "$0")/.."
 # shellcheck disable=SC1091
 [ -f .cargo-env ] && source .cargo-env
 
+# Verify that cpio is available before doing anything expensive.
+if ! command -v cpio >/dev/null 2>&1; then
+    echo "error: 'cpio' not found — install it with:" >&2
+    echo "  sudo apt-get install -y cpio" >&2
+    exit 1
+fi
+
 OUTPUT="${1:?usage: build-spike-initramfs.sh OUTPUT [RC_FILE]}"
 RC_FILE="${2:-}"
 mkdir -p "$(dirname "$OUTPUT")"
@@ -39,7 +46,7 @@ cargo build --manifest-path hack/spike/vsock-echo/Cargo.toml \
     --target x86_64-unknown-linux-musl --release
 
 WORK="$(mktemp -d)"
-chmod 755 "$WORK"
+chmod 755 "$WORK"  # mktemp creates 700; initramfs root must be world-traversable
 trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$WORK/bin" "$WORK/proc" "$WORK/sys" "$WORK/dev" "$WORK/tmp" "$WORK/mnt"
