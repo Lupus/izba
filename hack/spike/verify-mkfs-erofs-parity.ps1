@@ -12,13 +12,13 @@ $out   = Join-Path ([System.IO.Path]::GetTempPath()) 'izba-win.erofs'
 Remove-Item -Force -ErrorAction SilentlyContinue $out
 
 & $exe @flags $out $tar
-if ($LASTEXITCODE -ne 0) { Write-Error "mkfs.erofs.exe failed: $LASTEXITCODE"; exit 1 }
+if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("mkfs.erofs.exe failed: $LASTEXITCODE"); exit 1 }
 
 $got = (Get-FileHash -Algorithm SHA256 $out).Hash.ToLower()
-Remove-Item -Force $out
 if ($got -eq $want) {
+    Remove-Item -Force $out
     Write-Host "PASS: byte-identical to the Linux reference ($got)"
     exit 0
 }
-Write-Error "FAIL: sha256 $got != reference $want"
+[Console]::Error.WriteLine("FAIL: sha256 $got != reference $want (kept: $out)")
 exit 1
