@@ -4,6 +4,9 @@ This directory contains the tooling needed to build and fetch the runtime
 dependencies of izba.  None of these scripts are required to build the Rust
 code; they are for bootstrapping the host environment.
 
+Once the artifacts are in place, [../docs/testing.md](../docs/testing.md) is
+the runbook for actually booting sandboxes and running the integration suite.
+
 ---
 
 ## Scripts

@@ -8,6 +8,10 @@ and passes, so plain `cargo test` stays green everywhere.
 This runbook targets WSL2 Ubuntu on Windows 11, but everything except §1
 applies to any Linux host with KVM.
 
+Artifact tooling details live in [../hack/README.md](../hack/README.md); the
+design behind what these tests assert is in
+[superpowers/specs/2026-06-10-izba-v1-design.md](superpowers/specs/2026-06-10-izba-v1-design.md) §7.
+
 ---
 
 ## 1. One-time WSL2 setup (nested virtualization → /dev/kvm)

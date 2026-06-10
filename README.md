@@ -101,6 +101,16 @@ hack/          # scripts to fetch binaries and build the kernel/initramfs
 docs/          # architecture notes, design spec, testing runbook
 ```
 
+## Documentation
+
+| Doc | Read it for |
+| --- | --- |
+| [docs/superpowers/specs/2026-06-10-izba-v1-design.md](docs/superpowers/specs/2026-06-10-izba-v1-design.md) | The v1 design: every decision with its rationale, deferred scope, open spikes |
+| [docs/design-lineage.md](docs/design-lineage.md) | Design lineage & prior art — how each subsystem maps to its public OSS building blocks |
+| [docs/testing.md](docs/testing.md) | End-to-end testing runbook (WSL2/KVM setup, integration suite) |
+| [hack/README.md](hack/README.md) | Building the kernel/initramfs and fetching runtime binaries |
+| [CLAUDE.md](CLAUDE.md) | Contributor/agent crash course: build gates, crate map, load-bearing contracts |
+
 ## License
 
-Apache-2.0 — see [`Cargo.toml`](Cargo.toml).
+[Apache-2.0](LICENSE).
