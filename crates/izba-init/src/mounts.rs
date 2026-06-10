@@ -134,6 +134,9 @@ fn flags_to_ms(flags: &[String]) -> anyhow::Result<MsFlags> {
 /// the FUSE_INIT response never arrives because OpenVMM's virtiofs worker thread
 /// has not been scheduled yet. Cloud Hypervisor does not exhibit this behaviour.
 /// Do NOT remove these prints when targeting OpenVMM.
+/// This is a timing workaround, not a principled fix — the OpenVmmDriver work
+/// should investigate the OpenVMM virtiofs thread-scheduling lag (and consider
+/// an explicit mount-retry) before shipping.
 pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
     for op in ops {
         std::fs::create_dir_all(&op.target)

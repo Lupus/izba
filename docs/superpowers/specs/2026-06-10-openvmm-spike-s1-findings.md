@@ -27,7 +27,7 @@
 | 4 | vsock bridge | PASS | `--hv` required (VPCI path); kernel needed `CONFIG_HYPERV=y` + `CONFIG_PCI_HYPERV=y` (added); `--virtio-vsock-path C:\izba-spike\vsock`; `HANDSHAKE: OK 1073741824` + `SPIKE-RUNG4-ECHO-OK` confirmed in `rung4-client.log` |
 | 5 | consomme networking | PASS | `--hv --net consomme`; NIC model = netvsp (required adding `CONFIG_HYPERV_NET=y`); DHCP-OK, DNS-OK, HTTP-OK (`http://example.com`); kernel `ip=dhcp` also passes (`IP-Config: Complete`) |
 | 6 | headless serial capture | PASS | `file=` log readable from both WSL and Windows while VM runs; `SPIKE-INIT-OK` (line 321/325) visible at first tail (~8s); no file-locking contention; file fully flushed before kill; detachment confirmed (PID 31136 survived launching powershell exit) |
-| 7 | integration preview (full izba guest) | PASS | All pass criteria met: all mounts (erofs/ext4/overlay/virtiofs/devpts) complete; health `{"version":"0.1.0","uptime_ms":413}`; exec `sh -c 'echo from-guest > /workspace/exec-was-here && uname -a'` → ExecStarted + Wait `{"code":0}`; `/mnt/c/izba-spike/share/exec-was-here` = `"from-guest"` on host; `uname-out` = `"Linux spike-win 6.12.30 ..."` confirming guest hostname |
+| 7 | integration preview (full izba guest) | PASS | All pass criteria met: all mounts (erofs/ext4/overlay/virtiofs/devpts) complete; health `{"version":"0.1.0","uptime_ms":413}`; exec `sh -c 'echo from-guest > /workspace/exec-was-here && uname -a'` → ExecStarted + Wait `{"code":0}`; `/mnt/c/izba-spike/share/exec-was-here` = `"from-guest"` on host; `uname-out` = `"Linux spike-win 6.12.30 ..."` confirming guest hostname; required `mounts::apply()` serial-I/O workaround (bug #3) |
 | S4 | mkfs.erofs on Windows | PARTIAL | Native `.exe` build fails due to POSIX API gaps; viable path = run mkfs.erofs in WSL2 via interop; Cygwin route untested |
 
 ## Working command lines
@@ -478,10 +478,10 @@ Not reached — build did not produce `mkfs.erofs.exe`. Image-format compatibili
 
 ### Rung 7 — full izba guest integration preview
 
-**Objective:** Boot the UNMODIFIED production izba guest stack under OpenVMM on Windows and speak izba-proto to it.
+**Objective:** Boot the production izba guest stack (with one required crate workaround in `mounts::apply()` — see bug #3) under OpenVMM on Windows and speak izba-proto to it.
 
 **Artifacts staged to `C:\izba-spike\`:**
-- `izba-initramfs.cpio.gz` — production izba-init (statically-linked musl Rust, built from `crates/izba-init`); rebuilt multiple times during debugging; final binary is clean (no diagnostic prints in exec.rs).
+- `izba-initramfs.cpio.gz` — production izba-init (statically-linked musl Rust, built from `crates/izba-init`); rebuilt multiple times during debugging; final binary is clean (no diagnostic prints in exec.rs). `izba-initramfs.cpio.gz` was rebuilt from the modified `crates/izba-init` (commit `cfb208d`) that adds the `mounts::apply()` per-mount serial logging — the workaround is part of the booted binary.
 - `rootfs.erofs` — Alpine Linux erofs image (7.85 MB, RO lower layer). `/bin/busybox` (808 712 bytes) is dynamically linked PIE with interpreter `/lib/ld-musl-x86_64.so.1`; both are present in the image.
 - `rw.img` — 1 GiB ext4 (pre-formatted with `mkfs.ext4`; `ensure_formatted` detects non-blank → skips `mke2fs`).
 - `share/` — Windows directory exposed as virtiofs `workspace` tag → `/workspace` in guest.
