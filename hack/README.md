@@ -177,6 +177,11 @@ cargo build --release -p izba-cli
 
 ## mkfs.erofs for Windows
 
+```sh
+hack/build-mkfs-erofs-windows.sh
+# produces dist/mkfs.erofs.exe (Windows PE) + Linux reference binary under ~/.cache/izba/erofs-utils/
+```
+
 `build-mkfs-erofs-windows.sh` cross-compiles pinned erofs-utils into a
 native, tar-mode-only `dist/mkfs.erofs.exe` (imports: kernel32+msvcrt — no
 Cygwin, no WSL2) plus a same-source Linux reference binary. Compat shims
@@ -189,7 +194,8 @@ reference (under wine when present; otherwise it emits
 `dist/erofs-parity-bundle/` for `spike/verify-mkfs-erofs-parity.ps1` on a
 real Windows host — exit 2 means "run the Windows leg").
 
-izba-core finds the binary via `$IZBA_MKFS_EROFS` → `<exe dir>/libexec/` →
-`$PATH` (see `crates/izba-core/src/image/erofs.rs`).
+izba-core finds the binary via `$IZBA_MKFS_EROFS` → `<exe dir>/libexec/`
+(the directory containing the izba binary) → `$PATH` (see
+`crates/izba-core/src/image/erofs.rs`).
 
-Design: `docs/superpowers/specs/2026-06-10-mkfs-erofs-windows-design.md`.
+Design: [../docs/superpowers/specs/2026-06-10-mkfs-erofs-windows-design.md](../docs/superpowers/specs/2026-06-10-mkfs-erofs-windows-design.md).
