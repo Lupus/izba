@@ -15,7 +15,16 @@ pub trait IoStream: Read + Write + Send {
     fn set_io_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()>;
 }
 
-impl IoStream for std::os::unix::net::UnixStream {
+/// Platform alias for a connected AF_UNIX stream socket. Windows 10 1803+
+/// supports AF_UNIX natively, but Rust std only exposes it on Unix — the
+/// Windows side uses the `uds_windows` crate (same API surface: `connect`,
+/// `pair`, `try_clone`, `shutdown`, read/write timeouts).
+#[cfg(unix)]
+pub type UdsStream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+pub type UdsStream = uds_windows::UnixStream;
+
+impl IoStream for UdsStream {
     fn set_io_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
         self.set_read_timeout(t)?;
         self.set_write_timeout(t)

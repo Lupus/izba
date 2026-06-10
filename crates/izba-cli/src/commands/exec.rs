@@ -11,14 +11,13 @@ use crate::terminal;
 use anyhow::{bail, Context};
 use izba_core::paths::Paths;
 use izba_core::sandbox;
-use izba_core::vmm::IoStream;
+use izba_core::vmm::{IoStream, UdsStream};
 use izba_proto::{
     read_frame, write_frame, ErrorKind, ExecRequest, ExitStatus, Request, Response, StreamAttach,
     StreamKind,
 };
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
 pub fn run(
@@ -146,7 +145,7 @@ fn wait<S: Read + Write>(conn: &mut S, exec_id: u32) -> anyhow::Result<ExitStatu
 }
 
 /// Open a stream-port connection and bind it to `exec_id`'s `kind` stream.
-fn attach(paths: &Paths, name: &str, exec_id: u32, kind: StreamKind) -> anyhow::Result<UnixStream> {
+fn attach(paths: &Paths, name: &str, exec_id: u32, kind: StreamKind) -> anyhow::Result<UdsStream> {
     let mut conn = sandbox::default_stream_connector()(paths, name)
         .with_context(|| format!("opening {kind:?} stream"))?;
     write_frame(&mut conn, &StreamAttach { exec_id, kind })?;

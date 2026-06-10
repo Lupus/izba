@@ -65,11 +65,11 @@ pub fn default_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn Io
 /// The production stream-port connector: hybrid-vsock through `run/vsock.sock`
 /// to [`STREAM_PORT`].
 ///
-/// Returns a concrete [`std::os::unix::net::UnixStream`] (not `Box<dyn
-/// IoStream>`) because stream pumps need `try_clone` for the second direction
-/// and `shutdown` to signal half-close — neither is expressible on the trait.
-pub fn default_stream_connector(
-) -> impl Fn(&Paths, &str) -> anyhow::Result<std::os::unix::net::UnixStream> {
+/// Returns a concrete [`crate::vmm::UdsStream`] (not `Box<dyn IoStream>`)
+/// because stream pumps need `try_clone` for the second direction and
+/// `shutdown` to signal half-close — neither is expressible on the trait.
+pub fn default_stream_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<crate::vmm::UdsStream>
+{
     |paths: &Paths, name: &str| {
         let sock = paths.run_dir(name).join("vsock.sock");
         crate::vsock::hybrid_connect(&sock, STREAM_PORT)
@@ -667,9 +667,8 @@ pub fn list(paths: &Paths, connector: Connector) -> anyhow::Result<Vec<SandboxIn
 mod tests {
     use super::*;
     use crate::state::PidIdentity;
-    use crate::vmm::{CommandSpec, VmHandle};
+    use crate::vmm::{CommandSpec, UdsStream, VmHandle};
     use izba_proto::HealthInfo;
-    use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -840,7 +839,7 @@ mod tests {
             if !self.answer_health {
                 anyhow::bail!("connection refused (mock)");
             }
-            let (client, server) = UnixStream::pair()?;
+            let (client, server) = UdsStream::pair()?;
             let delay = self.health_delay;
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
@@ -885,7 +884,7 @@ mod tests {
         kill_on_shutdown: Option<PidIdentity>,
     ) -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn IoStream>> {
         move |_paths: &Paths, _name: &str| {
-            let (client, server) = UnixStream::pair()?;
+            let (client, server) = UdsStream::pair()?;
             let log = log.clone();
             let kill_on_shutdown = kill_on_shutdown.clone();
             std::thread::spawn(move || {
@@ -916,7 +915,7 @@ mod tests {
     /// simulates a wedged-but-accepting control plane.
     fn hanging_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn IoStream>> {
         |_paths: &Paths, _name: &str| {
-            let (client, server) = UnixStream::pair()?;
+            let (client, server) = UdsStream::pair()?;
             std::thread::spawn(move || {
                 let mut s = server;
                 let _ = read_frame::<_, Request>(&mut s);

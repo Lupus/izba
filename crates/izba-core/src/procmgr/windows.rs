@@ -64,6 +64,15 @@ fn creation_time(h: HANDLE) -> Option<u64> {
     (ok != 0).then_some(((create.dwHighDateTime as u64) << 32) | create.dwLowDateTime as u64)
 }
 
+/// Creation time of `pid` — the Windows `starttime` identity token.
+/// Test-only: consumed by `sandbox.rs` unit tests forging live identities
+/// (see the re-export gate in `procmgr/mod.rs`).
+#[cfg(test)]
+pub(crate) fn proc_starttime(pid: u32) -> anyhow::Result<u64> {
+    let h = open_query(pid).with_context(|| format!("no such process: {pid}"))?;
+    creation_time(h.0).context("reading process creation time")
+}
+
 /// Spawn a process detached from the current console, with stdin null and
 /// stdout+stderr appended to `log`. See the module docs for the detachment
 /// and identity model.

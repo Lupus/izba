@@ -1,6 +1,6 @@
+use crate::vmm::UdsStream;
 use anyhow::{bail, Context};
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
@@ -13,8 +13,8 @@ use std::time::Duration;
 ///      bytes past the `\n` belong to the stream data).
 ///   4. If the response starts with `OK `, the handshake succeeded and the stream
 ///      is raw guest-vsock data. Otherwise return an error containing the response.
-pub fn hybrid_connect(socket: &Path, port: u32) -> anyhow::Result<UnixStream> {
-    let s = UnixStream::connect(socket)
+pub fn hybrid_connect(socket: &Path, port: u32) -> anyhow::Result<UdsStream> {
+    let s = UdsStream::connect(socket)
         .with_context(|| format!("connecting to {}", socket.display()))?;
     hybrid_handshake(s, port)
 }
@@ -24,7 +24,7 @@ pub fn hybrid_connect(socket: &Path, port: u32) -> anyhow::Result<UnixStream> {
 ///
 /// A read timeout of 5 s is applied during the handshake and cleared afterwards
 /// so that a hung VMM cannot block the caller forever.
-fn hybrid_handshake(mut s: UnixStream, port: u32) -> anyhow::Result<UnixStream> {
+fn hybrid_handshake(mut s: UdsStream, port: u32) -> anyhow::Result<UdsStream> {
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
 
     s.write_all(format!("CONNECT {port}\n").as_bytes())?;
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn handshake() {
-        let (client, mut server) = UnixStream::pair().unwrap();
+        let (client, mut server) = UdsStream::pair().unwrap();
         let t = std::thread::spawn(move || {
             let mut line = String::new();
             std::io::BufReader::new(server.try_clone().unwrap())
@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn refused_port() {
-        let (client, mut server) = UnixStream::pair().unwrap();
+        let (client, mut server) = UdsStream::pair().unwrap();
         let t = std::thread::spawn(move || {
             // Read and discard the CONNECT line.
             let mut line = String::new();
@@ -113,6 +113,8 @@ mod tests {
     /// End-to-end through a real listening socket. Some sandboxes deny
     /// `UnixListener::bind` (EPERM); skip there — socketpair tests above
     /// cover the handshake logic, and the integration suite covers this path.
+    /// Unix-only: the listener comes from std's unix module.
+    #[cfg(unix)]
     #[test]
     fn full_connect_via_listener() {
         let dir = tempfile::tempdir().unwrap();

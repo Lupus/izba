@@ -19,7 +19,6 @@ use anyhow::Context;
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -31,6 +30,7 @@ use izba_core::procmgr;
 use izba_core::sandbox::{self, Artifacts, CreateOpts};
 use izba_core::state::{load_json, RunState, STATE_FILE};
 use izba_core::vmm::cloud_hypervisor::CloudHypervisorDriver;
+use izba_core::vmm::UdsStream;
 use izba_proto::{
     read_frame, write_frame, ErrorKind, ExecRequest, ExitStatus, Request, Response, StreamAttach,
     StreamKind,
@@ -335,7 +335,7 @@ fn wait(
 }
 
 /// Open a stream-port connection bound to `exec_id`'s `kind` stream.
-fn attach(paths: &Paths, name: &str, exec_id: u32, kind: StreamKind) -> UnixStream {
+fn attach(paths: &Paths, name: &str, exec_id: u32, kind: StreamKind) -> UdsStream {
     let mut conn = sandbox::default_stream_connector()(paths, name)
         .unwrap_or_else(|e| panic!("opening {kind:?} stream: {e:#}"));
     write_frame(&mut conn, &StreamAttach { exec_id, kind }).expect("sending stream attach");
@@ -343,7 +343,7 @@ fn attach(paths: &Paths, name: &str, exec_id: u32, kind: StreamKind) -> UnixStre
 }
 
 /// Read a stream to EOF, lossily decoded.
-fn slurp(mut s: UnixStream) -> String {
+fn slurp(mut s: UdsStream) -> String {
     let mut buf = Vec::new();
     let _ = std::io::Read::read_to_end(&mut s, &mut buf);
     String::from_utf8_lossy(&buf).into_owned()

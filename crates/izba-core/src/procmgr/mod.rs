@@ -18,5 +18,8 @@ pub use unix::{kill_pid, pid_alive, spawn_detached};
 
 #[cfg(windows)]
 mod windows;
+// Same test-only re-export rationale as the unix one above.
+#[cfg(all(windows, test))]
+pub(crate) use windows::proc_starttime;
 #[cfg(windows)]
 pub use windows::{kill_pid, pid_alive, spawn_detached};
