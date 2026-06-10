@@ -23,7 +23,7 @@
 | 0 | acquire openvmm.exe | PASS | Artifact `x64-windows-openvmm` from CI run 27240809751; `openvmm.exe --help` runs; all 7 expected flags confirmed |
 | 1 | smoke boot (their kernel) | PASS | openvmm-deps 0.3.0-59 kernel 6.1.172 boots to shell; `--com1 file=` and `--com1 stderr` both confirmed working; 292 lines of serial output captured |
 | 2 | direct-boot our vmlinux | PASS | izba kernel 6.12.30 + spike-initramfs boots; `SPIKE-INIT-OK` confirmed at line 319 of rung2.log; no config changes needed |
-| 3 | virtio-fs share | | |
+| 3 | virtio-fs share | PASS | Attempt A (PCIe route) worked first try; MOUNT-OK + READ-OK (`hello-from-host`) + WRITE-OK; `guest-file.txt` visible on host; uid/gid 1000 on Windows side |
 | 4 | vsock bridge | | |
 | 5 | consomme networking | | |
 | 6 | headless serial capture | | |
@@ -95,6 +95,52 @@ Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 **Whp-probe empty-log mystery — resolution:**
 - Root cause: The earlier probe session used shell interpolation that malformed the `file=C:\...` argument (backslash escaping issue in the command string; the argument was passed as a single shell word rather than via `Start-Process -ArgumentList`). The `file=` mechanism itself is fully functional.
 - Confirmation: our izba kernel (`vmlinux` + `spike-initramfs.cpio.gz`) also produces full serial output in both `file=` and `stderr` modes — `izba-kernel-file.log` is 20 291 bytes, 320+ kernel lines, boots to busybox shell.
+
+### Rung 3 — virtio-fs share
+
+**Kernel virtio transport inventory** (from `hack/kernel.config`):
+- `CONFIG_VIRTIO=y`, `CONFIG_VIRTIO_PCI=y`, `CONFIG_VIRTIO_FS=y`
+- `CONFIG_VIRTIO_BLK=y`, `CONFIG_VIRTIO_NET=y`, `CONFIG_VIRTIO_CONSOLE=y`, `CONFIG_VIRTIO_VSOCKETS=y`
+- `CONFIG_VIRTIO_MMIO` is **not set** — MMIO transport unavailable; PCIe or PCI is the only viable route.
+
+**Attempt A — PCIe route (PASS, first try):**
+
+`--pcie-root-complex` + `--pcie-root-port` are required for virtio-pci visibility in direct boot (the default DSDT has no PCI bus unless you add one explicitly via these flags).
+
+```powershell
+# Run from C:\izba-spike in PowerShell; kills after 25s
+$proc = Start-Process -FilePath 'C:\izba-spike\openvmm.exe' `
+  -ArgumentList '--kernel','C:\izba-spike\vmlinux',
+                '--initrd','C:\izba-spike\spike-initramfs-r3.cpio.gz',
+                '-c','console=ttyS0',
+                '--com1','file=C:\izba-spike\logs\rung3.log',
+                '--pcie-root-complex','rc0',
+                '--pcie-root-port','rc0:ws',
+                '--virtio-fs','pcie_port=ws:ws,C:\izba-spike\share' `
+  -PassThru -NoNewWindow `
+  -RedirectStandardOutput 'C:\izba-spike\logs\rung3-stdout.log' `
+  -RedirectStandardError  'C:\izba-spike\logs\rung3-stderr.log'
+Start-Sleep -Seconds 25
+Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+```
+
+**Result:** `rung3.log` — 354 lines. `SPIKE-RUNG3-MOUNT-OK` + `SPIKE-RUNG3-READ-OK: hello-from-host` + `SPIKE-RUNG3-WRITE-OK` all present. Bidirectional check: `C:\izba-spike\share\guest-file.txt` created by guest, contains `guest-was-here`.
+
+**PCIe probe lines from rung3.log (transport visibility confirmed):**
+```
+pci 0000:00:00.0: [1414:c030] type 01 class 0x060400 PCIe Root Port
+pci 0000:01:00.0: [1af4:105a] type 00 class 0x088000 conventional PCI endpoint
+virtio-pci 0000:01:00.0: enabling device (0000 -> 0002)
+```
+The virtio-fs device appears as virtio-pci vendor `1af4` device `105a` at `01:00.0` under the root port.
+
+**uid/gid mapping:** Files written by the guest appear as uid/gid 1000 on the Windows/WSL side. The in-process virtiofsd server runs as the Windows user (NTFS does not store POSIX uid/gid natively; WDK's projected filesystem maps the current user to uid 1000 in the WSL metadata view). No `uid=`/`gid=` mount options were required; the default mapping was correct. No permission errors for either the read or write direction.
+
+**Flag syntax notes:**
+- `--pcie-root-complex <name>` — just the name, no extra options needed for basic use (e.g., `rc0`)
+- `--pcie-root-port <rc_name>:<port_name>` — colon-separated (e.g., `rc0:ws`)
+- `--virtio-fs 'pcie_port=<port_name>:<tag>,<windows_path>'` — port name prefix before the tag; `--virtio-fs-bus` not needed when using `pcie_port=`
+- Attempts B/C (plain `--virtio-fs-bus pci` / `vpci` without the explicit PCIe topology) were NOT attempted — Attempt A passed cleanly on the first try.
 
 ### Rung 2 — direct-boot izba kernel
 
