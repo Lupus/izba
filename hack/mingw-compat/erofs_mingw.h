@@ -7,6 +7,10 @@
 #define EROFS_MINGW_COMPAT_H
 #ifdef __MINGW32__
 
+#if !defined(_FILE_OFFSET_BITS) || _FILE_OFFSET_BITS != 64
+#error "erofs_mingw.h requires -D_FILE_OFFSET_BITS=64 (64-bit off_t)"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>

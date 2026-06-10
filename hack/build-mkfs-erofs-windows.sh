@@ -121,6 +121,17 @@ x86_64-w64-mingw32-ar rcs "$BUILD_WIN/liberofs_mingw.a" "$BUILD_WIN/erofs_mingw.
     >"$BUILD_WIN/build.log" 2>&1 \
     || { tail -40 "$BUILD_WIN/build.log" >&2; echo "full log: $BUILD_WIN/build.log" >&2; exit 1; }
 
+# Multithreading-off assertion: autoconf silently ignores unknown --disable
+# flags, so a future pin bump could no-op --disable-multithreading and turn
+# the seek/read pread shim into a silent corruption race.  Verify config.h
+# explicitly — expect the undef form; a #define means MT crept back in.
+if grep -q "^#define EROFS_MT_ENABLED" "$BUILD_WIN/config.h" 2>/dev/null; then
+    echo "error: EROFS_MT_ENABLED is #define'd in $BUILD_WIN/config.h" >&2
+    echo "  --disable-multithreading had no effect; the pread/pwrite seek shim" >&2
+    echo "  is unsafe under multithreading. Check the erofs-utils version." >&2
+    exit 1
+fi
+
 # mkfs/mkfs.erofs.exe is only libtool's wrapper; the real PE lives in .libs/.
 EXE="$BUILD_WIN/mkfs/.libs/mkfs.erofs.exe"
 [ -f "$EXE" ] || EXE="$BUILD_WIN/mkfs/mkfs.erofs.exe"

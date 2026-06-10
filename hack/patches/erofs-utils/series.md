@@ -14,6 +14,10 @@ tree (POSIX shims, stubs, `_O_BINARY`) lives in `hack/mingw-compat/` instead.
     truncation crashed mkfs at the first `erofs_igrab()`.
   - `io.c`/`diskbuf.c`: MinGW's `struct stat` has no `st_blksize`; use 4096,
     which matches what the Linux reference sees on ext4 (and its page size).
+    Note: the Linux reference reads the host filesystem's real `st_blksize`
+    while Windows pins 4096, so on a host fs reporting ≠4096 the two builds
+    see different alignment inputs — benign for content parity but worth
+    knowing when debugging a divergence.
   - `gzran.c`: don't include `<zlib.h>` (absent from MinGW sysroots); the
     entire file body is already `HAVE_ZLIB`-guarded.
 

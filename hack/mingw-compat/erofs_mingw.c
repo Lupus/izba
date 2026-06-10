@@ -3,11 +3,15 @@
 #include "regex.h"
 #include <fcntl.h>
 #include <io.h>
+#include <limits.h>
 #include <string.h>
 #include <stdarg.h>
 
 /* CRT text-mode translation would corrupt the image; force binary mode for
- * every fd (mingw-w64 reads _CRT_fmode at startup). */
+ * every fd (mingw-w64 reads _CRT_fmode at startup).
+ * NOTE: this global only takes effect because this archive member is pulled in
+ * by the shim references.  If shims ever become header-only inlines, binary
+ * mode silently vanishes. */
 unsigned int _CRT_fmode = _O_BINARY;
 
 static void die_stub(const char *api)
@@ -69,15 +73,33 @@ void regfree(regex_t *preg)
 	die_stub("regfree");
 }
 
+/*
+ * pread / pwrite — save/seek/io/restore emulation of POSIX positioned I/O.
+ *
+ * Safety contract:
+ *   (a) The save→seek→read/write→restore sequence is NOT atomic per fd.  It is
+ *       only correct here because the build is pinned to --disable-multithreading
+ *       (single-threaded mkfs); a concurrent seek on the same fd between save and
+ *       restore would silently corrupt the output.
+ *   (b) Partial transfers are fine: upstream erofs_io_pread / erofs_io_pwrite
+ *       both loop on the returned byte count, so returning less than `count` is a
+ *       conforming POSIX partial-transfer and not an error.
+ *
+ * `count` is clamped to INT_MAX before the unsigned-int cast because _read /
+ * _write take `unsigned int` (max ~4 GB on Win32), while POSIX ssize_t allows
+ * any count; upstream loops on partials so this is always safe.
+ */
 ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
 	__int64 cur = _telli64(fd);
 	int n;
 
+	if (count > INT_MAX)
+		count = INT_MAX;
 	if (cur < 0 || _lseeki64(fd, offset, SEEK_SET) < 0)
 		return -1;
 	n = _read(fd, buf, (unsigned int)count);
-	_lseeki64(fd, cur, SEEK_SET);
+	(void)_lseeki64(fd, cur, SEEK_SET); /* best-effort restore; caller loops on partials */
 	return n;
 }
 
@@ -86,10 +108,12 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 	__int64 cur = _telli64(fd);
 	int n;
 
+	if (count > INT_MAX)
+		count = INT_MAX;
 	if (cur < 0 || _lseeki64(fd, offset, SEEK_SET) < 0)
 		return -1;
 	n = _write(fd, buf, (unsigned int)count);
-	_lseeki64(fd, cur, SEEK_SET);
+	(void)_lseeki64(fd, cur, SEEK_SET); /* best-effort restore; caller loops on partials */
 	return n;
 }
 
