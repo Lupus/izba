@@ -22,7 +22,7 @@
 | --- | --- | --- | --- |
 | 0 | acquire openvmm.exe | PASS | Artifact `x64-windows-openvmm` from CI run 27240809751; `openvmm.exe --help` runs; all 7 expected flags confirmed |
 | 1 | smoke boot (their kernel) | PASS | openvmm-deps 0.3.0-59 kernel 6.1.172 boots to shell; `--com1 file=` and `--com1 stderr` both confirmed working; 292 lines of serial output captured |
-| 2 | direct-boot our vmlinux | | |
+| 2 | direct-boot our vmlinux | PASS | izba kernel 6.12.30 + spike-initramfs boots; `SPIKE-INIT-OK` confirmed at line 319 of rung2.log; no config changes needed |
 | 3 | virtio-fs share | | |
 | 4 | vsock bridge | | |
 | 5 | consomme networking | | |
@@ -96,9 +96,33 @@ Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 - Root cause: The earlier probe session used shell interpolation that malformed the `file=C:\...` argument (backslash escaping issue in the command string; the argument was passed as a single shell word rather than via `Start-Process -ArgumentList`). The `file=` mechanism itself is fully functional.
 - Confirmation: our izba kernel (`vmlinux` + `spike-initramfs.cpio.gz`) also produces full serial output in both `file=` and `stderr` modes — `izba-kernel-file.log` is 20 291 bytes, 320+ kernel lines, boots to busybox shell.
 
+### Rung 2 — direct-boot izba kernel
+
+**Artifacts:** izba's own build artifacts (staged to `C:\izba-spike\` during rung-1 preparation):
+- Kernel: `vmlinux` — Linux 6.12.30, built by `hack/build-kernel.sh` targeting Cloud Hypervisor, uncompressed ELF, ~60 MB.
+- Initramfs: `spike-initramfs.cpio.gz` — busybox + `/init` that prints `SPIKE-INIT-OK` then drops to shell with sleep-infinity PID-1 keepalive.
+
+**Invocation (file capture mode):**
+
+```powershell
+# Run from C:\izba-spike in PowerShell; kills after 25s
+$proc = Start-Process -FilePath 'C:\izba-spike\openvmm.exe' `
+  -ArgumentList '--kernel','C:\izba-spike\vmlinux',
+                '--initrd','C:\izba-spike\spike-initramfs.cpio.gz',
+                '-c','console=ttyS0',
+                '--com1','file=C:\izba-spike\logs\rung2.log' `
+  -PassThru -NoNewWindow `
+  -RedirectStandardOutput 'C:\izba-spike\logs\rung2-stdout.log' `
+  -RedirectStandardError  'C:\izba-spike\logs\rung2-stderr.log'
+Start-Sleep -Seconds 25
+Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+```
+
+**Result:** `C:\izba-spike\logs\rung2.log` — 20 330 bytes, 323 lines of kernel serial output. Linux 6.12.30 banner at line 1; `SPIKE-INIT-OK` at line 319; guest reached busybox shell. No kernel config changes were required — izba's CH-targeted kernel boots under OpenVMM direct-boot without modification.
+
 ## Kernel config deltas
 
-(none yet)
+None. izba's Cloud Hypervisor-targeted kernel (Linux 6.12.30, built by `hack/build-kernel.sh`) requires no configuration changes for OpenVMM direct boot. Both rungs 1 and 2 confirm this — the same `vmlinux` that boots under Cloud Hypervisor boots identically under OpenVMM.
 
 ## S4 details — mkfs.erofs on Windows
 
