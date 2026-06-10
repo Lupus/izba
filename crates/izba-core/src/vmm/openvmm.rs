@@ -39,6 +39,32 @@ fn disk_port(i: usize) -> String {
     format!("vd{}", (b'a' + i as u8) as char)
 }
 
+/// OpenVMM device flags are comma-separated values (`file:<path>,ro,...`,
+/// `pcie_port=<port>:<tag>,<path>`); a comma inside an embedded path would
+/// silently truncate it into a bogus option list. Reject early with a clear
+/// error instead.
+fn reject_commas(spec: &VmSpec) -> anyhow::Result<()> {
+    for disk in &spec.disks {
+        if disk.path.display().to_string().contains(',') {
+            anyhow::bail!(
+                "disk path {} contains a comma, which the openvmm --virtio-blk \
+                 syntax cannot carry — move the izba data root to a comma-free path",
+                disk.path.display()
+            );
+        }
+    }
+    for share in &spec.shares {
+        if share.host_path.display().to_string().contains(',') {
+            anyhow::bail!(
+                "workspace path {} contains a comma, which the openvmm --virtio-fs \
+                 syntax cannot carry — use a comma-free workspace directory",
+                share.host_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn build_invocation(spec: &VmSpec, openvmm: &Path) -> CommandSpec {
     let vsock_sock = spec.run_dir.join("vsock.sock");
     let mut argv = vec![
@@ -102,6 +128,7 @@ pub struct OpenVmmDriver;
 
 impl VmmDriver for OpenVmmDriver {
     fn launch(&self, spec: &VmSpec) -> anyhow::Result<Box<dyn VmHandle>> {
+        reject_commas(spec)?;
         std::fs::create_dir_all(&spec.run_dir)
             .with_context(|| format!("creating {}", spec.run_dir.display()))?;
         let log_dir = spec
@@ -279,5 +306,18 @@ mod tests {
         assert!(joined.contains("file:/img/rootfs.erofs,ro,pcie_port=vda"));
         assert!(joined.contains("file:/sbx/rw.img,pcie_port=vdb"));
         assert!(joined.contains("file:/x/extra.img,pcie_port=vdc"));
+    }
+
+    #[test]
+    fn comma_in_share_path_rejected() {
+        let mut spec = base_spec();
+        spec.shares[0].host_path = PathBuf::from("/home/user/a,b");
+        let err = reject_commas(&spec).unwrap_err();
+        assert!(err.to_string().contains("comma"), "got: {err:#}");
+    }
+
+    #[test]
+    fn comma_free_spec_accepted() {
+        assert!(reject_commas(&base_spec()).is_ok());
     }
 }
