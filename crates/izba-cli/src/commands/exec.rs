@@ -27,7 +27,7 @@ pub fn run(
     tty: bool,
     argv: Vec<String>,
 ) -> anyhow::Result<i32> {
-    if tty && !terminal::is_tty(libc::STDIN_FILENO) {
+    if tty && !terminal::stdin_is_tty() {
         anyhow::bail!("exec -t requires a terminal on stdin");
     }
     let connector = sandbox::default_connector();
@@ -81,7 +81,7 @@ fn wait_tty(
 ) -> anyhow::Result<ExitStatus> {
     let control = Arc::new(Mutex::new(control));
     resize(&control, exec_id); // size the guest pty before the program looks
-    spawn_winch(Arc::clone(&control), exec_id)?;
+    spawn_resize_watcher(Arc::clone(&control), exec_id)?;
 
     let stream = attach(paths, name, exec_id, StreamKind::Tty)?;
     let stream_out = stream.try_clone().context("cloning tty stream")?;
@@ -181,12 +181,38 @@ fn resize(control: &Mutex<Box<dyn IoStream>>, exec_id: u32) {
     }
 }
 
-fn spawn_winch(control: Arc<Mutex<Box<dyn IoStream>>>, exec_id: u32) -> anyhow::Result<()> {
+/// Pushes a Resize RPC whenever the local terminal size changes.
+#[cfg(unix)]
+fn spawn_resize_watcher(
+    control: Arc<Mutex<Box<dyn IoStream>>>,
+    exec_id: u32,
+) -> anyhow::Result<()> {
     let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])
         .context("installing SIGWINCH handler")?;
     std::thread::spawn(move || {
         for _ in signals.forever() {
             resize(&control, exec_id);
+        }
+    });
+    Ok(())
+}
+
+/// Windows has no SIGWINCH: poll the console size. 200 ms is imperceptible
+/// for a human dragging a window and costs one syscall per tick.
+#[cfg(windows)]
+fn spawn_resize_watcher(
+    control: Arc<Mutex<Box<dyn IoStream>>>,
+    exec_id: u32,
+) -> anyhow::Result<()> {
+    std::thread::spawn(move || {
+        let mut last = terminal::winsize();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let now = terminal::winsize();
+            if now != last {
+                last = now;
+                resize(&control, exec_id);
+            }
         }
     });
     Ok(())

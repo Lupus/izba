@@ -1,7 +1,10 @@
 use crate::{artifacts, terminal, SandboxOpts};
 use izba_core::paths::Paths;
 use izba_core::state::CONFIG_FILE;
-use izba_core::vmm::cloud_hypervisor::CloudHypervisorDriver;
+#[cfg(unix)]
+use izba_core::vmm::cloud_hypervisor::CloudHypervisorDriver as DefaultDriver;
+#[cfg(windows)]
+use izba_core::vmm::openvmm::OpenVmmDriver as DefaultDriver;
 use izba_core::{image, sandbox};
 use std::path::Path;
 
@@ -13,7 +16,7 @@ pub fn run(
 ) -> anyhow::Result<i32> {
     let name = resolve_or_create(paths, opts, name_or_dir)?;
     let art = artifacts::locate(paths)?;
-    match sandbox::start(paths, &name, &CloudHypervisorDriver, &art) {
+    match sandbox::start(paths, &name, &DefaultDriver, &art) {
         Ok(()) => {}
         // `run` is idempotent: already running is exactly the state we want.
         Err(e) if e.to_string().contains("already running") => {}
@@ -24,7 +27,7 @@ pub fn run(
     } else {
         cmd
     };
-    let tty = terminal::is_tty(libc::STDIN_FILENO);
+    let tty = terminal::stdin_is_tty();
     super::exec::run(paths, &name, true, tty, cmd)
 }
 

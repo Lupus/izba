@@ -986,6 +986,7 @@ dependencies = [
  "libc",
  "nix 0.29.0",
  "signal-hook",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

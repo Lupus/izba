@@ -13,6 +13,14 @@ izba-core = { path = "../izba-core" }
 izba-proto = { path = "../izba-proto" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["term"] }
 signal-hook = "0.3"
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
