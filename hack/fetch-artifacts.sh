@@ -11,7 +11,9 @@
 # What this script manages:
 #   1. cloud-hypervisor   (static binary, GitHub releases)
 #   2. virtiofsd          (static binary, virtio-fs GitLab)
-#   3. passt              (distro package — no static build available)
+#   3. passt              (distro package; must support --vhost-user. If the
+#                          distro build is too old, install the upstream static
+#                          build — see the passt section below.)
 #   4. mkfs.erofs         (distro package — no static build available)
 #   5. Boot artifacts     (kernel vmlinux + initramfs.cpio.gz)
 #              → must be built locally; see hack/build-kernel.sh and
@@ -103,12 +105,52 @@ fi
 # ---------------------------------------------------------------------------
 # 2. virtiofsd
 # ---------------------------------------------------------------------------
-echo "=== virtiofsd ==="
-# Pinned release for reproducibility (same pattern as cloud-hypervisor above);
-# bump deliberately. Releases: https://gitlab.com/virtio-fs/virtiofsd/-/releases
-VIRTIOFSD_VERSION="${VIRTIOFSD_VERSION:-v1.13.2}"  # override with VIRTIOFSD_VERSION env var
-VIRTIOFSD_URL="https://gitlab.com/virtio-fs/virtiofsd/-/releases/${VIRTIOFSD_VERSION}/downloads/virtiofsd-x86_64"
+# As of ~v1.13.x the project no longer publishes a direct `virtiofsd-x86_64`
+# release permalink (that path now 404s). Each release instead attaches a
+# `virtiofsd-vX.Y.Z.zip` as a GitLab *project upload*, linked from the release
+# description, e.g. `[virtiofsd-v1.13.3.zip](/uploads/<hash>/virtiofsd-...zip)`.
+# The zip contains the static musl binary at
+# `target/x86_64-unknown-linux-musl/release/virtiofsd`. We resolve the upload
+# link via the API so this keeps working across version bumps.
+# Releases: https://gitlab.com/virtio-fs/virtiofsd/-/releases
+VIRTIOFSD_VERSION="${VIRTIOFSD_VERSION:-v1.13.3}"  # override with VIRTIOFSD_VERSION env var
+VIRTIOFSD_API="https://gitlab.com/api/v4/projects/virtio-fs%2Fvirtiofsd"
 
+# Resolve + download + extract the virtiofsd release zip into $1 (dest binary).
+download_virtiofsd() {
+    local dest="$1"
+    echo "Resolving virtiofsd ${VIRTIOFSD_VERSION} release asset..."
+    local rel upload_path pid url tmpd bin
+    rel=$(curl -fLs "$VIRTIOFSD_API/releases/${VIRTIOFSD_VERSION}") || {
+        echo "  error: cannot fetch release ${VIRTIOFSD_VERSION}" >&2; return 1; }
+    upload_path=$(printf '%s' "$rel" | grep -oE '/uploads/[a-f0-9]+/[^")]+\.zip' | head -1)
+    if [ -z "$upload_path" ]; then
+        echo "  error: no upload .zip link in release ${VIRTIOFSD_VERSION} description" >&2; return 1
+    fi
+    pid=$(curl -fLs "$VIRTIOFSD_API" | grep -oE '"id":[0-9]+' | head -1 | grep -oE '[0-9]+')
+    if [ -z "$pid" ]; then echo "  error: cannot resolve project id" >&2; return 1; fi
+    # Project uploads are served under the /-/project/<id>/ scope.
+    url="https://gitlab.com/-/project/${pid}${upload_path}"
+    tmpd=$(mktemp -d)
+    echo "Downloading virtiofsd from ${url}..."
+    if ! curl -fL --progress-bar -o "$tmpd/virtiofsd.zip" "$url"; then
+        rm -rf "$tmpd"; echo "  error: download failed" >&2; return 1
+    fi
+    if ! ( cd "$tmpd" && unzip -oq virtiofsd.zip ); then
+        rm -rf "$tmpd"; echo "  error: unzip failed (is 'unzip' installed?)" >&2; return 1
+    fi
+    bin=$(find "$tmpd" -type f -name virtiofsd -path '*release*' | head -1)
+    [ -z "$bin" ] && bin=$(find "$tmpd" -type f -name 'virtiofsd' ! -name '*.zip' | head -1)
+    if [ -z "$bin" ]; then
+        rm -rf "$tmpd"; echo "  error: virtiofsd binary not found inside zip" >&2; return 1
+    fi
+    mkdir -p "$(dirname "$dest")"
+    install -m755 "$bin" "$dest"
+    rm -rf "$tmpd"
+    echo "  installed to $dest"
+}
+
+echo "=== virtiofsd ==="
 if command -v virtiofsd >/dev/null 2>&1; then
     echo "  present: $(command -v virtiofsd)"
     mark_ok "virtiofsd"
@@ -118,7 +160,7 @@ elif [ -x "$BIN_DIR/virtiofsd" ]; then
 else
     echo "  missing"
     if [ "$CHECK_ONLY" -eq 0 ]; then
-        download_bin "$VIRTIOFSD_URL" "$BIN_DIR/virtiofsd" "virtiofsd"
+        download_virtiofsd "$BIN_DIR/virtiofsd"
         mark_ok "virtiofsd"
     else
         mark_missing "virtiofsd"
@@ -129,12 +171,39 @@ fi
 # 3. passt
 # ---------------------------------------------------------------------------
 echo "=== passt ==="
+# izba runs passt in vhost-user mode: cloud-hypervisor consumes the network
+# device over a vhost-user socket (see vmm/cloud_hypervisor.rs — passt is
+# invoked with `--vhost-user --socket-path .../net.sock`). That mode was added
+# upstream around 2024_03_20; older builds — including the one Ubuntu 24.04
+# ships (0.0~git20240220) — reject --vhost-user, exit immediately, and never
+# create net.sock, so every boot fails with "passt did not create ... net.sock
+# within 3s". Presence alone is therefore NOT enough — we probe the capability.
+passt_ok=0
 if command -v passt >/dev/null 2>&1; then
-    echo "  present: $(command -v passt)"
-    mark_ok "passt"
+    if passt --help 2>&1 | grep -q vhost-user; then
+        echo "  present: $(command -v passt) (supports --vhost-user)"
+        mark_ok "passt"
+        passt_ok=1
+    else
+        echo "  present but TOO OLD: $(command -v passt) lacks --vhost-user"
+    fi
 else
     echo "  missing"
-    need_install "passt" "sudo apt-get install -y passt"
+fi
+if [ "$passt_ok" -eq 0 ]; then
+    mark_missing "passt"
+    if [ "$CHECK_ONLY" -eq 0 ]; then
+        # Distro apt has no newer passt on Ubuntu 24.04, but upstream publishes
+        # an official static build. Install it to /usr/local/bin so it shadows
+        # any older /usr/bin/passt (izba resolves `passt` via PATH, and
+        # /usr/local/bin precedes /usr/bin). ~/.local/bin would NOT shadow a
+        # system passt, so this one genuinely needs the system location.
+        echo "  → Install a passt with vhost-user support (needs sudo):"
+        echo "      curl -fL https://passt.top/builds/latest/x86_64/passt -o /tmp/passt"
+        echo "      sudo install -m755 /tmp/passt /usr/local/bin/passt"
+        echo "      hash -r && passt --help | grep vhost-user   # verify"
+        echo "    (Upstream also ships .deb/.rpm: https://passt.top/builds/latest/x86_64/)"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
