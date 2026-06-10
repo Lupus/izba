@@ -1,0 +1,129 @@
+diff --git a/include/erofs/err.h b/include/erofs/err.h
+index 59c8c9c..de40e90 100644
+--- a/include/erofs/err.h
++++ b/include/erofs/err.h
+@@ -29,8 +29,15 @@ static inline const char *erofs_strerror(int err)
+ }
+ 
+ #define MAX_ERRNO (4095)
++#ifdef __MINGW32__
++/* unsigned long is 32-bit on LLP64 Windows and would truncate pointers */
++#include <stdint.h>
++#define IS_ERR_VALUE(x)                                                        \
++	((uintptr_t)(void *)(x) >= (uintptr_t)-MAX_ERRNO)
++#else
+ #define IS_ERR_VALUE(x)                                                        \
+ 	((unsigned long)(void *)(x) >= (unsigned long)-MAX_ERRNO)
++#endif
+ 
+ static inline void *ERR_PTR(long error)
+ {
+@@ -39,7 +46,11 @@ static inline void *ERR_PTR(long error)
+ 
+ static inline int IS_ERR(const void *ptr)
+ {
++#ifdef __MINGW32__
++	return IS_ERR_VALUE((uintptr_t)ptr);
++#else
+ 	return IS_ERR_VALUE((unsigned long)ptr);
++#endif
+ }
+ 
+ static inline long PTR_ERR(const void *ptr)
+diff --git a/include/erofs/internal.h b/include/erofs/internal.h
+index 671880f..fd34470 100644
+--- a/include/erofs/internal.h
++++ b/include/erofs/internal.h
+@@ -345,7 +345,13 @@ static inline unsigned int erofs_inode_datalayout(unsigned int ifmt)
+ 
+ static inline struct erofs_inode *erofs_parent_inode(struct erofs_inode *inode)
+ {
++#ifdef __MINGW32__
++	/* unsigned long is 32-bit on LLP64 Windows and would truncate */
++	return (struct erofs_inode *)((uintptr_t)inode->i_parent &
++				      ~(uintptr_t)1);
++#else
+ 	return (struct erofs_inode *)((unsigned long)inode->i_parent & ~1UL);
++#endif
+ }
+ 
+ #define IS_ROOT(x)	((x) == erofs_parent_inode(x))
+diff --git a/lib/diskbuf.c b/lib/diskbuf.c
+index 0bf42da..b15d03a 100644
+--- a/lib/diskbuf.c
++++ b/lib/diskbuf.c
+@@ -117,7 +117,14 @@ setupone:
+ 		erofs_atomic_set(&strm->count, 1);
+ 		if (fstat(strm->fd, &st))
+ 			return -errno;
++#ifdef __MINGW32__
++		/* MinGW's struct stat has no st_blksize; 4096 matches what
++		 * the Linux reference build computes (4096-byte blocks,
++		 * 4096-byte pages). */
++		strm->alignsize = 4096;
++#else
+ 		strm->alignsize = max_t(u32, st.st_blksize, getpagesize());
++#endif
+ 	}
+ 	return 0;
+ }
+diff --git a/lib/gzran.c b/lib/gzran.c
+index dffb20a..7f617ab 100644
+--- a/lib/gzran.c
++++ b/lib/gzran.c
+@@ -6,7 +6,10 @@
+ #include "erofs/err.h"
+ #include "liberofs_gzran.h"
+ #include <stdlib.h>
++#ifndef __MINGW32__
++/* everything below is HAVE_ZLIB-guarded; MinGW sysroots ship no zlib.h */
+ #include <zlib.h>
++#endif
+ 
+ #ifdef HAVE_ZLIB
+ struct erofs_gzran_cutpoint {
+diff --git a/lib/inode.c b/lib/inode.c
+index 2cfc6c5..6b58532 100644
+--- a/lib/inode.c
++++ b/lib/inode.c
+@@ -2096,13 +2096,22 @@ static int erofs_mkfs_handle_inode(const struct erofs_mkfs_btctx *ctx,
+ 
+ static bool erofs_inode_visited(struct erofs_inode *inode)
+ {
++#ifdef __MINGW32__
++	return (uintptr_t)inode->i_parent & 1;
++#else
+ 	return (unsigned long)inode->i_parent & 1UL;
++#endif
+ }
+ 
+ static void erofs_mark_parent_inode(struct erofs_inode *inode,
+ 				    struct erofs_inode *dir)
+ {
++#ifdef __MINGW32__
++	/* unsigned long is 32-bit on LLP64 Windows and would truncate */
++	inode->i_parent = (void *)((uintptr_t)dir | 1);
++#else
+ 	inode->i_parent = (void *)((unsigned long)dir | 1);
++#endif
+ }
+ 
+ static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
+diff --git a/lib/io.c b/lib/io.c
+index 0c5eb2c..08249f5 100644
+--- a/lib/io.c
++++ b/lib/io.c
+@@ -359,7 +359,13 @@ repeat:
+ 				return -errno;
+ 			}
+ 		}
++#ifdef __MINGW32__
++		/* MinGW's struct stat has no st_blksize; 4096 matches what the
++		 * Linux reference build sees for regular files on ext4. */
++		sbi->devblksz = 4096;
++#else
+ 		sbi->devblksz = st.st_blksize;
++#endif
+ 		break;
+ 	default:
+ 		erofs_err("bad file type (%s, %o).", dev, st.st_mode);
