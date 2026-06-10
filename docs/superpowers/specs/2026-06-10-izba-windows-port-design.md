@@ -18,7 +18,7 @@ places (verified by `cargo check --target x86_64-pc-windows-gnu`, 11 errors):
 
 | Coupling | Where | Windows answer |
 | --- | --- | --- |
-| `nix` Flock + errno | `sandbox.rs` lock | cross-platform `fd-lock` crate |
+| `nix` Flock + errno | `sandbox.rs` lock | std's `File::try_lock` (stable since Rust 1.89; flock/`LockFileEx` underneath) |
 | `setsid`/`pre_exec`, signal kill, `/proc` starttime | `procmgr.rs` | `CREATE_NO_WINDOW` flags, `TerminateProcess`, `GetProcessTimes` |
 | `std::os::unix::net::UnixStream` | `vsock.rs`, `vmm/mod.rs`, CLI `exec.rs` | `uds_windows` crate (Windows 10 1803+ AF_UNIX) |
 | `$HOME/.local/share/izba` | `paths.rs` | `%LOCALAPPDATA%\izba` |
@@ -62,13 +62,15 @@ guest side stays Linux/musl.
 
 ## 3. Design
 
-### 3.1 Sandbox lock: `fd-lock` (both platforms)
+### 3.1 Sandbox lock: std `File::try_lock` (both platforms)
 
-Replace `nix::fcntl::Flock` in `sandbox.rs` with the `fd-lock` crate
-(`flock` on Unix, `LockFileEx` on Windows). One code path on both platforms —
-this *deletes* platform-specific code. `try_write()` failure with
-`WouldBlock` maps to today's "another start is in flight" handling. The
-existing `flock_serializes_start` test keeps the behavior honest.
+Replace `nix::fcntl::Flock` in `sandbox.rs` with std's file locking
+(stabilized in Rust 1.89: `flock` on Unix, `LockFileEx` on Windows) — zero
+new dependencies and one code path on both platforms; this *deletes*
+platform-specific code. `TryLockError::WouldBlock` maps to today's "another
+operation in progress" error; the lock releases when the returned `File`
+drops, exactly like the `Flock` guard. The existing `flock_serializes_start`
+test keeps the behavior honest.
 
 ### 3.2 procmgr: platform split, same API
 
