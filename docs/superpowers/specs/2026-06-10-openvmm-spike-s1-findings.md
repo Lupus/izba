@@ -29,8 +29,8 @@
 | 4 | vsock bridge | PASS | `--hv` required (VPCI path); kernel needed `CONFIG_HYPERV=y` + `CONFIG_PCI_HYPERV=y` (added); `--virtio-vsock-path C:\izba-spike\vsock`; `HANDSHAKE: OK 1073741824` + `SPIKE-RUNG4-ECHO-OK` confirmed in `rung4-client.log` |
 | 5 | consomme networking | PASS | `--hv --net consomme`; NIC model = netvsp (required adding `CONFIG_HYPERV_NET=y`); DHCP-OK, DNS-OK, HTTP-OK (`http://example.com`); kernel `ip=dhcp` also passes (`IP-Config: Complete`) |
 | 6 | headless serial capture | PASS | `file=` log readable from both WSL and Windows while VM runs; `SPIKE-INIT-OK` (line 321/325) visible at first tail (~8s); no file-locking contention; file fully flushed before kill; detachment confirmed (PID 31136 survived launching powershell exit) |
-| 7 | integration preview (full izba guest) | PASS | All pass criteria met: all mounts (erofs/ext4/overlay/virtiofs/devpts) complete; health `{"version":"0.1.0","uptime_ms":413}`; exec `sh -c 'echo from-guest > /workspace/exec-was-here && uname -a'` → ExecStarted + Wait `{"code":0}`; `/mnt/c/izba-spike/share/exec-was-here` = `"from-guest"` on host; `uname-out` = `"Linux spike-win 6.12.30 ..."` confirming guest hostname; required `mounts::apply()` serial-I/O workaround (bug #3) |
-| S4 | mkfs.erofs on Windows | PARTIAL | Native `.exe` build fails due to POSIX API gaps; viable path = run mkfs.erofs in WSL2 via interop; Cygwin route untested |
+| 7 | integration preview (full izba guest) | PASS | All pass criteria met: all mounts (erofs/ext4/overlay/virtiofs/devpts) complete; health `{"version":"0.1.0","uptime_ms":413}`; exec `sh -c 'echo from-guest > /workspace/exec-was-here && uname -a'` → ExecStarted + Wait `{"code":0}`; `/mnt/c/izba-spike/share/exec-was-here` = `"from-guest"` on host; `uname-out` = `"Linux spike-win 6.12.30 ..."` confirming guest hostname; required `mounts::apply()` serial-I/O workaround (bug #3; post-spike replaced by `pre_mount_pause()` — see addendum) |
+| S4 | mkfs.erofs on Windows | PARTIAL | Native `.exe` build fails due to POSIX API gaps; viable path = run mkfs.erofs in WSL2 via interop; Cygwin route untested. *Post-spike research changed this picture substantially — see addendum.* |
 
 ## Working command lines
 
@@ -423,7 +423,7 @@ CONFIG_HYPERV_NET=y
 | winget `search erofs` | No package found |
 | GitHub `search repos erofs-utils windows` | No third-party Windows builds found |
 
-**Conclusion:** must build from source. No pre-built Windows binary is publicly available; how Docker's `sbx` ships erofs tooling on Windows is not confirmed — see Path A′/C discussion below.
+**Conclusion:** must build from source. No pre-built Windows binary is publicly available; how Docker's `sbx` ships erofs tooling on Windows is not confirmed — see Path A′/C discussion below. *(Post-spike: both points were overturned — Docker ships a native MinGW-w64 tar-mode `mkfs.erofs.exe`, and a maintained prebuilt Cygwin erofs-utils exists. See addendum.)*
 
 ### Build attempt (Steps 2–3)
 
@@ -562,7 +562,7 @@ uname-out: [Linux spike-win 6.12.30 #4 SMP PREEMPT_DYNAMIC Wed Jun 10 16:46:30 +
 
 2. **PowerShell `-ArgumentList` array splitting** — passing `$allargs` as an array (e.g., `--virtio-blk','file:...'`) causes `-c "console=ttyS0 ip=dhcp ..."` to be split at the space before `ip=dhcp`, delivering `ip=dhcp` as a separate argument. Fix: pass the entire argument string as a single pre-built flat string (`$allargs = '--kernel ... --virtio-vsock-path ...'`); `Start-Process` with a single `$allargs` string works correctly.
 
-3. **OpenVMM virtiofs FUSE_INIT scheduling hang** — `mount(virtiofs, "workspace", ...)` in izba-init blocked indefinitely after the ext4 mount. Root cause: OpenVMM's virtiofs server thread was not scheduled when the guest issued `FUSE_INIT`. Any serial I/O between the ext4 mount and the virtiofs mount forces the kernel to service device interrupts, which causes OpenVMM to process the pending FUSE_INIT response. Fix applied: added `eprintln!` before and after each `nix::mount::mount()` call in `mounts::apply()` — these writes to ttyS0 are the required I/O. The comment in `mounts.rs` documents this as a DO NOT REMOVE constraint when targeting OpenVMM. Cloud Hypervisor does not exhibit this behaviour.
+3. **OpenVMM virtiofs FUSE_INIT scheduling hang** — `mount(virtiofs, "workspace", ...)` in izba-init blocked indefinitely after the ext4 mount. Root cause: OpenVMM's virtiofs server thread was not scheduled when the guest issued `FUSE_INIT`. Any serial I/O between the ext4 mount and the virtiofs mount forces the kernel to service device interrupts, which causes OpenVMM to process the pending FUSE_INIT response. Fix applied: added `eprintln!` before and after each `nix::mount::mount()` call in `mounts::apply()` — these writes to ttyS0 are the required I/O. The comment in `mounts.rs` documents this as a DO NOT REMOVE constraint when targeting OpenVMM. Cloud Hypervisor does not exhibit this behaviour. *(Superseded post-spike: the root cause is a host-side device-worker scheduling lag recovered by ANY guest pause — the serial I/O was incidental. The crutch was replaced by a principled `pre_mount_pause()`; see the addendum and the [RCA](2026-06-10-openvmm-virtiofs-hang-rca.md).)*
 
 4. **PowerShell subprocess `-Argv` argument passing** — calling `pwsh -File izba-client.ps1 -Argv '/bin/uname','-a'` from within pwsh passes the array elements as a comma-joined string (`'/bin/uname','-a'` → argv0 = `"'/bin/uname','-a'"`) causing ENOENT. Fix: embed the client logic inline in the test script rather than launching a child pwsh process.
 
@@ -574,7 +574,7 @@ uname-out: [Linux spike-win 6.12.30 #4 SMP PREEMPT_DYNAMIC Wed Jun 10 16:46:30 +
 - `--virtio-fs pcie_port=ws:workspace,<path>` (virtiofs via PCIe)
 - `--virtio-blk file:<path>,ro,pcie_port=vda` and `--virtio-blk file:<path>,pcie_port=vdb` (virtio-blk via PCIe, NOT VPCI, to avoid device ID collision)
 - Kernel: `CONFIG_HYPERV=y`, `CONFIG_PCI_HYPERV=y`, `CONFIG_HYPERV_NET=y` (added in deltas 1–2)
-- initramfs: `mounts::apply()` must emit serial I/O before the virtiofs mount (currently the per-mount `eprintln!` lines; cannot be removed for OpenVMM target)
+- initramfs: `mounts::apply()` must give the host a brief guest pause before the virtiofs mount — implemented as `pre_mount_pause()` (a 50 ms sleep before virtiofs mounts, log-level-independent). The per-mount `eprintln!` lines are diagnostics only, no longer load-bearing. See the [RCA](2026-06-10-openvmm-virtiofs-hang-rca.md).
 
 ## Go/no-go recommendation
 
@@ -619,18 +619,21 @@ relative to `CloudHypervisorDriver`: no sidecar process management, no vhost-use
 sockets to set up, no sidecar PIDs to store in `run/`. The procmgr machinery for
 sidecar choreography is simply not needed on the Windows path.
 
-**(d) The virtiofs FUSE_INIT scheduling issue (tech debt).**
+**(d) The virtiofs FUSE_INIT scheduling issue (RESOLVED post-spike).**
 Under OpenVMM, the virtiofs mount in `mounts::apply()` hung indefinitely until
 serial I/O was emitted between the preceding ext4 mount and the virtiofs mount.
-Root cause: OpenVMM's in-process virtiofs server thread was not scheduled when
-the guest issued `FUSE_INIT`; serial I/O triggered kernel interrupt processing
-which caused OpenVMM to drain the pending FUSE_INIT. The current fix — per-mount
-`eprintln!` lines in `mounts::apply()` — is a crutch documented as a DO NOT
-REMOVE constraint for the OpenVMM target. The `OpenVmmDriver` plan must include
-a follow-up task to either investigate the scheduling root cause upstream (an
-OpenVMM bug) or replace the serial-I/O trigger with an explicit mount-retry loop
-(more robust: retry with backoff on ENOENT/ETIMEDOUT, independent of serial
-timing).
+The spike-era fix — load-bearing per-mount `eprintln!` lines — was investigated
+post-spike and replaced: the [RCA](2026-06-10-openvmm-virtiofs-hang-rca.md)
+established (experimentally, with OpenVMM source corroboration) that the cause
+is a host-side device-worker scheduling lag — OpenVMM runs all in-process
+virtio workers on one shared host thread, and the virtiofs worker arms its
+queue wait lazily on first poll; a guest that never yields between DRIVER_OK
+and FUSE_INIT starves it. ANY guest pause recovers it (a silent 20 ms sleep
+suffices; a kick is never lost — the notification path is race-free).
+`mounts::apply()` now uses `pre_mount_pause()` (50 ms sleep before virtiofs
+mounts), independent of log level; the prints are diagnostics only. An upstream
+OpenVMM issue draft is included in the RCA. The `OpenVmmDriver` needs no
+special handling beyond what izba-init now does.
 
 **(e) Rust `std` has no AF_UNIX on Windows.**
 The existing `vsock.rs` client uses `UnixStream::connect()` from Rust's standard
@@ -676,7 +679,9 @@ person-days). Three paths forward:
   depends on `cygwin1.dll` — not standalone Win32. Worth a short investigation
   only if a WSL2-free Windows deployment is ever required; not a v1 priority.
 
-**Recommendation for v1:** implement Path B.
+**Recommendation for v1:** implement Path B. *(Post-spike research widened the
+options — Docker's native MinGW tar-mode port and a maintained prebuilt Cygwin
+erofs-utils both make a WSL2-free path realistic; see addendum before deciding.)*
 
 ### Required follow-ups before the OpenVmmDriver driver plan
 
@@ -694,10 +699,92 @@ person-days). Three paths forward:
    is recommended; the implementation task should be scoped into the
    `OpenVmmDriver` plan alongside the disk attachment logic, since both are
    needed before `izba create` can work end-to-end on Windows.
+   **UPDATE (2026-06-10, post-spike):** new research (see addendum) found that
+   Docker ships a *native MinGW-w64* `mkfs.erofs.exe` driven in tar-mode, and
+   that a maintained prebuilt *Cygwin* erofs-utils exists — the decision space
+   is now wider and WSL2 is no longer the only realistic route.
 
-3. **Investigate the virtiofs FUSE_INIT scheduling issue.** The current
-   `mounts::apply()` workaround is fragile (any optimization that removes the
-   serial writes — e.g., a future `--log-level none` mode — would silently
-   reintroduce the hang). Before or during the `OpenVmmDriver` plan, file an
-   upstream OpenVMM issue and add a mount-retry fallback in `mounts::apply()` as
-   a defensive measure.
+3. **Investigate the virtiofs FUSE_INIT scheduling issue.** ~~The current
+   `mounts::apply()` workaround is fragile.~~ **DONE (2026-06-10, post-spike):**
+   root-caused (host-side device-worker scheduling lag; missed-kick theory
+   experimentally falsified) and fixed with `pre_mount_pause()` in
+   `mounts::apply()`; re-validated on both platforms (KVM suite 11/11, OpenVMM
+   rung-7 Health + Exec + host-visible `/workspace` write). Full analysis and
+   upstream-issue draft: [RCA](2026-06-10-openvmm-virtiofs-hang-rca.md).
+   Remaining: actually file the upstream issue.
+
+## Addendum — post-spike research (2026-06-10)
+
+Two focused research sessions ran after the spike completed (same day). Their
+results supersede parts of bug #3, §(d), §(g), and S4 above; the superseded
+text is kept for the historical record and marked in place.
+
+### A1. virtiofs FUSE_INIT hang: root-caused and fixed
+
+Full analysis: [2026-06-10-openvmm-virtiofs-hang-rca.md](2026-06-10-openvmm-virtiofs-hang-rca.md).
+
+- **Root cause (high confidence):** host-side device-worker scheduling lag.
+  OpenVMM runs all in-process virtio device workers on a single shared host
+  thread (`basic_device_thread`), and the virtiofs worker arms its
+  queue-notification wait lazily on its first poll. A guest that never yields
+  the CPU between DRIVER_OK and FUSE_INIT (izba-init's tight mount loop)
+  starves that thread; the mount blocks until anything pauses the guest.
+- **The missed-kick theory was falsified:** a *silent* 20 ms sleep (zero
+  serial I/O) before the virtiofs mount prevents the hang 3/3 — elapsed time
+  cannot recover a lost notification. Source tracing confirmed every layer of
+  the notification path (auto-reset NT event → `NtAssociateWaitCompletionPacket`
+  → WHP doorbell) individually survives a kick that arrives before the wait is
+  armed. The spike-era explanation ("serial I/O forces interrupt servicing")
+  was wrong about the mechanism; the serial write helped only because it
+  yields the CPU.
+- **Fix shipped:** `pre_mount_pause()` in `crates/izba-init/src/mounts.rs` —
+  a 50 ms sleep before any virtiofs mount, independent of log level. The
+  per-mount `eprintln\!` lines remain as diagnostics but are no longer
+  load-bearing. Re-validated: all four workspace gates green; KVM integration
+  suite 11/11 with the rebuilt initramfs; OpenVMM rung-7 re-run end-to-end
+  (boot through virtiofs, Health, Exec exit 0, host-visible `/workspace`
+  write). Evidence: `C:\izba-spike\logs\rca-*.log`, `fix-validate.log`.
+- **Upstream:** an OpenVMM issue is warranted (in-process virtio devices
+  should be serviceable from DRIVER_OK without requiring the guest to yield
+  first); full draft in the RCA. Not yet filed.
+
+### A2. erofs on Windows: tar-mode is the unlock, and new options
+
+Two findings overturn the S4 conclusions:
+
+**A native MinGW-w64 `mkfs.erofs` in tar-mode sidesteps the POSIX walk.**
+erofs-utils (GPL-2.0, source-readable) supports a **tar-mode** build
+(`mkfs.erofs --tar=f`, feeding OCI layer tars directly). In tar-mode every
+inode attribute comes from the ustar headers, so the POSIX APIs that killed our
+UCRT64 build (`lstat`, `readlink`, `DT_*`, `major()/minor()`) are never called
+on the real path — they only need stubbing, not porting. Notably, izba's own
+`image/erofs.rs` already invokes `mkfs.erofs --tar=f` (uncompressed; the guest
+kernel has only `CONFIG_EROFS_FS=y`, no ZIP/LZ4), so izba's invocation style is
+already tar-mode and therefore directly portable the same way. This revises
+the Path A estimate sharply downward: a tar-mode-only MinGW build needs a
+handful of stubs, not the 3–5-day POSIX-walk port.
+
+**A maintained prebuilt Cygwin erofs-utils exists:** `sekaiacg/erofs-utils`
+(GPL-2.0) ships per-platform builds including `Cygwin_x86_64` —
+verified by download: `mkfs.erofs.exe` (v1.8.10, 2025-12) + `cygwin1.dll`,
+PE32+ x86-64, help text confirms `--tar=X` support. CMake recipe is
+reproducible if we prefer building our own pinned copy in CI. This converts
+Path A′ from "untested hypothesis" to "working option, ~0.5 day to vendor".
+
+**Other survey results:** no pure-Rust or pure-Go erofs *writer* exists yet
+(`Dreamacro/erofs-rs` and the official `erofs/erofs-rs` are read-only; the
+latter's `mkfs` crate is a stub; containerd's erofs snapshotter shells out to
+mkfs.erofs) — a pure-Rust writer is the clean v2 endgame to track, and izba's
+uncompressed-only usage means it would be usable the day basic write support
+lands. No erofs-utils package exists in vcpkg/conda-forge/scoop/chocolatey/
+winget/MSYS2; upstream has no Windows port in flight.
+
+**Revised erofs decision space for the OpenVmmDriver plan** (decision still
+open — follow-up #2):
+
+| Option | WSL2-free? | Effort | Notes |
+| --- | --- | --- | --- |
+| Vendor sekaiacg Cygwin build | yes | ~0.5 d | GPL binary + `cygwin1.dll`; third-party trust |
+| CI-build our own Cygwin erofs-utils | yes | ~1–2 d | same recipe, pinned + trusted |
+| MinGW tar-mode port (Docker's route) | yes | ~1–2 d (revised from 3–5 d) | stub unused POSIX calls; cleanest binary |
+| Path B: WSL2 interop (spike rec) | no | ~0.5 d | zero porting; adds WSL2 dependency |
