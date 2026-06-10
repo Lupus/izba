@@ -1,0 +1,16 @@
+# Spike-only guest helper (see docs/superpowers/specs/2026-06-10-openvmm-spike-s1-design.md).
+# Standalone workspace: intentionally NOT a member of the root izba workspace.
+[workspace]
+
+[package]
+name = "vsock-echo"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+vsock = "0.5"
+libc = "0.2"
+
+[profile.release]
+strip = true
