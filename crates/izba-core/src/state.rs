@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 pub const CONFIG_FILE: &str = "config.json";
 pub const STATE_FILE: &str = "state.json";
 
-/// Identity that defeats PID reuse: `starttime` is field 22 of `/proc/<pid>/stat`,
-/// captured at spawn.
+/// Identity that defeats PID reuse: `starttime` is a platform-specific
+/// equality token captured at spawn (Linux: field 22 of `/proc/<pid>/stat`;
+/// Windows: the process creation `FILETIME`) — see [`crate::procmgr`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PidIdentity {
     pub pid: u32,
