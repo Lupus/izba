@@ -171,3 +171,25 @@ cargo build --release -p izba-cli
 | `IZBA_DATA_DIR` | Root data directory. Defaults to `$HOME/.local/share/izba`. |
 | `IZBA_MKE2FS` | Optional path to a static `mke2fs` binary to embed in the initramfs at `/sbin/mke2fs` (enables in-guest first-boot rw formatting). |
 | `VIRTIOFSD_VERSION` | virtiofsd release tag for `fetch-artifacts.sh`. Defaults to a pinned known-good version. |
+| `IZBA_MKFS_EROFS` | Absolute path to `mkfs.erofs` (or `mkfs.erofs.exe` on Windows). Overrides the bundled libexec copy and `$PATH`. |
+
+---
+
+## mkfs.erofs for Windows
+
+`build-mkfs-erofs-windows.sh` cross-compiles pinned erofs-utils into a
+native, tar-mode-only `dist/mkfs.erofs.exe` (imports: kernel32+msvcrt — no
+Cygwin, no WSL2) plus a same-source Linux reference binary. Compat shims
+live in `mingw-compat/`; forced in-tree edits in `patches/erofs-utils/`.
+POSIX dir-walk APIs are stubbed to abort with exit 70 — the binary is only
+valid for `mkfs.erofs --tar=f ...` invocations (which is all izba uses).
+
+`verify-mkfs-erofs-parity.sh` proves the .exe byte-identical to the Linux
+reference (under wine when present; otherwise it emits
+`dist/erofs-parity-bundle/` for `spike/verify-mkfs-erofs-parity.ps1` on a
+real Windows host — exit 2 means "run the Windows leg").
+
+izba-core finds the binary via `$IZBA_MKFS_EROFS` → `<exe dir>/libexec/` →
+`$PATH` (see `crates/izba-core/src/image/erofs.rs`).
+
+Design: `docs/superpowers/specs/2026-06-10-mkfs-erofs-windows-design.md`.
