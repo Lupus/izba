@@ -35,6 +35,22 @@ pub fn boot_mount_plan() -> Vec<MountOp> {
         MountOp::new("proc", "/proc", "proc", &["nosuid", "nodev", "noexec"], ""),
         MountOp::new("sysfs", "/sys", "sysfs", &["nosuid", "nodev", "noexec"], ""),
         MountOp::new("devtmpfs", "/dev", "devtmpfs", &["nosuid"], ""),
+        // devpts in init's OWN root, not just under /rootfs. The exec engine
+        // calls openpty() for tty jobs (exec.rs) from init's context, before
+        // the child chroots into /rootfs. openpty opens /dev/ptmx, and the
+        // kernel's ptmx_open → devpts_acquire → path_pts requires /dev/ptmx's
+        // sibling /dev/pts to be a devpts mount; without it openpty fails with
+        // ENODEV. The child inherits the already-opened slave fd (dup2'd by
+        // std before chroot), so it never reopens by path — only init needs a
+        // working /dev/ptmx here. /rootfs/dev/pts (rootfs_mount_plan) is still
+        // mounted separately for workloads that allocate their own ptys.
+        MountOp::new(
+            "devpts",
+            "/dev/pts",
+            "devpts",
+            &["nosuid", "noexec"],
+            "gid=5,mode=620,ptmxmode=666",
+        ),
         MountOp::new("tmpfs", "/tmp", "tmpfs", &["nosuid", "nodev"], ""),
     ]
 }
@@ -154,7 +170,7 @@ mod tests {
     #[test]
     fn boot_plan_sequence() {
         let p = boot_mount_plan();
-        assert_eq!(p.len(), 4);
+        assert_eq!(p.len(), 5);
         assert_eq!(
             op(&p, 0),
             (
@@ -181,6 +197,16 @@ mod tests {
         );
         assert_eq!(
             op(&p, 3),
+            (
+                "devpts",
+                "/dev/pts",
+                "devpts",
+                vec!["nosuid", "noexec"],
+                "gid=5,mode=620,ptmxmode=666"
+            )
+        );
+        assert_eq!(
+            op(&p, 4),
             ("tmpfs", "/tmp", "tmpfs", vec!["nosuid", "nodev"], "")
         );
     }
