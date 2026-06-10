@@ -22,9 +22,12 @@ cargo test --workspace                    # all unit/mock tests; integration tes
 cargo clippy --workspace --all-targets -- -D warnings   # gate: zero warnings
 cargo fmt --check
 cargo build -p izba-init --target x86_64-unknown-linux-musl --release  # must stay static
+cargo check  --target x86_64-pc-windows-gnu -p izba-proto -p izba-core -p izba-cli
+cargo clippy --target x86_64-pc-windows-gnu --all-targets -p izba-proto -p izba-core -p izba-cli -- -D warnings
 ```
 
-All four must be green before any commit. Real-VM integration tests need KVM +
+All six must be green before any commit (the cross gates need `rustup target
+add x86_64-pc-windows-gnu` and the `gcc-mingw-w64-x86-64` toolchain). Real-VM integration tests need KVM +
 artifacts and are env-gated: `IZBA_INTEGRATION=1 cargo test -p izba-core --test
 integration -- --test-threads=1` (full setup in [docs/testing.md](docs/testing.md)).
 

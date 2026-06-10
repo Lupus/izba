@@ -170,6 +170,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
         // Sparse scratch disk: apparent size only, no blocks allocated.
         let rw = dir.join("rw.img");
         let f = File::create(&rw).with_context(|| format!("creating {}", rw.display()))?;
+        mark_sparse(&f); // no-op on Unix; NTFS needs an explicit opt-in
         f.set_len(opts.rw_size_gb * 1024 * 1024 * 1024)
             .with_context(|| format!("sizing {}", rw.display()))?;
         drop(f); // release the file handle before running mkfs on it
@@ -212,6 +213,34 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
     }
     result
 }
+
+/// On NTFS, `set_len` allocates real clusters — without this, every sandbox
+/// physically reserves its full rw_size_gb. Unix filesystems extend sparsely
+/// by default, hence the no-op. Best-effort: failure costs disk space, not
+/// correctness.
+#[cfg(windows)]
+fn mark_sparse(f: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    let mut returned: u32 = 0;
+    // SAFETY: valid file handle; no in/out buffers; null overlapped = sync.
+    unsafe {
+        DeviceIoControl(
+            f.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_sparse(_f: &File) {}
 
 /// Holds the per-sandbox exclusive lock; explicitly unlocks on drop.
 ///

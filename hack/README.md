@@ -199,3 +199,17 @@ izba-core finds the binary via `$IZBA_MKFS_EROFS` → `<exe dir>/libexec/`
 `crates/izba-core/src/image/erofs.rs`).
 
 Design: [../docs/superpowers/specs/2026-06-10-mkfs-erofs-windows-design.md](../docs/superpowers/specs/2026-06-10-mkfs-erofs-windows-design.md).
+
+## izba.exe (Windows host CLI)
+
+Cross-built from WSL with the same MinGW toolchain as `mkfs.erofs.exe`:
+
+```sh
+rustup target add x86_64-pc-windows-gnu   # once
+cargo build --release --target x86_64-pc-windows-gnu -p izba-cli
+# → target/x86_64-pc-windows-gnu/release/izba.exe
+```
+
+The Windows binary discovers its tools via `$IZBA_MKFS_EROFS` /
+`$IZBA_OPENVMM`, an exe-adjacent `libexec\` directory, then `PATH` — see
+[the Windows-port design](../docs/superpowers/specs/2026-06-10-izba-windows-port-design.md).
