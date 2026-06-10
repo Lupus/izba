@@ -38,7 +38,7 @@ fn find_mkfs_erofs_from(
             return Ok(bundled);
         }
     }
-    which::which("mkfs.erofs").map_err(|_| {
+    which::which(MKFS_EROFS_EXE).map_err(|_| {
         anyhow::anyhow!(
             "mkfs.erofs not found (checked $IZBA_MKFS_EROFS, <exe dir>/libexec/{MKFS_EROFS_EXE}, PATH) — install erofs-utils or set IZBA_MKFS_EROFS"
         )
@@ -86,12 +86,31 @@ mod tests {
     }
 
     #[test]
-    fn resolve_env_override_missing_is_error() {
-        let err = find_mkfs_erofs_from(
-            Some(std::path::PathBuf::from("/nonexistent/mkfs.erofs")),
-            None,
+    fn resolve_env_override_beats_bundled() {
+        // Both an env-override file and a bundled libexec file exist; the env
+        // override must win.
+        let override_dir = tempfile::TempDir::new().unwrap();
+        let override_file = override_dir.path().join("my-mkfs-override");
+        std::fs::write(&override_file, b"").unwrap();
+
+        let exe_dir = tempfile::TempDir::new().unwrap();
+        let libexec = exe_dir.path().join("libexec");
+        std::fs::create_dir(&libexec).unwrap();
+        let bundled = libexec.join(MKFS_EROFS_EXE);
+        std::fs::write(&bundled, b"").unwrap();
+
+        let got = find_mkfs_erofs_from(
+            Some(override_file.clone()),
+            Some(exe_dir.path().join("izba")),
         )
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(got, override_file);
+    }
+
+    #[test]
+    fn resolve_env_override_missing_is_error() {
+        let err =
+            find_mkfs_erofs_from(Some(PathBuf::from("/nonexistent/mkfs.erofs")), None).unwrap_err();
         assert!(err.to_string().contains("IZBA_MKFS_EROFS"));
     }
 
