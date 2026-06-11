@@ -53,7 +53,7 @@ pub fn copy_to_guest<S: CpStream>(
 
     // Build the archive directly into the connection, rooted at the source
     // basename. The guest decides where it lands.
-    {
+    let write_result = (|| -> anyhow::Result<()> {
         let mut builder = tar::Builder::new(&mut conn);
         builder.follow_symlinks(false);
         if meta.is_dir() {
@@ -63,10 +63,24 @@ pub fn copy_to_guest<S: CpStream>(
             append_file(&mut builder, host_src, Path::new(&top_name)).context("archiving file")?;
         }
         builder.finish().context("finishing tar stream")?;
+        Ok(())
+    })();
+
+    // A write failure usually means the guest rejected the transfer early
+    // (e.g. dir-onto-file) and closed its end mid-archive, so our write hit a
+    // broken pipe. The guest's trailing status frame carries the real reason;
+    // try to read it and surface that instead of the raw pipe error. Only if
+    // no frame is available do we propagate the original write error.
+    if let Err(write_err) = write_result {
+        return match read_frame::<_, Response>(&mut conn) {
+            Ok(Response::Error { kind, message }) => {
+                Err(map_guest_error(kind, message, guest_dest))
+            }
+            Ok(Response::Ok) => Err(write_err),
+            Ok(other) => Err(write_err.context(format!("unexpected cp reply: {other:?}"))),
+            Err(_) => Err(write_err),
+        };
     }
-    // half-close so the guest's archive read sees tar EOF promptly.
-    // (UdsStream implements shutdown; the trait does not, so callers that
-    // need it pass a concrete type — production does. Best-effort here.)
 
     match read_frame::<_, Response>(&mut conn).context("reading cp result")? {
         Response::Ok => Ok(()),

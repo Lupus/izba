@@ -717,6 +717,10 @@ fn kill_vmm_then_ls_reports_stopped() {
     }
 }
 
+// Uses Unix-only fs APIs (exec-bit + symlink assertions); the integration
+// suite only ever boots on Linux/KVM. Gated so the windows-gnu --all-targets
+// clippy gate (gate 6) still compiles this test target.
+#[cfg(unix)]
 #[test]
 fn cp_round_trip_tree() {
     let Some(env) = want() else { return };

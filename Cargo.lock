@@ -1023,6 +1023,7 @@ dependencies = [
  "nix 0.29.0",
  "portable-pty",
  "signal-hook",
+ "tempfile",
  "windows-sys 0.60.2",
 ]
 
@@ -1057,6 +1058,7 @@ dependencies = [
  "izba-proto",
  "libc",
  "nix 0.29.0",
+ "tar",
  "tempfile",
  "vsock",
 ]
