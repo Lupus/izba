@@ -8,5 +8,8 @@
 pub mod proto;
 pub mod registry;
 pub mod relays;
+pub mod server;
 pub mod supervisor;
 pub mod transport;
+
+pub use server::{run_daemon, run_daemon_with, Daemon, DaemonDeps};
