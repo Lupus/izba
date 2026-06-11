@@ -125,10 +125,16 @@ fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, engine: 
     };
     let attach = match open {
         StreamOpen::Attach(a) => a,
-        // Dispatch skeleton: each feature branch fills in its variant.
-        StreamOpen::TcpDial { .. }
-        | StreamOpen::TarExtract { .. }
-        | StreamOpen::TarCreate { .. } => {
+        StreamOpen::TarExtract { dest } => {
+            tar_extract(&mut conn, &engine, &dest);
+            return;
+        }
+        StreamOpen::TarCreate { src } => {
+            tar_create(&mut conn, &engine, &src);
+            return;
+        }
+        // Port-publish lands on its own branch; still a stub here.
+        StreamOpen::TcpDial { .. } => {
             let _ = write_frame(
                 &mut conn,
                 &Response::Error {
@@ -176,6 +182,42 @@ fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, engine: 
             let _ = reader.join();
         }
     }
+}
+
+/// cp host->guest: read the tar from `conn` under the workload root, then
+/// write ONE trailing `Response` status frame.
+fn tar_extract<C: Read + Write>(conn: &mut C, engine: &ExecEngine, dest: &str) {
+    // With no chroot (tests), resolve against `/` so absolute guest paths
+    // still work; the real guest always has Some("/rootfs").
+    let root = engine.root().unwrap_or_else(|| std::path::Path::new("/"));
+    let resp = match crate::tarfs::extract(root, dest, conn) {
+        Ok(()) => Response::Ok,
+        Err((kind, message)) => Response::Error { kind, message },
+    };
+    let _ = write_frame(conn, &resp);
+}
+
+/// cp guest->host: resolve `src` FIRST; on failure write ONE leading
+/// `Response::Error` and close (no tar bytes precede it). On success write
+/// the leading `Response::Ok`, then STREAM the tar directly onto the
+/// connection while walking (never buffered) and close — tar's two
+/// zero-blocks are the EOF. A mid-walk I/O error just drops the connection;
+/// the host sees the missing EOF and reports "transfer truncated".
+fn tar_create<C: Read + Write>(conn: &mut C, engine: &ExecEngine, src: &str) {
+    let root = engine.root().unwrap_or_else(|| std::path::Path::new("/"));
+    let resolved = match crate::tarfs::resolve_src(root, src) {
+        Ok(r) => r,
+        Err((kind, message)) => {
+            let _ = write_frame(conn, &Response::Error { kind, message });
+            return;
+        }
+    };
+    if write_frame(conn, &Response::Ok).is_err() {
+        return;
+    }
+    // Stream straight onto the connection; an error here aborts mid-archive
+    // (no trailing frame exists in this direction by design).
+    let _ = crate::tarfs::stream_tar(&resolved, conn);
 }
 
 fn dup_fd(fd: std::os::fd::RawFd) -> std::io::Result<OwnedFd> {
@@ -360,22 +402,115 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_stream_open_variants_get_bad_request() {
+    fn tcp_dial_still_unimplemented_here() {
+        // Port-publish lands on its own branch; in this worktree TcpDial is
+        // still the skeleton's BadRequest stub.
         let h = Harness::new();
-        for open in [
-            StreamOpen::TcpDial { port: 80 },
-            StreamOpen::TarExtract { dest: "/d".into() },
-            StreamOpen::TarCreate { src: "/s".into() },
-        ] {
-            let mut conn = h.stream_conn();
-            write_frame(&mut conn, &open).unwrap();
-            match read_frame::<_, Response>(&mut conn).unwrap() {
-                Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::BadRequest),
-                other => panic!("unexpected: {other:?}"),
+        let mut conn = h.stream_conn();
+        write_frame(&mut conn, &StreamOpen::TcpDial { port: 80 }).unwrap();
+        match read_frame::<_, Response>(&mut conn).unwrap() {
+            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::BadRequest),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tar_extract_into_temp_root_then_create_back() {
+        // The engine in Harness uses root=None, so tarfs operates with the
+        // tempdir itself as "root". Drive a host->guest extract, then a
+        // guest->host create, over socketpairs.
+        use std::io::Cursor;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(ExecEngine::new(Some(tmp.path().to_path_buf())));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (stream_tx, rx) = mpsc::channel();
+        {
+            let e = Arc::clone(&engine);
+            let _ = &shutdown;
+            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), e));
+        }
+        let stream_conn = || {
+            let (mine, theirs) = UnixStream::pair().unwrap();
+            stream_tx.send(theirs).unwrap();
+            mine
+        };
+
+        // Pre-make the dest dir inside the root.
+        std::fs::create_dir_all(tmp.path().join("dst")).unwrap();
+
+        // --- TarExtract: send StreamOpen, then a tar rooted at the source
+        // basename (`file.txt`), with dest=/dst (an existing dir → into-dir
+        // rule), then expect ONE Ok frame. The entry lands at /dst/file.txt.
+        let mut ext = stream_conn();
+        write_frame(
+            &mut ext,
+            &StreamOpen::TarExtract {
+                dest: "/dst".into(),
+            },
+        )
+        .unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        let data = b"payload";
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(tar::EntryType::Regular);
+        hdr.set_size(data.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        b.append_data(&mut hdr, "file.txt", &mut &data[..]).unwrap();
+        let archive = b.into_inner().unwrap();
+        ext.write_all(&archive).unwrap();
+        ext.shutdown(std::net::Shutdown::Write).unwrap();
+        match read_frame::<_, Response>(&mut ext).unwrap() {
+            Response::Ok => {}
+            other => panic!("extract expected Ok, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(tmp.path().join("dst/file.txt")).unwrap(),
+            b"payload"
+        );
+
+        // --- TarCreate: send StreamOpen, expect ONE leading Ok, then a tar.
+        // src=/dst (a directory) → archive rooted at basename `dst`.
+        let mut cre = stream_conn();
+        write_frame(&mut cre, &StreamOpen::TarCreate { src: "/dst".into() }).unwrap();
+        match read_frame::<_, Response>(&mut cre).unwrap() {
+            Response::Ok => {}
+            other => panic!("create expected leading Ok, got {other:?}"),
+        }
+        let mut body = Vec::new();
+        cre.read_to_end(&mut body).unwrap();
+        let mut found = false;
+        let mut ar = tar::Archive::new(Cursor::new(&body));
+        for e in ar.entries().unwrap() {
+            let e = e.unwrap();
+            if e.path().unwrap().to_string_lossy() == "dst/file.txt" {
+                found = true;
             }
-            let mut rest = Vec::new();
-            conn.read_to_end(&mut rest).unwrap();
-            assert!(rest.is_empty());
+        }
+        assert!(found, "created archive must contain dst/file.txt");
+    }
+
+    #[test]
+    fn tar_create_missing_src_sends_leading_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(ExecEngine::new(Some(tmp.path().to_path_buf())));
+        let (stream_tx, rx) = mpsc::channel();
+        {
+            let e = Arc::clone(&engine);
+            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), e));
+        }
+        let (mut mine, theirs) = UnixStream::pair().unwrap();
+        stream_tx.send(theirs).unwrap();
+        write_frame(
+            &mut mine,
+            &StreamOpen::TarCreate {
+                src: "/nope".into(),
+            },
+        )
+        .unwrap();
+        match read_frame::<_, Response>(&mut mine).unwrap() {
+            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::PathNotFound),
+            other => panic!("expected PathNotFound, got {other:?}"),
         }
     }
 

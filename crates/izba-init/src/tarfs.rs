@@ -3,12 +3,6 @@
 //! (`/rootfs` in the guest) so no tar entry, dest, or symlink can escape into
 //! init's initramfs. Host-testable: every function takes the root as an
 //! explicit `&Path`, exactly like `ExecEngine::new(Some("/rootfs"))`.
-//!
-// NOTE: the resolver primitives below are exercised only from `#[cfg(test)]`
-// in this first commit; their non-test callers (`extract`/`create`) land in
-// the following commits. Allow dead_code so the resolver-only commit stays
-// clippy-clean; the allow is removed once the real callers exist.
-#![allow(dead_code)]
 
 use izba_proto::ErrorKind;
 use nix::fcntl::{openat2, OFlag, OpenHow, ResolveFlag};
@@ -25,12 +19,12 @@ fn internal(msg: impl std::fmt::Display) -> TarError {
 }
 
 /// Open `root` itself as a directory fd, to serve as the `dirfd` anchor for
-/// every `openat2(RESOLVE_IN_ROOT)` below. Resolution can never climb above
+/// every `openat2(RESOLVE_BENEATH)` below. Resolution can never climb above
 /// this fd.
 fn open_root_dir(root: &Path) -> Result<OwnedFd, TarError> {
     // The anchor path is init's own constant (never attacker-controlled), so a
     // plain open is safe; all relative opens are then re-anchored to this fd
-    // with RESOLVE_IN_ROOT.
+    // with RESOLVE_BENEATH.
     let raw = nix::fcntl::open(
         root,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,

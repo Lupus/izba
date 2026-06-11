@@ -77,6 +77,12 @@ impl ExecEngine {
         }
     }
 
+    /// The workload chroot root, if any (`Some("/rootfs")` in the guest,
+    /// `None` in tests). Used by the cp tar arms to confine path resolution.
+    pub fn root(&self) -> Option<&std::path::Path> {
+        self.root.as_deref()
+    }
+
     pub fn exec(&self, req: &ExecRequest) -> Result<u32, ExecError> {
         let argv0 = req
             .argv
