@@ -1,3 +1,4 @@
+pub mod cp;
 mod discover;
 pub mod image;
 pub mod liveness;
