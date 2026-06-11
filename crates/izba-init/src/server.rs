@@ -133,15 +133,8 @@ fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, engine: 
             tar_create(&mut conn, &engine, &src);
             return;
         }
-        // Port-publish lands on its own branch; still a stub here.
-        StreamOpen::TcpDial { .. } => {
-            let _ = write_frame(
-                &mut conn,
-                &Response::Error {
-                    kind: ErrorKind::BadRequest,
-                    message: "not implemented".into(),
-                },
-            );
+        StreamOpen::TcpDial { port } => {
+            tcp_dial(conn, port);
             return;
         }
     };
@@ -218,6 +211,80 @@ fn tar_create<C: Read + Write>(conn: &mut C, engine: &ExecEngine, src: &str) {
     // Stream straight onto the connection; an error here aborts mid-archive
     // (no trailing frame exists in this direction by design).
     let _ = crate::tarfs::stream_tar(&resolved, conn);
+}
+
+/// Init side of `StreamOpen::TcpDial`: dial `127.0.0.1:port` inside the guest,
+/// reply one `Response` frame (`Ok` | `Error{ConnectFailed}`), and on `Ok`
+/// become a raw bidirectional byte pipe.
+///
+/// `C` is the vsock connection (host side). On guest-socket EOF we
+/// `shutdown(Write)` toward the host and drain the remaining host->guest bytes;
+/// this graceful teardown is also the planned OpenVMM vsock-churn mitigation.
+fn tcp_dial<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, port: u16) {
+    use std::net::{Shutdown, SocketAddr, TcpStream};
+    // Spec §5: 10 s dial cap. Loopback normally refuses instantly; the cap
+    // guards pathological guest states (e.g. workload firewall DROP rules)
+    // so a relay thread can never hang in connect forever.
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let target = match TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10)) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = write_frame(
+                &mut conn,
+                &Response::Error {
+                    kind: ErrorKind::ConnectFailed,
+                    message: e.to_string(),
+                },
+            );
+            return;
+        }
+    };
+    if write_frame(&mut conn, &Response::Ok).is_err() {
+        return;
+    }
+
+    // Second handles for the opposite directions.
+    let conn_w = match dup_fd(conn.as_raw_fd()) {
+        Ok(d) => File::from(d),
+        Err(_) => return,
+    };
+    let target_r = match target.try_clone() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    // host -> guest: when the host half-closes, signal the guest socket so the
+    // guest service sees EOF, then this thread exits.
+    let reader = std::thread::spawn(move || {
+        let mut target_w = target;
+        relay_pump(conn, &mut target_w);
+        let _ = target_w.shutdown(Shutdown::Write);
+    });
+
+    // guest -> host: on guest EOF, half-close toward the host and drain is
+    // implicit (the host stops writing once it gets our shutdown).
+    let mut conn_w = conn_w;
+    relay_pump(target_r, &mut conn_w);
+    // SAFETY: conn_w is a dup of the vsock conn fd; SHUT_WR delivers EOF to
+    // the host's read side without tearing down the inbound direction.
+    unsafe { libc::shutdown(conn_w.as_raw_fd(), libc::SHUT_WR) };
+    let _ = reader.join();
+}
+
+/// Copy `r` to `w` until EOF or error. Mirrors `pump` but takes `w` by mutable
+/// reference so the caller can issue a shutdown after the copy completes.
+fn relay_pump(mut r: impl Read, w: &mut impl Write) {
+    let mut buf = [0u8; 32 * 1024];
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if w.write_all(&buf[..n]).is_err() {
+            return;
+        }
+    }
 }
 
 fn dup_fd(fd: std::os::fd::RawFd) -> std::io::Result<OwnedFd> {
@@ -402,19 +469,6 @@ mod tests {
     }
 
     #[test]
-    fn tcp_dial_still_unimplemented_here() {
-        // Port-publish lands on its own branch; in this worktree TcpDial is
-        // still the skeleton's BadRequest stub.
-        let h = Harness::new();
-        let mut conn = h.stream_conn();
-        write_frame(&mut conn, &StreamOpen::TcpDial { port: 80 }).unwrap();
-        match read_frame::<_, Response>(&mut conn).unwrap() {
-            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::BadRequest),
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
     fn tar_extract_into_temp_root_then_create_back() {
         // The engine in Harness uses root=None, so tarfs operates with the
         // tempdir itself as "root". Drive a host->guest extract, then a
@@ -512,6 +566,82 @@ mod tests {
             Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::PathNotFound),
             other => panic!("expected PathNotFound, got {other:?}"),
         }
+    }
+
+    /// A `TcpDial` that connects to a live loopback listener must reply Ok and
+    /// then pump bytes both ways. Binds a real TcpListener → runtime-skip if
+    /// the sandbox denies bind.
+    #[test]
+    fn tcp_dial_ok_pumps_both_ways() {
+        use std::net::TcpListener;
+        let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP tcp_dial_ok_pumps_both_ways: sandbox denies bind: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected bind failure: {e}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        // Echo server: read a line, write it back uppercased-prefixed.
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 16];
+            let n = s.read(&mut buf).unwrap();
+            s.write_all(b"re:").unwrap();
+            s.write_all(&buf[..n]).unwrap();
+            // Half-close so our drain sees EOF.
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let h = std::thread::spawn(move || tcp_dial(server, port));
+
+        // First frame the init side sends is the Ok response.
+        match read_frame::<_, Response>(&mut client).unwrap() {
+            Response::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        client.write_all(b"hi").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"re:hi");
+
+        srv.join().unwrap();
+        h.join().unwrap();
+    }
+
+    /// A `TcpDial` to a refused loopback port must reply Error{ConnectFailed}
+    /// and close. Port 1 is privileged/closed for an unprivileged dial; if the
+    /// dial unexpectedly succeeds the assert fails loudly.
+    #[test]
+    fn tcp_dial_refused_reports_connect_failed() {
+        // Bind-and-drop to obtain a definitely-free port, then dial it.
+        use std::net::TcpListener;
+        let port = match TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(l) => {
+                let p = l.local_addr().unwrap().port();
+                drop(l); // nothing is listening on p now
+                p
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP tcp_dial_refused_reports_connect_failed: sandbox denies bind: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected bind failure: {e}"),
+        };
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let h = std::thread::spawn(move || tcp_dial(server, port));
+        match read_frame::<_, Response>(&mut client).unwrap() {
+            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::ConnectFailed),
+            other => panic!("expected ConnectFailed, got {other:?}"),
+        }
+        // Conn is closed after the error frame.
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+        h.join().unwrap();
     }
 
     #[test]
