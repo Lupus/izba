@@ -6,4 +6,5 @@
 //! it never harms sandboxes.
 
 pub mod proto;
+pub mod relays;
 pub mod transport;
