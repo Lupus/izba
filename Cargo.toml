@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/izba-proto", "crates/izba-core", "crates/izba-cli", "crates/izba-init"]
+members = ["crates/izba-proto", "crates/izba-core", "crates/izba-cli", "crates/izba-init", "crates/izba-ttytest"]
 
 [workspace.package]
 edition = "2021"
