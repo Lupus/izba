@@ -257,22 +257,34 @@ impl Drop for SandboxLock {
     }
 }
 
+/// Path of the per-sandbox lock file — deliberately a SIBLING of the
+/// sandbox dir (`sandboxes/.<name>.lock`), not a file inside it: `remove`
+/// renames the dir while holding the lock, and Windows refuses to rename a
+/// directory containing an open file. The leading dot keeps the file name
+/// outside the valid sandbox-name space (names start with `[a-z0-9]`), so
+/// it can never collide with a real sandbox directory; `list` skips
+/// non-directories anyway.
+fn lock_path(paths: &Paths, name: &str) -> PathBuf {
+    paths.sandboxes_dir().join(format!(".{name}.lock"))
+}
+
 /// Take the per-sandbox exclusive lock (released eagerly when the returned
 /// guard drops).
 fn lock_sandbox(paths: &Paths, name: &str) -> anyhow::Result<SandboxLock> {
-    let lock_path = paths.sandbox_dir(name).join("lock");
-    let f = match File::options()
+    // The dir check replaces the old open-NotFound mapping (the lock file no
+    // longer lives inside the sandbox dir). A concurrent remove between this
+    // check and the lock acquisition is caught right after: the winner holds
+    // the lock and every post-lock state read fails with a clear error.
+    if !paths.sandbox_dir(name).is_dir() {
+        bail!("no such sandbox '{name}'");
+    }
+    let lock_path = lock_path(paths, name);
+    let f = File::options()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&lock_path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("no such sandbox '{name}'")
-        }
-        Err(e) => return Err(e).with_context(|| format!("opening {}", lock_path.display())),
-    };
+        .with_context(|| format!("opening {}", lock_path.display()))?;
     match f.try_lock() {
         Ok(()) => Ok(SandboxLock(f)),
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -614,13 +626,16 @@ pub fn remove(paths: &Paths, name: &str, connector: Connector, force: bool) -> a
         }
         fs::rename(&dir, &tombstone)
             .with_context(|| format!("renaming {} for removal", dir.display()))?;
-    } // the lock file moved with the dir; release before deleting it
+    } // release the lock (it lives beside the dir, so the rename was safe)
     if let Err(e) = fs::remove_dir_all(&tombstone) {
         eprintln!(
             "warning: sandbox '{name}' renamed to {} but final deletion failed: {e}",
             tombstone.display()
         );
     }
+    // Best-effort: the lock file is inert debris once the sandbox is gone
+    // (a late-coming locker bails on the missing dir before creating one).
+    let _ = fs::remove_file(lock_path(paths, name));
     Ok(())
 }
 
