@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use izba_core::daemon::relays::RelayManager;
 use izba_core::image::ensure_image;
 use izba_core::liveness::Liveness;
 use izba_core::paths::Paths;
@@ -84,7 +85,6 @@ fn want() -> Option<TestEnv> {
     }
     let kernel = require_env_file("IZBA_KERNEL", &mut missing);
     let initramfs = require_env_file("IZBA_INITRAMFS", &mut missing);
-    ensure_relay_exe(&mut missing);
 
     if !missing.is_empty() {
         panic!(
@@ -99,35 +99,6 @@ fn want() -> Option<TestEnv> {
         initramfs: initramfs.expect("checked above"),
         image_ref: std::env::var("IZBA_TEST_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string()),
     })
-}
-
-/// Point `IZBA_PORT_RELAY_EXE` at the real izba CLI binary. Port relays are
-/// `izba __port-relay` re-invocations of `current_exe`, which inside THIS
-/// process is the libtest harness, not the CLI — without the override the
-/// spawned "relay" is a test binary that exits immediately. Builds the CLI
-/// on demand (cheap when already up to date).
-fn ensure_relay_exe(missing: &mut Vec<String>) {
-    // target/debug/deps/integration-<hash> → target/debug/izba
-    let exe = std::env::current_exe().expect("test current_exe");
-    let debug_dir = exe
-        .parent() // deps/
-        .and_then(|p| p.parent()) // debug/
-        .expect("test binary not under target/debug/deps");
-    let izba = debug_dir.join(if cfg!(windows) { "izba.exe" } else { "izba" });
-    if !izba.is_file() {
-        let status = std::process::Command::new("cargo")
-            .args(["build", "-p", "izba-cli"])
-            .status();
-        if !matches!(status, Ok(s) if s.success()) || !izba.is_file() {
-            missing.push(format!(
-                "{} not found and `cargo build -p izba-cli` did not produce it \
-                 (needed as the port-relay worker)",
-                izba.display()
-            ));
-            return;
-        }
-    }
-    std::env::set_var("IZBA_PORT_RELAY_EXE", &izba);
 }
 
 fn require_env_file(var: &str, missing: &mut Vec<String>) -> Option<PathBuf> {
@@ -945,10 +916,25 @@ fn port_publish_create_time() {
         );
     }
 
+    // `start` no longer auto-spawns the config rules — that responsibility
+    // moved to the daemon's Start handler. Apply them here via a RelayManager
+    // exactly as that handler does.
+    let relays = RelayManager::new();
+    let config: izba_core::state::SandboxConfig =
+        load_json(&tb.paths.sandbox_dir("portc").join("config.json"))
+            .expect("read config.json")
+            .expect("config.json present");
+    for rule in &config.ports {
+        relays
+            .publish(&tb.paths, "portc", rule.clone())
+            .expect("publish config rule");
+    }
+
     start_guest_httpd(&tb.paths, "portc", "hello-from-guest", 8000);
     let body = http_get(18080).expect("curl published port");
     assert_eq!(body, "hello-from-guest");
 
+    relays.stop_all("portc");
     stop_sandbox(&tb, "portc");
 }
 
@@ -961,81 +947,36 @@ fn port_publish_runtime_and_unpublish() {
 
     start_guest_httpd(&tb.paths, "portr", "runtime-body", 8000);
 
-    let connector = sandbox::default_connector();
-    sandbox::publish_port(
-        &tb.paths,
-        "portr",
-        PortRule {
-            bind: "127.0.0.1".parse().unwrap(),
-            host_port: 18081,
-            guest_port: 8000,
-        },
-        &connector,
-    )
-    .expect("runtime publish");
+    let relays = RelayManager::new();
+    relays
+        .publish(
+            &tb.paths,
+            "portr",
+            PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: 18081,
+                guest_port: 8000,
+            },
+        )
+        .expect("runtime publish");
 
     let body = http_get(18081).expect("curl runtime-published port");
     assert_eq!(body, "runtime-body");
 
-    // ls shows exactly the one live rule.
-    let listed = sandbox::list_ports(&tb.paths, "portr").expect("ls");
+    // The manager reports exactly the one active rule.
+    let listed = relays.active("portr");
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].rule.host_port, 18081);
+    assert_eq!(listed[0].host_port, 18081);
 
-    // unpublish → the host port stops accepting (connection refused).
-    sandbox::unpublish_port(&tb.paths, "portr", "127.0.0.1".parse().unwrap(), 18081)
+    // unpublish (synchronous join) → the host port stops accepting.
+    relays
+        .unpublish("portr", "127.0.0.1".parse().unwrap(), 18081)
         .expect("unpublish");
-    // Give the relay a moment to die and release the port.
-    std::thread::sleep(Duration::from_millis(500));
     assert!(
         http_get(18081).is_err(),
         "port must be unreachable after unpublish"
     );
-    let listed = sandbox::list_ports(&tb.paths, "portr").expect("ls after unpublish");
-    assert!(listed.is_empty(), "no rules should remain");
+    assert!(relays.active("portr").is_empty(), "no rules should remain");
 
     stop_sandbox(&tb, "portr");
-}
-
-#[test]
-fn stop_kills_port_relays() {
-    let Some(env) = want() else { return };
-    let mut tb = TestBox::new();
-    let ws = tb.workspace("port-stop");
-    boot(&env, &mut tb, "ports", &ws);
-
-    let connector = sandbox::default_connector();
-    sandbox::publish_port(
-        &tb.paths,
-        "ports",
-        PortRule {
-            bind: "127.0.0.1".parse().unwrap(),
-            host_port: 18082,
-            guest_port: 8000,
-        },
-        &connector,
-    )
-    .expect("publish");
-    let records = sandbox::list_ports(&tb.paths, "ports").expect("ls");
-    assert_eq!(records.len(), 1);
-    let relay = records[0].relay.clone();
-    assert!(
-        procmgr::pid_alive(&relay),
-        "relay must be alive after publish"
-    );
-
-    stop_sandbox(&tb, "ports");
-
-    let dead = (0..40).any(|_| {
-        if !procmgr::pid_alive(&relay) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        !procmgr::pid_alive(&relay)
-    });
-    assert!(dead, "stop must kill the relay (no orphaned __port-relay)");
-    assert!(
-        !tb.paths.sandbox_dir("ports").join("ports.json").exists(),
-        "ports.json must be removed by stop"
-    );
 }

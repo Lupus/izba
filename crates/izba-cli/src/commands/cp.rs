@@ -71,16 +71,10 @@ fn guest_abs(path: &str) -> String {
     }
 }
 
-/// Liveness-gate the sandbox (same family of errors as `exec`) and open one
-/// stream-port connection.
+/// Open one stream-port connection through the daemon (which liveness-gates
+/// the sandbox — same error family as exec's "not running").
 fn open_stream(paths: &Paths, name: &str) -> anyhow::Result<izba_core::vmm::UdsStream> {
-    // Reuse exec's liveness gate: `control` errors with "not running" when
-    // the sandbox is stopped, which is the message family we want.
-    let connector = sandbox::default_connector();
-    let _gate =
-        sandbox::control(paths, name, &connector).with_context(|| format!("sandbox '{name}'"))?;
-    drop(_gate);
-    sandbox::default_stream_connector()(paths, name)
+    izba_core::daemon::DaemonClient::open_guest_stream(paths, name)
         .with_context(|| format!("opening cp stream to '{name}'"))
 }
 

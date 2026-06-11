@@ -1,11 +1,15 @@
+use izba_core::daemon::proto::DaemonRequest;
+use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
-use izba_core::sandbox;
-use std::time::Duration;
-
-const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
-    let connector = sandbox::default_connector();
-    sandbox::stop(paths, name, &connector, STOP_TIMEOUT)?;
+    let mut client = DaemonClient::connect(paths)?;
+    let resp = client.request(
+        &DaemonRequest::Stop {
+            name: name.to_string(),
+        },
+        &mut |_| {},
+    )?;
+    super::expect_ok(resp)?;
     Ok(0)
 }

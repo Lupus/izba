@@ -1,11 +1,10 @@
 use crate::{terminal, SandboxOpts};
+use anyhow::bail;
+use izba_core::daemon::proto::{DaemonCreate, DaemonRequest, DaemonResponse};
+use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
+use izba_core::sandbox;
 use izba_core::state::CONFIG_FILE;
-#[cfg(unix)]
-use izba_core::vmm::cloud_hypervisor::CloudHypervisorDriver as DefaultDriver;
-#[cfg(windows)]
-use izba_core::vmm::openvmm::OpenVmmDriver as DefaultDriver;
-use izba_core::{image, sandbox};
 use std::path::Path;
 
 pub fn run(
@@ -14,13 +13,16 @@ pub fn run(
     name_or_dir: &str,
     cmd: Vec<String>,
 ) -> anyhow::Result<i32> {
-    let name = resolve_or_create(paths, opts, name_or_dir)?;
-    let art = izba_core::artifacts::locate(paths)?;
-    match sandbox::start(paths, &name, &DefaultDriver, &art) {
-        Ok(()) => {}
+    let mut client = DaemonClient::connect(paths)?;
+    let name = resolve_or_create(&mut client, paths, opts, name_or_dir)?;
+    match client.request(&DaemonRequest::Start { name: name.clone() }, &mut |m| {
+        eprintln!("{m}")
+    })? {
+        DaemonResponse::Ok => {}
         // `run` is idempotent: already running is exactly the state we want.
-        Err(e) if e.to_string().contains("already running") => {}
-        Err(e) => return Err(e),
+        DaemonResponse::Error { message } if message.contains("already running") => {}
+        DaemonResponse::Error { message } => bail!(message),
+        other => bail!("unexpected daemon reply: {other:?}"),
     }
     let cmd = if cmd.is_empty() {
         vec!["/bin/sh".to_string(), "-l".to_string()]
@@ -33,7 +35,10 @@ pub fn run(
 
 /// NAME_OR_DIR: an existing sandbox name wins; anything else is a workspace
 /// directory (created if missing), with the sandbox created on first use.
+/// Reading config.json for name resolution is the one read-only local
+/// operation kept CLI-side; everything mutating goes through the daemon.
 fn resolve_or_create(
+    client: &mut DaemonClient,
     paths: &Paths,
     opts: &SandboxOpts,
     name_or_dir: &str,
@@ -41,12 +46,6 @@ fn resolve_or_create(
     if sandbox::validate_name(name_or_dir).is_ok()
         && paths.sandbox_dir(name_or_dir).join(CONFIG_FILE).is_file()
     {
-        // Note: detecting which flags were explicitly passed via clap is
-        // imprecise — we compare against the default values and warn whenever
-        // any non-default value is present.  This may warn for flags that
-        // happen to equal their default but were actually typed by the user;
-        // the opposite case (silently ignoring genuinely passed flags) is
-        // worse, so we err on the side of warning.
         let has_non_default = opts.image != "ubuntu:24.04"
             || opts.cpus != 2
             || opts.mem != 4096
@@ -64,14 +63,21 @@ fn resolve_or_create(
     let workspace = super::ensure_workspace(Path::new(name_or_dir))?;
     let name = super::name_for(opts, &workspace)?;
     if !paths.sandbox_dir(&name).join(CONFIG_FILE).is_file() {
-        eprintln!("resolving {} (pulls if not cached)...", opts.image);
-        let digest = image::ensure_image(paths, &opts.image)?;
         let ports = super::parse_publish(&opts.publish)?;
-        sandbox::create(
-            paths,
-            &name,
-            &super::create_opts(opts, digest, workspace, ports),
-        )?;
+        let req = DaemonRequest::Create(DaemonCreate {
+            name: name.clone(),
+            image_ref: opts.image.clone(),
+            cpus: opts.cpus,
+            mem_mb: opts.mem,
+            workspace,
+            rw_size_gb: opts.rw_size_gb,
+            ports,
+        });
+        match client.request(&req, &mut |m| eprintln!("{m}"))? {
+            DaemonResponse::Created { .. } => {}
+            DaemonResponse::Error { message } => bail!(message),
+            other => bail!("unexpected daemon reply: {other:?}"),
+        }
     }
     Ok(name)
 }

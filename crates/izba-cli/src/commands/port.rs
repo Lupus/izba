@@ -1,50 +1,60 @@
-//! `izba port` — publish/unpublish/ls host->guest TCP ports, plus the hidden
-//! `__port-relay` worker that each published rule runs as a detached process.
+//! `izba port` — publish/unpublish/ls host->guest TCP ports. Rules are owned
+//! by izbad: each published rule is a relay thread inside the daemon (no more
+//! detached `__port-relay` worker processes).
 
 use anyhow::{bail, Context};
+use izba_core::daemon::proto::{DaemonRequest, DaemonResponse};
+use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
-use izba_core::sandbox;
 use std::net::Ipv4Addr;
-use std::path::Path;
 
 pub fn publish(paths: &Paths, name: &str, rule_spec: &str) -> anyhow::Result<i32> {
     let rule = izba_core::portfwd::parse_rule(rule_spec)?;
-    let connector = sandbox::default_connector();
-    sandbox::publish_port(paths, name, rule.clone(), &connector)?;
+    let mut client = DaemonClient::connect(paths)?;
+    let resp = client.request(
+        &DaemonRequest::PortPublish {
+            name: name.to_string(),
+            rule: rule.clone(),
+        },
+        &mut |_| {},
+    )?;
+    super::expect_ok(resp)?;
     println!("{}:{} -> {}", rule.bind, rule.host_port, rule.guest_port);
     Ok(0)
 }
 
 pub fn unpublish(paths: &Paths, name: &str, key: &str) -> anyhow::Result<i32> {
     let (bind, host_port) = parse_key(key)?;
-    sandbox::unpublish_port(paths, name, bind, host_port)?;
+    let mut client = DaemonClient::connect(paths)?;
+    let resp = client.request(
+        &DaemonRequest::PortUnpublish {
+            name: name.to_string(),
+            bind,
+            host_port,
+        },
+        &mut |_| {},
+    )?;
+    super::expect_ok(resp)?;
     Ok(0)
 }
 
 pub fn ls(paths: &Paths, name: &str) -> anyhow::Result<i32> {
-    let records = sandbox::list_ports(paths, name)?;
-    for r in &records {
-        println!(
-            "{}:{} -> {} (relay pid {})",
-            r.rule.bind, r.rule.host_port, r.rule.guest_port, r.relay.pid
-        );
+    let mut client = DaemonClient::connect(paths)?;
+    match client.request(
+        &DaemonRequest::PortList {
+            name: name.to_string(),
+        },
+        &mut |_| {},
+    )? {
+        DaemonResponse::Ports { rules } => {
+            for r in &rules {
+                println!("{}:{} -> {}", r.bind, r.host_port, r.guest_port);
+            }
+            Ok(0)
+        }
+        DaemonResponse::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected daemon reply: {other:?}"),
     }
-    Ok(0)
-}
-
-/// The hidden `__port-relay` worker: runs the blocking relay loop forever.
-pub fn relay(
-    vsock: &Path,
-    bind: &str,
-    host_port: u16,
-    guest_port: u16,
-    pid_file: &Path,
-) -> anyhow::Result<i32> {
-    let bind: Ipv4Addr = bind
-        .parse()
-        .with_context(|| format!("invalid bind address '{bind}'"))?;
-    izba_core::portfwd::run_relay(vsock, bind, host_port, guest_port, pid_file)?;
-    Ok(0)
 }
 
 /// Parse an unpublish key `[BIND:]HOST` into `(bind, host_port)` (default bind

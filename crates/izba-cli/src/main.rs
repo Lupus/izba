@@ -1,4 +1,4 @@
-//! `izba` — daemonless microVM sandboxes. Arg parsing + dispatch only;
+//! `izba` — daemon-first microVM sandboxes. Arg parsing + dispatch only;
 //! all behavior lives in `commands/`.
 
 mod commands;
@@ -41,26 +41,6 @@ struct SandboxOpts {
     /// Publish a host port to the guest: [BIND:]HOST:GUEST (repeatable)
     #[arg(short = 'p', long = "publish", value_name = "[BIND:]HOST:GUEST")]
     publish: Vec<String>,
-}
-
-/// Args for the hidden `__port-relay` re-invocation.
-#[derive(Debug, Args)]
-struct PortRelayArgs {
-    /// Path to the sandbox's hybrid-vsock unix socket.
-    #[arg(long)]
-    vsock: PathBuf,
-    /// Host bind address.
-    #[arg(long)]
-    bind: String,
-    /// Host port to listen on.
-    #[arg(long)]
-    host_port: u16,
-    /// Guest port to dial.
-    #[arg(long)]
-    guest_port: u16,
-    /// Where the relay writes its own pid.
-    #[arg(long)]
-    pid_file: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -159,9 +139,6 @@ enum Cmd {
     /// Manage the izba daemon (auto-started by other commands)
     #[command(subcommand)]
     Daemon(DaemonCmd),
-    /// Internal: the per-rule port-publish relay process (not for direct use)
-    #[command(hide = true, name = "__port-relay")]
-    PortRelay(PortRelayArgs),
 }
 
 fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
@@ -192,9 +169,6 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             DaemonCmd::Status => commands::daemon::status(paths),
             DaemonCmd::Stop => commands::daemon::stop(paths),
         },
-        Cmd::PortRelay(a) => {
-            commands::port::relay(&a.vsock, &a.bind, a.host_port, a.guest_port, &a.pid_file)
-        }
     }
 }
 
@@ -341,30 +315,5 @@ mod tests {
         }
         // Bare `izba daemon` requires a subcommand.
         assert!(Cli::try_parse_from(["izba", "daemon"]).is_err());
-    }
-
-    #[test]
-    fn parse_hidden_port_relay() {
-        let cli = Cli::try_parse_from([
-            "izba",
-            "__port-relay",
-            "--vsock",
-            "/run/vsock.sock",
-            "--bind",
-            "127.0.0.1",
-            "--host-port",
-            "8080",
-            "--guest-port",
-            "80",
-            "--pid-file",
-            "/run/port.pid",
-        ])
-        .unwrap();
-        let Cmd::PortRelay(args) = cli.cmd else {
-            panic!("expected __port-relay");
-        };
-        assert_eq!(args.bind, "127.0.0.1");
-        assert_eq!(args.host_port, 8080);
-        assert_eq!(args.guest_port, 80);
     }
 }

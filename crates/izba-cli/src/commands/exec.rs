@@ -1,24 +1,48 @@
 //! `izba exec` — run a command inside a running sandbox.
 //!
-//! Connection layout: the guest control server handles one request at a time
-//! per connection and `Wait` blocks until the workload exits, so `Wait` gets
-//! a dedicated second control connection while the first stays free for
-//! `Resize`. Each stream (tty, or stdin/stdout/stderr) is its own connection
-//! to the stream port, opened with a single `StreamAttach` frame and raw
-//! bytes after that.
+//! All connections go through izbad: control RPCs are proxied via the
+//! daemon's `GuestRpc` request, streams via the `OpenStream` splice — the
+//! guest-side framing is unchanged. The guest control server handles one
+//! request at a time per connection and `Wait` blocks until the workload
+//! exits, so `Wait` gets a dedicated second control channel while the first
+//! stays free for `Resize`. Each stream (tty, or stdin/stdout/stderr) is its
+//! own connection to the stream port, opened with a single `StreamAttach`
+//! frame and raw bytes after that.
 
 use crate::terminal;
 use anyhow::{bail, Context};
+use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
-use izba_core::sandbox;
-use izba_core::vmm::{IoStream, UdsStream};
+use izba_core::vmm::UdsStream;
 use izba_proto::{
-    read_frame, write_frame, ErrorKind, ExecRequest, ExitStatus, Request, Response, StreamAttach,
-    StreamKind, StreamOpen,
+    write_frame, ErrorKind, ExecRequest, ExitStatus, Request, Response, StreamAttach, StreamKind,
+    StreamOpen,
 };
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::sync::{Arc, Mutex};
+
+/// One guest control channel, proxied through izbad (`GuestRpc`). Each RPC
+/// opens a fresh guest-side connection; `Wait` may block for the workload's
+/// lifetime, which is why exec uses TWO of these (control + wait), exactly
+/// like the pre-daemon two-connection layout.
+struct GuestControl {
+    client: DaemonClient,
+    name: String,
+}
+
+impl GuestControl {
+    fn connect(paths: &Paths, name: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: DaemonClient::connect(paths)?,
+            name: name.to_string(),
+        })
+    }
+
+    fn rpc(&mut self, req: &Request) -> anyhow::Result<Response> {
+        self.client.guest_rpc(&self.name, req)
+    }
+}
 
 pub fn run(
     paths: &Paths,
@@ -30,8 +54,7 @@ pub fn run(
     if tty && !terminal::stdin_is_tty() {
         anyhow::bail!("exec -t requires a terminal on stdin");
     }
-    let connector = sandbox::default_connector();
-    let mut control = sandbox::control(paths, name, &connector)?;
+    let mut control = GuestControl::connect(paths, name)?;
 
     let env = if tty {
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
@@ -47,7 +70,7 @@ pub fn run(
         uid: 0,
         gid: 0,
     });
-    let exec_id = match rpc(&mut control, &req)? {
+    let exec_id = match control.rpc(&req)? {
         Response::ExecStarted { exec_id } => exec_id,
         Response::Error {
             kind: ErrorKind::CommandNotFound,
@@ -59,7 +82,7 @@ pub fn run(
         Response::Error { kind, message } => bail!("exec failed ({kind:?}): {message}"),
         other => bail!("unexpected reply to exec: {other:?}"),
     };
-    let mut wait_conn = connector(paths, name).context("opening wait connection")?;
+    let mut wait_conn = GuestControl::connect(paths, name).context("opening wait connection")?;
 
     let status = if tty {
         wait_tty(paths, name, exec_id, control, &mut wait_conn)?
@@ -76,8 +99,8 @@ fn wait_tty(
     paths: &Paths,
     name: &str,
     exec_id: u32,
-    control: Box<dyn IoStream>,
-    wait_conn: &mut Box<dyn IoStream>,
+    control: GuestControl,
+    wait_conn: &mut GuestControl,
 ) -> anyhow::Result<ExitStatus> {
     let control = Arc::new(Mutex::new(control));
     resize(&control, exec_id); // size the guest pty before the program looks
@@ -107,7 +130,7 @@ fn wait_plain(
     name: &str,
     exec_id: u32,
     interactive: bool,
-    wait_conn: &mut Box<dyn IoStream>,
+    wait_conn: &mut GuestControl,
 ) -> anyhow::Result<ExitStatus> {
     let out_stream = attach(paths, name, exec_id, StreamKind::Stdout)?;
     let err_stream = attach(paths, name, exec_id, StreamKind::Stderr)?;
@@ -136,22 +159,18 @@ fn wait_plain(
     status
 }
 
-fn rpc<S: Read + Write>(conn: &mut S, req: &Request) -> anyhow::Result<Response> {
-    write_frame(conn, req)?;
-    Ok(read_frame(conn)?)
-}
-
-fn wait<S: Read + Write>(conn: &mut S, exec_id: u32) -> anyhow::Result<ExitStatus> {
-    match rpc(conn, &Request::Wait { exec_id })? {
+fn wait(conn: &mut GuestControl, exec_id: u32) -> anyhow::Result<ExitStatus> {
+    match conn.rpc(&Request::Wait { exec_id })? {
         Response::Wait { status } => Ok(status),
         Response::Error { kind, message } => bail!("wait failed ({kind:?}): {message}"),
         other => bail!("unexpected reply to wait: {other:?}"),
     }
 }
 
-/// Open a stream-port connection and bind it to `exec_id`'s `kind` stream.
+/// Open a guest stream-port connection (through the daemon splice) and bind
+/// it to `exec_id`'s `kind` stream.
 fn attach(paths: &Paths, name: &str, exec_id: u32, kind: StreamKind) -> anyhow::Result<UdsStream> {
-    let mut conn = sandbox::default_stream_connector()(paths, name)
+    let mut conn = DaemonClient::open_guest_stream(paths, name)
         .with_context(|| format!("opening {kind:?} stream"))?;
     write_frame(
         &mut conn,
@@ -175,26 +194,20 @@ fn pump(mut from: impl Read, mut to: impl Write) {
     }
 }
 
-fn resize(control: &Mutex<Box<dyn IoStream>>, exec_id: u32) {
+fn resize(control: &Mutex<GuestControl>, exec_id: u32) {
     let (cols, rows) = terminal::winsize();
     if let Ok(mut conn) = control.lock() {
-        let _ = rpc(
-            &mut *conn,
-            &Request::Resize {
-                exec_id,
-                cols,
-                rows,
-            },
-        );
+        let _ = conn.rpc(&Request::Resize {
+            exec_id,
+            cols,
+            rows,
+        });
     }
 }
 
 /// Pushes a Resize RPC whenever the local terminal size changes.
 #[cfg(unix)]
-fn spawn_resize_watcher(
-    control: Arc<Mutex<Box<dyn IoStream>>>,
-    exec_id: u32,
-) -> anyhow::Result<()> {
+fn spawn_resize_watcher(control: Arc<Mutex<GuestControl>>, exec_id: u32) -> anyhow::Result<()> {
     let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])
         .context("installing SIGWINCH handler")?;
     std::thread::spawn(move || {
@@ -208,10 +221,7 @@ fn spawn_resize_watcher(
 /// Windows has no SIGWINCH: poll the console size. 200 ms is imperceptible
 /// for a human dragging a window and costs one syscall per tick.
 #[cfg(windows)]
-fn spawn_resize_watcher(
-    control: Arc<Mutex<Box<dyn IoStream>>>,
-    exec_id: u32,
-) -> anyhow::Result<()> {
+fn spawn_resize_watcher(control: Arc<Mutex<GuestControl>>, exec_id: u32) -> anyhow::Result<()> {
     std::thread::spawn(move || {
         let mut last = terminal::winsize();
         loop {

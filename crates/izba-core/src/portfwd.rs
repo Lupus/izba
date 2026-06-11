@@ -1,18 +1,16 @@
 //! Host-side port-publish relay: pure vsock, no passt involvement, so the same
 //! code serves Cloud Hypervisor/Linux and OpenVMM/Windows.
 //!
-//! A published rule is an independent detached process (`izba __port-relay`)
-//! that runs [`run_relay`]. The relay binds a `TcpListener` and, per accepted
-//! connection, opens a hybrid-vsock connection to the guest [`STREAM_PORT`],
-//! sends `StreamOpen::TcpDial`, and — on `Response::Ok` — pumps bytes both ways
-//! with graceful `shutdown(Write)`+drain teardown.
-//!
-//! The loop lives here (not in the CLI) so a future `izbad` reuses it without
-//! the hidden-subcommand re-invocation trick.
+//! A published rule is a thread inside izbad, owned by the daemon's
+//! `RelayManager` and driven by [`run_relay_listener`]: the manager binds the
+//! `TcpListener` (so port-in-use errors are synchronous) and, per accepted
+//! connection, the loop opens a hybrid-vsock connection to the guest
+//! [`STREAM_PORT`], sends `StreamOpen::TcpDial`, and — on `Response::Ok` —
+//! pumps bytes both ways with graceful `shutdown(Write)`+drain teardown.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -55,33 +53,6 @@ fn parse_port(s: &str, spec: &str) -> anyhow::Result<u16> {
         bail!("port 0 is not allowed in rule '{spec}'");
     }
     Ok(p)
-}
-
-/// The detached relay entry point. Binds `(bind, host_port)`, writes `pid_file`,
-/// then accepts forever, spawning a per-connection thread. Returns only on a
-/// listener error (or never, in normal operation; the process is killed by
-/// `unpublish`/`stop`/`rm`).
-pub fn run_relay(
-    vsock: &Path,
-    bind: Ipv4Addr,
-    host_port: u16,
-    guest_port: u16,
-    pid_file: &Path,
-) -> anyhow::Result<()> {
-    let listener = TcpListener::bind((bind, host_port))
-        .with_context(|| format!("binding {bind}:{host_port}"))?;
-    std::fs::write(pid_file, std::process::id().to_string())
-        .with_context(|| format!("writing pid file {}", pid_file.display()))?;
-    let vsock = vsock.to_path_buf();
-    loop {
-        let (client, _peer) = listener.accept().context("accept")?;
-        let vsock = vsock.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = relay_one(client, &vsock, guest_port) {
-                eprintln!("relay connection error: {e:#}");
-            }
-        });
-    }
 }
 
 /// In-daemon relay accept loop on an already-bound listener. Nonblocking
@@ -175,17 +146,6 @@ pub(crate) fn copy_until_eof(mut r: impl Read, w: &mut impl Write) {
     }
 }
 
-/// Default pid-file path for a rule under `run_dir`: `port-<bind>-<hostport>.pid`.
-/// Used by both the relay (to write) and the CLI (to choose the spawn arg).
-pub fn pid_file_path(run_dir: &Path, bind: Ipv4Addr, host_port: u16) -> PathBuf {
-    run_dir.join(format!("port-{bind}-{host_port}.pid"))
-}
-
-/// Default log-file name for a rule's relay: `port-<bind>-<hostport>.log`.
-pub fn log_file_name(bind: Ipv4Addr, host_port: u16) -> String {
-    format!("port-{bind}-{host_port}.log")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,19 +178,6 @@ mod tests {
     fn parse_rejects_port_zero() {
         assert!(parse_rule("0:80").is_err());
         assert!(parse_rule("8080:0").is_err());
-    }
-
-    #[test]
-    fn pid_and_log_paths() {
-        let run = Path::new("/run");
-        assert_eq!(
-            pid_file_path(run, Ipv4Addr::LOCALHOST, 8080),
-            PathBuf::from("/run/port-127.0.0.1-8080.pid")
-        );
-        assert_eq!(
-            log_file_name(Ipv4Addr::new(0, 0, 0, 0), 8080),
-            "port-0.0.0.0-8080.log"
-        );
     }
 
     #[test]

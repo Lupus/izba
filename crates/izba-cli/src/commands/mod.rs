@@ -11,9 +11,18 @@ pub mod stop;
 use crate::name;
 use crate::SandboxOpts;
 use anyhow::Context;
-use izba_core::sandbox::CreateOpts;
 use izba_core::state::PortRule;
 use std::path::{Path, PathBuf};
+
+/// Map a daemon reply that should be `Ok` into `Result<()>`.
+pub(crate) fn expect_ok(resp: izba_core::daemon::proto::DaemonResponse) -> anyhow::Result<()> {
+    use izba_core::daemon::proto::DaemonResponse;
+    match resp {
+        DaemonResponse::Ok => Ok(()),
+        DaemonResponse::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected daemon reply: {other:?}"),
+    }
+}
 
 /// Resolve the sandbox name for a workspace dir: `--name` wins, otherwise
 /// the directory's basename, sanitized.
@@ -42,21 +51,4 @@ pub fn parse_publish(specs: &[String]) -> anyhow::Result<Vec<PortRule>> {
         .iter()
         .map(|s| izba_core::portfwd::parse_rule(s))
         .collect()
-}
-
-fn create_opts(
-    opts: &SandboxOpts,
-    digest: String,
-    workspace: PathBuf,
-    ports: Vec<PortRule>,
-) -> CreateOpts {
-    CreateOpts {
-        image_digest: digest,
-        image_ref: opts.image.clone(),
-        cpus: opts.cpus,
-        mem_mb: opts.mem,
-        workspace,
-        rw_size_gb: opts.rw_size_gb,
-        ports,
-    }
 }
