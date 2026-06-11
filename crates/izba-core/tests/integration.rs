@@ -218,6 +218,7 @@ fn create_sandbox(env: &TestEnv, tb: &mut TestBox, name: &str, ws: &Path) {
             mem_mb: 1024,
             workspace: ws.to_path_buf(),
             rw_size_gb: 2,
+            ports: Vec::new(),
         },
     )
     .expect("create");

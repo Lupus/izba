@@ -41,5 +41,6 @@ fn create_opts(opts: &SandboxOpts, digest: String, workspace: PathBuf) -> Create
         mem_mb: opts.mem,
         workspace,
         rw_size_gb: opts.rw_size_gb,
+        ports: Vec::new(),
     }
 }

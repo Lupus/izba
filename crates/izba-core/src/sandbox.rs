@@ -31,6 +31,7 @@ pub struct CreateOpts {
     pub mem_mb: u32,
     pub workspace: PathBuf,
     pub rw_size_gb: u64,
+    pub ports: Vec<crate::state::PortRule>,
 }
 
 /// Boot artifacts shared by all sandboxes (kernel + initramfs with izba-init).
@@ -164,7 +165,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             cpus: opts.cpus,
             mem_mb: opts.mem_mb,
             workspace: opts.workspace.clone(),
-            ports: Vec::new(),
+            ports: opts.ports.clone(),
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 
@@ -753,6 +754,7 @@ mod tests {
             mem_mb: 1024,
             workspace: workspace.to_path_buf(),
             rw_size_gb: 1,
+            ports: Vec::new(),
         }
     }
 
@@ -1012,6 +1014,25 @@ mod tests {
 
         let err = create(&paths, "web", &o).unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {err:#}");
+    }
+
+    #[test]
+    fn create_persists_ports() {
+        use crate::state::PortRule;
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let mut o = opts(&ws);
+        o.ports = vec![PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: 8080,
+            guest_port: 80,
+        }];
+        create(&paths, "web", &o).unwrap();
+        let config: SandboxConfig = load_json(&paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.ports, o.ports);
     }
 
     #[test]
