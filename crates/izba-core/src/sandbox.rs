@@ -164,6 +164,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             cpus: opts.cpus,
             mem_mb: opts.mem_mb,
             workspace: opts.workspace.clone(),
+            ports: Vec::new(),
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 

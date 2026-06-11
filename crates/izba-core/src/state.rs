@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -5,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "config.json";
 pub const STATE_FILE: &str = "state.json";
+pub const PORTS_FILE: &str = "ports.json";
 
 /// Identity that defeats PID reuse: `starttime` is a platform-specific
 /// equality token captured at spawn (Linux: field 22 of `/proc/<pid>/stat`;
@@ -22,6 +24,27 @@ pub struct SandboxConfig {
     pub cpus: u32,
     pub mem_mb: u32,
     pub workspace: PathBuf,
+    /// Persisted port-publish rules, re-applied on every `run`. Defaults to
+    /// empty so configs written before this feature still deserialize.
+    #[serde(default)]
+    pub ports: Vec<PortRule>,
+}
+
+/// A single host→guest TCP publish rule. Its identity (uniqueness key) is
+/// `(bind, host_port)`. `bind` serializes as a string, e.g. `"127.0.0.1"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRule {
+    pub bind: Ipv4Addr,
+    pub host_port: u16,
+    pub guest_port: u16,
+}
+
+/// One active relay: the rule it serves plus the detached relay process's
+/// PID-reuse-safe identity. Persisted in `ports.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRecord {
+    pub rule: PortRule,
+    pub relay: PidIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +96,7 @@ mod tests {
             cpus: 2,
             mem_mb: 512,
             workspace: PathBuf::from("/workspace"),
+            ports: Vec::new(),
         }
     }
 
@@ -139,6 +163,71 @@ mod tests {
 
         let result: anyhow::Result<Option<SandboxConfig>> = load_json(&path);
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn port_rule_serde_is_string_addr() {
+        let rule = PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert!(
+            json.contains("\"127.0.0.1\""),
+            "bind must serialize as a string: {json}"
+        );
+        let back: PortRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rule);
+    }
+
+    #[test]
+    fn sandbox_config_ports_defaults_when_absent() {
+        // A config.json written before this feature has no "ports" key.
+        let legacy = r#"{
+            "image_digest": "sha256:abc",
+            "image_ref": "ubuntu:22.04",
+            "cpus": 2,
+            "mem_mb": 512,
+            "workspace": "/workspace"
+        }"#;
+        let cfg: SandboxConfig = serde_json::from_str(legacy).unwrap();
+        assert!(cfg.ports.is_empty(), "missing ports must default to empty");
+    }
+
+    #[test]
+    fn sandbox_config_ports_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let mut cfg = sample_config();
+        cfg.ports = vec![PortRule {
+            bind: "0.0.0.0".parse().unwrap(),
+            host_port: 18080,
+            guest_port: 8000,
+        }];
+        save_json(&path, &cfg).unwrap();
+        let loaded: SandboxConfig = load_json(&path).unwrap().unwrap();
+        assert_eq!(loaded.ports, cfg.ports);
+    }
+
+    #[test]
+    fn port_record_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PORTS_FILE);
+        let records = vec![PortRecord {
+            rule: PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: 8080,
+                guest_port: 80,
+            },
+            relay: PidIdentity {
+                pid: 4321,
+                starttime: 777,
+            },
+        }];
+        save_json(&path, &records).unwrap();
+        let loaded: Vec<PortRecord> = load_json(&path).unwrap().unwrap();
+        assert_eq!(loaded, records);
     }
 
     #[test]
