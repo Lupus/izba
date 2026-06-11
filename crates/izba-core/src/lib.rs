@@ -8,5 +8,7 @@ pub mod portfwd;
 pub mod procmgr;
 pub mod sandbox;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod vmm;
 pub mod vsock;
