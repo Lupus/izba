@@ -45,10 +45,24 @@ pub fn build_invocations(spec: &VmSpec) -> Invocations {
         })
         .collect();
 
+    // Static guest addressing instead of passt's host-template autodetect.
+    // Autodetect copies the interface of the FIRST default route, which on
+    // hosts with several default routes (WSL mirrored networking + VPN) can
+    // be a gateway-less /32 — passt then serves no IPv4 DHCP and the guest's
+    // `ip=dhcp` stalls ~158s, well past the boot health window. The subnet
+    // matches gvisor-tap-vsock's (Docker sbx) 192.168.127.0/24; outbound NAT
+    // and DNS passthrough don't depend on it, but a host LAN that itself
+    // uses 192.168.127.0/24 would shadow this range inside the guest.
     let passt = spec.net.then(|| CommandSpec {
         argv: vec![
             "passt".to_string(),
             "--vhost-user".to_string(),
+            "--address".to_string(),
+            "192.168.127.2".to_string(),
+            "--netmask".to_string(),
+            "24".to_string(),
+            "--gateway".to_string(),
+            "192.168.127.1".to_string(),
             "--socket-path".to_string(),
             net_sock.display().to_string(),
             "--foreground".to_string(),
@@ -340,6 +354,12 @@ mod tests {
             argv(&[
                 "passt",
                 "--vhost-user",
+                "--address",
+                "192.168.127.2",
+                "--netmask",
+                "24",
+                "--gateway",
+                "192.168.127.1",
                 "--socket-path",
                 "/sbx/run/net.sock",
                 "--foreground",
