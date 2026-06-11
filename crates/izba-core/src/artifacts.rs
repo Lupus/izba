@@ -1,9 +1,10 @@
 //! Locating the shared boot artifacts (kernel + initramfs).
 
 use anyhow::bail;
-use izba_core::paths::Paths;
-use izba_core::sandbox::Artifacts;
 use std::path::PathBuf;
+
+use crate::paths::Paths;
+use crate::sandbox::Artifacts;
 
 /// Locate boot artifacts: `$IZBA_KERNEL`/`$IZBA_INITRAMFS` override (both or
 /// nothing), else `<data>/artifacts/{vmlinux,initramfs.cpio.gz}`.

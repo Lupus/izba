@@ -1,7 +1,6 @@
 //! `izba` — daemonless microVM sandboxes. Arg parsing + dispatch only;
 //! all behavior lives in `commands/`.
 
-mod artifacts;
 mod commands;
 mod name;
 mod terminal;

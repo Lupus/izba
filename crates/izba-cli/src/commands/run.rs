@@ -1,4 +1,4 @@
-use crate::{artifacts, terminal, SandboxOpts};
+use crate::{terminal, SandboxOpts};
 use izba_core::paths::Paths;
 use izba_core::state::CONFIG_FILE;
 #[cfg(unix)]
@@ -15,7 +15,7 @@ pub fn run(
     cmd: Vec<String>,
 ) -> anyhow::Result<i32> {
     let name = resolve_or_create(paths, opts, name_or_dir)?;
-    let art = artifacts::locate(paths)?;
+    let art = izba_core::artifacts::locate(paths)?;
     match sandbox::start(paths, &name, &DefaultDriver, &art) {
         Ok(()) => {}
         // `run` is idempotent: already running is exactly the state we want.
