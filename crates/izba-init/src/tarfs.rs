@@ -19,12 +19,12 @@ fn internal(msg: impl std::fmt::Display) -> TarError {
 }
 
 /// Open `root` itself as a directory fd, to serve as the `dirfd` anchor for
-/// every `openat2(RESOLVE_BENEATH)` below. Resolution can never climb above
+/// every `openat2(RESOLVE_IN_ROOT)` below. Resolution can never climb above
 /// this fd.
 fn open_root_dir(root: &Path) -> Result<OwnedFd, TarError> {
     // The anchor path is init's own constant (never attacker-controlled), so a
     // plain open is safe; all relative opens are then re-anchored to this fd
-    // with RESOLVE_BENEATH.
+    // with RESOLVE_IN_ROOT.
     let raw = nix::fcntl::open(
         root,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
@@ -36,27 +36,26 @@ fn open_root_dir(root: &Path) -> Result<OwnedFd, TarError> {
 }
 
 /// Resolve `rel` (a guest path, leading `/` stripped) under the workload
-/// root using `openat2(RESOLVE_BENEATH)`. Any attempt to escape (via `..`, an
-/// absolute symlink, or an upward symlink) fails with `EXDEV`/`ELOOP`, mapped
-/// to `BadRequest`. Inner relative symlinks that stay beneath the root resolve
-/// normally. Returns an `OwnedFd` for the resolved path opened with `flags`.
-///
-/// NOTE: the plan named `RESOLVE_IN_ROOT`, but that flag *clamps* escapes back
-/// into the root (`..` at the root is a no-op, absolute symlinks are
-/// reinterpreted relative to the root), so an escaping path silently resolves
-/// to a non-existent in-root path (`ENOENT`) instead of erroring. The spec (§7)
-/// requires escapes to be *rejected* with `BadRequest`. `RESOLVE_BENEATH`
-/// delivers that: it forbids leaving the dirfd subtree entirely and returns
-/// `EXDEV`, while still permitting in-tree relative symlinks. Containment is
-/// guaranteed either way; `RESOLVE_BENEATH` additionally makes the rejection
-/// observable.
+/// root using `openat2(RESOLVE_IN_ROOT)` — chroot semantics: absolute
+/// symlinks and `..` inside symlink targets are reinterpreted relative to the
+/// root, exactly as the workload itself would resolve them (so e.g. alpine's
+/// absolute `/bin/ls -> /bin/busybox` link works). Resolution can therefore
+/// never leave the root. `..` in the *requested path itself* is rejected
+/// loudly (lexically) with `BadRequest` before the syscall — under
+/// `RESOLVE_IN_ROOT` it would otherwise clamp silently, and the spec's error
+/// table wants escape *attempts* to be observable. Returns an `OwnedFd` for
+/// the resolved path opened with `flags`.
 fn resolve_under_root(root_dir: &OwnedFd, rel: &Path, flags: OFlag) -> Result<OwnedFd, TarError> {
+    reject_lexical_escape(rel)?;
     let how = OpenHow::new()
         .flags(flags | OFlag::O_CLOEXEC)
         .mode(Mode::empty())
-        .resolve(ResolveFlag::RESOLVE_BENEATH);
+        .resolve(ResolveFlag::RESOLVE_IN_ROOT);
     match openat2(root_dir.as_raw_fd(), rel, how) {
         Ok(raw) => Ok(unsafe { OwnedFd::from_raw_fd(raw) }),
+        // ELOOP: symlink loop; EXDEV: a magic-link/mount crossing forbidden
+        // under RESOLVE_IN_ROOT. Both are refusals to resolve, not missing
+        // paths.
         Err(nix::errno::Errno::EXDEV) | Err(nix::errno::Errno::ELOOP) => Err((
             ErrorKind::BadRequest,
             "path escapes workload root".to_string(),
@@ -67,6 +66,32 @@ fn resolve_under_root(root_dir: &OwnedFd, rel: &Path, flags: OFlag) -> Result<Ow
         )),
         Err(e) => Err(internal(format!("resolving {}: {e}", display_rel(rel)))),
     }
+}
+
+/// Loud lexical rejection of `..` (and any non-normal component) in a
+/// root-relative path. `RESOLVE_IN_ROOT` would clamp these silently; the
+/// spec error table requires escape attempts to fail with `BadRequest`.
+fn reject_lexical_escape(rel: &Path) -> Result<(), TarError> {
+    use std::path::Component;
+    if rel
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return Err((
+            ErrorKind::BadRequest,
+            "path escapes workload root".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The canonical (symlink-free, root-confined) host path behind an fd that
+/// was resolved with `RESOLVE_IN_ROOT`. Filesystem operations must use THIS
+/// path, never a plain `root.join(rel)`: the latter re-resolves symlinks
+/// natively and an absolute symlink inside the tree would escape the root.
+fn canon_via_fd(fd: &OwnedFd, what: &Path) -> Result<PathBuf, TarError> {
+    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .map_err(|e| internal(format!("canonicalizing {}: {e}", display_rel(what))))
 }
 
 /// Normalize a guest path to a root-relative path: strip a single leading
@@ -210,8 +235,15 @@ fn classify(root_dir: &OwnedFd, dest_rel: &Path) -> Result<DestKind, TarError> {
 }
 
 /// Unpack a single tar `entry` under `base_rel` (root-relative), rewriting its
-/// top path component to `rename` when set. The landing path's parent is
-/// validated with `openat2` (escape → `BadRequest`) before tar writes.
+/// top path component to `rename` when set.
+///
+/// Containment: the landing path is checked lexically (no `..`), its parent
+/// directory is resolved with `openat2(RESOLVE_IN_ROOT)`, and tar writes
+/// through the parent's CANONICAL path (via the resolved fd) — so symlinks in
+/// the prefix resolve with chroot semantics and can never lead outside the
+/// root. A pre-existing symlink at the final component is replaced, not
+/// followed (an archive could otherwise plant `x -> /etc/passwd` and then
+/// write through it via a regular entry `x`).
 fn unpack_one<R: Read>(
     root_dir: &OwnedFd,
     root: &Path,
@@ -223,12 +255,45 @@ fn unpack_one<R: Read>(
     let entry_path = entry.path().map_err(internal)?.into_owned();
     let rewritten = rewrite_top(&entry_path, src_top, rename);
     let landing_rel = base_rel.join(&rewritten);
-    guard_entry(root_dir, &landing_rel)?;
-    // Per-entry unpack to the computed absolute host path (entry names were
-    // rewritten, so `unpack_in` is unusable; the openat2 guard above is the
-    // authoritative escape check).
-    let landing_abs = root.join(&landing_rel);
-    entry.unpack(&landing_abs).map_err(truncated_or_internal)?;
+    reject_lexical_escape(&landing_rel)?;
+
+    // Resolve the parent dir. Our own builders always emit a directory entry
+    // before its children, so a missing parent means an out-of-order or
+    // crafted archive — reject it rather than guessing where to create dirs.
+    let parent = parent_rel(&landing_rel);
+    let parent_fd =
+        match resolve_under_root(root_dir, &parent, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
+            Ok(fd) => fd,
+            Err((ErrorKind::PathNotFound, _)) => {
+                return Err((
+                    ErrorKind::BadRequest,
+                    format!(
+                        "archive entry {} has no parent directory (out-of-order archive)",
+                        rewritten.display()
+                    ),
+                ))
+            }
+            Err(other) => return Err(other),
+        };
+    let canon_parent = canon_via_fd(&parent_fd, &parent)?;
+    if !canon_parent.starts_with(root) {
+        // RESOLVE_IN_ROOT guarantees this can't happen; treat a violation as
+        // an internal invariant failure, never write.
+        return Err(internal(format!(
+            "resolved parent {} left the workload root",
+            canon_parent.display()
+        )));
+    }
+    let landing = canon_parent.join(base_name(&landing_rel));
+
+    // Never write THROUGH a final-component symlink: replace it.
+    if let Ok(meta) = std::fs::symlink_metadata(&landing) {
+        if meta.file_type().is_symlink() {
+            std::fs::remove_file(&landing)
+                .map_err(|e| internal(format!("replacing symlink {}: {e}", landing.display())))?;
+        }
+    }
+    entry.unpack(&landing).map_err(truncated_or_internal)?;
     Ok(())
 }
 
@@ -277,26 +342,6 @@ fn base_name(rel: &Path) -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
-/// Authoritative containment check for one entry's landing path. Resolving
-/// it with `RESOLVE_BENEATH`: a missing final component is fine (we are about
-/// to create it), but any *escape* during resolution of the existing prefix
-/// is rejected. We resolve the PARENT directory of the landing path; if the
-/// parent escapes, reject; if the parent does not yet exist (an intermediate
-/// dir entry earlier in the archive will create it) we treat it as acceptable.
-fn guard_entry(root_dir: &OwnedFd, landing_rel: &Path) -> Result<(), TarError> {
-    let parent = parent_rel(landing_rel);
-    // Resolving the parent dir under the root catches `..` and escaping
-    // symlinks in the path prefix. A non-existent parent is PathNotFound,
-    // which for an in-archive intermediate dir is normal: tar's own unpack
-    // creates parents, so we only enforce containment here, treating a
-    // not-yet-existing (but in-root) parent as acceptable.
-    match resolve_under_root(root_dir, &parent, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
-        Ok(_fd) => Ok(()),
-        Err((ErrorKind::PathNotFound, _)) => Ok(()), // parent created by tar
-        Err(other) => Err(other),
-    }
-}
-
 /// A read error mid-archive (missing tar EOF blocks) surfaces as
 /// `UnexpectedEof`; map it to a clear truncation message, everything else to
 /// `Internal`.
@@ -324,8 +369,20 @@ pub struct ResolvedSrc {
 pub fn resolve_src(root: &Path, src: &str) -> Result<ResolvedSrc, TarError> {
     let root_dir = open_root_dir(root)?;
     let src_rel = root_relative(src);
-    let _src_fd = resolve_under_root(&root_dir, &src_rel, OFlag::O_RDONLY)?;
-    let abs = root.join(&src_rel);
+    let src_fd = resolve_under_root(&root_dir, &src_rel, OFlag::O_RDONLY)?;
+    // Walk the CANONICAL path behind the resolved fd, never `root.join(rel)`:
+    // the plain join would re-resolve symlinks natively, and an absolute
+    // symlink in the prefix would escape the root. This also makes the
+    // top-level src symlink "followed" (spec §3) with chroot semantics.
+    let abs = canon_via_fd(&src_fd, &src_rel)?;
+    if !abs.starts_with(root) {
+        return Err(internal(format!(
+            "resolved src {} left the workload root",
+            abs.display()
+        )));
+    }
+    // The in-archive name keeps the USER-VISIBLE basename (of the path as
+    // given, not of the symlink target).
     let arc_root: OsString = src_rel
         .file_name()
         .map(|n| n.to_os_string())
@@ -453,17 +510,46 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_symlink_escape() {
+    fn resolve_follows_absolute_symlink_inside_root() {
+        // Chroot semantics: an ABSOLUTE symlink resolves relative to the
+        // workload root, exactly as the workload sees it (e.g. alpine's
+        // /bin/ls -> /bin/busybox). This must WORK, not error.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("real.txt"), b"in-root").unwrap();
+        std::os::unix::fs::symlink("/real.txt", root.join("abs")).unwrap();
+        let root_dir = open_root_dir(root).unwrap();
+        let fd = resolve_under_root(&root_dir, &root_relative("/abs"), OFlag::O_RDONLY)
+            .expect("absolute in-root symlink must resolve");
+        let mut content = String::new();
+        std::fs::File::from(fd)
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, "in-root");
+    }
+
+    #[test]
+    fn resolve_clamps_escaping_symlink_to_root() {
+        // A symlink whose target points OUTSIDE the root resolves with chroot
+        // semantics: the absolute target is reinterpreted under the root, so
+        // it lands on a (missing) in-root path — the outside file is never
+        // reached. Containment by clamping, not by rejection.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         fs::create_dir_all(&root).unwrap();
         fs::write(dir.path().join("secret"), b"top").unwrap();
-        // A symlink inside the root pointing OUT of it.
         std::os::unix::fs::symlink(dir.path().join("secret"), root.join("link")).unwrap();
         let root_dir = open_root_dir(&root).unwrap();
         let (kind, _msg) = resolve_under_root(&root_dir, &root_relative("/link"), OFlag::O_RDONLY)
-            .expect_err("an escaping symlink must be rejected");
-        assert_eq!(kind, ErrorKind::BadRequest);
+            .expect_err("clamped target does not exist in-root");
+        assert_eq!(kind, ErrorKind::PathNotFound);
+
+        // An upward relative symlink clamps the same way (`..` at the root is
+        // a no-op under RESOLVE_IN_ROOT).
+        std::os::unix::fs::symlink("../secret", root.join("up")).unwrap();
+        let (kind, _msg) = resolve_under_root(&root_dir, &root_relative("/up"), OFlag::O_RDONLY)
+            .expect_err("clamped upward target does not exist in-root");
+        assert_eq!(kind, ErrorKind::PathNotFound);
     }
 
     #[test]
@@ -732,5 +818,81 @@ mod tests {
         let mut buf = Vec::new();
         let (kind, _msg) = create(&root, "/../secret", &mut buf).expect_err("escape");
         assert_eq!(kind, ErrorKind::BadRequest);
+    }
+
+    #[test]
+    fn extract_through_absolute_symlink_dir_clamps_in_root() {
+        // dest is reached through an in-root ABSOLUTE symlink (chroot
+        // semantics): the file must land under the symlink's in-root target.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink("/real", root.join("abs")).unwrap();
+        let archive = tar_file("f.txt", b"via-abs", 0o644);
+        let mut cursor = std::io::Cursor::new(archive);
+        extract(root, "/abs", &mut cursor).expect("extract through abs symlink");
+        assert_eq!(fs::read(root.join("real/f.txt")).unwrap(), b"via-abs");
+    }
+
+    #[test]
+    fn extract_replaces_final_symlink_instead_of_following() {
+        // A pre-existing symlink at the landing path must be REPLACED by the
+        // incoming file, never written through (its target stays untouched).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("dest")).unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, b"old").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("dest/f.txt")).unwrap();
+        let archive = tar_file("f.txt", b"new", 0o644);
+        let mut cursor = std::io::Cursor::new(archive);
+        extract(&root, "/dest", &mut cursor).expect("extract over symlink");
+        let meta = fs::symlink_metadata(root.join("dest/f.txt")).unwrap();
+        assert!(meta.file_type().is_file(), "symlink must be replaced");
+        assert_eq!(fs::read(root.join("dest/f.txt")).unwrap(), b"new");
+        assert_eq!(fs::read(&outside).unwrap(), b"old", "target untouched");
+    }
+
+    #[test]
+    fn extract_rejects_out_of_order_archive() {
+        // An entry whose parent directory has no earlier dir entry (and does
+        // not exist) is a crafted/out-of-order archive → BadRequest.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("dest")).unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        let payload = b"x";
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(payload.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, "top/missing/sub.txt", &mut &payload[..])
+            .unwrap();
+        let archive = b.into_inner().unwrap();
+        let mut cursor = std::io::Cursor::new(archive);
+        let (kind, msg) = extract(root, "/dest", &mut cursor).expect_err("out of order");
+        assert_eq!(kind, ErrorKind::BadRequest, "{msg}");
+        assert!(msg.contains("parent"), "{msg}");
+    }
+
+    #[test]
+    fn create_follows_absolute_symlink_src() {
+        // `izba cp NAME:/abs out` where /abs is an absolute in-root symlink
+        // (alpine-style) must archive the TARGET, under the user-visible name.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join("real/data.txt"), b"abc").unwrap();
+        std::os::unix::fs::symlink("/real", root.join("abs")).unwrap();
+        let mut buf = Vec::new();
+        create(root, "/abs", &mut buf).expect("create through abs symlink");
+        let mut names = Vec::new();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(buf));
+        for e in archive.entries().unwrap() {
+            names.push(e.unwrap().path().unwrap().display().to_string());
+        }
+        assert!(names.contains(&"abs".to_string()), "{names:?}");
+        assert!(names.contains(&"abs/data.txt".to_string()), "{names:?}");
     }
 }
