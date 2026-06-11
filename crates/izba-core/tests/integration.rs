@@ -716,3 +716,91 @@ fn kill_vmm_then_ls_reports_stopped() {
         let _ = procmgr::kill_pid(id);
     }
 }
+
+#[test]
+fn cp_round_trip_tree() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("cp");
+    boot(&env, &mut tb, "cpbox", &ws);
+
+    // Build a small tree on the host.
+    let src = tb.root.path().join("cp-src");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("a.txt"), b"alpha").unwrap();
+    fs::write(src.join("sub/run.sh"), b"#!/bin/sh\necho hi\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(src.join("sub/run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
+
+    // Host -> guest: dest /etc/izba-cp-test does NOT exist and /etc does, so
+    // the guest applies the RENAME rule (the tree source becomes the new tree
+    // root named izba-cp-test). The host sends the dest verbatim + an archive
+    // rooted at basename(src); tarfs::extract arbitrates this guest-side.
+    let conn = sandbox::default_stream_connector()(&tb.paths, "cpbox")
+        .expect("stream conn for cp to-guest");
+    izba_core::cp::copy_to_guest(conn, &src, "/etc/izba-cp-test").expect("copy_to_guest");
+
+    // Verify inside the guest via exec.
+    let cat = exec_ok(&tb.paths, "cpbox", &["cat", "/etc/izba-cp-test/a.txt"]);
+    assert_eq!(cat, "alpha");
+    let mode = exec_ok(
+        &tb.paths,
+        "cpbox",
+        &["sh", "-c", "stat -c %a /etc/izba-cp-test/sub/run.sh"],
+    );
+    assert_eq!(mode.trim(), "755", "exec bit must survive host->guest");
+    let link = exec_ok(&tb.paths, "cpbox", &["readlink", "/etc/izba-cp-test/link"]);
+    assert_eq!(link.trim(), "a.txt", "symlink must survive host->guest");
+
+    // Host -> guest INTO-DIR rule: /etc/izba-cp-test now EXISTS and is a
+    // directory, so copying a single file there lands it at
+    // /etc/izba-cp-test/<basename>, NOT overwriting the directory.
+    let extra = tb.root.path().join("extra.txt");
+    fs::write(&extra, b"into-dir").unwrap();
+    let conn = sandbox::default_stream_connector()(&tb.paths, "cpbox")
+        .expect("stream conn for cp into-dir");
+    izba_core::cp::copy_to_guest(conn, &extra, "/etc/izba-cp-test")
+        .expect("copy_to_guest into existing dir");
+    let into = exec_ok(&tb.paths, "cpbox", &["cat", "/etc/izba-cp-test/extra.txt"]);
+    assert_eq!(into, "into-dir", "file must land inside the existing dir");
+
+    // Guest -> host: copy it back out and assert byte-equality + bits.
+    let out = tb.root.path().join("cp-out");
+    fs::create_dir_all(&out).unwrap();
+    let conn = sandbox::default_stream_connector()(&tb.paths, "cpbox")
+        .expect("stream conn for cp from-guest");
+    izba_core::cp::copy_from_guest(conn, "/etc/izba-cp-test", &out).expect("copy_from_guest");
+
+    assert_eq!(fs::read(out.join("izba-cp-test/a.txt")).unwrap(), b"alpha");
+    let back_mode = fs::metadata(out.join("izba-cp-test/sub/run.sh"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(back_mode, 0o755, "exec bit must survive guest->host");
+    let back_link = fs::read_link(out.join("izba-cp-test/link")).unwrap();
+    assert_eq!(back_link, std::path::Path::new("a.txt"));
+
+    stop_sandbox(&tb, "cpbox");
+}
+
+#[test]
+fn cp_missing_guest_src_errors() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("cpmiss");
+    boot(&env, &mut tb, "cpmiss", &ws);
+
+    let out = tb.root.path().join("cp-miss-out");
+    fs::create_dir_all(&out).unwrap();
+    let conn = sandbox::default_stream_connector()(&tb.paths, "cpmiss").expect("stream conn");
+    let err = izba_core::cp::copy_from_guest(conn, "/no/such/path", &out)
+        .expect_err("missing guest src must error");
+    assert!(
+        err.to_string().contains("no such file or directory"),
+        "got: {err:#}"
+    );
+
+    stop_sandbox(&tb, "cpmiss");
+}
