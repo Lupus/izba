@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use futures_util::TryStreamExt;
-use oci_client::client::ClientConfig;
+use oci_client::client::{linux_amd64_resolver, ClientConfig};
 use oci_client::manifest::OciImageManifest;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
@@ -34,8 +34,10 @@ pub struct ResolvedImage {
 
 /// Fetch the manifest for `image_ref` (e.g. `"alpine:3.20"`,
 /// `"ghcr.io/x/y:tag"`; bare refs default to docker.io) with anonymous auth
-/// and resolve its canonical digest. Multi-platform indexes are resolved to
-/// the current platform's image manifest.
+/// and resolve its canonical digest. Multi-platform indexes are always
+/// resolved to the linux/amd64 image manifest: izba guests are linux/amd64
+/// microVMs regardless of host OS, so the client's own platform (e.g.
+/// windows/amd64 for izba.exe) must not influence resolution.
 pub fn resolve(image_ref: &str) -> Result<ResolvedImage> {
     let reference: Reference = image_ref
         .parse()
@@ -44,7 +46,10 @@ pub fn resolve(image_ref: &str) -> Result<ResolvedImage> {
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new(ClientConfig {
+        platform_resolver: Some(Box::new(linux_amd64_resolver)),
+        ..Default::default()
+    });
     let (manifest, digest) = rt
         .block_on(client.pull_image_manifest(&reference, &RegistryAuth::Anonymous))
         .with_context(|| format!("failed to pull manifest for {image_ref}"))?;
