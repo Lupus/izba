@@ -33,7 +33,7 @@ use izba_core::vmm::cloud_hypervisor::CloudHypervisorDriver;
 use izba_core::vmm::UdsStream;
 use izba_proto::{
     read_frame, write_frame, ErrorKind, ExecRequest, ExitStatus, Request, Response, StreamAttach,
-    StreamKind,
+    StreamKind, StreamOpen,
 };
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -338,7 +338,11 @@ fn wait(
 fn attach(paths: &Paths, name: &str, exec_id: u32, kind: StreamKind) -> UdsStream {
     let mut conn = sandbox::default_stream_connector()(paths, name)
         .unwrap_or_else(|e| panic!("opening {kind:?} stream: {e:#}"));
-    write_frame(&mut conn, &StreamAttach { exec_id, kind }).expect("sending stream attach");
+    write_frame(
+        &mut conn,
+        &StreamOpen::Attach(StreamAttach { exec_id, kind }),
+    )
+    .expect("sending stream attach");
     conn
 }
 

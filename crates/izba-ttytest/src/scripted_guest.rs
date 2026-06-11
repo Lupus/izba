@@ -14,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result};
 use izba_proto::{
-    read_frame, write_frame, ErrorKind, ExitStatus, HealthInfo, Request, Response, StreamAttach,
+    read_frame, write_frame, ErrorKind, ExitStatus, HealthInfo, Request, Response, StreamOpen,
     CONTROL_PORT, STREAM_PORT,
 };
 
@@ -295,12 +295,24 @@ fn serve_control(mut conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
 }
 
 fn serve_stream(conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
-    // Read the one StreamAttach frame off a clone so the original keeps its
+    // Read the one StreamOpen frame off a clone so the original keeps its
     // remaining bytes for the reader/writer split.
     let mut attach_conn = conn.try_clone().context("clone for attach")?;
-    let _attach: StreamAttach = match read_frame(&mut attach_conn) {
-        Ok(a) => a,
+    let open: StreamOpen = match read_frame(&mut attach_conn) {
+        Ok(o) => o,
         Err(_) => return Ok(()),
+    };
+    // The scripted guest only fakes exec streams; reject everything else
+    // like a guest that doesn't implement the feature.
+    let StreamOpen::Attach(_attach) = open else {
+        let _ = write_frame(
+            &mut attach_conn,
+            &Response::Error {
+                kind: ErrorKind::BadRequest,
+                message: "not implemented".into(),
+            },
+        );
+        return Ok(());
     };
     drop(attach_conn);
 

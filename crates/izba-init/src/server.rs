@@ -5,7 +5,7 @@
 
 use crate::exec::ExecEngine;
 use izba_proto::{
-    read_frame, write_frame, HealthInfo, Request, Response, StreamAttach, StreamKind,
+    read_frame, write_frame, ErrorKind, HealthInfo, Request, Response, StreamKind, StreamOpen,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -119,9 +119,25 @@ pub fn serve_streams<L: Listener>(l: L, engine: Arc<ExecEngine>) {
 }
 
 fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, engine: Arc<ExecEngine>) {
-    let attach: StreamAttach = match read_frame(&mut conn) {
-        Ok(a) => a,
+    let open: StreamOpen = match read_frame(&mut conn) {
+        Ok(o) => o,
         Err(_) => return,
+    };
+    let attach = match open {
+        StreamOpen::Attach(a) => a,
+        // Dispatch skeleton: each feature branch fills in its variant.
+        StreamOpen::TcpDial { .. }
+        | StreamOpen::TarExtract { .. }
+        | StreamOpen::TarCreate { .. } => {
+            let _ = write_frame(
+                &mut conn,
+                &Response::Error {
+                    kind: ErrorKind::BadRequest,
+                    message: "not implemented".into(),
+                },
+            );
+            return;
+        }
     };
     let fd = match engine.take_stream(attach.exec_id, attach.kind) {
         Ok(fd) => fd,
@@ -191,7 +207,7 @@ fn pump(mut r: impl Read, mut w: impl Write) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use izba_proto::{ErrorKind, ExecRequest, ExitStatus};
+    use izba_proto::{ErrorKind, ExecRequest, ExitStatus, StreamAttach};
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
     use std::sync::Mutex;
@@ -292,19 +308,19 @@ mod tests {
         let mut stdin = h.stream_conn();
         write_frame(
             &mut stdin,
-            &StreamAttach {
+            &StreamOpen::Attach(StreamAttach {
                 exec_id,
                 kind: StreamKind::Stdin,
-            },
+            }),
         )
         .unwrap();
         let mut stdout = h.stream_conn();
         write_frame(
             &mut stdout,
-            &StreamAttach {
+            &StreamOpen::Attach(StreamAttach {
                 exec_id,
                 kind: StreamKind::Stdout,
-            },
+            }),
         )
         .unwrap();
 
@@ -327,10 +343,10 @@ mod tests {
         let mut conn = h.stream_conn();
         write_frame(
             &mut conn,
-            &StreamAttach {
+            &StreamOpen::Attach(StreamAttach {
                 exec_id: 999,
                 kind: StreamKind::Stdout,
-            },
+            }),
         )
         .unwrap();
         match read_frame::<_, Response>(&mut conn).unwrap() {
@@ -341,6 +357,26 @@ mod tests {
         let mut rest = Vec::new();
         conn.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn unimplemented_stream_open_variants_get_bad_request() {
+        let h = Harness::new();
+        for open in [
+            StreamOpen::TcpDial { port: 80 },
+            StreamOpen::TarExtract { dest: "/d".into() },
+            StreamOpen::TarCreate { src: "/s".into() },
+        ] {
+            let mut conn = h.stream_conn();
+            write_frame(&mut conn, &open).unwrap();
+            match read_frame::<_, Response>(&mut conn).unwrap() {
+                Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::BadRequest),
+                other => panic!("unexpected: {other:?}"),
+            }
+            let mut rest = Vec::new();
+            conn.read_to_end(&mut rest).unwrap();
+            assert!(rest.is_empty());
+        }
     }
 
     #[test]

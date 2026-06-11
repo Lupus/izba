@@ -1,6 +1,6 @@
 use izba_proto::{
-    read_frame, write_frame, ExitStatus, Request, Response, StreamAttach, StreamKind, CONTROL_PORT,
-    STREAM_PORT,
+    read_frame, write_frame, ExitStatus, Request, Response, StreamAttach, StreamKind, StreamOpen,
+    CONTROL_PORT, STREAM_PORT,
 };
 use izba_ttytest::scripted_guest::{ExecOutcome, GuestScript, ScriptedGuest};
 use std::io::{Read, Write};
@@ -46,10 +46,10 @@ fn stream_emits_records_input_and_ends() {
     let mut stream = connect(&guest.vsock_path(), STREAM_PORT);
     write_frame(
         &mut stream,
-        &StreamAttach {
+        &StreamOpen::Attach(StreamAttach {
             exec_id: 1,
             kind: StreamKind::Tty,
-        },
+        }),
     )
     .unwrap();
     let mut buf = [0u8; 64];

@@ -14,7 +14,7 @@ use izba_core::sandbox;
 use izba_core::vmm::{IoStream, UdsStream};
 use izba_proto::{
     read_frame, write_frame, ErrorKind, ExecRequest, ExitStatus, Request, Response, StreamAttach,
-    StreamKind,
+    StreamKind, StreamOpen,
 };
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -153,7 +153,10 @@ fn wait<S: Read + Write>(conn: &mut S, exec_id: u32) -> anyhow::Result<ExitStatu
 fn attach(paths: &Paths, name: &str, exec_id: u32, kind: StreamKind) -> anyhow::Result<UdsStream> {
     let mut conn = sandbox::default_stream_connector()(paths, name)
         .with_context(|| format!("opening {kind:?} stream"))?;
-    write_frame(&mut conn, &StreamAttach { exec_id, kind })?;
+    write_frame(
+        &mut conn,
+        &StreamOpen::Attach(StreamAttach { exec_id, kind }),
+    )?;
     Ok(conn)
 }
 
