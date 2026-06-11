@@ -13,7 +13,8 @@
 use izba_proto::ErrorKind;
 use nix::fcntl::{openat2, OFlag, OpenHow, ResolveFlag};
 use nix::sys::stat::Mode;
-use std::io::Read;
+use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
@@ -313,6 +314,119 @@ fn truncated_or_internal(e: std::io::Error) -> TarError {
     }
 }
 
+/// A resolved cp source: the absolute host path under the root plus the
+/// in-archive top-level name (the source's basename, so the host can rename
+/// it).
+pub struct ResolvedSrc {
+    pub abs: PathBuf,
+    pub arc_root: OsString,
+}
+
+/// Resolve the guest path `src` under `root` (confined by `openat2`) WITHOUT
+/// touching the output stream — so a missing (`PathNotFound`) or escaping
+/// (`BadRequest`) src can be reported as the *leading* status frame with no
+/// tar bytes in front of it (§4). Opens read-only without `O_DIRECTORY` so a
+/// file src is accepted too.
+pub fn resolve_src(root: &Path, src: &str) -> Result<ResolvedSrc, TarError> {
+    let root_dir = open_root_dir(root)?;
+    let src_rel = root_relative(src);
+    let _src_fd = resolve_under_root(&root_dir, &src_rel, OFlag::O_RDONLY)?;
+    let abs = root.join(&src_rel);
+    let arc_root: OsString = src_rel
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| OsString::from("."));
+    Ok(ResolvedSrc { abs, arc_root })
+}
+
+/// Walk a resolved `src` and STREAM the tar directly into `out` (never
+/// buffered). Entry names are rooted at `src.arc_root`. Regular files,
+/// directories and symlinks are archived; sockets/fifos/devices are skipped
+/// with a stderr warning. A mid-walk I/O error returns `Err` and leaves a
+/// truncated archive on the wire — the host detects the missing EOF and
+/// reports "transfer truncated".
+pub fn stream_tar<W: Write>(src: &ResolvedSrc, out: &mut W) -> Result<(), TarError> {
+    let mut builder = tar::Builder::new(out);
+    // Symlinks INSIDE the tree are preserved (not followed). The top-level
+    // src symlink was already followed by openat2 resolution in resolve_src.
+    builder.follow_symlinks(false);
+    append_recursive(&mut builder, &src.abs, Path::new(&src.arc_root))?;
+    builder.finish().map_err(internal)?;
+    Ok(())
+}
+
+/// Convenience used by tests: resolve `src` then stream the tar into `out` in
+/// one call. The dispatch layer (server.rs) instead calls `resolve_src` and
+/// `stream_tar` separately so it can emit the leading status frame between
+/// them.
+#[cfg(test)]
+pub fn create<W: Write>(root: &Path, src: &str, out: &mut W) -> Result<(), TarError> {
+    let resolved = resolve_src(root, src)?;
+    stream_tar(&resolved, out)
+}
+
+/// Recursively append `host_path` to `builder` under in-archive name
+/// `arc_name`. Symlinks are archived as links; special files are skipped.
+fn append_recursive<W: Write>(
+    builder: &mut tar::Builder<W>,
+    host_path: &Path,
+    arc_name: &Path,
+) -> Result<(), TarError> {
+    let meta = std::fs::symlink_metadata(host_path)
+        .map_err(|e| internal(format!("stat {}: {e}", host_path.display())))?;
+    let ft = meta.file_type();
+
+    if ft.is_symlink() {
+        let target = std::fs::read_link(host_path)
+            .map_err(|e| internal(format!("readlink {}: {e}", host_path.display())))?;
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_metadata(&meta);
+        h.set_cksum();
+        builder
+            .append_link(&mut h, arc_name, &target)
+            .map_err(internal)?;
+    } else if ft.is_dir() {
+        // Emit the directory entry itself so empty dirs survive.
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_size(0);
+        h.set_metadata(&meta);
+        h.set_cksum();
+        builder
+            .append_data(&mut h, arc_name, &mut std::io::empty())
+            .map_err(internal)?;
+        let mut entries: Vec<_> = std::fs::read_dir(host_path)
+            .map_err(|e| internal(format!("readdir {}: {e}", host_path.display())))?
+            .filter_map(Result::ok)
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let child_host = e.path();
+            let child_arc = arc_name.join(e.file_name());
+            append_recursive(builder, &child_host, &child_arc)?;
+        }
+    } else if ft.is_file() {
+        let mut f = std::fs::File::open(host_path)
+            .map_err(|e| internal(format!("open {}: {e}", host_path.display())))?;
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_metadata(&meta);
+        h.set_cksum();
+        builder
+            .append_data(&mut h, arc_name, &mut f)
+            .map_err(internal)?;
+    } else {
+        // Socket / fifo / device / etc.: skip with a warning side-channel.
+        eprintln!(
+            "izba-init: cp: skipping unsupported file type at {}",
+            host_path.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,5 +675,68 @@ mod tests {
         let (kind, _msg) =
             extract(dir.path(), "/missing/d", &mut cursor).expect_err("missing parent");
         assert_eq!(kind, ErrorKind::PathNotFound);
+    }
+
+    #[test]
+    fn create_walks_tree_with_modes_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"hello").unwrap();
+        std::fs::write(root.join("src/sub/run.sh"), b"#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            root.join("src/sub/run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("a.txt", root.join("src/link")).unwrap();
+
+        let mut buf = Vec::new();
+        create(root, "/src", &mut buf).expect("create ok");
+
+        // Re-read the produced archive and assert the entry set.
+        let mut got: std::collections::BTreeMap<String, (tar::EntryType, u32)> = Default::default();
+        let mut links: std::collections::BTreeMap<String, String> = Default::default();
+        let mut ar = tar::Archive::new(std::io::Cursor::new(&buf));
+        for e in ar.entries().unwrap() {
+            let e = e.unwrap();
+            let p = e.path().unwrap().to_string_lossy().into_owned();
+            let ty = e.header().entry_type();
+            let mode = e.header().mode().unwrap() & 0o777;
+            if ty == tar::EntryType::Symlink {
+                links.insert(
+                    p.clone(),
+                    e.link_name()
+                        .unwrap()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            got.insert(p, (ty, mode));
+        }
+        assert!(got.contains_key("src/a.txt"), "{got:?}");
+        assert_eq!(got["src/sub/run.sh"].1, 0o755, "exec bit in archive");
+        assert_eq!(links.get("src/link").map(String::as_str), Some("a.txt"));
+    }
+
+    #[test]
+    fn create_missing_src_is_path_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut buf = Vec::new();
+        let (kind, _msg) = create(dir.path(), "/nope", &mut buf).expect_err("missing src");
+        assert_eq!(kind, ErrorKind::PathNotFound);
+    }
+
+    #[test]
+    fn create_rejects_escaping_src() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(dir.path().join("secret"), b"top").unwrap();
+        let mut buf = Vec::new();
+        let (kind, _msg) = create(&root, "/../secret", &mut buf).expect_err("escape");
+        assert_eq!(kind, ErrorKind::BadRequest);
     }
 }
