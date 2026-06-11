@@ -1,4 +1,5 @@
 pub mod cp;
+pub mod daemon;
 mod discover;
 pub mod image;
 pub mod liveness;
