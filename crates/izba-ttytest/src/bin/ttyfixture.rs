@@ -8,13 +8,13 @@ use std::io::{Read, Write};
 fn enter_raw_mode() {
     use std::os::unix::io::AsRawFd;
     let fd = std::io::stdin().as_raw_fd();
-    // SAFETY: fd is valid for the lifetime of the process, and termios ops
-    // are safe to call from a single-threaded context.
+    // SAFETY: stdin fd is valid; only enable raw mode if tcgetattr succeeds.
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
-        libc::tcgetattr(fd, &mut t);
-        libc::cfmakeraw(&mut t);
-        libc::tcsetattr(fd, libc::TCSANOW, &t);
+        if libc::tcgetattr(fd, &mut t) == 0 {
+            libc::cfmakeraw(&mut t);
+            libc::tcsetattr(fd, libc::TCSANOW, &t);
+        }
     }
 }
 

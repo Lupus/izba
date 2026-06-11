@@ -151,7 +151,10 @@ impl TerminalSession {
                 return Ok(());
             }
             if start.elapsed() > timeout {
-                bail!("screen not stable within {timeout:?}");
+                bail!(
+                    "screen not stable within {timeout:?}; screen was:\n{}",
+                    self.screen_text()
+                );
             }
         }
     }
@@ -169,7 +172,10 @@ impl TerminalSession {
                 });
             }
             if start.elapsed() > timeout {
-                bail!("child did not exit within {timeout:?}");
+                bail!(
+                    "child did not exit within {timeout:?}; screen was:\n{}",
+                    self.screen_text()
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
