@@ -40,7 +40,7 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 ## Crate map
 
 - `izba-proto` — host↔guest wire protocol: u32-LE length-prefixed JSON frames
-  + `Request`/`Response`/`StreamAttach` types. Shared verbatim by both sides.
+  + `Request`/`Response`/`StreamOpen` types. Shared verbatim by both sides.
 - `izba-core` — the product library, zero CLI assumptions (a future `izbad`
   daemon wraps the same core). `sandbox.rs` is the lifecycle heart;
   `vmm/` driver trait + Cloud Hypervisor impl; `image/` OCI→erofs pipeline;
@@ -60,9 +60,12 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   re-verified via pid + `/proc/<pid>/stat` starttime identity (PID-reuse-safe;
   zombies count as dead) — never trusted from `state.json` alone.
 - **vsock ports:** 1025 control RPC, 1026 streams (`CONTROL_PORT`/`STREAM_PORT`
-  in izba-proto). Stream conns send ONE `StreamAttach` frame, then raw bytes.
-  Host reaches them via Cloud Hypervisor hybrid-vsock: `CONNECT <port>\n` on
-  `run/vsock.sock`, response read byte-by-byte (buffering eats stream data).
+  in izba-proto). Stream conns send ONE `StreamOpen` frame (`Attach` exec
+  streams / `TcpDial` port relays / `TarExtract`+`TarCreate` for cp), then
+  bytes per the variant's framing. Host reaches them via Cloud Hypervisor
+  hybrid-vsock: `CONNECT <port>\n` on `run/vsock.sock`, response read
+  byte-by-byte (buffering eats stream data). CH does NOT propagate vsock
+  half-close guest→host: teardown must be full `SHUT_RDWR` once TX is done.
 - **Disk order:** `sandbox::start()` builds `[rootfs.erofs (RO), rw.img (RW)]`
   → CH enumerates `--disk` order as vda, vdb → init mounts `/dev/vda` erofs
   lower + `/dev/vdb` ext4 upper into an overlay at `/rootfs`.
