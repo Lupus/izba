@@ -71,7 +71,7 @@ pub struct ScriptedGuest {
     name: String,
     vsock: PathBuf,
     shared: Arc<Shared>,
-    _listener: std::thread::JoinHandle<()>,
+    _accept_thread: std::thread::JoinHandle<()>,
 }
 
 impl ScriptedGuest {
@@ -118,7 +118,7 @@ impl ScriptedGuest {
             name,
             vsock,
             shared,
-            _listener: handle,
+            _accept_thread: handle,
         })
     }
 
@@ -158,11 +158,21 @@ impl Drop for ScriptedGuest {
 }
 
 fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
+    // The accept thread is not joined; it exits when the shutdown flag is set
+    // (via Drop's nudge connection) or when the process ends.
     for conn in listener.incoming() {
         if shared.shutdown.load(Ordering::SeqCst) {
             return;
         }
-        let Ok(conn) = conn else { continue };
+        let conn = match conn {
+            Ok(c) => c,
+            Err(_) => {
+                if shared.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                continue;
+            }
+        };
         let shared = Arc::clone(&shared);
         std::thread::spawn(move || {
             if let Err(e) = serve_conn(conn, shared) {

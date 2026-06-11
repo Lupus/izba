@@ -1,7 +1,6 @@
 use izba_proto::{read_frame, write_frame, ExitStatus, Request, Response, CONTROL_PORT};
 use izba_ttytest::scripted_guest::{ExecOutcome, GuestScript, ScriptedGuest};
-use std::io::{BufRead, BufReader, Write};
-use std::time::Duration;
+use std::io::{Read, Write};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -12,10 +11,21 @@ use uds_windows::UnixStream;
 fn connect(sock: &std::path::Path, port: u32) -> UnixStream {
     let mut s = UnixStream::connect(sock).expect("connect vsock.sock");
     s.write_all(format!("CONNECT {port}\n").as_bytes()).unwrap();
-    let mut reader = BufReader::new(s.try_clone().unwrap());
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    assert!(line.starts_with("OK "), "handshake not OK: {line:?}");
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        let n = s.read(&mut b).unwrap();
+        assert_ne!(n, 0, "EOF before OK line");
+        if b[0] == b'\n' {
+            break;
+        }
+        line.push(b[0]);
+    }
+    assert!(
+        String::from_utf8_lossy(&line).starts_with("OK "),
+        "handshake not OK: {:?}",
+        String::from_utf8_lossy(&line)
+    );
     s
 }
 
@@ -38,5 +48,4 @@ fn answers_handshake_and_health() {
     }
     drop(conn);
     drop(guest);
-    std::thread::sleep(Duration::from_millis(50));
 }
