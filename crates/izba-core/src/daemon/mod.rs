@@ -5,6 +5,7 @@
 //! world from sandbox dirs + pid identity at startup (adoption), so killing
 //! it never harms sandboxes.
 
+pub mod client;
 pub mod proto;
 pub mod registry;
 pub mod relays;
@@ -12,4 +13,5 @@ pub mod server;
 pub mod supervisor;
 pub mod transport;
 
+pub use client::DaemonClient;
 pub use server::{run_daemon, run_daemon_with, Daemon, DaemonDeps};
