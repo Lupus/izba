@@ -76,6 +76,13 @@ enum Cmd {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Copy files between host and a running sandbox
+    Cp {
+        /// Source: HOST_PATH or NAME:GUEST_PATH
+        src: String,
+        /// Destination: HOST_PATH or NAME:GUEST_PATH
+        dst: String,
+    },
     /// List sandboxes
     Ls,
     /// Stop a running sandbox
@@ -107,6 +114,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             tty,
             cmd,
         } => commands::exec::run(paths, &name, interactive, tty, cmd),
+        Cmd::Cp { src, dst } => commands::cp::run(paths, &src, &dst),
         Cmd::Ls => commands::ls::run(paths),
         Cmd::Stop { name } => commands::stop::run(paths, &name),
         Cmd::Rm { name, force } => commands::rm::run(paths, &name, force),
@@ -176,5 +184,17 @@ mod tests {
 
         // cmd is mandatory
         assert!(Cli::try_parse_from(["izba", "exec", "web"]).is_err());
+    }
+
+    #[test]
+    fn parse_cp_operands() {
+        let cli = Cli::try_parse_from(["izba", "cp", "a.txt", "web:/etc/a"]).unwrap();
+        let Cmd::Cp { src, dst } = cli.cmd else {
+            panic!("expected cp");
+        };
+        assert_eq!(src, "a.txt");
+        assert_eq!(dst, "web:/etc/a");
+        // Both operands are required.
+        assert!(Cli::try_parse_from(["izba", "cp", "only-one"]).is_err());
     }
 }

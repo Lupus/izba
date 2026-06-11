@@ -1,3 +1,4 @@
+pub mod cp;
 pub mod create;
 pub mod exec;
 pub mod ls;
