@@ -89,7 +89,10 @@ fn wait_tty(
     let raw = terminal::RawGuard::new()?;
     // stdin pump never unblocks from its read; left detached, dies with us.
     std::thread::spawn(move || pump(io::stdin(), &stream));
-    let out = std::thread::spawn(move || pump(stream_out, io::stdout()));
+    // Guest tty bytes go to a raw console sink: on Windows `io::stdout()`
+    // rejects non-UTF-8 chunks (e.g. vim's 0xbd width-probe byte) and the
+    // pump would die mid-redraw. See `terminal::console_out`.
+    let out = std::thread::spawn(move || pump(stream_out, terminal::console_out()));
 
     let status = wait(wait_conn, exec_id);
     // The guest half-closes the stream when the child dies, so this join
@@ -122,8 +125,10 @@ fn wait_plain(
         let in_stream = attach(paths, name, exec_id, StreamKind::Stdin)?;
         let _ = in_stream.shutdown(Shutdown::Write);
     }
-    let out = std::thread::spawn(move || pump(out_stream, io::stdout()));
-    let err = std::thread::spawn(move || pump(err_stream, io::stderr()));
+    // Raw console sinks so non-UTF-8 guest bytes don't kill the pump on
+    // Windows (a console `io::stdout()` rejects them). See `terminal`.
+    let out = std::thread::spawn(move || pump(out_stream, terminal::console_out()));
+    let err = std::thread::spawn(move || pump(err_stream, terminal::console_err()));
 
     let status = wait(wait_conn, exec_id);
     let _ = out.join();
