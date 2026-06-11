@@ -74,7 +74,7 @@ fn proc_stat_fields(pid: u32) -> anyhow::Result<(char, u64)> {
     Ok((state, starttime))
 }
 
-pub(crate) fn proc_starttime(pid: u32) -> anyhow::Result<u64> {
+pub fn proc_starttime(pid: u32) -> anyhow::Result<u64> {
     proc_stat_fields(pid).map(|(_, starttime)| starttime)
 }
 

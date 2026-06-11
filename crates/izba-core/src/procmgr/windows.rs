@@ -84,10 +84,9 @@ fn creation_time(h: HANDLE) -> Option<u64> {
 }
 
 /// Creation time of `pid` — the Windows `starttime` identity token.
-/// Test-only: consumed by `sandbox.rs` unit tests forging live identities
-/// (see the re-export gate in `procmgr/mod.rs`).
-#[cfg(test)]
-pub(crate) fn proc_starttime(pid: u32) -> anyhow::Result<u64> {
+/// Returns the creation-time token for `pid`; used by `current_identity()` and
+/// by tests that forge live `PidIdentity` values.
+pub fn proc_starttime(pid: u32) -> anyhow::Result<u64> {
     let h = open_query(pid).with_context(|| format!("no such process: {pid}"))?;
     creation_time(h.0).context("reading process creation time")
 }

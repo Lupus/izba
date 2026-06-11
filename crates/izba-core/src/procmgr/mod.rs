@@ -8,18 +8,39 @@
 
 #[cfg(unix)]
 mod unix;
-// Consumed only by `sandbox.rs` unit tests (forging identities for liveness
-// checks), hence the `test` gate — an unconditional re-export trips
-// `unused_imports` in non-test builds.
-#[cfg(all(unix, test))]
-pub(crate) use unix::proc_starttime;
+#[cfg(unix)]
+pub use unix::proc_starttime;
 #[cfg(unix)]
 pub use unix::{kill_pid, pid_alive, spawn_detached};
 
 #[cfg(windows)]
 mod windows;
-// Same test-only re-export rationale as the unix one above.
-#[cfg(all(windows, test))]
-pub(crate) use windows::proc_starttime;
+#[cfg(windows)]
+pub use windows::proc_starttime;
 #[cfg(windows)]
 pub use windows::{kill_pid, pid_alive, spawn_detached};
+
+use crate::state::PidIdentity;
+
+/// PID-reuse-safe identity of the current process. Alive for as long as this
+/// process runs, so it is a valid `vmm_pid` for a fabricated `state.json` in
+/// tests and test-support tooling.
+pub fn current_identity() -> anyhow::Result<PidIdentity> {
+    let pid = std::process::id();
+    Ok(PidIdentity {
+        pid,
+        starttime: proc_starttime(pid)?,
+    })
+}
+
+#[cfg(test)]
+mod current_identity_tests {
+    use super::*;
+
+    #[test]
+    fn current_identity_is_self_and_alive() {
+        let id = current_identity().expect("current identity");
+        assert_eq!(id.pid, std::process::id());
+        assert!(pid_alive(&id), "the current process must read as alive");
+    }
+}
