@@ -1075,6 +1075,7 @@ dependencies = [
  "anyhow",
  "izba-core",
  "izba-proto",
+ "libc",
  "portable-pty",
  "serde_json",
  "tempfile",
