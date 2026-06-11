@@ -64,6 +64,16 @@ struct PortRelayArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum DaemonCmd {
+    /// Run the daemon in the foreground (debugging, service managers)
+    Run,
+    /// Show daemon health and supervised sandboxes (never starts a daemon)
+    Status,
+    /// Stop the daemon; sandboxes keep running, port relays pause
+    Stop,
+}
+
+#[derive(Debug, Subcommand)]
 enum PortCmd {
     /// Publish a port against a running sandbox
     Publish {
@@ -146,6 +156,9 @@ enum Cmd {
     /// Manage published ports (host -> guest TCP)
     #[command(subcommand)]
     Port(PortCmd),
+    /// Manage the izba daemon (auto-started by other commands)
+    #[command(subcommand)]
+    Daemon(DaemonCmd),
     /// Internal: the per-rule port-publish relay process (not for direct use)
     #[command(hide = true, name = "__port-relay")]
     PortRelay(PortRelayArgs),
@@ -173,6 +186,11 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             PortCmd::Publish { name, rule } => commands::port::publish(paths, &name, &rule),
             PortCmd::Unpublish { name, key } => commands::port::unpublish(paths, &name, &key),
             PortCmd::Ls { name } => commands::port::ls(paths, &name),
+        },
+        Cmd::Daemon(dc) => match dc {
+            DaemonCmd::Run => commands::daemon::run_foreground(paths),
+            DaemonCmd::Status => commands::daemon::status(paths),
+            DaemonCmd::Stop => commands::daemon::stop(paths),
         },
         Cmd::PortRelay(a) => {
             commands::port::relay(&a.vsock, &a.bind, a.host_port, a.guest_port, &a.pid_file)
@@ -306,6 +324,23 @@ mod tests {
             panic!("expected port ls");
         };
         assert_eq!(name, "web");
+    }
+
+    #[test]
+    fn parse_daemon_subcommands() {
+        for (args, expect) in [
+            (vec!["izba", "daemon", "run"], DaemonCmd::Run),
+            (vec!["izba", "daemon", "status"], DaemonCmd::Status),
+            (vec!["izba", "daemon", "stop"], DaemonCmd::Stop),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Cmd::Daemon(dc) = cli.cmd else {
+                panic!("expected daemon subcommand");
+            };
+            assert_eq!(format!("{dc:?}"), format!("{expect:?}"));
+        }
+        // Bare `izba daemon` requires a subcommand.
+        assert!(Cli::try_parse_from(["izba", "daemon"]).is_err());
     }
 
     #[test]
