@@ -122,6 +122,28 @@ impl ScriptedGuest {
         })
     }
 
+    /// Start a guest, or return `None` when this environment denies
+    /// `UnixListener::bind` with `PermissionDenied`/EPERM — matching the
+    /// project convention of runtime-skipping listener-bind tests in
+    /// restrictive sandboxes. Panics on any other failure.
+    pub fn start_or_skip(script: GuestScript) -> Option<Self> {
+        match Self::start(script) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                let denied = e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                });
+                if denied {
+                    eprintln!("SKIP: UnixListener::bind denied in this environment: {e:#}");
+                    None
+                } else {
+                    panic!("ScriptedGuest::start failed: {e:#}");
+                }
+            }
+        }
+    }
+
     /// Pass this to the child as `IZBA_DATA_DIR`.
     pub fn data_dir(&self) -> &Path {
         &self.data_root

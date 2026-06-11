@@ -38,7 +38,9 @@ fn stream_emits_records_input_and_ends() {
         end_when_input_contains: Some(b'q'),
         final_status: ExitStatus::Code(7),
     };
-    let guest = ScriptedGuest::start(script).unwrap();
+    let Some(guest) = ScriptedGuest::start_or_skip(script) else {
+        return;
+    };
 
     // Open the stream and read the initial emit.
     let mut stream = connect(&guest.vsock_path(), STREAM_PORT);

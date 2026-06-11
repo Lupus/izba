@@ -38,7 +38,9 @@ fn answers_handshake_and_health() {
         end_when_input_contains: None,
         final_status: ExitStatus::Code(0),
     };
-    let guest = ScriptedGuest::start(script).expect("start guest");
+    let Some(guest) = ScriptedGuest::start_or_skip(script) else {
+        return;
+    };
 
     let mut conn = connect(&guest.vsock_path(), CONTROL_PORT);
     write_frame(&mut conn, &Request::Health).unwrap();

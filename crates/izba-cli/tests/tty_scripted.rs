@@ -39,7 +39,9 @@ const T: Duration = Duration::from_secs(10);
 #[test]
 fn vim_renders_through_the_probe_byte() {
     let sc = scenarios::vim_redraw();
-    let guest = ScriptedGuest::start(scenarios::vim_redraw().script).unwrap();
+    let Some(guest) = ScriptedGuest::start_or_skip(scenarios::vim_redraw().script) else {
+        return;
+    };
     let Some(mut sess) = session_or_skip(&guest, &sc) else {
         return;
     };
@@ -61,7 +63,9 @@ fn vim_renders_through_the_probe_byte() {
 #[test]
 fn arrow_keys_reach_the_guest() {
     let sc = scenarios::arrow_keys();
-    let guest = ScriptedGuest::start(scenarios::arrow_keys().script).unwrap();
+    let Some(guest) = ScriptedGuest::start_or_skip(scenarios::arrow_keys().script) else {
+        return;
+    };
     let Some(mut sess) = session_or_skip(&guest, &sc) else {
         return;
     };
@@ -81,7 +85,9 @@ fn arrow_keys_reach_the_guest() {
 #[test]
 fn ctrl_c_ends_exec_without_killing_izba() {
     let sc = scenarios::ctrl_c();
-    let guest = ScriptedGuest::start(scenarios::ctrl_c().script).unwrap();
+    let Some(guest) = ScriptedGuest::start_or_skip(scenarios::ctrl_c().script) else {
+        return;
+    };
     let Some(mut sess) = session_or_skip(&guest, &sc) else {
         return;
     };
@@ -102,7 +108,9 @@ fn ctrl_c_ends_exec_without_killing_izba() {
 #[test]
 fn exit_code_passthrough() {
     let sc = scenarios::exit_code(42);
-    let guest = ScriptedGuest::start(scenarios::exit_code(42).script).unwrap();
+    let Some(guest) = ScriptedGuest::start_or_skip(scenarios::exit_code(42).script) else {
+        return;
+    };
     let Some(mut sess) = session_or_skip(&guest, &sc) else {
         return;
     };
@@ -113,7 +121,9 @@ fn exit_code_passthrough() {
 #[test]
 fn command_not_found_is_127() {
     let sc = scenarios::command_not_found();
-    let guest = ScriptedGuest::start(scenarios::command_not_found().script).unwrap();
+    let Some(guest) = ScriptedGuest::start_or_skip(scenarios::command_not_found().script) else {
+        return;
+    };
     let Some(mut sess) = session_or_skip(&guest, &sc) else {
         return;
     };
