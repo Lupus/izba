@@ -8,11 +8,22 @@ pub trait Probes {
     fn control_answers(&self) -> bool;
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Liveness {
     Running,
     Degraded(String),
     Stopped,
+}
+
+impl Liveness {
+    /// Human/status string shared by `izba ls` and the daemon's List/Status.
+    pub fn describe(&self) -> String {
+        match self {
+            Liveness::Running => "running".to_string(),
+            Liveness::Degraded(reason) => format!("degraded ({reason})"),
+            Liveness::Stopped => "stopped".to_string(),
+        }
+    }
 }
 
 /// Assess the liveness of a sandbox.
@@ -175,5 +186,21 @@ mod tests {
             assess(Some(&run), &p),
             Liveness::Degraded("control plane unresponsive".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // describe() + Clone
+    // -----------------------------------------------------------------------
+    #[test]
+    fn describe_strings() {
+        assert_eq!(Liveness::Running.describe(), "running");
+        assert_eq!(
+            Liveness::Degraded("sidecar passt died".into()).describe(),
+            "degraded (sidecar passt died)"
+        );
+        assert_eq!(Liveness::Stopped.describe(), "stopped");
+        // Clone is required by the daemon registry.
+        let l = Liveness::Degraded("x".into());
+        assert_eq!(l.clone(), l);
     }
 }

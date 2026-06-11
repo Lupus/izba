@@ -51,6 +51,22 @@ impl Paths {
     pub fn artifacts_dir(&self) -> PathBuf {
         self.root.join("artifacts")
     }
+
+    pub fn daemon_dir(&self) -> PathBuf {
+        self.root.join("daemon")
+    }
+
+    pub fn daemon_socket(&self) -> PathBuf {
+        self.daemon_dir().join("izbad.sock")
+    }
+
+    pub fn daemon_lock(&self) -> PathBuf {
+        self.daemon_dir().join("lock")
+    }
+
+    pub fn daemon_log(&self) -> PathBuf {
+        self.daemon_dir().join("daemon.log")
+    }
 }
 
 /// Both platform rules always compile (`cfg!`, not `#[cfg]`) so each is
@@ -101,6 +117,15 @@ mod tests {
         assert_eq!(
             p.logs_dir("web"),
             PathBuf::from("/data/izba/sandboxes/web/logs")
+        );
+        assert_eq!(
+            p.daemon_socket(),
+            PathBuf::from("/data/izba/daemon/izbad.sock")
+        );
+        assert_eq!(p.daemon_lock(), PathBuf::from("/data/izba/daemon/lock"));
+        assert_eq!(
+            p.daemon_log(),
+            PathBuf::from("/data/izba/daemon/daemon.log")
         );
     }
 
