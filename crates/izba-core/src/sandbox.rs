@@ -349,12 +349,20 @@ fn save_records(paths: &Paths, name: &str, records: &[PortRecord]) -> anyhow::Re
 }
 
 /// Build the detached `izba __port-relay` command for a rule.
+///
+/// The relay binary defaults to the current executable (the izba CLI
+/// relaunches itself). `IZBA_PORT_RELAY_EXE` overrides it for embedders whose
+/// `current_exe` is not the CLI — the integration-test harness today, a
+/// future `izbad`.
 fn relay_command(
     paths: &Paths,
     name: &str,
     rule: &PortRule,
 ) -> anyhow::Result<crate::vmm::CommandSpec> {
-    let exe = std::env::current_exe().context("locating the izba executable")?;
+    let exe = match std::env::var_os("IZBA_PORT_RELAY_EXE") {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_exe().context("locating the izba executable")?,
+    };
     let vsock = paths.run_dir(name).join("vsock.sock");
     let pid_file = crate::portfwd::pid_file_path(&paths.run_dir(name), rule.bind, rule.host_port);
     Ok(crate::vmm::CommandSpec {

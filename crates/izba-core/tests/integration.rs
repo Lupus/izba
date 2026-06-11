@@ -84,6 +84,7 @@ fn want() -> Option<TestEnv> {
     }
     let kernel = require_env_file("IZBA_KERNEL", &mut missing);
     let initramfs = require_env_file("IZBA_INITRAMFS", &mut missing);
+    ensure_relay_exe(&mut missing);
 
     if !missing.is_empty() {
         panic!(
@@ -98,6 +99,35 @@ fn want() -> Option<TestEnv> {
         initramfs: initramfs.expect("checked above"),
         image_ref: std::env::var("IZBA_TEST_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string()),
     })
+}
+
+/// Point `IZBA_PORT_RELAY_EXE` at the real izba CLI binary. Port relays are
+/// `izba __port-relay` re-invocations of `current_exe`, which inside THIS
+/// process is the libtest harness, not the CLI — without the override the
+/// spawned "relay" is a test binary that exits immediately. Builds the CLI
+/// on demand (cheap when already up to date).
+fn ensure_relay_exe(missing: &mut Vec<String>) {
+    // target/debug/deps/integration-<hash> → target/debug/izba
+    let exe = std::env::current_exe().expect("test current_exe");
+    let debug_dir = exe
+        .parent() // deps/
+        .and_then(|p| p.parent()) // debug/
+        .expect("test binary not under target/debug/deps");
+    let izba = debug_dir.join(if cfg!(windows) { "izba.exe" } else { "izba" });
+    if !izba.is_file() {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "izba-cli"])
+            .status();
+        if !matches!(status, Ok(s) if s.success()) || !izba.is_file() {
+            missing.push(format!(
+                "{} not found and `cargo build -p izba-cli` did not produce it \
+                 (needed as the port-relay worker)",
+                izba.display()
+            ));
+            return;
+        }
+    }
+    std::env::set_var("IZBA_PORT_RELAY_EXE", &izba);
 }
 
 fn require_env_file(var: &str, missing: &mut Vec<String>) -> Option<PathBuf> {
@@ -366,8 +396,11 @@ fn exec_ok(paths: &Paths, name: &str, argv: &[&str]) -> String {
     stdout
 }
 
-/// Start a busybox httpd in the guest serving `/workspace`, detached, so it
-/// keeps running after the exec returns. Writes `index.html` first.
+/// Start a tiny HTTP responder in the guest, detached, so it keeps running
+/// after the exec returns. alpine's base busybox has NO `httpd` applet (that
+/// lives in busybox-extras), but its `nc` supports `-l -p` and `-e PROG`
+/// (verified on a live alpine:3.20 guest) — so serve with an nc accept loop
+/// that reads the request line first, then answers from `index.html`.
 fn start_guest_httpd(paths: &Paths, name: &str, body: &str, guest_port: u16) {
     exec_ok(
         paths,
@@ -378,11 +411,29 @@ fn start_guest_httpd(paths: &Paths, name: &str, body: &str, guest_port: u16) {
             &format!("printf '%s' '{body}' > /workspace/index.html"),
         ],
     );
-    // `httpd -f` stays in the foreground; background it with & and disown via
-    // setsid so it survives the exec's process-group teardown.
-    let cmd = format!("setsid httpd -f -p {guest_port} -h /workspace >/dev/null 2>&1 &");
+    // The per-connection handler script: consume the request line, reply.
+    // `printf '%s\n' ARGS...` writes the args verbatim (no escape processing),
+    // so the script's own `printf "...\r\n\r\n"` reaches the file intact and
+    // is interpreted by the guest shell at serve time.
+    exec_ok(
+        paths,
+        name,
+        &[
+            "sh",
+            "-c",
+            concat!(
+                r#"printf '%s\n' 'read -r _' 'printf "HTTP/1.0 200 OK\r\n\r\n"' "#,
+                r#"'cat /workspace/index.html' > /workspace/serve.sh"#
+            ),
+        ],
+    );
+    // Accept loop, disowned via setsid so it survives the exec's teardown.
+    let cmd = format!(
+        "setsid sh -c 'while true; do nc -l -p {guest_port} -e sh /workspace/serve.sh; done' \
+         >/dev/null 2>&1 &"
+    );
     exec_ok(paths, name, &["sh", "-c", &cmd]);
-    // Give httpd a moment to bind.
+    // Give the listener a moment to bind.
     std::thread::sleep(Duration::from_millis(300));
 }
 
