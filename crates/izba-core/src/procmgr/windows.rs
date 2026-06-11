@@ -37,9 +37,14 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, CREATE_NEW_PROCESS_GROUP,
-    CREATE_NO_WINDOW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
+    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE,
 };
+
+/// Generic `SYNCHRONIZE` access right (winnt.h) — windows-sys only exports
+/// it from unrelated feature modules, so define the fixed value locally.
+const SYNCHRONIZE: u32 = 0x0010_0000;
 
 /// `GetExitCodeProcess` sentinel for "still running" (`STATUS_PENDING`).
 /// A process could in principle exit with code 259; that misread is the
@@ -215,20 +220,32 @@ fn descendants_of(root: u32, root_starttime: u64) -> Vec<u32> {
     found
 }
 
-/// Best-effort TerminateProcess on a bare pid (used for the descendant
-/// sweep, where there is no recorded identity beyond the creation-time
-/// check already done in [`descendants_of`]).
+/// How long to wait for a terminated process to FULLY die. TerminateProcess
+/// is asynchronous: the exit code is set immediately, but the process (and
+/// its open handles — disk images, the vsock socket, the WHP partition)
+/// lingers until kernel-side teardown finishes. Callers like `stop` rename
+/// or reuse those resources right after kill, so kill must wait for the
+/// handle to signal, not just for the exit code to flip.
+const TERMINATION_WAIT_MS: u32 = 10_000;
+
+/// Best-effort terminate + wait-for-full-death on a bare pid (used for the
+/// descendant sweep, where there is no recorded identity beyond the
+/// creation-time check already done in [`descendants_of`]).
 fn terminate_quiet(pid: u32) {
     // SAFETY: plain FFI.
-    let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    let h = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid) };
     if !h.is_null() {
         let h = OwnedHandle(h);
-        // SAFETY: valid handle with PROCESS_TERMINATE access.
-        unsafe { TerminateProcess(h.0, 1) };
+        // SAFETY: valid handle with PROCESS_TERMINATE | SYNCHRONIZE access.
+        unsafe {
+            TerminateProcess(h.0, 1);
+            WaitForSingleObject(h.0, TERMINATION_WAIT_MS);
+        }
     }
 }
 
-/// Terminate the process identified by `id` and every live descendant.
+/// Terminate the process identified by `id` and every live descendant,
+/// waiting for each to fully die (see [`TERMINATION_WAIT_MS`]).
 /// Idempotent: already-gone processes return `Ok(())` — but the descendant
 /// sweep still runs, catching workers orphaned by an earlier partial stop
 /// (their PPID keeps pointing at the dead parent).
@@ -242,17 +259,19 @@ pub fn kill_pid(id: &PidIdentity) -> anyhow::Result<()> {
             return Ok(());
         }
         // SAFETY: plain FFI call.
-        let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, id.pid) };
+        let h = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, id.pid) };
         if h.is_null() {
             // Vanished between the aliveness check and here — already dead.
             return Ok(());
         }
         let h = OwnedHandle(h);
-        // SAFETY: valid handle with PROCESS_TERMINATE access.
+        // SAFETY: valid handle with PROCESS_TERMINATE | SYNCHRONIZE access.
         let ok = unsafe { TerminateProcess(h.0, 1) };
         if ok == 0 {
             // ACCESS_DENIED can mean "already terminating": re-check before failing.
             if !pid_alive(id) {
+                // SAFETY: still our valid handle; wait out the teardown.
+                unsafe { WaitForSingleObject(h.0, TERMINATION_WAIT_MS) };
                 return Ok(());
             }
             anyhow::bail!(
@@ -261,6 +280,9 @@ pub fn kill_pid(id: &PidIdentity) -> anyhow::Result<()> {
                 std::io::Error::last_os_error()
             );
         }
+        // SAFETY: still our valid handle; block until full teardown (or
+        // the bounded wait elapses — callers re-probe liveness anyway).
+        unsafe { WaitForSingleObject(h.0, TERMINATION_WAIT_MS) };
         Ok(())
     })();
 
