@@ -1018,8 +1018,10 @@ dependencies = [
  "clap",
  "izba-core",
  "izba-proto",
+ "izba-ttytest",
  "libc",
  "nix 0.29.0",
+ "portable-pty",
  "signal-hook",
  "windows-sys 0.60.2",
 ]

@@ -339,6 +339,14 @@ fn serve_stream(conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
         cvar.notify_all();
     }
     *shared.resize_tx.lock().unwrap() = None;
+    // Shut down the socket (not just close one fd clone) so the host's output
+    // pump sees EOF immediately, even though the reader_thread still holds
+    // another clone of this socket end open. Without this, the host's
+    // `out.join()` in `wait_tty` deadlocks: it waits for EOF which only
+    // arrives when all guest socket fds are closed, but the reader_thread
+    // is itself waiting for the host stdin-pump to close — which never
+    // happens because that thread is left detached.
+    let _ = writer.shutdown(std::net::Shutdown::Both);
     drop(writer);
     let _ = reader_thread.join();
     Ok(())

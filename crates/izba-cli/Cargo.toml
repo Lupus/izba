@@ -4,15 +4,35 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Opt-in: builds the PTY/ConPTY terminal tests (pulls portable-pty/vt100 via the
+# izba-ttytest dev-dependency). Kept off by default so the six standard build
+# gates never cross-compile the harness.
+ttytests = []
+
 [[bin]]
 name = "izba"
 path = "src/main.rs"
+
+[[test]]
+name = "tty_scripted"
+required-features = ["ttytests"]
+
+[[test]]
+name = "tty_e2e"
+required-features = ["ttytests"]
 
 [dependencies]
 izba-core = { path = "../izba-core" }
 izba-proto = { path = "../izba-proto" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+izba-ttytest = { path = "../izba-ttytest" }
+izba-proto = { path = "../izba-proto" }
+portable-pty = "0.9"
+anyhow = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["term"] }
