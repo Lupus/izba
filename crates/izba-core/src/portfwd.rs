@@ -13,6 +13,8 @@
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use izba_proto::{read_frame, write_frame, Response, StreamOpen, STREAM_PORT};
@@ -82,6 +84,38 @@ pub fn run_relay(
     }
 }
 
+/// In-daemon relay accept loop on an already-bound listener. Nonblocking
+/// accept + 100 ms tick so the owning daemon can cancel it via `stop`
+/// (std has no way to interrupt a blocking accept portably). Returns when
+/// `stop` is set or on a listener error.
+pub fn run_relay_listener(
+    listener: TcpListener,
+    vsock: &Path,
+    guest_port: u16,
+    stop: &AtomicBool,
+) -> anyhow::Result<()> {
+    listener.set_nonblocking(true).context("set_nonblocking")?;
+    while !stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((client, _peer)) => {
+                // Accepted sockets inherit nonblocking on some platforms.
+                client.set_nonblocking(false).context("accepted socket")?;
+                let vsock = vsock.to_path_buf();
+                std::thread::spawn(move || {
+                    if let Err(e) = relay_one(client, &vsock, guest_port) {
+                        eprintln!("relay connection error: {e:#}");
+                    }
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e).context("accept"),
+        }
+    }
+    Ok(())
+}
+
 /// Serve one accepted TCP connection: open a vsock TcpDial to the guest port,
 /// and on `Ok` pump bytes both ways with graceful teardown.
 pub fn relay_one(client: TcpStream, vsock: &Path, guest_port: u16) -> anyhow::Result<()> {
@@ -127,7 +161,7 @@ fn pump_bidirectional(client: TcpStream, vs: UdsStream) {
     let _ = up.join();
 }
 
-fn copy_until_eof(mut r: impl Read, w: &mut impl Write) {
+pub(crate) fn copy_until_eof(mut r: impl Read, w: &mut impl Write) {
     let mut buf = [0u8; 32 * 1024];
     loop {
         let n = match r.read(&mut buf) {
@@ -196,6 +230,36 @@ mod tests {
         assert_eq!(
             log_file_name(Ipv4Addr::new(0, 0, 0, 0), 8080),
             "port-0.0.0.0-8080.log"
+        );
+    }
+
+    #[test]
+    fn relay_listener_stops_on_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // Real TcpListener — runtime-skip where bind is denied.
+        let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP: TcpListener::bind denied in this environment");
+                return;
+            }
+            Err(e) => panic!("bind: {e}"),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let t = std::thread::spawn(move || {
+            run_relay_listener(listener, Path::new("/nonexistent.sock"), 80, &stop2)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(!t.is_finished(), "loop must keep running until stopped");
+        stop.store(true, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let res = t.join().unwrap();
+        assert!(res.is_ok(), "clean stop: {res:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "must notice the flag within one tick"
         );
     }
 
