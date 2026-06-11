@@ -3,6 +3,7 @@ mod discover;
 pub mod image;
 pub mod liveness;
 pub mod paths;
+pub mod portfwd;
 pub mod procmgr;
 pub mod sandbox;
 pub mod state;
