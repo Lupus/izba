@@ -149,11 +149,13 @@ izba cp SRC DST
   stream connection (existing `connect_stream` helper → hybrid-vsock
   `CONNECT 1026`), sends the `StreamOpen` first frame, then drives
   `tar::Builder` (to guest) or `tar::Archive` (from guest).
-- Host-side dest rules (§3) are applied locally for guest→host copies;
-  guest-side dest rules are applied by init for host→guest copies. The
-  rename-to-dest rule is implemented by rewriting the top-level path
-  component of tar entry names on the *sending* side, so the receiver only
-  ever extracts "into a directory" — one code path each end.
+- Tar entries are always rooted at the *source's* basename (single top-level
+  component). The §3 dest-rule matrix is arbitrated on the **receiving**
+  side — the only side that can stat dest: init for host→guest copies
+  (through the root-confined resolver), the CLI locally for guest→host
+  copies. Into-dir → extract as-is under dest; rename/overwrite → the
+  receiver rewrites the top-level component to dest's basename and extracts
+  under dest's parent; dir-onto-file → error.
 - `izba-cli/src/commands/cp.rs`: operand parsing (§3 guest-ref detection),
   clap wiring (`Commands::Cp { src, dst }`).
 - New workspace dependency: `tar` (pinned minor; no default features beyond
