@@ -6,6 +6,7 @@
 
 use anyhow::{bail, Context};
 use std::fs::{self, File};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,7 +16,10 @@ use crate::image::store::ImageStore;
 use crate::liveness::{assess, Liveness, Probes};
 use crate::paths::Paths;
 use crate::procmgr;
-use crate::state::{load_json, save_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
+use crate::state::{
+    load_json, save_json, PortRecord, PortRule, RunState, SandboxConfig, CONFIG_FILE, PORTS_FILE,
+    STATE_FILE,
+};
 use crate::vmm::{BlockDisk, FsShare, IoStream, VmSpec, VmmDriver};
 
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -332,6 +336,171 @@ fn liveness_of(paths: &Paths, name: &str, connector: Connector) -> anyhow::Resul
     Ok(assess(state.as_ref(), &probes))
 }
 
+fn ports_path(paths: &Paths, name: &str) -> PathBuf {
+    paths.sandbox_dir(name).join(PORTS_FILE)
+}
+
+fn load_records(paths: &Paths, name: &str) -> anyhow::Result<Vec<PortRecord>> {
+    Ok(load_json(&ports_path(paths, name))?.unwrap_or_default())
+}
+
+fn save_records(paths: &Paths, name: &str, records: &[PortRecord]) -> anyhow::Result<()> {
+    save_json(&ports_path(paths, name), &records.to_vec())
+}
+
+/// Build the detached `izba __port-relay` command for a rule.
+fn relay_command(
+    paths: &Paths,
+    name: &str,
+    rule: &PortRule,
+) -> anyhow::Result<crate::vmm::CommandSpec> {
+    let exe = std::env::current_exe().context("locating the izba executable")?;
+    let vsock = paths.run_dir(name).join("vsock.sock");
+    let pid_file = crate::portfwd::pid_file_path(&paths.run_dir(name), rule.bind, rule.host_port);
+    Ok(crate::vmm::CommandSpec {
+        argv: vec![
+            exe.to_string_lossy().into_owned(),
+            "__port-relay".to_string(),
+            "--vsock".to_string(),
+            vsock.to_string_lossy().into_owned(),
+            "--bind".to_string(),
+            rule.bind.to_string(),
+            "--host-port".to_string(),
+            rule.host_port.to_string(),
+            "--guest-port".to_string(),
+            rule.guest_port.to_string(),
+            "--pid-file".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ],
+    })
+}
+
+/// Parent preflight: bind `(bind, host_port)` and immediately drop it, so the
+/// common port-in-use error is caught synchronously before the detached relay
+/// is spawned. A residual TOCTOU race is accepted (the relay's own bind
+/// failure lands in its log and the rule reads dead in `port ls`).
+fn preflight_bind(bind: Ipv4Addr, host_port: u16) -> anyhow::Result<()> {
+    std::net::TcpListener::bind((bind, host_port))
+        .map(drop)
+        .with_context(|| format!("host port {bind}:{host_port} is unavailable"))
+}
+
+/// Spawn a relay for `rule` and return its `PortRecord`.
+fn spawn_relay(paths: &Paths, name: &str, rule: &PortRule) -> anyhow::Result<PortRecord> {
+    let cmd = relay_command(paths, name, rule)?;
+    let log = paths
+        .logs_dir(name)
+        .join(crate::portfwd::log_file_name(rule.bind, rule.host_port));
+    let relay = procmgr::spawn_detached(&cmd, &log)?;
+    Ok(PortRecord {
+        rule: rule.clone(),
+        relay,
+    })
+}
+
+/// Publish a runtime port rule against a running sandbox.
+pub fn publish_port(
+    paths: &Paths,
+    name: &str,
+    rule: PortRule,
+    connector: Connector,
+) -> anyhow::Result<()> {
+    validate_name(name)?;
+    let _lock = lock_sandbox(paths, name)?;
+    match liveness_of(paths, name, connector)? {
+        Liveness::Running | Liveness::Degraded(_) => {}
+        Liveness::Stopped => bail!("sandbox '{name}' is not running"),
+    }
+    let mut records = load_records(paths, name)?;
+    records.retain(|r| procmgr::pid_alive(&r.relay));
+    if records
+        .iter()
+        .any(|r| r.rule.bind == rule.bind && r.rule.host_port == rule.host_port)
+    {
+        bail!("port already published: {}:{}", rule.bind, rule.host_port);
+    }
+    preflight_bind(rule.bind, rule.host_port)?;
+    let record = spawn_relay(paths, name, &rule)?;
+    records.push(record);
+    save_records(paths, name, &records)
+}
+
+/// Unpublish the rule with key `(bind, host_port)`: kill its relay, drop the
+/// record.
+pub fn unpublish_port(
+    paths: &Paths,
+    name: &str,
+    bind: Ipv4Addr,
+    host_port: u16,
+) -> anyhow::Result<()> {
+    validate_name(name)?;
+    let _lock = lock_sandbox(paths, name)?;
+    let mut records = load_records(paths, name)?;
+    let idx = records
+        .iter()
+        .position(|r| r.rule.bind == bind && r.rule.host_port == host_port)
+        .with_context(|| format!("no such published port: {bind}:{host_port}"))?;
+    let record = records.remove(idx);
+    procmgr::kill_pid(&record.relay)?;
+    save_records(paths, name, &records)
+}
+
+/// List active rules, pruning dead relays (and rewriting `ports.json` if any
+/// were pruned).
+pub fn list_ports(paths: &Paths, name: &str) -> anyhow::Result<Vec<PortRecord>> {
+    validate_name(name)?;
+    let _lock = lock_sandbox(paths, name)?;
+    let records = load_records(paths, name)?;
+    let live: Vec<PortRecord> = records
+        .iter()
+        .filter(|r| procmgr::pid_alive(&r.relay))
+        .cloned()
+        .collect();
+    if live.len() != records.len() {
+        save_records(paths, name, &live)?;
+    }
+    Ok(live)
+}
+
+/// Best-effort: kill every recorded relay and remove `ports.json`.
+fn kill_recorded_relays(paths: &Paths, name: &str) {
+    if let Ok(records) = load_records(paths, name) {
+        for r in &records {
+            let _ = procmgr::kill_pid(&r.relay);
+        }
+    }
+    let _ = fs::remove_file(ports_path(paths, name));
+}
+
+/// Spawn one relay per `config.ports` rule after a successful boot. A relay
+/// that fails its preflight bind is a warning (the VM is up; the port is not)
+/// and is excluded from `ports.json` — it does NOT fail `start`.
+fn spawn_config_ports(paths: &Paths, name: &str, config: &SandboxConfig) {
+    if config.ports.is_empty() {
+        return;
+    }
+    let mut records = Vec::new();
+    for rule in &config.ports {
+        if let Err(e) = preflight_bind(rule.bind, rule.host_port) {
+            eprintln!(
+                "warning: not publishing {}:{}: {e:#}",
+                rule.bind, rule.host_port
+            );
+            continue;
+        }
+        match spawn_relay(paths, name, rule) {
+            Ok(rec) => records.push(rec),
+            Err(e) => eprintln!(
+                "warning: failed to spawn relay for {}:{}: {e:#}",
+                rule.bind, rule.host_port
+            ),
+        }
+    }
+    if let Err(e) = save_records(paths, name, &records) {
+        eprintln!("warning: failed to write {PORTS_FILE}: {e:#}");
+    }
+}
+
 pub fn start(
     paths: &Paths,
     name: &str,
@@ -453,6 +622,8 @@ pub fn start_with_timeouts(
         clear_run_dir_files(paths, name);
         return Err(e);
     }
+    // Boot succeeded: (re-)apply the persisted publish rules afresh.
+    spawn_config_ports(paths, name, &config);
     Ok(())
 }
 
@@ -516,6 +687,7 @@ fn stop_locked(
             // VMM is already dead; sidecars (virtiofsd/passt) usually self-exit
             // with their vhost-user peer, but not always — best-effort kill them.
             kill_sidecars_from_state(paths, name);
+            kill_recorded_relays(paths, name);
             return cleanup_runtime(paths, name);
         }
         (_, Some(s)) => s,
@@ -563,6 +735,7 @@ fn stop_locked(
         }
     }
 
+    kill_recorded_relays(paths, name);
     cleanup_runtime(paths, name)
 }
 
@@ -1033,6 +1206,118 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(config.ports, o.ports);
+    }
+
+    #[test]
+    fn list_ports_prunes_dead_relays() {
+        use crate::state::{PortRecord, PortRule, PORTS_FILE};
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let live = spawn_sleep(dir.path());
+        let dead = dead_identity();
+        let records = vec![
+            PortRecord {
+                rule: PortRule {
+                    bind: "127.0.0.1".parse().unwrap(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+                relay: live.clone(),
+            },
+            PortRecord {
+                rule: PortRule {
+                    bind: "127.0.0.1".parse().unwrap(),
+                    host_port: 9090,
+                    guest_port: 90,
+                },
+                relay: dead,
+            },
+        ];
+        save_json(&paths.sandbox_dir("web").join(PORTS_FILE), &records).unwrap();
+
+        let live_set = list_ports(&paths, "web").unwrap();
+        assert_eq!(live_set.len(), 1, "dead relay must be pruned");
+        assert_eq!(live_set[0].rule.host_port, 8080);
+
+        // ports.json must have been rewritten without the dead record.
+        let on_disk: Vec<PortRecord> = load_json(&paths.sandbox_dir("web").join(PORTS_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_disk.len(), 1);
+
+        let _ = procmgr::kill_pid(&live);
+    }
+
+    #[test]
+    fn unpublish_kills_and_removes_record() {
+        use crate::state::{PortRecord, PortRule, PORTS_FILE};
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let relay = spawn_sleep(dir.path());
+        let records = vec![PortRecord {
+            rule: PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: 8080,
+                guest_port: 80,
+            },
+            relay: relay.clone(),
+        }];
+        save_json(&paths.sandbox_dir("web").join(PORTS_FILE), &records).unwrap();
+
+        unpublish_port(&paths, "web", "127.0.0.1".parse().unwrap(), 8080).unwrap();
+        assert!(wait_dead(&relay), "unpublish must kill the relay");
+        let on_disk: Vec<PortRecord> = load_json(&paths.sandbox_dir("web").join(PORTS_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(on_disk.is_empty(), "record must be removed");
+
+        let err = unpublish_port(&paths, "web", "127.0.0.1".parse().unwrap(), 8080).unwrap_err();
+        assert!(
+            err.to_string().contains("no such published port"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn stop_kills_recorded_relays() {
+        use crate::state::{PortRecord, PortRule, PORTS_FILE};
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        // VMM stand-in + a relay stand-in, both real processes.
+        let vmm = spawn_sleep(dir.path());
+        write_state(&paths, "web", vmm.clone());
+        let relay = spawn_sleep(dir.path());
+        save_json(
+            &paths.sandbox_dir("web").join(PORTS_FILE),
+            &vec![PortRecord {
+                rule: PortRule {
+                    bind: "127.0.0.1".parse().unwrap(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+                relay: relay.clone(),
+            }],
+        )
+        .unwrap();
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log, Some(vmm.clone()));
+        stop(&paths, "web", &conn, Duration::from_secs(5)).unwrap();
+
+        assert!(wait_dead(&relay), "stop must kill recorded relays");
+        assert!(
+            !paths.sandbox_dir("web").join(PORTS_FILE).exists(),
+            "ports.json must be removed by stop"
+        );
     }
 
     #[test]
