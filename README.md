@@ -11,10 +11,14 @@ Background on izba's architecture and where each piece comes from: [`docs/design
 ## Status
 
 v1 in active development. Linux/KVM (including WSL2 nested virtualization)
-works end-to-end and is pending full integration validation. Windows/WHP via
-OpenVMM is planned — see the
-[v1 design doc §8 spike S1](docs/superpowers/specs/2026-06-10-izba-v1-design.md)
-for the spike details.
+works end-to-end (gated integration suite green). Windows/WHP via OpenVMM
+works end-to-end as well (experimental): a natively cross-built `izba.exe`
+pulls, builds erofs with the bundled native `mkfs.erofs.exe`, and boots
+sandboxes under OpenVMM — full CLI parity is script-validated on Windows 11
+24H2. See the
+[Windows-port design + bring-up findings](docs/superpowers/specs/2026-06-10-izba-windows-port-design.md)
+and the staging runbook in [hack/README.md](hack/README.md); there is no
+installer yet (binaries are staged by script).
 
 ## How it works
 

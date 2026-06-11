@@ -194,5 +194,23 @@ next to it: `vmm.log`, `passt.log`, `virtiofsd-workspace.log`.
 | console.log: `rw disk is blank and initramfs has no mke2fs` | Neither host `mkfs.ext4` nor guest `mke2fs` available. Install `e2fsprogs`, or rebuild the initramfs with `IZBA_MKE2FS=...`. |
 | console.log stops after kernel lines, no izba-init output | Kernel/initramfs mismatch or missing config — rebuild both with the `hack/` scripts (the kernel needs the `hack/kernel.config` fragment: virtio, vsock, erofs, overlayfs built-in). |
 | Guest has no network (the `guest_networking` test fails) | Check `passt.log`; DHCP inside the guest comes from passt. Corporate VPNs/firewalls on the Windows host can also block WSL2 egress. |
-| `sandbox '<name>' is busy` | Another izba process holds the per-sandbox flock; wait for it or find it with `fuser <root>/sandboxes/<name>/lock`. |
+| `sandbox '<name>' is busy` | Another izba process holds the per-sandbox flock; wait for it or find it with `fuser '<root>/sandboxes/.<name>.lock'` (the lock lives beside the sandbox dir). |
 | Boot consistently > 5 s warning in `boot_to_healthy_under_5s` | Expected on slow/loaded machines; the hard budget is 10 s. Investigate console.log timestamps if it is near 10 s. |
+
+## 7. Windows validation (manual, spike host)
+
+The Windows port has no CI; validation is script-driven on a Windows 11
+host with WHP enabled. Build + stage from WSL, then run the parity suite:
+
+```sh
+cargo build --release --target x86_64-pc-windows-gnu -p izba-cli
+hack/fetch-openvmm.sh && hack/build-mkfs-erofs-windows.sh   # if dist/ is stale
+hack/stage-izba-windows.sh
+# Windows side (PowerShell 7):
+pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
+```
+
+Expected: `ALL PASS` (15 checks — boot, exec, exit codes, stdin, network,
+console capture, stop/restart/rm lifecycle). The interactive `exec -it`
+checklist (PTY, VT rendering, resize, Ctrl-C, mode restore) is in the
+[Plan 2 doc](superpowers/plans/2026-06-10-izba-windows-port-p2.md), Task 5.

@@ -1,7 +1,7 @@
 # izba on Windows: platform layer + OpenVmmDriver — design
 
 **Date:** 2026-06-10
-**Status:** approved, in implementation
+**Status:** implemented; Plan 1 + Plan 2 validated on the spike host 2026-06-11 (see §8)
 **Builds on:** [2026-06-10-openvmm-spike-s1-findings.md](2026-06-10-openvmm-spike-s1-findings.md)
 (spike S1+ verdict GO, all rungs 0–7 PASS) and
 [2026-06-10-mkfs-erofs-windows-design.md](2026-06-10-mkfs-erofs-windows-design.md)
@@ -263,3 +263,63 @@ promote artifacts.
 | Windows console raw mode quirks (VT input on older terminals) | spike host is Win11 24H2 (VT-capable); `ENABLE_VIRTUAL_TERMINAL_*` failure surfaces as a clear error, non-tty exec paths unaffected |
 | `GetProcessTimes` on other users' processes denied | not applicable — izba only inspects processes it spawned as the same user |
 | wine fidelity for Windows-target tests | wine runs are best-effort, never a gate; real validation is Plan 2 on the spike host |
+
+## 8. Bring-up findings (2026-06-11, spike host: Windows 11 24H2)
+
+**Result: full CLI parity validated.**
+`hack/spike/validate-izba-windows.ps1` — 15/15 checks ALL PASS, two
+consecutive runs: `run` (anonymous OCI pull → flatten → native erofs →
+OpenVMM boot → exec), workspace write-through, `ls` liveness across CLI
+invocations, exit-code mapping (0/1/127), `exec -i` stdin round-trip,
+consomme outbound HTTP, console.log capture, `stop` (including a
+no-surviving-openvmm assertion), restart, `rm`. The KVM integration suite
+stayed 11/11 with the same tree. The two spike-unverified flags were
+confirmed against `openvmm.exe --help` + a parse probe: `--processors <n>`
+and `--memory <n>MB` are correct as encoded. The inherited erofs §3.4 gate
+closed: ps1 parity PASS natively (byte-identical to the Linux reference).
+
+**Five real bugs found and fixed by the validation (none were reachable
+from Linux):**
+
+1. **OCI platform resolution** — `oci-client`'s default resolver matches
+   the *client's* platform, so izba.exe asked registries for windows/amd64
+   and every pull failed. Pinned to `linux_amd64_resolver` (guests are
+   always linux/amd64 microVMs). `image/pull.rs`.
+2. **CRT text-mode corruption in mkfs.erofs.exe** — the tar input fd
+   (opened without `O_BINARY` upstream; the `_CRT_fmode` global never
+   crosses the msvcrt.dll boundary) and the diskbuf temp fd (mingw
+   `mkstemp` has no `_O_BINARY`) were TEXT mode: any tar whose file data
+   contained `0x1a` failed with EIO, LF bytes risked CRLF mangling. Fixed
+   with a `__p__fmode()` constructor in the compat layer + patch 0002
+   (binary delete-on-close tmpfile in `%TMP%`; also skips the stream-0
+   2 TiB-sparse-stash trick, an NTFS hazard). The parity fixture now
+   carries a binary LF/CR/0x1a tripwire so text-mode bugs diverge the gate.
+3. **`TerminateProcess` is not a tree kill** — OpenVMM runs the guest in an
+   `openvmm vm` worker child; `izba stop` killed the tracked parent while
+   the workload survived, holding disks + vsock and wedging the next start.
+   `kill_pid` now sweeps live descendants (Toolhelp, creation-time-validated
+   against PID reuse) and waits (`SYNCHRONIZE` + bounded
+   `WaitForSingleObject`) for full teardown — TerminateProcess flips the
+   exit code instantly but resources release asynchronously.
+4. **stdio handle inheritance** — CreateProcess with `bInheritHandles=TRUE`
+   duplicates every inheritable handle, so the detached VMM held the calling
+   shell's pipe ends and anything reading izba.exe's output waited for EOF
+   until the VM died. `spawn_detached` clears `HANDLE_FLAG_INHERIT` on
+   izba's own stdio first.
+5. **Lock file pinned the sandbox dir** — `remove` renames the dir while
+   holding the lock; with the lock file inside the dir, Windows refuses the
+   rename (Access denied). The lock moved to `sandboxes/.<name>.lock`.
+
+**Also closed:** the guest-side `rw.img` formatting gap — Windows has no
+host `mkfs.ext4`, so the initramfs now embeds a static `mke2fs` (e2fsprogs
+1.47.2, `IZBA_MKE2FS` build option) and `rwdisk::ensure_formatted` handles
+first boot in-guest on both platforms.
+
+**One non-blocking observation:** OpenVMM does not exit when the guest
+powers off, so a graceful `izba stop` always rides the kill escalation
+after the grace period (~10 s). Cosmetic on Windows (stop is reliable);
+worth an upstream look alongside the virtiofs issue.
+
+The manual interactive check (`exec -it`: PTY shell, VT rendering, resize,
+Ctrl-C, mode restore) is operator-run — checklist in
+[the Plan 2 doc](../plans/2026-06-10-izba-windows-port-p2.md), Task 5.
