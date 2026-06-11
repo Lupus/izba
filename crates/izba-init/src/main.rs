@@ -9,6 +9,7 @@ mod exec;
 mod mounts;
 mod rwdisk;
 mod server;
+mod tarfs;
 
 use anyhow::Context;
 use exec::ExecEngine;
