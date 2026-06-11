@@ -18,8 +18,20 @@ fn izba_exec_cmd(guest: &ScriptedGuest, argv: &[String]) -> CommandBuilder {
         cmd.arg(a);
     }
     cmd.env("IZBA_DATA_DIR", guest.data_dir());
+    // The daemon-first CLI auto-starts izbad per data root; keep test
+    // daemons short-lived so nothing lingers after the suite.
+    cmd.env("IZBA_DAEMON_IDLE_SECS", "2");
     cmd.env("TERM", "xterm-256color");
     cmd
+}
+
+/// Best-effort: stop the per-data-root daemon the CLI auto-started.
+/// Leaked daemons also self-exit via IZBA_DAEMON_IDLE_SECS=2.
+fn stop_daemon(data_dir: &std::path::Path) {
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_izba"))
+        .env("IZBA_DATA_DIR", data_dir)
+        .args(["daemon", "stop"])
+        .output();
 }
 
 /// Spawn the session, self-skipping if no PTY is available here.
@@ -58,6 +70,7 @@ fn vim_renders_through_the_probe_byte() {
     let out = sess.wait_exit(T).expect("exit");
     assert_eq!(out.code, Some(0));
     assert_eq!(guest.last_resize(), Some((90, 20)));
+    stop_daemon(guest.data_dir());
 }
 
 #[test]
@@ -80,6 +93,7 @@ fn arrow_keys_reach_the_guest() {
         got.windows(3).any(|w| w == b"\x1b[A"),
         "up-arrow not delivered: {got:?}"
     );
+    stop_daemon(guest.data_dir());
 }
 
 #[test]
@@ -103,6 +117,7 @@ fn ctrl_c_ends_exec_without_killing_izba() {
     // ExitStatus::Signal(2) -> CLI exit 128 + 2 = 130.
     assert_eq!(out.code, Some(130));
     assert!(guest.received_input().contains(&0x03));
+    stop_daemon(guest.data_dir());
 }
 
 #[test]
@@ -116,6 +131,7 @@ fn exit_code_passthrough() {
     };
     let out = sess.wait_exit(T).expect("exit");
     assert_eq!(out.code, Some(42));
+    stop_daemon(guest.data_dir());
 }
 
 #[test]
@@ -129,4 +145,5 @@ fn command_not_found_is_127() {
     };
     let out = sess.wait_exit(T).expect("exit");
     assert_eq!(out.code, Some(127));
+    stop_daemon(guest.data_dir());
 }

@@ -47,7 +47,20 @@ fn want() -> Option<E2eEnv> {
 fn izba(env: &E2eEnv) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_izba"));
     c.env("IZBA_DATA_DIR", &env.data_dir);
+    // The daemon-first CLI auto-starts izbad per data root; keep test
+    // daemons short-lived so nothing lingers after the suite.
+    c.env("IZBA_DAEMON_IDLE_SECS", "2");
     c
+}
+
+/// Best-effort: stop the per-data-root daemon the CLI auto-started.
+/// Leaked daemons also self-exit via IZBA_DAEMON_IDLE_SECS=2.
+fn stop_daemon(data_dir: &std::path::Path) {
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_izba"))
+        .env("IZBA_DATA_DIR", data_dir)
+        .env("IZBA_DAEMON_IDLE_SECS", "2")
+        .args(["daemon", "stop"])
+        .output();
 }
 
 /// Bring up a sandbox: create its config then start the VM via `run NAME --
@@ -111,6 +124,7 @@ fn exit_code_passthrough_end_to_end() {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_izba"));
     cmd.args(["exec", "-it", name, "--", "sh", "-c", "exit 42"]);
     cmd.env("IZBA_DATA_DIR", &env.data_dir);
+    cmd.env("IZBA_DAEMON_IDLE_SECS", "2");
     cmd.env("TERM", "xterm-256color");
     let mut sess = TerminalSession::spawn(cmd, 80, 24).expect("spawn pty session");
     let outcome = sess.wait_exit(TIMEOUT).expect("wait for izba exec to exit");
@@ -121,6 +135,7 @@ fn exit_code_passthrough_end_to_end() {
     );
 
     tear_down(&env, name);
+    stop_daemon(&env.data_dir);
 }
 
 #[test]
@@ -139,6 +154,7 @@ fn vim_renders_on_real_guest() {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_izba"));
     cmd.args(["exec", "-it", name, "--", "vi", "/workspace/x"]);
     cmd.env("IZBA_DATA_DIR", &env.data_dir);
+    cmd.env("IZBA_DAEMON_IDLE_SECS", "2");
     cmd.env("TERM", "xterm-256color");
     let mut sess = TerminalSession::spawn(cmd, 80, 24).expect("spawn pty session");
 
@@ -156,4 +172,5 @@ fn vim_renders_on_real_guest() {
     let _ = sess.wait_exit(TIMEOUT);
 
     tear_down(&env, name);
+    stop_daemon(&env.data_dir);
 }
