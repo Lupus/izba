@@ -109,17 +109,20 @@ impl Daemon {
     }
 }
 
-/// RAII connection counter (idle-exit input).
-struct ConnGuard<'a>(&'a Daemon);
+/// RAII connection counter (idle-exit input). Constructed in the ACCEPT
+/// loop, not in the handler thread — otherwise a connection accepted just
+/// before an idle-exit check could go uncounted and the daemon would exit
+/// under a live client.
+pub struct ConnGuard(Arc<Daemon>);
 
-impl<'a> ConnGuard<'a> {
-    fn new(d: &'a Daemon) -> Self {
+impl ConnGuard {
+    fn new(d: Arc<Daemon>) -> Self {
         d.active_conns.fetch_add(1, Ordering::SeqCst);
         Self(d)
     }
 }
 
-impl Drop for ConnGuard<'_> {
+impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.0.active_conns.fetch_sub(1, Ordering::SeqCst);
         *self.0.idle_since.lock().unwrap() = Instant::now();
@@ -128,8 +131,8 @@ impl Drop for ConnGuard<'_> {
 
 /// Serve one client connection: hello, then request/response frames until
 /// EOF — or until an `OpenStream` converts the connection into a raw splice.
-pub fn handle_connection(d: &Arc<Daemon>, mut stream: UdsStream) {
-    let _guard = ConnGuard::new(d);
+/// `_guard` is the accept-time connection count; dropped when we return.
+pub fn handle_connection(d: &Arc<Daemon>, mut stream: UdsStream, _guard: ConnGuard) {
     let hello: DaemonHello = match read_frame(&mut stream) {
         Ok(h) => h,
         Err(_) => return,
@@ -265,16 +268,22 @@ pub fn dispatch(
                 d.registry.set(&name, &config.image_ref, Liveness::Running);
                 DaemonResponse::Ok
             }
+            // Stop/Rm tear relays down only AFTER the sandbox op succeeds —
+            // a failed stop/rm (e.g. `rm` without force on a running
+            // sandbox) must leave published ports running. During a graceful
+            // stop the relay threads still accept; their vsock dials fail
+            // once the VM dies, which relay_one handles (logged, conn
+            // closed) — same ordering as the pre-daemon relay teardown.
             DaemonRequest::Stop { name } => {
+                sandbox::stop(&d.paths, &name, d.connector(), STOP_TIMEOUT)?;
                 d.relays.stop_all(&name);
                 let _ = std::fs::remove_file(relays::rules_path(&d.paths, &name));
-                sandbox::stop(&d.paths, &name, d.connector(), STOP_TIMEOUT)?;
                 d.registry.set_liveness(&name, Liveness::Stopped);
                 DaemonResponse::Ok
             }
             DaemonRequest::Rm { name, force } => {
-                d.relays.stop_all(&name);
                 sandbox::remove(&d.paths, &name, d.connector(), force)?;
+                d.relays.stop_all(&name);
                 d.registry.remove(&name);
                 DaemonResponse::Ok
             }
@@ -319,13 +328,17 @@ pub fn dispatch(
                 bind,
                 host_port,
             } => {
+                sandbox_must_exist(&d.paths, &name)?;
                 d.relays.unpublish(&name, bind, host_port)?;
                 relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
                 DaemonResponse::Ok
             }
-            DaemonRequest::PortList { name } => DaemonResponse::Ports {
-                rules: d.relays.active(&name),
-            },
+            DaemonRequest::PortList { name } => {
+                sandbox_must_exist(&d.paths, &name)?;
+                DaemonResponse::Ports {
+                    rules: d.relays.active(&name),
+                }
+            }
             DaemonRequest::Status => DaemonResponse::Status(DaemonStatus {
                 version: d.deps.version.clone(),
                 pid: std::process::id(),
@@ -345,6 +358,14 @@ pub fn dispatch(
     result.unwrap_or_else(|e| DaemonResponse::Error {
         message: format!("{e:#}"),
     })
+}
+
+/// Pre-daemon port commands errored on unknown sandboxes; keep that contract.
+fn sandbox_must_exist(paths: &Paths, name: &str) -> anyhow::Result<()> {
+    if !paths.sandbox_dir(name).join(CONFIG_FILE).is_file() {
+        anyhow::bail!("no such sandbox '{name}'");
+    }
+    Ok(())
 }
 
 /// Rebuild the world from disk: sweep debris dirs, migrate legacy relay
@@ -448,6 +469,12 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
         }
     }
 
+    // The spec promises a fresh daemon.log per daemon instance; spawn_detached
+    // appends, so truncate now that the flock proves we are the only daemon.
+    // (When auto-started detached, our own stderr IS this file in append mode:
+    // truncating sets length 0 and appends continue at the new end — correct.)
+    let _ = std::fs::File::create(paths.daemon_log());
+
     let listener = transport::bind_socket(paths)?;
     listener
         .set_nonblocking(true)
@@ -482,8 +509,11 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
                 if stream.set_nonblocking(false).is_err() {
                     continue;
                 }
+                // Count the connection NOW (see ConnGuard) so the next
+                // should_exit() already observes it.
+                let guard = ConnGuard::new(Arc::clone(&d));
                 let d = Arc::clone(&d);
-                std::thread::spawn(move || handle_connection(&d, stream));
+                std::thread::spawn(move || handle_connection(&d, stream, guard));
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -494,6 +524,7 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
             }
         }
     }
+    d.request_shutdown(); // stops the supervisor thread for library embedders
     let _ = std::fs::remove_file(paths.daemon_socket());
     let _ = lock.unlock();
     eprintln!("izbad: exiting");
@@ -561,7 +592,8 @@ mod tests {
     fn client_conn(d: &Arc<Daemon>) -> UdsStream {
         let (client, server) = UdsStream::pair().unwrap();
         let d2 = Arc::clone(d);
-        std::thread::spawn(move || handle_connection(&d2, server));
+        let guard = ConnGuard::new(Arc::clone(d)); // as the accept loop would
+        std::thread::spawn(move || handle_connection(&d2, server, guard));
         let mut c = client;
         write_frame(
             &mut c,
@@ -701,6 +733,89 @@ mod tests {
             Some(crate::liveness::Liveness::Stopped)
         );
         assert!(wait_dead(&vmm), "vmm stand-in must be dead after stop");
+    }
+
+    #[test]
+    fn rm_without_force_keeps_relays() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        write_state(&d.paths, "web", live_identity()); // it looks running
+                                                       // Publish a relay thread (skip if this sandbox denies binds).
+        let l = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP: bind denied");
+                return;
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        };
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let rule = crate::state::PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: port,
+            guest_port: 80,
+        };
+        match rpc(
+            &mut c,
+            &DaemonRequest::PortPublish {
+                name: "web".into(),
+                rule: rule.clone(),
+            },
+        ) {
+            DaemonResponse::Ok => {}
+            other => panic!("publish: {other:?}"),
+        }
+        // rm WITHOUT force on a running sandbox must fail AND leave relays alone.
+        match rpc(
+            &mut c,
+            &DaemonRequest::Rm {
+                name: "web".into(),
+                force: false,
+            },
+        ) {
+            DaemonResponse::Error { message } => assert!(message.contains("running"), "{message}"),
+            other => panic!("rm: {other:?}"),
+        }
+        assert_eq!(
+            d.relays.active("web"),
+            vec![rule],
+            "relays must survive a failed rm"
+        );
+    }
+
+    #[test]
+    fn port_commands_on_unknown_sandbox_error() {
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        match rpc(
+            &mut c,
+            &DaemonRequest::PortList {
+                name: "ghost".into(),
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("no such sandbox"), "{message}")
+            }
+            other => panic!("port ls ghost: {other:?}"),
+        }
+        match rpc(
+            &mut c,
+            &DaemonRequest::PortUnpublish {
+                name: "ghost".into(),
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: 8080,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("no such sandbox"), "{message}")
+            }
+            other => panic!("port unpublish ghost: {other:?}"),
+        }
     }
 
     #[test]

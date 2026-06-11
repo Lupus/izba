@@ -242,8 +242,6 @@ pub(crate) fn fake_connector(
 
 /// Connector to a guest that accepts the request but never replies —
 /// simulates a wedged-but-accepting control plane.
-// used by daemon tests (next tasks)
-#[allow(dead_code)]
 pub(crate) fn hanging_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn IoStream>> {
     |_paths: &Paths, _name: &str| {
         let (client, server) = UdsStream::pair()?;

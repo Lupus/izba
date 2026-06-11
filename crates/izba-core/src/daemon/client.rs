@@ -42,6 +42,20 @@ impl DaemonClient {
         }
     }
 
+    /// Like [`Self::connect_existing`], but a handshake that dies mid-flight
+    /// (EOF / reset / timeout) also counts as "no daemon": a daemon caught
+    /// mid-idle-exit accepts from the backlog then exits before serving the
+    /// hello. The spec contract is auto-restart — worst case one retry — so
+    /// `connect_with` treats that as absent and takes the spawn path.
+    /// `connect_existing` itself stays strict (status/stop must not spawn).
+    fn connect_existing_tolerant(paths: &Paths) -> anyhow::Result<Option<DaemonClient>> {
+        match Self::connect_existing(paths) {
+            Ok(c) => Ok(c),
+            Err(e) if is_daemon_gone(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Daemon-first connect: auto-start when absent, auto-upgrade (shutdown +
     /// respawn) on version mismatch.
     pub fn connect(paths: &Paths) -> anyhow::Result<DaemonClient> {
@@ -55,7 +69,7 @@ impl DaemonClient {
         my_version: &str,
     ) -> anyhow::Result<DaemonClient> {
         for attempt in 0..2 {
-            let client = match Self::connect_existing(paths)? {
+            let client = match Self::connect_existing_tolerant(paths)? {
                 Some(c) => c,
                 None => {
                     clear_stale_socket(paths)?;
@@ -194,6 +208,29 @@ impl DaemonClient {
             other => bail!("unexpected shutdown reply: {other:?}"),
         }
     }
+}
+
+/// Does this error chain say "the daemon died under us mid-handshake"?
+/// EOF/reset/timeout from the socket (raw io or wrapped in a FrameError).
+fn is_daemon_gone(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        let kind = match c.downcast_ref::<std::io::Error>() {
+            Some(io) => Some(io.kind()),
+            None => match c.downcast_ref::<izba_proto::FrameError>() {
+                Some(izba_proto::FrameError::Eof) => return true,
+                Some(izba_proto::FrameError::Io(io)) => Some(io.kind()),
+                _ => None,
+            },
+        };
+        matches!(
+            kind,
+            Some(
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::TimedOut
+            )
+        )
+    })
 }
 
 /// Pre-spawn cleanup: if we can take the daemon flock, no daemon is alive —
@@ -353,6 +390,116 @@ mod tests {
             .guest_rpc("web", &izba_proto::Request::Health)
             .unwrap_err();
         assert!(err.to_string().contains("not running"), "{err:#}");
+    }
+
+    /// Scripted izbad on the REAL daemon socket: answers every hello with
+    /// `version`; a Shutdown request unlinks the socket before the Ok reply
+    /// (so post-shutdown connects fail like a dead daemon's) and stops the
+    /// accept loop.
+    fn serve_fake_daemon(paths: &crate::paths::Paths, version: &str) -> anyhow::Result<()> {
+        use crate::daemon::transport;
+        let listener = transport::bind_socket(paths)?;
+        let version = version.to_string();
+        let socket = paths.daemon_socket();
+        std::thread::spawn(move || loop {
+            let Ok((mut s, _peer)) = listener.accept() else {
+                return;
+            };
+            if read_frame::<_, DaemonHello>(&mut s).is_err() {
+                continue;
+            }
+            let hello_ok = DaemonResponse::HelloOk {
+                version: version.clone(),
+            };
+            if write_frame(&mut s, &hello_ok).is_err() {
+                continue;
+            }
+            // Serve requests until this client hangs up.
+            while let Ok(req) = read_frame::<_, DaemonRequest>(&mut s) {
+                if matches!(req, DaemonRequest::Shutdown) {
+                    let _ = std::fs::remove_file(&socket);
+                    let _ = write_frame(&mut s, &DaemonResponse::Ok);
+                    return; // daemon "exits": stop accepting
+                }
+                let _ = write_frame(&mut s, &DaemonResponse::Ok);
+            }
+        });
+        Ok(())
+    }
+
+    /// connect_with's two jobs against a real socket: (1) no daemon → the
+    /// spawner runs and the fresh daemon is connected; (2) version mismatch
+    /// → upgrade dance (shutdown, await_gone, respawn at the new version).
+    #[test]
+    fn connect_with_spawns_and_upgrades() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        // Probe bind permission via the real transport (project convention:
+        // runtime-skip in sandboxes that deny bind).
+        match crate::daemon::transport::bind_socket(&paths) {
+            Ok(l) => {
+                drop(l);
+                let _ = std::fs::remove_file(paths.daemon_socket());
+            }
+            Err(e) => {
+                let denied = e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                });
+                if denied {
+                    eprintln!("SKIP: bind denied in this environment");
+                    return;
+                }
+                panic!("bind probe: {e:#}");
+            }
+        }
+        let spawned = AtomicUsize::new(0);
+        // 1) No daemon: the spawner runs once and we connect at its version.
+        let client = DaemonClient::connect_with(
+            &paths,
+            &|p: &crate::paths::Paths| {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                serve_fake_daemon(p, "v1")
+            },
+            "v1",
+        )
+        .unwrap();
+        assert_eq!(spawned.load(Ordering::SeqCst), 1, "spawner ran");
+        assert_eq!(client.server_version, "v1");
+        drop(client);
+        // 2) v1 daemon still serving, CLI is now v2: connect_with must shut
+        //    the old daemon down and bring up a fresh one at v2.
+        let client = DaemonClient::connect_with(
+            &paths,
+            &|p: &crate::paths::Paths| {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                serve_fake_daemon(p, "v2")
+            },
+            "v2",
+        )
+        .unwrap();
+        assert_eq!(spawned.load(Ordering::SeqCst), 2, "upgrade respawned");
+        assert_eq!(client.server_version, "v2");
+    }
+
+    /// The idle-exit accept race classifier: mid-handshake EOF/reset means
+    /// "daemon just exited" (retry via spawn); anything else propagates.
+    #[test]
+    fn daemon_gone_detection() {
+        use anyhow::Context as _;
+        let eof = Err::<(), _>(izba_proto::FrameError::Eof)
+            .context("reading hello reply")
+            .unwrap_err();
+        assert!(is_daemon_gone(&eof));
+        let reset = Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            .context("sending hello")
+            .unwrap_err();
+        assert!(is_daemon_gone(&reset));
+        let denied = Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("connecting to the izbad socket")
+            .unwrap_err();
+        assert!(!is_daemon_gone(&denied));
     }
 
     #[test]

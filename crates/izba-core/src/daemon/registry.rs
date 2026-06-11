@@ -82,6 +82,9 @@ impl Registry {
     }
 
     /// Swap in a complete fresh view (adoption, supervisor tick).
+    /// Handlers that registered a sandbox after this tick's disk read began
+    /// may be clobbered for ≤1 tick — acceptable for a cache whose source of
+    /// truth is disk.
     pub fn replace_all(&self, infos: Vec<SandboxInfo>) {
         let fresh: HashMap<String, Entry> = infos
             .into_iter()

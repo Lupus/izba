@@ -177,7 +177,8 @@ confined inside image pull. Client connections number in the handfuls.
   before exit), unlink socket, drop flock, exit 0. A client that loses the
   race gets connection-refused and `ensure_daemon()` restarts izbad —
   worst case one retry, never a hang.
-- **Security:** `<data>/daemon/` is `0700`, socket `0600` (Unix); on
+- **Security:** the socket is reachable only through the `0700`
+  `<data>/daemon/` dir (Unix; the socket file's own mode stays default); on
   Windows the data-root ACLs gate access. Local single-user only.
 
 ## 7. Adoption, ports, and migration
