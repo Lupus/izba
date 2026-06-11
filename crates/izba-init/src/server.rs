@@ -261,13 +261,17 @@ fn tcp_dial<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, port: u16) 
         let _ = target_w.shutdown(Shutdown::Write);
     });
 
-    // guest -> host: on guest EOF, half-close toward the host and drain is
-    // implicit (the host stops writing once it gets our shutdown).
+    // guest -> host: pump until the guest service closes its socket.
     let mut conn_w = conn_w;
     relay_pump(target_r, &mut conn_w);
-    // SAFETY: conn_w is a dup of the vsock conn fd; SHUT_WR delivers EOF to
-    // the host's read side without tearing down the inbound direction.
-    unsafe { libc::shutdown(conn_w.as_raw_fd(), libc::SHUT_WR) };
+    // Full shutdown, not SHUT_WR: Cloud Hypervisor's hybrid vsock does not
+    // propagate a guest half-close to the host unix socket (the exec/tty path
+    // uses SHUT_RDWR for the same reason), so a lone SHUT_WR leaves the host
+    // client waiting for EOF forever. By this point the guest service has
+    // closed, our final bytes are written (graceful TX — the OpenVMM churn
+    // mitigation), and the inbound direction has nowhere to deliver to; the
+    // full shutdown also unblocks the reader thread's pending read.
+    unsafe { libc::shutdown(conn_w.as_raw_fd(), libc::SHUT_RDWR) };
     let _ = reader.join();
 }
 
