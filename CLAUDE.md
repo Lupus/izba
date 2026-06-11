@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 izba: open-source per-project microVM sandboxes for AI coding agents (a
-independent reimplementation of Docker Desktop's `sbx`). Daemonless Rust CLI on top of
+independent reimplementation of Docker Desktop's `sbx`). Daemon-first Rust CLI on top of
 Cloud Hypervisor/KVM; Windows/WHP via OpenVMM is planned but not started.
 
 ## Documentation map
@@ -30,6 +30,7 @@ All six must be green before any commit (the cross gates need `rustup target
 add x86_64-pc-windows-gnu` and the `gcc-mingw-w64-x86-64` toolchain). Real-VM integration tests need KVM +
 artifacts and are env-gated: `IZBA_INTEGRATION=1 cargo test -p izba-core --test
 integration -- --test-threads=1` (full setup in [docs/testing.md](docs/testing.md)).
+Daemon e2e (also KVM-gated): `IZBA_INTEGRATION=1 cargo test -p izba-cli --test daemon_e2e -- --test-threads=1`.
 
 **Test design constraint:** unit tests never bind unix/vsock listeners — some
 sandboxes deny `bind` with EPERM. Use `UnixStream::pair()` fakes (see the
@@ -41,10 +42,10 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 
 - `izba-proto` — host↔guest wire protocol: u32-LE length-prefixed JSON frames
   + `Request`/`Response`/`StreamOpen` types. Shared verbatim by both sides.
-- `izba-core` — the product library, zero CLI assumptions (a future `izbad`
-  daemon wraps the same core). `sandbox.rs` is the lifecycle heart;
-  `vmm/` driver trait + Cloud Hypervisor impl; `image/` OCI→erofs pipeline;
-  `procmgr.rs` detached spawning; `vsock.rs` hybrid-vsock client.
+- `izba-core` — the product library, zero CLI assumptions. `sandbox.rs` is the
+  lifecycle heart; `vmm/` driver trait + Cloud Hypervisor impl; `image/`
+  OCI→erofs pipeline; `procmgr.rs` detached spawning; `vsock.rs`
+  hybrid-vsock client; `daemon/` izbad server+client (framed JSON over AF_UNIX).
 - `izba-init` — guest PID 1 (static musl): mounts, exec engine (PTY + pipes),
   vsock servers. Everything except `main.rs` is host-testable.
 - `izba-cli` — thin clap binary over izba-core.
@@ -55,10 +56,15 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 
 ## Load-bearing contracts (change all ends or none)
 
-- **Daemonless invariant:** a sandbox = its dir under
-  `~/.local/share/izba/sandboxes/<name>/` + live processes. Liveness is always
-  re-verified via pid + `/proc/<pid>/stat` starttime identity (PID-reuse-safe;
-  zombies count as dead) — never trusted from `state.json` alone.
+- **Disk-state invariant (daemon-first):** a sandbox = its dir under
+  `~/.local/share/izba/sandboxes/<name>/` + live processes; liveness is
+  always re-verified via pid + `/proc/<pid>/stat` starttime identity — never
+  trusted from `state.json` alone. `izbad` (auto-started `izba daemon run`,
+  socket `<data>/daemon/izbad.sock`, framed-JSON `daemon::proto`) holds NO
+  authoritative state: it adopts everything from disk at startup, so
+  killing/upgrading it never harms sandboxes. Port relays are daemon
+  threads; rules persist in `ports.json` (plain `Vec<PortRule>`).
+  VMs/sidecars are never auto-restarted — death ⇒ honest unhealthy reason.
 - **vsock ports:** 1025 control RPC, 1026 streams (`CONTROL_PORT`/`STREAM_PORT`
   in izba-proto). Stream conns send ONE `StreamOpen` frame (`Attach` exec
   streams / `TcpDial` port relays / `TarExtract`+`TarCreate` for cp), then
@@ -66,6 +72,9 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   hybrid-vsock: `CONNECT <port>\n` on `run/vsock.sock`, response read
   byte-by-byte (buffering eats stream data). CH does NOT propagate vsock
   half-close guest→host: teardown must be full `SHUT_RDWR` once TX is done.
+  CLI streams now reach the guest through izbad's `OpenStream` splice (client
+  sends the guest `StreamOpen` in-band after the daemon replies Ok); the
+  framing after the splice is unchanged.
 - **Disk order:** `sandbox::start()` builds `[rootfs.erofs (RO), rw.img (RW)]`
   → CH enumerates `--disk` order as vda, vdb → init mounts `/dev/vda` erofs
   lower + `/dev/vdb` ext4 upper into an overlay at `/rootfs`.

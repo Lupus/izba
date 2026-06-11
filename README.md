@@ -33,10 +33,11 @@ installer yet (binaries are staged by script).
 
 Key properties:
 
-- **Daemonless.** The CLI spawns the VMM detached and exits. A running sandbox
-  is fully described by its state directory
-  (`~/.local/share/izba/sandboxes/<name>/`); any later invocation reconstructs
-  everything from disk — no background service required.
+- **Daemon-first, daemonless soul.** Every `izba` command auto-starts `izbad`
+  (the same binary, via `izba daemon run`, socket
+  `~/.local/share/izba/daemon/izbad.sock`) — no install or service step
+  required. The daemon rebuilds all state from disk at startup, so you can kill
+  or upgrade it at any time without harming running sandboxes.
 - **Disk-state as source of truth.** `state.json` records every PID with its
   `starttime` field from `/proc/<pid>/stat` to defeat PID reuse.
 - **Two vsock ports.** Port 1025 carries length-prefixed JSON control RPCs
@@ -91,6 +92,9 @@ izba port   publish|unpublish|ls NAME [RULE]   # TCP, runtime or create-time -p
 izba ls
 izba stop   NAME
 izba rm     [--force] NAME
+izba daemon run                         # run the daemon in the foreground (auto-started on demand otherwise)
+izba daemon status                      # daemon health + supervised sandboxes
+izba daemon stop                        # stop the daemon; sandboxes keep running, published ports pause
 ```
 
 ## Project layout
@@ -99,7 +103,7 @@ izba rm     [--force] NAME
 crates/
   izba-core/   # sandbox lifecycle, VMM driver trait + Cloud Hypervisor driver,
                #   OCI image → rootfs pipeline, guest control-plane client
-  izba-cli/    # `izba` binary — thin, daemonless wrapper over izba-core
+  izba-cli/    # `izba` binary — thin wrapper over izba-core; auto-starts izbad
   izba-init/   # guest PID 1 agent (static musl x86_64); boots, mounts,
                #   and serves the control + stream ports
   izba-proto/  # host↔guest protocol types shared by core and init

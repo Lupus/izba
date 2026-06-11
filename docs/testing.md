@@ -146,7 +146,30 @@ Notes:
   them on the way out (even on panic), so failed runs do not pollute
   `~/.local/share/izba`.
 
-## 5. Manual smoke test
+## 5. Daemon e2e
+
+Tests in `crates/izba-cli/tests/daemon_e2e.rs` exercise auto-start, kill-adopt,
+stop-survival, idle-timeout, and upgrade-dance using a real KVM sandbox. Same
+prerequisites as §4 (KVM + artifacts + env vars).
+
+```sh
+IZBA_INTEGRATION=1 \
+IZBA_KERNEL=$HOME/.local/share/izba/artifacts/vmlinux \
+IZBA_INITRAMFS=$HOME/.local/share/izba/artifacts/initramfs.cpio.gz \
+cargo test -p izba-cli --test daemon_e2e -- --test-threads=1 --nocapture
+```
+
+Env knobs available for the daemon tests:
+
+- `IZBA_DAEMON_IDLE_SECS` — seconds of inactivity before the daemon self-exits
+  (default 900; set to `0` to disable idle-exit).
+- `IZBA_DAEMON_TICK_MS` — supervision tick interval in milliseconds (default 2000).
+- `IZBA_DAEMON_VERSION` — version string override, used by upgrade-dance tests.
+
+The Windows PowerShell gate (`hack/spike/validate-izba-windows.ps1`) also
+validates daemon kill-adopt + stop-survival on Windows.
+
+## 6. Manual smoke test
 
 ```sh
 cargo build --release
@@ -177,7 +200,7 @@ target/release/izba rm <name>
 (`<name>` is the sanitized basename of the workspace directory; `izba ls`
 shows it.)
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 **Where to look first:** the guest serial console is written to
 `<root>/sandboxes/<name>/logs/console.log` (`<root>` is
@@ -197,7 +220,7 @@ next to it: `vmm.log`, `passt.log`, `virtiofsd-workspace.log`.
 | `sandbox '<name>' is busy` | Another izba process holds the per-sandbox flock; wait for it or find it with `fuser '<root>/sandboxes/.<name>.lock'` (the lock lives beside the sandbox dir). |
 | Boot consistently > 5 s warning in `boot_to_healthy_under_5s` | Expected on slow/loaded machines; the hard budget is 10 s. Investigate console.log timestamps if it is near 10 s. |
 
-## 7. Windows validation (manual, spike host)
+## 8. Windows validation (manual, spike host)
 
 The Windows port has no CI; validation is script-driven on a Windows 11
 host with WHP enabled. Build + stage from WSL, then run the parity suite:
