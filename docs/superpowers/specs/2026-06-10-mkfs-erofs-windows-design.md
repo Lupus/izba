@@ -1,7 +1,7 @@
 # mkfs.erofs on Windows: native MinGW tar-mode port — design
 
 **Date:** 2026-06-10
-**Status:** implemented, merged to main 2026-06-10 (§3.4 deferred — see section)
+**Status:** implemented, merged to main 2026-06-10; §3.4 closed on real Windows 2026-06-11
 **Resolves:** follow-up #2 from
 [2026-06-10-openvmm-spike-s1-findings.md](2026-06-10-openvmm-spike-s1-findings.md)
 (§A2 "erofs on Windows") — the erofs creation path for the future Windows/WHP
@@ -111,6 +111,13 @@ images vs the same-source Linux build), which was accepted as sufficient
 evidence for now. Run this gate as part of the OpenVmmDriver bring-up
 checklist instead — first via `hack/spike/verify-mkfs-erofs-parity.ps1` on
 the real Windows host, then the rung-7 boot with a Windows-built rootfs.
+
+**CLOSED (2026-06-11):** `verify-mkfs-erofs-parity.ps1` PASS on the spike
+host (Windows 11 24H2, native pwsh, no wine): sha256
+`8f21d899…ffd72345`, byte-identical to the Linux reference. The
+boot-with-a-Windows-built-rootfs leg is covered by the Windows-port Plan 2
+full-CLI validation (izba.exe builds its rootfs.erofs natively on Windows
+through the bundled binary).
 
 ### 3.5 izba-core discovery shim
 

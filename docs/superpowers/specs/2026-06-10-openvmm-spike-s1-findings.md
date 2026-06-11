@@ -710,8 +710,11 @@ erofs-utils both make a WSL2-free path realistic; see addendum before deciding.)
    same-source Linux build (verified under wine); izba-core discovers the
    binary via `$IZBA_MKFS_EROFS` → exe-adjacent `libexec/` → `PATH`. The
    real-Windows-host leg (`hack/spike/verify-mkfs-erofs-parity.ps1` + a rung-7
-   boot with a Windows-built rootfs.erofs) is **deferred** on the strength of
-   the wine parity result — fold it into the OpenVmmDriver bring-up checklist.
+   boot with a Windows-built rootfs.erofs) was deferred on the strength of
+   the wine parity result, then **closed 2026-06-11** during the Windows-port
+   bring-up: ps1 parity PASS natively on the spike host (byte-identical to
+   the Linux reference); the boot leg is covered by the Plan-2 full-CLI
+   validation.
 
 3. **Investigate the virtiofs FUSE_INIT scheduling issue.** ~~The current
    `mounts::apply()` workaround is fragile.~~ **DONE (2026-06-10, post-spike):**
