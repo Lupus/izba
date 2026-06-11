@@ -28,7 +28,7 @@ use izba_core::liveness::Liveness;
 use izba_core::paths::Paths;
 use izba_core::procmgr;
 use izba_core::sandbox::{self, Artifacts, CreateOpts};
-use izba_core::state::{load_json, RunState, STATE_FILE};
+use izba_core::state::{load_json, PortRule, RunState, STATE_FILE};
 use izba_core::vmm::cloud_hypervisor::CloudHypervisorDriver;
 use izba_core::vmm::UdsStream;
 use izba_proto::{
@@ -364,6 +364,56 @@ fn exec_ok(paths: &Paths, name: &str, argv: &[&str]) -> String {
         "exec {argv:?} failed: status {status:?}\nstdout: {stdout}\nstderr: {stderr}"
     );
     stdout
+}
+
+/// Start a busybox httpd in the guest serving `/workspace`, detached, so it
+/// keeps running after the exec returns. Writes `index.html` first.
+fn start_guest_httpd(paths: &Paths, name: &str, body: &str, guest_port: u16) {
+    exec_ok(
+        paths,
+        name,
+        &[
+            "sh",
+            "-c",
+            &format!("printf '%s' '{body}' > /workspace/index.html"),
+        ],
+    );
+    // `httpd -f` stays in the foreground; background it with & and disown via
+    // setsid so it survives the exec's process-group teardown.
+    let cmd = format!("setsid httpd -f -p {guest_port} -h /workspace >/dev/null 2>&1 &");
+    exec_ok(paths, name, &["sh", "-c", &cmd]);
+    // Give httpd a moment to bind.
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// Minimal HTTP/1.0 GET against a host TCP port; returns the response body
+/// (everything after the blank line). Retries briefly while the relay warms up.
+fn http_get(host_port: u16) -> anyhow::Result<String> {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let last_err = match (|| -> anyhow::Result<String> {
+            let mut s = TcpStream::connect(("127.0.0.1", host_port))?;
+            s.set_read_timeout(Some(Duration::from_secs(3)))?;
+            s.write_all(b"GET /index.html HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+            let mut resp = String::new();
+            s.read_to_string(&mut resp)?;
+            let body = resp
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_default();
+            Ok(body)
+        })() {
+            Ok(body) if !body.is_empty() => return Ok(body),
+            Ok(_) => "empty body".to_string(),
+            Err(e) => e.to_string(),
+        };
+        if Instant::now() >= deadline {
+            anyhow::bail!("http_get({host_port}) never succeeded: {last_err}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -808,4 +858,133 @@ fn cp_missing_guest_src_errors() {
     );
 
     stop_sandbox(&tb, "cpmiss");
+}
+
+#[test]
+fn port_publish_create_time() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("port-create");
+
+    // create with -p 18080:8000 (persisted), then boot.
+    let digest = provision_image(&env, &tb.paths);
+    sandbox::create(
+        &tb.paths,
+        "portc",
+        &CreateOpts {
+            image_digest: digest,
+            image_ref: env.image_ref.clone(),
+            cpus: 1,
+            mem_mb: 1024,
+            workspace: ws.to_path_buf(),
+            rw_size_gb: 2,
+            ports: vec![PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: 18080,
+                guest_port: 8000,
+            }],
+        },
+    )
+    .expect("create");
+    tb.names.push("portc".to_string());
+    if let Err(e) = start_sandbox(&env, &tb, "portc") {
+        panic!(
+            "boot failed: {e:#}\nconsole:\n{}",
+            console_tail(&tb.paths, "portc")
+        );
+    }
+
+    start_guest_httpd(&tb.paths, "portc", "hello-from-guest", 8000);
+    let body = http_get(18080).expect("curl published port");
+    assert_eq!(body, "hello-from-guest");
+
+    stop_sandbox(&tb, "portc");
+}
+
+#[test]
+fn port_publish_runtime_and_unpublish() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("port-runtime");
+    boot(&env, &mut tb, "portr", &ws);
+
+    start_guest_httpd(&tb.paths, "portr", "runtime-body", 8000);
+
+    let connector = sandbox::default_connector();
+    sandbox::publish_port(
+        &tb.paths,
+        "portr",
+        PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: 18081,
+            guest_port: 8000,
+        },
+        &connector,
+    )
+    .expect("runtime publish");
+
+    let body = http_get(18081).expect("curl runtime-published port");
+    assert_eq!(body, "runtime-body");
+
+    // ls shows exactly the one live rule.
+    let listed = sandbox::list_ports(&tb.paths, "portr").expect("ls");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].rule.host_port, 18081);
+
+    // unpublish → the host port stops accepting (connection refused).
+    sandbox::unpublish_port(&tb.paths, "portr", "127.0.0.1".parse().unwrap(), 18081)
+        .expect("unpublish");
+    // Give the relay a moment to die and release the port.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        http_get(18081).is_err(),
+        "port must be unreachable after unpublish"
+    );
+    let listed = sandbox::list_ports(&tb.paths, "portr").expect("ls after unpublish");
+    assert!(listed.is_empty(), "no rules should remain");
+
+    stop_sandbox(&tb, "portr");
+}
+
+#[test]
+fn stop_kills_port_relays() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("port-stop");
+    boot(&env, &mut tb, "ports", &ws);
+
+    let connector = sandbox::default_connector();
+    sandbox::publish_port(
+        &tb.paths,
+        "ports",
+        PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: 18082,
+            guest_port: 8000,
+        },
+        &connector,
+    )
+    .expect("publish");
+    let records = sandbox::list_ports(&tb.paths, "ports").expect("ls");
+    assert_eq!(records.len(), 1);
+    let relay = records[0].relay.clone();
+    assert!(
+        procmgr::pid_alive(&relay),
+        "relay must be alive after publish"
+    );
+
+    stop_sandbox(&tb, "ports");
+
+    let dead = (0..40).any(|_| {
+        if !procmgr::pid_alive(&relay) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        !procmgr::pid_alive(&relay)
+    });
+    assert!(dead, "stop must kill the relay (no orphaned __port-relay)");
+    assert!(
+        !tb.paths.sandbox_dir("ports").join("ports.json").exists(),
+        "ports.json must be removed by stop"
+    );
 }
