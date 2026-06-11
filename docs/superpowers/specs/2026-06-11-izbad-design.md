@@ -68,15 +68,21 @@ polling, not by parenthood.
   the existing `UdsStream` alias (std on Unix, `uds_windows` on Windows —
   native since Win10 1803). No named-pipe code path.
 - Daemon log: `<data>/daemon/daemon.log`, truncated at daemon start.
-- Wire format: izba-proto u32-LE length-prefixed JSON frames — identical
-  framing to the host↔guest protocol, new message types:
-  - `DaemonHello { version }` ⇄ `DaemonHelloOk { version }` — first
-    exchange on every connection; `version` is the crate version and must
-    match **exactly** (CLI and daemon are the same binary in normal
-    operation; mismatch means an upgrade happened).
+- Wire format: u32-LE length-prefixed JSON frames via the izba-proto codec.
+  The daemon message types live in `izba-core::daemon::proto` (izba-proto
+  stays the guest-shared protocol only — it cannot depend on core types like
+  `PortRule`, and both ends of the daemon protocol live in izba-core anyway):
+  - `DaemonHello { version }` ⇄ `DaemonResponse::HelloOk { version }` — first
+    exchange on every connection. The server always answers with its own
+    version; the **client** compares and drives the upgrade dance on
+    mismatch (exact match required — CLI and daemon are the same binary in
+    normal operation).
   - `DaemonRequest` / `DaemonResponse` — control RPCs (see §4).
-  - `DaemonStreamOpen` — one-shot first frame on stream connections, then
-    raw bytes (mirrors the guest `StreamOpen` pattern).
+  - `DaemonRequest::OpenStream { name }` converts the connection: after the
+    daemon replies `Ok` (sandbox validated, vsock stream-port dialed), the
+    connection becomes a raw byte splice to the guest. The client then sends
+    the guest `StreamOpen` frame itself, in-band — the daemon never parses
+    stream framing at all.
 - Long-running ops (create/pull, start-with-boot-wait) emit zero or more
   `DaemonResponse::Progress { … }` frames before the terminal Ok/Error on
   the same connection; the CLI renders them as today's progress output.
@@ -88,10 +94,10 @@ Guest byte streams pass through izbad as a **pure splice**:
 ```
 izba exec -it … (CLI)                         izbad                      guest
   control conn ── DaemonRequest::GuestRpc{name, req} ──► hybrid-vsock 1025 ──►
-  stream  conn ── DaemonStreamOpen::Guest{name, open: StreamOpen} ─┐
+  stream  conn ── DaemonRequest::OpenStream{name} ─────────────────┐
                                                                    ▼
                                               validate name, dial vsock 1026,
-                                              forward inner StreamOpen frame,
+                                              reply Ok; client sends the guest StreamOpen in-band,
                                               then splice bytes both ways
 ```
 
@@ -110,8 +116,7 @@ applies the same graceful shutdown+drain teardown on both legs.
 | Ports | `PortPublish`, `PortUnpublish`, `PortList` |
 | Daemon | `Status` (version, uptime, supervised set), `Shutdown` |
 
-`DaemonStreamOpen::Guest { name, open: StreamOpen }` is the only stream
-variant this iteration. Exact request/response fields are an
+`DaemonRequest::OpenStream { name }` is the only stream-conversion request this iteration. Exact request/response fields are an
 implementation-plan concern; the rule is that they carry the same data the
 corresponding `izba-core` functions take today.
 
@@ -139,6 +144,11 @@ Version mismatch at hello: client sends `Shutdown { reason: upgrade }`,
 waits boundedly for exit, re-runs `ensure_daemon()` once. Sandboxes are
 untouched throughout.
 
+`izba daemon status` and `izba daemon stop` never auto-start a daemon (they
+report "not running" instead). `Status` includes the daemon pid so tests and
+scripts can kill the process directly. `daemon stop` pauses published port
+relays (they are daemon threads) until the next daemon starts and re-adopts.
+
 The hidden `__port-relay` subcommand and its pid-file machinery are
 **deleted** (relays are daemon threads now). `izba daemon run` refuses to
 start if the flock is held ("daemon already running").
@@ -150,9 +160,10 @@ confined inside image pull. Client connections number in the handfuls.
 
 | Module | Responsibility |
 | --- | --- |
-| `transport.rs` | `Listener`/`Stream` seam over `UdsListener`/`UdsStream` + in-memory pair-backed fake (the `PairListener` pattern) so unit tests never bind sockets |
+| `transport.rs` | platform alias `UdsListener`, socket bind (perms, stale unlink), connect helper, version string |
 | `server.rs` | accept loop; thread per connection; hello, then dispatch control frames or hand stream conns to the splice path |
 | `registry.rs` | `Mutex<HashMap<name, SandboxEntry>>` — verified pid identities (VMM + sidecars), health + reason, relay thread handles, per-sandbox op lock. Built at startup by adoption (§7) |
+| `relays.rs` | in-daemon relay threads (bind + cancellable accept loop per rule) and `ports.json` rules persistence incl. legacy-schema migration |
 | `supervisor.rs` | background thread, 1–2 s tick: re-verify every owned process (existing `liveness.rs`), set unhealthy reasons, respawn dead relay threads, drive the idle-exit timer |
 | `client.rs` | `DaemonClient`: `ensure_daemon()`, hello/version check, typed RPC methods, `open_guest_stream()` returning a raw stream for the CLI's existing framing code |
 
