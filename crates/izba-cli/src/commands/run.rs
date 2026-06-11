@@ -51,7 +51,8 @@ fn resolve_or_create(
             || opts.cpus != 2
             || opts.mem != 4096
             || opts.rw_size_gb != 8
-            || opts.name.is_some();
+            || opts.name.is_some()
+            || !opts.publish.is_empty();
         if has_non_default {
             eprintln!(
                 "warning: '{name_or_dir}' is an existing sandbox — \
@@ -65,7 +66,12 @@ fn resolve_or_create(
     if !paths.sandbox_dir(&name).join(CONFIG_FILE).is_file() {
         eprintln!("resolving {} (pulls if not cached)...", opts.image);
         let digest = image::ensure_image(paths, &opts.image)?;
-        sandbox::create(paths, &name, &super::create_opts(opts, digest, workspace))?;
+        let ports = super::parse_publish(&opts.publish)?;
+        sandbox::create(
+            paths,
+            &name,
+            &super::create_opts(opts, digest, workspace, ports),
+        )?;
     }
     Ok(name)
 }

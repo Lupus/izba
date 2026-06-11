@@ -2,6 +2,7 @@ pub mod cp;
 pub mod create;
 pub mod exec;
 pub mod ls;
+pub mod port;
 pub mod rm;
 pub mod run;
 pub mod stop;
@@ -10,6 +11,7 @@ use crate::name;
 use crate::SandboxOpts;
 use anyhow::Context;
 use izba_core::sandbox::CreateOpts;
+use izba_core::state::PortRule;
 use std::path::{Path, PathBuf};
 
 /// Resolve the sandbox name for a workspace dir: `--name` wins, otherwise
@@ -33,7 +35,20 @@ fn ensure_workspace(dir: &Path) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("resolving workspace {}", dir.display()))
 }
 
-fn create_opts(opts: &SandboxOpts, digest: String, workspace: PathBuf) -> CreateOpts {
+/// Parse the repeatable `-p/--publish` specs into PortRules.
+pub fn parse_publish(specs: &[String]) -> anyhow::Result<Vec<PortRule>> {
+    specs
+        .iter()
+        .map(|s| izba_core::portfwd::parse_rule(s))
+        .collect()
+}
+
+fn create_opts(
+    opts: &SandboxOpts,
+    digest: String,
+    workspace: PathBuf,
+    ports: Vec<PortRule>,
+) -> CreateOpts {
     CreateOpts {
         image_digest: digest,
         image_ref: opts.image.clone(),
@@ -41,6 +56,6 @@ fn create_opts(opts: &SandboxOpts, digest: String, workspace: PathBuf) -> Create
         mem_mb: opts.mem,
         workspace,
         rw_size_gb: opts.rw_size_gb,
-        ports: Vec::new(),
+        ports,
     }
 }

@@ -39,6 +39,52 @@ struct SandboxOpts {
     /// Sandbox name (default: derived from the workspace directory name)
     #[arg(long)]
     name: Option<String>,
+    /// Publish a host port to the guest: [BIND:]HOST:GUEST (repeatable)
+    #[arg(short = 'p', long = "publish", value_name = "[BIND:]HOST:GUEST")]
+    publish: Vec<String>,
+}
+
+/// Args for the hidden `__port-relay` re-invocation.
+#[derive(Debug, Args)]
+struct PortRelayArgs {
+    /// Path to the sandbox's hybrid-vsock unix socket.
+    #[arg(long)]
+    vsock: PathBuf,
+    /// Host bind address.
+    #[arg(long)]
+    bind: String,
+    /// Host port to listen on.
+    #[arg(long)]
+    host_port: u16,
+    /// Guest port to dial.
+    #[arg(long)]
+    guest_port: u16,
+    /// Where the relay writes its own pid.
+    #[arg(long)]
+    pid_file: PathBuf,
+}
+
+#[derive(Debug, Subcommand)]
+enum PortCmd {
+    /// Publish a port against a running sandbox
+    Publish {
+        /// Sandbox name
+        name: String,
+        /// [BIND:]HOST:GUEST
+        rule: String,
+    },
+    /// Remove a published port by its [BIND:]HOST key
+    Unpublish {
+        /// Sandbox name
+        name: String,
+        /// [BIND:]HOST (GUEST is not needed)
+        key: String,
+    },
+    /// List active published ports
+    Ls {
+        /// Sandbox name
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,6 +144,12 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Manage published ports (host -> guest TCP)
+    #[command(subcommand)]
+    Port(PortCmd),
+    /// Internal: the per-rule port-publish relay process (not for direct use)
+    #[command(hide = true, name = "__port-relay")]
+    PortRelay(PortRelayArgs),
 }
 
 fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
@@ -118,6 +170,14 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         Cmd::Ls => commands::ls::run(paths),
         Cmd::Stop { name } => commands::stop::run(paths, &name),
         Cmd::Rm { name, force } => commands::rm::run(paths, &name, force),
+        Cmd::Port(pc) => match pc {
+            PortCmd::Publish { name, rule } => commands::port::publish(paths, &name, &rule),
+            PortCmd::Unpublish { name, key } => commands::port::unpublish(paths, &name, &key),
+            PortCmd::Ls { name } => commands::port::ls(paths, &name),
+        },
+        Cmd::PortRelay(a) => {
+            commands::port::relay(&a.vsock, &a.bind, a.host_port, a.guest_port, &a.pid_file)
+        }
     }
 }
 
@@ -196,5 +256,81 @@ mod tests {
         assert_eq!(dst, "web:/etc/a");
         // Both operands are required.
         assert!(Cli::try_parse_from(["izba", "cp", "only-one"]).is_err());
+    }
+
+    #[test]
+    fn parse_create_publish_flags() {
+        let cli = Cli::try_parse_from([
+            "izba",
+            "create",
+            "-p",
+            "8080:80",
+            "-p",
+            "0.0.0.0:9090:90",
+            ".",
+        ])
+        .unwrap();
+        let Cmd::Create { opts, .. } = cli.cmd else {
+            panic!("expected create");
+        };
+        assert_eq!(
+            opts.publish,
+            vec!["8080:80".to_string(), "0.0.0.0:9090:90".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_port_publish() {
+        let cli = Cli::try_parse_from(["izba", "port", "publish", "web", "8080:80"]).unwrap();
+        let Cmd::Port(PortCmd::Publish { name, rule }) = cli.cmd else {
+            panic!("expected port publish");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(rule, "8080:80");
+    }
+
+    #[test]
+    fn parse_port_unpublish() {
+        let cli =
+            Cli::try_parse_from(["izba", "port", "unpublish", "web", "127.0.0.1:8080"]).unwrap();
+        let Cmd::Port(PortCmd::Unpublish { name, key }) = cli.cmd else {
+            panic!("expected port unpublish");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(key, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn parse_port_ls() {
+        let cli = Cli::try_parse_from(["izba", "port", "ls", "web"]).unwrap();
+        let Cmd::Port(PortCmd::Ls { name }) = cli.cmd else {
+            panic!("expected port ls");
+        };
+        assert_eq!(name, "web");
+    }
+
+    #[test]
+    fn parse_hidden_port_relay() {
+        let cli = Cli::try_parse_from([
+            "izba",
+            "__port-relay",
+            "--vsock",
+            "/run/vsock.sock",
+            "--bind",
+            "127.0.0.1",
+            "--host-port",
+            "8080",
+            "--guest-port",
+            "80",
+            "--pid-file",
+            "/run/port.pid",
+        ])
+        .unwrap();
+        let Cmd::PortRelay(args) = cli.cmd else {
+            panic!("expected __port-relay");
+        };
+        assert_eq!(args.bind, "127.0.0.1");
+        assert_eq!(args.host_port, 8080);
+        assert_eq!(args.guest_port, 80);
     }
 }
