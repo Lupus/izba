@@ -8,11 +8,27 @@
 #include <stdarg.h>
 
 /* CRT text-mode translation would corrupt the image; force binary mode for
- * every fd (mingw-w64 reads _CRT_fmode at startup).
- * NOTE: this global only takes effect because this archive member is pulled in
- * by the shim references.  If shims ever become header-only inlines, binary
+ * every fd.
+ *
+ * The _CRT_fmode global alone is NOT sufficient: msvcrt.dll's open() reads
+ * its OWN _fmode default, reachable only through the __p__fmode() accessor —
+ * the mingw-side variable never crosses the DLL boundary on this code path.
+ * Empirically (real Windows and wine): erofs' tar fd, opened O_RDONLY
+ * without O_BINARY in mkfs/main.c, came up in TEXT mode — reads truncated
+ * at the first 0x1a byte in file data and izba image builds failed with
+ * EIO. The constructor writes msvcrt's real default before main() runs.
+ *
+ * NOTE: these only take effect because this archive member is pulled in by
+ * the shim references.  If shims ever become header-only inlines, binary
  * mode silently vanishes. */
 unsigned int _CRT_fmode = _O_BINARY;
+
+_CRTIMP int *__cdecl __p__fmode(void);
+
+__attribute__((constructor)) static void izba_force_binary_fmode(void)
+{
+	*__p__fmode() = _O_BINARY;
+}
 
 static void die_stub(const char *api)
 {

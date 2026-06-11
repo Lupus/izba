@@ -21,6 +21,22 @@ tree (POSIX shims, stubs, `_O_BINARY`) lives in `hack/mingw-compat/` instead.
   - `gzran.c`: don't include `<zlib.h>` (absent from MinGW sysroots); the
     entire file body is already `HAVE_ZLIB`-guarded.
 
+- `0002-mingw-binary-tmpfile.patch` — `lib/diskbuf.c`, `#ifdef __MINGW32__`-
+  guarded:
+  - `erofs_tmpfile()`: mingw-w64's `mkstemp` opens in CRT TEXT mode (no
+    `_O_BINARY`), so LF bytes are CRLF-expanded on write and `0x1a` reads
+    back as EOF — silently corrupting any binary file content staged in the
+    diskbuf (found on the real-Windows host: izba image builds failed with
+    EIO on the first tar entry containing a `0x1a` byte). Replaced with an
+    explicit `_O_BINARY | _O_TEMPORARY` open in `%TMPDIR%/%TMP%/%TEMP%`
+    (delete-on-close also fixes the unlink-while-open leak — Windows cannot
+    unlink open files).
+  - `erofs_diskbuf_init()`: skip the stream-0 "stash inside the device fd"
+    optimization — it ftruncates the output image to 2 TiB and writes at a
+    1 TiB offset, which relies on sparse-file semantics; on a non-sparse
+    NTFS file a successful ftruncate would make the first stash write
+    zero-fill terabytes.
+
 Regenerate after editing the extracted source:
 
     cd ${XDG_CACHE_HOME:-~/.cache}/izba/erofs-utils/erofs-utils-<ver>

@@ -1,0 +1,83 @@
+diff a/lib/diskbuf.c b/lib/diskbuf.c
+--- a/lib/diskbuf.c	2026-06-11 11:16:56.758203716 +0400
++++ b/lib/diskbuf.c	2026-06-11 11:18:02.238958645 +0400
+@@ -7,6 +7,11 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #include <stdlib.h>
++#ifdef __MINGW32__
++#include <fcntl.h>
++#include <io.h>
++#include <process.h>
++#endif
+ 
+ /* A simple approach to avoid creating too many temporary files */
+ static struct erofs_diskbufstrm {
+@@ -68,6 +73,36 @@
+ 
+ int erofs_tmpfile(void)
+ {
++#ifdef __MINGW32__
++	/* mingw-w64's mkstemp opens in CRT TEXT mode (no _O_BINARY): LF
++	 * bytes get CRLF-expanded on write and 0x1a reads back as EOF,
++	 * silently corrupting any binary payload staged in the disk buffer.
++	 * unlink() on an open file also never works on Windows.  Open
++	 * explicitly binary with delete-on-close, in the native temp dir.
++	 */
++	char buf[PATH_MAX];
++	const char *dirs[] = { getenv("TMPDIR"), getenv("TMP"),
++			       getenv("TEMP"), "." };
++	unsigned int i, j;
++	int fd;
++
++	for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
++		if (!dirs[i])
++			continue;
++		for (j = 0; j < 64; j++) {
++			(void)snprintf(buf, sizeof(buf), "%s/erofs.%u.%u.tmp",
++				       dirs[i], (unsigned int)_getpid(), j);
++			fd = _open(buf, _O_RDWR | _O_CREAT | _O_EXCL |
++				   _O_BINARY | _O_TEMPORARY,
++				   _S_IREAD | _S_IWRITE);
++			if (fd >= 0)
++				return fd;
++			if (errno != EEXIST)
++				break;
++		}
++	}
++	return -errno;
++#else
+ #define	TRAILER		"tmp.XXXXXXXXXX"
+ 	char buf[PATH_MAX];
+ 	int fd;
+@@ -85,6 +120,7 @@
+ 	(void)umask(u);
+ 	(void)fchmod(fd, 0666 & ~u);
+ 	return fd;
++#endif
+ }
+ 
+ int erofs_diskbuf_init(unsigned int nstrms)
+@@ -100,7 +136,13 @@
+ 	for (; strm < dbufstrm + nstrms; ++strm) {
+ 		struct stat st;
+ 
+-		/* try to use the devfd for regfiles on stream 0 */
++#ifndef __MINGW32__
++		/* try to use the devfd for regfiles on stream 0.
++		 * Not on MinGW: the trick relies on sparse-file semantics
++		 * (2 TiB ftruncate + a 1 TiB-offset stash); on a non-sparse
++		 * NTFS image file a successful ftruncate would make the
++		 * first stash write zero-fill terabytes.
++		 */
+ 		if (strm == dbufstrm && !g_sbi.bdev.ops) {
+ 			strm->devpos = 1ULL << 40;
+ 			if (!ftruncate(g_sbi.bdev.fd, strm->devpos << 1)) {
+@@ -108,6 +150,7 @@
+ 				goto setupone;
+ 			}
+ 		}
++#endif
+ 		strm->devpos = 0;
+ 		strm->fd = erofs_tmpfile();
+ 		if (strm->fd < 0)

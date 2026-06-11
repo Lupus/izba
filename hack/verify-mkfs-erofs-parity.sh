@@ -37,6 +37,10 @@ mkdir -p "$FIX/bin" "$FIX/deep/a/b/c"
 printf 'hello erofs\n'        > "$FIX/hello.txt"
 : > "$FIX/empty"
 head -c 8192 /dev/zero | tr '\0' 'x' > "$FIX/bin/big8k.bin"
+# CRT text-mode tripwire: LF, CR, and ctrl-Z (0x1a) bytes in binary content.
+# A Windows fd left in text mode CRLF-mangles the LFs and treats 0x1a as EOF
+# (the diskbuf temp-file bug fixed by patch 0002) — parity then diverges.
+printf '\x1a\x0d\x0a\x00\xff binary tripwire \x1a\x1a\x0d\x0a tail' > "$FIX/bin/textmode-tripwire.bin"
 printf 'nested leaf\n'        > "$FIX/deep/a/b/c/leaf"
 ln -s ../hello.txt              "$FIX/bin/link-to-hello"
 ln "$FIX/hello.txt"             "$FIX/hardlink-hello"
