@@ -48,6 +48,10 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - `izba-init` — guest PID 1 (static musl): mounts, exec engine (PTY + pipes),
   vsock servers. Everything except `main.rs` is host-testable.
 - `izba-cli` — thin clap binary over izba-core.
+- `izba-ttytest` — dev/test-support: drives the real `izba` binary through a
+  PTY/ConPTY (portable-pty + vt100) against a scripted fake guest or a real
+  sandbox; the automated `exec -it` checklist. Tests live in `crates/izba-cli/
+  tests/{tty_scripted,tty_e2e}.rs` behind the `ttytests` feature.
 
 ## Load-bearing contracts (change all ends or none)
 

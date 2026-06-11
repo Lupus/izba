@@ -101,6 +101,8 @@ crates/
   izba-init/   # guest PID 1 agent (static musl x86_64); boots, mounts,
                #   and serves the control + stream ports
   izba-proto/  # host↔guest protocol types shared by core and init
+  izba-ttytest/ # dev-support: PTY/ConPTY harness driving the real izba binary
+               #   through a pseudo-terminal for automated exec -it tests
 hack/          # scripts to fetch binaries and build the kernel/initramfs
 docs/          # architecture notes, design spec, testing runbook
 ```

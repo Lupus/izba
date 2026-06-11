@@ -214,3 +214,38 @@ Expected: `ALL PASS` (15 checks — boot, exec, exit codes, stdin, network,
 console capture, stop/restart/rm lifecycle). The interactive `exec -it`
 checklist (PTY, VT rendering, resize, Ctrl-C, mode restore) is in the
 [Plan 2 doc](superpowers/plans/2026-06-10-izba-windows-port-p2.md), Task 5.
+
+## exec -it terminal harness
+
+Automated replacement for the manual `exec -it` operator checklist
+(`crates/izba-ttytest`; design:
+docs/superpowers/specs/2026-06-11-izba-tty-test-harness-design.md). It drives the
+real `izba` binary through a real PTY (Linux) / ConPTY (Windows) and asserts on
+the rendered screen, so vim rendering, arrow-key/VT input, Ctrl-C, window
+resize, and exit-code mapping are checked automatically instead of by hand.
+
+- **Tier 1 (no VM, both OSes, CI):** drives the real `izba` binary through a
+  PTY/ConPTY against a scripted fake guest (no KVM/OpenVMM, no artifacts).
+  Includes the vim `0xbd` width-probe regression guard for the Windows console
+  byte bug.
+
+  ```sh
+  cargo test -p izba-cli --features ttytests --test tty_scripted -- --test-threads=1
+  ```
+
+  Self-skips where a PTY cannot be allocated. The scripted guest binds a Unix
+  socket, so in restrictive sandboxes that deny `bind` the tests runtime-skip.
+
+- **Tier 2 (real sandbox, env-gated):** full end-to-end against KVM (Linux) or
+  the OpenVMM spike host (Windows) — the only tier where real Ctrl-C->SIGINT and
+  real vim reflow happen.
+
+  ```sh
+  IZBA_TTY_E2E=1 IZBA_DATA_DIR=<dir> \
+    cargo test -p izba-cli --features ttytests --test tty_e2e -- --test-threads=1
+  ```
+
+  Self-skips unless `IZBA_TTY_E2E=1`.
+
+The harness is feature-gated (`ttytests`, off by default) so the six standard
+build gates never run or lint these tests.
