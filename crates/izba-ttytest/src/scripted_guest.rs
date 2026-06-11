@@ -272,12 +272,74 @@ fn serve_control(mut conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
     }
 }
 
-/// Stream port handler — fully implemented in Task 5. For now, accept the
-/// attach frame and close so the control-plane smoke test can run.
-fn serve_stream(mut conn: UnixStream, _shared: Arc<Shared>) -> Result<()> {
-    let _attach: StreamAttach = match read_frame(&mut conn) {
+fn serve_stream(conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
+    // Read the one StreamAttach frame off a clone so the original keeps its
+    // remaining bytes for the reader/writer split.
+    let mut attach_conn = conn.try_clone().context("clone for attach")?;
+    let _attach: StreamAttach = match read_frame(&mut attach_conn) {
         Ok(a) => a,
         Err(_) => return Ok(()),
     };
+    drop(attach_conn);
+
+    // Register the resize channel so control-port Resize RPCs reach us.
+    let (tx, rx) = std::sync::mpsc::channel::<(u16, u16)>();
+    *shared.resize_tx.lock().unwrap() = Some(tx);
+
+    // Reader thread: record everything the host sends.
+    let mut reader = conn.try_clone().context("clone stream reader")?;
+    let rec_shared = Arc::clone(&shared);
+    let reader_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => rec_shared
+                    .rec
+                    .received_input
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buf[..n]),
+            }
+        }
+    });
+
+    // Writer side: initial emit, then react to resizes until the end byte.
+    let mut writer = conn;
+    writer
+        .write_all(&shared.script.initial_emit)
+        .context("initial emit")?;
+    writer.flush().ok();
+
+    let end_byte = shared.script.end_when_input_contains;
+    loop {
+        // Emit any pending resize frames.
+        while let Ok((cols, rows)) = rx.try_recv() {
+            if let Some(f) = shared.script.on_resize {
+                let bytes = f(cols, rows);
+                let _ = writer.write_all(&bytes);
+                let _ = writer.flush();
+            }
+        }
+        // End condition.
+        let ended = match end_byte {
+            None => true, // end immediately after initial emit
+            Some(b) => shared.rec.received_input.lock().unwrap().contains(&b),
+        };
+        if ended || shared.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Signal Wait and tear down.
+    {
+        let (lock, cvar) = &shared.done;
+        *lock.lock().unwrap() = Some(shared.script.final_status);
+        cvar.notify_all();
+    }
+    *shared.resize_tx.lock().unwrap() = None;
+    drop(writer);
+    let _ = reader_thread.join();
     Ok(())
 }
