@@ -26,7 +26,7 @@ pub trait Listener {
 }
 
 /// Serves control RPCs until `shutdown` is set (by a `Shutdown` request,
-/// which is acknowledged with `Ok` before the flag flips).
+/// which sets the flag and then acknowledges with `Ok`).
 ///
 /// NOTE: exiting the accept loop is best-effort — a quiet listener blocks in
 /// accept() forever, so `main` watches the flag itself and never joins this
@@ -88,9 +88,13 @@ fn control_conn<C: Read + Write>(mut conn: C, engine: Arc<ExecEngine>, shutdown:
                 Err((kind, message)) => Response::Error { kind, message },
             },
             Request::Shutdown => {
-                // Reply first so the host sees the ack, then flip the flag.
-                let _ = write_frame(&mut conn, &Response::Ok);
+                // Commit the flag before acking: when the host receives Ok it
+                // can immediately observe the shutdown state (the test asserts
+                // this, and the real guest's PID 1 relies on it for poweroff
+                // sequencing).  write_frame is on the same thread, so the
+                // store strictly happens-before the socket write.
                 shutdown.store(true, Ordering::SeqCst);
+                let _ = write_frame(&mut conn, &Response::Ok);
                 return;
             }
         };
