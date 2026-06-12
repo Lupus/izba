@@ -13,6 +13,11 @@
 #   ${XDG_CACHE_HOME:-$HOME/.cache}/izba/kernel/
 # so repeated runs skip the download.
 #
+# Tarball integrity: known versions have a pinned sha256.  Building an
+# unlisted VERSION requires IZBA_KERNEL_SHA256=<hash> — there is no
+# unverified path.  Set IZBA_KERNEL_VERIFY_ONLY=1 to hash-check and exit
+# without building (useful for CI preflight).
+#
 # This script CANNOT build the kernel if a C toolchain is absent.  It checks
 # for required tools first and prints the exact install command if any are
 # missing.
@@ -23,6 +28,17 @@ REPO_ROOT="$(pwd)"
 
 VERSION="${1:-6.12.30}"
 OUTPUT="${2:-dist/vmlinux}"
+
+# sha256 pins for known-good tarballs.  Building any other VERSION requires
+# IZBA_KERNEL_SHA256=<hash> — there is deliberately no unverified path.
+declare -A KNOWN_SHA256=(
+    ["6.12.30"]="df046a48971e40ce0b2e003e7e55b6b1e7da2912120eb216d5d6c8450c9cf82e"
+)
+EXPECTED_SHA256="${IZBA_KERNEL_SHA256:-${KNOWN_SHA256[$VERSION]:-}}"
+if [ -z "$EXPECTED_SHA256" ]; then
+    echo "error: no pinned sha256 for linux-${VERSION}; set IZBA_KERNEL_SHA256" >&2
+    exit 1
+fi
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/izba/kernel"
 TARBALL="linux-${VERSION}.tar.xz"
@@ -72,6 +88,20 @@ if [ ! -f "$TARBALL_PATH" ]; then
     fi
 else
     echo "Using cached tarball: $TARBALL_PATH"
+fi
+
+GOT_SHA256="$(sha256sum "$TARBALL_PATH" | cut -d' ' -f1)"
+if [ "$GOT_SHA256" != "$EXPECTED_SHA256" ]; then
+    rm -f "$TARBALL_PATH"
+    echo "error: $TARBALL sha256 mismatch — removed; re-run to re-download" >&2
+    echo "  got:  $GOT_SHA256" >&2
+    echo "  want: $EXPECTED_SHA256" >&2
+    exit 1
+fi
+echo "sha256 OK: $TARBALL"
+# CI smoke / tests: stop after verification, before the expensive build.
+if [ "${IZBA_KERNEL_VERIFY_ONLY:-0}" = "1" ]; then
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------
