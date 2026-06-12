@@ -289,3 +289,10 @@ proxy with domain allow-lists + credential injection → port publishing →
 erofs layer dedup → snapshot/suspend/resume → policy engine. The §3 invariant
 (sandbox = disk state + live processes) and the §4.1 driver trait are the two
 load-bearing walls this future leans on.
+
+**Update (2026-06-12):** this horizon has since been steered into a larger
+product shape — a "sandbox" becomes a governed *set* of microVMs (a project), with
+`izbad` as a vsock policy/mesh hub that owns egress, brokers inter-service
+traffic, and injects per-role credentials. The egress MITM proxy above is now the
+credential-vault layer of that mesh. See [../../vision.md](../../vision.md) and
+[2026-06-12-izba-mesh-networking-design.md](2026-06-12-izba-mesh-networking-design.md).
