@@ -30,10 +30,9 @@ What does **not** exist yet:
 1. **Every milestone ships user-visible value**, not just plumbing. Where the
    design staging is infrastructure-shaped, we pull a thin slice of the
    security story forward to make the milestone demoable.
-2. **Linux-first, Windows-parity-follows.** The OpenVMM vsock crash gates
-   *Windows* mesh traffic, not Linux (the assert is OpenVMM-side). Windows may
-   trail a milestone behind a flag; it never forks the design (one network
-   story is the point).
+2. **Platform parity is the bar** (decided 2026-06-12). The OpenVMM vsock
+   crash is fixed *first*, untimeboxed — no Linux-first mesh work ships while
+   Windows would be left behind. One network story means one schedule.
 3. **Locked decisions stay locked** (vision §"Locked product decisions").
    Open questions land in §Open decisions below, with a forum (working
    session), not relitigated inline.
@@ -50,9 +49,12 @@ quarters. Order is dependency order; M3 and Track T run in parallel.
 Fix the OpenVMM vsock-assert crash (mitigation already identified: graceful
 `shutdown(Write)` + drain instead of abrupt drop; upstream issue if it's
 theirs to fix). **Exit:** `ttystorm floodfast` clean on OpenVMM; KVM suite
-unaffected. **Timebox it** — if the mitigation doesn't hold, M1+ proceeds
-Linux-first and Windows mesh waits on upstream (mirrors the v1 S1 fallback
-posture).
+unaffected. **No timebox — hard gate** (decided 2026-06-12): nothing
+mesh-related starts until this is clean. Consequently, prepare **plan B up
+front**: if the izba-side mitigation doesn't hold, we patch the assert and
+**self-build a pinned OpenVMM fork** (we already pin a fetched binary by
+run-id; pinning our own build is the same shape) rather than waiting on
+upstream review latency.
 
 ### M1 — One network story: izbad-owned egress (M)
 
@@ -60,10 +62,17 @@ Design steps 1–3 as one cut: `StreamOpen::TcpConnect` + izbad host dial-out
 (opt-in at first, coexisting with passt/consomme), the guest egress stub in
 izba-init (`nft` REDIRECT, `SO_ORIGINAL_DST`, DNS interception to izbad's
 resolver), then flip the default route and **retire passt/consomme from the
-egress path**. **Exit:** all suites green with stub-only egress on both
-platforms; the WSL+VPN and Tailscale topologies that produced `ea9e413` and
-`30e5c67` work with zero host sniffing; consomme/passt gone from the datapath
-(and `izba.ipv4only=1` with them).
+egress path**. Two decisions baked in (2026-06-12): daemon restart/upgrade
+**severs live flows — documented honest behavior, no drain logic** (apps
+retry; consistent with the no-auto-restart philosophy), and throughput is
+**measured, not gated** (an iperf-style number in the integration suite for
+baseline visibility; optimize only on real complaints). The izbad-internal
+**module seams** (router / DNS / policy / MITM-vault as separable modules)
+are defined in this milestone's design doc, before the daemon accretes them.
+**Exit:** all suites green with stub-only egress on both platforms; the
+WSL+VPN and Tailscale topologies that produced `ea9e413` and `30e5c67` work
+with zero host sniffing; consomme/passt gone from the datapath (and
+`izba.ipv4only=1` with them).
 
 ### M2 — Agent firewall: egress policy + audit log (S–M)
 
@@ -71,11 +80,14 @@ The pulled-forward slice of design step 5, north–south plane only, **for
 single sandboxes** — because once M1 lands, izbad already sees every flow and
 this is the headline feature for the target user: *"my agent can only reach
 `api.anthropic.com` and `github.com`, and I can see every connection it
-tried."* Per-sandbox allow-list (CLI/config), default-deny **when a policy is
-declared** (bare sandboxes keep allow-all until the project era — see Open
-decisions), allow/deny decisions in an audit log with an `izba netlog`-style
-view. **Exit:** the one-liner demo above, on both platforms. This is the first
-release-tag moment (see Track T).
+tried."* **Decided (2026-06-12):** per-sandbox allow-list (CLI/config);
+default-deny **when a policy is declared**; bare sandboxes keep allow-all for
+now. The longer-term shape is sbx-style **policy presets at create**
+(open/balanced/closed) — postponed until izba is mature/released, because a
+credible "balanced" preset artifact doesn't exist yet. Allow/deny decisions
+land in an audit log with an `izba netlog`-style view. **Exit:** the
+one-liner demo above, on both platforms. This is the first release-tag moment
+(see Track T).
 
 ### M3 — Sized & stateful sandboxes: resources + volumes (M) — parallel
 
@@ -96,22 +108,32 @@ The `izba.yaml` manifest (vms/expose/depends_on/healthcheck/resources/volumes
 + both policy planes), project disk layout + izbad adoption, member start
 ordering and readiness gates, name resolution (bare member names + `.izba`
 FQDN), east–west splice of declared edges, per-member egress lists from the
-manifest, audit log extended to east–west. **Exit:** the canonical
+manifest, audit log extended to east–west. **Policy mutability decided
+(2026-06-12): static + reload verb** — `izba project reload` re-reads
+`izba.yaml` and applies new rules to *new* flows, no runtime policy API, no
+VM restarts. **UDP decided: deny everything except the :53 resolver path**
+(dropped + logged); revisit only on a concrete need. **Exit:** the canonical
 research-agent demo — agent VM + graphiti/neo4j VM from one manifest; agent
 reaches `graphiti:8000` and *cannot* address neo4j; each member has its own
 scoped egress; full flow log. Consider cutting as 4a (project object +
 lifecycle) / 4b (mesh wiring) if it sprawls.
 
-### M5 — Credential vault: per-role MITM injection (M–L)
+### M5 — Credential vault: MITM everything, L7 policy (L)
 
-Design step 6. izbad CA (`rustls` + `rcgen`), CA baked into guest trust
-stores at boot, SNI-based detection, **per-role credential injection** at
-dial-out. Scope guardrails for v-first: HTTPS header injection for known SaaS
-APIs (Anthropic, OpenAI, GitHub); everything else passes through MITM-free
-but logged; cert-pinning clients are a documented limitation, not a fight we
-pick. **Exit:** agent calls `api.anthropic.com` with **no key anywhere in the
-guest**; graphiti uses its own scoped key the agent can never read; keys
-independently revocable/meterable.
+Design step 6, **scope widened (decided 2026-06-12): MITM everything** —
+izbad terminates TLS for all brokered :443/:80 flows (CA via
+`rustls` + `rcgen`, baked into guest trust stores at boot), no
+passthrough-encrypted-but-logged tier. That makes the policy plane **L7**:
+rules can judge on URL, method, and (where practical) body — not just
+domain:port. **Credential injection works for arbitrary endpoints**, not a
+known-SaaS shortlist: the manifest maps a member role + destination pattern
+to a secret + injection shape (header/bearer/etc.). Cert-pinning clients are
+**deliberately ignored** — they break under interception and that's the
+accepted, documented posture (an agent sandbox wants no uninspectable
+channels). **Exit:** agent calls `api.anthropic.com` with **no key anywhere
+in the guest**; graphiti uses its own scoped key the agent can never read; a
+URL/method-level rule demonstrably blocks one API route while allowing
+another on the same domain; keys independently revocable/meterable.
 
 ### Track T — Adoption & release engineering (continuous)
 
@@ -129,26 +151,40 @@ Runs parallel to everything; first slice lands during M0/M1.
 
 ## Risk register
 
+Reviewed with the owner 2026-06-12; ★ = elevated (gets a written plan before
+its milestone starts).
+
 | # | Risk | Exposure | Mitigation |
 | --- | --- | --- | --- |
-| 1 | OpenVMM vsock assert survives the graceful-shutdown fix | Windows mesh blocked | M0 timebox; Linux-first fallback; upstream issue early |
-| 2 | izbad becomes a traffic SPOF — every byte through userspace splices; daemon restart/upgrade now severs *all* flows, not just port relays | UX regression vs v1 | Define restart/upgrade semantics before M1 ships defaults; add a throughput benchmark gate |
+| 1★ | OpenVMM vsock assert survives the graceful-shutdown fix | The whole roadmap blocked (M0 is untimeboxed, parity sacred) | **Plan B prepared up front:** patch the assert + self-build a pinned OpenVMM fork (same pinning shape as today's fetched binary); upstream issue filed in parallel |
+| 2 | izbad is a traffic SPOF — restart/upgrade severs *all* flows, not just port relays | UX regression vs v1 | **Decided:** accepted + documented honest behavior, no drain logic (apps retry). Throughput: **measure, don't gate** — baseline number in the integration suite |
 | 3 | DNS interception edge cases (resolver behaviors, search domains, TCP DNS) | M1 flakiness | Scope: UDP :53 only at first; conservative resolver; integration tests per topology |
-| 4 | MITM vs cert pinning / h2 / websockets | M5 value narrower than hoped | Scoped injection + passthrough-and-log default; document limits honestly |
-| 5 | Disk-order contract change ripples (M3) | Subtle cross-platform boot breakage | One-milestone "change all ends" rule + KVM/Windows gates before M4 consumes it |
-| 6 | izbad scope creep (router + DNS + policy + MITM + vault in one binary) | Maintainability | Keep planes as separable modules with the daemon proto as the seam |
+| 4 | MITM-everything breaks cert-pinning clients; h2/websocket/body inspection is real work | M5 is now the largest, riskiest milestone | **Decided:** pinning breakage is accepted posture, not a risk to mitigate. Residual risk is scope: stage L7 features (URL/method first, body inspection later) inside M5 |
+| 5★ | Disk-order contract change ripples (M3) across driver enum, OpenVMM PCIe routing, init mount plan | Subtle cross-platform boot breakage | **Contract-change spec written before any M3 code**; one-milestone "change all ends" rule; KVM + Windows gates green before M4 consumes volumes |
+| 6★ | izbad scope creep (router + DNS + policy + MITM + vault in one binary) | Maintainability | **Module seams defined in the M1 design doc** (separable planes, daemon proto as the seam) rather than refactored out later |
+
+## Decisions log (owner-reviewed 2026-06-12)
+
+- **Bare-sandbox policy default:** allow-all until a policy is declared, then
+  default-deny; projects always default-deny. Future shape: sbx-style policy
+  **presets at create** (open/balanced/closed) — postponed post-release, no
+  credible "balanced" artifact exists yet.
+- **Policy mutability:** static + `izba project reload` (new flows only); no
+  runtime policy API.
+- **UDP beyond DNS:** deny (drop + log). Revisit only on a concrete need.
+- **M0 posture:** untimeboxed hard gate; plan-B is a self-built pinned
+  OpenVMM fork.
+- **izbad restart semantics:** severed flows accepted + documented; no drain.
+- **Performance:** measured baseline in the suite; no gate.
+- **MITM posture:** intercept everything; L7 policy (URL/method/body);
+  injection for arbitrary endpoints; cert-pinning clients knowingly broken.
 
 ## Open decisions (resolve in working sessions, not ad hoc)
 
-- **Bare-sandbox policy default** — proposal embedded in M2: allow-all with no
-  policy declared, default-deny the moment one is; projects are always
-  default-deny. Needs a yes/no.
 - **Manifest grammar finalization** (design §9): exact key names, `volumes`
-  lifecycle verbs (create/resize/prune), schema **versioning from day one**.
-- **Static vs runtime-mutable policy** (design §4 OPEN) — static-only is the
-  cheaper M4 default; mutability is a control-plane feature.
-- **UDP beyond DNS** (design §9) — default stays "deny"; revisit on a concrete
-  need only.
+  lifecycle verbs (create/resize/prune), schema **versioning from day one** —
+  now also carries the M5 credential-mapping grammar (role + destination
+  pattern → secret + injection shape).
 
 ## Explicitly not on this roadmap
 

@@ -248,16 +248,22 @@ Because every flow transits one daemon, the **audit log is free** — every
 brokered connection tagged with source member, destination service, allow/deny.
 This is full egress + east–west flow logging without any in-guest eBPF.
 
-**OPEN:** static-only vs. runtime-mutable policy; whether roles are per-VM or can
-be finer; org-level / cross-project governance (a central control plane `izbad`
-subscribes to) — noted as beyond this horizon in the vision doc.
+**Decided (2026-06-12, see [../../roadmap.md](../../roadmap.md) decisions log):**
+policy is **static + reload verb** — `izba project reload` re-reads the manifest
+and applies to new flows; no runtime policy API. **OPEN:** whether roles are
+per-VM or can be finer; org-level / cross-project governance (a central control
+plane `izbad` subscribes to) — noted as beyond this horizon in the vision doc.
 
 ## 5. Credentials — per-role vault at the MITM branch
 
 `izbad` already receives, per flow, the original `(dst, port)` plus the byte
 stream. The MITM is one branch before dial-out: for :443/:80, terminate TLS with
 a leaf minted by an `izbad` CA (`rustls` + `rcgen`), do SNI-based service
-detection + domain allow/deny, and inject **per-role** credentials outbound. The
+detection + domain allow/deny, and inject **per-role** credentials outbound.
+**Posture update (2026-06-12, roadmap M5):** intercept *everything* — no
+passthrough-encrypted tier; policy is L7 (URL, method, body where practical);
+injection targets arbitrary endpoints via manifest mapping, not a known-SaaS
+shortlist; cert-pinning clients are knowingly broken under interception. The
 agent's egress to `api.anthropic.com` gets the agent's key; graphiti's *own* LLM
 calls get a different, scoped key the agent never sees (or are denied/metered
 separately). Guest-side prerequisite is identical to sbx: bake the `izbad` CA
@@ -404,5 +410,6 @@ enumeration + OpenVMM PCIe routing + init mount plan).
 - **Manifest grammar finalization** (§3.3 — exact key names; `volumes` lifecycle
   verbs) and **org-level governance** (§4 OPEN). Filename, DNS name scheme,
   readiness contract, and resources/volumes are now decided.
-- **UDP handling** beyond DNS name resolution (which UDP, if any, is brokered).
+- ~~**UDP handling** beyond DNS name resolution~~ — **decided 2026-06-12:
+  deny all non-DNS UDP** (drop + log); revisit only on a concrete need.
 - **Image/layer reuse across members** (§6 — deferred to a later iteration).
