@@ -85,6 +85,22 @@ impl ScriptedGuest {
         // run_dir is sandbox_dir/run, so create_dir_all(&run) also creates sb.
         std::fs::create_dir_all(&run).context("create run dir")?;
 
+        // Fabricate config.json: the daemon-first CLI's adoption pass sweeps
+        // any sandbox dir without one as half-created debris, which would
+        // delete this fake sandbox before exec ever reaches it.
+        izba_core::state::save_json(
+            &sb.join(izba_core::state::CONFIG_FILE),
+            &izba_core::state::SandboxConfig {
+                image_digest: "sha256:ttytest".to_string(),
+                image_ref: "ttytest:fake".to_string(),
+                cpus: 1,
+                mem_mb: 128,
+                workspace: data_root.clone(),
+                ports: Vec::new(),
+            },
+        )
+        .context("write config.json")?;
+
         // Fabricate state.json so liveness passes: vmm_pid = current process.
         let id = izba_core::procmgr::current_identity().context("current identity")?;
         izba_core::state::save_json(

@@ -42,7 +42,7 @@ pub fn stop(paths: &Paths) -> anyhow::Result<i32> {
         println!("daemon: not running");
         return Ok(0);
     };
-    client.shutdown()?;
+    client.shutdown_and_wait(paths)?;
     println!("daemon stopped (sandboxes keep running; port relays pause until restart)");
     Ok(0)
 }

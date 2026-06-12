@@ -208,6 +208,16 @@ impl DaemonClient {
             other => bail!("unexpected shutdown reply: {other:?}"),
         }
     }
+
+    /// `shutdown`, then wait (bounded) until the daemon stops accepting —
+    /// the Shutdown reply only means the flag is set; the accept loop needs
+    /// up to one poll tick plus cleanup to actually exit. `izba daemon stop`
+    /// must be synchronous so a follow-up `status` can't see a zombie.
+    pub fn shutdown_and_wait(self, paths: &Paths) -> anyhow::Result<()> {
+        self.shutdown()?;
+        Self::await_gone(paths);
+        Ok(())
+    }
 }
 
 /// Does this error chain say "the daemon died under us mid-handshake"?

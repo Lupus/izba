@@ -227,15 +227,21 @@ fn daemon_full_lifecycle() {
     );
     let idle: &[(&str, &str)] = &[("IZBA_DAEMON_IDLE_SECS", "1")];
     assert_ok(&izba(&data, idle, &["ls"]), "start daemon with 1s idle");
+    // Watch the socket FILE, not `daemon status`: every status probe opens a
+    // connection, and connections reset the idle timer — polling via the API
+    // would keep the daemon alive forever. The exiting daemon unlinks its
+    // socket, so the file vanishing is the exit signal.
+    let sock = data.join("daemon/izbad.sock");
     let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let o = izba(&data, no_env, &["daemon", "status"]);
-        if stdout_of(&o).contains("not running") {
-            break;
-        }
+    while sock.exists() {
         assert!(Instant::now() < deadline, "daemon never idle-exited");
         std::thread::sleep(Duration::from_millis(300));
     }
+    let o = izba(&data, no_env, &["daemon", "status"]);
+    assert!(
+        stdout_of(&o).contains("not running"),
+        "status agrees the daemon is gone"
+    );
 
     // [8] Cleanup.
     assert_ok(&izba(&data, no_env, &["rm", "--force", "e2e"]), "rm");
