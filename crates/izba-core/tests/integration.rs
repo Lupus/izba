@@ -770,6 +770,66 @@ fn egress_dns_via_izbad() {
     mgr.stop(&tb.paths, "egress-dns");
 }
 
+/// M1 phase B exit: guest TCP egress rides the stub. The guest wgets a
+/// host-served one-shot HTTP page addressed by a routable host IP; the nft
+/// REDIRECT intercepts, izbad dials back to the host listener.
+#[test]
+fn egress_http_via_stub() {
+    use std::io::{Read as _, Write as _};
+    let Some(env) = want() else { return };
+    // A host IP the guest can name and izbad can dial (NOT loopback —
+    // 127/8 is excluded from REDIRECT by design).
+    let probe = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+    probe.connect(("8.8.8.8", 80)).unwrap();
+    let host_ip = probe.local_addr().unwrap().ip();
+
+    let listener = std::net::TcpListener::bind((host_ip, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let srv = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = s.read(&mut buf);
+        s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\nizba-m1ok")
+            .unwrap();
+    });
+
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("egress-http");
+    create_sandbox_egress(&env, &mut tb, "egress-http", &ws, EgressMode::Izbad);
+
+    // Daemonless suite: stand in for izbad's listener ourselves. The listener
+    // must exist on run/vsock.sock_1027 BEFORE the guest boots and dials it.
+    use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
+    let mgr = EgressManager::new(
+        std::sync::Arc::new(AllowAll),
+        std::sync::Arc::new(UdpForwarder::system()),
+    );
+    mgr.ensure_listening(&tb.paths, "egress-http")
+        .expect("bind vsock_1027 listener");
+
+    if let Err(e) = start_sandbox(&env, &tb, "egress-http") {
+        mgr.stop(&tb.paths, "egress-http");
+        panic!(
+            "boot of 'egress-http' failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, "egress-http")
+        );
+    }
+
+    // The guest's nft REDIRECT intercepts this connect to the host's real IP;
+    // the izba-init stub carries it over vsock as StreamOpen::TcpConnect, and
+    // our EgressManager stand-in dials host_ip:port from the host netns.
+    let out = exec_ok(
+        &tb.paths,
+        "egress-http",
+        &["sh", "-lc", &format!("wget -qO- http://{host_ip}:{port}/")],
+    );
+    assert_eq!(out.trim(), "izba-m1ok");
+
+    srv.join().unwrap();
+    stop_sandbox(&tb, "egress-http");
+    mgr.stop(&tb.paths, "egress-http");
+}
+
 #[test]
 fn concurrent_two_sandboxes() {
     let Some(env) = want() else { return };
