@@ -86,11 +86,15 @@ izba-windows ──────────────────────�
   `hack/spike/verify-mkfs-erofs-parity.ps1` on the bundle — the
   byte-identical proof, today manual, becomes a gate before the .exe is
   promoted.
-- **`izba-windows`**: win-gnu release build of `izba-cli` +
-  `hack/stage-izba-windows.sh` → staged `izba.exe` + `libexec\` bundle.
+- **`izba-windows`**: win-gnu release build of `izba-cli`, assembled into
+  the installer-shaped `bin/` + `bin/libexec/` layout in-job (mirroring
+  `hack/stage-izba-windows.sh`, which itself is WSL-interop-only —
+  `powershell.exe`, `/mnt/c` — and can't run on a runner) → `izba.exe` +
+  parity-proven `mkfs.erofs.exe` bundle.
 - **`manifest`**: needs all of the above; writes `SHA256SUMS` over every
-  produced file plus a `VERSIONS` provenance file (rustc, mingw, pinned
-  source versions), then `actions/upload-artifact` per artifact group.
+  produced file plus a `VERSIONS` provenance file (pinned source versions
+  + commit; exact rustc/mingw tool versions deferred until needed), then
+  `actions/upload-artifact` per artifact group.
 
 Out of scope: `openvmm.exe` (fetched pinned via `fetch-openvmm.sh`, not
 built; revisit if the Plan-B fork build activates),
@@ -113,7 +117,8 @@ by artifact builds; see Follow-ups).
   hack/ script that verifies before use, so local and CI share one
   verified code path.
 - **Rust toolchain:** stays `channel = "stable"` (local convention); the
-  manifest job records exact tool versions per run for provenance.
+  manifest job records the pinned source versions + commit for provenance
+  (exact per-run tool versions deferred until a concrete need).
 
 ## 5. Verifying the CI itself
 
