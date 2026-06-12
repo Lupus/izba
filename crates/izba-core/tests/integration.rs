@@ -246,7 +246,7 @@ fn boot(env: &TestEnv, tb: &mut TestBox, name: &str, ws: &Path) {
     if let Err(e) = start_sandbox(env, tb, name) {
         panic!(
             "boot of '{name}' failed: {e:#}\nconsole tail:\n{}",
-            console_tail(&tb.paths, name)
+            boot_diag(&tb.paths, name)
         );
     }
 }
@@ -268,6 +268,29 @@ fn console_tail(paths: &Paths, name: &str) -> String {
         start += 1;
     }
     text[start..].to_string()
+}
+
+/// Last ~30 lines of a sidecar log, or `(missing)` when absent/unreadable.
+fn log_tail(path: &Path) -> String {
+    let Ok(text) = fs::read_to_string(path) else {
+        return "(missing)".to_string();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(30);
+    lines[start..].join("\n")
+}
+
+/// Full boot-failure diagnostics: the console tail first, then the last lines
+/// of each sidecar log from the same `logs/` directory (the console can be
+/// empty when the VMM itself fails before the guest prints anything).
+fn boot_diag(paths: &Paths, name: &str) -> String {
+    let logs = paths.logs_dir(name);
+    let mut out = console_tail(paths, name);
+    for log in ["vmm.log", "passt.log", "virtiofsd-workspace.log"] {
+        out.push_str(&format!("\n--- {log} tail ---\n"));
+        out.push_str(&log_tail(&logs.join(log)));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -453,7 +476,7 @@ fn boot_to_healthy_under_5s() {
     if let Err(e) = start_sandbox(&env, &tb, "bench") {
         panic!(
             "boot failed: {e:#}\nconsole tail:\n{}",
-            console_tail(&tb.paths, "bench")
+            boot_diag(&tb.paths, "bench")
         );
     }
     let elapsed = t0.elapsed();
@@ -617,7 +640,7 @@ fn rw_persistence_across_restart() {
     if let Err(e) = start_sandbox(&env, &tb, "rw") {
         panic!(
             "second boot failed: {e:#}\nconsole tail:\n{}",
-            console_tail(&tb.paths, "rw")
+            boot_diag(&tb.paths, "rw")
         );
     }
     let stdout = exec_ok(&tb.paths, "rw", &["cat", "/marker"]);
@@ -655,7 +678,10 @@ fn first_boot_formats_blank_rw() {
                 );
                 return;
             }
-            panic!("boot with blank rw.img failed unexpectedly: {e:#}\nconsole tail:\n{console}");
+            panic!(
+                "boot with blank rw.img failed unexpectedly: {e:#}\nconsole tail:\n{}",
+                boot_diag(&tb.paths, "blank")
+            );
         }
     }
 }
@@ -912,7 +938,7 @@ fn port_publish_create_time() {
     if let Err(e) = start_sandbox(&env, &tb, "portc") {
         panic!(
             "boot failed: {e:#}\nconsole:\n{}",
-            console_tail(&tb.paths, "portc")
+            boot_diag(&tb.paths, "portc")
         );
     }
 
