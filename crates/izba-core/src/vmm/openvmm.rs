@@ -237,9 +237,18 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Compute a path under a directory the same way production code does, so
+    /// on Windows PathBuf::join produces the native separator and display()
+    /// matches what build_invocation() emits.
+    fn dir_join(dir: &Path, name: &str) -> String {
+        dir.join(name).display().to_string()
+    }
+
     #[test]
     fn openvmm_invocation() {
-        let inv = build_invocation(&base_spec(), &PathBuf::from("/opt/openvmm"));
+        let spec = base_spec();
+        let run = &spec.run_dir;
+        let inv = build_invocation(&spec, &PathBuf::from("/opt/openvmm"));
         assert_eq!(
             inv.argv,
             argv(&[
@@ -274,7 +283,7 @@ mod tests {
                 "--net",
                 "consomme",
                 "--virtio-vsock-path",
-                "/sbx/run/vsock.sock",
+                &dir_join(run, "vsock.sock"),
             ])
         );
     }

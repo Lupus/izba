@@ -138,7 +138,13 @@ mod tests {
     #[test]
     fn default_is_under_home() {
         let p = Paths::from_env_or_default(None);
-        assert!(p.root().ends_with(".local/share/izba"), "{:?}", p.root());
+        // On Unix the default ends with `.local/share/izba`; on Windows it ends
+        // with `izba` (under %LOCALAPPDATA%). Both are correct for their platform.
+        if cfg!(windows) {
+            assert!(p.root().ends_with("izba"), "{:?}", p.root());
+        } else {
+            assert!(p.root().ends_with(".local/share/izba"), "{:?}", p.root());
+        }
     }
 
     #[test]

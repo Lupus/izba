@@ -293,7 +293,7 @@ impl VmHandle for ChHandle {
 mod tests {
     use super::*;
     use crate::vmm::spec::{BlockDisk, FsShare};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn base_spec() -> VmSpec {
         VmSpec {
@@ -326,9 +326,18 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Compute a socket path under run_dir the same way production code does,
+    /// so on Windows PathBuf::join produces the native separator and display()
+    /// matches what build_invocations() emits.
+    fn run_sock(run_dir: &Path, name: &str) -> String {
+        run_dir.join(name).display().to_string()
+    }
+
     #[test]
     fn ch_invocations() {
-        let inv = build_invocations(&base_spec());
+        let spec = base_spec();
+        let run = &spec.run_dir;
+        let inv = build_invocations(&spec);
 
         assert_eq!(inv.virtiofsd.len(), 1);
         assert_eq!(
@@ -336,7 +345,7 @@ mod tests {
             argv(&[
                 "virtiofsd",
                 "--socket-path",
-                "/sbx/run/fs-workspace.sock",
+                &run_sock(run, "fs-workspace.sock"),
                 "--shared-dir",
                 "/home/user/project",
                 "--cache",
@@ -361,10 +370,10 @@ mod tests {
                 "--gateway",
                 "192.168.127.1",
                 "--socket-path",
-                "/sbx/run/net.sock",
+                &run_sock(run, "net.sock"),
                 "--foreground",
                 "--pid",
-                "/sbx/run/passt.pid",
+                &run_sock(run, "passt.pid"),
             ])
         );
 
@@ -386,17 +395,20 @@ mod tests {
                 "path=/img/rootfs.img,readonly=on",
                 "path=/sbx/scratch.img",
                 "--fs",
-                "tag=workspace,socket=/sbx/run/fs-workspace.sock",
+                &format!(
+                    "tag=workspace,socket={}",
+                    run_sock(run, "fs-workspace.sock")
+                ),
                 "--net",
-                "vhost_user=true,socket=/sbx/run/net.sock",
+                &format!("vhost_user=true,socket={}", run_sock(run, "net.sock")),
                 "--vsock",
-                "cid=3,socket=/sbx/run/vsock.sock",
+                &format!("cid=3,socket={}", run_sock(run, "vsock.sock")),
                 "--serial",
                 "file=/sbx/console.log",
                 "--console",
                 "off",
                 "--api-socket",
-                "/sbx/run/ch-api.sock",
+                &run_sock(run, "ch-api.sock"),
             ])
         );
     }
@@ -405,6 +417,7 @@ mod tests {
     fn ch_invocations_no_net() {
         let mut spec = base_spec();
         spec.net = false;
+        let run = spec.run_dir.clone();
         let inv = build_invocations(&spec);
 
         assert!(inv.passt.is_none());
@@ -426,15 +439,18 @@ mod tests {
                 "path=/img/rootfs.img,readonly=on",
                 "path=/sbx/scratch.img",
                 "--fs",
-                "tag=workspace,socket=/sbx/run/fs-workspace.sock",
+                &format!(
+                    "tag=workspace,socket={}",
+                    run_sock(&run, "fs-workspace.sock")
+                ),
                 "--vsock",
-                "cid=3,socket=/sbx/run/vsock.sock",
+                &format!("cid=3,socket={}", run_sock(&run, "vsock.sock")),
                 "--serial",
                 "file=/sbx/console.log",
                 "--console",
                 "off",
                 "--api-socket",
-                "/sbx/run/ch-api.sock",
+                &run_sock(&run, "ch-api.sock"),
             ])
         );
     }
@@ -452,6 +468,7 @@ mod tests {
                 host_path: PathBuf::from("/home/user/.cache/izba"),
             },
         ];
+        let run = spec.run_dir.clone();
         let inv = build_invocations(&spec);
 
         assert_eq!(inv.virtiofsd.len(), 2);
@@ -460,7 +477,7 @@ mod tests {
             argv(&[
                 "virtiofsd",
                 "--socket-path",
-                "/sbx/run/fs-workspace.sock",
+                &run_sock(&run, "fs-workspace.sock"),
                 "--shared-dir",
                 "/home/user/project",
                 "--cache",
@@ -474,7 +491,7 @@ mod tests {
             argv(&[
                 "virtiofsd",
                 "--socket-path",
-                "/sbx/run/fs-cache.sock",
+                &run_sock(&run, "fs-cache.sock"),
                 "--shared-dir",
                 "/home/user/.cache/izba",
                 "--cache",
@@ -502,18 +519,21 @@ mod tests {
                 "path=/img/rootfs.img,readonly=on",
                 "path=/sbx/scratch.img",
                 "--fs",
-                "tag=workspace,socket=/sbx/run/fs-workspace.sock",
-                "tag=cache,socket=/sbx/run/fs-cache.sock",
+                &format!(
+                    "tag=workspace,socket={}",
+                    run_sock(&run, "fs-workspace.sock")
+                ),
+                &format!("tag=cache,socket={}", run_sock(&run, "fs-cache.sock")),
                 "--net",
-                "vhost_user=true,socket=/sbx/run/net.sock",
+                &format!("vhost_user=true,socket={}", run_sock(&run, "net.sock")),
                 "--vsock",
-                "cid=3,socket=/sbx/run/vsock.sock",
+                &format!("cid=3,socket={}", run_sock(&run, "vsock.sock")),
                 "--serial",
                 "file=/sbx/console.log",
                 "--console",
                 "off",
                 "--api-socket",
-                "/sbx/run/ch-api.sock",
+                &run_sock(&run, "ch-api.sock"),
             ])
         );
     }
