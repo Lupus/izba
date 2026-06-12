@@ -581,6 +581,40 @@ mod tests {
         }
     }
 
+    /// The vsock-churn guard at the splice level: a client that dies abruptly
+    /// mid-stream must not make the daemon drop the guest (vsock) leg while
+    /// the guest still has buffered TX — the guest leg is drained to EOF
+    /// instead. The guest writer completing without error is the proof.
+    #[test]
+    fn splice_drains_guest_leg_when_client_dies() {
+        let (client_daemon_end, client_peer) = UdsStream::pair().unwrap();
+        let (guest_daemon_end, guest_peer) = UdsStream::pair().unwrap();
+        drop(client_peer); // client vanished before reading anything
+
+        const TOTAL: usize = 8 * 1024 * 1024;
+        let guest = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut g = guest_peer;
+            let chunk = [b'g'; 64 * 1024];
+            let mut sent = 0;
+            while sent < TOTAL {
+                let n = (TOTAL - sent).min(chunk.len());
+                g.write_all(&chunk[..n])?;
+                sent += n;
+            }
+            g.shutdown(std::net::Shutdown::Write)?;
+            // Drain the host's half-close like izba-init does.
+            let mut buf = [0u8; 4096];
+            while !matches!(g.read(&mut buf), Ok(0) | Err(_)) {}
+            Ok(())
+        });
+
+        splice(client_daemon_end, guest_daemon_end);
+        guest
+            .join()
+            .unwrap()
+            .expect("guest writer must complete: splice must drain the vsock leg, not drop it");
+    }
+
     fn test_daemon() -> (tempfile::TempDir, Arc<Daemon>) {
         let (dir, paths) = test_paths();
         std::fs::create_dir_all(dir.path().join("ws")).unwrap();

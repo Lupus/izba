@@ -132,16 +132,25 @@ fn pump_bidirectional(client: TcpStream, vs: UdsStream) {
     let _ = up.join();
 }
 
+/// Copy `r` → `w` until `r` reaches EOF (or a read error). A write failure
+/// does NOT end the loop: the destination may be gone, but the source must
+/// still be consumed to EOF, discarding. Abandoning the read side of a vsock
+/// leg while the guest has buffered TX makes the VMM's relay-socket write
+/// fail, which panics OpenVMM's virtio_vsock (`connections.rs:1093` assert —
+/// the vsock-churn crash). Draining keeps every vsock teardown EOF-shaped.
+/// The drain ends when the guest half-closes, which the opposite pump
+/// direction triggers via its `shutdown(Write)` on EOF of the dead peer.
 pub(crate) fn copy_until_eof(mut r: impl Read, w: &mut impl Write) {
     let mut buf = [0u8; 32 * 1024];
+    let mut discard = false;
     loop {
         let n = match r.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => n,
             Err(_) => return,
         };
-        if w.write_all(&buf[..n]).is_err() {
-            return;
+        if !discard && w.write_all(&buf[..n]).is_err() {
+            discard = true;
         }
     }
 }
@@ -178,6 +187,35 @@ mod tests {
     fn parse_rejects_port_zero() {
         assert!(parse_rule("0:80").is_err());
         assert!(parse_rule("8080:0").is_err());
+    }
+
+    /// The vsock-churn guard: when the destination dies mid-stream, the copy
+    /// must keep consuming the source to EOF (discarding) instead of
+    /// returning early — an early return drops the vsock socket while the
+    /// guest still has buffered TX, which panics OpenVMM's virtio_vsock.
+    /// The writer completing without error is the observable proof.
+    #[test]
+    fn copy_drains_source_after_write_failure() {
+        let (mut src_w, src_r) = UdsStream::pair().unwrap();
+        let (mut dead_w, dead_peer) = UdsStream::pair().unwrap();
+        drop(dead_peer); // every write into dead_w now fails
+
+        const TOTAL: usize = 8 * 1024 * 1024; // far beyond socketpair buffers
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            let chunk = [b'x'; 64 * 1024];
+            let mut sent = 0;
+            while sent < TOTAL {
+                let n = (TOTAL - sent).min(chunk.len());
+                src_w.write_all(&chunk[..n])?;
+                sent += n;
+            }
+            Ok(())
+        });
+
+        copy_until_eof(src_r, &mut dead_w);
+        writer.join().unwrap().expect(
+            "source writer must complete: the copy must drain to EOF, not abandon the read side",
+        );
     }
 
     #[test]
