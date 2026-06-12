@@ -75,6 +75,26 @@ if (-not ($egRc -eq 0 -and $egOut -match 'example\.com')) {
     $egListener = "$env:LOCALAPPDATA\izba\sandboxes\egress-a\run\vsock.sock_1027"
     [Console]::Error.WriteLine("  vsock.sock_1027 present: $(Test-Path $egListener)")
 }
+
+# [5c] M1 phase B: TCP egress via the in-guest nft REDIRECT stub on OpenVMM.
+# Guest connect()s out → nft REDIRECTs to the init listener → SO_ORIGINAL_DST →
+# vsock TcpConnect splice → izbad dials the real host. This is a real-internet
+# fetch (http://example.com): the WSL/VPN-topology bug-class check that the
+# consomme path above fails under VPN. The izbad path must PASS on the same host.
+# Exercises the B1 netfilter kernel + B3/B4 vendored nft in the initramfs:
+# an `izba-init: applying nft ruleset` error in console.log = kernel/nft mismatch.
+$tcpOut = (& $exe exec egress-a -- /bin/sh -lc 'wget -qO- http://example.com/ | head -c 64' 2>&1 | Out-String)
+$tcpRc  = $LASTEXITCODE
+Check 'TCP egress via izbad fetches http://example.com' ($tcpRc -eq 0 -and "$tcpOut".Trim().Length -gt 0)
+if (-not ($tcpRc -eq 0 -and "$tcpOut".Trim().Length -gt 0)) {
+    [Console]::Error.WriteLine("  egress-a wget rc=$tcpRc out='$($tcpOut.Trim())'")
+    $egConsole = "$env:LOCALAPPDATA\izba\sandboxes\egress-a\logs\console.log"
+    if (Test-Path $egConsole) {
+        [Console]::Error.WriteLine("  --- egress-a console.log tail ---")
+        Get-Content $egConsole -Tail 25 | ForEach-Object { [Console]::Error.WriteLine("  $_") }
+    }
+}
+
 & $exe stop egress-a 2>$null | Out-Null
 & $exe rm --force egress-a 2>$null | Out-Null
 
