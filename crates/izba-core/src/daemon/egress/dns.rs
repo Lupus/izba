@@ -28,12 +28,18 @@ impl UdpForwarder {
 
     /// Host-system upstream; falls back to 1.1.1.1:53 (logged) when
     /// discovery fails — a host with no DNS config is already broken.
+    ///
+    /// The upstream is captured from resolv.conf at construction time. Host
+    /// DNS config changes require a daemon restart — deliberate for M1.
     pub fn system() -> Self {
         Self::new(system_upstream())
     }
 }
 
 impl Resolver for UdpForwarder {
+    /// Single-shot forward: send the raw query, wait for one reply. No retry
+    /// — a timeout surfaces as `Err` → SERVFAIL at the caller; DNS clients
+    /// handle retries themselves.
     fn handle(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
         let local: SocketAddr = if self.upstream.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
@@ -41,10 +47,13 @@ impl Resolver for UdpForwarder {
             "[::]:0".parse().unwrap()
         };
         let sock = UdpSocket::bind(local)?;
+        // Connected socket: the kernel drops datagrams from any source
+        // other than the upstream (off-path response-injection hardening).
+        sock.connect(self.upstream)?;
         sock.set_read_timeout(Some(FORWARD_TIMEOUT))?;
-        sock.send_to(query, self.upstream)?;
+        sock.send(query)?;
         let mut buf = vec![0u8; MAX_DNS_MSG];
-        let (n, _from) = sock.recv_from(&mut buf)?;
+        let n = sock.recv(&mut buf)?;
         buf.truncate(n);
         Ok(buf)
     }
