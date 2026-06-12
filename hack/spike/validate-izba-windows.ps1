@@ -49,8 +49,34 @@ $out = 'ping' | & $exe exec -i valid8 -- /bin/cat
 Check 'exec -i round-trips stdin' ("$out".Trim() -eq 'ping')
 
 # [5] networking (consomme): DNS + outbound HTTP
+# Known pre-existing FAIL on this host: consomme guest-egress is refused
+# (VPN/IPv6-related). Retired in M1 phase C — leave as-is for now.
 & $exe exec valid8 -- /bin/sh -c 'wget -q -O /dev/null http://example.com' | Out-Null
 Check 'guest outbound HTTP' ($LASTEXITCODE -eq 0)
+
+# [5b] M1 phase A: egress DNS via izbad (FIRST runtime exercise of OpenVMM
+# guest-initiated hybrid vsock — guest connect(CID 2, 1027) must reach
+# izbad's run\vsock.sock_1027 listener, which izbad binds before VM boot).
+# Uses a dedicated sandbox so the consomme path above is untouched.
+& $exe stop egress-a 2>$null | Out-Null
+& $exe rm --force egress-a 2>$null | Out-Null
+& $exe run --image $image --egress izbad --name egress-a $ws -- /bin/true | Out-Null
+Check 'egress=izbad sandbox boots (run exits 0)' ($LASTEXITCODE -eq 0)
+$egOut = (& $exe exec egress-a -- /bin/sh -lc 'getent hosts example.com' 2>&1 | Out-String)
+$egRc  = $LASTEXITCODE
+Check 'egress DNS via izbad resolves example.com' ($egRc -eq 0 -and $egOut -match 'example\.com')
+if (-not ($egRc -eq 0 -and $egOut -match 'example\.com')) {
+    [Console]::Error.WriteLine("  egress-a getent rc=$egRc out='$($egOut.Trim())'")
+    $egConsole = "$env:LOCALAPPDATA\izba\sandboxes\egress-a\logs\console.log"
+    if (Test-Path $egConsole) {
+        [Console]::Error.WriteLine("  --- egress-a console.log tail ---")
+        Get-Content $egConsole -Tail 25 | ForEach-Object { [Console]::Error.WriteLine("  $_") }
+    }
+    $egListener = "$env:LOCALAPPDATA\izba\sandboxes\egress-a\run\vsock.sock_1027"
+    [Console]::Error.WriteLine("  vsock.sock_1027 present: $(Test-Path $egListener)")
+}
+& $exe stop egress-a 2>$null | Out-Null
+& $exe rm --force egress-a 2>$null | Out-Null
 
 # [6] console log captured
 $console = Get-Item "$env:LOCALAPPDATA\izba\sandboxes\valid8\logs\console.log" -ErrorAction SilentlyContinue
