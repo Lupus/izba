@@ -12,6 +12,12 @@ Artifact tooling details live in [../hack/README.md](../hack/README.md); the
 design behind what these tests assert is in
 [superpowers/specs/2026-06-10-izba-v1-design.md](superpowers/specs/2026-06-10-izba-v1-design.md) §7.
 
+**CI coverage:** the same suites run on GitHub-hosted runners via
+`.github/workflows/e2e.yml` (KVM on ubuntu-latest, OpenVMM/WHP on
+windows-latest) on every push to main, weekly, and on manual dispatch — see
+`docs/superpowers/specs/2026-06-12-e2e-ci-design.md`. This runbook remains
+the local-development path.
+
 ---
 
 ## 1. One-time WSL2 setup (nested virtualization → /dev/kvm)
@@ -222,8 +228,10 @@ next to it: `vmm.log`, `passt.log`, `virtiofsd-workspace.log`.
 
 ## 8. Windows validation (manual, spike host)
 
-The Windows port has no CI; validation is script-driven on a Windows 11
-host with WHP enabled. Build + stage from WSL, then run the parity suite:
+The Windows port is CI-validated by the `windows-whp` job in
+`.github/workflows/e2e.yml`; this section is the manual spike-host route.
+Validation is script-driven on a Windows 11 host with WHP enabled. Build +
+stage from WSL, then run the parity suite:
 
 ```sh
 cargo build --release --target x86_64-pc-windows-gnu -p izba-cli

@@ -35,6 +35,9 @@ artifacts and are env-gated: `IZBA_INTEGRATION=1 cargo test -p izba-core --test
 integration -- --test-threads=1` (full setup in [docs/testing.md](docs/testing.md)).
 Daemon e2e (also KVM-gated): `IZBA_INTEGRATION=1 cargo test -p izba-cli --test daemon_e2e -- --test-threads=1`.
 
+Both KVM suites + the Windows WHP validation also run in CI:
+`.github/workflows/e2e.yml` (main pushes, weekly cron, manual dispatch).
+
 **Agent environment reality check (do NOT re-derive this wrong):** this WSL2
 instance has nested virtualization — `/dev/kvm` exists and works; it is merely
 INVISIBLE inside Claude's sandboxed Bash. Run the KVM suites with the sandbox

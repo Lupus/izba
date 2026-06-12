@@ -66,6 +66,21 @@ Pass the result to `build-initramfs.sh` via `IZBA_MKE2FS` so the guest can
 format a blank `rw.img` on first boot.  The source tarball is cached in
 `${XDG_CACHE_HOME:-$HOME/.cache}/izba/e2fsprogs/`.
 
+### `build-passt.sh`
+
+Builds a static `passt` (user-mode networking) from a pinned source snapshot
+(tag `2026_05_26.038c51e`, sha256-verified). Ubuntu 24.04's packaged passt
+predates the `--vhost-user` mode izba requires. Output:
+`dist/passt-2026_05_26-static-x86_64`; install with
+`sudo install -m755 dist/passt-2026_05_26-static-x86_64 /usr/local/bin/passt`.
+
+### `ci/ttystorm-gate.sh` / `ci/ttystorm-gate.ps1`
+
+The scripted M0 vsock-churn gate used by `.github/workflows/e2e.yml`: boots a
+throwaway sandbox, runs `ttystorm floodfast 20 2048` + `chop 30 256` through
+izbad, and asserts the VM is still alive afterwards. Env: `IZBA_EXE`,
+`TTYSTORM_EXE` (paths to the binaries), `IZBA_IMAGE` (default `alpine:3.20`).
+
 ### `fetch-artifacts.sh`
 
 Idempotent dependency checker / downloader.  Manages:
@@ -84,6 +99,9 @@ Boot artifacts are expected at
 
 Use `--check` for report-only mode (prints what is present/missing, exits 1
 if anything is missing, installs nothing).
+
+Downloads are sha256-pinned: cloud-hypervisor and virtiofsd are verified
+after download and deleted on mismatch.
 
 ---
 
