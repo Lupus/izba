@@ -269,6 +269,19 @@ jobs:
         env:
           IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
         run: pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
+      # Non-tty M0 gate runs before the tty steps so its signal is never
+      # lost behind a tty failure.
+      - name: ttystorm M0 churn gate
+        env:
+          IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
+          TTYSTORM_EXE: ${{ github.workspace }}\target\release\examples\ttystorm.exe
+          IZBA_DATA_DIR: ${{ runner.temp }}\storm-data
+        run: pwsh -NoProfile -File hack/ci/ttystorm-gate.ps1
+      # ConPTY canary: the harness's own smoke tests (fixture banner/echo via
+      # raw ConPTY — no izba, no sockets, no VM). Isolates "ConPTY broken in
+      # the runner session" from izba-side tty failures.
+      - name: tty harness ConPTY canary
+        run: cargo test -p izba-ttytest -- --test-threads=1 --nocapture
       - name: tty Tier-1 scripted (no VM)
         run: cargo test -p izba-cli --features ttytests --test tty_scripted -- --test-threads=1 --nocapture
       - name: tty Tier-2 e2e
@@ -276,12 +289,6 @@ jobs:
           IZBA_TTY_E2E: '1'
           IZBA_DATA_DIR: ${{ runner.temp }}\tty-data
         run: cargo test -p izba-cli --features ttytests --test tty_e2e -- --test-threads=1 --nocapture
-      - name: ttystorm M0 churn gate
-        env:
-          IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
-          TTYSTORM_EXE: ${{ github.workspace }}\target\release\examples\ttystorm.exe
-          IZBA_DATA_DIR: ${{ runner.temp }}\storm-data
-        run: pwsh -NoProfile -File hack/ci/ttystorm-gate.ps1
       - name: Upload sandbox logs on failure
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
