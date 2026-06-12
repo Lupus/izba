@@ -62,13 +62,17 @@ where
 
 /// Bind 0.0.0.0:53 and serve forever (daemon thread); one thread per query
 /// so a slow upstream cannot head-of-line-block other resolutions.
+/// M1: unbounded thread-per-query (and one izbad conn each) — the host-side bound is M2 scope.
 pub fn serve_dns_udp() -> io::Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", 53))?;
     let mut buf = [0u8; 4096];
     loop {
         let (n, peer) = match sock.recv_from(&mut buf) {
             Ok(x) => x,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("izba-init: dns stub recv: {e}");
+                continue;
+            }
         };
         let query = buf[..n].to_vec();
         let sock2 = sock.try_clone()?;

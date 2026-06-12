@@ -293,7 +293,7 @@ fn tcp_dial<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, port: u16) 
 
 /// Copy `r` to `w` until EOF or error. Mirrors `pump` but takes `w` by mutable
 /// reference so the caller can issue a shutdown after the copy completes.
-pub(crate) fn relay_pump(mut r: impl Read, w: &mut impl Write) {
+fn relay_pump(mut r: impl Read, w: &mut impl Write) {
     let mut buf = [0u8; 32 * 1024];
     loop {
         let n = match r.read(&mut buf) {
@@ -307,7 +307,7 @@ pub(crate) fn relay_pump(mut r: impl Read, w: &mut impl Write) {
     }
 }
 
-pub(crate) fn dup_fd(fd: std::os::fd::RawFd) -> std::io::Result<OwnedFd> {
+fn dup_fd(fd: std::os::fd::RawFd) -> std::io::Result<OwnedFd> {
     let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if dup < 0 {
         return Err(std::io::Error::last_os_error());
