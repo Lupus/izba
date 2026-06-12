@@ -330,22 +330,20 @@ mod tests {
         }
     }
 
-    /// A guest that stops reading responses mid-stream must still get the
-    /// graceful teardown: the handler drains remaining queries to EOF
-    /// instead of dropping the socket (the M0 vsock-churn contract).
+    /// A guest that stops reading responses mid-stream must not deadlock
+    /// the handler: pending queries get consumed and the loop tears down.
     ///
-    /// Strategy: send one query and read its response (proves the happy path
-    /// works), then send two more queries WITHOUT reading their responses,
-    /// then close our write side. The server must consume all pending queries
-    /// and half-close; `h.join()` must return (no hang). If the write-failure
-    /// path were `return`+drop, the server would drop the socket without
-    /// draining and the join would still complete — but then `read_dns_msg`
-    /// for the first query would also succeed, so we assert that too. The
-    /// regression being guarded is a deadlock: if the loop hangs on a full
-    /// kernel buffer waiting for us to read responses we never read, join()
-    /// never returns and the test times out.
+    /// Honest scope: an in-process socketpair cannot deterministically
+    /// force the server's response write to fail while an observer stays
+    /// alive, so this test CANNOT distinguish `break`+drain from
+    /// `return`+drop in dns_loop's write-failure arm — it guards the
+    /// no-hang property only. The drain-on-write-failure contract itself
+    /// is load-bearing-tested at the splice level
+    /// (`portfwd::copy_drains_source_after_write_failure` and
+    /// `server::splice_drains_guest_leg_when_client_dies`), which dns_loop
+    /// mirrors.
     #[test]
-    fn dns_write_failure_still_drains_guest_tx() {
+    fn dns_loop_no_deadlock_when_client_stops_reading() {
         let (mut c, server) = UdsStream::pair().unwrap();
         let h = std::thread::spawn(move || {
             let mut s = server;
@@ -357,10 +355,8 @@ mod tests {
         // Happy-path: one round-trip confirms the loop is running.
         dns::write_dns_msg(&mut c, b"q0").unwrap();
         assert_eq!(dns::read_dns_msg(&mut c).unwrap().unwrap(), b"ans:q0");
-        // Send more queries but stop reading responses. On platforms where
-        // shutdown(Read) forces a write error on the peer the response writes
-        // fail immediately; on others the kernel buffers them. Either way the
-        // server must not deadlock — it must drain our TX and half-close.
+        // Send more queries but stop reading responses; the server must not
+        // deadlock — it must consume our TX and tear down.
         dns::write_dns_msg(&mut c, b"q1").unwrap();
         dns::write_dns_msg(&mut c, b"q2").unwrap();
         c.shutdown(std::net::Shutdown::Write).unwrap();
