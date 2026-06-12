@@ -49,6 +49,23 @@ subsequent runs skip the download.
 
 Output defaults to `dist/vmlinux`.
 
+**Tarball integrity:** known versions have a pinned sha256 (currently `6.12.30`).
+Building an unlisted version requires `IZBA_KERNEL_SHA256=<hash>` — there is no
+unverified path.  Set `IZBA_KERNEL_VERIFY_ONLY=1` to hash-check the cached
+tarball and exit without building (useful for CI preflight).
+
+### `build-mke2fs.sh`
+
+Builds a statically-linked `mke2fs` from pinned e2fsprogs sources
+(**1.47.2**, sha256-verified tarball) using `musl-gcc` (`musl-tools` package).
+Only the `mke2fs` binary is produced; no other e2fsprogs utilities are built.
+
+Output defaults to `dist/mke2fs-1.47.2-static-x86_64`.
+
+Pass the result to `build-initramfs.sh` via `IZBA_MKE2FS` so the guest can
+format a blank `rw.img` on first boot.  The source tarball is cached in
+`${XDG_CACHE_HOME:-$HOME/.cache}/izba/e2fsprogs/`.
+
 ### `fetch-artifacts.sh`
 
 Idempotent dependency checker / downloader.  Manages:
@@ -170,6 +187,8 @@ cargo build --release -p izba-cli
 | `IZBA_BIN_DIR` | Directory where `fetch-artifacts.sh` installs host binaries. Defaults to `$HOME/.local/bin`. |
 | `IZBA_DATA_DIR` | Root data directory. Defaults to `$HOME/.local/share/izba`. |
 | `IZBA_MKE2FS` | Optional path to a static `mke2fs` binary to embed in the initramfs at `/sbin/mke2fs` (enables in-guest first-boot rw formatting). |
+| `IZBA_KERNEL_SHA256` | sha256 of the kernel source tarball when building an unlisted version; required when the version has no entry in `build-kernel.sh`'s `KNOWN_SHA256` table. |
+| `IZBA_KERNEL_VERIFY_ONLY` | Set to `1` to hash-check the cached kernel tarball and exit without building (CI preflight mode). |
 | `VIRTIOFSD_VERSION` | virtiofsd release tag for `fetch-artifacts.sh`. Defaults to a pinned known-good version. |
 | `IZBA_MKFS_EROFS` | Absolute path to `mkfs.erofs` (or `mkfs.erofs.exe` on Windows). Overrides the bundled libexec copy and `$PATH`. |
 
