@@ -141,7 +141,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            curl tar make gcc autoconf automake libtool-bin pkg-config patch
+            curl tar make gcc autoconf automake libtool-bin pkg-config patch \
+            unzip file
           mkdir -p "$HOME/.local/bin"
           IZBA_BIN_DIR="$HOME/.local/bin" hack/fetch-artifacts.sh || true
           hack/build-passt.sh
@@ -245,7 +246,10 @@ jobs:
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           prefix-key: e2e-windows
+      # bash, not pwsh: fail-fast between the two builds (pwsh only gates the
+      # step on the LAST native command's exit code).
       - name: Build izba.exe + ttystorm.exe (native MSVC)
+        shell: bash
         run: |
           cargo build --release -p izba-cli
           cargo build --release -p izba-core --example ttystorm
@@ -270,7 +274,7 @@ jobs:
         with:
           name: windows-whp-failure-logs
           path: |
-            ${{ env.LOCALAPPDATA }}\izba\sandboxes\**\logs\**
+            ~\AppData\Local\izba\sandboxes\**\logs\**
             ${{ runner.temp }}\tty-data\**\logs\**
             ${{ runner.temp }}\storm-data\**\logs\**
           if-no-files-found: ignore
