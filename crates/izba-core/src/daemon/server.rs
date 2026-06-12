@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use izba_proto::{read_frame, write_frame, Response};
 
+use crate::daemon::egress::EgressManager;
 use crate::daemon::proto::{
     DaemonHello, DaemonRequest, DaemonResponse, DaemonStatus, SandboxDetail,
 };
@@ -22,7 +23,7 @@ use crate::paths::Paths;
 use crate::portfwd::copy_until_eof;
 use crate::procmgr;
 use crate::sandbox::{self, Artifacts, Connector, CreateOpts};
-use crate::state::{load_json, SandboxConfig, CONFIG_FILE};
+use crate::state::{load_json, EgressMode, SandboxConfig, CONFIG_FILE};
 use crate::vmm::{IoStream, UdsStream, VmmDriver};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -52,6 +53,8 @@ pub struct DaemonDeps {
     pub stream_connector: SharedStreamConnector,
     pub artifacts: ArtifactsFn,
     pub resolve_image: ResolveImageFn,
+    pub egress_policy: std::sync::Arc<dyn crate::daemon::egress::policy::Policy>,
+    pub egress_resolver: std::sync::Arc<dyn crate::daemon::egress::dns::Resolver>,
 }
 
 impl DaemonDeps {
@@ -67,6 +70,8 @@ impl DaemonDeps {
             stream_connector: Box::new(sandbox::default_stream_connector()),
             artifacts: Box::new(crate::artifacts::locate),
             resolve_image: Box::new(crate::image::ensure_image),
+            egress_policy: std::sync::Arc::new(crate::daemon::egress::policy::AllowAll),
+            egress_resolver: std::sync::Arc::new(crate::daemon::egress::dns::UdpForwarder::system()),
         }
     }
 }
@@ -76,6 +81,7 @@ pub struct Daemon {
     pub deps: DaemonDeps,
     pub registry: Registry,
     pub relays: RelayManager,
+    pub egress: EgressManager,
     started: Instant,
     active_conns: AtomicUsize,
     shutdown: AtomicBool,
@@ -84,11 +90,17 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(paths: Paths, deps: DaemonDeps) -> Self {
+        // Clone the egress seams before `deps` is moved into the struct.
+        let egress = EgressManager::new(
+            Arc::clone(&deps.egress_policy),
+            Arc::clone(&deps.egress_resolver),
+        );
         Self {
             paths,
             deps,
             registry: Registry::new(),
             relays: RelayManager::new(),
+            egress,
             started: Instant::now(),
             active_conns: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
@@ -250,11 +262,21 @@ pub fn dispatch(
             }
             DaemonRequest::Start { name } => {
                 progress(format!("starting '{name}'..."));
-                let art = (d.deps.artifacts)(&d.paths)?;
-                sandbox::start(&d.paths, &name, d.deps.driver.as_ref(), &art)?;
+                // Load config FIRST: the egress mode decides whether to bind
+                // the vsock_1027 listener BEFORE launch (so the guest can dial
+                // izbad during boot). Reused below for relay republish.
                 let config: SandboxConfig =
                     load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
                         .with_context(|| format!("no config.json for '{name}'"))?;
+                let art = (d.deps.artifacts)(&d.paths)?;
+                if config.egress == EgressMode::Izbad {
+                    d.egress.ensure_listening(&d.paths, &name)?;
+                }
+                if let Err(e) = sandbox::start(&d.paths, &name, d.deps.driver.as_ref(), &art) {
+                    // Boot never happened — tear the listener back down.
+                    d.egress.stop(&d.paths, &name);
+                    return Err(e);
+                }
                 // (Re-)apply the persisted publish rules afresh, as threads.
                 d.relays.stop_all(&name);
                 for rule in &config.ports {
@@ -278,6 +300,7 @@ pub fn dispatch(
             DaemonRequest::Stop { name } => {
                 sandbox::stop(&d.paths, &name, d.connector(), STOP_TIMEOUT)?;
                 d.relays.stop_all(&name);
+                d.egress.stop(&d.paths, &name);
                 let _ = std::fs::remove_file(relays::rules_path(&d.paths, &name));
                 d.registry.set_liveness(&name, Liveness::Stopped);
                 DaemonResponse::Ok
@@ -285,6 +308,7 @@ pub fn dispatch(
             DaemonRequest::Rm { name, force } => {
                 sandbox::remove(&d.paths, &name, d.connector(), force)?;
                 d.relays.stop_all(&name);
+                d.egress.stop(&d.paths, &name);
                 d.registry.remove(&name);
                 DaemonResponse::Ok
             }
@@ -418,6 +442,19 @@ pub fn adopt(d: &Arc<Daemon>) {
             }
             Err(e) => eprintln!("izbad: ports.json for '{}': {e:#}", info.name),
         }
+        // Rebind the egress listener for live egress=izbad sandboxes; a bind
+        // failure is logged but never aborts adoption of the rest.
+        if info.liveness != Liveness::Stopped {
+            if let Ok(Some(config)) =
+                load_json::<SandboxConfig>(&d.paths.sandbox_dir(&info.name).join(CONFIG_FILE))
+            {
+                if config.egress == EgressMode::Izbad {
+                    if let Err(e) = d.egress.ensure_listening(&d.paths, &info.name) {
+                        eprintln!("izbad: egress listener for '{}': {e:#}", info.name);
+                    }
+                }
+            }
+        }
     }
     d.registry.replace_all(infos);
 }
@@ -495,7 +532,7 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
             if d.shutdown_requested() {
                 return;
             }
-            supervisor::tick(&d.paths, &d.registry, &d.relays, d.connector());
+            supervisor::tick(&d.paths, &d.registry, &d.relays, &d.egress, d.connector());
             std::thread::sleep(supervisor::tick_interval());
         });
     }
@@ -579,6 +616,10 @@ mod tests {
                 })
             }),
             resolve_image: Box::new(|_, _| Ok("sha256:abc".into())),
+            egress_policy: std::sync::Arc::new(crate::daemon::egress::policy::AllowAll),
+            egress_resolver: std::sync::Arc::new(crate::daemon::egress::dns::UdpForwarder::new(
+                "127.0.0.1:53".parse().unwrap(),
+            )),
         }
     }
 
@@ -769,6 +810,53 @@ mod tests {
             Some(crate::liveness::Liveness::Stopped)
         );
         assert!(wait_dead(&vmm), "vmm stand-in must be dead after stop");
+    }
+
+    /// Start on an egress=izbad sandbox binds the vsock_1027 listener;
+    /// Stop removes it. Runtime-skips where the sandbox denies bind.
+    #[test]
+    fn start_binds_egress_listener_stop_removes_it() {
+        use crate::daemon::egress;
+        use crate::state::EgressMode;
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let vmm = spawn_sleep(dir.path());
+        let mut deps = test_deps();
+        deps.connector = Box::new(fake_connector(
+            Arc::new(Mutex::new(Vec::new())),
+            Some(vmm.clone()),
+        ));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        let mut req = create_req(&dir, "web");
+        if let DaemonRequest::Create(ref mut dc) = req {
+            dc.egress = EgressMode::Izbad;
+        }
+        assert!(matches!(rpc(&mut c, &req), DaemonResponse::Created { .. }));
+        match rpc(&mut c, &DaemonRequest::Start { name: "web".into() }) {
+            DaemonResponse::Ok => {}
+            // Bind EPERM wears several wordings across sandboxes ("Permission
+            // denied", "Operation not permitted") — runtime-skip on any.
+            DaemonResponse::Error { message }
+                if message.contains("denied")
+                    || message.contains("Permission")
+                    || message.contains("not permitted") =>
+            {
+                eprintln!("SKIP start_binds_egress_listener: bind denied: {message}");
+                return;
+            }
+            other => panic!("start: {other:?}"),
+        }
+        assert!(d.egress.listening("web"));
+        assert!(egress::listener_path(&d.paths, "web").exists());
+
+        write_state(&d.paths, "web", vmm.clone());
+        assert!(matches!(
+            rpc(&mut c, &DaemonRequest::Stop { name: "web".into() }),
+            DaemonResponse::Ok
+        ));
+        assert!(!d.egress.listening("web"));
+        assert!(!egress::listener_path(&d.paths, "web").exists());
     }
 
     #[test]

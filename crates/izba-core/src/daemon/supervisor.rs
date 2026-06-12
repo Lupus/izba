@@ -6,13 +6,21 @@
 
 use std::time::Duration;
 
+use crate::daemon::egress::EgressManager;
 use crate::daemon::registry::Registry;
 use crate::daemon::relays::RelayManager;
 use crate::liveness::Liveness;
 use crate::paths::Paths;
 use crate::sandbox::{self, Connector};
+use crate::state::{load_json, EgressMode, SandboxConfig, CONFIG_FILE};
 
-pub fn tick(paths: &Paths, registry: &Registry, relays: &RelayManager, connector: Connector) {
+pub fn tick(
+    paths: &Paths,
+    registry: &Registry,
+    relays: &RelayManager,
+    egress: &EgressManager,
+    connector: Connector,
+) {
     let infos = match sandbox::list(paths, connector) {
         Ok(i) => i,
         Err(e) => {
@@ -23,8 +31,18 @@ pub fn tick(paths: &Paths, registry: &Registry, relays: &RelayManager, connector
     for info in &infos {
         if info.liveness == Liveness::Stopped {
             relays.stop_all(&info.name);
+            egress.stop(paths, &info.name);
         } else {
             relays.respawn_dead(paths, &info.name);
+            // Idempotent: a no-op if the listener is alive, a crash-respawn
+            // otherwise. Only egress=izbad sandboxes own a vsock_1027 plane.
+            if let Ok(Some(config)) =
+                load_json::<SandboxConfig>(&paths.sandbox_dir(&info.name).join(CONFIG_FILE))
+            {
+                if config.egress == EgressMode::Izbad {
+                    let _ = egress.ensure_listening(paths, &info.name);
+                }
+            }
         }
     }
     registry.replace_all(infos);
@@ -44,12 +62,22 @@ fn interval_from(env: &dyn Fn(&str) -> Option<String>) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::egress::dns::UdpForwarder;
+    use crate::daemon::egress::policy::AllowAll;
+    use crate::daemon::egress::EgressManager;
     use crate::daemon::registry::Registry;
     use crate::daemon::relays::RelayManager;
     use crate::liveness::Liveness;
     use crate::sandbox::CreateOpts;
     use crate::testutil::{fake_connector, live_identity, test_paths, write_state};
     use std::sync::{Arc, Mutex};
+
+    fn test_egress() -> EgressManager {
+        EgressManager::new(
+            Arc::new(AllowAll),
+            Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
+        )
+    }
 
     #[test]
     fn tick_reflects_disk_state() {
@@ -72,9 +100,10 @@ mod tests {
 
         let registry = Registry::new();
         let relays = RelayManager::new();
+        let egress = test_egress();
         let log = Arc::new(Mutex::new(Vec::new()));
         let conn = fake_connector(log, None);
-        tick(&paths, &registry, &relays, &conn);
+        tick(&paths, &registry, &relays, &egress, &conn);
 
         assert_eq!(registry.liveness("up"), Some(Liveness::Running));
         assert_eq!(registry.liveness("down"), Some(Liveness::Stopped));

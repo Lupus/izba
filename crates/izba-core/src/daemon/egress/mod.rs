@@ -61,6 +61,9 @@ impl EgressManager {
             if !slot.thread.is_finished() {
                 return Ok(());
             }
+            // A slot is found here only if its accept thread exited
+            // unexpectedly: `stop()` always removes the slot, so it never
+            // leaves a finished thread behind. Drop it and rebind below.
             inner.remove(name);
         }
         let path = listener_path(paths, name);
@@ -108,7 +111,9 @@ impl EgressManager {
     }
 
     /// Stop and join the listener of `name` (sandbox stop/rm); removes the
-    /// socket file so a later VMM bridge attempt fails fast.
+    /// socket file so a later VMM bridge attempt fails fast. Only the accept
+    /// loop is joined: in-flight connection threads are detached and finish
+    /// on their own — their guest leg breaks once the VM stops.
     pub fn stop(&self, paths: &Paths, name: &str) {
         let Some(slot) = self.inner.lock().unwrap().remove(name) else {
             return;
@@ -125,6 +130,23 @@ impl EgressManager {
             .get(name)
             .map(|s| !s.thread.is_finished())
             .unwrap_or(false)
+    }
+
+    /// Test hook: a slot whose accept thread is already finished (simulated
+    /// crash), so `ensure_listening` exercises its rebind path.
+    #[cfg(test)]
+    fn insert_for_test(&self, name: &str) {
+        let thread = std::thread::spawn(|| {});
+        while !thread.is_finished() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.inner.lock().unwrap().insert(
+            name.to_string(),
+            EgressSlot {
+                stop: Arc::new(AtomicBool::new(false)),
+                thread,
+            },
+        );
     }
 }
 
@@ -204,5 +226,32 @@ mod tests {
     fn stop_unknown_is_a_noop() {
         let (_d, paths) = test_paths();
         mgr().stop(&paths, "ghost");
+    }
+
+    /// A crashed accept thread (finished slot) is rebound by the next
+    /// `ensure_listening` — the supervisor's respawn path. Runtime-skips
+    /// where the sandbox denies bind.
+    #[test]
+    fn ensure_listening_rebinds_a_crashed_slot() {
+        let (_d, paths) = test_paths();
+        let m = mgr();
+        m.insert_for_test("web");
+        assert!(!m.listening("web"), "the seeded slot is already finished");
+        match m.ensure_listening(&paths, "web") {
+            Ok(()) => {}
+            Err(e)
+                if e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                }) =>
+            {
+                eprintln!("SKIP ensure_listening_rebinds_a_crashed_slot: bind denied: {e:#}");
+                return;
+            }
+            Err(e) => panic!("ensure_listening: {e:#}"),
+        }
+        assert!(m.listening("web"), "rebound a fresh accept thread");
+        assert!(listener_path(&paths, "web").exists(), "socket file rebound");
+        m.stop(&paths, "web");
     }
 }
