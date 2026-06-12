@@ -85,8 +85,11 @@ if (-not ($egRc -eq 0 -and $egOut -match 'example\.com')) {
 # an `izba-init: applying nft ruleset` error in console.log = kernel/nft mismatch.
 $tcpOut = (& $exe exec egress-a -- /bin/sh -lc 'wget -qO- http://example.com/ | head -c 64' 2>&1 | Out-String)
 $tcpRc  = $LASTEXITCODE
-Check 'TCP egress via izbad fetches http://example.com' ($tcpRc -eq 0 -and "$tcpOut".Trim().Length -gt 0)
-if (-not ($tcpRc -eq 0 -and "$tcpOut".Trim().Length -gt 0)) {
+# Content match, not mere non-emptiness: busybox wget's stderr (merged by 2>&1)
+# would otherwise count as "output" even when the fetch failed (head exits 0).
+$tcpOk = ($tcpRc -eq 0 -and $tcpOut -match '(?i)<html|doctype')
+Check 'TCP egress via izbad fetches http://example.com' $tcpOk
+if (-not $tcpOk) {
     [Console]::Error.WriteLine("  egress-a wget rc=$tcpRc out='$($tcpOut.Trim())'")
     $egConsole = "$env:LOCALAPPDATA\izba\sandboxes\egress-a\logs\console.log"
     if (Test-Path $egConsole) {
