@@ -40,6 +40,7 @@ use izba_proto::{
     read_frame, write_frame, ExecRequest, Request, Response, StreamAttach, StreamKind, StreamOpen,
 };
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -106,7 +107,7 @@ fn main() -> anyhow::Result<()> {
     let rounds: u32 = args.next().map(|s| s.parse().unwrap()).unwrap_or(3);
     let kib: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(1024);
     let t = Target {
-        paths: Paths::from_env_or_default(None),
+        paths: Paths::from_env_or_default(std::env::var_os("IZBA_DATA_DIR").map(PathBuf::from)),
         name,
         direct,
     };
