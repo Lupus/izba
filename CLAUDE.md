@@ -11,6 +11,7 @@ Cloud Hypervisor/KVM; Windows/WHP via OpenVMM is planned but not started.
 | [README.md](README.md) | Product overview, quickstart, command surface |
 | [docs/vision.md](docs/vision.md) | **Product North Star** — what izba is becoming (compose-for-microVMs + service mesh + credential vault) and the locked steering decisions. Read before product-direction changes. |
 | [docs/superpowers/specs/2026-06-12-izba-mesh-networking-design.md](docs/superpowers/specs/2026-06-12-izba-mesh-networking-design.md) | v2 networking + multi-sandbox mesh design (decisions + rationale; `izbad` as vsock policy hub). The technical "how" for the vision. |
+| [docs/roadmap.md](docs/roadmap.md) | **Roadmap** — current-state assessment, milestones M0–M5 + adoption track, risk register, open product decisions. Read before picking the next work item. |
 | [docs/superpowers/specs/2026-06-10-izba-v1-design.md](docs/superpowers/specs/2026-06-10-izba-v1-design.md) | **The approved v1 design** — decisions + rationale, §8 spikes, §9 v2 horizon. Read before architectural changes. |
 | [docs/superpowers/plans/2026-06-10-izba-v1.md](docs/superpowers/plans/2026-06-10-izba-v1.md) | The executed v1 implementation plan (historical; useful for "why is X built this way") |
 | [docs/testing.md](docs/testing.md) | KVM integration-suite runbook (WSL2 setup, deps, troubleshooting) |
