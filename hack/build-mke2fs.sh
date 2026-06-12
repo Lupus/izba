@@ -24,7 +24,17 @@ TARBALL="$CACHE/e2fsprogs-${VERSION}.tar.xz"
 # ---------------------------------------------------------------------------
 # Dependency check
 # ---------------------------------------------------------------------------
+MISSING=""
+for tool in curl sha256sum tar make file; do
+    command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
+done
+if [ -n "$MISSING" ]; then
+    echo "error: missing tools:$MISSING" >&2
+    echo "install with: sudo apt-get install -y curl coreutils tar make file musl-tools" >&2
+    exit 1
+fi
 # musl-gcc gives a truly static binary with no glibc NSS caveats.
+# It comes from the musl-tools package, not a package named musl-gcc.
 if ! command -v musl-gcc >/dev/null 2>&1; then
     echo "error: musl-gcc not found — install it with:" >&2
     echo "  sudo apt-get install -y musl-tools" >&2
@@ -35,8 +45,11 @@ fi
 # Fetch (cached) + verify
 # ---------------------------------------------------------------------------
 mkdir -p "$CACHE"
-[ -f "$TARBALL" ] || curl -fsSL -o "$TARBALL" "$URL"
-if ! echo "$SHA256  $TARBALL" | sha256sum -c - >/dev/null 2>&1; then
+if [ ! -f "$TARBALL" ]; then
+    curl -fsSL -o "$TARBALL.part" "$URL" || { rm -f "$TARBALL.part"; exit 1; }
+    mv "$TARBALL.part" "$TARBALL"
+fi
+if ! echo "$SHA256  $TARBALL" | sha256sum -c - >/dev/null; then
     rm -f "$TARBALL"
     echo "error: $TARBALL failed sha256 verification — removed; re-run to re-download" >&2
     exit 1
@@ -68,9 +81,12 @@ cd "$BUILD"
     --disable-nls --disable-elf-shlibs --disable-uuidd \
     --disable-fuse2fs --disable-debugfs --disable-imager \
     --disable-resizer --disable-defrag \
-    >/dev/null
-make -j"$(nproc)" libs >/dev/null
-make -j"$(nproc)" -C misc mke2fs >/dev/null
+    >"$BUILD/build.log" 2>&1 \
+    || { tail -30 "$BUILD/build.log" >&2; echo "error: configure failed — full log: $BUILD/build.log" >&2; exit 1; }
+make -j"$(nproc)" libs >>"$BUILD/build.log" 2>&1 \
+    || { tail -30 "$BUILD/build.log" >&2; echo "error: make libs failed — full log: $BUILD/build.log" >&2; exit 1; }
+make -j"$(nproc)" -C misc mke2fs >>"$BUILD/build.log" 2>&1 \
+    || { tail -30 "$BUILD/build.log" >&2; echo "error: make mke2fs failed — full log: $BUILD/build.log" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Install
