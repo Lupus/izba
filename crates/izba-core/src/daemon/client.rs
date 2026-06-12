@@ -28,16 +28,15 @@ impl DaemonClient {
     /// Connect to a running daemon. `Ok(None)` when there is none (missing
     /// socket or nothing accepting). Never auto-starts.
     pub fn connect_existing(paths: &Paths) -> anyhow::Result<Option<DaemonClient>> {
+        // Check the socket file first: it is the cross-platform "is there a
+        // daemon" signal (the daemon unlinks it on exit), and it sidesteps
+        // WinSock's unhelpful errno mapping for dead AF_UNIX paths.
+        if !paths.daemon_socket().exists() {
+            return Ok(None);
+        }
         match transport::connect_socket(paths) {
             Ok(s) => Ok(Some(Self::handshake(s, &transport::daemon_version())?)),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                Ok(None)
-            }
+            Err(e) if connect_says_no_daemon(&e) => Ok(None),
             Err(e) => Err(e).context("connecting to the izbad socket"),
         }
     }
@@ -222,6 +221,18 @@ impl DaemonClient {
 
 /// Does this error chain say "the daemon died under us mid-handshake"?
 /// EOF/reset/timeout from the socket (raw io or wrapped in a FrameError).
+/// Does this connect error mean "no daemon is listening"? Beyond the
+/// portable kinds, Windows AF_UNIX surfaces raw WSA codes that std does not
+/// map: connecting to a stale socket file yields WSAENETDOWN (10050) or
+/// WSAEADDRNOTAVAIL (10049) instead of ConnectionRefused (observed on the
+/// real Windows validation host).
+fn connect_says_no_daemon(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    ) || matches!(e.raw_os_error(), Some(10050) | Some(10049))
+}
+
 fn is_daemon_gone(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         let kind = match c.downcast_ref::<std::io::Error>() {
