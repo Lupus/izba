@@ -1,0 +1,276 @@
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * 1'   # weekly drift check, Mon 03:00 UTC (see spec)
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  kernel:
+    name: vmlinux (pinned 6.12.30)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Restore built vmlinux
+        id: vmlinux
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: dist/vmlinux
+          key: vmlinux-${{ hashFiles('hack/kernel.config', 'hack/build-kernel.sh') }}
+      - name: Install kernel build deps
+        if: steps.vmlinux.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential flex bison bc libelf-dev
+      - name: Build kernel
+        if: steps.vmlinux.outputs.cache-hit != 'true'
+        run: hack/build-kernel.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vmlinux
+          path: dist/vmlinux
+          if-no-files-found: error
+
+  mke2fs:
+    name: static mke2fs (pinned e2fsprogs 1.47.2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      - run: hack/build-mke2fs.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mke2fs
+          path: dist/mke2fs-*-static-x86_64
+          if-no-files-found: error
+
+  initramfs:
+    name: initramfs (izba-init + embedded mke2fs)
+    needs: mke2fs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools cpio
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: initramfs
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mke2fs
+          path: dist/
+      - name: Build initramfs with embedded mke2fs
+        run: |
+          files=(dist/mke2fs-*-static-x86_64)
+          if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+            echo "expected exactly 1 mke2fs binary, got: ${files[*]}" >&2
+            exit 1
+          fi
+          chmod 755 "${files[0]}"
+          IZBA_MKE2FS="${files[0]}" hack/build-initramfs.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: initramfs
+          path: dist/initramfs.cpio.gz
+          if-no-files-found: error
+
+  erofs-exe:
+    name: mkfs.erofs.exe (pinned erofs-utils 1.9.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl tar make gcc autoconf automake libtool-bin pkg-config patch \
+            gcc-mingw-w64-x86-64
+      - run: hack/build-mkfs-erofs-windows.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-mkfs-erofs-windows
+          path: dist/mkfs.erofs.exe
+          if-no-files-found: error
+
+  linux-kvm:
+    name: KVM e2e (integration + daemon + tty + ttystorm)
+    needs: [kernel, initramfs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      IZBA_KERNEL: ${{ github.workspace }}/dist/vmlinux
+      IZBA_INITRAMFS: ${{ github.workspace }}/dist/initramfs.cpio.gz
+      IZBA_TEST_CACHE: /home/runner/.cache/izba-itest
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Make /dev/kvm accessible
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm
+          [ -r /dev/kvm ] && [ -w /dev/kvm ]
+      - name: Restore runtime tools
+        id: tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.local/bin/cloud-hypervisor
+            ~/.local/bin/virtiofsd
+            ~/.local/bin/passt
+            ~/.local/bin/mkfs.erofs
+          key: e2e-tools-${{ hashFiles('hack/fetch-artifacts.sh', 'hack/build-passt.sh', 'hack/build-mkfs-erofs-windows.sh') }}
+      - name: Build runtime tools (cache miss)
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl tar make gcc autoconf automake libtool-bin pkg-config patch
+          mkdir -p "$HOME/.local/bin"
+          IZBA_BIN_DIR="$HOME/.local/bin" hack/fetch-artifacts.sh || true
+          hack/build-passt.sh
+          install -m755 dist/passt-*-static-x86_64 "$HOME/.local/bin/passt"
+          hack/build-mkfs-erofs-windows.sh --linux-only
+          install -m755 "$HOME/.cache/izba/erofs-utils/build-linux/mkfs/mkfs.erofs" "$HOME/.local/bin/mkfs.erofs"
+      - name: Assert tools present
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          for t in cloud-hypervisor virtiofsd passt mkfs.erofs; do
+            command -v "$t" || { echo "missing $t" >&2; exit 1; }
+          done
+          passt --help | grep -q vhost-user
+          mkfs.erofs --version
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vmlinux
+          path: dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: initramfs
+          path: dist/
+      - name: Restore OCI test-image cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /home/runner/.cache/izba-itest
+          key: izba-itest-alpine-3.20
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: e2e-linux
+      - name: Integration suite (15 tests, real KVM VMs)
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          IZBA_INTEGRATION=1 cargo test -p izba-core --test integration -- --test-threads=1 --nocapture
+      - name: Daemon e2e (lifecycle suite)
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          IZBA_INTEGRATION=1 cargo test -p izba-cli --test daemon_e2e -- --test-threads=1 --nocapture
+      - name: tty Tier-2 e2e
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p "$RUNNER_TEMP/tty-data"
+          IZBA_TTY_E2E=1 IZBA_DATA_DIR="$RUNNER_TEMP/tty-data" \
+            cargo test -p izba-cli --features ttytests --test tty_e2e -- --test-threads=1 --nocapture
+      - name: ttystorm M0 churn gate
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          cargo build --release -p izba-cli
+          cargo build --release -p izba-core --example ttystorm
+          mkdir -p "$RUNNER_TEMP/storm-data"
+          IZBA_DATA_DIR="$RUNNER_TEMP/storm-data" \
+          IZBA_EXE="$PWD/target/release/izba" \
+          TTYSTORM_EXE="$PWD/target/release/examples/ttystorm" \
+            hack/ci/ttystorm-gate.sh
+      - name: Upload sandbox logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-kvm-failure-logs
+          path: |
+            ${{ runner.temp }}/tty-data/**/logs/**
+            ${{ runner.temp }}/storm-data/**/logs/**
+          if-no-files-found: ignore
+
+  windows-whp:
+    name: WHP e2e (validate + tty + ttystorm)
+    needs: [kernel, initramfs, erofs-exe]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      IZBA_KERNEL: ${{ github.workspace }}\dist\vmlinux
+      IZBA_INITRAMFS: ${{ github.workspace }}\dist\initramfs.cpio.gz
+      IZBA_OPENVMM: ${{ github.workspace }}\dist\openvmm.exe
+      IZBA_MKFS_EROFS: ${{ github.workspace }}\dist\mkfs.erofs.exe
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vmlinux
+          path: dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: initramfs
+          path: dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-mkfs-erofs-windows
+          path: dist/
+      - name: Restore pinned openvmm.exe
+        id: openvmm
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: dist/openvmm.exe
+          key: openvmm-run-27240809751
+      - name: Fetch pinned openvmm.exe (cache miss)
+        if: steps.openvmm.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: hack/fetch-openvmm.sh
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: e2e-windows
+      - name: Build izba.exe + ttystorm.exe (native MSVC)
+        run: |
+          cargo build --release -p izba-cli
+          cargo build --release -p izba-core --example ttystorm
+      - name: Windows validation suite (21 checks)
+        env:
+          IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
+        run: pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
+      - name: tty Tier-2 e2e
+        env:
+          IZBA_TTY_E2E: '1'
+          IZBA_DATA_DIR: ${{ runner.temp }}\tty-data
+        run: cargo test -p izba-cli --features ttytests --test tty_e2e -- --test-threads=1 --nocapture
+      - name: ttystorm M0 churn gate
+        env:
+          IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
+          TTYSTORM_EXE: ${{ github.workspace }}\target\release\examples\ttystorm.exe
+          IZBA_DATA_DIR: ${{ runner.temp }}\storm-data
+        run: pwsh -NoProfile -File hack/ci/ttystorm-gate.ps1
+      - name: Upload sandbox logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-whp-failure-logs
+          path: |
+            ${{ env.LOCALAPPDATA }}\izba\sandboxes\**\logs\**
+            ${{ runner.temp }}\tty-data\**\logs\**
+            ${{ runner.temp }}\storm-data\**\logs\**
+          if-no-files-found: ignore
