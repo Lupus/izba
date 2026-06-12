@@ -18,7 +18,6 @@ pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32>
         workspace,
         rw_size_gb: opts.rw_size_gb,
         ports,
-        egress: super::parse_egress(&opts.egress)?,
     });
     match client.request(&req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Created { name } => {

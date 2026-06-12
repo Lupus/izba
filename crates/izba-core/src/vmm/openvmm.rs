@@ -1,14 +1,15 @@
 //! OpenVMM backend (Windows/WHP): pure argv construction plus the
 //! [`OpenVmmDriver`] that spawns `openvmm.exe`. Unlike Cloud Hypervisor
-//! there are NO sidecars — the virtiofs server and consomme networking run
-//! in-process inside openvmm (spike S1+ finding (c)), so launch is a single
-//! detached spawn and `pids()` is just `[("vmm", id)]`.
+//! there are NO sidecars — the virtiofs server runs in-process inside
+//! openvmm (spike S1+ finding (c)), so launch is a single detached spawn
+//! and `pids()` is just `[("vmm", id)]`. There is no host NIC: guest egress
+//! rides the izbad-owned vsock 1027 plane (see `daemon::egress`), so openvmm
+//! is launched without `--net`.
 //!
 //! Flag shapes are pinned by the rung-7 canonical invocation in
 //! docs/superpowers/specs/2026-06-10-openvmm-spike-s1-findings.md:
-//! `--hv` is mandatory (VPCI vsock + netvsp need it); virtio-blk must be
-//! routed via per-disk PCIe root ports (VPCI auto-routing collides device
-//! IDs); networking is `--net consomme` (netvsp NIC), not virtio-net.
+//! `--hv` is mandatory (VPCI vsock needs it); virtio-blk must be routed via
+//! per-disk PCIe root ports (VPCI auto-routing collides device IDs).
 //! `--processors`/`--memory` are spike-unverified (defaults were used) and
 //! get confirmed against `openvmm.exe --help` during Plan 2 bring-up.
 
@@ -67,18 +68,6 @@ fn reject_commas(spec: &VmSpec) -> anyhow::Result<()> {
 
 pub fn build_invocation(spec: &VmSpec, openvmm: &Path) -> CommandSpec {
     let vsock_sock = spec.run_dir.join("vsock.sock");
-    // consomme advertises guest IPv6 (SLAAC) whenever the host has ANY
-    // non-link-local IPv6 address (a Tailscale/VPN ULA is enough), with no
-    // regard for whether the host has an IPv6 route out; guest IPv6 connects
-    // then die as instant RSTs ("Connection refused", racing SLAAC ~4s after
-    // boot). openvmm exposes no knob for this, so tell izba-init to disable
-    // guest IPv6 on eth0. The CH/passt path stays dual-stack: passt only
-    // offers IPv6 the host can actually route.
-    let cmdline = if spec.net {
-        format!("{} izba.ipv4only=1", spec.cmdline)
-    } else {
-        spec.cmdline.clone()
-    };
     let mut argv = vec![
         openvmm.display().to_string(),
         "--kernel".to_string(),
@@ -86,7 +75,7 @@ pub fn build_invocation(spec: &VmSpec, openvmm: &Path) -> CommandSpec {
         "--initrd".to_string(),
         spec.initramfs.display().to_string(),
         "-c".to_string(),
-        cmdline,
+        spec.cmdline.clone(),
         "--hv".to_string(),
         "--processors".to_string(),
         spec.cpus.to_string(),
@@ -122,10 +111,6 @@ pub fn build_invocation(spec: &VmSpec, openvmm: &Path) -> CommandSpec {
             share.tag,
             share.host_path.display()
         ));
-    }
-    if spec.net {
-        argv.push("--net".to_string());
-        argv.push("consomme".to_string());
     }
     argv.push("--virtio-vsock-path".to_string());
     argv.push(vsock_sock.display().to_string());
@@ -210,7 +195,7 @@ mod tests {
         VmSpec {
             kernel: PathBuf::from("/img/vmlinux"),
             initramfs: PathBuf::from("/img/initramfs.img"),
-            cmdline: "console=ttyS0 ip=dhcp izba.hostname=box".to_string(),
+            cmdline: "console=ttyS0 izba.hostname=box izba.egress=1".to_string(),
             cpus: 2,
             mem_mb: 4096,
             disks: vec![
@@ -227,7 +212,6 @@ mod tests {
                 tag: "workspace".to_string(),
                 host_path: PathBuf::from("/home/user/project"),
             }],
-            net: true,
             console_log: PathBuf::from("/sbx/console.log"),
             run_dir: PathBuf::from("/sbx/run"),
         }
@@ -258,7 +242,7 @@ mod tests {
                 "--initrd",
                 "/img/initramfs.img",
                 "-c",
-                "console=ttyS0 ip=dhcp izba.hostname=box izba.ipv4only=1",
+                "console=ttyS0 izba.hostname=box izba.egress=1",
                 "--hv",
                 "--processors",
                 "2",
@@ -280,8 +264,6 @@ mod tests {
                 "file:/sbx/rw.img,pcie_port=vdb",
                 "--virtio-fs",
                 "pcie_port=fs-workspace:workspace,/home/user/project",
-                "--net",
-                "consomme",
                 "--virtio-vsock-path",
                 &dir_join(run, "vsock.sock"),
             ])
@@ -289,17 +271,13 @@ mod tests {
     }
 
     #[test]
-    fn openvmm_invocation_no_net() {
-        let mut spec = base_spec();
-        spec.net = false;
-        let inv = build_invocation(&spec, &PathBuf::from("/opt/openvmm"));
+    fn openvmm_invocation_has_no_net() {
+        // No host NIC: guest egress rides the vsock 1027 plane. The cmdline
+        // passes through unmodified (no izba.ipv4only append).
+        let inv = build_invocation(&base_spec(), &PathBuf::from("/opt/openvmm"));
         assert!(!inv.argv.contains(&"--net".to_string()));
         assert!(!inv.argv.contains(&"consomme".to_string()));
-        // No consomme, no IPv4-only workaround: cmdline passes through as-is.
-        assert!(inv
-            .argv
-            .contains(&"console=ttyS0 ip=dhcp izba.hostname=box".to_string()));
-        // vsock stays:
+        assert!(inv.argv.iter().all(|a| !a.contains("izba.ipv4only")));
         assert!(inv.argv.contains(&"--virtio-vsock-path".to_string()));
     }
 

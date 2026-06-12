@@ -15,9 +15,7 @@ use crate::image::store::ImageStore;
 use crate::liveness::{assess, Liveness, Probes};
 use crate::paths::Paths;
 use crate::procmgr;
-use crate::state::{
-    load_json, save_json, EgressMode, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE,
-};
+use crate::state::{load_json, save_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
 use crate::vmm::{BlockDisk, FsShare, IoStream, VmSpec, VmmDriver};
 
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -43,7 +41,6 @@ pub struct CreateOpts {
     pub workspace: PathBuf,
     pub rw_size_gb: u64,
     pub ports: Vec<crate::state::PortRule>,
-    pub egress: EgressMode,
 }
 
 /// Boot artifacts shared by all sandboxes (kernel + initramfs with izba-init).
@@ -178,7 +175,6 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             mem_mb: opts.mem_mb,
             workspace: opts.workspace.clone(),
             ports: opts.ports.clone(),
-            egress: opts.egress,
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 
@@ -375,10 +371,9 @@ pub fn start_with_timeouts(
     }
 
     let console_log = paths.logs_dir(name).join("console.log");
-    let mut cmdline = format!("console=ttyS0 ip=dhcp izba.hostname={name}");
-    if config.egress == EgressMode::Izbad {
-        cmdline.push_str(" izba.egress=1");
-    }
+    // The guest is a pure vsock island: no NIC, no DHCP. izba.egress=1 is
+    // always on — guest egress rides the izbad-owned vsock 1027 plane.
+    let cmdline = format!("console=ttyS0 izba.hostname={name} izba.egress=1");
     let spec = VmSpec {
         kernel: art.kernel.clone(),
         initramfs: art.initramfs.clone(),
@@ -399,7 +394,6 @@ pub fn start_with_timeouts(
             tag: "workspace".to_string(),
             host_path: config.workspace.clone(),
         }],
-        net: true,
         console_log: console_log.clone(),
         run_dir: paths.run_dir(name),
     };
@@ -524,8 +518,8 @@ fn stop_locked(
     };
     let state = match (assess(state.as_ref(), &probes), state) {
         (Liveness::Stopped, _) | (_, None) => {
-            // VMM is already dead; sidecars (virtiofsd/passt) usually self-exit
-            // with their vhost-user peer, but not always — best-effort kill them.
+            // VMM is already dead; sidecars (virtiofsd) usually self-exit with
+            // their vhost-user peer, but not always — best-effort kill them.
             kill_sidecars_from_state(paths, name);
             return cleanup_runtime(paths, name);
         }
@@ -579,7 +573,7 @@ fn stop_locked(
 
 /// Best-effort kill every sidecar recorded in state.json.
 ///
-/// Called before wiping state.json so orphaned virtiofsd / passt processes
+/// Called before wiping state.json so orphaned virtiofsd processes
 /// (which normally self-exit when their vhost-user peer dies but sometimes
 /// do not) are reaped.  Errors are ignored — the cleanup must proceed
 /// regardless.
@@ -700,8 +694,8 @@ pub fn list(paths: &Paths, connector: Connector) -> anyhow::Result<Vec<SandboxIn
             // Correct stale state left behind by a VMM that died on its own —
             // but only if no concurrent operation (e.g. start) holds the lock,
             // otherwise we could delete the state.json it just wrote.
-            // Also best-effort kill any sidecars (virtiofsd/passt) that may
-            // still be alive even though the VMM is gone.
+            // Also best-effort kill any sidecars (virtiofsd) that may still be
+            // alive even though the VMM is gone.
             let state_path = entry.path().join(STATE_FILE);
             if state_path.exists() {
                 if let Ok(_lock) = lock_sandbox(paths, &name) {
@@ -744,7 +738,6 @@ mod tests {
             workspace: workspace.to_path_buf(),
             rw_size_gb: 1,
             ports: Vec::new(),
-            egress: EgressMode::Passt,
         }
     }
 
@@ -828,8 +821,14 @@ mod tests {
         assert_eq!(spec.kernel, PathBuf::from("/art/vmlinux"));
         assert_eq!(spec.initramfs, PathBuf::from("/art/initramfs.img"));
         assert!(
-            spec.cmdline.contains("console=ttyS0 ip=dhcp"),
+            spec.cmdline
+                .contains("console=ttyS0 izba.hostname=web izba.egress=1"),
             "cmdline: {}",
+            spec.cmdline
+        );
+        assert!(
+            !spec.cmdline.contains("ip=dhcp"),
+            "ip=dhcp must be absent: {}",
             spec.cmdline
         );
         assert_eq!(spec.cpus, 2);
@@ -848,7 +847,6 @@ mod tests {
         assert_eq!(spec.shares[0].tag, "workspace");
         assert_eq!(spec.shares[0].host_path, ws);
 
-        assert!(spec.net);
         assert_eq!(spec.console_log, paths.logs_dir("web").join("console.log"));
         assert_eq!(spec.run_dir, paths.run_dir("web"));
 
@@ -861,32 +859,19 @@ mod tests {
 
     #[test]
     fn start_cmdline_egress_flag() {
+        // izba.egress=1 is unconditional (the guest is always a vsock island).
         let (dir, paths) = test_paths();
         let ws = dir.path().join("ws");
         fs::create_dir_all(&ws).unwrap();
 
-        // Default (Passt) — no izba.egress=1.
         create(&paths, "web", &opts(&ws)).unwrap();
         let driver = MockDriver::new();
         start(&paths, "web", &driver, &arts()).unwrap();
         let spec = driver.captured.lock().unwrap().take().expect("spec");
         assert!(
-            !spec.cmdline.contains("izba.egress=1"),
-            "Passt cmdline must NOT contain izba.egress=1: {}",
+            spec.cmdline.contains("izba.egress=1"),
+            "cmdline must contain izba.egress=1: {}",
             spec.cmdline
-        );
-
-        // Izbad — must append izba.egress=1.
-        let mut izbad_opts = opts(&ws);
-        izbad_opts.egress = EgressMode::Izbad;
-        create(&paths, "izbad", &izbad_opts).unwrap();
-        let driver2 = MockDriver::new();
-        start(&paths, "izbad", &driver2, &arts()).unwrap();
-        let spec2 = driver2.captured.lock().unwrap().take().expect("spec2");
-        assert!(
-            spec2.cmdline.contains("izba.egress=1"),
-            "Izbad cmdline must contain izba.egress=1: {}",
-            spec2.cmdline
         );
     }
 
@@ -1211,7 +1196,7 @@ mod tests {
         );
     }
 
-    /// Verify that `stop` reaps sidecar processes (e.g. virtiofsd/passt) that
+    /// Verify that `stop` reaps sidecar processes (e.g. virtiofsd) that
     /// are still alive when the VMM has already died on its own.
     ///
     /// Scenario: state.json records a dead VMM identity and one live sidecar

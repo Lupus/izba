@@ -29,7 +29,7 @@ use izba_core::liveness::Liveness;
 use izba_core::paths::Paths;
 use izba_core::procmgr;
 use izba_core::sandbox::{self, Artifacts, CreateOpts};
-use izba_core::state::{load_json, EgressMode, PortRule, RunState, STATE_FILE};
+use izba_core::state::{load_json, PortRule, RunState, STATE_FILE};
 use izba_core::vmm::cloud_hypervisor::CloudHypervisorDriver;
 use izba_core::vmm::UdsStream;
 use izba_proto::{
@@ -206,20 +206,8 @@ impl Drop for TestBox {
 // ---------------------------------------------------------------------------
 
 /// `create` only — registers the name for cleanup before anything can fail
-/// to boot. Defaults to the v1 passt egress path.
+/// to boot. Egress is always the izbad-owned vsock_1027 plane now.
 fn create_sandbox(env: &TestEnv, tb: &mut TestBox, name: &str, ws: &Path) {
-    create_sandbox_egress(env, tb, name, ws, izba_core::state::EgressMode::Passt);
-}
-
-/// `create` with an explicit egress datapath (M1 `EgressMode::Izbad` exercises
-/// the guest-initiated vsock_1027 plane).
-fn create_sandbox_egress(
-    env: &TestEnv,
-    tb: &mut TestBox,
-    name: &str,
-    ws: &Path,
-    egress: izba_core::state::EgressMode,
-) {
     let digest = provision_image(env, &tb.paths);
     sandbox::create(
         &tb.paths,
@@ -227,7 +215,6 @@ fn create_sandbox_egress(
         &CreateOpts {
             image_digest: digest,
             image_ref: env.image_ref.clone(),
-            egress,
             cpus: 1,
             mem_mb: 1024,
             workspace: ws.to_path_buf(),
@@ -734,7 +721,7 @@ fn egress_dns_via_izbad() {
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("egress-dns");
-    create_sandbox_egress(&env, &mut tb, "egress-dns", &ws, EgressMode::Izbad);
+    create_sandbox(&env, &mut tb, "egress-dns", &ws);
 
     // Daemonless suite: stand in for izbad's listener ourselves. The listener
     // must exist on run/vsock.sock_1027 BEFORE the guest boots and dials it.
@@ -795,7 +782,7 @@ fn egress_http_via_stub() {
 
     let mut tb = TestBox::new();
     let ws = tb.workspace("egress-http");
-    create_sandbox_egress(&env, &mut tb, "egress-http", &ws, EgressMode::Izbad);
+    create_sandbox(&env, &mut tb, "egress-http", &ws);
 
     // Daemonless suite: stand in for izbad's listener ourselves. The listener
     // must exist on run/vsock.sock_1027 BEFORE the guest boots and dials it.
@@ -1048,7 +1035,6 @@ fn port_publish_create_time() {
                 host_port: 18080,
                 guest_port: 8000,
             }],
-            egress: izba_core::state::EgressMode::Passt,
         },
     )
     .expect("create");

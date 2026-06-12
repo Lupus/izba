@@ -1,4 +1,4 @@
-//! Host-side port-publish relay: pure vsock, no passt involvement, so the same
+//! Host-side port-publish relay: pure vsock, no host NIC involved, so the same
 //! code serves Cloud Hypervisor/Linux and OpenVMM/Windows.
 //!
 //! A published rule is a thread inside izbad, owned by the daemon's

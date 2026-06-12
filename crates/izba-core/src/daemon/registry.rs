@@ -118,7 +118,7 @@ mod tests {
         r.set(
             "api",
             "alpine:3.20",
-            Liveness::Degraded("sidecar passt died".into()),
+            Liveness::Degraded("sidecar virtiofsd:workspace died".into()),
         );
 
         let s = r.summaries();
@@ -128,7 +128,7 @@ mod tests {
             vec!["api", "db", "web"]
         );
         assert_eq!(s[2].status, "running");
-        assert_eq!(s[0].status, "degraded (sidecar passt died)");
+        assert_eq!(s[0].status, "degraded (sidecar virtiofsd:workspace died)");
         // Degraded counts as running (a VMM process exists to supervise).
         assert_eq!(r.running_count(), 2);
         assert_eq!(r.liveness("web"), Some(Liveness::Running));

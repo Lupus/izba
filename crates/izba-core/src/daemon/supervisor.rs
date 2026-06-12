@@ -12,7 +12,6 @@ use crate::daemon::relays::RelayManager;
 use crate::liveness::Liveness;
 use crate::paths::Paths;
 use crate::sandbox::{self, Connector};
-use crate::state::{load_json, EgressMode, SandboxConfig, CONFIG_FILE};
 
 pub fn tick(
     paths: &Paths,
@@ -35,14 +34,8 @@ pub fn tick(
         } else {
             relays.respawn_dead(paths, &info.name);
             // Idempotent: a no-op if the listener is alive, a crash-respawn
-            // otherwise. Only egress=izbad sandboxes own a vsock_1027 plane.
-            if let Ok(Some(config)) =
-                load_json::<SandboxConfig>(&paths.sandbox_dir(&info.name).join(CONFIG_FILE))
-            {
-                if config.egress == EgressMode::Izbad {
-                    let _ = egress.ensure_listening(paths, &info.name);
-                }
-            }
+            // otherwise. Every running sandbox owns a vsock_1027 plane.
+            let _ = egress.ensure_listening(paths, &info.name);
         }
     }
     registry.replace_all(infos);
@@ -92,7 +85,6 @@ mod tests {
             workspace: ws,
             rw_size_gb: 1,
             ports: Vec::new(),
-            egress: crate::state::EgressMode::Passt,
         };
         crate::sandbox::create(&paths, "up", &opts).unwrap();
         crate::sandbox::create(&paths, "down", &opts).unwrap();

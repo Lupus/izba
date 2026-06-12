@@ -1,59 +1,125 @@
-//! Guest network policy knobs.
+//! Guest network bring-up for the NIC-less end state: loopback up, dummy0
+//! with the static izba subnet (192.168.127.2/24 + the resolver address
+//! 192.168.127.1 as an alias), default route via the dummy. Everything the
+//! stub does not intercept therefore has nowhere to go — that IS the
+//! non-TCP deny posture.
 //!
-//! `izba.ipv4only=1` (set by the OpenVMM driver) disables IPv6 on eth0:
-//! consomme advertises SLAAC whenever the Windows host has *any*
-//! non-link-local IPv6 address (e.g. a Tailscale ULA), even with no IPv6
-//! default route — every guest IPv6 connect then fails host-side and comes
-//! back as an RST ("Connection refused" mid-`wget`, racing SLAAC). Writing
-//! `disable_ipv6` flushes any already-acquired SLAAC address and its routes
-//! atomically, so applying it after the kernel's `ip=dhcp` is race-free.
-//! Loopback is left alone: workloads may bind `::1`.
+//! All configuration is ioctl-based (SIOCSIFADDR/SIOCSIFNETMASK/
+//! SIOCSIFFLAGS/SIOCADDRT) — no netlink dependency in static musl PID 1.
 
 use std::io;
-use std::path::Path;
+use std::net::Ipv4Addr;
 
-/// Disables IPv6 on `eth0` (and `default`, for any later-created interface)
-/// under `conf_dir` (`/proc/sys/net/ipv6/conf` in the guest).
-pub fn apply_ipv4only(conf_dir: &Path) -> io::Result<()> {
-    for iface in ["eth0", "default"] {
-        std::fs::write(conf_dir.join(iface).join("disable_ipv6"), "1")?;
+pub const GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
+pub const RESOLVER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);
+pub const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+
+/// Bring up lo + dummy0 and install the default route. Errors are
+/// reported per step so a console log names the exact failure.
+pub fn configure() -> io::Result<()> {
+    if_up("lo")?;
+    set_addr("dummy0", GUEST_IP, NETMASK)?;
+    if_up("dummy0")?;
+    // The resolver address rides an ioctl alias interface.
+    set_addr("dummy0:1", RESOLVER_IP, NETMASK)?;
+    if_up("dummy0:1")?;
+    add_default_route(RESOLVER_IP)?;
+    Ok(())
+}
+
+fn ctl_socket() -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+fn ifreq_named(name: &str) -> io::Result<libc::ifreq> {
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    let bytes = name.as_bytes();
+    if bytes.len() >= req.ifr_name.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ifname too long",
+        ));
+    }
+    for (dst, src) in req.ifr_name.iter_mut().zip(bytes) {
+        *dst = *src as libc::c_char;
+    }
+    Ok(req)
+}
+
+fn sockaddr_v4(ip: Ipv4Addr) -> libc::sockaddr {
+    let sin = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(ip).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    // sockaddr_in and sockaddr are layout-compatible for this use.
+    unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sin) }
+}
+
+fn ioctl(req_no: libc::c_ulong, arg: *mut libc::c_void, what: &str) -> io::Result<()> {
+    let sock = ctl_socket()?;
+    use std::os::fd::AsRawFd;
+    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), req_no as _, arg) };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("{what}: {e}")));
     }
     Ok(())
+}
+
+fn set_addr(ifname: &str, ip: Ipv4Addr, mask: Ipv4Addr) -> io::Result<()> {
+    let mut req = ifreq_named(ifname)?;
+    req.ifr_ifru.ifru_addr = sockaddr_v4(ip);
+    ioctl(libc::SIOCSIFADDR, &mut req as *mut _ as *mut _, ifname)?;
+    let mut req = ifreq_named(ifname)?;
+    req.ifr_ifru.ifru_addr = sockaddr_v4(mask);
+    ioctl(libc::SIOCSIFNETMASK, &mut req as *mut _ as *mut _, ifname)
+}
+
+fn if_up(ifname: &str) -> io::Result<()> {
+    let mut req = ifreq_named(ifname)?;
+    ioctl(libc::SIOCGIFFLAGS, &mut req as *mut _ as *mut _, ifname)?;
+    unsafe {
+        req.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+    }
+    ioctl(libc::SIOCSIFFLAGS, &mut req as *mut _ as *mut _, ifname)
+}
+
+fn add_default_route(gw: Ipv4Addr) -> io::Result<()> {
+    let mut rt: libc::rtentry = unsafe { std::mem::zeroed() };
+    rt.rt_dst = sockaddr_v4(Ipv4Addr::UNSPECIFIED);
+    rt.rt_genmask = sockaddr_v4(Ipv4Addr::UNSPECIFIED);
+    rt.rt_gateway = sockaddr_v4(gw);
+    rt.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
+    ioctl(
+        libc::SIOCADDRT,
+        &mut rt as *mut _ as *mut _,
+        "default route",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fake_conf_dir(ifaces: &[&str]) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        for iface in ifaces {
-            let d = dir.path().join(iface);
-            std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join("disable_ipv6"), "0").unwrap();
-        }
-        dir
+    #[test]
+    fn ifreq_rejects_long_names() {
+        assert!(ifreq_named("a-name-longer-than-ifnamsiz!").is_err());
+        assert!(ifreq_named("dummy0:1").is_ok());
     }
 
     #[test]
-    fn writes_disable_ipv6_for_eth0_and_default_only() {
-        let dir = fake_conf_dir(&["eth0", "default", "lo", "all"]);
-        apply_ipv4only(dir.path()).unwrap();
-        for iface in ["eth0", "default"] {
-            let v = std::fs::read_to_string(dir.path().join(iface).join("disable_ipv6")).unwrap();
-            assert_eq!(v, "1", "{iface} must be disabled");
-        }
-        // Loopback (and the `all` aggregate, which would also hit lo) stay
-        // untouched so ::1 keeps working for workloads.
-        for iface in ["lo", "all"] {
-            let v = std::fs::read_to_string(dir.path().join(iface).join("disable_ipv6")).unwrap();
-            assert_eq!(v, "0", "{iface} must be left alone");
-        }
-    }
-
-    #[test]
-    fn missing_interface_is_an_error() {
-        let dir = fake_conf_dir(&["default"]); // no eth0
-        assert!(apply_ipv4only(dir.path()).is_err());
+    fn sockaddr_v4_is_network_order() {
+        let sa = sockaddr_v4(Ipv4Addr::new(192, 168, 127, 2));
+        let sin: libc::sockaddr_in = unsafe { std::mem::transmute(sa) };
+        assert_eq!(u32::from_be(sin.sin_addr.s_addr), 0xC0A87F02);
     }
 }

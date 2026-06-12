@@ -133,7 +133,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn vmm_dead_is_stopped() {
-        let run = run_with_sidecars(&["passt"]);
+        let run = run_with_sidecars(&["virtiofsd:workspace"]);
         // vmm NOT in alive list; sidecar is alive; control answers
         let p = FakeProbes {
             alive_pids: vec![sidecar_id(0)],
@@ -147,7 +147,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn all_alive_is_running() {
-        let run = run_with_sidecars(&["passt", "virtiofsd:workspace"]);
+        let run = run_with_sidecars(&["virtiofsd:workspace", "virtiofsd:cache"]);
         let p = FakeProbes {
             alive_pids: vec![vmm_id(), sidecar_id(0), sidecar_id(1)],
             control: true,
@@ -160,8 +160,9 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn sidecar_dead_is_degraded() {
-        let run = run_with_sidecars(&["passt", "virtiofsd:workspace"]);
-        // passt alive, virtiofsd dead, control also down — sidecar wins
+        let run = run_with_sidecars(&["virtiofsd:cache", "virtiofsd:workspace"]);
+        // virtiofsd:cache alive, virtiofsd:workspace dead, control also down —
+        // sidecar wins
         let p = FakeProbes {
             alive_pids: vec![vmm_id(), sidecar_id(0)],
             control: false,
@@ -177,7 +178,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn control_unresponsive_is_degraded() {
-        let run = run_with_sidecars(&["passt"]);
+        let run = run_with_sidecars(&["virtiofsd:workspace"]);
         let p = FakeProbes {
             alive_pids: vec![vmm_id(), sidecar_id(0)],
             control: false,
@@ -195,8 +196,8 @@ mod tests {
     fn describe_strings() {
         assert_eq!(Liveness::Running.describe(), "running");
         assert_eq!(
-            Liveness::Degraded("sidecar passt died".into()).describe(),
-            "degraded (sidecar passt died)"
+            Liveness::Degraded("sidecar virtiofsd:workspace died".into()).describe(),
+            "degraded (sidecar virtiofsd:workspace died)"
         );
         assert_eq!(Liveness::Stopped.describe(), "stopped");
         // Clone is required by the daemon registry.

@@ -23,7 +23,7 @@ use crate::paths::Paths;
 use crate::portfwd::copy_until_eof;
 use crate::procmgr;
 use crate::sandbox::{self, Artifacts, Connector, CreateOpts};
-use crate::state::{load_json, EgressMode, SandboxConfig, CONFIG_FILE};
+use crate::state::{load_json, SandboxConfig, CONFIG_FILE};
 use crate::vmm::{IoStream, UdsStream, VmmDriver};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -254,7 +254,6 @@ pub fn dispatch(
                         workspace: c.workspace.clone(),
                         rw_size_gb: c.rw_size_gb,
                         ports: c.ports.clone(),
-                        egress: c.egress,
                     },
                 )?;
                 d.registry.set(&c.name, &c.image_ref, Liveness::Stopped);
@@ -262,16 +261,15 @@ pub fn dispatch(
             }
             DaemonRequest::Start { name } => {
                 progress(format!("starting '{name}'..."));
-                // Load config FIRST: the egress mode decides whether to bind
-                // the vsock_1027 listener BEFORE launch (so the guest can dial
-                // izbad during boot). Reused below for relay republish.
+                // Load config FIRST (reused below for relay republish), then
+                // bind the vsock_1027 egress listener BEFORE launch so the
+                // guest can dial izbad during boot. Every sandbox owns one —
+                // egress is unconditional now.
                 let config: SandboxConfig =
                     load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
                         .with_context(|| format!("no config.json for '{name}'"))?;
                 let art = (d.deps.artifacts)(&d.paths)?;
-                if config.egress == EgressMode::Izbad {
-                    d.egress.ensure_listening(&d.paths, &name)?;
-                }
+                d.egress.ensure_listening(&d.paths, &name)?;
                 if let Err(e) = sandbox::start(&d.paths, &name, d.deps.driver.as_ref(), &art) {
                     // Boot never happened — tear the listener back down.
                     d.egress.stop(&d.paths, &name);
@@ -442,17 +440,11 @@ pub fn adopt(d: &Arc<Daemon>) {
             }
             Err(e) => eprintln!("izbad: ports.json for '{}': {e:#}", info.name),
         }
-        // Rebind the egress listener for live egress=izbad sandboxes; a bind
-        // failure is logged but never aborts adoption of the rest.
+        // Rebind the egress listener for every live sandbox; a bind failure
+        // is logged but never aborts adoption of the rest.
         if info.liveness != Liveness::Stopped {
-            if let Ok(Some(config)) =
-                load_json::<SandboxConfig>(&d.paths.sandbox_dir(&info.name).join(CONFIG_FILE))
-            {
-                if config.egress == EgressMode::Izbad {
-                    if let Err(e) = d.egress.ensure_listening(&d.paths, &info.name) {
-                        eprintln!("izbad: egress listener for '{}': {e:#}", info.name);
-                    }
-                }
+            if let Err(e) = d.egress.ensure_listening(&d.paths, &info.name) {
+                eprintln!("izbad: egress listener for '{}': {e:#}", info.name);
             }
         }
     }
@@ -574,7 +566,7 @@ mod tests {
     use super::*;
     use crate::daemon::proto::*;
     use crate::sandbox::CreateOpts;
-    use crate::state::{load_json, EgressMode, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
+    use crate::state::{load_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
     use crate::testutil::{
         fake_connector, live_identity, spawn_sleep, test_paths, wait_dead, write_state, MockDriver,
     };
@@ -705,7 +697,6 @@ mod tests {
             workspace: dir.path().join("ws"),
             rw_size_gb: 1,
             ports: Vec::new(),
-            egress: EgressMode::Passt,
         })
     }
 
@@ -787,6 +778,16 @@ mod tests {
         ));
         match rpc(&mut c, &DaemonRequest::Start { name: "web".into() }) {
             DaemonResponse::Ok => {}
+            // Start now binds the vsock_1027 egress listener unconditionally;
+            // runtime-skip where the sandbox denies bind (house pattern).
+            DaemonResponse::Error { message }
+                if message.contains("denied")
+                    || message.contains("Permission")
+                    || message.contains("not permitted") =>
+            {
+                eprintln!("SKIP start_then_stop_via_mock_driver: bind denied: {message}");
+                return;
+            }
             other => panic!("start: {other:?}"),
         }
         let state: Option<RunState> =
@@ -812,12 +813,11 @@ mod tests {
         assert!(wait_dead(&vmm), "vmm stand-in must be dead after stop");
     }
 
-    /// Start on an egress=izbad sandbox binds the vsock_1027 listener;
-    /// Stop removes it. Runtime-skips where the sandbox denies bind.
+    /// Every Start binds the vsock_1027 listener; Stop removes it.
+    /// Runtime-skips where the sandbox denies bind.
     #[test]
     fn start_binds_egress_listener_stop_removes_it() {
         use crate::daemon::egress;
-        use crate::state::EgressMode;
         let (dir, paths) = test_paths();
         std::fs::create_dir_all(dir.path().join("ws")).unwrap();
         let vmm = spawn_sleep(dir.path());
@@ -828,10 +828,7 @@ mod tests {
         ));
         let d = Arc::new(Daemon::new(paths, deps));
         let mut c = client_conn(&d);
-        let mut req = create_req(&dir, "web");
-        if let DaemonRequest::Create(ref mut dc) = req {
-            dc.egress = EgressMode::Izbad;
-        }
+        let req = create_req(&dir, "web");
         assert!(matches!(rpc(&mut c, &req), DaemonResponse::Created { .. }));
         match rpc(&mut c, &DaemonRequest::Start { name: "web".into() }) {
             DaemonResponse::Ok => {}
@@ -1080,7 +1077,6 @@ mod tests {
                 workspace: dir.path().join("ws"),
                 rw_size_gb: 1,
                 ports: Vec::new(),
-                egress: EgressMode::Passt,
             },
         )
         .unwrap();

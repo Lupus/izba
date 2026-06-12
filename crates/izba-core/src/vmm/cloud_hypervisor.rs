@@ -1,6 +1,8 @@
 //! Cloud-hypervisor backend: pure argv construction for a microVM plus its
-//! sidecars (one virtiofsd per shared dir, optional passt for user-mode
-//! networking), and the [`CloudHypervisorDriver`] that spawns them.
+//! sidecars (one virtiofsd per shared dir), and the
+//! [`CloudHypervisorDriver`] that spawns them. There is no host NIC — guest
+//! egress rides the izbad-owned vsock 1027 plane (see `daemon::egress`), so
+//! cloud-hypervisor is launched without `--net`.
 
 use super::spec::{CommandSpec, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
@@ -16,14 +18,12 @@ use std::time::{Duration, Instant};
 pub struct Invocations {
     /// One per share, order matches `spec.shares`.
     pub virtiofsd: Vec<CommandSpec>,
-    pub passt: Option<CommandSpec>,
     pub vmm: CommandSpec,
 }
 
 pub fn build_invocations(spec: &VmSpec) -> Invocations {
     let run = &spec.run_dir;
     let fs_sock = |tag: &str| run.join(format!("fs-{tag}.sock"));
-    let net_sock = run.join("net.sock");
     let vsock_sock = run.join("vsock.sock");
     let api_sock = run.join("ch-api.sock");
 
@@ -44,32 +44,6 @@ pub fn build_invocations(spec: &VmSpec) -> Invocations {
             ],
         })
         .collect();
-
-    // Static guest addressing instead of passt's host-template autodetect.
-    // Autodetect copies the interface of the FIRST default route, which on
-    // hosts with several default routes (WSL mirrored networking + VPN) can
-    // be a gateway-less /32 — passt then serves no IPv4 DHCP and the guest's
-    // `ip=dhcp` stalls ~158s, well past the boot health window. The subnet
-    // matches gvisor-tap-vsock's (Docker sbx) 192.168.127.0/24; outbound NAT
-    // and DNS passthrough don't depend on it, but a host LAN that itself
-    // uses 192.168.127.0/24 would shadow this range inside the guest.
-    let passt = spec.net.then(|| CommandSpec {
-        argv: vec![
-            "passt".to_string(),
-            "--vhost-user".to_string(),
-            "--address".to_string(),
-            "192.168.127.2".to_string(),
-            "--netmask".to_string(),
-            "24".to_string(),
-            "--gateway".to_string(),
-            "192.168.127.1".to_string(),
-            "--socket-path".to_string(),
-            net_sock.display().to_string(),
-            "--foreground".to_string(),
-            "--pid".to_string(),
-            run.join("passt.pid").display().to_string(),
-        ],
-    });
 
     let mut vmm = vec![
         "cloud-hypervisor".to_string(),
@@ -107,11 +81,6 @@ pub fn build_invocations(spec: &VmSpec) -> Invocations {
         }
     }
 
-    if spec.net {
-        vmm.push("--net".to_string());
-        vmm.push(format!("vhost_user=true,socket={}", net_sock.display()));
-    }
-
     vmm.extend([
         "--vsock".to_string(),
         format!("cid=3,socket={}", vsock_sock.display()),
@@ -125,15 +94,14 @@ pub fn build_invocations(spec: &VmSpec) -> Invocations {
 
     Invocations {
         virtiofsd,
-        passt,
         vmm: CommandSpec { argv: vmm },
     }
 }
 
 /// Spawns cloud-hypervisor and its sidecars as detached processes.
 ///
-/// Integration-tested on real hosts (requires the cloud-hypervisor, virtiofsd
-/// and passt binaries); not unit-tested.
+/// Integration-tested on real hosts (requires the cloud-hypervisor and
+/// virtiofsd binaries); not unit-tested.
 pub struct CloudHypervisorDriver;
 
 const SOCKET_WAIT: Duration = Duration::from_secs(3);
@@ -160,11 +128,11 @@ impl VmmDriver for CloudHypervisorDriver {
             .iter()
             .map(|s| spec.run_dir.join(format!("fs-{}.sock", s.tag)))
             .collect();
-        if spec.net {
-            stale.push(spec.run_dir.join("net.sock"));
-        }
         stale.push(spec.run_dir.join("vsock.sock"));
         stale.push(spec.run_dir.join("ch-api.sock"));
+        // net.sock/passt.pid are no longer created (passt retired in M1), but
+        // sweep them for one release so dirs from pre-cutover runs are clean.
+        stale.push(spec.run_dir.join("net.sock"));
         stale.push(spec.run_dir.join("passt.pid"));
         for path in &stale {
             match std::fs::remove_file(path) {
@@ -199,18 +167,6 @@ impl VmmDriver for CloudHypervisorDriver {
             };
             sidecars.push((role.clone(), id));
             expected_socks.push((role, spec.run_dir.join(format!("fs-{}.sock", share.tag))));
-        }
-
-        if let Some(cmd) = &inv.passt {
-            let id = match spawn_detached(cmd, &log_dir.join("passt.log")) {
-                Ok(id) => id,
-                Err(e) => {
-                    kill_all(&sidecars);
-                    return Err(e).context("spawning passt");
-                }
-            };
-            sidecars.push(("passt".to_string(), id));
-            expected_socks.push(("passt".to_string(), spec.run_dir.join("net.sock")));
         }
 
         // Each sidecar must create its listening socket before CH starts.
@@ -316,7 +272,6 @@ mod tests {
                 tag: "workspace".to_string(),
                 host_path: PathBuf::from("/home/user/project"),
             }],
-            net: true,
             console_log: PathBuf::from("/sbx/console.log"),
             run_dir: PathBuf::from("/sbx/run"),
         }
@@ -356,28 +311,6 @@ mod tests {
         );
 
         assert_eq!(
-            inv.passt
-                .as_ref()
-                .expect("passt expected when net=true")
-                .argv,
-            argv(&[
-                "passt",
-                "--vhost-user",
-                "--address",
-                "192.168.127.2",
-                "--netmask",
-                "24",
-                "--gateway",
-                "192.168.127.1",
-                "--socket-path",
-                &run_sock(run, "net.sock"),
-                "--foreground",
-                "--pid",
-                &run_sock(run, "passt.pid"),
-            ])
-        );
-
-        assert_eq!(
             inv.vmm.argv,
             argv(&[
                 "cloud-hypervisor",
@@ -399,8 +332,6 @@ mod tests {
                     "tag=workspace,socket={}",
                     run_sock(run, "fs-workspace.sock")
                 ),
-                "--net",
-                &format!("vhost_user=true,socket={}", run_sock(run, "net.sock")),
                 "--vsock",
                 &format!("cid=3,socket={}", run_sock(run, "vsock.sock")),
                 "--serial",
@@ -409,48 +340,6 @@ mod tests {
                 "off",
                 "--api-socket",
                 &run_sock(run, "ch-api.sock"),
-            ])
-        );
-    }
-
-    #[test]
-    fn ch_invocations_no_net() {
-        let mut spec = base_spec();
-        spec.net = false;
-        let run = spec.run_dir.clone();
-        let inv = build_invocations(&spec);
-
-        assert!(inv.passt.is_none());
-        assert_eq!(
-            inv.vmm.argv,
-            argv(&[
-                "cloud-hypervisor",
-                "--kernel",
-                "/img/vmlinux",
-                "--initramfs",
-                "/img/initramfs.img",
-                "--cmdline",
-                "console=ttyS0 init=/init",
-                "--cpus",
-                "boot=2",
-                "--memory",
-                "size=4096M,shared=on",
-                "--disk",
-                "path=/img/rootfs.img,readonly=on",
-                "path=/sbx/scratch.img",
-                "--fs",
-                &format!(
-                    "tag=workspace,socket={}",
-                    run_sock(&run, "fs-workspace.sock")
-                ),
-                "--vsock",
-                &format!("cid=3,socket={}", run_sock(&run, "vsock.sock")),
-                "--serial",
-                "file=/sbx/console.log",
-                "--console",
-                "off",
-                "--api-socket",
-                &run_sock(&run, "ch-api.sock"),
             ])
         );
     }
@@ -524,8 +413,6 @@ mod tests {
                     run_sock(&run, "fs-workspace.sock")
                 ),
                 &format!("tag=cache,socket={}", run_sock(&run, "fs-cache.sock")),
-                "--net",
-                &format!("vhost_user=true,socket={}", run_sock(&run, "net.sock")),
                 "--vsock",
                 &format!("cid=3,socket={}", run_sock(&run, "vsock.sock")),
                 "--serial",

@@ -35,7 +35,7 @@ impl IoStream for UdsStream {
 pub trait VmHandle: Send {
     /// Open a byte stream to the given guest vsock port.
     fn connect(&self, port: u32) -> anyhow::Result<Box<dyn IoStream>>;
-    /// All processes backing this VM: `("vmm", id)`, `("virtiofsd:<tag>", id)`, `("passt", id)`.
+    /// All processes backing this VM: `("vmm", id)`, `("virtiofsd:<tag>", id)`.
     fn pids(&self) -> Vec<(String, PidIdentity)>;
     fn is_alive(&self) -> bool;
     /// Hard stop (SIGKILL all). Graceful shutdown goes through the guest RPC instead.

@@ -51,12 +51,11 @@ fn resolve_or_create(
             || opts.mem != 4096
             || opts.rw_size_gb != 8
             || opts.name.is_some()
-            || !opts.publish.is_empty()
-            || opts.egress != super::DEFAULT_EGRESS;
+            || !opts.publish.is_empty();
         if has_non_default {
             eprintln!(
                 "warning: '{name_or_dir}' is an existing sandbox — \
-                 stored config wins; --image/--cpus/--mem/--rw-size-gb/--name/--egress are ignored"
+                 stored config wins; --image/--cpus/--mem/--rw-size-gb/--name are ignored"
             );
         }
         return Ok(name_or_dir.to_string());
@@ -73,7 +72,6 @@ fn resolve_or_create(
             workspace,
             rw_size_gb: opts.rw_size_gb,
             ports,
-            egress: super::parse_egress(&opts.egress)?,
         });
         match client.request(&req, &mut |m| eprintln!("{m}"))? {
             DaemonResponse::Created { .. } => {}

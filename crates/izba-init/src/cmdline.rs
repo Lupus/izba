@@ -21,10 +21,10 @@ mod tests {
 
     #[test]
     fn parses_pairs_and_flags() {
-        let m = parse("izba.hostname=web ip=dhcp console=ttyS0 quiet");
+        let m = parse("izba.hostname=web izba.egress=1 console=ttyS0 quiet");
         assert_eq!(m.len(), 4);
         assert_eq!(m["izba.hostname"], "web");
-        assert_eq!(m["ip"], "dhcp");
+        assert_eq!(m["izba.egress"], "1");
         assert_eq!(m["console"], "ttyS0");
         assert_eq!(m["quiet"], "");
     }

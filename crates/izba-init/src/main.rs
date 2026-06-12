@@ -80,14 +80,6 @@ fn run_pid1() -> anyhow::Result<()> {
             eprintln!("izba-init: sethostname {hostname:?}: {e}");
         }
     }
-    if params.get("izba.ipv4only").map(String::as_str) == Some("1") {
-        // Best-effort: a missing eth0 (net=false VM) is not fatal.
-        if let Err(e) = net::apply_ipv4only(Path::new("/proc/sys/net/ipv6/conf")) {
-            eprintln!("izba-init: izba.ipv4only: {e}");
-        }
-    }
-    let egress_on = params.get("izba.egress").map(String::as_str) == Some("1");
-
     rwdisk::ensure_formatted(Path::new("/dev/vdb")).context("rw disk")?;
 
     // The overlay (op 2) needs upperdir/workdir to exist on the freshly
@@ -99,7 +91,12 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     mounts::apply(&rootfs_plan[2..]).context("rootfs mounts")?;
 
-    write_resolv_conf(egress_on);
+    // Static guest networking: lo + dummy0 with the izba subnet. Log and
+    // continue on error — exec/cp/vsock still work without IP networking.
+    if let Err(e) = net::configure() {
+        eprintln!("izba-init: network configure: {e}");
+    }
+    write_resolv_conf();
 
     let engine = Arc::new(ExecEngine::new(Some("/rootfs".into())));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -120,11 +117,13 @@ fn run_pid1() -> anyhow::Result<()> {
         let e = Arc::clone(&engine);
         std::thread::spawn(move || server::serve_streams(streams, e));
     }
-    if egress_on {
-        // Order matters: listeners first, rules second — once REDIRECT is in,
-        // every guest TCP connect lands on the stub. The binds happen HERE on
-        // the main thread (not inside the spawned serve loops) so they strictly
-        // happen-before apply_nft; the accept/recv loops then move into threads.
+    {
+        // Egress is unconditional: the guest is a pure vsock island, so the
+        // stub IS the only way out. Order matters: listeners first, rules
+        // second — once REDIRECT is in, every guest TCP connect lands on the
+        // stub. The binds happen HERE on the main thread (not inside the
+        // spawned serve loops) so they strictly happen-before apply_nft; the
+        // accept/recv loops then move into threads.
         let dns_sock = match egress::bind_dns_udp() {
             Ok(s) => Some(s),
             Err(e) => {
@@ -182,23 +181,12 @@ fn run_pid1() -> anyhow::Result<()> {
     power_off();
 }
 
-/// With izbad egress, the resolver is the local stub (interim: loopback;
-/// the dummy0-carried 192.168.127.1 arrives with the phase-C cutover).
-/// Otherwise: kernel `ip=dhcp` autoconfig result from /proc/net/pnp.
-fn write_resolv_conf(egress_on: bool) {
-    let conf = if egress_on {
-        "nameserver 127.0.0.1\n".to_string()
-    } else {
-        let Ok(pnp) = std::fs::read_to_string("/proc/net/pnp") else {
-            return;
-        };
-        pnp.lines()
-            .filter(|l| l.starts_with("nameserver") || l.starts_with("domain"))
-            .map(|l| format!("{l}\n"))
-            .collect()
-    };
+/// The resolver is the egress stub, reached at the dummy0-carried
+/// 192.168.127.1 (where the stub binds UDP :53). There is no NIC and no
+/// DHCP, so there is nothing to discover from /proc/net/pnp.
+fn write_resolv_conf() {
     let _ = std::fs::create_dir_all("/rootfs/etc");
-    if let Err(e) = std::fs::write("/rootfs/etc/resolv.conf", conf) {
+    if let Err(e) = std::fs::write("/rootfs/etc/resolv.conf", "nameserver 192.168.127.1\n") {
         eprintln!("izba-init: writing resolv.conf: {e}");
     }
 }

@@ -8,17 +8,6 @@ pub const CONFIG_FILE: &str = "config.json";
 pub const STATE_FILE: &str = "state.json";
 pub const PORTS_FILE: &str = "ports.json";
 
-/// Which path carries guest egress. M1 transition knob: `Passt` is the v1
-/// NAT (passt on CH / consomme on OpenVMM); `Izbad` is the vsock-1027
-/// stub. Removed at the M1 phase-C cutover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EgressMode {
-    #[default]
-    Passt,
-    Izbad,
-}
-
 /// Identity that defeats PID reuse: `starttime` is a platform-specific
 /// equality token captured at spawn (Linux: field 22 of `/proc/<pid>/stat`;
 /// Windows: the process creation `FILETIME`) — see [`crate::procmgr`].
@@ -39,9 +28,6 @@ pub struct SandboxConfig {
     /// empty so configs written before this feature still deserialize.
     #[serde(default)]
     pub ports: Vec<PortRule>,
-    /// Egress datapath; default keeps pre-M1 configs deserializing.
-    #[serde(default)]
-    pub egress: EgressMode,
 }
 
 /// A single host→guest TCP publish rule. Its identity (uniqueness key) is
@@ -64,7 +50,7 @@ pub struct PortRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
     pub vmm_pid: PidIdentity,
-    /// `(role, identity)` — roles like `"virtiofsd:workspace"`, `"passt"`.
+    /// `(role, identity)` — roles like `"virtiofsd:workspace"`.
     pub sidecar_pids: Vec<(String, PidIdentity)>,
     pub started_unix_ms: u64,
 }
@@ -111,7 +97,6 @@ mod tests {
             mem_mb: 512,
             workspace: PathBuf::from("/workspace"),
             ports: Vec::new(),
-            egress: EgressMode::Passt,
         }
     }
 
@@ -130,7 +115,7 @@ mod tests {
                     },
                 ),
                 (
-                    "passt".to_string(),
+                    "virtiofsd:cache".to_string(),
                     PidIdentity {
                         pid: 5679,
                         starttime: 22222,
@@ -211,24 +196,14 @@ mod tests {
     }
 
     #[test]
-    fn egress_mode_defaults_to_passt_for_old_configs() {
-        // A pre-M1 config.json has no "egress" key.
+    fn old_config_with_egress_key_still_deserializes() {
+        // M1 phase-C removed the `egress` field; pre-cutover config.json
+        // files carry one. SandboxConfig has no deny_unknown_fields, so serde
+        // ignores it.
         let old = r#"{"image_digest":"sha256:a","image_ref":"r","cpus":1,
-            "mem_mb":256,"workspace":"/w","ports":[]}"#;
+            "mem_mb":256,"workspace":"/w","ports":[],"egress":"passt"}"#;
         let c: SandboxConfig = serde_json::from_str(old).unwrap();
-        assert_eq!(c.egress, EgressMode::Passt);
-    }
-
-    #[test]
-    fn egress_mode_serializes_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&EgressMode::Izbad).unwrap(),
-            r#""izbad""#
-        );
-        assert_eq!(
-            serde_json::to_string(&EgressMode::Passt).unwrap(),
-            r#""passt""#
-        );
+        assert_eq!(c.cpus, 1);
     }
 
     #[test]

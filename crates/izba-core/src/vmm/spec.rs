@@ -24,7 +24,6 @@ pub struct VmSpec {
     pub mem_mb: u32,
     pub disks: Vec<BlockDisk>,
     pub shares: Vec<FsShare>,
-    pub net: bool,
     pub console_log: PathBuf,
     /// Per-sandbox dir where control sockets live.
     pub run_dir: PathBuf,
