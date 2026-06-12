@@ -62,11 +62,17 @@ territory (the pinned-fork patch shape from M0) before anything builds on it.
   stream; izbad's resolver answers. TCP `:53` rides the normal TCP REDIRECT
   and izbad routes port-53 `TcpConnect`s to the same resolver instead of
   dialing out.
-- M1's resolver is a pure forwarder using the host's system resolver
-  configuration (hickory-resolver, MIT/Apache dual, handles system config on
-  both platforms). M4 puts member-name resolution in front of it.
-- All other UDP: nft drop (the decided posture). Audit-logging of drops is
-  M2 scope.
+- M1's resolver is a **raw-packet UDP forwarder** to the host's
+  system-configured upstream (parse `/etc/resolv.conf` on Unix; the
+  `ipconfig` crate on Windows) — no DNS parsing means full fidelity for any
+  qtype/EDNS. On forward failure it synthesizes SERVFAIL (a 2-byte header
+  tweak on the query) so clients fail fast. M4 puts member-name resolution
+  in front of it. (Refined from the earlier hickory-resolver idea: a packet
+  forwarder is simpler and more faithful than a recursive client.)
+- All other UDP is denied **structurally**: in the end state the default
+  route is dummy0, which discards everything the stub doesn't intercept —
+  no filter rule needed (a naive `udp dport != 53 drop` would also kill the
+  redirected DNS replies). Audit-logging of drops is M2 scope.
 
 ### 1.3 Guest network config (end state)
 
@@ -130,12 +136,17 @@ unconditional after phase C):
   closed → the app sees a reset (honest refusal). The original-dst
   `getsockopt` is one tiny isolated unsafe fn (integration-covered); the
   handler is unit-tested over socketpairs with an injected `(conn, orig_dst)`.
-- **DNS:** UDP socket on `:53`; per-query forward over a `Dns` stream.
-- **nft:** init execs `/sbin/nft -f` on a fixed `const` ruleset:
-  nat output chain — TCP `ip daddr != 127.0.0.0/8` redirect to `:15001`,
-  `udp dport 53` redirect to `:53`; filter chain — drop other UDP. The stub's
-  own egress is AF_VSOCK (not IP), so no exclusion rules are needed and no
-  redirect loop is possible.
+- **DNS:** UDP socket on `0.0.0.0:53`; per-query forward over a `Dns`
+  stream. While passt is still attached (phases A–B), init points
+  `resolv.conf` at `127.0.0.1` for opted-in sandboxes (documented interim:
+  docker-in-VM dislikes loopback resolvers, which is why the end state uses
+  the dummy0-carried `192.168.127.1` instead); the end state writes
+  `nameserver 192.168.127.1`.
+- **nft:** init execs `/sbin/nft -f` on a fixed `const` ruleset, one nat
+  output chain: `ip daddr 127.0.0.0/8 return`, TCP redirect to `:15001`,
+  `udp dport 53` redirect to `:53`. No UDP filter-drop rule (see §1.2 —
+  structural deny via dummy0). The stub's own egress is AF_VSOCK (not IP),
+  so no exclusion rules are needed and no redirect loop is possible.
 
 **Kernel config additions** (`hack/kernel.config`): `NETFILTER`, `NF_TABLES`
 (+ IPv4 family), `NFT_NAT`, `NFT_REDIR`, `NF_CONNTRACK`, `NF_NAT`, `DUMMY`
@@ -153,14 +164,16 @@ had two phases of life; deleting it then is part of the cutover).
 
 ## 6. Staging
 
-- **Phase A — wire + daemon (step 1).** Proto variants + `EGRESS_PORT`;
-  `egress/` module tree with allow-all policy and forwarder resolver;
-  listener lifecycle in start/adopt/stop. **First task: runtime-validate
-  guest-initiated vsock on both platforms** (KVM integration + Windows PS
-  check). Exit: a guest-side dial (test harness, no stub yet) reaches izbad
-  and round-trips bytes on both platforms.
-- **Phase B — guest stub (step 2).** Kernel config + rebuilt artifacts,
-  vendored `nft`, `egress.rs`, `izba.egress=1` end to end. Interim guest
+- **Phase A — wire + daemon + DNS half (step 1).** Proto variants +
+  `EGRESS_PORT`; `egress/` module tree with allow-all policy and forwarder
+  resolver; listener lifecycle in start/adopt/stop; **plus the DNS half of
+  the guest stub** — it needs no netfilter (loopback `:53` socket + interim
+  `nameserver 127.0.0.1`), so it doubles as the **runtime validation of
+  guest-initiated vsock on both platforms** using production code instead
+  of a throwaway harness. Exit: an opted-in sandbox resolves DNS through
+  izbad on both platforms (KVM integration + Windows PS check).
+- **Phase B — guest TCP stub (step 2).** Kernel config + rebuilt artifacts,
+  vendored `nft`, the TCP redirect half of `egress.rs`. Interim guest
   config: an opted-in sandbox still boots with eth0 + DHCP (passt/consomme
   attached), but the nft REDIRECT makes the stub authoritative for all TCP
   and the `:53` redirect captures the DHCP-provided resolver — the NIC is
@@ -200,9 +213,10 @@ is one revertable cut.
   tests with the runtime-skip-on-EPERM pattern.
 - **izba-init:** stub handler tests over socketpairs (injected orig-dst);
   nft ruleset content assertion; DNS forward path with a fake vsock dialer.
-- **KVM integration:** guest-initiated vsock smoke (phase A); opted-in
-  sandbox does DNS + HTTP through izbad (phase B); stub-only egress with
-  non-53 UDP denied + throughput baseline print (phase C).
+- **KVM integration:** opted-in sandbox resolves DNS through izbad — this
+  is also the guest-initiated-vsock validation (phase A); HTTP through the
+  TCP stub (phase B); stub-only egress + throughput baseline print
+  (phase C).
 - **Daemon e2e / CLI:** `--egress` flag persisted and honored.
 - **Windows PS suite:** guest-initiated vsock check (phase A), izbad egress
   checks replacing the consomme ones (phase C).
