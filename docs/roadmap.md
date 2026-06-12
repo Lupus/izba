@@ -92,7 +92,7 @@ restart/upgrade **severs live flows — no drain logic**; throughput is
   **2/2**.
 - Throughput baseline **279.3 MiB/s** (measured in the integration suite, not
   gated).
-- Windows PS validation suite **ALL PASS (25 checks)** — run on the same
+- Windows PS validation suite **ALL PASS** — run on the same
   VPN-topology host that produced the original consomme guest-egress failure;
   that failure is **retired with consomme**.
 - `passt`, `consomme`, `ip=dhcp` and `izba.ipv4only=1` are **gone from the

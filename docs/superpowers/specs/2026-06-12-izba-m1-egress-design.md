@@ -134,7 +134,8 @@ runtime-skips on `PermissionDenied` (house pattern).
 ## 4. Guest stub (`crates/izba-init/src/egress.rs`)
 
 Gated by cmdline `izba.egress=1` (driver-appended for opted-in sandboxes;
-unconditional after phase C):
+unconditional after phase C — post-impl note: init no longer reads the flag
+at all; the stub is always on and the cmdline token is vestigial):
 
 - **TCP:** listener on `127.0.0.1:15001`; per-connection thread extracts
   `SO_ORIGINAL_DST`, dials vsock `CID 2:1027`, writes `TcpConnect`, awaits

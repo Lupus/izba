@@ -67,6 +67,16 @@ impl EgressManager {
             inner.remove(name);
         }
         let path = listener_path(paths, name);
+        // This socket is an unauthenticated outbound proxy (AllowAll until
+        // M2 policy) — keep it reachable only via a 0700 run dir, the same
+        // defense-in-depth the daemon control socket gets (transport.rs).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let run = paths.run_dir(name);
+            std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod 0700 {}", run.display()))?;
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
