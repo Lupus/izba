@@ -42,7 +42,8 @@ struct SandboxOpts {
     #[arg(short = 'p', long = "publish", value_name = "[BIND:]HOST:GUEST")]
     publish: Vec<String>,
     /// Egress path: 'passt' (v1 NAT) or 'izbad' (M1 vsock egress)
-    #[arg(long, default_value = "passt")]
+    // Keep in sync with commands::DEFAULT_EGRESS (used for the existing-sandbox warning).
+    #[arg(long, default_value = commands::DEFAULT_EGRESS)]
     egress: String,
 }
 

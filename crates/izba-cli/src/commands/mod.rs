@@ -53,6 +53,10 @@ pub fn parse_publish(specs: &[String]) -> anyhow::Result<Vec<PortRule>> {
         .collect()
 }
 
+/// The default `--egress` value; kept here so `run.rs` comparison and the
+/// clap `default_value` attribute both reference a single source of truth.
+pub(crate) const DEFAULT_EGRESS: &str = "passt";
+
 pub(crate) fn parse_egress(s: &str) -> anyhow::Result<izba_core::state::EgressMode> {
     match s {
         "passt" => Ok(izba_core::state::EgressMode::Passt),

@@ -51,11 +51,12 @@ fn resolve_or_create(
             || opts.mem != 4096
             || opts.rw_size_gb != 8
             || opts.name.is_some()
-            || !opts.publish.is_empty();
+            || !opts.publish.is_empty()
+            || opts.egress != super::DEFAULT_EGRESS;
         if has_non_default {
             eprintln!(
                 "warning: '{name_or_dir}' is an existing sandbox — \
-                 stored config wins; --image/--cpus/--mem/--rw-size-gb/--name are ignored"
+                 stored config wins; --image/--cpus/--mem/--rw-size-gb/--name/--egress are ignored"
             );
         }
         return Ok(name_or_dir.to_string());
