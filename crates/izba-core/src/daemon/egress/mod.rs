@@ -2,4 +2,5 @@
 //! (policy / dns / router / manager) are deliberately separable — M2 fills
 //! policy, M4 fronts dns with member names, M5 branches MITM off the router.
 
+pub mod dns;
 pub mod policy;
