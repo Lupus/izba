@@ -186,7 +186,8 @@ fn run_pid1() -> anyhow::Result<()> {
 /// DHCP, so there is nothing to discover from /proc/net/pnp.
 fn write_resolv_conf() {
     let _ = std::fs::create_dir_all("/rootfs/etc");
-    if let Err(e) = std::fs::write("/rootfs/etc/resolv.conf", "nameserver 192.168.127.1\n") {
+    let conf = format!("nameserver {}\n", net::RESOLVER_IP);
+    if let Err(e) = std::fs::write("/rootfs/etc/resolv.conf", conf) {
         eprintln!("izba-init: writing resolv.conf: {e}");
     }
 }

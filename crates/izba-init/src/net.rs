@@ -10,9 +10,9 @@
 use std::io;
 use std::net::Ipv4Addr;
 
-pub const GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
-pub const RESOLVER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);
-pub const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+pub(crate) const GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
+pub(crate) const RESOLVER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);
+const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
 /// Bring up lo + dummy0 and install the default route. Errors are
 /// reported per step so a console log names the exact failure.
