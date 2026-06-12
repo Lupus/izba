@@ -118,6 +118,24 @@ with `if: failure()` — CI-debugging without SSH.
 - **Serial, not parallel, test execution** (`--test-threads=1`) keeps RAM
   within the 16 GB runner budget (each test boots a 1 GiB VM + sidecars).
 
+## Bring-up findings (2026-06-12, recorded post-implementation)
+
+- `GITHUB_TOKEN` DOES fetch the cross-repo openvmm.exe artifact — the PAT
+  fallback was never needed.
+- Ubuntu-24.04 runners set `kernel.apparmor_restrict_unprivileged_userns=1`,
+  which kills the unconfined static passt at startup ("Failed to detach
+  isolating namespaces"); the linux-kvm job flips the sysctl off first.
+- Hosted-runner nested virt boots slowly (Windows kernel up at ~19-25 s vs
+  ~4 s locally); the predicted boot-budget knob shipped as
+  `IZBA_BOOT_TIMEOUT_SECS` (default 30 s unchanged; CI sets 120).
+- **Hosted Windows runners lose all ConPTY child output** in the service
+  session — even a trivial echo fixture renders an empty screen (run
+  27445265822). The windows-whp job runs a ConPTY canary and auto-skips
+  tty Tier-1/Tier-2 when it fails; tty coverage on Windows stays on the
+  manual spike-host route. Linux tty steps are unconditional.
+- The 21-check validation suite and the ttystorm M0 churn gate pass on
+  hosted Windows runners — real OpenVMM/WHP VMs work in CI.
+
 ## Out of scope
 
 - e2e on pull requests (can be added later as a PR label or an explicit

@@ -16,7 +16,11 @@ design behind what these tests assert is in
 `.github/workflows/e2e.yml` (KVM on ubuntu-latest, OpenVMM/WHP on
 windows-latest) on every push to main, weekly, and on manual dispatch — see
 `docs/superpowers/specs/2026-06-12-e2e-ci-design.md`. This runbook remains
-the local-development path.
+the local-development path. One known hosted-runner gap: ConPTY child output
+does not flow in the Windows runner's service session, so the tty Tier-1/
+Tier-2 tests are auto-skipped there behind a ConPTY canary (a trivial
+echo-through-ConPTY smoke test); they run for real on Linux CI and on the
+manual spike-host route (§8).
 
 ---
 
