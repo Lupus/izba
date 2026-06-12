@@ -79,12 +79,28 @@ download_bin() {
     echo "  installed to $dest"
 }
 
+# Verify a file against an expected sha256; delete it and fail on mismatch.
+verify_sha256() {
+    local path="$1" want="$2" name="$3"
+    local got
+    got=$(sha256sum "$path" | cut -d' ' -f1)
+    if [ "$got" != "$want" ]; then
+        rm -f "$path"
+        echo "  error: $name sha256 mismatch" >&2
+        echo "    got:  $got" >&2
+        echo "    want: $want" >&2
+        return 1
+    fi
+    echo "  sha256 verified: $got"
+}
+
 # ---------------------------------------------------------------------------
 # 1. cloud-hypervisor
 # ---------------------------------------------------------------------------
 echo "=== cloud-hypervisor ==="
 CH_VERSION="42.0"
 CH_RELEASE_URL="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v${CH_VERSION}/cloud-hypervisor-static"
+CH_SHA256="537d1cbc1d4d3646099618f3b6f2b711116ad1ed8c8bc909a1a689417c7430aa"
 
 if command -v cloud-hypervisor >/dev/null 2>&1; then
     echo "  present: $(command -v cloud-hypervisor)"
@@ -96,6 +112,7 @@ else
     echo "  missing"
     if [ "$CHECK_ONLY" -eq 0 ]; then
         download_bin "$CH_RELEASE_URL" "$BIN_DIR/cloud-hypervisor" "cloud-hypervisor"
+        verify_sha256 "$BIN_DIR/cloud-hypervisor" "$CH_SHA256" "cloud-hypervisor"
         mark_ok "cloud-hypervisor"
     else
         mark_missing "cloud-hypervisor"
@@ -114,6 +131,11 @@ fi
 # link via the API so this keeps working across version bumps.
 # Releases: https://gitlab.com/virtio-fs/virtiofsd/-/releases
 VIRTIOFSD_VERSION="${VIRTIOFSD_VERSION:-v1.13.3}"  # override with VIRTIOFSD_VERSION env var
+# sha256 of the v1.13.3 release zip and of the static binary inside it.
+# Bumping VIRTIOFSD_VERSION via env skips pin checks ONLY if you also
+# override these (empty disables — intended for local experiments, never CI).
+VIRTIOFSD_ZIP_SHA256="${VIRTIOFSD_ZIP_SHA256-c79055af8189dcd3d942a16e5c165aa336aabbc47ea8e015c3a6cf9980ff73ab}"
+VIRTIOFSD_BIN_SHA256="${VIRTIOFSD_BIN_SHA256-b3f7d24d7a530515b1a44b035f426c700553cb4f0cd14189051d54c0e6b6ef78}"
 VIRTIOFSD_API="https://gitlab.com/api/v4/projects/virtio-fs%2Fvirtiofsd"
 
 # Resolve + download + extract the virtiofsd release zip into $1 (dest binary).
@@ -136,6 +158,10 @@ download_virtiofsd() {
     if ! curl -fL --progress-bar -o "$tmpd/virtiofsd.zip" "$url"; then
         rm -rf "$tmpd"; echo "  error: download failed" >&2; return 1
     fi
+    if [ -n "$VIRTIOFSD_ZIP_SHA256" ]; then
+        verify_sha256 "$tmpd/virtiofsd.zip" "$VIRTIOFSD_ZIP_SHA256" "virtiofsd.zip" \
+            || { rm -rf "$tmpd"; return 1; }
+    fi
     if ! ( cd "$tmpd" && unzip -oq virtiofsd.zip ); then
         rm -rf "$tmpd"; echo "  error: unzip failed (is 'unzip' installed?)" >&2; return 1
     fi
@@ -143,6 +169,10 @@ download_virtiofsd() {
     [ -z "$bin" ] && bin=$(find "$tmpd" -type f -name 'virtiofsd' ! -name '*.zip' | head -1)
     if [ -z "$bin" ]; then
         rm -rf "$tmpd"; echo "  error: virtiofsd binary not found inside zip" >&2; return 1
+    fi
+    if [ -n "$VIRTIOFSD_BIN_SHA256" ]; then
+        verify_sha256 "$bin" "$VIRTIOFSD_BIN_SHA256" "virtiofsd" \
+            || { rm -rf "$tmpd"; return 1; }
     fi
     mkdir -p "$(dirname "$dest")"
     install -m755 "$bin" "$dest"
@@ -198,11 +228,10 @@ if [ "$passt_ok" -eq 0 ]; then
         # any older /usr/bin/passt (izba resolves `passt` via PATH, and
         # /usr/local/bin precedes /usr/bin). ~/.local/bin would NOT shadow a
         # system passt, so this one genuinely needs the system location.
-        echo "  → Install a passt with vhost-user support (needs sudo):"
-        echo "      curl -fL https://passt.top/builds/latest/x86_64/passt -o /tmp/passt"
-        echo "      sudo install -m755 /tmp/passt /usr/local/bin/passt"
+        echo "  → Build the pinned passt and install it (needs sudo):"
+        echo "      hack/build-passt.sh"
+        echo "      sudo install -m755 dist/passt-2026_05_26-static-x86_64 /usr/local/bin/passt"
         echo "      hash -r && passt --help | grep vhost-user   # verify"
-        echo "    (Upstream also ships .deb/.rpm: https://passt.top/builds/latest/x86_64/)"
     fi
 fi
 
