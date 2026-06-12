@@ -121,18 +121,46 @@ fn run_pid1() -> anyhow::Result<()> {
         std::thread::spawn(move || server::serve_streams(streams, e));
     }
     if egress_on {
-        // Order matters: listeners first, rules second — once REDIRECT is
-        // in, every guest TCP connect lands on the stub.
-        std::thread::spawn(|| {
-            if let Err(e) = egress::serve_dns_udp() {
-                eprintln!("izba-init: dns stub: {e}");
+        // Order matters: listeners first, rules second — once REDIRECT is in,
+        // every guest TCP connect lands on the stub. The binds happen HERE on
+        // the main thread (not inside the spawned serve loops) so they strictly
+        // happen-before apply_nft; the accept/recv loops then move into threads.
+        let dns_sock = match egress::bind_dns_udp() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                // Bind failed: the udp :53 redirect now blackholes DNS until
+                // fixed, but TCP egress is unaffected — we still apply nft.
+                eprintln!("izba-init: binding dns :53: {e}");
+                None
             }
-        });
-        std::thread::spawn(|| {
-            if let Err(e) = egress::serve_tcp_redirect() {
-                eprintln!("izba-init: tcp redirect stub: {e}");
+        };
+        let tcp_listener = match egress::bind_tcp_redirect() {
+            Ok(l) => Some(l),
+            Err(e) => {
+                // Bind failed: the TCP REDIRECT now blackholes ALL guest TCP
+                // (loopback RST) — the honest deny posture; DNS is unaffected.
+                // We still apply nft so the deny is enforced, not bypassed.
+                eprintln!(
+                    "izba-init: binding tcp redirect :{}: {e}",
+                    egress::REDIRECT_PORT
+                );
+                None
             }
-        });
+        };
+        if let Some(sock) = dns_sock {
+            std::thread::spawn(move || {
+                if let Err(e) = egress::serve_dns_udp(sock) {
+                    eprintln!("izba-init: dns stub: {e}");
+                }
+            });
+        }
+        if let Some(listener) = tcp_listener {
+            std::thread::spawn(move || {
+                if let Err(e) = egress::serve_tcp_redirect(listener) {
+                    eprintln!("izba-init: tcp redirect stub: {e}");
+                }
+            });
+        }
         if let Err(e) = egress::apply_nft() {
             // Loud but not fatal: DNS still works via resolv.conf; TCP
             // egress is dead until fixed. The console log is captured.

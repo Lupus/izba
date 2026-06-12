@@ -62,11 +62,18 @@ where
     }
 }
 
-/// Bind 0.0.0.0:53 and serve forever (daemon thread); one thread per query
-/// so a slow upstream cannot head-of-line-block other resolutions.
+/// Bind 0.0.0.0:53. Split out of `serve_dns_udp` so the bind can happen on
+/// the main thread BEFORE `apply_nft` (the redirect rule is meaningless, and
+/// worse, blackholes :53, if nothing is listening), giving a real
+/// happens-before between "listener exists" and "rule installed".
+pub fn bind_dns_udp() -> io::Result<UdpSocket> {
+    UdpSocket::bind(("0.0.0.0", 53))
+}
+
+/// Serve DNS forever (daemon thread) on an already-bound socket; one thread
+/// per query so a slow upstream cannot head-of-line-block other resolutions.
 /// M1: unbounded thread-per-query (and one izbad conn each) — the host-side bound is M2 scope.
-pub fn serve_dns_udp() -> io::Result<()> {
-    let sock = UdpSocket::bind(("0.0.0.0", 53))?;
+pub fn serve_dns_udp(sock: UdpSocket) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     loop {
         let (n, peer) = match sock.recv_from(&mut buf) {
@@ -143,13 +150,22 @@ fn original_dst(conn: &TcpStream) -> io::Result<SocketAddrV4> {
     ))
 }
 
-/// Serve the redirect listener forever (daemon thread).
-pub fn serve_tcp_redirect() -> io::Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", REDIRECT_PORT))?;
+/// Bind the redirect listener. Split out of `serve_tcp_redirect` so the bind
+/// happens on the main thread BEFORE `apply_nft`: the REDIRECT rule sends all
+/// guest TCP here, so a listener must already exist or every connect gets a
+/// loopback RST. Returning the bound listener gives apply_nft a happens-before.
+pub fn bind_tcp_redirect() -> io::Result<TcpListener> {
+    TcpListener::bind(("127.0.0.1", REDIRECT_PORT))
+}
+
+/// Serve the redirect listener forever (daemon thread) on an already-bound
+/// listener.
+pub fn serve_tcp_redirect(listener: TcpListener) -> io::Result<()> {
     loop {
         let (conn, _peer) = match listener.accept() {
             Ok(x) => x,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("izba-init: tcp redirect accept: {e}");
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
@@ -169,10 +185,19 @@ pub fn serve_tcp_redirect() -> io::Result<()> {
 
 /// Splice one redirected client connection to izbad via TcpConnect.
 ///
-/// Teardown mirrors server.rs::tcp_dial, with the roles flipped: the
-/// client->izbad thread half-closes the vsock leg (best-effort — CH does
-/// not propagate guest->host half-close, the accepted v1 limitation that
-/// TcpDial shares); once izbad's side is done we full-shutdown both.
+/// Teardown mirrors server.rs::tcp_dial, with the roles flipped, but it has
+/// to shut down BOTH sockets at the end where tcp_dial shuts down only one.
+/// In tcp_dial both pumps touch the same `conn` fd, so the terminal
+/// `shutdown(conn, SHUT_RDWR)` happens to unblock the reader thread too.
+/// Here the two pumps read DIFFERENT sockets: the up-thread reads the client
+/// (`client_r`), the main pump reads the vsock (`host`). The terminal
+/// `shutdown(host, SHUT_RDWR)` only unblocks the main-side reader/vsock — it
+/// does nothing for the up-thread, which is parked in `client_r.read()`. If
+/// the remote closed first while the app still holds its write side open, the
+/// up-thread would block forever and `up.join()` would hang (leaking the
+/// thread + its fds). So once the main host->client pump is done we also
+/// fully shut down the client socket, which delivers EOF to the up-thread's
+/// read and lets it (and the join) finish.
 pub fn handle_redirected<S, D>(client: TcpStream, orig: SocketAddrV4, dial: D)
 where
     S: Read + Write + AsRawFd + Send + 'static,
@@ -222,8 +247,13 @@ where
     // izbad -> client; izbad full-closes when the remote is done.
     let mut client_w = client;
     crate::server::relay_pump(&mut host, &mut client_w);
-    let _ = client_w.shutdown(std::net::Shutdown::Write);
-    // Unblock the up-thread read and finish the vsock teardown.
+    // Full shutdown (Both), not just Write: the inbound direction has nowhere
+    // to deliver now that the host pump is done, and — unlike tcp_dial, whose
+    // two pumps share one fd — the up-thread reads THIS client socket, so it
+    // will sit in client_r.read() forever unless we close its read side too.
+    // SHUT_RDWR here delivers EOF to the up-thread (releasing up.join()).
+    let _ = client_w.shutdown(std::net::Shutdown::Both);
+    // Unblock the main-side vsock and finish the vsock teardown.
     unsafe { libc::shutdown(host.as_raw_fd(), libc::SHUT_RDWR) };
     let _ = up.join();
 }
@@ -340,6 +370,75 @@ mod tests {
         handle_redirected(client, orig, || Ok(izbad));
 
         assert_eq!(app.join().unwrap(), b"200ok");
+        fake.join().unwrap();
+    }
+
+    /// Regression: the up-thread reads the app's client socket, not the vsock.
+    /// If izbad closes first while the app keeps its write side open, the
+    /// terminal shutdown(host) alone never unblocks that read — handle_redirected
+    /// would hang in up.join(). The full client shutdown(Both) is what frees it.
+    /// We assert (a) handle_redirected returns at all, and (b) the app's pending
+    /// read sees EOF because handle_redirected fully closed the client socket.
+    #[test]
+    fn remote_close_first_does_not_hang() {
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP remote_close_first_does_not_hang: bind denied: {e}");
+                return;
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+
+        // The app connects but deliberately never closes its write side; it
+        // just blocks reading until EOF. If handle_redirected leaves the client
+        // socket's read side open, this read parks forever.
+        let (app_eof_tx, app_eof_rx) = mpsc::channel::<usize>();
+        let app = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(b"hi").unwrap();
+            // No shutdown(Write): the app holds its write side open.
+            let mut out = Vec::new();
+            let n = s.read_to_end(&mut out).unwrap();
+            app_eof_tx.send(n).unwrap();
+        });
+        let (client, _) = listener.accept().unwrap();
+
+        // Fake izbad: reply Ok, then immediately close (remote closes first).
+        let (izbad, theirs) = UnixStream::pair().unwrap();
+        let fake = std::thread::spawn(move || {
+            let mut s = theirs;
+            let open: StreamOpen = read_frame(&mut s).unwrap();
+            assert!(matches!(open, StreamOpen::TcpConnect { .. }));
+            write_frame(&mut s, &izba_proto::Response::Ok).unwrap();
+            // Drop `s` -> izbad's side closes while the app's write side stays open.
+        });
+
+        let orig = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 443);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            handle_redirected(client, orig, || Ok(izbad));
+            let _ = done_tx.send(());
+        });
+
+        // Watchdog: handle_redirected must return; a hang means the up-thread
+        // never unblocked.
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("handle_redirected hung: up-thread never unblocked");
+        handle.join().unwrap();
+
+        // And the full client shutdown must have delivered EOF to the app.
+        let n = app_eof_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("app read never saw EOF: client socket not fully shut down");
+        assert_eq!(n, 0, "app should see EOF with no inbound bytes");
+        app.join().unwrap();
         fake.join().unwrap();
     }
 }
