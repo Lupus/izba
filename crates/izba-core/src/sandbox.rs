@@ -23,6 +23,15 @@ const DEFAULT_BOOT_POLL: Duration = Duration::from_millis(200);
 /// Per-attempt deadline for any single control-plane request/response.
 const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Boot health budget: `IZBA_BOOT_TIMEOUT_SECS` env override, else 30s.
+/// CI runners with slow nested virtualization set this; the strict local
+/// default is intentionally unchanged.
+fn boot_timeout_from_env(raw: Option<&str>) -> Duration {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_BOOT_TIMEOUT)
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateOpts {
     pub image_digest: String,
@@ -338,14 +347,8 @@ pub fn start(
     driver: &dyn VmmDriver,
     art: &Artifacts,
 ) -> anyhow::Result<()> {
-    start_with_timeouts(
-        paths,
-        name,
-        driver,
-        art,
-        DEFAULT_BOOT_TIMEOUT,
-        DEFAULT_BOOT_POLL,
-    )
+    let timeout = boot_timeout_from_env(std::env::var("IZBA_BOOT_TIMEOUT_SECS").ok().as_deref());
+    start_with_timeouts(paths, name, driver, art, timeout, DEFAULT_BOOT_POLL)
 }
 
 pub fn start_with_timeouts(
@@ -1244,5 +1247,25 @@ mod tests {
             nonzero,
             "rw.img superblock region must be non-zero after mkfs.ext4 pre-format"
         );
+    }
+
+    #[test]
+    fn boot_timeout_defaults_when_env_unset() {
+        assert_eq!(boot_timeout_from_env(None), DEFAULT_BOOT_TIMEOUT);
+    }
+
+    #[test]
+    fn boot_timeout_parses_seconds_override() {
+        assert_eq!(boot_timeout_from_env(Some("120")), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn boot_timeout_ignores_garbage() {
+        assert_eq!(boot_timeout_from_env(Some("garbage")), DEFAULT_BOOT_TIMEOUT);
+    }
+
+    #[test]
+    fn boot_timeout_trims_whitespace() {
+        assert_eq!(boot_timeout_from_env(Some(" 45 ")), Duration::from_secs(45));
     }
 }

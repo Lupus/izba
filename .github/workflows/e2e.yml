@@ -116,6 +116,7 @@ jobs:
       IZBA_KERNEL: ${{ github.workspace }}/dist/vmlinux
       IZBA_INITRAMFS: ${{ github.workspace }}/dist/initramfs.cpio.gz
       IZBA_TEST_CACHE: /home/runner/.cache/izba-itest
+      IZBA_BOOT_TIMEOUT_SECS: '120'
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - name: Make /dev/kvm accessible
@@ -126,6 +127,12 @@ jobs:
           sudo udevadm trigger --name-match=kvm || true
           ls -l /dev/kvm
           [ -r /dev/kvm ] && [ -w /dev/kvm ]
+      - name: Allow unprivileged user namespaces (passt self-sandboxing)
+        run: |
+          # Ubuntu 24.04 runners restrict unconfined binaries from creating
+          # user namespaces; our pinned static passt exits at startup without
+          # this ("Failed to detach isolating namespaces").
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Restore runtime tools
         id: tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -221,6 +228,7 @@ jobs:
       IZBA_INITRAMFS: ${{ github.workspace }}\dist\initramfs.cpio.gz
       IZBA_OPENVMM: ${{ github.workspace }}\dist\openvmm.exe
       IZBA_MKFS_EROFS: ${{ github.workspace }}\dist\mkfs.erofs.exe
+      IZBA_BOOT_TIMEOUT_SECS: '120'
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
