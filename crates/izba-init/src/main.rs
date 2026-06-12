@@ -181,16 +181,17 @@ fn run_pid1() -> anyhow::Result<()> {
     power_off();
 }
 
-/// The resolver is the egress stub, reached over loopback at 127.0.0.1:53
-/// (the stub binds 0.0.0.0:53, so loopback hits it). It MUST be a loopback
-/// address, not the dummy0-carried 192.168.127.1: the guest is NIC-less and
-/// `dummy0` black-holes everything it transmits, so a DNS reply addressed to
-/// the guest's own 192.168.127.x would be routed out dummy0 and dropped. A
-/// query/reply pair on `lo` is the only path that actually returns. (Apps
-/// that hardcode an external resolver are still caught by the nft
-/// `udp dport 53 redirect to :53` rule; the resolv.conf path is the common
-/// one and is what must work.) There is no NIC and no DHCP, so there is
-/// nothing to discover from /proc/net/pnp.
+/// The resolver MUST be a loopback address (127.0.0.1) because 127.0.0.0/8
+/// hits the `return` rule in the nft REDIRECT chain and is never redirected.
+/// Any query sent to a non-loopback address IS redirected to :53, but the
+/// stub answers from an unconnected wildcard socket — the reply's source
+/// address does not match the address the client queried, so conntrack's
+/// reverse-NAT never finds the tuple and the reply never reaches the client
+/// (the transparent-UDP-proxy reply problem; see NFT_RULESET's doc in
+/// egress.rs). Apps that hardcode an external UDP resolver (e.g. 8.8.8.8)
+/// currently get no DNS — a known M1 gap, pending an IP_ORIGDSTADDR
+/// transparent-reply fix in the stub. There is no NIC and no DHCP, so there
+/// is nothing to discover from /proc/net/pnp.
 fn write_resolv_conf() {
     let _ = std::fs::create_dir_all("/rootfs/etc");
     let conf = format!("nameserver {}\n", net::DNS_LOOPBACK);

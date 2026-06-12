@@ -95,13 +95,20 @@ pub fn serve_dns_udp(sock: UdpSocket) -> io::Result<()> {
 /// Loopback port the nat-output REDIRECT delivers all outbound TCP to.
 pub const REDIRECT_PORT: u16 = 15001;
 
-/// The fixed transparent-redirect ruleset. Loopback destinations are left
-/// alone (guest-internal services, the stub itself); everything else TCP
-/// goes to the stub; UDP :53 to hardcoded resolvers is pulled to the local
-/// DNS socket (conntrack un-NATs the reply source). The stub's own egress
-/// is AF_VSOCK — not IP — so no exclusion rule is needed and no redirect
-/// loop is possible. Non-DNS UDP is denied structurally (no route once the
-/// NIC goes away in phase C), not by a filter rule here.
+/// The fixed transparent-redirect ruleset. Loopback destinations (`return`)
+/// are never redirected — that is the WORKING DNS path (resolv.conf points
+/// to 127.0.0.1; the stub answers from 0.0.0.0:53; loopback reply matches).
+/// All other TCP goes to the stub at :15001. `udp dport 53` pulls
+/// hardcoded-resolver queries to the stub too, but replies are currently
+/// DROPPED: the stub answers from an unconnected wildcard socket so the
+/// reply's source address doesn't match what the client sent to, conntrack's
+/// reverse-NAT tuple never matches, and the client never sees the answer
+/// (the textbook transparent-UDP-proxy reply problem). The udp:53 redirect
+/// rule stays as the hook for a future IP_ORIGDSTADDR transparent-reply fix;
+/// until then, apps that hardcode an external UDP resolver get no DNS (known
+/// M1 gap). The stub's own egress is AF_VSOCK — not IP — so no exclusion
+/// rule is needed and no redirect loop is possible. Non-DNS UDP is denied
+/// structurally (no route once the NIC goes away in phase C).
 pub const NFT_RULESET: &str = "\
 table ip izba {
   chain output {

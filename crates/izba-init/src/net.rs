@@ -12,10 +12,12 @@ use std::net::Ipv4Addr;
 
 pub(crate) const GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
 pub(crate) const RESOLVER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);
-/// resolv.conf nameserver. Loopback, NOT `RESOLVER_IP`: the DNS stub binds
-/// `0.0.0.0:53`, and a reply to the guest's own 192.168.127.x address would
-/// be routed out the black-hole `dummy0` and dropped; only an `lo`
-/// query/reply round-trip returns. See `main::write_resolv_conf`.
+/// resolv.conf nameserver. Loopback, NOT `RESOLVER_IP`: 127.0.0.0/8 is
+/// exempt from the nft REDIRECT rule, so the reply path stays clean. A
+/// non-loopback address would be REDIRECTed to :53, but the stub's wildcard
+/// socket replies from the wrong source address — conntrack never matches the
+/// reverse-NAT tuple and the reply is dropped. See `main::write_resolv_conf`
+/// and NFT_RULESET's doc in `egress.rs`.
 pub(crate) const DNS_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
@@ -123,9 +125,9 @@ mod tests {
 
     #[test]
     fn dns_nameserver_is_loopback() {
-        // The resolv.conf nameserver MUST be loopback: a reply to a
-        // non-loopback guest address is black-holed by dummy0. Regression
-        // guard for the NIC-less DNS reply path.
+        // The resolv.conf nameserver MUST be loopback: a non-loopback address
+        // is REDIRECTed by nft, and the stub's wildcard-socket reply is
+        // dropped (source-address mismatch; see NFT_RULESET's doc in egress.rs).
         assert!(
             DNS_LOOPBACK.is_loopback(),
             "resolv.conf nameserver must be a loopback address, got {DNS_LOOPBACK}"
