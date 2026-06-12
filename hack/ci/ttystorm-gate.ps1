@@ -10,7 +10,9 @@ $name  = 'stormgate'
 $ws    = Join-Path ([System.IO.Path]::GetTempPath()) "stormgate-ws-$PID"
 
 function Cleanup {
-    & $exe rm --force $name 2>$null | Out-Null
+    # Guarded: a bad $exe path must not throw here and mask the original
+    # failure (Cleanup runs from `finally` under EAP=Stop).
+    try { & $exe rm --force $name 2>$null | Out-Null } catch {}
     if (Test-Path $ws) { Remove-Item -Recurse -Force $ws -ErrorAction SilentlyContinue }
 }
 
