@@ -55,7 +55,16 @@ SRC="$CACHE/e2fsprogs-${VERSION}"
 BUILD="$CACHE/build-static"
 rm -rf "$BUILD" && mkdir -p "$BUILD"
 cd "$BUILD"
-"$SRC/configure" CC=musl-gcc CFLAGS="-O2" LDFLAGS="-static" \
+# musl-gcc's sysroot (/usr/include/x86_64-linux-musl) ships no Linux kernel
+# headers, so files like linux/unistd.h are missing.  We append the glibc
+# kernel-header paths with -idirafter (NOT -I) so they are searched last,
+# after musl's own headers win — plain -I would shadow musl headers with
+# glibc ones and silently produce a dynamically-linked binary.
+# The kernel headers themselves come from linux-libc-dev, pulled in by
+# build-essential on every Debian/Ubuntu box we care about.
+"$SRC/configure" CC=musl-gcc \
+    CFLAGS="-O2 -idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu" \
+    LDFLAGS="-static" \
     --disable-nls --disable-elf-shlibs --disable-uuidd \
     --disable-fuse2fs --disable-debugfs --disable-imager \
     --disable-resizer --disable-defrag \
