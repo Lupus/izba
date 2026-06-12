@@ -7,8 +7,9 @@
 # linked so it runs in the minimal initramfs with no shared libraries.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-OUT="${1:-dist/nft}"
-mkdir -p "$(dirname "$OUT")"
+# Fixed output path: the docker mount below writes to dist/ directly.
+OUT="dist/nft"
+mkdir -p dist
 
 docker run --rm -v "$PWD/dist:/out" alpine:3.22 sh -euc '
   apk add --no-cache build-base bison flex linux-headers pkgconf wget xz

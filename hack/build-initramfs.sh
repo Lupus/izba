@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the izba initramfs: static izba-init (+ optional static mke2fs).
+# Build the izba initramfs: static izba-init (+ optional static mke2fs/nft).
 #
 # Usage:
 #   hack/build-initramfs.sh [OUTPUT]
@@ -9,6 +9,9 @@
 #   IZBA_MKE2FS=/path/to/static/mke2fs  (optional)
 #       If set, the binary is embedded in /sbin/mke2fs so the guest can
 #       format the blank rw disk on first boot without a host-side mkfs.
+#   IZBA_NFT=/path/to/static/nft  (optional, see hack/build-nft.sh)
+#       If set, the binary is embedded in /sbin/nft for the egress stub's
+#       TCP REDIRECT ruleset (M1 izbad-owned egress).
 set -euo pipefail
 
 # Always run from repo root so cargo can find the workspace.
