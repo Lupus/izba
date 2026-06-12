@@ -25,9 +25,9 @@ installer yet (binaries are staged by script).
 ```
  izba CLI ──spawns──► cloud-hypervisor (per sandbox)     ┌─ microVM ──────────────┐
           ──spawns──► virtiofsd  (workspace share)  ◄────┤ izba-init (PID 1)      │
-          ──spawns──► passt      (user-mode NAT)    ◄────┤  ├ overlay rootfs      │
-          ──connects─► vsock port 1025 (control RPC) ◄───┤  ├ /workspace virtiofs │
-                       vsock port 1026 (stdio streams)◄──┤  └ spawns workloads    │
+          ──connects─► vsock port 1025 (control RPC) ◄───┤  ├ overlay rootfs      │
+                       vsock port 1026 (stdio streams)◄──┤  ├ /workspace virtiofs │
+       izbad ◄─dials── vsock port 1027 (egress: TCP/DNS) ┤  └ spawns workloads    │
                                                          └────────────────────────┘
 ```
 
@@ -40,11 +40,17 @@ Key properties:
   or upgrade it at any time without harming running sandboxes.
 - **Disk-state as source of truth.** `state.json` records every PID with its
   `starttime` field from `/proc/<pid>/stat` to defeat PID reuse.
-- **Two vsock ports.** Port 1025 carries length-prefixed JSON control RPCs
+- **Three vsock ports.** Port 1025 carries length-prefixed JSON control RPCs
   (Health, Exec, Wait, Resize, Shutdown). Port 1026 carries raw stdio/tty
-  streams.
-- **Unprivileged user-mode networking.** `passt --vhost-user` provides NAT
-  with no TAP device, no bridge, and no root on the host.
+  streams. Port 1027 carries **guest egress** — the guest dials out and `izbad`
+  bridges it.
+- **One network story: all egress through izbad.** The guest is a NIC-less
+  vsock island — no `passt`, no `consomme`, no host-side user-mode NAT. The
+  in-guest stub redirects all outbound TCP (nftables + `SO_ORIGINAL_DST`) and
+  DNS to `izbad` over vsock 1027; `izbad` is the single point that dials the
+  outside world. Because every flow already passes through `izbad`, the
+  agent-firewall (per-sandbox egress allow-lists + an audit log of every
+  connection tried) is the next milestone.
 - **OCI → erofs + overlay rootfs.** Images are pulled, flattened to a single
   erofs image (read-only), and combined with a sparse ext4 rw disk via
   overlayfs inside the guest. The erofs is content-addressed and shared across
@@ -59,8 +65,8 @@ hack/fetch-artifacts.sh
 ```
 
 This fetches `cloud-hypervisor` and `virtiofsd` static binaries into
-`~/.local/bin` and checks for `passt` and `mkfs.erofs` (install via your
-distro package manager if missing).
+`~/.local/bin` and checks for `mkfs.erofs` (install via your distro package
+manager if missing). No `passt` — egress is izbad-owned over vsock.
 
 **2. Build the kernel and initramfs**
 

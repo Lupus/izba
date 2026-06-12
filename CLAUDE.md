@@ -1,8 +1,10 @@
 # CLAUDE.md
 
-izba: open-source per-project microVM sandboxes for AI coding agents (a
-independent reimplementation of Docker Desktop's `sbx`). Daemon-first Rust CLI on top of
-Cloud Hypervisor/KVM; Windows/WHP via OpenVMM is planned but not started.
+izba: open-source per-project microVM sandboxes for AI coding agents — an
+independent reimplementation of the per-project-microVM agent-sandbox model
+popularized by Docker Desktop's `sbx`, built from public OSS building blocks.
+Daemon-first Rust CLI on top of Cloud Hypervisor/KVM, with a Windows/WHP-via-
+OpenVMM driver (M0 done).
 
 ## Documentation map
 
@@ -59,9 +61,13 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - `izba-core` — the product library, zero CLI assumptions. `sandbox.rs` is the
   lifecycle heart; `vmm/` driver trait + Cloud Hypervisor impl; `image/`
   OCI→erofs pipeline; `procmgr.rs` detached spawning; `vsock.rs`
-  hybrid-vsock client; `daemon/` izbad server+client (framed JSON over AF_UNIX).
+  hybrid-vsock client; `daemon/` izbad server+client (framed JSON over AF_UNIX);
+  `daemon/egress/` the guest-initiated vsock-1027 plane (policy/dns/router/
+  manager seams — M1 AllowAll policy + raw-UDP DNS forwarder, M2+ fill in).
 - `izba-init` — guest PID 1 (static musl): mounts, exec engine (PTY + pipes),
-  vsock servers. Everything except `main.rs` is host-testable.
+  vsock servers, NIC-less net bring-up (`net.rs`) + egress stub (`egress.rs`:
+  DNS UDP:53→vsock `Dns` half and TCP nft-REDIRECT→`TcpConnect` half).
+  Everything except `main.rs` is host-testable.
 - `izba-cli` — thin clap binary over izba-core.
 - `izba-ttytest` — dev/test-support: drives the real `izba` binary through a
   PTY/ConPTY (portable-pty + vt100) against a scripted fake guest or a real
@@ -79,28 +85,42 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   killing/upgrading it never harms sandboxes. Port relays are daemon
   threads; rules persist in `ports.json` (plain `Vec<PortRule>`).
   VMs/sidecars are never auto-restarted — death ⇒ honest unhealthy reason.
-- **vsock ports:** 1025 control RPC, 1026 streams (`CONTROL_PORT`/`STREAM_PORT`
-  in izba-proto). Stream conns send ONE `StreamOpen` frame (`Attach` exec
-  streams / `TcpDial` port relays / `TarExtract`+`TarCreate` for cp), then
-  bytes per the variant's framing. Host reaches them via Cloud Hypervisor
-  hybrid-vsock: `CONNECT <port>\n` on `run/vsock.sock`, response read
-  byte-by-byte (buffering eats stream data). CH does NOT propagate vsock
-  half-close guest→host: teardown must be full `SHUT_RDWR` once TX is done.
-  CLI streams now reach the guest through izbad's `OpenStream` splice (client
-  sends the guest `StreamOpen` in-band after the daemon replies Ok); the
-  framing after the splice is unchanged.
+- **vsock ports:** 1025 control RPC, 1026 streams, 1027 egress
+  (`CONTROL_PORT`/`STREAM_PORT`/`EGRESS_PORT` in izba-proto). Stream conns send
+  ONE `StreamOpen` frame (`Attach` exec streams / `TcpDial` port relays /
+  `TarExtract`+`TarCreate` for cp), then bytes per the variant's framing. Host
+  reaches them via Cloud Hypervisor hybrid-vsock: `CONNECT <port>\n` on
+  `run/vsock.sock`, response read byte-by-byte (buffering eats stream data). CH
+  does NOT propagate vsock half-close guest→host: teardown must be full
+  `SHUT_RDWR` once TX is done. CLI streams now reach the guest through izbad's
+  `OpenStream` splice (client sends the guest `StreamOpen` in-band after the
+  daemon replies Ok); the framing after the splice is unchanged.
+  **Egress is INVERTED (guest-initiated):** the guest dials CID 2:1027; the
+  VMM bridges that to izbad's `run/vsock.sock_1027` unix listener (Firecracker
+  hybrid-vsock convention, shared by CH and OpenVMM). The guest sends one
+  `StreamOpen::TcpConnect{addr,port}` (TcpDial's reply contract inverted:
+  izbad dials out + replies `Ok`/`Error`, then raw byte pipe) or
+  `StreamOpen::Dns` (RFC 1035 2-byte-BE length framing per `izba_proto::dns`,
+  request/response alternating). TCP `:53` routes to the same resolver.
 - **Disk order:** `sandbox::start()` builds `[rootfs.erofs (RO), rw.img (RW)]`
   → CH enumerates `--disk` order as vda, vdb → init mounts `/dev/vda` erofs
   lower + `/dev/vdb` ext4 upper into an overlay at `/rootfs`.
-- **Cmdline chain:** `console=ttyS0 ip=dhcp izba.hostname=<name>` ↔
-  `hack/kernel.config` (`SERIAL_8250_CONSOLE`, `IP_PNP_DHCP`) ↔ init reads
-  `/proc/net/pnp` for resolv.conf and `izba.hostname` for sethostname.
-  The OpenVMM driver (net VMs only) appends `izba.ipv4only=1` ↔ init
-  disables eth0 IPv6: consomme advertises guest SLAAC whenever the host has
-  ANY non-link-local IPv6 address (a Tailscale/VPN ULA counts) regardless
-  of v6 routability, and guest v6 connects then come back as instant RSTs
-  ("Connection refused", racing SLAAC ~4s after boot). CH/passt stays
-  dual-stack.
+- **Cmdline chain:** `console=ttyS0 izba.hostname=<name> izba.egress=1` ↔
+  `hack/kernel.config` (`SERIAL_8250_CONSOLE`; netfilter/nftables —
+  `NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK` — + `CONFIG_DUMMY`) ↔ init
+  reads `izba.hostname` for sethostname. NO `ip=dhcp`: the guest is a NIC-less
+  vsock island. `izba.egress=1` is vestigial — init no longer reads it; the
+  egress stub is always-on. init brings up `lo` + `dummy0`
+  (`192.168.127.2/24`, alias `192.168.127.1` as the default-route gateway via
+  `net.rs`): `dummy0` is the structural deny — anything the stub does not
+  intercept has nowhere to go. resolv.conf = `nameserver 127.0.0.1`
+  (loopback is REQUIRED, not cosmetic: 127/8 hits the nft `return` rule and is
+  never REDIRECTed; a REDIRECTed UDP reply is DROPPED — the stub answers from
+  an unconnected wildcard socket so the source mismatches and conntrack never
+  un-NATs it; see `egress.rs` NFT_RULESET doc). `/sbin/nft` is vendored into
+  the initramfs via `IZBA_NFT` (`hack/build-nft.sh`) and applies the nat-output
+  REDIRECT ruleset at boot. (passt/consomme/`izba.ipv4only` are GONE from the
+  datapath as of M1 — all egress flows through izbad over vsock 1027.)
 - **virtiofs tag** `workspace` (driver `FsShare` ↔ init mount plan) →
   `/workspace` inside the guest, which is also exec's default cwd.
 - **Exit-code mapping:** guest `CommandNotFound` → CLI exit 127;
@@ -114,6 +134,6 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - Known v1 trade-offs are doc-commented at the site: PAX xattrs dropped in
   `image/flatten.rs`, exec-entry retention + orphan-zombie policy in
   `izba-init`, no mount namespace for workloads (chroot only).
-- Deferred scope (don't build casually — see spec §8/§9): OpenVMM/Windows
-  driver (spike S1 first), egress MITM proxy + credential injection (v2 with
-  `izbad`), erofs layer dedup, snapshot/resume, CI-published kernel artifacts.
+- Deferred scope (don't build casually — see spec §8/§9): egress MITM proxy +
+  credential injection (M5, branches off the `daemon/egress/router.rs` dispatch
+  point), erofs layer dedup, snapshot/resume, CI-published kernel artifacts.

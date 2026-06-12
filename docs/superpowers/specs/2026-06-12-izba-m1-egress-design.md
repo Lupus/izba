@@ -52,12 +52,17 @@ territory (the pinned-fork patch shape from M0) before anything builds on it.
 
 ### 1.2 DNS
 
-- izba-init writes `resolv.conf` → `nameserver 192.168.127.1`, an address
-  carried by dummy0, where the stub binds UDP `:53` directly — the primary
-  path needs no interception.
+- izba-init writes `resolv.conf` → `nameserver 127.0.0.1` (loopback — see the
+  post-implementation amendment below; the earlier `192.168.127.1` plan
+  did not survive contact with the UDP REDIRECT reply path), where the stub
+  binds UDP `:53` directly — the primary path needs no interception.
 - An `nft udp dport 53 redirect to :53` rule additionally catches hardcoded
-  resolvers (e.g. 8.8.8.8). Conntrack un-NATs the reply source for UDP
-  REDIRECT, so answers appear to come from the address the client queried.
+  resolvers (e.g. 8.8.8.8). **NOTE (post-impl):** this reply path does NOT
+  work — the stub answers from an unconnected wildcard socket, the reply's
+  source address mismatches what the client queried, and conntrack's
+  reverse-NAT tuple never matches (textbook transparent-UDP-proxy problem).
+  Hardcoded-external-UDP-resolver DNS is therefore a known M1 gap; see the
+  amendment below.
 - The stub forwards each query over a per-query `StreamOpen::Dns` vsock
   stream; izbad's resolver answers. TCP `:53` rides the normal TCP REDIRECT
   and izbad routes port-53 `TcpConnect`s to the same resolver instead of
@@ -76,9 +81,11 @@ territory (the pinned-fork patch shape from M0) before anything builds on it.
 
 ### 1.3 Guest network config (end state)
 
-dummy0 carries `192.168.127.2/24` plus the resolver address `192.168.127.1`,
-with an on-link default route into it (same subnet the passt static config
-uses today, gvisor-tap-vsock-compatible). Locally-originated packets need
+dummy0 carries `192.168.127.2/24` plus `192.168.127.1` (an alias used as the
+default-route gateway; despite the variable name `RESOLVER_IP` it does NOT
+carry DNS — resolv.conf points at loopback, see the amendment below), with an
+on-link default route into it (same subnet the passt static config uses today,
+gvisor-tap-vsock-compatible). Locally-originated packets need
 only a route to exist for the nat-output hook to see them; nothing is ever
 emitted — dummy0 is the deny. IPv6: the guest has no v6 address or route, so
 v6 connects fail instantly with unreachable and clients fall back to v4. The
@@ -137,11 +144,11 @@ unconditional after phase C):
   `getsockopt` is one tiny isolated unsafe fn (integration-covered); the
   handler is unit-tested over socketpairs with an injected `(conn, orig_dst)`.
 - **DNS:** UDP socket on `0.0.0.0:53`; per-query forward over a `Dns`
-  stream. While passt is still attached (phases A–B), init points
-  `resolv.conf` at `127.0.0.1` for opted-in sandboxes (documented interim:
-  docker-in-VM dislikes loopback resolvers, which is why the end state uses
-  the dummy0-carried `192.168.127.1` instead); the end state writes
-  `nameserver 192.168.127.1`.
+  stream. init points `resolv.conf` at `127.0.0.1` — and the **end state keeps
+  it at loopback** (the `192.168.127.1` plan did not survive implementation;
+  see the amendment below). docker-in-VM's dislike of loopback resolvers
+  becomes a flagged M3/M4 prerequisite rather than a reason to move off
+  loopback.
 - **nft:** init execs `/sbin/nft -f` on a fixed `const` ruleset, one nat
   output chain: `ip daddr 127.0.0.0/8 return`, TCP redirect to `:15001`,
   `udp dport 53` redirect to `:53`. No UDP filter-drop rule (see §1.2 —
@@ -229,3 +236,31 @@ All suites green with stub-only egress on both platforms; the WSL+VPN and
 Tailscale topologies that produced `ea9e413` and `30e5c67` work with zero
 host sniffing; consomme/passt (and `izba.ipv4only=1`) gone from the egress
 datapath.
+
+## Post-implementation amendments (2026-06-13)
+
+Two honest corrections from building M1; the inline text above (§1.2, §1.3,
+§4) is patched to match.
+
+1. **resolv.conf end state is `127.0.0.1`, not `192.168.127.1`.**
+   Empirically established: the `nft udp dport 53 redirect to :53` reply path
+   does not work. The stub answers from an unconnected wildcard UDP socket, so
+   the reply's source address mismatches the address the client sent its query
+   to; conntrack's reverse-NAT tuple never matches and the reply is dropped
+   (the textbook transparent-UDP-proxy reply problem — the §1.2 claim that
+   "conntrack un-NATs the reply source for UDP REDIRECT so answers appear to
+   come from the address the client queried" was simply false). Loopback works
+   because `ip daddr 127.0.0.0/8 return` exempts 127/8 from the REDIRECT
+   entirely: the stub's `0.0.0.0:53` reply goes straight back over loopback
+   with a matching source. So the resolver address rides loopback, and the
+   `192.168.127.1` dummy0 alias is demoted to just the default-route gateway.
+
+2. **Hardcoded-external-UDP-resolver DNS is a known M1 gap.** Apps that query
+   an external resolver directly over UDP (e.g. `dig @8.8.8.8`) get no answer:
+   their queries are REDIRECTed to the stub, but the reply is dropped per (1).
+   The `udp dport 53 redirect to :53` rule is retained as the hook for a future
+   `IP_ORIGDSTADDR`-based transparent-reply fix (recvmsg the original dst,
+   reply from it via `IP_PKTINFO`). **This is a prerequisite for the
+   docker-in-VM milestone (M3/M4):** dockerd strips loopback resolvers from
+   container `resolv.conf` and falls back to `8.8.8.8`, which this gap breaks.
+   Flagged in the roadmap risk register + open decisions.

@@ -4,21 +4,24 @@
 > service mesh + credential vault"). Technical rationale lives in the
 > [mesh networking design](superpowers/specs/2026-06-12-izba-mesh-networking-design.md)
 > (its §8 staging is the engineering skeleton this roadmap re-cuts into
-> user-value milestones). Updated **2026-06-12**.
+> user-value milestones). Updated **2026-06-13**.
 
 ## Where we are
 
 v1 is **done and daemon-first** on both platforms: per-project microVM
 sandboxes with lifecycle, `exec -it`, `cp`, port publishing, OCI→erofs images,
 and `izbad` (disk-state adoption, stream splicing, upgrade dance). Linux/KVM
-via Cloud Hypervisor and Windows/WHP via OpenVMM both pass their gates (KVM
-integration 15/15, daemon e2e, tty harness, Windows PS validation).
+via Cloud Hypervisor and Windows/WHP via OpenVMM both pass their gates.
+
+**Networking is now unified on izbad** (mesh staging steps 1–3 done, M1
+2026-06-13): all guest egress — TCP and DNS — flows through izbad over
+guest-initiated vsock streams; the guest is a NIC-less vsock island and
+passt/consomme/`izba.ipv4only` are gone from the datapath. See M1 below.
 
 What does **not** exist yet:
 
-- Any of the mesh staging steps — no `StreamOpen::TcpConnect`, no egress stub,
-  no manifest, no policy, no vault. Guest egress still rides passt/consomme
-  (the host-autodetect bug class is contained, not killed).
+- The mesh/governance staging steps beyond egress — no manifest, no policy
+  engine, no credential vault (M2 onward).
 - **Adoption infrastructure**: no CI, no releases, no published kernel/initramfs
   artifacts, no install story beyond building from source.
 
@@ -69,23 +72,38 @@ commit, upstream-issue draft at
 apply the patch and self-build a pinned fork (same pinning shape as
 `hack/fetch-openvmm.sh`).
 
-### M1 — One network story: izbad-owned egress (M)
+### M1 — One network story: izbad-owned egress (M) — ✅ DONE (2026-06-13)
 
-Design steps 1–3 as one cut: `StreamOpen::TcpConnect` + izbad host dial-out
-(opt-in at first, coexisting with passt/consomme), the guest egress stub in
-izba-init (`nft` REDIRECT, `SO_ORIGINAL_DST`, DNS interception to izbad's
-resolver), then flip the default route and **retire passt/consomme from the
-egress path**. Two decisions baked in (2026-06-12): daemon restart/upgrade
-**severs live flows — documented honest behavior, no drain logic** (apps
-retry; consistent with the no-auto-restart philosophy), and throughput is
-**measured, not gated** (an iperf-style number in the integration suite for
-baseline visibility; optimize only on real complaints). The izbad-internal
-**module seams** (router / DNS / policy / MITM-vault as separable modules)
-are defined in this milestone's design doc, before the daemon accretes them.
-**Exit:** all suites green with stub-only egress on both platforms; the
-WSL+VPN and Tailscale topologies that produced `ea9e413` and `30e5c67` work
-with zero host sniffing; consomme/passt gone from the datapath (and
-`izba.ipv4only=1` with them).
+Design steps 1–3 landed as one cut: `StreamOpen::TcpConnect`/`Dns` +
+guest-initiated vsock 1027 + izbad host dial-out and a system-upstream DNS
+forwarder (`crates/izba-core/src/daemon/egress/` — router/dns/policy/manager
+seams), the guest egress stub in izba-init (`nft` REDIRECT to `:15001`,
+`SO_ORIGINAL_DST`, DNS UDP:53 → `Dns` stream; `crates/izba-init/src/egress.rs`
++ `net.rs`), then the cutover that removed virtio-net entirely. The guest is
+now a NIC-less vsock island (dummy0 static config, vendored static `/sbin/nft`,
+netfilter/`DUMMY` kernel config). The baked-in decisions held: daemon
+restart/upgrade **severs live flows — no drain logic**; throughput is
+**measured, not gated**. The izbad-internal **module seams** exist as designed
+(roadmap risk #6 retired for egress).
+
+**Exit — met (2026-06-13):**
+
+- KVM integration **18/18** with stub-only egress; daemon e2e green; tty_e2e
+  **2/2**.
+- Throughput baseline **279.3 MiB/s** (measured in the integration suite, not
+  gated).
+- Windows PS validation suite **ALL PASS (25 checks)** — run on the same
+  VPN-topology host that produced the original consomme guest-egress failure;
+  that failure is **retired with consomme**.
+- `passt`, `consomme`, `ip=dhcp` and `izba.ipv4only=1` are **gone from the
+  datapath**; WSL+VPN and Tailscale topologies (the `ea9e413` / `30e5c67`
+  bug class) work with zero host sniffing.
+
+**Known gap (carried forward):** apps that hardcode an *external UDP* resolver
+(e.g. `dig @8.8.8.8`) get no answer — the `udp dport 53` REDIRECT reply path
+doesn't work (transparent-UDP-proxy source-mismatch). `resolv.conf` points at
+loopback, which works. Flagged as a docker-in-VM (M3/M4) prerequisite — see
+risk #3 and Open decisions.
 
 ### M2 — Agent firewall: egress policy + audit log (S–M)
 
@@ -171,7 +189,7 @@ its milestone starts).
 | --- | --- | --- | --- |
 | 1★ | OpenVMM vsock assert survives the graceful-shutdown fix | The whole roadmap blocked (M0 is untimeboxed, parity sacred) | **Plan B prepared up front:** patch the assert + self-build a pinned OpenVMM fork (same pinning shape as today's fetched binary); upstream issue filed in parallel |
 | 2 | izbad is a traffic SPOF — restart/upgrade severs *all* flows, not just port relays | UX regression vs v1 | **Decided:** accepted + documented honest behavior, no drain logic (apps retry). Throughput: **measure, don't gate** — baseline number in the integration suite |
-| 3 | DNS interception edge cases (resolver behaviors, search domains, TCP DNS) | M1 flakiness | Scope: UDP :53 only at first; conservative resolver; integration tests per topology |
+| 3 | DNS interception edge cases (resolver behaviors, search domains, TCP DNS) | M1 flakiness | Largely closed in M1 (loopback resolv.conf + raw-UDP forwarder; TCP :53 routes to the same resolver). **Concrete realized instance:** the `udp dport 53` REDIRECT *reply* path doesn't work (stub's wildcard-socket source mismatches; conntrack never un-NATs) — so hardcoded external UDP resolvers get no answer. Mitigation: resolv.conf points at loopback (exempt from REDIRECT, works); the gap is flagged as a docker-in-VM (M3/M4) prerequisite (`IP_ORIGDSTADDR` transparent-reply fix) |
 | 4 | MITM-everything breaks cert-pinning clients; h2/websocket/body inspection is real work | M5 is now the largest, riskiest milestone | **Decided:** pinning breakage is accepted posture, not a risk to mitigate. Residual risk is scope: stage L7 features (URL/method first, body inspection later) inside M5 |
 | 5★ | Disk-order contract change ripples (M3) across driver enum, OpenVMM PCIe routing, init mount plan | Subtle cross-platform boot breakage | **Contract-change spec written before any M3 code**; one-milestone "change all ends" rule; KVM + Windows gates green before M4 consumes volumes |
 | 6★ | izbad scope creep (router + DNS + policy + MITM + vault in one binary) | Maintainability | **Module seams defined in the M1 design doc** (separable planes, daemon proto as the seam) rather than refactored out later |
@@ -198,6 +216,11 @@ its milestone starts).
   lifecycle verbs (create/resize/prune), schema **versioning from day one** —
   now also carries the M5 credential-mapping grammar (role + destination
   pattern → secret + injection shape).
+- **Hardcoded external-UDP-resolver DNS** (forum: before M3/M4 docker-in-VM
+  work). The M1 `udp dport 53` REDIRECT reply path is broken (source-mismatch;
+  see risk #3). Decide the `IP_ORIGDSTADDR`/`IP_PKTINFO` transparent-reply fix
+  vs. an alternative before docker-in-VM lands, since dockerd strips loopback
+  resolvers from container `resolv.conf` and falls back to `8.8.8.8`.
 
 ## Explicitly not on this roadmap
 

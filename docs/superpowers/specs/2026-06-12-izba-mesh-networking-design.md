@@ -371,19 +371,23 @@ All additions are **host-side, in `izbad`** — no new VMM or per-platform work 
 except the guest egress stub. Multi-container per trust domain needs *no* izba
 work: it's the guest's own dockerd/compose (§6).
 
-0. **Prerequisite — fix the OpenVMM vsock-assert crash first.** This design puts
-   *all* traffic on many short-lived vsock streams — precisely the churn that
-   trips `virtio_vsock connections.rs:1093` and panics the VM (reproduced via
-   `ttystorm floodfast`). Mitigation already identified: graceful `shutdown(Write)`
-   + drain instead of abrupt drop. **Hard gate.**
+0. **Prerequisite — fix the OpenVMM vsock-assert crash first.** ✅ **DONE (M0,
+   2026-06-12).** This design puts *all* traffic on many short-lived vsock
+   streams — precisely the churn that trips `virtio_vsock connections.rs:1093`
+   and panics the VM (reproduced via `ttystorm floodfast`). Fixed with graceful
+   `shutdown(Write)` + drain instead of abrupt drop; validated on real OpenVMM.
+   **Hard gate — closed.**
 1. **`StreamOpen::TcpConnect`** in izba-proto + the `izbad` splice + host
-   dial-out. Small; mirror of `TcpDial`. Can coexist with passt/consomme
-   initially (opt-in) to de-risk.
+   dial-out. ✅ **DONE (M1, 2026-06-13).** Small; mirror of `TcpDial`. Shipped
+   opt-in alongside passt/consomme, then made default at the cutover.
 2. **Guest egress stub + transparent REDIRECT + DNS interception** in izba-init.
-   The real new guest work (`nft` rules, `SO_ORIGINAL_DST`, DNS path). We control
-   the kernel config, so adding the netfilter bits is straightforward.
+   ✅ **DONE (M1, 2026-06-13).** The real new guest work (`nft` rules,
+   `SO_ORIGINAL_DST`, DNS path) — `crates/izba-init/src/egress.rs`, vendored
+   static `nft`, netfilter/`DUMMY` kernel config.
 3. **Flip the default route through the stub; retire passt/consomme egress.**
-   Optionally remove virtio-net.
+   ✅ **DONE (M1, 2026-06-13).** virtio-net removed; the guest is a NIC-less
+   vsock island (dummy0 + static config). passt/consomme/`izba.ipv4only` are
+   gone from the datapath.
 4. **Project object + manifest** (compose-shaped parse, disk layout, adoption,
    member lifecycle/readiness) + **intra-project name resolution** + **east–west
    brokering** (route name→member; reuse TcpConnect + existing TcpDial).
@@ -413,3 +417,12 @@ enumeration + OpenVMM PCIe routing + init mount plan).
 - ~~**UDP handling** beyond DNS name resolution~~ — **decided 2026-06-12:
   deny all non-DNS UDP** (drop + log); revisit only on a concrete need.
 - **Image/layer reuse across members** (§6 — deferred to a later iteration).
+- **Transparent-reply for hardcoded external UDP resolvers** (M1 gap, found in
+  implementation). DNS via `resolv.conf` (loopback) works; an app that queries
+  an external resolver directly over UDP (e.g. `dig @8.8.8.8`) gets its query
+  REDIRECTed to the stub but never sees the reply — the stub answers from an
+  unconnected wildcard socket, the source mismatches, and conntrack's
+  reverse-NAT tuple never matches. Fix shape: `recvmsg` with `IP_ORIGDSTADDR`,
+  reply from the original destination via `IP_PKTINFO`. **Prerequisite for the
+  docker-in-VM milestone** (dockerd strips loopback resolvers and falls back to
+  `8.8.8.8`). See the M1 egress-design post-impl amendment.

@@ -70,11 +70,12 @@ Final check — this must succeed without sudo:
 
 ## 2. Host dependencies
 
-Distro packages (passt for user-mode networking, erofs-utils for image
-conversion, cpio for the initramfs build):
+Distro packages (erofs-utils for image conversion, cpio for the initramfs
+build). **passt is no longer required** — as of M1 all guest egress flows
+through izbad over vsock; there is no host-side user-mode NIC:
 
 ```sh
-sudo apt install -y passt erofs-utils cpio
+sudo apt install -y erofs-utils cpio
 ```
 
 Static binaries (cloud-hypervisor + virtiofsd, installed to
@@ -96,7 +97,10 @@ on Ubuntu).
 
 ## 3. Boot artifacts (kernel + initramfs)
 
-Build the guest kernel (one-time, ~5–10 min; needs a C toolchain):
+Build the guest kernel (one-time, ~5–10 min; needs a C toolchain). The
+`hack/kernel.config` fragment now also carries the M1 egress bits —
+netfilter/nftables (`NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK`) for the
+guest TCP REDIRECT stub and `CONFIG_DUMMY` for the NIC-less `dummy0` interface:
 
 ```sh
 sudo apt install -y build-essential flex bison bc libelf-dev
@@ -111,12 +115,17 @@ rustup target add x86_64-unknown-linux-musl
 hack/build-initramfs.sh       # → dist/initramfs.cpio.gz
 ```
 
-Optionally embed a static `mke2fs` so the guest can format a blank scratch
-disk on first boot (this is what the `first_boot_formats_blank_rw` test
-exercises; without it that test self-skips):
+The initramfs needs a static `nft` for the M1 egress stub's TCP REDIRECT
+ruleset — build it with `hack/build-nft.sh` (writes `dist/nft`) and embed it
+via `IZBA_NFT`. Optionally also embed a static `mke2fs` (`IZBA_MKE2FS`) so the
+guest can format a blank scratch disk on first boot (the
+`first_boot_formats_blank_rw` test; self-skips without it):
 
 ```sh
-IZBA_MKE2FS=/path/to/static/mke2fs hack/build-initramfs.sh
+hack/build-nft.sh                                       # → dist/nft (needs Docker)
+IZBA_NFT=dist/nft \
+IZBA_MKE2FS=/path/to/static/mke2fs \
+  hack/build-initramfs.sh
 ```
 
 Install the artifacts where the CLI looks for them by default:
@@ -142,9 +151,9 @@ cargo test -p izba-core --test integration -- --test-threads=1 --nocapture
 Notes:
 
 - `--test-threads=1` is recommended, not required: each test boots its own
-  VM (1 vCPU / 1 GiB) plus a virtiofsd and passt sidecar, and serial
-  execution keeps the `--nocapture` output readable. Parallel runs work if
-  you have the RAM.
+  VM (1 vCPU / 1 GiB) plus a virtiofsd sidecar (no passt — egress rides izbad
+  over vsock now), and serial execution keeps the `--nocapture` output
+  readable. Parallel runs work if you have the RAM.
 - The test image (default `alpine:3.20`, override with `IZBA_TEST_IMAGE`)
   is pulled from the registry **once per run** into a shared cache. Set
   `IZBA_TEST_CACHE=$HOME/.cache/izba-itest` to persist that cache across
@@ -216,17 +225,17 @@ shows it.)
 `<root>/sandboxes/<name>/logs/console.log` (`<root>` is
 `~/.local/share/izba` for the CLI, or the test's tempdir — boot-failure
 panics in the suite print the console tail automatically). Sidecar logs sit
-next to it: `vmm.log`, `passt.log`, `virtiofsd-workspace.log`.
+next to it: `vmm.log`, `virtiofsd-workspace.log` (there is no `passt.log` —
+egress is izbad-owned; egress decisions land in the izbad/daemon log).
 
 | Symptom | Cause / fix |
 | --- | --- |
 | `boot ... did not become healthy` and `vmm.log` mentions `/dev/kvm` | No KVM. Re-do §1; verify `[ -w /dev/kvm ]`. |
-| start error naming `net.sock` (`passt did not create ... within 3s` or spawn failure) | `passt` missing or too old (needs `--vhost-user`). `sudo apt install passt`; Ubuntu ≤ 22.04 may need a backport. |
 | `mkfs.erofs not found ... — install it or set IZBA_MKFS_EROFS` from `ensure_image` | `sudo apt install erofs-utils` (needs ≥ 1.8 for `--tar=f`; build from source on older distros). |
 | start error naming `fs-workspace.sock` | `virtiofsd` missing/failed — check `virtiofsd-workspace.log`, re-run `hack/fetch-artifacts.sh`. |
 | console.log: `rw disk is blank and initramfs has no mke2fs` | Neither host `mkfs.ext4` nor guest `mke2fs` available. Install `e2fsprogs`, or rebuild the initramfs with `IZBA_MKE2FS=...`. |
-| console.log stops after kernel lines, no izba-init output | Kernel/initramfs mismatch or missing config — rebuild both with the `hack/` scripts (the kernel needs the `hack/kernel.config` fragment: virtio, vsock, erofs, overlayfs built-in). |
-| Guest has no network (the `guest_networking` test fails) | Check `passt.log`; DHCP inside the guest comes from passt. Corporate VPNs/firewalls on the Windows host can also block WSL2 egress. |
+| console.log stops after kernel lines, no izba-init output | Kernel/initramfs mismatch or missing config — rebuild both with the `hack/` scripts (the kernel needs the `hack/kernel.config` fragment: virtio, vsock, erofs, overlayfs, plus M1's netfilter/nftables + `CONFIG_DUMMY`, built-in). |
+| Guest can't reach the network (DNS/HTTP egress fails) | Egress flows through izbad over vsock 1027 — check the izbad/daemon log for `egress allow ...` lines and dial-out errors; confirm the guest stub bound (`/sbin/nft` present in the initramfs, `IZBA_NFT` set at build). An app that hardcodes an external UDP resolver (e.g. `8.8.8.8`) is a known M1 gap — use `resolv.conf` (loopback). |
 | `sandbox '<name>' is busy` | Another izba process holds the per-sandbox flock; wait for it or find it with `fuser '<root>/sandboxes/.<name>.lock'` (the lock lives beside the sandbox dir). |
 | Boot consistently > 5 s warning in `boot_to_healthy_under_5s` | Expected on slow/loaded machines; the hard budget is 10 s. Investigate console.log timestamps if it is near 10 s. |
 
@@ -245,23 +254,24 @@ hack/stage-izba-windows.sh
 pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
 ```
 
-Expected: `ALL PASS` (21 checks — boot, exec, exit codes, stdin, network,
-console capture, daemon lifecycle, stop/restart/rm). The interactive `exec -it`
-checklist (PTY, VT rendering, resize, Ctrl-C, mode restore) is in the
+Expected: `ALL PASS` (25 checks — boot, exec, exit codes, stdin, izbad egress
+(DNS + HTTP through vsock 1027), console capture, daemon lifecycle,
+stop/restart/rm). Validated on the VPN-topology host that produced the
+original consomme guest-egress failure — that failure is retired with
+consomme. The interactive `exec -it` checklist (PTY, VT rendering, resize,
+Ctrl-C, mode restore) is in the
 [Plan 2 doc](superpowers/plans/2026-06-10-izba-windows-port-p2.md), Task 5.
 
-**Guest egress on Windows is IPv4-only (by design).** OpenVMM's consomme
-backend advertises IPv6 to the guest (SLAAC) whenever the host has *any*
-non-link-local IPv6 address — a Tailscale or VPN ULA with no IPv6 default
-route is enough — and every guest IPv6 connect then dies host-side as an
-instant RST. The symptom was `wget: can't connect to remote host: Connection
-refused` for dual-stack destinations, intermittent because it raced SLAAC
-(checks in the first ~4 s of boot still picked IPv4 and passed). openvmm
-exposes no CLI knob for consomme IPv6, so the OpenVMM driver appends
-`izba.ipv4only=1` to the kernel cmdline and izba-init writes
-`net.ipv6.conf.{eth0,default}.disable_ipv6=1` (loopback `::1` keeps working
-for workloads). The Linux/passt path stays dual-stack — passt only offers
-IPv6 the host can actually route.
+**Historical (pre-M1, no longer applies).** Guest egress on Windows used to
+ride OpenVMM's consomme NAT, which advertised IPv6 (SLAAC) to the guest
+whenever the host had *any* non-link-local IPv6 address — a Tailscale/VPN ULA
+was enough — and guest IPv6 connects then died host-side as instant RSTs
+(`Connection refused`, racing SLAAC). The fix at the time was the OpenVMM
+driver appending `izba.ipv4only=1` and izba-init disabling eth0 IPv6. **M1
+removed consomme entirely**: there is no guest NIC, all egress flows through
+izbad over vsock, and both `consomme` and `izba.ipv4only=1` are gone from the
+datapath — the whole SLAAC-race bug class is structurally eliminated, on both
+platforms.
 
 ## exec -it terminal harness
 
