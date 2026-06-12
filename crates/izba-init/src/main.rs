@@ -5,6 +5,7 @@
 //! Shutdown: kill all workloads, sync, power off.
 
 mod cmdline;
+mod egress;
 mod exec;
 mod mounts;
 mod net;
@@ -85,6 +86,7 @@ fn run_pid1() -> anyhow::Result<()> {
             eprintln!("izba-init: izba.ipv4only: {e}");
         }
     }
+    let egress_on = params.get("izba.egress").map(String::as_str) == Some("1");
 
     rwdisk::ensure_formatted(Path::new("/dev/vdb")).context("rw disk")?;
 
@@ -97,7 +99,7 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     mounts::apply(&rootfs_plan[2..]).context("rootfs mounts")?;
 
-    write_resolv_conf();
+    write_resolv_conf(egress_on);
 
     let engine = Arc::new(ExecEngine::new(Some("/rootfs".into())));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -118,6 +120,13 @@ fn run_pid1() -> anyhow::Result<()> {
         let e = Arc::clone(&engine);
         std::thread::spawn(move || server::serve_streams(streams, e));
     }
+    if egress_on {
+        std::thread::spawn(|| {
+            if let Err(e) = egress::serve_dns_udp() {
+                eprintln!("izba-init: dns stub: {e}");
+            }
+        });
+    }
 
     // Zombie policy (v1): every engine exec is reaped by its dedicated
     // waitpid thread. We deliberately do NOT waitpid(-1) here — that would
@@ -133,17 +142,21 @@ fn run_pid1() -> anyhow::Result<()> {
     power_off();
 }
 
-/// The guest gets DNS from the kernel's ip=dhcp autoconfig; /proc/net/pnp
-/// holds the result. Best-effort: the file may not exist.
-fn write_resolv_conf() {
-    let Ok(pnp) = std::fs::read_to_string("/proc/net/pnp") else {
-        return;
+/// With izbad egress, the resolver is the local stub (interim: loopback;
+/// the dummy0-carried 192.168.127.1 arrives with the phase-C cutover).
+/// Otherwise: kernel `ip=dhcp` autoconfig result from /proc/net/pnp.
+fn write_resolv_conf(egress_on: bool) {
+    let conf = if egress_on {
+        "nameserver 127.0.0.1\n".to_string()
+    } else {
+        let Ok(pnp) = std::fs::read_to_string("/proc/net/pnp") else {
+            return;
+        };
+        pnp.lines()
+            .filter(|l| l.starts_with("nameserver") || l.starts_with("domain"))
+            .map(|l| format!("{l}\n"))
+            .collect()
     };
-    let conf: String = pnp
-        .lines()
-        .filter(|l| l.starts_with("nameserver") || l.starts_with("domain"))
-        .map(|l| format!("{l}\n"))
-        .collect();
     let _ = std::fs::create_dir_all("/rootfs/etc");
     if let Err(e) = std::fs::write("/rootfs/etc/resolv.conf", conf) {
         eprintln!("izba-init: writing resolv.conf: {e}");
