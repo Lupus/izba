@@ -285,3 +285,42 @@ resize, and exit-code mapping are checked automatically instead of by hand.
 
 The harness is feature-gated (`ttytests`, off by default) so the six standard
 build gates never run or lint these tests.
+
+## vsock churn stressor (ttystorm)
+
+`crates/izba-core/examples/ttystorm.rs` drives real `tty: true` exec streams
+under load — the diagnostic that localized both the Windows vim-hang and the
+OpenVMM vsock-assert crash. By default it goes through izbad (the production
+datapath: `GuestRpc` + `OpenStream` splice); `--direct` dials `run/vsock.sock`
+itself (the pre-daemon shape) to stress the raw VMM. It needs a *running*
+sandbox and never auto-starts a daemon (its `current_exe` is not `izba`).
+
+```sh
+# Linux/KVM, via izbad (run a sandbox first):
+cargo run -p izba-core --example ttystorm -- <name> floodfast 5 1024
+# Windows/OpenVMM (staged binary):
+C:\izba\bin\ttystorm.exe <name> floodfast 20 2048
+```
+
+Modes: `burst|bidi|mixed|inonly|bidiecho|floodfast|reactive|vim|chop`. A 15 s
+watchdog exits 2 on a stall (`WEDGED`). `floodfast` keeps reading until the
+writer drains (loopback backpressure otherwise self-deadlocks); `chop` is the
+assert reproducer — read once, stop, drop while the relay write is wedged.
+
+**M0 gate (OpenVMM vsock under churn) — exit criteria, validated 2026-06-12.**
+The crash is `virtio_vsock connections.rs:1093` ("connection should have been
+removed"); it aborts the whole VM (`mesh child ... code=0xc0000409`). Root
+cause + upstream-issue draft + Plan-B patch:
+`docs/superpowers/specs/2026-06-12-openvmm-vsock-assert-issue.md` and
+`hack/openvmm-vsock-assert.patch`. The izba-side mitigation is the
+`shutdown(Write)`+**drain** teardown in `portfwd.rs`/`daemon/server.rs`
+(`copy_until_eof` keeps consuming the vsock leg after a peer write fails, so
+the relay socket is never force-closed with guest TX buffered).
+
+- **Via izbad (production):** `floodfast 20 2048` and `chop 30 256` run clean,
+  VM stays alive (`izba exec ... -- echo` after the run succeeds). This is the
+  gate.
+- **Control, `--direct`:** `chop --direct` reproduces the assert and kills the
+  VM (`openvmm` process gone, `izba ls` shows `stopped`) — proves the bug is
+  real and the mitigation is what protects. The VM-death is honest (disk-state
+  invariant): `izba run <name>` recovers cleanly.

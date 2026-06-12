@@ -1,12 +1,22 @@
 //! ttystorm — diagnostic reproducer for the OpenVMM hybrid-vsock TTY stream
-//! wedge (vim hang during interactive exec on Windows).
+//! wedge (vim hang during interactive exec on Windows) and the vsock-churn
+//! assert crash (`virtio_vsock connections.rs:1093`).
 //!
 //! Drives a real `tty: true` exec session over a single bidirectional stream
 //! connection — exactly the shape `izba exec -it` uses — but with no console
 //! involved, so a hang here convicts the VMM-side relay, not izba's terminal
 //! code.
 //!
-//! Usage: ttystorm <sandbox> <burst|bidi|mixed|inonly> [rounds] [kib]
+//! By default connections go through izbad (GuestRpc + OpenStream splice),
+//! the production datapath: round teardown is abrupt on the client side by
+//! design, and the daemon must launder it into a graceful vsock teardown
+//! (the churn drain). `--direct` dials `run/vsock.sock` itself — the
+//! pre-daemon shape that reproduces the raw OpenVMM assert; expect it to
+//! KILL the VM on an unpatched openvmm.exe. Requires a running daemon
+//! unless `--direct` (it never auto-starts one: `current_exe` here is
+//! ttystorm, not izba).
+//!
+//! Usage: ttystorm <sandbox> <burst|bidi|mixed|inonly> [rounds] [kib] [--direct]
 //!   burst:  guest blasts `kib` KiB at the pty; host only reads
 //!   bidi:   guest runs raw-mode `cat`; host writes `kib` KiB while reading
 //!           the loopback (sustained two-way pressure, same connection)
@@ -14,12 +24,16 @@
 //!           vim's exact shape (redraw burst out, terminal replies in)
 //!   inonly: raw-mode no-echo guest sink reads `kib` KiB; host only writes
 //!           (unidirectional host->guest control)
+//!   chop:   guest blasts a burst; host reads once, stops reading, then
+//!           drops the connection with the relay write wedged — the
+//!           connections.rs:1093 assert reproducer (see fn doc)
 //!
 //! All progress is reported on stderr (unbuffered). A watchdog thread kills
 //! the run with exit 2 if neither direction moves for 15 s — socket read
 //! timeouts are silently ignored on Windows AF_UNIX, so blocking reads can
 //! never be trusted to wake up on their own.
 
+use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
 use izba_core::sandbox;
 use izba_proto::{
@@ -37,13 +51,69 @@ struct Progress {
     tx: AtomicU64,
 }
 
+/// How ttystorm reaches the guest: through izbad (production shape, default)
+/// or dialing `run/vsock.sock` directly (`--direct`, the raw-VMM stressor).
+struct Target {
+    paths: Paths,
+    name: String,
+    direct: bool,
+}
+
+impl Target {
+    /// One control RPC. Daemon path opens a fresh guest connection per call
+    /// (exactly what `izba exec` does via GuestRpc).
+    fn rpc(&self, req: &Request) -> anyhow::Result<Response> {
+        if self.direct {
+            let connector = sandbox::default_connector();
+            let mut control = sandbox::control(&self.paths, &self.name, &connector)?;
+            write_frame(&mut control, req)?;
+            Ok(read_frame(&mut control)?)
+        } else {
+            self.daemon()?.guest_rpc(&self.name, req)
+        }
+    }
+
+    fn stream(&self) -> anyhow::Result<izba_core::vmm::UdsStream> {
+        if self.direct {
+            sandbox::default_stream_connector()(&self.paths, &self.name)
+        } else {
+            self.daemon()?.open_stream_on_self(&self.name)
+        }
+    }
+
+    fn daemon(&self) -> anyhow::Result<DaemonClient> {
+        DaemonClient::connect_existing(&self.paths)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no izbad running (ttystorm never auto-starts one) — \
+                 run the sandbox via the izba CLI first, or pass --direct"
+            )
+        })
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
+    let (mut pos, mut direct) = (Vec::new(), false);
+    for a in std::env::args().skip(1) {
+        if a == "--direct" {
+            direct = true;
+        } else {
+            pos.push(a);
+        }
+    }
+    let mut args = pos.into_iter();
     let name = args.next().unwrap_or_else(|| "ws-validate".into());
     let mode = args.next().unwrap_or_else(|| "burst".into());
     let rounds: u32 = args.next().map(|s| s.parse().unwrap()).unwrap_or(3);
     let kib: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(1024);
-    let paths = Paths::from_env_or_default(None);
+    let t = Target {
+        paths: Paths::from_env_or_default(None),
+        name,
+        direct,
+    };
+    eprintln!(
+        "path: {}",
+        if direct { "DIRECT vsock" } else { "via izbad" }
+    );
 
     let progress = Arc::new(Progress {
         rx: AtomicU64::new(0),
@@ -54,14 +124,15 @@ fn main() -> anyhow::Result<()> {
     for round in 1..=rounds {
         let start = Instant::now();
         match mode.as_str() {
-            "burst" => burst(&paths, &name, kib, &progress)?,
-            "bidi" => bidi(&paths, &name, kib, &progress)?,
-            "mixed" => mixed(&paths, &name, kib, &progress)?,
-            "inonly" => inonly(&paths, &name, kib, &progress)?,
-            "bidiecho" => bidiecho(&paths, &name, kib, &progress)?,
-            "floodfast" => floodfast(&paths, &name, kib, &progress)?,
-            "reactive" => reactive(&paths, &name, kib, &progress)?,
-            "vim" => vim_probe(&paths, &name, &progress)?,
+            "burst" => burst(&t, kib, &progress)?,
+            "bidi" => bidi(&t, kib, &progress)?,
+            "mixed" => mixed(&t, kib, &progress)?,
+            "inonly" => inonly(&t, kib, &progress)?,
+            "bidiecho" => bidiecho(&t, kib, &progress)?,
+            "floodfast" => floodfast(&t, kib, &progress)?,
+            "chop" => chop(&t, kib, &progress)?,
+            "reactive" => reactive(&t, kib, &progress)?,
+            "vim" => vim_probe(&t, &progress)?,
             other => anyhow::bail!("unknown mode {other:?}"),
         }
         eprintln!("round {round}: PASS ({:?})", start.elapsed());
@@ -95,9 +166,7 @@ fn spawn_watchdog(progress: Arc<Progress>, mode: String) {
     });
 }
 
-fn exec_tty(paths: &Paths, name: &str, argv: &[&str]) -> anyhow::Result<u32> {
-    let connector = sandbox::default_connector();
-    let mut control = sandbox::control(paths, name, &connector)?;
+fn exec_tty(t: &Target, argv: &[&str]) -> anyhow::Result<u32> {
     let req = Request::Exec(ExecRequest {
         argv: argv.iter().map(|s| s.to_string()).collect(),
         env: vec![("TERM".into(), "xterm-256color".into())],
@@ -106,19 +175,14 @@ fn exec_tty(paths: &Paths, name: &str, argv: &[&str]) -> anyhow::Result<u32> {
         uid: 0,
         gid: 0,
     });
-    write_frame(&mut control, &req)?;
-    match read_frame(&mut control)? {
+    match t.rpc(&req)? {
         Response::ExecStarted { exec_id } => Ok(exec_id),
         other => anyhow::bail!("unexpected exec reply: {other:?}"),
     }
 }
 
-fn attach_tty(
-    paths: &Paths,
-    name: &str,
-    exec_id: u32,
-) -> anyhow::Result<izba_core::vmm::UdsStream> {
-    let mut conn = sandbox::default_stream_connector()(paths, name)?;
+fn attach_tty(t: &Target, exec_id: u32) -> anyhow::Result<izba_core::vmm::UdsStream> {
+    let mut conn = t.stream()?;
     write_frame(
         &mut conn,
         &StreamOpen::Attach(StreamAttach {
@@ -146,10 +210,10 @@ fn drain_to_eof(stream: &izba_core::vmm::UdsStream, progress: &Progress) -> anyh
     }
 }
 
-fn burst(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyhow::Result<()> {
+fn burst(t: &Target, kib: usize, progress: &Progress) -> anyhow::Result<()> {
     let cmd = format!("dd if=/dev/zero bs=1024 count={kib} 2>/dev/null | base64");
-    let exec_id = exec_tty(paths, name, &["sh", "-c", &cmd])?;
-    let stream = attach_tty(paths, name, exec_id)?;
+    let exec_id = exec_tty(t, &["sh", "-c", &cmd])?;
+    let stream = attach_tty(t, exec_id)?;
     let got = drain_to_eof(&stream, progress)?;
     eprintln!("  burst: read {got} bytes to EOF");
     Ok(())
@@ -181,16 +245,12 @@ fn await_marker(
     }
 }
 
-fn bidi(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyhow::Result<()> {
+fn bidi(t: &Target, kib: usize, progress: &Progress) -> anyhow::Result<()> {
     // Raw mode, no echo: the only loopback is cat itself, so expect exactly
     // `total` bytes back, then EOF cannot happen (cat stays open) — we stop
     // once the loopback is complete.
-    let exec_id = exec_tty(
-        paths,
-        name,
-        &["sh", "-c", "stty raw -echo && echo READY && cat"],
-    )?;
-    let stream = attach_tty(paths, name, exec_id)?;
+    let exec_id = exec_tty(t, &["sh", "-c", "stty raw -echo && echo READY && cat"])?;
+    let stream = attach_tty(t, exec_id)?;
     let leftover = await_marker(&stream, b"READY", progress)?;
     let writer_stream = stream.try_clone()?;
 
@@ -233,10 +293,10 @@ fn bidi(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyhow::R
 
 /// vim's shape: heavy guest->host burst while the host trickles tiny writes
 /// (terminal query responses) into the same connection.
-fn mixed(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyhow::Result<()> {
+fn mixed(t: &Target, kib: usize, progress: &Progress) -> anyhow::Result<()> {
     let cmd = format!("stty raw -echo && dd if=/dev/zero bs=1024 count={kib} 2>/dev/null | base64");
-    let exec_id = exec_tty(paths, name, &["sh", "-c", &cmd])?;
-    let stream = attach_tty(paths, name, exec_id)?;
+    let exec_id = exec_tty(t, &["sh", "-c", &cmd])?;
+    let stream = attach_tty(t, exec_id)?;
     let writer_stream = stream.try_clone()?;
 
     let done = Arc::new(AtomicU64::new(0));
@@ -283,9 +343,9 @@ fn mixed(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyhow::
 /// v1's exact shape, isolated to the echo factor: canonical mode, ECHO on,
 /// newline-terminated lines, but READY-gated so there is no attach race.
 /// Every line we send comes back twice (pty echo + cat), so expect ~2x.
-fn bidiecho(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyhow::Result<()> {
-    let exec_id = exec_tty(paths, name, &["sh", "-c", "echo READY && cat"])?;
-    let stream = attach_tty(paths, name, exec_id)?;
+fn bidiecho(t: &Target, kib: usize, progress: &Progress) -> anyhow::Result<()> {
+    let exec_id = exec_tty(t, &["sh", "-c", "echo READY && cat"])?;
+    let stream = attach_tty(t, exec_id)?;
     let leftover = await_marker(&stream, b"READY", progress)?;
     let writer_stream = stream.try_clone()?;
 
@@ -328,9 +388,9 @@ fn bidiecho(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyho
 /// v1's exact shape, isolated to the attach race: raw-mode cat, but the host
 /// flood starts the instant the StreamAttach frame is written — racing the
 /// relay's connection establishment and the guest-side attach plumbing.
-fn floodfast(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyhow::Result<()> {
-    let exec_id = exec_tty(paths, name, &["sh", "-c", "stty raw -echo && cat"])?;
-    let stream = attach_tty(paths, name, exec_id)?;
+fn floodfast(t: &Target, kib: usize, progress: &Progress) -> anyhow::Result<()> {
+    let exec_id = exec_tty(t, &["sh", "-c", "stty raw -echo && cat"])?;
+    let stream = attach_tty(t, exec_id)?;
     let writer_stream = stream.try_clone()?;
 
     let total = (kib * 1024) as u64;
@@ -352,11 +412,18 @@ fn floodfast(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyh
     // Pre-raw canonical buffering may eat a prefix (sh hasn't run stty yet
     // when the flood lands), so don't demand exact loopback — demand
     // continuous progress until the writer finishes and at least half the
-    // flood comes back. The watchdog converts a true stall into exit 2.
+    // flood comes back. Keep reading until BOTH hold: stopping reads while
+    // the writer still has bytes to push deadlocks on loopback backpressure
+    // once the in-flight remainder exceeds the path's buffering (cat blocks
+    // writing the echo, so it stops reading our flood). The watchdog
+    // converts a true stall into exit 2. The round still ENDS with an
+    // abrupt drop while cat holds unread echo — the churn stressor.
+    // (`wprog == total` is stored before the final chunk's echo can arrive
+    // back, so the loop can't block on a read with nothing left in flight.)
     let mut got = 0u64;
     let mut buf = [0u8; 8192];
     let mut s = &stream;
-    while got < total / 2 {
+    while got < total / 2 || wprog.load(Ordering::Relaxed) < total {
         match s.read(&mut buf) {
             Ok(0) => anyhow::bail!("unexpected EOF in floodfast after {got} bytes"),
             Ok(n) => {
@@ -374,14 +441,40 @@ fn floodfast(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyh
     Ok(())
 }
 
+/// The churn killer: attach to a guest blasting a bounded burst, read one
+/// chunk to prove flow, then STOP reading so every buffer between the guest
+/// and us fills and the VMM's relay write to our socket blocks — then drop
+/// the connection abruptly with that write pending. With `--direct` on an
+/// unpatched openvmm.exe this is the surgical reproducer for the
+/// `virtio_vsock connections.rs:1093` assert (the write-ready flush fails,
+/// SendReset is queued WITHOUT removing the connection, the next poll
+/// panic-aborts the VM). Through izbad the splice drains the leg to EOF
+/// instead, and the VM must survive.
+fn chop(t: &Target, kib: usize, progress: &Progress) -> anyhow::Result<()> {
+    let cmd = format!("dd if=/dev/zero bs=1024 count={kib} 2>/dev/null | base64");
+    let exec_id = exec_tty(t, &["sh", "-c", &cmd])?;
+    let stream = attach_tty(t, exec_id)?;
+    let mut buf = [0u8; 8192];
+    let mut s = &stream;
+    let n = s.read(&mut buf)?;
+    anyhow::ensure!(n > 0, "no burst bytes before chop");
+    progress.rx.fetch_add(n as u64, Ordering::Relaxed);
+    // Let the unread burst wedge the relay: guest -> vsock -> VMM -> (full
+    // socket buffer) before the abrupt close.
+    std::thread::sleep(Duration::from_millis(300));
+    progress.tx.fetch_add(1, Ordering::Relaxed); // keep the watchdog fed
+    drop(stream);
+    Ok(())
+}
+
 /// vim's established-connection shape, maximally tightened: the guest blasts
 /// a burst and the host answers EVERY read with an immediate tiny write —
 /// the way a terminal answers DA/DSR queries — so reverse writes land while
 /// forward data is in flight on the same connection.
-fn reactive(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyhow::Result<()> {
+fn reactive(t: &Target, kib: usize, progress: &Progress) -> anyhow::Result<()> {
     let cmd = format!("stty raw -echo && dd if=/dev/zero bs=1024 count={kib} 2>/dev/null | base64");
-    let exec_id = exec_tty(paths, name, &["sh", "-c", &cmd])?;
-    let stream = attach_tty(paths, name, exec_id)?;
+    let exec_id = exec_tty(t, &["sh", "-c", &cmd])?;
+    let stream = attach_tty(t, exec_id)?;
     let mut writer_stream = stream.try_clone()?;
 
     let mut got = 0u64;
@@ -412,55 +505,35 @@ fn reactive(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyho
 /// goes silent waiting for a terminal reply. Sets a 24x80 winsize first (the
 /// CLI resizes before the program looks), opens vim on a file, then dumps
 /// every byte vim sends with inter-chunk timing. Quits vim after 6 s.
-fn vim_probe(paths: &Paths, name: &str, progress: &Progress) -> anyhow::Result<()> {
+fn vim_probe(t: &Target, progress: &Progress) -> anyhow::Result<()> {
     use izba_proto::Request;
 
     // Make a file with enough lines that vim must paint a full screen.
     let exec_setup = exec_tty(
-        paths,
-        name,
+        t,
         &["sh", "-c", "seq 1 441 > /tmp/probe.txt; echo SETUP_DONE"],
     )?;
-    let setup_stream = attach_tty(paths, name, exec_setup)?;
+    let setup_stream = attach_tty(t, exec_setup)?;
     let _ = await_marker(&setup_stream, b"SETUP_DONE", progress)?;
     drop(setup_stream);
-
-    let connector = sandbox::default_connector();
-    let mut control = sandbox::control(paths, name, &connector)?;
 
     // Start vim under a tty. Default config (NOT -u NONE) so vim runs its
     // startup terminal-capability probes (u7 cursor-position request, DA1,
     // etc.) — the thing minimal vim skips and the suspected hang trigger.
-    let req = Request::Exec(ExecRequest {
-        argv: vec!["vim".into(), "/tmp/probe.txt".into()],
-        env: vec![("TERM".into(), "xterm-256color".into())],
-        cwd: "/workspace".into(),
-        tty: true,
-        uid: 0,
-        gid: 0,
-    });
-    write_frame(&mut control, &req)?;
-    let exec_id = match read_frame(&mut control)? {
-        Response::ExecStarted { exec_id } => exec_id,
-        other => anyhow::bail!("unexpected exec reply: {other:?}"),
-    };
+    let exec_id = exec_tty(t, &["vim", "/tmp/probe.txt"])?;
 
     // Size the pty to 80x24 BEFORE attaching the stream — same order the CLI
     // uses (resize() runs before the program looks at the winsize).
-    write_frame(
-        &mut control,
-        &Request::Resize {
-            exec_id,
-            cols: 80,
-            rows: 24,
-        },
-    )?;
-    match read_frame(&mut control)? {
+    match t.rpc(&Request::Resize {
+        exec_id,
+        cols: 80,
+        rows: 24,
+    })? {
         Response::Ok => {}
         other => eprintln!("  (resize reply: {other:?})"),
     }
 
-    let stream = attach_tty(paths, name, exec_id)?;
+    let stream = attach_tty(t, exec_id)?;
     let mut writer = stream.try_clone()?;
 
     // Reader thread: log every chunk vim emits with a timestamp, so a silent
@@ -547,11 +620,11 @@ fn escape_prefix(b: &[u8], n: usize) -> String {
 }
 
 /// Pure host->guest on the tty connection: raw, no echo, guest just counts.
-fn inonly(paths: &Paths, name: &str, kib: usize, progress: &Progress) -> anyhow::Result<()> {
+fn inonly(t: &Target, kib: usize, progress: &Progress) -> anyhow::Result<()> {
     let total = kib * 1024;
     let cmd = format!("stty raw -echo && echo READY && head -c {total} > /dev/null && echo DONE");
-    let exec_id = exec_tty(paths, name, &["sh", "-c", &cmd])?;
-    let stream = attach_tty(paths, name, exec_id)?;
+    let exec_id = exec_tty(t, &["sh", "-c", &cmd])?;
+    let stream = attach_tty(t, exec_id)?;
     let _ = await_marker(&stream, b"READY", progress)?;
     let writer_stream = stream.try_clone()?;
 

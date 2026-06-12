@@ -1,0 +1,60 @@
+# Plan B for the OpenVMM vsock-assert crash (izba M0).
+#
+# WHAT: virtio_vsock panics with "connection should have been removed"
+# (connections.rs:1093, the RxReady::SendReset assert) and the whole VM
+# worker abort-exits (mesh child code 0xc0000409) under vsock stream churn.
+#
+# ROOT CAUSE: two error arms queue RxReady::SendReset(key) WITHOUT first
+# removing the connection. The RX handler for SendReset asserts the key is
+# already gone (it emits an RST for a connection that must no longer exist).
+# The reliable trigger is a host relay socket force-closed (WSAECONNRESET,
+# os error 10054) while the guest still has buffered TX: the write-ready
+# flush fails, that arm queues SendReset, and the next device-thread poll
+# trips the assert. Reproduced via `ttystorm chop --direct` (izba): VM dead,
+# vmm.log shows the 10054 write failure immediately before the panic.
+#
+# STATUS: izba ships a host-side mitigation FIRST (graceful shutdown(Write)
+# + drain so the relay socket is never force-closed with guest TX pending —
+# see crates/izba-core/src/{portfwd.rs,daemon/server.rs}); with it, the same
+# churn survives indefinitely (floodfast 20x2MiB, chop 30x clean, VM alive).
+# This patch is Plan B: if a path ever force-closes a relay mid-TX anyway,
+# patch the VMM and self-build a pinned fork (same pinning shape as
+# hack/fetch-openvmm.sh, which today fetches a CI binary by RUN_ID/COMMIT).
+#
+# APPLIES TO: microsoft/openvmm @ commit
+#   7872712037c6ce3a03087a76207bd73cec9784a2 (the izba-pinned run).
+# Upstream main is still affected (same two arms). Upstream issue draft:
+#   docs/superpowers/specs/2026-06-12-openvmm-vsock-assert-issue.md
+#
+# APPLY: from an openvmm checkout at the pinned commit,
+#   git apply /path/to/hack/openvmm-vsock-assert.patch
+# then build x64-windows openvmm.exe and pin it like the fetched binary.
+
+--- a/vm/devices/virtio/virtio_vsock/src/connections.rs
++++ b/vm/devices/virtio/virtio_vsock/src/connections.rs
+@@ -866,6 +866,12 @@
+                     "failed to shutdown connection"
+                 );
+
++                // The SendReset RX path asserts the connection is already
++                // gone (it sends an RST for a key that must no longer exist).
++                // Removing here keeps that invariant; otherwise the next poll
++                // of RxReady::SendReset panics ("connection should have been
++                // removed").
++                self.remove_connection(&key);
+                 PendingFutures::simple_rx(RxReady::SendReset(key))
+             } else if conn.send_shutdown && conn.receive_shutdown && conn.is_recv_buf_empty() {
+                 // Both sides have shutdown and all buffered data has been forwarded, so we can
+@@ -989,6 +995,12 @@
+                     ?id,
+                     "failed to write buffered data to host socket on write ready"
+                 );
++                // Must remove before queueing SendReset: its RX path asserts
++                // the connection is gone. A host relay socket force-closed
++                // (e.g. WSAECONNRESET 10054) while guest TX is buffered hits
++                // this arm; without the removal the next poll panics
++                // ("connection should have been removed", connections.rs).
++                self.remove_connection(&id.key);
+                 PendingFutures::simple_rx(RxReady::SendReset(id.key))
+             }
+         }

@@ -182,9 +182,11 @@ impl DaemonClient {
         client.open_stream_on_self(name)
     }
 
-    /// The OpenStream conversion on THIS connection (test seam; production
-    /// callers use [`Self::open_guest_stream`]).
-    pub(crate) fn open_stream_on_self(mut self, name: &str) -> anyhow::Result<UdsStream> {
+    /// The OpenStream conversion on THIS connection (consumes it). Production
+    /// callers use [`Self::open_guest_stream`]; this is for callers that must
+    /// not auto-start a daemon (tests, diagnostics like ttystorm — their
+    /// `current_exe` is not the izba binary, so the spawn path is wrong).
+    pub fn open_stream_on_self(mut self, name: &str) -> anyhow::Result<UdsStream> {
         write_frame(
             &mut self.conn,
             &DaemonRequest::OpenStream {

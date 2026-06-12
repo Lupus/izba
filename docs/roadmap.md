@@ -19,11 +19,11 @@ What does **not** exist yet:
 - Any of the mesh staging steps — no `StreamOpen::TcpConnect`, no egress stub,
   no manifest, no policy, no vault. Guest egress still rides passt/consomme
   (the host-autodetect bug class is contained, not killed).
-- A fix for the **OpenVMM vsock-assert crash** under stream churn
-  (`virtio_vsock connections.rs:1093`, reproduced by `ttystorm floodfast`) —
-  the declared hard gate for putting all traffic on vsock.
 - **Adoption infrastructure**: no CI, no releases, no published kernel/initramfs
   artifacts, no install story beyond building from source.
+
+The **OpenVMM vsock-assert crash** under stream churn (the declared hard gate
+for putting all traffic on vsock) is **fixed** as of 2026-06-12 — see M0 below.
 
 ## Principles
 
@@ -44,17 +44,30 @@ What does **not** exist yet:
 Sizes are relative (S/M/L) — recent velocity makes weeks the natural unit, not
 quarters. Order is dependency order; M3 and Track T run in parallel.
 
-### M0 — Stability gate: vsock under churn (S–M)
+### M0 — Stability gate: vsock under churn (S–M) — ✅ DONE (2026-06-12)
 
-Fix the OpenVMM vsock-assert crash (mitigation already identified: graceful
-`shutdown(Write)` + drain instead of abrupt drop; upstream issue if it's
-theirs to fix). **Exit:** `ttystorm floodfast` clean on OpenVMM; KVM suite
-unaffected. **No timebox — hard gate** (decided 2026-06-12): nothing
-mesh-related starts until this is clean. Consequently, prepare **plan B up
-front**: if the izba-side mitigation doesn't hold, we patch the assert and
-**self-build a pinned OpenVMM fork** (we already pin a fetched binary by
-run-id; pinning our own build is the same shape) rather than waiting on
-upstream review latency.
+Fixed the OpenVMM vsock-assert crash. The mitigation is the graceful
+`shutdown(Write)` + **drain** teardown: `copy_until_eof` now keeps consuming
+the vsock leg after the peer write fails (instead of dropping the socket with
+guest TX buffered), so the VMM relay socket is never force-closed mid-TX — the
+exact condition that tripped the assert. Hardened at both host sites
+(`portfwd.rs` relay, `daemon/server.rs` splice) with socketpair TDD tests.
+
+**Exit — met:** `ttystorm` (now routed through izbad, the production datapath)
+runs `floodfast 20×2MiB` and `chop 30×` clean on OpenVMM with the VM alive
+afterward; KVM suite unaffected (15/15). The `--direct` control path still
+reproduces the assert and kills the VM (`connections.rs:1093`,
+`code=0xc0000409`) — confirming the bug is real and the drain is what protects;
+the VM-death is honest and `izba run` recovers.
+
+**Plan B prepared (not needed, kept ready):** the assert has a clean two-line
+fix (remove the connection before queueing `SendReset` in the two error arms
+that don't) — patch at `hack/openvmm-vsock-assert.patch` against the pinned
+commit, upstream-issue draft at
+`docs/superpowers/specs/2026-06-12-openvmm-vsock-assert-issue.md` (upstream
+`main` still affected). If a future path force-closes a relay mid-TX anyway,
+apply the patch and self-build a pinned fork (same pinning shape as
+`hack/fetch-openvmm.sh`).
 
 ### M1 — One network story: izbad-owned egress (M)
 
