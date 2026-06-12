@@ -148,20 +148,16 @@ jobs:
           if-no-files-found: error
 
   izba-windows:
-    name: izba.exe bundle (win-gnu)
+    name: izba.exe bundle (native MSVC)
     needs: erofs-parity
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
-      - run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
-      - run: rustup target add x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
-          prefix-key: izba-windows
-      - run: cargo build --release --target x86_64-pc-windows-gnu -p izba-cli
+          prefix-key: izba-windows-msvc
+      - run: cargo build --release -p izba-cli
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: mkfs-erofs-windows
@@ -170,9 +166,12 @@ jobs:
         # Mirrors hack/stage-izba-windows.sh layout (bin/ + bin/libexec/)
         # minus openvmm.exe, which is fetched-not-built (out of scope; see
         # the design doc) and minus boot artifacts (separate artifacts here).
+        # Native MSVC is the source-of-truth Windows toolchain (e2e CI spec,
+        # decision 6); the win-gnu cross gates in ci.yml remain as
+        # portability tripwires.
         run: |
-          mkdir -p stage/bin
-          cp target/x86_64-pc-windows-gnu/release/izba.exe stage/bin/
+          mkdir stage/bin -Force | Out-Null
+          Copy-Item target/release/izba.exe stage/bin/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: izba-windows-bundle
@@ -197,6 +196,7 @@ jobs:
             echo "linux: 6.12.30"
             echo "e2fsprogs: 1.47.2"
             echo "erofs-utils: 1.9.1"
+            echo "izba-windows-toolchain: msvc (native)"
           } > VERSIONS
           cat SHA256SUMS VERSIONS
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
