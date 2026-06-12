@@ -2,7 +2,10 @@ name: Artifacts
 
 on:
   push:
-    branches: [main]
+    # TEMP: feat/ci-github-actions added for pre-merge smoke-testing only —
+    # workflow_dispatch can't target a workflow that isn't on main yet.
+    # REVERT to [main] before merge.
+    branches: [main, feat/ci-github-actions]
     paths:
       - 'hack/**'
       - 'crates/izba-init/**'
