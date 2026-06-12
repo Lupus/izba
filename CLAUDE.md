@@ -89,6 +89,12 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - **Cmdline chain:** `console=ttyS0 ip=dhcp izba.hostname=<name>` ↔
   `hack/kernel.config` (`SERIAL_8250_CONSOLE`, `IP_PNP_DHCP`) ↔ init reads
   `/proc/net/pnp` for resolv.conf and `izba.hostname` for sethostname.
+  The OpenVMM driver (net VMs only) appends `izba.ipv4only=1` ↔ init
+  disables eth0 IPv6: consomme advertises guest SLAAC whenever the host has
+  ANY non-link-local IPv6 address (a Tailscale/VPN ULA counts) regardless
+  of v6 routability, and guest v6 connects then come back as instant RSTs
+  ("Connection refused", racing SLAAC ~4s after boot). CH/passt stays
+  dual-stack.
 - **virtiofs tag** `workspace` (driver `FsShare` ↔ init mount plan) →
   `/workspace` inside the guest, which is also exec's default cwd.
 - **Exit-code mapping:** guest `CommandNotFound` → CLI exit 127;

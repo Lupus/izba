@@ -233,10 +233,23 @@ hack/stage-izba-windows.sh
 pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
 ```
 
-Expected: `ALL PASS` (15 checks — boot, exec, exit codes, stdin, network,
-console capture, stop/restart/rm lifecycle). The interactive `exec -it`
+Expected: `ALL PASS` (21 checks — boot, exec, exit codes, stdin, network,
+console capture, daemon lifecycle, stop/restart/rm). The interactive `exec -it`
 checklist (PTY, VT rendering, resize, Ctrl-C, mode restore) is in the
 [Plan 2 doc](superpowers/plans/2026-06-10-izba-windows-port-p2.md), Task 5.
+
+**Guest egress on Windows is IPv4-only (by design).** OpenVMM's consomme
+backend advertises IPv6 to the guest (SLAAC) whenever the host has *any*
+non-link-local IPv6 address — a Tailscale or VPN ULA with no IPv6 default
+route is enough — and every guest IPv6 connect then dies host-side as an
+instant RST. The symptom was `wget: can't connect to remote host: Connection
+refused` for dual-stack destinations, intermittent because it raced SLAAC
+(checks in the first ~4 s of boot still picked IPv4 and passed). openvmm
+exposes no CLI knob for consomme IPv6, so the OpenVMM driver appends
+`izba.ipv4only=1` to the kernel cmdline and izba-init writes
+`net.ipv6.conf.{eth0,default}.disable_ipv6=1` (loopback `::1` keeps working
+for workloads). The Linux/passt path stays dual-stack — passt only offers
+IPv6 the host can actually route.
 
 ## exec -it terminal harness
 

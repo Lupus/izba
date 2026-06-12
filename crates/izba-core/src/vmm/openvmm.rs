@@ -67,6 +67,18 @@ fn reject_commas(spec: &VmSpec) -> anyhow::Result<()> {
 
 pub fn build_invocation(spec: &VmSpec, openvmm: &Path) -> CommandSpec {
     let vsock_sock = spec.run_dir.join("vsock.sock");
+    // consomme advertises guest IPv6 (SLAAC) whenever the host has ANY
+    // non-link-local IPv6 address (a Tailscale/VPN ULA is enough), with no
+    // regard for whether the host has an IPv6 route out; guest IPv6 connects
+    // then die as instant RSTs ("Connection refused", racing SLAAC ~4s after
+    // boot). openvmm exposes no knob for this, so tell izba-init to disable
+    // guest IPv6 on eth0. The CH/passt path stays dual-stack: passt only
+    // offers IPv6 the host can actually route.
+    let cmdline = if spec.net {
+        format!("{} izba.ipv4only=1", spec.cmdline)
+    } else {
+        spec.cmdline.clone()
+    };
     let mut argv = vec![
         openvmm.display().to_string(),
         "--kernel".to_string(),
@@ -74,7 +86,7 @@ pub fn build_invocation(spec: &VmSpec, openvmm: &Path) -> CommandSpec {
         "--initrd".to_string(),
         spec.initramfs.display().to_string(),
         "-c".to_string(),
-        spec.cmdline.clone(),
+        cmdline,
         "--hv".to_string(),
         "--processors".to_string(),
         spec.cpus.to_string(),
@@ -237,7 +249,7 @@ mod tests {
                 "--initrd",
                 "/img/initramfs.img",
                 "-c",
-                "console=ttyS0 ip=dhcp izba.hostname=box",
+                "console=ttyS0 ip=dhcp izba.hostname=box izba.ipv4only=1",
                 "--hv",
                 "--processors",
                 "2",
@@ -274,6 +286,10 @@ mod tests {
         let inv = build_invocation(&spec, &PathBuf::from("/opt/openvmm"));
         assert!(!inv.argv.contains(&"--net".to_string()));
         assert!(!inv.argv.contains(&"consomme".to_string()));
+        // No consomme, no IPv4-only workaround: cmdline passes through as-is.
+        assert!(inv
+            .argv
+            .contains(&"console=ttyS0 ip=dhcp izba.hostname=box".to_string()));
         // vsock stays:
         assert!(inv.argv.contains(&"--virtio-vsock-path".to_string()));
     }

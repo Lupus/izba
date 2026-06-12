@@ -7,6 +7,7 @@
 mod cmdline;
 mod exec;
 mod mounts;
+mod net;
 mod rwdisk;
 mod server;
 mod tarfs;
@@ -76,6 +77,12 @@ fn run_pid1() -> anyhow::Result<()> {
     if let Some(hostname) = params.get("izba.hostname").filter(|h| !h.is_empty()) {
         if let Err(e) = nix::unistd::sethostname(hostname) {
             eprintln!("izba-init: sethostname {hostname:?}: {e}");
+        }
+    }
+    if params.get("izba.ipv4only").map(String::as_str) == Some("1") {
+        // Best-effort: a missing eth0 (net=false VM) is not fatal.
+        if let Err(e) = net::apply_ipv4only(Path::new("/proc/sys/net/ipv6/conf")) {
+            eprintln!("izba-init: izba.ipv4only: {e}");
         }
     }
 
