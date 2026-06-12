@@ -2,7 +2,7 @@ name: E2E
 
 on:
   push:
-    branches: [main, feat/e2e-ci]   # TEMP: feat/e2e-ci, remove before merge
+    branches: [main]
   schedule:
     - cron: '0 3 * * 1'   # weekly drift check, Mon 03:00 UTC (see spec)
   workflow_dispatch:
