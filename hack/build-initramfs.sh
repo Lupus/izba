@@ -62,6 +62,17 @@ if [ -n "${IZBA_MKE2FS:-}" ]; then
     echo "  embedded mke2fs from $IZBA_MKE2FS"
 fi
 
+# Optional static nft — required for the izbad-egress TCP REDIRECT stub.
+if [ -n "${IZBA_NFT:-}" ]; then
+    if [ ! -f "$IZBA_NFT" ]; then
+        echo "error: IZBA_NFT='$IZBA_NFT' does not exist" >&2
+        exit 1
+    fi
+    cp "$IZBA_NFT" "$WORK/sbin/nft"
+    chmod 755 "$WORK/sbin/nft"
+    echo "  embedded nft from $IZBA_NFT"
+fi
+
 # Pack the tree into a newc cpio archive and gzip it.
 #
 # We include '.' (the root entry) by running find from inside WORK.  The

@@ -32,7 +32,26 @@ Builds the izba initramfs:
 `mke2fs` binary in `/sbin/mke2fs`.  This enables the guest to format the
 blank `rw.img` on first boot when no host-side `mkfs.ext4` is available.
 
+**Optional:** set `IZBA_NFT=/path/to/static/nft` to embed a static `nft`
+binary in `/sbin/nft`.  This is required for the M1 izbad-egress TCP REDIRECT
+stub (see `build-nft.sh`).
+
 Output defaults to `dist/initramfs.cpio.gz`.
+
+### `build-nft.sh`
+
+Builds a static `nft` (nftables CLI) for the initramfs, via a throwaway
+Alpine container (musl).  It compiles `libmnl 1.0.5`, `libnftnl 1.2.9`, and
+`nftables 1.1.3` from the netfilter.org source tarballs, configures nftables
+with mini-gmp (no external GMP), no interactive CLI, and no JSON, links it
+fully static (`-all-static`), strips it, and writes it to `dist/nft`.
+
+```sh
+hack/build-nft.sh            # writes dist/nft (~1.1 MB, statically linked)
+./dist/nft --version         # smoke-test: static linux binary, runs on WSL
+```
+
+Embed it via `IZBA_NFT=dist/nft hack/build-initramfs.sh`.  Requires Docker.
 
 ### `build-kernel.sh`
 
@@ -207,6 +226,7 @@ cargo build --release -p izba-cli
 | `IZBA_MKE2FS` | Optional path to a static `mke2fs` binary to embed in the initramfs at `/sbin/mke2fs` (enables in-guest first-boot rw formatting). |
 | `IZBA_KERNEL_SHA256` | sha256 of the kernel source tarball when building an unlisted version; required when the version has no entry in `build-kernel.sh`'s `KNOWN_SHA256` table. |
 | `IZBA_KERNEL_VERIFY_ONLY` | Set to `1` to hash-check the cached kernel tarball and exit without building (CI preflight mode). |
+| `IZBA_NFT` | Optional path to a static `nft` binary to embed in the initramfs at `/sbin/nft` (required for the M1 izbad-egress TCP REDIRECT stub; built by `build-nft.sh`). |
 | `VIRTIOFSD_VERSION` | virtiofsd release tag for `fetch-artifacts.sh`. Defaults to a pinned known-good version. |
 | `IZBA_MKFS_EROFS` | Absolute path to `mkfs.erofs` (or `mkfs.erofs.exe` on Windows). Overrides the bundled libexec copy and `$PATH`. |
 
