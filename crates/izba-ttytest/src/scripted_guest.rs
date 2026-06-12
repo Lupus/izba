@@ -97,6 +97,7 @@ impl ScriptedGuest {
                 mem_mb: 128,
                 workspace: data_root.clone(),
                 ports: Vec::new(),
+                egress: izba_core::state::EgressMode::Passt,
             },
         )
         .context("write config.json")?;

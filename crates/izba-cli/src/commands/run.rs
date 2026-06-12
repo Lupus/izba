@@ -72,6 +72,7 @@ fn resolve_or_create(
             workspace,
             rw_size_gb: opts.rw_size_gb,
             ports,
+            egress: super::parse_egress(&opts.egress)?,
         });
         match client.request(&req, &mut |m| eprintln!("{m}"))? {
             DaemonResponse::Created { .. } => {}

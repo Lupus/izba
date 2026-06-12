@@ -15,7 +15,9 @@ use crate::image::store::ImageStore;
 use crate::liveness::{assess, Liveness, Probes};
 use crate::paths::Paths;
 use crate::procmgr;
-use crate::state::{load_json, save_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
+use crate::state::{
+    load_json, save_json, EgressMode, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE,
+};
 use crate::vmm::{BlockDisk, FsShare, IoStream, VmSpec, VmmDriver};
 
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,6 +43,7 @@ pub struct CreateOpts {
     pub workspace: PathBuf,
     pub rw_size_gb: u64,
     pub ports: Vec<crate::state::PortRule>,
+    pub egress: EgressMode,
 }
 
 /// Boot artifacts shared by all sandboxes (kernel + initramfs with izba-init).
@@ -175,6 +178,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             mem_mb: opts.mem_mb,
             workspace: opts.workspace.clone(),
             ports: opts.ports.clone(),
+            egress: opts.egress,
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 
@@ -371,10 +375,14 @@ pub fn start_with_timeouts(
     }
 
     let console_log = paths.logs_dir(name).join("console.log");
+    let mut cmdline = format!("console=ttyS0 ip=dhcp izba.hostname={name}");
+    if config.egress == EgressMode::Izbad {
+        cmdline.push_str(" izba.egress=1");
+    }
     let spec = VmSpec {
         kernel: art.kernel.clone(),
         initramfs: art.initramfs.clone(),
-        cmdline: format!("console=ttyS0 ip=dhcp izba.hostname={name}"),
+        cmdline,
         cpus: config.cpus,
         mem_mb: config.mem_mb,
         disks: vec![
@@ -736,6 +744,7 @@ mod tests {
             workspace: workspace.to_path_buf(),
             rw_size_gb: 1,
             ports: Vec::new(),
+            egress: EgressMode::Passt,
         }
     }
 
@@ -848,6 +857,37 @@ mod tests {
             .expect("state.json written");
         assert_eq!(state.vmm_pid, live_identity());
         assert!(state.sidecar_pids.is_empty());
+    }
+
+    #[test]
+    fn start_cmdline_egress_flag() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        // Default (Passt) — no izba.egress=1.
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts()).unwrap();
+        let spec = driver.captured.lock().unwrap().take().expect("spec");
+        assert!(
+            !spec.cmdline.contains("izba.egress=1"),
+            "Passt cmdline must NOT contain izba.egress=1: {}",
+            spec.cmdline
+        );
+
+        // Izbad — must append izba.egress=1.
+        let mut izbad_opts = opts(&ws);
+        izbad_opts.egress = EgressMode::Izbad;
+        create(&paths, "izbad", &izbad_opts).unwrap();
+        let driver2 = MockDriver::new();
+        start(&paths, "izbad", &driver2, &arts()).unwrap();
+        let spec2 = driver2.captured.lock().unwrap().take().expect("spec2");
+        assert!(
+            spec2.cmdline.contains("izba.egress=1"),
+            "Izbad cmdline must contain izba.egress=1: {}",
+            spec2.cmdline
+        );
     }
 
     #[test]

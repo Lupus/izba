@@ -242,6 +242,7 @@ pub fn dispatch(
                         workspace: c.workspace.clone(),
                         rw_size_gb: c.rw_size_gb,
                         ports: c.ports.clone(),
+                        egress: c.egress,
                     },
                 )?;
                 d.registry.set(&c.name, &c.image_ref, Liveness::Stopped);
@@ -536,7 +537,7 @@ mod tests {
     use super::*;
     use crate::daemon::proto::*;
     use crate::sandbox::CreateOpts;
-    use crate::state::{load_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
+    use crate::state::{load_json, EgressMode, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
     use crate::testutil::{
         fake_connector, live_identity, spawn_sleep, test_paths, wait_dead, write_state, MockDriver,
     };
@@ -663,6 +664,7 @@ mod tests {
             workspace: dir.path().join("ws"),
             rw_size_gb: 1,
             ports: Vec::new(),
+            egress: EgressMode::Passt,
         })
     }
 
@@ -990,6 +992,7 @@ mod tests {
                 workspace: dir.path().join("ws"),
                 rw_size_gb: 1,
                 ports: Vec::new(),
+                egress: EgressMode::Passt,
             },
         )
         .unwrap();

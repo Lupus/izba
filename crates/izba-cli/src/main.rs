@@ -41,6 +41,9 @@ struct SandboxOpts {
     /// Publish a host port to the guest: [BIND:]HOST:GUEST (repeatable)
     #[arg(short = 'p', long = "publish", value_name = "[BIND:]HOST:GUEST")]
     publish: Vec<String>,
+    /// Egress path: 'passt' (v1 NAT) or 'izbad' (M1 vsock egress)
+    #[arg(long, default_value = "passt")]
+    egress: String,
 }
 
 #[derive(Debug, Subcommand)]

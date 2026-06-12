@@ -64,6 +64,7 @@ mod tests {
             workspace: ws,
             rw_size_gb: 1,
             ports: Vec::new(),
+            egress: crate::state::EgressMode::Passt,
         };
         crate::sandbox::create(&paths, "up", &opts).unwrap();
         crate::sandbox::create(&paths, "down", &opts).unwrap();

@@ -37,6 +37,9 @@ pub struct DaemonCreate {
     pub workspace: PathBuf,
     pub rw_size_gb: u64,
     pub ports: Vec<PortRule>,
+    /// Egress datapath (M1 transition knob). Defaults for old clients.
+    #[serde(default)]
+    pub egress: crate::state::EgressMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +174,7 @@ mod tests {
                     host_port: 8080,
                     guest_port: 80,
                 }],
+                egress: crate::state::EgressMode::Passt,
             }),
             DaemonRequest::Start { name: "web".into() },
             DaemonRequest::Stop { name: "web".into() },
