@@ -31,6 +31,7 @@ OUTPUT="${2:-dist/vmlinux}"
 
 # sha256 pins for known-good tarballs.  Building any other VERSION requires
 # IZBA_KERNEL_SHA256=<hash> — there is deliberately no unverified path.
+# sha256 from https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
 declare -A KNOWN_SHA256=(
     ["6.12.30"]="df046a48971e40ce0b2e003e7e55b6b1e7da2912120eb216d5d6c8450c9cf82e"
 )
@@ -49,7 +50,7 @@ FRAGMENT="$(pwd)/hack/kernel.config"
 # Dependency check
 # ---------------------------------------------------------------------------
 MISSING=""
-for tool in gcc make flex bison bc; do
+for tool in gcc make flex bison bc sha256sum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         MISSING="$MISSING $tool"
     fi
@@ -90,10 +91,11 @@ else
     echo "Using cached tarball: $TARBALL_PATH"
 fi
 
+# Manual compare (not 'sha256sum -c') so the error can show got/want.
 GOT_SHA256="$(sha256sum "$TARBALL_PATH" | cut -d' ' -f1)"
 if [ "$GOT_SHA256" != "$EXPECTED_SHA256" ]; then
     rm -f "$TARBALL_PATH"
-    echo "error: $TARBALL sha256 mismatch — removed; re-run to re-download" >&2
+    echo "error: $TARBALL failed sha256 verification — removed; re-run to re-download" >&2
     echo "  got:  $GOT_SHA256" >&2
     echo "  want: $EXPECTED_SHA256" >&2
     exit 1
