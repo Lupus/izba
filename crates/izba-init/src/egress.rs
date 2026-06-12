@@ -3,8 +3,10 @@
 //! SO_ORIGINAL_DST) lands with the phase-B kernel/nft artifacts.
 
 use izba_proto::{dns, write_frame, StreamOpen, EGRESS_PORT};
+use std::fs::File;
 use std::io::{self, Read, Write};
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::AsRawFd;
 
 /// Dial the host (CID 2) egress port. Production dialer; tests substitute
 /// a socketpair half through the `forward_query` seam.
@@ -83,6 +85,149 @@ pub fn serve_dns_udp() -> io::Result<()> {
     }
 }
 
+/// Loopback port the nat-output REDIRECT delivers all outbound TCP to.
+pub const REDIRECT_PORT: u16 = 15001;
+
+/// The fixed transparent-redirect ruleset. Loopback destinations are left
+/// alone (guest-internal services, the stub itself); everything else TCP
+/// goes to the stub; UDP :53 to hardcoded resolvers is pulled to the local
+/// DNS socket (conntrack un-NATs the reply source). The stub's own egress
+/// is AF_VSOCK — not IP — so no exclusion rule is needed and no redirect
+/// loop is possible. Non-DNS UDP is denied structurally (no route once the
+/// NIC goes away in phase C), not by a filter rule here.
+pub const NFT_RULESET: &str = "\
+table ip izba {
+  chain output {
+    type nat hook output priority -100; policy accept;
+    ip daddr 127.0.0.0/8 return
+    meta l4proto tcp redirect to :15001
+    udp dport 53 redirect to :53
+  }
+}
+";
+
+/// Apply the ruleset via the vendored static nft.
+pub fn apply_nft() -> io::Result<()> {
+    std::fs::write("/tmp/izba-egress.nft", NFT_RULESET)?;
+    let status = std::process::Command::new("/sbin/nft")
+        .args(["-f", "/tmp/izba-egress.nft"])
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("nft -f exited {status}")));
+    }
+    Ok(())
+}
+
+/// Recover the pre-REDIRECT destination from conntrack.
+/// One tiny unsafe getsockopt; integration-covered (needs a real
+/// REDIRECTed socket, which unit tests cannot make).
+fn original_dst(conn: &TcpStream) -> io::Result<SocketAddrV4> {
+    const SO_ORIGINAL_DST: libc::c_int = 80;
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            conn.as_raw_fd(),
+            libc::SOL_IP,
+            SO_ORIGINAL_DST,
+            &mut addr as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(SocketAddrV4::new(
+        Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+        u16::from_be(addr.sin_port),
+    ))
+}
+
+/// Serve the redirect listener forever (daemon thread).
+pub fn serve_tcp_redirect() -> io::Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", REDIRECT_PORT))?;
+    loop {
+        let (conn, _peer) = match listener.accept() {
+            Ok(x) => x,
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+        };
+        std::thread::spawn(move || {
+            let orig = match original_dst(&conn) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("izba-init: SO_ORIGINAL_DST: {e}");
+                    return;
+                }
+            };
+            handle_redirected(conn, orig, dial_host);
+        });
+    }
+}
+
+/// Splice one redirected client connection to izbad via TcpConnect.
+///
+/// Teardown mirrors server.rs::tcp_dial, with the roles flipped: the
+/// client->izbad thread half-closes the vsock leg (best-effort — CH does
+/// not propagate guest->host half-close, the accepted v1 limitation that
+/// TcpDial shares); once izbad's side is done we full-shutdown both.
+pub fn handle_redirected<S, D>(client: TcpStream, orig: SocketAddrV4, dial: D)
+where
+    S: Read + Write + AsRawFd + Send + 'static,
+    D: FnOnce() -> io::Result<S>,
+{
+    let mut host = match dial() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("izba-init: egress dial for {orig}: {e}");
+            return;
+        }
+    };
+    if write_frame(
+        &mut host,
+        &StreamOpen::TcpConnect {
+            addr: orig.ip().to_string(),
+            port: orig.port(),
+        },
+    )
+    .is_err()
+    {
+        return;
+    }
+    match izba_proto::read_frame::<_, izba_proto::Response>(&mut host) {
+        Ok(izba_proto::Response::Ok) => {}
+        Ok(izba_proto::Response::Error { kind, message }) => {
+            eprintln!("izba-init: egress {orig}: {kind:?}: {message}");
+            return; // client socket drops -> app sees RST/EOF (honest refusal)
+        }
+        _ => return,
+    }
+
+    let host_w = match crate::server::dup_fd(host.as_raw_fd()) {
+        Ok(d) => File::from(d),
+        Err(_) => return,
+    };
+    let client_r = match client.try_clone() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // client -> izbad
+    let up = std::thread::spawn(move || {
+        let mut host_w = host_w;
+        crate::server::relay_pump(client_r, &mut host_w);
+        unsafe { libc::shutdown(host_w.as_raw_fd(), libc::SHUT_WR) };
+    });
+    // izbad -> client; izbad full-closes when the remote is done.
+    let mut client_w = client;
+    crate::server::relay_pump(&mut host, &mut client_w);
+    let _ = client_w.shutdown(std::net::Shutdown::Write);
+    // Unblock the up-thread read and finish the vsock teardown.
+    unsafe { libc::shutdown(host.as_raw_fd(), libc::SHUT_RDWR) };
+    let _ = up.join();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +280,66 @@ mod tests {
         let q = [0x00u8, 0x01, 0x01, 0x00];
         let resp = forward_query(|| Ok(mine), &q);
         assert_eq!(resp[3] & 0x0f, 0x02);
+    }
+
+    #[test]
+    fn nft_ruleset_shape() {
+        // The contract bits the redirect depends on; the full file is integration-tested.
+        assert!(NFT_RULESET.contains("type nat hook output priority -100"));
+        assert!(NFT_RULESET.contains("ip daddr 127.0.0.0/8 return"));
+        assert!(NFT_RULESET.contains(&format!("redirect to :{REDIRECT_PORT}")));
+        assert!(NFT_RULESET.contains("udp dport 53 redirect to :53"));
+    }
+
+    /// handle_redirected with an injected orig-dst and a socketpair "izbad":
+    /// the TcpConnect frame carries the original destination; bytes flow
+    /// both ways after Ok. Binds a loopback TcpListener — runtime-skip
+    /// where denied (the accepted TcpStream plays the redirected client).
+    #[test]
+    fn redirected_conn_speaks_tcp_connect() {
+        use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+        let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP redirected_conn_speaks_tcp_connect: bind denied: {e}");
+                return;
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let app = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(b"GET").unwrap();
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).unwrap();
+            out
+        });
+        let (client, _) = listener.accept().unwrap();
+
+        let (izbad, theirs) = UnixStream::pair().unwrap();
+        let fake = std::thread::spawn(move || {
+            let mut s = theirs;
+            let open: StreamOpen = read_frame(&mut s).unwrap();
+            match open {
+                StreamOpen::TcpConnect { addr, port } => {
+                    assert_eq!(addr, "93.184.216.34");
+                    assert_eq!(port, 443);
+                }
+                other => panic!("expected TcpConnect, got {other:?}"),
+            }
+            write_frame(&mut s, &izba_proto::Response::Ok).unwrap();
+            let mut buf = [0u8; 3];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"GET");
+            s.write_all(b"200ok").unwrap();
+            // Full close: izbad's splice tears down with drain.
+        });
+
+        let orig = SocketAddrV4::new(Ipv4Addr::new(93, 184, 216, 34), 443);
+        handle_redirected(client, orig, || Ok(izbad));
+
+        assert_eq!(app.join().unwrap(), b"200ok");
+        fake.join().unwrap();
     }
 }

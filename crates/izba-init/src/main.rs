@@ -121,11 +121,23 @@ fn run_pid1() -> anyhow::Result<()> {
         std::thread::spawn(move || server::serve_streams(streams, e));
     }
     if egress_on {
+        // Order matters: listeners first, rules second — once REDIRECT is
+        // in, every guest TCP connect lands on the stub.
         std::thread::spawn(|| {
             if let Err(e) = egress::serve_dns_udp() {
                 eprintln!("izba-init: dns stub: {e}");
             }
         });
+        std::thread::spawn(|| {
+            if let Err(e) = egress::serve_tcp_redirect() {
+                eprintln!("izba-init: tcp redirect stub: {e}");
+            }
+        });
+        if let Err(e) = egress::apply_nft() {
+            // Loud but not fatal: DNS still works via resolv.conf; TCP
+            // egress is dead until fixed. The console log is captured.
+            eprintln!("izba-init: applying nft ruleset: {e}");
+        }
     }
 
     // Zombie policy (v1): every engine exec is reaped by its dedicated
