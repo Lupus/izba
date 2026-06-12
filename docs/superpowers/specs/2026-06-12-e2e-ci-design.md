@@ -57,12 +57,17 @@ Both GitHub-hosted runner images can run real VMs:
    then asserts `izba exec <name> -- echo alive` succeeds, then removes the
    sandbox. This encodes the M0 exit criteria (izbad-path churn must not
    kill the VM).
-6. **Windows leg builds natively** (`cargo build --release -p izba-cli` with
-   the runner's MSVC toolchain): `tty_e2e` needs a native cargo test run
-   anyway (`CARGO_BIN_EXE`), so one toolchain serves everything. The
-   cross-built bundle continues to be exercised by `artifacts.yml`. Only
-   `mkfs.erofs.exe` (MinGW cross) and the boot artifacts arrive as workflow
-   artifacts from ubuntu jobs.
+6. **Windows leg builds natively, and MSVC becomes the source-of-truth
+   Windows toolchain.** The e2e leg builds `izba.exe` with the runner's
+   native MSVC toolchain (`cargo build --release -p izba-cli`): `tty_e2e`
+   needs a native cargo test run anyway (`CARGO_BIN_EXE`), so one toolchain
+   serves everything. To keep "what we test" and "what we ship" the same
+   binary, `artifacts.yml`'s `izba-windows` job switches from the ubuntu
+   win-gnu cross build to a native MSVC build on windows-latest. The
+   win-gnu cross `check`/`clippy` gates in `ci.yml` stay (cheap portability
+   gates; they catch cfg/linker drift), but the published bundle is MSVC.
+   Only `mkfs.erofs.exe` (MinGW cross, unchanged) and the boot artifacts
+   arrive as workflow artifacts from ubuntu jobs.
 
 ## Workflow shape
 
@@ -119,3 +124,5 @@ with `if: failure()` — CI-debugging without SSH.
   dispatch against a branch).
 - Publishing e2e-validated bundles (release promotion stays at M2).
 - KVM inside the `windows-native` unit-test job (units don't need VMs).
+- Dropping the win-gnu target entirely: the cross check/clippy gates stay
+  as portability tripwires even though the shipped binary is now MSVC.
