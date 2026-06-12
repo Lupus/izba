@@ -181,12 +181,19 @@ fn run_pid1() -> anyhow::Result<()> {
     power_off();
 }
 
-/// The resolver is the egress stub, reached at the dummy0-carried
-/// 192.168.127.1 (where the stub binds UDP :53). There is no NIC and no
-/// DHCP, so there is nothing to discover from /proc/net/pnp.
+/// The resolver is the egress stub, reached over loopback at 127.0.0.1:53
+/// (the stub binds 0.0.0.0:53, so loopback hits it). It MUST be a loopback
+/// address, not the dummy0-carried 192.168.127.1: the guest is NIC-less and
+/// `dummy0` black-holes everything it transmits, so a DNS reply addressed to
+/// the guest's own 192.168.127.x would be routed out dummy0 and dropped. A
+/// query/reply pair on `lo` is the only path that actually returns. (Apps
+/// that hardcode an external resolver are still caught by the nft
+/// `udp dport 53 redirect to :53` rule; the resolv.conf path is the common
+/// one and is what must work.) There is no NIC and no DHCP, so there is
+/// nothing to discover from /proc/net/pnp.
 fn write_resolv_conf() {
     let _ = std::fs::create_dir_all("/rootfs/etc");
-    let conf = format!("nameserver {}\n", net::RESOLVER_IP);
+    let conf = format!("nameserver {}\n", net::DNS_LOOPBACK);
     if let Err(e) = std::fs::write("/rootfs/etc/resolv.conf", conf) {
         eprintln!("izba-init: writing resolv.conf: {e}");
     }

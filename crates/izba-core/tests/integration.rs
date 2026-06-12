@@ -75,7 +75,7 @@ fn want() -> Option<TestEnv> {
              and fix permissions (see docs/testing.md §1)"
         ));
     }
-    for bin in ["cloud-hypervisor", "virtiofsd", "passt", "mkfs.erofs"] {
+    for bin in ["cloud-hypervisor", "virtiofsd", "mkfs.erofs"] {
         if which::which(bin).is_err() {
             missing.push(format!(
                 "`{bin}` not found on PATH (run hack/fetch-artifacts.sh / apt install; \
@@ -686,15 +686,38 @@ fn first_boot_formats_blank_rw() {
     }
 }
 
+/// Real-internet reachability through the only egress path there is now: the
+/// izbad-owned vsock_1027 stub (nft REDIRECT + DNS stub -> izbad dial-out).
+/// The guest is NIC-less, so this fails outright without the EgressManager
+/// stand-in bound before boot.
 #[test]
 fn guest_networking() {
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("net");
-    boot(&env, &mut tb, "net", &ws);
+    create_sandbox(&env, &mut tb, "net", &ws);
+
+    // Daemonless suite: stand in for izbad's listener ourselves. The listener
+    // must exist on run/vsock.sock_1027 BEFORE the guest boots and dials it.
+    use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
+    let mgr = EgressManager::new(
+        std::sync::Arc::new(AllowAll),
+        std::sync::Arc::new(UdpForwarder::system()),
+    );
+    mgr.ensure_listening(&tb.paths, "net")
+        .expect("bind vsock_1027 listener");
+
+    if let Err(e) = start_sandbox(&env, &tb, "net") {
+        mgr.stop(&tb.paths, "net");
+        panic!(
+            "boot of 'net' failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, "net")
+        );
+    }
 
     // busybox wget (alpine) or curl (debian/ubuntu images), with in-guest
-    // retries — DHCP/DNS through passt can take a few seconds to settle.
+    // retries — the DNS stub + first egress dial can take a moment to settle
+    // right after boot.
     let script = "for i in 1 2 3 4 5; do \
          if wget -qO- http://detectportal.firefox.com/success.txt 2>/dev/null \
             || curl -fsS http://detectportal.firefox.com/success.txt 2>/dev/null; \
@@ -711,6 +734,9 @@ fn guest_networking() {
         stdout.contains("success"),
         "expected captive-portal 'success' body, got: {stdout:?}"
     );
+
+    stop_sandbox(&tb, "net");
+    mgr.stop(&tb.paths, "net");
 }
 
 /// M1 phase A exit: an egress=izbad sandbox resolves DNS through izbad.
@@ -742,7 +768,9 @@ fn egress_dns_via_izbad() {
     }
 
     // getent uses the guest resolv.conf (nameserver 127.0.0.1 -> the izba-init
-    // DNS stub -> vsock Dns stream -> izbad UdpForwarder -> host upstream).
+    // DNS stub on 0.0.0.0:53 -> vsock Dns stream -> izbad UdpForwarder -> host
+    // upstream). The reply rides loopback; a non-loopback resolver address
+    // would be black-holed by dummy0 (see init::write_resolv_conf).
     let out = exec_ok(
         &tb.paths,
         "egress-dns",
@@ -815,6 +843,72 @@ fn egress_http_via_stub() {
     srv.join().unwrap();
     stop_sandbox(&tb, "egress-http");
     mgr.stop(&tb.paths, "egress-http");
+}
+
+/// M1 throughput baseline: bulk transfer through the egress stub.
+/// MEASURED, NOT GATED (roadmap decision) — the number is printed for
+/// trend-watching; the only assertion is that the transfer completes.
+#[test]
+fn egress_throughput_baseline() {
+    use std::io::{Read as _, Write as _};
+    let Some(env) = want() else { return };
+    const PAYLOAD: usize = 64 * 1024 * 1024;
+    let probe = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+    probe.connect(("8.8.8.8", 80)).unwrap();
+    let host_ip = probe.local_addr().unwrap().ip();
+    let listener = std::net::TcpListener::bind((host_ip, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let srv = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = s.read(&mut buf);
+        s.write_all(format!("HTTP/1.0 200 OK\r\nContent-Length: {PAYLOAD}\r\n\r\n").as_bytes())
+            .unwrap();
+        let chunk = vec![0u8; 64 * 1024];
+        let mut sent = 0;
+        while sent < PAYLOAD {
+            let n = (PAYLOAD - sent).min(chunk.len());
+            s.write_all(&chunk[..n]).unwrap();
+            sent += n;
+        }
+    });
+
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("egress-tput");
+    create_sandbox(&env, &mut tb, "egress-tput", &ws);
+    use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
+    let mgr = EgressManager::new(
+        std::sync::Arc::new(AllowAll),
+        std::sync::Arc::new(UdpForwarder::system()),
+    );
+    mgr.ensure_listening(&tb.paths, "egress-tput").unwrap();
+    if let Err(e) = start_sandbox(&env, &tb, "egress-tput") {
+        mgr.stop(&tb.paths, "egress-tput");
+        panic!(
+            "boot of 'egress-tput' failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, "egress-tput")
+        );
+    }
+
+    let t0 = std::time::Instant::now();
+    exec_ok(
+        &tb.paths,
+        "egress-tput",
+        &[
+            "sh",
+            "-lc",
+            &format!("wget -qO /dev/null http://{host_ip}:{port}/"),
+        ],
+    );
+    let dt = t0.elapsed();
+    eprintln!(
+        "EGRESS THROUGHPUT BASELINE: {:.1} MiB/s ({PAYLOAD} bytes in {dt:?})",
+        PAYLOAD as f64 / 1024.0 / 1024.0 / dt.as_secs_f64()
+    );
+
+    srv.join().unwrap();
+    stop_sandbox(&tb, "egress-tput");
+    mgr.stop(&tb.paths, "egress-tput");
 }
 
 #[test]
@@ -913,8 +1007,8 @@ fn kill_vmm_then_ls_reports_stopped() {
         "list must clean up the stale state.json of a dead VMM"
     );
 
-    // The crash simulation orphaned the sidecars (virtiofsd, passt usually
-    // exit on their own when the vhost-user peer dies, but don't rely on it).
+    // The crash simulation orphaned the sidecars (virtiofsd usually exits on
+    // its own when the vhost-user peer dies, but don't rely on it).
     for (_, id) in &state.sidecar_pids {
         let _ = procmgr::kill_pid(id);
     }

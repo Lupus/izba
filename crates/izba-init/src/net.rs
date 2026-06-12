@@ -12,6 +12,11 @@ use std::net::Ipv4Addr;
 
 pub(crate) const GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
 pub(crate) const RESOLVER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);
+/// resolv.conf nameserver. Loopback, NOT `RESOLVER_IP`: the DNS stub binds
+/// `0.0.0.0:53`, and a reply to the guest's own 192.168.127.x address would
+/// be routed out the black-hole `dummy0` and dropped; only an `lo`
+/// query/reply round-trip returns. See `main::write_resolv_conf`.
+pub(crate) const DNS_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
 /// Bring up lo + dummy0 and install the default route. Errors are
@@ -114,6 +119,17 @@ mod tests {
     fn ifreq_rejects_long_names() {
         assert!(ifreq_named("a-name-longer-than-ifnamsiz!").is_err());
         assert!(ifreq_named("dummy0:1").is_ok());
+    }
+
+    #[test]
+    fn dns_nameserver_is_loopback() {
+        // The resolv.conf nameserver MUST be loopback: a reply to a
+        // non-loopback guest address is black-holed by dummy0. Regression
+        // guard for the NIC-less DNS reply path.
+        assert!(
+            DNS_LOOPBACK.is_loopback(),
+            "resolv.conf nameserver must be a loopback address, got {DNS_LOOPBACK}"
+        );
     }
 
     #[test]
