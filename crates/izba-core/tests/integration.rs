@@ -29,7 +29,7 @@ use izba_core::liveness::Liveness;
 use izba_core::paths::Paths;
 use izba_core::procmgr;
 use izba_core::sandbox::{self, Artifacts, CreateOpts};
-use izba_core::state::{load_json, PortRule, RunState, STATE_FILE};
+use izba_core::state::{load_json, EgressMode, PortRule, RunState, STATE_FILE};
 use izba_core::vmm::cloud_hypervisor::CloudHypervisorDriver;
 use izba_core::vmm::UdsStream;
 use izba_proto::{
@@ -206,8 +206,20 @@ impl Drop for TestBox {
 // ---------------------------------------------------------------------------
 
 /// `create` only — registers the name for cleanup before anything can fail
-/// to boot.
+/// to boot. Defaults to the v1 passt egress path.
 fn create_sandbox(env: &TestEnv, tb: &mut TestBox, name: &str, ws: &Path) {
+    create_sandbox_egress(env, tb, name, ws, izba_core::state::EgressMode::Passt);
+}
+
+/// `create` with an explicit egress datapath (M1 `EgressMode::Izbad` exercises
+/// the guest-initiated vsock_1027 plane).
+fn create_sandbox_egress(
+    env: &TestEnv,
+    tb: &mut TestBox,
+    name: &str,
+    ws: &Path,
+    egress: izba_core::state::EgressMode,
+) {
     let digest = provision_image(env, &tb.paths);
     sandbox::create(
         &tb.paths,
@@ -215,7 +227,7 @@ fn create_sandbox(env: &TestEnv, tb: &mut TestBox, name: &str, ws: &Path) {
         &CreateOpts {
             image_digest: digest,
             image_ref: env.image_ref.clone(),
-            egress: izba_core::state::EgressMode::Passt,
+            egress,
             cpus: 1,
             mem_mb: 1024,
             workspace: ws.to_path_buf(),
@@ -712,6 +724,50 @@ fn guest_networking() {
         stdout.contains("success"),
         "expected captive-portal 'success' body, got: {stdout:?}"
     );
+}
+
+/// M1 phase A exit: an egress=izbad sandbox resolves DNS through izbad.
+/// This is ALSO the runtime validation of guest-initiated hybrid vsock
+/// (guest dials CID 2:1027 -> CH bridges to run/vsock.sock_1027).
+#[test]
+fn egress_dns_via_izbad() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("egress-dns");
+    create_sandbox_egress(&env, &mut tb, "egress-dns", &ws, EgressMode::Izbad);
+
+    // Daemonless suite: stand in for izbad's listener ourselves. The listener
+    // must exist on run/vsock.sock_1027 BEFORE the guest boots and dials it.
+    use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
+    let mgr = EgressManager::new(
+        std::sync::Arc::new(AllowAll),
+        std::sync::Arc::new(UdpForwarder::system()),
+    );
+    mgr.ensure_listening(&tb.paths, "egress-dns")
+        .expect("bind vsock_1027 listener");
+
+    if let Err(e) = start_sandbox(&env, &tb, "egress-dns") {
+        mgr.stop(&tb.paths, "egress-dns");
+        panic!(
+            "boot of 'egress-dns' failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, "egress-dns")
+        );
+    }
+
+    // getent uses the guest resolv.conf (nameserver 127.0.0.1 -> the izba-init
+    // DNS stub -> vsock Dns stream -> izbad UdpForwarder -> host upstream).
+    let out = exec_ok(
+        &tb.paths,
+        "egress-dns",
+        &["sh", "-lc", "getent hosts example.com"],
+    );
+    assert!(
+        out.contains("example.com"),
+        "expected a resolved address for example.com, got: {out:?}"
+    );
+
+    stop_sandbox(&tb, "egress-dns");
+    mgr.stop(&tb.paths, "egress-dns");
 }
 
 #[test]
