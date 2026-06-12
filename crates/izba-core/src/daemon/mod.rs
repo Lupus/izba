@@ -6,6 +6,7 @@
 //! it never harms sandboxes.
 
 pub mod client;
+pub mod egress;
 pub mod proto;
 pub mod registry;
 pub mod relays;
