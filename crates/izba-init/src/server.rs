@@ -141,6 +141,18 @@ fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, engine: 
             tcp_dial(conn, port);
             return;
         }
+        // Egress variants are handled by izbad on the host (vsock port 1027),
+        // not by init. Reject them if they somehow arrive on port 1026.
+        StreamOpen::TcpConnect { .. } | StreamOpen::Dns => {
+            let _ = write_frame(
+                &mut conn,
+                &Response::Error {
+                    kind: ErrorKind::BadRequest,
+                    message: "egress variants are not handled by init".into(),
+                },
+            );
+            return;
+        }
     };
     let fd = match engine.take_stream(attach.exec_id, attach.kind) {
         Ok(fd) => fd,

@@ -93,10 +93,24 @@ pub enum StreamOpen {
     /// cp guest→host: init replies one `Response` frame first (`Ok` |
     /// `Error{PathNotFound}`), then streams a tar of `src` and closes.
     TarCreate { src: String },
+    /// Guest egress (vsock 1027, guest-initiated): izbad dials `addr:port`
+    /// on the host and replies one `Response` frame (`Ok` |
+    /// `Error{ConnectFailed}`); on `Ok` the connection becomes a raw
+    /// bidirectional byte pipe. `addr` is an IP literal in M1
+    /// (SO_ORIGINAL_DST); a name-carrying form is M5 scope.
+    TcpConnect { addr: String, port: u16 },
+    /// Guest DNS (vsock 1027, guest-initiated): DNS-over-TCP framing
+    /// follows (see `crate::dns`), request/response alternating;
+    /// sequential queries allowed; EOF closes.
+    Dns,
 }
 
 pub const CONTROL_PORT: u32 = 1025;
 pub const STREAM_PORT: u32 = 1026;
+/// Guest-dialed host port for egress streams; the VMM bridges it to the
+/// `run/vsock.sock_1027` unix listener owned by izbad (Firecracker hybrid-
+/// vsock convention, shared by Cloud Hypervisor and OpenVMM).
+pub const EGRESS_PORT: u32 = 1027;
 
 #[cfg(test)]
 mod tests {
@@ -171,6 +185,11 @@ mod tests {
             StreamOpen::TarCreate {
                 src: "data/out".into(),
             },
+            StreamOpen::TcpConnect {
+                addr: "93.184.216.34".into(),
+                port: 443,
+            },
+            StreamOpen::Dns,
         ] {
             let mut buf = Vec::new();
             crate::write_frame(&mut buf, &open).unwrap();
@@ -188,6 +207,14 @@ mod tests {
                 StreamOpen::TarCreate { src: "s".into() },
                 r#""type":"tar_create""#,
             ),
+            (
+                StreamOpen::TcpConnect {
+                    addr: "1.2.3.4".into(),
+                    port: 1,
+                },
+                r#""type":"tcp_connect""#,
+            ),
+            (StreamOpen::Dns, r#""type":"dns""#),
         ] {
             let s = serde_json::to_string(&open).unwrap();
             assert!(s.contains(tag), "{s}");
@@ -213,6 +240,11 @@ mod tests {
             .unwrap();
             assert!(s.contains(tag), "{s}");
         }
+    }
+
+    #[test]
+    fn egress_port_is_1027() {
+        assert_eq!(EGRESS_PORT, 1027);
     }
 
     #[test]
