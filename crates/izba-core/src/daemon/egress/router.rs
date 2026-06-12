@@ -24,7 +24,7 @@ pub fn handle_conn(
 ) {
     let open: StreamOpen = match read_frame(&mut conn) {
         Ok(o) => o,
-        Err(_) => return,
+        Err(_) => return, // malformed first frame: nothing spliced yet, just drop
     };
     match open {
         StreamOpen::TcpConnect { addr, port } => {
@@ -117,10 +117,19 @@ fn dns_loop(mut conn: UdsStream, resolver: &dyn Resolver) {
             dns::servfail(&query)
         });
         if dns::write_dns_msg(&mut conn, &resp).is_err() {
-            return;
+            break; // stop answering, but still drain + half-close below
         }
     }
     let _ = conn.shutdown(std::net::Shutdown::Write);
+    // Drain to EOF so the guest is never force-closed with TX buffered
+    // (the M0 vsock-churn contract; mirrors copy_until_eof's discipline).
+    let mut sink = [0u8; 4096];
+    loop {
+        match std::io::Read::read(&mut conn, &mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -319,5 +328,46 @@ mod tests {
             Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::ConnectFailed),
             other => panic!("expected ConnectFailed, got {other:?}"),
         }
+    }
+
+    /// A guest that stops reading responses mid-stream must still get the
+    /// graceful teardown: the handler drains remaining queries to EOF
+    /// instead of dropping the socket (the M0 vsock-churn contract).
+    ///
+    /// Strategy: send one query and read its response (proves the happy path
+    /// works), then send two more queries WITHOUT reading their responses,
+    /// then close our write side. The server must consume all pending queries
+    /// and half-close; `h.join()` must return (no hang). If the write-failure
+    /// path were `return`+drop, the server would drop the socket without
+    /// draining and the join would still complete — but then `read_dns_msg`
+    /// for the first query would also succeed, so we assert that too. The
+    /// regression being guarded is a deadlock: if the loop hangs on a full
+    /// kernel buffer waiting for us to read responses we never read, join()
+    /// never returns and the test times out.
+    #[test]
+    fn dns_write_failure_still_drains_guest_tx() {
+        let (mut c, server) = UdsStream::pair().unwrap();
+        let h = std::thread::spawn(move || {
+            let mut s = server;
+            let open: StreamOpen = read_frame(&mut s).unwrap();
+            assert!(matches!(open, StreamOpen::Dns));
+            dns_loop(s, &FakeResolver);
+        });
+        write_frame(&mut c, &StreamOpen::Dns).unwrap();
+        // Happy-path: one round-trip confirms the loop is running.
+        dns::write_dns_msg(&mut c, b"q0").unwrap();
+        assert_eq!(dns::read_dns_msg(&mut c).unwrap().unwrap(), b"ans:q0");
+        // Send more queries but stop reading responses. On platforms where
+        // shutdown(Read) forces a write error on the peer the response writes
+        // fail immediately; on others the kernel buffers them. Either way the
+        // server must not deadlock — it must drain our TX and half-close.
+        dns::write_dns_msg(&mut c, b"q1").unwrap();
+        dns::write_dns_msg(&mut c, b"q2").unwrap();
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        // Drop the read half so unread response data in the kernel buffer
+        // does not prevent the peer's shutdown from completing.
+        drop(c);
+        h.join()
+            .expect("dns_loop must not hang after write failure");
     }
 }
