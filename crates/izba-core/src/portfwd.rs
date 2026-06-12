@@ -109,7 +109,7 @@ pub fn relay_one(client: TcpStream, vsock: &Path, guest_port: u16) -> anyhow::Re
 /// graceful `shutdown(Write)`+drain on each side at EOF. Always shut down the
 /// vsock side with `shutdown(Write)` rather than an abrupt drop (the OpenVMM
 /// churn mitigation).
-fn pump_bidirectional(client: TcpStream, vs: UdsStream) {
+pub(crate) fn pump_bidirectional(client: TcpStream, vs: UdsStream) {
     let client_r = match client.try_clone() {
         Ok(c) => c,
         Err(_) => return,
