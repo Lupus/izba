@@ -16,7 +16,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -83,8 +83,13 @@ jobs:
           path: dist/
       - name: Build initramfs with embedded mke2fs
         run: |
-          chmod 755 dist/mke2fs-*-static-x86_64
-          IZBA_MKE2FS="$(echo dist/mke2fs-*-static-x86_64)" hack/build-initramfs.sh
+          files=(dist/mke2fs-*-static-x86_64)
+          if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+            echo "expected exactly 1 mke2fs binary, got: ${files[*]}" >&2
+            exit 1
+          fi
+          chmod 755 "${files[0]}"
+          IZBA_MKE2FS="${files[0]}" hack/build-initramfs.sh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: initramfs
@@ -109,9 +114,14 @@ jobs:
           hack/verify-mkfs-erofs-parity.sh
           rc=$?
           set -e
-          # 0 = parity proven here (wine present); 2 = bundle emitted for the
-          # Windows leg. Anything else is a real failure.
-          if [ "$rc" != 0 ] && [ "$rc" != 2 ]; then exit "$rc"; fi
+          # The script exits 2 when wine is absent (true on GitHub runners),
+          # emitting dist/erofs-parity-bundle/ for the Windows leg. Exit 0
+          # (wine present) would emit no bundle and strand the next step —
+          # treat anything but 2 as a failure.
+          if [ "$rc" != 2 ]; then
+            echo "expected exit 2 (no-wine bundle emission), got $rc" >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: erofs-parity-bundle
@@ -181,7 +191,7 @@ jobs:
       - name: Write SHA256SUMS + VERSIONS
         run: |
           cd all
-          find . -type f | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+          find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS
           {
             echo "commit: ${{ github.sha }}"
             echo "linux: 6.12.30"
