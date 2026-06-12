@@ -32,6 +32,14 @@ artifacts and are env-gated: `IZBA_INTEGRATION=1 cargo test -p izba-core --test
 integration -- --test-threads=1` (full setup in [docs/testing.md](docs/testing.md)).
 Daemon e2e (also KVM-gated): `IZBA_INTEGRATION=1 cargo test -p izba-cli --test daemon_e2e -- --test-threads=1`.
 
+**Agent environment reality check (do NOT re-derive this wrong):** this WSL2
+instance has nested virtualization — `/dev/kvm` exists and works; it is merely
+INVISIBLE inside Claude's sandboxed Bash. Run the KVM suites with the sandbox
+disabled and they work right here. Likewise the Windows host is reachable via
+WSL interop: `powershell.exe -NoProfile ...` (also unsandboxed) runs the
+Windows validation suite (`hack/spike/validate-izba-windows.ps1`) on the host
+directly. Neither requires a different machine.
+
 **Test design constraint:** unit tests never bind unix/vsock listeners — some
 sandboxes deny `bind` with EPERM. Use `UnixStream::pair()` fakes (see the
 `PairListener` pattern in `crates/izba-init/src/server.rs` tests); tests that
