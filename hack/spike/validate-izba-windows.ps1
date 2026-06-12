@@ -48,20 +48,21 @@ Check 'CommandNotFound -> 127' ($LASTEXITCODE -eq 127)
 $out = 'ping' | & $exe exec -i valid8 -- /bin/cat
 Check 'exec -i round-trips stdin' ("$out".Trim() -eq 'ping')
 
-# [5] networking (consomme): DNS + outbound HTTP
-# Known pre-existing FAIL on this host: consomme guest-egress is refused
-# (VPN/IPv6-related). Retired in M1 phase C — leave as-is for now.
-& $exe exec valid8 -- /bin/sh -c 'wget -q -O /dev/null http://example.com' | Out-Null
-Check 'guest outbound HTTP' ($LASTEXITCODE -eq 0)
+# [5] networking — izbad-owned vsock egress (the ONLY network story since M1
+# phase C: passt/consomme/--net are gone, the guest is a NIC-less vsock island
+# with dummy0 static addressing + an in-guest nft REDIRECT stub). The old
+# consomme `guest outbound HTTP` check is retired with consomme — there is no
+# host NIC path left to test. [5a]/[5b] below ARE the networking checks now,
+# and they are exactly the WSL/VPN-topology bug-class that consomme failed on
+# this host: izbad's vsock plane must PASS here regardless of the VPN.
 
-# [5b] M1 phase A: egress DNS via izbad (FIRST runtime exercise of OpenVMM
+# [5a] M1 phase A: egress DNS via izbad (runtime exercise of OpenVMM
 # guest-initiated hybrid vsock — guest connect(CID 2, 1027) must reach
 # izbad's run\vsock.sock_1027 listener, which izbad binds before VM boot).
-# Uses a dedicated sandbox so the consomme path above is untouched.
 & $exe stop egress-a 2>$null | Out-Null
 & $exe rm --force egress-a 2>$null | Out-Null
-& $exe run --image $image --egress izbad --name egress-a $ws -- /bin/true | Out-Null
-Check 'egress=izbad sandbox boots (run exits 0)' ($LASTEXITCODE -eq 0)
+& $exe run --image $image --name egress-a $ws -- /bin/true | Out-Null
+Check 'izbad-egress sandbox boots (run exits 0)' ($LASTEXITCODE -eq 0)
 $egOut = (& $exe exec egress-a -- /bin/sh -lc 'getent hosts example.com' 2>&1 | Out-String)
 $egRc  = $LASTEXITCODE
 Check 'egress DNS via izbad resolves example.com' ($egRc -eq 0 -and $egOut -match 'example\.com')
@@ -76,11 +77,11 @@ if (-not ($egRc -eq 0 -and $egOut -match 'example\.com')) {
     [Console]::Error.WriteLine("  vsock.sock_1027 present: $(Test-Path $egListener)")
 }
 
-# [5c] M1 phase B: TCP egress via the in-guest nft REDIRECT stub on OpenVMM.
+# [5b] M1 phase B: TCP egress via the in-guest nft REDIRECT stub on OpenVMM.
 # Guest connect()s out → nft REDIRECTs to the init listener → SO_ORIGINAL_DST →
 # vsock TcpConnect splice → izbad dials the real host. This is a real-internet
-# fetch (http://example.com): the WSL/VPN-topology bug-class check that the
-# consomme path above fails under VPN. The izbad path must PASS on the same host.
+# fetch (http://example.com): the WSL/VPN-topology bug-class check that the old
+# consomme path failed under VPN. The izbad vsock path must PASS on the same host.
 # Exercises the B1 netfilter kernel + B3/B4 vendored nft in the initramfs:
 # an `izba-init: applying nft ruleset` error in console.log = kernel/nft mismatch.
 $tcpOut = (& $exe exec egress-a -- /bin/sh -lc 'wget -qO- http://example.com/ | head -c 64' 2>&1 | Out-String)
@@ -101,9 +102,22 @@ if (-not $tcpOk) {
 & $exe stop egress-a 2>$null | Out-Null
 & $exe rm --force egress-a 2>$null | Out-Null
 
-# [6] console log captured
+# [6] console log captured + NIC-less boot sanity. Since M1 phase C the guest
+# brings up lo + dummy0 statically (no DHCP, no eth0): assert the console shows
+# no DHCP/eth0 chatter and no init network/nft errors. This is the boot-time
+# proof that the NIC-less init runs clean under OpenVMM/WHP (its device surface
+# differs from KVM, so we verify here rather than assume parity).
 $console = Get-Item "$env:LOCALAPPDATA\izba\sandboxes\valid8\logs\console.log" -ErrorAction SilentlyContinue
 Check 'console.log exists and is non-empty' ($null -ne $console -and $console.Length -gt 0)
+$conTxt = if ($null -ne $console) { Get-Content $console.FullName -Raw } else { '' }
+Check 'no DHCP/eth0 chatter in console (NIC-less boot)' (-not ($conTxt -match '(?im)dhcp|eth0'))
+$netErr = $conTxt -match '(?im)izba-init: (network configure|applying nft ruleset):'
+Check 'no init network/nft errors in console' (-not $netErr)
+if ($netErr) {
+    [Console]::Error.WriteLine("  --- valid8 console.log net lines ---")
+    ($conTxt -split "`n") | Where-Object { $_ -match '(?i)izba-init:.*(net|nft|dummy|resolv)' } |
+        ForEach-Object { [Console]::Error.WriteLine("  $_") }
+}
 
 # [7] daemon: status, kill-and-adopt, stop-survival (daemon-first CLI)
 $st = & $exe daemon status | Out-String
