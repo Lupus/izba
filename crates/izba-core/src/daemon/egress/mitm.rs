@@ -289,6 +289,14 @@ pub fn upstream_client_config(roots: rustls::RootCertStore) -> Arc<ClientConfig>
     Arc::new(config)
 }
 
+/// Upstream config trusting the Mozilla CA bundle (webpki-roots) — what
+/// production izbad uses to verify the *real* upstream it re-originates to.
+pub fn upstream_client_config_webpki() -> Arc<ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    upstream_client_config(roots)
+}
+
 /// Re-originate TLS to the verified upstream over a generic stream.
 /// ADAPTED from OpenShell `tls_connect_upstream` — the only change is the
 /// stream type: `impl AsyncRead+AsyncWrite+Unpin` instead of `TcpStream`, so

@@ -4,6 +4,7 @@
 
 pub mod dns;
 pub mod mitm;
+pub mod mitm_runtime;
 pub mod policy;
 pub mod router;
 

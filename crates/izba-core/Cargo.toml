@@ -14,7 +14,7 @@ flate2 = "1"
 tar = "0.4"
 tempfile = "3"
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1.52.3", features = ["rt", "io-util"] }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "net", "io-util", "time"] }
 sha2 = "0.10"
 hex = "0.4"
 which = "7"
@@ -28,6 +28,8 @@ rustls = { version = "0.23", default-features = false, features = ["std", "loggi
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 rustls-pemfile = "2"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+# Mozilla CA roots so the MITM verifies real upstreams (pure data, cross-compiles).
+webpki-roots = "0.26"
 
 # --- M2 egress policy engine: regorus = Microsoft's pure-Rust OPA/Rego
 # interpreter. `arc` is REQUIRED so Engine is Send+Sync (Rc otherwise);
