@@ -12,6 +12,28 @@
 
 ---
 
+## Progress (2026-06-14) — branch `feat/m2-agent-firewall`
+
+**DONE (committed, all six gates green: workspace tests + clippy -D warnings + fmt + musl-static init + windows cross-check):**
+- ✅ **T1** vendor MITM datapath (`mitm.rs`, SPDX-attributed, 8 tests)
+- ✅ **T2** per-SNI cert resolver (mint leaves from the ClientHello)
+- ✅ **T3** `RegoPolicy` behind `Policy` + L7 `FlowDesc` (host/method/path); regorus pinned 0.4 (cached; bump to 0.10 when network — API-compatible)
+- ✅ **T4** `MitmRuntime` + `DstMap` loopback bridge
+- ✅ **T5** router two-tier dispatch (`:80/:443` → loopback hop; DNS always-allow; tier-2 direct dial); `socket2` register-before-connect (no race); churn invariant untouched
+- ✅ **T12** CA-in-guest (`izba-init`: `izba-trust` share, `write_trust_anchor`, CA-bundle exec env) — contract: tag `izba-trust`, file `ca.pem`, guest `/etc/izba/ca{,-bundle}.pem`
+- ✅ **T13 (host-level slice)** `tests/egress_mitm.rs` — full host-side e2e: guest→loopback-hop→MITM→RegoPolicy allow(`api.anthropic.com`→upstream)/deny(`evil.*`→403). Runs locally + in the normal `cargo test` CI gate (skips on bind-EPERM).
+
+**REMAINING (not started; ordered):**
+- **T6/T7** structured audit log + `izba netlog` (the "see every connection" view). The policy still `eprintln!`s.
+- **T8/T9** DNS-snoop tier-2 (non-HTTP FQDN allow-list + RFC1918 denylist).
+- **T10** `--policy` config surface (per-sandbox YAML → regorus data + tier-2 list).
+- **T11** persistent CA mint (`ca.rs`) + `izba-trust` host share in `sandbox.rs` + **daemon construction of `MitmRuntime`** — **until this lands the daemon passes `mitm=None`, so production sandboxes do NOT yet MITM** (the datapath is proven, just not activated in `server.rs`).
+- **T14 (real-VM slice)** guest-`curl`-through-MITM e2e in `e2e.yml` on both platforms (needs T10+T11 + an initramfs rebuild).
+
+**Key handoff facts:** regorus is `0.4` (offline-cached); the daemon activation gap is the one thing between "proven datapath" and "live firewall" (T10+T11); the T12 merge is already in this branch.
+
+---
+
 ## File structure
 
 - `crates/izba-core/src/daemon/egress/mitm.rs` — MITM datapath (vendored, then a per-SNI cert resolver added).
