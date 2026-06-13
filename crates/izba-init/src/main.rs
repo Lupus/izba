@@ -12,6 +12,7 @@ mod net;
 mod rwdisk;
 mod server;
 mod tarfs;
+mod trust;
 
 use anyhow::Context;
 use exec::ExecEngine;
@@ -97,6 +98,7 @@ fn run_pid1() -> anyhow::Result<()> {
         eprintln!("izba-init: network configure: {e}");
     }
     write_resolv_conf();
+    write_trust_anchor();
 
     let engine = Arc::new(ExecEngine::new(Some("/rootfs".into())));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -197,6 +199,71 @@ fn write_resolv_conf() {
     let conf = format!("nameserver {}\n", net::DNS_LOOPBACK);
     if let Err(e) = std::fs::write("/rootfs/etc/resolv.conf", conf) {
         eprintln!("izba-init: writing resolv.conf: {e}");
+    }
+}
+
+/// Bakes izbad's root CA (delivered via the read-only `izba-trust` virtiofs
+/// share) into the guest trust store so workload tools trust the MITM leaves.
+///
+/// Best-effort and no-op when the share has no `ca.pem` — a sandbox without
+/// HTTPS MITM ships no CA, and the trust-env defaulting in `exec.rs` is gated
+/// on `ca-bundle.pem` existing, so absence here cleanly disables the feature.
+///
+/// Writes into the overlay (the guest's real, writable `/etc`):
+/// `/etc/izba/ca.pem` (the CA alone, for runtimes that ADD a root) and
+/// `/etc/izba/ca-bundle.pem` (CA + system roots, for tools that REPLACE the
+/// trust set). If a distro CA bundle exists it also appends the CA to it
+/// (best-effort, so tools that read the canonical system path also trust it).
+/// We do NOT run update-ca-certificates: this is a static-musl, distro-agnostic
+/// init.
+fn write_trust_anchor() {
+    // The share is mounted under /rootfs at the fixed trust mountpoint.
+    let share_ca = format!("/rootfs{}/{}", trust::TRUST_MOUNT, trust::CA_FILE);
+    let ca_pem = match std::fs::read_to_string(&share_ca) {
+        Ok(p) => p,
+        Err(e) => {
+            // ENOENT is the normal "no MITM for this sandbox" path; anything
+            // else is logged but still non-fatal.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("izba-init: reading trust anchor {share_ca}: {e}");
+            }
+            return;
+        }
+    };
+
+    if let Err(e) = std::fs::create_dir_all("/rootfs/etc/izba") {
+        eprintln!("izba-init: creating /etc/izba: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write("/rootfs/etc/izba/ca.pem", &ca_pem) {
+        eprintln!("izba-init: writing /etc/izba/ca.pem: {e}");
+        return;
+    }
+
+    // First existing distro CA bundle, if any (Debian/Alpine vs RHEL paths).
+    const SYSTEM_BUNDLES: [&str; 2] = [
+        "/rootfs/etc/ssl/certs/ca-certificates.crt",
+        "/rootfs/etc/pki/tls/certs/ca-bundle.crt",
+    ];
+    let system_pem = SYSTEM_BUNDLES
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok());
+    let bundle = trust::build_combined_bundle(&ca_pem, system_pem.as_deref());
+    if let Err(e) = std::fs::write("/rootfs/etc/izba/ca-bundle.pem", bundle) {
+        eprintln!("izba-init: writing /etc/izba/ca-bundle.pem: {e}");
+    }
+
+    // Best-effort: append the CA to the canonical Debian/Alpine bundle so tools
+    // that hardcode that path also trust the MITM. Ignore all errors (path may
+    // not exist; read-only/odd distros are fine — the env vars are the source
+    // of truth).
+    let canonical = "/rootfs/etc/ssl/certs/ca-certificates.crt";
+    if std::path::Path::new(canonical).exists() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(canonical) {
+            let _ = writeln!(f);
+            let _ = f.write_all(ca_pem.as_bytes());
+        }
     }
 }
 

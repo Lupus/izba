@@ -15,6 +15,10 @@ pub struct MountOp {
     pub fstype: String,
     pub flags: Vec<String>,
     pub data: String,
+    /// When `true`, a failed mount is logged and skipped rather than aborting
+    /// boot. Used for shares the host only attaches conditionally (e.g. the
+    /// `izba-trust` CA share, present only for MITM-enabled sandboxes).
+    pub optional: bool,
 }
 
 impl MountOp {
@@ -25,7 +29,14 @@ impl MountOp {
             fstype: fstype.to_string(),
             flags: flags.iter().map(|f| f.to_string()).collect(),
             data: data.to_string(),
+            optional: false,
         }
+    }
+
+    /// Marks this op optional: see [`MountOp::optional`].
+    fn optional(mut self) -> Self {
+        self.optional = true;
+        self
     }
 }
 
@@ -73,6 +84,19 @@ pub fn rootfs_mount_plan() -> Vec<MountOp> {
             "lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work",
         ),
         MountOp::new("workspace", "/rootfs/workspace", "virtiofs", &[], ""),
+        // The izba root CA, delivered read-only for the guest trust store.
+        // Optional: izbad only attaches it for MITM-enabled sandboxes, so a
+        // missing tag fails-soft instead of aborting boot. The target is under
+        // /rootfs (not /rootfs/etc) so the share itself stays read-only;
+        // write_trust_anchor() copies the CA into the writable overlay /etc.
+        MountOp::new(
+            crate::trust::TRUST_TAG,
+            "/rootfs/izba-trust",
+            "virtiofs",
+            &["ro"],
+            "",
+        )
+        .optional(),
         MountOp::new(
             "proc",
             "/rootfs/proc",
@@ -162,7 +186,7 @@ pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
         if let Some(pause) = pre_mount_pause(op) {
             std::thread::sleep(pause);
         }
-        nix::mount::mount(
+        let res = nix::mount::mount(
             Some(op.source.as_str()),
             &op.target,
             Some(op.fstype.as_str()),
@@ -176,7 +200,21 @@ pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
                 op.fstype,
                 op.target.display()
             )
-        })?;
+        });
+        if let Err(e) = res {
+            if op.optional {
+                // The host did not attach this share (e.g. no MITM CA): log and
+                // carry on so boot is unaffected.
+                eprintln!(
+                    "izba-init: optional mount {} ({}) on {} skipped: {e:#}",
+                    op.source,
+                    op.fstype,
+                    op.target.display()
+                );
+                continue;
+            }
+            return Err(e);
+        }
         eprintln!(
             "izba-init: mounted {} ({}) on {} OK",
             op.source,
@@ -249,7 +287,7 @@ mod tests {
     #[test]
     fn rootfs_plan_sequence() {
         let p = rootfs_mount_plan();
-        assert_eq!(p.len(), 9);
+        assert_eq!(p.len(), 10);
         assert_eq!(op(&p, 0), ("/dev/vda", "/lower", "erofs", vec!["ro"], ""));
         assert_eq!(op(&p, 1), ("/dev/vdb", "/upper", "ext4", vec![], ""));
         assert_eq!(
@@ -269,6 +307,16 @@ mod tests {
         assert_eq!(
             op(&p, 4),
             (
+                "izba-trust",
+                "/rootfs/izba-trust",
+                "virtiofs",
+                vec!["ro"],
+                ""
+            )
+        );
+        assert_eq!(
+            op(&p, 5),
+            (
                 "proc",
                 "/rootfs/proc",
                 "proc",
@@ -277,7 +325,7 @@ mod tests {
             )
         );
         assert_eq!(
-            op(&p, 5),
+            op(&p, 6),
             (
                 "sysfs",
                 "/rootfs/sys",
@@ -287,15 +335,15 @@ mod tests {
             )
         );
         assert_eq!(
-            op(&p, 6),
+            op(&p, 7),
             ("devtmpfs", "/rootfs/dev", "devtmpfs", vec!["nosuid"], "")
         );
         assert_eq!(
-            op(&p, 7),
+            op(&p, 8),
             ("tmpfs", "/rootfs/tmp", "tmpfs", vec!["nosuid", "nodev"], "")
         );
         assert_eq!(
-            op(&p, 8),
+            op(&p, 9),
             (
                 "devpts",
                 "/rootfs/dev/pts",
@@ -304,6 +352,20 @@ mod tests {
                 "gid=5,mode=620,ptmxmode=666"
             )
         );
+    }
+
+    #[test]
+    fn trust_share_is_optional_and_read_only() {
+        let p = rootfs_mount_plan();
+        let trust = p
+            .iter()
+            .find(|o| o.source == "izba-trust")
+            .expect("trust share present");
+        assert!(trust.optional, "trust share must fail-soft when absent");
+        assert!(trust.flags.iter().any(|f| f == "ro"));
+        assert_eq!(trust.target, PathBuf::from("/rootfs/izba-trust"));
+        // Only the trust share is optional; everything else is mandatory.
+        assert_eq!(p.iter().filter(|o| o.optional).count(), 1);
     }
 
     #[test]

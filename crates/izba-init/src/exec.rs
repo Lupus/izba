@@ -83,6 +83,19 @@ impl ExecEngine {
         self.root.as_deref()
     }
 
+    /// Whether the izba combined CA bundle exists in the guest, resolved
+    /// against the chroot root (`<root>/etc/izba/ca-bundle.pem` in the guest,
+    /// the bare guest path in tests). Gates the trust-env defaulting so only
+    /// MITM-enabled sandboxes advertise the CA-bundle vars.
+    fn trust_bundle_present(&self) -> bool {
+        let guest_path = crate::trust::GUEST_CA_BUNDLE.trim_start_matches('/');
+        let resolved = match &self.root {
+            Some(r) => r.join(guest_path),
+            None => PathBuf::from(crate::trust::GUEST_CA_BUNDLE),
+        };
+        resolved.is_file()
+    }
+
     pub fn exec(&self, req: &ExecRequest) -> Result<u32, ExecError> {
         let argv0 = req
             .argv
@@ -98,6 +111,18 @@ impl ExecEngine {
         }
         if req.tty && !req.env.iter().any(|(k, _)| k == "TERM") {
             cmd.env("TERM", DEFAULT_TERM);
+        }
+        // CA-bundle env defaults for the izba MITM trust anchor, mirroring the
+        // PATH/TERM "default unless the caller overrides" pattern. Only
+        // advertise them when the combined bundle actually exists in the guest
+        // (write_trust_anchor wrote it), so non-MITM sandboxes don't point
+        // tools at a missing file. The values are post-chroot guest paths.
+        if self.trust_bundle_present() {
+            for (k, v) in crate::trust::trust_env_pairs() {
+                if !req.env.iter().any(|(ek, _)| ek == k) {
+                    cmd.env(k, v);
+                }
+            }
         }
 
         let (pty_master, mut streams) = if req.tty {
@@ -557,5 +582,38 @@ mod tests {
             .unwrap();
         assert_eq!(out, format!("P={DEFAULT_PATH} M=unset\n"));
         e.wait(id).unwrap();
+    }
+
+    #[test]
+    fn trust_bundle_present_tracks_the_guest_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = ExecEngine::new(Some(dir.path().to_path_buf()));
+        // No bundle yet → not present → trust env defaulting is suppressed.
+        assert!(!e.trust_bundle_present());
+        // Materialize <root>/etc/izba/ca-bundle.pem.
+        let bundle = dir.path().join("etc/izba/ca-bundle.pem");
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        std::fs::write(&bundle, "CA\n").unwrap();
+        assert!(e.trust_bundle_present());
+    }
+
+    #[test]
+    fn trust_env_defaulting_skips_caller_supplied_keys() {
+        // Mirrors exec()'s injection loop: a caller override for one trust key
+        // must win, while the rest still default. (The gate + env_clear path is
+        // exercised by exit/PATH tests; this pins the override semantics.)
+        let caller: Vec<(String, String)> =
+            vec![("CURL_CA_BUNDLE".into(), "/custom/ca.pem".into())];
+        let mut injected = Vec::new();
+        for (k, v) in crate::trust::trust_env_pairs() {
+            if !caller.iter().any(|(ck, _)| ck == k) {
+                injected.push((k, v));
+            }
+        }
+        assert!(
+            !injected.iter().any(|(k, _)| *k == "CURL_CA_BUNDLE"),
+            "caller-supplied CURL_CA_BUNDLE must not be overwritten"
+        );
+        assert_eq!(injected.len(), 5, "the other five trust vars still default");
     }
 }
