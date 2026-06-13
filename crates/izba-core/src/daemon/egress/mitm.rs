@@ -33,6 +33,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -156,7 +158,10 @@ impl CertCache {
     }
 
     /// Build a `TlsAcceptor` presenting a freshly-minted leaf for `hostname`.
-    /// ADAPTED from OpenShell `ProxyTlsState::acceptor_for`.
+    /// ADAPTED from OpenShell `ProxyTlsState::acceptor_for`. Production uses the
+    /// per-SNI `server_config_with_resolver` instead; this single-host form
+    /// remains for the in-test upstream responder.
+    #[cfg(test)]
     fn acceptor_for(&self, hostname: &str) -> Result<TlsAcceptor> {
         let leaf = self.get_or_generate(hostname)?;
         let mut server_config = ServerConfig::builder()
@@ -166,6 +171,48 @@ impl CertCache {
         server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(TlsAcceptor::from(Arc::new(server_config)))
     }
+
+    /// Build a rustls `CertifiedKey` for `hostname` (leaf chain + ring signing
+    /// key) for use by a `ResolvesServerCert`. IZBA.
+    pub fn certified_key(&self, hostname: &str) -> Result<Arc<CertifiedKey>> {
+        let leaf = self.get_or_generate(hostname)?;
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&leaf.private_key)
+            .map_err(|e| anyhow!("leaf signing key: {e}"))?;
+        Ok(Arc::new(CertifiedKey::new(
+            leaf.cert_chain.clone(),
+            signing_key,
+        )))
+    }
+}
+
+/// Mints a leaf per ClientHello SNI under the izba CA. Production izbad does not
+/// know the hostname up front (the `TcpConnect` frame carries only an IP), so
+/// the SNI is recovered from the handshake rather than passed in. IZBA.
+struct SniResolver {
+    certs: Arc<CertCache>,
+}
+
+impl std::fmt::Debug for SniResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SniResolver")
+    }
+}
+
+impl ResolvesServerCert for SniResolver {
+    fn resolve(&self, hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        let host = hello.server_name()?.to_string();
+        self.certs.certified_key(&host).ok()
+    }
+}
+
+/// A `ServerConfig` whose leaf is minted per-ClientHello-SNI under the izba CA;
+/// ALPN pinned to `http/1.1` (h2 deferred — nearly all servers downgrade). IZBA.
+pub fn server_config_with_resolver(certs: Arc<CertCache>) -> ServerConfig {
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(SniResolver { certs }));
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    cfg
 }
 
 /// Detect a TLS ClientHello from the first bytes of a stream. LIFTED verbatim
@@ -331,7 +378,9 @@ where
 /// What izbad needs to MITM a flow: the cert cache (CA) and an upstream
 /// rustls config. Cheap to clone-share across connections.
 pub struct MitmState {
-    pub certs: Arc<CertCache>,
+    /// Acceptor whose leaf is minted per ClientHello SNI under the izba CA
+    /// (built via `server_config_with_resolver`).
+    pub acceptor: TlsAcceptor,
     pub upstream: Arc<ClientConfig>,
 }
 
@@ -341,15 +390,14 @@ pub struct MitmState {
 /// upstream.
 ///
 /// `client` is the raw guest byte stream (post-`StreamOpen::TcpConnect`, in
-/// production). `sni` is the hostname the guest asked for — in production this
-/// comes from the ClientHello SNI; the spike passes it explicitly. `connect_upstream`
-/// is a closure that dials the real upstream (kept abstract so this spike never
-/// touches real sockets / the vsock router).
+/// production). The leaf hostname is recovered from the ClientHello SNI by the
+/// acceptor's cert resolver. `connect_upstream` is a closure that dials the
+/// real upstream (kept abstract so the datapath never owns a socket / the vsock
+/// router).
 ///
-/// Returns the `L7Request` it observed, so the test can assert L7 visibility.
+/// Returns the `L7Request` it observed, so the caller can audit L7 visibility.
 pub async fn mitm_terminate<C, U, F, Fut>(
     client: C,
-    sni: &str,
     state: &MitmState,
     policy: &dyn MitmPolicy,
     connect_upstream: F,
@@ -360,9 +408,9 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<U>>,
 {
-    // 1. Terminate the client TLS under a leaf minted for the SNI.
-    let acceptor = state.certs.acceptor_for(sni)?;
-    let mut client_tls = acceptor
+    // 1. Terminate the client TLS under a leaf minted for the ClientHello SNI.
+    let mut client_tls = state
+        .acceptor
         .accept(client)
         .await
         .context("client TLS handshake (leaf under izba CA)")?;
@@ -463,10 +511,11 @@ mod tests {
         };
 
         let certs = Arc::new(CertCache::new(ca));
+        let acceptor = TlsAcceptor::from(Arc::new(server_config_with_resolver(certs)));
         (
             ca_der,
             MitmState {
-                certs,
+                acceptor,
                 upstream: dummy_upstream_cfg(),
             },
             guest_cfg,
@@ -541,7 +590,7 @@ mod tests {
         // Run the MITM. `connect_upstream` just hands over the upstream duplex.
         let up_stream = Mutex::new(Some(up_stream));
         let mitm = tokio::spawn(async move {
-            mitm_terminate(mitm_side, host, &state, &policy, || async move {
+            mitm_terminate(mitm_side, &state, &policy, || async move {
                 Ok(up_stream.lock().unwrap().take().unwrap())
             })
             .await
@@ -597,7 +646,6 @@ mod tests {
         let mitm = tokio::spawn(async move {
             mitm_terminate(
                 mitm_side,
-                host,
                 &state,
                 &policy,
                 // If this is ever called, the upstream connector errors —
@@ -633,6 +681,43 @@ mod tests {
         let observed = mitm.await.unwrap().expect("mitm deny path");
         assert_eq!(observed.host, "blocked.example.com");
         assert_eq!(observed.method, "GET");
+    }
+
+    #[tokio::test]
+    async fn cert_resolver_mints_for_clienthello_sni() {
+        // The resolver must mint a leaf for whatever SNI the ClientHello
+        // carries — production izbad never passes the hostname explicitly.
+        install_ring();
+        let ca = IzbaCa::generate().unwrap();
+        let ca_der = ca.cert_der();
+        let server_cfg = server_config_with_resolver(Arc::new(CertCache::new(ca)));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der).unwrap();
+        let mut gcfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        gcfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        let (g, s) = duplex(16 * 1024);
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+        let srv = tokio::spawn(async move {
+            acceptor
+                .accept(s)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+
+        let conn = TlsConnector::from(Arc::new(gcfg));
+        let name = ServerName::try_from("late.example.com").unwrap();
+        // Hold the client stream open until the server has finished accepting,
+        // else dropping it mid-final-flight breaks the server's handshake pipe.
+        let _guest = conn
+            .connect(name, g)
+            .await
+            .expect("handshake under izba CA via the SNI resolver");
+        srv.await.unwrap().expect("server side accepted");
     }
 
     // --- LIFTED unit tests from OpenShell tls.rs (CA / cache / tls-sniff) ---
