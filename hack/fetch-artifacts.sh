@@ -11,11 +11,8 @@
 # What this script manages:
 #   1. cloud-hypervisor   (static binary, GitHub releases)
 #   2. virtiofsd          (static binary, virtio-fs GitLab)
-#   3. passt              (distro package; must support --vhost-user. If the
-#                          distro build is too old, install the upstream static
-#                          build — see the passt section below.)
-#   4. mkfs.erofs         (distro package — no static build available)
-#   5. Boot artifacts     (kernel vmlinux + initramfs.cpio.gz)
+#   3. mkfs.erofs         (distro package — no static build available)
+#   4. Boot artifacts     (kernel vmlinux + initramfs.cpio.gz)
 #              → must be built locally; see hack/build-kernel.sh and
 #                hack/build-initramfs.sh.  No pre-built downloads exist yet.
 #
@@ -197,46 +194,12 @@ else
     fi
 fi
 
-# ---------------------------------------------------------------------------
-# 3. passt
-# ---------------------------------------------------------------------------
-echo "=== passt ==="
-# izba runs passt in vhost-user mode: cloud-hypervisor consumes the network
-# device over a vhost-user socket (see vmm/cloud_hypervisor.rs — passt is
-# invoked with `--vhost-user --socket-path .../net.sock`). That mode was added
-# upstream around 2024_03_20; older builds — including the one Ubuntu 24.04
-# ships (0.0~git20240220) — reject --vhost-user, exit immediately, and never
-# create net.sock, so every boot fails with "passt did not create ... net.sock
-# within 3s". Presence alone is therefore NOT enough — we probe the capability.
-passt_ok=0
-if command -v passt >/dev/null 2>&1; then
-    if passt --help 2>&1 | grep -q vhost-user; then
-        echo "  present: $(command -v passt) (supports --vhost-user)"
-        mark_ok "passt"
-        passt_ok=1
-    else
-        echo "  present but TOO OLD: $(command -v passt) lacks --vhost-user"
-    fi
-else
-    echo "  missing"
-fi
-if [ "$passt_ok" -eq 0 ]; then
-    mark_missing "passt"
-    if [ "$CHECK_ONLY" -eq 0 ]; then
-        # Distro apt has no newer passt on Ubuntu 24.04, but upstream publishes
-        # an official static build. Install it to /usr/local/bin so it shadows
-        # any older /usr/bin/passt (izba resolves `passt` via PATH, and
-        # /usr/local/bin precedes /usr/bin). ~/.local/bin would NOT shadow a
-        # system passt, so this one genuinely needs the system location.
-        echo "  → Build the pinned passt and install it (needs sudo):"
-        echo "      hack/build-passt.sh"
-        echo "      sudo install -m755 dist/passt-2026_05_26-static-x86_64 /usr/local/bin/passt"
-        echo "      hash -r && passt --help | grep vhost-user   # verify"
-    fi
-fi
+# passt is no longer a runtime dependency: as of M1, guest egress rides izbad
+# over vsock (no host NAT helper). The build-passt.sh script was removed with
+# the cutover. cloud-hypervisor still runs NIC-less — virtio-net is gone.
 
 # ---------------------------------------------------------------------------
-# 4. mkfs.erofs
+# 3. mkfs.erofs
 # ---------------------------------------------------------------------------
 echo "=== mkfs.erofs ==="
 if command -v mkfs.erofs >/dev/null 2>&1; then
@@ -248,7 +211,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Boot artifacts (kernel + initramfs)
+# 4. Boot artifacts (kernel + initramfs)
 # ---------------------------------------------------------------------------
 echo "=== boot artifacts ==="
 KERNEL="$ARTIFACTS_DIR/vmlinux"

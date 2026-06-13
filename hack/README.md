@@ -85,14 +85,6 @@ Pass the result to `build-initramfs.sh` via `IZBA_MKE2FS` so the guest can
 format a blank `rw.img` on first boot.  The source tarball is cached in
 `${XDG_CACHE_HOME:-$HOME/.cache}/izba/e2fsprogs/`.
 
-### `build-passt.sh`
-
-Builds a static `passt` (user-mode networking) from a pinned source snapshot
-(tag `2026_05_26.038c51e`, sha256-verified). Ubuntu 24.04's packaged passt
-predates the `--vhost-user` mode izba requires. Output:
-`dist/passt-2026_05_26-static-x86_64`; install with
-`sudo install -m755 dist/passt-2026_05_26-static-x86_64 /usr/local/bin/passt`.
-
 ### `ci/ttystorm-gate.sh` / `ci/ttystorm-gate.ps1`
 
 The scripted M0 vsock-churn gate used by `.github/workflows/e2e.yml`: boots a
@@ -108,7 +100,6 @@ Idempotent dependency checker / downloader.  Manages:
 |---|---|
 | `cloud-hypervisor` | GitHub releases (static binary) |
 | `virtiofsd` | virtio-fs GitLab (static binary) |
-| `passt` | `sudo apt-get install -y passt` |
 | `mkfs.erofs` | `sudo apt-get install -y erofs-utils` |
 | `vmlinux` + `initramfs.cpio.gz` | built locally (see above) |
 
@@ -149,8 +140,11 @@ sudo chmod 666 /dev/kvm # if your user cannot access it
 sudo apt-get update
 sudo apt-get install -y \
     build-essential flex bison bc libelf-dev \
-    passt erofs-utils cpio musl-tools
+    erofs-utils cpio musl-tools
 ```
+
+The static `nft` for the egress stub is built in a container (`build-nft.sh`),
+so Docker is the only extra requirement for that step.
 
 `musl-tools` provides `x86_64-linux-musl-gcc`, needed by the musl Rust target.
 
