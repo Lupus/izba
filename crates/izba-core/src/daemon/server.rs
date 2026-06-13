@@ -91,9 +91,12 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(paths: Paths, deps: DaemonDeps) -> Self {
         // Clone the egress seams before `deps` is moved into the struct.
+        // MITM runtime is wired in once the persistent CA exists (M2 daemon
+        // construction); until then egress takes the direct-dial path.
         let egress = EgressManager::new(
             Arc::clone(&deps.egress_policy),
             Arc::clone(&deps.egress_resolver),
+            None,
         );
         Self {
             paths,

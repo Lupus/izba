@@ -3,12 +3,13 @@
 //! splice; `Dns` (and `TcpConnect` to :53 — a hardcoded-resolver client) →
 //! the resolver. The M5 MITM/vault branch hangs off this dispatch point.
 
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
 use izba_proto::{dns, read_frame, write_frame, ErrorKind, Response, StreamOpen};
 
 use super::dns::Resolver;
+use super::mitm_runtime::{MitmRuntime, OrigDst};
 use super::policy::{FlowDesc, Policy, Verdict};
 use crate::vmm::UdsStream;
 
@@ -16,11 +17,13 @@ use crate::vmm::UdsStream;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serve one guest-initiated egress connection (the vsock-1027 bridge).
+/// `mitm` (when present) routes tier-1 HTTP(S) ports through the loopback hop.
 pub fn handle_conn(
     mut conn: UdsStream,
     sandbox: &str,
     policy: &dyn Policy,
     resolver: &dyn Resolver,
+    mitm: Option<&MitmRuntime>,
 ) {
     let open: StreamOpen = match read_frame(&mut conn) {
         Ok(o) => o,
@@ -28,7 +31,7 @@ pub fn handle_conn(
     };
     match open {
         StreamOpen::TcpConnect { addr, port } => {
-            tcp_connect(conn, sandbox, policy, resolver, &addr, port)
+            tcp_connect(conn, sandbox, policy, resolver, mitm, &addr, port)
         }
         StreamOpen::Dns => dns_loop(conn, resolver),
         _ => {
@@ -43,28 +46,19 @@ pub fn handle_conn(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tcp_connect(
     mut conn: UdsStream,
     sandbox: &str,
     policy: &dyn Policy,
     resolver: &dyn Resolver,
+    mitm: Option<&MitmRuntime>,
     addr: &str,
     port: u16,
 ) {
-    let flow = FlowDesc::l3(sandbox, addr, port);
-    if policy.check(&flow) == Verdict::Deny {
-        let _ = write_frame(
-            &mut conn,
-            &Response::Error {
-                kind: ErrorKind::ConnectFailed,
-                message: format!("egress to {addr}:{port} denied by policy"),
-            },
-        );
-        return;
-    }
-    // TCP DNS: izbad IS the resolver — answer locally instead of dialing
-    // out. After Ok the raw stream carries RFC 1035 TCP framing, which is
-    // exactly the `Dns` stream contract.
+    // TCP DNS: izbad IS the resolver — always allowed (the resolver path, not
+    // arbitrary guest egress), answer locally. After Ok the raw stream carries
+    // RFC 1035 TCP framing, exactly the `Dns` stream contract.
     if port == 53 {
         if write_frame(&mut conn, &Response::Ok).is_err() {
             return;
@@ -85,6 +79,31 @@ fn tcp_connect(
             return;
         }
     };
+
+    // Tier 1 — HTTP(S): hand the flow to the MITM runtime via the loopback hop.
+    // The policy decision happens AFTER TLS termination, on the decrypted Host,
+    // inside the MITM handler — so we do NOT pre-check on the IP here (an IP is
+    // never on a domain allow-list).
+    if let Some(mitm) = mitm {
+        if matches!(port, 80 | 443) {
+            mitm_hop(conn, mitm, ip, port, sandbox);
+            return;
+        }
+    }
+
+    // Tier 2 — non-HTTP TCP: policy on the destination (T9 consults DNS-snoop
+    // for the FQDN; today on the addr as given).
+    let flow = FlowDesc::l3(sandbox, addr, port);
+    if policy.check(&flow) == Verdict::Deny {
+        let _ = write_frame(
+            &mut conn,
+            &Response::Error {
+                kind: ErrorKind::ConnectFailed,
+                message: format!("egress to {addr}:{port} denied by policy"),
+            },
+        );
+        return;
+    }
     match TcpStream::connect_timeout(&SocketAddr::new(ip, port), DIAL_TIMEOUT) {
         Ok(target) => {
             if write_frame(&mut conn, &Response::Ok).is_err() {
@@ -98,6 +117,53 @@ fn tcp_connect(
                 &Response::Error {
                     kind: ErrorKind::ConnectFailed,
                     message: e.to_string(),
+                },
+            );
+        }
+    }
+}
+
+/// Tier-1 loopback hop: pre-bind a loopback source so the source port is known
+/// BEFORE connecting, register the `OrigDst` (register-before-connect → no race
+/// with the MITM accept claim), dial the MITM listener, then splice the vsock
+/// leg with the *unchanged* blocking pump (the OpenVMM churn invariant stays
+/// untouched — only the loopback TCP enters tokio, never the vsock `UdsStream`).
+fn mitm_hop(mut conn: UdsStream, mitm: &MitmRuntime, ip: IpAddr, port: u16, sandbox: &str) {
+    use socket2::{Domain, Socket, Type};
+    let listen = mitm.listen_addr();
+    let connect = || -> std::io::Result<TcpStream> {
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, None)?;
+        sock.bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())?;
+        let src_port = sock
+            .local_addr()?
+            .as_socket()
+            .map(|a| a.port())
+            .ok_or_else(|| std::io::Error::other("no loopback source port"))?;
+        // Register BEFORE connect so the accept handler can always claim it.
+        mitm.register(
+            src_port,
+            OrigDst {
+                ip,
+                port,
+                sandbox: sandbox.to_string(),
+            },
+        );
+        sock.connect(&listen.into())?;
+        Ok(sock.into())
+    };
+    match connect() {
+        Ok(sock) => {
+            if write_frame(&mut conn, &Response::Ok).is_err() {
+                return;
+            }
+            crate::portfwd::pump_bidirectional(sock, conn);
+        }
+        Err(e) => {
+            let _ = write_frame(
+                &mut conn,
+                &Response::Error {
+                    kind: ErrorKind::ConnectFailed,
+                    message: format!("MITM loopback dial: {e}"),
                 },
             );
         }
@@ -162,7 +228,7 @@ mod tests {
         resolver: &'static (dyn Resolver + Sync),
     ) -> UdsStream {
         let (client, server) = UdsStream::pair().unwrap();
-        std::thread::spawn(move || handle_conn(server, "web", policy, resolver));
+        std::thread::spawn(move || handle_conn(server, "web", policy, resolver, None));
         client
     }
 

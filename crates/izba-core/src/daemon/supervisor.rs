@@ -69,6 +69,7 @@ mod tests {
         EgressManager::new(
             Arc::new(AllowAll),
             Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
+            None,
         )
     }
 

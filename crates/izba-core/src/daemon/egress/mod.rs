@@ -17,6 +17,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use self::dns::Resolver;
+use self::mitm_runtime::MitmRuntime;
 use self::policy::Policy;
 use crate::daemon::transport::UdsListener;
 use crate::paths::Paths;
@@ -43,14 +44,23 @@ pub struct EgressManager {
     inner: Mutex<HashMap<String, EgressSlot>>,
     policy: Arc<dyn Policy>,
     resolver: Arc<dyn Resolver>,
+    /// The shared MITM runtime (tier-1 HTTP/S loopback hop). `None` ⇒ no MITM:
+    /// all TCP takes the direct-dial path. The policy is sandbox-aware via
+    /// `FlowDesc.sandbox`, so one runtime serves every sandbox.
+    mitm: Option<Arc<MitmRuntime>>,
 }
 
 impl EgressManager {
-    pub fn new(policy: Arc<dyn Policy>, resolver: Arc<dyn Resolver>) -> Self {
+    pub fn new(
+        policy: Arc<dyn Policy>,
+        resolver: Arc<dyn Resolver>,
+        mitm: Option<Arc<MitmRuntime>>,
+    ) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             policy,
             resolver,
+            mitm,
         }
     }
 
@@ -93,6 +103,7 @@ impl EgressManager {
         let stop2 = Arc::clone(&stop);
         let policy = Arc::clone(&self.policy);
         let resolver = Arc::clone(&self.resolver);
+        let mitm = self.mitm.clone();
         let sandbox = name.to_string();
         let thread = std::thread::spawn(move || {
             while !stop2.load(Ordering::SeqCst) {
@@ -103,9 +114,16 @@ impl EgressManager {
                         }
                         let policy = Arc::clone(&policy);
                         let resolver = Arc::clone(&resolver);
+                        let mitm = mitm.clone();
                         let sandbox = sandbox.clone();
                         std::thread::spawn(move || {
-                            router::handle_conn(conn, &sandbox, &*policy, &*resolver)
+                            router::handle_conn(
+                                conn,
+                                &sandbox,
+                                &*policy,
+                                &*resolver,
+                                mitm.as_deref(),
+                            )
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -177,7 +195,7 @@ mod tests {
     }
 
     fn mgr() -> EgressManager {
-        EgressManager::new(Arc::new(AllowAll), Arc::new(EchoResolver))
+        EgressManager::new(Arc::new(AllowAll), Arc::new(EchoResolver), None)
     }
 
     fn test_paths() -> (tempfile::TempDir, Paths) {

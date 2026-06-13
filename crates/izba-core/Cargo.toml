@@ -30,6 +30,9 @@ rustls-pemfile = "2"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 # Mozilla CA roots so the MITM verifies real upstreams (pure data, cross-compiles).
 webpki-roots = "0.26"
+# Pre-bind a loopback source so the router registers the dst BEFORE connecting
+# to the MITM listener (register-before-connect: no race with the accept claim).
+socket2 = "0.5"
 
 # --- M2 egress policy engine: regorus = Microsoft's pure-Rust OPA/Rego
 # interpreter. `arc` is REQUIRED so Engine is Send+Sync (Rc otherwise);
