@@ -51,11 +51,7 @@ fn tcp_connect(
     addr: &str,
     port: u16,
 ) {
-    let flow = FlowDesc {
-        sandbox: sandbox.to_string(),
-        addr: addr.to_string(),
-        port,
-    };
+    let flow = FlowDesc::l3(sandbox, addr, port);
     if policy.check(&flow) == Verdict::Deny {
         let _ = write_frame(
             &mut conn,

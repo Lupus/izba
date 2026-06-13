@@ -29,6 +29,14 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 rustls-pemfile = "2"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 
+# --- M2 egress policy engine: regorus = Microsoft's pure-Rust OPA/Rego
+# interpreter. `arc` is REQUIRED so Engine is Send+Sync (Rc otherwise);
+# std/regex/glob give the eval surface the docker-mitm-bridge policy uses.
+# Pinned to 0.4 (cached + proven by the spike); the embedding API
+# (add_policy/add_data_json/set_input_json/eval_bool_query) is identical in the
+# current 0.10 — bump when convenient (CI has network).
+regorus = { version = "0.4", default-features = false, features = ["std", "arc", "regex", "glob"] }
+
 [dev-dependencies]
 # in-memory duplex test driver for the MITM datapath needs a real runtime
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "time"] }
