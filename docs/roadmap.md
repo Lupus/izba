@@ -105,20 +105,32 @@ doesn't work (transparent-UDP-proxy source-mismatch). `resolv.conf` points at
 loopback, which works. Flagged as a docker-in-VM (M3/M4) prerequisite — see
 risk #3 and Open decisions.
 
-### M2 — Agent firewall: egress policy + audit log (S–M)
+### M2 — Agent firewall: merged MITM L7 + allow-list + audit (M)
 
-The pulled-forward slice of design step 5, north–south plane only, **for
-single sandboxes** — because once M1 lands, izbad already sees every flow and
-this is the headline feature for the target user: *"my agent can only reach
-`api.anthropic.com` and `github.com`, and I can see every connection it
-tried."* **Decided (2026-06-12):** per-sandbox allow-list (CLI/config);
-default-deny **when a policy is declared**; bare sandboxes keep allow-all for
-now. The longer-term shape is sbx-style **policy presets at create**
-(open/balanced/closed) — postponed until izba is mature/released, because a
-credible "balanced" preset artifact doesn't exist yet. Allow/deny decisions
-land in an audit log with an `izba netlog`-style view. **Exit:** the
-one-liner demo above, on both platforms. This is the first release-tag moment
-(see Track T).
+**Restructured 2026-06-14 (the M5 leapfrog):** M2 absorbs M5's MITM datapath —
+the OpenShell-salvage spike proved it cheap (compiles, tests green, Windows
+cross-check green). North–south plane, **single sandboxes**, the headline
+feature: *"my agent can only reach `api.anthropic.com` and `github.com`, every
+connection it tried is in `izba netlog`, and there are no uninspectable
+channels."* This is the first release-tag moment (see Track T).
+
+Scope: a TLS-MITM datapath in izbad (terminate guest HTTPS, mint per-SNI leaves
+under an izba CA, re-originate upstream — salvaged from the spike), reached via a
+**loopback-hop bridge** that leaves the blocking vsock egress plane + the
+OpenVMM churn invariant untouched; a **two-tier policy plane** (one `regorus`
+engine, default-deny when declared): tier 1 = hard L7 on the decrypted
+`{host,method,path}` for HTTP(S), tier 2 = soft **DNS-snoop** FQDN allow-list for
+the non-HTTP tail (raw-IP-with-no-snoop-record ⇒ deny); an **audit log + `izba
+netlog`**; and **CA-in-guest** (bake the izba CA into the guest trust store at
+boot). Force http/1.1 (ALPN); h2 deferred. **Decided (2026-06-12):** per-sandbox
+allow-list, default-deny when declared, bare sandboxes allow-all; presets
+(open/balanced/closed) postponed (no credible "balanced" artifact yet).
+**Decided (2026-06-13):** credential injection is **not** here — moved to M5.
+**Exit:** the one-liner demo on both platforms (KVM + OpenVMM/WHP), automated.
+
+Full design: [specs/2026-06-14-m2-agent-firewall-merged-design.md](superpowers/specs/2026-06-14-m2-agent-firewall-merged-design.md).
+Building-block decisions (regorus, DNS-snoop, OpenShell salvage map):
+[egress-firewall-building-blocks.md](egress-firewall-building-blocks.md).
 
 ### M3 — Sized & stateful sandboxes: resources + volumes (M) — parallel
 
@@ -149,22 +161,30 @@ reaches `graphiti:8000` and *cannot* address neo4j; each member has its own
 scoped egress; full flow log. Consider cutting as 4a (project object +
 lifecycle) / 4b (mesh wiring) if it sprawls.
 
-### M5 — Credential vault: MITM everything, L7 policy (L)
+### M5 — Credential vault: per-role injection + identity (L)
 
-Design step 6, **scope widened (decided 2026-06-12): MITM everything** —
-izbad terminates TLS for all brokered :443/:80 flows (CA via
-`rustls` + `rcgen`, baked into guest trust stores at boot), no
-passthrough-encrypted-but-logged tier. That makes the policy plane **L7**:
-rules can judge on URL, method, and (where practical) body — not just
-domain:port. **Credential injection works for arbitrary endpoints**, not a
-known-SaaS shortlist: the manifest maps a member role + destination pattern
-to a secret + injection shape (header/bearer/etc.). Cert-pinning clients are
-**deliberately ignored** — they break under interception and that's the
-accepted, documented posture (an agent sandbox wants no uninspectable
-channels). **Exit:** agent calls `api.anthropic.com` with **no key anywhere
-in the guest**; graphiti uses its own scoped key the agent can never read; a
-URL/method-level rule demonstrably blocks one API route while allowing
-another on the same domain; keys independently revocable/meterable.
+**Restructured 2026-06-14:** the MITM datapath + L7 policy + CA-in-guest moved
+*down* to M2 (the leapfrog). M5 is now the credential vault **only**, hanging off
+the MITM branch M2 already built. Design step 6, narrowed. **Credential injection
+for arbitrary endpoints** (not a known-SaaS shortlist): the M4 manifest maps a
+member role + destination pattern to a secret + injection shape
+(header/bearer/etc.); izbad strips the caller's credential and injects the
+backend one at the MITM branch — *no key anywhere in the guest* (stronger than
+the env-placeholder model: the credential lives only in izbad's vault, keyed by
+`(role, host\tport\tpath)`). Depends on M4's manifest for the role→secret
+mapping. **Two areas to explore here (decided 2026-06-14):** a real **OCSF**
+audit-event schema for the credential/flow log (beyond M2's structured netlog),
+and **SPIFFE/SVID** identity for the per-role vault (the `TokenGrantResolver`
+trait seam M2 leaves in place). The injection *logic* is a clean pure-function
+reimplement from OpenShell's design (strip+inject, RFC-7230 validation, CWE-113
+guard, specificity scorer — no OCSF/SPIFFE drag); OCSF/SPIFFE are the
+deliberately-additive exploration. Cert-pinning clients knowingly broken (the
+posture is already set in M2). **Exit:** agent calls `api.anthropic.com` with no
+key in the guest; graphiti uses its own scoped key the agent can never read; a
+URL/method-level rule blocks one API route while allowing another on the same
+domain; keys independently revocable/meterable; credential decisions in the OCSF
+flow log. See [egress-firewall-building-blocks.md](egress-firewall-building-blocks.md)
+(salvage map: `secrets.rs`/`token_grant_injection.rs` assessment).
 
 ### Track T — Adoption & release engineering (continuous)
 
@@ -190,7 +210,7 @@ its milestone starts).
 | 1★ | OpenVMM vsock assert survives the graceful-shutdown fix | The whole roadmap blocked (M0 is untimeboxed, parity sacred) | **Plan B prepared up front:** patch the assert + self-build a pinned OpenVMM fork (same pinning shape as today's fetched binary); upstream issue filed in parallel |
 | 2 | izbad is a traffic SPOF — restart/upgrade severs *all* flows, not just port relays | UX regression vs v1 | **Decided:** accepted + documented honest behavior, no drain logic (apps retry). Throughput: **measure, don't gate** — baseline number in the integration suite |
 | 3 | DNS interception edge cases (resolver behaviors, search domains, TCP DNS) | M1 flakiness | Largely closed in M1 (loopback resolv.conf + raw-UDP forwarder; TCP :53 routes to the same resolver). **Concrete realized instance:** the `udp dport 53` REDIRECT *reply* path doesn't work (stub's wildcard-socket source mismatches; conntrack never un-NATs) — so hardcoded external UDP resolvers get no answer. Mitigation: resolv.conf points at loopback (exempt from REDIRECT, works); the gap is flagged as a docker-in-VM (M3/M4) prerequisite (`IP_ORIGDSTADDR` transparent-reply fix) |
-| 4 | MITM-everything breaks cert-pinning clients; h2/websocket/body inspection is real work | M5 is now the largest, riskiest milestone | **Decided:** pinning breakage is accepted posture, not a risk to mitigate. Residual risk is scope: stage L7 features (URL/method first, body inspection later) inside M5 |
+| 4 | MITM datapath risk: cert-pinning breakage, h2/websocket, the vsock↔tokio bridge, OpenVMM churn under the hop | MITM moved *up* to M2 (the leapfrog) — largest part of M2 | **Largely retired by the 2026-06-13 OpenShell-salvage spike** (compiles, 164/164 tests incl. e2e MITM, Windows cross-check green). Pinning breakage = accepted posture. h2 deferred (force http/1.1). Bridge = loopback-hop reusing the proven blocking pump, so the churn invariant is untouched (re-proven by a dedicated integration test). See [specs/2026-06-14-m2-agent-firewall-merged-design.md](superpowers/specs/2026-06-14-m2-agent-firewall-merged-design.md) |
 | 5★ | Disk-order contract change ripples (M3) across driver enum, OpenVMM PCIe routing, init mount plan | Subtle cross-platform boot breakage | **Contract-change spec written before any M3 code**; one-milestone "change all ends" rule; KVM + Windows gates green before M4 consumes volumes |
 | 6★ | izbad scope creep (router + DNS + policy + MITM + vault in one binary) | Maintainability | **Module seams defined in the M1 design doc** (separable planes, daemon proto as the seam) rather than refactored out later |
 
