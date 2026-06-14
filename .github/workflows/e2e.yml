@@ -325,7 +325,8 @@ jobs:
           IZBA_INTEGRATION=1 cargo test -p izba-core --test integration -- --test-threads=1
           IZBA_INTEGRATION=1 cargo test -p izba-cli --test daemon_e2e -- --test-threads=1
           set -e
-          IGNORE='(/tests/|/target/|/build\.rs$)'
+          # Separator-agnostic so the same pattern works on Windows backslash paths.
+          IGNORE='([\\/]tests[\\/]|[\\/]target[\\/]|[\\/]build\.rs$)'
           mkdir -p target/coverage
           cargo llvm-cov report --lcov --output-path target/coverage/lcov-e2e.info --ignore-filename-regex "$IGNORE"
           cargo llvm-cov report --json --output-path target/coverage/coverage-e2e.json --ignore-filename-regex "$IGNORE"
@@ -463,4 +464,125 @@ jobs:
             ~\AppData\Local\izba\sandboxes\*\logs\*
             ${{ runner.temp }}\tty-data\sandboxes\*\logs\*
             ${{ runner.temp }}\storm-data\sandboxes\*\logs\*
+          if-no-files-found: ignore
+
+  # Real-VM host-side coverage on Windows/WHP (Phase 2). Same posture as
+  # linux-kvm-coverage: SEPARATE from the windows-whp gate (instrumentation can
+  # never break it), gated to weekly cron + manual dispatch. It covers the real
+  # OpenVMM/WHP driver host paths (vmm/openvmm.rs + Windows-specific code) that
+  # neither the Linux fast suite nor the KVM e2e can reach. Reported as its OWN
+  # platform artifact (coverage-report-e2e-windows) — Windows lcov is NOT merged
+  # with the Linux reports: the code paths differ and the absolute/backslash
+  # paths would not align, so a cross-platform merge would corrupt the report.
+  #
+  # NOTE: unlike the KVM leg, this was NOT validated locally (Windows coverage
+  # needs WHP + OpenVMM); it mirrors the KVM-validated single-shell pattern
+  # (bash sources show-env, then invokes the pwsh validation suite as a child so
+  # the instrumented izba.exe it spawns inherits LLVM_PROFILE_FILE). It is
+  # report-only and isolated, so a first-run issue surfaces on the weekly run
+  # without affecting any gate.
+  windows-whp-coverage:
+    name: WHP e2e host-side coverage
+    needs: [kernel, initramfs, erofs-exe]
+    if: github.event_name != 'push'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      IZBA_KERNEL: ${{ github.workspace }}\dist\vmlinux
+      IZBA_INITRAMFS: ${{ github.workspace }}\dist\initramfs.cpio.gz
+      IZBA_OPENVMM: ${{ github.workspace }}\dist\openvmm.exe
+      IZBA_MKFS_EROFS: ${{ github.workspace }}\dist\mkfs.erofs.exe
+      # Instrumented binaries are slower; give boots more headroom than the gate.
+      IZBA_BOOT_TIMEOUT_SECS: '240'
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vmlinux
+          path: dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: initramfs
+          path: dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-mkfs-erofs-windows
+          path: dist/
+      - name: Restore pinned openvmm.exe
+        id: openvmm
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: dist/openvmm.exe
+          key: openvmm-run-27240809751
+      - name: Fetch pinned openvmm.exe (cache miss)
+        if: steps.openvmm.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: hack/fetch-openvmm.sh
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: e2e-windows-coverage
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        with:
+          tool: cargo-llvm-cov
+      - name: Measure Windows host-side coverage (host suite + WHP validation)
+        shell: bash
+        env:
+          # Windows-style path so the pwsh validation suite resolves it; the
+          # instrumented izba.exe it spawns inherits LLVM_PROFILE_FILE from this
+          # step's environment.
+          IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
+        run: |
+          # Single shell: the show-env instrumentation env persists across every
+          # cargo invocation AND is inherited by the pwsh child below.
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov clean --workspace
+          # Report-only: a failing suite must not abort the run and wipe the
+          # report. windows-whp remains the authoritative Windows gate.
+          set +e
+          cargo test -p izba-proto -p izba-core -p izba-cli
+          cargo build --release -p izba-cli
+          pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
+          set -e
+          # Separator-agnostic regex: llvm-cov emits backslash paths on Windows.
+          IGNORE='([\\/]tests[\\/]|[\\/]target[\\/]|[\\/]build\.rs$)'
+          mkdir -p target/coverage
+          cargo llvm-cov report --lcov --output-path target/coverage/lcov-e2e-windows.info --ignore-filename-regex "$IGNORE"
+          cargo llvm-cov report --json --output-path target/coverage/coverage-e2e-windows.json --ignore-filename-regex "$IGNORE"
+          cargo llvm-cov report --html --output-dir target/coverage/html-e2e-windows --ignore-filename-regex "$IGNORE"
+          # `python` is the reliable interpreter name on windows-latest; keep the
+          # gap report non-fatal so lcov/json/html still upload if it hiccups.
+          python hack/coverage_report.py target/coverage/coverage-e2e-windows.json \
+            --out target/coverage/coverage-gaps-e2e-windows.md \
+            --title "Coverage gap report (Windows WHP e2e)" || echo "gap report generation failed"
+      - name: Publish gap report to step summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f target/coverage/coverage-gaps-e2e-windows.md ]; then
+            cat target/coverage/coverage-gaps-e2e-windows.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Windows e2e coverage gap report not produced (coverage run failed)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload Windows e2e coverage artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report-e2e-windows
+          path: |
+            target/coverage/coverage-gaps-e2e-windows.md
+            target/coverage/lcov-e2e-windows.info
+            target/coverage/coverage-e2e-windows.json
+            target/coverage/html-e2e-windows
+          if-no-files-found: warn
+      - name: Upload sandbox logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-whp-coverage-failure-logs
+          path: |
+            ~\AppData\Local\izba\sandboxes\*\logs\*
+            ${{ runner.temp }}\**\sandboxes\*\logs\*
           if-no-files-found: ignore
