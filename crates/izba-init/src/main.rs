@@ -101,6 +101,19 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     mounts::apply(&rootfs_plan[2..]).context("rootfs mounts")?;
 
+    // User volumes (vdc, vdd, …): format-if-blank then mount under /rootfs,
+    // in the order the host declared them on the izba.volumes cmdline list.
+    let vols: Vec<&str> = params
+        .get("izba.volumes")
+        .map(|s| s.split(',').filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
+    for i in 0..vols.len() {
+        let dev = mounts::volume_device(i);
+        rwdisk::ensure_formatted(Path::new(&dev))
+            .with_context(|| format!("formatting volume {dev}"))?;
+    }
+    mounts::apply(&mounts::volume_mount_plan(&vols)).context("volume mounts")?;
+
     // Static guest networking: lo + dummy0 with the izba subnet. Log and
     // continue on error — exec/cp/vsock still work without IP networking.
     if let Err(e) = net::configure() {
