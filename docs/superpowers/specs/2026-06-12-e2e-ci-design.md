@@ -128,11 +128,21 @@ with `if: failure()` — CI-debugging without SSH.
 - Hosted-runner nested virt boots slowly (Windows kernel up at ~19-25 s vs
   ~4 s locally); the predicted boot-budget knob shipped as
   `IZBA_BOOT_TIMEOUT_SECS` (default 30 s unchanged; CI sets 120).
-- **Hosted Windows runners lose all ConPTY child output** in the service
-  session — even a trivial echo fixture renders an empty screen (run
-  27445265822). The windows-whp job runs a ConPTY canary and auto-skips
-  tty Tier-1/Tier-2 when it fails; tty coverage on Windows stays on the
-  manual spike-host route. Linux tty steps are unconditional.
+- **Hosted Windows runners lost all ConPTY child output** — even a trivial
+  echo fixture rendered an empty screen (run 27445265822). Root-caused
+  2026-06-14: it is the runner's *system conhost* dropping output, not the OS
+  version (the runner is build 26100 / Server 2025, session 2 / WinSta0 — same
+  conhost as a working desktop). Two layered bugs, both fixed: (1) sideload a
+  sha-pinned modern ConPTY backend (`hack/ci/stage-conpty.ps1`:
+  `Microsoft.Windows.Console.ConPTY` → `conpty.dll` + `OpenConsole.exe` next to
+  the test exe, which portable-pty's `load_conpty()` prefers over the host
+  conhost) → output flows; (2) `ttyfixture` now puts its stdin in raw console
+  mode on Windows (the old no-op left it line-buffered, so input never reached
+  the child) → input flows. The windows-whp canary still gates the tty tests,
+  but with the fix it passes and tty Tier-1/Tier-2 run for real.
+  `.github/workflows/conpty-diag.yml` is the standalone VM-free probe that
+  diagnosed this (baseline vs sideloaded; job status = verdict). Linux tty
+  steps remain unconditional.
 - The 21-check validation suite and the ttystorm M0 churn gate pass on
   hosted Windows runners — real OpenVMM/WHP VMs work in CI.
 
