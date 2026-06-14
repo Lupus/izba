@@ -7,7 +7,7 @@
 //! whatever is present, so tier-1 (HTTP, hard) and tier-2 (DNS-snoop, soft)
 //! share one engine.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One egress connection attempt, as seen at the policy check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
@@ -37,7 +37,7 @@ impl FlowDesc {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Verdict {
     Allow,

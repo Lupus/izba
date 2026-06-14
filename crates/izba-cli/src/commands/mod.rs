@@ -3,6 +3,7 @@ pub mod create;
 pub mod daemon;
 pub mod exec;
 pub mod ls;
+pub mod netlog;
 pub mod port;
 pub mod rm;
 pub mod run;

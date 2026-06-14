@@ -19,6 +19,9 @@ sha2 = "0.10"
 hex = "0.4"
 which = "7"
 futures-util = "0.3"
+# Human-readable timestamps for the egress audit view (`izba netlog`). Already
+# in the tree via oci-client; declared direct so audit.rs can format ts_ms.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # --- M2 TLS-MITM datapath (salvaged from NVIDIA/OpenShell, Apache-2.0) ---
 # rustls/tokio-rustls/rcgen pinned to the ring CryptoProvider: ring

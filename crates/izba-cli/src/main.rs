@@ -133,6 +133,14 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Show the egress audit log (every allowed/denied connection)
+    Netlog {
+        /// Sandbox name
+        name: String,
+        /// Keep printing new records as they arrive
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Manage published ports (host -> guest TCP)
     #[command(subcommand)]
     Port(PortCmd),
@@ -159,6 +167,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         Cmd::Ls => commands::ls::run(paths),
         Cmd::Stop { name } => commands::stop::run(paths, &name),
         Cmd::Rm { name, force } => commands::rm::run(paths, &name, force),
+        Cmd::Netlog { name, follow } => commands::netlog::run(paths, &name, follow),
         Cmd::Port(pc) => match pc {
             PortCmd::Publish { name, rule } => commands::port::publish(paths, &name, &rule),
             PortCmd::Unpublish { name, key } => commands::port::unpublish(paths, &name, &key),
@@ -235,6 +244,20 @@ mod tests {
 
         // cmd is mandatory
         assert!(Cli::try_parse_from(["izba", "exec", "web"]).is_err());
+    }
+
+    #[test]
+    fn parse_netlog_flags() {
+        let cli = Cli::try_parse_from(["izba", "netlog", "web", "--follow"]).unwrap();
+        let Cmd::Netlog { name, follow } = cli.cmd else {
+            panic!("expected netlog");
+        };
+        assert_eq!(name, "web");
+        assert!(follow);
+        // name is required; -f is the short form.
+        assert!(Cli::try_parse_from(["izba", "netlog"]).is_err());
+        let short = Cli::try_parse_from(["izba", "netlog", "web", "-f"]).unwrap();
+        assert!(matches!(short.cmd, Cmd::Netlog { follow: true, .. }));
     }
 
     #[test]

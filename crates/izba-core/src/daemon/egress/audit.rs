@@ -8,13 +8,13 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::policy::{FlowDesc, Verdict};
 use crate::paths::Paths;
 
 /// Which enforcement tier produced the decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     /// Tier-1: HTTP(S) terminated by the MITM, decided on the decrypted Host.
@@ -25,7 +25,7 @@ pub enum Tier {
 
 /// One audit line. Field order is the on-disk JSON order. `ts_ms` is 0 until
 /// the [`AuditSink`] stamps it at write time (keeps the value pure/testable).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub ts_ms: u64,
     pub sandbox: String,
@@ -126,6 +126,40 @@ impl AuditRecord {
     }
 }
 
+/// Parse one JSONL line into an [`AuditRecord`]; `None` on a malformed line
+/// (so `izba netlog` skips junk rather than aborting the tail).
+pub fn parse_line(line: &str) -> Option<AuditRecord> {
+    serde_json::from_str(line.trim()).ok()
+}
+
+/// Render one record as a human-readable `izba netlog` line:
+/// `<utc>  ALLOW/DENY l7  sandbox  host|ip:port  [METHOD path]  (rule)`.
+/// Pure: the timestamp comes from the record, so this is deterministic.
+pub fn format_record(rec: &AuditRecord) -> String {
+    let ts = chrono::DateTime::from_timestamp_millis(rec.ts_ms as i64)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| rec.ts_ms.to_string());
+    let verdict = match rec.verdict {
+        Verdict::Allow => "ALLOW",
+        Verdict::Deny => "DENY ",
+    };
+    let tier = match rec.tier {
+        Tier::L7 => "l7",
+        Tier::L3 => "l3",
+    };
+    let target = rec.host.clone().unwrap_or_else(|| rec.dest_ip.to_string());
+    let req = match (&rec.method, &rec.path) {
+        (Some(m), Some(p)) => format!("  {m} {p}"),
+        _ => String::new(),
+    };
+    format!(
+        "{ts}  {verdict} {tier}  {sandbox}  {target}:{port}{req}  ({rule})",
+        sandbox = rec.sandbox,
+        port = rec.port,
+        rule = rec.rule,
+    )
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -221,6 +255,61 @@ mod tests {
         let j: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
         assert_eq!(j["method"], "GET");
         assert_eq!(j["path"], "/v1/messages");
+    }
+
+    #[test]
+    fn parse_line_round_trips_a_record() {
+        let mut rec = AuditRecord::allow(
+            "web",
+            "1.2.3.4".parse().unwrap(),
+            443,
+            Some("api.anthropic.com"),
+            Tier::L7,
+            "allow-list",
+        )
+        .with_request("GET", "/v1/messages");
+        rec.ts_ms = 1_700_000_000_000;
+        let parsed = parse_line(&rec.to_json()).expect("valid line parses");
+        assert_eq!(parsed, rec);
+        assert!(parse_line("{not json").is_none(), "junk line is skipped");
+    }
+
+    #[test]
+    fn format_record_renders_allow_and_deny() {
+        let mut allow = AuditRecord::allow(
+            "web",
+            "1.2.3.4".parse().unwrap(),
+            443,
+            Some("api.anthropic.com"),
+            Tier::L7,
+            "allow-list",
+        )
+        .with_request("GET", "/v1/messages");
+        allow.ts_ms = 1_700_000_000_000; // fixed → deterministic
+        let line = format_record(&allow);
+        assert!(line.contains("ALLOW l7"), "{line}");
+        assert!(line.contains("api.anthropic.com:443"), "{line}");
+        assert!(line.contains("GET /v1/messages"), "{line}");
+        assert!(line.contains("(allow-list)"), "{line}");
+        assert!(line.contains("2023-11-14"), "renders a UTC date: {line}");
+
+        // Tier-2 deny with no host falls back to the dest IP, no method/path.
+        let mut deny = AuditRecord::deny(
+            "web",
+            "9.9.9.9".parse().unwrap(),
+            22,
+            None,
+            Tier::L3,
+            "denied",
+        );
+        deny.ts_ms = 1_700_000_000_000;
+        let dline = format_record(&deny);
+        assert!(dline.contains("DENY  l3"), "{dline}");
+        assert!(dline.contains("9.9.9.9:22"), "{dline}");
+        assert!(
+            !dline.contains("  GET"),
+            "no request line when absent: {dline}"
+        );
     }
 
     /// The sink appends one JSON line per record and stamps a non-zero time.
