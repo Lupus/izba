@@ -13,7 +13,9 @@
     "windows": [
       { "title": "izba", "width": 1100, "height": 720, "minWidth": 880, "minHeight": 560 }
     ],
-    "security": { "csp": null }
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+    }
   },
   "bundle": { "active": true, "targets": "all" }
 }
