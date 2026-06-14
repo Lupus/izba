@@ -852,16 +852,23 @@ fn egress_http_via_stub() {
     mgr.stop(&tb.paths, "egress-http");
 }
 
-/// M2 exit: the agent firewall MITMs guest HTTPS under a declared policy. A
-/// sandbox with `--policy` allowing `example.com` gets the izba CA baked in;
-/// the guest's HTTPS handshake to an allowed host completes ONLY because it
-/// trusts that CA, and the MITM — having decrypted the Host — records an L7
-/// ALLOW; a non-allowed host records an L7 DENY (the MITM's synthesized 403).
+/// M2 exit: the agent firewall MITMs guest HTTP(S) under a declared policy. A
+/// sandbox with `--policy` allowing `example.com` gets the izba CA baked in, and
+/// the MITM is exercised over BOTH tier-1 transports:
+///   * HTTPS (:443) — the guest's TLS handshake to an allowed host completes
+///     ONLY because it trusts the baked per-SNI leaf; the MITM decrypts the Host
+///     and records an L7 ALLOW (non-allowed host → L7 DENY via a synthesized
+///     403).
+///   * Plaintext HTTP (:80) — apt's default. The cleartext request line is NOT
+///     a TLS ClientHello, so this exercises the `mitm_terminate_http` path
+///     (sniff → read head → policy) that shipped broken when every tier-1 flow
+///     was force-handshaked as TLS.
 ///
 /// The host-side audit log is the robust, image-agnostic proof: an `l7` record
-/// appears only if the guest finished the TLS handshake against the per-SNI
-/// leaf (so it trusted the baked CA) AND the MITM read the decrypted Host. The
-/// guest's exit code is secondary (busybox TLS quirks vary by image).
+/// on :443 appears only if the guest trusted the baked CA AND the MITM read the
+/// decrypted Host; an `l7` record on :80 appears only if the cleartext MITM read
+/// the Host without a TLS handshake. Guest exit codes are secondary (busybox
+/// TLS quirks vary by image).
 #[test]
 fn mitm_firewall_allows_and_denies_real_vm() {
     use izba_core::daemon::egress::audit::AuditSink;
@@ -912,20 +919,35 @@ fn mitm_firewall_allows_and_denies_real_vm() {
         );
     }
 
-    // The guest must already trust the baked CA: a clean HTTPS handshake to the
-    // allowed host (validation ON — no --no-check-certificate) is what proves
-    // it. The denied host's handshake also completes (so the MITM can read the
-    // Host and answer 403). Exit codes are informational; the audit log is the
-    // assertion. Retry the allowed fetch — DNS + first egress dial can settle a
-    // beat after boot.
+    // Two datapaths, both routed through the MITM for an enforcing sandbox:
+    //
+    //   * HTTPS on :443 — a clean TLS handshake to the allowed host (validation
+    //     ON, no --no-check-certificate) proves the guest trusts the baked CA;
+    //     the denied host's handshake also completes so the MITM can read the
+    //     Host and answer 403.
+    //   * Plaintext HTTP on :80 — apt's default (archive.ubuntu.com). This path
+    //     shipped BROKEN: the MITM force-handshaked TLS on every tier-1 flow, so
+    //     cleartext failed before any Host was parsed and NOTHING was audited.
+    //     The :80 records below are the regression guard — they appear only if
+    //     `mitm_terminate_http` read the cleartext request head and ran policy.
+    //
+    // Exit codes are informational; the audit log is the assertion. Retry the
+    // allowed fetches — DNS + first egress dial can settle a beat after boot.
     let script = "\
         for i in 1 2 3 4 5; do \
           wget -qO- https://example.com/ >/dev/null 2>&1 && break; \
           curl -fsS https://example.com/ >/dev/null 2>&1 && break; \
           sleep 2; \
-        done; echo allowed-rc=$?; \
-        wget -qO- https://www.iana.org/ >/dev/null 2>&1; echo denied-wget-rc=$?; \
-        curl -fsS https://www.iana.org/ >/dev/null 2>&1; echo denied-curl-rc=$?";
+        done; echo allowed-https-rc=$?; \
+        wget -qO- https://www.iana.org/ >/dev/null 2>&1; echo denied-https-wget-rc=$?; \
+        curl -fsS https://www.iana.org/ >/dev/null 2>&1; echo denied-https-curl-rc=$?; \
+        for i in 1 2 3 4 5; do \
+          wget -qO- http://example.com/ >/dev/null 2>&1 && break; \
+          curl -fsS http://example.com/ >/dev/null 2>&1 && break; \
+          sleep 2; \
+        done; echo allowed-http-rc=$?; \
+        wget -qO- http://www.iana.org/ >/dev/null 2>&1; echo denied-http-wget-rc=$?; \
+        curl -fsS http://www.iana.org/ >/dev/null 2>&1; echo denied-http-curl-rc=$?";
     let (_status, stdout, stderr) = exec_collect(&tb.paths, "mitm", &["sh", "-lc", script], None)
         .unwrap_or_else(|(k, m)| panic!("exec rejected ({k:?}): {m}"));
     eprintln!("guest output:\n{stdout}\n{stderr}");
@@ -934,9 +956,10 @@ fn mitm_firewall_allows_and_denies_real_vm() {
     // time the guest commands return the lines are on disk. Read with a short
     // retry to absorb filesystem lag.
     let records = read_audit_with_retry(&tb.paths, "mitm");
-    let l7 = |verdict: &str, host: &str| {
+    let l7 = |verdict: &str, host: &str, port: u16| {
         records.iter().any(|r| {
             r.tier == izba_core::daemon::egress::audit::Tier::L7
+                && r.port == port
                 && format!("{:?}", r.verdict).to_lowercase().contains(verdict)
                 && r.host.as_deref() == Some(host)
         })
@@ -950,14 +973,28 @@ fn mitm_firewall_allows_and_denies_real_vm() {
             console_tail(&tb.paths, "mitm")
         )
     };
+    // HTTPS (:443) — TLS-terminated MITM path.
     assert!(
-        l7("allow", "example.com"),
-        "expected an L7 ALLOW for example.com (guest trusted the baked CA + MITM saw the Host).\n{}",
+        l7("allow", "example.com", 443),
+        "expected an L7 ALLOW for example.com:443 (guest trusted the baked CA + MITM saw the Host).\n{}",
         dump()
     );
     assert!(
-        l7("deny", "www.iana.org"),
-        "expected an L7 DENY for www.iana.org (MITM terminated + policy denied).\n{}",
+        l7("deny", "www.iana.org", 443),
+        "expected an L7 DENY for www.iana.org:443 (MITM terminated + policy denied).\n{}",
+        dump()
+    );
+    // Plaintext HTTP (:80) — the apt-over-http path that shipped broken. These
+    // records exist only if the cleartext MITM (`mitm_terminate_http`) read the
+    // Host and ran policy instead of force-handshaking TLS on the request line.
+    assert!(
+        l7("allow", "example.com", 80),
+        "expected an L7 ALLOW for example.com:80 (plaintext HTTP MITM read the Host + allowed).\n{}",
+        dump()
+    );
+    assert!(
+        l7("deny", "www.iana.org", 80),
+        "expected an L7 DENY for www.iana.org:80 (plaintext HTTP MITM terminated + policy denied).\n{}",
         dump()
     );
 
