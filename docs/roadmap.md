@@ -18,12 +18,19 @@ via Cloud Hypervisor and Windows/WHP via OpenVMM both pass their gates.
 guest-initiated vsock streams; the guest is a NIC-less vsock island and
 passt/consomme/`izba.ipv4only` are gone from the datapath. See M1 below.
 
+**The agent firewall (M2) has since shipped** (MITM L7 + allow-list +
+DNS-snoop + `izba netlog`): `crates/izba-core/src/daemon/egress/{mitm,
+mitm_runtime,dns_snoop,audit,policy}.rs` + `ca.rs` + guest `trust.rs` are
+in-tree. **Adoption infrastructure (Track T) also landed**: CI six gates +
+real-VM e2e, published artifacts, and `.deb`/Windows installers on `v*` tags.
+
 What does **not** exist yet:
 
-- The mesh/governance staging steps beyond egress — no manifest, no policy
-  engine, no credential vault (M2 onward).
-- **Adoption infrastructure**: no CI, no releases, no published kernel/initramfs
-  artifacts, no install story beyond building from source.
+- The mesh/governance staging steps beyond the firewall — no manifest, no
+  project object, no credential vault (M4/M5).
+- **Sized & stateful sandboxes (M3)** is the in-flight milestone: per-member
+  resources are already wired; user-declared **persistent volumes** are landing
+  now (see M3).
 
 The **OpenVMM vsock-assert crash** under stream churn (the declared hard gate
 for putting all traffic on vsock) is **fixed** as of 2026-06-12 — see M0 below.
@@ -105,7 +112,13 @@ doesn't work (transparent-UDP-proxy source-mismatch). `resolv.conf` points at
 loopback, which works. Flagged as a docker-in-VM (M3/M4) prerequisite — see
 risk #3 and Open decisions.
 
-### M2 — Agent firewall: merged MITM L7 + allow-list + audit (M)
+### M2 — Agent firewall: merged MITM L7 + allow-list + audit (M) — ✅ DONE
+
+Shipped: TLS-MITM datapath + two-tier policy plane (regorus L7 + DNS-snoop) +
+`izba netlog` audit + per-sandbox `--policy` + CA-in-guest, daemon-activated and
+failing **closed** for enforcing sandboxes. Code: `daemon/egress/{mitm,
+mitm_runtime,dns_snoop,audit,policy}.rs`, `ca.rs`, init `trust.rs`,
+`crates/izba-cli/src/commands/netlog.rs`. This was the first release-tag moment.
 
 **Restructured 2026-06-14 (the M5 leapfrog):** M2 absorbs M5's MITM datapath —
 the OpenShell-salvage spike proved it cheap (compiles, tests green, Windows
@@ -132,14 +145,21 @@ Full design: [specs/2026-06-14-m2-agent-firewall-merged-design.md](superpowers/s
 Building-block decisions (regorus, DNS-snoop, OpenShell salvage map):
 [egress-firewall-building-blocks.md](egress-firewall-building-blocks.md).
 
-### M3 — Sized & stateful sandboxes: resources + volumes (M) — parallel
+### M3 — Sized & stateful sandboxes: resources + volumes (M) — 🚧 IN FLIGHT
 
-Per-sandbox `resources` (cpus/memory) and **user-declared persistent block
-devices** (design §3.4). Independent of the mesh (can start alongside M1) and
-a hard prerequisite for M4's stateful members: a dockerd-in-VM needs a sized
-`/var/lib/docker`. Touches the load-bearing **Disk order** contract — change
-all ends (driver enumeration, OpenVMM per-disk PCIe routing, init mount plan)
-in one milestone with integration coverage before anything builds on it.
+Per-sandbox `resources` (cpus/memory) **already ship** (CLI → daemon → both
+drivers' memory/processor knobs). The in-flight slice is **user-declared
+persistent block devices** (design §3.4, spec
+[2026-06-15-izba-m3-volumes-design.md](superpowers/specs/2026-06-15-izba-m3-volumes-design.md)):
+two inline volume classes — ephemeral (anonymous, in the sandbox dir) and
+persistent (named, `<data>/volumes/<name>.img`, survive `rm`, single-writer) —
+each an extra virtio-blk disk appended after `rw.img` (vdc, vdd, …), formatted
+ext4 and mounted at a declared guest path. Independent of the mesh and a hard
+prerequisite for M4's stateful members: a dockerd-in-VM needs a sized
+`/var/lib/docker`. Touches the load-bearing **Disk order** contract — changed
+at all ends (host disk assembly, the `izba.volumes` cmdline channel, the guest
+mount plan; both drivers were already order-driven) in one milestone with
+integration coverage. `izba volume prune` reaps unreferenced persistent images.
 **Exit:** a sandbox with a sized docker-state volume runs a real in-guest
 compose stack; data survives stop/start; both platforms.
 
