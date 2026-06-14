@@ -553,11 +553,13 @@ mod tests {
         }
     }
 
-    /// connect_with against a real socket: no daemon → the spawner runs and the
-    /// fresh daemon is connected; a second connect to the same (same-proto)
-    /// daemon reuses it without respawning.
+    /// connect_with against a real socket with no daemon: the spawner runs once
+    /// and the fresh (same-proto) daemon is connected. (Reuse-without-respawn of
+    /// an already-serving same-proto daemon is covered by
+    /// `connect_with_keeps_daemon_on_build_only_diff`, which avoids the
+    /// drop/reconnect timing that is flaky against the test fake on Windows.)
     #[test]
-    fn connect_with_spawns_when_absent_then_reuses() {
+    fn connect_with_spawns_when_absent() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
@@ -576,22 +578,6 @@ mod tests {
         .unwrap();
         assert_eq!(spawned.load(Ordering::SeqCst), 1, "spawner ran");
         assert_eq!(client.server_proto, DAEMON_PROTO_VERSION);
-        drop(client);
-        // Same-proto daemon still serving: connect reuses it, no respawn.
-        let client = DaemonClient::connect_with(
-            &paths,
-            &|p: &crate::paths::Paths| {
-                spawned.fetch_add(1, Ordering::SeqCst);
-                serve_fake_daemon(p, "v1", DAEMON_PROTO_VERSION)
-            },
-            "v1",
-        )
-        .unwrap();
-        assert_eq!(
-            spawned.load(Ordering::SeqCst),
-            1,
-            "no respawn for same proto"
-        );
         assert_eq!(client.server_version, "v1");
     }
 
