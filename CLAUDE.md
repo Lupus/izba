@@ -45,8 +45,12 @@ Both KVM suites + the Windows WHP validation also run in CI:
 Coverage (report-only, not a gate): `hack/coverage.sh --html` runs the host
 suite under `cargo-llvm-cov` and writes `target/coverage/coverage-gaps.md` (a
 QA gap report ranked by uncovered-line impact) + lcov + html. Same run in CI
-via `.github/workflows/coverage.yml` (every PR + main push). Needs
-`cargo install cargo-llvm-cov` + `rustup component add llvm-tools-preview`.
+via `.github/workflows/coverage.yml` (every PR + main push). A separate
+real-VM coverage job (`linux-kvm-coverage` in `e2e.yml`, weekly cron + dispatch,
+isolated from the KVM gate) boots actual microVMs under instrumentation and
+emits a merged host+e2e report; `IZBA_INTEGRATION=1 hack/coverage.sh` does the
+same locally. Needs `cargo install cargo-llvm-cov` +
+`rustup component add llvm-tools-preview`.
 
 **Agent environment reality check (do NOT re-derive this wrong):** this WSL2
 instance has nested virtualization — `/dev/kvm` exists and works; it is merely
