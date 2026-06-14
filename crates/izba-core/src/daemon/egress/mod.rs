@@ -4,6 +4,7 @@
 
 pub mod audit;
 pub mod dns;
+pub mod dns_snoop;
 pub mod mitm;
 pub mod mitm_runtime;
 pub mod policy;

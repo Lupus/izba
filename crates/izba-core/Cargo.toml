@@ -45,6 +45,11 @@ socket2 = "0.5"
 # current 0.10 — bump when convenient (CI has network).
 regorus = { version = "0.4", default-features = false, features = ["std", "arc", "regex", "glob"] }
 
+# DNS-snoop (tier-2): parse A/AAAA + TTL out of the resolver's responses to
+# recover FQDNs for the non-HTTP egress allow-list. default-features=false keeps
+# it a pure wire parser (no tokio/runtime) and cross-compiles to windows-gnu.
+hickory-proto = { version = "0.24", default-features = false }
+
 [dev-dependencies]
 # in-memory duplex test driver for the MITM datapath needs a real runtime
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "time"] }
