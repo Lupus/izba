@@ -6,6 +6,7 @@
 //! [`TerminalSession::wait_stable`] polls until the grid quiesces.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,11 +18,22 @@ pub struct ExitOutcome {
     pub code: Option<i32>,
 }
 
+/// Reader-thread telemetry, for ConPTY diagnostics. A master that yields
+/// `bytes=0 eof=true` shortly after spawn is the signature of the hosted-runner
+/// ConPTY-output-loss failure (child runs but nothing reaches the parent).
+#[derive(Default)]
+struct ReaderStats {
+    bytes: AtomicU64,
+    reads: AtomicU64,
+    eof: AtomicBool,
+}
+
 pub struct TerminalSession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     child: Box<dyn Child + Send + Sync>,
+    stats: Arc<ReaderStats>,
     _reader: std::thread::JoinHandle<()>,
 }
 
@@ -50,12 +62,21 @@ impl TerminalSession {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
 
         let sink = Arc::clone(&parser);
+        let stats = Arc::new(ReaderStats::default());
+        let stats_w = Arc::clone(&stats);
         let reader_thread = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => sink.lock().unwrap().process(&buf[..n]),
+                    Ok(0) | Err(_) => {
+                        stats_w.eof.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    Ok(n) => {
+                        stats_w.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        stats_w.reads.fetch_add(1, Ordering::Relaxed);
+                        sink.lock().unwrap().process(&buf[..n]);
+                    }
                 }
             }
         });
@@ -65,8 +86,21 @@ impl TerminalSession {
             writer,
             parser,
             child,
+            stats,
             _reader: reader_thread,
         })
+    }
+
+    /// Reader-thread telemetry for ConPTY diagnostics: bytes/reads observed on
+    /// the master and whether EOF/err was hit. `bytes=0 eof=true` is the
+    /// hosted-runner output-loss signature.
+    pub fn read_report(&self) -> String {
+        format!(
+            "reader bytes={} reads={} eof={}",
+            self.stats.bytes.load(Ordering::Relaxed),
+            self.stats.reads.load(Ordering::Relaxed),
+            self.stats.eof.load(Ordering::Relaxed),
+        )
     }
 
     pub fn send_bytes(&mut self, bytes: &[u8]) -> Result<()> {
@@ -130,7 +164,8 @@ impl TerminalSession {
             std::thread::sleep(Duration::from_millis(20));
         }
         bail!(
-            "timed out after {timeout:?} waiting for {needle:?}; screen was:\n{}",
+            "timed out after {timeout:?} waiting for {needle:?}; {}; screen was:\n{}",
+            self.read_report(),
             self.screen_text()
         );
     }

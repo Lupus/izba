@@ -1,0 +1,61 @@
+name: ConPTY diagnosis
+
+# Standalone, VM-free probe of the hosted-Windows ConPTY-output-loss failure
+# that forces the tty Tier-1/Tier-2 tests to auto-skip in e2e.yml. Runs the
+# REAL portable-pty path (the code that actually fails), captures structured
+# evidence, then tests the candidate fix (sideloading a modern ConPTY backend).
+# Fast loop: no kernel/initramfs/VM artifacts. Job status = fix verdict.
+on:
+  workflow_dispatch:
+  push:
+    branches: ['fix/windows-conpty-ci']
+
+permissions:
+  contents: read
+
+jobs:
+  conpty-diag:
+    name: ConPTY diagnosis (no VM)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: conpty-diag
+
+      - name: Environment diagnostics
+        run: pwsh -NoProfile -File hack/ci/conpty-diag.ps1
+
+      - name: Build ttytest harness (debug)
+        shell: bash
+        run: cargo test -p izba-ttytest --test harness_smoke --no-run
+
+      # --- Baseline: system conhost (no sideloaded ConPTY) ---
+      - name: Baseline diagnostic dump (system conhost)
+        shell: bash
+        continue-on-error: true
+        run: cargo test -p izba-ttytest --test harness_smoke conpty_diagnostic_dump -- --nocapture
+      - name: Baseline canary (system conhost)
+        shell: bash
+        run: |
+          if cargo test -p izba-ttytest --test harness_smoke fixture_banner_echo_and_exit -- --nocapture; then
+            echo "::notice title=baseline::system conhost ConPTY WORKS on this runner"
+          else
+            echo "::notice title=baseline::system conhost ConPTY LOSES output (expected on hosted runners)"
+          fi
+
+      # --- Candidate fix: sideload a modern, pinned ConPTY backend ---
+      - name: Stage bundled ConPTY redist
+        run: pwsh -NoProfile -File hack/ci/stage-conpty.ps1 -TargetDir target/debug/deps
+      - name: Bundled diagnostic dump (sideloaded ConPTY)
+        shell: bash
+        continue-on-error: true
+        run: cargo test -p izba-ttytest --test harness_smoke conpty_diagnostic_dump -- --nocapture
+
+      # Job status hinges on this step: green => sideloading fixes it (H1,
+      # stale system conhost); red => output still lost (H2, non-interactive
+      # session) and representative CI needs an interactive/self-hosted runner.
+      - name: FIX VERDICT — canary with sideloaded ConPTY
+        shell: bash
+        run: cargo test -p izba-ttytest --test harness_smoke fixture_banner_echo_and_exit -- --nocapture

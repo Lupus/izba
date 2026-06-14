@@ -16,11 +16,18 @@ design behind what these tests assert is in
 `.github/workflows/e2e.yml` (KVM on ubuntu-latest, OpenVMM/WHP on
 windows-latest) on every push to main, weekly, and on manual dispatch — see
 `docs/superpowers/specs/2026-06-12-e2e-ci-design.md`. This runbook remains
-the local-development path. One known hosted-runner gap: ConPTY child output
-does not flow in the Windows runner's service session, so the tty Tier-1/
-Tier-2 tests are auto-skipped there behind a ConPTY canary (a trivial
-echo-through-ConPTY smoke test); they run for real on Linux CI and on the
-manual spike-host route (§8).
+the local-development path. Historic hosted-runner gap: ConPTY child output
+did not flow in the Windows runner's session, so the tty Tier-1/Tier-2 tests
+auto-skipped there behind a ConPTY canary (a trivial echo-through-ConPTY smoke
+test). The windows-whp job now sideloads a modern, sha-pinned ConPTY backend
+(`hack/ci/stage-conpty.ps1` drops `conpty.dll` + `OpenConsole.exe` next to the
+test exe, which portable-pty's `load_conpty()` prefers over the host's stale
+system conhost); if the canary then passes, the tty tests run for real. The
+canary still gates them, so a runner that still loses output skips rather than
+fails. `.github/workflows/conpty-diag.yml` is a standalone, VM-free probe that
+captures `CONPTY-ENV`/`CONPTY-DIAG` evidence and reports the fix verdict.
+Linux tty steps stay unconditional; the manual spike-host route (§8) is
+unaffected.
 
 ---
 

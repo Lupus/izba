@@ -292,11 +292,18 @@ jobs:
         run: pwsh -NoProfile -File hack/ci/ttystorm-gate.ps1
       # ConPTY canary: spawn a trivial child through ConPTY and require its
       # output to reach the parser (izba-ttytest's own smoke test — no izba,
-      # no sockets, no VM). GitHub-hosted Windows runners currently lose ALL
-      # ConPTY child output in the service session (verified 2026-06-12, run
-      # 27445265822), so when the canary fails the tty tests below skip as an
-      # environment limitation instead of failing the leg. They stay
-      # mandatory on Linux and on the manual spike-host route (testing.md §8).
+      # no sockets, no VM). GitHub-hosted Windows runners historically lost ALL
+      # ConPTY child output (verified 2026-06-12, run 27445265822), forcing the
+      # tty tests to auto-skip. We now sideload a modern, pinned ConPTY backend
+      # (conpty.dll + OpenConsole.exe) so portable-pty bypasses the host's
+      # stale system conhost; if the canary then passes, the tty tests run for
+      # real. If it still fails, the tests skip as before (no regression).
+      # See .github/workflows/conpty-diag.yml for the standalone diagnosis.
+      - name: ConPTY environment diagnostics
+        continue-on-error: true
+        run: pwsh -NoProfile -File hack/ci/conpty-diag.ps1
+      - name: Stage bundled ConPTY redist (sideload over system conhost)
+        run: pwsh -NoProfile -File hack/ci/stage-conpty.ps1 -TargetDir target/debug/deps
       - name: tty harness ConPTY canary
         id: conpty
         shell: bash
@@ -305,7 +312,7 @@ jobs:
             echo "works=true" >> "$GITHUB_OUTPUT"
           else
             echo "works=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=tty tests skipped::ConPTY child output does not flow in this hosted-runner session; tty Tier-1/Tier-2 skipped (environment limitation, see docs/testing.md)"
+            echo "::notice title=tty tests skipped::ConPTY child output still does not flow even with a sideloaded backend; tty Tier-1/Tier-2 skipped (see docs/testing.md and conpty-diag.yml)"
           fi
       - name: tty Tier-1 scripted (no VM)
         if: steps.conpty.outputs.works == 'true'
