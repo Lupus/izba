@@ -15,3 +15,24 @@ export interface DaemonStatusView {
   uptime_ms: number;
   sandbox_count: number;
 }
+
+/** Build metadata for one component (mirrors izba_core::build_info::BuildInfoOwned). */
+export interface BuildInfo {
+  pkg_version: string;
+  git_describe: string;
+  git_sha: string;
+  commit_date: string;
+  build_timestamp: string;
+  rustc: string;
+  target: string;
+  profile: string;
+}
+
+/** App / core / daemon builds + a mismatch flag, for the About panel. */
+export interface VersionView {
+  app: BuildInfo;
+  core: BuildInfo;
+  daemon: BuildInfo | null;
+  proto: number;
+  mismatch: boolean;
+}

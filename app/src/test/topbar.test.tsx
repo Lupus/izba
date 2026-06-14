@@ -7,14 +7,15 @@ const daemon: DaemonStatusView = { version: "0.3.1", pid: 1, uptime_ms: 1, sandb
 
 describe("TopBar", () => {
   it("shows the daemon version when running", () => {
-    render(<TopBar daemon={daemon} error={null} />);
+    render(<TopBar daemon={daemon} error={null} onAbout={() => {}} />);
     expect(screen.getByText(/daemon running/i)).toBeInTheDocument();
     expect(screen.getByText(/v0\.3\.1/)).toBeInTheDocument();
   });
 
   it("shows an unreachable state when there is an error", () => {
-    render(<TopBar daemon={null} error="daemon unreachable" />);
+    render(<TopBar daemon={null} error="daemon unreachable" onAbout={() => {}} />);
     expect(screen.getByText(/daemon unreachable/i)).toBeInTheDocument();
     expect(screen.queryByText(/daemon running/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/about/i)).toBeInTheDocument();
   });
 });

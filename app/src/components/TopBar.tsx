@@ -1,6 +1,14 @@
 import type { DaemonStatusView } from "../lib/types";
 
-export function TopBar({ daemon, error }: { daemon: DaemonStatusView | null; error: string | null }) {
+export function TopBar({
+  daemon,
+  error,
+  onAbout,
+}: {
+  daemon: DaemonStatusView | null;
+  error: string | null;
+  onAbout: () => void;
+}) {
   return (
     <header className="flex items-center justify-between px-4 py-2.5 border-b border-line bg-surface">
       <div className="flex items-center gap-2 font-semibold">
@@ -9,18 +17,21 @@ export function TopBar({ daemon, error }: { daemon: DaemonStatusView | null; err
         </span>
         izba
       </div>
-      <div className="text-[13px] text-ink-2 flex items-center gap-2">
+      <div className="text-[13px] text-ink-2 flex items-center gap-3">
         {error ? (
-          <>
+          <span className="flex items-center gap-2">
             <span className="inline-block w-2 h-2 rounded-full bg-warn" aria-hidden="true" />
             <span className="text-warn">daemon unreachable</span>
-          </>
+          </span>
         ) : (
-          <>
+          <span className="flex items-center gap-2">
             <span className="inline-block w-2 h-2 rounded-full bg-ok" />
             daemon running{daemon ? ` · v${daemon.version}` : ""}
-          </>
+          </span>
         )}
+        <button className="text-ink-2 hover:text-ink-1" onClick={onAbout}>
+          About
+        </button>
       </div>
     </header>
   );
