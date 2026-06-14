@@ -28,7 +28,10 @@ mod tests {
 
     #[test]
     fn list_core_maps_error_to_string() {
-        let mut d = FakeDaemon { fail_list: true, ..Default::default() };
+        let mut d = FakeDaemon {
+            fail_list: true,
+            ..Default::default()
+        };
         let err = list_core(&mut d).unwrap_err();
         assert!(err.contains("daemon unreachable"), "got: {err}");
     }
@@ -39,5 +42,15 @@ mod tests {
         let s = status_core(&mut d).unwrap();
         assert_eq!(s.pid, 4242);
         assert_eq!(s.sandbox_count, 2);
+    }
+
+    #[test]
+    fn status_core_maps_error_to_string() {
+        let mut d = FakeDaemon {
+            fail_status: true,
+            ..Default::default()
+        };
+        let err = status_core(&mut d).unwrap_err();
+        assert!(err.contains("daemon unreachable"), "got: {err}");
     }
 }

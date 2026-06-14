@@ -1,8 +1,8 @@
 mod commands;
 mod daemon;
-mod views;
 #[cfg(test)]
 mod fake;
+mod views;
 
 use std::sync::Mutex;
 
@@ -16,18 +16,26 @@ pub struct AppState {
 
 #[tauri::command]
 async fn list(state: tauri::State<'_, AppState>) -> Result<Vec<SandboxView>, String> {
-    let mut guard = state.daemon.lock().map_err(|_| "state poisoned".to_string())?;
+    let mut guard = state
+        .daemon
+        .lock()
+        .map_err(|e| format!("state poisoned: {e}"))?;
     commands::list_core(guard.as_mut())
 }
 
 #[tauri::command]
 async fn daemon_status(state: tauri::State<'_, AppState>) -> Result<DaemonStatusView, String> {
-    let mut guard = state.daemon.lock().map_err(|_| "state poisoned".to_string())?;
+    let mut guard = state
+        .daemon
+        .lock()
+        .map_err(|e| format!("state poisoned: {e}"))?;
     commands::status_core(guard.as_mut())
 }
 
 pub fn run() {
-    let state = AppState { daemon: Mutex::new(Box::new(RealDaemon::new())) };
+    let state = AppState {
+        daemon: Mutex::new(Box::new(RealDaemon::new())),
+    };
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![list, daemon_status])
