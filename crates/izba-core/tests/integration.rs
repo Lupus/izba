@@ -852,6 +852,139 @@ fn egress_http_via_stub() {
     mgr.stop(&tb.paths, "egress-http");
 }
 
+/// M2 exit: the agent firewall MITMs guest HTTPS under a declared policy. A
+/// sandbox with `--policy` allowing `example.com` gets the izba CA baked in;
+/// the guest's HTTPS handshake to an allowed host completes ONLY because it
+/// trusts that CA, and the MITM — having decrypted the Host — records an L7
+/// ALLOW; a non-allowed host records an L7 DENY (the MITM's synthesized 403).
+///
+/// The host-side audit log is the robust, image-agnostic proof: an `l7` record
+/// appears only if the guest finished the TLS handshake against the per-SNI
+/// leaf (so it trusted the baked CA) AND the MITM read the decrypted Host. The
+/// guest's exit code is secondary (busybox TLS quirks vary by image).
+#[test]
+fn mitm_firewall_allows_and_denies_real_vm() {
+    use izba_core::daemon::egress::audit::AuditSink;
+    use izba_core::daemon::egress::config::EgressPolicyConfig;
+    use izba_core::daemon::egress::mitm::{upstream_client_config_webpki, CertCache};
+    use izba_core::daemon::egress::mitm_runtime::MitmRuntime;
+    use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
+
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("mitm");
+    create_sandbox(&env, &mut tb, "mitm", &ws);
+
+    // Declare the per-sandbox egress policy (allow example.com only). Persisting
+    // it makes `resolve_policy` arm an enforcing RegoPolicy at listen time, so
+    // tier-1 HTTPS is routed through the MITM.
+    std::fs::write(
+        EgressPolicyConfig::path_in(&tb.paths.sandbox_dir("mitm")),
+        "allow:\n  - example.com\n",
+    )
+    .expect("write policy.yaml");
+
+    // Build the shared MITM runtime from the SAME persistent CA that
+    // sandbox::start bakes into the guest (both read tb.paths.ca_dir()).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca = izba_core::ca::load_or_create(&tb.paths.ca_dir()).expect("izba CA");
+    let certs = std::sync::Arc::new(CertCache::new(ca));
+    let audit = AuditSink::new(tb.paths.clone());
+    let mitm = std::sync::Arc::new(
+        MitmRuntime::start(certs, upstream_client_config_webpki(), audit.clone())
+            .expect("start MITM runtime"),
+    );
+
+    let mgr = EgressManager::new(
+        std::sync::Arc::new(AllowAll),
+        std::sync::Arc::new(UdpForwarder::system()),
+        Some(mitm),
+        audit,
+    );
+    mgr.ensure_listening(&tb.paths, "mitm")
+        .expect("bind vsock_1027 listener");
+
+    if let Err(e) = start_sandbox(&env, &tb, "mitm") {
+        mgr.stop(&tb.paths, "mitm");
+        panic!(
+            "boot of 'mitm' failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, "mitm")
+        );
+    }
+
+    // The guest must already trust the baked CA: a clean HTTPS handshake to the
+    // allowed host (validation ON — no --no-check-certificate) is what proves
+    // it. The denied host's handshake also completes (so the MITM can read the
+    // Host and answer 403). Exit codes are informational; the audit log is the
+    // assertion. Retry the allowed fetch — DNS + first egress dial can settle a
+    // beat after boot.
+    let script = "\
+        for i in 1 2 3 4 5; do \
+          wget -qO- https://example.com/ >/dev/null 2>&1 && break; \
+          curl -fsS https://example.com/ >/dev/null 2>&1 && break; \
+          sleep 2; \
+        done; echo allowed-rc=$?; \
+        wget -qO- https://www.iana.org/ >/dev/null 2>&1; echo denied-wget-rc=$?; \
+        curl -fsS https://www.iana.org/ >/dev/null 2>&1; echo denied-curl-rc=$?";
+    let (_status, stdout, stderr) = exec_collect(&tb.paths, "mitm", &["sh", "-lc", script], None)
+        .unwrap_or_else(|(k, m)| panic!("exec rejected ({k:?}): {m}"));
+    eprintln!("guest output:\n{stdout}\n{stderr}");
+
+    // The MITM records each decision synchronously before replying, so by the
+    // time the guest commands return the lines are on disk. Read with a short
+    // retry to absorb filesystem lag.
+    let records = read_audit_with_retry(&tb.paths, "mitm");
+    let l7 = |verdict: &str, host: &str| {
+        records.iter().any(|r| {
+            r.tier == izba_core::daemon::egress::audit::Tier::L7
+                && format!("{:?}", r.verdict).to_lowercase().contains(verdict)
+                && r.host.as_deref() == Some(host)
+        })
+    };
+
+    let dump = || {
+        let lines: Vec<String> = records.iter().map(|r| r.to_json()).collect();
+        format!(
+            "audit records:\n{}\nconsole tail:\n{}",
+            lines.join("\n"),
+            console_tail(&tb.paths, "mitm")
+        )
+    };
+    assert!(
+        l7("allow", "example.com"),
+        "expected an L7 ALLOW for example.com (guest trusted the baked CA + MITM saw the Host).\n{}",
+        dump()
+    );
+    assert!(
+        l7("deny", "www.iana.org"),
+        "expected an L7 DENY for www.iana.org (MITM terminated + policy denied).\n{}",
+        dump()
+    );
+
+    stop_sandbox(&tb, "mitm");
+    mgr.stop(&tb.paths, "mitm");
+}
+
+/// Read + parse the per-sandbox egress audit log, retrying briefly so a record
+/// the MITM just wrote is observed.
+fn read_audit_with_retry(
+    paths: &Paths,
+    name: &str,
+) -> Vec<izba_core::daemon::egress::audit::AuditRecord> {
+    use izba_core::daemon::egress::audit::parse_line;
+    let path = paths.logs_dir(name).join("egress-audit.jsonl");
+    for _ in 0..10 {
+        if let Ok(body) = fs::read_to_string(&path) {
+            let recs: Vec<_> = body.lines().filter_map(parse_line).collect();
+            if !recs.is_empty() {
+                return recs;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Vec::new()
+}
+
 /// M1 throughput baseline: bulk transfer through the egress stub.
 /// MEASURED, NOT GATED (roadmap decision) — the number is printed for
 /// trend-watching; the only assertion is that the transfer completes.
