@@ -56,7 +56,11 @@ jobs:
   izba-linux-bin:
     name: izba (linux release binary)
     needs: gate
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 (glibc 2.35) so the shipped binary — and thus the .deb —
+    # runs on Ubuntu 22.04 AND 24.04 (glibc is backward-compatible). Building on
+    # 24.04 would hard-require glibc 2.39 at runtime, which `Depends: libc6`
+    # cannot pre-catch.
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
