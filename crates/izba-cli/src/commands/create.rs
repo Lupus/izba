@@ -9,6 +9,7 @@ pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32>
     let workspace = super::ensure_workspace(dir)?;
     let name = super::name_for(opts, &workspace)?;
     let ports = super::parse_publish(&opts.publish)?;
+    let volumes = super::parse_volumes(&opts.volumes)?;
     let mut client = DaemonClient::connect(paths)?;
     let req = DaemonRequest::Create(DaemonCreate {
         name,
@@ -18,6 +19,7 @@ pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32>
         workspace,
         rw_size_gb: opts.rw_size_gb,
         ports,
+        volumes,
     });
     match client.request(&req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Created { name } => {

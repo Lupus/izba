@@ -50,6 +50,10 @@ struct SandboxOpts {
     /// Publish a host port to the guest: [BIND:]HOST:GUEST (repeatable)
     #[arg(short = 'p', long = "publish", value_name = "[BIND:]HOST:GUEST")]
     publish: Vec<String>,
+    /// Attach a volume: [NAME:]GUEST_PATH:SIZE (named => persistent under
+    /// <data>/volumes and survives rm; anonymous => ephemeral). Repeatable.
+    #[arg(long = "volume", value_name = "[NAME:]GUEST_PATH:SIZE")]
+    volumes: Vec<String>,
     /// Egress policy YAML: a domain allow-list this sandbox may reach. Without
     /// it the sandbox is unrestricted (no firewall).
     #[arg(long, value_name = "FILE")]
@@ -157,6 +161,9 @@ enum Cmd {
     /// Manage published ports (host -> guest TCP)
     #[command(subcommand)]
     Port(PortCmd),
+    /// Manage persistent volumes
+    #[command(subcommand)]
+    Volume(commands::volume::VolumeCmd),
     /// Manage the izba daemon (auto-started by other commands)
     #[command(subcommand)]
     Daemon(DaemonCmd),
@@ -192,6 +199,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             PortCmd::Unpublish { name, key } => commands::port::unpublish(paths, &name, &key),
             PortCmd::Ls { name } => commands::port::ls(paths, &name),
         },
+        Cmd::Volume(vc) => commands::volume::run(paths, &vc),
         Cmd::Version { json } => commands::version::run(paths, json),
         Cmd::Daemon(dc) => match dc {
             DaemonCmd::Run => commands::daemon::run_foreground(paths),

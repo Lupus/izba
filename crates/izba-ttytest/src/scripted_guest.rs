@@ -97,6 +97,7 @@ impl ScriptedGuest {
                 mem_mb: 128,
                 workspace: data_root.clone(),
                 ports: Vec::new(),
+                volumes: Vec::new(),
             },
         )
         .context("write config.json")?;
