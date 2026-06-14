@@ -247,3 +247,99 @@ fn daemon_full_lifecycle() {
     assert_ok(&izba(&data, no_env, &["rm", "--force", "e2e"]), "rm");
     let _ = izba(&data, no_env, &["daemon", "stop"]);
 }
+
+/// CLI-surface lifecycle: drives the thin verbs `daemon_full_lifecycle` does
+/// NOT reach end-to-end against a real daemon + microVM — `create` (vs `run`),
+/// `netlog`, `port ls`/`unpublish`, `stop`, and non-force `rm`. These verbs read
+/// 0% in the merged coverage report precisely because the monolithic lifecycle
+/// test uses `run` (never standalone `create`) and aborts at its upgrade-dance
+/// phase before reaching its own `stop`/`rm` steps. A standalone test is also
+/// more robust: one verb's regression can't mask the rest.
+#[test]
+fn cli_surface_lifecycle() {
+    if !want() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+
+    // [1] `create` (not `run`): provisions a STOPPED sandbox and prints its name
+    // (create does not boot the VM — only `run`/Start does).
+    let o = izba(
+        &data,
+        no_env,
+        &["create", "--image", IMAGE, "--name", "cli", &ws_s],
+    );
+    assert_ok(&o, "create");
+    assert!(stdout_of(&o).contains("cli"), "create prints the name");
+    assert!(
+        data.join("daemon/izbad.sock").exists(),
+        "create auto-started the daemon"
+    );
+
+    // [2] `ls` lists it as stopped.
+    let o = izba(&data, no_env, &["ls"]);
+    assert_ok(&o, "ls after create");
+    let ls = stdout_of(&o);
+    assert!(ls.contains("cli"), "ls lists the sandbox: {ls}");
+    assert!(ls.contains("stopped"), "created-not-run is stopped: {ls}");
+
+    // [3] `netlog` on a never-run sandbox: no egress recorded yet, clean exit 0.
+    assert_ok(&izba(&data, no_env, &["netlog", "cli"]), "netlog (empty)");
+    // [3b] `netlog` on a missing sandbox is an honest error (nonzero exit).
+    let o = izba(&data, no_env, &["netlog", "no-such-sandbox"]);
+    assert!(!o.status.success(), "netlog on missing sandbox must error");
+
+    // [4] `run` an EXISTING sandbox by name: starts it (no re-create) + execs.
+    assert_ok(
+        &izba(&data, no_env, &["run", "cli", "--", "/bin/true"]),
+        "run existing sandbox",
+    );
+    let o = izba(&data, no_env, &["ls"]);
+    assert!(
+        stdout_of(&o).contains("running"),
+        "sandbox running after run: {}",
+        stdout_of(&o)
+    );
+
+    // [5] `port` verbs the lifecycle monolith never reaches: publish/ls/unpublish.
+    assert_ok(
+        &izba(&data, no_env, &["port", "publish", "cli", "18093:8000"]),
+        "port publish",
+    );
+    let o = izba(&data, no_env, &["port", "ls", "cli"]);
+    assert_ok(&o, "port ls");
+    let pls = stdout_of(&o);
+    assert!(
+        pls.contains("18093") && pls.contains("8000"),
+        "port ls shows the rule: {pls}"
+    );
+    assert_ok(
+        &izba(&data, no_env, &["port", "unpublish", "cli", "18093"]),
+        "port unpublish",
+    );
+    assert!(
+        !stdout_of(&izba(&data, no_env, &["port", "ls", "cli"])).contains("18093"),
+        "rule is gone after unpublish"
+    );
+
+    // [6] `stop` the running sandbox; `ls` reflects stopped.
+    assert_ok(&izba(&data, no_env, &["stop", "cli"]), "stop");
+    assert!(
+        stdout_of(&izba(&data, no_env, &["ls"])).contains("stopped"),
+        "stopped after stop"
+    );
+
+    // [7] non-force `rm` on a stopped sandbox removes it; `ls` no longer lists it.
+    assert_ok(&izba(&data, no_env, &["rm", "cli"]), "rm (non-force)");
+    assert!(
+        !stdout_of(&izba(&data, no_env, &["ls"])).contains("cli"),
+        "removed sandbox is gone"
+    );
+
+    let _ = izba(&data, no_env, &["daemon", "stop"]);
+}
