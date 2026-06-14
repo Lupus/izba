@@ -264,3 +264,43 @@ cargo build --release --target x86_64-pc-windows-gnu -p izba-cli
 The Windows binary discovers its tools via `$IZBA_MKFS_EROFS` /
 `$IZBA_OPENVMM`, an exe-adjacent `libexec\` directory, then `PATH` — see
 [the Windows-port design](../docs/superpowers/specs/2026-06-10-izba-windows-port-design.md).
+
+---
+
+## Packaging (release installers)
+
+The `packaging/` directory holds the recipes for the self-contained installers
+that `.github/workflows/release.yml` builds on a `v*` git tag (and on manual
+`workflow_dispatch` for test builds).
+
+### `packaging/build-deb.sh`
+
+Assembles the Linux `.deb`. It stages a self-contained tree and runs
+`dpkg-deb`. Inputs are passed as absolute-path env vars:
+
+| Var | What |
+| --- | --- |
+| `IZBA_BIN` | the `izba` CLI binary (linux glibc release) |
+| `IZBA_CH` | static `cloud-hypervisor` |
+| `IZBA_VIRTIOFSD` | static `virtiofsd` |
+| `IZBA_VMLINUX` | kernel image |
+| `IZBA_INITRAMFS` | `initramfs.cpio.gz` |
+| `VERSION` | deb version (e.g. `0.1.0` or `0.1.0~git<sha>`) |
+| `OUT_DIR` | output dir (default `dist/`) |
+
+Installed layout: `/usr/lib/izba/bin/izba`,
+`/usr/lib/izba/bin/libexec/{cloud-hypervisor,virtiofsd}`,
+`/usr/lib/izba/artifacts/{vmlinux,initramfs.cpio.gz}`, and a
+`/usr/bin/izba` symlink. `mkfs.erofs` is an apt dependency (`erofs-utils`).
+
+### `packaging/windows/izba.iss`
+
+The Inno Setup script for the Windows installer. Build it with:
+
+```sh
+iscc /DMyAppVersion=<ver> /DStageDir=<abs stage dir> /O<abs out dir> packaging/windows/izba.iss
+```
+
+It expects the stage dir to contain `bin/izba.exe`, `bin/libexec/{openvmm.exe,
+mkfs.erofs.exe}`, and `artifacts/{vmlinux, initramfs.cpio.gz}`, and installs them
+under `%ProgramFiles%\izba`, adding `%ProgramFiles%\izba\bin` to the system PATH.
