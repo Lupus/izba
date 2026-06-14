@@ -1,6 +1,7 @@
 #![cfg(test)]
 use crate::daemon::DaemonApi;
 use crate::views::{DaemonStatusView, SandboxView, SbxState};
+use izba_core::build_info::BuildInfoOwned;
 
 /// Scripted `DaemonApi` for unit tests — no socket, no daemon.
 pub struct FakeDaemon {
@@ -8,6 +9,10 @@ pub struct FakeDaemon {
     pub status: DaemonStatusView,
     pub fail_list: bool,
     pub fail_status: bool,
+    /// Short sha the fake daemon reports (lets a test force an app↔daemon diff).
+    pub daemon_sha: String,
+    /// When true, `version()` errors as if no daemon were reachable.
+    pub daemon_absent: bool,
 }
 
 impl Default for FakeDaemon {
@@ -33,6 +38,8 @@ impl Default for FakeDaemon {
             },
             fail_list: false,
             fail_status: false,
+            daemon_sha: "feedface".into(),
+            daemon_absent: false,
         }
     }
 }
@@ -49,5 +56,15 @@ impl DaemonApi for FakeDaemon {
             anyhow::bail!("daemon unreachable");
         }
         Ok(self.status.clone())
+    }
+    fn version(&mut self) -> anyhow::Result<(BuildInfoOwned, u32)> {
+        if self.daemon_absent {
+            anyhow::bail!("daemon unreachable");
+        }
+        let build = BuildInfoOwned {
+            git_sha: self.daemon_sha.clone(),
+            ..BuildInfoOwned::default()
+        };
+        Ok((build, 1))
     }
 }

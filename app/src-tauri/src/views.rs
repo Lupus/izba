@@ -1,4 +1,35 @@
+use izba_core::build_info::BuildInfoOwned;
 use serde::Serialize;
+
+/// Version comparison surfaced to the About panel: this app's build, the linked
+/// izba-core build, and (when reachable) the daemon's — with a mismatch flag.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VersionView {
+    pub app: BuildInfoOwned,
+    pub core: BuildInfoOwned,
+    pub daemon: Option<BuildInfoOwned>,
+    pub proto: u32,
+    pub mismatch: bool,
+}
+
+/// This app binary's own build metadata. The app's `build.rs` (vergen) emits
+/// the `VERGEN_*`/`IZBA_PROFILE` vars into THIS crate, so they describe the app
+/// — distinct from `izba_core`'s, which describes the linked library.
+pub fn app_build_info() -> BuildInfoOwned {
+    fn or_unknown(v: Option<&str>) -> String {
+        v.unwrap_or("unknown").to_string()
+    }
+    BuildInfoOwned {
+        pkg_version: env!("CARGO_PKG_VERSION").to_string(),
+        git_describe: or_unknown(option_env!("VERGEN_GIT_DESCRIBE")),
+        git_sha: or_unknown(option_env!("VERGEN_GIT_SHA")),
+        commit_date: or_unknown(option_env!("VERGEN_GIT_COMMIT_DATE")),
+        build_timestamp: or_unknown(option_env!("VERGEN_BUILD_TIMESTAMP")),
+        rustc: or_unknown(option_env!("VERGEN_RUSTC_SEMVER")),
+        target: or_unknown(option_env!("VERGEN_CARGO_TARGET_TRIPLE")),
+        profile: or_unknown(option_env!("IZBA_PROFILE")),
+    }
+}
 
 /// Structured sandbox state for the frontend (parsed from izba's status string).
 #[derive(Debug, Clone, PartialEq, Serialize)]

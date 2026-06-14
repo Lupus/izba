@@ -1,5 +1,5 @@
 use crate::daemon::DaemonApi;
-use crate::views::{DaemonStatusView, SandboxView};
+use crate::views::{app_build_info, DaemonStatusView, SandboxView, VersionView};
 
 /// Core of the `list` command: maps daemon errors to a UI-friendly string.
 pub fn list_core(d: &mut dyn DaemonApi) -> Result<Vec<SandboxView>, String> {
@@ -9,6 +9,28 @@ pub fn list_core(d: &mut dyn DaemonApi) -> Result<Vec<SandboxView>, String> {
 /// Core of the `daemon_status` command.
 pub fn status_core(d: &mut dyn DaemonApi) -> Result<DaemonStatusView, String> {
     d.status().map_err(|e| e.to_string())
+}
+
+/// Core of the `version_info` command: this app's build, the linked core build,
+/// and the daemon's (when reachable) with a mismatch flag. An unreachable
+/// daemon is not an error here — the panel just shows "not running".
+pub fn version_core(d: &mut dyn DaemonApi) -> Result<VersionView, String> {
+    let app = app_build_info();
+    let core = izba_core::build_info::BuildInfoOwned::current();
+    let (daemon, proto, mismatch) = match d.version() {
+        Ok((build, proto)) => {
+            let mismatch = build != app;
+            (Some(build), proto, mismatch)
+        }
+        Err(_) => (None, 0, false),
+    };
+    Ok(VersionView {
+        app,
+        core,
+        daemon,
+        proto,
+        mismatch,
+    })
 }
 
 #[cfg(test)]
@@ -52,5 +74,29 @@ mod tests {
         };
         let err = status_core(&mut d).unwrap_err();
         assert!(err.contains("daemon unreachable"), "got: {err}");
+    }
+
+    #[test]
+    fn version_core_flags_mismatch_when_daemon_differs() {
+        // The fake daemon reports a sha that cannot match the real app build.
+        let mut d = FakeDaemon {
+            daemon_sha: "deadbeef".into(),
+            ..Default::default()
+        };
+        let v = version_core(&mut d).unwrap();
+        assert!(v.daemon.is_some());
+        assert!(v.mismatch);
+        assert!(!v.app.git_describe.is_empty());
+    }
+
+    #[test]
+    fn version_core_no_mismatch_when_daemon_absent() {
+        let mut d = FakeDaemon {
+            daemon_absent: true,
+            ..Default::default()
+        };
+        let v = version_core(&mut d).unwrap();
+        assert!(v.daemon.is_none());
+        assert!(!v.mismatch);
     }
 }
