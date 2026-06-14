@@ -5,16 +5,17 @@ interface Props {
   sandboxes: SandboxView[];
   selected: string | null;
   onSelect: (name: string) => void;
+  onNew: () => void;
 }
 
-export function Rail({ sandboxes, selected, onSelect }: Props) {
+export function Rail({ sandboxes, selected, onSelect, onNew }: Props) {
   return (
     <nav className="w-56 shrink-0 border-r border-line bg-rail p-3 flex flex-col gap-1">
       <button
         type="button"
-        disabled
-        aria-label="New sandbox (coming soon)"
-        className="mb-2 rounded-lg bg-accent/40 text-white font-semibold py-2 shadow-sm cursor-not-allowed"
+        onClick={onNew}
+        aria-label="New sandbox"
+        className="mb-2 rounded-lg bg-accent text-white font-semibold py-2 shadow-sm hover:bg-accent/90"
       >
         ＋ New sandbox
       </button>
