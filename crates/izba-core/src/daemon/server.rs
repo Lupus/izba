@@ -285,6 +285,7 @@ pub fn dispatch(
     let result = (|| -> anyhow::Result<DaemonResponse> {
         Ok(match req {
             DaemonRequest::Create(c) => {
+                crate::volume::validate_volumes(&c.volumes)?;
                 progress(format!(
                     "resolving {} (pulls if not cached)...",
                     c.image_ref
@@ -301,6 +302,7 @@ pub fn dispatch(
                         workspace: c.workspace.clone(),
                         rw_size_gb: c.rw_size_gb,
                         ports: c.ports.clone(),
+                        volumes: c.volumes.clone(),
                     },
                 )?;
                 d.registry.set(&c.name, &c.image_ref, Liveness::Stopped);
@@ -418,6 +420,13 @@ pub fn dispatch(
                 socket: d.paths.daemon_socket().display().to_string(),
                 sandboxes: d.registry.summaries(),
             }),
+            DaemonRequest::VolumePrune => {
+                let pruned = sandbox::prune_volumes(&d.paths)?;
+                DaemonResponse::Pruned {
+                    removed: pruned.removed,
+                    reclaimed_bytes: pruned.reclaimed_bytes,
+                }
+            }
             DaemonRequest::Shutdown => {
                 d.request_shutdown();
                 DaemonResponse::Ok
@@ -750,6 +759,7 @@ mod tests {
             workspace: dir.path().join("ws"),
             rw_size_gb: 1,
             ports: Vec::new(),
+            volumes: Vec::new(),
         })
     }
 
@@ -1130,6 +1140,7 @@ mod tests {
                 workspace: dir.path().join("ws"),
                 rw_size_gb: 1,
                 ports: Vec::new(),
+                volumes: Vec::new(),
             },
         )
         .unwrap();
