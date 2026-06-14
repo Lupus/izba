@@ -12,6 +12,13 @@ vi.mock("../lib/ipc", () => ({
   },
 }));
 
+vi.mock("../components/LogsView", () => ({
+  LogsView: ({ name }: { name: string }) => <div>logs-for-{name}</div>,
+}));
+vi.mock("../components/ShellView", () => ({
+  ShellView: ({ name }: { name: string }) => <div>shell-for-{name}</div>,
+}));
+
 const noop = () => {};
 
 describe("Detail", () => {
@@ -71,5 +78,34 @@ describe("Detail actions", () => {
     const dialog = screen.getByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: /^remove$/i }));
     await waitFor(() => expect(api.remove).toHaveBeenCalledWith("web", false));
+  });
+});
+
+describe("Detail tabs", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("defaults to Overview and shows lifecycle actions", () => {
+    const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
+    render(<Detail sandbox={sbx} onChanged={noop} />);
+    expect(screen.getByRole("button", { name: /^stop$/i })).toBeInTheDocument();
+  });
+
+  it("switches to the Logs tab", () => {
+    const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
+    render(<Detail sandbox={sbx} onChanged={noop} />);
+    fireEvent.click(screen.getByRole("tab", { name: /logs/i }));
+    expect(screen.getByText("logs-for-web")).toBeInTheDocument();
+  });
+
+  it("shows the shell for a running sandbox and a hint when stopped", () => {
+    const running: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
+    const { rerender } = render(<Detail sandbox={running} onChanged={noop} />);
+    fireEvent.click(screen.getByRole("tab", { name: /shell/i }));
+    expect(screen.getByText("shell-for-web")).toBeInTheDocument();
+
+    const stopped: SandboxView = { name: "db", image: "postgres:16", state: { kind: "stopped" } };
+    rerender(<Detail sandbox={stopped} onChanged={noop} />);
+    fireEvent.click(screen.getByRole("tab", { name: /shell/i }));
+    expect(screen.getByText(/start the sandbox/i)).toBeInTheDocument();
   });
 });
