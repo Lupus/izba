@@ -11,13 +11,22 @@ pub enum SbxState {
 
 /// Parse izba's `Liveness::describe()` string into a structured state.
 /// Formats: "running" | "stopped" | "degraded (<reason>)".
+///
+/// NOTE: the `degraded (...)` branch strips the final ')', so a reason that
+/// itself ends with ')' would lose one character. izba's reasons never do
+/// (see `liveness.rs`), but keep that invariant in mind if reasons change.
 pub fn parse_state(status: &str) -> SbxState {
     if status == "running" {
         SbxState::Running
     } else if status == "stopped" {
         SbxState::Stopped
-    } else if let Some(reason) = status.strip_prefix("degraded (").and_then(|s| s.strip_suffix(')')) {
-        SbxState::Degraded { reason: reason.to_string() }
+    } else if let Some(reason) = status
+        .strip_prefix("degraded (")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        SbxState::Degraded {
+            reason: reason.to_string(),
+        }
     } else {
         // Unknown/empty status is treated as stopped rather than panicking.
         SbxState::Stopped
@@ -33,7 +42,11 @@ pub struct SandboxView {
 
 impl From<izba_core::daemon::proto::SandboxSummary> for SandboxView {
     fn from(s: izba_core::daemon::proto::SandboxSummary) -> Self {
-        SandboxView { name: s.name, image: s.image_ref, state: parse_state(&s.status) }
+        SandboxView {
+            name: s.name,
+            image: s.image_ref,
+            state: parse_state(&s.status),
+        }
     }
 }
 
@@ -70,7 +83,9 @@ mod tests {
     fn parses_degraded_with_reason() {
         assert_eq!(
             parse_state("degraded (sidecar virtiofsd:workspace died)"),
-            SbxState::Degraded { reason: "sidecar virtiofsd:workspace died".into() }
+            SbxState::Degraded {
+                reason: "sidecar virtiofsd:workspace died".into()
+            }
         );
     }
 
@@ -83,9 +98,18 @@ mod tests {
     #[test]
     fn summary_maps_to_view() {
         let s = izba_core::daemon::proto::SandboxSummary {
-            name: "web".into(), image_ref: "ubuntu:24.04".into(), status: "running".into(),
+            name: "web".into(),
+            image_ref: "ubuntu:24.04".into(),
+            status: "running".into(),
         };
         let v: SandboxView = s.into();
-        assert_eq!(v, SandboxView { name: "web".into(), image: "ubuntu:24.04".into(), state: SbxState::Running });
+        assert_eq!(
+            v,
+            SandboxView {
+                name: "web".into(),
+                image: "ubuntu:24.04".into(),
+                state: SbxState::Running
+            }
+        );
     }
 }
