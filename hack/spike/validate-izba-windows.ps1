@@ -59,10 +59,24 @@ Check 'exec -i round-trips stdin' ("$out".Trim() -eq 'ping')
 # [5a] M1 phase A: egress DNS via izbad (runtime exercise of OpenVMM
 # guest-initiated hybrid vsock — guest connect(CID 2, 1027) must reach
 # izbad's run\vsock.sock_1027 listener, which izbad binds before VM boot).
-& $exe stop egress-a 2>$null | Out-Null
-& $exe rm --force egress-a 2>$null | Out-Null
-& $exe run --image $image --name egress-a $ws -- /bin/true | Out-Null
-Check 'izbad-egress sandbox boots (run exits 0)' ($LASTEXITCODE -eq 0)
+$egFailsBefore = $fails
+# egress-a is the SECOND concurrent nested microVM (valid8 is still running).
+# On hosted GitHub Windows runners the nested WHP partition occasionally fails
+# to start: the VM emits zero console output and never reaches health within
+# the boot budget. A manual re-run from the same commit reliably passes, so a
+# from-scratch retry (the programmatic equivalent of that re-run) absorbs the
+# flake without masking a real regression — a genuine boot break fails all
+# attempts. KVM never exhibits this; it is specific to nested virt on hosted
+# Windows runners. See e2e.yml / izba CI flake notes.
+$bootOk = $false
+foreach ($attempt in 1..3) {
+    & $exe stop egress-a 2>$null | Out-Null
+    & $exe rm --force egress-a 2>$null | Out-Null
+    & $exe run --image $image --name egress-a $ws -- /bin/true | Out-Null
+    if ($LASTEXITCODE -eq 0) { $bootOk = $true; break }
+    [Console]::Error.WriteLine("  egress-a boot attempt $attempt/3 timed out (nested-WHP flake); retrying from scratch")
+}
+Check 'izbad-egress sandbox boots (run exits 0)' $bootOk
 $egOut = (& $exe exec egress-a -- /bin/sh -lc 'getent hosts example.com' 2>&1 | Out-String)
 $egRc  = $LASTEXITCODE
 Check 'egress DNS via izbad resolves example.com' ($egRc -eq 0 -and $egOut -match 'example\.com')
@@ -100,7 +114,15 @@ if (-not $tcpOk) {
 }
 
 & $exe stop egress-a 2>$null | Out-Null
-& $exe rm --force egress-a 2>$null | Out-Null
+# Only purge the sandbox dir when the egress checks passed. On failure, keep it
+# so the `windows-whp-failure-logs` artifact step can upload egress-a's
+# console.log — otherwise every sandbox is rm'd before that step runs and the
+# upload finds no files (as it did on the nested-WHP boot flake).
+if ($fails -eq $egFailsBefore) {
+    & $exe rm --force egress-a 2>$null | Out-Null
+} else {
+    [Console]::Error.WriteLine("  (keeping egress-a sandbox dir for the failure-log artifact upload)")
+}
 
 # [6] console log captured + NIC-less boot sanity. Since M1 phase C the guest
 # brings up lo + dummy0 statically (no DHCP, no eth0): assert the console shows
