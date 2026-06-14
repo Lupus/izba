@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use izba_proto::{read_frame, write_frame, Request, Response};
 
-use crate::daemon::proto::{DaemonHello, DaemonRequest, DaemonResponse};
+use crate::build_info::BuildInfoOwned;
+use crate::daemon::proto::{DaemonHello, DaemonRequest, DaemonResponse, DAEMON_PROTO_VERSION};
 use crate::daemon::transport;
 use crate::paths::Paths;
 use crate::procmgr;
@@ -21,7 +22,12 @@ const GONE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct DaemonClient {
     conn: UdsStream,
+    /// The daemon's display version string (`build.short()`).
     pub server_version: String,
+    /// The daemon's wire-protocol version — the compatibility gate.
+    pub server_proto: u32,
+    /// The daemon's full build metadata (for `izba version` / the app UI).
+    pub server_build: BuildInfoOwned,
 }
 
 impl DaemonClient {
@@ -86,18 +92,23 @@ impl DaemonClient {
                     Self::await_daemon(paths, my_version)?
                 }
             };
-            if client.server_version == my_version {
+            // Compatibility is gated on the wire PROTOCOL version, not the
+            // (now sha-bearing) display string: a same-proto rebuild must not
+            // churn-restart a healthy daemon. Only a proto change forces it.
+            if client.server_proto == DAEMON_PROTO_VERSION {
                 return Ok(client);
             }
-            let server_version = client.server_version.clone();
+            let server_proto = client.server_proto;
+            let server_build = client.server_build.short();
             if attempt == 1 {
                 bail!(
-                    "daemon still reports version {server_version} (CLI is {my_version}) \
-                     after a restart — kill it manually: izba daemon stop"
+                    "daemon still speaks proto {server_proto} (CLI speaks {DAEMON_PROTO_VERSION}; \
+                     daemon build {server_build}) after a restart — kill it manually: izba daemon stop"
                 );
             }
             eprintln!(
-                "izba: daemon version {server_version} != CLI {my_version}; restarting daemon"
+                "izba: daemon proto {server_proto} != CLI {DAEMON_PROTO_VERSION} \
+                 (daemon build {server_build}); restarting daemon"
             );
             client.shutdown()?;
             Self::await_gone(paths);
@@ -113,15 +124,22 @@ impl DaemonClient {
             &mut s,
             &DaemonHello {
                 version: my_version.to_string(),
+                proto: DAEMON_PROTO_VERSION,
             },
         )
         .context("sending hello")?;
         let resp: DaemonResponse = read_frame(&mut s).context("reading hello reply")?;
         s.set_read_timeout(None)?;
         match resp {
-            DaemonResponse::HelloOk { version } => Ok(DaemonClient {
+            DaemonResponse::HelloOk {
+                version,
+                proto,
+                build,
+            } => Ok(DaemonClient {
                 conn: s,
                 server_version: version,
+                server_proto: proto,
+                server_build: build,
             }),
             other => bail!("unexpected hello reply: {other:?}"),
         }
@@ -376,7 +394,12 @@ mod tests {
                 Ok(h) => h,
                 Err(_) => return,
             };
-            if write_frame(&mut s, &DaemonResponse::HelloOk { version }).is_err() {
+            let hello_ok = DaemonResponse::HelloOk {
+                version,
+                proto: DAEMON_PROTO_VERSION,
+                build: BuildInfoOwned::default(),
+            };
+            if write_frame(&mut s, &hello_ok).is_err() {
                 return;
             }
             script(s);
@@ -469,7 +492,11 @@ mod tests {
     /// `version`; a Shutdown request unlinks the socket before the Ok reply
     /// (so post-shutdown connects fail like a dead daemon's) and stops the
     /// accept loop.
-    fn serve_fake_daemon(paths: &crate::paths::Paths, version: &str) -> anyhow::Result<()> {
+    fn serve_fake_daemon(
+        paths: &crate::paths::Paths,
+        version: &str,
+        proto: u32,
+    ) -> anyhow::Result<()> {
         use crate::daemon::transport;
         let listener = transport::bind_socket(paths)?;
         let version = version.to_string();
@@ -483,6 +510,8 @@ mod tests {
             }
             let hello_ok = DaemonResponse::HelloOk {
                 version: version.clone(),
+                proto,
+                build: BuildInfoOwned::default(),
             };
             if write_frame(&mut s, &hello_ok).is_err() {
                 continue;
@@ -500,20 +529,14 @@ mod tests {
         Ok(())
     }
 
-    /// connect_with's two jobs against a real socket: (1) no daemon → the
-    /// spawner runs and the fresh daemon is connected; (2) version mismatch
-    /// → upgrade dance (shutdown, await_gone, respawn at the new version).
-    #[test]
-    fn connect_with_spawns_and_upgrades() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let dir = tempfile::tempdir().unwrap();
-        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
-        // Probe bind permission via the real transport (project convention:
-        // runtime-skip in sandboxes that deny bind).
-        match crate::daemon::transport::bind_socket(&paths) {
+    /// Probe bind permission via the real transport; returns true (and prints
+    /// SKIP) when the sandbox denies bind (project convention: runtime-skip).
+    fn bind_denied(paths: &crate::paths::Paths) -> bool {
+        match crate::daemon::transport::bind_socket(paths) {
             Ok(l) => {
                 drop(l);
                 let _ = std::fs::remove_file(paths.daemon_socket());
+                false
             }
             Err(e) => {
                 let denied = e.chain().any(|c| {
@@ -522,38 +545,103 @@ mod tests {
                 });
                 if denied {
                     eprintln!("SKIP: bind denied in this environment");
-                    return;
+                    true
+                } else {
+                    panic!("bind probe: {e:#}");
                 }
-                panic!("bind probe: {e:#}");
             }
         }
+    }
+
+    /// connect_with against a real socket: no daemon → the spawner runs and the
+    /// fresh daemon is connected; a second connect to the same (same-proto)
+    /// daemon reuses it without respawning.
+    #[test]
+    fn connect_with_spawns_when_absent_then_reuses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        if bind_denied(&paths) {
+            return;
+        }
         let spawned = AtomicUsize::new(0);
-        // 1) No daemon: the spawner runs once and we connect at its version.
         let client = DaemonClient::connect_with(
             &paths,
             &|p: &crate::paths::Paths| {
                 spawned.fetch_add(1, Ordering::SeqCst);
-                serve_fake_daemon(p, "v1")
+                serve_fake_daemon(p, "v1", DAEMON_PROTO_VERSION)
             },
             "v1",
         )
         .unwrap();
         assert_eq!(spawned.load(Ordering::SeqCst), 1, "spawner ran");
-        assert_eq!(client.server_version, "v1");
+        assert_eq!(client.server_proto, DAEMON_PROTO_VERSION);
         drop(client);
-        // 2) v1 daemon still serving, CLI is now v2: connect_with must shut
-        //    the old daemon down and bring up a fresh one at v2.
+        // Same-proto daemon still serving: connect reuses it, no respawn.
         let client = DaemonClient::connect_with(
             &paths,
             &|p: &crate::paths::Paths| {
                 spawned.fetch_add(1, Ordering::SeqCst);
-                serve_fake_daemon(p, "v2")
+                serve_fake_daemon(p, "v1", DAEMON_PROTO_VERSION)
             },
-            "v2",
+            "v1",
         )
         .unwrap();
-        assert_eq!(spawned.load(Ordering::SeqCst), 2, "upgrade respawned");
-        assert_eq!(client.server_version, "v2");
+        assert_eq!(spawned.load(Ordering::SeqCst), 1, "no respawn for same proto");
+        assert_eq!(client.server_version, "v1");
+    }
+
+    /// A daemon speaking an OLDER proto triggers the upgrade dance: shutdown,
+    /// await_gone, respawn at the current proto.
+    #[test]
+    fn connect_with_restarts_on_proto_mismatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        if bind_denied(&paths) {
+            return;
+        }
+        // Pre-existing daemon at proto 0 (an "old" build) already serving.
+        serve_fake_daemon(&paths, "old", 0).unwrap();
+        let spawned = AtomicUsize::new(0);
+        let client = DaemonClient::connect_with(
+            &paths,
+            &|p: &crate::paths::Paths| {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                serve_fake_daemon(p, "new", DAEMON_PROTO_VERSION)
+            },
+            "new",
+        )
+        .unwrap();
+        assert_eq!(spawned.load(Ordering::SeqCst), 1, "proto mismatch respawned");
+        assert_eq!(client.server_proto, DAEMON_PROTO_VERSION);
+        assert_eq!(client.server_version, "new");
+    }
+
+    /// A same-proto daemon whose DISPLAY build differs (different sha) must NOT
+    /// be restarted — the key behavior change from string-gating to proto-gating.
+    #[test]
+    fn connect_with_keeps_daemon_on_build_only_diff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().join("izba"));
+        if bind_denied(&paths) {
+            return;
+        }
+        // Daemon at the CURRENT proto but a different display version.
+        serve_fake_daemon(&paths, "0.1.0 (aaaaaaa)", DAEMON_PROTO_VERSION).unwrap();
+        let spawned = AtomicUsize::new(0);
+        let client = DaemonClient::connect_with(
+            &paths,
+            &|p: &crate::paths::Paths| {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                serve_fake_daemon(p, "unused", DAEMON_PROTO_VERSION)
+            },
+            "0.1.0 (bbbbbbb)",
+        )
+        .unwrap();
+        assert_eq!(spawned.load(Ordering::SeqCst), 0, "no respawn on build-only diff");
+        assert_eq!(client.server_version, "0.1.0 (aaaaaaa)");
     }
 
     /// The idle-exit accept race classifier: mid-handshake EOF/reset means
