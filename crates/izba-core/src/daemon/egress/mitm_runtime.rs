@@ -39,12 +39,21 @@ pub struct OrigDst {
     pub sandbox: String,
 }
 
+/// What the router hands the MITM runtime per flow: the original destination
+/// plus the per-sandbox policy to apply (the runtime is shared across sandboxes,
+/// so the policy travels with the flow rather than living on the runtime).
+struct DstEntry {
+    dst: OrigDst,
+    policy: Arc<dyn Policy>,
+    at: Instant,
+}
+
 /// Rendezvous between the blocking router and the MITM runtime, keyed by the
 /// loopback source port (unique per live connection). The router inserts before
 /// connecting; the handler claims (removes) on accept; a TTL sweep guards leaks.
 #[derive(Clone, Default)]
 pub struct DstMap {
-    inner: Arc<Mutex<HashMap<u16, (OrigDst, Instant)>>>,
+    inner: Arc<Mutex<HashMap<u16, DstEntry>>>,
 }
 
 impl DstMap {
@@ -52,20 +61,25 @@ impl DstMap {
         Self::default()
     }
 
-    pub fn insert(&self, src_port: u16, dst: OrigDst) {
-        self.inner
-            .lock()
-            .expect("DstMap poisoned")
-            .insert(src_port, (dst, Instant::now()));
+    pub fn insert(&self, src_port: u16, dst: OrigDst, policy: Arc<dyn Policy>) {
+        self.inner.lock().expect("DstMap poisoned").insert(
+            src_port,
+            DstEntry {
+                dst,
+                policy,
+                at: Instant::now(),
+            },
+        );
     }
 
-    /// Claim (remove) the dst for a source port; `None` if unknown or swept.
-    pub fn claim(&self, src_port: u16) -> Option<OrigDst> {
+    /// Claim (remove) the dst + policy for a source port; `None` if unknown or
+    /// swept.
+    pub fn claim(&self, src_port: u16) -> Option<(OrigDst, Arc<dyn Policy>)> {
         self.inner
             .lock()
             .expect("DstMap poisoned")
             .remove(&src_port)
-            .map(|(d, _)| d)
+            .map(|e| (e.dst, e.policy))
     }
 
     /// Drop entries older than `max_age`.
@@ -74,7 +88,7 @@ impl DstMap {
         self.inner
             .lock()
             .expect("DstMap poisoned")
-            .retain(|_, (_, t)| now.duration_since(*t) < max_age);
+            .retain(|_, e| now.duration_since(e.at) < max_age);
     }
 }
 
@@ -129,12 +143,13 @@ pub struct MitmRuntime {
 
 impl MitmRuntime {
     /// Start a multi-thread tokio runtime, bind `127.0.0.1:0`, and serve the
-    /// MITM accept loop. `certs` signs per-SNI leaves; `upstream` verifies the
-    /// real upstream; `policy` is the egress allow-list.
+    /// MITM accept loop. `certs` signs per-SNI leaves under the izba CA;
+    /// `upstream` verifies the real upstream; `audit` logs every decision. The
+    /// per-flow policy travels with each registered flow (the runtime is shared
+    /// across sandboxes), so it is not a start-time parameter.
     pub fn start(
         certs: Arc<CertCache>,
         upstream: Arc<ClientConfig>,
-        policy: Arc<dyn Policy>,
         audit: AuditSink,
     ) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -154,9 +169,7 @@ impl MitmRuntime {
 
         let dsts_loop = dsts.clone();
         let dsts_sweep = dsts.clone();
-        rt.spawn(async move {
-            accept_loop(listener, acceptor, upstream, policy, audit, dsts_loop).await
-        });
+        rt.spawn(async move { accept_loop(listener, acceptor, upstream, audit, dsts_loop).await });
         rt.spawn(async move {
             let mut tick = tokio::time::interval(DST_TTL);
             loop {
@@ -177,9 +190,10 @@ impl MitmRuntime {
         self.listen
     }
 
-    /// Register the dst for a loopback source port, before the router connects.
-    pub fn register(&self, src_port: u16, dst: OrigDst) {
-        self.dsts.insert(src_port, dst);
+    /// Register the dst + its per-sandbox policy for a loopback source port,
+    /// before the router connects.
+    pub fn register(&self, src_port: u16, dst: OrigDst, policy: Arc<dyn Policy>) {
+        self.dsts.insert(src_port, dst, policy);
     }
 }
 
@@ -187,7 +201,6 @@ async fn accept_loop(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     upstream: Arc<ClientConfig>,
-    policy: Arc<dyn Policy>,
     audit: AuditSink,
     dsts: DstMap,
 ) {
@@ -197,7 +210,7 @@ async fn accept_loop(
             Err(_) => continue,
         };
         // Recover what izbad knew about this flow by the loopback source port.
-        let Some(dst) = dsts.claim(peer.port()) else {
+        let Some((dst, policy)) = dsts.claim(peer.port()) else {
             // Unknown source port: not a flow we registered — drop it.
             continue;
         };
@@ -228,6 +241,7 @@ async fn accept_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::egress::policy::AllowAll;
 
     fn dst(ip: &str, port: u16, sandbox: &str) -> OrigDst {
         OrigDst {
@@ -237,14 +251,21 @@ mod tests {
         }
     }
 
+    fn pol() -> Arc<dyn Policy> {
+        Arc::new(AllowAll)
+    }
+
     #[test]
     fn dstmap_claims_once_and_expires() {
         let map = DstMap::new();
-        map.insert(40001, dst("1.2.3.4", 443, "web"));
-        assert_eq!(map.claim(40001), Some(dst("1.2.3.4", 443, "web")));
+        map.insert(40001, dst("1.2.3.4", 443, "web"), pol());
+        assert_eq!(
+            map.claim(40001).map(|(d, _)| d),
+            Some(dst("1.2.3.4", 443, "web"))
+        );
         assert!(map.claim(40001).is_none(), "second claim must be empty");
 
-        map.insert(40002, dst("5.6.7.8", 443, "web"));
+        map.insert(40002, dst("5.6.7.8", 443, "web"), pol());
         map.expire_older_than(Duration::ZERO); // everything is stale vs zero age
         assert!(map.claim(40002).is_none(), "expired entry must be gone");
     }

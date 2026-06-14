@@ -28,6 +28,40 @@ use crate::vmm::{IoStream, UdsStream, VmmDriver};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Build the shared MITM tier-1 runtime: load/mint the persistent izba CA, sign
+/// per-SNI leaves under it, verify real upstreams against the Mozilla roots, and
+/// audit every decision. Returns `None` (egress falls back to direct dial) if
+/// CA init or the runtime fails — the daemon must still come up. The per-sandbox
+/// policy travels with each flow, so no policy is needed here.
+fn build_mitm_runtime(
+    paths: &Paths,
+    audit: crate::daemon::egress::audit::AuditSink,
+) -> Option<Arc<crate::daemon::egress::mitm_runtime::MitmRuntime>> {
+    use crate::daemon::egress::mitm::{upstream_client_config_webpki, CertCache};
+    use crate::daemon::egress::mitm_runtime::MitmRuntime;
+
+    // The MITM datapath signs/verifies with the ring CryptoProvider (aws-lc-rs
+    // is also linked via oci-client's reqwest, so an ambiguous process default
+    // would panic). Installing it is best-effort: an existing default is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let ca = match crate::ca::load_or_create(&paths.ca_dir()) {
+        Ok(ca) => ca,
+        Err(e) => {
+            eprintln!("izbad: egress MITM disabled — CA init failed: {e:#}");
+            return None;
+        }
+    };
+    let certs = Arc::new(CertCache::new(ca));
+    match MitmRuntime::start(certs, upstream_client_config_webpki(), audit) {
+        Ok(rt) => Some(Arc::new(rt)),
+        Err(e) => {
+            eprintln!("izbad: egress MITM disabled — runtime start failed: {e:#}");
+            None
+        }
+    }
+}
+
 /// Boxed, thread-shareable flavor of [`sandbox::Connector`] — the daemon
 /// owns it for its lifetime and lends `&dyn Fn` views to connection threads.
 pub type SharedConnector =
@@ -90,14 +124,17 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(paths: Paths, deps: DaemonDeps) -> Self {
-        // Clone the egress seams before `deps` is moved into the struct.
-        // MITM runtime is wired in once the persistent CA exists (M2 daemon
-        // construction); until then egress takes the direct-dial path.
+        // Clone the egress seams before `deps` is moved into the struct. The
+        // MITM tier-1 runtime is built from the persistent izba CA; if that
+        // fails the daemon still runs — egress just takes the direct-dial path
+        // (an honest degrade, logged in `build_mitm_runtime`).
+        let audit = crate::daemon::egress::audit::AuditSink::new(paths.clone());
+        let mitm = build_mitm_runtime(&paths, audit.clone());
         let egress = EgressManager::new(
             Arc::clone(&deps.egress_policy),
             Arc::clone(&deps.egress_resolver),
-            None,
-            crate::daemon::egress::audit::AuditSink::new(paths.clone()),
+            mitm,
+            audit,
         );
         Self {
             paths,

@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod ca;
 pub mod cp;
 pub mod daemon;
 mod discover;

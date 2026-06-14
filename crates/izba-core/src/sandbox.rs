@@ -371,6 +371,18 @@ pub fn start_with_timeouts(
     }
 
     let console_log = paths.logs_dir(name).join("console.log");
+
+    // Bake the izba root CA into the guest trust store: write a per-sandbox copy
+    // of just the public cert (NEVER the CA dir — it holds the private key) and
+    // share it as the read-only `izba-trust` virtiofs tag. izba-init copies it
+    // into the guest CA bundle so leaves the MITM mints are trusted in-guest.
+    let trust_dir = paths.sandbox_dir(name).join("trust");
+    std::fs::create_dir_all(&trust_dir)
+        .with_context(|| format!("creating trust dir {}", trust_dir.display()))?;
+    let ca = crate::ca::load_or_create(&paths.ca_dir()).context("loading izba CA")?;
+    std::fs::write(trust_dir.join("ca.pem"), ca.cert_pem())
+        .with_context(|| format!("writing guest CA into {}", trust_dir.display()))?;
+
     // The guest is a pure vsock island: no NIC, no DHCP. izba.egress=1 is
     // always on — guest egress rides the izbad-owned vsock 1027 plane.
     let cmdline = format!("console=ttyS0 izba.hostname={name} izba.egress=1");
@@ -390,10 +402,16 @@ pub fn start_with_timeouts(
                 readonly: false,
             },
         ],
-        shares: vec![FsShare {
-            tag: "workspace".to_string(),
-            host_path: config.workspace.clone(),
-        }],
+        shares: vec![
+            FsShare {
+                tag: "workspace".to_string(),
+                host_path: config.workspace.clone(),
+            },
+            FsShare {
+                tag: "izba-trust".to_string(),
+                host_path: trust_dir.clone(),
+            },
+        ],
         console_log: console_log.clone(),
         run_dir: paths.run_dir(name),
     };
@@ -843,9 +861,24 @@ mod tests {
         assert_eq!(spec.disks[1].path, paths.sandbox_dir("web").join("rw.img"));
         assert!(!spec.disks[1].readonly);
 
-        assert_eq!(spec.shares.len(), 1);
+        assert_eq!(spec.shares.len(), 2);
         assert_eq!(spec.shares[0].tag, "workspace");
         assert_eq!(spec.shares[0].host_path, ws);
+        // The izba CA is baked into every guest via the read-only izba-trust
+        // share (a per-sandbox copy of just the public cert).
+        assert_eq!(spec.shares[1].tag, "izba-trust");
+        assert_eq!(
+            spec.shares[1].host_path,
+            paths.sandbox_dir("web").join("trust")
+        );
+        assert!(
+            paths
+                .sandbox_dir("web")
+                .join("trust")
+                .join("ca.pem")
+                .exists(),
+            "guest CA cert written for the izba-trust share"
+        );
 
         assert_eq!(spec.console_log, paths.logs_dir("web").join("console.log"));
         assert_eq!(spec.run_dir, paths.run_dir("web"));

@@ -42,6 +42,35 @@ struct EgressSlot {
     thread: JoinHandle<()>,
 }
 
+/// Resolve a sandbox's egress policy from its `--policy` file: an enforcing
+/// [`RegoPolicy`](self::policy::RegoPolicy) when declared, else `default`
+/// (a bare, non-enforcing sandbox). A present-but-broken policy fails CLOSED
+/// (an empty enforcing allow-list = deny-all) rather than silently allowing.
+fn resolve_policy(default: &Arc<dyn Policy>, paths: &Paths, name: &str) -> Arc<dyn Policy> {
+    use self::config::EgressPolicyConfig;
+    let deny_all = || -> Arc<dyn Policy> {
+        // An enforcing policy with an empty allow-list denies everything.
+        match EgressPolicyConfig::default().into_policy(name) {
+            Ok(p) => Arc::new(p),
+            Err(_) => Arc::clone(default), // unreachable (embedded Rego is valid)
+        }
+    };
+    match EgressPolicyConfig::load(&paths.sandbox_dir(name)) {
+        Ok(None) => Arc::clone(default),
+        Ok(Some(cfg)) => match cfg.into_policy(name) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("izbad: egress policy for '{name}' failed to compile: {e:#}; deny-all");
+                deny_all()
+            }
+        },
+        Err(e) => {
+            eprintln!("izbad: reading egress policy for '{name}': {e:#}; deny-all");
+            deny_all()
+        }
+    }
+}
+
 /// All egress listeners, keyed by sandbox name. The daemon owns one
 /// instance for its lifetime; daemon restart severs live flows (decided —
 /// adopt rebinds for new ones).
@@ -117,7 +146,11 @@ impl EgressManager {
             .context("egress listener nonblocking")?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);
-        let policy = Arc::clone(&self.policy);
+        // Resolve THIS sandbox's policy once, when the listener is armed: its
+        // `--policy` file (if any) compiles to an enforcing RegoPolicy, else the
+        // bare default (AllowAll). The Arc travels into the MITM runtime per
+        // flow, so the shared runtime serves every sandbox's own allow-list.
+        let policy = resolve_policy(&self.policy, paths, name);
         let resolver = Arc::clone(&self.resolver);
         let mitm = self.mitm.clone();
         let audit = self.audit.clone();
@@ -140,7 +173,7 @@ impl EgressManager {
                             router::handle_conn(
                                 conn,
                                 &sandbox,
-                                &*policy,
+                                policy,
                                 &*resolver,
                                 mitm.as_deref(),
                                 &audit,

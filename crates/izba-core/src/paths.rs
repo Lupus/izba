@@ -67,6 +67,13 @@ impl Paths {
     pub fn daemon_log(&self) -> PathBuf {
         self.daemon_dir().join("daemon.log")
     }
+
+    /// The izba root-CA directory (`<root>/ca`): the persistent CA the MITM
+    /// signs leaves with and that is baked into every guest's trust store.
+    /// Holds the private key, so it is created 0700 and never shared into a VM.
+    pub fn ca_dir(&self) -> PathBuf {
+        self.root.join("ca")
+    }
 }
 
 /// Both platform rules always compile (`cfg!`, not `#[cfg]`) so each is

@@ -27,9 +27,9 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 fn install_ring() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("install ring provider");
+        // Best-effort: an already-installed ring default (e.g. from another
+        // test in this binary) is fine — both install the same provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
 
@@ -82,6 +82,7 @@ async fn spawn_upstream(cache: Arc<CertCache>, body: &'static str) -> u16 {
 /// `sni`, send a request, and return the response text.
 async fn guest_request(
     mitm: &MitmRuntime,
+    policy: &Arc<dyn izba_core::daemon::egress::policy::Policy>,
     gcfg: &Arc<rustls::ClientConfig>,
     sni: &'static str,
     dst_port: u16,
@@ -98,6 +99,7 @@ async fn guest_request(
             port: dst_port,
             sandbox: "web".into(),
         },
+        Arc::clone(policy),
     );
     sock.connect(&mitm.listen_addr().into()).unwrap();
     sock.set_nonblocking(true).unwrap();
@@ -141,16 +143,17 @@ fn mitm_firewall_allows_and_denies_by_decrypted_host() {
     let izba_ca_der = izba_ca.cert_der();
     let izba_certs = Arc::new(CertCache::new(izba_ca));
 
-    // Default-deny allow-list: api.anthropic.com allowed, evil.* denied.
-    let policy = Arc::new(RegoPolicy::embedded().unwrap());
+    // Default-deny allow-list: api.anthropic.com allowed, evil.* denied. The
+    // policy now travels with each registered flow (the runtime is shared).
+    let policy: Arc<dyn izba_core::daemon::egress::policy::Policy> =
+        Arc::new(RegoPolicy::embedded().unwrap());
 
     // Start the MITM runtime (sync context — its own runtime can block_on bind).
     let audit =
         izba_core::daemon::egress::audit::AuditSink::new(izba_core::paths::Paths::with_root(
             std::env::temp_dir().join("izba-egress-mitm-test-audit"),
         ));
-    let mitm =
-        MitmRuntime::start(izba_certs, upstream_cfg, policy, audit).expect("start MITM runtime");
+    let mitm = MitmRuntime::start(izba_certs, upstream_cfg, audit).expect("start MITM runtime");
 
     // Guest rustls config: trusts ONLY the izba CA (proves leaves chain to it).
     let mut guest_roots = rustls::RootCertStore::empty();
@@ -174,6 +177,7 @@ fn mitm_firewall_allows_and_denies_by_decrypted_host() {
         // ALLOW: SNI api.anthropic.com is on the allow-list -> 200 from upstream.
         let allowed = guest_request(
             &mitm,
+            &policy,
             &gcfg,
             "api.anthropic.com",
             up_port,
@@ -187,7 +191,8 @@ fn mitm_firewall_allows_and_denies_by_decrypted_host() {
         );
 
         // DENY: SNI evil.example.com is not allow-listed -> izbad 403, no upstream.
-        let denied = guest_request(&mitm, &gcfg, "evil.example.com", up_port, "GET /x").await;
+        let denied =
+            guest_request(&mitm, &policy, &gcfg, "evil.example.com", up_port, "GET /x").await;
         assert!(denied.contains("403"), "denied flow status: {denied}");
         assert!(
             denied.contains("izba egress policy"),

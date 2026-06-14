@@ -58,10 +58,11 @@ pub struct IzbaCa {
 }
 
 impl IzbaCa {
-    /// Generate a new CA keypair.
-    pub fn generate() -> Result<Self> {
-        let ca_key = KeyPair::generate().context("generate CA keypair")?;
-
+    /// The fixed CA certificate params. Shared by `generate` and `from_pem` so
+    /// a reconstructed signer carries the same subject DN as the persisted cert
+    /// — leaves it signs chain to the on-disk `ca.pem` (matched by subject +
+    /// the shared key).
+    fn ca_params() -> CertificateParams {
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         params
@@ -71,15 +72,45 @@ impl IzbaCa {
             .distinguished_name
             .push(DnType::OrganizationName, "izba");
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params
+    }
 
-        let ca_cert = params.self_signed(&ca_key).context("self-sign CA")?;
+    /// Generate a new CA keypair.
+    pub fn generate() -> Result<Self> {
+        let ca_key = KeyPair::generate().context("generate CA keypair")?;
+        let ca_cert = Self::ca_params()
+            .self_signed(&ca_key)
+            .context("self-sign CA")?;
         let ca_cert_pem = ca_cert.pem();
-
         Ok(Self {
             ca_cert,
             ca_key,
             ca_cert_pem,
         })
+    }
+
+    /// Reconstruct a CA from a persisted cert+key PEM pair (the load path of
+    /// [`crate::ca::load_or_create`]). The signer `Certificate` is rebuilt from
+    /// the fixed CA params + the persisted key (NOT by re-parsing the cert —
+    /// that would need rcgen's `x509-parser` feature). The cert PEM handed to
+    /// guests is the persisted one verbatim, and leaves signed by the rebuilt
+    /// signer chain to it because they share the subject DN + key.
+    pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self> {
+        let ca_key = KeyPair::from_pem(key_pem).context("load CA keypair from PEM")?;
+        let ca_cert = Self::ca_params()
+            .self_signed(&ca_key)
+            .context("rebuild CA signer cert")?;
+        Ok(Self {
+            ca_cert,
+            ca_key,
+            ca_cert_pem: cert_pem.to_string(),
+        })
+    }
+
+    /// The CA private key in PKCS#8 PEM — persisted (0600) so the CA survives
+    /// daemon restarts. NEVER shared into a guest.
+    pub fn key_pem(&self) -> String {
+        self.ca_key.serialize_pem()
     }
 
     /// The CA certificate in PEM — this is what gets baked into the guest.
@@ -496,9 +527,11 @@ mod tests {
         use std::sync::OnceLock;
         static ONCE: OnceLock<()> = OnceLock::new();
         ONCE.get_or_init(|| {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("install ring provider");
+            // Best-effort: another part of the process (e.g. the daemon's
+            // build_mitm_runtime, exercised by server tests in the same binary)
+            // may have already installed ring as the default. Both install ring,
+            // so an "already installed" error is fine to ignore.
+            let _ = rustls::crypto::ring::default_provider().install_default();
         });
     }
 

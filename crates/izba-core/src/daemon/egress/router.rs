@@ -4,6 +4,7 @@
 //! the resolver. The M5 MITM/vault branch hangs off this dispatch point.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
 
 use izba_proto::{dns, read_frame, write_frame, ErrorKind, Response, StreamOpen};
@@ -24,7 +25,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn handle_conn(
     mut conn: UdsStream,
     sandbox: &str,
-    policy: &dyn Policy,
+    policy: Arc<dyn Policy>,
     resolver: &dyn Resolver,
     mitm: Option<&MitmRuntime>,
     audit: &AuditSink,
@@ -55,7 +56,7 @@ pub fn handle_conn(
 fn tcp_connect(
     mut conn: UdsStream,
     sandbox: &str,
-    policy: &dyn Policy,
+    policy: Arc<dyn Policy>,
     resolver: &dyn Resolver,
     mitm: Option<&MitmRuntime>,
     audit: &AuditSink,
@@ -87,13 +88,15 @@ fn tcp_connect(
         }
     };
 
-    // Tier 1 — HTTP(S): hand the flow to the MITM runtime via the loopback hop.
-    // The policy decision happens AFTER TLS termination, on the decrypted Host,
-    // inside the MITM handler — so we do NOT pre-check on the IP here (an IP is
-    // never on a domain allow-list).
+    // Tier 1 — HTTP(S) under an ENFORCING policy: hand the flow to the MITM
+    // runtime via the loopback hop. The policy decision happens AFTER TLS
+    // termination, on the decrypted Host, inside the MITM handler — so we do NOT
+    // pre-check on the IP here (an IP is never on a domain allow-list). A bare
+    // (non-enforcing) sandbox skips MITM and keeps the transparent direct dial,
+    // so it needs no CA trust and no http/1.1 downgrade — M1 behavior preserved.
     if let Some(mitm) = mitm {
-        if matches!(port, 80 | 443) {
-            mitm_hop(conn, mitm, ip, port, sandbox);
+        if matches!(port, 80 | 443) && policy.enforces() {
+            mitm_hop(conn, mitm, Arc::clone(&policy), ip, port, sandbox);
             return;
         }
     }
@@ -101,7 +104,7 @@ fn tcp_connect(
     // Tier 2 — non-HTTP TCP: recover the FQDN from DNS-snoop and decide. An
     // enforcing policy is strict (private-address denylist + default-deny on a
     // raw-IP dial with no snoop record); a bare sandbox stays permissive.
-    let (verdict, flow, rule) = decide_tier2(policy, snoop, sandbox, ip, port);
+    let (verdict, flow, rule) = decide_tier2(&*policy, snoop, sandbox, ip, port);
     audit.record(AuditRecord::from_flow(verdict, &flow, ip, Tier::L3, rule));
     if verdict == Verdict::Deny {
         let _ = write_frame(
@@ -137,7 +140,14 @@ fn tcp_connect(
 /// with the MITM accept claim), dial the MITM listener, then splice the vsock
 /// leg with the *unchanged* blocking pump (the OpenVMM churn invariant stays
 /// untouched — only the loopback TCP enters tokio, never the vsock `UdsStream`).
-fn mitm_hop(mut conn: UdsStream, mitm: &MitmRuntime, ip: IpAddr, port: u16, sandbox: &str) {
+fn mitm_hop(
+    mut conn: UdsStream,
+    mitm: &MitmRuntime,
+    policy: Arc<dyn Policy>,
+    ip: IpAddr,
+    port: u16,
+    sandbox: &str,
+) {
     use socket2::{Domain, Socket, Type};
     let listen = mitm.listen_addr();
     let connect = || -> std::io::Result<TcpStream> {
@@ -148,7 +158,8 @@ fn mitm_hop(mut conn: UdsStream, mitm: &MitmRuntime, ip: IpAddr, port: u16, sand
             .as_socket()
             .map(|a| a.port())
             .ok_or_else(|| std::io::Error::other("no loopback source port"))?;
-        // Register BEFORE connect so the accept handler can always claim it.
+        // Register BEFORE connect so the accept handler can always claim it —
+        // the flow carries its per-sandbox policy to the shared MITM runtime.
         mitm.register(
             src_port,
             OrigDst {
@@ -156,6 +167,7 @@ fn mitm_hop(mut conn: UdsStream, mitm: &MitmRuntime, ip: IpAddr, port: u16, sand
                 port,
                 sandbox: sandbox.to_string(),
             },
+            Arc::clone(&policy),
         );
         sock.connect(&listen.into())?;
         Ok(sock.into())
@@ -300,7 +312,7 @@ mod tests {
     }
 
     fn spawn_handler(
-        policy: &'static (dyn Policy + Sync),
+        policy: Arc<dyn Policy>,
         resolver: &'static (dyn Resolver + Sync),
     ) -> UdsStream {
         let (client, server) = UdsStream::pair().unwrap();
@@ -316,7 +328,7 @@ mod tests {
 
     #[test]
     fn dns_stream_roundtrips_queries() {
-        let mut c = spawn_handler(&AllowAll, &FakeResolver);
+        let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
         write_frame(&mut c, &StreamOpen::Dns).unwrap();
         dns::write_dns_msg(&mut c, b"q1").unwrap();
         assert_eq!(dns::read_dns_msg(&mut c).unwrap().unwrap(), b"ans:q1");
@@ -328,7 +340,7 @@ mod tests {
 
     #[test]
     fn dns_resolver_failure_becomes_servfail() {
-        let mut c = spawn_handler(&AllowAll, &FailingResolver);
+        let mut c = spawn_handler(Arc::new(AllowAll), &FailingResolver);
         write_frame(&mut c, &StreamOpen::Dns).unwrap();
         let q = [0xbeu8, 0xef, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
         dns::write_dns_msg(&mut c, &q).unwrap();
@@ -339,7 +351,7 @@ mod tests {
 
     #[test]
     fn tcp_connect_denied_by_policy() {
-        let mut c = spawn_handler(&DenyAll, &FakeResolver);
+        let mut c = spawn_handler(Arc::new(DenyAll), &FakeResolver);
         write_frame(
             &mut c,
             &StreamOpen::TcpConnect {
@@ -466,7 +478,7 @@ mod tests {
 
     #[test]
     fn tcp_connect_bad_addr_is_bad_request() {
-        let mut c = spawn_handler(&AllowAll, &FakeResolver);
+        let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
         write_frame(
             &mut c,
             &StreamOpen::TcpConnect {
@@ -483,7 +495,7 @@ mod tests {
 
     #[test]
     fn tcp_connect_port53_routes_to_resolver() {
-        let mut c = spawn_handler(&AllowAll, &FakeResolver);
+        let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
         write_frame(
             &mut c,
             &StreamOpen::TcpConnect {
@@ -502,7 +514,7 @@ mod tests {
 
     #[test]
     fn unsupported_stream_open_is_bad_request() {
-        let mut c = spawn_handler(&AllowAll, &FakeResolver);
+        let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
         write_frame(&mut c, &StreamOpen::TcpDial { port: 80 }).unwrap();
         match read_frame::<_, Response>(&mut c).unwrap() {
             Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::BadRequest),
@@ -531,7 +543,7 @@ mod tests {
             s.write_all(&buf[..n]).unwrap();
             s.shutdown(std::net::Shutdown::Write).unwrap();
         });
-        let mut c = spawn_handler(&AllowAll, &FakeResolver);
+        let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
         write_frame(
             &mut c,
             &StreamOpen::TcpConnect {
@@ -566,7 +578,7 @@ mod tests {
             }
             Err(e) => panic!("bind probe: {e}"),
         };
-        let mut c = spawn_handler(&AllowAll, &FakeResolver);
+        let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
         write_frame(
             &mut c,
             &StreamOpen::TcpConnect {
