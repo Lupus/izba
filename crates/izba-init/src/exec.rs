@@ -570,6 +570,30 @@ mod tests {
     }
 
     #[test]
+    fn kill_with_invalid_signal_is_bad_request() {
+        let e = engine();
+        let id = e.exec(&req(&["sleep", "30"])).unwrap();
+        // 9999 is not a valid signal number → BadRequest before any signal.
+        let (kind, _) = e.kill(id, 9999).unwrap_err();
+        assert_eq!(kind, ErrorKind::BadRequest);
+        // The job is still running; reap it so the test leaves nothing behind.
+        e.kill(id, libc::SIGKILL).unwrap();
+        e.wait(id).unwrap();
+    }
+
+    #[test]
+    fn kill_all_sigkills_unreaped() {
+        let e = engine();
+        let running = e.exec(&req(&["sleep", "30"])).unwrap();
+        let done = e.exec(&req(&["true"])).unwrap();
+        // Reap the short-lived one so kill_all must skip it (status present)
+        // and only signal the still-running job.
+        assert_eq!(e.wait(done).unwrap(), ExitStatus::Code(0));
+        e.kill_all();
+        assert_eq!(e.wait(running).unwrap(), ExitStatus::Signal(libc::SIGKILL));
+    }
+
+    #[test]
     fn env_is_cleared_and_path_defaulted() {
         let e = engine();
         let mut r = req(&["sh", "-c", "echo \"P=$PATH M=${IZBA_MARKER:-unset}\""]);
