@@ -30,8 +30,11 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build the shared MITM tier-1 runtime: load/mint the persistent izba CA, sign
 /// per-SNI leaves under it, verify real upstreams against the Mozilla roots, and
-/// audit every decision. Returns `None` (egress falls back to direct dial) if
-/// CA init or the runtime fails — the daemon must still come up. The per-sandbox
+/// audit every decision. Returns `None` if CA init or the runtime fails — the
+/// daemon must still come up (it also serves bare sandboxes that never MITM).
+/// With `None`, bare sandboxes keep their transparent direct dial, but an
+/// ENFORCING sandbox's HTTP(S) FAILS CLOSED at the router (it is never silently
+/// downgraded to a direct dial — see `router::tcp_connect`). The per-sandbox
 /// policy travels with each flow, so no policy is needed here.
 fn build_mitm_runtime(
     paths: &Paths,
@@ -126,8 +129,9 @@ impl Daemon {
     pub fn new(paths: Paths, deps: DaemonDeps) -> Self {
         // Clone the egress seams before `deps` is moved into the struct. The
         // MITM tier-1 runtime is built from the persistent izba CA; if that
-        // fails the daemon still runs — egress just takes the direct-dial path
-        // (an honest degrade, logged in `build_mitm_runtime`).
+        // fails the daemon still runs (bare sandboxes never MITM), but enforcing
+        // sandboxes' HTTP(S) then fails closed at the router rather than
+        // downgrading — logged in `build_mitm_runtime`.
         let audit = crate::daemon::egress::audit::AuditSink::new(paths.clone());
         let mitm = build_mitm_runtime(&paths, audit.clone());
         let egress = EgressManager::new(

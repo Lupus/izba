@@ -88,17 +88,41 @@ fn tcp_connect(
         }
     };
 
-    // Tier 1 — HTTP(S) under an ENFORCING policy: hand the flow to the MITM
-    // runtime via the loopback hop. The policy decision happens AFTER TLS
-    // termination, on the decrypted Host, inside the MITM handler — so we do NOT
-    // pre-check on the IP here (an IP is never on a domain allow-list). A bare
-    // (non-enforcing) sandbox skips MITM and keeps the transparent direct dial,
-    // so it needs no CA trust and no http/1.1 downgrade — M1 behavior preserved.
-    if let Some(mitm) = mitm {
-        if matches!(port, 80 | 443) && policy.enforces() {
-            mitm_hop(conn, mitm, Arc::clone(&policy), ip, port, sandbox);
-            return;
+    // Tier 1 — HTTP(S) under an ENFORCING policy MUST be terminated by the MITM,
+    // so the allow-list is judged on the decrypted Host (an IP is never on a
+    // domain allow-list, so we do NOT pre-check on the IP here). A bare
+    // (non-enforcing) sandbox skips this entirely and keeps the transparent
+    // direct dial — no CA trust, no http/1.1 downgrade, M1 behavior preserved.
+    if matches!(port, 80 | 443) && policy.enforces() {
+        match mitm {
+            Some(mitm) => mitm_hop(conn, mitm, Arc::clone(&policy), ip, port, sandbox),
+            // FAIL CLOSED: a firewall was declared but the MITM runtime is
+            // unavailable (CA/runtime init failed at daemon start). Deny rather
+            // than fall through to a tier-2 direct dial — silently downgrading
+            // an "enforced" sandbox to DNS-snoop-only (no L7, smuggling-prone)
+            // is exactly the wrong failure direction for a security control.
+            None => {
+                let flow = FlowDesc::l3(sandbox, addr, port);
+                audit.record(AuditRecord::from_flow(
+                    Verdict::Deny,
+                    &flow,
+                    ip,
+                    Tier::L7,
+                    "HTTP(S) firewall (MITM) unavailable — fail-closed",
+                ));
+                let _ = write_frame(
+                    &mut conn,
+                    &Response::Error {
+                        kind: ErrorKind::ConnectFailed,
+                        message: format!(
+                            "egress to {addr}:{port} denied: HTTP(S) firewall unavailable \
+                             (izbad MITM did not initialize) — failing closed"
+                        ),
+                    },
+                );
+            }
         }
+        return;
     }
 
     // Tier 2 — non-HTTP TCP: recover the FQDN from DNS-snoop and decide. An
@@ -474,6 +498,36 @@ mod tests {
             vec!["api.anthropic.com".to_string()],
             "the resolved A record was snooped into the store"
         );
+    }
+
+    /// FAIL-CLOSED: a declared (enforcing) policy whose MITM runtime is absent
+    /// (`mitm=None`, e.g. CA/runtime init failed at daemon start) must DENY an
+    /// HTTP(S) flow, never fall through to a tier-2 direct dial. `spawn_handler`
+    /// always passes `mitm=None`, so this exercises exactly that path. The deny
+    /// must cite the firewall being unavailable (tier-1 fail-closed), not a
+    /// tier-2 "denied by policy" — proving the downgrade cannot happen even for
+    /// an allow-listed host (the IP here is irrelevant; we never reach tier-2).
+    #[test]
+    fn enforcing_https_fails_closed_when_mitm_unavailable() {
+        let mut c = spawn_handler(Arc::new(RegoPolicy::embedded().unwrap()), &FakeResolver);
+        write_frame(
+            &mut c,
+            &StreamOpen::TcpConnect {
+                addr: "1.2.3.4".into(),
+                port: 443,
+            },
+        )
+        .unwrap();
+        match read_frame::<_, Response>(&mut c).unwrap() {
+            Response::Error { kind, message } => {
+                assert_eq!(kind, ErrorKind::ConnectFailed);
+                assert!(
+                    message.contains("firewall unavailable"),
+                    "expected a tier-1 fail-closed reason, got: {message}"
+                );
+            }
+            other => panic!("expected fail-closed deny, got {other:?}"),
+        }
     }
 
     #[test]
