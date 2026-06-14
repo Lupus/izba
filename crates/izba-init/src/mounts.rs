@@ -129,6 +129,26 @@ pub fn upper_prep_dirs() -> Vec<PathBuf> {
     vec![PathBuf::from("/upper/data"), PathBuf::from("/upper/work")]
 }
 
+/// Guest block device for the Nth user volume: vdc, vdd, … (vda=erofs,
+/// vdb=rw). Mirrors the host disk-list order and OpenVMM's `disk_port`.
+pub fn volume_device(index: usize) -> String {
+    format!("/dev/vd{}", (b'c' + index as u8) as char)
+}
+
+/// Mount ops for user volumes, one per guest path in declaration order.
+/// Mounted under /rootfs AFTER the overlay + virtiofs shares. ext4, no
+/// special flags. Targets are created by [`apply`].
+pub fn volume_mount_plan(guest_paths: &[&str]) -> Vec<MountOp> {
+    guest_paths
+        .iter()
+        .enumerate()
+        .map(|(i, gp)| {
+            let target = format!("/rootfs{gp}");
+            MountOp::new(&volume_device(i), &target, "ext4", &[], "")
+        })
+        .collect()
+}
+
 fn flags_to_ms(flags: &[String]) -> anyhow::Result<MsFlags> {
     let mut ms = MsFlags::empty();
     for f in flags {
@@ -394,6 +414,31 @@ mod tests {
                 assert_eq!(pause, None, "{} must not pause", op.fstype);
             }
         }
+    }
+
+    #[test]
+    fn volume_plan_maps_order_to_vdc_onward() {
+        let plan = volume_mount_plan(&["/var/lib/docker", "/data"]);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            op(&plan, 0),
+            ("/dev/vdc", "/rootfs/var/lib/docker", "ext4", vec![], "")
+        );
+        assert_eq!(
+            op(&plan, 1),
+            ("/dev/vdd", "/rootfs/data", "ext4", vec![], "")
+        );
+    }
+
+    #[test]
+    fn volume_plan_empty() {
+        assert!(volume_mount_plan(&[]).is_empty());
+    }
+
+    #[test]
+    fn volume_devices_match_plan() {
+        assert_eq!(volume_device(0), "/dev/vdc");
+        assert_eq!(volume_device(2), "/dev/vde");
     }
 
     #[test]
