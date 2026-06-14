@@ -37,8 +37,10 @@ worktree**; Phases 2 and 3 are designed here but implemented after review.
    `cargo-llvm-cov` over the host unit + integration suite, `hack/coverage.sh`
    + `hack/coverage_report.py`, a new `coverage.yml` workflow (`rust-host` +
    `report` jobs), the `coverage-gaps.md` report, and docs.
-2. **Phase 2 — real-VM e2e host-side coverage.** Instrument `e2e.yml`'s KVM leg
-   under `cargo llvm-cov show-env` and merge the (Linux) lcov into the report.
+2. **Phase 2 — real-VM e2e host-side coverage (BUILT).** A separate
+   `linux-kvm-coverage` job in `e2e.yml` (weekly cron + dispatch, isolated from
+   the gate) runs the host + gated suites under one instrumented shell and emits
+   a merged host+e2e gap report. Validated locally against real KVM.
 3. **Phase 3 — Tauri app coverage.** Frontend `vitest --coverage` + `src-tauri`
    `cargo-llvm-cov`, plugged into `app.yml`.
 
@@ -125,26 +127,35 @@ report.
 
 No threshold/failure step. The workflow's value is the artifacts + summary.
 
-### 4. Phase 2 — e2e host-side coverage (designed, not built this pass)
+### 4. Phase 2 — e2e host-side coverage (BUILT)
 
 The real-VM tests in `e2e.yml` exercise host-side `izba-core` paths (VMM driver,
-vsock bridging, daemon splice) that the fast host suite cannot reach. To capture
-them:
+vsock bridging, daemon splice) that the fast host suite cannot reach. Phase 2
+adds a **separate `linux-kvm-coverage` job** to `e2e.yml`:
 
-- In the KVM leg, wrap the build+test in the llvm-cov environment:
-  `source <(cargo llvm-cov show-env --export-prefix)` then
-  `cargo llvm-cov clean --workspace`, build the binaries (so they are
-  instrumented), run the gated suite (`IZBA_INTEGRATION=1 cargo test ...` — the
-  spawned `izba`/`izbad` binaries inherit `LLVM_PROFILE_FILE` and emit profraw),
-  then `cargo llvm-cov report --lcov --output-path lcov-e2e-kvm.info`.
-- Upload `lcov-e2e-kvm.info` as an artifact.
-- The `report` job merges `lcov-host.info` + `lcov-e2e-kvm.info` (both Linux,
-  same checkout path `/home/runner/work/izba/izba`, so file paths align) with
-  the `lcov` tool (`lcov -a a.info -a b.info -o merged.info`) before generating
-  the unified gap report.
-- **Windows** coverage (windows-native / app-windows) is reported as a separate
-  platform artifact, NOT cross-merged with Linux — the code paths differ and
-  absolute paths don't align, so merging would corrupt the report.
+- **Isolated from the gate.** The existing `linux-kvm` job stays the
+  authoritative real-VM test gate, untouched. A coverage-instrumentation problem
+  can never break it. The coverage job is `if: github.event_name != 'push'` —
+  it runs on the weekly cron + manual dispatch only, so it does not double the
+  expensive real-VM minutes on every main push.
+- **Self-contained merge, no cross-workflow lcov merge.** The job runs the host
+  workspace suite *and* the gated real-VM suites (`integration`, `daemon_e2e`)
+  under a single `source <(cargo llvm-cov show-env --export-prefix)` shell, so
+  every cargo invocation is instrumented and all profraw accumulate into one
+  profile set. A single `cargo llvm-cov report` then yields a genuine host+e2e
+  **merge** in one artifact — avoiding the fragile cross-workflow lcov merge
+  (control-char `RUSTFLAGS`, `$GITHUB_ENV` quoting) the multi-step variant would
+  require. The spawned `izba`/`izbad` binaries inherit `LLVM_PROFILE_FILE` and
+  emit their own profraw, so subprocess host paths are captured too. **Validated
+  locally against real KVM** before landing (a single boot test alone covered
+  19.3% of izba-core; `daemon_e2e` confirmed subprocess capture).
+- Report-only: suites run under `set +e` so a flake cannot wipe the report; the
+  gap report (`coverage-gaps-e2e.md`), lcov, json, and HTML upload as the
+  `coverage-report-e2e` artifact + step summary (all `if: always()`).
+- **Windows** (WHP) is NOT coverage-instrumented — its paths differ and absolute
+  paths would not merge with Linux. Reported separately if/when needed.
+- **Guest-side** `izba-init` running *inside* the microVM is not capturable; its
+  host-testable modules are already covered by the host suite.
 
 ### 5. Phase 3 — Tauri app coverage (designed, not built this pass)
 
@@ -214,3 +225,9 @@ real-VM e2e (Phase 2)      ─┘                                  └─► lco
 - `.gitignore` (+`target/coverage/` if not already covered by `target/`)
 - `docs/testing.md` (+ coverage runbook section)
 - `CLAUDE.md` (+ coverage command in Build & test)
+
+## Files touched (Phase 2)
+
+- `.github/workflows/e2e.yml` (+ `linux-kvm-coverage` job)
+- `docs/testing.md` + `CLAUDE.md` (real-VM coverage notes)
+- reuses `hack/coverage_report.py` unchanged (`--title` flag)
