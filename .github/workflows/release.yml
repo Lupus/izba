@@ -189,6 +189,9 @@ jobs:
         run: cd rel && sha256sum * > SHA256SUMS && cat SHA256SUMS
       - uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
+          # Tags containing a hyphen (e.g. v0.1.0-rc1) are pre-releases, so they
+          # never become the repo's "Latest" release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             rel/izba_*_amd64.deb
             rel/izba-setup-*.exe
