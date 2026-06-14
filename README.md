@@ -90,11 +90,12 @@ integration test suite.
 ## Commands
 
 ```
-izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [DIR]
+izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [--volume [NAME:]GUEST_PATH:SIZE]... [DIR]
 izba run    [--image IMG] [NAME_OR_DIR] [-- CMD...]
 izba exec   NAME [-it] [-- CMD...]
 izba cp     HOST_PATH NAME:GUEST_PATH   # or NAME:GUEST_PATH HOST_PATH; recursive
 izba port   publish|unpublish|ls NAME [RULE]   # TCP, runtime or create-time -p
+izba volume prune [-f]                  # remove persistent volumes no sandbox uses
 izba ls
 izba stop   NAME
 izba rm     [--force] NAME

@@ -123,13 +123,25 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   izbad dials out + replies `Ok`/`Error`, then raw byte pipe) or
   `StreamOpen::Dns` (RFC 1035 2-byte-BE length framing per `izba_proto::dns`,
   request/response alternating). TCP `:53` routes to the same resolver.
-- **Disk order:** `sandbox::start()` builds `[rootfs.erofs (RO), rw.img (RW)]`
-  → CH enumerates `--disk` order as vda, vdb → init mounts `/dev/vda` erofs
-  lower + `/dev/vdb` ext4 upper into an overlay at `/rootfs`.
-- **Cmdline chain:** `console=ttyS0 izba.hostname=<name> izba.egress=1` ↔
+- **Disk order:** `sandbox::start()` builds
+  `[rootfs.erofs (RO)=vda, rw.img (RW)=vdb, vol₀=vdc, vol₁=vdd, …]`
+  (`build_vm_disks`) → CH enumerates `--disk` in that order, OpenVMM gives each
+  disk its own PCIe root port via `disk_port(i)` (vda, vdb, vdc, …) → init
+  mounts `/dev/vda` erofs lower + `/dev/vdb` ext4 upper into an overlay at
+  `/rootfs`, then formats-if-blank + mounts each user volume `/dev/vd{c…}` at
+  its declared guest path under `/rootfs` (after the overlay + virtiofs).
+  User volumes append after `rw.img` in declaration order; the binding between
+  a volume and its `vd{c…}` slot is purely positional, carried on `izba.volumes`
+  (see Cmdline chain). Max 24 volumes (26 virtio-blk slots − vda − vdb).
+  Named volumes are persistent (`<data>/volumes/<name>.img`, survive `rm`,
+  single-writer); anonymous are ephemeral (in the sandbox dir).
+- **Cmdline chain:** `console=ttyS0 izba.hostname=<name> izba.egress=1
+  [izba.volumes=<p0>,<p1>,…]` ↔
   `hack/kernel.config` (`SERIAL_8250_CONSOLE`; netfilter/nftables —
   `NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK` — + `CONFIG_DUMMY`) ↔ init
-  reads `izba.hostname` for sethostname. NO `ip=dhcp`: the guest is a NIC-less
+  reads `izba.hostname` for sethostname and `izba.volumes` (ordered,
+  comma-separated guest mountpoints, one per user volume in `vd{c…}` order) for
+  the volume format+mount pass. NO `ip=dhcp`: the guest is a NIC-less
   vsock island. `izba.egress=1` is vestigial — init no longer reads it; the
   egress stub is always-on. init brings up `lo` + `dummy0`
   (`192.168.127.2/24`, alias `192.168.127.1` as the default-route gateway via
