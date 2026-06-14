@@ -38,6 +38,9 @@ impl CreateOpts {
             workspace: PathBuf::from(self.workspace),
             rw_size_gb: self.rw_size_gb,
             ports,
+            // The app does not expose volume creation yet (a future "Storage"
+            // tab); send none so the daemon treats it as a volume-less sandbox.
+            volumes: Vec::new(),
         })
     }
 }

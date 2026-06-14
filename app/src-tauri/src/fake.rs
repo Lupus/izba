@@ -124,6 +124,7 @@ mod tests {
             workspace: std::path::PathBuf::from("/ws"),
             rw_size_gb: 4,
             ports: vec![],
+            volumes: vec![],
         }
     }
 
