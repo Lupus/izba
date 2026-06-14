@@ -11,7 +11,10 @@ export function TopBar({ daemon, error }: { daemon: DaemonStatusView | null; err
       </div>
       <div className="text-[13px] text-ink-2 flex items-center gap-2">
         {error ? (
-          <span className="text-warn">● daemon unreachable</span>
+          <>
+            <span className="inline-block w-2 h-2 rounded-full bg-warn" aria-hidden="true" />
+            <span className="text-warn">daemon unreachable</span>
+          </>
         ) : (
           <>
             <span className="inline-block w-2 h-2 rounded-full bg-ok" />
