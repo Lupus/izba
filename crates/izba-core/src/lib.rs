@@ -14,4 +14,5 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod vmm;
+pub mod volume;
 pub mod vsock;
