@@ -17,6 +17,8 @@ pub struct FakeDaemon {
     pub fail_action: bool,
     pub calls: Vec<String>,
     pub progress: Vec<String>,
+    /// Canned console output returned by `read_logs`.
+    pub logs: String,
 }
 
 impl Default for FakeDaemon {
@@ -47,6 +49,7 @@ impl Default for FakeDaemon {
             fail_action: false,
             calls: Vec::new(),
             progress: vec!["pulling image".into(), "booting".into()],
+            logs: "boot ok\nlogin:\n".into(),
         }
     }
 }
@@ -109,6 +112,12 @@ impl DaemonApi for FakeDaemon {
         self.calls.push(format!("create:{}", req.name));
         Ok(req.name)
     }
+    fn read_logs(&mut self, _name: &str) -> anyhow::Result<String> {
+        if self.fail_action {
+            anyhow::bail!("action failed");
+        }
+        Ok(self.logs.clone())
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +165,12 @@ mod tests {
             ..Default::default()
         };
         assert!(d.start("web").is_err());
+    }
+
+    #[test]
+    fn fake_read_logs_returns_canned_text() {
+        let mut d = FakeDaemon::default();
+        let logs = d.read_logs("web").unwrap();
+        assert!(logs.contains("boot"), "got: {logs}");
     }
 }

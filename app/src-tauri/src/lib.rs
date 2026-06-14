@@ -96,6 +96,11 @@ async fn create(
     .await
 }
 
+#[tauri::command]
+async fn read_logs(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    run_action(&state, move |d| commands::read_logs_core(d, &name)).await
+}
+
 pub fn run() {
     let state = AppState {
         daemon: Mutex::new(Box::new(RealDaemon::new())),
@@ -112,7 +117,8 @@ pub fn run() {
             stop,
             restart,
             remove,
-            create
+            create,
+            read_logs
         ])
         .run(tauri::generate_context!())
         .expect("error while running izba app");
