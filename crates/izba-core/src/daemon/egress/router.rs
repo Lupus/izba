@@ -10,6 +10,7 @@ use izba_proto::{dns, read_frame, write_frame, ErrorKind, Response, StreamOpen};
 
 use super::audit::{AuditRecord, AuditSink, Tier};
 use super::dns::Resolver;
+use super::dns_snoop::{self, SnoopStore};
 use super::mitm_runtime::{MitmRuntime, OrigDst};
 use super::policy::{FlowDesc, Policy, Verdict};
 use crate::vmm::UdsStream;
@@ -19,6 +20,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serve one guest-initiated egress connection (the vsock-1027 bridge).
 /// `mitm` (when present) routes tier-1 HTTP(S) ports through the loopback hop.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_conn(
     mut conn: UdsStream,
     sandbox: &str,
@@ -26,16 +28,17 @@ pub fn handle_conn(
     resolver: &dyn Resolver,
     mitm: Option<&MitmRuntime>,
     audit: &AuditSink,
+    snoop: &SnoopStore,
 ) {
     let open: StreamOpen = match read_frame(&mut conn) {
         Ok(o) => o,
         Err(_) => return, // malformed first frame: nothing spliced yet, just drop
     };
     match open {
-        StreamOpen::TcpConnect { addr, port } => {
-            tcp_connect(conn, sandbox, policy, resolver, mitm, audit, &addr, port)
-        }
-        StreamOpen::Dns => dns_loop(conn, resolver),
+        StreamOpen::TcpConnect { addr, port } => tcp_connect(
+            conn, sandbox, policy, resolver, mitm, audit, snoop, &addr, port,
+        ),
+        StreamOpen::Dns => dns_loop(conn, resolver, sandbox, snoop),
         _ => {
             let _ = write_frame(
                 &mut conn,
@@ -56,6 +59,7 @@ fn tcp_connect(
     resolver: &dyn Resolver,
     mitm: Option<&MitmRuntime>,
     audit: &AuditSink,
+    snoop: &SnoopStore,
     addr: &str,
     port: u16,
 ) {
@@ -66,7 +70,7 @@ fn tcp_connect(
         if write_frame(&mut conn, &Response::Ok).is_err() {
             return;
         }
-        dns_loop(conn, resolver);
+        dns_loop(conn, resolver, sandbox, snoop);
         return;
     }
     let ip: IpAddr = match addr.parse() {
@@ -94,17 +98,11 @@ fn tcp_connect(
         }
     }
 
-    // Tier 2 — non-HTTP TCP: policy on the destination (T9 consults DNS-snoop
-    // for the FQDN; today on the addr as given).
-    let flow = FlowDesc::l3(sandbox, addr, port);
-    let verdict = policy.check(&flow);
-    audit.record(AuditRecord::from_flow(
-        verdict,
-        &flow,
-        ip,
-        Tier::L3,
-        "tier-2 policy",
-    ));
+    // Tier 2 — non-HTTP TCP: recover the FQDN from DNS-snoop and decide. An
+    // enforcing policy is strict (private-address denylist + default-deny on a
+    // raw-IP dial with no snoop record); a bare sandbox stays permissive.
+    let (verdict, flow, rule) = decide_tier2(policy, snoop, sandbox, ip, port);
+    audit.record(AuditRecord::from_flow(verdict, &flow, ip, Tier::L3, rule));
     if verdict == Verdict::Deny {
         let _ = write_frame(
             &mut conn,
@@ -181,14 +179,81 @@ fn mitm_hop(mut conn: UdsStream, mitm: &MitmRuntime, ip: IpAddr, port: u16, sand
     }
 }
 
+/// Tier-2 (non-HTTP TCP) decision: recover the FQDN(s) izbad resolved for `ip`
+/// and decide. Returns the verdict, the `FlowDesc` to audit, and a rule label.
+///
+/// Enforcing policy (a declared firewall): a private/loopback/link-local
+/// destination is denied (DNS-rebinding / SSRF guard); a raw-IP dial with no
+/// snoop record is default-denied (the red flag); otherwise the flow is allowed
+/// iff ANY snooped name passes the policy. A non-enforcing `AllowAll` keeps
+/// today's permissive behavior — it decides on the address as given.
+pub fn decide_tier2(
+    policy: &dyn Policy,
+    snoop: &SnoopStore,
+    sandbox: &str,
+    ip: IpAddr,
+    port: u16,
+) -> (Verdict, FlowDesc, &'static str) {
+    let names = snoop.fqdns_for(sandbox, ip);
+    let mut flow = FlowDesc::l3(sandbox, ip.to_string(), port);
+    flow.host = names.first().cloned();
+
+    if !policy.enforces() {
+        // Permissive bare sandbox: decide on the addr (today's behavior).
+        let verdict = policy.check(&flow);
+        return (verdict, flow, "permissive");
+    }
+
+    if is_private(ip) {
+        return (Verdict::Deny, flow, "private-address denylist");
+    }
+    if names.is_empty() {
+        return (Verdict::Deny, flow, "no DNS-snoop record (raw IP)");
+    }
+    // Allow if any resolved name passes the allow-list.
+    for name in &names {
+        let mut f = flow.clone();
+        f.addr = name.clone();
+        f.host = Some(name.clone());
+        if policy.check(&f) == Verdict::Allow {
+            return (Verdict::Allow, f, "allow-list");
+        }
+    }
+    (Verdict::Deny, flow, "not in allow-list")
+}
+
+/// Private / loopback / link-local / unspecified destinations the egress plane
+/// must never reach from an enforced sandbox (SSRF + DNS-rebinding guard).
+fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
+}
+
 /// Framed query/response pairs until EOF; resolver failures become SERVFAIL
-/// so the guest client fails fast instead of timing out.
-fn dns_loop(mut conn: UdsStream, resolver: &dyn Resolver) {
+/// so the guest client fails fast instead of timing out. Each answer is snooped
+/// into `snoop` (IP→FQDN for tier-2) BEFORE the reply is written, so the mapping
+/// is installed before the guest can dial the resolved address.
+fn dns_loop(mut conn: UdsStream, resolver: &dyn Resolver, sandbox: &str, snoop: &SnoopStore) {
     while let Ok(Some(query)) = dns::read_dns_msg(&mut conn) {
         let resp = resolver.handle(&query).unwrap_or_else(|e| {
             eprintln!("izbad: dns forward failed: {e:#}");
             dns::servfail(&query)
         });
+        snoop.record(sandbox, &dns_snoop::extract_a_aaaa(&resp));
         if dns::write_dns_msg(&mut conn, &resp).is_err() {
             break; // stop answering, but still drain + half-close below
         }
@@ -208,7 +273,7 @@ fn dns_loop(mut conn: UdsStream, resolver: &dyn Resolver) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::egress::policy::AllowAll;
+    use crate::daemon::egress::policy::{AllowAll, RegoPolicy};
     use std::io::{Read, Write};
 
     struct FakeResolver;
@@ -242,7 +307,10 @@ mod tests {
         let audit = AuditSink::new(crate::paths::Paths::with_root(
             std::env::temp_dir().join("izba-router-audit-test"),
         ));
-        std::thread::spawn(move || handle_conn(server, "web", policy, resolver, None, &audit));
+        let snoop = SnoopStore::new();
+        std::thread::spawn(move || {
+            handle_conn(server, "web", policy, resolver, None, &audit, &snoop)
+        });
         client
     }
 
@@ -287,6 +355,113 @@ mod tests {
             }
             other => panic!("expected deny error, got {other:?}"),
         }
+    }
+
+    // --- decide_tier2: pure tier-2 decision (no listeners). ---
+
+    #[test]
+    fn decide_tier2_denies_raw_ip_with_no_snoop() {
+        let p = RegoPolicy::embedded().unwrap();
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443);
+        assert_eq!(v, Verdict::Deny);
+        assert!(rule.contains("no DNS-snoop"), "{rule}");
+    }
+
+    #[test]
+    fn decide_tier2_allows_snooped_allowlisted_fqdn() {
+        let p = RegoPolicy::embedded().unwrap();
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        snoop.record("web", &[("api.anthropic.com".to_string(), ip, 300)]);
+        let (v, f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443);
+        assert_eq!(v, Verdict::Allow);
+        assert_eq!(f.host.as_deref(), Some("api.anthropic.com"));
+        assert_eq!(rule, "allow-list");
+    }
+
+    #[test]
+    fn decide_tier2_denies_snooped_but_unlisted_fqdn() {
+        let p = RegoPolicy::embedded().unwrap();
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        snoop.record("web", &[("evil.example.com".to_string(), ip, 300)]);
+        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443);
+        assert_eq!(v, Verdict::Deny);
+        assert_eq!(rule, "not in allow-list");
+    }
+
+    /// DNS-rebinding guard: even a rebinding to an allow-listed name that points
+    /// at a private IP is denied by the address denylist.
+    #[test]
+    fn decide_tier2_denies_private_ip_even_when_snooped() {
+        let p = RegoPolicy::embedded().unwrap();
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        snoop.record("web", &[("api.anthropic.com".to_string(), ip, 300)]);
+        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443);
+        assert_eq!(v, Verdict::Deny);
+        assert!(rule.contains("private"), "{rule}");
+    }
+
+    /// A bare sandbox (non-enforcing AllowAll) keeps today's permissive
+    /// behavior — a raw-IP dial with no snoop record is allowed.
+    #[test]
+    fn decide_tier2_permissive_allows_raw_ip() {
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let (v, _f, rule) = decide_tier2(&AllowAll, &snoop, "web", ip, 8443);
+        assert_eq!(v, Verdict::Allow);
+        assert_eq!(rule, "permissive");
+        // Permissive even reaches a private IP (M1 behavior preserved).
+        let priv_ip: IpAddr = "10.0.0.5".parse().unwrap();
+        let (v2, _f2, _r) = decide_tier2(&AllowAll, &snoop, "web", priv_ip, 8443);
+        assert_eq!(v2, Verdict::Allow);
+    }
+
+    /// dns_loop installs the IP→FQDN snoop mapping from each answer it returns.
+    #[test]
+    fn dns_loop_snoops_returned_a_records() {
+        use crate::daemon::egress::dns_snoop;
+        use hickory_proto::op::{Message, Query};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        use std::str::FromStr;
+
+        let ip = std::net::Ipv4Addr::new(203, 0, 113, 7);
+        let name = Name::from_str("api.anthropic.com.").unwrap();
+        let mut msg = Message::new();
+        msg.add_query(Query::query(name.clone(), RecordType::A));
+        msg.add_answer(Record::from_rdata(name, 300, RData::A(A(ip))));
+        let response = msg.to_vec().unwrap();
+
+        struct FixedResolver(Vec<u8>);
+        impl Resolver for FixedResolver {
+            fn handle(&self, _q: &[u8]) -> anyhow::Result<Vec<u8>> {
+                Ok(self.0.clone())
+            }
+        }
+        let resolver = FixedResolver(response);
+        let snoop = SnoopStore::new();
+        let _ = dns_snoop::extract_a_aaaa(&[]); // (parser exercised by its own tests)
+
+        let (mut c, server) = UdsStream::pair().unwrap();
+        // Borrow `snoop`/`resolver` into the scoped thread that runs dns_loop.
+        std::thread::scope(|s| {
+            let h = s.spawn(|| dns_loop(server, &resolver, "web", &snoop));
+            dns::write_dns_msg(&mut c, b"q").unwrap();
+            let _ = dns::read_dns_msg(&mut c).unwrap(); // the resolved answer
+            c.shutdown(std::net::Shutdown::Write).unwrap();
+            drop(c); // let dns_loop's drain reach EOF and return
+            h.join().unwrap();
+        });
+
+        assert_eq!(
+            snoop.fqdns_for("web", IpAddr::V4(ip)),
+            vec!["api.anthropic.com".to_string()],
+            "the resolved A record was snooped into the store"
+        );
     }
 
     #[test]
@@ -425,7 +600,7 @@ mod tests {
             let mut s = server;
             let open: StreamOpen = read_frame(&mut s).unwrap();
             assert!(matches!(open, StreamOpen::Dns));
-            dns_loop(s, &FakeResolver);
+            dns_loop(s, &FakeResolver, "web", &SnoopStore::new());
         });
         write_frame(&mut c, &StreamOpen::Dns).unwrap();
         // Happy-path: one round-trip confirms the loop is running.

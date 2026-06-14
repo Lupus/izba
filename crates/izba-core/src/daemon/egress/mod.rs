@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use self::audit::AuditSink;
 use self::dns::Resolver;
+use self::dns_snoop::SnoopStore;
 use self::mitm_runtime::MitmRuntime;
 use self::policy::Policy;
 use crate::daemon::transport::UdsListener;
@@ -54,6 +55,11 @@ pub struct EgressManager {
     /// Structured per-flow audit log (tier-2 decisions; tier-1 is audited
     /// inside the shared `MitmRuntime`). Cheap to clone into each handler.
     audit: AuditSink,
+    /// DNS-snoop store (tier-2 IP→FQDN recovery). Pure runtime state, so the
+    /// manager owns it rather than taking it as a dependency. One store keyed
+    /// by sandbox serves every listener; the resolver path fills it and the
+    /// `TcpConnect` path reads it.
+    snoop: Arc<SnoopStore>,
 }
 
 impl EgressManager {
@@ -69,6 +75,7 @@ impl EgressManager {
             resolver,
             mitm,
             audit,
+            snoop: Arc::new(SnoopStore::new()),
         }
     }
 
@@ -113,6 +120,7 @@ impl EgressManager {
         let resolver = Arc::clone(&self.resolver);
         let mitm = self.mitm.clone();
         let audit = self.audit.clone();
+        let snoop = Arc::clone(&self.snoop);
         let sandbox = name.to_string();
         let thread = std::thread::spawn(move || {
             while !stop2.load(Ordering::SeqCst) {
@@ -125,6 +133,7 @@ impl EgressManager {
                         let resolver = Arc::clone(&resolver);
                         let mitm = mitm.clone();
                         let audit = audit.clone();
+                        let snoop = Arc::clone(&snoop);
                         let sandbox = sandbox.clone();
                         std::thread::spawn(move || {
                             router::handle_conn(
@@ -134,6 +143,7 @@ impl EgressManager {
                                 &*resolver,
                                 mitm.as_deref(),
                                 &audit,
+                                &snoop,
                             )
                         });
                     }

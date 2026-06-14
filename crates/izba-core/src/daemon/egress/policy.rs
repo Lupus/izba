@@ -48,6 +48,15 @@ pub trait Policy: Send + Sync {
     /// A pure decision: the caller (router tier-2 / MITM tier-1) owns the
     /// structured audit emission, since it knows the tier and the audit sink.
     fn check(&self, flow: &FlowDesc) -> Verdict;
+
+    /// Whether this policy is a real firewall. Tier-2 (non-HTTP) treats an
+    /// enforcing policy strictly — a private-address denylist + default-deny on
+    /// a raw-IP dial with no DNS-snoop record. A bare sandbox's [`AllowAll`]
+    /// does NOT enforce, so its raw-IP / RFC1918 egress stays permitted
+    /// (today's behavior). Defaults to `true`; only `AllowAll` opts out.
+    fn enforces(&self) -> bool {
+        true
+    }
 }
 
 /// Default policy for a bare sandbox (no declared `--policy`): everything
@@ -58,6 +67,9 @@ pub struct AllowAll;
 impl Policy for AllowAll {
     fn check(&self, _flow: &FlowDesc) -> Verdict {
         Verdict::Allow
+    }
+    fn enforces(&self) -> bool {
+        false
     }
 }
 
