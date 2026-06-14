@@ -8,9 +8,13 @@ use crate::sandbox::Artifacts;
 
 /// Locate boot artifacts. Resolution order:
 /// 1. `$IZBA_KERNEL` + `$IZBA_INITRAMFS` overrides (both or neither).
-/// 2. `<data>/artifacts/{vmlinux,initramfs.cpio.gz}` (per-user data dir).
-/// 3. `<exe-dir>/../artifacts/{...}` (a self-contained package install:
-///    binary at `<root>/bin/izba`, artifacts at `<root>/artifacts`).
+/// 2. `<exe-dir>/../artifacts/{vmlinux,initramfs.cpio.gz}` — the
+///    version-matched bundle shipped next to the binary (`.deb`, installer).
+///    This wins by default so that a package upgrade is never silently shadowed
+///    by a stale data-dir left behind from earlier dev work.
+/// 3. `<data>/artifacts/{...}` — per-user data dir, used as a fallback for
+///    `cargo run` / dev builds that have no sibling bundle (populated by
+///    `hack/fetch-artifacts.sh`).
 pub fn locate(paths: &Paths) -> anyhow::Result<Artifacts> {
     let kernel = std::env::var_os("IZBA_KERNEL").map(PathBuf::from);
     let initramfs = std::env::var_os("IZBA_INITRAMFS").map(PathBuf::from);
@@ -36,11 +40,13 @@ fn locate_from(
         (None, None) => {}
     }
 
-    // 2. per-user data dir, then 3. exe-relative `../artifacts`.
+    // 2. exe-relative `../artifacts` (version-matched bundle), then 3. data dir.
     let exe_relative = exe_dir
         .and_then(Path::parent)
         .map(|root| root.join("artifacts"));
-    let candidates = std::iter::once(data_dir.to_path_buf()).chain(exe_relative);
+    let candidates = exe_relative
+        .into_iter()
+        .chain(std::iter::once(data_dir.to_path_buf()));
     for dir in candidates {
         let kernel = dir.join("vmlinux");
         let initramfs = dir.join("initramfs.cpio.gz");
@@ -113,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_wins_over_exe_relative() {
+    fn exe_relative_wins_over_data_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
         let data = tmp.path().join("data");
         touch(&data, "vmlinux");
@@ -123,9 +129,11 @@ mod tests {
         let art = tmp.path().join("artifacts");
         touch(&art, "vmlinux");
         touch(&art, "initramfs.cpio.gz");
+        // The version-matched bundle next to the binary must win over a
+        // potentially stale data dir left behind by an earlier dev build.
         let got = locate_from(None, None, &data, Some(&bin)).unwrap();
-        assert_eq!(got.kernel, data.join("vmlinux"));
-        assert_eq!(got.initramfs, data.join("initramfs.cpio.gz"));
+        assert_eq!(got.kernel, art.join("vmlinux"));
+        assert_eq!(got.initramfs, art.join("initramfs.cpio.gz"));
     }
 
     #[test]
