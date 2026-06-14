@@ -1,4 +1,5 @@
 use crate::views::{DaemonStatusView, SandboxView};
+use izba_core::build_info::BuildInfoOwned;
 use izba_core::daemon::proto::{DaemonRequest, DaemonResponse};
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
@@ -7,6 +8,8 @@ use izba_core::paths::Paths;
 pub trait DaemonApi: Send {
     fn list(&mut self) -> anyhow::Result<Vec<SandboxView>>;
     fn status(&mut self) -> anyhow::Result<DaemonStatusView>;
+    /// The connected daemon's build metadata + wire-protocol version.
+    fn version(&mut self) -> anyhow::Result<(BuildInfoOwned, u32)>;
 }
 
 /// Production `DaemonApi`: a lazily-connected `DaemonClient`. Connects via
@@ -69,5 +72,10 @@ impl DaemonApi for RealDaemon {
             DaemonResponse::Error { message } => anyhow::bail!("{message}"),
             other => anyhow::bail!("unexpected Status reply: {other:?}"),
         })
+    }
+
+    fn version(&mut self) -> anyhow::Result<(BuildInfoOwned, u32)> {
+        // The handshake already captured these; no extra round trip needed.
+        self.with_client(|c| Ok((c.server_build.clone(), c.server_proto)))
     }
 }

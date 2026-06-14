@@ -12,6 +12,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Emits VERGEN_* for THIS (app) binary's own git/build provenance.
+vergen-gitcl = { version = "10", features = ["build", "cargo", "rustc"] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
