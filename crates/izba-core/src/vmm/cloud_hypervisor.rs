@@ -21,7 +21,28 @@ pub struct Invocations {
     pub vmm: CommandSpec,
 }
 
-pub fn build_invocations(spec: &VmSpec) -> Invocations {
+/// Resolved paths to the external VMM binaries, looked up once per launch via
+/// the standard discovery order (env override → `<exe-dir>/libexec/` → PATH).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmmTools {
+    pub cloud_hypervisor: PathBuf,
+    pub virtiofsd: PathBuf,
+}
+
+impl VmmTools {
+    /// Resolve both binaries. Errors if either is not found.
+    pub fn resolve() -> anyhow::Result<Self> {
+        Ok(Self {
+            cloud_hypervisor: crate::discover::find_tool(
+                "IZBA_CLOUD_HYPERVISOR",
+                "cloud-hypervisor",
+            )?,
+            virtiofsd: crate::discover::find_tool("IZBA_VIRTIOFSD", "virtiofsd")?,
+        })
+    }
+}
+
+pub fn build_invocations(spec: &VmSpec, tools: &VmmTools) -> Invocations {
     let run = &spec.run_dir;
     let fs_sock = |tag: &str| run.join(format!("fs-{tag}.sock"));
     let vsock_sock = run.join("vsock.sock");
@@ -32,7 +53,7 @@ pub fn build_invocations(spec: &VmSpec) -> Invocations {
         .iter()
         .map(|share| CommandSpec {
             argv: vec![
-                "virtiofsd".to_string(),
+                tools.virtiofsd.display().to_string(),
                 "--socket-path".to_string(),
                 fs_sock(&share.tag).display().to_string(),
                 "--shared-dir".to_string(),
@@ -46,7 +67,7 @@ pub fn build_invocations(spec: &VmSpec) -> Invocations {
         .collect();
 
     let mut vmm = vec![
-        "cloud-hypervisor".to_string(),
+        tools.cloud_hypervisor.display().to_string(),
         "--kernel".to_string(),
         spec.kernel.display().to_string(),
         "--initramfs".to_string(),
@@ -118,7 +139,8 @@ impl VmmDriver for CloudHypervisorDriver {
         std::fs::create_dir_all(log_dir)
             .with_context(|| format!("creating {}", log_dir.display()))?;
 
-        let inv = build_invocations(spec);
+        let tools = VmmTools::resolve()?;
+        let inv = build_invocations(spec, &tools);
 
         // A previous crashed run may have left sockets/pid files behind; the
         // socket-wait below would then "succeed" against a dead socket. Clear
@@ -277,6 +299,13 @@ mod tests {
         }
     }
 
+    fn base_tools() -> VmmTools {
+        VmmTools {
+            cloud_hypervisor: PathBuf::from("/opt/izba/cloud-hypervisor"),
+            virtiofsd: PathBuf::from("/opt/izba/virtiofsd"),
+        }
+    }
+
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
     }
@@ -292,13 +321,13 @@ mod tests {
     fn ch_invocations() {
         let spec = base_spec();
         let run = &spec.run_dir;
-        let inv = build_invocations(&spec);
+        let inv = build_invocations(&spec, &base_tools());
 
         assert_eq!(inv.virtiofsd.len(), 1);
         assert_eq!(
             inv.virtiofsd[0].argv,
             argv(&[
-                "virtiofsd",
+                "/opt/izba/virtiofsd",
                 "--socket-path",
                 &run_sock(run, "fs-workspace.sock"),
                 "--shared-dir",
@@ -313,7 +342,7 @@ mod tests {
         assert_eq!(
             inv.vmm.argv,
             argv(&[
-                "cloud-hypervisor",
+                "/opt/izba/cloud-hypervisor",
                 "--kernel",
                 "/img/vmlinux",
                 "--initramfs",
@@ -358,13 +387,13 @@ mod tests {
             },
         ];
         let run = spec.run_dir.clone();
-        let inv = build_invocations(&spec);
+        let inv = build_invocations(&spec, &base_tools());
 
         assert_eq!(inv.virtiofsd.len(), 2);
         assert_eq!(
             inv.virtiofsd[0].argv,
             argv(&[
-                "virtiofsd",
+                "/opt/izba/virtiofsd",
                 "--socket-path",
                 &run_sock(&run, "fs-workspace.sock"),
                 "--shared-dir",
@@ -378,7 +407,7 @@ mod tests {
         assert_eq!(
             inv.virtiofsd[1].argv,
             argv(&[
-                "virtiofsd",
+                "/opt/izba/virtiofsd",
                 "--socket-path",
                 &run_sock(&run, "fs-cache.sock"),
                 "--shared-dir",
@@ -393,7 +422,7 @@ mod tests {
         assert_eq!(
             inv.vmm.argv,
             argv(&[
-                "cloud-hypervisor",
+                "/opt/izba/cloud-hypervisor",
                 "--kernel",
                 "/img/vmlinux",
                 "--initramfs",
