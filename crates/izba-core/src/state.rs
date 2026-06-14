@@ -28,6 +28,10 @@ pub struct SandboxConfig {
     /// empty so configs written before this feature still deserialize.
     #[serde(default)]
     pub ports: Vec<PortRule>,
+    /// User-declared volumes (extra block devices). Defaults to empty so
+    /// configs written before this feature still deserialize.
+    #[serde(default)]
+    pub volumes: Vec<crate::volume::VolumeSpec>,
 }
 
 /// A single host→guest TCP publish rule. Its identity (uniqueness key) is
@@ -97,7 +101,30 @@ mod tests {
             mem_mb: 512,
             workspace: PathBuf::from("/workspace"),
             ports: Vec::new(),
+            volumes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn config_without_volumes_defaults_empty() {
+        let json = r#"{"image_digest":"sha256:x","image_ref":"img",
+            "cpus":2,"mem_mb":1024,"workspace":"/w"}"#;
+        let c: SandboxConfig = serde_json::from_str(json).unwrap();
+        assert!(c.volumes.is_empty());
+        assert!(c.ports.is_empty());
+    }
+
+    #[test]
+    fn config_roundtrips_volumes() {
+        let mut c = sample_config();
+        c.volumes = vec![crate::volume::VolumeSpec {
+            name: Some("cache".into()),
+            guest_path: "/data".into(),
+            size_bytes: 1 << 30,
+        }];
+        let s = serde_json::to_string(&c).unwrap();
+        let back: SandboxConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.volumes, c.volumes);
     }
 
     fn sample_run_state() -> RunState {

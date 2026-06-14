@@ -6,7 +6,7 @@
 
 use anyhow::{bail, Context};
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use izba_proto::{read_frame, write_frame, Request, Response, CONTROL_PORT, STREAM_PORT};
@@ -41,6 +41,7 @@ pub struct CreateOpts {
     pub workspace: PathBuf,
     pub rw_size_gb: u64,
     pub ports: Vec<crate::state::PortRule>,
+    pub volumes: Vec<crate::volume::VolumeSpec>,
 }
 
 /// Boot artifacts shared by all sandboxes (kernel + initramfs with izba-init).
@@ -155,6 +156,47 @@ fn console_tail(log: &std::path::Path, n: usize) -> String {
     )
 }
 
+/// Disk list for a launch: `[erofs=vda (RO), rw=vdb (RW), vol₀=vdc, …]`.
+/// Volumes append in declaration order (the binding the cmdline + guest mount
+/// plan rely on).
+fn build_vm_disks(
+    paths: &Paths,
+    name: &str,
+    image_digest: &str,
+    volumes: &[crate::volume::VolumeSpec],
+) -> Vec<BlockDisk> {
+    let mut disks = vec![
+        BlockDisk {
+            path: ImageStore::new(paths).rootfs_path(image_digest),
+            readonly: true,
+        },
+        BlockDisk {
+            path: paths.sandbox_dir(name).join("rw.img"),
+            readonly: false,
+        },
+    ];
+    for (i, v) in volumes.iter().enumerate() {
+        disks.push(BlockDisk {
+            path: v.image_path(paths, name, i),
+            readonly: false,
+        });
+    }
+    disks
+}
+
+/// Kernel cmdline for a launch. `izba.volumes` carries the ordered guest
+/// mountpoints (vdc, vdd, …) only when volumes are present.
+fn build_cmdline(name: &str, volumes: &[crate::volume::VolumeSpec]) -> String {
+    let mut c = format!("console=ttyS0 izba.hostname={name} izba.egress=1");
+    if !volumes.is_empty() {
+        c.push_str(&format!(
+            " izba.volumes={}",
+            crate::volume::cmdline_value(volumes)
+        ));
+    }
+    c
+}
+
 pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()> {
     validate_name(name)?;
     let dir = paths.sandbox_dir(name);
@@ -175,6 +217,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             mem_mb: opts.mem_mb,
             workspace: opts.workspace.clone(),
             ports: opts.ports.clone(),
+            volumes: opts.volumes.clone(),
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 
@@ -191,30 +234,15 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
         // mkfs.ext4 is absent or fails, the guest-side mke2fs (if present in
         // the initramfs) will handle it; if neither works, init exits with a
         // clear error.
-        match which::which("mkfs.ext4") {
-            Err(_) => {
-                // mkfs.ext4 not on PATH — guest must handle formatting.
-            }
-            Ok(mkfs) => {
-                let out = std::process::Command::new(&mkfs)
-                    .args(["-q", "-F"])
-                    .arg(&rw)
-                    .output();
-                match out {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => {
-                        eprintln!(
-                            "warning: mkfs.ext4 on {} failed ({}): {}",
-                            rw.display(),
-                            o.status,
-                            String::from_utf8_lossy(&o.stderr).trim()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("warning: failed to run {}: {e}", mkfs.display());
-                    }
-                }
-            }
+        best_effort_mkfs(&rw);
+
+        // User volumes: same sparse-create + best-effort-format pattern.
+        // A persistent volume whose image already exists is reused as-is
+        // (never reformatted), so its data survives across sandboxes.
+        for (i, v) in opts.volumes.iter().enumerate() {
+            let img = v.image_path(paths, name, i);
+            ensure_volume_image(&img, v.size_bytes)
+                .with_context(|| format!("provisioning volume {}", v.guest_path.display()))?;
         }
         Ok(())
     };
@@ -252,6 +280,49 @@ fn mark_sparse(f: &File) {
 
 #[cfg(not(windows))]
 fn mark_sparse(_f: &File) {}
+
+/// Best-effort host-side ext4 pre-format. Non-fatal: if `mkfs.ext4` is absent
+/// or fails, the guest-side mke2fs reformats the blank image at boot.
+fn best_effort_mkfs(path: &Path) {
+    match which::which("mkfs.ext4") {
+        Err(_) => {} // not on PATH — guest handles formatting
+        Ok(mkfs) => {
+            let out = std::process::Command::new(&mkfs)
+                .args(["-q", "-F"])
+                .arg(path)
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => eprintln!(
+                    "warning: mkfs.ext4 on {} failed ({}): {}",
+                    path.display(),
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => eprintln!("warning: failed to run {}: {e}", mkfs.display()),
+            }
+        }
+    }
+}
+
+/// Create a sparse ext4-preformatted image at `path` of `size_bytes`, unless
+/// it already exists (persistent volumes are reused as-is — never reformatted,
+/// so their data survives across sandboxes).
+fn ensure_volume_image(path: &Path, size_bytes: u64) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let f = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    mark_sparse(&f);
+    f.set_len(size_bytes)
+        .with_context(|| format!("sizing {}", path.display()))?;
+    drop(f);
+    best_effort_mkfs(path);
+    Ok(())
+}
 
 /// Holds the per-sandbox exclusive lock; explicitly unlocks on drop.
 ///
@@ -383,25 +454,25 @@ pub fn start_with_timeouts(
     std::fs::write(trust_dir.join("ca.pem"), ca.cert_pem())
         .with_context(|| format!("writing guest CA into {}", trust_dir.display()))?;
 
+    // Single-writer: a persistent volume may back at most one LIVE sandbox.
+    for v in config.volumes.iter().filter(|v| v.is_persistent()) {
+        let vol = v.name.as_deref().unwrap();
+        if let Some(holder) = persistent_volume_holder(paths, vol, name, &conn)? {
+            bail!("persistent volume {vol:?} is in use by running sandbox '{holder}'");
+        }
+    }
+
     // The guest is a pure vsock island: no NIC, no DHCP. izba.egress=1 is
     // always on — guest egress rides the izbad-owned vsock 1027 plane.
-    let cmdline = format!("console=ttyS0 izba.hostname={name} izba.egress=1");
+    // izba.volumes (when present) carries the ordered guest mountpoints.
+    let cmdline = build_cmdline(name, &config.volumes);
     let spec = VmSpec {
         kernel: art.kernel.clone(),
         initramfs: art.initramfs.clone(),
         cmdline,
         cpus: config.cpus,
         mem_mb: config.mem_mb,
-        disks: vec![
-            BlockDisk {
-                path: ImageStore::new(paths).rootfs_path(&config.image_digest),
-                readonly: true,
-            },
-            BlockDisk {
-                path: paths.sandbox_dir(name).join("rw.img"),
-                readonly: false,
-            },
-        ],
+        disks: build_vm_disks(paths, name, &config.image_digest, &config.volumes),
         shares: vec![
             FsShare {
                 tag: "workspace".to_string(),
@@ -732,6 +803,97 @@ pub fn list(paths: &Paths, connector: Connector) -> anyhow::Result<Vec<SandboxIn
     Ok(out)
 }
 
+/// Every persistent-volume name referenced by any sandbox's `config.json`.
+/// A volume is "referenced" if some sandbox (running or stopped) declares it;
+/// that is the keep rule for prune (mirrors Docker).
+fn referenced_volume_names(paths: &Paths) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut names = std::collections::HashSet::new();
+    let dir = paths.sandboxes_dir();
+    if !dir.is_dir() {
+        return Ok(names);
+    }
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let config: SandboxConfig = match load_json(&entry.path().join(CONFIG_FILE)) {
+            Ok(Some(c)) => c,
+            _ => continue, // half-created / tombstone dirs reference nothing
+        };
+        for v in &config.volumes {
+            if let Some(n) = &v.name {
+                names.insert(n.clone());
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Remove persistent volume images under `<data>/volumes` not referenced by
+/// any sandbox config. Returns the names removed and the bytes reclaimed.
+pub fn prune_volumes(paths: &Paths) -> anyhow::Result<crate::volume::Pruned> {
+    let dir = paths.volumes_dir();
+    if !dir.is_dir() {
+        return Ok(crate::volume::Pruned::default());
+    }
+    let referenced = referenced_volume_names(paths)?;
+    let mut on_disk = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if let Some(name) = fname.strip_suffix(".img") {
+            on_disk.push(name.to_string());
+        }
+    }
+    let mut pruned = crate::volume::Pruned::default();
+    for name in crate::volume::unreferenced_volumes(&on_disk, &referenced) {
+        let img = paths.volume_image(&name);
+        let bytes = fs::metadata(&img).map(|m| m.len()).unwrap_or(0);
+        fs::remove_file(&img).with_context(|| format!("removing {}", img.display()))?;
+        pruned.removed.push(name);
+        pruned.reclaimed_bytes += bytes;
+    }
+    pruned.removed.sort();
+    Ok(pruned)
+}
+
+/// If a *live* sandbox other than `exclude` references persistent volume
+/// `vol_name`, return that sandbox's name. Enforces single-writer at start.
+fn persistent_volume_holder(
+    paths: &Paths,
+    vol_name: &str,
+    exclude: &str,
+    connector: Connector,
+) -> anyhow::Result<Option<String>> {
+    let dir = paths.sandboxes_dir();
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == exclude || name.contains(".removing-") {
+            continue;
+        }
+        let config: SandboxConfig = match load_json(&entry.path().join(CONFIG_FILE)) {
+            Ok(Some(c)) => c,
+            _ => continue,
+        };
+        let references = config
+            .volumes
+            .iter()
+            .any(|v| v.name.as_deref() == Some(vol_name));
+        if references && liveness_of(paths, &name, connector)? != Liveness::Stopped {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +909,108 @@ mod tests {
     // Sandbox-specific helpers (not shared)
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn create_provisions_volume_images() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut o = opts(&ws);
+        o.volumes = vec![
+            crate::volume::VolumeSpec {
+                name: None,
+                guest_path: "/eph".into(),
+                size_bytes: 1 << 20,
+            },
+            crate::volume::VolumeSpec {
+                name: Some("cache".into()),
+                guest_path: "/data".into(),
+                size_bytes: 1 << 20,
+            },
+        ];
+        create(&paths, "web", &o).unwrap();
+        assert!(paths.sandbox_dir("web").join("volumes/0.img").exists());
+        assert!(paths.volume_image("cache").exists());
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.volumes.len(), 2);
+    }
+
+    #[test]
+    fn create_keeps_existing_persistent_volume() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(paths.volumes_dir()).unwrap();
+        std::fs::write(paths.volume_image("keep"), b"SENTINEL-DATA").unwrap();
+        let mut o = opts(&ws);
+        o.volumes = vec![crate::volume::VolumeSpec {
+            name: Some("keep".into()),
+            guest_path: "/data".into(),
+            size_bytes: 1 << 20,
+        }];
+        create(&paths, "web", &o).unwrap();
+        let data = std::fs::read(paths.volume_image("keep")).unwrap();
+        assert!(data.starts_with(b"SENTINEL-DATA"));
+    }
+
+    #[test]
+    fn prune_removes_unreferenced_only() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        // "kept" is referenced by a sandbox; "orphan" is not.
+        let mut o = opts(&ws);
+        o.volumes = vec![crate::volume::VolumeSpec {
+            name: Some("kept".into()),
+            guest_path: "/data".into(),
+            size_bytes: 1 << 20,
+        }];
+        create(&paths, "web", &o).unwrap();
+        std::fs::write(paths.volume_image("orphan"), vec![0u8; 4096]).unwrap();
+
+        let pruned = prune_volumes(&paths).unwrap();
+        assert_eq!(pruned.removed, vec!["orphan".to_string()]);
+        assert!(!paths.volume_image("orphan").exists());
+        assert!(paths.volume_image("kept").exists());
+    }
+
+    #[test]
+    fn disks_append_volumes_after_rw() {
+        let (_dir, paths) = test_paths();
+        let vols = vec![
+            crate::volume::VolumeSpec {
+                name: None,
+                guest_path: "/a".into(),
+                size_bytes: 1 << 20,
+            },
+            crate::volume::VolumeSpec {
+                name: Some("c".into()),
+                guest_path: "/b".into(),
+                size_bytes: 1 << 20,
+            },
+        ];
+        let disks = build_vm_disks(&paths, "web", "sha256:x", &vols);
+        assert_eq!(disks.len(), 4);
+        assert!(disks[0].readonly && !disks[1].readonly);
+        assert_eq!(
+            disks[2].path,
+            paths.sandbox_dir("web").join("volumes/0.img")
+        );
+        assert_eq!(disks[3].path, paths.volume_image("c"));
+    }
+
+    #[test]
+    fn cmdline_includes_volumes_when_present() {
+        let vols = vec![crate::volume::VolumeSpec {
+            name: None,
+            guest_path: "/a".into(),
+            size_bytes: 1 << 20,
+        }];
+        assert!(build_cmdline("web", &vols).contains("izba.volumes=/a"));
+        assert!(!build_cmdline("web", &[]).contains("izba.volumes"));
+    }
+
     fn opts(workspace: &Path) -> CreateOpts {
         CreateOpts {
             image_digest: "sha256:abc".to_string(),
@@ -756,6 +1020,7 @@ mod tests {
             workspace: workspace.to_path_buf(),
             rw_size_gb: 1,
             ports: Vec::new(),
+            volumes: Vec::new(),
         }
     }
 

@@ -48,6 +48,10 @@ pub struct DaemonCreate {
     pub workspace: PathBuf,
     pub rw_size_gb: u64,
     pub ports: Vec<PortRule>,
+    /// User-declared volumes. Defaults to empty so a pre-feature client frame
+    /// still deserializes.
+    #[serde(default)]
+    pub volumes: Vec<crate::volume::VolumeSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +98,8 @@ pub enum DaemonRequest {
         name: String,
     },
     Status,
+    /// Remove persistent volume images not referenced by any sandbox config.
+    VolumePrune,
     /// Graceful daemon exit. Sandboxes keep running (detached children);
     /// in-daemon port relays pause until the next daemon adopts.
     Shutdown,
@@ -171,6 +177,11 @@ pub enum DaemonResponse {
         rules: Vec<PortRule>,
     },
     Status(DaemonStatus),
+    /// Result of a `VolumePrune`: which volumes were removed and bytes freed.
+    Pruned {
+        removed: Vec<String>,
+        reclaimed_bytes: u64,
+    },
 }
 
 #[cfg(test)]
@@ -193,7 +204,13 @@ mod tests {
                     host_port: 8080,
                     guest_port: 80,
                 }],
+                volumes: vec![crate::volume::VolumeSpec {
+                    name: Some("cache".into()),
+                    guest_path: "/data".into(),
+                    size_bytes: 1 << 30,
+                }],
             }),
+            DaemonRequest::VolumePrune,
             DaemonRequest::Start { name: "web".into() },
             DaemonRequest::Stop { name: "web".into() },
             DaemonRequest::Rm {
