@@ -1,14 +1,24 @@
 name: ConPTY diagnosis
 
-# Standalone, VM-free probe of the hosted-Windows ConPTY-output-loss failure
-# that forces the tty Tier-1/Tier-2 tests to auto-skip in e2e.yml. Runs the
+# Standalone, VM-free probe of the hosted-Windows ConPTY behaviour that, when
+# broken, forces the tty Tier-1/Tier-2 tests to auto-skip in e2e.yml. Runs the
 # REAL portable-pty path (the code that actually fails), captures structured
-# evidence, then tests the candidate fix (sideloading a modern ConPTY backend).
-# Fast loop: no kernel/initramfs/VM artifacts. Job status = fix verdict.
+# evidence, and asserts the sideloaded modern ConPTY backend makes the canary
+# pass. No kernel/initramfs/VM artifacts, so it finishes in ~2 min — kept as a
+# dedicated check that catches runner-image / ConPTY drift independently of the
+# heavyweight e2e leg. Weekly schedule = drift tripwire; path-filtered main push
+# = guard the moving parts; dispatch = on demand.
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'   # weekly, Mon 04:00 UTC — catch runner/ConPTY drift
   push:
-    branches: ['fix/windows-conpty-ci']
+    branches: [main]
+    paths:
+      - 'crates/izba-ttytest/**'
+      - 'hack/ci/conpty-diag.ps1'
+      - 'hack/ci/stage-conpty.ps1'
+      - '.github/workflows/conpty-diag.yml'
 
 permissions:
   contents: read
