@@ -73,6 +73,15 @@ fn run_pid1() -> anyhow::Result<()> {
     // Pin the uptime origin (server::START is lazy) to boot time.
     let _ = *server::START;
 
+    // Record the guest-side build in the serial console (logs/console.log on the
+    // host) so a boot capture identifies exactly which init binary booted.
+    println!(
+        "izba-init {} {} (built {})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("VERGEN_GIT_DESCRIBE").unwrap_or("unknown"),
+        option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or("unknown"),
+    );
+
     mounts::apply(&mounts::boot_mount_plan()).context("boot mounts")?;
 
     let params = cmdline::parse(&std::fs::read_to_string("/proc/cmdline").unwrap_or_default());
