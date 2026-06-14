@@ -116,10 +116,12 @@ Jobs:
   `coverage-gaps.md` to `$GITHUB_STEP_SUMMARY`. This job's number is the
   canonical headline.
 
-- **`report`** (Phase 1: trivial; Phase 2: real merge): downloads the coverage
-  artifact(s) and republishes the merged HTML + gap report as a single
-  `coverage-report` artifact and step summary. In Phase 1 there is one input
-  (host); in Phase 2 the e2e Linux lcov is merged in.
+In Phase 1 there is a single coverage input, so `rust-host` itself uploads the
+`coverage-report` artifact (lcov + json + html + gap report) and writes the gap
+report to `$GITHUB_STEP_SUMMARY` — a separate `report` job would only re-download
+and re-upload one input (YAGNI). Phase 2 introduces a dedicated `report` job that
+merges the e2e Linux lcov with `lcov-host.info` before generating the unified
+report.
 
 No threshold/failure step. The workflow's value is the artifacts + summary.
 
@@ -173,8 +175,13 @@ real-VM e2e (Phase 2)      ─┘                                  └─► lco
 - `coverage_report.py` fails with a clear message if the JSON is missing or
   malformed (e.g. an empty/failed coverage run), rather than emitting a
   misleading empty report.
-- CI coverage jobs do not fail the build on low coverage (report-only); they
-  only fail on a genuine tooling error (test failure, missing tool).
+- CI coverage jobs do not fail the build on low coverage (report-only). Tests
+  run under `--no-fail-fast` so a single failing/flaky test cannot abort the run
+  and wipe the report: the report is always generated and uploaded (the
+  workflow's summary + upload steps use `if: always()`). `coverage.sh` then
+  exits with the test status so a genuine failure still shows red, while
+  CI's `linux-gates` job remains the authoritative test gate. A compilation
+  failure (no profile data) aborts naturally — there is nothing to report.
 
 ## Testing
 

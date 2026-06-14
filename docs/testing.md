@@ -195,6 +195,47 @@ Env knobs available for the daemon tests:
 The Windows PowerShell gate (`hack/spike/validate-izba-windows.ps1`) also
 validates daemon kill-adopt + stop-survival on Windows.
 
+## 5a. Code coverage
+
+`hack/coverage.sh` measures coverage for the Rust workspace with
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) and writes a
+QA-facing gap report. Install the tool once:
+
+```sh
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+```
+
+Then, from the repo root:
+
+```sh
+hack/coverage.sh --html        # run the host suite, emit lcov + json + html + gap report
+hack/coverage.sh --open        # same, and open the HTML report in a browser
+IZBA_INTEGRATION=1 hack/coverage.sh   # also fold in the KVM-gated suites (needs §1 setup)
+```
+
+Outputs land in `target/coverage/`:
+
+- `coverage-gaps.md` — the **QA gap report**: overall %, per-crate table, and
+  files ranked by *uncovered-line count* (the highest-impact places to add
+  tests), plus a 0%-coverage callout. Regenerate standalone from existing JSON
+  with `python3 hack/coverage_report.py target/coverage/coverage.json`.
+- `lcov.info` — for merging / external tooling.
+- `html/html/index.html` — browsable line-by-line report.
+
+Coverage is **report-only** (no threshold gate). The same run happens in CI via
+`.github/workflows/coverage.yml` on every PR and push to main: it uploads the
+`coverage-report` artifact and posts the gap report to the job step summary.
+Integration-test harness files (`tests/`) are excluded from the report so it
+focuses on production code. The gap-report generator has its own unit tests:
+`cd hack && python3 -m unittest test_coverage_report`.
+
+> The KVM-gated suites self-skip without `IZBA_INTEGRATION=1`, so the default
+> `hack/coverage.sh` measures only host-reachable paths. Folding the real-VM
+> e2e host-side paths into CI coverage is Phase 2; covering the Tauri app
+> (`app/`) is Phase 3 — see
+> [superpowers/specs/2026-06-14-izba-coverage-metrics-design.md](superpowers/specs/2026-06-14-izba-coverage-metrics-design.md).
+
 ## 6. Manual smoke test
 
 ```sh

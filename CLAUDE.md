@@ -42,6 +42,12 @@ Daemon e2e (also KVM-gated): `IZBA_INTEGRATION=1 cargo test -p izba-cli --test d
 Both KVM suites + the Windows WHP validation also run in CI:
 `.github/workflows/e2e.yml` (main pushes, weekly cron, manual dispatch).
 
+Coverage (report-only, not a gate): `hack/coverage.sh --html` runs the host
+suite under `cargo-llvm-cov` and writes `target/coverage/coverage-gaps.md` (a
+QA gap report ranked by uncovered-line impact) + lcov + html. Same run in CI
+via `.github/workflows/coverage.yml` (every PR + main push). Needs
+`cargo install cargo-llvm-cov` + `rustup component add llvm-tools-preview`.
+
 **Agent environment reality check (do NOT re-derive this wrong):** this WSL2
 instance has nested virtualization — `/dev/kvm` exists and works; it is merely
 INVISIBLE inside Claude's sandboxed Bash. Run the KVM suites with the sandbox
