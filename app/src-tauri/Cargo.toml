@@ -21,8 +21,11 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+base64 = "0.22"
 # Embedded directly (not via the CLI): Task 2 wires DaemonClient through this.
 izba-core = { path = "../../crates/izba-core" }
+# Wire types for the interactive shell stream (Exec/Attach/Resize frames).
+izba-proto = { path = "../../crates/izba-proto" }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
