@@ -13,14 +13,15 @@ pub type UdsListener = std::os::unix::net::UnixListener;
 #[cfg(windows)]
 pub type UdsListener = uds_windows::UnixListener;
 
-/// The version exchanged in the hello frame. `IZBA_DAEMON_VERSION` overrides
-/// (tests use it to force a mismatch); otherwise the crate version.
+/// The display version string carried in the hello frame (NOT the
+/// compatibility gate — that is the proto version). `IZBA_DAEMON_VERSION`
+/// overrides; otherwise the rich `BuildInfo::short()` (`0.1.0 (de57bb5)`).
 pub fn daemon_version() -> String {
     version_from(&|k| std::env::var(k).ok())
 }
 
 fn version_from(env: &dyn Fn(&str) -> Option<String>) -> String {
-    env("IZBA_DAEMON_VERSION").unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    env("IZBA_DAEMON_VERSION").unwrap_or_else(|| crate::build_info::BuildInfo::current().short())
 }
 
 /// Create `<data>/daemon/` (0700 on Unix), remove any stale socket file,
@@ -58,7 +59,9 @@ mod tests {
     #[test]
     fn version_default_and_override() {
         let no_env = |_: &str| None;
-        assert_eq!(version_from(&no_env), env!("CARGO_PKG_VERSION"));
+        // Default is the rich short build string; at minimum it carries the
+        // crate semver.
+        assert!(version_from(&no_env).starts_with(env!("CARGO_PKG_VERSION")));
         let with_env = |k: &str| (k == "IZBA_DAEMON_VERSION").then(|| "9.9.9-test".to_string());
         assert_eq!(version_from(&with_env), "9.9.9-test");
     }

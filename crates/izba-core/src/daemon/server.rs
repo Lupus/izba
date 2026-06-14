@@ -194,11 +194,13 @@ pub fn handle_connection(d: &Arc<Daemon>, mut stream: UdsStream, _guard: ConnGua
         Ok(h) => h,
         Err(_) => return,
     };
-    let _ = hello; // the CLIENT decides about version mismatches
+    let _ = hello; // the CLIENT decides about proto mismatches
     if write_frame(
         &mut stream,
         &DaemonResponse::HelloOk {
             version: d.deps.version.clone(),
+            proto: crate::daemon::proto::DAEMON_PROTO_VERSION,
+            build: crate::build_info::BuildInfoOwned::current(),
         },
     )
     .is_err()
@@ -409,6 +411,8 @@ pub fn dispatch(
             }
             DaemonRequest::Status => DaemonResponse::Status(DaemonStatus {
                 version: d.deps.version.clone(),
+                proto: crate::daemon::proto::DAEMON_PROTO_VERSION,
+                build: crate::build_info::BuildInfoOwned::current(),
                 pid: std::process::id(),
                 uptime_ms: d.started.elapsed().as_millis() as u64,
                 socket: d.paths.daemon_socket().display().to_string(),
@@ -712,12 +716,16 @@ mod tests {
             &mut c,
             &DaemonHello {
                 version: "whatever".into(),
+                proto: crate::daemon::proto::DAEMON_PROTO_VERSION,
             },
         )
         .unwrap();
         let resp: DaemonResponse = read_frame(&mut c).unwrap();
         match resp {
-            DaemonResponse::HelloOk { version } => assert_eq!(version, "testv"),
+            DaemonResponse::HelloOk { version, proto, .. } => {
+                assert_eq!(version, "testv");
+                assert_eq!(proto, crate::daemon::proto::DAEMON_PROTO_VERSION);
+            }
             other => panic!("expected HelloOk, got {other:?}"),
         }
         c

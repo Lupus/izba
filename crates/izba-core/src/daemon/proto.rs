@@ -17,13 +17,24 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::build_info::BuildInfoOwned;
 use crate::state::PortRule;
 use izba_proto::{Request, Response};
+
+/// Wire-protocol version exchanged in the hello frame. The CLI↔daemon
+/// **compatibility** gate compares THIS (not the now-sha-bearing display
+/// string), so a dev rebuild of the same protocol never churn-restarts the
+/// daemon. Bump only on a wire-breaking change to any daemon frame.
+pub const DAEMON_PROTO_VERSION: u32 = 1;
 
 /// First frame on every daemon connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonHello {
+    /// Display string (`BuildInfo::short()`); kept for logs/diagnostics.
     pub version: String,
+    /// Compatibility gate. Absent (a pre-proto client) → 0 via serde default.
+    #[serde(default)]
+    pub proto: u32,
 }
 
 /// Parameters of `DaemonRequest::Create` — mirrors `sandbox::CreateOpts`,
@@ -110,7 +121,14 @@ pub struct SandboxDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
+    /// Display string (`build.short()`); retained for back-compat.
     pub version: String,
+    /// The daemon's wire-protocol version.
+    #[serde(default)]
+    pub proto: u32,
+    /// The daemon's full build metadata.
+    #[serde(default)]
+    pub build: BuildInfoOwned,
     pub pid: u32,
     pub uptime_ms: u64,
     pub socket: String,
@@ -122,6 +140,10 @@ pub struct DaemonStatus {
 pub enum DaemonResponse {
     HelloOk {
         version: String,
+        #[serde(default)]
+        proto: u32,
+        #[serde(default)]
+        build: BuildInfoOwned,
     },
     Ok,
     Error {
@@ -214,6 +236,8 @@ mod tests {
         for resp in [
             DaemonResponse::HelloOk {
                 version: "0.1.0".into(),
+                proto: DAEMON_PROTO_VERSION,
+                build: BuildInfoOwned::current(),
             },
             DaemonResponse::Ok,
             DaemonResponse::Error {
@@ -246,6 +270,8 @@ mod tests {
             DaemonResponse::Ports { rules: vec![] },
             DaemonResponse::Status(DaemonStatus {
                 version: "0.1.0".into(),
+                proto: DAEMON_PROTO_VERSION,
+                build: BuildInfoOwned::current(),
                 pid: 42,
                 uptime_ms: 1000,
                 socket: "/x/izbad.sock".into(),
@@ -265,11 +291,14 @@ mod tests {
         // by older daemons so the upgrade dance can run).
         let s = serde_json::to_string(&DaemonHello {
             version: "1".into(),
+            proto: DAEMON_PROTO_VERSION,
         })
         .unwrap();
         assert!(s.contains(r#""version":"1""#), "{s}");
         let s = serde_json::to_string(&DaemonResponse::HelloOk {
             version: "1".into(),
+            proto: DAEMON_PROTO_VERSION,
+            build: BuildInfoOwned::current(),
         })
         .unwrap();
         assert!(s.contains(r#""type":"hello_ok""#), "{s}");
@@ -277,5 +306,39 @@ mod tests {
         assert!(s.contains(r#""type":"shutdown""#), "{s}");
         let s = serde_json::to_string(&DaemonRequest::OpenStream { name: "w".into() }).unwrap();
         assert!(s.contains(r#""type":"open_stream""#), "{s}");
+    }
+
+    #[test]
+    fn hello_ok_carries_proto_and_build() {
+        let resp = DaemonResponse::HelloOk {
+            version: "0.1.0 (9f0d480)".into(),
+            proto: DAEMON_PROTO_VERSION,
+            build: BuildInfoOwned::current(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match back {
+            DaemonResponse::HelloOk { proto, .. } => assert_eq!(proto, DAEMON_PROTO_VERSION),
+            other => panic!("expected HelloOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_hello_ok_without_proto_defaults_to_zero() {
+        // An old daemon's frame had only {"type":"hello_ok","version":"x"}.
+        let json = r#"{"type":"hello_ok","version":"old"}"#;
+        let back: DaemonResponse = serde_json::from_str(json).unwrap();
+        match back {
+            DaemonResponse::HelloOk {
+                proto,
+                version,
+                build,
+            } => {
+                assert_eq!(proto, 0);
+                assert_eq!(version, "old");
+                assert_eq!(build, BuildInfoOwned::default());
+            }
+            other => panic!("expected HelloOk, got {other:?}"),
+        }
     }
 }
