@@ -20,7 +20,24 @@ fn enter_raw_mode() {
 
 #[cfg(windows)]
 fn enter_raw_mode() {
-    // ConPTY on Windows already delivers input without buffering.
+    // A ConPTY child's stdin defaults to cooked console mode (ENABLE_LINE_INPUT
+    // | ENABLE_ECHO_INPUT), so reads block until Enter and the pty echoes input
+    // locally — the Windows analogue of cfmakeraw. Clear those so reads return
+    // per-keystroke, matching the unix fixture (and how real TUI apps behave).
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+        ENABLE_PROCESSED_INPUT, STD_INPUT_HANDLE,
+    };
+    // SAFETY: STD_INPUT_HANDLE is a valid console handle under ConPTY; we only
+    // mutate the input mode if GetConsoleMode succeeds.
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0u32;
+        if GetConsoleMode(h, &mut mode) != 0 {
+            mode &= !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+            SetConsoleMode(h, mode);
+        }
+    }
 }
 
 fn main() {
