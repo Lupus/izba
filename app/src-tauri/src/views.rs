@@ -1,5 +1,46 @@
 use izba_core::build_info::BuildInfoOwned;
-use serde::Serialize;
+use izba_core::daemon::proto::DaemonCreate;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Create-sandbox options coming from the frontend wizard. Mirrors the CLI's
+/// `SandboxOpts` core fields (no `--policy`: deferred to the firewall milestone).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateOpts {
+    pub name: String,
+    pub image: String,
+    pub cpus: u32,
+    pub mem_mb: u32,
+    pub workspace: String,
+    pub rw_size_gb: u64,
+    /// Repeatable `[BIND:]HOST:GUEST` port specs (blank entries are ignored).
+    pub ports: Vec<String>,
+}
+
+impl CreateOpts {
+    /// Validate the name and parse port specs, mirroring the CLI create path
+    /// (`validate_name` + `portfwd::parse_rule`). Workspace is passed through
+    /// as-is — the picker yields an existing absolute path.
+    pub fn into_daemon_create(self) -> anyhow::Result<DaemonCreate> {
+        izba_core::sandbox::validate_name(&self.name)?;
+        let ports = self
+            .ports
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(izba_core::portfwd::parse_rule)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(DaemonCreate {
+            name: self.name,
+            image_ref: self.image,
+            cpus: self.cpus,
+            mem_mb: self.mem_mb,
+            workspace: PathBuf::from(self.workspace),
+            rw_size_gb: self.rw_size_gb,
+            ports,
+        })
+    }
+}
 
 /// Version comparison surfaced to the About panel: this app's build, the linked
 /// izba-core build, and (when reachable) the daemon's — with a mismatch flag.
@@ -124,6 +165,44 @@ mod tests {
     fn unknown_status_is_stopped() {
         assert_eq!(parse_state("weird"), SbxState::Stopped);
         assert_eq!(parse_state(""), SbxState::Stopped);
+    }
+
+    #[test]
+    fn create_opts_maps_to_daemon_create() {
+        let opts = CreateOpts {
+            name: "web".into(),
+            image: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: "/ws".into(),
+            rw_size_gb: 8,
+            ports: vec!["127.0.0.1:8080:80".into(), "  ".into()],
+        };
+        let dc = opts.into_daemon_create().unwrap();
+        assert_eq!(dc.name, "web");
+        assert_eq!(dc.image_ref, "ubuntu:24.04");
+        assert_eq!(dc.cpus, 2);
+        assert_eq!(dc.mem_mb, 4096);
+        assert_eq!(dc.workspace, std::path::PathBuf::from("/ws"));
+        assert_eq!(dc.rw_size_gb, 8);
+        assert_eq!(dc.ports.len(), 1); // blank spec dropped
+        assert_eq!(dc.ports[0].host_port, 8080);
+        assert_eq!(dc.ports[0].guest_port, 80);
+    }
+
+    #[test]
+    fn create_opts_rejects_bad_name() {
+        let opts = CreateOpts {
+            name: "Bad Name".into(),
+            image: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: "/ws".into(),
+            rw_size_gb: 8,
+            ports: vec![],
+        };
+        let err = opts.into_daemon_create().unwrap_err().to_string();
+        assert!(err.contains("invalid sandbox name"), "got: {err}");
     }
 
     #[test]

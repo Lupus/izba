@@ -1,5 +1,5 @@
 use crate::daemon::DaemonApi;
-use crate::views::{app_build_info, DaemonStatusView, SandboxView, VersionView};
+use crate::views::{app_build_info, CreateOpts, DaemonStatusView, SandboxView, VersionView};
 
 /// Core of the `list` command: maps daemon errors to a UI-friendly string.
 pub fn list_core(d: &mut dyn DaemonApi) -> Result<Vec<SandboxView>, String> {
@@ -33,11 +33,99 @@ pub fn version_core(d: &mut dyn DaemonApi) -> Result<VersionView, String> {
     })
 }
 
+/// Start a sandbox (may boot-wait inside the daemon).
+pub fn start_core(d: &mut dyn DaemonApi, name: &str) -> Result<(), String> {
+    d.start(name).map_err(|e| e.to_string())
+}
+
+/// Stop a sandbox.
+pub fn stop_core(d: &mut dyn DaemonApi, name: &str) -> Result<(), String> {
+    d.stop(name).map_err(|e| e.to_string())
+}
+
+/// Restart = stop then start (izba never auto-restarts). Stop failure aborts
+/// before start so a half-restart never silently boots a stale config.
+pub fn restart_core(d: &mut dyn DaemonApi, name: &str) -> Result<(), String> {
+    d.stop(name).map_err(|e| e.to_string())?;
+    d.start(name).map_err(|e| e.to_string())
+}
+
+/// Remove a sandbox (force skips the running-state guard).
+pub fn remove_core(d: &mut dyn DaemonApi, name: &str, force: bool) -> Result<(), String> {
+    d.remove(name, force).map_err(|e| e.to_string())
+}
+
+/// Create a sandbox, forwarding daemon `Progress` messages via `on_progress`.
+pub fn create_core(
+    d: &mut dyn DaemonApi,
+    opts: CreateOpts,
+    on_progress: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    let req = opts.into_daemon_create().map_err(|e| e.to_string())?;
+    d.create(req, on_progress).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fake::FakeDaemon;
-    use crate::views::SbxState;
+    use crate::views::{CreateOpts, SbxState};
+
+    fn create_opts() -> CreateOpts {
+        CreateOpts {
+            name: "new".into(),
+            image: "ubuntu:24.04".into(),
+            cpus: 1,
+            mem_mb: 1024,
+            workspace: "/ws".into(),
+            rw_size_gb: 4,
+            ports: vec![],
+        }
+    }
+
+    #[test]
+    fn start_stop_remove_dispatch() {
+        let mut d = FakeDaemon::default();
+        start_core(&mut d, "web").unwrap();
+        stop_core(&mut d, "web").unwrap();
+        remove_core(&mut d, "web", true).unwrap();
+        assert_eq!(d.calls, vec!["start:web", "stop:web", "rm:web:true"]);
+    }
+
+    #[test]
+    fn restart_is_stop_then_start() {
+        let mut d = FakeDaemon::default();
+        restart_core(&mut d, "web").unwrap();
+        assert_eq!(d.calls, vec!["stop:web", "start:web"]);
+    }
+
+    #[test]
+    fn restart_does_not_start_if_stop_fails() {
+        let mut d = FakeDaemon {
+            fail_action: true,
+            ..Default::default()
+        };
+        assert!(restart_core(&mut d, "web").is_err());
+        assert_eq!(d.calls, vec!["stop:web"]); // start not attempted
+    }
+
+    #[test]
+    fn create_core_streams_and_returns_name() {
+        let mut d = FakeDaemon::default();
+        let mut seen = Vec::new();
+        let name = create_core(&mut d, create_opts(), &mut |m| seen.push(m.to_string())).unwrap();
+        assert_eq!(name, "new");
+        assert_eq!(seen, vec!["pulling image", "booting"]);
+    }
+
+    #[test]
+    fn create_core_maps_bad_name_to_error() {
+        let mut d = FakeDaemon::default();
+        let mut bad = create_opts();
+        bad.name = "Bad Name".into();
+        let err = create_core(&mut d, bad, &mut |_| {}).unwrap_err();
+        assert!(err.contains("invalid sandbox name"), "got: {err}");
+    }
 
     #[test]
     fn list_core_returns_mapped_sandboxes() {

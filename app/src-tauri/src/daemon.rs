@@ -1,6 +1,6 @@
 use crate::views::{DaemonStatusView, SandboxView};
 use izba_core::build_info::BuildInfoOwned;
-use izba_core::daemon::proto::{DaemonRequest, DaemonResponse};
+use izba_core::daemon::proto::{DaemonCreate, DaemonRequest, DaemonResponse};
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
 
@@ -10,6 +10,15 @@ pub trait DaemonApi: Send {
     fn status(&mut self) -> anyhow::Result<DaemonStatusView>;
     /// The connected daemon's build metadata + wire-protocol version.
     fn version(&mut self) -> anyhow::Result<(BuildInfoOwned, u32)>;
+    fn start(&mut self, name: &str) -> anyhow::Result<()>;
+    fn stop(&mut self, name: &str) -> anyhow::Result<()>;
+    fn remove(&mut self, name: &str, force: bool) -> anyhow::Result<()>;
+    /// Streams `Progress` messages via `on_progress`; returns the created name.
+    fn create(
+        &mut self,
+        req: DaemonCreate,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<String>;
 }
 
 /// Production `DaemonApi`: a lazily-connected `DaemonClient`. Connects via
@@ -77,5 +86,43 @@ impl DaemonApi for RealDaemon {
     fn version(&mut self) -> anyhow::Result<(BuildInfoOwned, u32)> {
         // The handshake already captured these; no extra round trip needed.
         self.with_client(|c| Ok((c.server_build.clone(), c.server_proto)))
+    }
+
+    fn start(&mut self, name: &str) -> anyhow::Result<()> {
+        let name = name.to_string();
+        self.with_client(|c| expect_ok(c.request(&DaemonRequest::Start { name }, &mut |_| {})?))
+    }
+
+    fn stop(&mut self, name: &str) -> anyhow::Result<()> {
+        let name = name.to_string();
+        self.with_client(|c| expect_ok(c.request(&DaemonRequest::Stop { name }, &mut |_| {})?))
+    }
+
+    fn remove(&mut self, name: &str, force: bool) -> anyhow::Result<()> {
+        let name = name.to_string();
+        self.with_client(|c| expect_ok(c.request(&DaemonRequest::Rm { name, force }, &mut |_| {})?))
+    }
+
+    fn create(
+        &mut self,
+        req: DaemonCreate,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<String> {
+        self.with_client(
+            |c| match c.request(&DaemonRequest::Create(req), on_progress)? {
+                DaemonResponse::Created { name } => Ok(name),
+                DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected Create reply: {other:?}"),
+            },
+        )
+    }
+}
+
+/// Map a one-shot daemon reply that should be `Ok` into `()`.
+fn expect_ok(resp: DaemonResponse) -> anyhow::Result<()> {
+    match resp {
+        DaemonResponse::Ok => Ok(()),
+        DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
     }
 }
