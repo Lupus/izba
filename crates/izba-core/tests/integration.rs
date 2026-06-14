@@ -227,6 +227,33 @@ fn create_sandbox(env: &TestEnv, tb: &mut TestBox, name: &str, ws: &Path) {
     tb.names.push(name.to_string());
 }
 
+/// `create` with user volumes; registers the name for cleanup.
+fn create_sandbox_with_volumes(
+    env: &TestEnv,
+    tb: &mut TestBox,
+    name: &str,
+    ws: &Path,
+    volumes: Vec<izba_core::volume::VolumeSpec>,
+) {
+    let digest = provision_image(env, &tb.paths);
+    sandbox::create(
+        &tb.paths,
+        name,
+        &CreateOpts {
+            image_digest: digest,
+            image_ref: env.image_ref.clone(),
+            cpus: 1,
+            mem_mb: 1024,
+            workspace: ws.to_path_buf(),
+            rw_size_gb: 2,
+            ports: Vec::new(),
+            volumes,
+        },
+    )
+    .expect("create");
+    tb.names.push(name.to_string());
+}
+
 fn start_sandbox(env: &TestEnv, tb: &TestBox, name: &str) -> anyhow::Result<()> {
     sandbox::start_with_timeouts(
         &tb.paths,
@@ -646,6 +673,112 @@ fn rw_persistence_across_restart() {
     }
     let stdout = exec_ok(&tb.paths, "rw", &["cat", "/marker"]);
     assert_eq!(stdout, "keep\n", "/marker must survive a restart");
+}
+
+#[test]
+fn volumes_persist_reattach_and_prune() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("vol");
+    let vols = vec![
+        izba_core::volume::VolumeSpec {
+            name: None,
+            guest_path: "/eph".into(),
+            size_bytes: 64 << 20,
+        },
+        izba_core::volume::VolumeSpec {
+            name: Some("data".into()),
+            guest_path: "/data".into(),
+            size_bytes: 64 << 20,
+        },
+    ];
+    create_sandbox_with_volumes(&env, &mut tb, "vol", &ws, vols);
+    if let Err(e) = start_sandbox(&env, &tb, "vol") {
+        panic!(
+            "boot of 'vol' failed: {e:#}\nconsole tail:\n{}",
+            boot_diag(&tb.paths, "vol")
+        );
+    }
+
+    // Both volumes are mounted ext4 at their declared paths; write a sentinel
+    // to each (these land on the volume disks, NOT the overlay/rw.img).
+    exec_ok(
+        &tb.paths,
+        "vol",
+        &[
+            "sh",
+            "-c",
+            "echo eph > /eph/s && echo data > /data/s && sync",
+        ],
+    );
+
+    // Survive a stop/start (the M3 exit criterion).
+    stop_sandbox(&tb, "vol");
+    if let Err(e) = start_sandbox(&env, &tb, "vol") {
+        panic!(
+            "restart of 'vol' failed: {e:#}\nconsole tail:\n{}",
+            boot_diag(&tb.paths, "vol")
+        );
+    }
+    assert_eq!(exec_ok(&tb.paths, "vol", &["cat", "/eph/s"]), "eph\n");
+    assert_eq!(exec_ok(&tb.paths, "vol", &["cat", "/data/s"]), "data\n");
+
+    // Remove the sandbox: ephemeral image goes with the sandbox dir, the named
+    // persistent image survives under <data>/volumes.
+    stop_sandbox(&tb, "vol");
+    let connector = sandbox::default_connector();
+    sandbox::remove(&tb.paths, "vol", &connector, true).expect("remove vol");
+    tb.names.retain(|n| n != "vol");
+    assert!(
+        tb.paths.volume_image("data").exists(),
+        "persistent volume must survive rm"
+    );
+    assert!(
+        !tb.paths.sandbox_dir("vol").exists(),
+        "ephemeral volume goes with the sandbox dir"
+    );
+
+    // A new sandbox re-attaches the named volume by name — data is intact and
+    // the image is NOT reformatted.
+    let ws2 = tb.workspace("vol2");
+    create_sandbox_with_volumes(
+        &env,
+        &mut tb,
+        "vol2",
+        &ws2,
+        vec![izba_core::volume::VolumeSpec {
+            name: Some("data".into()),
+            guest_path: "/data".into(),
+            size_bytes: 64 << 20,
+        }],
+    );
+    if let Err(e) = start_sandbox(&env, &tb, "vol2") {
+        panic!(
+            "boot of 'vol2' failed: {e:#}\nconsole tail:\n{}",
+            boot_diag(&tb.paths, "vol2")
+        );
+    }
+    assert_eq!(
+        exec_ok(&tb.paths, "vol2", &["cat", "/data/s"]),
+        "data\n",
+        "re-attached persistent volume keeps prior data"
+    );
+
+    // Prune while "data" is still referenced by vol2: it must be kept.
+    let kept = sandbox::prune_volumes(&tb.paths).expect("prune (referenced)");
+    assert!(
+        kept.removed.is_empty(),
+        "referenced volume must not be pruned"
+    );
+    assert!(tb.paths.volume_image("data").exists());
+
+    // Remove vol2, then prune: now "data" is unreferenced and gets reaped.
+    stop_sandbox(&tb, "vol2");
+    sandbox::remove(&tb.paths, "vol2", &connector, true).expect("remove vol2");
+    tb.names.retain(|n| n != "vol2");
+    let pruned = sandbox::prune_volumes(&tb.paths).expect("prune (unreferenced)");
+    assert_eq!(pruned.removed, vec!["data".to_string()]);
+    assert!(!tb.paths.volume_image("data").exists());
 }
 
 #[test]

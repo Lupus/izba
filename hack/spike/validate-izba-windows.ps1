@@ -8,7 +8,7 @@
 # Sections: [1] run/boot/exec, [2] liveness, [3] exec exit-codes,
 #           [4] exec stdin, [5] networking, [6] console log,
 #           [7] daemon lifecycle (status/kill-adopt/stop-survival),
-#           [8] stop/restart/rm.
+#           [8] stop/restart/rm, [9] M3 persistent volume + prune (vdc parity).
 $ErrorActionPreference = 'Continue'
 $exe   = if ($env:IZBA_EXE)   { $env:IZBA_EXE }   else { 'C:\izba\bin\izba.exe' }
 $image = if ($env:IZBA_IMAGE) { $env:IZBA_IMAGE } else { 'alpine:3.20' }
@@ -178,6 +178,31 @@ Check 'restart after stop' ($LASTEXITCODE -eq 0)
 & $exe rm valid8 | Out-Null
 Check 'rm exits 0' ($LASTEXITCODE -eq 0)
 Check 'sandbox dir removed' (-not (Test-Path "$env:LOCALAPPDATA\izba\sandboxes\valid8"))
+
+# [9] M3 volumes parity: a named persistent volume is an extra virtio-blk disk
+# (vdc) the OpenVMM driver routes to its own PCIe root port; it must format +
+# mount, survive a stop/start, persist past rm, and be reaped by prune. This is
+# the WHP analogue of the KVM `volumes_persist_reattach_and_prune` test and the
+# proof the per-disk PCIe routing carries disks beyond vda/vdb on Windows.
+$wsv = "$env:TEMP\izba-validate-vol"
+& $exe stop volc 2>$null | Out-Null
+& $exe rm --force volc 2>$null | Out-Null
+& $exe volume prune -f 2>$null | Out-Null
+if (Test-Path $wsv) { Remove-Item -Recurse -Force $wsv }
+New-Item -ItemType Directory -Path $wsv | Out-Null
+
+& $exe run --image $image --name volc --volume "vdata:/data:128m" $wsv -- /bin/sh -c 'echo persisted > /data/s && sync'
+Check 'volume run exits 0' ($LASTEXITCODE -eq 0)
+& $exe stop volc | Out-Null
+& $exe run --name volc $wsv -- /bin/sh -c 'cat /data/s' | Out-Null
+$volRead = & $exe run --name volc $wsv -- /bin/sh -c 'cat /data/s' | Out-String
+Check 'volume survives stop/start' ("$volRead".Trim() -eq 'persisted')
+& $exe stop volc | Out-Null
+& $exe rm volc | Out-Null
+Check 'persistent volume image survives rm' (Test-Path "$env:LOCALAPPDATA\izba\volumes\vdata.img")
+& $exe volume prune -f | Out-Null
+Check 'prune exits 0' ($LASTEXITCODE -eq 0)
+Check 'prune reaps unreferenced volume' (-not (Test-Path "$env:LOCALAPPDATA\izba\volumes\vdata.img"))
 
 # Best-effort daemon cleanup so the validation run leaves no daemon behind.
 & $exe daemon stop 2>$null | Out-Null
