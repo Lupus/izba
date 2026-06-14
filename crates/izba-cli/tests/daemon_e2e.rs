@@ -189,7 +189,16 @@ fn daemon_full_lifecycle() {
     let body = http_get(18091).expect("relay respawned after adoption");
     assert!(body.contains("daemon-port-body"), "got: {body}");
 
-    // [5] Version upgrade dance: daemon at version A, client at version B.
+    // [5] Same-proto rebuild does NOT churn-restart the daemon. Compatibility
+    // is gated on DAEMON_PROTO_VERSION, not the display string (commit
+    // 14efddb): a client carrying a *different display version* (e.g. a rebuild
+    // /redeploy at the same wire proto) connects to the healthy daemon and
+    // leaves it — and its live sandbox — untouched. The respawn-on-proto-
+    // mismatch path is the unit test `connect_with_restarts_on_proto_mismatch`
+    // in client.rs; the proto version is a compile-time constant with no env
+    // override, so a real proto mismatch cannot be driven through the binary
+    // here. This phase is the e2e mirror of `connect_with_keeps_daemon_on_
+    // build_only_diff` against a real daemon carrying a live VM.
     let va: &[(&str, &str)] = &[("IZBA_DAEMON_VERSION", "e2e-A")];
     let vb: &[(&str, &str)] = &[("IZBA_DAEMON_VERSION", "e2e-B")];
     assert_ok(
@@ -198,16 +207,22 @@ fn daemon_full_lifecycle() {
     );
     assert_ok(&izba(&data, va, &["ls"]), "start daemon as version A");
     assert_eq!(daemon_version_of(&data, va).as_deref(), Some("e2e-A"));
+    let pid_a = daemon_pid(&data, va).expect("daemon A pid");
     let o = izba(&data, vb, &["ls"]);
-    assert_ok(&o, "client B against daemon A succeeds via upgrade dance");
+    assert_ok(&o, "client B against same-proto daemon A succeeds");
     assert_eq!(
         daemon_version_of(&data, vb).as_deref(),
-        Some("e2e-B"),
-        "daemon was replaced by the new version"
+        Some("e2e-A"),
+        "a display-version-only change must NOT replace a same-proto daemon"
+    );
+    assert_eq!(
+        daemon_pid(&data, vb),
+        Some(pid_a),
+        "the daemon process is unchanged (no churn-restart on a build-only diff)"
     );
     assert!(
         stdout_of(&o).contains("running"),
-        "sandbox survived the upgrade"
+        "sandbox untouched by the client's version difference"
     );
 
     // [6] daemon stop leaves the sandbox running; next command revives.
