@@ -1,0 +1,75 @@
+name: App CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  app-linux:
+    name: app frontend + backend (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Install Tauri system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev build-essential file libxdo-dev libssl-dev patchelf
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: app-linux
+          workspaces: app/src-tauri
+      - name: npm ci
+        working-directory: app
+        run: npm ci
+      - name: frontend build (tsc typecheck + vite)
+        working-directory: app
+        run: npm run build
+      - name: frontend tests
+        working-directory: app
+        run: npm run test
+      - name: backend fmt
+        working-directory: app/src-tauri
+        run: cargo fmt --check
+      - name: backend clippy
+        working-directory: app/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+      - name: backend tests
+        working-directory: app/src-tauri
+        run: cargo test
+
+  app-windows:
+    name: app frontend + backend (windows)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: app-windows
+          workspaces: app/src-tauri
+      - name: npm ci
+        working-directory: app
+        run: npm ci
+      - name: frontend build (tsc typecheck + vite)
+        working-directory: app
+        run: npm run build
+      - name: frontend tests
+        working-directory: app
+        run: npm run test
+      - name: backend clippy
+        working-directory: app/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+      - name: backend tests
+        working-directory: app/src-tauri
+        run: cargo test
