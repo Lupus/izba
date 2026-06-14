@@ -37,10 +37,12 @@ worktree**; Phases 2 and 3 are designed here but implemented after review.
    `cargo-llvm-cov` over the host unit + integration suite, `hack/coverage.sh`
    + `hack/coverage_report.py`, a new `coverage.yml` workflow (`rust-host` +
    `report` jobs), the `coverage-gaps.md` report, and docs.
-2. **Phase 2 — real-VM e2e host-side coverage (BUILT).** A separate
-   `linux-kvm-coverage` job in `e2e.yml` (weekly cron + dispatch, isolated from
-   the gate) runs the host + gated suites under one instrumented shell and emits
-   a merged host+e2e gap report. Validated locally against real KVM.
+2. **Phase 2 — real-VM e2e host-side coverage (BUILT).** Separate
+   `linux-kvm-coverage` + `windows-whp-coverage` jobs in `e2e.yml` (weekly cron
+   + dispatch, isolated from the gates) run the host + gated suites under one
+   instrumented shell each. Linux emits a merged host+e2e report (validated
+   locally against real KVM); Windows emits its own platform report (real
+   OpenVMM/WHP driver paths), not cross-merged.
 3. **Phase 3 — Tauri app coverage.** Frontend `vitest --coverage` + `src-tauri`
    `cargo-llvm-cov`, plugged into `app.yml`.
 
@@ -152,8 +154,20 @@ adds a **separate `linux-kvm-coverage` job** to `e2e.yml`:
 - Report-only: suites run under `set +e` so a flake cannot wipe the report; the
   gap report (`coverage-gaps-e2e.md`), lcov, json, and HTML upload as the
   `coverage-report-e2e` artifact + step summary (all `if: always()`).
-- **Windows** (WHP) is NOT coverage-instrumented — its paths differ and absolute
-  paths would not merge with Linux. Reported separately if/when needed.
+- **Windows** (WHP) gets a parallel `windows-whp-coverage` job, same posture
+  (separate from the windows-whp gate, non-push gated). A single bash step
+  sources show-env, runs the Windows host suite + builds the instrumented
+  `izba.exe`, then invokes the pwsh validation suite as a child — so the
+  spawned `izba.exe` inherits `LLVM_PROFILE_FILE` and the real OpenVMM/WHP
+  driver host paths (`vmm/openvmm.rs` + Windows-only code) are captured. It is
+  reported as its **own** platform artifact (`coverage-report-e2e-windows`),
+  NOT merged with the Linux reports: the code paths differ and the
+  absolute/backslash paths would not align, so a cross-platform merge would
+  corrupt the report. The ignore-regex is separator-agnostic
+  (`[\\/]tests[\\/]`…) so it matches Windows backslash paths. Unlike the KVM
+  leg this was not validated locally (Windows coverage needs WHP + OpenVMM); it
+  mirrors the KVM-validated single-shell pattern and is report-only + isolated,
+  so a first-run issue surfaces on the weekly run without touching any gate.
 - **Guest-side** `izba-init` running *inside* the microVM is not capturable; its
   host-testable modules are already covered by the host suite.
 
@@ -228,6 +242,7 @@ real-VM e2e (Phase 2)      ─┘                                  └─► lco
 
 ## Files touched (Phase 2)
 
-- `.github/workflows/e2e.yml` (+ `linux-kvm-coverage` job)
+- `.github/workflows/e2e.yml` (+ `linux-kvm-coverage` and `windows-whp-coverage`
+  jobs; separator-agnostic ignore-regex)
 - `docs/testing.md` + `CLAUDE.md` (real-VM coverage notes)
 - reuses `hack/coverage_report.py` unchanged (`--title` flag)

@@ -231,11 +231,14 @@ focuses on production code. The gap-report generator has its own unit tests:
 `cd hack && python3 -m unittest test_coverage_report`.
 
 > The KVM-gated suites self-skip without `IZBA_INTEGRATION=1`, so the default
-> `hack/coverage.sh` measures only host-reachable paths. CI also runs a
-> **real-VM coverage job** (`linux-kvm-coverage` in `.github/workflows/e2e.yml`,
-> weekly cron + manual dispatch) that boots actual microVMs under the same
-> instrumentation and uploads a merged host+e2e gap report (`coverage-report-e2e`)
-> — this reaches the daemon/CLI host paths the fast suite leaves at 0%. Locally,
+> `hack/coverage.sh` measures only host-reachable paths. CI also runs **real-VM
+> coverage jobs** (`linux-kvm-coverage` + `windows-whp-coverage` in
+> `.github/workflows/e2e.yml`, weekly cron + manual dispatch) that boot actual
+> microVMs under the same instrumentation. The Linux job uploads a merged
+> host+e2e gap report (`coverage-report-e2e`) — reaching the daemon/CLI host
+> paths the fast suite leaves at 0%; the Windows job uploads its own platform
+> report (`coverage-report-e2e-windows`) covering the real OpenVMM/WHP driver
+> paths (not cross-merged with Linux). Locally on Linux,
 > `IZBA_INTEGRATION=1 hack/coverage.sh` does the same. Covering the Tauri app
 > (`app/`) is Phase 3 — see
 > [superpowers/specs/2026-06-14-izba-coverage-metrics-design.md](superpowers/specs/2026-06-14-izba-coverage-metrics-design.md).
