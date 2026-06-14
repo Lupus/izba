@@ -9,9 +9,12 @@ pub trait DaemonApi: Send {
     fn status(&mut self) -> anyhow::Result<DaemonStatusView>;
 }
 
-/// Production `DaemonApi`: a lazily-connected `DaemonClient`. On any send/recv
-/// error the connection is dropped so the next call reconnects (the daemon
-/// idle-exits after ~5 min; polling keeps it warm but reconnect must be cheap).
+/// Production `DaemonApi`: a lazily-connected `DaemonClient`. Connects via
+/// `connect_spawning_izba` so a fresh install starts the sibling `izba daemon
+/// run` (the app's own `current_exe` is `izba-app`, not a daemon). On any
+/// send/recv error the connection is dropped so the next call reconnects (the
+/// daemon idle-exits after ~5 min; polling keeps it warm but reconnect must be
+/// cheap).
 pub struct RealDaemon {
     paths: Paths,
     client: Option<DaemonClient>,
@@ -36,7 +39,7 @@ impl RealDaemon {
         f: impl FnOnce(&mut DaemonClient) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         if self.client.is_none() {
-            self.client = Some(DaemonClient::connect(&self.paths)?);
+            self.client = Some(DaemonClient::connect_spawning_izba(&self.paths)?);
         }
         let client = self.client.as_mut().expect("just connected");
         match f(client) {
