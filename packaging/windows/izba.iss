@@ -3,6 +3,7 @@
 ;   iscc /DMyAppVersion=<ver> /DStageDir=<abs path to stage> packaging\windows\izba.iss
 ; Expected stage layout:
 ;   <StageDir>\bin\izba.exe
+;   <StageDir>\bin\izba-app.exe          (GUI; optional component)
 ;   <StageDir>\bin\libexec\openvmm.exe
 ;   <StageDir>\bin\libexec\mkfs.erofs.exe
 ;   <StageDir>\artifacts\vmlinux
@@ -32,10 +33,18 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 ChangesEnvironment=yes
 
+[Components]
+Name: "cli"; Description: "izba CLI + microVM runtime"; Types: full custom; Flags: fixed
+Name: "gui"; Description: "izba desktop app (GUI)";     Types: full
+
 [Files]
-Source: "{#StageDir}\bin\izba.exe";          DestDir: "{app}\bin";         Flags: ignoreversion
-Source: "{#StageDir}\bin\libexec\*";          DestDir: "{app}\bin\libexec"; Flags: ignoreversion recursesubdirs
-Source: "{#StageDir}\artifacts\*";            DestDir: "{app}\artifacts";   Flags: ignoreversion recursesubdirs
+Source: "{#StageDir}\bin\izba.exe";      DestDir: "{app}\bin";         Flags: ignoreversion;                 Components: cli
+Source: "{#StageDir}\bin\libexec\*";     DestDir: "{app}\bin\libexec"; Flags: ignoreversion recursesubdirs;  Components: cli
+Source: "{#StageDir}\artifacts\*";       DestDir: "{app}\artifacts";   Flags: ignoreversion recursesubdirs;  Components: cli
+Source: "{#StageDir}\bin\izba-app.exe";  DestDir: "{app}\bin";         Flags: ignoreversion;                 Components: gui
+
+[Icons]
+Name: "{group}\izba"; Filename: "{app}\bin\izba-app.exe"; Components: gui
 
 [Registry]
 ; Append {app}\bin to the system PATH (only if not already present).
