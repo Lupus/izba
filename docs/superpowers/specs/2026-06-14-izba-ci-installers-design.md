@@ -119,7 +119,7 @@ and `"virtiofsd"` as `argv[0]`, relying on `$PATH`. Resolve both through
 `find_tool` order is unchanged (env override → `<exe-dir>/libexec/<name>` →
 `$PATH`), so:
 
-- Packaged install: resolves to `/usr/lib/izba/libexec/{cloud-hypervisor,virtiofsd}`.
+- Packaged install: resolves to `/usr/lib/izba/bin/libexec/{cloud-hypervisor,virtiofsd}`.
 - Dev / `fetch-artifacts.sh` install (`~/.local/bin` on PATH): resolves via
   `$PATH` exactly as before — **no behavior change for existing setups**.
 
