@@ -36,3 +36,13 @@ export interface VersionView {
   proto: number;
   mismatch: boolean;
 }
+
+export interface CreateOpts {
+  name: string;
+  image: string;
+  cpus: number;
+  mem_mb: number;
+  workspace: string;
+  rw_size_gb: number;
+  ports: string[];
+}
