@@ -2,3 +2,5 @@
 /.toolchain
 /.cargo-env
 /dist
+__pycache__/
+*.pyc

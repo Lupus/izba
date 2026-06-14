@@ -1,0 +1,56 @@
+name: Coverage
+
+# Report-only code-coverage for the Rust workspace. Does NOT gate on a
+# threshold — it publishes a browsable HTML report, an lcov.info, and a
+# QA-facing gap report (ranked by uncovered-line impact) as a build artifact
+# and in the job step summary, so a QA specialist can see where tests are
+# missing. Phase 2 folds in real-VM e2e host-side coverage; Phase 3 adds the
+# Tauri app.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust-host:
+    name: coverage (rust workspace, linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: coverage
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        with:
+          tool: cargo-llvm-cov
+      - name: Measure coverage + build gap report
+        run: hack/coverage.sh --html
+      - name: Publish gap report to step summary
+        if: always()
+        run: |
+          if [ -f target/coverage/coverage-gaps.md ]; then
+            cat target/coverage/coverage-gaps.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "coverage gap report not produced (coverage run failed)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: |
+            target/coverage/coverage-gaps.md
+            target/coverage/lcov.info
+            target/coverage/coverage.json
+            target/coverage/html
+          if-no-files-found: warn
