@@ -44,6 +44,16 @@ impl Paths {
         self.sandbox_dir(name).join("run")
     }
 
+    /// Directory for persistent (named) volume images: `<root>/volumes`.
+    pub fn volumes_dir(&self) -> PathBuf {
+        self.root.join("volumes")
+    }
+
+    /// Backing image for a persistent volume.
+    pub fn volume_image(&self, name: &str) -> PathBuf {
+        self.volumes_dir().join(format!("{name}.img"))
+    }
+
     pub fn logs_dir(&self, name: &str) -> PathBuf {
         self.sandbox_dir(name).join("logs")
     }
@@ -133,6 +143,16 @@ mod tests {
         assert_eq!(
             p.daemon_log(),
             PathBuf::from("/data/izba/daemon/daemon.log")
+        );
+    }
+
+    #[test]
+    fn volume_paths_compose() {
+        let p = Paths::with_root("/data/izba".into());
+        assert_eq!(p.volumes_dir(), PathBuf::from("/data/izba/volumes"));
+        assert_eq!(
+            p.volume_image("cache"),
+            PathBuf::from("/data/izba/volumes/cache.img")
         );
     }
 
