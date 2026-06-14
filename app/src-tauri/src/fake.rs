@@ -1,8 +1,35 @@
 #![cfg(test)]
-use crate::daemon::DaemonApi;
+use crate::daemon::{DaemonApi, ShellSession};
 use crate::views::{DaemonStatusView, SandboxView, SbxState};
 use izba_core::build_info::BuildInfoOwned;
 use izba_core::daemon::proto::DaemonCreate;
+use std::sync::{Arc, Mutex};
+
+/// Scripted `ShellSession` for unit tests. Records writes/resizes/close and
+/// echoes every write back through `on_output`, so the output-event wiring is
+/// observable without a real PTY.
+pub struct FakeShell {
+    pub writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub resizes: Arc<Mutex<Vec<(u16, u16)>>>,
+    pub closed: Arc<Mutex<bool>>,
+    on_output: Box<dyn FnMut(Vec<u8>) + Send>,
+}
+
+impl ShellSession for FakeShell {
+    fn write(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        self.writes.lock().unwrap().push(data.to_vec());
+        (self.on_output)(data.to_vec());
+        Ok(())
+    }
+    fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        self.resizes.lock().unwrap().push((cols, rows));
+        Ok(())
+    }
+    fn close(&mut self) -> anyhow::Result<()> {
+        *self.closed.lock().unwrap() = true;
+        Ok(())
+    }
+}
 
 /// Scripted `DaemonApi` for unit tests — no socket, no daemon.
 pub struct FakeDaemon {
@@ -19,6 +46,9 @@ pub struct FakeDaemon {
     pub progress: Vec<String>,
     /// Canned console output returned by `read_logs`.
     pub logs: String,
+    pub shell_writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub shell_resizes: Arc<Mutex<Vec<(u16, u16)>>>,
+    pub shell_closed: Arc<Mutex<bool>>,
 }
 
 impl Default for FakeDaemon {
@@ -50,6 +80,9 @@ impl Default for FakeDaemon {
             calls: Vec::new(),
             progress: vec!["pulling image".into(), "booting".into()],
             logs: "boot ok\nlogin:\n".into(),
+            shell_writes: Arc::new(Mutex::new(Vec::new())),
+            shell_resizes: Arc::new(Mutex::new(Vec::new())),
+            shell_closed: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -118,6 +151,23 @@ impl DaemonApi for FakeDaemon {
         }
         Ok(self.logs.clone())
     }
+    fn open_shell(
+        &mut self,
+        _name: &str,
+        mut on_output: Box<dyn FnMut(Vec<u8>) + Send>,
+        _on_exit: Box<dyn FnOnce() + Send>,
+    ) -> anyhow::Result<Box<dyn ShellSession>> {
+        if self.fail_action {
+            anyhow::bail!("action failed");
+        }
+        on_output(b"$ ".to_vec()); // canned prompt banner
+        Ok(Box::new(FakeShell {
+            writes: self.shell_writes.clone(),
+            resizes: self.shell_resizes.clone(),
+            closed: self.shell_closed.clone(),
+            on_output,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -172,5 +222,36 @@ mod tests {
         let mut d = FakeDaemon::default();
         let logs = d.read_logs("web").unwrap();
         assert!(logs.contains("boot"), "got: {logs}");
+    }
+
+    #[test]
+    fn fake_shell_echoes_and_records() {
+        let mut d = FakeDaemon::default();
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let out2 = out.clone();
+        let mut s = d
+            .open_shell(
+                "web",
+                Box::new(move |b| out2.lock().unwrap().extend_from_slice(&b)),
+                Box::new(|| {}),
+            )
+            .unwrap();
+        s.write(b"ls\n").unwrap();
+        s.resize(100, 40).unwrap();
+        s.close().unwrap();
+        assert_eq!(&d.shell_writes.lock().unwrap()[..], &[b"ls\n".to_vec()]);
+        assert_eq!(d.shell_resizes.lock().unwrap()[0], (100, 40));
+        assert!(*d.shell_closed.lock().unwrap());
+        assert_eq!(&*out.lock().unwrap(), b"$ ls\n"); // banner + echo
+    }
+
+    #[test]
+    fn fake_open_shell_surfaces_failure() {
+        let mut d = FakeDaemon {
+            fail_action: true,
+            ..Default::default()
+        };
+        let r = d.open_shell("web", Box::new(|_| {}), Box::new(|| {}));
+        assert!(r.is_err());
     }
 }

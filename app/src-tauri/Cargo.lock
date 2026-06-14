@@ -1864,7 +1864,9 @@ name = "izba-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "izba-core",
+ "izba-proto",
  "serde",
  "serde_json",
  "tauri",
