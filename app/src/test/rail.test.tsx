@@ -21,4 +21,10 @@ describe("Rail", () => {
     fireEvent.click(screen.getByText("db"));
     expect(onSelect).toHaveBeenCalledWith("db");
   });
+
+  it("marks the selected sandbox as pressed", () => {
+    render(<Rail sandboxes={sandboxes} selected="web" onSelect={() => {}} />);
+    expect(screen.getByText("web").closest("button")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("db").closest("button")).toHaveAttribute("aria-pressed", "false");
+  });
 });

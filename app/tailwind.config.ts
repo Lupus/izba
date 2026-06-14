@@ -11,6 +11,7 @@ export default {
         rail: "#fbfcfd",
         bg: "#f6f7f9",
         line: "#e4e7ec",
+        hover: "#eef1f5",
         ok: "#16a34a",
         warn: "#d97706",
         off: "#9aa3b2",

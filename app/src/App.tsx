@@ -5,6 +5,7 @@ import { Rail } from "./components/Rail";
 import { Detail } from "./components/Detail";
 
 export default function App() {
+  // `refresh` is also available from usePolling for a future manual-refresh control.
   const { sandboxes, daemon, error } = usePolling(2000);
   const [selected, setSelected] = useState<string | null>(null);
   const current = sandboxes.find((s) => s.name === selected) ?? null;
