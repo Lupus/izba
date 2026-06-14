@@ -786,9 +786,13 @@ jobs:
         run: |
           choco install innosetup --no-progress -y
           $stage = Join-Path $env:GITHUB_WORKSPACE 'stage'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          # /O overrides the .iss OutputDir (which is relative to the .iss file,
+          # i.e. packaging\windows\dist) so the installer lands in repo-root dist\.
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
             "/DMyAppVersion=${{ needs.version.outputs.version }}" `
             "/DStageDir=$stage" `
+            "/O$out" `
             packaging\windows\izba.iss
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
