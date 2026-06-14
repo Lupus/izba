@@ -775,10 +775,21 @@ jobs:
         with:
           name: initramfs
           path: stage/artifacts
-      - name: Fetch openvmm.exe into libexec
+      - name: Restore pinned openvmm.exe
+        id: openvmm
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: dist/openvmm.exe
+          key: openvmm-run-27240809751
+      - name: Fetch pinned openvmm.exe (cache miss)
+        if: steps.openvmm.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: hack/fetch-openvmm.sh
+      - name: Stage openvmm.exe into libexec
         shell: bash
         run: |
-          hack/fetch-openvmm.sh
           mkdir -p stage/bin/libexec
           cp dist/openvmm.exe stage/bin/libexec/openvmm.exe
       - name: Build installer with Inno Setup
