@@ -487,6 +487,59 @@ where
     Ok(req)
 }
 
+/// Plaintext-HTTP sibling of [`mitm_terminate`]: terminate a guest connection
+/// that is **not** TLS (cleartext HTTP/1.x on :80, e.g. `apt`). No client
+/// handshake and no upstream TLS — read the request head for the same L7
+/// visibility (Host/method/path → policy + audit), and on Allow dial the real
+/// upstream in the clear, replay the head, and splice. On Deny, synthesize the
+/// 403 without touching the upstream.
+///
+/// The router still sends :80/:443 into the MITM; the accept loop sniffs the
+/// first bytes ([`looks_like_tls`]) and calls this for cleartext, so a plain
+/// HTTP request is no longer force-handshaken as TLS (which silently broke it).
+/// Returns the observed `L7Request` so the caller can audit L7 visibility.
+pub async fn mitm_terminate_http<C, U, F, Fut>(
+    mut client: C,
+    policy: &dyn MitmPolicy,
+    connect_upstream: F,
+) -> Result<L7Request>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<U>>,
+{
+    // 1. Read the request head in the clear — same L7 view as the TLS path.
+    let (req, head_bytes) = read_request_head(&mut client).await?;
+
+    // 2. Policy hook (records the audit). Deny short-circuits with a 403.
+    if let L7Verdict::Deny(body) = policy.check(&req) {
+        let resp = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        client
+            .write_all(resp.as_bytes())
+            .await
+            .context("write deny response")?;
+        client.flush().await.ok();
+        client.shutdown().await.ok();
+        return Ok(req);
+    }
+
+    // 3. Allow: dial the upstream in the clear, replay the head we already
+    //    consumed, then pipe both directions.
+    let mut upstream = connect_upstream().await.context("dial upstream")?;
+    upstream
+        .write_all(&head_bytes)
+        .await
+        .context("replay request head to upstream")?;
+    upstream.flush().await.ok();
+    pump_bidirectional(client, upstream).await;
+    Ok(req)
+}
+
 /// Copy both directions to EOF, then full-shutdown each peer. IZBA — mirrors
 /// the blocking `portfwd::pump_bidirectional` discipline in async form:
 /// drain-to-EOF + explicit `shutdown()` honour the OpenVMM churn-teardown
@@ -721,6 +774,118 @@ mod tests {
         // The datapath returned the observed request without dialing upstream.
         let observed = mitm.await.unwrap().expect("mitm deny path");
         assert_eq!(observed.host, "blocked.example.com");
+        assert_eq!(observed.method, "GET");
+    }
+
+    /// A plaintext HTTP request line is NOT a TLS ClientHello — the accept loop
+    /// uses this to route :80 cleartext (apt) down the HTTP path instead of
+    /// force-handshaking TLS on it.
+    #[test]
+    fn http_request_is_not_classified_as_tls() {
+        assert!(!looks_like_tls(b"GET / HTTP/1.1\r\n"));
+        // A real TLS record header (handshake, version 3.x) still is.
+        assert!(looks_like_tls(&[0x16, 0x03, 0x01, 0x00, 0x10]));
+    }
+
+    /// Plain HTTP on :80 (no TLS): the MITM reads the L7 head in the clear,
+    /// allows it, dials the upstream in the clear, replays the head, and pipes
+    /// the response back. This is the apt-over-http path that the TLS-only
+    /// datapath used to break.
+    #[tokio::test]
+    async fn http_plaintext_allow_pipes_upstream_response() {
+        let host = "archive.ubuntu.com";
+        let (mut guest, mitm_side) = duplex(64 * 1024);
+        let (up_mitm, mut up_srv) = duplex(64 * 1024);
+
+        let policy = HostAllowlist {
+            allowed: vec![host.to_string()],
+        };
+        let up_mitm = Mutex::new(Some(up_mitm));
+        let mitm = tokio::spawn(async move {
+            mitm_terminate_http(mitm_side, &policy, || async move {
+                Ok::<_, anyhow::Error>(up_mitm.lock().unwrap().take().unwrap())
+            })
+            .await
+        });
+
+        guest
+            .write_all(b"GET /ubuntu/dists/ HTTP/1.0\r\nHost: archive.ubuntu.com\r\n\r\n")
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+
+        // The upstream sees the replayed request head verbatim.
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            let n = up_srv.read(&mut b).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            head.push(b[0]);
+            if head.len() >= 4 && &head[head.len() - 4..] == b"\r\n\r\n" {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&head);
+        assert!(
+            head.contains("GET /ubuntu/dists/ HTTP/1.0"),
+            "upstream head: {head}"
+        );
+        assert!(
+            head.contains("Host: archive.ubuntu.com"),
+            "upstream host: {head}"
+        );
+
+        up_srv
+            .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDATA")
+            .await
+            .unwrap();
+        up_srv.flush().await.unwrap();
+        drop(up_srv);
+
+        let mut got = Vec::new();
+        guest.read_to_end(&mut got).await.unwrap();
+        let got = String::from_utf8_lossy(&got);
+        assert!(got.contains("200 OK"), "guest response: {got}");
+        assert!(got.contains("DATA"), "guest body: {got}");
+        drop(guest);
+
+        let observed = mitm.await.unwrap().expect("http mitm datapath");
+        assert_eq!(observed.method, "GET");
+        assert_eq!(observed.path, "/ubuntu/dists/");
+        assert_eq!(observed.host, "archive.ubuntu.com");
+    }
+
+    /// Plain HTTP deny: a Host not on the allow-list gets a 403 and the upstream
+    /// is never dialed (the connector errors if touched).
+    #[tokio::test]
+    async fn http_plaintext_deny_short_circuits_without_upstream() {
+        let (mut guest, mitm_side) = duplex(64 * 1024);
+        let policy = HostAllowlist {
+            allowed: vec!["allowed.example".to_string()],
+        };
+        let mitm = tokio::spawn(async move {
+            mitm_terminate_http(mitm_side, &policy, || async {
+                Err::<tokio::io::DuplexStream, _>(anyhow!("upstream must NOT be dialed on deny"))
+            })
+            .await
+        });
+
+        guest
+            .write_all(b"GET /secret HTTP/1.0\r\nHost: blocked.example\r\n\r\n")
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+
+        let mut got = Vec::new();
+        guest.read_to_end(&mut got).await.unwrap();
+        let got = String::from_utf8_lossy(&got);
+        assert!(got.contains("403 Forbidden"), "deny response: {got}");
+        assert!(got.contains("izba egress policy"), "deny body: {got}");
+
+        let observed = mitm.await.unwrap().expect("http mitm deny path");
+        assert_eq!(observed.host, "blocked.example");
         assert_eq!(observed.method, "GET");
     }
 
