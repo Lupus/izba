@@ -448,4 +448,75 @@ mod tests {
         app.join().unwrap();
         fake.join().unwrap();
     }
+
+    /// A loopback TcpStream to play the redirected client, plus its accepting
+    /// listener; runtime-skips where the sandbox denies bind.
+    fn loopback_client() -> Option<(TcpStream, std::thread::JoinHandle<Vec<u8>>)> {
+        let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP: sandbox denies bind: {e}");
+                return None;
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        // The app connects and reads until EOF — it expects an honest
+        // RST/EOF when izbad refuses the dial.
+        let app = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut out = Vec::new();
+            let _ = s.read_to_end(&mut out);
+            out
+        });
+        let (client, _) = listener.accept().unwrap();
+        Some((client, app))
+    }
+
+    /// When the egress dial itself fails, handle_redirected must log and return
+    /// (dropping the client so the app sees EOF) — never panic or hang.
+    #[test]
+    fn redirected_dial_failure_returns() {
+        let Some((client, app)) = loopback_client() else {
+            return;
+        };
+        let orig = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 80);
+        handle_redirected::<UnixStream, _>(client, orig, || {
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "no izbad"))
+        });
+        // The dropped client delivers EOF to the app's pending read.
+        assert!(app.join().unwrap().is_empty());
+    }
+
+    /// When izbad replies Error (upstream refused), handle_redirected must
+    /// return after the Error frame — the client drops so the app sees EOF,
+    /// the honest refusal path.
+    #[test]
+    fn redirected_error_response_returns() {
+        let Some((client, app)) = loopback_client() else {
+            return;
+        };
+        let (izbad, theirs) = UnixStream::pair().unwrap();
+        let fake = std::thread::spawn(move || {
+            let mut s = theirs;
+            let open: StreamOpen = read_frame(&mut s).unwrap();
+            assert!(
+                matches!(open, StreamOpen::TcpConnect { .. }),
+                "expected TcpConnect, got {open:?}"
+            );
+            write_frame(
+                &mut s,
+                &izba_proto::Response::Error {
+                    kind: izba_proto::ErrorKind::ConnectFailed,
+                    message: "upstream refused".into(),
+                },
+            )
+            .unwrap();
+            // Drop `s`: izbad's side closes after the Error frame.
+        });
+        let orig = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 80);
+        handle_redirected(client, orig, || Ok(izbad));
+        assert!(app.join().unwrap().is_empty(), "app sees EOF after refusal");
+        fake.join().unwrap();
+    }
 }

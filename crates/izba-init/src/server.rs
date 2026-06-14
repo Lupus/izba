@@ -733,4 +733,58 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
     }
+
+    /// Egress variants (`Dns`/`TcpConnect`) are izbad's job on vsock 1027; if
+    /// one arrives on the init stream port it must get one BadRequest frame and
+    /// a closed conn, never silent acceptance.
+    #[test]
+    fn egress_variant_rejected_on_stream_port() {
+        let h = Harness::new();
+        let mut conn = h.stream_conn();
+        write_frame(&mut conn, &StreamOpen::Dns).unwrap();
+        match read_frame::<_, Response>(&mut conn).unwrap() {
+            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::BadRequest),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Server closes the conn after the single error frame.
+        let mut rest = Vec::new();
+        conn.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+    }
+
+    /// A Resize RPC against a non-tty exec must round-trip through the control
+    /// server to a BadRequest (exercises the control Resize arm + error mapping).
+    #[test]
+    fn resize_non_tty_via_control() {
+        let h = Harness::new();
+        let mut c = h.control_conn();
+        let exec_id = match rpc(
+            &mut c,
+            &Request::Exec(ExecRequest {
+                argv: vec!["sleep".into(), "30".into()],
+                env: vec![],
+                cwd: "/".into(),
+                tty: false,
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: nix::unistd::getegid().as_raw(),
+            }),
+        ) {
+            Response::ExecStarted { exec_id } => exec_id,
+            other => panic!("unexpected: {other:?}"),
+        };
+        match rpc(
+            &mut c,
+            &Request::Resize {
+                exec_id,
+                cols: 80,
+                rows: 24,
+            },
+        ) {
+            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::BadRequest),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Reap the sleep so the test leaves no lingering process.
+        let _ = rpc(&mut c, &Request::Kill { exec_id, signal: 9 });
+        let _ = rpc(&mut c, &Request::Wait { exec_id });
+    }
 }
