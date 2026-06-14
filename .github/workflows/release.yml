@@ -193,3 +193,52 @@ jobs:
             rel/izba_*_amd64.deb
             rel/izba-setup-*.exe
             rel/SHA256SUMS
+
+  smoke:
+    name: Dispatch smoke (verify installers)
+    needs: [package-deb, package-windows]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: izba-deb
+          path: smoke
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: izba-windows-installer
+          path: smoke
+      - name: Verify .deb layout + symlink
+        run: |
+          set -euo pipefail
+          deb=$(ls smoke/izba_*_amd64.deb)
+          contents=$(dpkg-deb --contents "$deb")
+          {
+            echo "### izba release smoke"
+            echo '```'
+            dpkg-deb --info "$deb" | grep -E 'Package|Version|Architecture|Depends'
+            echo "$contents"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          for p in \
+            usr/lib/izba/bin/izba \
+            usr/lib/izba/bin/libexec/cloud-hypervisor \
+            usr/lib/izba/bin/libexec/virtiofsd \
+            usr/lib/izba/artifacts/vmlinux \
+            usr/lib/izba/artifacts/initramfs.cpio.gz; do
+            echo "$contents" | grep -qF "$p" || { echo "MISSING in .deb: $p" >&2; exit 1; }
+          done
+          echo "$contents" | grep -qF 'usr/bin/izba -> ../lib/izba/bin/izba' \
+            || { echo "MISSING/incorrect /usr/bin/izba symlink" >&2; exit 1; }
+          echo "deb layout OK"
+      - name: Verify Windows installer present + non-trivial
+        run: |
+          set -euo pipefail
+          exe=$(ls smoke/izba-setup-*.exe)
+          sz=$(stat -c%s "$exe")
+          echo "installer: $exe ($sz bytes)"
+          # A real installer bundles the kernel + initramfs + tools; anything
+          # under ~1 MiB means a packaging failure produced a stub.
+          [ "$sz" -gt 1000000 ] || { echo "installer suspiciously small ($sz bytes)" >&2; exit 1; }
+          echo "windows installer OK" >> "$GITHUB_STEP_SUMMARY"
