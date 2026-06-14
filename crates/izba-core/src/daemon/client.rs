@@ -61,6 +61,16 @@ impl DaemonClient {
         Self::connect_with(paths, &spawn_daemon, &transport::daemon_version())
     }
 
+    /// Connect for embedders (the GUI) whose own `current_exe` is NOT `izba`:
+    /// spawn the sibling `izba` binary's `daemon run` rather than re-exec
+    /// ourselves. `izba-app` and `izba` install side by side (same dir on
+    /// Windows; both on PATH via the .deb), so we resolve `izba[.exe]` next to
+    /// the current executable first, then fall back to bare `izba` for the OS
+    /// to resolve via PATH.
+    pub fn connect_spawning_izba(paths: &Paths) -> anyhow::Result<DaemonClient> {
+        Self::connect_with(paths, &spawn_sibling_izba, &transport::daemon_version())
+    }
+
     /// Seam for tests: injectable spawner + client version.
     fn connect_with(
         paths: &Paths,
@@ -282,6 +292,46 @@ fn spawn_daemon(paths: &Paths) -> anyhow::Result<()> {
     let cmd = CommandSpec {
         argv: vec![
             exe.to_string_lossy().into_owned(),
+            "daemon".to_string(),
+            "run".to_string(),
+        ],
+    };
+    procmgr::spawn_detached(&cmd, &paths.daemon_log())?;
+    Ok(())
+}
+
+/// `izba` on Windows is `izba.exe`; elsewhere bare `izba`.
+fn izba_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "izba.exe"
+    } else {
+        "izba"
+    }
+}
+
+/// Sibling `izba[.exe]` in `dir` as an absolute path, if it exists as a file.
+fn resolve_izba_in(dir: &std::path::Path) -> Option<String> {
+    let cand = dir.join(izba_exe_name());
+    cand.is_file().then(|| cand.to_string_lossy().into_owned())
+}
+
+/// Resolve the `izba` binary to spawn: sibling of `current_exe` if present,
+/// else bare `izba[.exe]` (PATH-resolved by the OS).
+fn resolve_izba_binary() -> String {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .and_then(resolve_izba_in)
+        .unwrap_or_else(|| izba_exe_name().to_string())
+}
+
+/// Spawn `izba daemon run` detached (mirrors `spawn_daemon`, but targets the
+/// sibling `izba` rather than `current_exe`).
+fn spawn_sibling_izba(paths: &Paths) -> anyhow::Result<()> {
+    let cmd = CommandSpec {
+        argv: vec![
+            resolve_izba_binary(),
             "daemon".to_string(),
             "run".to_string(),
         ],
@@ -523,6 +573,23 @@ mod tests {
             .context("connecting to the izbad socket")
             .unwrap_err();
         assert!(!is_daemon_gone(&denied));
+    }
+
+    #[test]
+    fn resolve_izba_in_finds_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(izba_exe_name());
+        std::fs::write(&p, b"x").unwrap();
+        assert_eq!(
+            resolve_izba_in(dir.path()),
+            Some(p.to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_izba_in_absent_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_izba_in(dir.path()), None);
     }
 
     #[test]
