@@ -100,6 +100,13 @@ impl RegoPolicy {
         Self::new(Self::REGO, Self::DATA_JSON)
     }
 
+    /// Build from the embedded `egress.rego` + a supplied data document — the
+    /// per-sandbox allow-list a `--policy` file compiles to (see
+    /// [`super::config::EgressPolicyConfig`]).
+    pub fn with_data(data_json: &str) -> anyhow::Result<Self> {
+        Self::new(Self::REGO, data_json)
+    }
+
     /// Build from an explicit Rego module + JSON data document (the per-sandbox
     /// data doc is supplied here at egress start; tests vary the tier).
     pub fn new(rego: &str, data_json: &str) -> anyhow::Result<Self> {

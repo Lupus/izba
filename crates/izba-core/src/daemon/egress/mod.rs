@@ -3,6 +3,7 @@
 //! policy, M4 fronts dns with member names, M5 branches MITM off the router.
 
 pub mod audit;
+pub mod config;
 pub mod dns;
 pub mod dns_snoop;
 pub mod mitm;

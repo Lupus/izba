@@ -21,6 +21,7 @@ pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32>
     });
     match client.request(&req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Created { name } => {
+            super::persist_policy(paths, &name, opts.policy.as_deref())?;
             println!("{name}");
             Ok(0)
         }

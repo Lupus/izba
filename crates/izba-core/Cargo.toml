@@ -50,6 +50,10 @@ regorus = { version = "0.4", default-features = false, features = ["std", "arc",
 # it a pure wire parser (no tokio/runtime) and cross-compiles to windows-gnu.
 hickory-proto = { version = "0.24", default-features = false }
 
+# Per-sandbox `--policy` config parse (mirrors the user's docker-mitm-bridge
+# data.yml shape). serde_yaml 0.9 is archived-but-final + pure Rust.
+serde_yaml = "0.9"
+
 [dev-dependencies]
 # in-memory duplex test driver for the MITM datapath needs a real runtime
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "time"] }

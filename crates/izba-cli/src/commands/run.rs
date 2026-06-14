@@ -51,11 +51,12 @@ fn resolve_or_create(
             || opts.mem != 4096
             || opts.rw_size_gb != 8
             || opts.name.is_some()
-            || !opts.publish.is_empty();
+            || !opts.publish.is_empty()
+            || opts.policy.is_some();
         if has_non_default {
             eprintln!(
                 "warning: '{name_or_dir}' is an existing sandbox — \
-                 stored config wins; --image/--cpus/--mem/--rw-size-gb/--name are ignored"
+                 stored config wins; --image/--cpus/--mem/--rw-size-gb/--name/--policy are ignored"
             );
         }
         return Ok(name_or_dir.to_string());
@@ -78,6 +79,7 @@ fn resolve_or_create(
             DaemonResponse::Error { message } => bail!(message),
             other => bail!("unexpected daemon reply: {other:?}"),
         }
+        super::persist_policy(paths, &name, opts.policy.as_deref())?;
     }
     Ok(name)
 }

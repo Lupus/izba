@@ -41,6 +41,10 @@ struct SandboxOpts {
     /// Publish a host port to the guest: [BIND:]HOST:GUEST (repeatable)
     #[arg(short = 'p', long = "publish", value_name = "[BIND:]HOST:GUEST")]
     publish: Vec<String>,
+    /// Egress policy YAML: a domain allow-list this sandbox may reach. Without
+    /// it the sandbox is unrestricted (no firewall).
+    #[arg(long, value_name = "FILE")]
+    policy: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -244,6 +248,22 @@ mod tests {
 
         // cmd is mandatory
         assert!(Cli::try_parse_from(["izba", "exec", "web"]).is_err());
+    }
+
+    #[test]
+    fn parse_create_policy_flag() {
+        let cli =
+            Cli::try_parse_from(["izba", "create", "--policy", "/etc/izba/web.yaml"]).unwrap();
+        let Cmd::Create { opts, .. } = cli.cmd else {
+            panic!("expected create");
+        };
+        assert_eq!(opts.policy, Some(PathBuf::from("/etc/izba/web.yaml")));
+        // Absent by default (unrestricted sandbox).
+        let bare = Cli::try_parse_from(["izba", "create"]).unwrap();
+        let Cmd::Create { opts, .. } = bare.cmd else {
+            panic!("expected create");
+        };
+        assert_eq!(opts.policy, None);
     }
 
     #[test]

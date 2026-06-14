@@ -53,3 +53,25 @@ pub fn parse_publish(specs: &[String]) -> anyhow::Result<Vec<PortRule>> {
         .map(|s| izba_core::portfwd::parse_rule(s))
         .collect()
 }
+
+/// Validate a `--policy` file and persist it into the sandbox directory as
+/// `policy.yaml` (the daemon loads it when arming the sandbox's egress plane).
+/// No-op when no policy was given. Must run after the sandbox dir exists.
+pub(crate) fn persist_policy(
+    paths: &izba_core::paths::Paths,
+    name: &str,
+    policy: Option<&Path>,
+) -> anyhow::Result<()> {
+    use izba_core::daemon::egress::config::EgressPolicyConfig;
+    let Some(src) = policy else {
+        return Ok(());
+    };
+    let raw = std::fs::read_to_string(src)
+        .with_context(|| format!("reading egress policy {}", src.display()))?;
+    // Fail fast at create on a malformed allow-list rather than at boot.
+    EgressPolicyConfig::from_yaml(&raw)
+        .with_context(|| format!("invalid egress policy {}", src.display()))?;
+    let dst = EgressPolicyConfig::path_in(&paths.sandbox_dir(name));
+    std::fs::write(&dst, raw).with_context(|| format!("writing {}", dst.display()))?;
+    Ok(())
+}
