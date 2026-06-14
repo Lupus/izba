@@ -12,12 +12,21 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "izba",
-    version,
+    version = short_version(),
     about = "Run coding agents in microVM sandboxes"
 )]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// `izba --version` one-liner: `0.1.0 (de57bb5)`. clap needs a `&'static str`,
+/// so the allocated short string is computed once and leaked behind a OnceLock.
+fn short_version() -> &'static str {
+    use std::sync::OnceLock;
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| izba_core::build_info::BuildInfo::current().short())
+        .as_str()
 }
 
 /// Options shared by `create` and `run`.
@@ -151,6 +160,12 @@ enum Cmd {
     /// Manage the izba daemon (auto-started by other commands)
     #[command(subcommand)]
     Daemon(DaemonCmd),
+    /// Show detailed build info for the CLI and (if running) the daemon
+    Version {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
@@ -177,6 +192,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             PortCmd::Unpublish { name, key } => commands::port::unpublish(paths, &name, &key),
             PortCmd::Ls { name } => commands::port::ls(paths, &name),
         },
+        Cmd::Version { json } => commands::version::run(paths, json),
         Cmd::Daemon(dc) => match dc {
             DaemonCmd::Run => commands::daemon::run_foreground(paths),
             DaemonCmd::Status => commands::daemon::status(paths),

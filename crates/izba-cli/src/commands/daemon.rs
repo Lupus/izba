@@ -25,6 +25,12 @@ pub fn status(paths: &Paths) -> anyhow::Result<i32> {
                 s.version,
                 s.uptime_ms / 1000
             );
+            let cli = izba_core::build_info::BuildInfoOwned::current();
+            println!("daemon build: {} (proto {})", s.build.short(), s.proto);
+            println!("cli build:    {}", cli.short());
+            if s.build != cli {
+                println!("⚠ daemon and CLI builds differ (run `izba version` for detail)");
+            }
             println!("socket: {}", s.socket);
             println!("{:<24} {:<32} STATUS", "NAME", "IMAGE");
             for sb in &s.sandboxes {

@@ -8,6 +8,7 @@ pub mod port;
 pub mod rm;
 pub mod run;
 pub mod stop;
+pub mod version;
 
 use crate::name;
 use crate::SandboxOpts;
