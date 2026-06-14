@@ -62,7 +62,7 @@ impl DaemonClient {
     }
 
     /// Daemon-first connect: auto-start when absent, auto-upgrade (shutdown +
-    /// respawn) on version mismatch.
+    /// respawn) on wire-protocol mismatch.
     pub fn connect(paths: &Paths) -> anyhow::Result<DaemonClient> {
         Self::connect_with(paths, &spawn_daemon, &transport::daemon_version())
     }
@@ -587,7 +587,11 @@ mod tests {
             "v1",
         )
         .unwrap();
-        assert_eq!(spawned.load(Ordering::SeqCst), 1, "no respawn for same proto");
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            1,
+            "no respawn for same proto"
+        );
         assert_eq!(client.server_version, "v1");
     }
 
@@ -613,7 +617,11 @@ mod tests {
             "new",
         )
         .unwrap();
-        assert_eq!(spawned.load(Ordering::SeqCst), 1, "proto mismatch respawned");
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            1,
+            "proto mismatch respawned"
+        );
         assert_eq!(client.server_proto, DAEMON_PROTO_VERSION);
         assert_eq!(client.server_version, "new");
     }
@@ -640,7 +648,11 @@ mod tests {
             "0.1.0 (bbbbbbb)",
         )
         .unwrap();
-        assert_eq!(spawned.load(Ordering::SeqCst), 0, "no respawn on build-only diff");
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            0,
+            "no respawn on build-only diff"
+        );
         assert_eq!(client.server_version, "0.1.0 (aaaaaaa)");
     }
 
