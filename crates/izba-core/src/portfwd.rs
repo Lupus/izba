@@ -132,6 +132,37 @@ pub(crate) fn pump_bidirectional(client: TcpStream, vs: UdsStream) {
     let _ = up.join();
 }
 
+/// Windows AF_UNIX (`uds_windows`) intermittently DROPS the peer-EOF wakeup
+/// for a blocking read: after the peer half-closes (`shutdown(Write)`) or fully
+/// closes, an already-blocked `read` can hang forever instead of returning
+/// `Ok(0)`. A *fresh* `recv` issued after a timeout does observe the
+/// already-present EOF (verified empirically on a hosted runner: 500/500 churn
+/// iterations went from intermittent 60-min hangs to clean ~280-ms teardowns).
+/// So we bound the read with a timeout and retry on expiry. `std`'s Unix
+/// `UnixStream` delivers EOF reliably, so this is a no-op there and the relay
+/// behaves byte-for-byte as before. This is the root cause of the
+/// `ttystorm M0 churn gate` hang and the sibling `copy_drains_source_after_
+/// write_failure` unit-test wedge on Windows CI.
+#[cfg(windows)]
+const EOF_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A read source for [`copy_until_eof`] that can bound its blocking reads so a
+/// lost peer-EOF wakeup cannot hang the drain forever. Arming is a no-op
+/// everywhere except the Windows AF_UNIX stream, where it sets a read timeout
+/// (see [`EOF_POLL_INTERVAL`]).
+pub(crate) trait DrainRead: Read {
+    fn arm_eof_poll(&self) {}
+}
+impl DrainRead for TcpStream {}
+#[cfg(unix)]
+impl DrainRead for UdsStream {}
+#[cfg(windows)]
+impl DrainRead for UdsStream {
+    fn arm_eof_poll(&self) {
+        let _ = self.set_read_timeout(Some(EOF_POLL_INTERVAL));
+    }
+}
+
 /// Copy `r` → `w` until `r` reaches EOF (or a read error). A write failure
 /// does NOT end the loop: the destination may be gone, but the source must
 /// still be consumed to EOF, discarding. Abandoning the read side of a vsock
@@ -140,13 +171,25 @@ pub(crate) fn pump_bidirectional(client: TcpStream, vs: UdsStream) {
 /// the vsock-churn crash). Draining keeps every vsock teardown EOF-shaped.
 /// The drain ends when the guest half-closes, which the opposite pump
 /// direction triggers via its `shutdown(Write)` on EOF of the dead peer.
-pub(crate) fn copy_until_eof(mut r: impl Read, w: &mut impl Write) {
+///
+/// A `TimedOut`/`WouldBlock` read is the bounded-read tick (see [`DrainRead`]),
+/// NOT EOF: re-issue the `recv` so an already-present EOF gets observed.
+pub(crate) fn copy_until_eof<R: DrainRead>(mut r: R, w: &mut impl Write) {
+    r.arm_eof_poll();
     let mut buf = [0u8; 32 * 1024];
     let mut discard = false;
     loop {
         let n = match r.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => n,
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
             Err(_) => return,
         };
         if !discard && w.write_all(&buf[..n]).is_err() {
@@ -215,6 +258,50 @@ mod tests {
         copy_until_eof(src_r, &mut dead_w);
         writer.join().unwrap().expect(
             "source writer must complete: the copy must drain to EOF, not abandon the read side",
+        );
+    }
+
+    /// A scripted `Read` that replays a fixed sequence of results, then EOF.
+    struct ScriptedReader {
+        steps: std::collections::VecDeque<std::io::Result<&'static [u8]>>,
+    }
+    impl Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(Ok(data)) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok(n)
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(0), // EOF
+            }
+        }
+    }
+    impl DrainRead for ScriptedReader {}
+
+    /// A read timeout firing mid-stream must NOT be mistaken for EOF: the copy
+    /// must retry the read and keep draining. On Windows AF_UNIX a bounded read
+    /// is the only way to survive the intermittently-lost peer-EOF wakeup (a
+    /// blocking read can hang forever after the peer half-closes), so
+    /// `copy_until_eof` arms a read timeout there and must treat
+    /// `TimedOut`/`WouldBlock` as "read again", not "done".
+    #[test]
+    fn copy_retries_on_read_timeout_instead_of_treating_it_as_eof() {
+        use std::collections::VecDeque;
+        let mut steps: VecDeque<std::io::Result<&'static [u8]>> = VecDeque::new();
+        steps.push_back(Ok(&b"hello"[..]));
+        steps.push_back(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
+        steps.push_back(Ok(&b"world"[..]));
+        steps.push_back(Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)));
+        steps.push_back(Ok(&b"!"[..]));
+        // VecDeque now drained -> next read returns Ok(0) = EOF.
+        let reader = ScriptedReader { steps };
+        let mut sink = Vec::new();
+        copy_until_eof(reader, &mut sink);
+        assert_eq!(
+            sink, b"helloworld!",
+            "mid-stream read timeouts must be retried, not treated as EOF"
         );
     }
 
