@@ -65,7 +65,10 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   OCI→erofs pipeline; `procmgr.rs` detached spawning; `vsock.rs`
   hybrid-vsock client; `daemon/` izbad server+client (framed JSON over AF_UNIX);
   `daemon/egress/` the guest-initiated vsock-1027 plane (policy/dns/router/
-  manager seams — M1 AllowAll policy + raw-UDP DNS forwarder, M2+ fill in).
+  manager seams — M1 AllowAll policy + raw-UDP DNS forwarder, M2+ fill in);
+  `build_info.rs` compile-time build metadata (git describe/sha/date, rustc,
+  target, profile) via a `vergen-gitcl` `build.rs` — the single source of truth
+  for `izba --version` / `izba version`, the daemon hello/status, and the app.
 - `izba-init` — guest PID 1 (static musl): mounts, exec engine (PTY + pipes),
   vsock servers, NIC-less net bring-up (`net.rs`) + egress stub (`egress.rs`:
   DNS UDP:53→vsock `Dns` half and TCP nft-REDIRECT→`TcpConnect` half).
@@ -87,6 +90,11 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   killing/upgrading it never harms sandboxes. Port relays are daemon
   threads; rules persist in `ports.json` (plain `Vec<PortRule>`).
   VMs/sidecars are never auto-restarted — death ⇒ honest unhealthy reason.
+  The CLI↔daemon hello exchanges `DAEMON_PROTO_VERSION` (the COMPATIBILITY gate
+  — bump on any wire-breaking frame change; a stale-proto daemon is auto
+  shut-down + respawned) plus a display-only `BuildInfoOwned` (git sha/date).
+  Both `proto` and `build` are `#[serde(default)]` so a pre-change daemon
+  deserializes to proto 0 and self-heals via one restart.
 - **vsock ports:** 1025 control RPC, 1026 streams, 1027 egress
   (`CONTROL_PORT`/`STREAM_PORT`/`EGRESS_PORT` in izba-proto). Stream conns send
   ONE `StreamOpen` frame (`Attach` exec streams / `TcpDial` port relays /
