@@ -2,6 +2,7 @@
 //! (policy / dns / router / manager) are deliberately separable — M2 fills
 //! policy, M4 fronts dns with member names, M5 branches MITM off the router.
 
+pub mod audit;
 pub mod dns;
 pub mod mitm;
 pub mod mitm_runtime;
@@ -16,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use self::audit::AuditSink;
 use self::dns::Resolver;
 use self::mitm_runtime::MitmRuntime;
 use self::policy::Policy;
@@ -48,6 +50,9 @@ pub struct EgressManager {
     /// all TCP takes the direct-dial path. The policy is sandbox-aware via
     /// `FlowDesc.sandbox`, so one runtime serves every sandbox.
     mitm: Option<Arc<MitmRuntime>>,
+    /// Structured per-flow audit log (tier-2 decisions; tier-1 is audited
+    /// inside the shared `MitmRuntime`). Cheap to clone into each handler.
+    audit: AuditSink,
 }
 
 impl EgressManager {
@@ -55,12 +60,14 @@ impl EgressManager {
         policy: Arc<dyn Policy>,
         resolver: Arc<dyn Resolver>,
         mitm: Option<Arc<MitmRuntime>>,
+        audit: AuditSink,
     ) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             policy,
             resolver,
             mitm,
+            audit,
         }
     }
 
@@ -104,6 +111,7 @@ impl EgressManager {
         let policy = Arc::clone(&self.policy);
         let resolver = Arc::clone(&self.resolver);
         let mitm = self.mitm.clone();
+        let audit = self.audit.clone();
         let sandbox = name.to_string();
         let thread = std::thread::spawn(move || {
             while !stop2.load(Ordering::SeqCst) {
@@ -115,6 +123,7 @@ impl EgressManager {
                         let policy = Arc::clone(&policy);
                         let resolver = Arc::clone(&resolver);
                         let mitm = mitm.clone();
+                        let audit = audit.clone();
                         let sandbox = sandbox.clone();
                         std::thread::spawn(move || {
                             router::handle_conn(
@@ -123,6 +132,7 @@ impl EgressManager {
                                 &*policy,
                                 &*resolver,
                                 mitm.as_deref(),
+                                &audit,
                             )
                         });
                     }
@@ -195,7 +205,10 @@ mod tests {
     }
 
     fn mgr() -> EgressManager {
-        EgressManager::new(Arc::new(AllowAll), Arc::new(EchoResolver), None)
+        let audit = AuditSink::new(Paths::with_root(
+            std::env::temp_dir().join("izba-audit-test"),
+        ));
+        EgressManager::new(Arc::new(AllowAll), Arc::new(EchoResolver), None, audit)
     }
 
     fn test_paths() -> (tempfile::TempDir, Paths) {

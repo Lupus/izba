@@ -20,6 +20,7 @@ use rustls::ClientConfig;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
+use super::audit::{AuditRecord, AuditSink, Tier};
 use super::mitm::{
     self, server_config_with_resolver, CertCache, L7Request, L7Verdict, MitmPolicy, MitmState,
 };
@@ -79,10 +80,13 @@ impl DstMap {
 
 /// Bridges the egress [`Policy`] (`FlowDesc`) into the MITM datapath's
 /// [`MitmPolicy`] (`L7Request`) for one connection, closing over the `OrigDst`
-/// the router supplied (sandbox + port the L7 view lacks).
+/// the router supplied (sandbox + ip + port the L7 view lacks). Records the
+/// tier-1 decision to the audit sink — the MITM path's "see every connection".
 struct PolicyAdapter {
     policy: Arc<dyn Policy>,
+    audit: AuditSink,
     sandbox: String,
+    ip: IpAddr,
     port: u16,
 }
 
@@ -96,7 +100,19 @@ impl MitmPolicy for PolicyAdapter {
             method: Some(req.method.clone()),
             path: Some(req.path.clone()),
         };
-        match self.policy.check(&flow) {
+        let verdict = self.policy.check(&flow);
+        let rule = match verdict {
+            Verdict::Allow => "allow-list",
+            Verdict::Deny => "not in allow-list",
+        };
+        self.audit.record(AuditRecord::from_flow(
+            verdict,
+            &flow,
+            self.ip,
+            Tier::L7,
+            rule,
+        ));
+        match verdict {
             Verdict::Allow => L7Verdict::Allow,
             Verdict::Deny => L7Verdict::Deny("403 Forbidden by izba egress policy\n"),
         }
@@ -119,6 +135,7 @@ impl MitmRuntime {
         certs: Arc<CertCache>,
         upstream: Arc<ClientConfig>,
         policy: Arc<dyn Policy>,
+        audit: AuditSink,
     ) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -137,7 +154,9 @@ impl MitmRuntime {
 
         let dsts_loop = dsts.clone();
         let dsts_sweep = dsts.clone();
-        rt.spawn(async move { accept_loop(listener, acceptor, upstream, policy, dsts_loop).await });
+        rt.spawn(async move {
+            accept_loop(listener, acceptor, upstream, policy, audit, dsts_loop).await
+        });
         rt.spawn(async move {
             let mut tick = tokio::time::interval(DST_TTL);
             loop {
@@ -169,6 +188,7 @@ async fn accept_loop(
     acceptor: TlsAcceptor,
     upstream: Arc<ClientConfig>,
     policy: Arc<dyn Policy>,
+    audit: AuditSink,
     dsts: DstMap,
 ) {
     loop {
@@ -184,11 +204,14 @@ async fn accept_loop(
         let acceptor = acceptor.clone();
         let upstream = Arc::clone(&upstream);
         let policy = Arc::clone(&policy);
+        let audit = audit.clone();
         tokio::spawn(async move {
             let state = MitmState { acceptor, upstream };
             let adapter = PolicyAdapter {
                 policy,
+                audit,
                 sandbox: dst.sandbox.clone(),
+                ip: dst.ip,
                 port: dst.port,
             };
             let dst_addr = (dst.ip, dst.port);

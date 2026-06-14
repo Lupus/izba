@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use izba_proto::{dns, read_frame, write_frame, ErrorKind, Response, StreamOpen};
 
+use super::audit::{AuditRecord, AuditSink, Tier};
 use super::dns::Resolver;
 use super::mitm_runtime::{MitmRuntime, OrigDst};
 use super::policy::{FlowDesc, Policy, Verdict};
@@ -24,6 +25,7 @@ pub fn handle_conn(
     policy: &dyn Policy,
     resolver: &dyn Resolver,
     mitm: Option<&MitmRuntime>,
+    audit: &AuditSink,
 ) {
     let open: StreamOpen = match read_frame(&mut conn) {
         Ok(o) => o,
@@ -31,7 +33,7 @@ pub fn handle_conn(
     };
     match open {
         StreamOpen::TcpConnect { addr, port } => {
-            tcp_connect(conn, sandbox, policy, resolver, mitm, &addr, port)
+            tcp_connect(conn, sandbox, policy, resolver, mitm, audit, &addr, port)
         }
         StreamOpen::Dns => dns_loop(conn, resolver),
         _ => {
@@ -53,6 +55,7 @@ fn tcp_connect(
     policy: &dyn Policy,
     resolver: &dyn Resolver,
     mitm: Option<&MitmRuntime>,
+    audit: &AuditSink,
     addr: &str,
     port: u16,
 ) {
@@ -94,7 +97,15 @@ fn tcp_connect(
     // Tier 2 — non-HTTP TCP: policy on the destination (T9 consults DNS-snoop
     // for the FQDN; today on the addr as given).
     let flow = FlowDesc::l3(sandbox, addr, port);
-    if policy.check(&flow) == Verdict::Deny {
+    let verdict = policy.check(&flow);
+    audit.record(AuditRecord::from_flow(
+        verdict,
+        &flow,
+        ip,
+        Tier::L3,
+        "tier-2 policy",
+    ));
+    if verdict == Verdict::Deny {
         let _ = write_frame(
             &mut conn,
             &Response::Error {
@@ -228,7 +239,10 @@ mod tests {
         resolver: &'static (dyn Resolver + Sync),
     ) -> UdsStream {
         let (client, server) = UdsStream::pair().unwrap();
-        std::thread::spawn(move || handle_conn(server, "web", policy, resolver, None));
+        let audit = AuditSink::new(crate::paths::Paths::with_root(
+            std::env::temp_dir().join("izba-router-audit-test"),
+        ));
+        std::thread::spawn(move || handle_conn(server, "web", policy, resolver, None, &audit));
         client
     }
 

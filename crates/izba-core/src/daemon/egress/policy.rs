@@ -37,28 +37,26 @@ impl FlowDesc {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Verdict {
     Allow,
     Deny,
 }
 
 pub trait Policy: Send + Sync {
-    /// Decide AND record: implementations own their audit emission.
+    /// A pure decision: the caller (router tier-2 / MITM tier-1) owns the
+    /// structured audit emission, since it knows the tier and the audit sink.
     fn check(&self, flow: &FlowDesc) -> Verdict;
 }
 
-/// M1 policy: everything allowed; each decision goes to stderr (the daemon
-/// log), so the audit trail exists from day one. Bare sandboxes (no declared
-/// policy) keep this behaviour.
+/// Default policy for a bare sandbox (no declared `--policy`): everything
+/// allowed. The decision is still recorded by the call site's audit sink, so
+/// `izba netlog` shows every connection even with no allow-list.
 pub struct AllowAll;
 
 impl Policy for AllowAll {
-    fn check(&self, flow: &FlowDesc) -> Verdict {
-        eprintln!(
-            "izbad: egress allow {} -> {}:{}",
-            flow.sandbox, flow.addr, flow.port
-        );
+    fn check(&self, _flow: &FlowDesc) -> Verdict {
         Verdict::Allow
     }
 }
@@ -144,30 +142,12 @@ impl Policy for RegoPolicy {
                 .eval_bool_query(self.query.clone(), false)
                 .map_err(|e| anyhow::anyhow!("eval_bool_query: {e}"))
         })();
-        let target = flow.host.as_deref().unwrap_or(&flow.addr);
         match verdict {
-            Ok(true) => {
-                eprintln!(
-                    "izbad: egress allow {} -> {}:{}",
-                    flow.sandbox, target, flow.port
-                );
-                Verdict::Allow
-            }
-            Ok(false) => {
-                eprintln!(
-                    "izbad: egress deny {} -> {}:{}",
-                    flow.sandbox, target, flow.port
-                );
-                Verdict::Deny
-            }
-            Err(e) => {
-                // Fail-closed: a policy evaluation error denies the flow.
-                eprintln!(
-                    "izbad: egress deny (policy error) {} -> {}:{}: {e:#}",
-                    flow.sandbox, target, flow.port
-                );
-                Verdict::Deny
-            }
+            Ok(true) => Verdict::Allow,
+            // Fail-closed: a `false` result OR an evaluation error both deny —
+            // a broken policy must never silently allow egress. The error is
+            // dropped here; the audit sink records the resulting Deny.
+            Ok(false) | Err(_) => Verdict::Deny,
         }
     }
 }

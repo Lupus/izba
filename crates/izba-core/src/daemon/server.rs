@@ -97,6 +97,7 @@ impl Daemon {
             Arc::clone(&deps.egress_policy),
             Arc::clone(&deps.egress_resolver),
             None,
+            crate::daemon::egress::audit::AuditSink::new(paths.clone()),
         );
         Self {
             paths,

@@ -145,7 +145,12 @@ fn mitm_firewall_allows_and_denies_by_decrypted_host() {
     let policy = Arc::new(RegoPolicy::embedded().unwrap());
 
     // Start the MITM runtime (sync context — its own runtime can block_on bind).
-    let mitm = MitmRuntime::start(izba_certs, upstream_cfg, policy).expect("start MITM runtime");
+    let audit =
+        izba_core::daemon::egress::audit::AuditSink::new(izba_core::paths::Paths::with_root(
+            std::env::temp_dir().join("izba-egress-mitm-test-audit"),
+        ));
+    let mitm =
+        MitmRuntime::start(izba_certs, upstream_cfg, policy, audit).expect("start MITM runtime");
 
     // Guest rustls config: trusts ONLY the izba CA (proves leaves chain to it).
     let mut guest_roots = rustls::RootCertStore::empty();

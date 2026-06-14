@@ -66,10 +66,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn test_egress() -> EgressManager {
+        use crate::daemon::egress::audit::AuditSink;
         EgressManager::new(
             Arc::new(AllowAll),
             Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
             None,
+            AuditSink::new(crate::paths::Paths::with_root(
+                std::env::temp_dir().join("izba-supervisor-audit-test"),
+            )),
         )
     }
 

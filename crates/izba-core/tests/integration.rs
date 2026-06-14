@@ -704,6 +704,7 @@ fn guest_networking() {
         std::sync::Arc::new(AllowAll),
         std::sync::Arc::new(UdpForwarder::system()),
         None,
+        izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
     mgr.ensure_listening(&tb.paths, "net")
         .expect("bind vsock_1027 listener");
@@ -757,6 +758,7 @@ fn egress_dns_via_izbad() {
         std::sync::Arc::new(AllowAll),
         std::sync::Arc::new(UdpForwarder::system()),
         None,
+        izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
     mgr.ensure_listening(&tb.paths, "egress-dns")
         .expect("bind vsock_1027 listener");
@@ -822,6 +824,7 @@ fn egress_http_via_stub() {
         std::sync::Arc::new(AllowAll),
         std::sync::Arc::new(UdpForwarder::system()),
         None,
+        izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
     mgr.ensure_listening(&tb.paths, "egress-http")
         .expect("bind vsock_1027 listener");
@@ -885,6 +888,7 @@ fn egress_throughput_baseline() {
         std::sync::Arc::new(AllowAll),
         std::sync::Arc::new(UdpForwarder::system()),
         None,
+        izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
     mgr.ensure_listening(&tb.paths, "egress-tput").unwrap();
     if let Err(e) = start_sandbox(&env, &tb, "egress-tput") {
