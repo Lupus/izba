@@ -1130,6 +1130,8 @@ dependencies = [
  "libc",
  "nix 0.29.0",
  "portable-pty",
+ "serde",
+ "serde_json",
  "signal-hook",
  "tempfile",
  "windows-sys 0.60.2",
