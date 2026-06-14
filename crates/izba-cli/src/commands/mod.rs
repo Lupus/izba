@@ -9,6 +9,7 @@ pub mod rm;
 pub mod run;
 pub mod stop;
 pub mod version;
+pub mod volume;
 
 use crate::name;
 use crate::SandboxOpts;
@@ -53,6 +54,17 @@ pub fn parse_publish(specs: &[String]) -> anyhow::Result<Vec<PortRule>> {
         .iter()
         .map(|s| izba_core::portfwd::parse_rule(s))
         .collect()
+}
+
+/// Parse the repeatable `--volume` specs into VolumeSpecs and validate the set
+/// (count ceiling, unique guest paths + names).
+pub fn parse_volumes(specs: &[String]) -> anyhow::Result<Vec<izba_core::volume::VolumeSpec>> {
+    let volumes = specs
+        .iter()
+        .map(|s| izba_core::volume::parse_volume_flag(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    izba_core::volume::validate_volumes(&volumes)?;
+    Ok(volumes)
 }
 
 /// Validate a `--policy` file and persist it into the sandbox directory as

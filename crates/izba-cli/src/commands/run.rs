@@ -58,6 +58,7 @@ fn resolve_or_create(
         return Ok(name);
     }
     let ports = super::parse_publish(&opts.publish)?;
+    let volumes = super::parse_volumes(&opts.volumes)?;
     let req = DaemonRequest::Create(DaemonCreate {
         name: name.clone(),
         image_ref: opts.image.clone(),
@@ -66,6 +67,7 @@ fn resolve_or_create(
         workspace,
         rw_size_gb: opts.rw_size_gb,
         ports,
+        volumes,
     });
     match client.request(&req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Created { .. } => {}
@@ -118,6 +120,9 @@ fn ignored_create_opts(opts: &SandboxOpts) -> Vec<&'static str> {
     if !opts.publish.is_empty() {
         ignored.push("--publish");
     }
+    if !opts.volumes.is_empty() {
+        ignored.push("--volume");
+    }
     ignored
 }
 
@@ -135,6 +140,7 @@ mod tests {
             name: None,
             publish: vec![],
             policy: None,
+            volumes: vec![],
         }
     }
 
