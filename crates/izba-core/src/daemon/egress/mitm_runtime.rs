@@ -228,12 +228,24 @@ async fn accept_loop(
                 port: dst.port,
             };
             let dst_addr = (dst.ip, dst.port);
-            let _ = mitm::mitm_terminate(tcp, &state, &adapter, || async move {
+            let dial = || async move {
                 TcpStream::connect(dst_addr)
                     .await
                     .map_err(|e| anyhow::anyhow!("dial upstream {dst_addr:?}: {e}"))
-            })
-            .await;
+            };
+            // Classify the guest's first bytes: a TLS ClientHello takes the TLS
+            // terminate path; cleartext (e.g. apt's HTTP on :80) takes the
+            // plaintext HTTP path. Routing by sniff, not by port, also handles
+            // TLS-on-:80 / HTTP-on-:443 correctly. A peek that yields nothing
+            // (closed/idle) defaults to non-TLS → the HTTP reader then reports a
+            // clean "client closed" rather than a bogus TLS handshake error.
+            let mut peek = [0u8; 8];
+            let n = tcp.peek(&mut peek).await.unwrap_or(0);
+            if mitm::looks_like_tls(&peek[..n]) {
+                let _ = mitm::mitm_terminate(tcp, &state, &adapter, dial).await;
+            } else {
+                let _ = mitm::mitm_terminate_http(tcp, &adapter, dial).await;
+            }
         });
     }
 }
