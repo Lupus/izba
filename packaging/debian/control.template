@@ -1,0 +1,12 @@
+Package: izba
+Version: __VERSION__
+Section: admin
+Priority: optional
+Architecture: amd64
+Depends: erofs-utils, libc6
+Maintainer: Konstantin Olkhovskiy <lupus@oxnull.net>
+Homepage: https://github.com/Lupus/izba
+Description: per-project microVM sandboxes for AI coding agents
+ izba runs each project in an isolated Cloud Hypervisor microVM. This package
+ bundles the izba CLI, a static cloud-hypervisor and virtiofsd, and the boot
+ artifacts (kernel + initramfs) needed to launch sandboxes.
