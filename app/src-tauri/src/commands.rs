@@ -11,6 +11,11 @@ pub fn status_core(d: &mut dyn DaemonApi) -> Result<DaemonStatusView, String> {
     d.status().map_err(|e| e.to_string())
 }
 
+/// Core of the `read_logs` command.
+pub fn read_logs_core(d: &mut dyn DaemonApi, name: &str) -> Result<String, String> {
+    d.read_logs(name).map_err(|e| e.to_string())
+}
+
 /// Core of the `version_info` command: this app's build, the linked core build,
 /// and the daemon's (when reachable) with a mismatch flag. An unreachable
 /// daemon is not an error here — the panel just shows "not running".
@@ -175,6 +180,13 @@ mod tests {
         assert!(v.daemon.is_some());
         assert!(v.mismatch);
         assert!(!v.app.git_describe.is_empty());
+    }
+
+    #[test]
+    fn read_logs_core_returns_text() {
+        let mut d = FakeDaemon::default();
+        let t = read_logs_core(&mut d, "web").unwrap();
+        assert!(t.contains("boot"), "got: {t}");
     }
 
     #[test]

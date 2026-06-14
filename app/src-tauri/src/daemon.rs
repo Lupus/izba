@@ -19,6 +19,9 @@ pub trait DaemonApi: Send {
         req: DaemonCreate,
         on_progress: &mut dyn FnMut(&str),
     ) -> anyhow::Result<String>;
+    /// Read the sandbox's captured console output (`logs/console.log`).
+    /// Returns an empty string if the file does not exist yet.
+    fn read_logs(&mut self, name: &str) -> anyhow::Result<String>;
 }
 
 /// Production `DaemonApi`: a lazily-connected `DaemonClient`. Connects via
@@ -115,6 +118,15 @@ impl DaemonApi for RealDaemon {
                 other => anyhow::bail!("unexpected Create reply: {other:?}"),
             },
         )
+    }
+
+    fn read_logs(&mut self, name: &str) -> anyhow::Result<String> {
+        let path = self.paths.logs_dir(name).join("console.log");
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+        }
     }
 }
 
