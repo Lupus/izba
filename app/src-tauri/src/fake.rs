@@ -7,27 +7,47 @@ pub struct FakeDaemon {
     pub sandboxes: Vec<SandboxView>,
     pub status: DaemonStatusView,
     pub fail_list: bool,
+    pub fail_status: bool,
 }
 
 impl Default for FakeDaemon {
     fn default() -> Self {
         FakeDaemon {
             sandboxes: vec![
-                SandboxView { name: "web".into(), image: "ubuntu:24.04".into(), state: SbxState::Running },
-                SandboxView { name: "db".into(), image: "postgres:16".into(), state: SbxState::Stopped },
+                SandboxView {
+                    name: "web".into(),
+                    image: "ubuntu:24.04".into(),
+                    state: SbxState::Running,
+                },
+                SandboxView {
+                    name: "db".into(),
+                    image: "postgres:16".into(),
+                    state: SbxState::Stopped,
+                },
             ],
-            status: DaemonStatusView { version: "0.3.1".into(), pid: 4242, uptime_ms: 1000, sandbox_count: 2 },
+            status: DaemonStatusView {
+                version: "0.3.1".into(),
+                pid: 4242,
+                uptime_ms: 1000,
+                sandbox_count: 2,
+            },
             fail_list: false,
+            fail_status: false,
         }
     }
 }
 
 impl DaemonApi for FakeDaemon {
     fn list(&mut self) -> anyhow::Result<Vec<SandboxView>> {
-        if self.fail_list { anyhow::bail!("daemon unreachable"); }
+        if self.fail_list {
+            anyhow::bail!("daemon unreachable");
+        }
         Ok(self.sandboxes.clone())
     }
     fn status(&mut self) -> anyhow::Result<DaemonStatusView> {
+        if self.fail_status {
+            anyhow::bail!("daemon unreachable");
+        }
         Ok(self.status.clone())
     }
 }
