@@ -46,3 +46,14 @@ export interface CreateOpts {
   rw_size_gb: number;
   ports: string[];
 }
+
+/** Payload of the `shell-output` event (raw PTY bytes, base64-encoded). */
+export interface ShellOutputPayload {
+  name: string;
+  data: string;
+}
+
+/** Payload of the `shell-exit` event. */
+export interface ShellExitPayload {
+  name: string;
+}

@@ -4,7 +4,7 @@ const { invoke, listen } = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen }));
 
-import { api, onCreateProgress } from "../lib/ipc";
+import { api, onCreateProgress, b64ToBytes } from "../lib/ipc";
 
 describe("ipc action wrappers", () => {
   beforeEach(() => {
@@ -44,5 +44,28 @@ describe("ipc action wrappers", () => {
   it("onCreateProgress subscribes to the event", async () => {
     await onCreateProgress(() => {});
     expect(listen).toHaveBeenCalledWith("create-progress", expect.any(Function));
+  });
+
+  it("readLogs invokes read_logs with the name", async () => {
+    invoke.mockResolvedValue("logs!");
+    await api.readLogs("web");
+    expect(invoke).toHaveBeenCalledWith("read_logs", { name: "web" });
+  });
+
+  it("shellWrite invokes shell_write with name and data", async () => {
+    invoke.mockResolvedValue(undefined);
+    await api.shellWrite("web", "ls\n");
+    expect(invoke).toHaveBeenCalledWith("shell_write", { name: "web", data: "ls\n" });
+  });
+
+  it("shellResize invokes shell_resize with dimensions", async () => {
+    invoke.mockResolvedValue(undefined);
+    await api.shellResize("web", 80, 24);
+    expect(invoke).toHaveBeenCalledWith("shell_resize", { name: "web", cols: 80, rows: 24 });
+  });
+
+  it("b64ToBytes decodes base64 to bytes", () => {
+    // btoa("hi") === "aGk="
+    expect(Array.from(b64ToBytes("aGk="))).toEqual([104, 105]);
   });
 });
