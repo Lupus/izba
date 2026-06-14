@@ -23,14 +23,18 @@
 - ✅ **T12** CA-in-guest (`izba-init`: `izba-trust` share, `write_trust_anchor`, CA-bundle exec env) — contract: tag `izba-trust`, file `ca.pem`, guest `/etc/izba/ca{,-bundle}.pem`
 - ✅ **T13 (host-level slice)** `tests/egress_mitm.rs` — full host-side e2e: guest→loopback-hop→MITM→RegoPolicy allow(`api.anthropic.com`→upstream)/deny(`evil.*`→403). Runs locally + in the normal `cargo test` CI gate (skips on bind-EPERM).
 
-**REMAINING (not started; ordered):**
-- **T6/T7** structured audit log + `izba netlog` (the "see every connection" view). The policy still `eprintln!`s.
-- **T8/T9** DNS-snoop tier-2 (non-HTTP FQDN allow-list + RFC1918 denylist).
-- **T10** `--policy` config surface (per-sandbox YAML → regorus data + tier-2 list).
-- **T11** persistent CA mint (`ca.rs`) + `izba-trust` host share in `sandbox.rs` + **daemon construction of `MitmRuntime`** — **until this lands the daemon passes `mitm=None`, so production sandboxes do NOT yet MITM** (the datapath is proven, just not activated in `server.rs`).
-- **T14 (real-VM slice)** guest-`curl`-through-MITM e2e in `e2e.yml` on both platforms (needs T10+T11 + an initramfs rebuild).
+**DONE (2026-06-14, all six gates green + validated on real KVM):**
+- ✅ **T6** structured per-flow audit log (`audit.rs`: `AuditRecord`→`logs/egress-audit.jsonl`); policies are now pure decisions, call sites emit by tier.
+- ✅ **T7** `izba netlog <sandbox> [--follow]` over the audit log (parse/format in core, thin CLI; chrono for timestamps).
+- ✅ **T8** DNS-snoop store (`dns_snoop.rs`: per-sandbox IP→FQDN, TTL clamp [60s,15min], hickory-proto A/AAAA parse, Cilium-style `*.`/`**.` matcher).
+- ✅ **T9** tier-2 dispatch: `dns_loop` feeds the store; `decide_tier2` (enforcing = private-address denylist + default-deny raw-IP-no-snoop + allow-list; bare = permissive). New `Policy::enforces()`.
+- ✅ **T10** `--policy <file>` (per-sandbox YAML → `sandbox_domains[<name>]` Rego data; `config.rs`; CLI validate+persist; serde_yaml).
+- ✅ **T11** persistent CA (`ca.rs::load_or_create`, reload-signs-trusted-leaf proven) + `izba-trust` guest share in `sandbox.rs` + **daemon `build_mitm_runtime` — production now MITMs**. Per-sandbox policy travels with each flow via the `DstMap`; MITM gated on `policy.enforces()` (bare sandbox keeps M1 direct-dial).
+- ✅ **T14** real-VM e2e `mitm_firewall_allows_and_denies_real_vm` (KVM leg auto-runs it). Validated locally: integration 19/19 + daemon_e2e green; guest wget https with cert-validation ON ⇒ L7 ALLOW (example.com) / L7 DENY (www.iana.org) in the host audit log.
 
-**Key handoff facts:** regorus is `0.4` (offline-cached); the daemon activation gap is the one thing between "proven datapath" and "live firewall" (T10+T11); the T12 merge is already in this branch.
+**Follow-ups (not blocking M2):** wildcard `*.`/`**.` enforcement (matcher built+tested in `dns_snoop`, not yet wired into the Rego/exact path); WHP real-VM curl-through-MITM (datapath already cross-platform-proven by `tests/egress_mitm.rs` on windows-native CI); h2 ALPN; the M5 credential vault.
+
+**Key facts:** regorus `0.4` (offline-cached), hickory-proto/serde_yaml/chrono added (all cross-compile to windows-gnu); the CA is `<data>/ca/` (0700, key 0600), per-guest copy of only `ca.pem` shared as `izba-trust`.
 
 ---
 
