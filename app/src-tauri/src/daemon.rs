@@ -253,6 +253,9 @@ impl ShellSession for RealShell {
             },
         );
         // Unblock the reader thread (in case the kill RPC could not be sent).
+        // shutdown(Both) is the load-bearing unblock: it forces the reader's
+        // blocking read to return EOF so the join below is bounded. The Kill
+        // above is best-effort (the shell may already be gone).
         let _ = self.write_half.shutdown(Shutdown::Both);
         if let Some(h) = self.reader.take() {
             let _ = h.join();
