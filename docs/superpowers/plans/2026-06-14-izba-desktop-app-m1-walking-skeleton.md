@@ -1231,4 +1231,13 @@ Each milestone below produces working, testable software and will be written out
 - **Plan 3 — Logs & shell:** console.log viewer with follow; xterm.js terminal bound to `OpenStream` + `StreamOpen::Attach` PTY pump (stdin/stdout events + `Resize`), with the `SHUT_RDWR` teardown contract.
 - **Plan 4 — Ports & firewall:** port publish/unpublish/list + "open in browser"; netlog audit stream (tail `egress-audit.jsonl`) + policy view.
 - **Plan 5 — System tray & settings:** tray status + quick start/stop + show/hide; launch-on-login toggle; Settings view.
-- **Plan 6 — App CI job & packaging:** add the `app` CI job (npm build + vitest + `cargo clippy` on `app/src-tauri`); platform bundling.
+- **Plan 6 — App CI job & packaging:** add the `app` CI job (npm build + vitest + `cargo clippy` on `app/src-tauri`); platform bundling. Narrow `tauri.conf.json` `bundle.targets` from `"all"` to per-OS targets here.
+
+## Carry-forward notes from the M1 final review (for Plans 2–4)
+
+These are non-blocking for M1 but should shape the streaming work:
+
+- **Don't route streaming calls through the shared `Mutex<Box<dyn DaemonApi>>`.** The single warm `DaemonClient` serializes all RPCs at the 2s polling cadence — correct for `list`/`inspect`/lifecycle, but a logs-follow or exec-PTY call holds a connection open for the workload's lifetime and would block all polling. Streaming must use its own connection(s) (`DaemonClient::open_guest_stream` opens a fresh one); add it as a distinct path, not by extending the shared lock.
+- **Move blocking daemon calls onto `spawn_blocking` once calls can be slow.** The async commands currently call the synchronous `DaemonClient::request` directly. `request()` clears the read timeout, so a wedged daemon blocks a tokio worker indefinitely. Fine at 2s polling on a healthy local socket; before Plan 2/3 add long/streaming calls, wrap blocking calls in `tauri::async_runtime::spawn_blocking` (or a dedicated thread) and/or bound the read.
+- **`inspect` is the natural next command.** The spec's Overview wants cpus/mem/uptime/workspace; M1 shows only name/image/state. `SandboxDetail` already exists in the proto — add an `inspect` command + `SandboxDetailView` following the exact `list`/`SandboxView` pattern (no rework).
+- **Consider distinguishing transient-reconnect from real RPC failure in the TopBar** once lifecycle actions can fail; M1 collapses both into one amber "unreachable" state.
