@@ -3,7 +3,7 @@ import type { SandboxView } from "../lib/types";
 import { StatusDot } from "./StatusDot";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LogsView } from "./LogsView";
-import { ShellView } from "./ShellView";
+import { ShellPanel } from "./ShellPanel";
 import { api } from "../lib/ipc";
 
 interface Props {
@@ -133,7 +133,7 @@ export function Detail({ sandbox, onChanged }: Props) {
 
         {tab === "shell" &&
           (running ? (
-            <ShellView name={name} />
+            <ShellPanel sandbox={name} />
           ) : (
             <div className="text-ink-3">Start the sandbox to open a shell.</div>
           ))}
