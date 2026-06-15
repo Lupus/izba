@@ -122,6 +122,62 @@ async fn read_logs(state: State<'_, AppState>, name: String) -> Result<String, S
     run_action(&state, move |d| commands::read_logs_core(d, &name)).await
 }
 
+#[tauri::command]
+async fn read_netlog(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Vec<izba_core::daemon::egress::audit::EndpointSummary>, String> {
+    run_action(&state, move |d| commands::read_netlog_core(d, &name)).await
+}
+
+#[tauri::command]
+async fn policy_show(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<views::PolicyView, String> {
+    run_action(&state, move |d| commands::policy_show_core(d, &name)).await
+}
+
+#[tauri::command]
+async fn policy_allow(
+    state: State<'_, AppState>,
+    name: String,
+    host: String,
+    port: u16,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::policy_allow_core(d, &name, &host, port)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn policy_block(
+    state: State<'_, AppState>,
+    name: String,
+    host: String,
+    port: u16,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::policy_block_core(d, &name, &host, port)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn policy_set(
+    state: State<'_, AppState>,
+    name: String,
+    allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
+) -> Result<(), String> {
+    run_action(&state, move |d| commands::policy_set_core(d, &name, allow)).await
+}
+
+#[tauri::command]
+async fn policy_enable(state: State<'_, AppState>, name: String) -> Result<usize, String> {
+    run_action(&state, move |d| commands::policy_enable_core(d, &name)).await
+}
+
 #[derive(Clone, serde::Serialize)]
 struct ShellOutput {
     id: String,
@@ -241,6 +297,12 @@ pub fn run() {
             remove,
             create,
             read_logs,
+            read_netlog,
+            policy_show,
+            policy_allow,
+            policy_block,
+            policy_set,
+            policy_enable,
             shell_open,
             shell_write,
             shell_resize,
