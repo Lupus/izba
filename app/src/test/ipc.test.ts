@@ -52,10 +52,10 @@ describe("ipc action wrappers", () => {
     expect(invoke).toHaveBeenCalledWith("read_logs", { name: "web" });
   });
 
-  it("shellOpen invokes shell_open with the name", async () => {
-    invoke.mockResolvedValue("sh-0");
-    await api.shellOpen("web");
-    expect(invoke).toHaveBeenCalledWith("shell_open", { name: "web" });
+  it("shellOpen invokes shell_open with the name and id", async () => {
+    invoke.mockResolvedValue(undefined);
+    await api.shellOpen("web", "sh-0");
+    expect(invoke).toHaveBeenCalledWith("shell_open", { name: "web", id: "sh-0" });
   });
 
   it("shellWrite invokes shell_write with id and data", async () => {

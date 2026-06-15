@@ -17,6 +17,8 @@ export interface ShellSession {
 
 const sessions: ShellSession[] = [];
 const listeners = new Set<() => void>();
+// Client-minted session ids (a plain counter, NOT crypto, for test determinism).
+let seq = 0;
 // useSyncExternalStore requires a STABLE snapshot reference between renders, but a
 // FRESH one on change (else it never re-renders). We cache a copy and rebuild it
 // only inside emit() — so identity changes exactly when the session set changes.
@@ -39,15 +41,15 @@ export const shellStore = {
   },
 
   async open(sandbox: string): Promise<string> {
+    const id = `sh-${seq++}`;
     const el = document.createElement("div");
     el.style.width = "100%";
     el.style.height = "100%";
     const term = new Terminal({ fontSize: 13, cursorBlink: true });
     const fit = new FitAddon();
     term.loadAddon(fit);
-    // Placeholder session inserted synchronously so the UI shows the tab; id filled after open.
     const session: ShellSession = {
-      id: "",
+      id,
       sandbox,
       label: "",
       term,
@@ -60,10 +62,7 @@ export const shellStore = {
     sessions.push(session);
     session.label = `Shell ${sessions.filter((s) => s.sandbox === sandbox).length}`;
     emit();
-    // The filter is by id, so we must know the id first — open the backend shell,
-    // then wire listeners to its id.
-    const id = await api.shellOpen(sandbox);
-    session.id = id;
+    // Subscribe BEFORE opening the backend shell so no early output is lost.
     const outUn = await onShellOutput(id, (bytes) => term.write(bytes));
     const exitUn = await onShellExit(id, () => {
       session.exited = true;
@@ -72,6 +71,19 @@ export const shellStore = {
     });
     session.unlisten.push(outUn, exitUn);
     term.onData((d) => void api.shellWrite(id, d));
+    try {
+      await api.shellOpen(sandbox, id);
+    } catch (e) {
+      // Clean up the failed session rather than leaving a zombie tab.
+      outUn();
+      exitUn();
+      term.dispose();
+      el.remove();
+      const i = sessions.findIndex((s) => s.id === id);
+      if (i >= 0) sessions.splice(i, 1);
+      emit();
+      throw e;
+    }
     emit();
     return id;
   },
