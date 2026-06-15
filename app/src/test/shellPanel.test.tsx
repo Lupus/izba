@@ -70,6 +70,16 @@ describe("ShellPanel", () => {
     expect(api.shellOpen).toHaveBeenCalledTimes(1);
   });
 
+  it("clips the terminal host so a shrink can't leak a page-level scrollbar", async () => {
+    // Regression: on window shrink, xterm parks its absolutely-positioned helper
+    // textarea at the old cursor pixel `top`, inflating scrollHeight up the flex
+    // chain unless the host clips. jsdom has no layout, so guard the contract:
+    // the host that xterm is opened into must hide overflow.
+    render(<ShellPanel sandbox="web" />);
+    const host = await screen.findByTestId("shell-host");
+    expect(host.className).toContain("overflow-hidden");
+  });
+
   it("opens a second session when clicking +", async () => {
     render(<ShellPanel sandbox="web" />);
     await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(1));
