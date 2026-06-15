@@ -48,9 +48,22 @@ Key properties:
   vsock island — no `passt`, no `consomme`, no host-side user-mode NAT. The
   in-guest stub redirects all outbound TCP (nftables + `SO_ORIGINAL_DST`) and
   DNS to `izbad` over vsock 1027; `izbad` is the single point that dials the
-  outside world. Because every flow already passes through `izbad`, the
-  agent-firewall (per-sandbox egress allow-lists + an audit log of every
-  connection tried) is the next milestone.
+  outside world. The **agent firewall** (`--policy policy.yaml`,
+  `izba netlog`) enforces a per-sandbox egress allow-list and logs every
+  connection. A `policy.yaml` allow entry is a bare host (web ports 80/443
+  only) or an explicit host+ports pair:
+
+  ```yaml
+  allow:
+    - api.anthropic.com          # web ports only: 80 and 443
+    - host: db.internal
+      ports: [5432]              # exactly 5432 — explicit ports replace the default
+  ```
+
+  A bare host authorizes ports 80 and 443 only. To reach any other port,
+  list it explicitly with `ports:` — explicit ports replace, not extend, the
+  web default. (Before M2.1 a bare allow-list host reached every TCP port;
+  that loophole is now closed.)
 - **OCI → erofs + overlay rootfs.** Images are pulled, flattened to a single
   erofs image (read-only), and combined with a sparse ext4 rw disk via
   overlayfs inside the guest. The erofs is content-addressed and shared across
@@ -90,7 +103,7 @@ integration test suite.
 ## Commands
 
 ```
-izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [--volume [NAME:]GUEST_PATH:SIZE]... [DIR]
+izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [--volume [NAME:]GUEST_PATH:SIZE]... [--policy PATH] [DIR]
 izba run    [--image IMG] [NAME_OR_DIR] [-- CMD...]
 izba exec   NAME [-it] [-- CMD...]
 izba cp     HOST_PATH NAME:GUEST_PATH   # or NAME:GUEST_PATH HOST_PATH; recursive
@@ -102,6 +115,7 @@ izba rm     [--force] NAME
 izba daemon run                         # run the daemon in the foreground (auto-started on demand otherwise)
 izba daemon status                      # daemon health + supervised sandboxes
 izba daemon stop                        # stop the daemon; sandboxes keep running, published ports pause
+izba netlog  NAME [--follow]            # stream the egress audit log for a sandbox
 ```
 
 ## Project layout
