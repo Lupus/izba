@@ -30,6 +30,37 @@ describe("NewSandbox", () => {
     );
   });
 
+  it("assembles a host:guest port from an added row", async () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add port/i }));
+    fireEvent.change(screen.getByLabelText(/port 1 host/i), { target: { value: "8080" } });
+    fireEvent.change(screen.getByLabelText(/port 1 guest/i), { target: { value: "80" } });
+    fireEvent.click(screen.getByRole("button", { name: /create/i }));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({ ports: ["8080:80"] })),
+    );
+  });
+
+  it("includes the bind prefix when given, and drops removed rows", async () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add port/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add port/i }));
+    fireEvent.change(screen.getByLabelText(/port 1 bind/i), { target: { value: "127.0.0.1" } });
+    fireEvent.change(screen.getByLabelText(/port 1 host/i), { target: { value: "5432" } });
+    fireEvent.change(screen.getByLabelText(/port 1 guest/i), { target: { value: "5432" } });
+    fireEvent.click(screen.getByRole("button", { name: /remove port 2/i }));
+    fireEvent.click(screen.getByRole("button", { name: /create/i }));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(
+        expect.objectContaining({ ports: ["127.0.0.1:5432:5432"] }),
+      ),
+    );
+  });
+
   it("disables Create when name is empty", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
