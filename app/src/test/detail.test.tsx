@@ -15,8 +15,8 @@ vi.mock("../lib/ipc", () => ({
 vi.mock("../components/LogsView", () => ({
   LogsView: ({ name }: { name: string }) => <div>logs-for-{name}</div>,
 }));
-vi.mock("../components/ShellView", () => ({
-  ShellView: ({ name }: { name: string }) => <div>shell-for-{name}</div>,
+vi.mock("../components/ShellPanel", () => ({
+  ShellPanel: ({ sandbox }: { sandbox: string }) => <div>shell-for-{sandbox}</div>,
 }));
 
 const noop = () => {};
