@@ -100,6 +100,11 @@ pub enum DaemonRequest {
     Status,
     /// Remove persistent volume images not referenced by any sandbox config.
     VolumePrune,
+    /// Re-read a sandbox's `policy.yaml` and hot-swap it into the live egress
+    /// plane (new flows only; no VM restart).
+    ReloadPolicy {
+        name: String,
+    },
     /// Graceful daemon exit. Sandboxes keep running (detached children);
     /// in-daemon port relays pause until the next daemon adopts.
     Shutdown,
@@ -238,6 +243,7 @@ mod tests {
             },
             DaemonRequest::PortList { name: "web".into() },
             DaemonRequest::OpenStream { name: "web".into() },
+            DaemonRequest::ReloadPolicy { name: "web".into() },
             DaemonRequest::Status,
             DaemonRequest::Shutdown,
         ] {
@@ -323,6 +329,8 @@ mod tests {
         assert!(s.contains(r#""type":"shutdown""#), "{s}");
         let s = serde_json::to_string(&DaemonRequest::OpenStream { name: "w".into() }).unwrap();
         assert!(s.contains(r#""type":"open_stream""#), "{s}");
+        let s = serde_json::to_string(&DaemonRequest::ReloadPolicy { name: "w".into() }).unwrap();
+        assert!(s.contains(r#""type":"reload_policy""#), "{s}");
     }
 
     #[test]
