@@ -427,6 +427,11 @@ pub fn dispatch(
                     reclaimed_bytes: pruned.reclaimed_bytes,
                 }
             }
+            DaemonRequest::ReloadPolicy { name } => {
+                sandbox_must_exist(&d.paths, &name)?;
+                d.egress.reload_policy(&d.paths, &name);
+                DaemonResponse::Ok
+            }
             DaemonRequest::Shutdown => {
                 d.request_shutdown();
                 DaemonResponse::Ok
