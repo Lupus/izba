@@ -187,6 +187,21 @@ impl DaemonClient {
         }
     }
 
+    /// Re-read `name`'s `policy.yaml` and hot-swap it into the live egress
+    /// plane (new flows only; no restart). Ok even if the sandbox is stopped.
+    pub fn reload_policy(&mut self, name: &str) -> anyhow::Result<()> {
+        match self.request(
+            &DaemonRequest::ReloadPolicy {
+                name: name.to_string(),
+            },
+            &mut |_| {},
+        )? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::Error { message } => bail!("{message}"),
+            other => bail!("unexpected daemon reply: {other:?}"),
+        }
+    }
+
     /// Proxy one guest control RPC, unwrapping the daemon envelope.
     pub fn guest_rpc(&mut self, name: &str, req: &Request) -> anyhow::Result<Response> {
         match self.request(
