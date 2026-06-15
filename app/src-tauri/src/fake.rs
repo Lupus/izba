@@ -168,6 +168,48 @@ impl DaemonApi for FakeDaemon {
             on_output,
         }))
     }
+    fn read_netlog(
+        &mut self,
+        _name: &str,
+    ) -> anyhow::Result<Vec<izba_core::daemon::egress::audit::EndpointSummary>> {
+        use izba_core::daemon::egress::audit::{aggregate, AuditRecord, Tier};
+        let mut r = AuditRecord::allow(
+            "web",
+            "1.1.1.1".parse().unwrap(),
+            443,
+            Some("api.x.com"),
+            Tier::L7,
+            "ok",
+        );
+        r.ts_ms = 1;
+        Ok(aggregate(vec![r]))
+    }
+    fn policy_show(&mut self, _name: &str) -> anyhow::Result<crate::views::PolicyView> {
+        Ok(crate::views::PolicyView {
+            enforcing: false,
+            allow: vec![],
+        })
+    }
+    fn policy_allow(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
+        self.calls.push(format!("allow:{name}:{host}:{port}"));
+        Ok(())
+    }
+    fn policy_block(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
+        self.calls.push(format!("block:{name}:{host}:{port}"));
+        Ok(())
+    }
+    fn policy_set(
+        &mut self,
+        name: &str,
+        allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
+    ) -> anyhow::Result<()> {
+        self.calls.push(format!("set:{name}:{}", allow.len()));
+        Ok(())
+    }
+    fn policy_enable_from_traffic(&mut self, name: &str) -> anyhow::Result<usize> {
+        self.calls.push(format!("enable:{name}"));
+        Ok(1)
+    }
 }
 
 #[cfg(test)]

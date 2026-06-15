@@ -48,6 +48,25 @@ pub trait DaemonApi: Send {
         on_output: Box<dyn FnMut(Vec<u8>) + Send>,
         on_exit: Box<dyn FnOnce() + Send>,
     ) -> anyhow::Result<Box<dyn ShellSession>>;
+    /// Aggregate the sandbox's egress audit log into per-endpoint summaries.
+    fn read_netlog(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<Vec<izba_core::daemon::egress::audit::EndpointSummary>>;
+    /// The sandbox's effective egress policy (enforcing flag + allow-list).
+    fn policy_show(&mut self, name: &str) -> anyhow::Result<crate::views::PolicyView>;
+    /// Authorize `host:port`, then best-effort live-reload.
+    fn policy_allow(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()>;
+    /// Revoke `host:port`, then best-effort live-reload.
+    fn policy_block(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()>;
+    /// Replace the allow-list wholesale, then best-effort live-reload.
+    fn policy_set(
+        &mut self,
+        name: &str,
+        allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
+    ) -> anyhow::Result<()>;
+    /// Seed the allow-list from observed traffic; returns the host count seeded.
+    fn policy_enable_from_traffic(&mut self, name: &str) -> anyhow::Result<usize>;
 }
 
 /// Production `DaemonApi`: a lazily-connected `DaemonClient`. Connects via
@@ -90,6 +109,19 @@ impl RealDaemon {
                 Err(e)
             }
         }
+    }
+
+    /// Persist a policy edit then best-effort live-reload (a not-running sandbox
+    /// just gets the change on next start; the edit itself still succeeds).
+    fn edit_and_reload(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(&mut izba_core::daemon::egress::config::EgressPolicyConfig),
+    ) -> anyhow::Result<()> {
+        izba_core::daemon::egress::config::edit_policy_file(&self.paths.sandbox_dir(name), f)?;
+        // Reload only if the daemon is already up; ignore "sandbox not running".
+        let _ = self.with_client(|c| c.reload_policy(name));
+        Ok(())
     }
 }
 
@@ -205,6 +237,68 @@ impl DaemonApi for RealDaemon {
             exec_id,
             reader: Some(reader),
         }))
+    }
+
+    fn read_netlog(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<Vec<izba_core::daemon::egress::audit::EndpointSummary>> {
+        use izba_core::daemon::egress::audit::{aggregate, parse_line};
+        let path = self.paths.logs_dir(name).join("egress-audit.jsonl");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+        };
+        Ok(aggregate(text.lines().filter_map(parse_line)))
+    }
+
+    fn policy_show(&mut self, name: &str) -> anyhow::Result<crate::views::PolicyView> {
+        use izba_core::daemon::egress::config::EgressPolicyConfig;
+        Ok(
+            match EgressPolicyConfig::load(&self.paths.sandbox_dir(name))? {
+                Some(cfg) => crate::views::PolicyView {
+                    enforcing: true,
+                    allow: cfg.allow,
+                },
+                None => crate::views::PolicyView {
+                    enforcing: false,
+                    allow: vec![],
+                },
+            },
+        )
+    }
+
+    fn policy_allow(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
+        self.edit_and_reload(name, |cfg| {
+            cfg.allow(host, port);
+        })
+    }
+
+    fn policy_block(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
+        self.edit_and_reload(name, |cfg| {
+            let _ = cfg.block(host, port);
+        })
+    }
+
+    fn policy_set(
+        &mut self,
+        name: &str,
+        allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
+    ) -> anyhow::Result<()> {
+        self.edit_and_reload(name, move |cfg| {
+            cfg.allow = allow;
+        })
+    }
+
+    fn policy_enable_from_traffic(&mut self, name: &str) -> anyhow::Result<usize> {
+        let summaries = self.read_netlog(name)?;
+        let seeded = izba_core::daemon::egress::config::seed_from_summaries(&summaries);
+        let n = seeded.allow.len();
+        self.edit_and_reload(name, move |cfg| {
+            *cfg = seeded;
+        })?;
+        Ok(n)
     }
 }
 

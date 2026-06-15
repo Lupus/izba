@@ -1,7 +1,17 @@
 use izba_core::build_info::BuildInfoOwned;
+use izba_core::daemon::egress::config::AllowEntry;
 use izba_core::daemon::proto::DaemonCreate;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// A sandbox's egress policy as the UI sees it. `enforcing` is true iff a
+/// `policy.yaml` exists (an absent file = bare AllowAll sandbox; an empty
+/// `allow` with `enforcing: true` = deny-all firewall).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PolicyView {
+    pub enforcing: bool,
+    pub allow: Vec<AllowEntry>,
+}
 
 /// Create-sandbox options coming from the frontend wizard. Mirrors the CLI's
 /// `SandboxOpts` core fields (no `--policy`: deferred to the firewall milestone).
@@ -206,6 +216,19 @@ mod tests {
         };
         let err = opts.into_daemon_create().unwrap_err().to_string();
         assert!(err.contains("invalid sandbox name"), "got: {err}");
+    }
+
+    #[test]
+    fn policy_view_serializes_enforcing_and_entries() {
+        let v = PolicyView {
+            enforcing: true,
+            allow: vec![izba_core::daemon::egress::config::AllowEntry::Host(
+                "api.x.com".into(),
+            )],
+        };
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(j["enforcing"], true);
+        assert_eq!(j["allow"][0], "api.x.com"); // untagged: bare host → string
     }
 
     #[test]

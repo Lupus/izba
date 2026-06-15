@@ -1,5 +1,9 @@
 use crate::daemon::DaemonApi;
-use crate::views::{app_build_info, CreateOpts, DaemonStatusView, SandboxView, VersionView};
+use crate::views::{
+    app_build_info, CreateOpts, DaemonStatusView, PolicyView, SandboxView, VersionView,
+};
+use izba_core::daemon::egress::audit::EndpointSummary;
+use izba_core::daemon::egress::config::AllowEntry;
 
 /// Core of the `list` command: maps daemon errors to a UI-friendly string.
 pub fn list_core(d: &mut dyn DaemonApi) -> Result<Vec<SandboxView>, String> {
@@ -68,6 +72,51 @@ pub fn create_core(
 ) -> Result<String, String> {
     let req = opts.into_daemon_create().map_err(|e| e.to_string())?;
     d.create(req, on_progress).map_err(|e| e.to_string())
+}
+
+/// Core of `read_netlog`: per-endpoint aggregated audit summaries.
+pub fn read_netlog_core(d: &mut dyn DaemonApi, name: &str) -> Result<Vec<EndpointSummary>, String> {
+    d.read_netlog(name).map_err(|e| e.to_string())
+}
+
+/// Core of `policy_show`: the sandbox's effective egress policy.
+pub fn policy_show_core(d: &mut dyn DaemonApi, name: &str) -> Result<PolicyView, String> {
+    d.policy_show(name).map_err(|e| e.to_string())
+}
+
+/// Core of `policy_allow`: authorize a host:port (auto-reloads).
+pub fn policy_allow_core(
+    d: &mut dyn DaemonApi,
+    name: &str,
+    host: &str,
+    port: u16,
+) -> Result<(), String> {
+    d.policy_allow(name, host, port).map_err(|e| e.to_string())
+}
+
+/// Core of `policy_block`: revoke a host:port (auto-reloads).
+pub fn policy_block_core(
+    d: &mut dyn DaemonApi,
+    name: &str,
+    host: &str,
+    port: u16,
+) -> Result<(), String> {
+    d.policy_block(name, host, port).map_err(|e| e.to_string())
+}
+
+/// Core of `policy_set`: replace the allow-list wholesale (auto-reloads).
+pub fn policy_set_core(
+    d: &mut dyn DaemonApi,
+    name: &str,
+    allow: Vec<AllowEntry>,
+) -> Result<(), String> {
+    d.policy_set(name, allow).map_err(|e| e.to_string())
+}
+
+/// Core of `policy_enable`: seed the allow-list from traffic; returns host count.
+pub fn policy_enable_core(d: &mut dyn DaemonApi, name: &str) -> Result<usize, String> {
+    d.policy_enable_from_traffic(name)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -187,6 +236,25 @@ mod tests {
         let mut d = FakeDaemon::default();
         let t = read_logs_core(&mut d, "web").unwrap();
         assert!(t.contains("boot"), "got: {t}");
+    }
+
+    #[test]
+    fn read_netlog_core_returns_summaries() {
+        let mut d = crate::fake::FakeDaemon::default();
+        let rows = read_netlog_core(&mut d, "web").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].host.as_deref(), Some("api.x.com"));
+    }
+
+    #[test]
+    fn policy_edit_cores_record_calls() {
+        let mut d = crate::fake::FakeDaemon::default();
+        policy_allow_core(&mut d, "web", "api.x.com", 443).unwrap();
+        policy_block_core(&mut d, "web", "api.x.com", 80).unwrap();
+        policy_enable_core(&mut d, "web").unwrap();
+        assert!(d.calls.iter().any(|c| c == "allow:web:api.x.com:443"));
+        assert!(d.calls.iter().any(|c| c == "block:web:api.x.com:80"));
+        assert!(d.calls.iter().any(|c| c == "enable:web"));
     }
 
     #[test]
