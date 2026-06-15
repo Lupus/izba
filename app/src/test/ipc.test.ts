@@ -52,16 +52,28 @@ describe("ipc action wrappers", () => {
     expect(invoke).toHaveBeenCalledWith("read_logs", { name: "web" });
   });
 
-  it("shellWrite invokes shell_write with name and data", async () => {
-    invoke.mockResolvedValue(undefined);
-    await api.shellWrite("web", "ls\n");
-    expect(invoke).toHaveBeenCalledWith("shell_write", { name: "web", data: "ls\n" });
+  it("shellOpen invokes shell_open with the name", async () => {
+    invoke.mockResolvedValue("sh-0");
+    await api.shellOpen("web");
+    expect(invoke).toHaveBeenCalledWith("shell_open", { name: "web" });
   });
 
-  it("shellResize invokes shell_resize with dimensions", async () => {
+  it("shellWrite invokes shell_write with id and data", async () => {
     invoke.mockResolvedValue(undefined);
-    await api.shellResize("web", 80, 24);
-    expect(invoke).toHaveBeenCalledWith("shell_resize", { name: "web", cols: 80, rows: 24 });
+    await api.shellWrite("sh-0", "ls\n");
+    expect(invoke).toHaveBeenCalledWith("shell_write", { id: "sh-0", data: "ls\n" });
+  });
+
+  it("shellResize invokes shell_resize with id and dimensions", async () => {
+    invoke.mockResolvedValue(undefined);
+    await api.shellResize("sh-0", 80, 24);
+    expect(invoke).toHaveBeenCalledWith("shell_resize", { id: "sh-0", cols: 80, rows: 24 });
+  });
+
+  it("shellClose invokes shell_close with the id", async () => {
+    invoke.mockResolvedValue(undefined);
+    await api.shellClose("sh-0");
+    expect(invoke).toHaveBeenCalledWith("shell_close", { id: "sh-0" });
   });
 
   it("b64ToBytes decodes base64 to bytes", () => {
