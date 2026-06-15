@@ -8,6 +8,12 @@ interface Props {
   onCreated: (name: string) => void;
 }
 
+interface PortRow {
+  bind: string;
+  host: string;
+  guest: string;
+}
+
 export function NewSandbox({ onClose, onCreated }: Props) {
   const [name, setName] = useState("");
   const [image, setImage] = useState("ubuntu:24.04");
@@ -15,7 +21,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const [memMb, setMemMb] = useState(4096);
   const [rwSizeGb, setRwSizeGb] = useState(8);
   const [workspace, setWorkspace] = useState("");
-  const [portsText, setPortsText] = useState("");
+  const [ports, setPorts] = useState<PortRow[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<string[]>([]);
@@ -37,6 +43,11 @@ export function NewSandbox({ onClose, onCreated }: Props) {
     }
   }
 
+  const setPort = (i: number, patch: Partial<PortRow>) =>
+    setPorts((rows) => rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const addPort = () => setPorts((rows) => [...rows, { bind: "", host: "", guest: "" }]);
+  const removePort = (i: number) => setPorts((rows) => rows.filter((_, j) => j !== i));
+
   async function submit() {
     setBusy(true);
     setError(null);
@@ -48,10 +59,12 @@ export function NewSandbox({ onClose, onCreated }: Props) {
       mem_mb: memMb,
       workspace,
       rw_size_gb: rwSizeGb,
-      ports: portsText
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean),
+      ports: ports
+        .filter((r) => r.host.trim() && r.guest.trim())
+        .map(
+          (r) =>
+            `${r.bind.trim() ? `${r.bind.trim()}:` : ""}${r.host.trim()}:${r.guest.trim()}`,
+        ),
     };
     try {
       const created = await api.create(opts);
@@ -141,15 +154,54 @@ export function NewSandbox({ onClose, onCreated }: Props) {
               />
             </label>
           </div>
-          <label className="grid gap-1">
-            <span className="text-ink-2">Ports (one [BIND:]HOST:GUEST per line)</span>
-            <textarea
-              value={portsText}
-              onChange={(e) => setPortsText(e.target.value)}
-              rows={2}
-              className="rounded-lg border border-line px-2 py-1.5 font-mono text-xs"
-            />
-          </label>
+          <div className="grid gap-1">
+            <span className="text-ink-2">Ports</span>
+            <div className="grid gap-1.5">
+              {ports.map((r, i) => (
+                <div key={i} className="flex items-center gap-1.5">
+                  <input
+                    aria-label={`Port ${i + 1} bind`}
+                    placeholder="127.0.0.1 (optional)"
+                    value={r.bind}
+                    onChange={(e) => setPort(i, { bind: e.target.value })}
+                    className="min-w-0 flex-1 rounded-lg border border-line px-2 py-1.5 text-xs"
+                  />
+                  <input
+                    aria-label={`Port ${i + 1} host`}
+                    placeholder="host"
+                    inputMode="numeric"
+                    value={r.host}
+                    onChange={(e) => setPort(i, { host: e.target.value })}
+                    className="w-20 min-w-0 rounded-lg border border-line px-2 py-1.5 text-xs"
+                  />
+                  <span className="text-ink-3">:</span>
+                  <input
+                    aria-label={`Port ${i + 1} guest`}
+                    placeholder="guest"
+                    inputMode="numeric"
+                    value={r.guest}
+                    onChange={(e) => setPort(i, { guest: e.target.value })}
+                    className="w-20 min-w-0 rounded-lg border border-line px-2 py-1.5 text-xs"
+                  />
+                  <button
+                    type="button"
+                    aria-label={`Remove port ${i + 1}`}
+                    onClick={() => removePort(i)}
+                    className="rounded-lg border border-line px-2 py-1.5 text-ink-2 hover:bg-hover"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={addPort}
+                className="justify-self-start rounded-lg border border-line px-2 py-1 text-xs text-ink-2 hover:bg-hover"
+              >
+                + Add port
+              </button>
+            </div>
+          </div>
         </div>
 
         {progress.length > 0 && (
