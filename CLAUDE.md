@@ -170,3 +170,33 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - Deferred scope (don't build casually — see spec §8/§9): egress MITM proxy +
   credential injection (M5, branches off the `daemon/egress/router.rs` dispatch
   point), erofs layer dedup, snapshot/resume, CI-published kernel artifacts.
+
+## Agent autonomy & delivery workflow (repo owner authorization)
+
+The repo owner (lupus@oxnull.net) authorizes the agent to act on their behalf in
+**this repository**, overriding the global "hand me the git/gh command to run"
+preference for this repo only:
+
+- **Push feature branches** to `origin` (`git push`, `--force-with-lease` after a
+  rebase). Never push to `main` directly.
+- **Open and update pull requests** (`gh pr create` / `gh pr edit`). PR bodies
+  end with the Claude Code attribution trailer.
+- **Trigger and watch CI** (`gh workflow run`, `gh run watch`, `gh pr checks`).
+
+These need the Bash sandbox disabled and a `gh` token with `repo`+`workflow`
+scope; the Windows-host build path (`powershell.exe`, `/mnt/c`, `~/.cache`) is
+likewise unsandboxed.
+
+**Standard delivery loop for a feature branch:**
+
+1. Push the branch, open/refresh its PR, and start CI.
+2. **While CI runs, bake a local dev build** for manual testing with
+   `bash hack/devbuild.sh` (run unsandboxed — see [the script](hack/devbuild.sh)
+   and [its design](docs/superpowers/specs/2026-06-15-local-devbuild-script-design.md)).
+   It prints the exact output dir `dist/local/<UTC-ts>-<sha>/`. **Record and
+   report that exact path — never `dist/local/latest`**, which a parallel
+   agent's build can repoint out from under you.
+3. When **all** CI checks are green, report to the owner: a concise summary of
+   the work completed; pointers to the local artifacts for manual testing (the
+   exact `dist/local/<ts>-<sha>/` installer + `.deb`s); and the PR link to
+   review.
