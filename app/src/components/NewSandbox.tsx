@@ -80,7 +80,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              className="rounded-lg border border-line px-2 py-1.5"
+              className="w-full min-w-0 rounded-lg border border-line px-2 py-1.5"
             />
           </label>
           <div className="grid gap-1">
@@ -106,7 +106,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
             <input
               value={image}
               onChange={(e) => setImage(e.target.value)}
-              className="rounded-lg border border-line px-2 py-1.5"
+              className="w-full min-w-0 rounded-lg border border-line px-2 py-1.5"
             />
           </label>
           <div className="grid grid-cols-3 gap-3">
@@ -117,7 +117,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                 min={1}
                 value={cpus}
                 onChange={(e) => setCpus(+e.target.value)}
-                className="rounded-lg border border-line px-2 py-1.5"
+                className="w-full min-w-0 rounded-lg border border-line px-2 py-1.5"
               />
             </label>
             <label className="grid gap-1">
@@ -127,7 +127,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                 min={256}
                 value={memMb}
                 onChange={(e) => setMemMb(+e.target.value)}
-                className="rounded-lg border border-line px-2 py-1.5"
+                className="w-full min-w-0 rounded-lg border border-line px-2 py-1.5"
               />
             </label>
             <label className="grid gap-1">
@@ -137,7 +137,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                 min={1}
                 value={rwSizeGb}
                 onChange={(e) => setRwSizeGb(+e.target.value)}
-                className="rounded-lg border border-line px-2 py-1.5"
+                className="w-full min-w-0 rounded-lg border border-line px-2 py-1.5"
               />
             </label>
           </div>
