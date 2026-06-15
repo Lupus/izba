@@ -154,7 +154,10 @@ enum Cmd {
     Netlog {
         /// Sandbox name
         name: String,
-        /// Keep printing new records as they arrive
+        /// Aggregate into a per-endpoint summary instead of a line-by-line tail
+        #[arg(long)]
+        summary: bool,
+        /// Keep printing new records as they arrive (ignored with --summary)
         #[arg(short, long)]
         follow: bool,
     },
@@ -196,7 +199,11 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         Cmd::Ls => commands::ls::run(paths),
         Cmd::Stop { name } => commands::stop::run(paths, &name),
         Cmd::Rm { name, force } => commands::rm::run(paths, &name, force),
-        Cmd::Netlog { name, follow } => commands::netlog::run(paths, &name, follow),
+        Cmd::Netlog {
+            name,
+            summary,
+            follow,
+        } => commands::netlog::run(paths, &name, summary, follow),
         Cmd::Port(pc) => match pc {
             PortCmd::Publish { name, rule } => commands::port::publish(paths, &name, &rule),
             PortCmd::Unpublish { name, key } => commands::port::unpublish(paths, &name, &key),
@@ -297,7 +304,7 @@ mod tests {
     #[test]
     fn parse_netlog_flags() {
         let cli = Cli::try_parse_from(["izba", "netlog", "web", "--follow"]).unwrap();
-        let Cmd::Netlog { name, follow } = cli.cmd else {
+        let Cmd::Netlog { name, follow, .. } = cli.cmd else {
             panic!("expected netlog");
         };
         assert_eq!(name, "web");
@@ -306,6 +313,19 @@ mod tests {
         assert!(Cli::try_parse_from(["izba", "netlog"]).is_err());
         let short = Cli::try_parse_from(["izba", "netlog", "web", "-f"]).unwrap();
         assert!(matches!(short.cmd, Cmd::Netlog { follow: true, .. }));
+    }
+
+    #[test]
+    fn parse_netlog_summary_flag() {
+        let cli = Cli::try_parse_from(["izba", "netlog", "web", "--summary"]).unwrap();
+        let Cmd::Netlog {
+            summary, follow, ..
+        } = cli.cmd
+        else {
+            panic!("expected netlog")
+        };
+        assert!(summary);
+        assert!(!follow);
     }
 
     #[test]
