@@ -143,11 +143,6 @@ fn mitm_firewall_allows_and_denies_by_decrypted_host() {
     let izba_ca_der = izba_ca.cert_der();
     let izba_certs = Arc::new(CertCache::new(izba_ca));
 
-    // Default-deny allow-list: api.anthropic.com allowed, evil.* denied. The
-    // policy now travels with each registered flow (the runtime is shared).
-    let policy: Arc<dyn izba_core::daemon::egress::policy::Policy> =
-        Arc::new(RegoPolicy::embedded().unwrap());
-
     // Start the MITM runtime (sync context — its own runtime can block_on bind).
     let audit =
         izba_core::daemon::egress::audit::AuditSink::new(izba_core::paths::Paths::with_root(
@@ -173,6 +168,16 @@ fn mitm_firewall_allows_and_denies_by_decrypted_host() {
         .unwrap();
     rt.block_on(async {
         let up_port = spawn_upstream(up_cache, "UPSTREAM-PONG").await;
+
+        // Default-deny allow-list: api.anthropic.com allowed, evil.* denied. The
+        // policy now travels with each registered flow (the runtime is shared).
+        // M2.1 port-aware: a host is allowed only on its listed ports, so the
+        // data doc names the (ephemeral) upstream port this test actually dials.
+        let data = format!(
+            r#"{{"global_domains": {{"api.anthropic.com": [{up_port}]}}, "sandbox_ports": {{}}}}"#
+        );
+        let policy: Arc<dyn izba_core::daemon::egress::policy::Policy> =
+            Arc::new(RegoPolicy::with_data(&data).unwrap());
 
         // ALLOW: SNI api.anthropic.com is on the allow-list -> 200 from upstream.
         let allowed = guest_request(
