@@ -203,12 +203,15 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
     if dir.exists() {
         bail!("sandbox '{name}' already exists");
     }
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // 0700 on Unix for the per-sandbox dir and every izba-owned ancestor it
+    // creates (data root + `sandboxes/`) — never world-traversable on a
+    // multi-user host (matches the `ca/` and `daemon/` hardening; F-15).
+    crate::paths::create_dir_700(&dir, paths.root())?;
 
     // Anything failing past this point leaves a partial sandbox — clean it up.
     let populate = || -> anyhow::Result<()> {
-        fs::create_dir_all(paths.logs_dir(name))?;
-        fs::create_dir_all(paths.run_dir(name))?;
+        crate::paths::create_dir_700(&paths.logs_dir(name), paths.root())?;
+        crate::paths::create_dir_700(&paths.run_dir(name), paths.root())?;
 
         let config = SandboxConfig {
             image_digest: opts.image_digest.clone(),
@@ -241,7 +244,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
         // (never reformatted), so its data survives across sandboxes.
         for (i, v) in opts.volumes.iter().enumerate() {
             let img = v.image_path(paths, name, i);
-            ensure_volume_image(&img, v.size_bytes)
+            ensure_volume_image(&img, v.size_bytes, paths.root())
                 .with_context(|| format!("provisioning volume {}", v.guest_path.display()))?;
         }
         Ok(())
@@ -308,12 +311,12 @@ fn best_effort_mkfs(path: &Path) {
 /// Create a sparse ext4-preformatted image at `path` of `size_bytes`, unless
 /// it already exists (persistent volumes are reused as-is — never reformatted,
 /// so their data survives across sandboxes).
-fn ensure_volume_image(path: &Path, size_bytes: u64) -> anyhow::Result<()> {
+fn ensure_volume_image(path: &Path, size_bytes: u64, root: &Path) -> anyhow::Result<()> {
     if path.exists() {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        crate::paths::create_dir_700(parent, root)?;
     }
     let f = File::create(path).with_context(|| format!("creating {}", path.display()))?;
     mark_sparse(&f);
