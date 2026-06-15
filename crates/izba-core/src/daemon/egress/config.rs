@@ -119,6 +119,59 @@ impl EgressPolicyConfig {
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
+
+    /// Ensure `host` authorizes `port`, adding the host and/or the port as
+    /// needed. Normalizes the entry to the explicit `Scoped` form. Returns
+    /// `true` if the config changed, `false` if `port` was already authorized.
+    pub fn allow(&mut self, host: &str, port: u16) -> bool {
+        if let Some(entry) = self.allow.iter_mut().find(|e| e.host() == host) {
+            let mut ports = entry.ports();
+            if ports.contains(&port) {
+                return false;
+            }
+            ports.push(port);
+            ports.sort_unstable();
+            *entry = AllowEntry::Scoped {
+                host: host.to_string(),
+                ports,
+            };
+            true
+        } else {
+            self.allow.push(AllowEntry::Scoped {
+                host: host.to_string(),
+                ports: vec![port],
+            });
+            true
+        }
+    }
+
+    /// Remove `port` from `host`; drop the host entirely once its last port is
+    /// gone. Returns `true` if the config changed.
+    pub fn block(&mut self, host: &str, port: u16) -> bool {
+        let Some(idx) = self.allow.iter().position(|e| e.host() == host) else {
+            return false;
+        };
+        let mut ports = self.allow[idx].ports();
+        let before = ports.len();
+        ports.retain(|p| *p != port);
+        if ports.len() == before {
+            return false; // port wasn't authorized
+        }
+        if ports.is_empty() {
+            self.allow.remove(idx);
+        } else {
+            self.allow[idx] = AllowEntry::Scoped {
+                host: host.to_string(),
+                ports,
+            };
+        }
+        true
+    }
+
+    /// Serialize back to canonical `policy.yaml` text (round-trips `from_yaml`).
+    pub fn to_yaml(&self) -> String {
+        serde_yaml::to_string(self).expect("EgressPolicyConfig serializes")
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +314,75 @@ mod tests {
     fn load_missing_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(EgressPolicyConfig::load(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn allow_adds_new_host_as_scoped_single_port() {
+        let mut cfg = EgressPolicyConfig::default();
+        assert!(cfg.allow("api.x.com", 443));
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: vec![443]
+            }]
+        );
+        // Idempotent: allowing an already-authorized port is a no-op.
+        assert!(!cfg.allow("api.x.com", 443));
+    }
+
+    #[test]
+    fn allow_extends_existing_host_ports_sorted() {
+        let mut cfg = EgressPolicyConfig {
+            allow: vec![AllowEntry::Host("api.x.com".into())], // {80,443}
+        };
+        assert!(cfg.allow("api.x.com", 8080));
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: vec![80, 443, 8080]
+            }]
+        );
+    }
+
+    #[test]
+    fn block_removes_port_then_host_when_last() {
+        let mut cfg = EgressPolicyConfig {
+            allow: vec![AllowEntry::Host("api.x.com".into())], // {80,443}
+        };
+        assert!(cfg.block("api.x.com", 443));
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: vec![80]
+            }]
+        );
+        assert!(
+            cfg.block("api.x.com", 80),
+            "removing the last port drops the host"
+        );
+        assert!(cfg.allow.is_empty());
+        assert!(
+            !cfg.block("api.x.com", 80),
+            "blocking an absent host is a no-op"
+        );
+    }
+
+    #[test]
+    fn to_yaml_round_trips_through_from_yaml() {
+        let cfg = EgressPolicyConfig {
+            allow: vec![
+                AllowEntry::Host("api.x.com".into()),
+                AllowEntry::Scoped {
+                    host: "db.internal".into(),
+                    ports: vec![5432],
+                },
+            ],
+        };
+        let back = EgressPolicyConfig::from_yaml(&cfg.to_yaml()).unwrap();
+        assert_eq!(back, cfg);
     }
 
     #[test]
