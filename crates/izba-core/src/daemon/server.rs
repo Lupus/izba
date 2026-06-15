@@ -546,8 +546,7 @@ pub fn run_daemon(paths: &Paths) -> anyhow::Result<()> {
 }
 
 pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
-    std::fs::create_dir_all(paths.daemon_dir())
-        .with_context(|| format!("creating {}", paths.daemon_dir().display()))?;
+    crate::paths::create_dir_700(&paths.daemon_dir(), paths.root())?;
     let lock = File::options()
         .create(true)
         .truncate(false)
