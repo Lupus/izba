@@ -94,5 +94,11 @@ function ShellViewer({ sandbox, sessionKey }: { sandbox: string; sessionKey: str
       if (s.el.parentElement === host) host.removeChild(s.el); // detach, do NOT dispose
     };
   }, [sandbox, sessionKey]);
-  return <div ref={ref} data-testid="shell-host" className="h-full w-full" />;
+  // overflow-hidden is load-bearing: xterm's own `.xterm-viewport` is the only
+  // legitimate scroller (it owns the scrollback). On shrink, xterm leaves its
+  // absolutely-positioned `.xterm-helper-textarea` parked at the old cursor's
+  // pixel `top` (e.g. 780px from a former full-screen height); without clipping,
+  // that stale element inflates scrollHeight up the whole flex chain into a
+  // page-level scrollbar over empty space. Clipping here contains it.
+  return <div ref={ref} data-testid="shell-host" className="h-full w-full overflow-hidden" />;
 }
