@@ -5,6 +5,7 @@ mod fake;
 mod views;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -23,19 +24,20 @@ type ShellHandle = Arc<Mutex<Box<dyn ShellSession>>>;
 pub struct AppState {
     pub daemon: Mutex<Box<dyn DaemonApi>>,
     pub make_daemon: Arc<dyn Fn() -> Box<dyn DaemonApi> + Send + Sync>,
-    /// Live interactive shells, keyed by sandbox name (one per sandbox).
+    /// Live interactive shells, keyed by session id now.
     pub shells: Mutex<HashMap<String, ShellHandle>>,
+    pub shell_seq: AtomicU64,
 }
 
 /// Look up a live shell, cloning the per-session handle so the map lock is
 /// released before any (blocking) shell I/O runs.
-fn shell_handle(state: &AppState, name: &str) -> Result<ShellHandle, String> {
+fn shell_handle(state: &AppState, id: &str) -> Result<ShellHandle, String> {
     let shells = state
         .shells
         .lock()
         .map_err(|e| format!("state poisoned: {e}"))?;
     shells
-        .get(name)
+        .get(id)
         .cloned()
         .ok_or_else(|| "no active shell".to_string())
 }
@@ -124,14 +126,14 @@ async fn read_logs(state: State<'_, AppState>, name: String) -> Result<String, S
 
 #[derive(Clone, serde::Serialize)]
 struct ShellOutput {
-    name: String,
+    id: String,
     /// Base64-encoded raw PTY bytes (terminal output is not always UTF-8).
     data: String,
 }
 
 #[derive(Clone, serde::Serialize)]
 struct ShellExit {
-    name: String,
+    id: String,
 }
 
 #[tauri::command]
@@ -139,42 +141,29 @@ async fn shell_open(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     name: String,
-) -> Result<(), String> {
-    // Replace any stale session for this sandbox.
-    let stale = {
-        let mut shells = state
-            .shells
-            .lock()
-            .map_err(|e| format!("state poisoned: {e}"))?;
-        shells.remove(&name)
-    };
-    if let Some(stale) = stale {
-        if let Ok(mut s) = stale.lock() {
-            let _ = s.close();
-        }
-    }
+) -> Result<String, String> {
+    let id = format!("sh-{}", state.shell_seq.fetch_add(1, Ordering::Relaxed));
     let make = state.make_daemon.clone();
     let out_app = app.clone();
-    let out_name = name.clone();
+    let out_id = id.clone();
     let exit_app = app.clone();
-    let exit_name = name.clone();
-    let open_name = name.clone();
+    let exit_id = id.clone();
     let session = tauri::async_runtime::spawn_blocking(move || {
         let mut d = make();
         d.open_shell(
-            &open_name,
+            &name,
             Box::new(move |bytes: Vec<u8>| {
                 let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 let _ = out_app.emit(
                     "shell-output",
                     ShellOutput {
-                        name: out_name.clone(),
+                        id: out_id.clone(),
                         data,
                     },
                 );
             }),
             Box::new(move || {
-                let _ = exit_app.emit("shell-exit", ShellExit { name: exit_name });
+                let _ = exit_app.emit("shell-exit", ShellExit { id: exit_id });
             }),
         )
     })
@@ -185,13 +174,13 @@ async fn shell_open(
         .shells
         .lock()
         .map_err(|e| format!("state poisoned: {e}"))?
-        .insert(name, Arc::new(Mutex::new(session)));
-    Ok(())
+        .insert(id.clone(), Arc::new(Mutex::new(session)));
+    Ok(id)
 }
 
 #[tauri::command]
-async fn shell_write(state: State<'_, AppState>, name: String, data: String) -> Result<(), String> {
-    let shell = shell_handle(&state, &name)?;
+async fn shell_write(state: State<'_, AppState>, id: String, data: String) -> Result<(), String> {
+    let shell = shell_handle(&state, &id)?;
     let mut s = shell.lock().map_err(|e| format!("shell poisoned: {e}"))?;
     s.write(data.as_bytes()).map_err(|e| e.to_string())
 }
@@ -199,23 +188,23 @@ async fn shell_write(state: State<'_, AppState>, name: String, data: String) -> 
 #[tauri::command]
 async fn shell_resize(
     state: State<'_, AppState>,
-    name: String,
+    id: String,
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let shell = shell_handle(&state, &name)?;
+    let shell = shell_handle(&state, &id)?;
     let mut s = shell.lock().map_err(|e| format!("shell poisoned: {e}"))?;
     s.resize(cols, rows).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn shell_close(state: State<'_, AppState>, name: String) -> Result<(), String> {
+async fn shell_close(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let shell = {
         let mut shells = state
             .shells
             .lock()
             .map_err(|e| format!("state poisoned: {e}"))?;
-        shells.remove(&name)
+        shells.remove(&id)
     };
     if let Some(shell) = shell {
         let mut s = shell.lock().map_err(|e| format!("shell poisoned: {e}"))?;
@@ -229,6 +218,7 @@ pub fn run() {
         daemon: Mutex::new(Box::new(RealDaemon::new())),
         make_daemon: Arc::new(|| Box::new(RealDaemon::new())),
         shells: Mutex::new(HashMap::new()),
+        shell_seq: AtomicU64::new(0),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
