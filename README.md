@@ -115,7 +115,12 @@ izba rm     [--force] NAME
 izba daemon run                         # run the daemon in the foreground (auto-started on demand otherwise)
 izba daemon status                      # daemon health + supervised sandboxes
 izba daemon stop                        # stop the daemon; sandboxes keep running, published ports pause
-izba netlog  NAME [--follow]            # stream the egress audit log for a sandbox
+izba netlog  NAME [--summary] [--follow]   # egress audit log; --summary aggregates per endpoint
+izba policy  show NAME                   # print the effective egress allow-list (host + ports)
+izba policy  allow NAME HOST[:PORT]      # allow a destination (port defaults to 443); live-reloads
+izba policy  block NAME HOST[:PORT]      # remove a destination (port defaults to 443); live-reloads
+izba policy  enable NAME                 # seed the allow-list from observed allowed traffic; live-reloads
+izba policy  reload NAME                 # re-read policy.yaml and apply to new connections (no restart)
 ```
 
 ## Project layout
