@@ -4,6 +4,7 @@
 //! connection"). The record is a pure value (host-testable, no clock); the
 //! [`AuditSink`] stamps the wall-clock time and does the append.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -126,6 +127,73 @@ impl AuditRecord {
     }
 }
 
+/// One aggregated endpoint row for `izba netlog --summary` / the app Netlog tab.
+/// Records are grouped by `(host-or-ip, port)`; verdict/method/path reflect the
+/// latest record in the group, counts tally allow vs deny. Serializable so the
+/// Tauri layer can hand it straight to the frontend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EndpointSummary {
+    /// Resolved name (tier-1 Host / tier-2 DNS-snoop FQDN), else `None` (raw IP).
+    pub host: Option<String>,
+    pub dest_ip: IpAddr,
+    pub port: u16,
+    pub tier: Tier,
+    /// The current effective verdict (from the most recent record).
+    pub verdict: Verdict,
+    pub allow_count: u64,
+    pub deny_count: u64,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+    pub last_method: Option<String>,
+    pub last_path: Option<String>,
+}
+
+/// Group audit `records` by `(host-or-ip, port)`, newest endpoint first.
+/// Pure (no clock, no IO) so it is fully host-testable. Key uses the resolved
+/// host when present, else the dest IP string, so a raw-IP flow and a named
+/// flow to the same IP:port stay distinct rows.
+pub fn aggregate(records: impl IntoIterator<Item = AuditRecord>) -> Vec<EndpointSummary> {
+    let mut map: HashMap<(String, u16), EndpointSummary> = HashMap::new();
+    for r in records {
+        let key = (
+            r.host.clone().unwrap_or_else(|| r.dest_ip.to_string()),
+            r.port,
+        );
+        let s = map.entry(key).or_insert_with(|| EndpointSummary {
+            host: r.host.clone(),
+            dest_ip: r.dest_ip,
+            port: r.port,
+            tier: r.tier,
+            verdict: r.verdict,
+            allow_count: 0,
+            deny_count: 0,
+            first_seen_ms: r.ts_ms,
+            last_seen_ms: 0,
+            last_method: None,
+            last_path: None,
+        });
+        match r.verdict {
+            Verdict::Allow => s.allow_count += 1,
+            Verdict::Deny => s.deny_count += 1,
+        }
+        s.first_seen_ms = s.first_seen_ms.min(r.ts_ms);
+        // `>=` so that among equal timestamps the later-appended (genuinely
+        // newer) record wins — audit lines are appended in chronological order.
+        if r.ts_ms >= s.last_seen_ms {
+            s.last_seen_ms = r.ts_ms;
+            s.verdict = r.verdict;
+            s.tier = r.tier;
+            s.host = r.host.clone();
+            s.dest_ip = r.dest_ip;
+            s.last_method = r.method.clone();
+            s.last_path = r.path.clone();
+        }
+    }
+    let mut out: Vec<EndpointSummary> = map.into_values().collect();
+    out.sort_by_key(|s| std::cmp::Reverse(s.last_seen_ms));
+    out
+}
+
 /// Parse one JSONL line into an [`AuditRecord`]; `None` on a malformed line
 /// (so `izba netlog` skips junk rather than aborting the tail).
 pub fn parse_line(line: &str) -> Option<AuditRecord> {
@@ -204,6 +272,90 @@ impl AuditSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(
+        ts: u64,
+        host: Option<&str>,
+        ip: &str,
+        port: u16,
+        v: Verdict,
+        tier: Tier,
+    ) -> AuditRecord {
+        let mut r = match v {
+            Verdict::Allow => AuditRecord::allow("web", ip.parse().unwrap(), port, host, tier, "r"),
+            Verdict::Deny => AuditRecord::deny("web", ip.parse().unwrap(), port, host, tier, "r"),
+        };
+        r.ts_ms = ts;
+        r
+    }
+
+    #[test]
+    fn aggregate_groups_by_host_and_port_counts_and_latest() {
+        let recs = vec![
+            rec(
+                100,
+                Some("api.x.com"),
+                "1.1.1.1",
+                443,
+                Verdict::Allow,
+                Tier::L7,
+            ),
+            rec(
+                200,
+                Some("api.x.com"),
+                "1.1.1.1",
+                443,
+                Verdict::Deny,
+                Tier::L7,
+            ),
+            rec(
+                150,
+                Some("api.x.com"),
+                "1.1.1.1",
+                80,
+                Verdict::Allow,
+                Tier::L7,
+            ), // different port → own group
+        ];
+        let out = aggregate(recs);
+        // newest endpoint first: the :443 group's last_seen is 200, the :80 group's is 150.
+        assert_eq!(out.len(), 2);
+        let g443 = out.iter().find(|s| s.port == 443).unwrap();
+        assert_eq!(g443.host.as_deref(), Some("api.x.com"));
+        assert_eq!(g443.allow_count, 1);
+        assert_eq!(g443.deny_count, 1);
+        assert_eq!(g443.first_seen_ms, 100);
+        assert_eq!(g443.last_seen_ms, 200);
+        assert_eq!(g443.verdict, Verdict::Deny, "latest verdict wins");
+        assert_eq!(out[0].port, 443, "sorted by last_seen desc");
+    }
+
+    #[test]
+    fn aggregate_raw_ip_rows_keep_none_host_and_group_by_ip() {
+        let recs = vec![
+            rec(10, None, "9.9.9.9", 22, Verdict::Deny, Tier::L3),
+            rec(20, None, "9.9.9.9", 22, Verdict::Deny, Tier::L3),
+        ];
+        let out = aggregate(recs);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].host.is_none());
+        assert_eq!(out[0].dest_ip.to_string(), "9.9.9.9");
+        assert_eq!(out[0].deny_count, 2);
+    }
+
+    #[test]
+    fn aggregate_picks_latest_method_path_and_empty_is_empty() {
+        assert!(aggregate(std::iter::empty()).is_empty());
+        let mut a = rec(10, Some("h"), "1.1.1.1", 443, Verdict::Allow, Tier::L7);
+        a.method = Some("GET".into());
+        a.path = Some("/old".into());
+        let mut b = rec(20, Some("h"), "1.1.1.1", 443, Verdict::Allow, Tier::L7);
+        b.method = Some("POST".into());
+        b.path = Some("/new".into());
+        let out = aggregate(vec![a, b]);
+        assert_eq!(out[0].last_method.as_deref(), Some("POST"));
+        assert_eq!(out[0].last_path.as_deref(), Some("/new"));
+    }
 
     #[test]
     fn audit_record_serializes_with_tier_and_verdict() {
