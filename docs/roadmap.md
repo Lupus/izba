@@ -152,6 +152,17 @@ replace (not extend) the web default. This closes the port loophole where an
 allow-listed host was reachable on every TCP port. Existing string-list
 `policy.yaml` files keep parsing unchanged and now mean "80/443 only".
 
+**M2.1 Step 3 — interactive firewall (2026-06-15):** made the port-aware
+allow-list usable end-to-end. New CLI surface `izba policy show/allow/block/
+enable/reload` edits `policy.yaml` and live-reloads a running sandbox, and
+`izba netlog --summary` aggregates the audit log per endpoint (host/IP + port,
+allow/deny counts, latest verdict). The desktop app gains P4 Netlog + Policy
+tabs: click-to-allow/block, a disabled Allow on raw-IP rows (SSRF guard), and
+"Enable firewall" that seeds the allow-list from observed allowed traffic. All
+edits route through one core grammar helper (`EgressPolicyConfig::{allow,block,
+to_yaml}` + `edit_policy_file`/`seed_from_summaries`), so the CLI and app stay
+consistent. Host-side pure logic + UI only — no datapath change.
+
 ### M3 — Sized & stateful sandboxes: resources + volumes (M) — 🚧 IN FLIGHT
 
 Per-sandbox `resources` (cpus/memory) **already ship** (CLI → daemon → both
