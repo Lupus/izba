@@ -456,6 +456,53 @@ mod tests {
         assert_eq!(v2, Verdict::Allow);
     }
 
+    /// A snooped, allow-listed FQDN reached on a non-web port is now DENIED —
+    /// the tier-2 exfil channel the port loophole left open is closed.
+    #[test]
+    fn tier2_allowed_fqdn_on_non_web_port_is_denied() {
+        let p = RegoPolicy::embedded().unwrap();
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        snoop.record("web", &[("api.anthropic.com".to_string(), ip, 300)]);
+
+        // Web port 443: allow (baseline — ensures the setup is correct).
+        let (v_web, f_web, rule_web) = decide_tier2(&p, &snoop, "web", ip, 443);
+        assert_eq!(
+            v_web,
+            Verdict::Allow,
+            "port 443 must be allowed: {rule_web}"
+        );
+        assert_eq!(f_web.host.as_deref(), Some("api.anthropic.com"));
+
+        // Non-web port 22 on the SAME allowed FQDN: the port predicate now denies it.
+        let (v_ssh, _f_ssh, rule_ssh) = decide_tier2(&p, &snoop, "web", ip, 22);
+        assert_eq!(v_ssh, Verdict::Deny, "port 22 must be denied: {rule_ssh}");
+        assert_eq!(rule_ssh, "not in allow-list");
+    }
+
+    /// Scoped ports flow through tier-2: a host listed for 5432 is reachable on
+    /// 5432 but not on 443.
+    #[test]
+    fn tier2_scoped_port_is_honored() {
+        let p = RegoPolicy::with_data(
+            r#"{"global_domains": {}, "sandbox_ports": {"web": {"db.internal": [5432]}}}"#,
+        )
+        .unwrap();
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        snoop.record("web", &[("db.internal".to_string(), ip, 300)]);
+
+        // Scoped port 5432: allow.
+        let (v_pg, _f_pg, rule_pg) = decide_tier2(&p, &snoop, "web", ip, 5432);
+        assert_eq!(v_pg, Verdict::Allow, "port 5432 must be allowed: {rule_pg}");
+        assert_eq!(rule_pg, "allow-list");
+
+        // Non-scoped port 443: deny.
+        let (v_tls, _f_tls, rule_tls) = decide_tier2(&p, &snoop, "web", ip, 443);
+        assert_eq!(v_tls, Verdict::Deny, "port 443 must be denied: {rule_tls}");
+        assert_eq!(rule_tls, "not in allow-list");
+    }
+
     /// dns_loop installs the IP→FQDN snoop mapping from each answer it returns.
     #[test]
     fn dns_loop_snoops_returned_a_records() {
