@@ -27,31 +27,28 @@ dest_name := input.host
 
 dest_name := input.dest if not input.host
 
-# Global allow-list: a destination any sandbox may reach. This is the union of
-# upstream's `allowed_domains` + `unrestricted_domains` tiers — once we enforce
-# the HTTP method we re-split them (see bottom of file).
+# Global allow-list: a host any sandbox may reach, ON ONE OF ITS LISTED PORTS.
+# `data.global_domains[dest_name]` is the port list for the host (undefined when
+# the host is not listed, which makes the membership undefined → rule does not
+# fire → default-deny).
 allow if {
-	dest_name in data.global_domains
+	input.port in data.global_domains[dest_name]
 }
 
-# Per-sandbox allow-list: a destination only THIS sandbox may reach. This is the
-# M2 trust-domain dimension docker-mitm-bridge lacks — different sandboxes get
-# different reachability from the same daemon.
+# Per-sandbox allow-list: a host only THIS sandbox may reach, on a listed port.
 allow if {
-	some dest in data.sandbox_domains[input.sandbox]
-	dest_name == dest
+	input.port in data.sandbox_ports[input.sandbox][dest_name]
 }
 
 # Decision object mirrors upstream's `decision := {"allow", "reason"}` so the
 # audit log + future denial UX have a human-readable cause from day one.
 reason := "allowed: global domain" if {
-	dest_name in data.global_domains
+	input.port in data.global_domains[dest_name]
 }
 
 reason := "allowed: per-sandbox domain" if {
-	not dest_name in data.global_domains
-	some dest in data.sandbox_domains[input.sandbox]
-	dest_name == dest
+	not input.port in data.global_domains[dest_name]
+	input.port in data.sandbox_ports[input.sandbox][dest_name]
 }
 
 default reason := "denied: destination not in any allow-list"

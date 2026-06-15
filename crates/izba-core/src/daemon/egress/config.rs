@@ -3,7 +3,7 @@
 //! that compiles to the regorus data document the [`RegoPolicy`] evaluates.
 //!
 //! The file is scoped to ONE sandbox (it is supplied at create time), so its
-//! `allow` list becomes that sandbox's `sandbox_domains[<name>]` entry in the
+//! `allow` list becomes that sandbox's `sandbox_ports[<name>]` entry in the
 //! Rego data doc. A sandbox with no policy file stays a bare, non-enforcing
 //! [`AllowAll`](super::policy::AllowAll) — today's permissive behavior.
 //!
@@ -15,20 +15,58 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::policy::RegoPolicy;
 
 /// On-disk policy file name under the sandbox directory.
 pub const POLICY_FILE: &str = "policy.yaml";
 
+/// One entry in a sandbox's egress allow-list: either a bare host (which
+/// authorizes the default web ports) or a host scoped to an explicit port set.
+///
+/// `#[serde(untagged)]` keeps every existing `allow: [<string>...]` file parsing
+/// unchanged — a YAML string deserializes to `Host`, a `{host, ports}` map to
+/// `Scoped`. Variant order matters: `Host` is tried first.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum AllowEntry {
+    /// Bare host → implicit web ports [80, 443].
+    Host(String),
+    /// Host scoped to an explicit port set (REPLACES the default web ports).
+    Scoped { host: String, ports: Vec<u16> },
+}
+
+impl AllowEntry {
+    /// Ports a bare host authorizes when no explicit set is given.
+    pub const DEFAULT_PORTS: [u16; 2] = [80, 443];
+
+    /// The host this entry names.
+    pub fn host(&self) -> &str {
+        match self {
+            AllowEntry::Host(h) => h,
+            AllowEntry::Scoped { host, .. } => host,
+        }
+    }
+
+    /// The ports this entry authorizes: `[80, 443]` for a bare host, else the
+    /// explicit set (which REPLACES — not extends — the default).
+    pub fn ports(&self) -> Vec<u16> {
+        match self {
+            AllowEntry::Host(_) => AllowEntry::DEFAULT_PORTS.to_vec(),
+            AllowEntry::Scoped { ports, .. } => ports.clone(),
+        }
+    }
+}
+
 /// A sandbox's egress allow-list, parsed from its `--policy` YAML.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EgressPolicyConfig {
     /// Destinations this sandbox may reach (HTTP host for tier-1, DNS-snoop
-    /// FQDN for tier-2). Exact-match in M2.
+    /// FQDN for tier-2). A bare host means web ports (80/443) only; a
+    /// `{host, ports}` entry names the exact ports allowed for that host.
     #[serde(default)]
-    pub allow: Vec<String>,
+    pub allow: Vec<AllowEntry>,
 }
 
 impl EgressPolicyConfig {
@@ -43,12 +81,18 @@ impl EgressPolicyConfig {
     }
 
     /// The regorus data document for `sandbox`: the allow-list becomes this
-    /// sandbox's per-sandbox domains (global stays empty — a `--policy` file is
-    /// scoped to one sandbox, never granted to others).
+    /// sandbox's `sandbox_ports[<name>]` host→ports map (`global_domains` stays
+    /// empty — a `--policy` file is scoped to one sandbox, never granted to
+    /// others). A bare host maps to the default web ports; a scoped host to its
+    /// exact set.
     pub fn to_rego_data_json(&self, sandbox: &str) -> String {
+        let mut ports = serde_json::Map::new();
+        for entry in &self.allow {
+            ports.insert(entry.host().to_string(), serde_json::json!(entry.ports()));
+        }
         serde_json::json!({
-            "global_domains": [],
-            "sandbox_domains": { sandbox: self.allow },
+            "global_domains": {},
+            "sandbox_ports": { sandbox: ports },
         })
         .to_string()
     }
@@ -83,10 +127,59 @@ mod tests {
     use crate::daemon::egress::policy::{FlowDesc, Policy, Verdict};
 
     #[test]
-    fn parses_allow_list() {
-        let cfg = EgressPolicyConfig::from_yaml("allow:\n  - api.anthropic.com\n  - github.com\n")
-            .unwrap();
-        assert_eq!(cfg.allow, vec!["api.anthropic.com", "github.com"]);
+    fn parses_bare_host_as_default_web_ports() {
+        let cfg = EgressPolicyConfig::from_yaml("allow:\n  - api.anthropic.com\n").unwrap();
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Host("api.anthropic.com".into())]
+        );
+        assert_eq!(cfg.allow[0].host(), "api.anthropic.com");
+        assert_eq!(cfg.allow[0].ports(), vec![80, 443]);
+    }
+
+    #[test]
+    fn parses_scoped_host_with_explicit_ports() {
+        let cfg =
+            EgressPolicyConfig::from_yaml("allow:\n  - host: db.internal\n    ports: [5432]\n")
+                .unwrap();
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "db.internal".into(),
+                ports: vec![5432],
+            }]
+        );
+        assert_eq!(cfg.allow[0].ports(), vec![5432]);
+    }
+
+    #[test]
+    fn parses_mixed_bare_and_scoped_list() {
+        let yaml =
+            "allow:\n  - api.anthropic.com\n  - host: registry.internal\n    ports: [443, 5000]\n";
+        let cfg = EgressPolicyConfig::from_yaml(yaml).unwrap();
+        assert_eq!(cfg.allow.len(), 2);
+        assert_eq!(cfg.allow[0], AllowEntry::Host("api.anthropic.com".into()));
+        assert_eq!(
+            cfg.allow[1],
+            AllowEntry::Scoped {
+                host: "registry.internal".into(),
+                ports: vec![443, 5000]
+            }
+        );
+    }
+
+    #[test]
+    fn allow_entry_round_trips_via_serialize() {
+        let entries = vec![
+            AllowEntry::Host("api.anthropic.com".into()),
+            AllowEntry::Scoped {
+                host: "db.internal".into(),
+                ports: vec![5432],
+            },
+        ];
+        let yaml = serde_yaml::to_string(&entries).unwrap();
+        let back: Vec<AllowEntry> = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(entries, back);
     }
 
     #[test]
@@ -102,34 +195,63 @@ mod tests {
     }
 
     #[test]
-    fn data_doc_scopes_domains_to_the_sandbox() {
+    fn data_doc_scopes_ports_to_the_sandbox() {
         let cfg = EgressPolicyConfig {
-            allow: vec!["api.anthropic.com".into()],
+            allow: vec![AllowEntry::Host("api.anthropic.com".into())],
         };
         let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
-        assert_eq!(doc["global_domains"].as_array().unwrap().len(), 0);
-        assert_eq!(doc["sandbox_domains"]["web"][0], "api.anthropic.com");
+        // global stays empty for a declared --policy.
+        assert!(doc["global_domains"].as_object().unwrap().is_empty());
+        // bare host → default web ports, scoped under the sandbox.
+        assert_eq!(
+            doc["sandbox_ports"]["web"]["api.anthropic.com"],
+            serde_json::json!([80, 443])
+        );
     }
 
     #[test]
-    fn compiled_policy_enforces_the_allow_list() {
+    fn compiled_policy_enforces_ports_and_isolation() {
         let cfg = EgressPolicyConfig {
-            allow: vec!["api.anthropic.com".into()],
+            allow: vec![
+                AllowEntry::Host("api.anthropic.com".into()),
+                AllowEntry::Scoped {
+                    host: "db.internal".into(),
+                    ports: vec![5432],
+                },
+            ],
         };
         let policy = cfg.into_policy("web").unwrap();
         assert!(policy.enforces(), "a declared policy is a firewall");
 
-        // The sandbox it was scoped to may reach the listed host...
-        let mut allowed = FlowDesc::l3("web", "1.2.3.4", 443);
-        allowed.host = Some("api.anthropic.com".into());
-        assert_eq!(policy.check(&allowed), Verdict::Allow);
+        // Bare host on a web port: allowed.
+        let mut https = FlowDesc::l3("web", "1.2.3.4", 443);
+        https.host = Some("api.anthropic.com".into());
+        assert_eq!(policy.check(&https), Verdict::Allow);
 
-        // ...an unlisted host is denied...
-        let mut denied = FlowDesc::l3("web", "1.2.3.4", 443);
-        denied.host = Some("evil.example.com".into());
-        assert_eq!(policy.check(&denied), Verdict::Deny);
+        // THE LOOPHOLE, NOW CLOSED: same allowed host, non-web port → deny.
+        let mut ssh = FlowDesc::l3("web", "1.2.3.4", 22);
+        ssh.host = Some("api.anthropic.com".into());
+        assert_eq!(
+            policy.check(&ssh),
+            Verdict::Deny,
+            "bare host must NOT authorize port 22"
+        );
 
-        // ...and another sandbox does NOT inherit the grant.
+        // Scoped host on its declared port: allowed.
+        let mut db = FlowDesc::l3("web", "1.2.3.4", 5432);
+        db.host = Some("db.internal".into());
+        assert_eq!(policy.check(&db), Verdict::Allow);
+
+        // Scoped host on a non-declared port (443): denied — explicit ports REPLACE the default.
+        let mut db443 = FlowDesc::l3("web", "1.2.3.4", 443);
+        db443.host = Some("db.internal".into());
+        assert_eq!(
+            policy.check(&db443),
+            Verdict::Deny,
+            "explicit ports replace the web default"
+        );
+
+        // Another sandbox does NOT inherit the grant.
         let mut other = FlowDesc::l3("build", "1.2.3.4", 443);
         other.host = Some("api.anthropic.com".into());
         assert_eq!(policy.check(&other), Verdict::Deny);
@@ -150,6 +272,6 @@ mod tests {
         )
         .unwrap();
         let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
-        assert_eq!(cfg.allow, vec!["api.openai.com"]);
+        assert_eq!(cfg.allow, vec![AllowEntry::Host("api.openai.com".into())]);
     }
 }
