@@ -145,6 +145,13 @@ Full design: [specs/2026-06-14-m2-agent-firewall-merged-design.md](superpowers/s
 Building-block decisions (regorus, DNS-snoop, OpenShell salvage map):
 [egress-firewall-building-blocks.md](egress-firewall-building-blocks.md).
 
+**M2.1 — Port-aware allow-list (2026-06-15):** tightened the allow-list
+grammar: a bare host entry now authorizes web ports (80/443) only; any other
+port must be listed explicitly with `{host, ports: [...]}`. Explicit ports
+replace (not extend) the web default. This closes the port loophole where an
+allow-listed host was reachable on every TCP port. Existing string-list
+`policy.yaml` files keep parsing unchanged and now mean "80/443 only".
+
 ### M3 — Sized & stateful sandboxes: resources + volumes (M) — 🚧 IN FLIGHT
 
 Per-sandbox `resources` (cpus/memory) **already ship** (CLI → daemon → both
