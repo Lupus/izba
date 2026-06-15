@@ -164,6 +164,9 @@ enum Cmd {
     /// Manage persistent volumes
     #[command(subcommand)]
     Volume(commands::volume::VolumeCmd),
+    /// Manage a sandbox's egress policy
+    #[command(subcommand)]
+    Policy(commands::policy::PolicyCmd),
     /// Manage the izba daemon (auto-started by other commands)
     #[command(subcommand)]
     Daemon(DaemonCmd),
@@ -200,6 +203,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             PortCmd::Ls { name } => commands::port::ls(paths, &name),
         },
         Cmd::Volume(vc) => commands::volume::run(paths, &vc),
+        Cmd::Policy(pc) => commands::policy::run(paths, &pc),
         Cmd::Version { json } => commands::version::run(paths, json),
         Cmd::Daemon(dc) => match dc {
             DaemonCmd::Run => commands::daemon::run_foreground(paths),
