@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import React from "react";
 
 const term = vi.hoisted(() => ({
   open: vi.fn(),
@@ -15,10 +16,9 @@ vi.mock("@xterm/xterm", () => ({ Terminal: vi.fn(() => term) }));
 vi.mock("@xterm/xterm/css/xterm.css", () => ({}));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: vi.fn(() => ({ fit: vi.fn() })) }));
 
-let nextId = 0;
 vi.mock("../lib/ipc", () => ({
   api: {
-    shellOpen: vi.fn(() => Promise.resolve(`sh-${nextId++}`)),
+    shellOpen: vi.fn().mockResolvedValue(undefined),
     shellWrite: vi.fn().mockResolvedValue(undefined),
     shellResize: vi.fn().mockResolvedValue(undefined),
     shellClose: vi.fn().mockResolvedValue(undefined),
@@ -51,14 +51,23 @@ describe("ShellPanel", () => {
   });
 
   beforeEach(() => {
-    nextId = 0;
     vi.clearAllMocks();
   });
 
   it("auto-opens one session on mount when none exist", async () => {
     render(<ShellPanel sandbox="web" />);
-    await waitFor(() => expect(api.shellOpen).toHaveBeenCalledWith("web"));
+    await waitFor(() => expect(api.shellOpen).toHaveBeenCalledWith("web", expect.any(String)));
     await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(1));
+  });
+
+  it("auto-opens exactly once under StrictMode (double-invoke guard)", async () => {
+    render(
+      <React.StrictMode>
+        <ShellPanel sandbox="web" />
+      </React.StrictMode>,
+    );
+    await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(1));
+    expect(api.shellOpen).toHaveBeenCalledTimes(1);
   });
 
   it("opens a second session when clicking +", async () => {
@@ -74,5 +83,16 @@ describe("ShellPanel", () => {
     await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(1));
     fireEvent.click(screen.getByRole("button", { name: /^close /i }));
     await waitFor(() => expect(api.shellClose).toHaveBeenCalled());
+  });
+
+  it("closing the last shell shows the empty state and does NOT reopen", async () => {
+    render(<ShellPanel sandbox="web" />);
+    await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(1));
+    expect(api.shellOpen).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: /^close /i }));
+    await waitFor(() => expect(screen.queryAllByRole("tab")).toHaveLength(0));
+    // The empty-state hint replaces the viewer; auto-open does NOT re-fire.
+    expect(screen.getByText(/no shells/i)).toBeTruthy();
+    expect(api.shellOpen).toHaveBeenCalledTimes(1);
   });
 });
