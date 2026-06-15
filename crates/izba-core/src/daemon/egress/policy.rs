@@ -277,12 +277,45 @@ mod tests {
     fn empty_data_denies_everything() {
         let p = RegoPolicy::new(
             RegoPolicy::REGO,
-            r#"{"global_domains": [], "sandbox_domains": {}}"#,
+            r#"{"global_domains": {}, "sandbox_ports": {}}"#,
         )
         .unwrap();
         assert_eq!(
             p.check(&flow("web", "api.anthropic.com", 443)),
             Verdict::Deny
+        );
+    }
+
+    /// The loophole, now closed: a globally-allowed host on a non-web port is denied.
+    #[test]
+    fn global_host_on_non_web_port_is_denied() {
+        let p = RegoPolicy::embedded().unwrap();
+        assert_eq!(
+            p.check(&flow("web", "api.anthropic.com", 443)),
+            Verdict::Allow,
+            "web port stays allowed"
+        );
+        assert_eq!(
+            p.check(&flow("web", "api.anthropic.com", 22)),
+            Verdict::Deny,
+            "non-web port on an allowed host must be denied"
+        );
+    }
+
+    /// Scoped ports REPLACE the web default: a host listed for 5432 only is
+    /// allowed on 5432 and denied on 443.
+    #[test]
+    fn scoped_ports_replace_the_web_default() {
+        let p = RegoPolicy::new(
+            RegoPolicy::REGO,
+            r#"{"global_domains": {}, "sandbox_ports": {"web": {"db.internal": [5432]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.check(&flow("web", "db.internal", 5432)), Verdict::Allow);
+        assert_eq!(
+            p.check(&flow("web", "db.internal", 443)),
+            Verdict::Deny,
+            "explicit ports replace, not extend, the web default"
         );
     }
 

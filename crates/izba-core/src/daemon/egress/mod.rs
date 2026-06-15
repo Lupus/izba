@@ -385,7 +385,9 @@ mod tests {
         assert!(!cell.load().enforces(), "AllowAll is non-enforcing");
 
         let enforcing = EgressPolicyConfig {
-            allow: vec!["api.anthropic.com".into()],
+            allow: vec![crate::daemon::egress::config::AllowEntry::Host(
+                "api.anthropic.com".into(),
+            )],
         }
         .into_policy("web")
         .unwrap();

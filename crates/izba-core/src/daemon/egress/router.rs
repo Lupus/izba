@@ -411,7 +411,7 @@ mod tests {
         let snoop = SnoopStore::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         snoop.record("web", &[("api.anthropic.com".to_string(), ip, 300)]);
-        let (v, f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443);
+        let (v, f, rule) = decide_tier2(&p, &snoop, "web", ip, 443);
         assert_eq!(v, Verdict::Allow);
         assert_eq!(f.host.as_deref(), Some("api.anthropic.com"));
         assert_eq!(rule, "allow-list");
