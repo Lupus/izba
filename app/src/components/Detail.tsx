@@ -4,6 +4,7 @@ import { StatusDot } from "./StatusDot";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LogsView } from "./LogsView";
 import { NetlogView } from "./NetlogView";
+import { PolicyEditor } from "./PolicyEditor";
 import { ShellPanel } from "./ShellPanel";
 import { api } from "../lib/ipc";
 
@@ -13,7 +14,7 @@ interface Props {
 }
 
 type Pending = { kind: "stop" | "remove"; name: string } | null;
-type Tab = "overview" | "logs" | "netlog" | "shell";
+type Tab = "overview" | "logs" | "netlog" | "policy" | "shell";
 
 export function Detail({ sandbox, onChanged }: Props) {
   const [busy, setBusy] = useState(false);
@@ -52,6 +53,7 @@ export function Detail({ sandbox, onChanged }: Props) {
     { id: "overview", label: "Overview" },
     { id: "logs", label: "Logs" },
     { id: "netlog", label: "Netlog" },
+    { id: "policy", label: "Policy" },
     { id: "shell", label: "Shell" },
   ];
 
@@ -134,6 +136,8 @@ export function Detail({ sandbox, onChanged }: Props) {
         {tab === "logs" && <LogsView name={name} />}
 
         {tab === "netlog" && <NetlogView name={name} />}
+
+        {tab === "policy" && <PolicyEditor name={name} />}
 
         {tab === "shell" &&
           (running ? (
