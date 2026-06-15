@@ -37,6 +37,34 @@ pub fn listener_path(paths: &Paths, name: &str) -> PathBuf {
         .join(format!("vsock.sock_{EGRESS_PORT}"))
 }
 
+/// A swappable holder for a sandbox's live egress policy. The accept loop reads
+/// it per connection via [`PolicyCell::load`], so a [`PolicyCell::store`] from a
+/// reload takes effect on the *next* connection; in-flight connections keep the
+/// `Arc` they already cloned. The lock is held only for an `Arc` clone/replace,
+/// never across I/O, so a plain `Mutex` is contention-free here (one accept
+/// thread per sandbox).
+pub struct PolicyCell {
+    inner: Mutex<Arc<dyn Policy>>,
+}
+
+impl PolicyCell {
+    pub fn new(policy: Arc<dyn Policy>) -> Self {
+        Self {
+            inner: Mutex::new(policy),
+        }
+    }
+
+    /// Snapshot the current policy (cheap `Arc` clone under a short lock).
+    pub fn load(&self) -> Arc<dyn Policy> {
+        Arc::clone(&self.inner.lock().expect("PolicyCell poisoned"))
+    }
+
+    /// Replace the policy; future `load`s see the new one.
+    pub fn store(&self, policy: Arc<dyn Policy>) {
+        *self.inner.lock().expect("PolicyCell poisoned") = policy;
+    }
+}
+
 struct EgressSlot {
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
@@ -237,6 +265,7 @@ impl EgressManager {
 
 #[cfg(test)]
 mod tests {
+    use super::config::EgressPolicyConfig;
     use super::policy::AllowAll;
     use super::*;
     use crate::vmm::UdsStream;
@@ -314,6 +343,20 @@ mod tests {
     fn stop_unknown_is_a_noop() {
         let (_d, paths) = test_paths();
         mgr().stop(&paths, "ghost");
+    }
+
+    #[test]
+    fn policy_cell_loads_and_swaps() {
+        let cell = PolicyCell::new(std::sync::Arc::new(AllowAll));
+        assert!(!cell.load().enforces(), "AllowAll is non-enforcing");
+
+        let enforcing = EgressPolicyConfig {
+            allow: vec!["api.anthropic.com".into()],
+        }
+        .into_policy("web")
+        .unwrap();
+        cell.store(std::sync::Arc::new(enforcing));
+        assert!(cell.load().enforces(), "swapped-in RegoPolicy enforces");
     }
 
     /// A crashed accept thread (finished slot) is rebound by the next
