@@ -257,6 +257,18 @@ impl EgressManager {
             .unwrap_or(false)
     }
 
+    /// Re-read `name`'s `policy.yaml` from disk and hot-swap it into the live
+    /// egress slot. Takes effect on new connections only (in-flight flows keep
+    /// their snapshot). No-op when `name` has no live slot — the file on disk is
+    /// already what the next start will read. The resolve (file I/O) happens
+    /// off-lock; only the `Arc` swap is under the slot lock.
+    pub fn reload_policy(&self, paths: &Paths, name: &str) {
+        let new = resolve_policy(&self.policy, paths, name);
+        if let Some(slot) = self.inner.lock().unwrap().get(name) {
+            slot.policy.store(new);
+        }
+    }
+
     /// Test hook: a slot whose accept thread is already finished (simulated
     /// crash), so `ensure_listening` exercises its rebind path.
     #[cfg(test)]
@@ -273,6 +285,15 @@ impl EgressManager {
                 policy: Arc::new(PolicyCell::new(Arc::clone(&self.policy))),
             },
         );
+    }
+
+    #[cfg(test)]
+    fn slot_enforces(&self, name: &str) -> Option<bool> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|s| s.policy.load().enforces())
     }
 }
 
@@ -370,6 +391,36 @@ mod tests {
         .unwrap();
         cell.store(std::sync::Arc::new(enforcing));
         assert!(cell.load().enforces(), "swapped-in RegoPolicy enforces");
+    }
+
+    #[test]
+    fn reload_policy_swaps_a_live_slot() {
+        let (_tmp, paths) = test_paths();
+        let mgr = mgr(); // default policy is the bare AllowAll
+        mgr.insert_for_test("web");
+        assert_eq!(mgr.slot_enforces("web"), Some(false), "starts bare");
+
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        std::fs::write(
+            EgressPolicyConfig::path_in(&paths.sandbox_dir("web")),
+            "allow:\n  - api.anthropic.com\n",
+        )
+        .unwrap();
+        mgr.reload_policy(&paths, "web");
+
+        assert_eq!(
+            mgr.slot_enforces("web"),
+            Some(true),
+            "after reload the slot enforces the written allow-list"
+        );
+    }
+
+    #[test]
+    fn reload_policy_unknown_sandbox_is_a_noop() {
+        let (_tmp, paths) = test_paths();
+        let mgr = mgr();
+        mgr.reload_policy(&paths, "ghost"); // must not panic
+        assert_eq!(mgr.slot_enforces("ghost"), None);
     }
 
     /// A crashed accept thread (finished slot) is rebound by the next
