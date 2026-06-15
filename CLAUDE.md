@@ -196,7 +196,25 @@ likewise unsandboxed.
    It prints the exact output dir `dist/local/<UTC-ts>-<sha>/`. **Record and
    report that exact path — never `dist/local/latest`**, which a parallel
    agent's build can repoint out from under you.
+   - **When built from a worktree, copy that dir into the MAIN checkout's
+     `dist/local/`** so the owner (who works in the main checkout) finds it where
+     they expect — a worktree's `dist/` is a separate working tree. Use a plain
+     copy, not a symlink (it must survive the worktree being removed):
+     `MAIN=$(git -C "$(git rev-parse --git-common-dir)/.." rev-parse --show-toplevel)`
+     then `mkdir -p "$MAIN/dist/local" && cp -a dist/local/<ts>-<sha> "$MAIN/dist/local/"`.
+     The copy lands outside the worktree sandbox, so run it unsandboxed. Report
+     the main-checkout path as the canonical one.
 3. When **all** CI checks are green, report to the owner: a concise summary of
-   the work completed; pointers to the local artifacts for manual testing (the
-   exact `dist/local/<ts>-<sha>/` installer + `.deb`s); and the PR link to
-   review.
+   the work completed; the PR link to review; and pointers to the local
+   artifacts for manual testing — the exact main-checkout `dist/local/<ts>-<sha>/`
+   path **plus ready-to-paste install commands**:
+   - Linux CLI/daemon: `sudo dpkg -i <dir>/izba_*.deb` (and the app:
+     `sudo dpkg -i <dir>/izba-app_*.deb`).
+   - Windows installer via WSL interop — the Inno installer runs the
+     `\\wsl.localhost\…` UNC path fine, BUT the zsh→`powershell.exe` hop eats
+     backslashes, so DOUBLE every backslash of the `wslpath -w` output (its
+     leading `\\` becomes `\\\\`):
+     `powershell.exe -NoProfile -Command "Start-Process -Wait '\\\\wsl.localhost\\<distro>\\<abs\\path>\\izba-setup-*.exe'"`.
+     If it still rejects the UNC path, copy the `.exe` to a Windows-local dir
+     (`cp <dir>/izba-setup-*.exe /mnt/c/Users/<user>/Downloads/`) and
+     `Start-Process` that path instead.
