@@ -68,6 +68,9 @@ impl PolicyCell {
 struct EgressSlot {
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+    /// The sandbox's live policy, swappable by `reload_policy`. Shared with the
+    /// accept thread, which reads it per connection.
+    policy: Arc<PolicyCell>,
 }
 
 /// Resolve a sandbox's egress policy from its `--policy` file: an enforcing
@@ -179,6 +182,8 @@ impl EgressManager {
         // bare default (AllowAll). The Arc travels into the MITM runtime per
         // flow, so the shared runtime serves every sandbox's own allow-list.
         let policy = resolve_policy(&self.policy, paths, name);
+        let cell = Arc::new(PolicyCell::new(policy));
+        let cell_for_thread = Arc::clone(&cell);
         let resolver = Arc::clone(&self.resolver);
         let mitm = self.mitm.clone();
         let audit = self.audit.clone();
@@ -191,7 +196,7 @@ impl EgressManager {
                         if conn.set_nonblocking(false).is_err() {
                             continue;
                         }
-                        let policy = Arc::clone(&policy);
+                        let policy = cell_for_thread.load();
                         let resolver = Arc::clone(&resolver);
                         let mitm = mitm.clone();
                         let audit = audit.clone();
@@ -219,7 +224,14 @@ impl EgressManager {
                 }
             }
         });
-        inner.insert(name.to_string(), EgressSlot { stop, thread });
+        inner.insert(
+            name.to_string(),
+            EgressSlot {
+                stop,
+                thread,
+                policy: cell,
+            },
+        );
         Ok(())
     }
 
@@ -258,6 +270,7 @@ impl EgressManager {
             EgressSlot {
                 stop: Arc::new(AtomicBool::new(false)),
                 thread,
+                policy: Arc::new(PolicyCell::new(Arc::clone(&self.policy))),
             },
         );
     }
