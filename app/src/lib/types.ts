@@ -57,3 +57,28 @@ export interface ShellOutputPayload {
 export interface ShellExitPayload {
   id: string;
 }
+
+export type Tier = "l7" | "l3";
+export type Verdict = "allow" | "deny";
+
+export interface EndpointSummary {
+  host: string | null;
+  dest_ip: string;
+  port: number;
+  tier: Tier;
+  verdict: Verdict;
+  allow_count: number;
+  deny_count: number;
+  first_seen_ms: number;
+  last_seen_ms: number;
+  last_method: string | null;
+  last_path: string | null;
+}
+
+/** Untagged on the Rust side: a bare host is a string, a scoped host an object. */
+export type AllowEntry = string | { host: string; ports: number[] };
+
+export interface PolicyView {
+  enforcing: boolean;
+  allow: AllowEntry[];
+}

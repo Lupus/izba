@@ -3,6 +3,7 @@ import type { SandboxView } from "../lib/types";
 import { StatusDot } from "./StatusDot";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LogsView } from "./LogsView";
+import { NetlogView } from "./NetlogView";
 import { ShellPanel } from "./ShellPanel";
 import { api } from "../lib/ipc";
 
@@ -12,7 +13,7 @@ interface Props {
 }
 
 type Pending = { kind: "stop" | "remove"; name: string } | null;
-type Tab = "overview" | "logs" | "shell";
+type Tab = "overview" | "logs" | "netlog" | "shell";
 
 export function Detail({ sandbox, onChanged }: Props) {
   const [busy, setBusy] = useState(false);
@@ -50,6 +51,7 @@ export function Detail({ sandbox, onChanged }: Props) {
   const tabs: { id: Tab; label: string }[] = [
     { id: "overview", label: "Overview" },
     { id: "logs", label: "Logs" },
+    { id: "netlog", label: "Netlog" },
     { id: "shell", label: "Shell" },
   ];
 
@@ -130,6 +132,8 @@ export function Detail({ sandbox, onChanged }: Props) {
         )}
 
         {tab === "logs" && <LogsView name={name} />}
+
+        {tab === "netlog" && <NetlogView name={name} />}
 
         {tab === "shell" &&
           (running ? (
