@@ -34,3 +34,32 @@ pub struct VmSpec {
 pub struct CommandSpec {
     pub argv: Vec<String>,
 }
+
+/// Both VMM backends format host paths into comma-delimited device-option
+/// grammar — cloud-hypervisor's `--disk path=<p>,readonly=on` /
+/// `--fs tag=...,socket=<p>` and openvmm's `--virtio-blk file:<p>,ro,...` /
+/// `--virtio-fs pcie_port=...,<p>`. A comma embedded in a disk or workspace
+/// path would silently split into bogus extra options (option-injection /
+/// misconfiguration; not shell injection — argv is passed directly). Reject
+/// such paths early with a clear error, before any invocation is built.
+pub fn reject_commas(spec: &VmSpec) -> anyhow::Result<()> {
+    for disk in &spec.disks {
+        if disk.path.display().to_string().contains(',') {
+            anyhow::bail!(
+                "disk path {} contains a comma, which the VMM device-option \
+                 syntax cannot carry — move the izba data root to a comma-free path",
+                disk.path.display()
+            );
+        }
+    }
+    for share in &spec.shares {
+        if share.host_path.display().to_string().contains(',') {
+            anyhow::bail!(
+                "workspace path {} contains a comma, which the VMM device-option \
+                 syntax cannot carry — use a comma-free workspace directory",
+                share.host_path.display()
+            );
+        }
+    }
+    Ok(())
+}
