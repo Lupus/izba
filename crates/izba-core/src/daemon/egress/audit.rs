@@ -200,13 +200,20 @@ pub fn parse_line(line: &str) -> Option<AuditRecord> {
     serde_json::from_str(line.trim()).ok()
 }
 
+/// Format an epoch-millis timestamp as `%Y-%m-%d %H:%M:%S` (UTC), falling
+/// back to the raw number if it is out of range. Shared by `format_record`
+/// and the CLI's `--summary` view so both render dates identically.
+pub fn format_ts_ms(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| ms.to_string())
+}
+
 /// Render one record as a human-readable `izba netlog` line:
 /// `<utc>  ALLOW/DENY l7  sandbox  host|ip:port  [METHOD path]  (rule)`.
 /// Pure: the timestamp comes from the record, so this is deterministic.
 pub fn format_record(rec: &AuditRecord) -> String {
-    let ts = chrono::DateTime::from_timestamp_millis(rec.ts_ms as i64)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| rec.ts_ms.to_string());
+    let ts = format_ts_ms(rec.ts_ms);
     let verdict = match rec.verdict {
         Verdict::Allow => "ALLOW",
         Verdict::Deny => "DENY ",
