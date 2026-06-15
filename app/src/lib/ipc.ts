@@ -19,7 +19,7 @@ export const api = {
   remove: (name: string, force: boolean) => invoke<void>("remove", { name, force }),
   create: (opts: CreateOpts) => invoke<string>("create", { opts }),
   readLogs: (name: string) => invoke<string>("read_logs", { name }),
-  shellOpen: (name: string) => invoke<string>("shell_open", { name }), // returns session id
+  shellOpen: (name: string, id: string) => invoke<void>("shell_open", { name, id }),
   shellWrite: (id: string, data: string) => invoke<void>("shell_write", { id, data }),
   shellResize: (id: string, cols: number, rows: number) =>
     invoke<void>("shell_resize", { id, cols, rows }),

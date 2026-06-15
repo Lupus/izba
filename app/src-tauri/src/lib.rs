@@ -5,7 +5,6 @@ mod fake;
 mod views;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -26,7 +25,6 @@ pub struct AppState {
     pub make_daemon: Arc<dyn Fn() -> Box<dyn DaemonApi> + Send + Sync>,
     /// Live interactive shells, keyed by session id now.
     pub shells: Mutex<HashMap<String, ShellHandle>>,
-    pub shell_seq: AtomicU64,
 }
 
 /// Look up a live shell, cloning the per-session handle so the map lock is
@@ -141,8 +139,19 @@ async fn shell_open(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     name: String,
-) -> Result<String, String> {
-    let id = format!("sh-{}", state.shell_seq.fetch_add(1, Ordering::Relaxed));
+    id: String,
+) -> Result<(), String> {
+    // The frontend mints the id (subscribes to its events BEFORE this call so
+    // no early output is lost). Reject a clash so we never clobber a live session.
+    {
+        let shells = state
+            .shells
+            .lock()
+            .map_err(|e| format!("state poisoned: {e}"))?;
+        if shells.contains_key(&id) {
+            return Err("shell id already in use".to_string());
+        }
+    }
     let make = state.make_daemon.clone();
     let out_app = app.clone();
     let out_id = id.clone();
@@ -174,8 +183,8 @@ async fn shell_open(
         .shells
         .lock()
         .map_err(|e| format!("state poisoned: {e}"))?
-        .insert(id.clone(), Arc::new(Mutex::new(session)));
-    Ok(id)
+        .insert(id, Arc::new(Mutex::new(session)));
+    Ok(())
 }
 
 #[tauri::command]
@@ -218,7 +227,6 @@ pub fn run() {
         daemon: Mutex::new(Box::new(RealDaemon::new())),
         make_daemon: Arc::new(|| Box::new(RealDaemon::new())),
         shells: Mutex::new(HashMap::new()),
-        shell_seq: AtomicU64::new(0),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

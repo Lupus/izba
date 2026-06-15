@@ -14,10 +14,9 @@ vi.mock("@xterm/xterm", () => ({ Terminal: vi.fn(() => term) }));
 vi.mock("@xterm/xterm/css/xterm.css", () => ({}));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: vi.fn(() => ({ fit: vi.fn() })) }));
 
-let nextId = 0;
 vi.mock("../lib/ipc", () => ({
   api: {
-    shellOpen: vi.fn(() => Promise.resolve(`sh-${nextId++}`)),
+    shellOpen: vi.fn().mockResolvedValue(undefined),
     shellWrite: vi.fn().mockResolvedValue(undefined),
     shellResize: vi.fn().mockResolvedValue(undefined),
     shellClose: vi.fn().mockResolvedValue(undefined),
@@ -27,11 +26,10 @@ vi.mock("../lib/ipc", () => ({
 }));
 
 import { shellStore } from "../lib/shellStore";
-import { api } from "../lib/ipc";
+import { api, onShellOutput, onShellExit } from "../lib/ipc";
 
 describe("shellStore", () => {
   beforeEach(() => {
-    nextId = 0;
     vi.clearAllMocks();
   });
 
@@ -42,12 +40,20 @@ describe("shellStore", () => {
     }
   });
 
-  it("open pushes a session, calls api.shellOpen, and assigns the returned id", async () => {
-    await shellStore.open("web");
-    expect(api.shellOpen).toHaveBeenCalledWith("web");
+  it("open mints a client id, subscribes BEFORE opening, then calls api.shellOpen", async () => {
+    const id = await shellStore.open("web");
+    // Client-minted, deterministic counter id; passed to the backend.
+    expect(id).toMatch(/^sh-\d+$/);
+    expect(api.shellOpen).toHaveBeenCalledWith("web", id);
+    // Subscriptions are wired to the id before the backend open.
+    expect(onShellOutput).toHaveBeenCalledWith(id, expect.any(Function));
+    expect(onShellExit).toHaveBeenCalledWith(id, expect.any(Function));
+    const onOutOrder = (onShellOutput as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const openOrder = (api.shellOpen as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    expect(onOutOrder).toBeLessThan(openOrder);
     const got = shellStore.forSandbox("web");
     expect(got).toHaveLength(1);
-    expect(got[0].id).toBe("sh-0");
+    expect(got[0].id).toBe(id);
   });
 
   it("forSandbox returns only that sandbox's sessions", async () => {
