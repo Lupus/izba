@@ -478,9 +478,17 @@ IZBA_PROFILE = { value = "release", force = true }
 EOF
 
     # --- Build izba.exe (MSVC). ---
+    # Git attribution for the git-less copy is delivered two ways, because in the
+    # PERSISTENT per-worktree build dir neither alone is reliable:
+    #   1. PROCESS env (\$env:VERGEN_*) — build scripts inherit it (the cargo
+    #      [env] table does NOT reliably reach build-script execution);
+    #   2. drop izba-core's .fingerprint + build-script output dir so vergen's
+    #      build script RE-RUNS and re-emits the current sha (cargo otherwise
+    #      replays the cached `rustc-env=VERGEN_GIT_SHA=<old>`, which wins over
+    #      the [env] table → a STALE sha). The gate below enforces correctness.
     log "cargo build --release -p izba-cli (Windows)..."
     powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \
-        "Set-Location '$WIN_BUILD_WIN'; cargo build --release -p izba-cli; exit \$LASTEXITCODE" \
+        "Set-Location '$WIN_BUILD_WIN'; Remove-Item -Recurse -Force target\\release\\.fingerprint\\izba-core-*,target\\release\\build\\izba-core-* -ErrorAction SilentlyContinue; \$env:VERGEN_GIT_SHA='$SHA'; \$env:VERGEN_GIT_DESCRIBE='$DESCRIBE'; \$env:VERGEN_GIT_COMMIT_DATE='$CDATE'; \$env:IZBA_PROFILE='release'; cargo build --release -p izba-cli; exit \$LASTEXITCODE" \
         || die "Windows cargo build of izba-cli failed"
     WIN_IZBA_WSL="$WIN_BUILD_WSL/target/release/izba.exe"
     [ -f "$WIN_IZBA_WSL" ] || die "izba.exe not found at $WIN_IZBA_WSL"
@@ -500,8 +508,11 @@ EOF
     WIN_APP_WSL=""
     if [ "$DO_GUI" -eq 1 ]; then
         log "izba-app.exe: npm ci + tauri build --no-bundle (Windows)..."
+        # Same stale-attribution guard for the app workspace (separate target):
+        # process env + drop izba-core + izba-app fingerprints/build-script output
+        # so the About panel shows the current sha, not a prior run's.
         powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \
-            "Set-Location '$WIN_BUILD_WIN\\app'; npm ci; if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }; npm run tauri -- build --no-bundle; exit \$LASTEXITCODE" \
+            "Set-Location '$WIN_BUILD_WIN\\app'; Remove-Item -Recurse -Force src-tauri\\target\\release\\.fingerprint\\izba-core-*,src-tauri\\target\\release\\build\\izba-core-*,src-tauri\\target\\release\\.fingerprint\\izba-app-*,src-tauri\\target\\release\\build\\izba-app-* -ErrorAction SilentlyContinue; \$env:VERGEN_GIT_SHA='$SHA'; \$env:VERGEN_GIT_DESCRIBE='$DESCRIBE'; \$env:VERGEN_GIT_COMMIT_DATE='$CDATE'; \$env:IZBA_PROFILE='release'; npm ci; if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }; npm run tauri -- build --no-bundle; exit \$LASTEXITCODE" \
             || die "Windows izba-app.exe build failed"
         WIN_APP_WSL="$WIN_BUILD_WSL/app/src-tauri/target/release/izba-app.exe"
         [ -f "$WIN_APP_WSL" ] || die "izba-app.exe not found at $WIN_APP_WSL"
