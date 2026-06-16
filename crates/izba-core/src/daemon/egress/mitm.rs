@@ -336,27 +336,9 @@ pub fn upstream_client_config_webpki() -> Arc<ClientConfig> {
     upstream_client_config(roots)
 }
 
-/// Re-originate TLS to the verified upstream over a generic stream.
-/// ADAPTED from OpenShell `tls_connect_upstream` — the only change is the
-/// stream type: `impl AsyncRead+AsyncWrite+Unpin` instead of `TcpStream`, so
-/// izbad can dial the upstream through whatever transport it likes.
-pub async fn tls_connect_upstream<S>(
-    upstream: S,
-    hostname: &str,
-    client_config: &Arc<ClientConfig>,
-) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let connector = TlsConnector::from(Arc::clone(client_config));
-    let server_name = ServerName::try_from(hostname.to_string())
-        .map_err(|e| anyhow!("invalid upstream server name {hostname:?}: {e}"))?;
-    let tls = connector
-        .connect(server_name, upstream)
-        .await
-        .context("upstream TLS handshake")?;
-    Ok(tls)
-}
+// The re-originating TLS connect (formerly OpenShell's `tls_connect_upstream`)
+// now lives inline in `ConnCtx::dial_upstream`, which also handles the cleartext
+// `:80` upstream leg and the HTTP/1.1 client handshake.
 
 // ============================================================================
 // The MITM orchestrator  (IZBA — a real hyper-util HTTP datapath)
@@ -375,37 +357,56 @@ pub struct MitmState {
 /// (`Full<Bytes>`) and the proxied upstream body (`Incoming`).
 type SvcBody = BoxBody<Bytes, anyhow::Error>;
 
-/// A re-originated upstream HTTP connection, picked by the upstream's negotiated
-/// ALPN. One per guest connection, reused across keep-alive (the SNI==Host check
-/// pins the whole guest connection to a single Host).
-enum UpstreamSender {
-    H1(hyper::client::conn::http1::SendRequest<Incoming>),
-    H2(hyper::client::conn::http2::SendRequest<Incoming>),
-}
+/// A re-originated upstream HTTP/1.1 connection. One per guest connection, reused
+/// across keep-alive (the SNI==Host check pins the whole guest connection to a
+/// single Host).
+///
+/// The upstream leg is HTTP/1.1 ONLY: `upstream_client_config*` advertise ALPN
+/// `["http/1.1"]`, so the upstream never negotiates h2. A guest speaking h2 is
+/// bridged h2→h1 transparently by hyper at the Request/Response layer (proven by
+/// `h2_client_path_is_policy_checked`), so we deliberately keep no untested h2
+/// upstream edge here.
+struct UpstreamSender(hyper::client::conn::http1::SendRequest<Incoming>);
 
 impl UpstreamSender {
     async fn send(&mut self, req: Request<Incoming>) -> Result<Response<Incoming>, hyper::Error> {
-        match self {
-            UpstreamSender::H1(s) => s.send_request(req).await,
-            UpstreamSender::H2(s) => s.send_request(req).await,
-        }
+        self.0.send_request(req).await
     }
+}
+
+/// Normalize a host string: strip a port, strip a trailing dot, lowercase.
+fn normalize_host(h: &str) -> String {
+    h.split(':')
+        .next()
+        .unwrap_or(h)
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+/// The normalized host from the URI authority (h2 `:authority` / absolute-form
+/// h1), if the request carries one. `None` for origin-form requests.
+fn uri_authority_host<B>(req: &Request<B>) -> Option<String> {
+    req.uri().host().map(normalize_host)
+}
+
+/// The normalized host from the single `Host` header, if present. Callers must
+/// have already rejected requests carrying more than one `Host` header.
+fn header_host<B>(req: &Request<B>) -> Option<String> {
+    req.headers()
+        .get(hyper::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(normalize_host)
 }
 
 /// Normalize the request's target Host: prefer the URI authority host (h2
 /// `:authority` / absolute-form h1), else the `Host` header; strip a port + a
-/// trailing dot, lowercase. `None` when neither carries a host.
+/// trailing dot, lowercase. `None` when neither carries a host. Production
+/// `handle_request` consults `uri_authority_host` / `header_host` separately (to
+/// catch authority/Host confusion); this combined form backs the normalization
+/// unit test.
+#[cfg(test)]
 fn req_host<B>(req: &Request<B>) -> Option<String> {
-    req.uri()
-        .host()
-        .map(str::to_string)
-        .or_else(|| {
-            req.headers()
-                .get(hyper::header::HOST)
-                .and_then(|h| h.to_str().ok())
-                .map(|h| h.split(':').next().unwrap_or(h).to_string())
-        })
-        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+    uri_authority_host(req).or_else(|| header_host(req))
 }
 
 /// A synthesized fail-closed response (403, `Connection: close`).
@@ -471,6 +472,18 @@ impl ConnCtx {
         let tcp = tokio::net::TcpStream::connect((self.orig.ip, self.orig.port))
             .await
             .with_context(|| format!("dial upstream {}:{}", self.orig.ip, self.orig.port))?;
+
+        // Cleartext ingress (`:80`, no captured SNI) re-originates as plaintext
+        // HTTP — policy is still enforced per request above; we simply do not
+        // wrap the upstream leg in TLS (a `:80` upstream has no TLS to speak).
+        // HTTPS ingress (`:443`, SNI captured) re-originates over TLS, verifying
+        // the upstream cert against the vetted `host` (webpki). Either way the
+        // upstream leg is HTTP/1.1 (ALPN is http/1.1-only).
+        if self.client_sni.is_none() && self.orig.port != 443 {
+            let io = TokioIo::new(tcp);
+            return Self::h1_sender(io).await;
+        }
+
         let connector = TlsConnector::from(Arc::clone(&self.upstream_cfg));
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|e| anyhow!("invalid upstream server name {host:?}: {e}"))?;
@@ -478,21 +491,21 @@ impl ConnCtx {
             .connect(server_name, tcp)
             .await
             .context("upstream TLS handshake")?;
-        let alpn_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
-        let io = TokioIo::new(tls);
-        if alpn_h2 {
-            let (sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-                .await
-                .context("upstream h2 handshake")?;
-            tokio::spawn(conn);
-            Ok(UpstreamSender::H2(sender))
-        } else {
-            let (sender, conn) = hyper::client::conn::http1::handshake(io)
-                .await
-                .context("upstream h1 handshake")?;
-            tokio::spawn(conn.with_upgrades());
-            Ok(UpstreamSender::H1(sender))
-        }
+        Self::h1_sender(TokioIo::new(tls)).await
+    }
+
+    /// Drive an HTTP/1.1 client handshake over an already-established (TLS or
+    /// plaintext) upstream stream and spawn its connection task (with upgrades,
+    /// for WebSocket bridging).
+    async fn h1_sender<I>(io: I) -> Result<UpstreamSender>
+    where
+        I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    {
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .context("upstream h1 handshake")?;
+        tokio::spawn(conn.with_upgrades());
+        Ok(UpstreamSender(sender))
     }
 }
 
@@ -504,7 +517,10 @@ impl ConnCtx {
 /// `client_io` is the already-TLS-terminated guest stream (or the raw cleartext
 /// stream on :80, `sni = None`). `policy` is the audited per-request decision
 /// seam ([`MitmPolicy`] / `PolicyAdapter`). `orig` carries the dial target +
-/// sandbox the L7 view lacks.
+/// sandbox the L7 view lacks. The upstream leg mirrors the ingress: TLS
+/// re-origination (verified against the vetted Host) for HTTPS `:443`, and a
+/// plaintext HTTP/1.1 dial for cleartext `:80` (`sni = None`, `orig.port != 443`)
+/// — policy + the confused-deputy Host rewrite still run per request either way.
 ///
 /// Fails closed for everything it cannot inspect: non-HTTP after TLS makes
 /// hyper error on the preface; we audit + drop, never blind-tunnel.
@@ -545,9 +561,52 @@ where
 async fn handle_request(
     ctx: Arc<ConnCtx>,
     policy: Arc<dyn MitmPolicy>,
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
 ) -> Result<Response<SvcBody>, anyhow::Error> {
-    let host = match req_host(&req) {
+    // Confused-deputy guard (Host vs SNI vs upstream wire Host). The vetted host
+    // that passes policy + SNI==Host + cert verification MUST be the one the
+    // upstream receives. hyper's h1 client forwards request headers verbatim and
+    // does not synthesize/rewrite Host, so a hostile guest could otherwise vet
+    // host A (URI authority / first Host header) while the upstream is sent
+    // `Host: B`. We reject ambiguous/contradictory targets, then rewrite the
+    // outgoing request so its single Host header is exactly the vetted host.
+    let audit_l7 = |req: &Request<Incoming>, host: &str| L7Request {
+        host: host.to_string(),
+        method: req.method().to_string(),
+        path: req.uri().path().to_string(),
+    };
+
+    // 1. More than one `Host` header is inherently ambiguous — fail closed.
+    if req.headers().get_all(hyper::header::HOST).iter().count() > 1 {
+        // Best-effort host for the audit record (authority, else first header).
+        let h = uri_authority_host(&req)
+            .or_else(|| {
+                req.headers()
+                    .get(hyper::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(normalize_host)
+            })
+            .unwrap_or_default();
+        policy.record_deny(&audit_l7(&req, &h), "ambiguous-host");
+        return Ok(forbidden(
+            "403 Forbidden by izba egress policy: ambiguous Host\n",
+        ));
+    }
+
+    // 2. If both the URI authority and the `Host` header carry a host and they
+    //    disagree, the request is a confused deputy — fail closed.
+    let authority_host = uri_authority_host(&req);
+    let hdr_host = header_host(&req);
+    if let (Some(a), Some(h)) = (&authority_host, &hdr_host) {
+        if a != h {
+            policy.record_deny(&audit_l7(&req, a), "authority-host-mismatch");
+            return Ok(forbidden(
+                "403 Forbidden by izba egress policy: authority/Host mismatch\n",
+            ));
+        }
+    }
+
+    let host = match authority_host.or(hdr_host) {
         Some(h) => h,
         // No Host at all: nothing to bind SNI to or policy-check — fail closed.
         None => {
@@ -586,6 +645,13 @@ async fn handle_request(
         return Ok(forbidden(body));
     }
 
+    // Pin the wire identity to the vetted host: rewrite the outgoing request so
+    // its single `Host` header is exactly `host`, and (for absolute-form / h2
+    // requests) re-anchor the URI to origin-form so hyper's h1 client encoder
+    // emits a clean origin-form request line carrying that Host — never a
+    // smuggled second value. This is what makes SNI==Host==upstream-wire-Host.
+    rewrite_outgoing_host(&mut req, &host)?;
+
     if is_websocket_upgrade(&req) {
         return bridge_websocket(ctx, host, req).await;
     }
@@ -593,6 +659,35 @@ async fn handle_request(
     // Allow: forward upstream over the (lazily-established, reused) connection.
     let resp = ctx.upstream_send(&host, req).await?;
     Ok(resp.map(|b| b.map_err(anyhow::Error::from).boxed()))
+}
+
+/// Re-anchor an allowed request to the single vetted `host` before it leaves for
+/// the upstream: collapse the `Host` header to exactly `host` (dropping any
+/// extras) and rewrite an absolute-form / h2 URI down to origin-form (path +
+/// query only). After this, hyper's h1 client encoder cannot emit any Host but
+/// the vetted one. h2 carries `:authority`; we re-set it to `host` too so the
+/// h2 upstream leg is equally pinned.
+fn rewrite_outgoing_host<B>(req: &mut Request<B>, host: &str) -> Result<()> {
+    // Collapse the Host header to the single vetted value.
+    let host_value = hyper::header::HeaderValue::from_str(host)
+        .map_err(|e| anyhow!("vetted host {host:?} is not a valid header value: {e}"))?;
+    req.headers_mut().insert(hyper::header::HOST, host_value);
+
+    // If the URI carries an authority (absolute-form h1 / h2 `:authority`),
+    // rebuild it as origin-form so the request line stops carrying its own host.
+    if req.uri().authority().is_some() {
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| hyper::http::uri::PathAndQuery::from_static("/"));
+        let origin_form = hyper::Uri::builder()
+            .path_and_query(path_and_query)
+            .build()
+            .context("rebuild origin-form URI")?;
+        *req.uri_mut() = origin_form;
+    }
+    Ok(())
 }
 
 /// Bridge an HTTP/1.1 WebSocket upgrade: forward the upgrade request upstream;
@@ -645,7 +740,7 @@ async fn bridge_websocket(
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use http_body_util::BodyExt;
     use hyper::body::Incoming;
@@ -767,6 +862,120 @@ mod tests {
             port: addr.port(),
             sandbox: "web".into(),
         }
+    }
+
+    /// A responder that records the inbound `Host` header (one per request) into
+    /// `seen` and answers 200 with `body`. Lets a test assert the EXACT Host the
+    /// upstream received — the confused-deputy invariant (SNI==Host==wire-Host).
+    fn host_recording_responder(
+        seen: Arc<Mutex<Vec<String>>>,
+        body: &'static str,
+    ) -> impl Fn(Request<Incoming>) -> BoxFut<Full<Bytes>> + Send + Sync + Clone + 'static {
+        move |req: Request<Incoming>| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                let host = req
+                    .headers()
+                    .get(hyper::header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or("<none>")
+                    .to_string();
+                seen.lock().unwrap().push(host);
+                Ok(Response::new(Full::new(Bytes::from_static(
+                    body.as_bytes(),
+                ))))
+            }) as BoxFut<Full<Bytes>>
+        }
+    }
+
+    /// Like `spawn_https_upstream` but also counts every TCP `accept()` into
+    /// `accepts`, so a test can prove keep-alive reuses ONE upstream connection.
+    async fn spawn_counting_https_upstream<S, B>(
+        host: &'static str,
+        accepts: Arc<AtomicUsize>,
+        service: S,
+    ) -> (CertificateDer<'static>, SocketAddr)
+    where
+        S: Fn(Request<Incoming>) -> BoxFut<B> + Send + Sync + Clone + 'static,
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let up_ca = IzbaCa::generate().unwrap();
+        let up_ca_der = up_ca.cert_der();
+        let cache = CertCache::new(up_ca);
+        let acceptor = cache.acceptor_for(host).unwrap();
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind counting upstream listener");
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                accepts.fetch_add(1, Ordering::SeqCst);
+                let acceptor = acceptor.clone();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    let tls = match acceptor.accept(tcp).await {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
+                    let svc = service_fn(move |req| (service.clone())(req));
+                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(TokioIo::new(tls), svc)
+                        .await;
+                });
+            }
+        });
+
+        (up_ca_der, addr)
+    }
+
+    /// A loopback TCP listener that records each accepted connection's `Host`
+    /// header (best-effort, from the first read) and counts accepts. Used as a
+    /// PLAINTEXT upstream for the `:80` cleartext path, and as a real
+    /// no-dial observer (assert the count stays 0).
+    async fn spawn_plaintext_observer(
+        accepts: Arc<AtomicUsize>,
+        seen_host: Arc<Mutex<Vec<String>>>,
+    ) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind plaintext observer");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut tcp, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                accepts.fetch_add(1, Ordering::SeqCst);
+                let seen_host = Arc::clone(&seen_host);
+                tokio::spawn(async move {
+                    // Read the request head, extract Host, answer a minimal 200.
+                    let mut buf = vec![0u8; 4096];
+                    if let Ok(n) = tcp.read(&mut buf).await {
+                        let head = String::from_utf8_lossy(&buf[..n]);
+                        if let Some(h) = head.lines().find_map(|l| {
+                            l.strip_prefix("Host:").or_else(|| l.strip_prefix("host:"))
+                        }) {
+                            seen_host.lock().unwrap().push(h.trim().to_string());
+                        }
+                    }
+                    let _ = tcp
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nPLAIN-PONG",
+                        )
+                        .await;
+                    let _ = tcp.flush().await;
+                });
+            }
+        });
+        addr
     }
 
     /// Accept the guest TLS (capturing SNI) and run serve_mitm on it.
@@ -966,14 +1175,19 @@ mod tests {
         let host = "api.anthropic.com";
         let (ca_der, state, _g) = test_ca_and_state();
 
-        let dialed = Arc::new(AtomicBool::new(false));
-        let unused: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // Real no-dial observer: point orig_dst at a loopback listener we own and
+        // assert it never accepts a connection (the old AtomicBool was never
+        // wired into the datapath, so `assert!(!dialed)` was vacuous).
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let obs_addr = spawn_plaintext_observer(Arc::clone(&accepts), Arc::clone(&seen)).await;
+
         let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
             allowed: vec![host.to_string()],
         });
 
         let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
-        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(unused));
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(obs_addr));
 
         let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
         let mut guest = connector
@@ -989,10 +1203,382 @@ mod tests {
 
         let res = tokio::time::timeout(std::time::Duration::from_secs(5), mitm).await;
         assert!(res.is_ok(), "serve_mitm hung on non-HTTP input");
-        assert!(
-            !dialed.load(Ordering::SeqCst),
-            "upstream must not be dialed"
+        // Give any (erroneous) dial a beat to land before asserting it didn't.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            0,
+            "non-HTTP after TLS must NOT dial upstream"
         );
+    }
+
+    // ---- confused-deputy: SNI==Host==upstream-wire-Host (MUST-FIX 1) --------
+
+    /// A policy that allows a fixed host AND records every `record_deny` rule,
+    /// so a test can assert the EXACT fail-closed reason (e.g. "ambiguous-host").
+    struct RecordingPolicy {
+        allowed: String,
+        denies: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl MitmPolicy for RecordingPolicy {
+        fn check(&self, req: &L7Request) -> L7Verdict {
+            if req.host == self.allowed {
+                L7Verdict::Allow
+            } else {
+                L7Verdict::Deny("403 Forbidden by izba egress policy\n")
+            }
+        }
+        fn record_deny(&self, _req: &L7Request, rule: &'static str) {
+            self.denies.lock().unwrap().push(rule);
+        }
+    }
+
+    /// A guest that handshakes SNI=allowed and sends absolute-form
+    /// `GET http://allowed/ ...` but `Host: blocked` must 403 BEFORE any upstream
+    /// dial, audited "authority-host-mismatch". The upstream wire-Host can never
+    /// disagree with the vetted host.
+    #[tokio::test]
+    async fn absolute_form_authority_host_mismatch_denied() {
+        install_ring();
+        let host = "allowed.example.com";
+        let (ca_der, state, _g) = test_ca_and_state();
+
+        // Real no-dial observer.
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let obs_addr = spawn_plaintext_observer(Arc::clone(&accepts), Arc::clone(&seen)).await;
+
+        let denies = Arc::new(Mutex::new(Vec::new()));
+        let policy: Arc<dyn MitmPolicy> = Arc::new(RecordingPolicy {
+            allowed: host.to_string(),
+            denies: Arc::clone(&denies),
+        });
+
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(obs_addr));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake");
+        // Absolute-form request line carries authority=allowed; the Host header
+        // smuggles a different value.
+        guest
+            .write_all(
+                b"GET http://allowed.example.com/ HTTP/1.1\r\nHost: blocked.example.com\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+
+        let status = read_status_line(&mut guest).await;
+        assert!(
+            status.contains("403"),
+            "authority/Host mismatch -> 403: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 0, "must not dial upstream");
+        assert_eq!(
+            denies.lock().unwrap().as_slice(),
+            &["authority-host-mismatch"],
+            "must audit the confused-deputy deny"
+        );
+
+        drop(guest);
+        let _ = mitm.await;
+    }
+
+    /// Two `Host` headers are inherently ambiguous -> 403, audited
+    /// "ambiguous-host", no upstream dial.
+    #[tokio::test]
+    async fn duplicate_host_header_denied() {
+        install_ring();
+        let host = "allowed.example.com";
+        let (ca_der, state, _g) = test_ca_and_state();
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let obs_addr = spawn_plaintext_observer(Arc::clone(&accepts), Arc::clone(&seen)).await;
+
+        let denies = Arc::new(Mutex::new(Vec::new()));
+        let policy: Arc<dyn MitmPolicy> = Arc::new(RecordingPolicy {
+            allowed: host.to_string(),
+            denies: Arc::clone(&denies),
+        });
+
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(obs_addr));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake");
+        guest
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: allowed.example.com\r\nHost: blocked.example.com\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+
+        let status = read_status_line(&mut guest).await;
+        assert!(status.contains("403"), "duplicate Host -> 403: {status}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 0, "must not dial upstream");
+        assert_eq!(
+            denies.lock().unwrap().as_slice(),
+            &["ambiguous-host"],
+            "must audit the ambiguous-host deny"
+        );
+
+        drop(guest);
+        let _ = mitm.await;
+    }
+
+    /// Positive: a normal allowed request reaches the upstream carrying EXACTLY
+    /// the vetted Host (SNI==Host==upstream-wire-Host). Proves the outgoing
+    /// rewrite, not just the deny side.
+    #[tokio::test]
+    async fn allowed_request_forwards_with_vetted_host() {
+        install_ring();
+        let host = "api.anthropic.com";
+        let (ca_der, mut state, _g) = test_ca_and_state();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (up_ca_der, up_addr) =
+            spawn_https_upstream(host, host_recording_responder(Arc::clone(&seen), "OK")).await;
+        let mut up_roots = rustls::RootCertStore::empty();
+        up_roots.add(up_ca_der).unwrap();
+        state.upstream = upstream_client_config(up_roots);
+
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
+            allowed: vec![host.to_string()],
+        });
+
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(up_addr));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake");
+        // Send absolute-form with a redundant (matching) Host: hyper must emit a
+        // clean origin-form request line carrying exactly the vetted Host.
+        guest
+            .write_all(
+                b"GET http://api.anthropic.com/v1/x HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+        let mut got = Vec::new();
+        guest.read_to_end(&mut got).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&got).contains("200 OK"),
+            "allowed request must 200"
+        );
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["api.anthropic.com".to_string()],
+            "upstream must see EXACTLY the vetted Host"
+        );
+
+        drop(guest);
+        let _ = mitm.await;
+    }
+
+    /// An h1 request with neither absolute-form authority nor a Host header has
+    /// nothing to bind SNI to / policy-check -> 403 (the `req_host == None` arm).
+    #[tokio::test]
+    async fn missing_host_header_h1_denied() {
+        install_ring();
+        let host = "api.anthropic.com";
+        let (ca_der, state, _g) = test_ca_and_state();
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let obs_addr = spawn_plaintext_observer(Arc::clone(&accepts), Arc::clone(&seen)).await;
+
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
+            allowed: vec![host.to_string()],
+        });
+
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(obs_addr));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake");
+        // HTTP/1.0 origin-form with no Host header at all.
+        guest.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+        guest.flush().await.unwrap();
+        let status = read_status_line(&mut guest).await;
+        assert!(status.contains("403"), "missing Host -> 403: {status}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 0, "must not dial upstream");
+
+        drop(guest);
+        let _ = mitm.await;
+    }
+
+    // ---- cleartext :80 upstream is policy-checked + forwarded (SHOULD-FIX 5) -
+
+    #[tokio::test]
+    async fn cleartext_http_port80_is_policy_checked_and_forwarded() {
+        install_ring();
+        let host = "plain.example.com";
+        let (_ca_der, mut state, _g) = test_ca_and_state();
+        // Upstream config is irrelevant for the cleartext leg (no TLS), but keep
+        // a sane value.
+        state.upstream = upstream_client_config(rustls::RootCertStore::empty());
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let up_addr = spawn_plaintext_observer(Arc::clone(&accepts), Arc::clone(&seen)).await;
+
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
+            allowed: vec![host.to_string()],
+        });
+
+        // Cleartext ingress: no guest TLS, sni = None, orig.port != 443.
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let orig = OrigDst {
+            ip: up_addr.ip(),
+            port: up_addr.port(),
+            sandbox: "web".into(),
+        };
+        assert_ne!(orig.port, 443, "observer must not be on :443");
+        let mitm =
+            tokio::spawn(async move { serve_mitm(mitm_side, None, &state, policy, orig).await });
+
+        let mut guest = guest_side;
+        guest
+            .write_all(
+                b"GET /thing HTTP/1.1\r\nHost: plain.example.com\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+        let mut got = Vec::new();
+        guest.read_to_end(&mut got).await.unwrap();
+        let got = String::from_utf8_lossy(&got);
+        assert!(got.contains("200"), "cleartext :80 allowed -> 200: {got}");
+        assert!(got.contains("PLAIN-PONG"), "cleartext body relayed: {got}");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "exactly one plaintext dial"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["plain.example.com".to_string()],
+            "cleartext upstream must see the vetted Host"
+        );
+
+        let _ = mitm.await;
+    }
+
+    // ---- upstream handshake failure fails closed (SHOULD-FIX 6) -------------
+
+    /// The upstream presents a cert the upstream config does NOT trust. The TLS
+    /// re-origination must fail, so the guest gets no 200 (fails closed).
+    #[tokio::test]
+    async fn upstream_handshake_failure_fails_closed() {
+        install_ring();
+        let host = "api.anthropic.com";
+        let (ca_der, mut state, _g) = test_ca_and_state();
+
+        // Upstream is real HTTPS, but we DELIBERATELY leave state.upstream
+        // trusting an empty root store -> the upstream cert won't verify.
+        let (_up_ca_der, up_addr) =
+            spawn_https_upstream(host, ok_responder("SHOULD-NOT-SEE")).await;
+        state.upstream = upstream_client_config(rustls::RootCertStore::empty());
+
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
+            allowed: vec![host.to_string()],
+        });
+
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(up_addr));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake");
+        guest
+            .write_all(b"GET / HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+
+        let mut got = Vec::new();
+        let _ = guest.read_to_end(&mut got).await;
+        let got = String::from_utf8_lossy(&got);
+        assert!(
+            !got.contains("200 OK") && !got.contains("SHOULD-NOT-SEE"),
+            "untrusted upstream cert must fail closed, got: {got:?}"
+        );
+
+        drop(guest);
+        let _ = mitm.await;
+    }
+
+    // ---- keep-alive reuses ONE upstream connection (SHOULD-FIX 6) -----------
+
+    #[tokio::test]
+    async fn keepalive_reuses_one_upstream_connection() {
+        install_ring();
+        let host = "api.anthropic.com";
+        let (ca_der, mut state, _g) = test_ca_and_state();
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let (up_ca_der, up_addr) =
+            spawn_counting_https_upstream(host, Arc::clone(&accepts), ok_responder("PONG")).await;
+        let mut up_roots = rustls::RootCertStore::empty();
+        up_roots.add(up_ca_der).unwrap();
+        state.upstream = upstream_client_config(up_roots);
+
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
+            allowed: vec![host.to_string()],
+        });
+
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(up_addr));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake");
+
+        for path in ["/a", "/b"] {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n");
+            guest.write_all(req.as_bytes()).await.unwrap();
+            guest.flush().await.unwrap();
+            let status = read_status_line(&mut guest).await;
+            assert!(status.contains("200"), "req {path} status: {status}");
+            drain_response_headers(&mut guest).await;
+            let mut body = [0u8; 4];
+            guest.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"PONG");
+        }
+
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "two keep-alive requests must reuse ONE upstream connection"
+        );
+
+        drop(guest);
+        let _ = mitm.await;
     }
 
     // ---- WebSocket upgrade is policy-checked and bridged --------------------
