@@ -335,7 +335,10 @@ Consequences:
   (admin-provisioned, Hyper-V's `vmms` model) — documented residual, not in
   scope. What F-06 *does* buy on Windows is **host↔VMM** deprivilege: the VMM
   cannot write-up to the user's Medium-IL files outside its share, cannot gain
-  privilege, cannot spawn children, and is resource-bounded.
+  privilege, and is resource-bounded. (Child-process creation is **not** blocked
+  — see §6.3: OpenVMM forks a worker and the Windows child-block primitive is
+  all-or-nothing, so it is not applied; children merely inherit the deprivileged
+  token + Low IL.)
 - This matches the Codex precedent exactly (it also confines uncooperative target
   binaries with a single restricted token + job, no `LowerToken`).
 - **Optional future hardening:** a tiny izba-authored **launcher shim** (which we
@@ -378,7 +381,7 @@ on an immutable create-time property; leave only resource governance on the job:
 | Token (restricted SIDs, dropped privileges) | `CreateProcessAsUser` primary token | **Yes** (immutable) |
 | Integrity level (Low) | token, set before resume | **Yes** (immutable) |
 | Process mitigations (DEP/ASLR/CIG-off/win32k/extension-point…) | creation-time `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` | **Yes** (immutable) |
-| **Child-process blocking** | creation-time `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` — **not** the job's `ActiveProcessLimit` | **Yes** (immutable) |
+| **Child-process blocking** *(considered, NOT applied — §6.3)* | would be creation-time `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`, but it is all-or-nothing and would block OpenVMM's own worker, so it is **off**; children inherit the restricted token + Low IL instead | n/a (not applied) |
 | Shatter protection *(optional, §6.2.2)* | mostly **Low IL / UIPI**; optionally the alternate desktop (`STARTUPINFO.lpDesktop`, §5) — **not** the job's UI flags | **Yes** (immutable) |
 | Memory / CPU caps | job object | No — lapses if the job dies (see below) |
 
@@ -480,8 +483,9 @@ Extend the existing Windows validation harness (`hack/spike/validate-izba-window
    starts. Iterate the mitigation set until boot is green (expect CIG/ACG off).
 3. **Negative containment test** — from inside the confined VMM process context,
    assert a **write to a Medium-IL host file** outside the share is **denied**
-   (Low IL no-write-up), the process **cannot spawn** a disallowed child, and the
-   token query shows restricted + Low IL.
+   (Low IL no-write-up), and the token query shows restricted + Low IL.
+   (Child-process creation is **not** a tested gate — it is not blocked; see
+   §6.3.)
 4. **Daemonless-survival test** — kill izbad; assert the VMM keeps running and
    stays at its restricted token (security boundary intact), then on izbad
    restart the resource job is re-applied.
