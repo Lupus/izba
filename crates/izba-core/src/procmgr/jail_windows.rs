@@ -1,6 +1,6 @@
 //! Windows host-side confinement for the VMM: builds the restricted, low-
-//! integrity primary token the OpenVMM process is launched under (the
-//! `CreateProcessAsUserW` spawn itself lands in a later phase).
+//! integrity primary token the OpenVMM process is launched under, and spawns it
+//! confined via `CreateProcessAsUserW` (`spawn_confined`).
 //!
 //! Win32 plumbing structure adapted from OpenAI codex windows-sandbox-rs
 //! (Apache-2.0); lifecycle inverted to detached spawn.
@@ -19,14 +19,15 @@ use crate::vmm::CommandSpec;
 use anyhow::Context;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, SetTokenInformation, TokenIntegrityLevel, DISABLE_MAX_PRIVILEGE,
     SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
+    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_ALWAYS,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -55,7 +56,7 @@ const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
 /// integrity lowered. Restricting/deny-only SID shaping per `policy.token` is a
 /// follow-up (DISABLE_MAX_PRIVILEGE is the proven baseline that keeps WHP).
 ///
-/// Used by `probe_confinable` and (in a later task) by `spawn_confined`.
+/// Used by `spawn_confined`.
 ///
 /// SAFETY: linear FFI; base token closed always, new token closed on error.
 unsafe fn build_confined_token(policy: &ConfinementPolicy) -> anyhow::Result<HANDLE> {
@@ -95,8 +96,10 @@ unsafe fn build_confined_token(policy: &ConfinementPolicy) -> anyhow::Result<HAN
 /// label. Returns an error (never a silent no-op) so the caller can fail the
 /// confinement attempt rather than run at the parent's integrity.
 ///
-/// SAFETY: FFI; the converted SID is owned by the OS allocation and intentionally
-/// not freed here (process-lifetime; matches the short-lived token-build path).
+/// SAFETY: FFI. `ConvertStringSidToSidW` returns a `LocalAlloc`'d SID that
+/// strictly should be released with `LocalFree`; we intentionally skip that.
+/// The decision is acceptable because it is one small allocation per
+/// VMM-launch (sandbox lifetime), not a per-request leak.
 unsafe fn set_integrity(tok: HANDLE, il: IntegrityLevel) -> anyhow::Result<()> {
     let sid_str: Vec<u16> = match il {
         IntegrityLevel::Low => "S-1-16-4096\0".encode_utf16().collect(),
@@ -129,24 +132,6 @@ unsafe fn set_integrity(tok: HANDLE, il: IntegrityLevel) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-/// One-shot host capability probe: can a process under the VMM policy be built?
-/// For now (full WHP round-trip wired in Phase 4) it returns true iff the
-/// confined token can be constructed — the necessary precondition. Returns false
-/// (degrade) on any failure so the launch path can fall back + report honestly.
-pub fn probe_confinable(policy: &ConfinementPolicy, probe_exe: &std::path::Path) -> bool {
-    let _ = probe_exe; // reserved for the Phase-4 WHP round-trip
-                       // SAFETY: FFI; token closed on the success path.
-    unsafe {
-        match build_confined_token(policy) {
-            Ok(t) => {
-                CloseHandle(t);
-                true
-            }
-            Err(_) => false,
-        }
-    }
 }
 
 /// A NAMED, best-effort resource job. CRITICAL: never KILL_ON_JOB_CLOSE — izbad
@@ -296,11 +281,14 @@ pub fn spawn_confined(
                 lpSecurityDescriptor: std::ptr::null_mut(),
                 bInheritHandle: 1, // make the log handle inheritable
             };
-            // FILE_APPEND_DATA (0x0004) within the GENERIC_WRITE umbrella;
-            // OPEN_ALWAYS creates if absent, opens+seeks-to-end via append.
+            // FILE_APPEND_DATA is the atomic-append access right: every write
+            // goes to end-of-file regardless of the handle's file pointer, so
+            // VMM logs append rather than overwrite from offset 0 (matches
+            // spawn_detached's OpenOptions::append). OPEN_ALWAYS creates if
+            // absent, opens otherwise.
             let hlog = CreateFileW(
                 log_w.as_ptr(),
-                GENERIC_WRITE,
+                FILE_APPEND_DATA,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 &sa,
                 OPEN_ALWAYS,
@@ -520,5 +508,71 @@ impl Drop for OwnedJobHandle {
     fn drop(&mut self) {
         // SAFETY: a job handle from create_resource_job, closed at most once.
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_command_line, quote_arg};
+
+    fn quoted(arg: &str) -> String {
+        let mut out = String::new();
+        quote_arg(arg, &mut out);
+        out
+    }
+
+    fn cmdline(argv: &[&str]) -> String {
+        let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let w = build_command_line(&owned);
+        // Drop the trailing NUL terminator before decoding back to a String.
+        assert_eq!(w.last(), Some(&0), "command line must be NUL-terminated");
+        String::from_utf16(&w[..w.len() - 1]).expect("valid utf16")
+    }
+
+    #[test]
+    fn empty_arg_is_quoted() {
+        assert_eq!(quoted(""), "\"\"");
+    }
+
+    #[test]
+    fn simple_arg_is_unquoted() {
+        assert_eq!(quoted("plain"), "plain");
+    }
+
+    #[test]
+    fn arg_with_spaces_is_quoted() {
+        assert_eq!(quoted("a b"), "\"a b\"");
+        assert_eq!(quoted("with\ttab"), "\"with\ttab\"");
+    }
+
+    #[test]
+    fn embedded_quote_is_backslash_escaped() {
+        // a"b -> "a\"b"
+        assert_eq!(quoted("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn trailing_backslashes_before_closing_quote_are_doubled() {
+        // The arg `a\` has spaces? No — but force quoting via a space so the
+        // closing quote follows the backslash run, which must then be doubled.
+        // `a \` -> "a \\"
+        assert_eq!(quoted("a \\"), "\"a \\\\\"");
+        // Two trailing backslashes -> doubled to four before the closing quote.
+        assert_eq!(quoted("a \\\\"), "\"a \\\\\\\\\"");
+    }
+
+    #[test]
+    fn backslashes_before_embedded_quote_are_doubled_plus_one() {
+        // `a\"` -> the run of 1 backslash is doubled and the quote escaped:
+        // "a\\\"" (i.e. backslash backslash backslash quote inside the quotes).
+        assert_eq!(quoted("a\\\""), "\"a\\\\\\\"\"");
+    }
+
+    #[test]
+    fn multi_arg_command_line() {
+        assert_eq!(
+            cmdline(&["openvmm.exe", "--config", "a b", "plain"]),
+            "openvmm.exe --config \"a b\" plain"
+        );
     }
 }
