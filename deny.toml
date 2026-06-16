@@ -12,8 +12,16 @@ version = 2
 # replace, or record an explicit, time-boxed, justified exception) — never
 # silenced wholesale. Any entry here must be SPECIFIC and triaged, each with a
 # justification and a removal trigger — not a blanket silence. New, untriaged
-# advisories still surface loudly. The graph is clean today: no exceptions.
-ignore = []
+# advisories still surface loudly.
+ignore = [
+    # RUSTSEC-2024-0436: paste crate is unmaintained (archived by dtolnay).
+    # Impact: purely a maintenance concern — no CVE, no exploitable vulnerability.
+    # Source: transitive dep introduced by if-watch 3.2.2 → netlink-packet-core
+    # 0.8.1 → paste 1.0.15. paste is a proc-macro used at build time only.
+    # Removal trigger: if-watch drops netlink-packet-core, or netlink-packet-core
+    # drops paste (track netlink-packet-core releases); remove this entry then.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained only (no CVE), transitive via if-watch->netlink-packet-core, proc-macro build-time only; removal trigger: netlink-packet-core drops paste" },
+]
 
 [bans]
 # The crate graph is large (reqwest/hyper/rustls/ring/aws-lc-rs/regorus/…), so
