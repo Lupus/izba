@@ -15,7 +15,9 @@
 
 use super::spec::{reject_commas, CommandSpec, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
-use crate::procmgr::{kill_pid, pid_alive, spawn_detached, ConfinementStatus};
+use crate::procmgr::{
+    kill_pid, pid_alive, spawn_confined, spawn_detached, ConfinementPolicy, ConfinementStatus,
+};
 use crate::state::PidIdentity;
 use crate::vsock::hybrid_connect;
 use anyhow::Context;
@@ -125,11 +127,38 @@ impl VmmDriver for OpenVmmDriver {
 
         // Guest serial goes to spec.console_log via --com1 file=; openvmm's
         // own stdout/stderr go to a sibling vmm.log.
-        // Confined-by-default launch with a fail-closed contract + opt-out is
-        // wired in the next step; for now the VMM still spawns detached and the
-        // achieved confinement is reported honestly as not-yet-applied.
-        let vmm_id = spawn_detached(&inv, &log_dir.join("vmm.log")).context("spawning openvmm")?;
-        let confinement = ConfinementStatus::degraded("host-side VMM confinement not yet wired");
+        let vmm_log = log_dir.join("vmm.log");
+
+        // Confined-by-default with a HARD fail-closed contract. The DEFAULT
+        // (no --allow-unconfined) path confines the VMM or errors — it NEVER
+        // falls back to an unconfined spawn. spawn_confined itself builds the
+        // restricted token before spawning anything, so a confinement failure
+        // never leaves a running unconfined VMM.
+        let mut policy = ConfinementPolicy::vmm_default();
+        // Size the best-effort resource job from the guest's RAM plus VMM
+        // overhead; the job is caps-only and never kill-on-close.
+        policy.job_memory_max_mb = Some(spec.mem_mb as u64 + 512);
+
+        let (vmm_id, confinement) = if spec.allow_unconfined {
+            // User EXPLICITLY opted out: run unconfined, record it loudly so
+            // status never silently claims confinement that was waived.
+            let id = spawn_detached(&inv, &vmm_log).context("spawning openvmm")?;
+            (
+                id,
+                ConfinementStatus::degraded(
+                    "--allow-unconfined: host-side VMM confinement disabled by user",
+                ),
+            )
+        } else {
+            match spawn_confined(&inv, &vmm_log, &policy) {
+                Ok(id) => (id, ConfinementStatus::applied(&policy)),
+                Err(e) => anyhow::bail!(
+                    "failed to apply host-side confinement to the VMM: {e}. \
+                     Re-run with --allow-unconfined to start the VMM WITHOUT host-side \
+                     confinement (NOT recommended)."
+                ),
+            }
+        };
 
         Ok(Box::new(OpenVmmHandle {
             vsock_sock,
