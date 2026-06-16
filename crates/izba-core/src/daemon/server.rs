@@ -108,7 +108,8 @@ impl DaemonDeps {
             artifacts: Box::new(crate::artifacts::locate),
             resolve_image: Box::new(crate::image::ensure_image),
             egress_policy: std::sync::Arc::new(crate::daemon::egress::policy::AllowAll),
-            egress_resolver: std::sync::Arc::new(crate::daemon::egress::dns::UdpForwarder::system()),
+            egress_resolver: crate::daemon::egress::sys_resolver::SystemResolver::new()
+                .expect("build system DNS resolver"),
         }
     }
 }

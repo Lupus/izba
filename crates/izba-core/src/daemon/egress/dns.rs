@@ -2,8 +2,6 @@
 //! host's system-configured upstream — no DNS parsing, full fidelity for
 //! any qtype/EDNS. M4 slots member-name resolution in front of this.
 
-#[cfg(unix)]
-use std::net::IpAddr;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
@@ -24,15 +22,6 @@ pub struct UdpForwarder {
 impl UdpForwarder {
     pub fn new(upstream: SocketAddr) -> Self {
         Self { upstream }
-    }
-
-    /// Host-system upstream; falls back to 1.1.1.1:53 (logged) when
-    /// discovery fails — a host with no DNS config is already broken.
-    ///
-    /// The upstream is captured from resolv.conf at construction time. Host
-    /// DNS config changes require a daemon restart — deliberate for M1.
-    pub fn system() -> Self {
-        Self::new(system_upstream())
     }
 }
 
@@ -59,68 +48,9 @@ impl Resolver for UdpForwarder {
     }
 }
 
-/// First `nameserver` in resolv.conf-style text, as a `:53` socket addr.
-#[cfg(unix)]
-fn parse_resolv_conf(text: &str) -> Option<SocketAddr> {
-    for line in text.lines() {
-        let mut it = line.split_whitespace();
-        if it.next() == Some("nameserver") {
-            if let Some(ip) = it.next().and_then(|s| s.parse::<IpAddr>().ok()) {
-                return Some(SocketAddr::new(ip, 53));
-            }
-        }
-    }
-    None
-}
-
-pub fn system_upstream() -> SocketAddr {
-    let found = discover_upstream();
-    found.unwrap_or_else(|| {
-        eprintln!("izbad: no system DNS upstream found; falling back to 1.1.1.1:53");
-        "1.1.1.1:53".parse().unwrap()
-    })
-}
-
-#[cfg(unix)]
-fn discover_upstream() -> Option<SocketAddr> {
-    parse_resolv_conf(&std::fs::read_to_string("/etc/resolv.conf").ok()?)
-}
-
-#[cfg(windows)]
-fn discover_upstream() -> Option<SocketAddr> {
-    let adapters = ipconfig::get_adapters().ok()?;
-    adapters
-        .iter()
-        .filter(|a| a.oper_status() == ipconfig::OperStatus::IfOperStatusUp)
-        .flat_map(|a| a.dns_servers())
-        .next()
-        .map(|ip| SocketAddr::new(*ip, 53))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn parses_first_nameserver() {
-        let conf = "# comment\nsearch local\nnameserver 10.0.0.2\nnameserver 10.0.0.3\n";
-        assert_eq!(
-            parse_resolv_conf(conf),
-            Some("10.0.0.2:53".parse().unwrap())
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn parses_ipv6_nameserver_and_handles_garbage() {
-        assert_eq!(
-            parse_resolv_conf("nameserver fd00::1\n"),
-            Some("[fd00::1]:53".parse().unwrap())
-        );
-        assert_eq!(parse_resolv_conf("nameserver not-an-ip\n"), None);
-        assert_eq!(parse_resolv_conf(""), None);
-    }
 
     /// Forwarder round-trip against a fake upstream. Binds UDP sockets —
     /// runtime-skip where the sandbox denies bind (house pattern).
