@@ -72,6 +72,16 @@ if-watch = { version = "3", features = ["tokio"] }
 # data.yml shape). serde_yaml 0.9 is archived-but-final + pure Rust.
 serde_yaml = "0.9"
 
+# --- M2 MITM HTTP engine: hyper-util auto server (h1+h2) + per-request policy.
+# Replaces the hand-rolled request sniffer; all already transitive via
+# reqwest/oci-client, so no new cargo-deny surface. Pure-Rust + rustls/ring →
+# x86_64-pc-windows-gnu cross stays green.
+hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "client-legacy", "http1", "http2", "tokio"] }
+http-body-util = "0.1"
+# Body/byte buffers shared between synthesized 403 responses and proxied bodies.
+bytes = "1"
+
 [dev-dependencies]
 # in-memory duplex test driver for the MITM datapath needs a real runtime
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "time"] }
