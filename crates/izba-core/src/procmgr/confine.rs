@@ -23,17 +23,22 @@ pub enum IntegrityLevel {
     Medium,
 }
 
+/// NOTE: child-process creation is **not** blocked. OpenVMM forks an
+/// `openvmm vm` worker, and the only Windows primitive for blocking children
+/// (`PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY =
+/// PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`) is all-or-nothing — it has no
+/// per-child exception, so it cannot be applied without breaking the worker.
+/// Children DO inherit the restricted token + Low IL (so they are deprivileged),
+/// but they are not prevented from spawning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfinementPolicy {
     pub token: TokenLevel,
     pub integrity: IntegrityLevel,
     pub drop_all_privileges: bool,
-    /// Best-effort resource job. NEVER kill-on-close (izba daemonless contract).
+    /// Best-effort resource job. NEVER kill-on-close (izba daemonless contract):
+    /// the no-kill-on-close behavior is unconditionally baked into
+    /// `create_resource_job` (Windows), so there is no policy field for it.
     pub job_memory_max_mb: Option<u64>,
-    pub kill_on_close: bool,
-    /// OpenVMM forks an `openvmm vm` worker; the child-process block must permit
-    /// it, so we never set ActiveProcessLimit=1 / CHILD_PROCESS_RESTRICTED hard.
-    pub allow_worker_child: bool,
 }
 
 impl ConfinementPolicy {
@@ -44,8 +49,6 @@ impl ConfinementPolicy {
             integrity: IntegrityLevel::Low,
             drop_all_privileges: true,
             job_memory_max_mb: None, // sized by the VMM driver from guest mem
-            kill_on_close: false,
-            allow_worker_child: true,
         }
     }
 }
@@ -124,14 +127,6 @@ mod tests {
         assert_eq!(p.token, TokenLevel::Limited);
         assert_eq!(p.integrity, IntegrityLevel::Low);
         assert!(p.drop_all_privileges);
-        assert!(
-            !p.kill_on_close,
-            "izba contract: VMM must outlive the broker"
-        );
-        assert!(
-            p.allow_worker_child,
-            "OpenVMM spawns an `openvmm vm` worker"
-        );
     }
 
     #[test]
