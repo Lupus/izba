@@ -12,8 +12,8 @@
 //! deprivileged. Restricting/deny-only SID shaping per `policy.token` is a
 //! follow-up — dropping privileges is the proven precondition.
 
-use crate::procmgr::windows::creation_time;
 use crate::procmgr::confine::{ConfinementPolicy, IntegrityLevel};
+use crate::procmgr::windows::creation_time;
 use crate::state::PidIdentity;
 use crate::vmm::CommandSpec;
 use anyhow::Context;
@@ -29,9 +29,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
 };
 // NEVER import/use JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — izbad death/upgrade must
 // not kill VMMs (izba daemonless contract).
@@ -81,10 +81,7 @@ unsafe fn build_confined_token(policy: &ConfinementPolicy) -> anyhow::Result<HAN
     );
     CloseHandle(base);
     if ok == 0 {
-        anyhow::bail!(
-            "CreateRestrictedToken: {}",
-            std::io::Error::last_os_error()
-        );
+        anyhow::bail!("CreateRestrictedToken: {}", std::io::Error::last_os_error());
     }
     if let Err(e) = set_integrity(tok, policy.integrity) {
         CloseHandle(tok);
@@ -176,7 +173,10 @@ unsafe fn create_resource_job(name_w: &[u16], mem_mb: Option<u64>) -> anyhow::Re
     ) == 0
     {
         CloseHandle(job);
-        anyhow::bail!("SetInformationJobObject: {}", std::io::Error::last_os_error());
+        anyhow::bail!(
+            "SetInformationJobObject: {}",
+            std::io::Error::last_os_error()
+        );
     }
     Ok(job)
 }
