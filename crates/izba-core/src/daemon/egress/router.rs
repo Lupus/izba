@@ -285,7 +285,8 @@ pub fn decide_tier2(
 }
 
 /// Private / loopback / link-local / unspecified destinations the egress plane
-/// must never reach from an enforced sandbox (SSRF + DNS-rebinding guard).
+/// must never reach — applied UNCONDITIONALLY to all sandboxes (bare and
+/// enforcing) as the SSRF + DNS-rebinding guard (F-01).
 fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -297,16 +298,44 @@ fn is_private(ip: IpAddr) -> bool {
                 || v4.is_documentation()
         }
         IpAddr::V6(v6) => {
-            // Screen IPv4-mapped (::ffff:a.b.c.d) via the embedded v4 — a known
-            // SSRF bypass. `to_ipv4_mapped` matches ONLY ::ffff:/96 (unlike the
-            // deprecated `to_ipv4`, which would mis-map ::1 to 0.0.0.1).
+            // Screen embedded-IPv4 forms via their v4 — all are SSRF bypass vectors:
+            //   ::ffff:a.b.c.d   IPv4-mapped     (to_ipv4_mapped matches ONLY ::ffff:/96)
+            //   ::a.b.c.d        IPv4-compatible (deprecated, ::/96 prefix)
+            //   64:ff9b::a.b.c.d NAT64 well-known prefix (RFC 6052)
+            // `to_ipv4_mapped` (not `to_ipv4`) so pure-v6 ::1 is not mis-mapped to
+            // 0.0.0.1; the native v6 checks below still catch ::1 / :: / ULA / link-local.
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_private(IpAddr::V4(v4));
             }
+            let seg = v6.segments();
+            let embedded = || {
+                std::net::Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    seg[6] as u8,
+                    (seg[7] >> 8) as u8,
+                    seg[7] as u8,
+                )
+            };
+            // IPv4-compatible ::a.b.c.d (high 96 bits zero); skip :: and ::1 which the
+            // native is_unspecified/is_loopback checks below handle.
+            if seg[..6] == [0, 0, 0, 0, 0, 0] {
+                let v4 = embedded();
+                if !v4.is_unspecified() && is_private(IpAddr::V4(v4)) {
+                    return true;
+                }
+            }
+            // NAT64 64:ff9b::/96.
+            if seg[0] == 0x0064
+                && seg[1] == 0xff9b
+                && seg[2..6] == [0, 0, 0, 0]
+                && is_private(IpAddr::V4(embedded()))
+            {
+                return true;
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (seg[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
         }
     }
 }
@@ -688,6 +717,52 @@ mod tests {
         // Native v6 loopback / public still classified correctly.
         assert!(is_private("::1".parse().unwrap()));
         assert!(!is_private("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    /// M-1/M-2: IPv4-compatible (::a.b.c.d) and NAT64 (64:ff9b::a.b.c.d) forms
+    /// carrying a private embedded address must be screened. Public embedded and
+    /// pure-v6 addresses must NOT be mis-classified.
+    #[test]
+    fn is_private_screens_ipv4_compatible_and_nat64_bypass_forms() {
+        // IPv4-compatible (::a.b.c.d) — deprecated ::/96 prefix.
+        assert!(
+            is_private("::10.0.0.1".parse().unwrap()),
+            "IPv4-compat private RFC1918"
+        );
+        assert!(
+            is_private("::127.0.0.1".parse().unwrap()),
+            "IPv4-compat loopback"
+        );
+        assert!(
+            is_private("::169.254.169.254".parse().unwrap()),
+            "IPv4-compat link-local metadata"
+        );
+
+        // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052).
+        assert!(
+            is_private("64:ff9b::10.0.0.1".parse().unwrap()),
+            "NAT64 private RFC1918"
+        );
+        assert!(
+            is_private("64:ff9b::169.254.169.254".parse().unwrap()),
+            "NAT64 link-local metadata"
+        );
+        // NAT64 with a PUBLIC embedded address must NOT be flagged.
+        assert!(
+            !is_private("64:ff9b::1.2.3.4".parse().unwrap()),
+            "NAT64 with public embedded must be allowed"
+        );
+
+        // Pure-v6 :: (unspecified) and ::1 (loopback) must still be caught by
+        // the native v6 checks — they must NOT be mis-routed through IPv4-compat.
+        assert!(is_private("::1".parse().unwrap()), "pure-v6 loopback");
+        assert!(is_private("::".parse().unwrap()), "pure-v6 unspecified");
+
+        // Public pure-v6 must not be flagged.
+        assert!(
+            !is_private("2606:4700:4700::1111".parse().unwrap()),
+            "public v6"
+        );
     }
 
     /// A guest that stops reading responses mid-stream must not deadlock
