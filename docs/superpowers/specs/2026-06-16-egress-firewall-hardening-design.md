@@ -42,9 +42,16 @@ churn-teardown on the vsock leg, fail-closed-for-enforcing).
 
 **Non-goals (recorded, not built here):**
 - Default-deny-as-baseline for *bare* sandboxes — a bare `izba run` stays
-  allow-all for **public** destinations (M1-compatible "no firewall" mode). F-01
-  only closes the SSRF hole for everyone. Flipping the bare default to deny-all is
-  a separate product/UX posture decision.
+  permissive for everything except the **hard floor** (loopback / link-local +
+  cloud-metadata / unspecified), including **public AND RFC1918/LAN** (M1
+  contract: the user declined a firewall, so reaching their own LAN / localhost
+  dev services is intended). F-01 closes the catastrophic SSRF (host loopback,
+  IMDS credentials) for everyone; it does **not** make bare a deny-all.
+- CIDR-range LAN rules in policy — an enforcing sandbox can allow a LAN target by
+  listing the **exact IP**; CIDR/range matching (rego `net.cidr_contains`) is a
+  follow-on.
+- F-05 DNS resolve-and-pin / rate-limit / QNAME gate — Phase 3 follow-on, gated on
+  the hickory-resolver adoption.
 - F-05 DNS resolve-and-pin / rate-limit / QNAME gate — Phase 3 follow-on, gated on
   the hickory-resolver adoption.
 - F-04 audit-log integrity; F-23 CA validity/pathlen.
@@ -62,7 +69,7 @@ guest (vsock 1027)
   └─ StreamOpen::TcpConnect{addr,port}
        router::tcp_connect          [BLOCKING std-thread plane]
          ├─ port 53            → dns_loop (resolver)         (unchanged)
-         ├─ is_private(ip)?    → DENY  ◄── PHASE 1 (unconditional)
+         ├─ is_hard_denied(ip)? → DENY  ◄── PHASE 1 (non-overridable floor)
          ├─ port∈{80,443} & enforcing
          │     └─ mitm_hop → loopback dial → DstMap rendezvous
          │            └─ MitmRuntime accept_loop  [TOKIO plane]
@@ -70,27 +77,40 @@ guest (vsock 1027)
          └─ else tier-2: decide_tier2 → dial → splice
 ```
 
-### Phase 1 — F-01: unconditional SSRF address denylist (`router.rs` only)
+### Phase 1 — F-01: SSRF address posture (`router.rs` only)
 
-Make `is_private` an **unconditional chokepoint** screening *every* egress dial,
-bare or enforcing, tier-1 or tier-2.
+Split the address denylist into two tiers, so "structural never-allow" is
+separated from "configurable allow":
 
-1. **`decide_tier2`:** screen `is_private(ip)` **before** the `enforces()` branch.
-   The permissive (bare) branch then relaxes only the *allow-list* requirement,
-   never the address denylist. A bare sandbox keeps reaching **public** IPs; it no
-   longer reaches loopback/link-local/RFC1918/unspecified.
-2. **Tier-1 MITM path:** in `tcp_connect`, add an `is_private(ip)` guard for
-   `port ∈ {80,443}` **before** `mitm_hop` (today there is none). Deny + audit
-   (`Tier::L7`, rule `"private-address denylist"`).
-3. **Harden `is_private`:** canonicalize **IPv4-mapped IPv6** (`::ffff:a.b.c.d`)
-   and IPv4-compatible IPv6, and screen the embedded v4 — a known SSRF bypass.
-   Keep the existing v4 (private/loopback/link-local/unspecified/broadcast/
-   documentation) and v6 (loopback/unspecified/ULA fc00::/7/link-local fe80::/10)
-   coverage.
+- **`is_hard_denied` — the non-overridable floor (ALL sandboxes, before any
+  policy):** loopback (the host's own services, incl. izbad), link-local +
+  cloud-metadata (`169.254.0.0/16`, `fe80::/10` — IMDS credentials), unspecified,
+  broadcast, documentation, and their IPv6-embedded forms. Not even an explicit
+  policy may allow these.
+- **`is_lan` — RFC1918 / ULA, policy-governed:** a **bare** sandbox may reach LAN
+  (M1 permissive); an **enforcing** sandbox may reach a LAN target only via an
+  **explicit IP rule** in its policy — never via a domain (that is the
+  DNS-rebinding bypass).
 
-**Behavior change:** `decide_tier2_permissive_allows_raw_ip`'s private-IP
-assertion (currently asserts a bare sandbox reaches `10.0.0.5`) flips to Deny;
-its public-IP assertion (`1.2.3.4` allowed) stays.
+1. **`tcp_connect`:** a single `is_hard_denied(ip)` guard after the IP parse
+   (covers tier-1 MITM + tier-2) → Deny + audit (rule `"blocked address
+   (loopback/link-local/metadata)"`). RFC1918/LAN is *not* blocked here.
+2. **`decide_tier2`:** hard-floor first; then bare = permissive (incl. LAN);
+   enforcing = default-deny where a snoop'd FQDN authorizes only a **public** ip
+   (skipped for LAN — rebind defense) and the **raw-IP literal** is always a
+   candidate, so a policy can permit a specific public or LAN ip by listing it.
+3. **`is_hard_denied`/`is_lan`:** canonicalize the IPv6 embedded-v4 bypass forms
+   (IPv4-mapped `::ffff:`, IPv4-compatible `::a.b.c.d`, NAT64 `64:ff9b::`) via a
+   shared `embedded_v4` helper, classifying each by its embedded v4 in *both*
+   tiers.
+
+**Configurable LAN** needs no rego/config change: `AllowEntry::Host` already
+accepts an IP literal and the rego matches the dialed `addr` (`input.dest`) — an
+enforcing policy `allow: ["10.1.0.124"]` permits that IP.
+
+**Behavior:** bare sandboxes keep reaching public **and** LAN (M1); they lose
+loopback/metadata/link-local. Enforcing sandboxes deny LAN unless an explicit IP
+rule lists it, and never via a rebind-able domain.
 
 ### Phase 2 — F-02/F-03: hyper-util MITM engine (`mitm.rs` + `mitm_runtime.rs`)
 
