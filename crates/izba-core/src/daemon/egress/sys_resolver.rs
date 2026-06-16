@@ -1,12 +1,18 @@
 //! Terminating system DNS resolver with live config reload. Replaces the
 //! start-time-captured `UdpForwarder`: re-reads host DNS config and self-heals
 //! on network change (VPN reconnect) via lazy-on-failure + poll + if-watch.
-// The public types/functions here will be consumed by Task 7 (SystemResolver
-// struct). Suppress dead_code until that task is implemented.
-#![allow(dead_code)]
 
+use futures_util::StreamExt;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{Record, RecordType};
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::{Resolver as HickoryResolver, TokioResolver};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use super::dns::Resolver;
 
 /// The query types the guest is allowed to resolve. Terminating resolution
 /// gives us this control point; v1 hardcodes a sane set.
@@ -66,9 +72,6 @@ fn response_with_answers(req: &Message, records: &[Record]) -> anyhow::Result<Ve
     Ok(resp.to_vec()?)
 }
 
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use std::hash::{Hash, Hasher};
-
 /// Source of host DNS config. Seam so reload logic is testable without network.
 pub(crate) trait ConfigSource: Send + Sync {
     fn discover(&self) -> anyhow::Result<(ResolverConfig, ResolverOpts)>;
@@ -92,10 +95,6 @@ fn fingerprint(config: &ResolverConfig) -> u64 {
     format!("{config:?}").hash(&mut h);
     h.finish()
 }
-
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::{Resolver as HickoryResolver, TokioResolver};
-use std::sync::{Arc, Mutex};
 
 /// Live resolver + the fingerprint of the config it was built from.
 struct ResolverState {
@@ -152,10 +151,6 @@ fn reload_if_changed(cell: &ResolverCell, source: &dyn ConfigSource) -> anyhow::
     Ok(true)
 }
 
-use super::dns::Resolver;
-use futures_util::StreamExt;
-use std::time::{Duration, Instant};
-
 const MIN_REBUILD_INTERVAL: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const IFWATCH_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -181,10 +176,9 @@ impl SystemResolver {
         // to 1.1.1.1 (mirrors the retired UdpForwarder), logged.
         let (config, opts) = source.discover().unwrap_or_else(|e| {
             eprintln!("izbad: no system DNS upstream found ({e:#}); falling back to 1.1.1.1");
-            use hickory_resolver::config::{NameServerConfig, CLOUDFLARE};
+            use hickory_resolver::config::CLOUDFLARE;
             let fallback =
                 ResolverConfig::from_parts(None, vec![], CLOUDFLARE.udp_and_tcp().collect());
-            let _ = NameServerConfig::udp_and_tcp; // silence unused import
             (fallback, ResolverOpts::default())
         });
         let fp = fingerprint(&config);

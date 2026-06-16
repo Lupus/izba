@@ -836,7 +836,7 @@ fn guest_networking() {
     use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
     let mgr = EgressManager::new(
         std::sync::Arc::new(AllowAll),
-        std::sync::Arc::new(UdpForwarder::system()),
+        std::sync::Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
@@ -890,7 +890,7 @@ fn egress_dns_via_izbad() {
     use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
     let mgr = EgressManager::new(
         std::sync::Arc::new(AllowAll),
-        std::sync::Arc::new(UdpForwarder::system()),
+        std::sync::Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
@@ -956,7 +956,7 @@ fn egress_http_via_stub() {
     use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
     let mgr = EgressManager::new(
         std::sync::Arc::new(AllowAll),
-        std::sync::Arc::new(UdpForwarder::system()),
+        std::sync::Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
@@ -1038,7 +1038,7 @@ fn mitm_firewall_allows_and_denies_real_vm() {
 
     let mgr = EgressManager::new(
         std::sync::Arc::new(AllowAll),
-        std::sync::Arc::new(UdpForwarder::system()),
+        std::sync::Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
         Some(mitm),
         audit,
     );
@@ -1190,7 +1190,7 @@ fn egress_throughput_baseline() {
     use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
     let mgr = EgressManager::new(
         std::sync::Arc::new(AllowAll),
-        std::sync::Arc::new(UdpForwarder::system()),
+        std::sync::Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
