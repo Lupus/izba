@@ -88,6 +88,28 @@ fn tcp_connect(
         }
     };
 
+    // UNCONDITIONAL SSRF guard for the whole TCP datapath (tier-1 MITM + tier-2).
+    // port 53 short-circuited above; this covers everything else. Mirrors
+    // decide_tier2's denylist so the MITM path can't be used to reach the host.
+    if is_private(ip) {
+        let flow = FlowDesc::l3(sandbox, addr, port);
+        audit.record(AuditRecord::from_flow(
+            Verdict::Deny,
+            &flow,
+            ip,
+            Tier::L3,
+            "private-address denylist",
+        ));
+        let _ = write_frame(
+            &mut conn,
+            &Response::Error {
+                kind: ErrorKind::ConnectFailed,
+                message: format!("egress to {addr}:{port} denied: private address"),
+            },
+        );
+        return;
+    }
+
     // Tier 1 — HTTP(S) under an ENFORCING policy MUST be terminated by the MITM,
     // so the allow-list is judged on the decrypted Host (an IP is never on a
     // domain allow-list, so we do NOT pre-check on the IP here). A bare
@@ -703,5 +725,48 @@ mod tests {
         drop(c);
         h.join()
             .expect("dns_loop must not hang after write failure");
+    }
+
+    #[test]
+    fn mitm_path_denies_private_origdst_before_mitm() {
+        let mut c = spawn_handler(Arc::new(RegoPolicy::embedded().unwrap()), &FakeResolver);
+        write_frame(
+            &mut c,
+            &StreamOpen::TcpConnect {
+                addr: "127.0.0.1".into(),
+                port: 443,
+            },
+        )
+        .unwrap();
+        match read_frame::<_, Response>(&mut c).unwrap() {
+            Response::Error { kind, message } => {
+                assert_eq!(kind, ErrorKind::ConnectFailed);
+                assert!(
+                    message.contains("private"),
+                    "want private-address deny, got: {message}"
+                );
+            }
+            other => panic!("expected private-address deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_connect_loopback_is_denied_as_private() {
+        let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
+        write_frame(
+            &mut c,
+            &StreamOpen::TcpConnect {
+                addr: "127.0.0.1".into(),
+                port: 9,
+            },
+        )
+        .unwrap();
+        match read_frame::<_, Response>(&mut c).unwrap() {
+            Response::Error { kind, message } => {
+                assert_eq!(kind, ErrorKind::ConnectFailed);
+                assert!(message.contains("private"), "{message}");
+            }
+            other => panic!("expected private deny, got {other:?}"),
+        }
     }
 }
