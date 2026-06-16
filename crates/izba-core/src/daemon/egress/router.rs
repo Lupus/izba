@@ -271,6 +271,12 @@ fn is_private(ip: IpAddr) -> bool {
                 || v4.is_documentation()
         }
         IpAddr::V6(v6) => {
+            // Screen IPv4-mapped (::ffff:a.b.c.d) via the embedded v4 — a known
+            // SSRF bypass. `to_ipv4_mapped` matches ONLY ::ffff:/96 (unlike the
+            // deprecated `to_ipv4`, which would mis-map ::1 to 0.0.0.1).
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private(IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
@@ -692,6 +698,19 @@ mod tests {
             Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::ConnectFailed),
             other => panic!("expected ConnectFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn is_private_canonicalizes_ipv4_mapped_v6() {
+        // ::ffff:127.0.0.1 and ::ffff:10.0.0.1 must be screened via their v4.
+        assert!(is_private("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_private("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(is_private("::ffff:169.254.169.254".parse().unwrap()));
+        // A public mapped address is NOT private.
+        assert!(!is_private("::ffff:1.2.3.4".parse().unwrap()));
+        // Native v6 loopback / public still classified correctly.
+        assert!(is_private("::1".parse().unwrap()));
+        assert!(!is_private("2606:4700:4700::1111".parse().unwrap()));
     }
 
     /// A guest that stops reading responses mid-stream must not deadlock
