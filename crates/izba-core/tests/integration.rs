@@ -993,10 +993,10 @@ fn egress_http_via_stub() {
 ///     ONLY because it trusts the baked per-SNI leaf; the MITM decrypts the Host
 ///     and records an L7 ALLOW (non-allowed host → L7 DENY via a synthesized
 ///     403).
-///   * Plaintext HTTP (:80) — apt's default. The cleartext request line is NOT
-///     a TLS ClientHello, so this exercises the `mitm_terminate_http` path
-///     (sniff → read head → policy) that shipped broken when every tier-1 flow
-///     was force-handshaked as TLS.
+///   * Plaintext HTTP (:80) — apt's default. Classified as cleartext by
+///     `OrigDst.port` (not TLS-handshaked), so this exercises `serve_mitm`'s
+///     cleartext-ingress branch (hyper h1 server → per-request policy → h1
+///     upstream over a raw TCP connection).
 ///
 /// The host-side audit log is the robust, image-agnostic proof: an `l7` record
 /// on :443 appears only if the guest trusted the baked CA AND the MITM read the
@@ -1059,11 +1059,11 @@ fn mitm_firewall_allows_and_denies_real_vm() {
     //     ON, no --no-check-certificate) proves the guest trusts the baked CA;
     //     the denied host's handshake also completes so the MITM can read the
     //     Host and answer 403.
-    //   * Plaintext HTTP on :80 — apt's default (archive.ubuntu.com). This path
-    //     shipped BROKEN: the MITM force-handshaked TLS on every tier-1 flow, so
-    //     cleartext failed before any Host was parsed and NOTHING was audited.
-    //     The :80 records below are the regression guard — they appear only if
-    //     `mitm_terminate_http` read the cleartext request head and ran policy.
+    //   * Plaintext HTTP on :80 — apt's default (archive.ubuntu.com). The :80
+    //     records below are the regression guard for the cleartext-ingress path —
+    //     they appear only if `serve_mitm`'s cleartext branch read the request
+    //     head and ran policy (rather than force-handshaking TLS on the request
+    //     line, which silently broke plaintext egress in an earlier design).
     //
     // Exit codes are informational; the audit log is the assertion. Retry the
     // allowed fetches — DNS + first egress dial can settle a beat after boot.
@@ -1118,9 +1118,9 @@ fn mitm_firewall_allows_and_denies_real_vm() {
         "expected an L7 DENY for www.iana.org:443 (MITM terminated + policy denied).\n{}",
         dump()
     );
-    // Plaintext HTTP (:80) — the apt-over-http path that shipped broken. These
-    // records exist only if the cleartext MITM (`mitm_terminate_http`) read the
-    // Host and ran policy instead of force-handshaking TLS on the request line.
+    // Plaintext HTTP (:80) — the apt-over-http path. These records exist only if
+    // `serve_mitm`'s cleartext-ingress branch read the Host and ran policy instead
+    // of force-handshaking TLS on the request line.
     assert!(
         l7("allow", "example.com", 80),
         "expected an L7 ALLOW for example.com:80 (plaintext HTTP MITM read the Host + allowed).\n{}",
