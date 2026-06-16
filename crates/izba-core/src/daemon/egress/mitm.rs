@@ -484,12 +484,14 @@ impl ConnCtx {
             .await
             .with_context(|| format!("dial upstream {}:{}", self.orig.ip, self.orig.port))?;
 
-        // Cleartext ingress (`:80`, no captured SNI) re-originates as plaintext
-        // HTTP — policy is still enforced per request above; we simply do not
-        // wrap the upstream leg in TLS (a `:80` upstream has no TLS to speak).
-        // HTTPS ingress (`:443`, SNI captured) re-originates over TLS, verifying
-        // the upstream cert against the vetted `host` (webpki). Either way the
-        // upstream leg is HTTP/1.1 (ALPN is http/1.1-only).
+        // Mirror the leg the guest used (the runtime peeked the wire to classify
+        // it). Cleartext ingress (no captured SNI) re-originates as plaintext
+        // HTTP — policy is still enforced per request above; we just don't wrap
+        // the upstream in TLS. TLS ingress (SNI captured) re-originates over TLS,
+        // verifying the upstream cert against the vetted `host` (webpki). The
+        // `port != 443` tie-breaker keeps a TLS upstream for the odd cleartext-on
+        // -:443 flow (a :443 origin expects TLS). Either way the upstream leg is
+        // HTTP/1.1 (ALPN is http/1.1-only); guest h2 is bridged h2→h1 by hyper.
         if self.client_sni.is_none() && self.orig.port != 443 {
             let io = TokioIo::new(tcp);
             return Self::h1_sender(io).await;
@@ -525,13 +527,14 @@ impl ConnCtx {
 /// policy `Service`, so keep-alive can no longer smuggle a second Host past the
 /// first check (F-03). The ClientHello SNI is bound to the HTTP Host (F-02).
 ///
-/// `client_io` is the already-TLS-terminated guest stream (or the raw cleartext
-/// stream on :80, `sni = None`). `policy` is the audited per-request decision
-/// seam ([`MitmPolicy`] / `PolicyAdapter`). `orig` carries the dial target +
-/// sandbox the L7 view lacks. The upstream leg mirrors the ingress: TLS
-/// re-origination (verified against the vetted Host) for HTTPS `:443`, and a
-/// plaintext HTTP/1.1 dial for cleartext `:80` (`sni = None`, `orig.port != 443`)
-/// — policy + the confused-deputy Host rewrite still run per request either way.
+/// `client_io` is the already-TLS-terminated guest stream (when the runtime's
+/// wire peek saw a ClientHello) or the raw cleartext stream (`sni = None`).
+/// `policy` is the audited per-request decision seam ([`MitmPolicy`] /
+/// `PolicyAdapter`). `orig` carries the dial target + sandbox the L7 view lacks.
+/// The upstream leg mirrors the ingress: TLS re-origination (verified against the
+/// vetted Host via webpki) for a TLS-terminated flow, and a plaintext HTTP/1.1
+/// dial for a cleartext flow — policy + the confused-deputy Host rewrite still
+/// run per request either way.
 ///
 /// Fails closed for everything it cannot inspect: non-HTTP after TLS makes
 /// hyper error on the preface; we audit + drop, never blind-tunnel.
