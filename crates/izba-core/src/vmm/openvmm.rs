@@ -15,7 +15,7 @@
 
 use super::spec::{reject_commas, CommandSpec, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
-use crate::procmgr::{kill_pid, pid_alive, spawn_detached};
+use crate::procmgr::{kill_pid, pid_alive, spawn_detached, ConfinementStatus};
 use crate::state::PidIdentity;
 use crate::vsock::hybrid_connect;
 use anyhow::Context;
@@ -125,11 +125,16 @@ impl VmmDriver for OpenVmmDriver {
 
         // Guest serial goes to spec.console_log via --com1 file=; openvmm's
         // own stdout/stderr go to a sibling vmm.log.
+        // Confined-by-default launch with a fail-closed contract + opt-out is
+        // wired in the next step; for now the VMM still spawns detached and the
+        // achieved confinement is reported honestly as not-yet-applied.
         let vmm_id = spawn_detached(&inv, &log_dir.join("vmm.log")).context("spawning openvmm")?;
+        let confinement = ConfinementStatus::degraded("host-side VMM confinement not yet wired");
 
         Ok(Box::new(OpenVmmHandle {
             vsock_sock,
             vmm: ("vmm".to_string(), vmm_id),
+            confinement,
         }))
     }
 }
@@ -138,6 +143,8 @@ impl VmmDriver for OpenVmmDriver {
 struct OpenVmmHandle {
     vsock_sock: PathBuf,
     vmm: (String, PidIdentity),
+    /// Host-side confinement achieved at launch (see `VmHandle::confinement`).
+    confinement: ConfinementStatus,
 }
 
 impl VmHandle for OpenVmmHandle {
@@ -152,6 +159,10 @@ impl VmHandle for OpenVmmHandle {
 
     fn is_alive(&self) -> bool {
         pid_alive(&self.vmm.1)
+    }
+
+    fn confinement(&self) -> ConfinementStatus {
+        self.confinement.clone()
     }
 
     fn kill(&mut self) -> anyhow::Result<()> {
@@ -188,6 +199,7 @@ mod tests {
             }],
             console_log: PathBuf::from("/sbx/console.log"),
             run_dir: PathBuf::from("/sbx/run"),
+            allow_unconfined: false,
         }
     }
 

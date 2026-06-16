@@ -27,6 +27,12 @@ pub struct VmSpec {
     pub console_log: PathBuf,
     /// Per-sandbox dir where control sockets live.
     pub run_dir: PathBuf,
+    /// User opt-out of host-side VMM confinement. DEFAULT false: the driver
+    /// confines the VMM and FAILS CLOSED if it cannot. When true the VMM is
+    /// launched unconfined and the degraded status is recorded loudly. Only the
+    /// Windows OpenVMM driver consults this; the Linux jailer is a separate
+    /// milestone.
+    pub allow_unconfined: bool,
 }
 
 /// A fully-resolved command line: `argv[0]` is the program name.

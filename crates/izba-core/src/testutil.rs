@@ -192,6 +192,10 @@ impl VmHandle for MockHandle {
         self.alive.load(Ordering::SeqCst)
     }
 
+    fn confinement(&self) -> crate::procmgr::ConfinementStatus {
+        crate::procmgr::ConfinementStatus::degraded("mock handle")
+    }
+
     fn kill(&mut self) -> anyhow::Result<()> {
         self.alive.store(false, Ordering::SeqCst);
         self.killed.store(true, Ordering::SeqCst);
