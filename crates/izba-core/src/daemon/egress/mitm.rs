@@ -31,13 +31,23 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, ServerConfig};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+use super::mitm_runtime::OrigDst;
 
 const MAX_CACHED_CERTS: usize = 256;
 
@@ -248,21 +258,6 @@ pub fn server_config_with_resolver(certs: Arc<CertCache>) -> ServerConfig {
     cfg
 }
 
-/// Detect a TLS ClientHello from the first bytes of a stream. LIFTED verbatim
-/// from OpenShell `looks_like_tls` — the non-TLS fallthrough decision point.
-pub fn looks_like_tls(peek: &[u8]) -> bool {
-    if peek.len() < 3 {
-        return false;
-    }
-    if peek[0] != 0x16 {
-        return false; // not ContentType::Handshake
-    }
-    if peek[1] != 0x03 {
-        return false; // TLS major version must be 0x03
-    }
-    peek[2] <= 0x04 // minor: SSL3.0 (0x00) .. TLS1.3 record (0x04)
-}
-
 // ============================================================================
 // Policy seam  (IZBA — where regorus RegoPolicy plugs in at M5)
 // ============================================================================
@@ -287,7 +282,13 @@ pub enum L7Verdict {
 /// The policy hook. The production impl wraps regorus; the spike ships a
 /// host-allowlist toy so the seam is exercised end to end.
 pub trait MitmPolicy: Send + Sync {
+    /// Decide + audit one request. Called on EVERY request (F-03).
     fn check(&self, req: &L7Request) -> L7Verdict;
+
+    /// Audit a Deny that the datapath made on its own (not via `check`) — e.g.
+    /// the SNI≠Host rejection (F-02), which must be recorded with its own rule.
+    /// Defaults to a no-op for policies without an audit sink (the toy spike).
+    fn record_deny(&self, _req: &L7Request, _rule: &'static str) {}
 }
 
 /// Toy policy: deny any Host not on the allowlist. The clear seam where a
@@ -353,67 +354,7 @@ where
 }
 
 // ============================================================================
-// HTTP request-line sniff  (IZBA — replaces OpenShell's hyper/L7Provider stack)
-// ============================================================================
-
-/// Read just enough of the decrypted request to prove L7 visibility: the
-/// request line (`METHOD SP PATH SP HTTP/x.x`) + the `Host:` header.
-///
-/// Returns the parsed view AND the raw header bytes consumed, so the caller can
-/// forward them verbatim to the upstream (we must not lose what we peeled off).
-///
-/// NOTE (production path): this hand-rolled reader proves the datapath; the
-/// real izbad should parse with `hyper`'s `http1` server so it handles chunked
-/// bodies, pipelining, and connection reuse. OpenShell does exactly that behind
-/// its `L7Provider::parse_request` trait — that layer is what we did NOT lift
-/// (it is fused to OpenShell's OCSF telemetry + OPA engine).
-async fn read_request_head<R>(client: &mut R) -> Result<(L7Request, Vec<u8>)>
-where
-    R: AsyncRead + Unpin,
-{
-    // Read byte-by-byte until the CRLFCRLF end-of-headers. Bounded so a
-    // malicious guest can't make us buffer forever.
-    const MAX_HEAD: usize = 64 * 1024;
-    let mut head = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-    loop {
-        let n = client.read(&mut byte).await.context("read request head")?;
-        if n == 0 {
-            return Err(anyhow!("client closed before end of request headers"));
-        }
-        head.push(byte[0]);
-        if head.len() >= 4 && &head[head.len() - 4..] == b"\r\n\r\n" {
-            break;
-        }
-        if head.len() > MAX_HEAD {
-            return Err(anyhow!("request headers exceeded {MAX_HEAD} bytes"));
-        }
-    }
-
-    let text = String::from_utf8_lossy(&head);
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split(' ');
-    let method = parts.next().unwrap_or_default().to_string();
-    let path = parts.next().unwrap_or_default().to_string();
-    if method.is_empty() || path.is_empty() {
-        return Err(anyhow!("malformed request line: {request_line:?}"));
-    }
-
-    let host = lines
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.trim()
-                .eq_ignore_ascii_case("host")
-                .then(|| v.trim().to_string())
-        })
-        .unwrap_or_default();
-
-    Ok((L7Request { host, method, path }, head))
-}
-
-// ============================================================================
-// The MITM orchestrator  (IZBA — the izba-shaped datapath, generic over stream)
+// The MITM orchestrator  (IZBA — a real hyper-util HTTP datapath)
 // ============================================================================
 
 /// What izbad needs to MITM a flow: the cert cache (CA) and an upstream
@@ -425,510 +366,805 @@ pub struct MitmState {
     pub upstream: Arc<ClientConfig>,
 }
 
-/// Terminate the guest's client TLS, sniff the request, apply policy, then
-/// (on Allow) splice it to `upstream` re-encrypting under a verified TLS
-/// session. On Deny, synthesize a response and return without touching the
-/// upstream.
+/// The boxed response body the service returns — unifies the synthesized 403
+/// (`Full<Bytes>`) and the proxied upstream body (`Incoming`).
+type SvcBody = BoxBody<Bytes, anyhow::Error>;
+
+/// A re-originated upstream HTTP connection, picked by the upstream's negotiated
+/// ALPN. One per guest connection, reused across keep-alive (the SNI==Host check
+/// pins the whole guest connection to a single Host).
+enum UpstreamSender {
+    H1(hyper::client::conn::http1::SendRequest<Incoming>),
+    H2(hyper::client::conn::http2::SendRequest<Incoming>),
+}
+
+impl UpstreamSender {
+    async fn send(&mut self, req: Request<Incoming>) -> Result<Response<Incoming>, hyper::Error> {
+        match self {
+            UpstreamSender::H1(s) => s.send_request(req).await,
+            UpstreamSender::H2(s) => s.send_request(req).await,
+        }
+    }
+}
+
+/// Normalize the request's target Host: prefer the URI authority host (h2
+/// `:authority` / absolute-form h1), else the `Host` header; strip a port + a
+/// trailing dot, lowercase. `None` when neither carries a host.
+fn req_host<B>(req: &Request<B>) -> Option<String> {
+    req.uri()
+        .host()
+        .map(str::to_string)
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.split(':').next().unwrap_or(h).to_string())
+        })
+        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+}
+
+/// A synthesized fail-closed response (403, `Connection: close`).
+fn forbidden(body: &'static str) -> Response<SvcBody> {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(hyper::header::CONNECTION, "close")
+        .body(boxed(body))
+        .expect("static forbidden response builds")
+}
+
+fn boxed(body: &'static str) -> SvcBody {
+    Full::new(Bytes::from_static(body.as_bytes()))
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+/// Is this an HTTP/1.1 `Upgrade: websocket` request?
+fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
+    fn header_has_token<B>(req: &Request<B>, name: hyper::header::HeaderName, token: &str) -> bool {
+        req.headers().get_all(name).iter().any(|v| {
+            v.to_str()
+                .map(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+                .unwrap_or(false)
+        })
+    }
+    header_has_token(req, hyper::header::CONNECTION, "upgrade")
+        && header_has_token(req, hyper::header::UPGRADE, "websocket")
+}
+
+/// Per-connection shared state the service closure captures.
+struct ConnCtx {
+    upstream_cfg: Arc<ClientConfig>,
+    orig: OrigDst,
+    /// SNI captured from the guest's ClientHello (`None` for cleartext :80).
+    client_sni: Option<String>,
+    /// Lazily-established upstream sender, reused across keep-alive requests.
+    upstream: AsyncMutex<Option<UpstreamSender>>,
+}
+
+impl ConnCtx {
+    /// Establish (once) or reuse the upstream connection to `host`. The first
+    /// allowed request dials `orig.ip:orig.port`, TLS-connects verifying the
+    /// cert against `host` (webpki), and picks h1/h2 by the upstream ALPN.
+    async fn upstream_send(
+        &self,
+        host: &str,
+        req: Request<Incoming>,
+    ) -> Result<Response<Incoming>> {
+        let mut guard = self.upstream.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.dial_upstream(host).await?);
+        }
+        guard
+            .as_mut()
+            .expect("upstream just established")
+            .send(req)
+            .await
+            .context("forward request upstream")
+    }
+
+    async fn dial_upstream(&self, host: &str) -> Result<UpstreamSender> {
+        let tcp = tokio::net::TcpStream::connect((self.orig.ip, self.orig.port))
+            .await
+            .with_context(|| format!("dial upstream {}:{}", self.orig.ip, self.orig.port))?;
+        let connector = TlsConnector::from(Arc::clone(&self.upstream_cfg));
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|e| anyhow!("invalid upstream server name {host:?}: {e}"))?;
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
+            .context("upstream TLS handshake")?;
+        let alpn_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+        let io = TokioIo::new(tls);
+        if alpn_h2 {
+            let (sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                .await
+                .context("upstream h2 handshake")?;
+            tokio::spawn(conn);
+            Ok(UpstreamSender::H2(sender))
+        } else {
+            let (sender, conn) = hyper::client::conn::http1::handshake(io)
+                .await
+                .context("upstream h1 handshake")?;
+            tokio::spawn(conn.with_upgrades());
+            Ok(UpstreamSender::H1(sender))
+        }
+    }
+}
+
+/// The hyper-util MITM datapath. Replaces the hand-rolled request sniffer with a
+/// real HTTP stack: every request (or h2 stream) on the connection hits the
+/// policy `Service`, so keep-alive can no longer smuggle a second Host past the
+/// first check (F-03). The ClientHello SNI is bound to the HTTP Host (F-02).
 ///
-/// `client` is the raw guest byte stream (post-`StreamOpen::TcpConnect`, in
-/// production). The leaf hostname is recovered from the ClientHello SNI by the
-/// acceptor's cert resolver. `connect_upstream` is a closure that dials the
-/// real upstream (kept abstract so the datapath never owns a socket / the vsock
-/// router).
+/// `client_io` is the already-TLS-terminated guest stream (or the raw cleartext
+/// stream on :80, `sni = None`). `policy` is the audited per-request decision
+/// seam ([`MitmPolicy`] / `PolicyAdapter`). `orig` carries the dial target +
+/// sandbox the L7 view lacks.
 ///
-/// Returns the `L7Request` it observed, so the caller can audit L7 visibility.
-pub async fn mitm_terminate<C, U, F, Fut>(
-    client: C,
+/// Fails closed for everything it cannot inspect: non-HTTP after TLS makes
+/// hyper error on the preface; we audit + drop, never blind-tunnel.
+pub async fn serve_mitm<C>(
+    client_io: C,
+    sni: Option<String>,
     state: &MitmState,
-    policy: &dyn MitmPolicy,
-    connect_upstream: F,
-) -> Result<L7Request>
+    policy: Arc<dyn MitmPolicy>,
+    orig: OrigDst,
+) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<U>>,
 {
-    // 1. Terminate the client TLS under a leaf minted for the ClientHello SNI.
-    let mut client_tls = state
-        .acceptor
-        .accept(client)
+    let ctx = Arc::new(ConnCtx {
+        upstream_cfg: Arc::clone(&state.upstream),
+        orig,
+        client_sni: sni,
+        upstream: AsyncMutex::new(None),
+    });
+
+    // `service_fn` is invoked per request (per h2 stream under h2). It must be
+    // `Fn` + `'static`, so it captures cloneable owned handles only.
+    let service = service_fn(move |req: Request<Incoming>| {
+        let ctx = Arc::clone(&ctx);
+        let policy = Arc::clone(&policy);
+        async move { handle_request(ctx, policy, req).await }
+    });
+
+    let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    builder
+        .serve_connection_with_upgrades(TokioIo::new(client_io), service)
         .await
-        .context("client TLS handshake (leaf under izba CA)")?;
+        .map_err(|e| anyhow!("serve guest HTTP connection: {e}"))
+}
 
-    // 2. Read the decrypted request head — L7 visibility for policy / creds.
-    let (req, head_bytes) = read_request_head(&mut client_tls).await?;
+/// Per-request: SNI==Host (F-02), audited policy (F-03), then forward upstream
+/// (or bridge a WebSocket upgrade) on Allow.
+async fn handle_request(
+    ctx: Arc<ConnCtx>,
+    policy: Arc<dyn MitmPolicy>,
+    req: Request<Incoming>,
+) -> Result<Response<SvcBody>, anyhow::Error> {
+    let host = match req_host(&req) {
+        Some(h) => h,
+        // No Host at all: nothing to bind SNI to or policy-check — fail closed.
+        None => {
+            return Ok(forbidden(
+                "403 Forbidden by izba egress policy: missing Host\n",
+            ))
+        }
+    };
 
-    // 3. Policy hook. Deny short-circuits with a synthesized response.
-    if let L7Verdict::Deny(body) = policy.check(&req) {
-        let resp = format!(
-            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        client_tls
-            .write_all(resp.as_bytes())
-            .await
-            .context("write deny response")?;
-        client_tls.flush().await.ok();
-        client_tls.shutdown().await.ok();
-        return Ok(req);
+    // F-02: the ClientHello SNI (when present) must equal the HTTP Host. A guest
+    // that handshakes for a.com then asks for b.com on the same session is
+    // rejected without an upstream dial.
+    if let Some(sni) = &ctx.client_sni {
+        if !sni.eq_ignore_ascii_case(&host) {
+            policy.record_deny(
+                &L7Request {
+                    host: host.clone(),
+                    method: req.method().to_string(),
+                    path: req.uri().path().to_string(),
+                },
+                "sni-host-mismatch",
+            );
+            return Ok(forbidden(
+                "403 Forbidden by izba egress policy: SNI/Host mismatch\n",
+            ));
+        }
     }
 
-    // 4. Allow: dial + TLS-connect the real upstream, replay the request head
-    //    we already consumed, then pipe both directions.
-    let upstream_raw = connect_upstream().await.context("dial upstream")?;
-    let mut upstream_tls = tls_connect_upstream(upstream_raw, &req.host, &state.upstream).await?;
-    upstream_tls
-        .write_all(&head_bytes)
-        .await
-        .context("replay request head to upstream")?;
-    upstream_tls.flush().await.ok();
-
-    pump_bidirectional(client_tls, upstream_tls).await;
-    Ok(req)
-}
-
-/// Plaintext-HTTP sibling of [`mitm_terminate`]: terminate a guest connection
-/// that is **not** TLS (cleartext HTTP/1.x on :80, e.g. `apt`). No client
-/// handshake and no upstream TLS — read the request head for the same L7
-/// visibility (Host/method/path → policy + audit), and on Allow dial the real
-/// upstream in the clear, replay the head, and splice. On Deny, synthesize the
-/// 403 without touching the upstream.
-///
-/// The router still sends :80/:443 into the MITM; the accept loop sniffs the
-/// first bytes ([`looks_like_tls`]) and calls this for cleartext, so a plain
-/// HTTP request is no longer force-handshaken as TLS (which silently broke it).
-/// Returns the observed `L7Request` so the caller can audit L7 visibility.
-pub async fn mitm_terminate_http<C, U, F, Fut>(
-    mut client: C,
-    policy: &dyn MitmPolicy,
-    connect_upstream: F,
-) -> Result<L7Request>
-where
-    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<U>>,
-{
-    // 1. Read the request head in the clear — same L7 view as the TLS path.
-    let (req, head_bytes) = read_request_head(&mut client).await?;
-
-    // 2. Policy hook (records the audit). Deny short-circuits with a 403.
-    if let L7Verdict::Deny(body) = policy.check(&req) {
-        let resp = format!(
-            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        client
-            .write_all(resp.as_bytes())
-            .await
-            .context("write deny response")?;
-        client.flush().await.ok();
-        client.shutdown().await.ok();
-        return Ok(req);
+    // F-03: policy runs on EVERY request, audited by the adapter.
+    let l7 = L7Request {
+        host: host.clone(),
+        method: req.method().to_string(),
+        path: req.uri().path().to_string(),
+    };
+    if let L7Verdict::Deny(body) = policy.check(&l7) {
+        return Ok(forbidden(body));
     }
 
-    // 3. Allow: dial the upstream in the clear, replay the head we already
-    //    consumed, then pipe both directions.
-    let mut upstream = connect_upstream().await.context("dial upstream")?;
-    upstream
-        .write_all(&head_bytes)
-        .await
-        .context("replay request head to upstream")?;
-    upstream.flush().await.ok();
-    pump_bidirectional(client, upstream).await;
-    Ok(req)
+    if is_websocket_upgrade(&req) {
+        return bridge_websocket(ctx, host, req).await;
+    }
+
+    // Allow: forward upstream over the (lazily-established, reused) connection.
+    let resp = ctx.upstream_send(&host, req).await?;
+    Ok(resp.map(|b| b.map_err(anyhow::Error::from).boxed()))
 }
 
-/// Copy both directions to EOF, then full-shutdown each peer. IZBA — mirrors
-/// the blocking `portfwd::pump_bidirectional` discipline in async form:
-/// drain-to-EOF + explicit `shutdown()` honour the OpenVMM churn-teardown
-/// invariant (never force-close a peer with TX still buffered). Failures are
-/// swallowed — a half-closed peer is normal teardown, not an error.
-async fn pump_bidirectional<A, B>(client: A, upstream: B)
-where
-    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (cr, cw) = tokio::io::split(client);
-    let (ur, uw) = tokio::io::split(upstream);
-    let c2u = tokio::spawn(copy_then_shutdown(cr, uw));
-    let u2c = tokio::spawn(copy_then_shutdown(ur, cw));
-    let _ = c2u.await;
-    let _ = u2c.await;
-}
+/// Bridge an HTTP/1.1 WebSocket upgrade: forward the upgrade request upstream;
+/// on the upstream `101`, return `101` to the guest and splice both upgraded
+/// byte streams with `copy_bidirectional`. Policy already ran on the request's
+/// Host (and SNI==Host was enforced).
+async fn bridge_websocket(
+    ctx: Arc<ConnCtx>,
+    host: String,
+    mut req: Request<Incoming>,
+) -> Result<Response<SvcBody>, anyhow::Error> {
+    // Take the guest-side upgrade future BEFORE the request is consumed upstream.
+    let guest_on = hyper::upgrade::on(&mut req);
 
-async fn copy_then_shutdown<R, W>(mut r: ReadHalf<R>, mut w: WriteHalf<W>)
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let _ = tokio::io::copy(&mut r, &mut w).await;
-    let _ = w.shutdown().await;
+    let mut upstream_resp = ctx.upstream_send(&host, req).await?;
+    if upstream_resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        // Upstream declined the upgrade — relay its response verbatim.
+        return Ok(upstream_resp.map(|b| b.map_err(anyhow::Error::from).boxed()));
+    }
+
+    // Take the upstream-side upgrade future, then build the 101 we hand the
+    // guest from the upstream response headers.
+    let upstream_on = hyper::upgrade::on(&mut upstream_resp);
+    let mut to_guest = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (k, v) in upstream_resp.headers() {
+        to_guest = to_guest.header(k, v);
+    }
+
+    tokio::spawn(async move {
+        let (guest, upstream) = match tokio::try_join!(guest_on, upstream_on) {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        let mut guest = TokioIo::new(guest);
+        let mut upstream = TokioIo::new(upstream);
+        let _ = tokio::io::copy_bidirectional(&mut guest, &mut upstream).await;
+    });
+
+    let resp = to_guest
+        .body(
+            Empty::<Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .context("build websocket 101 to guest")?;
+    Ok(resp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use http_body_util::BodyExt;
+    use hyper::body::Incoming;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use crate::daemon::egress::mitm_runtime::OrigDst;
 
     /// Ensure the ring CryptoProvider is the process default. aws-lc-rs is
     /// ALSO linked (via oci-client's reqwest), so an ambiguous default would
-    /// panic — installing ring explicitly is exactly what production izbad
-    /// must do too. Idempotent across tests via `OnceLock`.
+    /// panic. Idempotent via `OnceLock`.
     fn install_ring() {
         use std::sync::OnceLock;
         static ONCE: OnceLock<()> = OnceLock::new();
         ONCE.get_or_init(|| {
-            // Best-effort: another part of the process (e.g. the daemon's
-            // build_mitm_runtime, exercised by server tests in the same binary)
-            // may have already installed ring as the default. Both install ring,
-            // so an "already installed" error is fine to ignore.
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
     }
 
+    /// Build the MITM state (izba CA + acceptor) and the guest's rustls config
+    /// (trusting ONLY the izba CA). `state.upstream` starts trusting nothing;
+    /// each test rewires it to the in-test upstream CA.
     fn test_ca_and_state() -> (CertificateDer<'static>, MitmState, Arc<ClientConfig>) {
         let ca = IzbaCa::generate().unwrap();
         let ca_der = ca.cert_der();
 
-        // The guest's rustls config: trusts ONLY the izba CA (proving the
-        // MITM leaf chains to it).
-        let mut guest_roots = rustls::RootCertStore::empty();
-        guest_roots.add(ca_der.clone()).unwrap();
-        let guest_cfg = {
-            let mut c = ClientConfig::builder()
-                .with_root_certificates(guest_roots)
-                .with_no_client_auth();
-            c.alpn_protocols = vec![b"http/1.1".to_vec()];
-            Arc::new(c)
-        };
-
+        let guest_cfg = guest_cfg_with_alpn(ca_der.clone(), &[b"http/1.1"]);
         let certs = Arc::new(CertCache::new(ca));
         let acceptor = TlsAcceptor::from(Arc::new(server_config_with_resolver(certs)));
         (
             ca_der,
             MitmState {
                 acceptor,
-                upstream: dummy_upstream_cfg(),
+                upstream: upstream_client_config(rustls::RootCertStore::empty()),
             },
             guest_cfg,
         )
     }
 
-    /// Upstream rustls config for the MITM->upstream leg. The in-test upstream
-    /// presents a cert signed by `upstream_ca`, which this config trusts.
-    fn dummy_upstream_cfg() -> Arc<ClientConfig> {
-        upstream_client_config(rustls::RootCertStore::empty())
+    /// A guest rustls config trusting the izba CA with the given ALPN.
+    fn guest_cfg_with_alpn(ca_der: CertificateDer<'static>, alpn: &[&[u8]]) -> Arc<ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der).unwrap();
+        let mut c = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        c.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        Arc::new(c)
     }
 
-    /// Spin a tiny TLS "upstream" on one end of a duplex: it presents a leaf
-    /// for `host` under `upstream_ca`, reads the replayed request, and answers
-    /// a fixed body. Returns (its CA der, a duplex end the MITM connects to).
-    fn spawn_tls_upstream(
+    type BoxFut<B> = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response<B>, anyhow::Error>> + Send>,
+    >;
+
+    /// Spin a real HTTPS upstream on a loopback TCP listener presenting a leaf
+    /// for `host` under a fresh CA (ALPN h2+http/1.1), serving `service` per
+    /// request via the hyper-util auto server. Returns (upstream CA der, addr).
+    async fn spawn_https_upstream<S, B>(
         host: &'static str,
-        body: &'static str,
-    ) -> (CertificateDer<'static>, tokio::io::DuplexStream) {
+        service: S,
+    ) -> (CertificateDer<'static>, SocketAddr)
+    where
+        S: Fn(Request<Incoming>) -> BoxFut<B> + Send + Sync + Clone + 'static,
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let up_ca = IzbaCa::generate().unwrap();
         let up_ca_der = up_ca.cert_der();
         let cache = CertCache::new(up_ca);
         let acceptor = cache.acceptor_for(host).unwrap();
-        let (mitm_side, up_side) = duplex(64 * 1024);
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind upstream listener");
+        let addr = listener.local_addr().unwrap();
+
         tokio::spawn(async move {
-            let mut tls = acceptor.accept(up_side).await.expect("upstream accept");
-            // Read the replayed request head (to CRLFCRLF).
-            let mut buf = Vec::new();
-            let mut b = [0u8; 1];
             loop {
-                let n = tls.read(&mut b).await.unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.push(b[0]);
-                if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
-                    break;
-                }
+                let (tcp, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let acceptor = acceptor.clone();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    let tls = match acceptor.accept(tcp).await {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
+                    let svc = service_fn(move |req| (service.clone())(req));
+                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(TokioIo::new(tls), svc)
+                        .await;
+                });
             }
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            tls.write_all(resp.as_bytes()).await.ok();
-            tls.flush().await.ok();
-            tls.shutdown().await.ok();
         });
-        (up_ca_der, mitm_side)
+
+        (up_ca_der, addr)
     }
+
+    /// A responder that answers 200 with `body` for any request.
+    fn ok_responder(
+        body: &'static str,
+    ) -> impl Fn(Request<Incoming>) -> BoxFut<Full<Bytes>> + Send + Sync + Clone + 'static {
+        move |_req: Request<Incoming>| {
+            Box::pin(async move {
+                Ok(Response::new(Full::new(Bytes::from_static(
+                    body.as_bytes(),
+                ))))
+            }) as BoxFut<Full<Bytes>>
+        }
+    }
+
+    fn orig_dst(addr: SocketAddr) -> OrigDst {
+        OrigDst {
+            ip: addr.ip(),
+            port: addr.port(),
+            sandbox: "web".into(),
+        }
+    }
+
+    /// Accept the guest TLS (capturing SNI) and run serve_mitm on it.
+    fn run_mitm_tls<C>(
+        state: MitmState,
+        guest_conn: C,
+        policy: Arc<dyn MitmPolicy>,
+        orig: OrigDst,
+    ) -> tokio::task::JoinHandle<Result<()>>
+    where
+        C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let tls = state
+                .acceptor
+                .accept(guest_conn)
+                .await
+                .context("MITM accept guest TLS")?;
+            let sni = tls.get_ref().1.server_name().map(str::to_string);
+            serve_mitm(tls, sni, &state, policy, orig).await
+        })
+    }
+
+    // ---- F-03: every request on a keep-alive connection is re-checked --------
+
+    #[tokio::test]
+    async fn keepalive_second_request_is_rechecked() {
+        install_ring();
+        let host = "api.anthropic.com";
+        let (ca_der, mut state, _g) = test_ca_and_state();
+
+        let (up_ca_der, up_addr) = spawn_https_upstream(host, ok_responder("PONG")).await;
+        let mut up_roots = rustls::RootCertStore::empty();
+        up_roots.add(up_ca_der).unwrap();
+        state.upstream = upstream_client_config(up_roots);
+
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
+            allowed: vec![host.to_string()],
+        });
+
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(up_addr));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake");
+
+        guest
+            .write_all(b"GET /a HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n")
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+        let status1 = read_status_line(&mut guest).await;
+        assert!(status1.contains("200"), "req1 status: {status1}");
+        drain_response_headers(&mut guest).await;
+        // Drain the 200 response body (Content-Length: 4 -> "PONG").
+        let mut body1 = [0u8; 4];
+        guest.read_exact(&mut body1).await.unwrap();
+
+        guest
+            .write_all(b"GET /b HTTP/1.1\r\nHost: evil.example.com\r\n\r\n")
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+        let status2 = read_status_line(&mut guest).await;
+        assert!(
+            status2.contains("403"),
+            "req2 must be denied (F-03): {status2}"
+        );
+
+        drop(guest);
+        let _ = mitm.await;
+    }
+
+    // ---- F-02: ClientHello SNI must equal the HTTP Host ---------------------
+
+    #[tokio::test]
+    async fn sni_host_mismatch_is_denied() {
+        install_ring();
+        let sni_host = "allowed.example.com";
+        let (ca_der, state, _g) = test_ca_and_state();
+
+        let unused: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
+            allowed: vec!["other.example.com".to_string()],
+        });
+
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(unused));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(sni_host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake");
+        guest
+            .write_all(b"GET / HTTP/1.1\r\nHost: other.example.com\r\n\r\n")
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+        let status = read_status_line(&mut guest).await;
+        assert!(
+            status.contains("403"),
+            "SNI!=Host must 403 (F-02): {status}"
+        );
+
+        drop(guest);
+        let _ = mitm.await;
+    }
+
+    // ---- ported happy-path: MITM sees L7 + pipes upstream response ----------
 
     #[tokio::test]
     async fn mitm_sees_l7_and_pipes_upstream_response() {
         install_ring();
         let host = "api.anthropic.com";
-        let (_izba_ca, mut state, guest_cfg) = test_ca_and_state();
+        let (ca_der, mut state, _g) = test_ca_and_state();
 
-        // Wire the MITM's upstream config to trust the in-test upstream CA.
-        let (up_ca_der, up_stream) = spawn_tls_upstream(host, "UPSTREAM-PONG");
+        let (up_ca_der, up_addr) = spawn_https_upstream(host, ok_responder("UPSTREAM-PONG")).await;
         let mut up_roots = rustls::RootCertStore::empty();
         up_roots.add(up_ca_der).unwrap();
         state.upstream = upstream_client_config(up_roots);
 
-        // The guest <-> MITM in-memory pipe.
-        let (guest_side, mitm_side) = duplex(64 * 1024);
-
-        // Policy: allow the host under test.
-        let policy = HostAllowlist {
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
             allowed: vec![host.to_string()],
-        };
-
-        // Run the MITM. `connect_upstream` just hands over the upstream duplex.
-        let up_stream = Mutex::new(Some(up_stream));
-        let mitm = tokio::spawn(async move {
-            mitm_terminate(mitm_side, &state, &policy, || async move {
-                Ok(up_stream.lock().unwrap().take().unwrap())
-            })
-            .await
         });
 
-        // The guest: TLS-handshake to the MITM (trusting only the izba CA),
-        // send a request, read the response.
-        let connector = TlsConnector::from(guest_cfg);
-        let server_name = ServerName::try_from(host).unwrap();
-        let mut guest_tls = connector
-            .connect(server_name, guest_side)
-            .await
-            .expect("(a) guest handshake under izba CA must succeed");
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(up_addr));
 
-        guest_tls
-            .write_all(b"GET /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n")
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake under izba CA");
+        guest
+            .write_all(b"GET /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
-        guest_tls.flush().await.unwrap();
+        guest.flush().await.unwrap();
 
         let mut got = Vec::new();
-        guest_tls.read_to_end(&mut got).await.unwrap();
+        guest.read_to_end(&mut got).await.unwrap();
         let got = String::from_utf8_lossy(&got);
-
-        // (c) upstream response flowed back through the MITM.
         assert!(got.contains("200 OK"), "response status: {got}");
         assert!(got.contains("UPSTREAM-PONG"), "response body: {got}");
 
-        // Close the guest leg so the proxy's drain-to-EOF (guest->upstream
-        // direction) completes — without this the churn-safe pump never
-        // returns and the `mitm.await` below would block forever.
-        drop(guest_tls);
-
-        // (b) the MITM SAW the decrypted L7 request.
-        let observed = mitm.await.unwrap().expect("mitm datapath");
-        assert_eq!(observed.method, "GET");
-        assert_eq!(observed.path, "/v1/messages");
-        assert_eq!(observed.host, "api.anthropic.com");
+        drop(guest);
+        let _ = mitm.await;
     }
+
+    // ---- ported deny short-circuit (no upstream dial) -----------------------
 
     #[tokio::test]
     async fn policy_deny_short_circuits_without_upstream() {
         install_ring();
         let host = "blocked.example.com";
-        let (_izba_ca, state, guest_cfg) = test_ca_and_state();
+        let (ca_der, state, _g) = test_ca_and_state();
 
-        let (guest_side, mitm_side) = duplex(64 * 1024);
-        // Allowlist does NOT contain `host` -> Deny.
-        let policy = HostAllowlist {
+        let unused: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
             allowed: vec!["allowed.example.com".to_string()],
-        };
-
-        let mitm = tokio::spawn(async move {
-            mitm_terminate(
-                mitm_side,
-                &state,
-                &policy,
-                // If this is ever called, the upstream connector errors —
-                // proving Deny short-circuited before any upstream dial.
-                || async {
-                    Err::<tokio::io::DuplexStream, _>(anyhow!(
-                        "upstream must NOT be dialed on deny"
-                    ))
-                },
-            )
-            .await
         });
 
-        let connector = TlsConnector::from(guest_cfg);
-        let server_name = ServerName::try_from(host).unwrap();
-        let mut guest_tls = connector
-            .connect(server_name, guest_side)
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(unused));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
             .await
             .expect("guest handshake under izba CA");
-        guest_tls
-            .write_all(b"GET /secret HTTP/1.1\r\nHost: blocked.example.com\r\n\r\n")
-            .await
-            .unwrap();
-        guest_tls.flush().await.unwrap();
-
-        let mut got = Vec::new();
-        guest_tls.read_to_end(&mut got).await.unwrap();
-        let got = String::from_utf8_lossy(&got);
-        assert!(got.contains("403 Forbidden"), "deny response: {got}");
-        assert!(got.contains("izba egress policy"), "deny body: {got}");
-
-        // The datapath returned the observed request without dialing upstream.
-        let observed = mitm.await.unwrap().expect("mitm deny path");
-        assert_eq!(observed.host, "blocked.example.com");
-        assert_eq!(observed.method, "GET");
-    }
-
-    /// A plaintext HTTP request line is NOT a TLS ClientHello — the accept loop
-    /// uses this to route :80 cleartext (apt) down the HTTP path instead of
-    /// force-handshaking TLS on it.
-    #[test]
-    fn http_request_is_not_classified_as_tls() {
-        assert!(!looks_like_tls(b"GET / HTTP/1.1\r\n"));
-        // A real TLS record header (handshake, version 3.x) still is.
-        assert!(looks_like_tls(&[0x16, 0x03, 0x01, 0x00, 0x10]));
-    }
-
-    /// Plain HTTP on :80 (no TLS): the MITM reads the L7 head in the clear,
-    /// allows it, dials the upstream in the clear, replays the head, and pipes
-    /// the response back. This is the apt-over-http path that the TLS-only
-    /// datapath used to break.
-    #[tokio::test]
-    async fn http_plaintext_allow_pipes_upstream_response() {
-        let host = "archive.ubuntu.com";
-        let (mut guest, mitm_side) = duplex(64 * 1024);
-        let (up_mitm, mut up_srv) = duplex(64 * 1024);
-
-        let policy = HostAllowlist {
-            allowed: vec![host.to_string()],
-        };
-        let up_mitm = Mutex::new(Some(up_mitm));
-        let mitm = tokio::spawn(async move {
-            mitm_terminate_http(mitm_side, &policy, || async move {
-                Ok::<_, anyhow::Error>(up_mitm.lock().unwrap().take().unwrap())
-            })
-            .await
-        });
-
         guest
-            .write_all(b"GET /ubuntu/dists/ HTTP/1.0\r\nHost: archive.ubuntu.com\r\n\r\n")
+            .write_all(
+                b"GET /secret HTTP/1.1\r\nHost: blocked.example.com\r\nConnection: close\r\n\r\n",
+            )
             .await
             .unwrap();
         guest.flush().await.unwrap();
 
-        // The upstream sees the replayed request head verbatim.
-        let mut head = Vec::new();
-        let mut b = [0u8; 1];
-        loop {
-            let n = up_srv.read(&mut b).await.unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            head.push(b[0]);
-            if head.len() >= 4 && &head[head.len() - 4..] == b"\r\n\r\n" {
-                break;
-            }
-        }
-        let head = String::from_utf8_lossy(&head);
-        assert!(
-            head.contains("GET /ubuntu/dists/ HTTP/1.0"),
-            "upstream head: {head}"
-        );
-        assert!(
-            head.contains("Host: archive.ubuntu.com"),
-            "upstream host: {head}"
-        );
-
-        up_srv
-            .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDATA")
-            .await
-            .unwrap();
-        up_srv.flush().await.unwrap();
-        drop(up_srv);
-
         let mut got = Vec::new();
         guest.read_to_end(&mut got).await.unwrap();
         let got = String::from_utf8_lossy(&got);
-        assert!(got.contains("200 OK"), "guest response: {got}");
-        assert!(got.contains("DATA"), "guest body: {got}");
+        assert!(got.contains("403"), "deny response: {got}");
+
         drop(guest);
-
-        let observed = mitm.await.unwrap().expect("http mitm datapath");
-        assert_eq!(observed.method, "GET");
-        assert_eq!(observed.path, "/ubuntu/dists/");
-        assert_eq!(observed.host, "archive.ubuntu.com");
+        let _ = mitm.await;
     }
 
-    /// Plain HTTP deny: a Host not on the allow-list gets a 403 and the upstream
-    /// is never dialed (the connector errors if touched).
+    // ---- non-HTTP after TLS termination fails closed (no dial, no hang) ------
+
     #[tokio::test]
-    async fn http_plaintext_deny_short_circuits_without_upstream() {
-        let (mut guest, mitm_side) = duplex(64 * 1024);
-        let policy = HostAllowlist {
-            allowed: vec!["allowed.example".to_string()],
-        };
-        let mitm = tokio::spawn(async move {
-            mitm_terminate_http(mitm_side, &policy, || async {
-                Err::<tokio::io::DuplexStream, _>(anyhow!("upstream must NOT be dialed on deny"))
-            })
-            .await
+    async fn non_http_over_tls_fails_closed() {
+        install_ring();
+        let host = "api.anthropic.com";
+        let (ca_der, state, _g) = test_ca_and_state();
+
+        let dialed = Arc::new(AtomicBool::new(false));
+        let unused: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
+            allowed: vec![host.to_string()],
         });
 
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(unused));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake");
         guest
-            .write_all(b"GET /secret HTTP/1.0\r\nHost: blocked.example\r\n\r\n")
+            .write_all(b"\x00\x01\x02not-http-at-all")
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+        guest.shutdown().await.ok();
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), mitm).await;
+        assert!(res.is_ok(), "serve_mitm hung on non-HTTP input");
+        assert!(
+            !dialed.load(Ordering::SeqCst),
+            "upstream must not be dialed"
+        );
+    }
+
+    // ---- WebSocket upgrade is policy-checked and bridged --------------------
+
+    #[tokio::test]
+    async fn websocket_upgrade_is_policy_checked_and_bridged() {
+        install_ring();
+        let host = "api.anthropic.com";
+        let (ca_der, mut state, _g) = test_ca_and_state();
+
+        let ws_responder = move |mut req: Request<Incoming>| {
+            Box::pin(async move {
+                let on = hyper::upgrade::on(&mut req);
+                tokio::spawn(async move {
+                    if let Ok(upgraded) = on.await {
+                        let mut io = TokioIo::new(upgraded);
+                        let mut buf = [0u8; 64];
+                        if let Ok(n) = io.read(&mut buf).await {
+                            if n > 0 {
+                                let _ = io.write_all(&buf[..n]).await;
+                                let _ = io.flush().await;
+                            }
+                        }
+                    }
+                });
+                Ok(Response::builder()
+                    .status(StatusCode::SWITCHING_PROTOCOLS)
+                    .header(hyper::header::CONNECTION, "upgrade")
+                    .header(hyper::header::UPGRADE, "websocket")
+                    .body(Empty::<Bytes>::new())
+                    .unwrap())
+            }) as BoxFut<Empty<Bytes>>
+        };
+        let (up_ca_der, up_addr) = spawn_https_upstream(host, ws_responder).await;
+        let mut up_roots = rustls::RootCertStore::empty();
+        up_roots.add(up_ca_der).unwrap();
+        state.upstream = upstream_client_config(up_roots);
+
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
+            allowed: vec![host.to_string()],
+        });
+
+        let (guest_side, mitm_side) = tokio::io::duplex(64 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(up_addr));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"http/1.1"]));
+        let mut guest = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest handshake");
+        guest
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: x\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
             .await
             .unwrap();
         guest.flush().await.unwrap();
 
-        let mut got = Vec::new();
-        guest.read_to_end(&mut got).await.unwrap();
-        let got = String::from_utf8_lossy(&got);
-        assert!(got.contains("403 Forbidden"), "deny response: {got}");
-        assert!(got.contains("izba egress policy"), "deny body: {got}");
+        let status = read_status_line(&mut guest).await;
+        assert!(status.contains("101"), "expected 101 upgrade: {status}");
+        drain_response_headers(&mut guest).await;
 
-        let observed = mitm.await.unwrap().expect("http mitm deny path");
-        assert_eq!(observed.host, "blocked.example");
-        assert_eq!(observed.method, "GET");
+        guest.write_all(b"hello-ws").await.unwrap();
+        guest.flush().await.unwrap();
+        let mut echoed = [0u8; 8];
+        guest.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(
+            &echoed, b"hello-ws",
+            "websocket bytes must bridge both ways"
+        );
+
+        drop(guest);
+        let _ = mitm.await;
     }
 
+    // ---- h2 client path is policy-checked per stream ------------------------
+
     #[tokio::test]
-    async fn cert_resolver_mints_for_clienthello_sni() {
-        // The resolver must mint a leaf for whatever SNI the ClientHello
-        // carries — production izbad never passes the hostname explicitly.
+    async fn h2_client_path_is_policy_checked() {
+        install_ring();
+        let host = "api.anthropic.com";
+        let (ca_der, mut state, _g) = test_ca_and_state();
+
+        let (up_ca_der, up_addr) = spawn_https_upstream(host, ok_responder("H2-PONG")).await;
+        let mut up_roots = rustls::RootCertStore::empty();
+        up_roots.add(up_ca_der).unwrap();
+        state.upstream = upstream_client_config(up_roots);
+
+        let policy: Arc<dyn MitmPolicy> = Arc::new(HostAllowlist {
+            allowed: vec![host.to_string()],
+        });
+
+        let (guest_side, mitm_side) = tokio::io::duplex(256 * 1024);
+        let mitm = run_mitm_tls(state, mitm_side, policy, orig_dst(up_addr));
+
+        let connector = TlsConnector::from(guest_cfg_with_alpn(ca_der, &[b"h2"]));
+        let guest_tls = connector
+            .connect(ServerName::try_from(host).unwrap(), guest_side)
+            .await
+            .expect("guest h2 handshake");
+        assert_eq!(
+            guest_tls.get_ref().1.alpn_protocol(),
+            Some(&b"h2"[..]),
+            "guest must have negotiated h2"
+        );
+
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(guest_tls))
+                .await
+                .expect("h2 client handshake");
+        tokio::spawn(conn);
+
+        let req = Request::builder()
+            .uri("https://api.anthropic.com/v1/messages")
+            .header(hyper::header::HOST, "api.anthropic.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.expect("h2 send allowed");
+        assert_eq!(resp.status(), StatusCode::OK, "allowed h2 stream -> 200");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"H2-PONG");
+
+        let req2 = Request::builder()
+            .uri("https://evil.example.com/")
+            .header(hyper::header::HOST, "evil.example.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp2 = sender.send_request(req2).await.expect("h2 send denied");
+        assert_eq!(
+            resp2.status(),
+            StatusCode::FORBIDDEN,
+            "denied h2 stream -> 403"
+        );
+
+        // The guest's h2 connection driver keeps the session open; we've proven
+        // both streams' verdicts, so abort the MITM rather than wait on EOF.
+        drop(sender);
+        mitm.abort();
+    }
+
+    // ---- unit tests for host-normalization + ALPN helpers --------------------
+
+    #[test]
+    fn client_leg_alpn_offers_h2_and_http11() {
         install_ring();
         let ca = IzbaCa::generate().unwrap();
-        let ca_der = ca.cert_der();
-        let server_cfg = server_config_with_resolver(Arc::new(CertCache::new(ca)));
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca_der).unwrap();
-        let mut gcfg = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        gcfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-        let (g, s) = duplex(16 * 1024);
-        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
-        let srv = tokio::spawn(async move {
-            acceptor
-                .accept(s)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        });
-
-        let conn = TlsConnector::from(Arc::new(gcfg));
-        let name = ServerName::try_from("late.example.com").unwrap();
-        // Hold the client stream open until the server has finished accepting,
-        // else dropping it mid-final-flight breaks the server's handshake pipe.
-        let _guest = conn
-            .connect(name, g)
-            .await
-            .expect("handshake under izba CA via the SNI resolver");
-        srv.await.unwrap().expect("server side accepted");
+        let cfg = server_config_with_resolver(Arc::new(CertCache::new(ca)));
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
-    // --- LIFTED unit tests from OpenShell tls.rs (CA / cache / tls-sniff) ---
+    #[test]
+    fn req_host_strips_port_and_lowercases() {
+        let r: Request<Empty<Bytes>> = Request::builder()
+            .uri("/x")
+            .header(hyper::header::HOST, "API.Example.COM:8443")
+            .body(Empty::new())
+            .unwrap();
+        assert_eq!(req_host(&r).as_deref(), Some("api.example.com"));
+
+        let r2: Request<Empty<Bytes>> = Request::builder()
+            .uri("https://Authority.Example.com/y")
+            .body(Empty::new())
+            .unwrap();
+        assert_eq!(req_host(&r2).as_deref(), Some("authority.example.com"));
+
+        let r3: Request<Empty<Bytes>> = Request::builder()
+            .uri("/z")
+            .header(hyper::header::HOST, "host.example.com.")
+            .body(Empty::new())
+            .unwrap();
+        assert_eq!(req_host(&r3).as_deref(), Some("host.example.com"));
+    }
+
+    // --- LIFTED unit tests from OpenShell tls.rs (CA / cache) ---
 
     #[test]
     fn ca_generation() {
@@ -942,7 +1178,7 @@ mod tests {
     fn leaf_cert_generation() {
         let cache = CertCache::new(IzbaCa::generate().unwrap());
         let leaf = cache.get_or_generate("example.com").unwrap();
-        assert_eq!(leaf.cert_chain.len(), 2); // leaf + CA
+        assert_eq!(leaf.cert_chain.len(), 2);
     }
 
     #[test]
@@ -965,20 +1201,65 @@ mod tests {
         assert_eq!(cache.cache.lock().unwrap().len(), 1);
     }
 
-    #[test]
-    fn client_leg_alpn_offers_h2_and_http11() {
+    #[tokio::test]
+    async fn cert_resolver_mints_for_clienthello_sni() {
         install_ring();
         let ca = IzbaCa::generate().unwrap();
-        let cfg = server_config_with_resolver(Arc::new(CertCache::new(ca)));
-        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let ca_der = ca.cert_der();
+        let server_cfg = server_config_with_resolver(Arc::new(CertCache::new(ca)));
+
+        let gcfg = guest_cfg_with_alpn(ca_der, &[b"http/1.1"]);
+        let (g, s) = tokio::io::duplex(16 * 1024);
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+        let srv = tokio::spawn(async move {
+            acceptor
+                .accept(s)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+
+        let conn = TlsConnector::from(gcfg);
+        let name = ServerName::try_from("late.example.com").unwrap();
+        let _guest = conn
+            .connect(name, g)
+            .await
+            .expect("handshake under izba CA via the SNI resolver");
+        srv.await.unwrap().expect("server side accepted");
     }
 
-    #[test]
-    fn looks_like_tls_detects_clienthello() {
-        assert!(looks_like_tls(&[0x16, 0x03, 0x01, 0x00, 0x05]));
-        assert!(looks_like_tls(&[0x16, 0x03, 0x03]));
-        assert!(!looks_like_tls(b"GET / HTTP/1.1"));
-        assert!(!looks_like_tls(&[0x16]));
-        assert!(!looks_like_tls(&[0x17, 0x03, 0x03])); // app data, not handshake
+    // --- helpers to read a raw HTTP/1.1 response over the TLS stream -----------
+
+    async fn read_status_line<R: AsyncRead + Unpin>(r: &mut R) -> String {
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            let n = r.read(&mut b).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            line.push(b[0]);
+            if line.ends_with(b"\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&line).trim().to_string()
+    }
+
+    /// Consume up to (and including) the blank line ending the response headers.
+    async fn drain_response_headers<R: AsyncRead + Unpin>(r: &mut R) {
+        let mut window = [0u8; 4];
+        let mut b = [0u8; 1];
+        loop {
+            let n = r.read(&mut b).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            window.rotate_left(1);
+            window[3] = b[0];
+            if &window == b"\r\n\r\n" {
+                break;
+            }
+        }
     }
 }

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rustls::ClientConfig;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use super::audit::{AuditRecord, AuditSink, Tier};
@@ -104,16 +104,22 @@ struct PolicyAdapter {
     port: u16,
 }
 
-impl MitmPolicy for PolicyAdapter {
-    fn check(&self, req: &L7Request) -> L7Verdict {
-        let flow = FlowDesc {
+impl PolicyAdapter {
+    fn flow_for(&self, req: &L7Request) -> FlowDesc {
+        FlowDesc {
             sandbox: self.sandbox.clone(),
             addr: req.host.clone(),
             port: self.port,
             host: Some(req.host.clone()),
             method: Some(req.method.clone()),
             path: Some(req.path.clone()),
-        };
+        }
+    }
+}
+
+impl MitmPolicy for PolicyAdapter {
+    fn check(&self, req: &L7Request) -> L7Verdict {
+        let flow = self.flow_for(req);
         let verdict = self.policy.check(&flow);
         let rule = match verdict {
             Verdict::Allow => "allow-list",
@@ -130,6 +136,17 @@ impl MitmPolicy for PolicyAdapter {
             Verdict::Allow => L7Verdict::Allow,
             Verdict::Deny => L7Verdict::Deny("403 Forbidden by izba egress policy\n"),
         }
+    }
+
+    fn record_deny(&self, req: &L7Request, rule: &'static str) {
+        let flow = self.flow_for(req);
+        self.audit.record(AuditRecord::from_flow(
+            Verdict::Deny,
+            &flow,
+            self.ip,
+            Tier::L7,
+            rule,
+        ));
     }
 }
 
@@ -220,31 +237,31 @@ async fn accept_loop(
         let audit = audit.clone();
         tokio::spawn(async move {
             let state = MitmState { acceptor, upstream };
-            let adapter = PolicyAdapter {
+            let adapter: Arc<dyn MitmPolicy> = Arc::new(PolicyAdapter {
                 policy,
                 audit,
                 sandbox: dst.sandbox.clone(),
                 ip: dst.ip,
                 port: dst.port,
-            };
-            let dst_addr = (dst.ip, dst.port);
-            let dial = || async move {
-                TcpStream::connect(dst_addr)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("dial upstream {dst_addr:?}: {e}"))
-            };
-            // Classify the guest's first bytes: a TLS ClientHello takes the TLS
-            // terminate path; cleartext (e.g. apt's HTTP on :80) takes the
-            // plaintext HTTP path. Routing by sniff, not by port, also handles
-            // TLS-on-:80 / HTTP-on-:443 correctly. A peek that yields nothing
-            // (closed/idle) defaults to non-TLS → the HTTP reader then reports a
-            // clean "client closed" rather than a bogus TLS handshake error.
-            let mut peek = [0u8; 8];
-            let n = tcp.peek(&mut peek).await.unwrap_or(0);
-            if mitm::looks_like_tls(&peek[..n]) {
-                let _ = mitm::mitm_terminate(tcp, &state, &adapter, dial).await;
+            });
+            // Classify by the ORIGINAL destination port, not by peeking: :443 is
+            // TLS-terminated (per-SNI leaf under the izba CA, SNI captured from
+            // the handshake), :80 is cleartext HTTP. Non-conforming traffic
+            // (plaintext to :443, TLS to :80) fails the accept / h1 parse and
+            // serve_mitm fails closed — no buffering / Rewind adapter.
+            if dst.port == 443 {
+                match state.acceptor.accept(tcp).await {
+                    Ok(tls) => {
+                        let sni = tls.get_ref().1.server_name().map(str::to_string);
+                        let _ = mitm::serve_mitm(tls, sni, &state, adapter, dst.clone()).await;
+                    }
+                    Err(_) => {
+                        // Audited fail-closed: a guest that opened :443 but sent
+                        // a non-TLS / unSNI'd handshake never reaches an upstream.
+                    }
+                }
             } else {
-                let _ = mitm::mitm_terminate_http(tcp, &adapter, dial).await;
+                let _ = mitm::serve_mitm(tcp, None, &state, adapter, dst.clone()).await;
             }
         });
     }
