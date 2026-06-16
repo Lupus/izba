@@ -152,6 +152,165 @@ fn reload_if_changed(cell: &ResolverCell, source: &dyn ConfigSource) -> anyhow::
     Ok(true)
 }
 
+use super::dns::Resolver;
+use futures_util::StreamExt;
+use std::time::{Duration, Instant};
+
+const MIN_REBUILD_INTERVAL: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_secs(30);
+const IFWATCH_DEBOUNCE: Duration = Duration::from_secs(1);
+
+pub(crate) struct SystemResolver {
+    rt: tokio::runtime::Runtime,
+    cell: Arc<ResolverCell>,
+    caps: DnsCaps,
+    source: Arc<dyn ConfigSource>,
+    last_reload: Mutex<Instant>,
+}
+
+impl SystemResolver {
+    /// Build the production system resolver and start its reload tasks.
+    pub(crate) fn new() -> anyhow::Result<Arc<Self>> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let source: Arc<dyn ConfigSource> = Arc::new(SystemConfigSource);
+
+        // Initial build. A host with no DNS config is already broken; fall back
+        // to 1.1.1.1 (mirrors the retired UdpForwarder), logged.
+        let (config, opts) = source.discover().unwrap_or_else(|e| {
+            eprintln!("izbad: no system DNS upstream found ({e:#}); falling back to 1.1.1.1");
+            use hickory_resolver::config::{NameServerConfig, CLOUDFLARE};
+            let fallback =
+                ResolverConfig::from_parts(None, vec![], CLOUDFLARE.udp_and_tcp().collect());
+            let _ = NameServerConfig::udp_and_tcp; // silence unused import
+            (fallback, ResolverOpts::default())
+        });
+        let fp = fingerprint(&config);
+        let resolver = {
+            let _g = rt.enter();
+            build_resolver(config, opts)?
+        };
+        let cell = Arc::new(ResolverCell::new(Arc::new(ResolverState {
+            resolver,
+            fingerprint: fp,
+        })));
+
+        let me = Arc::new(Self {
+            rt,
+            cell,
+            caps: DnsCaps::v1(),
+            source,
+            last_reload: Mutex::new(Instant::now()),
+        });
+        me.spawn_reload_tasks();
+        Ok(me)
+    }
+
+    fn spawn_reload_tasks(self: &Arc<Self>) {
+        // L3: poll every 30s.
+        let cell = Arc::clone(&self.cell);
+        let source = Arc::clone(&self.source);
+        self.rt.spawn(async move {
+            let mut tick = tokio::time::interval(POLL_INTERVAL);
+            loop {
+                tick.tick().await;
+                if let Err(e) = reload_if_changed(&cell, &*source) {
+                    eprintln!("izbad: dns poll reload failed: {e:#}");
+                }
+            }
+        });
+
+        // if-watch: proactive reload on interface/IP change (VPN reconnect).
+        let cell = Arc::clone(&self.cell);
+        let source = Arc::clone(&self.source);
+        self.rt.spawn(async move {
+            let mut watcher = match if_watch::tokio::IfWatcher::new() {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("izbad: if-watch unavailable ({e:#}); poll-only reload");
+                    return;
+                }
+            };
+            while let Some(ev) = watcher.next().await {
+                if ev.is_err() {
+                    continue;
+                }
+                // Debounce: VPN connect emits a burst; sleep then reload once.
+                // fingerprint-dedupe makes any residual extra reload a no-op.
+                tokio::time::sleep(IFWATCH_DEBOUNCE).await;
+                if let Err(e) = reload_if_changed(&cell, &*source) {
+                    eprintln!("izbad: dns event reload failed: {e:#}");
+                }
+            }
+        });
+    }
+
+    /// Lazy reload-on-failure (Layer 2), rate-limited. Runs the apply path in a
+    /// runtime context.
+    fn try_reload_on_failure(&self) {
+        {
+            let mut last = self.last_reload.lock().unwrap();
+            if last.elapsed() < MIN_REBUILD_INTERVAL {
+                return;
+            }
+            *last = Instant::now();
+        }
+        let _g = self.rt.enter();
+        if let Err(e) = reload_if_changed(&self.cell, &*self.source) {
+            eprintln!("izbad: dns failure reload failed: {e:#}");
+        }
+    }
+
+    fn lookup_once(
+        &self,
+        name: &hickory_proto::rr::Name,
+        qtype: RecordType,
+    ) -> Result<Vec<Record>, hickory_resolver::net::NetError> {
+        let state = self.cell.load();
+        self.rt
+            .block_on(state.resolver.lookup(name.clone(), qtype))
+            .map(|l| l.answers().to_vec())
+    }
+
+    fn resolve(
+        &self,
+        req: Message,
+        name: hickory_proto::rr::Name,
+        qtype: RecordType,
+    ) -> anyhow::Result<Vec<u8>> {
+        match self.lookup_once(&name, qtype) {
+            Ok(records) => response_with_answers(&req, &records),
+            Err(e) if e.is_nx_domain() => response_with_rcode(&req, ResponseCode::NXDomain),
+            Err(e) if e.is_no_records_found() => response_with_rcode(&req, ResponseCode::NoError),
+            Err(_transient) => {
+                // Layer 2: the upstream may have moved (VPN reconnect). Rebuild
+                // from current system config and retry exactly once.
+                self.try_reload_on_failure();
+                match self.lookup_once(&name, qtype) {
+                    Ok(records) => response_with_answers(&req, &records),
+                    Err(e) if e.is_nx_domain() => response_with_rcode(&req, ResponseCode::NXDomain),
+                    Err(e) if e.is_no_records_found() => {
+                        response_with_rcode(&req, ResponseCode::NoError)
+                    }
+                    Err(e) => anyhow::bail!("dns lookup failed after reload: {e}"),
+                }
+            }
+        }
+    }
+}
+
+impl Resolver for SystemResolver {
+    fn handle(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        match classify_query(query, &self.caps) {
+            QueryDecision::Unparseable => anyhow::bail!("unparseable DNS query"),
+            QueryDecision::Unsupported { req } => response_with_rcode(&req, ResponseCode::NotImp),
+            QueryDecision::Answerable { req, name, qtype } => self.resolve(req, name, qtype),
+        }
+    }
+}
+
 /// Pure front-half of `handle`: parse + capability-gate, with no network. The
 /// network back-half consumes `Answerable`.
 enum QueryDecision {
@@ -309,5 +468,20 @@ mod tests {
             }
             _ => panic!("expected Unsupported"),
         }
+    }
+
+    #[test]
+    fn end_to_end_resolves_a_real_name() {
+        if std::env::var("IZBA_INTEGRATION").is_err() {
+            eprintln!("skipping: set IZBA_INTEGRATION=1 to run (needs network DNS)");
+            return;
+        }
+        let r = SystemResolver::new().unwrap();
+        let query = sample_query(0x4242, RecordType::A).to_vec().unwrap();
+        let bytes = r.handle(&query).unwrap();
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert_eq!(resp.id, 0x4242);
+        assert_eq!(resp.response_code, ResponseCode::NoError);
+        assert!(!resp.answers.is_empty(), "expected at least one A record");
     }
 }
