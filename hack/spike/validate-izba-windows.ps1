@@ -22,6 +22,25 @@ function Check($name, $ok) {
     else     { [Console]::Error.WriteLine("FAIL [$t]: $name"); $script:fails++ }
 }
 
+# Best-effort: dump the tail of a sandbox's vmm.log AND console.log to stderr so
+# a "did not become healthy" boot failure shows WHY in the CI log — even when
+# console.log is empty (e.g. the VMM never started, or hit an access-denied
+# HRESULT writing its scratch). vmm.log = openvmm's own stdout/stderr;
+# console.log = the guest serial. Purely diagnostic; never changes pass/fail.
+function Dump-BootLogs($name) {
+    $logs = "$env:LOCALAPPDATA\izba\sandboxes\$name\logs"
+    foreach ($f in @('vmm.log', 'console.log')) {
+        $p = Join-Path $logs $f
+        if (Test-Path $p) {
+            [Console]::Error.WriteLine("  --- $name $f tail (boot failure diag) ---")
+            Get-Content $p -Tail 40 -ErrorAction SilentlyContinue |
+                ForEach-Object { [Console]::Error.WriteLine("  $_") }
+        } else {
+            [Console]::Error.WriteLine("  ($name $f absent at $p)")
+        }
+    }
+}
+
 # Fresh workspace + no leftover sandbox from a previous run
 & $exe stop valid8 2>$null | Out-Null
 & $exe rm --force valid8 2>$null | Out-Null
@@ -30,7 +49,9 @@ New-Item -ItemType Directory -Path $ws | Out-Null
 
 # [1] run: create-on-first-use + pull + erofs + boot + exec, non-interactive
 & $exe run --image $image --name valid8 $ws -- /bin/sh -c 'echo booted > /workspace/marker && uname -s'
-Check 'run exits 0' ($LASTEXITCODE -eq 0)
+$valid8Boot = ($LASTEXITCODE -eq 0)
+Check 'run exits 0' $valid8Boot
+if (-not $valid8Boot) { Dump-BootLogs 'valid8' }
 Check 'workspace write visible on host' ((Get-Content "$ws\marker" -ErrorAction SilentlyContinue) -eq 'booted')
 
 # [2] liveness across CLI invocations (daemonless invariant)
@@ -78,6 +99,7 @@ foreach ($attempt in 1..3) {
     [Console]::Error.WriteLine("  egress-a boot attempt $attempt/3 timed out (nested-WHP flake); retrying from scratch")
 }
 Check 'izbad-egress sandbox boots (run exits 0)' $bootOk
+if (-not $bootOk) { Dump-BootLogs 'egress-a' }
 $egOut = (& $exe exec egress-a -- /bin/sh -lc 'getent hosts example.com' 2>&1 | Out-String)
 $egRc  = $LASTEXITCODE
 Check 'egress DNS via izbad resolves example.com' ($egRc -eq 0 -and $egOut -match 'example\.com')
