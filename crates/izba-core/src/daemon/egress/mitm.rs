@@ -237,12 +237,14 @@ impl ResolvesServerCert for SniResolver {
 }
 
 /// A `ServerConfig` whose leaf is minted per-ClientHello-SNI under the izba CA;
-/// ALPN pinned to `http/1.1` (h2 deferred — nearly all servers downgrade). IZBA.
+/// ALPN offers `h2` then `http/1.1` so guests may negotiate either — the
+/// hyper-util auto server serves both, and hyper bridges h2↔h1 at the
+/// Request/Response layer (the upstream leg negotiates its own protocol). IZBA.
 pub fn server_config_with_resolver(certs: Arc<CertCache>) -> ServerConfig {
     let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(SniResolver { certs }));
-    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     cfg
 }
 
@@ -961,6 +963,14 @@ mod tests {
         }
         cache.get_or_generate("overflow.example.com").unwrap();
         assert_eq!(cache.cache.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn client_leg_alpn_offers_h2_and_http11() {
+        install_ring();
+        let ca = IzbaCa::generate().unwrap();
+        let cfg = server_config_with_resolver(Arc::new(CertCache::new(ca)));
+        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     #[test]
