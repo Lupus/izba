@@ -1,6 +1,9 @@
 //! Terminating system DNS resolver with live config reload. Replaces the
 //! start-time-captured `UdpForwarder`: re-reads host DNS config and self-heals
 //! on network change (VPN reconnect) via lazy-on-failure + poll + if-watch.
+// The public types/functions here will be consumed by Task 7 (SystemResolver
+// struct). Suppress dead_code until that task is implemented.
+#![allow(dead_code)]
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{Record, RecordType};
