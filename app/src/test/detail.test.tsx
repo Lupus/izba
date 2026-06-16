@@ -15,6 +15,9 @@ vi.mock("../lib/ipc", () => ({
 vi.mock("../components/LogsView", () => ({
   LogsView: ({ name }: { name: string }) => <div>logs-for-{name}</div>,
 }));
+vi.mock("../components/FirewallStatus", () => ({
+  FirewallStatus: ({ name }: { name: string }) => <div>firewall-for-{name}</div>,
+}));
 vi.mock("../components/ShellPanel", () => ({
   ShellPanel: ({ sandbox }: { sandbox: string }) => <div>shell-for-{sandbox}</div>,
 }));
