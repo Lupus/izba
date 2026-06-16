@@ -906,8 +906,8 @@ fn egress_dns_via_izbad() {
     }
 
     // getent uses the guest resolv.conf (nameserver 127.0.0.1 -> the izba-init
-    // DNS stub on 0.0.0.0:53 -> vsock Dns stream -> izbad UdpForwarder -> host
-    // upstream). The reply rides loopback; a non-loopback resolver address
+    // DNS stub on 0.0.0.0:53 -> vsock Dns stream -> izbad SystemResolver ->
+    // host upstream). The reply rides loopback; a non-loopback resolver address
     // would be REDIRECTed by nft and its reply dropped (wildcard-socket
     // source-address mismatch; see NFT_RULESET's doc in egress.rs).
     let out = exec_ok(
