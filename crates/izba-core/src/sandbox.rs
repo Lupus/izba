@@ -420,16 +420,27 @@ pub fn start(
     name: &str,
     driver: &dyn VmmDriver,
     art: &Artifacts,
+    allow_unconfined: bool,
 ) -> anyhow::Result<()> {
     let timeout = boot_timeout_from_env(std::env::var("IZBA_BOOT_TIMEOUT_SECS").ok().as_deref());
-    start_with_timeouts(paths, name, driver, art, timeout, DEFAULT_BOOT_POLL)
+    start_with_timeouts(
+        paths,
+        name,
+        driver,
+        art,
+        allow_unconfined,
+        timeout,
+        DEFAULT_BOOT_POLL,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_with_timeouts(
     paths: &Paths,
     name: &str,
     driver: &dyn VmmDriver,
     art: &Artifacts,
+    allow_unconfined: bool,
     boot_timeout: Duration,
     poll: Duration,
 ) -> anyhow::Result<()> {
@@ -488,8 +499,7 @@ pub fn start_with_timeouts(
         ],
         console_log: console_log.clone(),
         run_dir: paths.run_dir(name),
-        // Threaded through from the caller in a later step; default-confine.
-        allow_unconfined: false,
+        allow_unconfined,
     };
 
     let mut handle = driver.launch(&spec)?;
@@ -534,6 +544,9 @@ pub fn start_with_timeouts(
             .position(|(role, _)| role == "vmm")
             .context("driver returned no 'vmm' pid")?;
         let (_, vmm_pid) = pids.remove(vmm_idx);
+        // Record the host-side confinement actually achieved for the VMM so
+        // status can report it honestly (and loudly when unconfined).
+        let confinement = Some(handle.confinement());
         let state = RunState {
             vmm_pid,
             sidecar_pids: pids,
@@ -541,6 +554,7 @@ pub fn start_with_timeouts(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            confinement,
         };
         save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)?;
         Ok(())
@@ -1098,7 +1112,7 @@ mod tests {
         create(&paths, "web", &opts(&ws)).unwrap();
 
         let driver = MockDriver::new();
-        start(&paths, "web", &driver, &arts()).unwrap();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
 
         let spec = driver
             .captured
@@ -1169,7 +1183,7 @@ mod tests {
 
         create(&paths, "web", &opts(&ws)).unwrap();
         let driver = MockDriver::new();
-        start(&paths, "web", &driver, &arts()).unwrap();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
         let spec = driver.captured.lock().unwrap().take().expect("spec");
         assert!(
             spec.cmdline.contains("izba.egress=1"),
@@ -1191,6 +1205,7 @@ mod tests {
             "web",
             &driver,
             &arts(),
+            false,
             Duration::from_secs(2),
             Duration::from_millis(50),
         )
@@ -1214,6 +1229,7 @@ mod tests {
             "web",
             &driver,
             &arts(),
+            false,
             Duration::from_millis(300),
             Duration::from_millis(50),
         )
@@ -1252,7 +1268,7 @@ mod tests {
         create(&paths, "web", &opts(&ws)).unwrap();
 
         let driver = MockDriver::without_vmm_pid();
-        let err = start(&paths, "web", &driver, &arts()).unwrap_err();
+        let err = start(&paths, "web", &driver, &arts(), false).unwrap_err();
 
         assert!(err.to_string().contains("vmm"), "got: {err:#}");
         let killed = driver
@@ -1279,9 +1295,9 @@ mod tests {
         create(&paths, "web", &opts(&ws)).unwrap();
 
         let driver = MockDriver::new();
-        start(&paths, "web", &driver, &arts()).unwrap();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
 
-        let err = start(&paths, "web", &driver, &arts()).unwrap_err();
+        let err = start(&paths, "web", &driver, &arts(), false).unwrap_err();
         assert!(err.to_string().contains("already running"), "got: {err:#}");
     }
 
@@ -1477,6 +1493,7 @@ mod tests {
                             "web",
                             &driver,
                             &art,
+                            false,
                             Duration::from_secs(2),
                             Duration::from_millis(50),
                         )

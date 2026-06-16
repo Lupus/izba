@@ -320,7 +320,8 @@ pub fn dispatch(
                         .with_context(|| format!("no config.json for '{name}'"))?;
                 let art = (d.deps.artifacts)(&d.paths)?;
                 d.egress.ensure_listening(&d.paths, &name)?;
-                if let Err(e) = sandbox::start(&d.paths, &name, d.deps.driver.as_ref(), &art) {
+                if let Err(e) = sandbox::start(&d.paths, &name, d.deps.driver.as_ref(), &art, false)
+                {
                     // Boot never happened — tear the listener back down.
                     d.egress.stop(&d.paths, &name);
                     return Err(e);
