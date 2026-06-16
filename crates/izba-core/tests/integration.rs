@@ -833,10 +833,10 @@ fn guest_networking() {
 
     // Daemonless suite: stand in for izbad's listener ourselves. The listener
     // must exist on run/vsock.sock_1027 BEFORE the guest boots and dials it.
-    use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
+    use izba_core::daemon::egress::{policy::AllowAll, EgressManager};
     let mgr = EgressManager::new(
         std::sync::Arc::new(AllowAll),
-        std::sync::Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
+        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
@@ -887,10 +887,10 @@ fn egress_dns_via_izbad() {
 
     // Daemonless suite: stand in for izbad's listener ourselves. The listener
     // must exist on run/vsock.sock_1027 BEFORE the guest boots and dials it.
-    use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
+    use izba_core::daemon::egress::{policy::AllowAll, EgressManager};
     let mgr = EgressManager::new(
         std::sync::Arc::new(AllowAll),
-        std::sync::Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
+        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
@@ -953,10 +953,10 @@ fn egress_http_via_stub() {
 
     // Daemonless suite: stand in for izbad's listener ourselves. The listener
     // must exist on run/vsock.sock_1027 BEFORE the guest boots and dials it.
-    use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
+    use izba_core::daemon::egress::{policy::AllowAll, EgressManager};
     let mgr = EgressManager::new(
         std::sync::Arc::new(AllowAll),
-        std::sync::Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
+        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
@@ -1009,7 +1009,7 @@ fn mitm_firewall_allows_and_denies_real_vm() {
     use izba_core::daemon::egress::config::EgressPolicyConfig;
     use izba_core::daemon::egress::mitm::{upstream_client_config_webpki, CertCache};
     use izba_core::daemon::egress::mitm_runtime::MitmRuntime;
-    use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
+    use izba_core::daemon::egress::{policy::AllowAll, EgressManager};
 
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
@@ -1038,7 +1038,7 @@ fn mitm_firewall_allows_and_denies_real_vm() {
 
     let mgr = EgressManager::new(
         std::sync::Arc::new(AllowAll),
-        std::sync::Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
+        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
         Some(mitm),
         audit,
     );
@@ -1187,10 +1187,10 @@ fn egress_throughput_baseline() {
     let mut tb = TestBox::new();
     let ws = tb.workspace("egress-tput");
     create_sandbox(&env, &mut tb, "egress-tput", &ws);
-    use izba_core::daemon::egress::{dns::UdpForwarder, policy::AllowAll, EgressManager};
+    use izba_core::daemon::egress::{policy::AllowAll, EgressManager};
     let mgr = EgressManager::new(
         std::sync::Arc::new(AllowAll),
-        std::sync::Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
+        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
