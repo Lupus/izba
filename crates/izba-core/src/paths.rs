@@ -86,6 +86,46 @@ impl Paths {
     }
 }
 
+/// Create `path` (and any missing ancestors) and harden the izba-owned tree to
+/// `0700` on Unix: `path` itself plus every ancestor up to and including `root`
+/// that did not already exist. This keeps the data root, `sandboxes/`, the
+/// per-sandbox dir, `run/`, and `logs/` private to the owning user on a
+/// multi-user host (matching the `ca/` and `daemon/` hardening) rather than
+/// world-traversable under the process umask. A no-op chmod on Windows.
+pub fn create_dir_700(path: &Path, root: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    // Ancestors (leaf-first) that don't exist yet and live inside `root` — only
+    // these get chmodded, so we never touch dirs we didn't create (e.g. $HOME).
+    let mut to_harden: Vec<&Path> = Vec::new();
+    let mut cur = Some(path);
+    while let Some(p) = cur {
+        if p.exists() {
+            break;
+        }
+        to_harden.push(p);
+        if p == root {
+            break;
+        }
+        cur = p.parent();
+    }
+
+    std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in to_harden {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod 0700 {}", p.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = to_harden;
+
+    Ok(())
+}
+
 /// Both platform rules always compile (`cfg!`, not `#[cfg]`) so each is
 /// unit-tested regardless of the build target.
 fn default_root(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
@@ -199,6 +239,26 @@ mod tests {
             windows_default_root(&env),
             PathBuf::from(r"C:\Users\u\AppData\Local").join("izba")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_700_hardens_path_and_created_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("izba");
+        let leaf = root.join("sandboxes").join("web").join("logs");
+
+        create_dir_700(&leaf, &root).unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // The leaf and every izba-owned ancestor up to (and including) the
+        // data root must be 0700 — not world-traversable.
+        assert_eq!(mode(&leaf), 0o700, "leaf");
+        assert_eq!(mode(&root.join("sandboxes").join("web")), 0o700, "sandbox");
+        assert_eq!(mode(&root.join("sandboxes")), 0o700, "sandboxes");
+        assert_eq!(mode(&root), 0o700, "data root");
     }
 
     #[test]

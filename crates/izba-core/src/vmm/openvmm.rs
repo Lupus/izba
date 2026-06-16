@@ -13,7 +13,7 @@
 //! `--processors`/`--memory` are spike-unverified (defaults were used) and
 //! get confirmed against `openvmm.exe --help` during Plan 2 bring-up.
 
-use super::spec::{CommandSpec, VmSpec};
+use super::spec::{reject_commas, CommandSpec, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
 use crate::procmgr::{kill_pid, pid_alive, spawn_detached};
 use crate::state::PidIdentity;
@@ -38,32 +38,6 @@ pub fn find_openvmm() -> anyhow::Result<PathBuf> {
 fn disk_port(i: usize) -> String {
     assert!(i < 26, "more than 26 disks is not a supported VmSpec");
     format!("vd{}", (b'a' + i as u8) as char)
-}
-
-/// OpenVMM device flags are comma-separated values (`file:<path>,ro,...`,
-/// `pcie_port=<port>:<tag>,<path>`); a comma inside an embedded path would
-/// silently truncate it into a bogus option list. Reject early with a clear
-/// error instead.
-fn reject_commas(spec: &VmSpec) -> anyhow::Result<()> {
-    for disk in &spec.disks {
-        if disk.path.display().to_string().contains(',') {
-            anyhow::bail!(
-                "disk path {} contains a comma, which the openvmm --virtio-blk \
-                 syntax cannot carry — move the izba data root to a comma-free path",
-                disk.path.display()
-            );
-        }
-    }
-    for share in &spec.shares {
-        if share.host_path.display().to_string().contains(',') {
-            anyhow::bail!(
-                "workspace path {} contains a comma, which the openvmm --virtio-fs \
-                 syntax cannot carry — use a comma-free workspace directory",
-                share.host_path.display()
-            );
-        }
-    }
-    Ok(())
 }
 
 pub fn build_invocation(spec: &VmSpec, openvmm: &Path) -> CommandSpec {
