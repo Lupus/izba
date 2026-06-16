@@ -116,7 +116,59 @@ pub fn copy_from_guest<S: CpStream>(
     let dest_is_file = host_dest.is_file();
     let (unpack_base, rename_top) = host_dest_plan(host_dest, &src_base)?;
 
-    let mut archive = tar::Archive::new(&mut conn);
+    unpack_stream(
+        &mut conn,
+        &unpack_base,
+        &src_base,
+        rename_top.as_deref(),
+        dest_is_file,
+        guest_src,
+        host_dest,
+    )
+}
+
+/// Unpack a guest-produced tar `reader` under `unpack_base`, applying the §3
+/// dest rules (top-component rewrite + dir-onto-file guard) AND containing the
+/// extraction against a hostile guest. This is the security-load-bearing seam:
+/// the host side of boundary B-CP (threat-model §7 invariant 1 — "no host-FS
+/// write outside the dest root from any guest action"). The archive is
+/// **untrusted** (the guest builds it), so we mirror the guest-side
+/// `izba-init/tarfs.rs` hardening here rather than trusting the `tar` crate,
+/// whose `entry.unpack` does NOT contain absolute paths, `..`, or symlink
+/// targets (verified by the `poc_*` abuse tests):
+///
+///   - Reject any entry whose landing path is lexically absolute or contains a
+///     `..` component (after the top-component rewrite), before joining.
+///   - Refuse to traverse a symlink while materializing the parent
+///     (`safe_create_dir_all`), and verify the realized parent stays within
+///     `unpack_base`. This blocks entry B of the two-step symlink escape.
+///   - Symlink/hardlink ENTRIES whose target escapes `unpack_base` (absolute,
+///     or `..` climbing above the base) are refused. This blocks entry A.
+///   - A pre-existing symlink AT the final component is replaced, never
+///     followed.
+///
+/// Portable across Linux (KVM) and Windows (WHP) — the baseline is pure path
+/// arithmetic + `symlink_metadata`, no `openat2`. `unpack_base` must already
+/// exist (the dest-plan guarantees it). Split out of `copy_from_guest` so
+/// abuse-case tests can drive it with an in-memory tar via `std::io::Cursor`
+/// instead of a real vsock connection.
+#[allow(clippy::too_many_arguments)]
+fn unpack_stream<R: Read>(
+    reader: R,
+    unpack_base: &Path,
+    src_base: &str,
+    rename_top: Option<&str>,
+    dest_is_file: bool,
+    guest_src: &str,
+    host_dest: &Path,
+) -> anyhow::Result<()> {
+    // Canonical base, used to confine every per-entry parent resolution. The
+    // base is host-chosen (never attacker-controlled) and known to exist.
+    let canon_base = unpack_base
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", unpack_base.display()))?;
+
+    let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_mtime(true);
     archive.set_unpack_xattrs(false);
@@ -124,10 +176,11 @@ pub fn copy_from_guest<S: CpStream>(
     let mut saw_entry = false;
     for entry in archive.entries().context("reading guest archive")? {
         let mut entry = entry.map_err(truncated)?;
+        let entry_type = entry.header().entry_type();
         // §3 matrix: a directory source cannot overwrite an existing file.
         // The first entry reveals the source type (dir-walk tars emit the
         // top directory entry first).
-        if !saw_entry && dest_is_file && entry.header().entry_type() == tar::EntryType::Directory {
+        if !saw_entry && dest_is_file && entry_type == tar::EntryType::Directory {
             bail!(
                 "cannot overwrite non-directory {} with directory {}",
                 host_dest.display(),
@@ -136,12 +189,62 @@ pub fn copy_from_guest<S: CpStream>(
         }
         saw_entry = true;
         let path = entry.path().context("reading entry path")?.into_owned();
-        let rewritten = rewrite_top(&path, &src_base, rename_top.as_deref());
-        let dest_path = unpack_base.join(&rewritten);
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+        let rewritten = rewrite_top(&path, src_base, rename_top);
+
+        // (1) Lexical containment: no absolute path, no `..` component. Under a
+        // plain `unpack_base.join(rewritten)` an absolute `rewritten` REPLACES
+        // the base entirely, and a `..` climbs out (both PoC-confirmed).
+        reject_lexical_escape(&rewritten)
+            .with_context(|| format!("refusing guest archive entry {}", rewritten.display()))?;
+
+        let dest_path = canon_base.join(&rewritten);
+
+        // (2) Link entries: refuse a symlink/hardlink whose target escapes the
+        // base (absolute, or `..` above the base). Blocks entry A of the
+        // two-step symlink escape (planting `x -> /tmp/evil`).
+        if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
+            if let Some(link) = entry.link_name().context("reading entry link target")? {
+                reject_escaping_link_target(&link, &rewritten, &canon_base).with_context(|| {
+                    format!(
+                        "refusing guest archive link {} -> {}",
+                        rewritten.display(),
+                        link.display()
+                    )
+                })?;
+            }
         }
+
+        // (3) Materialize the parent WITHOUT following any symlink prefix, then
+        // verify the realized parent is still inside the base.
+        // `safe_create_dir_all` refuses to descend through an existing symlink
+        // component, so entry B of the two-step escape (writing `x/payload`
+        // where `x` is a planted symlink) cannot reach outside.
+        if let Some(parent) = dest_path.parent() {
+            safe_create_dir_all(&canon_base, parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+            let canon_parent = parent
+                .canonicalize()
+                .with_context(|| format!("canonicalizing {}", parent.display()))?;
+            if !canon_parent.starts_with(&canon_base) {
+                bail!(
+                    "refusing guest archive entry {}: parent {} escapes {}",
+                    rewritten.display(),
+                    canon_parent.display(),
+                    canon_base.display()
+                );
+            }
+        }
+
+        // (4) Never write THROUGH a final-component symlink: replace it (an
+        // archive could otherwise plant `x -> /etc/passwd` then write `x`).
+        if let Ok(meta) = std::fs::symlink_metadata(&dest_path) {
+            if meta.file_type().is_symlink() {
+                std::fs::remove_file(&dest_path).with_context(|| {
+                    format!("replacing pre-existing symlink {}", dest_path.display())
+                })?;
+            }
+        }
+
         entry
             .unpack(&dest_path)
             .map_err(truncated)
@@ -149,6 +252,92 @@ pub fn copy_from_guest<S: CpStream>(
     }
     if !saw_entry {
         bail!("transfer truncated (no archive entries received)");
+    }
+    Ok(())
+}
+
+/// Loud lexical rejection of an absolute path or any `..`/non-normal component
+/// in a base-relative landing path. Mirrors `izba-init/tarfs.rs`'s
+/// `reject_lexical_escape`: `RootDir`/`Prefix` (absolute) and `ParentDir`
+/// (`..`) escape; only `Normal`/`CurDir` are allowed.
+fn reject_lexical_escape(rel: &Path) -> anyhow::Result<()> {
+    use std::path::Component;
+    if rel
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        bail!("path escapes the destination root");
+    }
+    Ok(())
+}
+
+/// Refuse a symlink/hardlink whose `target`, resolved lexically relative to the
+/// link's own location, would land outside `canon_base`. An absolute target is
+/// always refused; a relative target is joined onto the link's parent and
+/// reduced lexically (`..`-collapsed) before the containment check. Pure path
+/// arithmetic — no filesystem access (the prefix is contained separately by
+/// `safe_create_dir_all`).
+fn reject_escaping_link_target(
+    target: &Path,
+    link_rel: &Path,
+    canon_base: &Path,
+) -> anyhow::Result<()> {
+    if target.is_absolute() {
+        bail!("link target is absolute");
+    }
+    let link_parent = link_rel.parent().unwrap_or_else(|| Path::new(""));
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    for comp in canon_base.join(link_parent).join(target).components() {
+        use std::path::Component;
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                stack.clear();
+                stack.push(comp.as_os_str().to_os_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                stack.pop();
+            }
+            Component::Normal(c) => stack.push(c.to_os_string()),
+        }
+    }
+    let resolved: PathBuf = stack.iter().collect();
+    if !resolved.starts_with(canon_base) {
+        bail!("link target escapes the destination root");
+    }
+    Ok(())
+}
+
+/// `create_dir_all` that refuses to traverse an existing symlink: it walks the
+/// path component-by-component under `canon_base`, and if any existing
+/// component is a symlink it bails rather than following it. The host analogue
+/// of the guest's per-entry `openat2(RESOLVE_IN_ROOT)` parent resolution —
+/// portable (Linux + Windows) and the always-on baseline.
+fn safe_create_dir_all(canon_base: &Path, dir: &Path) -> anyhow::Result<()> {
+    // `dir` is `canon_base.join(rel)`; walk only the relative tail.
+    let rel = dir.strip_prefix(canon_base).unwrap_or(dir);
+    let mut cur = canon_base.to_path_buf();
+    for comp in rel.components() {
+        use std::path::Component;
+        match comp {
+            Component::Normal(c) => cur.push(c),
+            Component::CurDir => continue,
+            // Should never occur (the lexical check ran first); refuse loudly.
+            _ => bail!("refusing to create directory through {}", dir.display()),
+        }
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                bail!(
+                    "refusing to descend through existing symlink {}",
+                    cur.display()
+                );
+            }
+            Ok(meta) if meta.is_dir() => {} // already a real directory: fine
+            Ok(_) => bail!("{} exists and is not a directory", cur.display()),
+            Err(_) => {
+                std::fs::create_dir(&cur).with_context(|| format!("creating {}", cur.display()))?
+            }
+        }
     }
     Ok(())
 }
@@ -586,5 +775,240 @@ mod tests {
             err.to_string().contains("no such file or directory"),
             "got: {err:#}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // F-08 abuse cases: a hostile guest crafts the archive. `unpack_stream`
+    // is the host-side receiver and the only line of defense (boundary B-CP,
+    // threat-model §7 invariant 1: no host-FS write outside the dest root).
+    // These drive `unpack_stream` directly with an in-memory `Cursor` (no
+    // vsock), exactly like tarfs.rs's host-testable extract.
+    // ---------------------------------------------------------------------
+
+    /// Append a forged entry with a RAW GNU header name, bypassing the
+    /// high-level `append_data`/`set_path` `..`-validation (which a real
+    /// hostile guest sidesteps trivially by writing tar bytes by hand).
+    fn forge_entry(
+        b: &mut tar::Builder<Vec<u8>>,
+        name: &[u8],
+        etype: tar::EntryType,
+        link_target: Option<&str>,
+        data: &[u8],
+    ) {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(etype);
+        h.set_mode(0o644);
+        h.set_mtime(0);
+        if let Some(t) = link_target {
+            h.set_size(0);
+            h.set_link_name(t).unwrap();
+        } else {
+            h.set_size(data.len() as u64);
+        }
+        let gnu = h.as_gnu_mut().unwrap();
+        gnu.name[..name.len()].copy_from_slice(name);
+        h.set_cksum();
+        b.append(&h, data).unwrap();
+    }
+
+    /// Helper: run `unpack_stream` over `archive` into an existing `dest` dir,
+    /// keeping the src basename (into-dir rule, no rename).
+    fn run_unpack_into_dir(archive: Vec<u8>, dest: &Path, src_base: &str) -> anyhow::Result<()> {
+        unpack_stream(
+            std::io::Cursor::new(archive),
+            dest,
+            src_base,
+            None,
+            false,
+            src_base,
+            dest,
+        )
+    }
+
+    #[test]
+    fn poc_two_step_absolute_symlink_escape_blocked() {
+        // The classic two-step escape: entry A is a symlink `x -> <victim>`
+        // (absolute, OUTSIDE the unpack root), entry B is a regular file
+        // `x/payload` that, if `x` is followed, lands at <victim>/payload on
+        // the host. The unpack root is `into`; the victim is a SEPARATE
+        // tempdir the guest must never reach.
+        let host = tempfile::tempdir().unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        let into = host.path().join("into");
+        std::fs::create_dir_all(&into).unwrap();
+
+        let victim_abs = victim.path().to_string_lossy().into_owned();
+        let mut b = tar::Builder::new(Vec::new());
+        // entry A: symlink x -> /abs/victim
+        forge_entry(
+            &mut b,
+            b"src/x",
+            tar::EntryType::Symlink,
+            Some(&victim_abs),
+            b"",
+        );
+        // entry B: regular file x/payload
+        forge_entry(
+            &mut b,
+            b"src/x/payload",
+            tar::EntryType::Regular,
+            None,
+            b"PWNED",
+        );
+        let archive = b.into_inner().unwrap();
+
+        let res = run_unpack_into_dir(archive, &into, "src");
+
+        // The victim location must be untouched no matter what.
+        let escaped = victim.path().join("payload");
+        assert!(
+            !escaped.exists(),
+            "ESCAPE: guest wrote through symlink to {}",
+            escaped.display()
+        );
+        // And the unpack must have refused.
+        assert!(res.is_err(), "escape attempt must error, got Ok");
+    }
+
+    #[test]
+    fn poc_dotdot_traversal_entry_blocked() {
+        // A single entry whose name climbs out with `..` after the (unchanged)
+        // top component. `rewrite_top` only touches the FIRST component, so the
+        // `..` rides through the join.
+        let host = tempfile::tempdir().unwrap();
+        let into = host.path().join("into");
+        std::fs::create_dir_all(&into).unwrap();
+        // Victim sits as a sibling of `into`.
+        let victim = host.path().join("victim.txt");
+
+        let mut b = tar::Builder::new(Vec::new());
+        forge_entry(
+            &mut b,
+            b"src/../victim.txt",
+            tar::EntryType::Regular,
+            None,
+            b"PWNED",
+        );
+        let archive = b.into_inner().unwrap();
+
+        let res = run_unpack_into_dir(archive, &into, "src");
+        assert!(
+            !victim.exists(),
+            "ESCAPE: `..` entry wrote to {}",
+            victim.display()
+        );
+        assert!(res.is_err(), "`..` entry must error, got Ok");
+    }
+
+    #[test]
+    fn poc_absolute_path_entry_blocked() {
+        // An entry with an ABSOLUTE name. `unpack_base.join("/abs/...")`
+        // discards the base entirely under POSIX join semantics.
+        let host = tempfile::tempdir().unwrap();
+        let into = host.path().join("into");
+        std::fs::create_dir_all(&into).unwrap();
+        let victim = host.path().join("abs-victim.txt");
+        let victim_abs = victim.to_string_lossy().into_owned();
+
+        let mut b = tar::Builder::new(Vec::new());
+        // raw absolute name (leading slash kept verbatim in the GNU header)
+        forge_entry(
+            &mut b,
+            victim_abs.as_bytes(),
+            tar::EntryType::Regular,
+            None,
+            b"PWNED",
+        );
+        let archive = b.into_inner().unwrap();
+
+        let res = run_unpack_into_dir(archive, &into, "src");
+        assert!(
+            std::fs::read(&victim)
+                .map(|d| d != b"PWNED")
+                .unwrap_or(true),
+            "ESCAPE: absolute entry wrote to {}",
+            victim.display()
+        );
+        assert!(res.is_err(), "absolute entry must error, got Ok");
+    }
+
+    #[test]
+    fn poc_dotdot_symlink_target_escape_blocked() {
+        // Two-step escape with a RELATIVE `..` symlink target instead of an
+        // absolute one: x -> ../../<victim-dir>, then x/payload.
+        let host = tempfile::tempdir().unwrap();
+        let root = host.path().join("a/b/into");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim_dir = host.path().join("a/victim");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+
+        let mut b = tar::Builder::new(Vec::new());
+        // From <root>/src/x, `../../../victim` climbs to <host>/a/victim.
+        forge_entry(
+            &mut b,
+            b"src/x",
+            tar::EntryType::Symlink,
+            Some("../../../victim"),
+            b"",
+        );
+        forge_entry(
+            &mut b,
+            b"src/x/payload",
+            tar::EntryType::Regular,
+            None,
+            b"PWNED",
+        );
+        let archive = b.into_inner().unwrap();
+
+        let res = run_unpack_into_dir(archive, &root, "src");
+        let escaped = victim_dir.join("payload");
+        assert!(
+            !escaped.exists(),
+            "ESCAPE: relative-symlink escape wrote to {}",
+            escaped.display()
+        );
+        assert!(res.is_err(), "relative-symlink escape must error, got Ok");
+    }
+
+    #[test]
+    fn legit_archive_with_inner_symlink_still_extracts() {
+        // Defense must NOT break the legitimate case: a directory tree with an
+        // INNER, in-root relative symlink extracts fine (mirrors the guest's
+        // `extract_dir_into_existing_dir_nests_under_srcname`).
+        let host = tempfile::tempdir().unwrap();
+        let into = host.path().join("into");
+        std::fs::create_dir_all(&into).unwrap();
+
+        let mut b = tar::Builder::new(Vec::new());
+        // top dir entry first (as a real dir-walk emits)
+        let mut dh = tar::Header::new_gnu();
+        dh.set_entry_type(tar::EntryType::Directory);
+        dh.set_size(0);
+        dh.set_mode(0o755);
+        dh.set_mtime(0);
+        dh.set_cksum();
+        b.append_data(&mut dh, "tree/", &mut std::io::empty())
+            .unwrap();
+        forge_entry(
+            &mut b,
+            b"tree/a.txt",
+            tar::EntryType::Regular,
+            None,
+            b"hello",
+        );
+        // a safe inner symlink pointing at a sibling inside the tree
+        forge_entry(
+            &mut b,
+            b"tree/link",
+            tar::EntryType::Symlink,
+            Some("a.txt"),
+            b"",
+        );
+        let archive = b.into_inner().unwrap();
+
+        run_unpack_into_dir(archive, &into, "tree").expect("legit archive must extract");
+        assert_eq!(std::fs::read(into.join("tree/a.txt")).unwrap(), b"hello");
+        let target = std::fs::read_link(into.join("tree/link")).unwrap();
+        assert_eq!(target, std::path::Path::new("a.txt"));
     }
 }

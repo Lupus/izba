@@ -4,7 +4,7 @@
 //! egress rides the izbad-owned vsock 1027 plane (see `daemon::egress`), so
 //! cloud-hypervisor is launched without `--net`.
 
-use super::spec::{CommandSpec, VmSpec};
+use super::spec::{reject_commas, CommandSpec, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
 use crate::procmgr::{kill_pid, pid_alive, spawn_detached};
 use crate::state::PidIdentity;
@@ -42,7 +42,13 @@ impl VmmTools {
     }
 }
 
-pub fn build_invocations(spec: &VmSpec, tools: &VmmTools) -> Invocations {
+pub fn build_invocations(spec: &VmSpec, tools: &VmmTools) -> anyhow::Result<Invocations> {
+    // A comma in a disk or workspace path would silently split into bogus
+    // extra CH device options (`--disk path=<p>,readonly=on` / `--fs
+    // tag=...,socket=<p>`). Reject before formatting anything (mirrors the
+    // openvmm backend's guard — F-24).
+    reject_commas(spec)?;
+
     let run = &spec.run_dir;
     let fs_sock = |tag: &str| run.join(format!("fs-{tag}.sock"));
     let vsock_sock = run.join("vsock.sock");
@@ -113,10 +119,10 @@ pub fn build_invocations(spec: &VmSpec, tools: &VmmTools) -> Invocations {
         api_sock.display().to_string(),
     ]);
 
-    Invocations {
+    Ok(Invocations {
         virtiofsd,
         vmm: CommandSpec { argv: vmm },
-    }
+    })
 }
 
 /// Spawns cloud-hypervisor and its sidecars as detached processes.
@@ -140,7 +146,7 @@ impl VmmDriver for CloudHypervisorDriver {
             .with_context(|| format!("creating {}", log_dir.display()))?;
 
         let tools = VmmTools::resolve()?;
-        let inv = build_invocations(spec, &tools);
+        let inv = build_invocations(spec, &tools)?;
 
         // A previous crashed run may have left sockets/pid files behind; the
         // socket-wait below would then "succeed" against a dead socket. Clear
@@ -321,7 +327,7 @@ mod tests {
     fn ch_invocations() {
         let spec = base_spec();
         let run = &spec.run_dir;
-        let inv = build_invocations(&spec, &base_tools());
+        let inv = build_invocations(&spec, &base_tools()).unwrap();
 
         assert_eq!(inv.virtiofsd.len(), 1);
         assert_eq!(
@@ -387,7 +393,7 @@ mod tests {
             },
         ];
         let run = spec.run_dir.clone();
-        let inv = build_invocations(&spec, &base_tools());
+        let inv = build_invocations(&spec, &base_tools()).unwrap();
 
         assert_eq!(inv.virtiofsd.len(), 2);
         assert_eq!(
@@ -452,5 +458,32 @@ mod tests {
                 &run_sock(&run, "ch-api.sock"),
             ])
         );
+    }
+
+    #[test]
+    fn comma_in_disk_path_rejected() {
+        // A comma in a disk path would split `--disk path=<p>,readonly=on`
+        // into a bogus extra device option; build_invocations must refuse it
+        // rather than silently emit a malformed argv (F-24).
+        let mut spec = base_spec();
+        spec.disks[1].path = PathBuf::from("/sbx/a,b/scratch.img");
+        let err = build_invocations(&spec, &base_tools()).unwrap_err();
+        assert!(err.to_string().contains("comma"), "got: {err:#}");
+    }
+
+    #[test]
+    fn comma_in_share_path_rejected() {
+        // A comma in a workspace path would split the virtiofs / `--fs`
+        // option value the same way; refuse it (F-24).
+        let mut spec = base_spec();
+        spec.shares[0].host_path = PathBuf::from("/home/user/a,b");
+        let err = build_invocations(&spec, &base_tools()).unwrap_err();
+        assert!(err.to_string().contains("comma"), "got: {err:#}");
+    }
+
+    #[test]
+    fn comma_free_spec_accepted() {
+        // Positive control: comma-free paths still build a valid invocation.
+        assert!(build_invocations(&base_spec(), &base_tools()).is_ok());
     }
 }
