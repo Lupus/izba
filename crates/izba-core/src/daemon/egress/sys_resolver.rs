@@ -63,6 +63,33 @@ fn response_with_answers(req: &Message, records: &[Record]) -> anyhow::Result<Ve
     Ok(resp.to_vec()?)
 }
 
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use std::hash::{Hash, Hasher};
+
+/// Source of host DNS config. Seam so reload logic is testable without network.
+pub(crate) trait ConfigSource: Send + Sync {
+    fn discover(&self) -> anyhow::Result<(ResolverConfig, ResolverOpts)>;
+}
+
+/// Production: read the host's system DNS config (resolv.conf on unix; adapter
+/// DNS servers via the `ipconfig` crate on Windows — picks up the live VPN).
+pub(crate) struct SystemConfigSource;
+
+impl ConfigSource for SystemConfigSource {
+    fn discover(&self) -> anyhow::Result<(ResolverConfig, ResolverOpts)> {
+        Ok(hickory_resolver::system_conf::read_system_conf()?)
+    }
+}
+
+/// Stable hash of the parts of a resolver config that affect reachability
+/// (nameservers + search). Hashing the Debug rendering dodges per-field getter
+/// drift across hickory versions while still flipping on any server change.
+fn fingerprint(config: &ResolverConfig) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{config:?}").hash(&mut h);
+    h.finish()
+}
+
 /// Pure front-half of `handle`: parse + capability-gate, with no network. The
 /// network back-half consumes `Answerable`.
 enum QueryDecision {
@@ -99,7 +126,19 @@ mod tests {
     use super::*;
     use hickory_proto::op::Query;
     use hickory_proto::rr::Name;
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig as RC};
+    use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
+
+    fn config_with(ip: [u8; 4]) -> RC {
+        RC::from_parts(
+            None,
+            vec![],
+            vec![NameServerConfig::udp_and_tcp(IpAddr::V4(Ipv4Addr::from(
+                ip,
+            )))],
+        )
+    }
 
     fn sample_query(id: u16, qtype: RecordType) -> Message {
         let mut m = Message::new(id, MessageType::Query, OpCode::Query);
@@ -131,6 +170,15 @@ mod tests {
         assert_eq!(resp.queries.len(), 1);
         assert_eq!(resp.queries[0].query_type(), RecordType::A);
         assert!(resp.answers.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_change_sensitive() {
+        let a = config_with([10, 0, 0, 2]);
+        let a2 = config_with([10, 0, 0, 2]);
+        let b = config_with([8, 8, 8, 8]);
+        assert_eq!(fingerprint(&a), fingerprint(&a2));
+        assert_ne!(fingerprint(&a), fingerprint(&b));
     }
 
     #[test]
