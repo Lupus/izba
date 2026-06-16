@@ -244,20 +244,25 @@ async fn accept_loop(
                 ip: dst.ip,
                 port: dst.port,
             });
-            // Classify by the ORIGINAL destination port, not by peeking: :443 is
-            // TLS-terminated (per-SNI leaf under the izba CA, SNI captured from
-            // the handshake), :80 is cleartext HTTP. Non-conforming traffic
-            // (plaintext to :443, TLS to :80) fails the accept / h1 parse and
-            // serve_mitm fails closed — no buffering / Rewind adapter.
-            if dst.port == 443 {
+            // Classify TLS vs cleartext by PEEKING the first wire bytes
+            // (`TcpStream::peek` — does not consume them), not by the destination
+            // port. This is robust regardless of port: HTTPS may arrive on a
+            // non-443 port the router forwards, and the in-runtime tests dial an
+            // ephemeral upstream. A TLS ClientHello is terminated under the izba
+            // CA (SNI captured from the handshake); anything else is served as
+            // cleartext HTTP. No buffering/Rewind adapter — peek leaves the bytes
+            // in the socket for the acceptor / h1 server to re-read.
+            let mut hdr = [0u8; 5];
+            let n = tcp.peek(&mut hdr).await.unwrap_or(0);
+            if mitm::looks_like_tls(&hdr[..n]) {
                 match state.acceptor.accept(tcp).await {
                     Ok(tls) => {
                         let sni = tls.get_ref().1.server_name().map(str::to_string);
                         let _ = mitm::serve_mitm(tls, sni, &state, adapter, dst.clone()).await;
                     }
                     Err(_) => {
-                        // Audited fail-closed: a guest that opened :443 but sent
-                        // a non-TLS / unSNI'd handshake never reaches an upstream.
+                        // Audited fail-closed: a TLS-looking handshake that fails
+                        // (e.g. no SNI ⇒ no leaf) never reaches an upstream.
                     }
                 }
             } else {

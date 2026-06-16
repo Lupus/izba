@@ -263,6 +263,17 @@ pub fn server_config_with_resolver(certs: Arc<CertCache>) -> ServerConfig {
     cfg
 }
 
+/// Does the first stream byte(s) look like a TLS ClientHello? The MITM runtime
+/// classifies each loopback flow by peeking these bytes (`TcpStream::peek`, which
+/// does not consume them), so TLS vs cleartext is decided by the wire — robust
+/// regardless of the destination port — rather than by assuming :443⇒TLS. A
+/// `Handshake` record (`0x16`) with a `0x03xx` TLS version is unmistakable: an
+/// HTTP request line always starts with an uppercase ASCII method letter, never
+/// `0x16`. LIFTED from OpenShell `looks_like_tls`.
+pub(crate) fn looks_like_tls(peek: &[u8]) -> bool {
+    matches!(peek, [0x16, 0x03, minor, ..] if *minor <= 0x04)
+}
+
 // ============================================================================
 // Policy seam  (IZBA — where regorus RegoPolicy plugs in at M5)
 // ============================================================================
@@ -663,10 +674,12 @@ async fn handle_request(
 
 /// Re-anchor an allowed request to the single vetted `host` before it leaves for
 /// the upstream: collapse the `Host` header to exactly `host` (dropping any
-/// extras) and rewrite an absolute-form / h2 URI down to origin-form (path +
-/// query only). After this, hyper's h1 client encoder cannot emit any Host but
-/// the vetted one. h2 carries `:authority`; we re-set it to `host` too so the
-/// h2 upstream leg is equally pinned.
+/// extras) and rewrite an absolute-form / h2 `:authority` URI down to origin-form
+/// (path + query only), stripping the request's own authority. After this the
+/// upstream wire request (always HTTP/1.1 — guest h2 is bridged h2→h1 by hyper,
+/// which serializes from the Host header + origin-form URI) can carry no Host but
+/// the vetted one. This is what makes "policy host == cert host == wire host"
+/// hold, closing the confused-deputy gap.
 fn rewrite_outgoing_host<B>(req: &mut Request<B>, host: &str) -> Result<()> {
     // Collapse the Host header to the single vetted value.
     let host_value = hyper::header::HeaderValue::from_str(host)
@@ -1730,6 +1743,22 @@ mod tests {
             cfg.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
+    }
+
+    #[test]
+    fn looks_like_tls_detects_clienthello_not_http() {
+        // TLS ClientHello: Handshake record (0x16) + TLS major 0x03 + minor ≤ 0x04.
+        assert!(looks_like_tls(&[0x16, 0x03, 0x01, 0x00, 0x05])); // TLS 1.0 record
+        assert!(looks_like_tls(&[0x16, 0x03, 0x03])); // TLS 1.2 record header
+                                                      // HTTP request lines start with an ASCII method letter, never 0x16.
+        assert!(!looks_like_tls(b"GET / HTTP/1.1"));
+        assert!(!looks_like_tls(b"POST"));
+        // Too short / wrong content type / impossible version.
+        assert!(!looks_like_tls(&[0x16]));
+        assert!(!looks_like_tls(&[0x16, 0x03])); // need the minor byte
+        assert!(!looks_like_tls(&[0x17, 0x03, 0x03])); // app-data, not handshake
+        assert!(!looks_like_tls(&[0x16, 0x03, 0x05])); // minor > 0x04
+        assert!(!looks_like_tls(&[])); // empty peek (no bytes yet)
     }
 
     #[test]
