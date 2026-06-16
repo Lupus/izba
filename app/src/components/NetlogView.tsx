@@ -121,9 +121,6 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
           </button>
         </div>
       )}
-      {enforcing && hovering && rows.length > 0 && (
-        <div className="mb-2 text-xs text-ink-3">Auto-refresh paused while hovering.</div>
-      )}
       <div className="min-h-0 flex-1 overflow-auto">
         <table
           className="w-full text-left text-xs"
@@ -204,6 +201,11 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
           </tbody>
         </table>
         {rows.length === 0 && <div className="mt-3 text-ink-3">No egress recorded yet.</div>}
+      </div>
+      {/* Fixed-height status line, always present so toggling its text never
+          reflows the table (it sits below the scroll area, not above it). */}
+      <div className="mt-2 h-5 shrink-0 text-xs text-ink-3" aria-live="polite">
+        {hovering ? "Auto-refresh paused while hovering." : ""}
       </div>
     </div>
   );
