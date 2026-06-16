@@ -80,6 +80,11 @@ jobs:
   rust-host:
     name: coverage (rust workspace, linux)
     needs: [coverage-windows]
+    # Run even if coverage-windows failed/was-skipped: the Windows lcov merge is
+    # additive, and the Download step is best-effort (continue-on-error), so a
+    # flaky Windows coverage job degrades to Linux-only coverage rather than
+    # skipping the authoritative Linux scan entirely.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
