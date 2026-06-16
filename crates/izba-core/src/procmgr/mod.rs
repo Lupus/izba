@@ -19,6 +19,8 @@ pub use unix::proc_starttime;
 pub use unix::{kill_pid, pid_alive, spawn_detached};
 
 #[cfg(windows)]
+mod jail_windows;
+#[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use windows::proc_starttime;
