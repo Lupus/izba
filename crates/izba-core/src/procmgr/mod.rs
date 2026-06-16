@@ -29,6 +29,19 @@ pub use windows::proc_starttime;
 #[cfg(windows)]
 pub use windows::{kill_pid, pid_alive, spawn_detached};
 
+/// Unix fallback so call sites can use `spawn_confined` uniformly: the Linux
+/// jailer is a separate work item, so this is a plain detached spawn (the VMM
+/// already runs as the invoking user). `_policy` is accepted for signature
+/// parity and intentionally unused here.
+#[cfg(not(windows))]
+pub fn spawn_confined(
+    cmd: &crate::vmm::CommandSpec,
+    log: &std::path::Path,
+    _policy: &confine::ConfinementPolicy,
+) -> anyhow::Result<crate::state::PidIdentity> {
+    spawn_detached(cmd, log)
+}
+
 use crate::state::PidIdentity;
 
 /// PID-reuse-safe identity of the current process. Alive for as long as this
