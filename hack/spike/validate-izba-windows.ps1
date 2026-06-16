@@ -8,7 +8,8 @@
 # Sections: [1] run/boot/exec, [2] liveness, [3] exec exit-codes,
 #           [4] exec stdin, [5] networking, [6] console log,
 #           [7] daemon lifecycle (status/kill-adopt/stop-survival),
-#           [8] stop/restart/rm, [9] M3 persistent volume + prune (vdc parity).
+#           [8] stop/restart/rm, [9] M3 persistent volume + prune (vdc parity),
+#           [10] VMM confinement (differential PoC + live status).
 $ErrorActionPreference = 'Continue'
 $exe   = if ($env:IZBA_EXE)   { $env:IZBA_EXE }   else { 'C:\izba\bin\izba.exe' }
 $image = if ($env:IZBA_IMAGE) { $env:IZBA_IMAGE } else { 'alpine:3.20' }
@@ -203,6 +204,46 @@ Check 'persistent volume image survives rm' (Test-Path "$env:LOCALAPPDATA\izba\v
 & $exe volume prune -f | Out-Null
 Check 'prune exits 0' ($LASTEXITCODE -eq 0)
 Check 'prune reaps unreferenced volume' (-not (Test-Path "$env:LOCALAPPDATA\izba\volumes\vdata.img"))
+
+# [10] VMM confinement: the real OpenVMM process is launched confined by default
+# (restricted token + Low IL + job). This is the F-06 hardening proof and it must
+# FAIL the run on regression — a skipped security proof must NOT look green.
+#
+# (10a) Differential PoC: the confine_probe harness spawns each abuse case
+# confined-vs-unconfined on real WHP hardware and exits 0 iff every protection
+# holds (write-up/acquire-priv DENIED confined + OK unconfined; self-il Low vs
+# Medium; whp OK both, or SKIPPED if WHP absent). A missing probe path is a FAIL,
+# never a silent skip.
+if (-not $env:IZBA_CONFINE_PROBE) {
+    Check 'confine_probe harness exits 0 (differential PoC)' $false
+    [Console]::Error.WriteLine("  IZBA_CONFINE_PROBE is unset — refusing to skip the confinement proof")
+} elseif (-not (Test-Path $env:IZBA_CONFINE_PROBE)) {
+    Check 'confine_probe harness exits 0 (differential PoC)' $false
+    [Console]::Error.WriteLine("  IZBA_CONFINE_PROBE='$($env:IZBA_CONFINE_PROBE)' does not exist — refusing to skip the confinement proof")
+} else {
+    $probeOut = (& $env:IZBA_CONFINE_PROBE harness 2>&1 | Out-String)
+    $probeRc  = $LASTEXITCODE
+    Check 'confine_probe harness exits 0 (differential PoC)' ($probeRc -eq 0)
+    if ($probeRc -ne 0) {
+        [Console]::Error.WriteLine("  confine_probe harness rc=$probeRc")
+        ($probeOut -split "`n") | ForEach-Object { [Console]::Error.WriteLine("  $_") }
+    }
+}
+
+# (10b) Live product status: a real confined VMM must be honestly reported. The
+# earlier checks rm'd valid8, so boot a fresh one and assert `izba status` shows
+# a `confinement:` line that says `confined` and NOT `UNCONFINED`.
+& $exe run --image $image --name valid8 $ws -- /bin/true | Out-Null
+Check 'confinement status sandbox boots (run exits 0)' ($LASTEXITCODE -eq 0)
+$stConf = & $exe status valid8 | Out-String
+$confOk = ($stConf -match 'confinement:' -and $stConf -match 'confined' -and -not ($stConf -match 'UNCONFINED'))
+Check 'izba status reports the VMM as confined' $confOk
+if (-not $confOk) {
+    [Console]::Error.WriteLine("  --- izba status valid8 ---")
+    ($stConf -split "`n") | ForEach-Object { [Console]::Error.WriteLine("  $_") }
+}
+& $exe stop valid8 2>$null | Out-Null
+& $exe rm --force valid8 2>$null | Out-Null
 
 # Best-effort daemon cleanup so the validation run leaves no daemon behind.
 & $exe daemon stop 2>$null | Out-Null
