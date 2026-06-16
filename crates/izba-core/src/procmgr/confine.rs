@@ -82,6 +82,23 @@ impl ConfinementStatus {
             reason: format!("{token}+{il}+job"),
         }
     }
+    /// Token+IL boundary applied, but the best-effort resource job could not be
+    /// created/assigned. Same shape as `applied()` MINUS the "+job" claim, plus
+    /// a note that the job is absent — so health never overstates confinement.
+    pub fn token_only(p: &ConfinementPolicy) -> Self {
+        let token = match p.token {
+            TokenLevel::Limited => "restricted(limited)",
+            TokenLevel::RestrictedNonAdmin => "restricted(non-admin)",
+        };
+        let il = match p.integrity {
+            IntegrityLevel::Low => "low-il",
+            IntegrityLevel::Medium => "medium-il",
+        };
+        Self {
+            mode: ConfinementMode::TokenOnly,
+            reason: format!("{token}+{il} (resource job unavailable)"),
+        }
+    }
     pub fn degraded(reason: &str) -> Self {
         Self {
             mode: ConfinementMode::None,
@@ -125,5 +142,17 @@ mod tests {
         let none = ConfinementStatus::degraded("WHP unavailable under restricted token");
         assert_eq!(none.mode, ConfinementMode::None);
         assert!(none.summary().contains("WHP unavailable"));
+    }
+
+    #[test]
+    fn token_only_status_omits_job_and_summarizes_honestly() {
+        let s = ConfinementStatus::token_only(&ConfinementPolicy::vmm_default());
+        assert_eq!(s.mode, ConfinementMode::TokenOnly);
+        // Honest: keeps the token+IL claim but NEVER asserts the job.
+        assert!(s.reason.contains("restricted(limited)"));
+        assert!(s.reason.contains("low-il"));
+        assert!(!s.reason.contains("+job"));
+        assert!(s.reason.contains("resource job unavailable"));
+        assert!(s.summary().starts_with("confined (token only):"));
     }
 }

@@ -12,7 +12,7 @@
 //! deprivileged. Restricting/deny-only SID shaping per `policy.token` is a
 //! follow-up — dropping privileges is the proven precondition.
 
-use crate::procmgr::confine::{ConfinementPolicy, IntegrityLevel};
+use crate::procmgr::confine::{ConfinementMode, ConfinementPolicy, IntegrityLevel};
 use crate::procmgr::windows::creation_time;
 use crate::state::PidIdentity;
 use crate::vmm::CommandSpec;
@@ -260,7 +260,10 @@ fn build_command_line(argv: &[String]) -> Vec<u16> {
 }
 
 /// Spawn `cmd` confined per `policy`, detached, stdio appended to `log`. Returns
-/// the same PidIdentity the daemonless liveness model uses. Job handle is
+/// the daemonless-liveness PidIdentity plus the `ConfinementMode` actually
+/// achieved: `Restricted` when the best-effort resource job was created AND
+/// assigned, `TokenOnly` when the token+IL boundary succeeded but the job
+/// could not be applied (the honest "no +job" status). Job handle is
 /// intentionally leaked (no kill-on-close) so the VMM survives the launcher.
 /// FAILS CLOSED: if the confined token can't be built, returns Err (never an
 /// unconfined spawn). SAFETY: linear FFI; setup handles closed; job leaked.
@@ -268,7 +271,7 @@ pub fn spawn_confined(
     cmd: &CommandSpec,
     log: &Path,
     policy: &ConfinementPolicy,
-) -> anyhow::Result<PidIdentity> {
+) -> anyhow::Result<(PidIdentity, ConfinementMode)> {
     if cmd.argv.is_empty() {
         anyhow::bail!("spawn_confined: empty argv");
     }
@@ -282,7 +285,7 @@ pub fn spawn_confined(
         let token = build_confined_token(policy)?;
 
         // From here, `token` must be closed on every exit path.
-        let spawn = (|| -> anyhow::Result<PidIdentity> {
+        let spawn = (|| -> anyhow::Result<(PidIdentity, ConfinementMode)> {
             // 1. Inheritable append handle to the log file (mirrors the
             //    stdout/stderr→log redirection in windows.rs spawn_detached).
             //    This is the ONLY handle made inheritable into the child.
@@ -313,7 +316,7 @@ pub fn spawn_confined(
             }
 
             // From here, `hlog` must be closed on every exit path.
-            let inner = (|| -> anyhow::Result<PidIdentity> {
+            let inner = (|| -> anyhow::Result<(PidIdentity, ConfinementMode)> {
                 // 2. Attribute list (count=2): the inheritable-handle allow-list
                 //    (exactly [hlog]) + the mitigation policy.
                 let mut size: usize = 0;
@@ -345,7 +348,7 @@ pub fn spawn_confined(
                 // values eagerly on each Update call.
                 let handles: [HANDLE; 1] = [hlog];
                 let mit: u64 = vmm_mitigation_flags();
-                let built = (|| -> anyhow::Result<PidIdentity> {
+                let built = (|| -> anyhow::Result<(PidIdentity, ConfinementMode)> {
                     if InitializeProcThreadAttributeList(attr, 2, 0, &mut size) == 0 {
                         anyhow::bail!(
                             "InitializeProcThreadAttributeList: {}",
@@ -353,7 +356,7 @@ pub fn spawn_confined(
                         );
                     }
                     // From here, `attr` is initialized → must be Delete'd too.
-                    let after_init = (|| -> anyhow::Result<PidIdentity> {
+                    let after_init = (|| -> anyhow::Result<(PidIdentity, ConfinementMode)> {
                         // 2a. HANDLE_LIST = exactly [hlog]: the only handle the
                         //     child may inherit even with bInheritHandles=TRUE.
                         if UpdateProcThreadAttribute(
@@ -437,7 +440,13 @@ pub fn spawn_confined(
                         let job_name = format!("izba-vmm-{}", pi.dwProcessId);
                         let job_name_w: Vec<u16> =
                             job_name.encode_utf16().chain(std::iter::once(0)).collect();
-                        match create_resource_job(&job_name_w, policy.job_memory_max_mb) {
+                        // Mode reflects what the resource job ACTUALLY achieved:
+                        // `Restricted` only when both create AND assign succeed;
+                        // `TokenOnly` if either fails (token+IL still applied, so
+                        // the boundary is intact — the status must just not claim
+                        // "+job"). This drives the honest ConfinementStatus.
+                        let mode = match create_resource_job(&job_name_w, policy.job_memory_max_mb)
+                        {
                             Ok(job) => {
                                 if AssignProcessToJobObject(job, pi.hProcess) == 0 {
                                     eprintln!(
@@ -445,18 +454,21 @@ pub fn spawn_confined(
                                         std::io::Error::last_os_error()
                                     );
                                     CloseHandle(job);
+                                    ConfinementMode::TokenOnly
                                 } else {
                                     // Leak the job handle: closing it must never
                                     // kill members, and izbad reopens by name.
                                     std::mem::forget(OwnedJobHandle(job));
+                                    ConfinementMode::Restricted
                                 }
                             }
                             Err(e) => {
                                 eprintln!(
                                     "izba: resource job for {job_name}: {e:#} — running without it"
                                 );
+                                ConfinementMode::TokenOnly
                             }
-                        }
+                        };
 
                         // 7. Resume the suspended child now that it is confined +
                         //    (best-effort) job-assigned.
@@ -477,10 +489,13 @@ pub fn spawn_confined(
                         }
                         CloseHandle(pi.hThread);
                         CloseHandle(pi.hProcess);
-                        Ok(PidIdentity {
-                            pid,
-                            starttime: starttime?,
-                        })
+                        Ok((
+                            PidIdentity {
+                                pid,
+                                starttime: starttime?,
+                            },
+                            mode,
+                        ))
                     })();
                     DeleteProcThreadAttributeList(attr);
                     after_init

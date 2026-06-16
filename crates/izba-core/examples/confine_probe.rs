@@ -538,7 +538,8 @@ mod win {
 
         let spec = CommandSpec { argv };
         let id = if confined {
-            spawn_confined(&spec, log, &ConfinementPolicy::vmm_default())?
+            let (id, _mode) = spawn_confined(&spec, log, &ConfinementPolicy::vmm_default())?;
+            id
         } else {
             spawn_detached(&spec, log)?
         };

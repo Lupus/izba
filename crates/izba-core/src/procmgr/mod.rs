@@ -32,14 +32,15 @@ pub use windows::{kill_pid, pid_alive, spawn_detached};
 /// Unix fallback so call sites can use `spawn_confined` uniformly: the Linux
 /// jailer is a separate work item, so this is a plain detached spawn (the VMM
 /// already runs as the invoking user). `_policy` is accepted for signature
-/// parity and intentionally unused here.
+/// parity and intentionally unused here. Reports `ConfinementMode::None`
+/// honestly — the parity stub does not confine.
 #[cfg(not(windows))]
 pub fn spawn_confined(
     cmd: &crate::vmm::CommandSpec,
     log: &std::path::Path,
     _policy: &confine::ConfinementPolicy,
-) -> anyhow::Result<crate::state::PidIdentity> {
-    spawn_detached(cmd, log)
+) -> anyhow::Result<(crate::state::PidIdentity, confine::ConfinementMode)> {
+    Ok((spawn_detached(cmd, log)?, confine::ConfinementMode::None))
 }
 
 use crate::state::PidIdentity;
