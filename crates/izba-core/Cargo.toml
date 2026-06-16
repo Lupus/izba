@@ -61,6 +61,12 @@ regorus = { version = "0.4", default-features = false, features = ["std", "arc",
 # recover FQDNs for the non-HTTP egress allow-list. default-features=false keeps
 # it a pure wire parser (no tokio/runtime) and cross-compiles to windows-gnu.
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
+# Terminating system resolver with live config reload (replaces the
+# start-time-captured UDP forwarder; self-heals on VPN/network change).
+hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"] }
+# Cross-platform interface/IP change events (netlink on Linux, IP Helper on
+# Windows) — proactive reload trigger. Pure-Rust; cross-compiles to windows-gnu.
+if-watch = { version = "3", features = ["tokio"] }
 
 # Per-sandbox `--policy` config parse (mirrors the user's docker-mitm-bridge
 # data.yml shape). serde_yaml 0.9 is archived-but-final + pure Rust.
