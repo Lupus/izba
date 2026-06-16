@@ -19,6 +19,13 @@ use windows_sys::Win32::Security::{
     CreateRestrictedToken, SetTokenInformation, TokenIntegrityLevel, DISABLE_MAX_PRIVILEGE,
     SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL,
 };
+use windows_sys::Win32::System::JobObjects::{
+    CreateJobObjectW, SetInformationJobObject, JobObjectExtendedLimitInformation,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+};
+// NEVER import/use JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — izbad death/upgrade must
+// not kill VMMs (izba daemonless contract).
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// `SE_GROUP_INTEGRITY` (winnt.h) — the SID-and-attributes flag marking a group
@@ -126,4 +133,36 @@ pub fn probe_confinable(policy: &ConfinementPolicy, probe_exe: &std::path::Path)
             Err(_) => false,
         }
     }
+}
+
+/// A NAMED, best-effort resource job. CRITICAL: never KILL_ON_JOB_CLOSE — izbad
+/// death/upgrade must not kill VMMs. SILENT_BREAKAWAY_OK so an adopted VMM is
+/// never tied to a launcher handle. Returns the job handle (kept by the caller;
+/// closing it does NOT kill members).
+/// SAFETY: FFI; on error the job handle is closed.
+// Unused until Task 8 wires `spawn_confined`; the job is the resource-cap layer.
+#[allow(dead_code)]
+unsafe fn create_resource_job(name_w: &[u16], mem_mb: Option<u64>) -> anyhow::Result<HANDLE> {
+    let job = CreateJobObjectW(std::ptr::null(), name_w.as_ptr());
+    if job.is_null() {
+        anyhow::bail!("CreateJobObjectW: {}", std::io::Error::last_os_error());
+    }
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+    if let Some(mb) = mem_mb {
+        info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        info.JobMemoryLimit = (mb as usize) * 1024 * 1024;
+    }
+    let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+    if SetInformationJobObject(
+        job,
+        JobObjectExtendedLimitInformation,
+        &info as *const _ as *const _,
+        size,
+    ) == 0
+    {
+        CloseHandle(job);
+        anyhow::bail!("SetInformationJobObject: {}", std::io::Error::last_os_error());
+    }
+    Ok(job)
 }
