@@ -1,0 +1,370 @@
+//! Differential confinement proof-of-concept for the Windows VMM jailer.
+//!
+//! This example is the CI artifact that PROVES the host-side confinement
+//! (`spawn_confined`: restricted token + Low integrity + job + mitigations)
+//! actually blocks the security-relevant operations it is meant to block, while
+//! NOT breaking the one capability the VMM needs (WHP). It is the concrete
+//! evidence for security finding F-06 ("unjailed VMM") on Windows.
+//!
+//! It runs in two roles:
+//!
+//! - `confine_probe child --attempt <kind> --result <file> [--target <path>]`
+//!   performs one abuse case and records `OK` (operation succeeded) or
+//!   `DENIED` (operation was blocked) into `<file>`, also mirroring that into
+//!   the process exit code (0 = OK, 13 = DENIED).
+//! - `confine_probe harness` is the differential driver: for each attempt it
+//!   runs the child CONFINED and UNCONFINED, then asserts the security-relevant
+//!   attempts are DENIED-under-confinement / OK-without, and that the WHP
+//!   capability gate stays OK under BOTH. A vacuous run (the unconfined leg did
+//!   not even succeed) is a FAIL, so the differential is always meaningful.
+//!
+//! The whole Windows body is `#[cfg(windows)]`; the Linux build compiles a
+//! no-op so the example stays in the cross-checked surface.
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("confine_probe: windows-only");
+}
+
+#[cfg(windows)]
+fn main() -> std::process::ExitCode {
+    win::main()
+}
+
+#[cfg(windows)]
+mod win {
+    use izba_core::procmgr::confine::ConfinementPolicy;
+    use izba_core::procmgr::{pid_alive, spawn_confined, spawn_detached};
+    use izba_core::vmm::CommandSpec;
+    use std::path::{Path, PathBuf};
+    use std::process::ExitCode;
+    use std::time::{Duration, Instant};
+
+    /// Result-file / exit-code sentinels shared by the two roles.
+    const OK: &str = "OK";
+    const DENIED: &str = "DENIED";
+    const EXIT_DENIED: u8 = 13;
+
+    /// The abuse cases. `write-up` and `acquire-priv` are SECURITY gates (must be
+    /// blocked under confinement, allowed without); `whp` is the CAPABILITY gate
+    /// (must stay allowed under BOTH — confinement must not break the hypervisor).
+    const SECURITY_ATTEMPTS: &[&str] = &["write-up", "acquire-priv"];
+    const CAPABILITY_ATTEMPTS: &[&str] = &["whp"];
+
+    pub fn main() -> ExitCode {
+        let mut args = std::env::args().skip(1);
+        match args.next().as_deref() {
+            Some("child") => child(args.collect()),
+            Some("harness") | None => harness(),
+            Some(other) => {
+                eprintln!("confine_probe: unknown role {other:?} (expected child|harness)");
+                ExitCode::from(2)
+            }
+        }
+    }
+
+    // ---- child role ---------------------------------------------------------
+
+    /// Parse `--attempt <kind> --result <file> [--target <path>]`, run the
+    /// attempt, write OK/DENIED, exit 0/13 accordingly.
+    fn child(args: Vec<String>) -> ExitCode {
+        let mut attempt = None;
+        let mut result = None;
+        let mut target = None;
+        let mut it = args.into_iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--attempt" => attempt = it.next(),
+                "--result" => result = it.next(),
+                "--target" => target = it.next(),
+                other => {
+                    eprintln!("confine_probe child: unexpected arg {other:?}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        let (Some(attempt), Some(result)) = (attempt, result) else {
+            eprintln!("confine_probe child: --attempt and --result are required");
+            return ExitCode::from(2);
+        };
+
+        let allowed = match attempt.as_str() {
+            "write-up" => {
+                let Some(t) = target else {
+                    eprintln!("confine_probe child: write-up requires --target");
+                    return ExitCode::from(2);
+                };
+                attempt_write_up(Path::new(&t))
+            }
+            "acquire-priv" => attempt_acquire_priv(),
+            "whp" => attempt_whp(),
+            other => {
+                eprintln!("confine_probe child: unknown attempt {other:?}");
+                return ExitCode::from(2);
+            }
+        };
+
+        let verdict = if allowed { OK } else { DENIED };
+        // Best-effort: even if the result file write fails, the exit code carries
+        // the verdict, but the harness reads the file, so surface a write error.
+        if let Err(e) = std::fs::write(&result, verdict) {
+            eprintln!("confine_probe child: writing result {result}: {e}");
+            return ExitCode::from(2);
+        }
+        if allowed {
+            ExitCode::from(0)
+        } else {
+            ExitCode::from(EXIT_DENIED)
+        }
+    }
+
+    /// write-up: try to create+write a file at a Medium-IL location the harness
+    /// prepared. A Low-IL confined child cannot write a Medium-IL object (the
+    /// mandatory-label no-write-up policy) and gets ACCESS_DENIED; an unconfined
+    /// Medium child succeeds. Returns true iff the write SUCCEEDED.
+    fn attempt_write_up(target: &Path) -> bool {
+        match std::fs::File::create(target) {
+            Ok(mut f) => {
+                use std::io::Write;
+                // Actually write so we exercise data flow, not just object create.
+                f.write_all(b"izba-confine-probe").is_ok()
+            }
+            Err(_) => false, // ACCESS_DENIED (and any other failure) => DENIED
+        }
+    }
+
+    /// acquire-priv: try to ENABLE SeShutdownPrivilege on our own token. Under
+    /// `DISABLE_MAX_PRIVILEGE` the privilege is REMOVED from the token, so
+    /// AdjustTokenPrivileges returns success-with-`ERROR_NOT_ALL_ASSIGNED` ->
+    /// DENIED. A normal token has the privilege -> enabled, GetLastError==0 -> OK.
+    /// Returns true iff the privilege was actually enabled.
+    fn attempt_acquire_priv() -> bool {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GetLastError, ERROR_SUCCESS, HANDLE, LUID,
+        };
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
+            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        // SAFETY: linear FFI; the opened token handle is closed on every path.
+        unsafe {
+            let mut tok: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut tok,
+            ) == 0
+            {
+                return false;
+            }
+            let enabled = (|| {
+                let name: Vec<u16> = "SeShutdownPrivilege\0".encode_utf16().collect();
+                let mut luid: LUID = std::mem::zeroed();
+                if LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) == 0 {
+                    return false;
+                }
+                let tp = TOKEN_PRIVILEGES {
+                    PrivilegeCount: 1,
+                    Privileges: [LUID_AND_ATTRIBUTES {
+                        Luid: luid,
+                        Attributes: SE_PRIVILEGE_ENABLED,
+                    }],
+                };
+                // AdjustTokenPrivileges returns nonzero even on partial failure;
+                // the real verdict is GetLastError: ERROR_NOT_ALL_ASSIGNED means
+                // the privilege was not in the token (removed by DISABLE_MAX_PRIVILEGE).
+                let ok = AdjustTokenPrivileges(
+                    tok,
+                    0,
+                    &tp,
+                    std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                ok != 0 && GetLastError() == ERROR_SUCCESS
+            })();
+            CloseHandle(tok);
+            enabled
+        }
+    }
+
+    /// whp: open then close a Windows Hypervisor Platform partition. This is the
+    /// capability gate — confinement must NOT break WHP, so this must be OK under
+    /// both confined and unconfined. Returns true iff `WHvCreatePartition`
+    /// succeeded (S_OK). The partition is always deleted on success.
+    fn attempt_whp() -> bool {
+        use windows_sys::Win32::System::Hypervisor::{
+            WHvCreatePartition, WHvDeletePartition, WHV_PARTITION_HANDLE,
+        };
+        // S_OK is 0; WHvCreatePartition returns an HRESULT.
+        let mut part: WHV_PARTITION_HANDLE = 0;
+        // SAFETY: single out-pointer; the partition is deleted iff created.
+        unsafe {
+            let hr = WHvCreatePartition(&mut part);
+            if hr == 0 {
+                WHvDeletePartition(part);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    // ---- harness role -------------------------------------------------------
+
+    /// Outcome of running one child leg.
+    struct Leg {
+        verdict: String,
+    }
+
+    fn harness() -> ExitCode {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("confine_probe harness: current_exe: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let log = std::env::temp_dir().join("izba-confine-probe.log");
+
+        let mut all_pass = true;
+        println!("izba confine_probe — differential confinement PoC (F-06 Windows)");
+        println!(
+            "{a:<14} {c:<16} {u:<16} verdict",
+            a = "attempt",
+            c = "confined",
+            u = "unconfined"
+        );
+
+        for &attempt in SECURITY_ATTEMPTS.iter().chain(CAPABILITY_ATTEMPTS) {
+            let security = SECURITY_ATTEMPTS.contains(&attempt);
+            let row = run_attempt(&exe, &log, attempt);
+            let (confined, unconfined) = match row {
+                Ok(pair) => pair,
+                Err(e) => {
+                    println!("{attempt:<14} {:<16} {:<16} FAIL ({e})", "-", "-");
+                    all_pass = false;
+                    continue;
+                }
+            };
+
+            let pass = if security {
+                // SECURITY gate: must be DENIED confined AND OK unconfined.
+                // The unconfined==OK clause defeats a vacuous test (e.g. the op
+                // failing for an incidental reason rather than the confinement).
+                confined.verdict == DENIED && unconfined.verdict == OK
+            } else {
+                // CAPABILITY gate: confinement must not break it.
+                confined.verdict == OK && unconfined.verdict == OK
+            };
+            if !pass {
+                all_pass = false;
+            }
+            println!(
+                "{attempt:<14} {:<16} {:<16} {}",
+                confined.verdict,
+                unconfined.verdict,
+                if pass { "PASS" } else { "FAIL" },
+            );
+            if !pass {
+                let want = if security {
+                    "expected confined=DENIED unconfined=OK"
+                } else {
+                    "expected confined=OK unconfined=OK"
+                };
+                println!("    -> {want}");
+            }
+        }
+
+        if all_pass {
+            println!("confine_probe: ALL attempts passed");
+            ExitCode::from(0)
+        } else {
+            println!("confine_probe: FAILURES present — confinement differential not satisfied");
+            ExitCode::from(1)
+        }
+    }
+
+    /// Run one attempt both confined and unconfined; return (confined, unconfined).
+    fn run_attempt(exe: &Path, log: &Path, attempt: &str) -> anyhow::Result<(Leg, Leg)> {
+        let confined = run_leg(exe, log, attempt, true)?;
+        let unconfined = run_leg(exe, log, attempt, false)?;
+        Ok((confined, unconfined))
+    }
+
+    /// Spawn the child for `attempt` (confined or not), wait for it to die, and
+    /// read its OK/DENIED verdict back from the result file.
+    fn run_leg(exe: &Path, log: &Path, attempt: &str, confined: bool) -> anyhow::Result<Leg> {
+        let tag = if confined { "confined" } else { "unconfined" };
+        let result = unique_temp(&format!("izba-cp-{attempt}-{tag}-result"));
+        // Clean any stale file so a missing write is detectable.
+        let _ = std::fs::remove_file(&result);
+
+        let mut argv = vec![
+            path_string(exe)?,
+            "child".into(),
+            "--attempt".into(),
+            attempt.into(),
+            "--result".into(),
+            path_string(&result)?,
+        ];
+        if attempt == "write-up" {
+            // The harness runs at Medium IL, so a freshly-created harness-owned
+            // temp dir is a Medium-IL object: the Low-IL confined child must be
+            // blocked from writing it, the unconfined child must succeed.
+            let dir = unique_temp(&format!("izba-cp-target-{tag}"));
+            std::fs::create_dir_all(&dir)?;
+            let target = dir.join("write-up-target.bin");
+            argv.push("--target".into());
+            argv.push(path_string(&target)?);
+        }
+
+        let spec = CommandSpec { argv };
+        let id = if confined {
+            spawn_confined(&spec, log, &ConfinementPolicy::vmm_default())?
+        } else {
+            spawn_detached(&spec, log)?
+        };
+
+        // Poll for death (cap ~30s); the child is short-lived.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while pid_alive(&id) {
+            if Instant::now() >= deadline {
+                anyhow::bail!("{attempt} ({tag}) child did not exit within 30s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let verdict = std::fs::read_to_string(&result).map_err(|e| {
+            anyhow::anyhow!(
+                "{attempt} ({tag}): no result file {} ({e}) — child likely failed to start \
+                 or was killed before writing",
+                result.display()
+            )
+        })?;
+        let verdict = verdict.trim().to_string();
+        let _ = std::fs::remove_file(&result);
+        if verdict != OK && verdict != DENIED {
+            anyhow::bail!("{attempt} ({tag}): unexpected verdict {verdict:?}");
+        }
+        Ok(Leg { verdict })
+    }
+
+    /// A fresh, process+time unique path under the system temp dir.
+    fn unique_temp(stem: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("{stem}-{}-{nanos}", std::process::id()))
+    }
+
+    fn path_string(p: &Path) -> anyhow::Result<String> {
+        p.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {}", p.display()))
+    }
+}
