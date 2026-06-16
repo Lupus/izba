@@ -19,11 +19,15 @@ use crate::vmm::CommandSpec;
 use anyhow::Context;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSidToSidW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+};
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, SetTokenInformation, TokenIntegrityLevel, DISABLE_MAX_PRIVILEGE,
-    SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL,
+    AddMandatoryAce, CreateRestrictedToken, GetLengthSid, InitializeAcl, SetTokenInformation,
+    TokenIntegrityLevel, ACL, ACL_REVISION, CONTAINER_INHERIT_ACE, DISABLE_MAX_PRIVILEGE,
+    LABEL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
+    TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -51,6 +55,107 @@ use windows_sys::Win32::System::Threading::{
 /// `Win32_System_SystemServices` feature (not enabled here), so define the fixed
 /// value locally, mirroring the `SYNCHRONIZE` pattern in `windows.rs`.
 const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
+
+/// `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP` (winnt.h) — the mandatory policy of a
+/// label ACE: deny write access to anything at a higher integrity level. This
+/// is the only policy bit we set; it makes the label a pure no-write-up barrier
+/// (NOT no-read-up / no-execute-up), which is what a Low-labelled scratch dir
+/// needs. windows-sys only exports it from the un-enabled
+/// `Win32_System_SystemServices` feature, so define the fixed value locally
+/// (same pattern as `SE_GROUP_INTEGRITY`). `1`.
+const SYSTEM_MANDATORY_LABEL_NO_WRITE_UP: u32 = 0x0000_0001;
+
+/// `S-1-16-4096` — the Low integrity SID, as a NUL-terminated UTF-16 literal
+/// for `ConvertStringSidToSidW`. `4096 == 0x1000 == SECURITY_MANDATORY_LOW_RID`.
+const LOW_INTEGRITY_SID: &str = "S-1-16-4096\0";
+
+/// Label `path` (and, via inheritance, every existing and future child) with a
+/// **Low** mandatory integrity label so a Low-IL process — the confined VMM —
+/// can write into it. Without this the VMM, lowered to Low IL, cannot write up
+/// to the Medium-IL files izbad created (`console.log`, `rw.img`, the vsock
+/// socket under `run/`), and the VM never boots (MIC no-write-up).
+///
+/// Implementation choice **(a)** (the spec's preferred, self-contained + unit-
+/// testable path): build a SACL holding one `SYSTEM_MANDATORY_LABEL_ACE` (Low,
+/// no-write-up) flagged `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`, then apply
+/// it with `SetNamedSecurityInfoW(.., SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION,
+/// ..)`. `SetNamedSecurityInfoW` performs inheritance propagation itself: setting
+/// an inheritable label on the container re-applies it to the existing subtree
+/// AND it is inherited by children created later, so no manual recursion is
+/// needed. Lowering the label is a write-DOWN for izbad (Medium → Low), so izbad
+/// keeps full control of the now-Low dir.
+///
+/// SAFETY: linear FFI. The label SID is `LocalAlloc`'d by
+/// `ConvertStringSidToSidW`; as elsewhere in this file we accept not freeing it
+/// (one small allocation per VMM launch, sandbox lifetime, not per-request).
+/// The ACL lives in a local heap `Vec<u8>` whose lifetime spans the
+/// `SetNamedSecurityInfoW` call (the OS copies it), and a NUL-terminated UTF-16
+/// path buffer likewise outlives the call.
+#[cfg(windows)]
+pub fn set_low_integrity_recursive(path: &Path) -> anyhow::Result<()> {
+    // SAFETY: a single linear FFI sequence; every buffer handed to the OS
+    // outlives the call that reads it, and the only allocation (the label SID)
+    // is intentionally leaked per the doc-comment.
+    unsafe {
+        // Resolve the Low integrity SID.
+        let sid_str: Vec<u16> = LOW_INTEGRITY_SID.encode_utf16().collect();
+        let mut sid = std::ptr::null_mut();
+        if ConvertStringSidToSidW(sid_str.as_ptr(), &mut sid) == 0 {
+            anyhow::bail!(
+                "ConvertStringSidToSidW(Low): {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Size a SACL big enough for the ACL header + one mandatory-label ACE.
+        // The ACE carries a copy of the SID, so the buffer must include the
+        // SID's length; SYSTEM_MANDATORY_LABEL_ACE's fixed header is the same
+        // size as ACCESS_ALLOWED_ACE's, so size generously by adding the SID
+        // length to a fixed ACL+ACE overhead. 64 bytes of overhead comfortably
+        // covers the ACL header (8) + the label-ACE fixed fields.
+        let sid_len = GetLengthSid(sid) as usize;
+        let acl_size = 64 + sid_len;
+        let mut acl_buf = vec![0u8; acl_size];
+        let acl = acl_buf.as_mut_ptr() as *mut ACL;
+        if InitializeAcl(acl, acl_size as u32, ACL_REVISION) == 0 {
+            anyhow::bail!("InitializeAcl: {}", std::io::Error::last_os_error());
+        }
+        // The label ACE: Low integrity, no-write-up, inherited by files
+        // (OBJECT_INHERIT) and subdirectories (CONTAINER_INHERIT) so the whole
+        // scratch subtree is writable by the Low-IL VMM.
+        if AddMandatoryAce(
+            acl,
+            ACL_REVISION,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+            sid,
+        ) == 0
+        {
+            anyhow::bail!("AddMandatoryAce(Low): {}", std::io::Error::last_os_error());
+        }
+
+        // Apply the SACL as the object's mandatory label. SetNamedSecurityInfoW
+        // propagates the inheritable label across the existing subtree.
+        let mut path_w: Vec<u16> = path.as_os_str().encode_wide().collect();
+        path_w.push(0);
+        let rc = SetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(), // owner unchanged
+            std::ptr::null_mut(), // group unchanged
+            std::ptr::null(),     // DACL unchanged
+            acl,                  // the SACL = our label
+        );
+        if rc != ERROR_SUCCESS {
+            anyhow::bail!(
+                "SetNamedSecurityInfoW({}): WIN32_ERROR {rc}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Builds the single primary token the VMM runs under: privileges dropped,
 /// integrity lowered. Restricting/deny-only SID shaping per `policy.token` is a
@@ -514,15 +619,19 @@ impl Drop for OwnedJobHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_command_line, build_confined_token, create_resource_job, quote_arg, spawn_confined,
+        build_command_line, build_confined_token, create_resource_job, quote_arg,
+        set_low_integrity_recursive, spawn_confined,
     };
     use crate::procmgr::confine::{ConfinementMode, ConfinementPolicy};
     use crate::procmgr::windows::kill_pid;
     use crate::vmm::CommandSpec;
-    use windows_sys::Win32::Foundation::{CloseHandle, LUID};
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, LUID};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, LookupPrivilegeValueW,
-        TokenIntegrityLevel, TokenPrivileges, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES,
+        GetAce, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+        LookupPrivilegeValueW, TokenIntegrityLevel, TokenPrivileges, ACL,
+        LABEL_SECURITY_INFORMATION, SYSTEM_MANDATORY_LABEL_ACE, TOKEN_MANDATORY_LABEL,
+        TOKEN_PRIVILEGES,
     };
     use windows_sys::Win32::System::JobObjects::{
         JobObjectExtendedLimitInformation, QueryInformationJobObject,
@@ -755,6 +864,86 @@ mod tests {
         // Best-effort cleanup: cmd /c exit 0 likely already exited, so ignore errors.
         let _ = kill_pid(&id);
         let _ = std::fs::remove_file(&log);
+    }
+
+    /// Labeling a directory tree Low must produce a readable Low mandatory label
+    /// (RID == SECURITY_MANDATORY_LOW_RID) on the directory itself — and, via the
+    /// inheritable ACE, on a file created inside it before labeling. We read the
+    /// label back through `GetNamedSecurityInfoW(LABEL_SECURITY_INFORMATION)` and
+    /// walk the returned SACL to the single mandatory-label ACE's SID.
+    #[test]
+    fn set_low_integrity_recursive_sets_low_label() {
+        let dir = std::env::temp_dir().join(format!("izba-low-il-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let file = dir.join("rw.img");
+        std::fs::write(&file, b"scratch").expect("create temp file");
+
+        set_low_integrity_recursive(&dir).expect("set Low IL");
+
+        // The directory must carry the Low label directly; the child file must
+        // carry it via OBJECT_INHERIT propagation done by SetNamedSecurityInfoW.
+        assert_eq!(
+            read_label_rid(&dir),
+            Some(SECURITY_MANDATORY_LOW_RID),
+            "directory must carry a Low integrity label"
+        );
+        assert_eq!(
+            read_label_rid(&file),
+            Some(SECURITY_MANDATORY_LOW_RID),
+            "child file must inherit the Low integrity label"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Read `path`'s mandatory-label SID RID via the security API, or `None` if
+    /// the object has no label ACE. SAFETY: queries the SACL into an OS-allocated
+    /// security descriptor (freed with LocalFree), then walks to ACE 0 — the
+    /// label ACE we set — and extracts its SID's last sub-authority.
+    fn read_label_rid(path: &std::path::Path) -> Option<u32> {
+        use std::os::windows::ffi::OsStrExt;
+        unsafe {
+            let mut path_w: Vec<u16> = path.as_os_str().encode_wide().collect();
+            path_w.push(0);
+            let mut sacl: *mut ACL = std::ptr::null_mut();
+            let mut sd = std::ptr::null_mut();
+            let rc = GetNamedSecurityInfoW(
+                path_w.as_ptr(),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sacl,
+                &mut sd,
+            );
+            assert_eq!(rc, ERROR_SUCCESS, "GetNamedSecurityInfoW: WIN32_ERROR {rc}");
+            let result = (|| {
+                if sacl.is_null() || (*sacl).AceCount == 0 {
+                    return None;
+                }
+                let mut ace = std::ptr::null_mut();
+                if GetAce(sacl, 0, &mut ace) == 0 {
+                    return None;
+                }
+                let label = ace as *const SYSTEM_MANDATORY_LABEL_ACE;
+                // SidStart is the first DWORD of the inline SID.
+                let sid = std::ptr::addr_of!((*label).SidStart) as *mut core::ffi::c_void;
+                let count_p = GetSidSubAuthorityCount(sid);
+                if count_p.is_null() {
+                    return None;
+                }
+                let count = *count_p;
+                if count == 0 {
+                    return None;
+                }
+                Some(*GetSidSubAuthority(sid, (count - 1) as u32))
+            })();
+            if !sd.is_null() {
+                LocalFree(sd as _);
+            }
+            result
+        }
     }
 
     fn last_err() -> std::io::Error {
