@@ -21,7 +21,7 @@ pub use unix::{kill_pid, pid_alive, spawn_detached};
 #[cfg(windows)]
 mod jail_windows;
 #[cfg(windows)]
-pub use jail_windows::spawn_confined;
+pub use jail_windows::{set_low_integrity_recursive, spawn_confined};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -41,6 +41,14 @@ pub fn spawn_confined(
     _policy: &confine::ConfinementPolicy,
 ) -> anyhow::Result<(crate::state::PidIdentity, confine::ConfinementMode)> {
     Ok((spawn_detached(cmd, log)?, confine::ConfinementMode::None))
+}
+
+/// Non-Windows no-op so confined-launch call sites stay platform-uniform. Linux
+/// integrity labels are a Windows MIC concept with no equivalent here; the Linux
+/// jailer (a separate milestone) handles its own filesystem confinement.
+#[cfg(not(windows))]
+pub fn set_low_integrity_recursive(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 use crate::state::PidIdentity;

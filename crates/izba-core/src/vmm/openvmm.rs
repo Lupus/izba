@@ -16,8 +16,8 @@
 use super::spec::{reject_commas, CommandSpec, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
 use crate::procmgr::{
-    kill_pid, pid_alive, spawn_confined, spawn_detached, ConfinementMode, ConfinementPolicy,
-    ConfinementStatus,
+    kill_pid, pid_alive, set_low_integrity_recursive, spawn_confined, spawn_detached,
+    ConfinementMode, ConfinementPolicy, ConfinementStatus,
 };
 use crate::state::PidIdentity;
 use crate::vsock::hybrid_connect;
@@ -151,6 +151,35 @@ impl VmmDriver for OpenVmmDriver {
                 ),
             )
         } else {
+            // The confined VMM runs at Low integrity, but izbad created the
+            // sandbox's writable files (console.log, rw.img, the vsock socket
+            // under run/) at Medium integrity — and MIC forbids a Low-IL process
+            // from writing UP to Medium-IL objects. Label the per-sandbox
+            // writable scratch dir Low (with object+container inherit) so the
+            // confined VMM can write there; without this the VM never boots
+            // (empty console.log, 100% boot failure under confinement).
+            //
+            // Target = the sandbox dir (run_dir's parent), the smallest dir that
+            // contains EVERY VMM-writable path: run/ (vsock socket), logs/
+            // (console.log + vmm.log), and rw.img — all siblings under it.
+            // Lowering it is a write-DOWN for izbad (Medium → Low), so izbad
+            // retains full control. We deliberately do NOT touch izbad's own
+            // daemon/socket dir — only this sandbox's scratch.
+            //
+            // FAIL CLOSED: if labeling fails, the VMM would boot into a doomed,
+            // un-writable scratch; propagate the error rather than proceed.
+            let scratch_dir = spec.run_dir.parent().with_context(|| {
+                format!(
+                    "run_dir {} has no parent sandbox directory to label",
+                    spec.run_dir.display()
+                )
+            })?;
+            set_low_integrity_recursive(scratch_dir).with_context(|| {
+                format!(
+                    "labeling sandbox scratch {} Low-integrity for the confined VMM",
+                    scratch_dir.display()
+                )
+            })?;
             match spawn_confined(&inv, &vmm_log, &policy) {
                 // Honest mapping: the resource job is best-effort, so report
                 // TokenOnly when it could not be applied even though token+IL
