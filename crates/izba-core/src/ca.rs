@@ -127,7 +127,8 @@ mod tests {
 
         // A guest that trusts ONLY the persisted ca.pem must accept the leaf.
         let mut roots = rustls::RootCertStore::empty();
-        for c in rustls_pemfile::certs(&mut trusted_pem.as_bytes()) {
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        for c in CertificateDer::pem_slice_iter(trusted_pem.as_bytes()) {
             roots.add(c.unwrap()).unwrap();
         }
         let mut gcfg = rustls::ClientConfig::builder()
