@@ -170,10 +170,14 @@ agent: report PR link + dist/local path + paste-ready install commands
 - **First build always builds the full set** (both platforms, CLI + app).
   Per-leg scope-skipping (Linux-only → skip the slow Windows legs) would require
   conditional plumbing into `_artifacts.yml`; deferred as a future optimization.
-- **Dispatching requires `devbuild.yml` to exist on the target branch.** Once
-  merged to `main`, every branch cut from `main` has it. Branches created before
-  the merge must rebase onto `main` first. (Validation of this very change is
-  done by dispatching on its own feature branch, which carries the new file.)
+- **`workflow_dispatch` registers only from the default branch (`main`).**
+  GitHub exposes a `workflow_dispatch` trigger only for the workflow file present
+  on the default branch; once dispatched with `--ref <branch>` it runs *that
+  branch's* checkout and workflow definition. Two consequences: (1) this
+  bootstrapping change can be end-to-end validated only **after it merges to
+  `main`** — until then `gh workflow run devbuild.yml` has nothing to dispatch;
+  (2) every future branch cut from `main` inherits the file, so the on-demand
+  flow works for those branches pre-merge exactly as designed.
 
 ## Non-goals
 
@@ -186,8 +190,9 @@ agent: report PR link + dist/local path + paste-ready install commands
 
 ## Validation
 
-- `devbuild.yml` dispatched on this feature branch produces `izba-deb`,
-  `izba-app-deb`, and `izba-windows-installer` artifacts on a green run.
+- `devbuild.yml` dispatched (post-merge, since `workflow_dispatch` registers
+  from `main`) produces `izba-deb`, `izba-app-deb`, and `izba-windows-installer`
+  artifacts on a green run.
 - `hack/devbuild.sh` on the branch dispatches, watches, downloads, and produces
   a populated `dist/local/<ts>-<sha>/` with `SHA256SUMS` + `manifest.txt` and
   prints install commands.

@@ -211,8 +211,9 @@ likewise unsandboxed.
    — **the build runs entirely in CI, in parallel with the PR checks; nothing
    heavy builds on the laptop or the Windows host** (only ~150 MB of installers
    is downloaded). It needs the branch **pushed** first (CI builds the pushed
-   tip), and `devbuild.yml` must exist on the branch (rebase onto `main` if it
-   predates this workflow). It prints the exact output dir
+   tip), and `devbuild.yml` must already be on `main` (GitHub registers
+   `workflow_dispatch` only from the default branch; branches cut from `main`
+   inherit it). It prints the exact output dir
    `dist/local/<UTC-ts>-<sha>/`. **Record and report that exact path — never
    `dist/local/latest`**, which a parallel run can repoint out from under you.
    - **When run from a worktree it auto-copies that dir into the MAIN checkout's

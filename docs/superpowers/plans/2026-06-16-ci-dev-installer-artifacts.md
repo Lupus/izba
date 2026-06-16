@@ -685,14 +685,16 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ### Task 4: End-to-end validation (unsandboxed, at delivery)
 
-This is the real integration check; it requires pushing the branch and a green CI run, so it runs unsandboxed once Tasks 1–3 are committed. It is not a unit test.
+This is the real integration check; it runs unsandboxed. **It can only run after this change merges to `main`**, because GitHub registers a `workflow_dispatch` trigger only from the workflow file on the default branch — until `devbuild.yml` is on `main`, `gh workflow run devbuild.yml` has nothing to dispatch. (Every *future* branch cut from `main` validates pre-merge as designed; only this bootstrapping branch is gated on merge.) It is not a unit test.
 
-- [ ] **Step 1: Push the branch**
+- [ ] **Step 1: Land the change, then run from `main` (or a fresh branch off the merged `main`)**
 
 ```bash
-git push -u origin <this-branch>
+git push -u origin <this-branch>   # open the PR; let ci.yml/app.yml/coverage gate it
+# ... after the PR merges to main:
+git checkout main && git pull
 ```
-(Per repo policy the agent may push feature branches; never to `main`.)
+(Per repo policy the agent may push feature branches and open/merge PRs; never push to `main` directly.)
 
 - [ ] **Step 2: Dispatch + download via the new helper**
 
