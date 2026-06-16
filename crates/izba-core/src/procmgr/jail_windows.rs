@@ -513,7 +513,28 @@ impl Drop for OwnedJobHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_command_line, quote_arg};
+    use super::{
+        build_command_line, build_confined_token, create_resource_job, quote_arg, spawn_confined,
+    };
+    use crate::procmgr::confine::{ConfinementMode, ConfinementPolicy};
+    use crate::procmgr::windows::kill_pid;
+    use crate::vmm::CommandSpec;
+    use windows_sys::Win32::Foundation::{CloseHandle, LUID};
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, LookupPrivilegeValueW,
+        TokenIntegrityLevel, TokenPrivileges, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    };
+
+    /// `SECURITY_MANDATORY_LOW_RID` (winnt.h) — the last sub-authority (RID) of
+    /// the Low integrity SID `S-1-16-4096`. windows-sys does not export the
+    /// mandatory-RID constants, so define the fixed value locally (same pattern
+    /// as `SE_GROUP_INTEGRITY`). `0x1000` == 4096.
+    const SECURITY_MANDATORY_LOW_RID: u32 = 0x0000_1000;
 
     fn quoted(arg: &str) -> String {
         let mut out = String::new();
@@ -574,5 +595,179 @@ mod tests {
             cmdline(&["openvmm.exe", "--config", "a b", "plain"]),
             "openvmm.exe --config \"a b\" plain"
         );
+    }
+
+    /// The confined token must (a) carry a Low integrity label and (b) have its
+    /// privileges dropped to at most `SeChangeNotifyPrivilege` (what
+    /// `DISABLE_MAX_PRIVILEGE` leaves behind). NOTE: this is NOT an
+    /// `IsTokenRestricted` assertion — `build_confined_token` adds no restricting
+    /// SIDs, so the token is "restricted" only in the privilege/IL sense.
+    #[test]
+    fn build_confined_token_drops_privileges_and_lowers_integrity() {
+        // SAFETY: build the token under the documented policy, then query it via
+        // GetTokenInformation into correctly-sized buffers; the token is closed
+        // on every exit path.
+        unsafe {
+            let token =
+                build_confined_token(&ConfinementPolicy::vmm_default()).expect("build token");
+
+            // --- Integrity: extract the label SID's last sub-authority (RID). ---
+            let mut needed: u32 = 0;
+            // First call sizes the buffer (returns FALSE / ERROR_INSUFFICIENT_BUFFER).
+            GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            assert!(needed > 0, "TokenIntegrityLevel size query returned 0");
+            let mut buf = vec![0u8; needed as usize];
+            let ok = GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                buf.as_mut_ptr() as *mut _,
+                needed,
+                &mut needed,
+            );
+            assert!(ok != 0, "GetTokenInformation(IL): {}", last_err());
+            // The buffer is a TOKEN_MANDATORY_LABEL whose Label.Sid points within it.
+            let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+            let sid = label.Label.Sid;
+            assert!(!sid.is_null(), "integrity SID is null");
+            let count_p = GetSidSubAuthorityCount(sid);
+            assert!(!count_p.is_null(), "GetSidSubAuthorityCount null");
+            let count = *count_p;
+            assert!(count >= 1, "integrity SID has no sub-authorities");
+            // The RID is the LAST sub-authority.
+            let rid = *GetSidSubAuthority(sid, (count - 1) as u32);
+            assert_eq!(
+                rid, SECURITY_MANDATORY_LOW_RID,
+                "integrity RID {rid:#x} != SECURITY_MANDATORY_LOW_RID"
+            );
+
+            // --- Privileges: 0, or exactly SeChangeNotifyPrivilege. ---
+            let mut needed: u32 = 0;
+            GetTokenInformation(token, TokenPrivileges, std::ptr::null_mut(), 0, &mut needed);
+            assert!(needed > 0, "TokenPrivileges size query returned 0");
+            let mut buf = vec![0u8; needed as usize];
+            let ok = GetTokenInformation(
+                token,
+                TokenPrivileges,
+                buf.as_mut_ptr() as *mut _,
+                needed,
+                &mut needed,
+            );
+            assert!(ok != 0, "GetTokenInformation(privs): {}", last_err());
+            let privs = &*(buf.as_ptr() as *const TOKEN_PRIVILEGES);
+            let n = privs.PrivilegeCount;
+            assert!(
+                n <= 1,
+                "expected <=1 privilege after DISABLE_MAX_PRIVILEGE, got {n}"
+            );
+            if n == 1 {
+                // The single survivor must be SeChangeNotifyPrivilege.
+                let want = lookup_priv_luid("SeChangeNotifyPrivilege");
+                // Privileges is a flexible array; the [0] element is in-struct.
+                let got = privs.Privileges[0].Luid;
+                assert!(
+                    got.LowPart == want.LowPart && got.HighPart == want.HighPart,
+                    "the surviving privilege is not SeChangeNotifyPrivilege"
+                );
+            }
+
+            CloseHandle(token);
+        }
+    }
+
+    /// The resource job must be breakaway-OK, NOT kill-on-close (izba daemonless
+    /// contract), and carry the requested per-job memory cap.
+    #[test]
+    fn create_resource_job_is_breakaway_not_kill_on_close() {
+        // SAFETY: create a uniquely-named job, query its extended limits into a
+        // correctly-sized struct, then close the handle.
+        unsafe {
+            let name = format!("izba-test-job-{}", std::process::id());
+            let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let job = create_resource_job(&name_w, Some(256)).expect("create job");
+
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            let mut ret: u32 = 0;
+            let ok = QueryInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                &mut ret,
+            );
+            assert!(ok != 0, "QueryInformationJobObject: {}", last_err());
+
+            let flags = info.BasicLimitInformation.LimitFlags;
+            assert!(
+                flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK != 0,
+                "SILENT_BREAKAWAY_OK not set (flags={flags:#x})"
+            );
+            assert!(
+                flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0,
+                "KILL_ON_JOB_CLOSE must never be set (flags={flags:#x})"
+            );
+            assert!(
+                flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0,
+                "JOB_MEMORY limit flag not set (flags={flags:#x})"
+            );
+            assert_eq!(
+                info.JobMemoryLimit,
+                256 * 1024 * 1024,
+                "job memory limit mismatch"
+            );
+
+            CloseHandle(job);
+        }
+    }
+
+    /// The full CreateProcessAsUserW launch path: builds the confined token +
+    /// integrity label + attribute list + (best-effort) job and resumes a real
+    /// child (`cmd /c exit 0`). Asserts it returns a usable identity and a
+    /// confinement mode; cmd exits immediately, so we do NOT assert liveness.
+    /// Best-effort kill for cleanup (the process has likely already exited).
+    #[test]
+    fn spawn_confined_launches_and_is_trackable() {
+        let cmd = CommandSpec {
+            argv: vec![
+                "C:\\Windows\\System32\\cmd.exe".into(),
+                "/c".into(),
+                "exit".into(),
+                "0".into(),
+            ],
+        };
+        let log =
+            std::env::temp_dir().join(format!("izba-spawn-confined-{}.log", std::process::id()));
+        let (id, mode) =
+            spawn_confined(&cmd, &log, &ConfinementPolicy::vmm_default()).expect("spawn_confined");
+        assert_ne!(id.pid, 0, "spawned pid must be non-zero");
+        assert!(
+            matches!(
+                mode,
+                ConfinementMode::Restricted | ConfinementMode::TokenOnly
+            ),
+            "mode must be Restricted or TokenOnly, got {mode:?}"
+        );
+        // Best-effort cleanup: cmd /c exit 0 likely already exited, so ignore errors.
+        let _ = kill_pid(&id);
+        let _ = std::fs::remove_file(&log);
+    }
+
+    fn last_err() -> std::io::Error {
+        std::io::Error::last_os_error()
+    }
+
+    /// Look up the LUID of a well-known privilege on the local system.
+    /// SAFETY: `LookupPrivilegeValueW` with a NUL-terminated name + out-LUID.
+    fn lookup_priv_luid(name: &str) -> LUID {
+        let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut luid: LUID = unsafe { std::mem::zeroed() };
+        let ok = unsafe { LookupPrivilegeValueW(std::ptr::null(), name_w.as_ptr(), &mut luid) };
+        assert!(ok != 0, "LookupPrivilegeValueW({name}): {}", last_err());
+        luid
     }
 }
