@@ -90,6 +90,65 @@ fn fingerprint(config: &ResolverConfig) -> u64 {
     h.finish()
 }
 
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::{Resolver as HickoryResolver, TokioResolver};
+use std::sync::{Arc, Mutex};
+
+/// Live resolver + the fingerprint of the config it was built from.
+struct ResolverState {
+    resolver: TokioResolver,
+    fingerprint: u64,
+}
+
+/// Swappable holder for the live resolver. Mirrors `PolicyCell`: the lock is
+/// held only for an `Arc` clone/replace, never across I/O, so a plain `Mutex`
+/// is contention-free. In-flight lookups keep the `Arc` they cloned; a reload
+/// takes effect on the next query.
+struct ResolverCell {
+    inner: Mutex<Arc<ResolverState>>,
+}
+
+impl ResolverCell {
+    fn new(state: Arc<ResolverState>) -> Self {
+        Self {
+            inner: Mutex::new(state),
+        }
+    }
+    fn load(&self) -> Arc<ResolverState> {
+        Arc::clone(&self.inner.lock().unwrap())
+    }
+    fn store(&self, state: Arc<ResolverState>) {
+        *self.inner.lock().unwrap() = state;
+    }
+}
+
+/// Build a Tokio resolver from explicit config. MUST be called inside a tokio
+/// runtime context (the connection provider uses `Handle::current()`).
+fn build_resolver(config: ResolverConfig, opts: ResolverOpts) -> anyhow::Result<TokioResolver> {
+    Ok(
+        HickoryResolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(opts)
+            .build()?,
+    )
+}
+
+/// Re-read system DNS config; if the fingerprint changed, rebuild the resolver
+/// and swap the cell. Returns whether a swap happened. MUST run inside a tokio
+/// runtime context (for `build_resolver`).
+fn reload_if_changed(cell: &ResolverCell, source: &dyn ConfigSource) -> anyhow::Result<bool> {
+    let (config, opts) = source.discover()?;
+    let fp = fingerprint(&config);
+    if cell.load().fingerprint == fp {
+        return Ok(false); // dedupe: no change
+    }
+    let resolver = build_resolver(config, opts)?;
+    cell.store(Arc::new(ResolverState {
+        resolver,
+        fingerprint: fp,
+    }));
+    Ok(true)
+}
+
 /// Pure front-half of `handle`: parse + capability-gate, with no network. The
 /// network back-half consumes `Answerable`.
 enum QueryDecision {
@@ -126,7 +185,7 @@ mod tests {
     use super::*;
     use hickory_proto::op::Query;
     use hickory_proto::rr::Name;
-    use hickory_resolver::config::{NameServerConfig, ResolverConfig as RC};
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig as RC, ResolverOpts};
     use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
 
@@ -179,6 +238,41 @@ mod tests {
         let b = config_with([8, 8, 8, 8]);
         assert_eq!(fingerprint(&a), fingerprint(&a2));
         assert_ne!(fingerprint(&a), fingerprint(&b));
+    }
+
+    struct FakeSource {
+        ip: std::sync::atomic::AtomicU8,
+    }
+    impl ConfigSource for FakeSource {
+        fn discover(&self) -> anyhow::Result<(ResolverConfig, ResolverOpts)> {
+            let n = self.ip.load(std::sync::atomic::Ordering::SeqCst);
+            Ok((config_with([10, 0, 0, n]), ResolverOpts::default()))
+        }
+    }
+
+    #[test]
+    fn reload_swaps_only_on_config_change() {
+        // Building a resolver needs a runtime context but does NO network I/O
+        // (sockets are created lazily on first query). Safe in sandbox.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let src = FakeSource {
+            ip: std::sync::atomic::AtomicU8::new(2),
+        };
+        let (cfg, opts) = src.discover().unwrap();
+        let cell = ResolverCell::new(Arc::new(ResolverState {
+            resolver: build_resolver(cfg.clone(), opts).unwrap(),
+            fingerprint: fingerprint(&cfg),
+        }));
+
+        // Same config → no swap.
+        assert!(!reload_if_changed(&cell, &src).unwrap());
+        // Change the upstream → swap.
+        src.ip.store(8, std::sync::atomic::Ordering::SeqCst);
+        assert!(reload_if_changed(&cell, &src).unwrap());
+        // Idempotent at the new config.
+        assert!(!reload_if_changed(&cell, &src).unwrap());
     }
 
     #[test]
