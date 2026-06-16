@@ -38,10 +38,11 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapAlloc, HeapFree, HEAP_ZERO_MEMORY};
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess,
-    InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, UpdateProcThreadAttribute,
-    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, TerminateProcess,
+    UpdateProcThreadAttribute, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW,
 };
 
 /// `SE_GROUP_INTEGRITY` (winnt.h) — the SID-and-attributes flag marking a group
@@ -336,6 +337,14 @@ pub fn spawn_confined(
 
                 // From here, `attr` must be freed (HeapFree) on every exit path,
                 // and once initialized also DeleteProcThreadAttributeList'd.
+                // `handles` and `mit` back pointers handed to
+                // UpdateProcThreadAttribute. They are declared HERE — in the
+                // scope that calls DeleteProcThreadAttributeList(attr) below —
+                // so it is self-evident their backing storage outlives the
+                // attribute list it is wired into, even though the OS copies the
+                // values eagerly on each Update call.
+                let handles: [HANDLE; 1] = [hlog];
+                let mit: u64 = vmm_mitigation_flags();
                 let built = (|| -> anyhow::Result<PidIdentity> {
                     if InitializeProcThreadAttributeList(attr, 2, 0, &mut size) == 0 {
                         anyhow::bail!(
@@ -347,7 +356,6 @@ pub fn spawn_confined(
                     let after_init = (|| -> anyhow::Result<PidIdentity> {
                         // 2a. HANDLE_LIST = exactly [hlog]: the only handle the
                         //     child may inherit even with bInheritHandles=TRUE.
-                        let handles: [HANDLE; 1] = [hlog];
                         if UpdateProcThreadAttribute(
                             attr,
                             0,
@@ -364,7 +372,6 @@ pub fn spawn_confined(
                             );
                         }
                         // 2b. MITIGATION_POLICY = the OpenVMM-safe DEP/ASLR set.
-                        let mit: u64 = vmm_mitigation_flags();
                         if UpdateProcThreadAttribute(
                             attr,
                             0,
@@ -460,6 +467,14 @@ pub fn spawn_confined(
                         let pid = pi.dwProcessId;
                         let starttime = creation_time(pi.hProcess)
                             .context("reading confined process creation time");
+                        // If the identity read fails, the child is ALREADY
+                        // running confined — returning Err without killing it
+                        // would leave an untracked-but-confined VMM (no
+                        // state.json points at it, so nothing reaps it). Kill it
+                        // while pi.hProcess is still open, then surface the Err.
+                        if starttime.is_err() {
+                            TerminateProcess(pi.hProcess, 1);
+                        }
                         CloseHandle(pi.hThread);
                         CloseHandle(pi.hProcess);
                         Ok(PidIdentity {
