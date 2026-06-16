@@ -102,11 +102,16 @@ stays the splice for the vsock↔loopback hop; only the loopback TCP enters toki
 
 **New tokio-side handler** (replaces `accept_loop`'s `mitm_terminate` call):
 
-1. **Classify by port, not by peeking.** The `DstMap` entry carries `OrigDst.port`.
-   `443 ⇒ TLS-terminate` (via the existing `state.acceptor`, per-SNI leaf);
-   `80 ⇒ cleartext HTTP`. No `looks_like_tls` peek and **no buffering/Rewind
-   adapter.** Non-conforming traffic (plaintext to :443, TLS to :80) fails the
-   accept / h1 parse → fail closed.
+1. **Classify TLS vs cleartext by a raw first-byte peek.** Peek the first wire
+   bytes with `TcpStream::peek` (which does **not** consume them — so **no
+   buffering/Rewind adapter**) and apply `looks_like_tls`: a TLS ClientHello is
+   TLS-terminated (via the existing `state.acceptor`, per-SNI leaf); anything else
+   is served as cleartext HTTP. This is robust regardless of the destination port
+   (HTTPS may arrive on a non-443 port the router forwards) and decouples the
+   classification from the upstream dial port. *(Note: an earlier draft classified
+   purely by `OrigDst.port`, but that coupled the TLS decision to the dial port and
+   misjudged non-443 HTTPS — the peek is the robust form, and `TcpStream::peek` is
+   the clean mechanism that avoids the fragile decrypted-peek we rejected.)*
 2. **Capture the negotiated SNI** after the TLS handshake via
    `tls.get_ref().1.server_name()` → `Option<String>`. A ClientHello with **no
    SNI** already fails closed today (the `SniResolver` returns no leaf); keep that.
