@@ -88,23 +88,26 @@ fn tcp_connect(
         }
     };
 
-    // UNCONDITIONAL SSRF guard for the whole TCP datapath (tier-1 MITM + tier-2).
-    // port 53 short-circuited above; this covers everything else. Mirrors
-    // decide_tier2's denylist so the MITM path can't be used to reach the host.
-    if is_private(ip) {
+    // NON-OVERRIDABLE SSRF floor for the whole TCP datapath (tier-1 MITM +
+    // tier-2), applied before any policy: loopback / link-local + cloud metadata
+    // / unspecified — the host itself and IMDS credentials are never a legitimate
+    // egress target for ANY sandbox. (RFC1918/LAN is NOT blocked here; it is
+    // policy-governed in decide_tier2 — bare-permissive, enforcing-by-IP-rule.)
+    // port 53 short-circuited above.
+    if is_hard_denied(ip) {
         let flow = FlowDesc::l3(sandbox, addr, port);
         audit.record(AuditRecord::from_flow(
             Verdict::Deny,
             &flow,
             ip,
             Tier::L3,
-            "private-address denylist",
+            "blocked address (loopback/link-local/metadata)",
         ));
         let _ = write_frame(
             &mut conn,
             &Response::Error {
                 kind: ErrorKind::ConnectFailed,
-                message: format!("egress to {addr}:{port} denied: private address"),
+                message: format!("egress to {addr}:{port} denied: blocked address"),
             },
         );
         return;
@@ -147,9 +150,11 @@ fn tcp_connect(
         return;
     }
 
-    // Tier 2 — non-HTTP TCP: recover the FQDN from DNS-snoop and decide. An
-    // enforcing policy is strict (private-address denylist + default-deny on a
-    // raw-IP dial with no snoop record); a bare sandbox stays permissive.
+    // Tier 2 — non-HTTP TCP: recover the FQDN from DNS-snoop and decide_tier2.
+    // Hard floor (loopback/link-local/metadata) is denied for all; an enforcing
+    // policy is default-deny (a LAN target only via an explicit IP rule, never a
+    // rebind-able domain); a bare sandbox is permissive for all non-hard-denied
+    // addresses (incl. RFC1918/LAN).
     let (verdict, flow, rule) = decide_tier2(&*policy, snoop, sandbox, ip, port);
     audit.record(AuditRecord::from_flow(verdict, &flow, ip, Tier::L3, rule));
     if verdict == Verdict::Deny {
@@ -240,13 +245,16 @@ fn mitm_hop(
 /// Tier-2 (non-HTTP TCP) decision: recover the FQDN(s) izbad resolved for `ip`
 /// and decide. Returns the verdict, the `FlowDesc` to audit, and a rule label.
 ///
-/// Enforcing policy (a declared firewall): a raw-IP dial with no snoop record
-/// is default-denied (the red flag); otherwise the flow is allowed iff ANY
-/// snooped name passes the policy. A non-enforcing `AllowAll` keeps today's
-/// permissive behavior for PUBLIC destinations only.
-///
-/// The private-address denylist is UNCONDITIONAL — applied to bare AND enforcing
-/// sandboxes (F-01 SSRF guard).
+/// Address posture (F-01):
+/// - `is_hard_denied` (loopback / link-local + metadata / unspecified) is a
+///   non-overridable Deny for EVERY sandbox — the SSRF floor.
+/// - A bare (non-enforcing `AllowAll`) sandbox is permissive for everything else,
+///   including RFC1918/LAN (M1 behavior — the user declined a firewall).
+/// - An enforcing sandbox is default-deny. A snoop'd allow-listed FQDN authorizes
+///   only a PUBLIC ip; it must NOT authorize a LAN ip (that is the DNS-rebinding
+///   bypass — a guest controlling resolution points an allowed name at an
+///   internal host). So a LAN target is reachable ONLY via an explicit IP rule in
+///   the policy (`is_lan` ⇒ the raw-IP literal is the sole candidate).
 pub fn decide_tier2(
     policy: &dyn Policy,
     snoop: &SnoopStore,
@@ -258,84 +266,119 @@ pub fn decide_tier2(
     let mut flow = FlowDesc::l3(sandbox, ip.to_string(), port);
     flow.host = names.first().cloned();
 
-    // UNCONDITIONAL SSRF / DNS-rebinding guard — applies to bare AND enforcing
-    // sandboxes. A bare sandbox stays permissive for PUBLIC destinations only.
-    if is_private(ip) {
-        return (Verdict::Deny, flow, "private-address denylist");
+    // Non-overridable SSRF floor (bare AND enforcing).
+    if is_hard_denied(ip) {
+        return (
+            Verdict::Deny,
+            flow,
+            "blocked address (loopback/link-local/metadata)",
+        );
     }
 
     if !policy.enforces() {
+        // Bare/M1: permissive for everything not hard-denied — incl. RFC1918/LAN.
         let verdict = policy.check(&flow);
         return (verdict, flow, "permissive");
     }
 
-    // (enforcing) private already denied above.
-    if names.is_empty() {
-        return (Verdict::Deny, flow, "no DNS-snoop record (raw IP)");
-    }
-    for name in &names {
-        let mut f = flow.clone();
-        f.addr = name.clone();
-        f.host = Some(name.clone());
-        if policy.check(&f) == Verdict::Allow {
-            return (Verdict::Allow, f, "allow-list");
+    // Enforcing: default-deny. A snoop'd FQDN may authorize only a public ip
+    // (skipped for LAN to defeat DNS-rebinding); the raw-IP literal is always a
+    // candidate (lets a policy permit a specific public OR LAN ip by listing it).
+    let lan = is_lan(ip);
+    if !lan {
+        for name in &names {
+            let mut f = flow.clone();
+            f.addr = name.clone();
+            f.host = Some(name.clone());
+            if policy.check(&f) == Verdict::Allow {
+                return (Verdict::Allow, f, "allow-list");
+            }
         }
     }
-    (Verdict::Deny, flow, "not in allow-list")
+    let mut raw = flow.clone();
+    raw.addr = ip.to_string();
+    raw.host = None;
+    if policy.check(&raw) == Verdict::Allow {
+        return (Verdict::Allow, raw, "allow-list (explicit IP)");
+    }
+    let rule = if lan {
+        "LAN not in allow-list (list the IP to permit)"
+    } else {
+        "not in allow-list"
+    };
+    (Verdict::Deny, flow, rule)
 }
 
-/// Private / loopback / link-local / unspecified destinations the egress plane
-/// must never reach — applied UNCONDITIONALLY to all sandboxes (bare and
-/// enforcing) as the SSRF + DNS-rebinding guard (F-01).
-fn is_private(ip: IpAddr) -> bool {
+/// An IPv4 embedded in a bypass-prone IPv6 form (mapped `::ffff:a.b.c.d`,
+/// deprecated IPv4-compatible `::a.b.c.d`, or NAT64 `64:ff9b::a.b.c.d`), if any.
+/// Centralizes the SSRF-bypass canonicalization shared by [`is_hard_denied`] and
+/// [`is_lan`]. Uses `to_ipv4_mapped` (NOT `to_ipv4`) and explicitly skips `::`
+/// and `::1` so those pure-v6 specials are classified by the native v6 checks,
+/// never mis-mapped to `0.0.0.0`/`0.0.0.1`.
+fn embedded_v4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let seg = v6.segments();
+    let tail = std::net::Ipv4Addr::new(
+        (seg[6] >> 8) as u8,
+        seg[6] as u8,
+        (seg[7] >> 8) as u8,
+        seg[7] as u8,
+    );
+    // IPv4-compatible ::a.b.c.d (high 96 bits zero), excluding :: and ::1.
+    if seg[..6] == [0, 0, 0, 0, 0, 0]
+        && !tail.is_unspecified()
+        && tail != std::net::Ipv4Addr::new(0, 0, 0, 1)
+    {
+        return Some(tail);
+    }
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052).
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+        return Some(tail);
+    }
+    None
+}
+
+/// Destinations the egress plane must NEVER reach from ANY sandbox — not even an
+/// explicit policy may allow them. Loopback (the host's own services, incl.
+/// izbad), link-local + cloud metadata (`169.254.0.0/16`, `fe80::/10` — IMDS
+/// credentials), and the unspecified/broadcast/documentation ranges, plus their
+/// IPv6-embedded forms. The non-negotiable SSRF floor (F-01). RFC1918/LAN is NOT
+/// here — that is policy-governed ([`is_lan`]).
+fn is_hard_denied(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
+            v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
                 || v4.is_documentation()
         }
         IpAddr::V6(v6) => {
-            // Screen embedded-IPv4 forms via their v4 — all are SSRF bypass vectors:
-            //   ::ffff:a.b.c.d   IPv4-mapped     (to_ipv4_mapped matches ONLY ::ffff:/96)
-            //   ::a.b.c.d        IPv4-compatible (deprecated, ::/96 prefix)
-            //   64:ff9b::a.b.c.d NAT64 well-known prefix (RFC 6052)
-            // `to_ipv4_mapped` (not `to_ipv4`) so pure-v6 ::1 is not mis-mapped to
-            // 0.0.0.1; the native v6 checks below still catch ::1 / :: / ULA / link-local.
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_private(IpAddr::V4(v4));
+            if let Some(v4) = embedded_v4(v6) {
+                return is_hard_denied(IpAddr::V4(v4));
             }
-            let seg = v6.segments();
-            let embedded = || {
-                std::net::Ipv4Addr::new(
-                    (seg[6] >> 8) as u8,
-                    seg[6] as u8,
-                    (seg[7] >> 8) as u8,
-                    seg[7] as u8,
-                )
-            };
-            // IPv4-compatible ::a.b.c.d (high 96 bits zero); skip :: and ::1 which the
-            // native is_unspecified/is_loopback checks below handle.
-            if seg[..6] == [0, 0, 0, 0, 0, 0] {
-                let v4 = embedded();
-                if !v4.is_unspecified() && is_private(IpAddr::V4(v4)) {
-                    return true;
-                }
+            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
+            // link-local fe80::/10
+        }
+    }
+}
+
+/// RFC1918 / unique-local "LAN" destinations (and their IPv6-embedded forms).
+/// NOT hard-denied: a bare sandbox may reach them (M1 permissive — the user
+/// declined a firewall, so reaching their own LAN/localhost dev services is the
+/// intended workflow), and an enforcing sandbox may reach them only when its
+/// policy lists the IP *explicitly* — never via a domain, which would be a
+/// DNS-rebinding bypass (see [`decide_tier2`]).
+fn is_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = embedded_v4(v6) {
+                return is_lan(IpAddr::V4(v4));
             }
-            // NAT64 64:ff9b::/96.
-            if seg[0] == 0x0064
-                && seg[1] == 0xff9b
-                && seg[2..6] == [0, 0, 0, 0]
-                && is_private(IpAddr::V4(embedded()))
-            {
-                return true;
-            }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (seg[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
-                || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+            (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
         }
     }
 }
@@ -462,7 +505,7 @@ mod tests {
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443);
         assert_eq!(v, Verdict::Deny);
-        assert!(rule.contains("no DNS-snoop"), "{rule}");
+        assert_eq!(rule, "not in allow-list", "{rule}");
     }
 
     #[test]
@@ -488,55 +531,67 @@ mod tests {
         assert_eq!(rule, "not in allow-list");
     }
 
-    /// DNS-rebinding guard: even a rebinding to an allow-listed name that points
-    /// at a private IP is denied by the address denylist.
+    /// DNS-rebinding guard: a rebinding that points an allow-listed NAME at a LAN
+    /// IP is denied — for an enforcing sandbox a snoop'd FQDN never authorizes a
+    /// private target (only an explicit IP rule could, and none is listed here).
     #[test]
-    fn decide_tier2_denies_private_ip_even_when_snooped() {
+    fn decide_tier2_rebind_to_lan_via_allowlisted_name_is_denied() {
         let p = RegoPolicy::embedded().unwrap();
         let snoop = SnoopStore::new();
         let ip: IpAddr = "10.0.0.5".parse().unwrap();
         snoop.record("web", &[("api.anthropic.com".to_string(), ip, 300)]);
         let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443);
         assert_eq!(v, Verdict::Deny);
-        assert!(rule.contains("private"), "{rule}");
+        assert!(rule.contains("LAN"), "{rule}");
     }
 
-    /// F-01: even a bare (non-enforcing AllowAll) sandbox must NOT be usable as an
-    /// SSRF proxy to loopback / link-local+metadata / RFC1918 / unspecified.
+    /// F-01 floor: even a bare (AllowAll) sandbox must NEVER reach loopback /
+    /// link-local+metadata / unspecified — the non-overridable SSRF floor.
     #[test]
-    fn decide_tier2_denies_private_even_for_bare_sandbox() {
+    fn decide_tier2_bare_hard_denies_loopback_and_metadata() {
         let snoop = SnoopStore::new();
-        for ip in [
-            "127.0.0.1",
-            "169.254.169.254", // cloud metadata (link-local)
-            "10.0.0.5",
-            "192.168.1.1",
-            "172.16.0.1",
-            "0.0.0.0",
-        ] {
+        for ip in ["127.0.0.1", "169.254.169.254", "0.0.0.0", "::1", "fe80::1"] {
             let (v, _f, rule) = decide_tier2(&AllowAll, &snoop, "web", ip.parse().unwrap(), 6379);
             assert_eq!(v, Verdict::Deny, "bare sandbox must not reach {ip}");
-            assert!(rule.contains("private"), "{ip}: {rule}");
+            assert!(rule.contains("blocked address"), "{ip}: {rule}");
         }
-        // A public IP is still allowed for a bare sandbox.
-        let (v, _f, _r) = decide_tier2(&AllowAll, &snoop, "web", "1.2.3.4".parse().unwrap(), 443);
-        assert_eq!(v, Verdict::Allow);
     }
 
-    /// A bare sandbox (non-enforcing AllowAll) keeps today's permissive behavior for
-    /// PUBLIC destinations — a raw-IP dial with no snoop record is allowed — but the
-    /// unconditional SSRF denylist still blocks private addresses (F-01).
+    /// A bare (non-enforcing AllowAll) sandbox is permissive for everything not
+    /// hard-denied — public AND RFC1918/LAN (the M1 contract: the user declined a
+    /// firewall, so reaching their own LAN / localhost dev services is intended).
     #[test]
-    fn decide_tier2_permissive_allows_public_raw_ip_but_denies_private() {
+    fn decide_tier2_bare_allows_public_and_lan() {
         let snoop = SnoopStore::new();
-        let (v, _f, rule) =
-            decide_tier2(&AllowAll, &snoop, "web", "1.2.3.4".parse().unwrap(), 8443);
-        assert_eq!(v, Verdict::Allow);
-        assert_eq!(rule, "permissive");
-        let (v2, _f2, r2) =
-            decide_tier2(&AllowAll, &snoop, "web", "10.0.0.5".parse().unwrap(), 8443);
+        for ip in ["1.2.3.4", "10.0.0.5", "192.168.1.1", "172.16.0.1"] {
+            let (v, _f, rule) = decide_tier2(&AllowAll, &snoop, "web", ip.parse().unwrap(), 8443);
+            assert_eq!(v, Verdict::Allow, "bare sandbox should reach {ip}");
+            assert_eq!(rule, "permissive");
+        }
+    }
+
+    /// Configurable LAN (enforcing): an enforcing sandbox reaches a private IP
+    /// ONLY when its policy lists that IP literally. A domain rule cannot (the
+    /// rebind bypass, covered above); the hard floor is non-overridable by policy.
+    #[test]
+    fn decide_tier2_enforcing_allows_explicitly_listed_lan_ip() {
+        let snoop = SnoopStore::new();
+        let data = r#"{"global_domains": {"10.1.0.124": [8080]}, "sandbox_ports": {}}"#;
+        let p = RegoPolicy::with_data(data).unwrap();
+        let ip: IpAddr = "10.1.0.124".parse().unwrap();
+        let (v, f, rule) = decide_tier2(&p, &snoop, "web", ip, 8080);
+        assert_eq!(v, Verdict::Allow, "explicit IP rule must permit the LAN IP");
+        assert_eq!(f.host, None, "matched as a raw IP, not a domain");
+        assert!(rule.contains("explicit IP"), "{rule}");
+        // A LAN IP NOT listed is still denied.
+        let (v2, _f2, _r) = decide_tier2(&p, &snoop, "web", "10.1.0.200".parse().unwrap(), 8080);
         assert_eq!(v2, Verdict::Deny);
-        assert!(r2.contains("private"), "{r2}");
+        // Loopback stays denied even if (absurdly) listed — the hard floor wins.
+        let data2 = r#"{"global_domains": {"127.0.0.1": [8080]}, "sandbox_ports": {}}"#;
+        let p2 = RegoPolicy::with_data(data2).unwrap();
+        let (v3, _f3, r3) = decide_tier2(&p2, &snoop, "web", "127.0.0.1".parse().unwrap(), 8080);
+        assert_eq!(v3, Verdict::Deny, "hard floor is non-overridable by policy");
+        assert!(r3.contains("blocked address"), "{r3}");
     }
 
     /// A snooped, allow-listed FQDN reached on a non-web port is now DENIED —
@@ -706,63 +761,50 @@ mod tests {
         }
     }
 
+    // (IPv4-mapped / IPv4-compatible / NAT64 embedded-v4 bypass forms are
+    // covered across both address tiers by `hard_denied_vs_lan_classification`.)
+
+    /// The split that the F-01 posture rests on: loopback / link-local+metadata /
+    /// unspecified / broadcast / docs are the NON-OVERRIDABLE hard floor; RFC1918
+    /// / ULA are LAN (policy-governed), NOT hard-denied. Embedded-IPv4 v6 forms
+    /// classify by their embedded v4 in BOTH tiers.
     #[test]
-    fn is_private_canonicalizes_ipv4_mapped_v6() {
-        // ::ffff:127.0.0.1 and ::ffff:10.0.0.1 must be screened via their v4.
-        assert!(is_private("::ffff:127.0.0.1".parse().unwrap()));
-        assert!(is_private("::ffff:10.0.0.1".parse().unwrap()));
-        assert!(is_private("::ffff:169.254.169.254".parse().unwrap()));
-        // A public mapped address is NOT private.
-        assert!(!is_private("::ffff:1.2.3.4".parse().unwrap()));
-        // Native v6 loopback / public still classified correctly.
-        assert!(is_private("::1".parse().unwrap()));
-        assert!(!is_private("2606:4700:4700::1111".parse().unwrap()));
-    }
-
-    /// M-1/M-2: IPv4-compatible (::a.b.c.d) and NAT64 (64:ff9b::a.b.c.d) forms
-    /// carrying a private embedded address must be screened. Public embedded and
-    /// pure-v6 addresses must NOT be mis-classified.
-    #[test]
-    fn is_private_screens_ipv4_compatible_and_nat64_bypass_forms() {
-        // IPv4-compatible (::a.b.c.d) — deprecated ::/96 prefix.
-        assert!(
-            is_private("::10.0.0.1".parse().unwrap()),
-            "IPv4-compat private RFC1918"
-        );
-        assert!(
-            is_private("::127.0.0.1".parse().unwrap()),
-            "IPv4-compat loopback"
-        );
-        assert!(
-            is_private("::169.254.169.254".parse().unwrap()),
-            "IPv4-compat link-local metadata"
-        );
-
-        // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052).
-        assert!(
-            is_private("64:ff9b::10.0.0.1".parse().unwrap()),
-            "NAT64 private RFC1918"
-        );
-        assert!(
-            is_private("64:ff9b::169.254.169.254".parse().unwrap()),
-            "NAT64 link-local metadata"
-        );
-        // NAT64 with a PUBLIC embedded address must NOT be flagged.
-        assert!(
-            !is_private("64:ff9b::1.2.3.4".parse().unwrap()),
-            "NAT64 with public embedded must be allowed"
-        );
-
-        // Pure-v6 :: (unspecified) and ::1 (loopback) must still be caught by
-        // the native v6 checks — they must NOT be mis-routed through IPv4-compat.
-        assert!(is_private("::1".parse().unwrap()), "pure-v6 loopback");
-        assert!(is_private("::".parse().unwrap()), "pure-v6 unspecified");
-
-        // Public pure-v6 must not be flagged.
-        assert!(
-            !is_private("2606:4700:4700::1111".parse().unwrap()),
-            "public v6"
-        );
+    fn hard_denied_vs_lan_classification() {
+        for ip in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::169.254.0.1",
+            "64:ff9b::127.0.0.1",
+        ] {
+            let p: IpAddr = ip.parse().unwrap();
+            assert!(is_hard_denied(p), "{ip} must be hard-denied");
+            assert!(!is_lan(p), "{ip} is not LAN");
+        }
+        for ip in [
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.1",
+            "fc00::1",
+            "fd12::3",
+            "::ffff:10.0.0.5",
+            "::192.168.0.1",
+            "64:ff9b::10.0.0.1",
+        ] {
+            let p: IpAddr = ip.parse().unwrap();
+            assert!(is_lan(p), "{ip} must be LAN");
+            assert!(!is_hard_denied(p), "{ip} is LAN, not hard-denied");
+        }
+        for ip in ["1.2.3.4", "2606:4700:4700::1111", "::ffff:1.2.3.4"] {
+            let p: IpAddr = ip.parse().unwrap();
+            assert!(!is_hard_denied(p), "{ip} is public");
+            assert!(!is_lan(p), "{ip} is public");
+        }
     }
 
     /// A guest that stops reading responses mid-stream must not deadlock
@@ -803,7 +845,9 @@ mod tests {
     }
 
     #[test]
-    fn mitm_path_denies_private_origdst_before_mitm() {
+    fn mitm_path_denies_hard_floor_origdst_before_mitm() {
+        // An enforcing :443 flow to a loopback OrigDst is hard-floor-denied at the
+        // top of tcp_connect, before ever reaching the MITM hop.
         let mut c = spawn_handler(Arc::new(RegoPolicy::embedded().unwrap()), &FakeResolver);
         write_frame(
             &mut c,
@@ -817,16 +861,18 @@ mod tests {
             Response::Error { kind, message } => {
                 assert_eq!(kind, ErrorKind::ConnectFailed);
                 assert!(
-                    message.contains("private"),
-                    "want private-address deny, got: {message}"
+                    message.contains("blocked address"),
+                    "want hard-floor deny, got: {message}"
                 );
             }
-            other => panic!("expected private-address deny, got {other:?}"),
+            other => panic!("expected hard-floor deny, got {other:?}"),
         }
     }
 
     #[test]
-    fn tcp_connect_loopback_is_denied_as_private() {
+    fn tcp_connect_loopback_is_hard_denied_even_for_bare() {
+        // Loopback is the non-overridable SSRF floor — denied even for a bare
+        // (AllowAll) sandbox.
         let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
         write_frame(
             &mut c,
@@ -839,9 +885,9 @@ mod tests {
         match read_frame::<_, Response>(&mut c).unwrap() {
             Response::Error { kind, message } => {
                 assert_eq!(kind, ErrorKind::ConnectFailed);
-                assert!(message.contains("private"), "{message}");
+                assert!(message.contains("blocked address"), "{message}");
             }
-            other => panic!("expected private deny, got {other:?}"),
+            other => panic!("expected hard-floor deny, got {other:?}"),
         }
     }
 }
