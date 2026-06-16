@@ -8,6 +8,7 @@ pub mod policy;
 pub mod port;
 pub mod rm;
 pub mod run;
+pub mod status;
 pub mod stop;
 pub mod version;
 pub mod volume;

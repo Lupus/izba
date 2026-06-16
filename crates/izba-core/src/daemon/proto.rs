@@ -60,6 +60,11 @@ pub enum DaemonRequest {
     Create(DaemonCreate),
     Start {
         name: String,
+        /// Opt out of host-side VMM confinement (NOT recommended). Defaults to
+        /// false via serde so an older client's frame (no field) still
+        /// deserializes and the daemon confines as usual.
+        #[serde(default)]
+        allow_unconfined: bool,
     },
     Stop {
         name: String,
@@ -128,6 +133,12 @@ pub struct SandboxDetail {
     pub workspace: String,
     pub status: String,
     pub ports: Vec<PortRule>,
+    /// Host-side VMM confinement summary (`ConfinementStatus::summary()`), or
+    /// `None` when the sandbox is stopped / its state predates the field — the
+    /// CLI renders `None` as "unknown". serde(default) keeps older frames
+    /// parseable.
+    #[serde(default)]
+    pub confinement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,7 +227,14 @@ mod tests {
                 }],
             }),
             DaemonRequest::VolumePrune,
-            DaemonRequest::Start { name: "web".into() },
+            DaemonRequest::Start {
+                name: "web".into(),
+                allow_unconfined: false,
+            },
+            DaemonRequest::Start {
+                name: "web".into(),
+                allow_unconfined: true,
+            },
             DaemonRequest::Stop { name: "web".into() },
             DaemonRequest::Rm {
                 name: "web".into(),
@@ -289,6 +307,7 @@ mod tests {
                 workspace: "/ws".into(),
                 status: "running".into(),
                 ports: vec![],
+                confinement: Some("confined: restricted(limited)+low-il+job".into()),
             }),
             DaemonResponse::Ports { rules: vec![] },
             DaemonResponse::Status(DaemonStatus {
@@ -331,6 +350,24 @@ mod tests {
         assert!(s.contains(r#""type":"open_stream""#), "{s}");
         let s = serde_json::to_string(&DaemonRequest::ReloadPolicy { name: "w".into() }).unwrap();
         assert!(s.contains(r#""type":"reload_policy""#), "{s}");
+    }
+
+    #[test]
+    fn old_start_without_allow_unconfined_defaults_false() {
+        // A pre-confinement client's Start frame has no allow_unconfined key;
+        // serde(default) must read it as false so the daemon confines.
+        let json = r#"{"type":"start","name":"web"}"#;
+        let back: DaemonRequest = serde_json::from_str(json).unwrap();
+        match back {
+            DaemonRequest::Start {
+                name,
+                allow_unconfined,
+            } => {
+                assert_eq!(name, "web");
+                assert!(!allow_unconfined, "missing field must default to confine");
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
     }
 
     #[test]

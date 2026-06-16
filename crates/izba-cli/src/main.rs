@@ -110,6 +110,10 @@ enum Cmd {
         /// Existing sandbox name, or a workspace directory
         #[arg(default_value = ".")]
         name_or_dir: String,
+        /// Start the VMM WITHOUT host-side confinement (NOT recommended; only
+        /// if confinement fails on your host)
+        #[arg(long)]
+        allow_unconfined: bool,
         /// Command to run (default: /bin/sh -l)
         #[arg(last = true)]
         cmd: Vec<String>,
@@ -137,6 +141,11 @@ enum Cmd {
     },
     /// List sandboxes
     Ls,
+    /// Show detailed status for one sandbox (incl. host-side VMM confinement)
+    Status {
+        /// Sandbox name
+        name: String,
+    },
     /// Stop a running sandbox
     Stop {
         /// Sandbox name
@@ -187,8 +196,9 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         Cmd::Run {
             opts,
             name_or_dir,
+            allow_unconfined,
             cmd,
-        } => commands::run::run(paths, &opts, &name_or_dir, cmd),
+        } => commands::run::run(paths, &opts, &name_or_dir, allow_unconfined, cmd),
         Cmd::Exec {
             name,
             interactive,
@@ -197,6 +207,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         } => commands::exec::run(paths, &name, interactive, tty, cmd),
         Cmd::Cp { src, dst } => commands::cp::run(paths, &src, &dst),
         Cmd::Ls => commands::ls::run(paths),
+        Cmd::Status { name } => commands::status::run(paths, &name),
         Cmd::Stop { name } => commands::stop::run(paths, &name),
         Cmd::Rm { name, force } => commands::rm::run(paths, &name, force),
         Cmd::Netlog {
@@ -255,13 +266,38 @@ mod tests {
     fn parse_run_trailing_cmd() {
         let cli = Cli::try_parse_from(["izba", "run", ".", "--", "claude", "--yolo"]).unwrap();
         let Cmd::Run {
-            name_or_dir, cmd, ..
+            name_or_dir,
+            allow_unconfined,
+            cmd,
+            ..
         } = cli.cmd
         else {
             panic!("expected run");
         };
         assert_eq!(name_or_dir, ".");
+        assert!(!allow_unconfined, "default must be confined");
         assert_eq!(cmd, vec!["claude".to_string(), "--yolo".to_string()]);
+    }
+
+    #[test]
+    fn parse_run_allow_unconfined_flag() {
+        let cli = Cli::try_parse_from(["izba", "run", "--allow-unconfined", "."]).unwrap();
+        let Cmd::Run {
+            allow_unconfined, ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert!(allow_unconfined);
+        // Absent by default.
+        let bare = Cli::try_parse_from(["izba", "run", "."]).unwrap();
+        let Cmd::Run {
+            allow_unconfined, ..
+        } = bare.cmd
+        else {
+            panic!("expected run");
+        };
+        assert!(!allow_unconfined);
     }
 
     #[test]
