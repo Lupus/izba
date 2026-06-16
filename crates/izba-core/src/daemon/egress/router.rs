@@ -514,7 +514,7 @@ mod tests {
 
         let ip = std::net::Ipv4Addr::new(203, 0, 113, 7);
         let name = Name::from_str("api.anthropic.com.").unwrap();
-        let mut msg = Message::new();
+        let mut msg = Message::query();
         msg.add_query(Query::query(name.clone(), RecordType::A));
         msg.add_answer(Record::from_rdata(name, 300, RData::A(A(ip))));
         let response = msg.to_vec().unwrap();

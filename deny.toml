@@ -10,19 +10,10 @@
 version = 2
 # Do NOT add blanket ignores. A real RUSTSEC hit must be TRIAGED (patch, bump,
 # replace, or record an explicit, time-boxed, justified exception) — never
-# silenced wholesale. The entries below are SPECIFIC, triaged exceptions, each
-# with a justification and a removal trigger — not a blanket silence. New,
-# untriaged advisories still surface loudly.
-ignore = [
-    # hickory-proto DoS via O(n²) name compression is in the ENCODER; izba
-    # production only DECODES resolver answers (Message::from_vec,
-    # dns_snoop.rs) — the encoder (to_vec) is reached only in a #[cfg(test)]
-    # helper, not guest-reachable. The patched release requires hickory 0.25+
-    # (a major bump outside izba-core's `0.24` range); no semver-compatible fix
-    # exists. REMOVE after a patched hickory-proto is available within our
-    # semver range.
-    "RUSTSEC-2026-0119",
-]
+# silenced wholesale. Any entry here must be SPECIFIC and triaged, each with a
+# justification and a removal trigger — not a blanket silence. New, untriaged
+# advisories still surface loudly. The graph is clean today: no exceptions.
+ignore = []
 
 [bans]
 # The crate graph is large (reqwest/hyper/rustls/ring/aws-lc-rs/regorus/…), so
