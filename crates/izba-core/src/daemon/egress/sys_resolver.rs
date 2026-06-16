@@ -51,14 +51,32 @@ fn response_with_rcode(req: &Message, rcode: ResponseCode) -> anyhow::Result<Vec
     for q in &req.queries {
         resp.add_query(q.clone());
     }
+    resp.metadata.recursion_desired = req.recursion_desired;
     resp.metadata.recursion_available = true;
     resp.metadata.response_code = rcode;
     Ok(resp.to_vec()?)
 }
 
+/// Header-only truncated response (TC=1, no answers) → the guest retries over
+/// TCP:53 (routed to the same resolver). Used when a UDP answer would exceed
+/// the 512-byte non-EDNS limit.
+fn truncated_response(req: &Message) -> anyhow::Result<Vec<u8>> {
+    let mut resp = Message::new(req.id, MessageType::Response, OpCode::Query);
+    for q in &req.queries {
+        resp.add_query(q.clone());
+    }
+    resp.metadata.recursion_desired = req.recursion_desired;
+    resp.metadata.recursion_available = true;
+    resp.metadata.truncation = true;
+    resp.metadata.response_code = ResponseCode::NoError;
+    Ok(resp.to_vec()?)
+}
+
 /// Build a NOERROR response echoing the question and carrying `records` as the
 /// answer section. Records come straight from hickory's `Lookup`, so no
-/// per-RData destructuring is needed.
+/// per-RData destructuring is needed. If the encoded response would exceed the
+/// 512-byte non-EDNS UDP limit, a TC=1 truncated response is returned instead
+/// so the guest retries over TCP:53.
 fn response_with_answers(req: &Message, records: &[Record]) -> anyhow::Result<Vec<u8>> {
     let mut resp = Message::new(req.id, MessageType::Response, OpCode::Query);
     for q in &req.queries {
@@ -67,9 +85,14 @@ fn response_with_answers(req: &Message, records: &[Record]) -> anyhow::Result<Ve
     for r in records {
         resp.add_answer(r.clone());
     }
+    resp.metadata.recursion_desired = req.recursion_desired;
     resp.metadata.recursion_available = true;
     resp.metadata.response_code = ResponseCode::NoError;
-    Ok(resp.to_vec()?)
+    let bytes = resp.to_vec()?;
+    if bytes.len() > MAX_UDP_RESPONSE {
+        return truncated_response(req);
+    }
+    Ok(bytes)
 }
 
 /// Source of host DNS config. Seam so reload logic is testable without network.
@@ -150,6 +173,12 @@ fn reload_if_changed(cell: &ResolverCell, source: &dyn ConfigSource) -> anyhow::
     }));
     Ok(true)
 }
+
+/// Non-EDNS UDP response size limit. The guest stub queries without an OPT RR
+/// and we drop EDNS from responses, so the effective cap is the classic 512
+/// bytes. Responses that would exceed this are returned as TC=1/no-answers so
+/// the guest retries over TCP:53 (routed to the same resolver by `dns_loop`).
+const MAX_UDP_RESPONSE: usize = 512;
 
 const MIN_REBUILD_INTERVAL: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -462,6 +491,48 @@ mod tests {
             }
             _ => panic!("expected Unsupported"),
         }
+    }
+
+    #[test]
+    fn oversized_answer_is_truncated_for_tcp_retry() {
+        use hickory_proto::rr::{rdata::A, RData, Record};
+        let req = sample_query(0x55, RecordType::A);
+        let name = Name::from_str("a-fairly-long-cdn-name.example.com.").unwrap();
+        // Build 40 A records — enough to push the full response well past 512 bytes.
+        let records: Vec<Record> = (0..40u32)
+            .map(|i| {
+                let ip = std::net::Ipv4Addr::new(203, 0, 113, (i & 0xff) as u8);
+                Record::from_rdata(name.clone(), 30, RData::A(A(ip)))
+            })
+            .collect();
+
+        // Sanity-check: the untruncated encoding must exceed 512 bytes, otherwise
+        // the test would not exercise the truncation path.
+        let mut full_resp = Message::new(0x55, MessageType::Response, OpCode::Query);
+        full_resp.add_query(req.queries[0].clone());
+        for r in &records {
+            full_resp.add_answer(r.clone());
+        }
+        let full_bytes = full_resp.to_vec().unwrap();
+        assert!(
+            full_bytes.len() > MAX_UDP_RESPONSE,
+            "pre-condition: full response must exceed 512 bytes (got {})",
+            full_bytes.len()
+        );
+
+        let bytes = response_with_answers(&req, &records).unwrap();
+        assert!(
+            bytes.len() <= MAX_UDP_RESPONSE,
+            "truncated response must fit 512 bytes: {}",
+            bytes.len()
+        );
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert!(resp.truncation, "TC bit must be set");
+        assert!(
+            resp.answers.is_empty(),
+            "answers must be dropped on truncation"
+        );
+        assert_eq!(resp.id, 0x55, "id must be echoed");
     }
 
     #[test]
