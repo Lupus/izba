@@ -582,7 +582,7 @@ jobs:
           # Report-only: a failing suite must not abort the run and wipe the
           # report. windows-whp remains the authoritative Windows gate.
           set +e
-          cargo test -p izba-proto -p izba-core -p izba-cli
+          cargo test --locked -p izba-proto -p izba-core -p izba-cli
           cargo build --locked --release -p izba-cli
           cargo build --locked --release -p izba-core --example confine_probe
           pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
