@@ -73,7 +73,11 @@ fn open_query(pid: u32) -> Option<OwnedHandle> {
 }
 
 /// Process creation time as a single u64 (FILETIME: 100 ns ticks since 1601).
-fn creation_time(h: HANDLE) -> Option<u64> {
+///
+/// `pub(crate)` so the confined-spawn path in `jail_windows.rs` builds its
+/// returned `PidIdentity.starttime` with the SAME FILETIME read as
+/// `spawn_detached` — one identity definition for both spawn paths.
+pub(crate) fn creation_time(h: HANDLE) -> Option<u64> {
     let mut create: FILETIME = unsafe { std::mem::zeroed() };
     let mut exit: FILETIME = unsafe { std::mem::zeroed() };
     let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
