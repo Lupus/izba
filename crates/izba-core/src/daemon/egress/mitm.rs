@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// TLS-MITM datapath for izba's egress plane (M5 SPIKE — not wired into the
-// production router yet; see `super::router` for the integration point).
+// TLS-MITM datapath for izba's egress plane (wired into the production router
+// via `super::mitm_runtime`; the blocking router hops the vsock leg into this
+// tokio-side orchestrator).
 //
 // The CA / leaf-minting / TLS-terminate / TLS-connect-upstream machinery in
 // this file is SALVAGED from NVIDIA OpenShell's
@@ -14,18 +15,22 @@
 //                (miette -> anyhow) and `tracing` dropped.
 //   - ADAPTED  : OpenShell logic, reshaped for izba (e.g. generic streams
 //                instead of `tokio::net::TcpStream`).
-//   - IZBA     : new code written for this spike (HTTP request-line sniff,
-//                policy seam, the generic-stream orchestrator + pump).
+//   - IZBA     : new code written for izba (the policy seam + `serve_mitm`, the
+//                hyper-util HTTP orchestrator). OpenShell parses the L7 with a
+//                real HTTP stack behind its `L7Provider` trait; `serve_mitm`
+//                does the same with `hyper_util::server::conn::auto`.
 //
 //! MITM TLS termination for guest HTTPS egress.
 //!
 //! The guest trusts an izba root CA baked into its store. izbad terminates the
-//! client TLS by minting a leaf for the SNI under that CA, reads the decrypted
-//! HTTP request line + Host (L7 visibility for policy / credential injection),
-//! applies a policy hook, then re-originates TLS to the real upstream and pipes
-//! the bytes back. Operates on any `AsyncRead + AsyncWrite + Unpin` so it is
-//! decoupled from the vsock/TCP transport — the test drives it over
-//! `tokio::io::duplex`.
+//! client TLS by minting a leaf for the ClientHello SNI under that CA, then runs
+//! a real hyper-util HTTP server (h1 + h2) so EVERY request — not just the first
+//! on a kept-alive connection — passes a policy `Service` (F-03). The captured
+//! SNI is bound to the decrypted HTTP `Host` (F-02). On Allow it re-originates
+//! TLS to the real upstream (webpki-verified against `Host`), bridging
+//! request/response (and WebSocket upgrades) rather than blind-splicing bytes;
+//! non-HTTP after TLS fails closed. `serve_mitm` is generic over the guest
+//! stream so tests drive it over `tokio::io::duplex`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
