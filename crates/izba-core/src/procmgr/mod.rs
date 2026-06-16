@@ -6,6 +6,11 @@
 //! process creation `FILETIME`. `state.json` is per-host, so the differing
 //! unit never crosses platforms.
 
+pub mod confine;
+pub use confine::{
+    ConfinementMode, ConfinementPolicy, ConfinementStatus, IntegrityLevel, TokenLevel,
+};
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
