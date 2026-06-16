@@ -355,6 +355,19 @@ jobs:
             target/coverage/coverage-e2e.json
             target/coverage/html-e2e
           if-no-files-found: warn
+      # Frontend (app/) coverage for the main-branch scan below, so the Tauri
+      # app isn't shown as 0%-covered on the dashboard. The app is a separate
+      # npm project outside the cargo workspace; vitest emits app/-relative
+      # lcov, rewritten to repo-root-relative to resolve against the scanned tree.
+      - name: Frontend coverage (vitest lcov)
+        if: always()
+        working-directory: app
+        run: |
+          npm ci --ignore-scripts
+          npm run test:coverage
+      - name: Rewrite frontend lcov paths to repo-root-relative
+        if: always()
+        run: sed -i 's|^SF:|SF:app/|' app/coverage/lcov.info
       # SonarCloud main-branch analysis with the richer host+real-VM report.
       # This job runs on schedule + workflow_dispatch (never on push), so the
       # main coverage on the Sonar dashboard refreshes on that cadence — a
