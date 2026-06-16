@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
-import { NetlogView } from "../components/NetlogView";
+import { NetlogView, relTime } from "../components/NetlogView";
 import { api } from "../lib/ipc";
 import type { PolicyView } from "../lib/types";
 
@@ -78,5 +78,56 @@ describe("NetlogView", () => {
     const btn = await screen.findByRole("button", { name: /enable firewall/i });
     fireEvent.click(btn);
     await waitFor(() => expect(api.policyEnable).toHaveBeenCalledWith("web"));
+  });
+
+  it("orders rows deterministically by recency then host:port, not backend order", async () => {
+    // Two endpoints with the SAME last_seen_ms — the backend's HashMap can
+    // hand them back in either order between polls (the 'jumping' bug). The
+    // view must impose a stable tiebreaker so the DOM order never flips.
+    // dest_ip is inherited from the fixture — these rows resolve by host, so the
+    // value is irrelevant here (and avoids hardcoded-IP-literal lint noise).
+    const beta = { ...allowedNamed, host: "beta.example", port: 443, last_seen_ms: 100 };
+    const alpha = { ...allowedNamed, host: "alpha.example", port: 443, last_seen_ms: 100 };
+    // Hand them to the view in the 'wrong' (beta-first) order.
+    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([beta, alpha]);
+    render(<NetlogView name="web" />);
+    await screen.findByText("alpha.example");
+    const cells = screen.getAllByText(/example$/);
+    // Same recency ⇒ alphabetical host wins: alpha before beta.
+    expect(cells.map((c) => c.textContent)).toEqual(["alpha.example", "beta.example"]);
+  });
+
+  it("shows a Last activity column with a relative time", async () => {
+    render(<NetlogView name="web" />);
+    await screen.findByText("api.x.com");
+    expect(screen.getByRole("columnheader", { name: /last activity/i })).toBeInTheDocument();
+  });
+
+  it("pauses polling while the pointer hovers the table", async () => {
+    const read = api.readNetlog as ReturnType<typeof vi.fn>;
+    render(<NetlogView name="web" pollMs={20} />);
+    // Let a couple of poll ticks accrue.
+    await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(2));
+    fireEvent.mouseEnter(screen.getByRole("table"));
+    const frozen = read.mock.calls.length;
+    // Across several poll intervals, no new reads fire while hovering.
+    await new Promise((r) => setTimeout(r, 120));
+    expect(read.mock.calls.length).toBe(frozen);
+    // Leaving resumes polling.
+    fireEvent.mouseLeave(screen.getByRole("table"));
+    await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(frozen));
+  });
+});
+
+describe("relTime", () => {
+  const now = 1_000_000_000;
+  it("renders sub-second as 'just now'", () => {
+    expect(relTime(now - 200, now)).toBe("just now");
+  });
+  it("renders seconds, minutes, hours, days", () => {
+    expect(relTime(now - 5_000, now)).toBe("5s ago");
+    expect(relTime(now - 3 * 60_000, now)).toBe("3m ago");
+    expect(relTime(now - 2 * 3_600_000, now)).toBe("2h ago");
+    expect(relTime(now - 4 * 86_400_000, now)).toBe("4d ago");
   });
 });
