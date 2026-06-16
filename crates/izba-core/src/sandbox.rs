@@ -488,6 +488,8 @@ pub fn start_with_timeouts(
         ],
         console_log: console_log.clone(),
         run_dir: paths.run_dir(name),
+        // Threaded through from the caller in a later step; default-confine.
+        allow_unconfined: false,
     };
 
     let mut handle = driver.launch(&spec)?;
