@@ -151,7 +151,15 @@ impl DaemonApi for RealDaemon {
 
     fn start(&mut self, name: &str) -> anyhow::Result<()> {
         let name = name.to_string();
-        self.with_client(|c| expect_ok(c.request(&DaemonRequest::Start { name }, &mut |_| {})?))
+        self.with_client(|c| {
+            expect_ok(c.request(
+                &DaemonRequest::Start {
+                    name,
+                    allow_unconfined: false,
+                },
+                &mut |_| {},
+            )?)
+        })
     }
 
     fn stop(&mut self, name: &str) -> anyhow::Result<()> {
