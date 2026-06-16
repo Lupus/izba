@@ -26,10 +26,20 @@ against the user's real project directory. F-06.
 2. **Single-token launch, no `LowerToken()`.** OpenVMM is third-party; we cannot
    make it cooperate. One token is the process's whole-life identity, tight
    enough to confine but loose enough to open `\Device\VidExo` and bootstrap.
-   Token level: `DISABLE_MAX_PRIVILEGE` (drop all privileges) + keep the user /
-   logon / `RESTRICTED` identity as restricting SIDs (the Chromium
-   `USER_LIMITED`/`USER_RESTRICTED_NON_ADMIN` shape) + Low IL. **No unique
-   per-sandbox restricting SID** (would break WHP).
+   Token = `DISABLE_MAX_PRIVILEGE` (drop all privileges) + **Low IL**. **NO
+   restricting SIDs.** Live-validated 2026-06-16: adding the Chromium
+   `USER_LIMITED` restricting-SID set (Users/Everyone/RESTRICTED ± logon SID)
+   makes the process fail to initialize (`0xC0000142` STATUS_DLL_INIT_FAILED) —
+   reproduced even with native `cmd.exe`, so it is fundamental, not .NET-specific.
+   Chromium survives this only via two-token warmup (`LowerToken`), which a
+   third-party VMM can't do and which doesn't transfer to child processes. So
+   `TokenLevel` is effectively a single proven shape; the `Limited`/
+   `RestrictedNonAdmin` enum variants are forward-declared but inert.
+   **Consequence (residual):** the token gives *integrity* protection (Low-IL
+   no-write-up + no privileges) but **not read-confinement** — a Low-IL
+   non-restricted VMM can still READ the user's files. Read-confinement would
+   need AppContainer (breaks WHP) or per-VM service accounts (admin); both out of
+   scope.
 3. **No `KILL_ON_JOB_CLOSE`.** izba's contract is "killing/upgrading izbad never
    harms sandboxes." The security boundary is the **create-time-immutable** token
    + IL + mitigations (survive izbad death). The job is **best-effort
@@ -46,9 +56,15 @@ against the user's real project directory. F-06.
    structure (Apache-2.0 attribution) but inverting the lifecycle to
    spawn-detached. Confined launch is `CreateProcessAsUserW` (std `Command`
    cannot carry a custom token / `STARTUPINFOEX`).
-6. **UX:** capability-probe once at startup; if the confined launch can't open WHP
-   on a host, **degrade gracefully** to the next weaker tier and surface an
-   **honest reason** in health (`izba status`), never requiring user config.
+6. **UX — LOUD on degradation, never silent** (general izba rule, see memory
+   `izba-loud-on-security-degradation`). If the VMM cannot be confined on a host,
+   izba **FAILS CLOSED** by default: it refuses to start the sandbox with a clear
+   error. To proceed unconfined the user must pass an explicit, deliberately
+   awkward opt-in flag (`--allow-unconfined`); even then izba emits a prominent
+   CLI warning, shows `UNCONFINED` in `izba status`, and (follow-up) warns in the
+   desktop UI. Never silently downgrade. (Distinct from Linux, where the jailer is
+   a not-yet-implemented milestone — reported honestly in status, not gated by the
+   flag.)
 
 ## What the first PR delivers (and proves in CI)
 
