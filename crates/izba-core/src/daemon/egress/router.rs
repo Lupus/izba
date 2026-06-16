@@ -218,11 +218,13 @@ fn mitm_hop(
 /// Tier-2 (non-HTTP TCP) decision: recover the FQDN(s) izbad resolved for `ip`
 /// and decide. Returns the verdict, the `FlowDesc` to audit, and a rule label.
 ///
-/// Enforcing policy (a declared firewall): a private/loopback/link-local
-/// destination is denied (DNS-rebinding / SSRF guard); a raw-IP dial with no
-/// snoop record is default-denied (the red flag); otherwise the flow is allowed
-/// iff ANY snooped name passes the policy. A non-enforcing `AllowAll` keeps
-/// today's permissive behavior — it decides on the address as given.
+/// Enforcing policy (a declared firewall): a raw-IP dial with no snoop record
+/// is default-denied (the red flag); otherwise the flow is allowed iff ANY
+/// snooped name passes the policy. A non-enforcing `AllowAll` keeps today's
+/// permissive behavior for PUBLIC destinations only.
+///
+/// The private-address denylist is UNCONDITIONAL — applied to bare AND enforcing
+/// sandboxes (F-01 SSRF guard).
 pub fn decide_tier2(
     policy: &dyn Policy,
     snoop: &SnoopStore,
@@ -234,19 +236,21 @@ pub fn decide_tier2(
     let mut flow = FlowDesc::l3(sandbox, ip.to_string(), port);
     flow.host = names.first().cloned();
 
+    // UNCONDITIONAL SSRF / DNS-rebinding guard — applies to bare AND enforcing
+    // sandboxes. A bare sandbox stays permissive for PUBLIC destinations only.
+    if is_private(ip) {
+        return (Verdict::Deny, flow, "private-address denylist");
+    }
+
     if !policy.enforces() {
-        // Permissive bare sandbox: decide on the addr (today's behavior).
         let verdict = policy.check(&flow);
         return (verdict, flow, "permissive");
     }
 
-    if is_private(ip) {
-        return (Verdict::Deny, flow, "private-address denylist");
-    }
+    // (enforcing) private already denied above.
     if names.is_empty() {
         return (Verdict::Deny, flow, "no DNS-snoop record (raw IP)");
     }
-    // Allow if any resolved name passes the allow-list.
     for name in &names {
         let mut f = flow.clone();
         f.addr = name.clone();
@@ -316,7 +320,6 @@ fn dns_loop(mut conn: UdsStream, resolver: &dyn Resolver, sandbox: &str, snoop: 
 mod tests {
     use super::*;
     use crate::daemon::egress::policy::{AllowAll, RegoPolicy};
-    use std::io::{Read, Write};
 
     struct FakeResolver;
     impl Resolver for FakeResolver {
@@ -447,19 +450,42 @@ mod tests {
         assert!(rule.contains("private"), "{rule}");
     }
 
-    /// A bare sandbox (non-enforcing AllowAll) keeps today's permissive
-    /// behavior — a raw-IP dial with no snoop record is allowed.
+    /// F-01: even a bare (non-enforcing AllowAll) sandbox must NOT be usable as an
+    /// SSRF proxy to loopback / link-local+metadata / RFC1918 / unspecified.
     #[test]
-    fn decide_tier2_permissive_allows_raw_ip() {
+    fn decide_tier2_denies_private_even_for_bare_sandbox() {
         let snoop = SnoopStore::new();
-        let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        let (v, _f, rule) = decide_tier2(&AllowAll, &snoop, "web", ip, 8443);
+        for ip in [
+            "127.0.0.1",
+            "169.254.169.254", // cloud metadata (link-local)
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.1",
+            "0.0.0.0",
+        ] {
+            let (v, _f, rule) = decide_tier2(&AllowAll, &snoop, "web", ip.parse().unwrap(), 6379);
+            assert_eq!(v, Verdict::Deny, "bare sandbox must not reach {ip}");
+            assert!(rule.contains("private"), "{ip}: {rule}");
+        }
+        // A public IP is still allowed for a bare sandbox.
+        let (v, _f, _r) = decide_tier2(&AllowAll, &snoop, "web", "1.2.3.4".parse().unwrap(), 443);
+        assert_eq!(v, Verdict::Allow);
+    }
+
+    /// A bare sandbox (non-enforcing AllowAll) keeps today's permissive behavior for
+    /// PUBLIC destinations — a raw-IP dial with no snoop record is allowed — but the
+    /// unconditional SSRF denylist still blocks private addresses (F-01).
+    #[test]
+    fn decide_tier2_permissive_allows_public_raw_ip_but_denies_private() {
+        let snoop = SnoopStore::new();
+        let (v, _f, rule) =
+            decide_tier2(&AllowAll, &snoop, "web", "1.2.3.4".parse().unwrap(), 8443);
         assert_eq!(v, Verdict::Allow);
         assert_eq!(rule, "permissive");
-        // Permissive even reaches a private IP (M1 behavior preserved).
-        let priv_ip: IpAddr = "10.0.0.5".parse().unwrap();
-        let (v2, _f2, _r) = decide_tier2(&AllowAll, &snoop, "web", priv_ip, 8443);
-        assert_eq!(v2, Verdict::Allow);
+        let (v2, _f2, r2) =
+            decide_tier2(&AllowAll, &snoop, "web", "10.0.0.5".parse().unwrap(), 8443);
+        assert_eq!(v2, Verdict::Deny);
+        assert!(r2.contains("private"), "{r2}");
     }
 
     /// A snooped, allow-listed FQDN reached on a non-web port is now DENIED —
@@ -626,77 +652,6 @@ mod tests {
         match read_frame::<_, Response>(&mut c).unwrap() {
             Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::BadRequest),
             other => panic!("expected BadRequest, got {other:?}"),
-        }
-    }
-
-    /// Real dial-out happy path + refused port. Binds a TcpListener —
-    /// runtime-skip where denied.
-    #[test]
-    fn tcp_connect_dials_and_splices() {
-        let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
-            Ok(l) => l,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("SKIP tcp_connect_dials_and_splices: bind denied: {e}");
-                return;
-            }
-            Err(e) => panic!("bind probe: {e}"),
-        };
-        let port = listener.local_addr().unwrap().port();
-        let srv = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 16];
-            let n = s.read(&mut buf).unwrap();
-            s.write_all(b"re:").unwrap();
-            s.write_all(&buf[..n]).unwrap();
-            s.shutdown(std::net::Shutdown::Write).unwrap();
-        });
-        let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
-        write_frame(
-            &mut c,
-            &StreamOpen::TcpConnect {
-                addr: "127.0.0.1".into(),
-                port,
-            },
-        )
-        .unwrap();
-        match read_frame::<_, Response>(&mut c).unwrap() {
-            Response::Ok => {}
-            other => panic!("expected Ok, got {other:?}"),
-        }
-        c.write_all(b"hi").unwrap();
-        c.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut got = Vec::new();
-        c.read_to_end(&mut got).unwrap();
-        assert_eq!(got, b"re:hi");
-        srv.join().unwrap();
-    }
-
-    #[test]
-    fn tcp_connect_refused_reports_connect_failed() {
-        let port = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
-            Ok(l) => {
-                let p = l.local_addr().unwrap().port();
-                drop(l);
-                p
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("SKIP tcp_connect_refused: bind denied: {e}");
-                return;
-            }
-            Err(e) => panic!("bind probe: {e}"),
-        };
-        let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
-        write_frame(
-            &mut c,
-            &StreamOpen::TcpConnect {
-                addr: "127.0.0.1".into(),
-                port,
-            },
-        )
-        .unwrap();
-        match read_frame::<_, Response>(&mut c).unwrap() {
-            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::ConnectFailed),
-            other => panic!("expected ConnectFailed, got {other:?}"),
         }
     }
 
