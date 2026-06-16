@@ -261,7 +261,9 @@ impl VmHandle for ChHandle {
         // The Linux host-side VMM jailer is a separate milestone, not a runtime
         // failure: report it honestly as not-yet-implemented rather than
         // claiming confinement that was never applied.
-        crate::procmgr::ConfinementStatus::degraded("linux host-side VMM jailer not yet implemented")
+        crate::procmgr::ConfinementStatus::degraded(
+            "linux host-side VMM jailer not yet implemented",
+        )
     }
 
     fn kill(&mut self) -> anyhow::Result<()> {
