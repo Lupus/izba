@@ -31,9 +31,9 @@ const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
 /// integrity lowered. Restricting/deny-only SID shaping per `policy.token` is a
 /// follow-up (DISABLE_MAX_PRIVILEGE is the proven baseline that keeps WHP).
 ///
+/// Used by `probe_confinable` and (in a later task) by `spawn_confined`.
+///
 /// SAFETY: linear FFI; base token closed always, new token closed on error.
-// used by spawn_confined in a later task
-#[allow(dead_code)]
 unsafe fn build_confined_token(policy: &ConfinementPolicy) -> anyhow::Result<HANDLE> {
     let mut base: HANDLE = std::ptr::null_mut();
     if OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut base) == 0 {
@@ -76,8 +76,6 @@ unsafe fn build_confined_token(policy: &ConfinementPolicy) -> anyhow::Result<HAN
 ///
 /// SAFETY: FFI; the converted SID is owned by the OS allocation and intentionally
 /// not freed here (process-lifetime; matches the short-lived token-build path).
-// used by spawn_confined in a later task (via build_confined_token)
-#[allow(dead_code)]
 unsafe fn set_integrity(tok: HANDLE, il: IntegrityLevel) -> anyhow::Result<()> {
     let sid_str: Vec<u16> = match il {
         IntegrityLevel::Low => "S-1-16-4096\0".encode_utf16().collect(),
@@ -110,4 +108,22 @@ unsafe fn set_integrity(tok: HANDLE, il: IntegrityLevel) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// One-shot host capability probe: can a process under the VMM policy be built?
+/// For now (full WHP round-trip wired in Phase 4) it returns true iff the
+/// confined token can be constructed — the necessary precondition. Returns false
+/// (degrade) on any failure so the launch path can fall back + report honestly.
+pub fn probe_confinable(policy: &ConfinementPolicy, probe_exe: &std::path::Path) -> bool {
+    let _ = probe_exe; // reserved for the Phase-4 WHP round-trip
+                       // SAFETY: FFI; token closed on the success path.
+    unsafe {
+        match build_confined_token(policy) {
+            Ok(t) => {
+                CloseHandle(t);
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }

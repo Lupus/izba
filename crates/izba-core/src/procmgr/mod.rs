@@ -21,6 +21,8 @@ pub use unix::{kill_pid, pid_alive, spawn_detached};
 #[cfg(windows)]
 mod jail_windows;
 #[cfg(windows)]
+pub use jail_windows::probe_confinable;
+#[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use windows::proc_starttime;
