@@ -155,7 +155,7 @@ const MIN_REBUILD_INTERVAL: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const IFWATCH_DEBOUNCE: Duration = Duration::from_secs(1);
 
-pub(crate) struct SystemResolver {
+pub struct SystemResolver {
     rt: tokio::runtime::Runtime,
     cell: Arc<ResolverCell>,
     caps: DnsCaps,
@@ -165,7 +165,7 @@ pub(crate) struct SystemResolver {
 
 impl SystemResolver {
     /// Build the production system resolver and start its reload tasks.
-    pub(crate) fn new() -> anyhow::Result<Arc<Self>> {
+    pub fn new() -> anyhow::Result<Arc<Self>> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
