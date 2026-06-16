@@ -16,7 +16,8 @@
 use super::spec::{reject_commas, CommandSpec, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
 use crate::procmgr::{
-    kill_pid, pid_alive, spawn_confined, spawn_detached, ConfinementPolicy, ConfinementStatus,
+    kill_pid, pid_alive, spawn_confined, spawn_detached, ConfinementMode, ConfinementPolicy,
+    ConfinementStatus,
 };
 use crate::state::PidIdentity;
 use crate::vsock::hybrid_connect;
@@ -151,7 +152,20 @@ impl VmmDriver for OpenVmmDriver {
             )
         } else {
             match spawn_confined(&inv, &vmm_log, &policy) {
-                Ok(id) => (id, ConfinementStatus::applied(&policy)),
+                // Honest mapping: the resource job is best-effort, so report
+                // TokenOnly when it could not be applied even though token+IL
+                // (the real boundary) succeeded.
+                Ok((id, ConfinementMode::Restricted)) => (id, ConfinementStatus::applied(&policy)),
+                Ok((id, ConfinementMode::TokenOnly)) => {
+                    (id, ConfinementStatus::token_only(&policy))
+                }
+                // Unreachable on the confined path (the Windows jailer never
+                // returns None and the Unix stub is not hit here), but map it
+                // defensively rather than silently claiming confinement.
+                Ok((id, ConfinementMode::None)) => (
+                    id,
+                    ConfinementStatus::degraded("confinement unavailable on this platform"),
+                ),
                 Err(e) => anyhow::bail!(
                     "failed to apply host-side confinement to the VMM: {e}. \
                      Re-run with --allow-unconfined to start the VMM WITHOUT host-side \
