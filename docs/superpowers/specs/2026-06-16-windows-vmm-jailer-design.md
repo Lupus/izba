@@ -45,10 +45,15 @@ against the user's real project directory. F-06.
    + IL + mitigations (survive izbad death). The job is **best-effort
    resource-governance only**, named per sandbox, `SILENT_BREAKAWAY_OK`,
    re-acquired on adoption.
-4. **Security on immutable create-time properties:** child-process blocking via
-   `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` (sized for OpenVMM's worker
-   child, not `ActiveProcessLimit=1`); shatter protection is **optional** (Low-IL
-   /UIPI already covers it for a headless VMM — alternate desktop is
+4. **Security on immutable create-time properties** (token + IL + mitigations).
+   **Child-process creation is NOT blocked:** OpenVMM forks an `openvmm vm`
+   worker, and the only Windows primitive for it
+   (`PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY =
+   PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`) is all-or-nothing — there is no
+   per-worker exception — so it cannot be applied without breaking the VM.
+   Children DO inherit the restricted token + Low IL (so they run deprivileged),
+   but they are not prevented from spawning. Shatter protection is **optional**
+   (Low-IL/UIPI already covers it for a headless VMM — alternate desktop is
    belt-and-suspenders, deferred).
 5. **Reuse:** no usable crate exists (`codex-windows-sandbox` is unpublished,
    monorepo-coupled, run-to-completion + kill-on-close). Build on the existing
@@ -76,9 +81,8 @@ against the user's real project directory. F-06.
 - **Demonstrated protections (the deterministic PoC):** an izba-authored
   `confine-probe` example launched **confined vs unconfined**; CI asserts the
   security-relevant operations (write-up to a Medium-IL host file outside the
-  share; acquiring a deleted privilege; spawning a disallowed child) **fail under
-  confinement and succeed unconfined** — the methodology's required abuse-case
-  PoC.
+  share; acquiring a deleted privilege) **fail under confinement and succeed
+  unconfined** — the methodology's required abuse-case PoC.
 - **Integration proof:** the existing Windows e2e suite (`validate-izba-windows.ps1`)
   still boots a real VM **with the VMM confined**, and a new assertion queries
   the live `openvmm.exe` token to confirm Low IL + restricted.
