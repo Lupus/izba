@@ -26,6 +26,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          fetch-depth: 0  # full history → accurate Sonar new-code detection & blame
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           prefix-key: coverage
@@ -54,3 +56,14 @@ jobs:
             target/coverage/coverage.json
             target/coverage/html
           if-no-files-found: warn
+      # SonarCloud, pull requests only. This is the per-PR "new code" coverage
+      # feed (host workspace; the KVM-gated integration tests self-skip on this
+      # NIC-less hosted runner). The richer host+real-VM main-branch analysis is
+      # owned by e2e.yml's `linux-kvm-coverage` job, so main is never scanned
+      # from here — one writer per branch context, no dashboard oscillation.
+      # Fork PRs lack the secret, so guard on same-repo.
+      - name: SonarQube Scan (PR)
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
