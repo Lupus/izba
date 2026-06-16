@@ -5,6 +5,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { LogsView } from "./LogsView";
 import { NetlogView } from "./NetlogView";
 import { PolicyEditor } from "./PolicyEditor";
+import { FirewallStatus } from "./FirewallStatus";
 import { ShellPanel } from "./ShellPanel";
 import { api } from "../lib/ipc";
 
@@ -91,7 +92,8 @@ export function Detail({ sandbox, onChanged }: Props) {
 
       <div className="mt-4 min-h-0 flex-1">
         {tab === "overview" && (
-          <div>
+          <div className="flex flex-col gap-3">
+            <FirewallStatus name={name} />
             <div className="flex flex-wrap gap-2">
               {running ? (
                 <button
