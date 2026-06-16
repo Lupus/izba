@@ -3,6 +3,10 @@ name = "izba-core"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+# Internal application crate — never published to crates.io. Marking it private
+# lets cargo-deny's `allow-wildcard-paths` exempt its `version = "*"` path deps
+# on sibling crates (the wildcard ban only skips path deps for private crates).
+publish = false
 
 [build-dependencies]
 # Emits VERGEN_* build metadata (git describe/sha, build date, rustc, target).
@@ -35,7 +39,9 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # (aws-lc-sys is the risk we avoid). default-features=false drops aws-lc-rs.
 rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
-rustls-pemfile = "2"
+# PEM decode via rustls-pki-types' `pem` module (the `std` feature enables it,
+# pulling in `alloc`); replaces the unmaintained rustls-pemfile (RUSTSEC-2025-0134).
+rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 # Mozilla CA roots so the MITM verifies real upstreams (pure data, cross-compiles).
 webpki-roots = "0.26"
@@ -54,7 +60,7 @@ regorus = { version = "0.4", default-features = false, features = ["std", "arc",
 # DNS-snoop (tier-2): parse A/AAAA + TTL out of the resolver's responses to
 # recover FQDNs for the non-HTTP egress allow-list. default-features=false keeps
 # it a pure wire parser (no tokio/runtime) and cross-compiles to windows-gnu.
-hickory-proto = { version = "0.24", default-features = false }
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 
 # Per-sandbox `--policy` config parse (mirrors the user's docker-mitm-bridge
 # data.yml shape). serde_yaml 0.9 is archived-but-final + pure Rust.

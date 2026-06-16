@@ -1,0 +1,75 @@
+# Supply-chain gate (F-22). See docs/security/methodology.md §C.
+#
+# Pre-merge, deterministic, green-before-commit: RUSTSEC advisories +
+# license policy + dependency bans/sources. Run by `.github/workflows/ci.yml`
+# (job `cargo-deny`) via `cargo deny check advisories bans licenses sources`.
+
+[advisories]
+# RUSTSEC advisory DB. With version-2 semantics, unmaintained/unsound/etc.
+# are denied by default; any advisory match fails the gate.
+version = 2
+# Do NOT add blanket ignores. A real RUSTSEC hit must be TRIAGED (patch, bump,
+# replace, or record an explicit, time-boxed, justified exception) — never
+# silenced wholesale. Any entry here must be SPECIFIC and triaged, each with a
+# justification and a removal trigger — not a blanket silence. New, untriaged
+# advisories still surface loudly. The graph is clean today: no exceptions.
+ignore = []
+
+[bans]
+# The crate graph is large (reqwest/hyper/rustls/ring/aws-lc-rs/regorus/…), so
+# duplicate transitive versions are common and not a security defect on their
+# own — start at `warn` rather than blocking merges on dup versions.
+multiple-versions = "warn"
+# Wildcard ("*") version requirements defeat reproducible, auditable builds.
+wildcards = "deny"
+# Internal workspace crates are path deps declared `version = "*"` — a wildcard
+# only in the registry sense. Exempt path deps from the wildcard ban.
+allow-wildcard-paths = true
+# No crates are banned outright today; add `{ crate = "name" }` entries here
+# after triage if a dependency must be forbidden.
+deny = []
+# Crates intentionally allowed to appear multiple times. Keep empty; add an
+# entry (with a comment) only after triaging a specific duplicate.
+skip = []
+
+[licenses]
+version = 2
+# Permissive SPDX ids that actually appear in the resolved dependency graph
+# (derived from `cargo metadata` over Cargo.lock). Generous on purpose: the
+# goal is a forward-looking gate that is GREEN on today's graph, not a license
+# audit that fails now. A new permissive license can be appended here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "Unlicense",
+    "0BSD",
+    "BSL-1.0",
+    "MIT-0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# regorus ships `license-file = "LICENSE"` (a verbatim MIT license) with no SPDX
+# `license` field, so harvesting needs a hint. The file is the standard MIT
+# text; clarify it to MIT explicitly.
+[[licenses.clarify]]
+crate = "regorus"
+expression = "MIT"
+license-files = [{ path = "LICENSE", hash = 0x40348758 }]
+
+[sources]
+# Flag (don't yet block) crates from outside crates.io so a new registry or git
+# source is surfaced for review rather than silently trusted.
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

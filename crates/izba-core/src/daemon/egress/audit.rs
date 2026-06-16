@@ -260,7 +260,7 @@ impl AuditSink {
     pub fn record(&self, mut rec: AuditRecord) {
         rec.ts_ms = now_ms();
         let dir = self.paths.logs_dir(&rec.sandbox);
-        if std::fs::create_dir_all(&dir).is_err() {
+        if crate::paths::create_dir_700(&dir, self.paths.root()).is_err() {
             return;
         }
         let path = dir.join("egress-audit.jsonl");

@@ -37,21 +37,18 @@ pub fn extract_a_aaaa(resp: &[u8]) -> Vec<(String, IpAddr, u32)> {
     let Ok(msg) = Message::from_vec(resp) else {
         return Vec::new();
     };
-    let qname = msg
-        .queries()
-        .first()
-        .map(|q| normalize(&q.name().to_utf8()));
+    let qname = msg.queries.first().map(|q| normalize(&q.name().to_utf8()));
     let mut out = Vec::new();
-    for rec in msg.answers() {
-        let ip = match rec.data() {
-            Some(RData::A(a)) => IpAddr::V4(a.0),
-            Some(RData::AAAA(a)) => IpAddr::V6(a.0),
+    for rec in &msg.answers {
+        let ip = match &rec.data {
+            RData::A(a) => IpAddr::V4(a.0),
+            RData::AAAA(a) => IpAddr::V6(a.0),
             _ => continue,
         };
         let fqdn = qname
             .clone()
-            .unwrap_or_else(|| normalize(&rec.name().to_utf8()));
-        out.push((fqdn, ip, rec.ttl()));
+            .unwrap_or_else(|| normalize(&rec.name.to_utf8()));
+        out.push((fqdn, ip, rec.ttl));
     }
     out
 }
@@ -178,7 +175,7 @@ mod tests {
         use hickory_proto::rr::{Name, Record, RecordType};
 
         let name = Name::from_str(qname).unwrap();
-        let mut msg = Message::new();
+        let mut msg = Message::query();
         msg.add_query(Query::query(name.clone(), RecordType::A));
         msg.add_answer(Record::from_rdata(name, ttl, RData::A(A(ip))));
         msg.to_vec().unwrap()

@@ -3,6 +3,10 @@ name = "izba-init"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+# Internal application crate — never published to crates.io. Marking it private
+# lets cargo-deny's `allow-wildcard-paths` exempt its `version = "*"` path deps
+# on sibling crates (the wildcard ban only skips path deps for private crates).
+publish = false
 
 [build-dependencies]
 # Host-only: emits VERGEN_* so PID 1 can log its build at boot. Does not affect

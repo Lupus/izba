@@ -305,8 +305,7 @@ fn is_daemon_gone(e: &anyhow::Error) -> bool {
 /// concurrent-spawn loser exits "daemon already running" and both clients
 /// connect to the winner).
 fn clear_stale_socket(paths: &Paths) -> anyhow::Result<()> {
-    std::fs::create_dir_all(paths.daemon_dir())
-        .with_context(|| format!("creating {}", paths.daemon_dir().display()))?;
+    crate::paths::create_dir_700(&paths.daemon_dir(), paths.root())?;
     let f = std::fs::File::options()
         .create(true)
         .truncate(false)
