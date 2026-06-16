@@ -110,11 +110,15 @@ describe("NetlogView", () => {
     await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(2));
     fireEvent.mouseEnter(screen.getByRole("table"));
     const frozen = read.mock.calls.length;
+    // The paused hint appears (it lives in an always-present footer below the
+    // table, so showing it never reflows the rows).
+    expect(screen.getByText(/auto-refresh paused/i)).toBeInTheDocument();
     // Across several poll intervals, no new reads fire while hovering.
     await new Promise((r) => setTimeout(r, 120));
     expect(read.mock.calls.length).toBe(frozen);
-    // Leaving resumes polling.
+    // Leaving resumes polling and clears the hint.
     fireEvent.mouseLeave(screen.getByRole("table"));
+    expect(screen.queryByText(/auto-refresh paused/i)).not.toBeInTheDocument();
     await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(frozen));
   });
 });
