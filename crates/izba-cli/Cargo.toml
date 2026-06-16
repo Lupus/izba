@@ -3,6 +3,10 @@ name = "izba-cli"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+# Internal application crate — never published to crates.io. Marking it private
+# lets cargo-deny's `allow-wildcard-paths` exempt its `version = "*"` path deps
+# on sibling crates (the wildcard ban only skips path deps for private crates).
+publish = false
 
 [features]
 # Opt-in: builds the PTY/ConPTY terminal tests (pulls portable-pty/vt100 via the

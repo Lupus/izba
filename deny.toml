@@ -10,8 +10,27 @@
 version = 2
 # Do NOT add blanket ignores. A real RUSTSEC hit must be TRIAGED (patch, bump,
 # replace, or record an explicit, time-boxed, justified exception) — never
-# silenced wholesale. Keep this empty so new advisories surface loudly.
-ignore = []
+# silenced wholesale. The entries below are SPECIFIC, triaged exceptions, each
+# with a justification and a removal trigger — not a blanket silence. New,
+# untriaged advisories still surface loudly.
+ignore = [
+    # rustls-pemfile unmaintained (NOT a vuln) — thin wrapper over
+    # rustls-pki-types; single call site (ca.rs:130, CA-cert PEM parse).
+    # REMOVE after migrating to rustls_pki_types::pem::PemObject.
+    "RUSTSEC-2025-0134",
+    # proc-macro-error2 unmaintained (NOT a vuln) — transitive via
+    # getset -> oci-spec -> oci-client; no direct control. REMOVE when a newer
+    # oci-client drops getset.
+    "RUSTSEC-2026-0173",
+    # hickory-proto DoS via O(n²) name compression is in the ENCODER; izba
+    # production only DECODES resolver answers (Message::from_vec,
+    # dns_snoop.rs) — the encoder (to_vec) is reached only in a #[cfg(test)]
+    # helper, not guest-reachable. The patched release requires hickory 0.25+
+    # (a major bump outside izba-core's `0.24` range); no semver-compatible fix
+    # exists. REMOVE after a patched hickory-proto is available within our
+    # semver range.
+    "RUSTSEC-2026-0119",
+]
 
 [bans]
 # The crate graph is large (reqwest/hyper/rustls/ring/aws-lc-rs/regorus/…), so
@@ -20,6 +39,9 @@ ignore = []
 multiple-versions = "warn"
 # Wildcard ("*") version requirements defeat reproducible, auditable builds.
 wildcards = "deny"
+# Internal workspace crates are path deps declared `version = "*"` — a wildcard
+# only in the registry sense. Exempt path deps from the wildcard ban.
+allow-wildcard-paths = true
 # No crates are banned outright today; add `{ crate = "name" }` entries here
 # after triage if a dependency must be forbidden.
 deny = []
