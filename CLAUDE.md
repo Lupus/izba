@@ -90,6 +90,17 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   PTY/ConPTY (portable-pty + vt100) against a scripted fake guest or a real
   sandbox; the automated `exec -it` checklist. Tests live in `crates/izba-cli/
   tests/{tty_scripted,tty_e2e}.rs` behind the `ttytests` feature.
+- `app/src-tauri` (Tauri 2 GUI) — **OUT of the workspace, separate gate.** It is
+  `exclude`d from the root workspace (`Cargo.toml`) but embeds `izba-core` +
+  `izba-proto` by path. The six workspace gates above do NOT compile it, so a
+  wire/type change in core (a new field on `DaemonRequest`, a changed enum
+  variant, a struct built by field shorthand) can stay green across `cargo
+  {test,clippy} --workspace` while silently breaking the GUI build. When you
+  touch `izba-core`/`izba-proto` public types, also run the app gate locally:
+  `cd app && npm ci && npm run build && (cd src-tauri && cargo clippy --all-targets -- -D warnings && cargo test)`.
+  CI mirrors this as the **App CI** workflow (`.github/workflows/app.yml`, jobs
+  `app frontend + backend (linux)` / `(windows)`); both are branch-protection
+  required checks on `main`, alongside the four `ci.yml` gates.
 
 ## Load-bearing contracts (change all ends or none)
 
