@@ -82,6 +82,13 @@ fn truncated_response(req: &Message) -> anyhow::Result<Vec<u8>> {
 /// the full answer is returned — DNS-over-TCP allows up to 64 KiB (the 2-byte
 /// length prefix), so there is nothing to truncate to and truncating would
 /// strand any name whose answer is larger than 512 bytes.
+///
+/// The TCP answer can never overflow `izba_proto::dns::write_dns_msg`'s 2-byte
+/// (`u16`) length prefix: hickory's `Message::to_vec` encodes against the 64 KiB
+/// DNS message ceiling, dropping trailing records rather than emitting more than
+/// `u16::MAX` bytes (asserted by `tcp_answer_never_exceeds_64kib_framing_limit`).
+/// So the full-answer path is always framable — no separate overflow guard is
+/// needed.
 fn response_with_answers(
     req: &Message,
     records: &[Record],
@@ -98,6 +105,8 @@ fn response_with_answers(
     resp.metadata.recursion_available = true;
     resp.metadata.response_code = ResponseCode::NoError;
     let bytes = resp.to_vec()?;
+    // UDP-origin: cap at 512 + TC=1 so the guest retries over TCP. TCP-origin:
+    // return the full answer (hickory already bounds it to 64 KiB; see above).
     if !over_tcp && bytes.len() > MAX_UDP_RESPONSE {
         return truncated_response(req);
     }
@@ -264,10 +273,11 @@ impl ResolverCell {
 ///    echo an OPT record but report it in the authority count (NSCOUNT) with
 ///    ARCOUNT=0, so the OPT lands outside the ADDITIONAL section. hickory-proto
 ///    strictly rejects that (`RecordNotInAdditionalSection(OPT)`), turning every
-///    lookup into SERVFAIL. We gain nothing from EDNS here: answers are
-///    re-encoded to the classic 512-byte non-EDNS form anyway
-///    (`response_with_answers`), and anything that overflows 512 bytes falls
-///    back to TCP (`try_tcp_on_error`, on by default).
+///    lookup into SERVFAIL. We gain nothing from EDNS here: we re-encode every
+///    response ourselves (`response_with_answers`), so upstream EDNS size
+///    negotiation is irrelevant. UDP-origin answers are capped at the classic
+///    512-byte non-EDNS form and anything larger sets TC=1 to fall back to TCP;
+///    TCP-origin answers are returned in full (up to the 64 KiB framing limit).
 ///
 /// 2. **Honor our upstream order, sequentially.** `discover()` hands hickory a
 ///    deliberately preference-ordered upstream list (on Windows, ordered by
@@ -864,6 +874,43 @@ mod tests {
             "all records must be present in the full TCP answer"
         );
         assert_eq!(resp.id, 0x66, "id must be echoed");
+    }
+
+    /// A TCP answer is always framable: even a pathologically large record set
+    /// must encode to <= 64 KiB so `izba_proto::dns::write_dns_msg`'s `u16`
+    /// length never overflows (which would drop the guest conn with an EOF
+    /// instead of delivering a frame). hickory's encoder enforces this by
+    /// setting TC=1 and dropping trailing records at the DNS message ceiling, so
+    /// the full-answer path needs no separate guard. This is the property the
+    /// `response_with_answers` doc relies on.
+    #[test]
+    fn tcp_answer_never_exceeds_64kib_framing_limit() {
+        use hickory_proto::rr::{rdata::A, RData, Record};
+        let req = sample_query(0x77, RecordType::A);
+        let name = Name::from_str("huge.example.com.").unwrap();
+        // ~6000 A records: uncompressed that is ~96 KiB, well past the ceiling.
+        let records: Vec<Record> = (0..6000u32)
+            .map(|i| {
+                let o = i.to_be_bytes();
+                let ip = std::net::Ipv4Addr::new(o[0], o[1], o[2], o[3]);
+                Record::from_rdata(name.clone(), 30, RData::A(A(ip)))
+            })
+            .collect();
+
+        let bytes = response_with_answers(&req, &records, true).unwrap();
+        assert!(
+            bytes.len() <= u16::MAX as usize,
+            "TCP answer must fit the 2-byte DNS-over-TCP length prefix (got {})",
+            bytes.len()
+        );
+        // The encoder bounded the message at the ceiling, so trailing records
+        // were dropped — that is what keeps the frame writable.
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert!(
+            resp.answers.len() < 6000,
+            "trailing records dropped to stay within the ceiling (got {})",
+            resp.answers.len()
+        );
     }
 
     #[test]
