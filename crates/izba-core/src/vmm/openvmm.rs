@@ -287,6 +287,30 @@ mod tests {
     use crate::vmm::spec::{BlockDisk, FsShare, VmSpec};
     use std::path::PathBuf;
 
+    /// The handle accessors (`pids`/`is_alive`/`confinement`) are otherwise only
+    /// reachable via a real `launch()` (VM-gated). Construct a handle directly to
+    /// exercise them: a fabricated dead pid reads as not-alive, and the recorded
+    /// confinement is surfaced verbatim.
+    #[test]
+    fn handle_accessors_report_pids_liveness_and_confinement() {
+        let h = OpenVmmHandle {
+            vsock_sock: PathBuf::from("/run/izba/vsock.sock"),
+            vmm: (
+                "vmm".to_string(),
+                PidIdentity {
+                    pid: u32::MAX, // a pid that does not exist -> not alive
+                    starttime: 0,
+                },
+            ),
+            confinement: ConfinementStatus::applied(&ConfinementPolicy::vmm_default()),
+        };
+        let pids = h.pids();
+        assert_eq!(pids.len(), 1);
+        assert_eq!(pids[0].0, "vmm");
+        assert!(!h.is_alive(), "a fabricated pid must not read as alive");
+        assert_eq!(h.confinement().mode, ConfinementMode::Restricted);
+    }
+
     fn base_spec() -> VmSpec {
         VmSpec {
             kernel: PathBuf::from("/img/vmlinux"),
