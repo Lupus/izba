@@ -137,22 +137,28 @@ gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run 'gh auth log
 stage "Stage 1: identity"
 [ -n "$REF" ] || REF="$(git rev-parse --abbrev-ref HEAD)"
 [ "$REF" != "HEAD" ] || die "detached HEAD — pass --ref <branch>."
-SHA="$(git rev-parse HEAD)"
-SHORT="$(git rev-parse --short HEAD)"
-CDATE="$(git show -s --format=%cs HEAD)"
-DESCRIBE="$(git describe --tags --always --dirty)"
-if git diff --quiet; then DIRTY=""; else DIRTY="-dirty"; fi
-BASE="$(grep -m1 '^version' crates/izba-cli/Cargo.toml | cut -d'"' -f2)"
+
+# CI builds the PUSHED tip of $REF (workflow_dispatch checks out that ref), so
+# derive ALL identity from origin/$REF — never the local working tree, which can
+# differ (unpushed commits, or --ref pointing at another branch entirely). This
+# is also what makes the headSha run-match in Stage 2 succeed.
+git fetch --quiet origin "$REF" 2>/dev/null \
+    || warn "could not fetch origin/$REF — using last-known remote ref."
+git rev-parse --verify --quiet "origin/$REF" >/dev/null \
+    || die "origin/$REF not found — push the branch first ('git push -u origin $REF')."
+if [ "$REF" = "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" ] \
+   && [ "$(git rev-parse "origin/$REF")" != "$(git rev-parse HEAD)" ]; then
+    warn "local HEAD differs from origin/$REF — CI builds the pushed tip, not your working copy."
+fi
+SHA="$(git rev-parse "origin/$REF")"
+SHORT="$(git rev-parse --short "origin/$REF")"
+CDATE="$(git show -s --format=%cs "origin/$REF")"
+DESCRIBE="$(git describe --tags --always "origin/$REF" 2>/dev/null || echo "$SHORT")"
+# Base version from the SAME ref CI builds so VERSION matches the deb exactly.
+BASE="$(git show "origin/$REF:crates/izba-cli/Cargo.toml" 2>/dev/null | grep -m1 '^version' | cut -d'"' -f2)"
+[ -n "$BASE" ] || BASE="$(grep -m1 '^version' crates/izba-cli/Cargo.toml | cut -d'"' -f2)"
 VERSION="${BASE}~git${SHORT}"
 log "ref=$REF sha=$SHA version=$VERSION"
-
-# Warn (don't block) if the local tip isn't the pushed tip — CI builds the
-# pushed ref, so an unpushed commit would build a stale tree.
-if ! git rev-parse --verify --quiet "origin/$REF" >/dev/null; then
-    warn "origin/$REF not found — push the branch first, else dispatch builds an old/absent ref."
-elif [ "$(git rev-parse "origin/$REF")" != "$SHA" ]; then
-    warn "origin/$REF != local HEAD — push the branch; CI builds the pushed tip, not your working copy."
-fi
 
 declare -A PROV
 
@@ -251,7 +257,7 @@ stage "Stage 4: collect"
 } > "$RUN_OUT/manifest.txt"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-FINAL_NAME="${TS}-${SHORT}${DIRTY}"
+FINAL_NAME="${TS}-${SHORT}"
 FINAL_DIR="$REPO_ROOT/dist/local/$FINAL_NAME"
 mkdir -p "$REPO_ROOT/dist/local"
 mv "$RUN_OUT" "$FINAL_DIR"
