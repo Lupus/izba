@@ -214,8 +214,8 @@ jobs:
       - name: ttystorm M0 churn gate
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          cargo build --release -p izba-cli
-          cargo build --release -p izba-core --example ttystorm
+          cargo build --locked --release -p izba-cli
+          cargo build --locked --release -p izba-core --example ttystorm
           mkdir -p "$RUNNER_TEMP/storm-data"
           IZBA_DATA_DIR="$RUNNER_TEMP/storm-data" \
           IZBA_EXE="$PWD/target/release/izba" \
@@ -442,8 +442,8 @@ jobs:
       - name: Build izba.exe + ttystorm.exe (native MSVC)
         shell: bash
         run: |
-          cargo build --release -p izba-cli
-          cargo build --release -p izba-core --example ttystorm
+          cargo build --locked --release -p izba-cli
+          cargo build --locked --release -p izba-core --example ttystorm
       - name: Windows validation suite (21 checks)
         env:
           IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
@@ -577,7 +577,7 @@ jobs:
           # report. windows-whp remains the authoritative Windows gate.
           set +e
           cargo test -p izba-proto -p izba-core -p izba-cli
-          cargo build --release -p izba-cli
+          cargo build --locked --release -p izba-cli
           pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
           set -e
           # Separator-agnostic regex: llvm-cov emits backslash paths on Windows.
