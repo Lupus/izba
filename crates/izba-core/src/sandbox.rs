@@ -562,15 +562,17 @@ pub fn start_with_timeouts(
 
     if let Err(e) = booted {
         let _ = handle.kill();
-        // A confined launch Low-labelled the workspace share so the guest could
-        // write it. Boot failed BEFORE state.json was written, so the
+        // A confined launch Low-labelled the VMM's write surfaces (workspace +
+        // writable disks). Boot failed BEFORE state.json was written, so the
         // state.json-gated teardown restore (restore_confined_workspace) cannot
-        // fire — restore the workspace here, gated on the handle's actual
+        // fire — restore them here from the spec, gated on the handle's actual
         // confinement so an unconfined (--allow-unconfined) start never touches
-        // the user's dir. The VMM was just killed, so this is safe. No-op on
+        // the user's dirs. The VMM was just killed, so this is safe. No-op on
         // non-Windows.
         if handle.confinement().is_confined() {
-            let _ = procmgr::restore_integrity_recursive(&config.workspace);
+            for p in spec.confined_write_surfaces() {
+                let _ = procmgr::restore_integrity_recursive(&p);
+            }
         }
         // Best-effort: clear stale sockets/pid files so a retry starts clean.
         clear_run_dir_files(paths, name);
@@ -714,15 +716,22 @@ fn kill_sidecars_from_state(paths: &Paths, name: &str) {
     }
 }
 
-/// Restore a confined sandbox's workspace to Medium integrity after the VMM is
-/// gone.
+/// Restore a confined sandbox's write surfaces to Medium integrity after the VMM
+/// is gone.
 ///
-/// On Windows the confined VMM runs at Low IL, so its workspace share (the
-/// user's project dir) is Low-labelled at launch to let the in-process virtiofs
-/// write it; this undoes that. A complete no-op on non-Windows and for
-/// unconfined/legacy sandboxes (`is_confined()` gate), and best-effort +
-/// idempotent — re-asserting Medium is safe to repeat, and a missed restore only
-/// leaves a benign Low label (Medium tools write *down* to it).
+/// On Windows the confined VMM runs at Low IL, so its write surfaces — the
+/// workspace share (the user's project dir) AND every writable disk backing file
+/// (notably named persistent volumes under `<data>/volumes`) — are Low-labelled
+/// at launch (mirroring [`VmSpec::confined_write_surfaces`]); this undoes that.
+/// A complete no-op on non-Windows and for unconfined/legacy sandboxes
+/// (`is_confined()` gate), and best-effort + idempotent — re-asserting Medium is
+/// safe to repeat, and a missed restore only leaves a benign Low label (Medium
+/// tools write *down* to it).
+///
+/// (The scratch dir + the disks inside it — rw.img, anon volumes — are wiped on
+/// `rm` and re-labelled on the next start, so they need no separate restore; only
+/// the persistent, OUTSIDE-the-sandbox-dir surfaces genuinely matter, but
+/// restoring the in-sandbox ones too is harmless.)
 ///
 /// Safe to call on every teardown path: graceful stop, force-remove, AND the
 /// stale-state sweep that `list` (hence daemon adoption) runs — that sweep is how
@@ -739,19 +748,31 @@ fn restore_confined_workspace(paths: &Paths, name: &str) {
     if !confined {
         return;
     }
-    match load_json::<SandboxConfig>(&dir.join(CONFIG_FILE)) {
-        Ok(Some(cfg)) => {
-            if let Err(e) = procmgr::restore_integrity_recursive(&cfg.workspace) {
-                eprintln!(
-                    "warning: sandbox '{name}': restoring workspace {} to Medium integrity failed: {e:#}",
-                    cfg.workspace.display()
-                );
-            }
+    let cfg = match load_json::<SandboxConfig>(&dir.join(CONFIG_FILE)) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("warning: sandbox '{name}': cannot read config to restore integrity: {e:#}");
+            return;
         }
-        Ok(None) => {}
-        Err(e) => eprintln!(
-            "warning: sandbox '{name}': cannot read config to restore workspace integrity: {e:#}"
-        ),
+    };
+    // Reconstruct the same write surfaces the confined launch Low-labelled (the
+    // spec is gone post-launch): the workspace share + every writable disk
+    // backing file. Mirrors VmSpec::confined_write_surfaces via the persisted
+    // config. Best-effort: a failure on one surface must not skip the rest.
+    let mut surfaces = vec![cfg.workspace.clone()];
+    for disk in build_vm_disks(paths, name, &cfg.image_digest, &cfg.volumes) {
+        if !disk.readonly {
+            surfaces.push(disk.path);
+        }
+    }
+    for p in &surfaces {
+        if let Err(e) = procmgr::restore_integrity_recursive(p) {
+            eprintln!(
+                "warning: sandbox '{name}': restoring {} to Medium integrity failed: {e:#}",
+                p.display()
+            );
+        }
     }
 }
 
@@ -1639,7 +1660,15 @@ mod tests {
         let (dir, paths) = test_paths();
         let ws = dir.path().join("ws");
         fs::create_dir_all(&ws).unwrap();
-        create(&paths, "web", &opts(&ws)).unwrap();
+        // Include a NAMED persistent volume so restore exercises the writable-disk
+        // loop (the named volume image lives outside the sandbox scratch dir).
+        let mut o = opts(&ws);
+        o.volumes = vec![crate::volume::VolumeSpec {
+            name: Some("data".into()),
+            guest_path: "/data".into(),
+            size_bytes: 1 << 20,
+        }];
+        create(&paths, "web", &o).unwrap();
         // Record a CONFINED status so restore loads config + restores the ws.
         save_json(
             &paths.sandbox_dir("web").join(STATE_FILE),

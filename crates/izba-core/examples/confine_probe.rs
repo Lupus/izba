@@ -42,11 +42,14 @@ fn main() -> std::process::ExitCode {
 #[cfg(windows)]
 mod win {
     use izba_core::procmgr::confine::ConfinementPolicy;
-    use izba_core::procmgr::{pid_alive, spawn_confined, spawn_detached};
+    use izba_core::procmgr::{
+        pid_alive, set_low_integrity_recursive, spawn_confined, spawn_detached,
+    };
     use izba_core::vmm::CommandSpec;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
     /// Result-file / exit-code sentinels shared by the two roles.
@@ -512,7 +515,9 @@ mod win {
         deadline: Instant,
     ) -> anyhow::Result<Leg> {
         let tag = if confined { "confined" } else { "unconfined" };
-        let result = unique_temp(&format!("izba-cp-{attempt}-{tag}-result"));
+        // The verdict file lives in the Low-labelled result dir so a confined
+        // (Low-IL) child can actually write it; NOT in the Medium %TEMP%.
+        let result = unique_result(&format!("izba-cp-{attempt}-{tag}-result"));
         // Clean any stale file so a missing write is detectable.
         let _ = std::fs::remove_file(&result);
         // Fresh per-spawn nonce (Fix 1): pid + monotonic counter + high-res clock.
@@ -611,6 +616,30 @@ mod win {
     /// A fresh, process+time unique path under the system temp dir.
     fn unique_temp(stem: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{stem}-{}-{}", std::process::id(), entropy()))
+    }
+
+    /// A per-process result directory, **Low-labelled** so a CONFINED (Low-IL)
+    /// child can write its verdict file here. The Medium `%TEMP%` is itself NOT
+    /// writable by a Low-IL process — that is the very no-write-up barrier this
+    /// probe demonstrates — so the verdict IPC channel must be lowered, or every
+    /// confined leg fails to report. The write-up *target* (the object whose
+    /// denial we assert) stays at Medium; only this verdict channel is lowered.
+    fn result_dir() -> &'static Path {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        DIR.get_or_init(|| {
+            let d = std::env::temp_dir().join(format!("izba-cp-results-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&d);
+            // Best-effort: if labelling fails the confined legs fail loudly with
+            // "no result file", which correctly surfaces the broken channel.
+            let _ = set_low_integrity_recursive(&d);
+            d
+        })
+        .as_path()
+    }
+
+    /// A fresh, unique verdict-file path inside the Low-labelled [`result_dir`].
+    fn unique_result(stem: &str) -> PathBuf {
+        result_dir().join(format!("{stem}-{}-{}", std::process::id(), entropy()))
     }
 
     /// A unique hex nonce per call: pid + monotonic counter + high-res clock, so
