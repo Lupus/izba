@@ -120,6 +120,16 @@ impl ConfigSource for SystemConfigSource {
     /// servers by interface metric (lowest = most preferred), drop unroutable
     /// site-local/link-local placeholders, and dedupe. Re-run on every reload
     /// so VPN connect/disconnect is tracked.
+    ///
+    /// Search/suffix domains are intentionally NOT carried (empty search list),
+    /// unlike the Unix `read_system_conf` path: the `ipconfig` 0.3.4 crate
+    /// exposes no per-adapter DNS-suffix accessor (only `dns_servers()`), so
+    /// reading a VPN's split-DNS suffix would mean hand-rolling
+    /// `GetAdaptersAddresses` FFI. Resolving VPN-internal names is a documented
+    /// deferred non-goal, and the guest's resolv.conf carries no search list
+    /// either (so the guest never sends short names expecting expansion);
+    /// fully-qualified internal names still resolve via the metric-selected VPN
+    /// resolver above. Revisit if short-name expansion becomes a requirement.
     #[cfg(windows)]
     fn discover(&self) -> anyhow::Result<(ResolverConfig, ResolverOpts)> {
         use hickory_resolver::config::NameServerConfig;
@@ -617,6 +627,11 @@ mod tests {
         ];
         let err =
             Message::from_vec(malformed).expect_err("strict decode must reject misplaced OPT");
+        // hickory-proto 0.26.1 surfaces this as
+        // `DecodeError::RecordNotInAdditionalSection(OPT)`; we match its Display
+        // wording rather than the variant because the kind is buried under
+        // `ProtoErrorKind` and hickory's own tests string-match it too
+        // (see hickory-proto `op/message.rs`). Revisit on a hickory-proto bump.
         assert!(
             err.to_string().contains("OPT only allowed in additional"),
             "unexpected error: {err}"
