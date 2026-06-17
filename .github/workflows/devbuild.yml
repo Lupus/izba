@@ -45,7 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           prefix-key: izba-linux
-      - run: cargo build --release -p izba-cli
+      - run: cargo build --locked --release -p izba-cli
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: izba-linux-bin
