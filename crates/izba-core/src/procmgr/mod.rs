@@ -21,7 +21,7 @@ pub use unix::{kill_pid, pid_alive, spawn_detached};
 #[cfg(windows)]
 mod jail_windows;
 #[cfg(windows)]
-pub use jail_windows::{set_low_integrity_recursive, spawn_confined};
+pub use jail_windows::{restore_integrity_recursive, set_low_integrity_recursive, spawn_confined};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -48,6 +48,13 @@ pub fn spawn_confined(
 /// jailer (a separate milestone) handles its own filesystem confinement.
 #[cfg(not(windows))]
 pub fn set_low_integrity_recursive(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Non-Windows no-op counterpart to the integrity-restore teardown. Mirrors
+/// `set_low_integrity_recursive`'s stub: there is no MIC label to undo here.
+#[cfg(not(windows))]
+pub fn restore_integrity_recursive(_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 

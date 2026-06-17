@@ -562,6 +562,16 @@ pub fn start_with_timeouts(
 
     if let Err(e) = booted {
         let _ = handle.kill();
+        // A confined launch Low-labelled the workspace share so the guest could
+        // write it. Boot failed BEFORE state.json was written, so the
+        // state.json-gated teardown restore (restore_confined_workspace) cannot
+        // fire — restore the workspace here, gated on the handle's actual
+        // confinement so an unconfined (--allow-unconfined) start never touches
+        // the user's dir. The VMM was just killed, so this is safe. No-op on
+        // non-Windows.
+        if handle.confinement().is_confined() {
+            let _ = procmgr::restore_integrity_recursive(&config.workspace);
+        }
         // Best-effort: clear stale sockets/pid files so a retry starts clean.
         clear_run_dir_files(paths, name);
         return Err(e);
@@ -628,6 +638,8 @@ fn stop_locked(
         (Liveness::Stopped, _) | (_, None) => {
             // VMM is already dead; sidecars (virtiofsd) usually self-exit with
             // their vhost-user peer, but not always — best-effort kill them.
+            // The VMM is gone, so restore the confined workspace's integrity.
+            restore_confined_workspace(paths, name);
             kill_sidecars_from_state(paths, name);
             return cleanup_runtime(paths, name);
         }
@@ -676,6 +688,10 @@ fn stop_locked(
         }
     }
 
+    // The VMM is confirmed dead above; restore the confined workspace's
+    // integrity before wiping state.json (after which we'd lose the "was
+    // confined" signal).
+    restore_confined_workspace(paths, name);
     cleanup_runtime(paths, name)
 }
 
@@ -695,6 +711,47 @@ fn kill_sidecars_from_state(paths: &Paths, name: &str) {
         for (_, id) in &s.sidecar_pids {
             let _ = procmgr::kill_pid(id);
         }
+    }
+}
+
+/// Restore a confined sandbox's workspace to Medium integrity after the VMM is
+/// gone.
+///
+/// On Windows the confined VMM runs at Low IL, so its workspace share (the
+/// user's project dir) is Low-labelled at launch to let the in-process virtiofs
+/// write it; this undoes that. A complete no-op on non-Windows and for
+/// unconfined/legacy sandboxes (`is_confined()` gate), and best-effort +
+/// idempotent — re-asserting Medium is safe to repeat, and a missed restore only
+/// leaves a benign Low label (Medium tools write *down* to it).
+///
+/// Safe to call on every teardown path: graceful stop, force-remove, AND the
+/// stale-state sweep that `list` (hence daemon adoption) runs — that sweep is how
+/// an orphaned VMM's label is eventually reconciled. MUST run only once the VMM
+/// is dead (every caller ensures this before wiping state.json), so the label is
+/// never pulled out from under a still-running guest.
+fn restore_confined_workspace(paths: &Paths, name: &str) {
+    let dir = paths.sandbox_dir(name);
+    let state: Option<RunState> = load_json(&dir.join(STATE_FILE)).ok().flatten();
+    let confined = state
+        .as_ref()
+        .and_then(|s| s.confinement.as_ref())
+        .is_some_and(|c| c.is_confined());
+    if !confined {
+        return;
+    }
+    match load_json::<SandboxConfig>(&dir.join(CONFIG_FILE)) {
+        Ok(Some(cfg)) => {
+            if let Err(e) = procmgr::restore_integrity_recursive(&cfg.workspace) {
+                eprintln!(
+                    "warning: sandbox '{name}': restoring workspace {} to Medium integrity failed: {e:#}",
+                    cfg.workspace.display()
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!(
+            "warning: sandbox '{name}': cannot read config to restore workspace integrity: {e:#}"
+        ),
     }
 }
 
@@ -807,8 +864,22 @@ pub fn list(paths: &Paths, connector: Connector) -> anyhow::Result<Vec<SandboxIn
             let state_path = entry.path().join(STATE_FILE);
             if state_path.exists() {
                 if let Ok(_lock) = lock_sandbox(paths, &name) {
-                    kill_sidecars_from_state(paths, &name);
-                    let _ = fs::remove_file(&state_path);
+                    // The liveness above was read WITHOUT the lock; a `start` may
+                    // have raced in and booted a fresh (confined) VM by now.
+                    // Re-confirm Stopped UNDER the lock before the destructive
+                    // sweep — otherwise we would delete a freshly-written
+                    // state.json AND, worse, restore the workspace to Medium while
+                    // the new Low-IL VMM is still running (yanking its write
+                    // access). Only proceed if the sandbox is still down.
+                    if liveness_of(paths, &name, connector).ok() == Some(Liveness::Stopped) {
+                        // This stale-state sweep is also the daemon-adoption
+                        // reconcile point: an orphaned confined VMM that has since
+                        // died gets its workspace integrity restored here before
+                        // its state is wiped.
+                        restore_confined_workspace(paths, &name);
+                        kill_sidecars_from_state(paths, &name);
+                        let _ = fs::remove_file(&state_path);
+                    }
                 }
             }
         }

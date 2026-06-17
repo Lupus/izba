@@ -108,6 +108,18 @@ impl ConfinementStatus {
             reason: reason.to_string(),
         }
     }
+    /// True when the VMM actually ran confined (token+IL applied), i.e. mode is
+    /// `Restricted` or `TokenOnly` — both imply the Low-IL token, which is what
+    /// required the workspace to be Low-labelled. Drives the teardown decision to
+    /// restore the workspace integrity (`sandbox::restore_confined_workspace`).
+    /// `None` (unconfined / no jailer) means no relabel happened, so no restore.
+    pub fn is_confined(&self) -> bool {
+        matches!(
+            self.mode,
+            ConfinementMode::Restricted | ConfinementMode::TokenOnly
+        )
+    }
+
     pub fn summary(&self) -> String {
         match self.mode {
             ConfinementMode::Restricted => format!("confined: {}", self.reason),
@@ -137,6 +149,16 @@ mod tests {
         let none = ConfinementStatus::degraded("WHP unavailable under restricted token");
         assert_eq!(none.mode, ConfinementMode::None);
         assert!(none.summary().contains("WHP unavailable"));
+    }
+
+    #[test]
+    fn is_confined_tracks_token_il_application() {
+        // Restricted + TokenOnly both applied the Low-IL token → confined → the
+        // workspace was relabelled → teardown must restore it.
+        assert!(ConfinementStatus::applied(&ConfinementPolicy::vmm_default()).is_confined());
+        assert!(ConfinementStatus::token_only(&ConfinementPolicy::vmm_default()).is_confined());
+        // Unconfined: no relabel happened, so no restore.
+        assert!(!ConfinementStatus::degraded("WHP unavailable").is_confined());
     }
 
     #[test]

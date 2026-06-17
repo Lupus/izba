@@ -37,9 +37,18 @@ against the user's real project directory. F-06.
    `RestrictedNonAdmin` enum variants are forward-declared but inert.
    **Consequence (residual):** the token gives *integrity* protection (Low-IL
    no-write-up + no privileges) but **not read-confinement** — a Low-IL
-   non-restricted VMM can still READ the user's files. Read-confinement would
-   need AppContainer (breaks WHP) or per-VM service accounts (admin); both out of
-   scope.
+   non-restricted VMM still runs as the user and can READ the user's files.
+   Read-confinement needs a **distinct security principal**, and the only two
+   ways to get one both have costs: AppContainer (probe-proven to break WHP →
+   ruled out), or a **dedicated low-privilege local account** for the VMM (needs
+   one-time admin at install). The latter is the documented **future hardening
+   tier** (`izba install --harden`, see §7) — not built here, but the path is
+   real: it would ACL-grant the VMM account just the workspace + scratch and
+   close this residual. Two assumptions remain unverified for that tier and are
+   probe-gated before it ships: (i) WHP works under a separate standard account
+   in **Hyper-V Administrators**; (ii) the per-run cross-account ACL/profile
+   plumbing. Until then the residual is accepted (integrity-only). See Non-goals
+   for the tier's status.
 3. **No `KILL_ON_JOB_CLOSE`.** izba's contract is "killing/upgrading izbad never
    harms sandboxes." The security boundary is the **create-time-immutable** token
    + IL + mitigations (survive izbad death). The job is **best-effort
@@ -71,6 +80,56 @@ against the user's real project directory. F-06.
    a not-yet-implemented milestone — reported honestly in status, not gated by the
    flag.)
 
+7. **The writable surface must be Low-labelled, and restored on teardown.** A
+   Low-IL process cannot write *up* to Medium-IL objects (MIC no-write-up), so
+   every path the confined VMM must write has to be Low-labelled first. Two
+   surfaces qualify: (a) the per-sandbox **scratch dir** izbad created at Medium
+   (`console.log`, `rw.img`, the vsock socket under `run/`) — without it the VM
+   never boots (empty console.log, 100% boot failure under confinement); and
+   (b) the **virtiofs workspace share** (the user's project dir) — the guest
+   writes `/workspace` through the in-process virtiofs server, which runs *inside*
+   the Low-IL VMM, so without a Low label there the guest's writes fail and the
+   core izba function is dead under confinement. The label is inheritable
+   (`OBJECT_INHERIT | CONTAINER_INHERIT`); for the common case inheritance is
+   **probe-proven** (2026-06-17: a Medium process doing a plain create in the
+   labelled tree yields a Low child, so user-created-mid-session files stay
+   guest-writable). Narrow exceptions (atomic-rename-in) are residuals below.
+   **Restore on teardown:** the user's workspace is raised back to Medium when the
+   VMM is gone — on graceful stop, force-remove, AND the stale-state sweep that
+   `list`/daemon-adoption runs (the orphan reconcile point). A *missed* restore is
+   benign (a stale Low label lets Medium tools write *down* to it freely; only a
+   mild integrity weakening until the next adoption sweep re-asserts Medium), so
+   the design is best-effort + idempotent rather than transactional. Restore is
+   gated on `ConfinementStatus::is_confined()` so unconfined/legacy sandboxes are
+   untouched, and on non-Windows the whole relabel/restore pair is a no-op.
+   Relabelling happens **before** `state.json` is written, so the state.json-gated
+   teardown restore cannot undo it on an early failure — the launch path therefore
+   restores every share it labelled on its own error paths (label-failure,
+   confined-spawn-failure, boot-timeout), so a failed confined start never strands
+   the user's dir at Low.
+
+   **Accepted residuals of integrity-relabelling (all benign for the boundary;
+   each cleanly closed by the dedicated-account tier, which never relabels the
+   user's dir).** Surfaced by adversarial review, documented at the code site:
+   - *Approximate restore.* Teardown re-asserts an *explicit* Medium label rather
+     than capturing+restoring the exact prior SACL. Equivalent for the universal
+     case (project dirs are unlabelled == effective Medium); a dir genuinely
+     sub-Medium before izba ran ends up Medium (mildly *more* restrictive). Rare.
+   - *Atomic-rename-in.* A host save that creates a temp *outside* the labelled
+     tree and renames it in keeps its non-Low label, which the Low-IL guest then
+     can't write. Narrow (most editors/git temp within the same dir → inherits
+     Low); fully fixed by the account tier.
+   - *Post-teardown Low files.* Re-propagation refreshes only *inherited* child
+     labels; files the Low-IL VMM created carry their own *explicit* Low label and
+     keep it, so the workspace can hold a scattering of Low files after teardown.
+     Benign (Medium tools write *down* freely).
+   - *Worker-child liveness.* Liveness is judged from the tracked `openvmm.exe`
+     parent; OpenVMM may leave an untracked `openvmm vm` worker that outlives it
+     (pre-existing `windows.rs` caveat). If the parent dies but a worker survives,
+     teardown could raise the workspace while that worker still runs. Pre-existing
+     stop-semantics gap, not introduced here; closed by the account tier (and a
+     future worker-aware liveness fix).
+
 ## What the first PR delivers (and proves in CI)
 
 - A `ConfinementPolicy` + a Windows jailer (`jail_windows.rs`) that spawns a
@@ -90,9 +149,16 @@ against the user's real project directory. F-06.
 ## Non-goals (this PR)
 
 - Linux jailer (separate plan). Alternate desktop / window station (deferred,
-  §6.2.2 of the reference). Per-VM *mutual* file isolation (needs per-VM service
-  accounts — admin; documented residual). The optional launcher-shim two-token
-  hardening (§6.1). MITM/credential work (M5).
+  §6.2.2 of the reference). The optional launcher-shim two-token hardening (§6.1).
+  MITM/credential work (M5).
+- **Dedicated-account hardening tier (`izba install --harden`)** — the documented
+  *future opt-in* that closes the read-confinement residual (decision 2): a
+  one-time admin installer creates a low-privilege `izba-vmm` local account in
+  Hyper-V Administrators; the VMM then runs as that distinct principal with the
+  workspace+scratch ACL-granted per run, giving read **and** write confinement
+  (and removing the need to integrity-relabel the user's dir). Not built in this
+  PR; gated on the two probes named in decision 2. This is the SOTA ceiling;
+  the default (no-admin) tier this PR ships is the verified floor.
 
 ## Acceptance / verification
 
