@@ -595,7 +595,7 @@ mod win {
 
         // Validate the payload shape per attempt kind.
         if attempt == "self-il" {
-            if payload != IL_LOW && payload != IL_MEDIUM && payload != IL_OTHER {
+            if ![IL_LOW, IL_MEDIUM, IL_HIGH, IL_OTHER].contains(&payload) {
                 anyhow::bail!("{attempt} ({tag}): unexpected integrity payload {payload:?}");
             }
         } else if payload != OK && payload != DENIED {
