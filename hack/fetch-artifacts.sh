@@ -23,8 +23,13 @@
 #   ${IZBA_DATA_DIR:-$HOME/.local/share/izba}/artifacts/
 set -euo pipefail
 
+# Binary names (single source of truth — also the labels printed in the
+# present/missing summary and passed to the download/verify helpers).
+readonly CH_BIN="cloud-hypervisor"
+readonly VIRTIOFSD_BIN="virtiofsd"
+
 CHECK_ONLY=0
-if [ "${1:-}" = "--check" ]; then
+if [[ "${1:-}" = "--check" ]]; then
     CHECK_ONLY=1
 fi
 
@@ -44,7 +49,7 @@ mark_missing() { MISSING="$MISSING $1"; }
 need_install() {
     local name="$1"; shift
     mark_missing "$name"
-    if [ "$CHECK_ONLY" -eq 0 ]; then
+    if [[ "$CHECK_ONLY" -eq 0 ]]; then
         echo "  → $*"
     fi
 }
@@ -52,7 +57,7 @@ need_install() {
 need_build() {
     local name="$1"; shift
     mark_missing "$name"
-    if [ "$CHECK_ONLY" -eq 0 ]; then
+    if [[ "$CHECK_ONLY" -eq 0 ]]; then
         echo "  → $*"
     fi
 }
@@ -81,7 +86,7 @@ verify_sha256() {
     local path="$1" want="$2" name="$3"
     local got
     got=$(sha256sum "$path" | cut -d' ' -f1)
-    if [ "$got" != "$want" ]; then
+    if [[ "$got" != "$want" ]]; then
         rm -f "$path"
         echo "  error: $name sha256 mismatch" >&2
         echo "    got:  $got" >&2
@@ -101,18 +106,18 @@ CH_SHA256="537d1cbc1d4d3646099618f3b6f2b711116ad1ed8c8bc909a1a689417c7430aa"
 
 if command -v cloud-hypervisor >/dev/null 2>&1; then
     echo "  present: $(command -v cloud-hypervisor)"
-    mark_ok "cloud-hypervisor"
-elif [ -x "$BIN_DIR/cloud-hypervisor" ]; then
+    mark_ok "$CH_BIN"
+elif [[ -x "$BIN_DIR/cloud-hypervisor" ]]; then
     echo "  present: $BIN_DIR/cloud-hypervisor (not on PATH — add $BIN_DIR to PATH)"
-    mark_ok "cloud-hypervisor"
+    mark_ok "$CH_BIN"
 else
     echo "  missing"
-    if [ "$CHECK_ONLY" -eq 0 ]; then
-        download_bin "$CH_RELEASE_URL" "$BIN_DIR/cloud-hypervisor" "cloud-hypervisor"
-        verify_sha256 "$BIN_DIR/cloud-hypervisor" "$CH_SHA256" "cloud-hypervisor"
-        mark_ok "cloud-hypervisor"
+    if [[ "$CHECK_ONLY" -eq 0 ]]; then
+        download_bin "$CH_RELEASE_URL" "$BIN_DIR/cloud-hypervisor" "$CH_BIN"
+        verify_sha256 "$BIN_DIR/cloud-hypervisor" "$CH_SHA256" "$CH_BIN"
+        mark_ok "$CH_BIN"
     else
-        mark_missing "cloud-hypervisor"
+        mark_missing "$CH_BIN"
     fi
 fi
 
@@ -143,11 +148,11 @@ download_virtiofsd() {
     rel=$(curl -fLs "$VIRTIOFSD_API/releases/${VIRTIOFSD_VERSION}") || {
         echo "  error: cannot fetch release ${VIRTIOFSD_VERSION}" >&2; return 1; }
     upload_path=$(printf '%s' "$rel" | grep -oE '/uploads/[a-f0-9]+/[^")]+\.zip' | head -1)
-    if [ -z "$upload_path" ]; then
+    if [[ -z "$upload_path" ]]; then
         echo "  error: no upload .zip link in release ${VIRTIOFSD_VERSION} description" >&2; return 1
     fi
     pid=$(curl -fLs "$VIRTIOFSD_API" | grep -oE '"id":[0-9]+' | head -1 | grep -oE '[0-9]+')
-    if [ -z "$pid" ]; then echo "  error: cannot resolve project id" >&2; return 1; fi
+    if [[ -z "$pid" ]]; then echo "  error: cannot resolve project id" >&2; return 1; fi
     # Project uploads are served under the /-/project/<id>/ scope.
     url="https://gitlab.com/-/project/${pid}${upload_path}"
     tmpd=$(mktemp -d)
@@ -155,20 +160,20 @@ download_virtiofsd() {
     if ! curl -fL --progress-bar -o "$tmpd/virtiofsd.zip" "$url"; then
         rm -rf "$tmpd"; echo "  error: download failed" >&2; return 1
     fi
-    if [ -n "$VIRTIOFSD_ZIP_SHA256" ]; then
+    if [[ -n "$VIRTIOFSD_ZIP_SHA256" ]]; then
         verify_sha256 "$tmpd/virtiofsd.zip" "$VIRTIOFSD_ZIP_SHA256" "virtiofsd.zip" \
             || { rm -rf "$tmpd"; return 1; }
     fi
     if ! ( cd "$tmpd" && unzip -oq virtiofsd.zip ); then
         rm -rf "$tmpd"; echo "  error: unzip failed (is 'unzip' installed?)" >&2; return 1
     fi
-    bin=$(find "$tmpd" -type f -name virtiofsd -path '*release*' | head -1)
-    [ -z "$bin" ] && bin=$(find "$tmpd" -type f -name 'virtiofsd' ! -name '*.zip' | head -1)
-    if [ -z "$bin" ]; then
+    bin=$(find "$tmpd" -type f -name "$VIRTIOFSD_BIN" -path '*release*' | head -1)
+    [[ -z "$bin" ]] && bin=$(find "$tmpd" -type f -name "$VIRTIOFSD_BIN" ! -name '*.zip' | head -1)
+    if [[ -z "$bin" ]]; then
         rm -rf "$tmpd"; echo "  error: virtiofsd binary not found inside zip" >&2; return 1
     fi
-    if [ -n "$VIRTIOFSD_BIN_SHA256" ]; then
-        verify_sha256 "$bin" "$VIRTIOFSD_BIN_SHA256" "virtiofsd" \
+    if [[ -n "$VIRTIOFSD_BIN_SHA256" ]]; then
+        verify_sha256 "$bin" "$VIRTIOFSD_BIN_SHA256" "$VIRTIOFSD_BIN" \
             || { rm -rf "$tmpd"; return 1; }
     fi
     mkdir -p "$(dirname "$dest")"
@@ -180,17 +185,17 @@ download_virtiofsd() {
 echo "=== virtiofsd ==="
 if command -v virtiofsd >/dev/null 2>&1; then
     echo "  present: $(command -v virtiofsd)"
-    mark_ok "virtiofsd"
-elif [ -x "$BIN_DIR/virtiofsd" ]; then
+    mark_ok "$VIRTIOFSD_BIN"
+elif [[ -x "$BIN_DIR/virtiofsd" ]]; then
     echo "  present: $BIN_DIR/virtiofsd (not on PATH — add $BIN_DIR to PATH)"
-    mark_ok "virtiofsd"
+    mark_ok "$VIRTIOFSD_BIN"
 else
     echo "  missing"
-    if [ "$CHECK_ONLY" -eq 0 ]; then
+    if [[ "$CHECK_ONLY" -eq 0 ]]; then
         download_virtiofsd "$BIN_DIR/virtiofsd"
-        mark_ok "virtiofsd"
+        mark_ok "$VIRTIOFSD_BIN"
     else
-        mark_missing "virtiofsd"
+        mark_missing "$VIRTIOFSD_BIN"
     fi
 fi
 
@@ -220,7 +225,7 @@ INITRAMFS="$ARTIFACTS_DIR/initramfs.cpio.gz"
 KERNEL_OK=0
 INITRAMFS_OK=0
 
-if [ -f "$KERNEL" ]; then
+if [[ -f "$KERNEL" ]]; then
     echo "  kernel:     $KERNEL  (present)"
     KERNEL_OK=1
     mark_ok "vmlinux"
@@ -229,7 +234,7 @@ else
     mark_missing "vmlinux"
 fi
 
-if [ -f "$INITRAMFS" ]; then
+if [[ -f "$INITRAMFS" ]]; then
     echo "  initramfs:  $INITRAMFS  (present)"
     INITRAMFS_OK=1
     mark_ok "initramfs.cpio.gz"
@@ -238,30 +243,28 @@ else
     mark_missing "initramfs.cpio.gz"
 fi
 
-if [ "$KERNEL_OK" -eq 0 ] || [ "$INITRAMFS_OK" -eq 0 ]; then
-    if [ "$CHECK_ONLY" -eq 0 ]; then
-        echo ""
-        echo "NOTE: No pre-built kernel or initramfs downloads exist yet."
-        echo "      Build them locally, then copy into place:"
-        echo ""
-        if [ "$KERNEL_OK" -eq 0 ]; then
-            echo "  # Build kernel (requires gcc toolchain — see above for deps):"
-            echo "  hack/build-kernel.sh"
-            echo "  mkdir -p '$ARTIFACTS_DIR'"
-            echo "  cp dist/vmlinux '$KERNEL'"
-        fi
-        if [ "$INITRAMFS_OK" -eq 0 ]; then
-            echo ""
-            echo "  # Build initramfs:"
-            echo "  hack/build-initramfs.sh"
-            echo "  mkdir -p '$ARTIFACTS_DIR'"
-            echo "  cp dist/initramfs.cpio.gz '$INITRAMFS'"
-        fi
-        echo ""
-        echo "  Or use the env-var overrides to point at the files directly:"
-        echo "    export IZBA_KERNEL=/path/to/vmlinux"
-        echo "    export IZBA_INITRAMFS=/path/to/initramfs.cpio.gz"
+if { [[ "$KERNEL_OK" -eq 0 ]] || [[ "$INITRAMFS_OK" -eq 0 ]]; } && [[ "$CHECK_ONLY" -eq 0 ]]; then
+    echo ""
+    echo "NOTE: No pre-built kernel or initramfs downloads exist yet."
+    echo "      Build them locally, then copy into place:"
+    echo ""
+    if [[ "$KERNEL_OK" -eq 0 ]]; then
+        echo "  # Build kernel (requires gcc toolchain — see above for deps):"
+        echo "  hack/build-kernel.sh"
+        echo "  mkdir -p '$ARTIFACTS_DIR'"
+        echo "  cp dist/vmlinux '$KERNEL'"
     fi
+    if [[ "$INITRAMFS_OK" -eq 0 ]]; then
+        echo ""
+        echo "  # Build initramfs:"
+        echo "  hack/build-initramfs.sh"
+        echo "  mkdir -p '$ARTIFACTS_DIR'"
+        echo "  cp dist/initramfs.cpio.gz '$INITRAMFS'"
+    fi
+    echo ""
+    echo "  Or use the env-var overrides to point at the files directly:"
+    echo "    export IZBA_KERNEL=/path/to/vmlinux"
+    echo "    export IZBA_INITRAMFS=/path/to/initramfs.cpio.gz"
 fi
 
 # ---------------------------------------------------------------------------
@@ -269,10 +272,10 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== summary ==="
-if [ -n "$OK" ]; then
+if [[ -n "$OK" ]]; then
     echo "  present: $OK"
 fi
-if [ -n "$MISSING" ]; then
+if [[ -n "$MISSING" ]]; then
     echo "  missing: $MISSING"
     exit 1
 fi

@@ -30,12 +30,12 @@ LINUX_ONLY="${1:-}"
 # Dependency check (mirrors hack/build-kernel.sh)
 # ---------------------------------------------------------------------------
 TOOLS="curl tar make gcc autoconf automake libtoolize pkg-config patch"
-[ "$LINUX_ONLY" = "--linux-only" ] || TOOLS="$TOOLS x86_64-w64-mingw32-gcc x86_64-w64-mingw32-objdump"
+[[ "$LINUX_ONLY" = "--linux-only" ]] || TOOLS="$TOOLS x86_64-w64-mingw32-gcc x86_64-w64-mingw32-objdump"
 MISSING=""
 for tool in $TOOLS; do
     command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
 done
-if [ -n "$MISSING" ]; then
+if [[ -n "$MISSING" ]]; then
     echo "error: missing tools:$MISSING" >&2
     echo "install with: sudo apt-get install -y curl tar make gcc autoconf automake libtool-bin pkg-config patch gcc-mingw-w64-x86-64" >&2
     exit 1
@@ -46,7 +46,7 @@ fi
 # ---------------------------------------------------------------------------
 mkdir -p "$CACHE_DIR"
 TARBALL="$CACHE_DIR/erofs-utils-$VERSION.tar.gz"
-[ -f "$TARBALL" ] || curl -fsSL -o "$TARBALL" "$URL"
+[[ -f "$TARBALL" ]] || curl -fsSL -o "$TARBALL" "$URL"
 if ! echo "$SHA256  $TARBALL" | sha256sum -c - >/dev/null; then
     rm -f "$TARBALL"
     echo "error: $TARBALL failed sha256 verification — removed; re-run to re-download" >&2
@@ -88,7 +88,7 @@ rm -rf "$BUILD_LINUX" && mkdir -p "$BUILD_LINUX"
     || { tail -30 "$BUILD_LINUX/build.log" >&2; echo "full log: $BUILD_LINUX/build.log" >&2; exit 1; }
 echo "linux reference: $BUILD_LINUX/mkfs/mkfs.erofs"
 
-[ "$LINUX_ONLY" = "--linux-only" ] && exit 0
+[[ "$LINUX_ONLY" = "--linux-only" ]] && exit 0
 
 # ---------------------------------------------------------------------------
 # Windows cross build
@@ -134,13 +134,13 @@ fi
 
 # mkfs/mkfs.erofs.exe is only libtool's wrapper; the real PE lives in .libs/.
 EXE="$BUILD_WIN/mkfs/.libs/mkfs.erofs.exe"
-[ -f "$EXE" ] || EXE="$BUILD_WIN/mkfs/mkfs.erofs.exe"
-[ -f "$EXE" ] || { echo "error: mkfs.erofs.exe not produced" >&2; exit 1; }
+[[ -f "$EXE" ]] || EXE="$BUILD_WIN/mkfs/mkfs.erofs.exe"
+[[ -f "$EXE" ]] || { echo "error: mkfs.erofs.exe not produced" >&2; exit 1; }
 
 # Import assertion (spec §3.2): only kernel32 + msvcrt allowed.
 IMPORTS="$(x86_64-w64-mingw32-objdump -p "$EXE" | awk '/DLL Name/{print tolower($3)}' | sort -u)"
 BAD="$(echo "$IMPORTS" | grep -Ev '^(kernel32\.dll|msvcrt\.dll)$' || true)"
-if [ -n "$BAD" ]; then
+if [[ -n "$BAD" ]]; then
     echo "error: unexpected DLL imports:" >&2
     echo "$BAD" >&2
     exit 1

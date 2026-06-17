@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 
 # Source the repo-local cargo/rustup if present.
 # shellcheck disable=SC1091
-[ -f .cargo-env ] && source .cargo-env
+[[ -f .cargo-env ]] && source .cargo-env
 
 # Verify that cpio is available before doing anything expensive.
 if ! command -v cpio >/dev/null 2>&1; then
@@ -35,7 +35,7 @@ echo "Building izba-init (musl static)..."
 cargo build -p izba-init --target x86_64-unknown-linux-musl --release
 
 INIT_BIN="target/x86_64-unknown-linux-musl/release/izba-init"
-if [ ! -f "$INIT_BIN" ]; then
+if [[ ! -f "$INIT_BIN" ]]; then
     echo "error: expected $INIT_BIN after cargo build" >&2
     exit 1
 fi
@@ -55,8 +55,8 @@ chmod 755 "$WORK/init"
 
 # Optional static mke2fs — enables in-guest first-boot formatting of rw.img
 # when the host-side mkfs.ext4 pre-format did not run or is unavailable.
-if [ -n "${IZBA_MKE2FS:-}" ]; then
-    if [ ! -f "$IZBA_MKE2FS" ]; then
+if [[ -n "${IZBA_MKE2FS:-}" ]]; then
+    if [[ ! -f "$IZBA_MKE2FS" ]]; then
         echo "error: IZBA_MKE2FS='$IZBA_MKE2FS' does not exist" >&2
         exit 1
     fi
@@ -66,8 +66,8 @@ if [ -n "${IZBA_MKE2FS:-}" ]; then
 fi
 
 # Optional static nft — required for the izbad-egress TCP REDIRECT stub.
-if [ -n "${IZBA_NFT:-}" ]; then
-    if [ ! -f "$IZBA_NFT" ]; then
+if [[ -n "${IZBA_NFT:-}" ]]; then
+    if [[ ! -f "$IZBA_NFT" ]]; then
         echo "error: IZBA_NFT='$IZBA_NFT' does not exist" >&2
         exit 1
     fi

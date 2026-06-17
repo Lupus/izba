@@ -36,7 +36,7 @@ declare -A KNOWN_SHA256=(
     ["6.12.30"]="df046a48971e40ce0b2e003e7e55b6b1e7da2912120eb216d5d6c8450c9cf82e"
 )
 EXPECTED_SHA256="${IZBA_KERNEL_SHA256:-${KNOWN_SHA256[$VERSION]:-}}"
-if [ -z "$EXPECTED_SHA256" ]; then
+if [[ -z "$EXPECTED_SHA256" ]]; then
     echo "error: no pinned sha256 for linux-${VERSION}; set IZBA_KERNEL_SHA256" >&2
     exit 1
 fi
@@ -56,14 +56,13 @@ for tool in gcc make flex bison bc sha256sum; do
     fi
 done
 # libelf is a library; check for the companion header via its dev package.
-if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists libelf 2>/dev/null; then
-    # Fall back: check for the header directly.
-    if [ ! -f /usr/include/libelf.h ] && [ ! -f /usr/include/gelf.h ]; then
-        MISSING="$MISSING libelf-dev"
-    fi
+if (! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists libelf 2>/dev/null) \
+    && [[ ! -f /usr/include/libelf.h ]] && [[ ! -f /usr/include/gelf.h ]]; then
+    # Fall back: header not present either — record the missing dev package.
+    MISSING="$MISSING libelf-dev"
 fi
 
-if [ -n "$MISSING" ]; then
+if [[ -n "$MISSING" ]]; then
     echo "error: the following build dependencies are missing:$MISSING" >&2
     echo "" >&2
     echo "Install them with:" >&2
@@ -77,7 +76,7 @@ fi
 mkdir -p "$CACHE_DIR"
 TARBALL_PATH="$CACHE_DIR/$TARBALL"
 
-if [ ! -f "$TARBALL_PATH" ]; then
+if [[ ! -f "$TARBALL_PATH" ]]; then
     echo "Downloading linux-${VERSION}..."
     if command -v curl >/dev/null 2>&1; then
         curl -fL --progress-bar -o "$TARBALL_PATH" "$TARBALL_URL"
@@ -93,7 +92,7 @@ fi
 
 # Manual compare (not 'sha256sum -c') so the error can show got/want.
 GOT_SHA256="$(sha256sum "$TARBALL_PATH" | cut -d' ' -f1)"
-if [ "$GOT_SHA256" != "$EXPECTED_SHA256" ]; then
+if [[ "$GOT_SHA256" != "$EXPECTED_SHA256" ]]; then
     rm -f "$TARBALL_PATH"
     echo "error: $TARBALL failed sha256 verification — removed; re-run to re-download" >&2
     echo "  got:  $GOT_SHA256" >&2
@@ -102,7 +101,7 @@ if [ "$GOT_SHA256" != "$EXPECTED_SHA256" ]; then
 fi
 echo "sha256 OK: $TARBALL"
 # CI smoke / tests: stop after verification, before the expensive build.
-if [ "${IZBA_KERNEL_VERIFY_ONLY:-0}" = "1" ]; then
+if [[ "${IZBA_KERNEL_VERIFY_ONLY:-0}" = "1" ]]; then
     exit 0
 fi
 
@@ -110,7 +109,7 @@ fi
 # Unpack
 # ---------------------------------------------------------------------------
 BUILD_DIR="$CACHE_DIR/linux-${VERSION}"
-if [ ! -d "$BUILD_DIR" ]; then
+if [[ ! -d "$BUILD_DIR" ]]; then
     echo "Unpacking..."
     tar -C "$CACHE_DIR" -xf "$TARBALL_PATH"
 fi
@@ -124,7 +123,7 @@ make x86_64_defconfig
 
 # merge_config.sh -m: merge the fragment ON TOP of the existing .config
 # without interactively asking about new symbols (olddefconfig handles those).
-if [ ! -f scripts/kconfig/merge_config.sh ]; then
+if [[ ! -f scripts/kconfig/merge_config.sh ]]; then
     echo "error: scripts/kconfig/merge_config.sh not found in kernel tree" >&2
     exit 1
 fi
