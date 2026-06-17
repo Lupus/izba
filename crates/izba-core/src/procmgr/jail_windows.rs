@@ -19,7 +19,7 @@ use crate::vmm::CommandSpec;
 use anyhow::Context;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSidToSidW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
@@ -148,16 +148,16 @@ pub fn restore_integrity_recursive(path: &Path) -> anyhow::Result<()> {
 /// is always within its rights.
 ///
 /// SAFETY: linear FFI. The label SID is `LocalAlloc`'d by
-/// `ConvertStringSidToSidW`; as elsewhere in this file we accept not freeing it
-/// (one small allocation per VMM launch/teardown, not per-request). The ACL
-/// lives in a local heap `Vec<u8>` whose lifetime spans the
-/// `SetNamedSecurityInfoW` call (the OS copies it), and a NUL-terminated UTF-16
-/// path buffer likewise outlives the call.
+/// `ConvertStringSidToSidW` and `LocalFree`'d once `AddMandatoryAce` has copied
+/// it into the ACL (on the error path we bail before the free — a one-off small
+/// leak only when an OS call fails). The ACL lives in a local heap `Vec<u8>`
+/// whose lifetime spans the `SetNamedSecurityInfoW` call (the OS copies it), and
+/// a NUL-terminated UTF-16 path buffer likewise outlives the call.
 #[cfg(windows)]
 fn apply_inheritable_integrity_label(path: &Path, sid_str: &str) -> anyhow::Result<()> {
     // SAFETY: a single linear FFI sequence; every buffer handed to the OS
-    // outlives the call that reads it, and the only allocation (the label SID)
-    // is intentionally leaked per the doc-comment.
+    // outlives the call that reads it, and the label SID is LocalFree'd after
+    // the ACL copies it.
     unsafe {
         // Resolve the integrity SID.
         let sid_str: Vec<u16> = sid_str.encode_utf16().collect();
@@ -198,6 +198,10 @@ fn apply_inheritable_integrity_label(path: &Path, sid_str: &str) -> anyhow::Resu
                 std::io::Error::last_os_error()
             );
         }
+        // AddMandatoryAce copied the SID into the ACL, so release the
+        // LocalAlloc'd SID now (this fn runs per-share + per-teardown +
+        // per-adoption-sweep — frequent enough that the leak should not stand).
+        LocalFree(sid as _);
 
         // Apply the SACL as the object's mandatory label. SetNamedSecurityInfoW
         // propagates the inheritable label across the existing subtree.
@@ -266,10 +270,10 @@ unsafe fn build_confined_token(policy: &ConfinementPolicy) -> anyhow::Result<HAN
 /// label. Returns an error (never a silent no-op) so the caller can fail the
 /// confinement attempt rather than run at the parent's integrity.
 ///
-/// SAFETY: FFI. `ConvertStringSidToSidW` returns a `LocalAlloc`'d SID that
-/// strictly should be released with `LocalFree`; we intentionally skip that.
-/// The decision is acceptable because it is one small allocation per
-/// VMM-launch (sandbox lifetime), not a per-request leak.
+/// SAFETY: FFI. `ConvertStringSidToSidW` returns a `LocalAlloc`'d SID; we
+/// `LocalFree` it once `SetTokenInformation` has copied the label into the token
+/// (on the error path we bail before the free — a one-off small leak only when
+/// the OS call itself fails).
 unsafe fn set_integrity(tok: HANDLE, il: IntegrityLevel) -> anyhow::Result<()> {
     let sid_str: Vec<u16> = match il {
         IntegrityLevel::Low => "S-1-16-4096\0".encode_utf16().collect(),
@@ -301,6 +305,8 @@ unsafe fn set_integrity(tok: HANDLE, il: IntegrityLevel) -> anyhow::Result<()> {
             std::io::Error::last_os_error()
         );
     }
+    // The token holds its own copy of the label now; release the SID.
+    LocalFree(sid as _);
     Ok(())
 }
 
@@ -629,8 +635,21 @@ pub fn spawn_confined(
                         };
 
                         // 7. Resume the suspended child now that it is confined +
-                        //    (best-effort) job-assigned.
-                        ResumeThread(pi.hThread);
+                        //    (best-effort) job-assigned. ResumeThread returns
+                        //    (DWORD)-1 on failure; if we ignored that, the child
+                        //    would stay SUSPENDED forever yet read as alive
+                        //    (pid_alive true), so the caller's boot wait would
+                        //    time out with a misleading "VM never became healthy"
+                        //    instead of a confinement error — and the suspended
+                        //    process would pin the VMM binary + log + token. So on
+                        //    failure, terminate it (handles still open) and bail.
+                        if ResumeThread(pi.hThread) == u32::MAX {
+                            let err = std::io::Error::last_os_error();
+                            TerminateProcess(pi.hProcess, 1);
+                            CloseHandle(pi.hThread);
+                            CloseHandle(pi.hProcess);
+                            anyhow::bail!("ResumeThread(confined VMM): {err}");
+                        }
 
                         // 8. Identity from the SAME FILETIME read spawn_detached
                         //    uses; pi.hProcess pins the PID until we close it.

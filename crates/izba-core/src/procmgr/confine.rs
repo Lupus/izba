@@ -70,36 +70,41 @@ pub struct ConfinementStatus {
     pub reason: String,
 }
 
+/// Human description of the token confinement ACTUALLY applied. NOTE: today both
+/// `TokenLevel` variants apply only `DISABLE_MAX_PRIVILEGE` (all privileges
+/// dropped) and **no restricting SIDs** — see design decision 2 — so both render
+/// "privileges-dropped" rather than "restricted(...)", which would overstate the
+/// confinement to a reader of `izba status`. When SID shaping lands this gains
+/// per-variant descriptions.
+fn token_desc(_token: TokenLevel) -> &'static str {
+    "privileges-dropped"
+}
+
+fn il_desc(il: IntegrityLevel) -> &'static str {
+    match il {
+        IntegrityLevel::Low => "low-il",
+        IntegrityLevel::Medium => "medium-il",
+    }
+}
+
 impl ConfinementStatus {
     pub fn applied(p: &ConfinementPolicy) -> Self {
-        let token = match p.token {
-            TokenLevel::Limited => "restricted(limited)",
-            TokenLevel::RestrictedNonAdmin => "restricted(non-admin)",
-        };
-        let il = match p.integrity {
-            IntegrityLevel::Low => "low-il",
-            IntegrityLevel::Medium => "medium-il",
-        };
         Self {
             mode: ConfinementMode::Restricted,
-            reason: format!("{token}+{il}+job"),
+            reason: format!("{}+{}+job", token_desc(p.token), il_desc(p.integrity)),
         }
     }
     /// Token+IL boundary applied, but the best-effort resource job could not be
     /// created/assigned. Same shape as `applied()` MINUS the "+job" claim, plus
     /// a note that the job is absent — so health never overstates confinement.
     pub fn token_only(p: &ConfinementPolicy) -> Self {
-        let token = match p.token {
-            TokenLevel::Limited => "restricted(limited)",
-            TokenLevel::RestrictedNonAdmin => "restricted(non-admin)",
-        };
-        let il = match p.integrity {
-            IntegrityLevel::Low => "low-il",
-            IntegrityLevel::Medium => "medium-il",
-        };
         Self {
             mode: ConfinementMode::TokenOnly,
-            reason: format!("{token}+{il} (resource job unavailable)"),
+            reason: format!(
+                "{}+{} (resource job unavailable)",
+                token_desc(p.token),
+                il_desc(p.integrity)
+            ),
         }
     }
     pub fn degraded(reason: &str) -> Self {
@@ -144,7 +149,10 @@ mod tests {
     #[test]
     fn status_renders_human_reason() {
         let ok = ConfinementStatus::applied(&ConfinementPolicy::vmm_default());
-        assert!(ok.summary().contains("restricted"));
+        // Honest: no restricting SIDs are applied yet, so the token reads as
+        // "privileges-dropped", never "restricted(...)".
+        assert!(ok.summary().contains("privileges-dropped"));
+        assert!(!ok.summary().contains("restricted"));
         assert!(ok.summary().contains("low-il"));
         let none = ConfinementStatus::degraded("WHP unavailable under restricted token");
         assert_eq!(none.mode, ConfinementMode::None);
@@ -166,7 +174,7 @@ mod tests {
         let s = ConfinementStatus::token_only(&ConfinementPolicy::vmm_default());
         assert_eq!(s.mode, ConfinementMode::TokenOnly);
         // Honest: keeps the token+IL claim but NEVER asserts the job.
-        assert!(s.reason.contains("restricted(limited)"));
+        assert!(s.reason.contains("privileges-dropped"));
         assert!(s.reason.contains("low-il"));
         assert!(!s.reason.contains("+job"));
         assert!(s.reason.contains("resource job unavailable"));
