@@ -16,7 +16,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck disable=SC1091
-[ -f .cargo-env ] && source .cargo-env
+[[ -f .cargo-env ]] && source .cargo-env
 
 # Verify that cpio is available before doing anything expensive.
 if ! command -v cpio >/dev/null 2>&1; then
@@ -34,11 +34,11 @@ mkdir -p "$(dirname "$OUTPUT")"
 # the real archive lives at latest/musl/amd64/rootfs.tar.gz.
 BUSYBOX_URL="${BUSYBOX_URL:-https://raw.githubusercontent.com/docker-library/busybox/dist-amd64/latest/musl/amd64/rootfs.tar.gz}"
 CACHE="dist/.busybox"
-if [ ! -x "$CACHE/bin/busybox" ]; then
+if [[ ! -x "$CACHE/bin/busybox" ]]; then
     echo "Fetching static busybox..."
     mkdir -p "$CACHE"
     curl -fsSL "$BUSYBOX_URL" | tar -xz -C "$CACHE"
-    [ -x "$CACHE/bin/busybox" ] || { echo "error: no bin/busybox in archive" >&2; exit 1; }
+    [[ -x "$CACHE/bin/busybox" ]] || { echo "error: no bin/busybox in archive" >&2; exit 1; }
 fi
 
 echo "Building vsock-echo (musl static)..."
@@ -71,7 +71,7 @@ exec /bin/busybox sleep infinity
 EOF
 chmod 755 "$WORK/init"
 
-if [ -n "$RC_FILE" ]; then
+if [[ -n "$RC_FILE" ]]; then
     cp "$RC_FILE" "$WORK/spike.rc"
     chmod 644 "$WORK/spike.rc"
 fi

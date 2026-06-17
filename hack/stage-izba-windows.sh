@@ -10,14 +10,14 @@ cd "$(dirname "$0")/.."
 
 WIN_ROOT="${WIN_ROOT:-/mnt/c/izba}"
 # %LOCALAPPDATA% as seen from WSL; derive from the Windows user if not given.
-if [ -z "${WIN_LOCALAPPDATA:-}" ]; then
+if [[ -z "${WIN_LOCALAPPDATA:-}" ]]; then
     WINUSER="$(powershell.exe -NoProfile -Command '$env:UserName' | tr -d '\r')"
     WIN_LOCALAPPDATA="/mnt/c/Users/$WINUSER/AppData/Local"
 fi
 
 IZBA_EXE="target/x86_64-pc-windows-gnu/release/izba.exe"
 for f in "$IZBA_EXE" dist/openvmm.exe dist/mkfs.erofs.exe dist/vmlinux dist/initramfs.cpio.gz; do
-    [ -f "$f" ] || { echo "error: missing $f (build/fetch it first)" >&2; exit 1; }
+    [[ -f "$f" ]] || { echo "error: missing $f (build/fetch it first)" >&2; exit 1; }
 done
 
 mkdir -p "$WIN_ROOT/bin/libexec" "$WIN_LOCALAPPDATA/izba/artifacts"

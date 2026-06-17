@@ -68,16 +68,16 @@ Housekeeping:
 EOF
 }
 
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
     case "$1" in
-        --ref)          shift; REF="${1:-}"; [ -n "$REF" ] || die "--ref needs a branch" ;;
-        --run)          shift; RUN_ID="${1:-}"; [ -n "$RUN_ID" ] || die "--run needs an id"; DO_DISPATCH=0 ;;
+        --ref)          shift; REF="${1:-}"; [[ -n "$REF" ]] || die "--ref needs a branch" ;;
+        --run)          shift; RUN_ID="${1:-}"; [[ -n "$RUN_ID" ]] || die "--run needs an id"; DO_DISPATCH=0 ;;
         --no-dispatch)  DO_DISPATCH=0 ;;
         --linux-only)   DL_WINDOWS=0 ;;
         --windows-only) DL_LINUX=0 ;;
         --no-gui)       DL_GUI=0 ;;
         --clean)        DO_CLEAN=1 ;;
-        --keep)         shift; KEEP_N="${1:-}"; [ -n "$KEEP_N" ] || die "--keep needs N" ;;
+        --keep)         shift; KEEP_N="${1:-}"; [[ -n "$KEEP_N" ]] || die "--keep needs N" ;;
         -h|--help)      usage; exit 0 ;;
         *)              usage; die "unknown flag: $1" ;;
     esac
@@ -89,9 +89,9 @@ done
 # ---------------------------------------------------------------------------
 prune_dist() {
     local base="$REPO_ROOT/dist/local"
-    [ -d "$base" ] || { log "nothing to clean (no $base)"; return 0; }
+    [[ -d "$base" ]] || { log "nothing to clean (no $base)"; return 0; }
     local latest_target=""
-    [ -L "$base/latest" ] && latest_target="$(readlink "$base/latest")"
+    [[ -L "$base/latest" ]] && latest_target="$(readlink "$base/latest")"
     local dirs=()
     while IFS= read -r d; do dirs+=("$d"); done < <(
         find "$base" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort -r
@@ -100,12 +100,12 @@ prune_dist() {
     local i=0 removed=0
     for d in "${dirs[@]}"; do
         local protect=0
-        if [ -n "$keep" ]; then
-            [ "$i" -lt "$keep" ] && protect=1
+        if [[ -n "$keep" ]]; then
+            [[ "$i" -lt "$keep" ]] && protect=1
         else
-            [ "$d" = "$latest_target" ] && protect=1
+            [[ "$d" = "$latest_target" ]] && protect=1
         fi
-        if [ "$protect" -eq 1 ]; then
+        if [[ "$protect" -eq 1 ]]; then
             i=$((i+1))
         else
             log "clean: removing dist/local/$d"
@@ -113,13 +113,13 @@ prune_dist() {
             removed=$((removed+1))
         fi
     done
-    if [ -L "$base/latest" ] && [ ! -e "$base/latest" ]; then
+    if [[ -L "$base/latest" ]] && [[ ! -e "$base/latest" ]]; then
         rm -f "$base/latest"
     fi
     log "clean: removed $removed run dir(s)"
 }
 
-if [ "$DO_CLEAN" -eq 1 ]; then
+if [[ "$DO_CLEAN" -eq 1 ]]; then
     stage "Clean dist/local"
     prune_dist
     exit 0
@@ -135,8 +135,8 @@ gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run 'gh auth log
 # Stage 1 — identity
 # ---------------------------------------------------------------------------
 stage "Stage 1: identity"
-[ -n "$REF" ] || REF="$(git rev-parse --abbrev-ref HEAD)"
-[ "$REF" != "HEAD" ] || die "detached HEAD — pass --ref <branch>."
+[[ -n "$REF" ]] || REF="$(git rev-parse --abbrev-ref HEAD)"
+[[ "$REF" != "HEAD" ]] || die "detached HEAD — pass --ref <branch>."
 
 # CI builds the PUSHED tip of $REF (workflow_dispatch checks out that ref), so
 # derive ALL identity from origin/$REF — never the local working tree, which can
@@ -146,8 +146,8 @@ git fetch --quiet origin "$REF" 2>/dev/null \
     || warn "could not fetch origin/$REF — using last-known remote ref."
 git rev-parse --verify --quiet "origin/$REF" >/dev/null \
     || die "origin/$REF not found — push the branch first ('git push -u origin $REF')."
-if [ "$REF" = "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" ] \
-   && [ "$(git rev-parse "origin/$REF")" != "$(git rev-parse HEAD)" ]; then
+if [[ "$REF" = "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" ]] \
+   && [[ "$(git rev-parse "origin/$REF")" != "$(git rev-parse HEAD)" ]]; then
     warn "local HEAD differs from origin/$REF — CI builds the pushed tip, not your working copy."
 fi
 SHA="$(git rev-parse "origin/$REF")"
@@ -156,7 +156,7 @@ CDATE="$(git show -s --format=%cs "origin/$REF")"
 DESCRIBE="$(git describe --tags --always "origin/$REF" 2>/dev/null || echo "$SHORT")"
 # Base version from the SAME ref CI builds so VERSION matches the deb exactly.
 BASE="$(git show "origin/$REF:crates/izba-cli/Cargo.toml" 2>/dev/null | grep -m1 '^version' | cut -d'"' -f2)"
-[ -n "$BASE" ] || BASE="$(grep -m1 '^version' crates/izba-cli/Cargo.toml | cut -d'"' -f2)"
+[[ -n "$BASE" ]] || BASE="$(grep -m1 '^version' crates/izba-cli/Cargo.toml | cut -d'"' -f2)"
 VERSION="${BASE}~git${SHORT}"
 log "ref=$REF sha=$SHA version=$VERSION"
 
@@ -175,22 +175,22 @@ resolve_run_for_head() {
 }
 
 stage "Stage 2: dispatch + resolve CI run"
-if [ "$DO_DISPATCH" -eq 1 ]; then
+if [[ "$DO_DISPATCH" -eq 1 ]]; then
     log "dispatching $WORKFLOW on $REF..."
     gh workflow run "$WORKFLOW" --ref "$REF" \
         || die "gh workflow run failed (is $WORKFLOW present on $REF? rebase onto main)."
     log "waiting for the dispatched run to register..."
     for _ in $(seq 1 30); do
         RUN_ID="$(resolve_run_for_head)"
-        [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ] && break
+        [[ -n "$RUN_ID" ]] && [[ "$RUN_ID" != "null" ]] && break
         sleep 3
     done
-    [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ] \
+    [[ -n "$RUN_ID" ]] && [[ "$RUN_ID" != "null" ]] \
         || die "dispatched run for $SHA did not appear — check 'gh run list --workflow=$WORKFLOW'."
-elif [ -z "$RUN_ID" ]; then
+elif [[ -z "$RUN_ID" ]]; then
     log "resolving newest $WORKFLOW run for $SHA (no dispatch)..."
     RUN_ID="$(resolve_run_for_head)"
-    [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ] \
+    [[ -n "$RUN_ID" ]] && [[ "$RUN_ID" != "null" ]] \
         || die "no $WORKFLOW run found for $SHA on $REF — dispatch one (drop --no-dispatch)."
 fi
 log "CI run: $RUN_ID"
@@ -207,7 +207,7 @@ mkdir -p "$REPO_ROOT/dist"
 # leak one. The vars are pre-set empty; cleanup skips whichever isn't made yet.
 RUN_OUT=""
 DL_TMP=""
-cleanup() { [ -n "${RUN_OUT:-}" ] && rm -rf "$RUN_OUT"; [ -n "${DL_TMP:-}" ] && rm -rf "$DL_TMP"; }
+cleanup() { [[ -n "${RUN_OUT:-}" ]] && rm -rf "$RUN_OUT"; [[ -n "${DL_TMP:-}" ]] && rm -rf "$DL_TMP"; }
 trap cleanup EXIT
 RUN_OUT="$(mktemp -d "$REPO_ROOT/dist/.devbuild-run.XXXXXX")"
 DL_TMP="$(mktemp -d "$REPO_ROOT/dist/.devbuild-dl.XXXXXX")"
@@ -220,16 +220,16 @@ fetch_one() {
         || die "failed to download artifact $name from run $RUN_ID"
     local f
     f="$(find "$DL_TMP/$name" -type f -name "$glob" | head -1)"
-    [ -n "$f" ] || die "artifact $name had no file matching $glob"
+    [[ -n "$f" ]] || die "artifact $name had no file matching $glob"
     cp -f "$f" "$RUN_OUT/"
     PROV[$provkey]="fetched (run $RUN_ID)"
 }
 
-if [ "$DL_LINUX" -eq 1 ]; then
+if [[ "$DL_LINUX" -eq 1 ]]; then
     fetch_one izba-deb 'izba_*_amd64.deb' izba-deb
-    [ "$DL_GUI" -eq 1 ] && fetch_one izba-app-deb 'izba-app_*_amd64.deb' izba-app-deb
+    [[ "$DL_GUI" -eq 1 ]] && fetch_one izba-app-deb 'izba-app_*_amd64.deb' izba-app-deb
 fi
-if [ "$DL_WINDOWS" -eq 1 ]; then
+if [[ "$DL_WINDOWS" -eq 1 ]]; then
     fetch_one izba-windows-installer 'izba-setup-*.exe' installer
 fi
 
@@ -252,7 +252,7 @@ stage "Stage 4: collect"
     echo ""
     echo "artifacts:"
     for k in izba-deb izba-app-deb installer; do
-        [ -n "${PROV[$k]:-}" ] && printf '  %-14s %s\n' "$k:" "${PROV[$k]}"
+        [[ -n "${PROV[$k]:-}" ]] && printf '  %-14s %s\n' "$k:" "${PROV[$k]}"
     done
 } > "$RUN_OUT/manifest.txt"
 
@@ -270,9 +270,9 @@ ln -sfn "$FINAL_NAME" "$REPO_ROOT/dist/local/latest"
 # ---------------------------------------------------------------------------
 REPORT_DIR="$FINAL_DIR"
 GIT_COMMON="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-if [ -n "$GIT_COMMON" ]; then
+if [[ -n "$GIT_COMMON" ]]; then
     MAIN_ROOT="$(cd "$GIT_COMMON/.." && pwd)"
-    if [ "$MAIN_ROOT" != "$REPO_ROOT" ]; then
+    if [[ "$MAIN_ROOT" != "$REPO_ROOT" ]]; then
         mkdir -p "$MAIN_ROOT/dist/local"
         cp -a "$FINAL_DIR" "$MAIN_ROOT/dist/local/"
         REPORT_DIR="$MAIN_ROOT/dist/local/$FINAL_NAME"
@@ -290,18 +290,18 @@ cat "$FINAL_DIR/manifest.txt" >&2
 
 echo "" >&2
 echo "==== install commands ====" >&2
-if [ "$DL_LINUX" -eq 1 ]; then
+if [[ "$DL_LINUX" -eq 1 ]]; then
     printf '\nLinux (WSL2):\n  sudo dpkg -i "%s"/izba_*.deb\n' "$REPORT_DIR" >&2
-    [ "$DL_GUI" -eq 1 ] && printf '  sudo dpkg -i "%s"/izba-app_*.deb\n' "$REPORT_DIR" >&2
+    [[ "$DL_GUI" -eq 1 ]] && printf '  sudo dpkg -i "%s"/izba-app_*.deb\n' "$REPORT_DIR" >&2
 fi
-if [ "$DL_WINDOWS" -eq 1 ]; then
+if [[ "$DL_WINDOWS" -eq 1 ]]; then
     # The exe is referenced by its real name; the zsh→powershell hop eats one
     # set of backslashes, so double every backslash of the wslpath -w output
     # AND the separator we add (printf '\\\\' emits a literal '\\').
     EXE_NAME="$(cd "$FINAL_DIR" && ls izba-setup-*.exe 2>/dev/null | head -1 || true)"
     WIN_DIR="$(wslpath -w "$REPORT_DIR" 2>/dev/null || true)"
     WIN_DIR_ESC="${WIN_DIR//\\/\\\\}"
-    if [ -n "$WIN_DIR_ESC" ] && [ -n "$EXE_NAME" ]; then
+    if [[ -n "$WIN_DIR_ESC" ]] && [[ -n "$EXE_NAME" ]]; then
         printf '\nWindows installer (via WSL interop):\n' >&2
         printf '  powershell.exe -NoProfile -Command "Start-Process -Wait '\''%s\\\\%s'\''"\n' \
             "$WIN_DIR_ESC" "$EXE_NAME" >&2

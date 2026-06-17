@@ -21,13 +21,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Sandbox-local toolchain, if present (matches the rest of the build).
-[ -f .cargo-env ] && source .cargo-env
+[[ -f .cargo-env ]] && source .cargo-env
 
 HTML=0
 OPEN=0
 TOP=25
 EXTRA=()
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --html) HTML=1 ;;
     --open) HTML=1; OPEN=1 ;;
@@ -69,7 +69,7 @@ set +e
 cargo llvm-cov --no-report --no-fail-fast --workspace "${EXTRA[@]}"
 TEST_STATUS=$?
 set -e
-if [ "$TEST_STATUS" -ne 0 ]; then
+if [[ "$TEST_STATUS" -ne 0 ]]; then
   echo "WARNING: tests exited non-zero ($TEST_STATUS); coverage reflects only the tests that ran." >&2
 fi
 
@@ -77,7 +77,7 @@ echo "==> generating lcov + json reports"
 cargo llvm-cov report --lcov --output-path "$OUT/lcov.info" --ignore-filename-regex "$IGNORE"
 cargo llvm-cov report --json --output-path "$OUT/coverage.json" --ignore-filename-regex "$IGNORE"
 
-if [ "$HTML" = 1 ]; then
+if [[ "$HTML" = 1 ]]; then
   echo "==> generating HTML report"
   cargo llvm-cov report --html --output-dir "$OUT/html" --ignore-filename-regex "$IGNORE"
 fi
@@ -92,9 +92,9 @@ echo "  - $OUT/lcov.info"
 echo "  - $OUT/coverage.json"
 # cargo-llvm-cov nests the HTML under <output-dir>/html/.
 HTML_INDEX="$OUT/html/html/index.html"
-[ "$HTML" = 1 ] && echo "  - $HTML_INDEX"
+[[ "$HTML" = 1 ]] && echo "  - $HTML_INDEX"
 
-if [ "$OPEN" = 1 ]; then
+if [[ "$OPEN" = 1 ]]; then
   if command -v xdg-open >/dev/null 2>&1; then xdg-open "$HTML_INDEX" >/dev/null 2>&1 || true
   elif command -v open >/dev/null 2>&1; then open "$HTML_INDEX" || true
   fi

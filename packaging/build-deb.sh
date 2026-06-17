@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 OUT_DIR="${OUT_DIR:-dist}"
 
 for f in "$IZBA_BIN" "$IZBA_CH" "$IZBA_VIRTIOFSD" "$IZBA_VMLINUX" "$IZBA_INITRAMFS"; do
-    [ -f "$f" ] || { echo "error: missing input $f" >&2; exit 1; }
+    [[ -f "$f" ]] || { echo "error: missing input $f" >&2; exit 1; }
 done
 
 STAGE="$(mktemp -d)"
