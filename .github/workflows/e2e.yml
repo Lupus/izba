@@ -439,14 +439,16 @@ jobs:
           prefix-key: e2e-windows
       # bash, not pwsh: fail-fast between the two builds (pwsh only gates the
       # step on the LAST native command's exit code).
-      - name: Build izba.exe + ttystorm.exe (native MSVC)
+      - name: Build izba.exe + ttystorm.exe + confine_probe.exe (native MSVC)
         shell: bash
         run: |
           cargo build --locked --release -p izba-cli
           cargo build --locked --release -p izba-core --example ttystorm
+          cargo build --locked --release -p izba-core --example confine_probe
       - name: Windows validation suite (21 checks)
         env:
           IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
+          IZBA_CONFINE_PROBE: ${{ github.workspace }}\target\release\examples\confine_probe.exe
         run: pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
       # Non-tty M0 gate runs before the tty steps so its signal is never
       # lost behind a tty failure.
@@ -568,6 +570,10 @@ jobs:
           # instrumented izba.exe it spawns inherits LLVM_PROFILE_FILE from this
           # step's environment.
           IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
+          # Same release output dir as izba.exe (llvm-cov instruments via env, not
+          # a separate target dir) so the [10] confinement check has its probe and
+          # does not fail-closed with a misleading failure in the coverage report.
+          IZBA_CONFINE_PROBE: ${{ github.workspace }}\target\release\examples\confine_probe.exe
         run: |
           # Single shell: the show-env instrumentation env persists across every
           # cargo invocation AND is inherited by the pwsh child below.
@@ -576,8 +582,9 @@ jobs:
           # Report-only: a failing suite must not abort the run and wipe the
           # report. windows-whp remains the authoritative Windows gate.
           set +e
-          cargo test -p izba-proto -p izba-core -p izba-cli
+          cargo test --locked -p izba-proto -p izba-core -p izba-cli
           cargo build --locked --release -p izba-cli
+          cargo build --locked --release -p izba-core --example confine_probe
           pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
           set -e
           # Separator-agnostic regex: llvm-cov emits backslash paths on Windows.

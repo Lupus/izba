@@ -263,6 +263,7 @@ fn start_sandbox(env: &TestEnv, tb: &TestBox, name: &str) -> anyhow::Result<()> 
             kernel: env.kernel.clone(),
             initramfs: env.initramfs.clone(),
         },
+        false,
         BOOT_TIMEOUT,
         BOOT_POLL,
     )

@@ -110,6 +110,7 @@ impl ScriptedGuest {
                 vmm_pid: id,
                 sidecar_pids: vec![],
                 started_unix_ms: 0,
+                confinement: None,
             },
         )
         .context("write state.json")?;

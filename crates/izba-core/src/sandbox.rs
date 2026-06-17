@@ -420,16 +420,27 @@ pub fn start(
     name: &str,
     driver: &dyn VmmDriver,
     art: &Artifacts,
+    allow_unconfined: bool,
 ) -> anyhow::Result<()> {
     let timeout = boot_timeout_from_env(std::env::var("IZBA_BOOT_TIMEOUT_SECS").ok().as_deref());
-    start_with_timeouts(paths, name, driver, art, timeout, DEFAULT_BOOT_POLL)
+    start_with_timeouts(
+        paths,
+        name,
+        driver,
+        art,
+        allow_unconfined,
+        timeout,
+        DEFAULT_BOOT_POLL,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_with_timeouts(
     paths: &Paths,
     name: &str,
     driver: &dyn VmmDriver,
     art: &Artifacts,
+    allow_unconfined: bool,
     boot_timeout: Duration,
     poll: Duration,
 ) -> anyhow::Result<()> {
@@ -488,6 +499,7 @@ pub fn start_with_timeouts(
         ],
         console_log: console_log.clone(),
         run_dir: paths.run_dir(name),
+        allow_unconfined,
     };
 
     let mut handle = driver.launch(&spec)?;
@@ -532,6 +544,9 @@ pub fn start_with_timeouts(
             .position(|(role, _)| role == "vmm")
             .context("driver returned no 'vmm' pid")?;
         let (_, vmm_pid) = pids.remove(vmm_idx);
+        // Record the host-side confinement actually achieved for the VMM so
+        // status can report it honestly (and loudly when unconfined).
+        let confinement = Some(handle.confinement());
         let state = RunState {
             vmm_pid,
             sidecar_pids: pids,
@@ -539,6 +554,7 @@ pub fn start_with_timeouts(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            confinement,
         };
         save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)?;
         Ok(())
@@ -546,6 +562,18 @@ pub fn start_with_timeouts(
 
     if let Err(e) = booted {
         let _ = handle.kill();
+        // A confined launch Low-labelled the VMM's write surfaces (workspace +
+        // writable disks). Boot failed BEFORE state.json was written, so the
+        // state.json-gated teardown restore (restore_confined_workspace) cannot
+        // fire — restore them here from the spec, gated on the handle's actual
+        // confinement so an unconfined (--allow-unconfined) start never touches
+        // the user's dirs. The VMM was just killed, so this is safe. No-op on
+        // non-Windows.
+        if handle.confinement().is_confined() {
+            for p in spec.confined_write_surfaces() {
+                let _ = procmgr::restore_integrity_recursive(&p);
+            }
+        }
         // Best-effort: clear stale sockets/pid files so a retry starts clean.
         clear_run_dir_files(paths, name);
         return Err(e);
@@ -612,6 +640,8 @@ fn stop_locked(
         (Liveness::Stopped, _) | (_, None) => {
             // VMM is already dead; sidecars (virtiofsd) usually self-exit with
             // their vhost-user peer, but not always — best-effort kill them.
+            // The VMM is gone, so restore the confined workspace's integrity.
+            restore_confined_workspace(paths, name);
             kill_sidecars_from_state(paths, name);
             return cleanup_runtime(paths, name);
         }
@@ -660,6 +690,10 @@ fn stop_locked(
         }
     }
 
+    // The VMM is confirmed dead above; restore the confined workspace's
+    // integrity before wiping state.json (after which we'd lose the "was
+    // confined" signal).
+    restore_confined_workspace(paths, name);
     cleanup_runtime(paths, name)
 }
 
@@ -678,6 +712,66 @@ fn kill_sidecars_from_state(paths: &Paths, name: &str) {
     if let Some(s) = state {
         for (_, id) in &s.sidecar_pids {
             let _ = procmgr::kill_pid(id);
+        }
+    }
+}
+
+/// Restore a confined sandbox's write surfaces to Medium integrity after the VMM
+/// is gone.
+///
+/// On Windows the confined VMM runs at Low IL, so its write surfaces — the
+/// workspace share (the user's project dir) AND every writable disk backing file
+/// (notably named persistent volumes under `<data>/volumes`) — are Low-labelled
+/// at launch (mirroring [`VmSpec::confined_write_surfaces`]); this undoes that.
+/// A complete no-op on non-Windows and for unconfined/legacy sandboxes
+/// (`is_confined()` gate), and best-effort + idempotent — re-asserting Medium is
+/// safe to repeat, and a missed restore only leaves a benign Low label (Medium
+/// tools write *down* to it).
+///
+/// (The scratch dir + the disks inside it — rw.img, anon volumes — are wiped on
+/// `rm` and re-labelled on the next start, so they need no separate restore; only
+/// the persistent, OUTSIDE-the-sandbox-dir surfaces genuinely matter, but
+/// restoring the in-sandbox ones too is harmless.)
+///
+/// Safe to call on every teardown path: graceful stop, force-remove, AND the
+/// stale-state sweep that `list` (hence daemon adoption) runs — that sweep is how
+/// an orphaned VMM's label is eventually reconciled. MUST run only once the VMM
+/// is dead (every caller ensures this before wiping state.json), so the label is
+/// never pulled out from under a still-running guest.
+fn restore_confined_workspace(paths: &Paths, name: &str) {
+    let dir = paths.sandbox_dir(name);
+    let state: Option<RunState> = load_json(&dir.join(STATE_FILE)).ok().flatten();
+    let confined = state
+        .as_ref()
+        .and_then(|s| s.confinement.as_ref())
+        .is_some_and(|c| c.is_confined());
+    if !confined {
+        return;
+    }
+    let cfg = match load_json::<SandboxConfig>(&dir.join(CONFIG_FILE)) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("warning: sandbox '{name}': cannot read config to restore integrity: {e:#}");
+            return;
+        }
+    };
+    // Reconstruct the same write surfaces the confined launch Low-labelled (the
+    // spec is gone post-launch): the workspace share + every writable disk
+    // backing file. Mirrors VmSpec::confined_write_surfaces via the persisted
+    // config. Best-effort: a failure on one surface must not skip the rest.
+    let mut surfaces = vec![cfg.workspace.clone()];
+    for disk in build_vm_disks(paths, name, &cfg.image_digest, &cfg.volumes) {
+        if !disk.readonly {
+            surfaces.push(disk.path);
+        }
+    }
+    for p in &surfaces {
+        if let Err(e) = procmgr::restore_integrity_recursive(p) {
+            eprintln!(
+                "warning: sandbox '{name}': restoring {} to Medium integrity failed: {e:#}",
+                p.display()
+            );
         }
     }
 }
@@ -791,8 +885,22 @@ pub fn list(paths: &Paths, connector: Connector) -> anyhow::Result<Vec<SandboxIn
             let state_path = entry.path().join(STATE_FILE);
             if state_path.exists() {
                 if let Ok(_lock) = lock_sandbox(paths, &name) {
-                    kill_sidecars_from_state(paths, &name);
-                    let _ = fs::remove_file(&state_path);
+                    // The liveness above was read WITHOUT the lock; a `start` may
+                    // have raced in and booted a fresh (confined) VM by now.
+                    // Re-confirm Stopped UNDER the lock before the destructive
+                    // sweep — otherwise we would delete a freshly-written
+                    // state.json AND, worse, restore the workspace to Medium while
+                    // the new Low-IL VMM is still running (yanking its write
+                    // access). Only proceed if the sandbox is still down.
+                    if liveness_of(paths, &name, connector).ok() == Some(Liveness::Stopped) {
+                        // This stale-state sweep is also the daemon-adoption
+                        // reconcile point: an orphaned confined VMM that has since
+                        // died gets its workspace integrity restored here before
+                        // its state is wiped.
+                        restore_confined_workspace(paths, &name);
+                        kill_sidecars_from_state(paths, &name);
+                        let _ = fs::remove_file(&state_path);
+                    }
                 }
             }
         }
@@ -1096,7 +1204,7 @@ mod tests {
         create(&paths, "web", &opts(&ws)).unwrap();
 
         let driver = MockDriver::new();
-        start(&paths, "web", &driver, &arts()).unwrap();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
 
         let spec = driver
             .captured
@@ -1167,7 +1275,7 @@ mod tests {
 
         create(&paths, "web", &opts(&ws)).unwrap();
         let driver = MockDriver::new();
-        start(&paths, "web", &driver, &arts()).unwrap();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
         let spec = driver.captured.lock().unwrap().take().expect("spec");
         assert!(
             spec.cmdline.contains("izba.egress=1"),
@@ -1189,6 +1297,7 @@ mod tests {
             "web",
             &driver,
             &arts(),
+            false,
             Duration::from_secs(2),
             Duration::from_millis(50),
         )
@@ -1212,6 +1321,7 @@ mod tests {
             "web",
             &driver,
             &arts(),
+            false,
             Duration::from_millis(300),
             Duration::from_millis(50),
         )
@@ -1250,7 +1360,7 @@ mod tests {
         create(&paths, "web", &opts(&ws)).unwrap();
 
         let driver = MockDriver::without_vmm_pid();
-        let err = start(&paths, "web", &driver, &arts()).unwrap_err();
+        let err = start(&paths, "web", &driver, &arts(), false).unwrap_err();
 
         assert!(err.to_string().contains("vmm"), "got: {err:#}");
         let killed = driver
@@ -1277,9 +1387,9 @@ mod tests {
         create(&paths, "web", &opts(&ws)).unwrap();
 
         let driver = MockDriver::new();
-        start(&paths, "web", &driver, &arts()).unwrap();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
 
-        let err = start(&paths, "web", &driver, &arts()).unwrap_err();
+        let err = start(&paths, "web", &driver, &arts(), false).unwrap_err();
         assert!(err.to_string().contains("already running"), "got: {err:#}");
     }
 
@@ -1475,6 +1585,7 @@ mod tests {
                             "web",
                             &driver,
                             &art,
+                            false,
                             Duration::from_secs(2),
                             Duration::from_millis(50),
                         )
@@ -1539,6 +1650,68 @@ mod tests {
             wait_dead(&sidecar_id),
             "orphaned sidecar must be killed by stop()"
         );
+    }
+
+    /// A confined sandbox's teardown takes the load-config + restore-integrity
+    /// branch of `restore_confined_workspace` (the integrity restore itself is a
+    /// no-op on non-Windows; here we exercise the control flow). Must not panic.
+    #[test]
+    fn restore_confined_workspace_runs_full_path_for_confined_sandbox() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        // Include a NAMED persistent volume so restore exercises the writable-disk
+        // loop (the named volume image lives outside the sandbox scratch dir).
+        let mut o = opts(&ws);
+        o.volumes = vec![crate::volume::VolumeSpec {
+            name: Some("data".into()),
+            guest_path: "/data".into(),
+            size_bytes: 1 << 20,
+        }];
+        create(&paths, "web", &o).unwrap();
+        // Record a CONFINED status so restore loads config + restores the ws.
+        save_json(
+            &paths.sandbox_dir("web").join(STATE_FILE),
+            &RunState {
+                vmm_pid: dead_identity(),
+                sidecar_pids: vec![],
+                started_unix_ms: 0,
+                confinement: Some(procmgr::ConfinementStatus::applied(
+                    &procmgr::ConfinementPolicy::vmm_default(),
+                )),
+            },
+        )
+        .unwrap();
+        restore_confined_workspace(&paths, "web"); // Ok(Some(config)) arm
+    }
+
+    /// `restore_confined_workspace` is a no-op for unconfined/legacy sandboxes
+    /// and tolerates a missing or malformed config without panicking — it is
+    /// called best-effort on every teardown path.
+    #[test]
+    fn restore_confined_workspace_skips_unconfined_and_tolerates_bad_config() {
+        let (_dir, paths) = test_paths();
+        let sdir = paths.sandbox_dir("box");
+        fs::create_dir_all(&sdir).unwrap();
+        // No state.json -> not confined -> early return.
+        restore_confined_workspace(&paths, "box");
+        // Unconfined state (confinement: None) -> is_confined() false -> return.
+        write_state(&paths, "box", dead_identity());
+        restore_confined_workspace(&paths, "box");
+        // Confined state but config.json MISSING (Ok(None) arm).
+        let confined = RunState {
+            vmm_pid: dead_identity(),
+            sidecar_pids: vec![],
+            started_unix_ms: 0,
+            confinement: Some(procmgr::ConfinementStatus::applied(
+                &procmgr::ConfinementPolicy::vmm_default(),
+            )),
+        };
+        save_json(&sdir.join(STATE_FILE), &confined).unwrap();
+        restore_confined_workspace(&paths, "box"); // Ok(None) arm
+                                                   // Confined state but MALFORMED config.json (Err arm).
+        fs::write(sdir.join(CONFIG_FILE), b"{ not json").unwrap();
+        restore_confined_workspace(&paths, "box"); // Err arm
     }
 
     /// Verify that `create` pre-formats rw.img with ext4 when `mkfs.ext4` is

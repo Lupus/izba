@@ -8,7 +8,8 @@
 # Sections: [1] run/boot/exec, [2] liveness, [3] exec exit-codes,
 #           [4] exec stdin, [5] networking, [6] console log,
 #           [7] daemon lifecycle (status/kill-adopt/stop-survival),
-#           [8] stop/restart/rm, [9] M3 persistent volume + prune (vdc parity).
+#           [8] stop/restart/rm, [9] M3 persistent volume + prune (vdc parity),
+#           [10] VMM confinement (differential PoC + live status).
 $ErrorActionPreference = 'Continue'
 $exe   = if ($env:IZBA_EXE)   { $env:IZBA_EXE }   else { 'C:\izba\bin\izba.exe' }
 $image = if ($env:IZBA_IMAGE) { $env:IZBA_IMAGE } else { 'alpine:3.20' }
@@ -21,6 +22,25 @@ function Check($name, $ok) {
     else     { [Console]::Error.WriteLine("FAIL [$t]: $name"); $script:fails++ }
 }
 
+# Best-effort: dump the tail of a sandbox's vmm.log AND console.log to stderr so
+# a "did not become healthy" boot failure shows WHY in the CI log — even when
+# console.log is empty (e.g. the VMM never started, or hit an access-denied
+# HRESULT writing its scratch). vmm.log = openvmm's own stdout/stderr;
+# console.log = the guest serial. Purely diagnostic; never changes pass/fail.
+function Dump-BootLogs($name) {
+    $logs = "$env:LOCALAPPDATA\izba\sandboxes\$name\logs"
+    foreach ($f in @('vmm.log', 'console.log')) {
+        $p = Join-Path $logs $f
+        if (Test-Path $p) {
+            [Console]::Error.WriteLine("  --- $name $f tail (boot failure diag) ---")
+            Get-Content $p -Tail 40 -ErrorAction SilentlyContinue |
+                ForEach-Object { [Console]::Error.WriteLine("  $_") }
+        } else {
+            [Console]::Error.WriteLine("  ($name $f absent at $p)")
+        }
+    }
+}
+
 # Fresh workspace + no leftover sandbox from a previous run
 & $exe stop valid8 2>$null | Out-Null
 & $exe rm --force valid8 2>$null | Out-Null
@@ -29,7 +49,9 @@ New-Item -ItemType Directory -Path $ws | Out-Null
 
 # [1] run: create-on-first-use + pull + erofs + boot + exec, non-interactive
 & $exe run --image $image --name valid8 $ws -- /bin/sh -c 'echo booted > /workspace/marker && uname -s'
-Check 'run exits 0' ($LASTEXITCODE -eq 0)
+$valid8Boot = ($LASTEXITCODE -eq 0)
+Check 'run exits 0' $valid8Boot
+if (-not $valid8Boot) { Dump-BootLogs 'valid8' }
 Check 'workspace write visible on host' ((Get-Content "$ws\marker" -ErrorAction SilentlyContinue) -eq 'booted')
 
 # [2] liveness across CLI invocations (daemonless invariant)
@@ -77,6 +99,7 @@ foreach ($attempt in 1..3) {
     [Console]::Error.WriteLine("  egress-a boot attempt $attempt/3 timed out (nested-WHP flake); retrying from scratch")
 }
 Check 'izbad-egress sandbox boots (run exits 0)' $bootOk
+if (-not $bootOk) { Dump-BootLogs 'egress-a' }
 $egOut = (& $exe exec egress-a -- /bin/sh -lc 'getent hosts example.com' 2>&1 | Out-String)
 $egRc  = $LASTEXITCODE
 Check 'egress DNS via izbad resolves example.com' ($egRc -eq 0 -and $egOut -match 'example\.com')
@@ -179,6 +202,15 @@ Check 'restart after stop' ($LASTEXITCODE -eq 0)
 Check 'rm exits 0' ($LASTEXITCODE -eq 0)
 Check 'sandbox dir removed' (-not (Test-Path "$env:LOCALAPPDATA\izba\sandboxes\valid8"))
 
+# [8a] Workspace integrity restored. A confined VMM runs at Low IL, so izba
+# Low-labels the workspace share to let its in-process virtiofs write /workspace
+# (proven by [1]'s host-visible marker). Teardown (stop/rm) must raise the user's
+# project dir back to Medium so it is not left at Low. The dir ($ws) is the
+# user's own — outside the removed sandbox dir — so it still exists here.
+$wsLabel = (& icacls $ws 2>$null) -join "`n"
+Check 'workspace integrity restored to Medium after teardown (no residual Low label)' `
+    ($wsLabel -notmatch 'Low Mandatory Level')
+
 # [9] M3 volumes parity: a named persistent volume is an extra virtio-blk disk
 # (vdc) the OpenVMM driver routes to its own PCIe root port; it must format +
 # mount, survive a stop/start, persist past rm, and be reaped by prune. This is
@@ -203,6 +235,46 @@ Check 'persistent volume image survives rm' (Test-Path "$env:LOCALAPPDATA\izba\v
 & $exe volume prune -f | Out-Null
 Check 'prune exits 0' ($LASTEXITCODE -eq 0)
 Check 'prune reaps unreferenced volume' (-not (Test-Path "$env:LOCALAPPDATA\izba\volumes\vdata.img"))
+
+# [10] VMM confinement: the real OpenVMM process is launched confined by default
+# (restricted token + Low IL + job). This is the F-06 hardening proof and it must
+# FAIL the run on regression — a skipped security proof must NOT look green.
+#
+# (10a) Differential PoC: the confine_probe harness spawns each abuse case
+# confined-vs-unconfined on real WHP hardware and exits 0 iff every protection
+# holds (write-up/acquire-priv DENIED confined + OK unconfined; self-il Low vs
+# Medium; whp OK both, or SKIPPED if WHP absent). A missing probe path is a FAIL,
+# never a silent skip.
+if (-not $env:IZBA_CONFINE_PROBE) {
+    Check 'confine_probe harness exits 0 (differential PoC)' $false
+    [Console]::Error.WriteLine("  IZBA_CONFINE_PROBE is unset — refusing to skip the confinement proof")
+} elseif (-not (Test-Path $env:IZBA_CONFINE_PROBE)) {
+    Check 'confine_probe harness exits 0 (differential PoC)' $false
+    [Console]::Error.WriteLine("  IZBA_CONFINE_PROBE='$($env:IZBA_CONFINE_PROBE)' does not exist — refusing to skip the confinement proof")
+} else {
+    $probeOut = (& $env:IZBA_CONFINE_PROBE harness 2>&1 | Out-String)
+    $probeRc  = $LASTEXITCODE
+    Check 'confine_probe harness exits 0 (differential PoC)' ($probeRc -eq 0)
+    if ($probeRc -ne 0) {
+        [Console]::Error.WriteLine("  confine_probe harness rc=$probeRc")
+        ($probeOut -split "`n") | ForEach-Object { [Console]::Error.WriteLine("  $_") }
+    }
+}
+
+# (10b) Live product status: a real confined VMM must be honestly reported. The
+# earlier checks rm'd valid8, so boot a fresh one and assert `izba status` shows
+# a `confinement:` line that says `confined` and NOT `UNCONFINED`.
+& $exe run --image $image --name valid8 $ws -- /bin/true | Out-Null
+Check 'confinement status sandbox boots (run exits 0)' ($LASTEXITCODE -eq 0)
+$stConf = & $exe status valid8 | Out-String
+$confOk = ($stConf -match 'confinement:' -and $stConf -match 'confined' -and -not ($stConf -match 'UNCONFINED'))
+Check 'izba status reports the VMM as confined' $confOk
+if (-not $confOk) {
+    [Console]::Error.WriteLine("  --- izba status valid8 ---")
+    ($stConf -split "`n") | ForEach-Object { [Console]::Error.WriteLine("  $_") }
+}
+& $exe stop valid8 2>$null | Out-Null
+& $exe rm --force valid8 2>$null | Out-Null
 
 # Best-effort daemon cleanup so the validation run leaves no daemon behind.
 & $exe daemon stop 2>$null | Out-Null

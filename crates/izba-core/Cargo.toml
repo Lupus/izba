@@ -98,4 +98,12 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_Storage_FileSystem",
+    # WHvCreatePartition/WHvDeletePartition for the confine_probe capability gate
+    # (confinement must NOT break WHP). winhvplatform.dll, link-only.
+    "Win32_System_Hypervisor",
 ] }

@@ -3,6 +3,7 @@ pub mod openvmm;
 pub mod spec;
 pub use spec::*;
 
+use crate::procmgr::ConfinementStatus;
 use crate::state::PidIdentity;
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -40,6 +41,11 @@ pub trait VmHandle: Send {
     fn is_alive(&self) -> bool;
     /// Hard stop (SIGKILL all). Graceful shutdown goes through the guest RPC instead.
     fn kill(&mut self) -> anyhow::Result<()>;
+    /// The host-side confinement actually achieved for this VM's VMM process,
+    /// captured at launch. Surfaced in status and persisted into `state.json`
+    /// so liveness reporting is honest about whether a VM escape would be
+    /// contained.
+    fn confinement(&self) -> ConfinementStatus;
 }
 
 pub trait VmmDriver {

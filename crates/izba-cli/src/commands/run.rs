@@ -11,13 +11,26 @@ pub fn run(
     paths: &Paths,
     opts: &SandboxOpts,
     name_or_dir: &str,
+    allow_unconfined: bool,
     cmd: Vec<String>,
 ) -> anyhow::Result<i32> {
     let mut client = DaemonClient::connect(paths)?;
     let name = resolve_or_create(&mut client, paths, opts, name_or_dir)?;
-    match client.request(&DaemonRequest::Start { name: name.clone() }, &mut |m| {
-        eprintln!("{m}")
-    })? {
+    if allow_unconfined {
+        // Loud, BEFORE start: the user is waiving the host-side jail, so a VM
+        // escape would run with their full user privileges.
+        eprintln!(
+            "⚠️  WARNING: --allow-unconfined set — the VMM will run WITHOUT host-side \
+             confinement. A VM escape would run with your full user privileges."
+        );
+    }
+    match client.request(
+        &DaemonRequest::Start {
+            name: name.clone(),
+            allow_unconfined,
+        },
+        &mut |m| eprintln!("{m}"),
+    )? {
         DaemonResponse::Ok => {}
         // `run` is idempotent: already running is exactly the state we want.
         DaemonResponse::Error { message } if message.contains("already running") => {}

@@ -20,8 +20,71 @@ permissions:
   contents: read
 
 jobs:
+  # Windows host unit/mock coverage. Runs the SAME host suite as ci.yml's
+  # `cargo test (windows)` job under llvm-cov instrumentation so the
+  # #[cfg(windows)] code — notably procmgr/jail_windows.rs (the VMM jailer FFI)
+  # and its new unit tests — is MEASURED on PRs, not coverage-excluded. It does
+  # NOT run the real-VM e2e (that needs WHP/OpenVMM; owned by e2e.yml's
+  # windows-whp-coverage on the weekly/dispatch cadence). The emitted lcov is a
+  # hard `needs:` input to the linux scan below, which merges both files; the
+  # upload uses if-no-files-found: warn so a tooling hiccup degrades to "linux
+  # only" rather than blocking the PR — but the hard `needs` keeps it reliable.
+  coverage-windows:
+    name: coverage (rust host suite, windows)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          fetch-depth: 0  # full history → accurate Sonar new-code detection & blame
+      # llvm-tools-preview is the LLVM-coverage profiler component; the
+      # windows-latest runner ships rustup + stable, so add the component
+      # rather than re-installing a toolchain (mirrors e2e.yml's windows
+      # coverage leg, which relies on the preinstalled toolchain).
+      - name: Add llvm-tools-preview
+        shell: bash
+        run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: coverage-windows
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        with:
+          tool: cargo-llvm-cov
+      - name: Measure Windows host-suite coverage
+        shell: bash
+        run: |
+          # Single shell so the show-env instrumentation env persists across
+          # every cargo invocation (the documented robust pattern, mirroring
+          # e2e.yml's windows-whp-coverage job).
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov clean --workspace
+          # Host unit/mock suite ONLY — these run the #[cfg(windows)] jail tests.
+          # Report-only: a flaky test must not abort the run and wipe the lcov.
+          set +e
+          cargo test --locked -p izba-proto -p izba-core -p izba-cli
+          set -e
+          # Separator-agnostic regex: llvm-cov emits backslash paths on Windows;
+          # same test-harness stripping the linux path (hack/coverage.sh) uses.
+          IGNORE='([\\/]tests[\\/]|[\\/]target[\\/]|[\\/]build\.rs$)'
+          mkdir -p target/coverage
+          cargo llvm-cov report --lcov --output-path target/coverage/lcov-windows.info --ignore-filename-regex "$IGNORE"
+      - name: Upload Windows lcov artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-windows-lcov
+          path: target/coverage/lcov-windows.info
+          if-no-files-found: warn
+
   rust-host:
     name: coverage (rust workspace, linux)
+    needs: [coverage-windows]
+    # Run even if coverage-windows failed/was-skipped: the Windows lcov merge is
+    # additive, and the Download step is best-effort (continue-on-error), so a
+    # flaky Windows coverage job degrades to Linux-only coverage rather than
+    # skipping the authoritative Linux scan entirely.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -37,6 +100,16 @@ jobs:
           tool: cargo-llvm-cov
       - name: Measure coverage + build gap report
         run: hack/coverage.sh --html
+      # Pull the Windows lcov (from coverage-windows) so the PR Sonar scan can
+      # MERGE host Linux + host Windows coverage — this is how #[cfg(windows)]
+      # code (the VMM jailer FFI) gets measured on PRs. continue-on-error so a
+      # missing artifact degrades to a Linux-only scan rather than failing the PR.
+      - name: Download Windows lcov
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: coverage-windows-lcov
+          path: target/coverage/
       - name: Publish gap report to step summary
         if: always()
         run: |
@@ -86,3 +159,11 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          # Merge BOTH host lcov reports (Linux + Windows) so #[cfg(windows)]
+          # code is measured on PRs. Overrides the single path in
+          # sonar-project.properties for the PR scan only (the main-branch e2e
+          # analysis sets its own reportPaths). Sonar tolerates a missing entry
+          # (logs a warning), so a degraded windows leg still yields linux numbers.
+          args: >
+            -Dsonar.rust.lcov.reportPaths=target/coverage/lcov.info,target/coverage/lcov-windows.info

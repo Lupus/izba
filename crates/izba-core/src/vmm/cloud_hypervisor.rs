@@ -257,6 +257,15 @@ impl VmHandle for ChHandle {
         pid_alive(self.vmm_pid())
     }
 
+    fn confinement(&self) -> crate::procmgr::ConfinementStatus {
+        // The Linux host-side VMM jailer is a separate milestone, not a runtime
+        // failure: report it honestly as not-yet-implemented rather than
+        // claiming confinement that was never applied.
+        crate::procmgr::ConfinementStatus::degraded(
+            "linux host-side VMM jailer not yet implemented",
+        )
+    }
+
     fn kill(&mut self) -> anyhow::Result<()> {
         // In order: vmm first (it is pids[0]), then sidecars — killing the
         // backends first would leave the VMM running on dead devices.
@@ -302,6 +311,7 @@ mod tests {
             }],
             console_log: PathBuf::from("/sbx/console.log"),
             run_dir: PathBuf::from("/sbx/run"),
+            allow_unconfined: false,
         }
     }
 

@@ -113,6 +113,7 @@ mod tests {
                 .map(|(i, r)| (r.to_string(), sidecar_id(i as u32)))
                 .collect(),
             started_unix_ms: 0,
+            confinement: None,
         }
     }
 

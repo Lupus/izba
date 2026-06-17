@@ -28,7 +28,7 @@ MISSING=""
 for tool in curl sha256sum tar make file; do
     command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
 done
-if [ -n "$MISSING" ]; then
+if [[ -n "$MISSING" ]]; then
     echo "error: missing tools:$MISSING" >&2
     echo "install with: sudo apt-get install -y curl coreutils tar make file musl-tools" >&2
     exit 1
@@ -45,7 +45,7 @@ fi
 # Fetch (cached) + verify
 # ---------------------------------------------------------------------------
 mkdir -p "$CACHE"
-if [ ! -f "$TARBALL" ]; then
+if [[ ! -f "$TARBALL" ]]; then
     curl -fsSL -o "$TARBALL.part" "$URL" || { rm -f "$TARBALL.part"; exit 1; }
     mv "$TARBALL.part" "$TARBALL"
 fi
@@ -60,7 +60,7 @@ echo "sha256 OK: e2fsprogs-${VERSION}.tar.xz"
 # Extract
 # ---------------------------------------------------------------------------
 SRC="$CACHE/e2fsprogs-${VERSION}"
-[ -d "$SRC" ] || tar -C "$CACHE" -xf "$TARBALL"
+[[ -d "$SRC" ]] || tar -C "$CACHE" -xf "$TARBALL"
 
 # ---------------------------------------------------------------------------
 # Configure + build

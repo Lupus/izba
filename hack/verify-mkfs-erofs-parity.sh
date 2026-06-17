@@ -16,7 +16,7 @@ LINUX_MKFS="$CACHE/build-linux/mkfs/mkfs.erofs"
 LINUX_FSCK="$CACHE/build-linux/fsck/fsck.erofs"
 EXE="${IZBA_EROFS_EXE:-dist/mkfs.erofs.exe}"
 for f in "$LINUX_MKFS" "$LINUX_FSCK" "$EXE"; do
-    [ -f "$f" ] || { echo "error: $f missing — run hack/build-mkfs-erofs-windows.sh first" >&2; exit 1; }
+    [[ -f "$f" ]] || { echo "error: $f missing — run hack/build-mkfs-erofs-windows.sh first" >&2; exit 1; }
 done
 
 # Shared deterministic flags: -T0 pins timestamps, -U pins the volume UUID.

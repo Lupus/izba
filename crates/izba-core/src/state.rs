@@ -57,6 +57,11 @@ pub struct RunState {
     /// `(role, identity)` — roles like `"virtiofsd:workspace"`.
     pub sidecar_pids: Vec<(String, PidIdentity)>,
     pub started_unix_ms: u64,
+    /// Host-side confinement achieved for the VMM at launch. `Option` +
+    /// `serde(default)` so a `state.json` written before this field still
+    /// deserializes (it then reads as `None` ⇒ "unknown" in status).
+    #[serde(default)]
+    pub confinement: Option<crate::procmgr::ConfinementStatus>,
 }
 
 /// Crash-safe write: serialise to a sibling `.tmp` file in the same directory,
@@ -150,6 +155,7 @@ mod tests {
                 ),
             ],
             started_unix_ms: 1_700_000_000_000,
+            confinement: None,
         }
     }
 
@@ -181,6 +187,32 @@ mod tests {
         assert_eq!(loaded.vmm_pid, original.vmm_pid);
         assert_eq!(loaded.sidecar_pids, original.sidecar_pids);
         assert_eq!(loaded.started_unix_ms, original.started_unix_ms);
+    }
+
+    #[test]
+    fn run_state_without_confinement_defaults_none() {
+        // A state.json written before the confinement field must still load
+        // (the field is Option + serde(default) ⇒ None ⇒ "unknown" in status).
+        let legacy = r#"{
+            "vmm_pid": {"pid": 1, "starttime": 2},
+            "sidecar_pids": [],
+            "started_unix_ms": 0
+        }"#;
+        let s: RunState = serde_json::from_str(legacy).unwrap();
+        assert!(s.confinement.is_none());
+    }
+
+    #[test]
+    fn run_state_roundtrips_confinement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let mut s = sample_run_state();
+        s.confinement = Some(crate::procmgr::ConfinementStatus::applied(
+            &crate::procmgr::ConfinementPolicy::vmm_default(),
+        ));
+        save_json(&path, &s).unwrap();
+        let loaded: RunState = load_json(&path).unwrap().unwrap();
+        assert_eq!(loaded.confinement, s.confinement);
     }
 
     #[test]

@@ -15,7 +15,10 @@
 
 use super::spec::{reject_commas, CommandSpec, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
-use crate::procmgr::{kill_pid, pid_alive, spawn_detached};
+use crate::procmgr::{
+    kill_pid, pid_alive, restore_integrity_recursive, set_low_integrity_recursive, spawn_confined,
+    spawn_detached, ConfinementMode, ConfinementPolicy, ConfinementStatus,
+};
 use crate::state::PidIdentity;
 use crate::vsock::hybrid_connect;
 use anyhow::Context;
@@ -125,11 +128,98 @@ impl VmmDriver for OpenVmmDriver {
 
         // Guest serial goes to spec.console_log via --com1 file=; openvmm's
         // own stdout/stderr go to a sibling vmm.log.
-        let vmm_id = spawn_detached(&inv, &log_dir.join("vmm.log")).context("spawning openvmm")?;
+        let vmm_log = log_dir.join("vmm.log");
+
+        // Confined-by-default with a HARD fail-closed contract. The DEFAULT
+        // (no --allow-unconfined) path confines the VMM or errors — it NEVER
+        // falls back to an unconfined spawn. spawn_confined itself builds the
+        // restricted token before spawning anything, so a confinement failure
+        // never leaves a running unconfined VMM.
+        let mut policy = ConfinementPolicy::vmm_default();
+        // Size the best-effort resource job from the guest's RAM plus VMM
+        // overhead; the job is caps-only and never kill-on-close.
+        policy.job_memory_max_mb = Some(spec.mem_mb as u64 + 512);
+
+        let (vmm_id, confinement) = if spec.allow_unconfined {
+            // User EXPLICITLY opted out: run unconfined, record it loudly so
+            // status never silently claims confinement that was waived.
+            let id = spawn_detached(&inv, &vmm_log).context("spawning openvmm")?;
+            (
+                id,
+                ConfinementStatus::degraded(
+                    "--allow-unconfined: host-side VMM confinement disabled by user",
+                ),
+            )
+        } else {
+            // The confined VMM runs at Low integrity, but izbad created the
+            // sandbox's writable host files at Medium — and MIC forbids a Low-IL
+            // process from writing UP to Medium-IL objects, so the VM would never
+            // boot (empty console.log) and the guest could not write /workspace.
+            // Low-label EVERY host path the confined VMM must write
+            // (`VmSpec::confined_write_surfaces`: the scratch dir, the virtiofs
+            // shares, and writable disk backing files incl. named volumes outside
+            // the scratch). Lowering is a write-DOWN for izbad (Medium → Low), so
+            // izbad keeps full control; the labels are restored to Medium on
+            // teardown (sandbox::restore_confined_workspace). Inheritance is
+            // robust for plain creates; documented residuals (atomic-rename-in,
+            // post-teardown Low files) live in the design spec / F-06 finding.
+            //
+            // FAIL CLOSED, but NEVER strand a user dir at Low after a failed
+            // start: relabelling precedes state.json, so the state.json-gated
+            // teardown restore cannot undo it on an early failure. So if labelling
+            // ANY surface OR the confined spawn fails, restore every surface we
+            // touched before propagating the error.
+            let surfaces = spec.confined_write_surfaces();
+            let mut labelled: Vec<&PathBuf> = Vec::new();
+            for p in &surfaces {
+                if let Err(e) = set_low_integrity_recursive(p) {
+                    for done in &labelled {
+                        let _ = restore_integrity_recursive(done);
+                    }
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Low-labelling confined write surface {} so the VMM \
+                             (and its in-process virtiofs) can write it",
+                            p.display()
+                        )
+                    });
+                }
+                labelled.push(p);
+            }
+            match spawn_confined(&inv, &vmm_log, &policy) {
+                // Honest mapping: the resource job is best-effort, so report
+                // TokenOnly when it could not be applied even though token+IL
+                // (the real boundary) succeeded.
+                Ok((id, ConfinementMode::Restricted)) => (id, ConfinementStatus::applied(&policy)),
+                Ok((id, ConfinementMode::TokenOnly)) => {
+                    (id, ConfinementStatus::token_only(&policy))
+                }
+                // Unreachable on the confined path (the Windows jailer never
+                // returns None and the Unix stub is not hit here), but map it
+                // defensively rather than silently claiming confinement.
+                Ok((id, ConfinementMode::None)) => (
+                    id,
+                    ConfinementStatus::degraded("confinement unavailable on this platform"),
+                ),
+                Err(e) => {
+                    // The VMM never launched; undo the Low labels so a failed
+                    // confined start does not strand any user dir at Low.
+                    for p in &surfaces {
+                        let _ = restore_integrity_recursive(p);
+                    }
+                    anyhow::bail!(
+                        "failed to apply host-side confinement to the VMM: {e}. \
+                         Re-run with --allow-unconfined to start the VMM WITHOUT host-side \
+                         confinement (NOT recommended)."
+                    )
+                }
+            }
+        };
 
         Ok(Box::new(OpenVmmHandle {
             vsock_sock,
             vmm: ("vmm".to_string(), vmm_id),
+            confinement,
         }))
     }
 }
@@ -138,6 +228,8 @@ impl VmmDriver for OpenVmmDriver {
 struct OpenVmmHandle {
     vsock_sock: PathBuf,
     vmm: (String, PidIdentity),
+    /// Host-side confinement achieved at launch (see `VmHandle::confinement`).
+    confinement: ConfinementStatus,
 }
 
 impl VmHandle for OpenVmmHandle {
@@ -154,6 +246,10 @@ impl VmHandle for OpenVmmHandle {
         pid_alive(&self.vmm.1)
     }
 
+    fn confinement(&self) -> ConfinementStatus {
+        self.confinement.clone()
+    }
+
     fn kill(&mut self) -> anyhow::Result<()> {
         kill_pid(&self.vmm.1).context("killing vmm")
     }
@@ -164,6 +260,30 @@ mod tests {
     use super::*;
     use crate::vmm::spec::{BlockDisk, FsShare, VmSpec};
     use std::path::PathBuf;
+
+    /// The handle accessors (`pids`/`is_alive`/`confinement`) are otherwise only
+    /// reachable via a real `launch()` (VM-gated). Construct a handle directly to
+    /// exercise them: a fabricated dead pid reads as not-alive, and the recorded
+    /// confinement is surfaced verbatim.
+    #[test]
+    fn handle_accessors_report_pids_liveness_and_confinement() {
+        let h = OpenVmmHandle {
+            vsock_sock: PathBuf::from("/run/izba/vsock.sock"),
+            vmm: (
+                "vmm".to_string(),
+                PidIdentity {
+                    pid: u32::MAX, // a pid that does not exist -> not alive
+                    starttime: 0,
+                },
+            ),
+            confinement: ConfinementStatus::applied(&ConfinementPolicy::vmm_default()),
+        };
+        let pids = h.pids();
+        assert_eq!(pids.len(), 1);
+        assert_eq!(pids[0].0, "vmm");
+        assert!(!h.is_alive(), "a fabricated pid must not read as alive");
+        assert_eq!(h.confinement().mode, ConfinementMode::Restricted);
+    }
 
     fn base_spec() -> VmSpec {
         VmSpec {
@@ -188,6 +308,7 @@ mod tests {
             }],
             console_log: PathBuf::from("/sbx/console.log"),
             run_dir: PathBuf::from("/sbx/run"),
+            allow_unconfined: false,
         }
     }
 

@@ -309,7 +309,10 @@ pub fn dispatch(
                 d.registry.set(&c.name, &c.image_ref, Liveness::Stopped);
                 DaemonResponse::Created { name: c.name }
             }
-            DaemonRequest::Start { name } => {
+            DaemonRequest::Start {
+                name,
+                allow_unconfined,
+            } => {
                 progress(format!("starting '{name}'..."));
                 // Load config FIRST (reused below for relay republish), then
                 // bind the vsock_1027 egress listener BEFORE launch so the
@@ -320,7 +323,13 @@ pub fn dispatch(
                         .with_context(|| format!("no config.json for '{name}'"))?;
                 let art = (d.deps.artifacts)(&d.paths)?;
                 d.egress.ensure_listening(&d.paths, &name)?;
-                if let Err(e) = sandbox::start(&d.paths, &name, d.deps.driver.as_ref(), &art) {
+                if let Err(e) = sandbox::start(
+                    &d.paths,
+                    &name,
+                    d.deps.driver.as_ref(),
+                    &art,
+                    allow_unconfined,
+                ) {
                     // Boot never happened — tear the listener back down.
                     d.egress.stop(&d.paths, &name);
                     return Err(e);
@@ -372,6 +381,13 @@ pub fn dispatch(
                     .liveness(&name)
                     .unwrap_or(Liveness::Stopped)
                     .describe();
+                // Host-side VMM confinement is recorded in state.json at launch.
+                // None (stopped / pre-confinement state) ⇒ CLI shows "unknown".
+                let confinement = load_json::<crate::state::RunState>(
+                    &d.paths.sandbox_dir(&name).join(crate::state::STATE_FILE),
+                )?
+                .and_then(|s| s.confinement)
+                .map(|c| c.summary());
                 DaemonResponse::Inspect(SandboxDetail {
                     name,
                     image_ref: config.image_ref,
@@ -381,6 +397,7 @@ pub fn dispatch(
                     workspace: config.workspace.display().to_string(),
                     status,
                     ports: config.ports,
+                    confinement,
                 })
             }
             DaemonRequest::GuestRpc { name, req } => {
@@ -803,6 +820,8 @@ mod tests {
                 assert_eq!(det.image_digest, "sha256:abc");
                 assert_eq!(det.cpus, 1);
                 assert_eq!(det.status, "stopped");
+                // No state.json (never started) ⇒ confinement unknown.
+                assert_eq!(det.confinement, None);
             }
             other => panic!("inspect: {other:?}"),
         }
@@ -844,7 +863,13 @@ mod tests {
             rpc(&mut c, &create_req(&dir, "web")),
             DaemonResponse::Created { .. }
         ));
-        match rpc(&mut c, &DaemonRequest::Start { name: "web".into() }) {
+        match rpc(
+            &mut c,
+            &DaemonRequest::Start {
+                name: "web".into(),
+                allow_unconfined: false,
+            },
+        ) {
             DaemonResponse::Ok => {}
             // Start now binds the vsock_1027 egress listener unconditionally;
             // runtime-skip where the sandbox denies bind (house pattern).
@@ -898,7 +923,13 @@ mod tests {
         let mut c = client_conn(&d);
         let req = create_req(&dir, "web");
         assert!(matches!(rpc(&mut c, &req), DaemonResponse::Created { .. }));
-        match rpc(&mut c, &DaemonRequest::Start { name: "web".into() }) {
+        match rpc(
+            &mut c,
+            &DaemonRequest::Start {
+                name: "web".into(),
+                allow_unconfined: false,
+            },
+        ) {
             DaemonResponse::Ok => {}
             // Bind EPERM wears several wordings across sandboxes ("Permission
             // denied", "Operation not permitted") — runtime-skip on any.
