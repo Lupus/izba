@@ -60,6 +60,7 @@ mod win {
     /// `self-il` integrity-level payload names (written after the nonce).
     const IL_LOW: &str = "LOW";
     const IL_MEDIUM: &str = "MEDIUM";
+    const IL_HIGH: &str = "HIGH";
     const IL_OTHER: &str = "OTHER";
 
     /// Mandatory-label RIDs (winnt.h `SECURITY_MANDATORY_*_RID`). Not exported by
@@ -67,6 +68,7 @@ mod win {
     /// `jail_windows.rs`).
     const SECURITY_MANDATORY_LOW_RID: u32 = 0x0000_1000; // 4096
     const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x0000_2000; // 8192
+    const SECURITY_MANDATORY_HIGH_RID: u32 = 0x0000_3000; // 12288 (elevated)
 
     /// The abuse cases. `write-up` and `acquire-priv` are SECURITY gates (must be
     /// blocked under confinement, allowed without); `whp` is the CAPABILITY gate
@@ -258,9 +260,11 @@ mod win {
     }
 
     /// self-il: query our OWN token integrity level and return its name. This is
-    /// the positive control: a confined child must report `LOW`, an unconfined
-    /// one `MEDIUM`, directly proving `spawn_confined` lowered the IL (decoupled
-    /// from any %TEMP%-labeling assumption the write-up gate relies on).
+    /// the positive control: a confined child must report `LOW` while the
+    /// unconfined one reports a HIGHER level (`MEDIUM` normally, or `HIGH` when
+    /// the harness itself runs elevated — e.g. CI runners), directly proving
+    /// `spawn_confined` LOWERED the IL (decoupled from the %TEMP%-labeling the
+    /// write-up gate relies on).
     fn self_integrity_name() -> &'static str {
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
         use windows_sys::Win32::Security::{
@@ -326,6 +330,7 @@ mod win {
             match rid {
                 Some(SECURITY_MANDATORY_LOW_RID) => IL_LOW,
                 Some(SECURITY_MANDATORY_MEDIUM_RID) => IL_MEDIUM,
+                Some(SECURITY_MANDATORY_HIGH_RID) => IL_HIGH,
                 _ => IL_OTHER,
             }
         }
@@ -438,7 +443,11 @@ mod win {
         // confinement lowered the token IL (confined=LOW, unconfined=MEDIUM).
         match run_attempt(&exe, &log, "self-il", deadline) {
             Ok((confined, unconfined)) => {
-                let pass = confined.verdict == IL_LOW && unconfined.verdict == IL_MEDIUM;
+                // The control proves confinement LOWERED the IL: confined must be
+                // Low and the unconfined baseline must be a higher KNOWN level —
+                // Medium normally, or High when the harness runs elevated (CI).
+                let pass = confined.verdict == IL_LOW
+                    && (unconfined.verdict == IL_MEDIUM || unconfined.verdict == IL_HIGH);
                 if !pass {
                     all_pass = false;
                 }
@@ -449,7 +458,7 @@ mod win {
                     if pass { "PASS" } else { "FAIL" },
                 );
                 if !pass {
-                    println!("    -> expected confined=LOW unconfined=MEDIUM");
+                    println!("    -> expected confined=LOW unconfined=MEDIUM-or-HIGH");
                 }
             }
             Err(e) => {
