@@ -160,6 +160,18 @@ mod tests {
     }
 
     #[test]
+    fn medium_il_renders_in_status_reason() {
+        // The default policy is Low; exercise the Medium arm of `il_desc` via a
+        // Medium-integrity policy so the status text reads "medium-il".
+        let mut p = ConfinementPolicy::vmm_default();
+        p.integrity = IntegrityLevel::Medium;
+        assert!(ConfinementStatus::applied(&p).reason.contains("medium-il"));
+        assert!(ConfinementStatus::token_only(&p)
+            .reason
+            .contains("medium-il"));
+    }
+
+    #[test]
     fn is_confined_tracks_token_il_application() {
         // Restricted + TokenOnly both applied the Low-IL token → confined → the
         // workspace was relabelled → teardown must restore it.

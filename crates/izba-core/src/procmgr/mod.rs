@@ -82,3 +82,42 @@ mod current_identity_tests {
         assert!(pid_alive(&id), "the current process must read as alive");
     }
 }
+
+/// Exercises the non-Windows parity stubs so they are measured, not just
+/// compiled. The Windows realisations are covered by `jail_windows.rs`'s own
+/// `#[cfg(windows)]` tests (run under the Windows coverage job).
+#[cfg(all(test, not(windows)))]
+mod non_windows_stub_tests {
+    use super::*;
+    use crate::vmm::CommandSpec;
+
+    #[test]
+    fn integrity_label_helpers_are_noops() {
+        // No MIC on this platform: both calls are infallible no-ops.
+        let dir = std::env::temp_dir();
+        set_low_integrity_recursive(&dir).expect("set_low stub returns Ok");
+        restore_integrity_recursive(&dir).expect("restore stub returns Ok");
+    }
+
+    #[test]
+    fn spawn_confined_delegates_to_detached_reporting_none() {
+        // The parity stub spawns the process detached (no confinement) and
+        // honestly reports ConfinementMode::None. `/bin/true` exits immediately.
+        let log = std::env::temp_dir().join(format!(
+            "izba-spawn-confined-stub-{}.log",
+            std::process::id()
+        ));
+        let cmd = CommandSpec {
+            argv: vec!["/bin/true".to_string()],
+        };
+        let (id, mode) = spawn_confined(&cmd, &log, &ConfinementPolicy::vmm_default())
+            .expect("stub spawn succeeds");
+        assert_ne!(id.pid, 0, "spawned pid must be non-zero");
+        assert_eq!(
+            mode,
+            ConfinementMode::None,
+            "the non-Windows stub never confines"
+        );
+        let _ = std::fs::remove_file(&log);
+    }
+}

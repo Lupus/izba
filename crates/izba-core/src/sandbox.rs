@@ -1631,6 +1631,60 @@ mod tests {
         );
     }
 
+    /// A confined sandbox's teardown takes the load-config + restore-integrity
+    /// branch of `restore_confined_workspace` (the integrity restore itself is a
+    /// no-op on non-Windows; here we exercise the control flow). Must not panic.
+    #[test]
+    fn restore_confined_workspace_runs_full_path_for_confined_sandbox() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        // Record a CONFINED status so restore loads config + restores the ws.
+        save_json(
+            &paths.sandbox_dir("web").join(STATE_FILE),
+            &RunState {
+                vmm_pid: dead_identity(),
+                sidecar_pids: vec![],
+                started_unix_ms: 0,
+                confinement: Some(procmgr::ConfinementStatus::applied(
+                    &procmgr::ConfinementPolicy::vmm_default(),
+                )),
+            },
+        )
+        .unwrap();
+        restore_confined_workspace(&paths, "web"); // Ok(Some(config)) arm
+    }
+
+    /// `restore_confined_workspace` is a no-op for unconfined/legacy sandboxes
+    /// and tolerates a missing or malformed config without panicking — it is
+    /// called best-effort on every teardown path.
+    #[test]
+    fn restore_confined_workspace_skips_unconfined_and_tolerates_bad_config() {
+        let (_dir, paths) = test_paths();
+        let sdir = paths.sandbox_dir("box");
+        fs::create_dir_all(&sdir).unwrap();
+        // No state.json -> not confined -> early return.
+        restore_confined_workspace(&paths, "box");
+        // Unconfined state (confinement: None) -> is_confined() false -> return.
+        write_state(&paths, "box", dead_identity());
+        restore_confined_workspace(&paths, "box");
+        // Confined state but config.json MISSING (Ok(None) arm).
+        let confined = RunState {
+            vmm_pid: dead_identity(),
+            sidecar_pids: vec![],
+            started_unix_ms: 0,
+            confinement: Some(procmgr::ConfinementStatus::applied(
+                &procmgr::ConfinementPolicy::vmm_default(),
+            )),
+        };
+        save_json(&sdir.join(STATE_FILE), &confined).unwrap();
+        restore_confined_workspace(&paths, "box"); // Ok(None) arm
+                                                   // Confined state but MALFORMED config.json (Err arm).
+        fs::write(sdir.join(CONFIG_FILE), b"{ not json").unwrap();
+        restore_confined_workspace(&paths, "box"); // Err arm
+    }
+
     /// Verify that `create` pre-formats rw.img with ext4 when `mkfs.ext4` is
     /// available on PATH.  Skipped (with a note) when mkfs.ext4 is absent so
     /// the test suite stays green in minimal CI environments.
