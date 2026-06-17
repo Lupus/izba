@@ -191,11 +191,9 @@ impl Drop for ConnGuard {
 /// EOF — or until an `OpenStream` converts the connection into a raw splice.
 /// `_guard` is the accept-time connection count; dropped when we return.
 pub fn handle_connection(d: &Arc<Daemon>, mut stream: UdsStream, _guard: ConnGuard) {
-    let hello: DaemonHello = match read_frame(&mut stream) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let _ = hello; // the CLIENT decides about proto mismatches
+    if read_frame::<_, DaemonHello>(&mut stream).is_err() {
+        return; // hello never arrived — the CLIENT decides about proto mismatches
+    }
     if write_frame(
         &mut stream,
         &DaemonResponse::HelloOk {
@@ -211,45 +209,62 @@ pub fn handle_connection(d: &Arc<Daemon>, mut stream: UdsStream, _guard: ConnGua
     // A second handle onto the same socket for in-flight Progress frames, so
     // the `progress` closure does not hold a long-lived `&mut stream` borrow
     // across `dispatch` (whose terminal response is written to `stream`).
-    let mut progress_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
+    // A single Progress handle reused across requests (matches the pre-refactor
+    // single-clone-outside-the-loop behavior).
+    let Ok(mut progress_stream) = stream.try_clone() else {
+        return;
     };
     loop {
         let req: DaemonRequest = match read_frame(&mut stream) {
             Ok(r) => r,
             Err(_) => return, // client done (or died) — both are fine
         };
-        match req {
-            DaemonRequest::OpenStream { name } => {
-                match open_guest_stream(d, &name) {
-                    Ok(g) => {
-                        if write_frame(&mut stream, &DaemonResponse::Ok).is_err() {
-                            return;
-                        }
-                        splice(stream, g);
-                    }
-                    Err(e) => {
-                        let _ = write_frame(
-                            &mut stream,
-                            &DaemonResponse::Error {
-                                message: format!("{e:#}"),
-                            },
-                        );
-                    }
-                }
-                return; // the connection is consumed either way
+        // `serve_request` consumes `stream` only when the request converts the
+        // connection into a raw splice (or the socket dies); otherwise it
+        // hands the stream back so the loop can read the next request.
+        match serve_request(d, req, stream, &mut progress_stream) {
+            Some(s) => stream = s,
+            None => return,
+        }
+    }
+}
+
+/// Handle one request frame on an established connection. Returns the stream
+/// to keep serving on, or `None` once the connection is finished (a write
+/// failed, or an `OpenStream` spliced/consumed it).
+fn serve_request(
+    d: &Arc<Daemon>,
+    req: DaemonRequest,
+    mut stream: UdsStream,
+    progress_stream: &mut UdsStream,
+) -> Option<UdsStream> {
+    if let DaemonRequest::OpenStream { name } = req {
+        serve_open_stream(d, &name, stream);
+        return None; // the connection is consumed either way
+    }
+    let mut progress = |message: String| {
+        let _ = write_frame(progress_stream, &DaemonResponse::Progress { message });
+    };
+    let resp = dispatch(d, req, &mut progress);
+    write_frame(&mut stream, &resp).ok().map(|()| stream)
+}
+
+/// Reply to an `OpenStream`, then splice the connection to the guest stream
+/// port. Consumes `stream`.
+fn serve_open_stream(d: &Arc<Daemon>, name: &str, mut stream: UdsStream) {
+    match open_guest_stream(d, name) {
+        Ok(g) => {
+            if write_frame(&mut stream, &DaemonResponse::Ok).is_ok() {
+                splice(stream, g);
             }
-            req => {
-                let mut progress = |message: String| {
-                    let _ =
-                        write_frame(&mut progress_stream, &DaemonResponse::Progress { message });
-                };
-                let resp = dispatch(d, req, &mut progress);
-                if write_frame(&mut stream, &resp).is_err() {
-                    return;
-                }
-            }
+        }
+        Err(e) => {
+            let _ = write_frame(
+                &mut stream,
+                &DaemonResponse::Error {
+                    message: format!("{e:#}"),
+                },
+            );
         }
     }
 }
@@ -283,185 +298,229 @@ pub fn dispatch(
     req: DaemonRequest,
     progress: &mut dyn FnMut(String),
 ) -> DaemonResponse {
-    let result = (|| -> anyhow::Result<DaemonResponse> {
-        Ok(match req {
-            DaemonRequest::Create(c) => {
-                crate::volume::validate_volumes(&c.volumes)?;
-                progress(format!(
-                    "resolving {} (pulls if not cached)...",
-                    c.image_ref
-                ));
-                let digest = (d.deps.resolve_image)(&d.paths, &c.image_ref)?;
-                sandbox::create(
-                    &d.paths,
-                    &c.name,
-                    &CreateOpts {
-                        image_digest: digest,
-                        image_ref: c.image_ref.clone(),
-                        cpus: c.cpus,
-                        mem_mb: c.mem_mb,
-                        workspace: c.workspace.clone(),
-                        rw_size_gb: c.rw_size_gb,
-                        ports: c.ports.clone(),
-                        volumes: c.volumes.clone(),
-                    },
-                )?;
-                d.registry.set(&c.name, &c.image_ref, Liveness::Stopped);
-                DaemonResponse::Created { name: c.name }
-            }
-            DaemonRequest::Start {
-                name,
-                allow_unconfined,
-            } => {
-                progress(format!("starting '{name}'..."));
-                // Load config FIRST (reused below for relay republish), then
-                // bind the vsock_1027 egress listener BEFORE launch so the
-                // guest can dial izbad during boot. Every sandbox owns one —
-                // egress is unconditional now.
-                let config: SandboxConfig =
-                    load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
-                        .with_context(|| format!("no config.json for '{name}'"))?;
-                let art = (d.deps.artifacts)(&d.paths)?;
-                d.egress.ensure_listening(&d.paths, &name)?;
-                if let Err(e) = sandbox::start(
-                    &d.paths,
-                    &name,
-                    d.deps.driver.as_ref(),
-                    &art,
-                    allow_unconfined,
-                ) {
-                    // Boot never happened — tear the listener back down.
-                    d.egress.stop(&d.paths, &name);
-                    return Err(e);
-                }
-                // (Re-)apply the persisted publish rules afresh, as threads.
-                d.relays.stop_all(&name);
-                for rule in &config.ports {
-                    if let Err(e) = d.relays.publish(&d.paths, &name, rule.clone()) {
-                        progress(format!(
-                            "warning: not publishing {}:{}: {e:#}",
-                            rule.bind, rule.host_port
-                        ));
-                    }
-                }
-                relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
-                d.registry.set(&name, &config.image_ref, Liveness::Running);
-                DaemonResponse::Ok
-            }
-            // Stop/Rm tear relays down only AFTER the sandbox op succeeds —
-            // a failed stop/rm (e.g. `rm` without force on a running
-            // sandbox) must leave published ports running. During a graceful
-            // stop the relay threads still accept; their vsock dials fail
-            // once the VM dies, which relay_one handles (logged, conn
-            // closed) — same ordering as the pre-daemon relay teardown.
-            DaemonRequest::Stop { name } => {
-                sandbox::stop(&d.paths, &name, d.connector(), STOP_TIMEOUT)?;
-                d.relays.stop_all(&name);
-                d.egress.stop(&d.paths, &name);
-                let _ = std::fs::remove_file(relays::rules_path(&d.paths, &name));
-                d.registry.set_liveness(&name, Liveness::Stopped);
-                DaemonResponse::Ok
-            }
-            DaemonRequest::Rm { name, force } => {
-                sandbox::remove(&d.paths, &name, d.connector(), force)?;
-                d.relays.stop_all(&name);
-                d.egress.stop(&d.paths, &name);
-                d.registry.remove(&name);
-                DaemonResponse::Ok
-            }
-            DaemonRequest::List => DaemonResponse::List {
-                sandboxes: d.registry.summaries(),
-            },
-            DaemonRequest::Inspect { name } => {
-                let config: SandboxConfig =
-                    load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
-                        .with_context(|| format!("no such sandbox '{name}'"))?;
-                let status = d
-                    .registry
-                    .liveness(&name)
-                    .unwrap_or(Liveness::Stopped)
-                    .describe();
-                // Host-side VMM confinement is recorded in state.json at launch.
-                // None (stopped / pre-confinement state) ⇒ CLI shows "unknown".
-                let confinement = load_json::<crate::state::RunState>(
-                    &d.paths.sandbox_dir(&name).join(crate::state::STATE_FILE),
-                )?
-                .and_then(|s| s.confinement)
-                .map(|c| c.summary());
-                DaemonResponse::Inspect(SandboxDetail {
-                    name,
-                    image_ref: config.image_ref,
-                    image_digest: config.image_digest,
-                    cpus: config.cpus,
-                    mem_mb: config.mem_mb,
-                    workspace: config.workspace.display().to_string(),
-                    status,
-                    ports: config.ports,
-                    confinement,
-                })
-            }
-            DaemonRequest::GuestRpc { name, req } => {
-                let mut conn = sandbox::control(&d.paths, &name, d.connector())?;
-                write_frame(&mut conn, &req)?;
-                let resp: Response = read_frame(&mut conn)?;
-                DaemonResponse::Guest { payload: resp }
-            }
-            DaemonRequest::PortPublish { name, rule } => {
-                // Same liveness gate as the old publish_port.
-                drop(sandbox::control(&d.paths, &name, d.connector())?);
-                d.relays.publish(&d.paths, &name, rule)?;
-                relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
-                DaemonResponse::Ok
-            }
-            DaemonRequest::PortUnpublish {
-                name,
-                bind,
-                host_port,
-            } => {
-                sandbox_must_exist(&d.paths, &name)?;
-                d.relays.unpublish(&name, bind, host_port)?;
-                relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
-                DaemonResponse::Ok
-            }
-            DaemonRequest::PortList { name } => {
-                sandbox_must_exist(&d.paths, &name)?;
-                DaemonResponse::Ports {
-                    rules: d.relays.active(&name),
-                }
-            }
-            DaemonRequest::Status => DaemonResponse::Status(DaemonStatus {
-                version: d.deps.version.clone(),
-                proto: crate::daemon::proto::DAEMON_PROTO_VERSION,
-                build: crate::build_info::BuildInfoOwned::current(),
-                pid: std::process::id(),
-                uptime_ms: d.started.elapsed().as_millis() as u64,
-                socket: d.paths.daemon_socket().display().to_string(),
-                sandboxes: d.registry.summaries(),
-            }),
-            DaemonRequest::VolumePrune => {
-                let pruned = sandbox::prune_volumes(&d.paths)?;
-                DaemonResponse::Pruned {
-                    removed: pruned.removed,
-                    reclaimed_bytes: pruned.reclaimed_bytes,
-                }
-            }
-            DaemonRequest::ReloadPolicy { name } => {
-                sandbox_must_exist(&d.paths, &name)?;
-                d.egress.reload_policy(&d.paths, &name);
-                DaemonResponse::Ok
-            }
-            DaemonRequest::Shutdown => {
-                d.request_shutdown();
-                DaemonResponse::Ok
-            }
-            DaemonRequest::OpenStream { .. } => {
-                bail!("OpenStream is handled at the connection layer")
-            }
-        })
-    })();
-    result.unwrap_or_else(|e| DaemonResponse::Error {
+    dispatch_inner(d, req, progress).unwrap_or_else(|e| DaemonResponse::Error {
         message: format!("{e:#}"),
     })
+}
+
+/// The fallible body of [`dispatch`]: route each request variant to its
+/// handler. The arms stay one-line so the routing itself carries no nesting;
+/// the per-variant work lives in the `handle_*` helpers below.
+fn dispatch_inner(
+    d: &Arc<Daemon>,
+    req: DaemonRequest,
+    progress: &mut dyn FnMut(String),
+) -> anyhow::Result<DaemonResponse> {
+    match req {
+        DaemonRequest::Create(c) => handle_create(d, c, progress),
+        DaemonRequest::Start {
+            name,
+            allow_unconfined,
+        } => handle_start(d, name, allow_unconfined, progress),
+        DaemonRequest::Stop { name } => handle_stop(d, name),
+        DaemonRequest::Rm { name, force } => handle_rm(d, name, force),
+        DaemonRequest::List => Ok(DaemonResponse::List {
+            sandboxes: d.registry.summaries(),
+        }),
+        DaemonRequest::Inspect { name } => handle_inspect(d, name),
+        DaemonRequest::GuestRpc { name, req } => handle_guest_rpc(d, name, req),
+        DaemonRequest::PortPublish { name, rule } => handle_port_publish(d, name, rule),
+        DaemonRequest::PortUnpublish {
+            name,
+            bind,
+            host_port,
+        } => handle_port_unpublish(d, name, bind, host_port),
+        DaemonRequest::PortList { name } => {
+            sandbox_must_exist(&d.paths, &name)?;
+            Ok(DaemonResponse::Ports {
+                rules: d.relays.active(&name),
+            })
+        }
+        DaemonRequest::Status => Ok(DaemonResponse::Status(DaemonStatus {
+            version: d.deps.version.clone(),
+            proto: crate::daemon::proto::DAEMON_PROTO_VERSION,
+            build: crate::build_info::BuildInfoOwned::current(),
+            pid: std::process::id(),
+            uptime_ms: d.started.elapsed().as_millis() as u64,
+            socket: d.paths.daemon_socket().display().to_string(),
+            sandboxes: d.registry.summaries(),
+        })),
+        DaemonRequest::VolumePrune => {
+            let pruned = sandbox::prune_volumes(&d.paths)?;
+            Ok(DaemonResponse::Pruned {
+                removed: pruned.removed,
+                reclaimed_bytes: pruned.reclaimed_bytes,
+            })
+        }
+        DaemonRequest::ReloadPolicy { name } => {
+            sandbox_must_exist(&d.paths, &name)?;
+            d.egress.reload_policy(&d.paths, &name);
+            Ok(DaemonResponse::Ok)
+        }
+        DaemonRequest::Shutdown => {
+            d.request_shutdown();
+            Ok(DaemonResponse::Ok)
+        }
+        DaemonRequest::OpenStream { .. } => {
+            bail!("OpenStream is handled at the connection layer")
+        }
+    }
+}
+
+fn handle_create(
+    d: &Arc<Daemon>,
+    c: crate::daemon::proto::DaemonCreate,
+    progress: &mut dyn FnMut(String),
+) -> anyhow::Result<DaemonResponse> {
+    crate::volume::validate_volumes(&c.volumes)?;
+    progress(format!(
+        "resolving {} (pulls if not cached)...",
+        c.image_ref
+    ));
+    let digest = (d.deps.resolve_image)(&d.paths, &c.image_ref)?;
+    sandbox::create(
+        &d.paths,
+        &c.name,
+        &CreateOpts {
+            image_digest: digest,
+            image_ref: c.image_ref.clone(),
+            cpus: c.cpus,
+            mem_mb: c.mem_mb,
+            workspace: c.workspace.clone(),
+            rw_size_gb: c.rw_size_gb,
+            ports: c.ports.clone(),
+            volumes: c.volumes.clone(),
+        },
+    )?;
+    d.registry.set(&c.name, &c.image_ref, Liveness::Stopped);
+    Ok(DaemonResponse::Created { name: c.name })
+}
+
+fn handle_start(
+    d: &Arc<Daemon>,
+    name: String,
+    allow_unconfined: bool,
+    progress: &mut dyn FnMut(String),
+) -> anyhow::Result<DaemonResponse> {
+    progress(format!("starting '{name}'..."));
+    // Load config FIRST (reused below for relay republish), then
+    // bind the vsock_1027 egress listener BEFORE launch so the
+    // guest can dial izbad during boot. Every sandbox owns one —
+    // egress is unconditional now.
+    let config: SandboxConfig = load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
+        .with_context(|| format!("no config.json for '{name}'"))?;
+    let art = (d.deps.artifacts)(&d.paths)?;
+    d.egress.ensure_listening(&d.paths, &name)?;
+    if let Err(e) = sandbox::start(
+        &d.paths,
+        &name,
+        d.deps.driver.as_ref(),
+        &art,
+        allow_unconfined,
+    ) {
+        // Boot never happened — tear the listener back down.
+        d.egress.stop(&d.paths, &name);
+        return Err(e);
+    }
+    // (Re-)apply the persisted publish rules afresh, as threads.
+    d.relays.stop_all(&name);
+    for rule in &config.ports {
+        if let Err(e) = d.relays.publish(&d.paths, &name, rule.clone()) {
+            progress(format!(
+                "warning: not publishing {}:{}: {e:#}",
+                rule.bind, rule.host_port
+            ));
+        }
+    }
+    relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+    d.registry.set(&name, &config.image_ref, Liveness::Running);
+    Ok(DaemonResponse::Ok)
+}
+
+// Stop/Rm tear relays down only AFTER the sandbox op succeeds —
+// a failed stop/rm (e.g. `rm` without force on a running
+// sandbox) must leave published ports running. During a graceful
+// stop the relay threads still accept; their vsock dials fail
+// once the VM dies, which relay_one handles (logged, conn
+// closed) — same ordering as the pre-daemon relay teardown.
+fn handle_stop(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> {
+    sandbox::stop(&d.paths, &name, d.connector(), STOP_TIMEOUT)?;
+    d.relays.stop_all(&name);
+    d.egress.stop(&d.paths, &name);
+    let _ = std::fs::remove_file(relays::rules_path(&d.paths, &name));
+    d.registry.set_liveness(&name, Liveness::Stopped);
+    Ok(DaemonResponse::Ok)
+}
+
+fn handle_rm(d: &Arc<Daemon>, name: String, force: bool) -> anyhow::Result<DaemonResponse> {
+    sandbox::remove(&d.paths, &name, d.connector(), force)?;
+    d.relays.stop_all(&name);
+    d.egress.stop(&d.paths, &name);
+    d.registry.remove(&name);
+    Ok(DaemonResponse::Ok)
+}
+
+fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> {
+    let config: SandboxConfig = load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
+        .with_context(|| format!("no such sandbox '{name}'"))?;
+    let status = d
+        .registry
+        .liveness(&name)
+        .unwrap_or(Liveness::Stopped)
+        .describe();
+    // Host-side VMM confinement is recorded in state.json at launch.
+    // None (stopped / pre-confinement state) ⇒ CLI shows "unknown".
+    let confinement = load_json::<crate::state::RunState>(
+        &d.paths.sandbox_dir(&name).join(crate::state::STATE_FILE),
+    )?
+    .and_then(|s| s.confinement)
+    .map(|c| c.summary());
+    Ok(DaemonResponse::Inspect(SandboxDetail {
+        name,
+        image_ref: config.image_ref,
+        image_digest: config.image_digest,
+        cpus: config.cpus,
+        mem_mb: config.mem_mb,
+        workspace: config.workspace.display().to_string(),
+        status,
+        ports: config.ports,
+        confinement,
+    }))
+}
+
+fn handle_guest_rpc(
+    d: &Arc<Daemon>,
+    name: String,
+    req: izba_proto::Request,
+) -> anyhow::Result<DaemonResponse> {
+    let mut conn = sandbox::control(&d.paths, &name, d.connector())?;
+    write_frame(&mut conn, &req)?;
+    let resp: Response = read_frame(&mut conn)?;
+    Ok(DaemonResponse::Guest { payload: resp })
+}
+
+fn handle_port_publish(
+    d: &Arc<Daemon>,
+    name: String,
+    rule: crate::state::PortRule,
+) -> anyhow::Result<DaemonResponse> {
+    // Same liveness gate as the old publish_port.
+    drop(sandbox::control(&d.paths, &name, d.connector())?);
+    d.relays.publish(&d.paths, &name, rule)?;
+    relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+    Ok(DaemonResponse::Ok)
+}
+
+fn handle_port_unpublish(
+    d: &Arc<Daemon>,
+    name: String,
+    bind: std::net::Ipv4Addr,
+    host_port: u16,
+) -> anyhow::Result<DaemonResponse> {
+    sandbox_must_exist(&d.paths, &name)?;
+    d.relays.unpublish(&name, bind, host_port)?;
+    relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+    Ok(DaemonResponse::Ok)
 }
 
 /// Pre-daemon port commands errored on unknown sandboxes; keep that contract.

@@ -179,6 +179,28 @@ pub fn pid_alive(id: &PidIdentity) -> bool {
 /// recycled PID that merely happens to claim a dead parent's PID as its
 /// PPID is never swept up.
 fn descendants_of(root: u32, root_starttime: u64) -> Vec<u32> {
+    let table = process_table();
+    let mut frontier = vec![root];
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < frontier.len() {
+        let parent = frontier[i];
+        i += 1;
+        for &(pid, ppid) in &table {
+            if ppid != parent || pid == parent || frontier.contains(&pid) {
+                continue;
+            }
+            if is_live_descendant(pid, root_starttime) {
+                frontier.push(pid);
+                found.push(pid);
+            }
+        }
+    }
+    found
+}
+
+/// Snapshot the live process set as `(pid, ppid)` pairs. Empty on failure.
+fn process_table() -> Vec<(u32, u32)> {
     // SAFETY: plain FFI; the snapshot handle is closed by OwnedHandle.
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snap == INVALID_HANDLE_VALUE {
@@ -187,7 +209,6 @@ fn descendants_of(root: u32, root_starttime: u64) -> Vec<u32> {
     let snap = OwnedHandle(snap);
     let mut entry: PROCESSENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
-    // (pid, ppid) pairs for every live process.
     let mut table: Vec<(u32, u32)> = Vec::new();
     // SAFETY: valid snapshot handle and a properly-sized entry.
     unsafe {
@@ -200,27 +221,16 @@ fn descendants_of(root: u32, root_starttime: u64) -> Vec<u32> {
             }
         }
     }
-    let mut frontier = vec![root];
-    let mut found = Vec::new();
-    let mut i = 0;
-    while i < frontier.len() {
-        let parent = frontier[i];
-        i += 1;
-        for &(pid, ppid) in &table {
-            if ppid != parent || pid == parent || frontier.contains(&pid) {
-                continue;
-            }
-            let Some(h) = open_query(pid) else { continue };
-            match creation_time(h.0) {
-                Some(t) if t >= root_starttime => {
-                    frontier.push(pid);
-                    found.push(pid);
-                }
-                _ => {}
-            }
-        }
-    }
-    found
+    table
+}
+
+/// True iff `pid` is openable and was created at or after `root_starttime` —
+/// so a recycled PID claiming a dead parent's PID as PPID is never swept up.
+fn is_live_descendant(pid: u32, root_starttime: u64) -> bool {
+    let Some(h) = open_query(pid) else {
+        return false;
+    };
+    matches!(creation_time(h.0), Some(t) if t >= root_starttime)
 }
 
 /// How long to wait for a terminated process to FULLY die. TerminateProcess

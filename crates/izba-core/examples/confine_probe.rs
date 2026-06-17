@@ -389,82 +389,15 @@ mod win {
         );
 
         for &attempt in SECURITY_ATTEMPTS.iter().chain(CAPABILITY_ATTEMPTS) {
-            let security = SECURITY_ATTEMPTS.contains(&attempt);
-
-            // WHP capability precheck (Fix 2): if the hypervisor is absent, SKIP
-            // the whp gate — neither a pass nor a fail; it's neutral.
-            if attempt == "whp" && !whp_present() {
-                println!(
-                    "{attempt:<14} {:<16} {:<16} SKIPPED (WHP not present on this host)",
-                    "-", "-"
-                );
-                continue;
-            }
-
-            let row = run_attempt(&exe, &log, attempt, deadline);
-            let (confined, unconfined) = match row {
-                Ok(pair) => pair,
-                Err(e) => {
-                    println!("{attempt:<14} {:<16} {:<16} FAIL ({e})", "-", "-");
-                    all_pass = false;
-                    continue;
-                }
-            };
-
-            let pass = if security {
-                // SECURITY gate: must be DENIED confined AND OK unconfined.
-                // The unconfined==OK clause defeats a vacuous test (e.g. the op
-                // failing for an incidental reason rather than the confinement).
-                confined.verdict == DENIED && unconfined.verdict == OK
-            } else {
-                // CAPABILITY gate: confinement must not break it.
-                confined.verdict == OK && unconfined.verdict == OK
-            };
-            if !pass {
+            if !run_one_attempt(&exe, &log, attempt, deadline) {
                 all_pass = false;
-            }
-            println!(
-                "{attempt:<14} {:<16} {:<16} {}",
-                confined.verdict,
-                unconfined.verdict,
-                if pass { "PASS" } else { "FAIL" },
-            );
-            if !pass {
-                let want = if security {
-                    "expected confined=DENIED unconfined=OK"
-                } else {
-                    "expected confined=OK unconfined=OK"
-                };
-                println!("    -> {want}");
             }
         }
 
         // self-il positive control (Fix 3): its own row, asserting the
         // confinement lowered the token IL (confined=LOW, unconfined=MEDIUM).
-        match run_attempt(&exe, &log, "self-il", deadline) {
-            Ok((confined, unconfined)) => {
-                // The control proves confinement LOWERED the IL: confined must be
-                // Low and the unconfined baseline must be a higher KNOWN level —
-                // Medium normally, or High when the harness runs elevated (CI).
-                let pass = confined.verdict == IL_LOW
-                    && (unconfined.verdict == IL_MEDIUM || unconfined.verdict == IL_HIGH);
-                if !pass {
-                    all_pass = false;
-                }
-                println!(
-                    "self-il        confined={:<8} unconfined={:<8} -> {}",
-                    confined.verdict,
-                    unconfined.verdict,
-                    if pass { "PASS" } else { "FAIL" },
-                );
-                if !pass {
-                    println!("    -> expected confined=LOW unconfined=MEDIUM-or-HIGH");
-                }
-            }
-            Err(e) => {
-                println!("self-il        {:<16} {:<16} FAIL ({e})", "-", "-");
-                all_pass = false;
-            }
+        if !run_self_il_control(&exe, &log, deadline) {
+            all_pass = false;
         }
 
         if all_pass {
@@ -474,6 +407,83 @@ mod win {
             println!("confine_probe: FAILURES present — confinement differential not satisfied");
             ExitCode::from(1)
         }
+    }
+
+    /// Run one security/capability attempt both confined and unconfined, print
+    /// its result row, and report whether it passed its gate. A WHP precheck
+    /// SKIP (hypervisor absent) is neutral and counts as a pass; a harness error
+    /// is a fail.
+    fn run_one_attempt(exe: &Path, log: &Path, attempt: &str, deadline: Instant) -> bool {
+        let security = SECURITY_ATTEMPTS.contains(&attempt);
+
+        // WHP capability precheck (Fix 2): if the hypervisor is absent, SKIP
+        // the whp gate — neither a pass nor a fail; it's neutral.
+        if attempt == "whp" && !whp_present() {
+            println!(
+                "{attempt:<14} {:<16} {:<16} SKIPPED (WHP not present on this host)",
+                "-", "-"
+            );
+            return true;
+        }
+
+        let (confined, unconfined) = match run_attempt(exe, log, attempt, deadline) {
+            Ok(pair) => pair,
+            Err(e) => {
+                println!("{attempt:<14} {:<16} {:<16} FAIL ({e})", "-", "-");
+                return false;
+            }
+        };
+
+        let pass = if security {
+            // SECURITY gate: must be DENIED confined AND OK unconfined.
+            // The unconfined==OK clause defeats a vacuous test (e.g. the op
+            // failing for an incidental reason rather than the confinement).
+            confined.verdict == DENIED && unconfined.verdict == OK
+        } else {
+            // CAPABILITY gate: confinement must not break it.
+            confined.verdict == OK && unconfined.verdict == OK
+        };
+        println!(
+            "{attempt:<14} {:<16} {:<16} {}",
+            confined.verdict,
+            unconfined.verdict,
+            if pass { "PASS" } else { "FAIL" },
+        );
+        if !pass {
+            let want = if security {
+                "expected confined=DENIED unconfined=OK"
+            } else {
+                "expected confined=OK unconfined=OK"
+            };
+            println!("    -> {want}");
+        }
+        pass
+    }
+
+    /// The `self-il` positive control: prove confinement LOWERED the token IL
+    /// (confined must be Low; the unconfined baseline a higher KNOWN level —
+    /// Medium normally, or High when the harness runs elevated in CI). Prints its
+    /// row and returns whether the control passed.
+    fn run_self_il_control(exe: &Path, log: &Path, deadline: Instant) -> bool {
+        let (confined, unconfined) = match run_attempt(exe, log, "self-il", deadline) {
+            Ok(pair) => pair,
+            Err(e) => {
+                println!("self-il        {:<16} {:<16} FAIL ({e})", "-", "-");
+                return false;
+            }
+        };
+        let pass = confined.verdict == IL_LOW
+            && (unconfined.verdict == IL_MEDIUM || unconfined.verdict == IL_HIGH);
+        println!(
+            "self-il        confined={:<8} unconfined={:<8} -> {}",
+            confined.verdict,
+            unconfined.verdict,
+            if pass { "PASS" } else { "FAIL" },
+        );
+        if !pass {
+            println!("    -> expected confined=LOW unconfined=MEDIUM-or-HIGH");
+        }
+        pass
     }
 
     /// Run one attempt both confined and unconfined; return (confined, unconfined).

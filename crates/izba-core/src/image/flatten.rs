@@ -72,86 +72,110 @@ fn stage_layers(layers: Vec<Box<dyn Read>>) -> Result<Vec<File>> {
 fn index_layers(staged: &[File]) -> Result<BTreeMap<String, Node>> {
     let mut map: BTreeMap<String, Node> = BTreeMap::new();
     for (i, file) in staged.iter().enumerate() {
-        // Sub-pass (a): whiteouts and opaque markers.
-        let mut f = file.try_clone()?;
-        f.seek(SeekFrom::Start(0))?;
-        let mut ar = tar::Archive::new(f);
-        for entry in ar.entries().with_context(|| format!("read layer {i}"))? {
-            let entry = entry.with_context(|| format!("read layer {i}"))?;
-            if is_metadata(entry.header().entry_type()) {
-                continue;
-            }
-            let Some(path) = normalize(&entry.path()?)? else {
-                continue;
-            };
-            let (parent, base) = split(&path);
-            if base == ".wh..wh..opq" {
-                remove_subtree(&mut map, parent);
-            } else if let Some(name) = base.strip_prefix(".wh.") {
-                let target = join(parent, name);
-                map.remove(&target);
-                remove_subtree(&mut map, &target);
-            }
-        }
-
-        // Sub-pass (b): regular entries.
-        let mut f = file.try_clone()?;
-        f.seek(SeekFrom::Start(0))?;
-        let mut ar = tar::Archive::new(f);
-        for entry in ar.entries().with_context(|| format!("read layer {i}"))? {
-            let entry = entry.with_context(|| format!("read layer {i}"))?;
-            let ty = entry.header().entry_type();
-            if is_metadata(ty) {
-                continue;
-            }
-            // GNU old-style sparse entries cannot be re-emitted faithfully;
-            // fail closed rather than silently corrupting the output.
-            if ty == EntryType::GNUSparse {
-                let path = entry.path().unwrap_or_default();
-                bail!("GNU sparse entries are not supported (entry {:?})", path);
-            }
-            let Some(path) = normalize(&entry.path()?)? else {
-                continue;
-            };
-            let (_, base) = split(&path);
-            if base.starts_with(".wh.") {
-                continue; // consumed in sub-pass (a)
-            }
-            // Normalize hardlink link targets the same way we normalize entry
-            // paths: strip leading `./` / `/`, reject `..` components.
-            // Symlink targets are left raw — absolute paths and `..` are
-            // legitimate filesystem semantics for symlinks.
-            let link_name = if ty == EntryType::Link {
-                entry
-                    .link_name()?
-                    .map(|raw| -> Result<PathBuf> {
-                        normalize(&raw)?.map(PathBuf::from).ok_or_else(|| {
-                            anyhow::anyhow!("hardlink in layer {i} has an empty link target")
-                        })
-                    })
-                    .transpose()?
-            } else {
-                entry.link_name()?.map(|c| c.into_owned())
-            };
-            // A non-dir replacing anything hides everything that was under
-            // that path (dir replaced by file drops the subtree). A dir over
-            // a dir just replaces the node and keeps children.
-            if ty != EntryType::Directory {
-                remove_subtree(&mut map, &path);
-            }
-            map.insert(
-                path,
-                Node {
-                    layer: i,
-                    offset: entry.raw_file_position(),
-                    size: entry.size(),
-                    header: entry.header().clone(),
-                    link_name,
-                },
-            );
-        }
+        // Sub-pass (a): whiteouts and opaque markers (affect lower layers).
+        apply_whiteouts(&mut map, file, i)?;
+        // Sub-pass (b): the layer's own regular entries (tar last-wins).
+        insert_entries(&mut map, file, i)?;
     }
     Ok(map)
+}
+
+/// Clone `file` and open a fresh tar archive over it from offset 0.
+fn open_layer(file: &File) -> Result<tar::Archive<File>> {
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(0))?;
+    Ok(tar::Archive::new(f))
+}
+
+/// Sub-pass (a): apply this layer's whiteouts/opaque markers to lower content.
+fn apply_whiteouts(map: &mut BTreeMap<String, Node>, file: &File, i: usize) -> Result<()> {
+    let mut ar = open_layer(file)?;
+    for entry in ar.entries().with_context(|| format!("read layer {i}"))? {
+        let entry = entry.with_context(|| format!("read layer {i}"))?;
+        if is_metadata(entry.header().entry_type()) {
+            continue;
+        }
+        let Some(path) = normalize(&entry.path()?)? else {
+            continue;
+        };
+        let (parent, base) = split(&path);
+        if base == ".wh..wh..opq" {
+            remove_subtree(map, parent);
+        } else if let Some(name) = base.strip_prefix(".wh.") {
+            let target = join(parent, name);
+            map.remove(&target);
+            remove_subtree(map, &target);
+        }
+    }
+    Ok(())
+}
+
+/// Sub-pass (b): insert this layer's regular entries (tar last-wins).
+fn insert_entries(map: &mut BTreeMap<String, Node>, file: &File, i: usize) -> Result<()> {
+    let mut ar = open_layer(file)?;
+    for entry in ar.entries().with_context(|| format!("read layer {i}"))? {
+        let entry = entry.with_context(|| format!("read layer {i}"))?;
+        let ty = entry.header().entry_type();
+        if is_metadata(ty) {
+            continue;
+        }
+        // GNU old-style sparse entries cannot be re-emitted faithfully;
+        // fail closed rather than silently corrupting the output.
+        if ty == EntryType::GNUSparse {
+            let path = entry.path().unwrap_or_default();
+            bail!("GNU sparse entries are not supported (entry {:?})", path);
+        }
+        let Some(path) = normalize(&entry.path()?)? else {
+            continue;
+        };
+        let (_, base) = split(&path);
+        if base.starts_with(".wh.") {
+            continue; // consumed in sub-pass (a)
+        }
+        let link_name = entry_link_name(&entry, ty, i)?;
+        // A non-dir replacing anything hides everything that was under
+        // that path (dir replaced by file drops the subtree). A dir over
+        // a dir just replaces the node and keeps children.
+        if ty != EntryType::Directory {
+            remove_subtree(map, &path);
+        }
+        map.insert(
+            path,
+            Node {
+                layer: i,
+                offset: entry.raw_file_position(),
+                size: entry.size(),
+                header: entry.header().clone(),
+                link_name,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Resolve an entry's link target.
+///
+/// Normalize hardlink link targets the same way we normalize entry paths:
+/// strip leading `./` / `/`, reject `..` components. Symlink targets are left
+/// raw — absolute paths and `..` are legitimate filesystem semantics for
+/// symlinks.
+fn entry_link_name<R: Read>(
+    entry: &tar::Entry<R>,
+    ty: EntryType,
+    i: usize,
+) -> Result<Option<PathBuf>> {
+    if ty == EntryType::Link {
+        entry
+            .link_name()?
+            .map(|raw| -> Result<PathBuf> {
+                normalize(&raw)?.map(PathBuf::from).ok_or_else(|| {
+                    anyhow::anyhow!("hardlink in layer {i} has an empty link target")
+                })
+            })
+            .transpose()
+    } else {
+        Ok(entry.link_name()?.map(|c| c.into_owned()))
+    }
 }
 
 /// Pass 2: write the merged tar. Non-hardlinks go first in lexicographic

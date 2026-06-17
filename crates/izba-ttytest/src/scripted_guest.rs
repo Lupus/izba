@@ -267,40 +267,9 @@ fn serve_control(mut conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
             Ok(r) => r,
             Err(_) => return Ok(()),
         };
-        let resp = match req {
-            Request::Health => Response::Health(HealthInfo {
-                version: "ttytest-guest".to_string(),
-                uptime_ms: 0,
-            }),
-            Request::Exec(_) => match shared.script.exec_outcome {
-                ExecOutcome::Started => Response::ExecStarted { exec_id: 1 },
-                ExecOutcome::CommandNotFound => Response::Error {
-                    kind: ErrorKind::CommandNotFound,
-                    message: "ttytest: command not found".to_string(),
-                },
-            },
-            Request::Wait { .. } => {
-                let (lock, cvar) = &shared.done;
-                let mut guard = lock.lock().unwrap();
-                while guard.is_none() {
-                    guard = cvar.wait(guard).unwrap();
-                }
-                Response::Wait {
-                    status: guard.unwrap(),
-                }
-            }
-            Request::Kill { signal, .. } => {
-                shared.rec.kills.lock().unwrap().push(signal);
-                Response::Ok
-            }
-            Request::Resize { cols, rows, .. } => {
-                *shared.rec.last_resize.lock().unwrap() = Some((cols, rows));
-                if let Some(tx) = shared.resize_tx.lock().unwrap().as_ref() {
-                    let _ = tx.send((cols, rows));
-                }
-                Response::Ok
-            }
-            Request::Shutdown => {
+        let resp = match handle_control_request(req, &shared) {
+            ControlOutcome::Reply(resp) => resp,
+            ControlOutcome::Shutdown => {
                 let _ = write_frame(&mut conn, &Response::Ok);
                 shared.shutdown.store(true, Ordering::SeqCst);
                 return Ok(());
@@ -310,6 +279,52 @@ fn serve_control(mut conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+/// What `handle_control_request` decided: either a response to write back, or a
+/// request to tear the control connection down (after acking the `Shutdown`).
+enum ControlOutcome {
+    Reply(Response),
+    Shutdown,
+}
+
+fn handle_control_request(req: Request, shared: &Arc<Shared>) -> ControlOutcome {
+    let resp = match req {
+        Request::Health => Response::Health(HealthInfo {
+            version: "ttytest-guest".to_string(),
+            uptime_ms: 0,
+        }),
+        Request::Exec(_) => match shared.script.exec_outcome {
+            ExecOutcome::Started => Response::ExecStarted { exec_id: 1 },
+            ExecOutcome::CommandNotFound => Response::Error {
+                kind: ErrorKind::CommandNotFound,
+                message: "ttytest: command not found".to_string(),
+            },
+        },
+        Request::Wait { .. } => {
+            let (lock, cvar) = &shared.done;
+            let mut guard = lock.lock().unwrap();
+            while guard.is_none() {
+                guard = cvar.wait(guard).unwrap();
+            }
+            Response::Wait {
+                status: guard.unwrap(),
+            }
+        }
+        Request::Kill { signal, .. } => {
+            shared.rec.kills.lock().unwrap().push(signal);
+            Response::Ok
+        }
+        Request::Resize { cols, rows, .. } => {
+            *shared.rec.last_resize.lock().unwrap() = Some((cols, rows));
+            if let Some(tx) = shared.resize_tx.lock().unwrap().as_ref() {
+                let _ = tx.send((cols, rows));
+            }
+            Response::Ok
+        }
+        Request::Shutdown => return ControlOutcome::Shutdown,
+    };
+    ControlOutcome::Reply(resp)
 }
 
 fn serve_stream(conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
@@ -339,22 +354,8 @@ fn serve_stream(conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
     *shared.resize_tx.lock().unwrap() = Some(tx);
 
     // Reader thread: record everything the host sends.
-    let mut reader = conn.try_clone().context("clone stream reader")?;
-    let rec_shared = Arc::clone(&shared);
-    let reader_thread = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => rec_shared
-                    .rec
-                    .received_input
-                    .lock()
-                    .unwrap()
-                    .extend_from_slice(&buf[..n]),
-            }
-        }
-    });
+    let reader = conn.try_clone().context("clone stream reader")?;
+    let reader_thread = spawn_input_recorder(reader, Arc::clone(&shared));
 
     // Writer side: initial emit, then react to resizes until the end byte.
     let mut writer = conn;
@@ -363,26 +364,7 @@ fn serve_stream(conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
         .context("initial emit")?;
     writer.flush().ok();
 
-    let end_byte = shared.script.end_when_input_contains;
-    loop {
-        // Emit any pending resize frames.
-        while let Ok((cols, rows)) = rx.try_recv() {
-            if let Some(f) = shared.script.on_resize {
-                let bytes = f(cols, rows);
-                let _ = writer.write_all(&bytes);
-                let _ = writer.flush();
-            }
-        }
-        // End condition.
-        let ended = match end_byte {
-            None => true, // end immediately after initial emit
-            Some(b) => shared.rec.received_input.lock().unwrap().contains(&b),
-        };
-        if ended || shared.shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    run_writer_loop(&mut writer, &rx, &shared);
 
     // Signal Wait and tear down.
     {
@@ -402,4 +384,57 @@ fn serve_stream(conn: UnixStream, shared: Arc<Shared>) -> Result<()> {
     drop(writer);
     let _ = reader_thread.join();
     Ok(())
+}
+
+/// Spawn a thread that records every byte the host sends until EOF/error.
+fn spawn_input_recorder(
+    mut reader: UnixStream,
+    shared: Arc<Shared>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => shared
+                    .rec
+                    .received_input
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+}
+
+/// Emit scripted resize output until the end condition (end byte seen, or
+/// `None` end byte ⇒ stop after the initial emit) or a shutdown.
+fn run_writer_loop(
+    writer: &mut UnixStream,
+    rx: &std::sync::mpsc::Receiver<(u16, u16)>,
+    shared: &Arc<Shared>,
+) {
+    let end_byte = shared.script.end_when_input_contains;
+    loop {
+        // Emit any pending resize frames.
+        while let Ok((cols, rows)) = rx.try_recv() {
+            if let Some(f) = shared.script.on_resize {
+                let bytes = f(cols, rows);
+                let _ = writer.write_all(&bytes);
+                let _ = writer.flush();
+            }
+        }
+        if writer_loop_should_end(end_byte, shared) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn writer_loop_should_end(end_byte: Option<u8>, shared: &Arc<Shared>) -> bool {
+    let ended = match end_byte {
+        None => true, // end immediately after initial emit
+        Some(b) => shared.rec.received_input.lock().unwrap().contains(&b),
+    };
+    ended || shared.shutdown.load(Ordering::SeqCst)
 }

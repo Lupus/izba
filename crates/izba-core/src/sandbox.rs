@@ -16,7 +16,7 @@ use crate::liveness::{assess, Liveness, Probes};
 use crate::paths::Paths;
 use crate::procmgr;
 use crate::state::{load_json, save_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
-use crate::vmm::{BlockDisk, FsShare, IoStream, VmSpec, VmmDriver};
+use crate::vmm::{BlockDisk, FsShare, IoStream, VmHandle, VmSpec, VmmDriver};
 
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BOOT_POLL: Duration = Duration::from_millis(200);
@@ -507,57 +507,8 @@ pub fn start_with_timeouts(
     // Everything after launch must kill the handle on failure, or the VMM
     // would be orphaned with no state.json pointing at it.
     let booted = (|| -> anyhow::Result<()> {
-        // Boot-wait: poll the guest control port until Health answers. Each
-        // attempt is individually bounded so a wedged-but-accepting guest
-        // cannot stall past the boot budget.
-        let deadline = Instant::now() + boot_timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let attempt_timeout = CONTROL_RPC_TIMEOUT
-                .min(remaining)
-                .max(Duration::from_millis(10));
-            let healthy = (|| -> anyhow::Result<bool> {
-                let mut s = handle.connect(CONTROL_PORT)?;
-                Ok(matches!(
-                    rpc(&mut s, &Request::Health, attempt_timeout)?,
-                    Response::Health(_)
-                ))
-            })()
-            .unwrap_or(false);
-            if healthy {
-                break;
-            }
-            if Instant::now() >= deadline {
-                bail!(
-                    "sandbox '{name}' did not become healthy within {boot_timeout:?}; \
-                     check {} for boot output{}",
-                    console_log.display(),
-                    console_tail(&console_log, 15)
-                );
-            }
-            std::thread::sleep(poll);
-        }
-
-        let mut pids = handle.pids();
-        let vmm_idx = pids
-            .iter()
-            .position(|(role, _)| role == "vmm")
-            .context("driver returned no 'vmm' pid")?;
-        let (_, vmm_pid) = pids.remove(vmm_idx);
-        // Record the host-side confinement actually achieved for the VMM so
-        // status can report it honestly (and loudly when unconfined).
-        let confinement = Some(handle.confinement());
-        let state = RunState {
-            vmm_pid,
-            sidecar_pids: pids,
-            started_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            confinement,
-        };
-        save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)?;
-        Ok(())
+        wait_for_boot(handle.as_ref(), name, &console_log, boot_timeout, poll)?;
+        record_run_state(paths, name, handle.as_ref())
     })();
 
     if let Err(e) = booted {
@@ -579,6 +530,73 @@ pub fn start_with_timeouts(
         return Err(e);
     }
     Ok(())
+}
+
+/// Poll the guest control port until `Health` answers, or `boot_timeout`
+/// elapses. Each attempt is individually bounded so a wedged-but-accepting
+/// guest cannot stall past the boot budget.
+fn wait_for_boot(
+    handle: &dyn VmHandle,
+    name: &str,
+    console_log: &std::path::Path,
+    boot_timeout: Duration,
+    poll: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + boot_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let attempt_timeout = CONTROL_RPC_TIMEOUT
+            .min(remaining)
+            .max(Duration::from_millis(10));
+        if control_is_healthy(handle, attempt_timeout) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "sandbox '{name}' did not become healthy within {boot_timeout:?}; \
+                 check {} for boot output{}",
+                console_log.display(),
+                console_tail(console_log, 15)
+            );
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// One bounded `Health` probe over the control port; any error (not-yet-up,
+/// timeout) is squashed to `false` so the boot-wait loop keeps polling.
+fn control_is_healthy(handle: &dyn VmHandle, attempt_timeout: Duration) -> bool {
+    (|| -> anyhow::Result<bool> {
+        let mut s = handle.connect(CONTROL_PORT)?;
+        Ok(matches!(
+            rpc(&mut s, &Request::Health, attempt_timeout)?,
+            Response::Health(_)
+        ))
+    })()
+    .unwrap_or(false)
+}
+
+/// Persist the post-boot `state.json`: the VMM pid (split out of the driver's
+/// pid list) plus the remaining sidecar pids, the start timestamp, and the
+/// host-side confinement actually achieved for the VMM (so status can report it
+/// honestly — and loudly when unconfined).
+fn record_run_state(paths: &Paths, name: &str, handle: &dyn VmHandle) -> anyhow::Result<()> {
+    let mut pids = handle.pids();
+    let vmm_idx = pids
+        .iter()
+        .position(|(role, _)| role == "vmm")
+        .context("driver returned no 'vmm' pid")?;
+    let (_, vmm_pid) = pids.remove(vmm_idx);
+    let state = RunState {
+        vmm_pid,
+        sidecar_pids: pids,
+        started_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        confinement: Some(handle.confinement()),
+    };
+    save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)
 }
 
 /// Best-effort removal of regular files in the run dir (sockets, pid files).
@@ -840,78 +858,92 @@ pub fn list(paths: &Paths, connector: Connector) -> anyhow::Result<Vec<SandboxIn
     }
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+        if let Some(info) = scan_sandbox_entry(paths, connector, &entry)? {
+            out.push(info);
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // Tombstones from interrupted `remove` final-deletes are inert debris,
-        // not sandboxes.
-        if name.contains(".removing-") {
-            continue;
-        }
-        let config: SandboxConfig = match load_json(&entry.path().join(CONFIG_FILE)) {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                eprintln!("warning: sandbox '{name}' has no {CONFIG_FILE}; skipping");
-                continue;
-            }
-            Err(e) => {
-                eprintln!("warning: skipping sandbox '{name}': {e:#}");
-                continue;
-            }
-        };
-        let liveness = match liveness_of(paths, &name, connector) {
-            Ok(l) => l,
-            Err(e) => {
-                // Corrupt state.json must not abort the whole listing; report
-                // the sandbox as stopped and leave the file for inspection.
-                eprintln!(
-                    "warning: sandbox '{name}' has unreadable state ({e:#}); showing as stopped"
-                );
-                out.push(SandboxInfo {
-                    name,
-                    image_ref: config.image_ref,
-                    liveness: Liveness::Stopped,
-                });
-                continue;
-            }
-        };
-        if liveness == Liveness::Stopped {
-            // Correct stale state left behind by a VMM that died on its own —
-            // but only if no concurrent operation (e.g. start) holds the lock,
-            // otherwise we could delete the state.json it just wrote.
-            // Also best-effort kill any sidecars (virtiofsd) that may still be
-            // alive even though the VMM is gone.
-            let state_path = entry.path().join(STATE_FILE);
-            if state_path.exists() {
-                if let Ok(_lock) = lock_sandbox(paths, &name) {
-                    // The liveness above was read WITHOUT the lock; a `start` may
-                    // have raced in and booted a fresh (confined) VM by now.
-                    // Re-confirm Stopped UNDER the lock before the destructive
-                    // sweep — otherwise we would delete a freshly-written
-                    // state.json AND, worse, restore the workspace to Medium while
-                    // the new Low-IL VMM is still running (yanking its write
-                    // access). Only proceed if the sandbox is still down.
-                    if liveness_of(paths, &name, connector).ok() == Some(Liveness::Stopped) {
-                        // This stale-state sweep is also the daemon-adoption
-                        // reconcile point: an orphaned confined VMM that has since
-                        // died gets its workspace integrity restored here before
-                        // its state is wiped.
-                        restore_confined_workspace(paths, &name);
-                        kill_sidecars_from_state(paths, &name);
-                        let _ = fs::remove_file(&state_path);
-                    }
-                }
-            }
-        }
-        out.push(SandboxInfo {
-            name,
-            image_ref: config.image_ref,
-            liveness,
-        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// Classify one entry under `<data>/sandboxes`. Returns `None` for entries that
+/// are not live sandboxes (non-dirs, tombstones, half-created dirs missing a
+/// config), `Some` for everything reported to the caller. Warnings are emitted
+/// for skipped-but-noteworthy dirs, exactly as the inline loop did.
+fn scan_sandbox_entry(
+    paths: &Paths,
+    connector: Connector,
+    entry: &fs::DirEntry,
+) -> anyhow::Result<Option<SandboxInfo>> {
+    if !entry.file_type()?.is_dir() {
+        return Ok(None);
+    }
+    let name = entry.file_name().to_string_lossy().into_owned();
+    // Tombstones from interrupted `remove` final-deletes are inert debris,
+    // not sandboxes.
+    if name.contains(".removing-") {
+        return Ok(None);
+    }
+    let config: SandboxConfig = match load_json(&entry.path().join(CONFIG_FILE)) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            eprintln!("warning: sandbox '{name}' has no {CONFIG_FILE}; skipping");
+            return Ok(None);
+        }
+        Err(e) => {
+            eprintln!("warning: skipping sandbox '{name}': {e:#}");
+            return Ok(None);
+        }
+    };
+    let liveness = match liveness_of(paths, &name, connector) {
+        Ok(l) => l,
+        Err(e) => {
+            // Corrupt state.json must not abort the whole listing; report
+            // the sandbox as stopped and leave the file for inspection.
+            eprintln!("warning: sandbox '{name}' has unreadable state ({e:#}); showing as stopped");
+            return Ok(Some(SandboxInfo {
+                name,
+                image_ref: config.image_ref,
+                liveness: Liveness::Stopped,
+            }));
+        }
+    };
+    if liveness == Liveness::Stopped {
+        reap_stale_stopped(paths, &name, connector, &entry.path());
+    }
+    Ok(Some(SandboxInfo {
+        name,
+        image_ref: config.image_ref,
+        liveness,
+    }))
+}
+
+/// Best-effort cleanup of a stopped sandbox's stale runtime state left behind by
+/// a VMM that died on its own — but only if no concurrent operation (e.g. start)
+/// holds the lock, otherwise we could delete the state.json it just wrote. Also
+/// kills any sidecars (virtiofsd) that may still be alive though the VMM is gone.
+fn reap_stale_stopped(paths: &Paths, name: &str, connector: Connector, sandbox_dir: &Path) {
+    let state_path = sandbox_dir.join(STATE_FILE);
+    if !state_path.exists() {
+        return;
+    }
+    let Ok(_lock) = lock_sandbox(paths, name) else {
+        return;
+    };
+    // The liveness above was read WITHOUT the lock; a `start` may have raced in
+    // and booted a fresh (confined) VM by now. Re-confirm Stopped UNDER the lock
+    // before the destructive sweep — otherwise we would delete a freshly-written
+    // state.json AND, worse, restore the workspace to Medium while the new Low-IL
+    // VMM is still running (yanking its write access). Only proceed if still down.
+    if liveness_of(paths, name, connector).ok() != Some(Liveness::Stopped) {
+        return;
+    }
+    // This stale-state sweep is also the daemon-adoption reconcile point: an
+    // orphaned confined VMM that has since died gets its workspace integrity
+    // restored here before its state is wiped.
+    restore_confined_workspace(paths, name);
+    kill_sidecars_from_state(paths, name);
+    let _ = fs::remove_file(&state_path);
 }
 
 /// Every persistent-volume name referenced by any sandbox's `config.json`.

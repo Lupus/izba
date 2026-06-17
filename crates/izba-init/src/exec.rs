@@ -106,70 +106,9 @@ impl ExecEngine {
         cmd.args(&req.argv[1..]);
         cmd.env_clear();
         cmd.envs(req.env.iter().map(|(k, v)| (k, v)));
-        if !req.env.iter().any(|(k, _)| k == "PATH") {
-            cmd.env("PATH", DEFAULT_PATH);
-        }
-        if req.tty && !req.env.iter().any(|(k, _)| k == "TERM") {
-            cmd.env("TERM", DEFAULT_TERM);
-        }
-        // CA-bundle env defaults for the izba MITM trust anchor, mirroring the
-        // PATH/TERM "default unless the caller overrides" pattern. Only
-        // advertise them when the combined bundle actually exists in the guest
-        // (write_trust_anchor wrote it), so non-MITM sandboxes don't point
-        // tools at a missing file. The values are post-chroot guest paths.
-        if self.trust_bundle_present() {
-            for (k, v) in crate::trust::trust_env_pairs() {
-                if !req.env.iter().any(|(ek, _)| ek == k) {
-                    cmd.env(k, v);
-                }
-            }
-        }
+        self.configure_env_defaults(&mut cmd, req);
 
-        let (pty_master, mut streams) = if req.tty {
-            // Pre-size the pty so a client's first Resize cannot race the
-            // child's first size query.
-            let ws = nix::pty::Winsize {
-                ws_row: 24,
-                ws_col: 80,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            let pty = nix::pty::openpty(Some(&ws), None).map_err(|e| {
-                if e == nix::errno::Errno::EPERM || e == nix::errno::Errno::EACCES {
-                    internal(format!("openpty denied: {e}"))
-                } else {
-                    internal(format!("openpty: {e}"))
-                }
-            })?;
-            // Keep the master out of the child (fork inherits it; exec must
-            // close it or master EOF never arrives after the child exits).
-            set_cloexec(&pty.master).map_err(internal)?;
-            // Set CLOEXEC on the slave immediately: without it the slave fd is
-            // inherited by every child spawned concurrently from this process.
-            // Those children hold the slave open across their own exec, keeping
-            // the pty alive beyond this tty job and preventing master EOF.
-            // std's child-side dup2(slave, 0/1/2) clears CLOEXEC on the dup'd
-            // descriptors, so the actual tty child is unaffected.
-            set_cloexec(&pty.slave).map_err(internal)?;
-            let slave_in = pty.slave.try_clone().map_err(internal)?;
-            let slave_out = pty.slave.try_clone().map_err(internal)?;
-            cmd.stdin(Stdio::from(slave_in));
-            cmd.stdout(Stdio::from(slave_out));
-            cmd.stderr(Stdio::from(pty.slave));
-            let master_dup = pty.master.try_clone().map_err(internal)?;
-            (
-                Some(pty.master),
-                Streams {
-                    tty: Some(master_dup),
-                    ..Streams::default()
-                },
-            )
-        } else {
-            cmd.stdin(Stdio::piped());
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-            (None, Streams::default())
-        };
+        let (pty_master, mut streams) = self.configure_stdio(&mut cmd, req.tty)?;
 
         // Pre-validate the working directory so a nonexistent cwd surfaces as
         // BadRequest rather than being misclassified as CommandNotFound (both
@@ -193,40 +132,7 @@ impl ExecEngine {
         // SAFETY: pre_exec runs in the forked child before exec; only
         // async-signal-safe calls (setsid/ioctl/chroot/chdir/setgid/setuid).
         unsafe {
-            cmd.pre_exec(move || {
-                // Own session per exec → killpg targets the whole job.
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if tty {
-                    // Stdio fds were already dup2'ed by std; fd 0 is the
-                    // pty slave. Adopt it as the controlling terminal.
-                    if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                if let Some(root) = &root {
-                    nix::unistd::chroot(root.as_path()).map_err(std::io::Error::from)?;
-                }
-                nix::unistd::chdir(Path::new(&cwd)).map_err(std::io::Error::from)?;
-                // Drop privileges last (gid before uid, or setgid fails).
-                // Skip no-op changes so unprivileged test runs work.
-                //
-                // Clear supplementary groups to exactly {gid} before setgid.
-                // setgroups may fail with EPERM in unprivileged test runs;
-                // ignore that — root inside a guest will succeed, and tests
-                // run as the invoking user (which has no extra groups to drop).
-                let _ = nix::unistd::setgroups(&[nix::unistd::Gid::from_raw(gid)]);
-                if gid != nix::unistd::getegid().as_raw() {
-                    nix::unistd::setgid(nix::unistd::Gid::from_raw(gid))
-                        .map_err(std::io::Error::from)?;
-                }
-                if uid != nix::unistd::geteuid().as_raw() {
-                    nix::unistd::setuid(nix::unistd::Uid::from_raw(uid))
-                        .map_err(std::io::Error::from)?;
-                }
-                Ok(())
-            });
+            cmd.pre_exec(move || child_pre_exec(tty, root.as_deref(), &cwd, uid, gid));
         }
 
         let mut child = cmd.spawn().map_err(|e| {
@@ -247,26 +153,7 @@ impl ExecEngine {
         let status: StatusCell = Arc::new((Mutex::new(None), Condvar::new()));
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        // Dedicated reaper: exactly one waitpid per child, so the engine
-        // never races itself over exit statuses.
-        {
-            let status = Arc::clone(&status);
-            std::thread::spawn(move || {
-                // `child` is moved in (but never `wait()`ed) so its Drop
-                // runs here, not in exec(); only this waitpid reaps.
-                let _keep = child;
-                let st = match waitpid(pid, None) {
-                    Ok(WaitStatus::Exited(_, code)) => ExitStatus::Code(code),
-                    Ok(WaitStatus::Signaled(_, sig, _)) => ExitStatus::Signal(sig as i32),
-                    // Anything else (or waitpid error) is reported as a
-                    // wedge-proof synthetic failure rather than wedging wait().
-                    _ => ExitStatus::Code(-1),
-                };
-                let (lock, cvar) = &*status;
-                *lock.lock().unwrap() = Some(st);
-                cvar.notify_all();
-            });
-        }
+        spawn_reaper(child, pid, Arc::clone(&status));
 
         self.procs.lock().unwrap().insert(
             id,
@@ -279,6 +166,84 @@ impl ExecEngine {
             },
         );
         Ok(id)
+    }
+
+    /// Apply izba's default env (PATH/TERM and the MITM CA-bundle vars) unless
+    /// the caller already set each key. Mirrors the "default unless overridden"
+    /// pattern across all defaults.
+    fn configure_env_defaults(&self, cmd: &mut Command, req: &ExecRequest) {
+        let has = |key: &str| req.env.iter().any(|(k, _)| k == key);
+        if !has("PATH") {
+            cmd.env("PATH", DEFAULT_PATH);
+        }
+        if req.tty && !has("TERM") {
+            cmd.env("TERM", DEFAULT_TERM);
+        }
+        // CA-bundle env defaults for the izba MITM trust anchor. Only advertise
+        // them when the combined bundle actually exists in the guest
+        // (write_trust_anchor wrote it), so non-MITM sandboxes don't point
+        // tools at a missing file. The values are post-chroot guest paths.
+        if self.trust_bundle_present() {
+            for (k, v) in crate::trust::trust_env_pairs() {
+                if !has(k) {
+                    cmd.env(k, v);
+                }
+            }
+        }
+    }
+
+    /// Wire up the child's stdio. Tty mode allocates a pre-sized pty and returns
+    /// the master (kept for resize) + a `Streams` carrying a master dup; pipe
+    /// mode just requests piped stdio (taken from the child after spawn).
+    fn configure_stdio(
+        &self,
+        cmd: &mut Command,
+        tty: bool,
+    ) -> Result<(Option<OwnedFd>, Streams), ExecError> {
+        if !tty {
+            cmd.stdin(Stdio::piped());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            return Ok((None, Streams::default()));
+        }
+        // Pre-size the pty so a client's first Resize cannot race the
+        // child's first size query.
+        let ws = nix::pty::Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = nix::pty::openpty(Some(&ws), None).map_err(|e| {
+            if e == nix::errno::Errno::EPERM || e == nix::errno::Errno::EACCES {
+                internal(format!("openpty denied: {e}"))
+            } else {
+                internal(format!("openpty: {e}"))
+            }
+        })?;
+        // Keep the master out of the child (fork inherits it; exec must
+        // close it or master EOF never arrives after the child exits).
+        set_cloexec(&pty.master).map_err(internal)?;
+        // Set CLOEXEC on the slave immediately: without it the slave fd is
+        // inherited by every child spawned concurrently from this process.
+        // Those children hold the slave open across their own exec, keeping
+        // the pty alive beyond this tty job and preventing master EOF.
+        // std's child-side dup2(slave, 0/1/2) clears CLOEXEC on the dup'd
+        // descriptors, so the actual tty child is unaffected.
+        set_cloexec(&pty.slave).map_err(internal)?;
+        let slave_in = pty.slave.try_clone().map_err(internal)?;
+        let slave_out = pty.slave.try_clone().map_err(internal)?;
+        cmd.stdin(Stdio::from(slave_in));
+        cmd.stdout(Stdio::from(slave_out));
+        cmd.stderr(Stdio::from(pty.slave));
+        let master_dup = pty.master.try_clone().map_err(internal)?;
+        Ok((
+            Some(pty.master),
+            Streams {
+                tty: Some(master_dup),
+                ..Streams::default()
+            },
+        ))
     }
 
     /// Blocks until the exec exits; repeatable (returns the same status).
@@ -387,6 +352,70 @@ fn set_cloexec(fd: &OwnedFd) -> std::io::Result<()> {
     flags.insert(FdFlag::FD_CLOEXEC);
     fcntl(fd.as_raw_fd(), FcntlArg::F_SETFD(flags))?;
     Ok(())
+}
+
+/// Child-side setup run in the forked process before exec.
+///
+/// # Safety
+/// Runs in the forked child before exec; only async-signal-safe calls
+/// (setsid/ioctl/chroot/chdir/setgid/setuid).
+fn child_pre_exec(
+    tty: bool,
+    root: Option<&Path>,
+    cwd: &str,
+    uid: u32,
+    gid: u32,
+) -> std::io::Result<()> {
+    // Own session per exec → killpg targets the whole job.
+    if unsafe { libc::setsid() } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if tty {
+        // Stdio fds were already dup2'ed by std; fd 0 is the pty slave.
+        // Adopt it as the controlling terminal.
+        if unsafe { libc::ioctl(0, libc::TIOCSCTTY, 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    if let Some(root) = root {
+        nix::unistd::chroot(root).map_err(std::io::Error::from)?;
+    }
+    nix::unistd::chdir(Path::new(cwd)).map_err(std::io::Error::from)?;
+    // Drop privileges last (gid before uid, or setgid fails).
+    // Skip no-op changes so unprivileged test runs work.
+    //
+    // Clear supplementary groups to exactly {gid} before setgid.
+    // setgroups may fail with EPERM in unprivileged test runs;
+    // ignore that — root inside a guest will succeed, and tests
+    // run as the invoking user (which has no extra groups to drop).
+    let _ = nix::unistd::setgroups(&[nix::unistd::Gid::from_raw(gid)]);
+    if gid != nix::unistd::getegid().as_raw() {
+        nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)).map_err(std::io::Error::from)?;
+    }
+    if uid != nix::unistd::geteuid().as_raw() {
+        nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)).map_err(std::io::Error::from)?;
+    }
+    Ok(())
+}
+
+/// Dedicated reaper: exactly one waitpid per child, so the engine never races
+/// itself over exit statuses. Fills `status` and notifies waiters on exit.
+fn spawn_reaper(child: std::process::Child, pid: Pid, status: StatusCell) {
+    std::thread::spawn(move || {
+        // `child` is moved in (but never `wait()`ed) so its Drop
+        // runs here, not in exec(); only this waitpid reaps.
+        let _keep = child;
+        let st = match waitpid(pid, None) {
+            Ok(WaitStatus::Exited(_, code)) => ExitStatus::Code(code),
+            Ok(WaitStatus::Signaled(_, sig, _)) => ExitStatus::Signal(sig as i32),
+            // Anything else (or waitpid error) is reported as a
+            // wedge-proof synthetic failure rather than wedging wait().
+            _ => ExitStatus::Code(-1),
+        };
+        let (lock, cvar) = &*status;
+        *lock.lock().unwrap() = Some(st);
+        cvar.notify_all();
+    });
 }
 
 #[cfg(test)]

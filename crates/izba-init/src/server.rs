@@ -60,47 +60,53 @@ fn control_conn<C: Read + Write>(mut conn: C, engine: Arc<ExecEngine>, shutdown:
             Ok(r) => r,
             Err(_) => return, // clean EOF or broken peer either way
         };
-        let resp = match req {
-            Request::Health => Response::Health(HealthInfo {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                uptime_ms: START.elapsed().as_millis() as u64,
-            }),
-            Request::Exec(er) => match engine.exec(&er) {
-                Ok(exec_id) => Response::ExecStarted { exec_id },
-                Err((kind, message)) => Response::Error { kind, message },
-            },
-            // Wait may block this connection's thread for as long as the
-            // workload runs; other connections are unaffected.
-            Request::Wait { exec_id } => match engine.wait(exec_id) {
-                Ok(status) => Response::Wait { status },
-                Err((kind, message)) => Response::Error { kind, message },
-            },
-            Request::Kill { exec_id, signal } => match engine.kill(exec_id, signal) {
-                Ok(()) => Response::Ok,
-                Err((kind, message)) => Response::Error { kind, message },
-            },
-            Request::Resize {
-                exec_id,
-                cols,
-                rows,
-            } => match engine.resize(exec_id, cols, rows) {
-                Ok(()) => Response::Ok,
-                Err((kind, message)) => Response::Error { kind, message },
-            },
-            Request::Shutdown => {
-                // Commit the flag before acking: when the host receives Ok it
-                // can immediately observe the shutdown state (the test asserts
-                // this, and the real guest's PID 1 relies on it for poweroff
-                // sequencing).  write_frame is on the same thread, so the
-                // store strictly happens-before the socket write.
-                shutdown.store(true, Ordering::SeqCst);
-                let _ = write_frame(&mut conn, &Response::Ok);
-                return;
-            }
-        };
+        if let Request::Shutdown = req {
+            // Commit the flag before acking: when the host receives Ok it
+            // can immediately observe the shutdown state (the test asserts
+            // this, and the real guest's PID 1 relies on it for poweroff
+            // sequencing).  write_frame is on the same thread, so the
+            // store strictly happens-before the socket write.
+            shutdown.store(true, Ordering::SeqCst);
+            let _ = write_frame(&mut conn, &Response::Ok);
+            return;
+        }
+        let resp = dispatch_control_request(&engine, req);
         if write_frame(&mut conn, &resp).is_err() {
             return;
         }
+    }
+}
+
+/// Maps a non-`Shutdown` control request to its response. `Shutdown` is handled
+/// by the caller because it must ack then close the connection.
+fn dispatch_control_request(engine: &ExecEngine, req: Request) -> Response {
+    let from_unit = |r: Result<(), (ErrorKind, String)>| match r {
+        Ok(()) => Response::Ok,
+        Err((kind, message)) => Response::Error { kind, message },
+    };
+    match req {
+        Request::Health => Response::Health(HealthInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_ms: START.elapsed().as_millis() as u64,
+        }),
+        Request::Exec(er) => match engine.exec(&er) {
+            Ok(exec_id) => Response::ExecStarted { exec_id },
+            Err((kind, message)) => Response::Error { kind, message },
+        },
+        // Wait may block this connection's thread for as long as the
+        // workload runs; other connections are unaffected.
+        Request::Wait { exec_id } => match engine.wait(exec_id) {
+            Ok(status) => Response::Wait { status },
+            Err((kind, message)) => Response::Error { kind, message },
+        },
+        Request::Kill { exec_id, signal } => from_unit(engine.kill(exec_id, signal)),
+        Request::Resize {
+            exec_id,
+            cols,
+            rows,
+        } => from_unit(engine.resize(exec_id, cols, rows)),
+        // Handled by control_conn (acks then closes the connection).
+        Request::Shutdown => unreachable!("Shutdown handled by control_conn"),
     }
 }
 

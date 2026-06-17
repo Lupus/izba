@@ -188,70 +188,112 @@ fn unpack_stream<R: Read>(
             );
         }
         saw_entry = true;
-        let path = entry.path().context("reading entry path")?.into_owned();
-        let rewritten = rewrite_top(&path, src_base, rename_top);
-
-        // (1) Lexical containment: no absolute path, no `..` component. Under a
-        // plain `unpack_base.join(rewritten)` an absolute `rewritten` REPLACES
-        // the base entirely, and a `..` climbs out (both PoC-confirmed).
-        reject_lexical_escape(&rewritten)
-            .with_context(|| format!("refusing guest archive entry {}", rewritten.display()))?;
-
-        let dest_path = canon_base.join(&rewritten);
-
-        // (2) Link entries: refuse a symlink/hardlink whose target escapes the
-        // base (absolute, or `..` above the base). Blocks entry A of the
-        // two-step symlink escape (planting `x -> /tmp/evil`).
-        if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
-            if let Some(link) = entry.link_name().context("reading entry link target")? {
-                reject_escaping_link_target(&link, &rewritten, &canon_base).with_context(|| {
-                    format!(
-                        "refusing guest archive link {} -> {}",
-                        rewritten.display(),
-                        link.display()
-                    )
-                })?;
-            }
-        }
-
-        // (3) Materialize the parent WITHOUT following any symlink prefix, then
-        // verify the realized parent is still inside the base.
-        // `safe_create_dir_all` refuses to descend through an existing symlink
-        // component, so entry B of the two-step escape (writing `x/payload`
-        // where `x` is a planted symlink) cannot reach outside.
-        if let Some(parent) = dest_path.parent() {
-            safe_create_dir_all(&canon_base, parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-            let canon_parent = parent
-                .canonicalize()
-                .with_context(|| format!("canonicalizing {}", parent.display()))?;
-            if !canon_parent.starts_with(&canon_base) {
-                bail!(
-                    "refusing guest archive entry {}: parent {} escapes {}",
-                    rewritten.display(),
-                    canon_parent.display(),
-                    canon_base.display()
-                );
-            }
-        }
-
-        // (4) Never write THROUGH a final-component symlink: replace it (an
-        // archive could otherwise plant `x -> /etc/passwd` then write `x`).
-        if let Ok(meta) = std::fs::symlink_metadata(&dest_path) {
-            if meta.file_type().is_symlink() {
-                std::fs::remove_file(&dest_path).with_context(|| {
-                    format!("replacing pre-existing symlink {}", dest_path.display())
-                })?;
-            }
-        }
-
-        entry
-            .unpack(&dest_path)
-            .map_err(truncated)
-            .with_context(|| format!("writing {}", dest_path.display()))?;
+        unpack_one_entry(&mut entry, entry_type, &canon_base, src_base, rename_top)?;
     }
     if !saw_entry {
         bail!("transfer truncated (no archive entries received)");
+    }
+    Ok(())
+}
+
+/// Materialize one already-vetted-for-direction tar `entry` under `canon_base`,
+/// applying the §3 top-component rewrite and all four containment checks (see
+/// `unpack_stream`). `canon_base` is the canonicalized, host-chosen base.
+fn unpack_one_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    entry_type: tar::EntryType,
+    canon_base: &Path,
+    src_base: &str,
+    rename_top: Option<&str>,
+) -> anyhow::Result<()> {
+    let path = entry.path().context("reading entry path")?.into_owned();
+    let rewritten = rewrite_top(&path, src_base, rename_top);
+
+    // (1) Lexical containment: no absolute path, no `..` component. Under a
+    // plain `unpack_base.join(rewritten)` an absolute `rewritten` REPLACES
+    // the base entirely, and a `..` climbs out (both PoC-confirmed).
+    reject_lexical_escape(&rewritten)
+        .with_context(|| format!("refusing guest archive entry {}", rewritten.display()))?;
+
+    let dest_path = canon_base.join(&rewritten);
+
+    // (2) Link entries: refuse a symlink/hardlink whose target escapes the
+    // base (absolute, or `..` above the base). Blocks entry A of the
+    // two-step symlink escape (planting `x -> /tmp/evil`).
+    if let Some(link) = link_target(entry, entry_type)? {
+        reject_escaping_link_target(&link, &rewritten, canon_base).with_context(|| {
+            format!(
+                "refusing guest archive link {} -> {}",
+                rewritten.display(),
+                link.display()
+            )
+        })?;
+    }
+
+    // (3) Materialize the parent WITHOUT following any symlink prefix, then
+    // verify the realized parent is still inside the base.
+    if let Some(parent) = dest_path.parent() {
+        contain_parent(canon_base, parent, &rewritten)?;
+    }
+
+    // (4) Never write THROUGH a final-component symlink: replace it (an
+    // archive could otherwise plant `x -> /etc/passwd` then write `x`).
+    replace_final_symlink(&dest_path)?;
+
+    entry
+        .unpack(&dest_path)
+        .map_err(truncated)
+        .with_context(|| format!("writing {}", dest_path.display()))?;
+    Ok(())
+}
+
+/// The link target of a symlink/hardlink entry, or `None` for any other entry
+/// type (or a link entry with no target). Lets the caller skip the link-escape
+/// check for non-link entries without nesting.
+fn link_target<R: Read>(
+    entry: &tar::Entry<'_, R>,
+    entry_type: tar::EntryType,
+) -> anyhow::Result<Option<PathBuf>> {
+    if !matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
+        return Ok(None);
+    }
+    Ok(entry
+        .link_name()
+        .context("reading entry link target")?
+        .map(|l| l.into_owned()))
+}
+
+/// Step (3) of `unpack_one_entry`: create `parent` without following any
+/// symlink prefix (`safe_create_dir_all` refuses to descend through an existing
+/// symlink — blocks entry B of the two-step escape, writing `x/payload` where
+/// `x` is a planted symlink), then verify the realized parent stays in the base.
+fn contain_parent(canon_base: &Path, parent: &Path, rewritten: &Path) -> anyhow::Result<()> {
+    safe_create_dir_all(canon_base, parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
+    let canon_parent = parent
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", parent.display()))?;
+    if !canon_parent.starts_with(canon_base) {
+        bail!(
+            "refusing guest archive entry {}: parent {} escapes {}",
+            rewritten.display(),
+            canon_parent.display(),
+            canon_base.display()
+        );
+    }
+    Ok(())
+}
+
+/// Step (4) of `unpack_one_entry`: if `dest_path` already exists as a symlink,
+/// remove it so the upcoming `unpack` writes a fresh file rather than following
+/// the planted link.
+fn replace_final_symlink(dest_path: &Path) -> anyhow::Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(dest_path) {
+        if meta.file_type().is_symlink() {
+            std::fs::remove_file(dest_path).with_context(|| {
+                format!("replacing pre-existing symlink {}", dest_path.display())
+            })?;
+        }
     }
     Ok(())
 }
