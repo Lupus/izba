@@ -5,7 +5,7 @@
 use futures_util::StreamExt;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{Record, RecordType};
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::config::{ResolverConfig, ResolverOpts, ServerOrderingStrategy};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::{Resolver as HickoryResolver, TokioResolver};
 use std::hash::{Hash, Hasher};
@@ -247,19 +247,45 @@ impl ResolverCell {
     }
 }
 
-/// Force plain DNS (no EDNS/OPT) on upstream queries. Some real-world
-/// resolvers — notably consumer routers — answer an EDNS query with a
-/// miscounted section header: they echo an OPT record but report it in the
-/// authority count (NSCOUNT) with ARCOUNT=0, so the OPT lands outside the
-/// ADDITIONAL section. hickory-proto strictly rejects that
-/// (`RecordNotInAdditionalSection(OPT)`), turning every lookup into SERVFAIL.
-/// We gain nothing from EDNS here: answers are re-encoded to the classic
-/// 512-byte non-EDNS form anyway (`response_with_answers`), and anything that
-/// overflows 512 bytes falls back to TCP (`try_tcp_on_error`, on by default).
-/// Centralized so the initial build, the 1.1.1.1 fallback, and every reload
-/// all talk plain DNS.
+/// Harden the resolver options so the resolver behaves like the OS stub
+/// resolver and never second-guesses the upstream order we hand it.
+///
+/// 1. **Plain DNS (no EDNS/OPT).** Some real-world resolvers — notably consumer
+///    routers — answer an EDNS query with a miscounted section header: they
+///    echo an OPT record but report it in the authority count (NSCOUNT) with
+///    ARCOUNT=0, so the OPT lands outside the ADDITIONAL section. hickory-proto
+///    strictly rejects that (`RecordNotInAdditionalSection(OPT)`), turning every
+///    lookup into SERVFAIL. We gain nothing from EDNS here: answers are
+///    re-encoded to the classic 512-byte non-EDNS form anyway
+///    (`response_with_answers`), and anything that overflows 512 bytes falls
+///    back to TCP (`try_tcp_on_error`, on by default).
+///
+/// 2. **Honor our upstream order, sequentially.** `discover()` hands hickory a
+///    deliberately preference-ordered upstream list (on Windows, ordered by
+///    interface metric so the VPN's resolver precedes a LAN/physical NIC's). But
+///    hickory's *defaults* discard that: `QueryStatistics` re-ranks servers by
+///    observed RTT and `num_concurrent_reqs = 2` races the top two. When a
+///    corporate VPN is active its DNS enforcement is split-horizon — only the
+///    VPN's own resolver may answer; a query that escapes to any other (LAN or
+///    public) resolver is blocked and comes back as an instant NXDOMAIN. A
+///    deprioritized LAN resolver sitting on the local segment answers in well
+///    under a millisecond, so that policy-injected NXDOMAIN out-races the
+///    correct-but-slower VPN resolver across the tunnel and the guest sees it —
+///    intermittently, per name, exactly as a race predicts. (This is also why
+///    the OS resolver uses *only* the metric-1 VPN servers, and why other LAN
+///    devices not on the VPN resolve fine against the same router.) Mirror the
+///    OS resolver: `UserProvidedOrder` keeps our order verbatim, and
+///    `num_concurrent_reqs = 1` queries one server at a time, advancing to the
+///    next only on transient failure (never on a valid negative answer). A
+///    deprioritized resolver is thus consulted only when every preferred one is
+///    unreachable.
+///
+/// Centralized so the initial build, the 1.1.1.1 fallback, and every reload all
+/// share these semantics.
 fn harden_opts(mut opts: ResolverOpts) -> ResolverOpts {
     opts.edns0 = false;
+    opts.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
+    opts.num_concurrent_reqs = 1;
     opts
 }
 
@@ -548,6 +574,31 @@ mod tests {
         assert!(
             !harden_opts(o).edns0,
             "upstream queries must not carry EDNS/OPT"
+        );
+    }
+
+    /// Root-cause regression for the "metric ordering ignored at runtime" bug.
+    /// `discover()` hands hickory a preference-ordered upstream list (VPN before
+    /// a LAN resolver), but hickory's *default* opts override it at query time:
+    /// `QueryStatistics` re-ranks by observed RTT and `num_concurrent_reqs = 2`
+    /// races the top two, so a fast LAN resolver — whose answer corporate-VPN
+    /// DNS enforcement turns into an instant NXDOMAIN — out-races the correct VPN
+    /// resolver and the guest sees NXDOMAIN. `harden_opts` must pin the
+    /// OS-resolver semantics.
+    #[test]
+    fn harden_opts_forces_ordered_sequential_upstreams() {
+        let mut o = ResolverOpts::default();
+        o.server_ordering_strategy = ServerOrderingStrategy::QueryStatistics;
+        o.num_concurrent_reqs = 2;
+        let h = harden_opts(o);
+        assert_eq!(
+            h.server_ordering_strategy,
+            ServerOrderingStrategy::UserProvidedOrder,
+            "must honor our metric-ordered upstream list, not re-rank by RTT"
+        );
+        assert_eq!(
+            h.num_concurrent_reqs, 1,
+            "query upstreams strictly in order; never race a deprioritized server"
         );
     }
 
