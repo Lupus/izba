@@ -1,6 +1,8 @@
-//! Guest egress stub — M1. This file ships the DNS half (UDP :53 →
-//! per-query vsock `Dns` stream to izbad); the TCP REDIRECT half (nft +
-//! SO_ORIGINAL_DST) lands with the phase-B kernel/nft artifacts.
+//! Guest egress stub. The DNS half forwards guest resolution to izbad over
+//! vsock: UDP :53 → per-query `Dns` stream (answers capped at 512 bytes, TC=1
+//! on overflow) and TCP :53 → per-connection `DnsTcp` stream (full answers, so
+//! a TC=1 UDP retry succeeds). The TCP REDIRECT half (nft + SO_ORIGINAL_DST)
+//! tunnels all other guest TCP to izbad via `TcpConnect`.
 
 use izba_proto::{dns, write_frame, StreamOpen, EGRESS_PORT};
 use std::fs::File;
@@ -92,12 +94,94 @@ pub fn serve_dns_udp(sock: UdpSocket) -> io::Result<()> {
     }
 }
 
+/// Bind 0.0.0.0:53 for DNS-over-TCP. Split out like [`bind_dns_udp`] so the
+/// bind happens on the main thread BEFORE [`apply_nft`].
+///
+/// No nft rule is needed to reach this listener: the resolver in resolv.conf is
+/// `127.0.0.1`, and the nat-output `ip daddr 127.0.0.0/8 return` rule means a
+/// client's TCP retry to `127.0.0.1:53` is never redirected — it is delivered
+/// straight to this loopback listener. (Contrast the UDP path, which needs
+/// `udp dport 53 redirect to :53` only to pull hardcoded-resolver datagrams.)
+/// This is the path a resolver takes after izbad answers a UDP query with TC=1
+/// (an answer over the 512-byte non-EDNS limit): without it, large or
+/// split-horizon record sets are unresolvable in the guest.
+pub fn bind_dns_tcp() -> io::Result<TcpListener> {
+    TcpListener::bind(("0.0.0.0", 53))
+}
+
+/// Serve DNS-over-TCP forever (daemon thread) on an already-bound listener; one
+/// thread per connection so a slow upstream cannot head-of-line-block others.
+pub fn serve_dns_tcp(listener: TcpListener) -> io::Result<()> {
+    loop {
+        let (conn, _peer) = match listener.accept() {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("izba-init: dns-tcp accept: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+        };
+        std::thread::spawn(move || forward_tcp_conn(conn, dial_host));
+    }
+}
+
+/// One client TCP connection ↔ one `DnsTcp` vsock stream to izbad. DNS-over-TCP
+/// framing (RFC 1035 §4.2.2, 2-byte length prefix) IS the `izba_proto::dns`
+/// wire form, so each framed message relays verbatim in both directions; the
+/// `DnsTcp` open frame tells izbad to return full answers rather than capping
+/// at the 512-byte UDP limit. A failed forward becomes SERVFAIL for that query
+/// (the client fails fast), then the connection closes. Sequential queries on
+/// one connection are supported (RFC 7766) while the vsock stream stays healthy.
+fn forward_tcp_conn<C, S, D>(mut client: C, dial: D)
+where
+    C: Read + Write,
+    S: Read + Write,
+    D: FnOnce() -> io::Result<S>,
+{
+    let mut host = match dial() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("izba-init: dns-tcp dial: {e}");
+            return; // client sees the connection close → resolver fails fast
+        }
+    };
+    if let Err(e) = write_frame(&mut host, &StreamOpen::DnsTcp) {
+        eprintln!("izba-init: dns-tcp open: {e}");
+        return;
+    }
+    // Ends on clean boundary EOF (client done) or a truncated/short frame.
+    while let Ok(Some(query)) = dns::read_dns_msg(&mut client) {
+        match relay_tcp_query(&mut host, &query) {
+            Ok(resp) => {
+                if dns::write_dns_msg(&mut client, &resp).is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("izba-init: dns-tcp relay: {e}");
+                let _ = dns::write_dns_msg(&mut client, &dns::servfail(&query));
+                break; // the vsock stream is likely broken; close the conn
+            }
+        }
+    }
+}
+
+/// Forward one framed query to izbad over the open `DnsTcp` stream and read back
+/// its framed response.
+fn relay_tcp_query<S: Read + Write>(host: &mut S, query: &[u8]) -> io::Result<Vec<u8>> {
+    dns::write_dns_msg(host, query)?;
+    dns::read_dns_msg(host)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no dns response from izbad"))
+}
+
 /// Loopback port the nat-output REDIRECT delivers all outbound TCP to.
 pub const REDIRECT_PORT: u16 = 15001;
 
 /// The fixed transparent-redirect ruleset. Loopback destinations (`return`)
-/// are never redirected — that is the WORKING DNS path (resolv.conf points
-/// to 127.0.0.1; the stub answers from 0.0.0.0:53; loopback reply matches).
+/// are never redirected — that is the WORKING DNS path (resolv.conf points to
+/// 127.0.0.1; the UDP stub answers from 0.0.0.0:53 and the loopback reply
+/// matches; a client's TCP retry to 127.0.0.1:53 is likewise delivered
+/// straight to the TCP stub on 0.0.0.0:53, no redirect involved).
 /// All other TCP goes to the stub at :15001. `udp dport 53` pulls
 /// hardcoded-resolver queries to the stub too, but replies are currently
 /// DROPPED: the stub answers from an unconnected wildcard socket so the
@@ -317,6 +401,105 @@ mod tests {
         let q = [0x00u8, 0x01, 0x01, 0x00];
         let resp = forward_query(|| Ok(mine), &q);
         assert_eq!(resp[3] & 0x0f, 0x02);
+    }
+
+    /// Fake izbad on the far end of a socketpair for the TCP-DNS path: expects
+    /// the `DnsTcp` open frame, then answers each framed query with `re:<query>`.
+    fn fake_izbad_tcp() -> (UnixStream, std::thread::JoinHandle<()>) {
+        let (mine, theirs) = UnixStream::pair().unwrap();
+        let h = std::thread::spawn(move || {
+            let mut s = theirs;
+            let open: StreamOpen = read_frame(&mut s).unwrap();
+            assert!(
+                matches!(open, StreamOpen::DnsTcp),
+                "expected DnsTcp, got {open:?}"
+            );
+            while let Ok(Some(q)) = dns::read_dns_msg(&mut s) {
+                let mut r = b"re:".to_vec();
+                r.extend_from_slice(&q);
+                dns::write_dns_msg(&mut s, &r).unwrap();
+            }
+        });
+        (mine, h)
+    }
+
+    #[test]
+    fn tcp_conn_forwards_sequential_queries() {
+        let (host, izbad) = fake_izbad_tcp();
+        let (mut app, loop_side) = UnixStream::pair().unwrap();
+        let h = std::thread::spawn(move || forward_tcp_conn(loop_side, || Ok(host)));
+        dns::write_dns_msg(&mut app, b"q1").unwrap();
+        assert_eq!(dns::read_dns_msg(&mut app).unwrap().unwrap(), b"re:q1");
+        dns::write_dns_msg(&mut app, b"q2").unwrap();
+        assert_eq!(dns::read_dns_msg(&mut app).unwrap().unwrap(), b"re:q2");
+        app.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(app);
+        h.join().unwrap();
+        izbad.join().unwrap();
+    }
+
+    /// The whole point of the TCP path: a >512-byte answer relays through the
+    /// guest stub intact (no truncation on the guest leg — izbad decides size).
+    #[test]
+    fn tcp_conn_relays_large_answer_untruncated() {
+        let (host, theirs) = UnixStream::pair().unwrap();
+        let big = vec![0xABu8; 4000];
+        let big2 = big.clone();
+        let izbad = std::thread::spawn(move || {
+            let mut s = theirs;
+            let open: StreamOpen = read_frame(&mut s).unwrap();
+            assert!(matches!(open, StreamOpen::DnsTcp));
+            let _q = dns::read_dns_msg(&mut s).unwrap().unwrap();
+            dns::write_dns_msg(&mut s, &big2).unwrap();
+        });
+        let (mut app, loop_side) = UnixStream::pair().unwrap();
+        let h = std::thread::spawn(move || forward_tcp_conn(loop_side, || Ok(host)));
+        dns::write_dns_msg(&mut app, b"q").unwrap();
+        let resp = dns::read_dns_msg(&mut app).unwrap().unwrap();
+        assert_eq!(resp.len(), 4000, "full answer relayed without truncation");
+        assert_eq!(resp, big);
+        app.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(app);
+        h.join().unwrap();
+        izbad.join().unwrap();
+    }
+
+    /// A failed egress dial closes the client connection (the resolver fails
+    /// fast) rather than hanging.
+    #[test]
+    fn tcp_dial_failure_closes_connection() {
+        let (mut app, loop_side) = UnixStream::pair().unwrap();
+        let h = std::thread::spawn(move || {
+            forward_tcp_conn::<UnixStream, UnixStream, _>(loop_side, || {
+                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "no izbad"))
+            })
+        });
+        h.join().unwrap();
+        // The loop side was dropped on return → the app's read sees EOF.
+        let mut buf = Vec::new();
+        assert_eq!(app.read_to_end(&mut buf).unwrap(), 0);
+    }
+
+    /// izbad accepts the `DnsTcp` open then vanishes mid-query: the relay error
+    /// becomes a SERVFAIL for that query so the client fails fast.
+    #[test]
+    fn tcp_relay_failure_becomes_servfail() {
+        let (host, theirs) = UnixStream::pair().unwrap();
+        let izbad = std::thread::spawn(move || {
+            let mut s = theirs;
+            let open: StreamOpen = read_frame(&mut s).unwrap();
+            assert!(matches!(open, StreamOpen::DnsTcp));
+            // Drop without answering: the relay read sees EOF → SERVFAIL.
+        });
+        let (mut app, loop_side) = UnixStream::pair().unwrap();
+        let h = std::thread::spawn(move || forward_tcp_conn(loop_side, || Ok(host)));
+        let q = [0xbeu8, 0xef, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        dns::write_dns_msg(&mut app, &q).unwrap();
+        let resp = dns::read_dns_msg(&mut app).unwrap().unwrap();
+        assert_eq!(&resp[..2], &[0xbe, 0xef], "ID preserved");
+        assert_eq!(resp[3] & 0x0f, 0x02, "SERVFAIL");
+        h.join().unwrap();
+        izbad.join().unwrap();
     }
 
     #[test]

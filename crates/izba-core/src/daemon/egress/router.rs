@@ -39,7 +39,10 @@ pub fn handle_conn(
         StreamOpen::TcpConnect { addr, port } => tcp_connect(
             conn, sandbox, policy, resolver, mitm, audit, snoop, &addr, port,
         ),
-        StreamOpen::Dns => dns_loop(conn, resolver, sandbox, snoop),
+        // `Dns` is UDP-origin (cap answers at 512, TC=1 on overflow); `DnsTcp`
+        // is TCP-origin (return the full answer, up to 64 KiB).
+        StreamOpen::Dns => dns_loop(conn, resolver, sandbox, snoop, false),
+        StreamOpen::DnsTcp => dns_loop(conn, resolver, sandbox, snoop, true),
         _ => {
             let _ = write_frame(
                 &mut conn,
@@ -66,12 +69,14 @@ fn tcp_connect(
 ) {
     // TCP DNS: izbad IS the resolver — always allowed (the resolver path, not
     // arbitrary guest egress), answer locally. After Ok the raw stream carries
-    // RFC 1035 TCP framing, exactly the `Dns` stream contract.
+    // RFC 1035 TCP framing, exactly the `Dns` stream contract. This is a
+    // TCP-origin query (the guest dialed an upstream resolver on :53 over TCP),
+    // so answers are NOT capped at the 512-byte UDP limit.
     if port == 53 {
         if write_frame(&mut conn, &Response::Ok).is_err() {
             return;
         }
-        dns_loop(conn, resolver, sandbox, snoop);
+        dns_loop(conn, resolver, sandbox, snoop, true);
         return;
     }
     let ip: IpAddr = match addr.parse() {
@@ -387,9 +392,20 @@ fn is_lan(ip: IpAddr) -> bool {
 /// so the guest client fails fast instead of timing out. Each answer is snooped
 /// into `snoop` (IP→FQDN for tier-2) BEFORE the reply is written, so the mapping
 /// is installed before the guest can dial the resolved address.
-fn dns_loop(mut conn: UdsStream, resolver: &dyn Resolver, sandbox: &str, snoop: &SnoopStore) {
+fn dns_loop(
+    mut conn: UdsStream,
+    resolver: &dyn Resolver,
+    sandbox: &str,
+    snoop: &SnoopStore,
+    over_tcp: bool,
+) {
     while let Ok(Some(query)) = dns::read_dns_msg(&mut conn) {
-        let resp = resolver.handle(&query).unwrap_or_else(|e| {
+        let result = if over_tcp {
+            resolver.handle_tcp(&query)
+        } else {
+            resolver.handle(&query)
+        };
+        let resp = result.unwrap_or_else(|e| {
             eprintln!("izbad: dns forward failed: {e:#}");
             dns::servfail(&query)
         });
@@ -431,6 +447,22 @@ mod tests {
         }
     }
 
+    /// Distinguishes the UDP and TCP resolver entry points so a test can prove
+    /// which one a given `StreamOpen` routes to.
+    struct TransportResolver;
+    impl Resolver for TransportResolver {
+        fn handle(&self, q: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let mut r = b"udp:".to_vec();
+            r.extend_from_slice(q);
+            Ok(r)
+        }
+        fn handle_tcp(&self, q: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let mut r = b"tcp:".to_vec();
+            r.extend_from_slice(q);
+            Ok(r)
+        }
+    }
+
     struct DenyAll;
     impl Policy for DenyAll {
         fn check(&self, _f: &FlowDesc) -> Verdict {
@@ -463,6 +495,46 @@ mod tests {
         assert_eq!(dns::read_dns_msg(&mut c).unwrap().unwrap(), b"ans:q2");
         c.shutdown(std::net::Shutdown::Write).unwrap();
         assert!(dns::read_dns_msg(&mut c).unwrap().is_none());
+    }
+
+    /// `StreamOpen::Dns` is UDP-origin → `handle`; `StreamOpen::DnsTcp` is
+    /// TCP-origin → `handle_tcp`. Proves the new variant reaches the
+    /// non-truncating resolver path (the DNS-over-TCP fix).
+    #[test]
+    fn dns_tcp_stream_routes_to_handle_tcp() {
+        let mut c = spawn_handler(Arc::new(AllowAll), &TransportResolver);
+        write_frame(&mut c, &StreamOpen::DnsTcp).unwrap();
+        dns::write_dns_msg(&mut c, b"q").unwrap();
+        assert_eq!(dns::read_dns_msg(&mut c).unwrap().unwrap(), b"tcp:q");
+    }
+
+    #[test]
+    fn dns_udp_stream_routes_to_handle() {
+        let mut c = spawn_handler(Arc::new(AllowAll), &TransportResolver);
+        write_frame(&mut c, &StreamOpen::Dns).unwrap();
+        dns::write_dns_msg(&mut c, b"q").unwrap();
+        assert_eq!(dns::read_dns_msg(&mut c).unwrap().unwrap(), b"udp:q");
+    }
+
+    /// A guest dialing an upstream resolver on :53 over TCP (TcpConnect:53)
+    /// is TCP-origin too — it must reach `handle_tcp`, not `handle`.
+    #[test]
+    fn tcp_connect_port53_is_tcp_origin() {
+        let mut c = spawn_handler(Arc::new(AllowAll), &TransportResolver);
+        write_frame(
+            &mut c,
+            &StreamOpen::TcpConnect {
+                addr: "8.8.8.8".into(),
+                port: 53,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, Response>(&mut c).unwrap(),
+            Response::Ok
+        ));
+        dns::write_dns_msg(&mut c, b"q").unwrap();
+        assert_eq!(dns::read_dns_msg(&mut c).unwrap().unwrap(), b"tcp:q");
     }
 
     #[test]
@@ -670,7 +742,7 @@ mod tests {
         let (mut c, server) = UdsStream::pair().unwrap();
         // Borrow `snoop`/`resolver` into the scoped thread that runs dns_loop.
         std::thread::scope(|s| {
-            let h = s.spawn(|| dns_loop(server, &resolver, "web", &snoop));
+            let h = s.spawn(|| dns_loop(server, &resolver, "web", &snoop, false));
             dns::write_dns_msg(&mut c, b"q").unwrap();
             let _ = dns::read_dns_msg(&mut c).unwrap(); // the resolved answer
             c.shutdown(std::net::Shutdown::Write).unwrap();
@@ -826,7 +898,7 @@ mod tests {
             let mut s = server;
             let open: StreamOpen = read_frame(&mut s).unwrap();
             assert!(matches!(open, StreamOpen::Dns));
-            dns_loop(s, &FakeResolver, "web", &SnoopStore::new());
+            dns_loop(s, &FakeResolver, "web", &SnoopStore::new(), false);
         });
         write_frame(&mut c, &StreamOpen::Dns).unwrap();
         // Happy-path: one round-trip confirms the loop is running.

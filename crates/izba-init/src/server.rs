@@ -143,7 +143,7 @@ fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, engine: 
         }
         // Egress variants are handled by izbad on the host (vsock port 1027),
         // not by init. Reject them if they somehow arrive on port 1026.
-        StreamOpen::TcpConnect { .. } | StreamOpen::Dns => {
+        StreamOpen::TcpConnect { .. } | StreamOpen::Dns | StreamOpen::DnsTcp => {
             let _ = write_frame(
                 &mut conn,
                 &Response::Error {

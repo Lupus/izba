@@ -6,9 +6,20 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 pub trait Resolver: Send + Sync {
-    /// Raw DNS query in, raw DNS response out. The caller turns an `Err`
-    /// into SERVFAIL (`izba_proto::dns::servfail`).
+    /// Raw DNS query in, raw DNS response out, for a UDP-origin query. The
+    /// caller turns an `Err` into SERVFAIL (`izba_proto::dns::servfail`).
+    /// A resolver that re-encodes answers caps them at the 512-byte non-EDNS
+    /// UDP limit and sets TC=1 on overflow so the guest retries over TCP.
     fn handle(&self, query: &[u8]) -> anyhow::Result<Vec<u8>>;
+
+    /// As [`handle`](Resolver::handle), but for a query that reached the guest
+    /// stub over TCP:53: answers may exceed 512 bytes (DNS-over-TCP allows up
+    /// to 64 KiB), so a re-encoding resolver must NOT truncate. The default
+    /// delegates to `handle` — correct for forwarders and test fakes that do
+    /// not re-encode/truncate; the terminating `SystemResolver` overrides it.
+    fn handle_tcp(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.handle(query)
+    }
 }
 
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
