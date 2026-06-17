@@ -202,6 +202,15 @@ Check 'restart after stop' ($LASTEXITCODE -eq 0)
 Check 'rm exits 0' ($LASTEXITCODE -eq 0)
 Check 'sandbox dir removed' (-not (Test-Path "$env:LOCALAPPDATA\izba\sandboxes\valid8"))
 
+# [8a] Workspace integrity restored. A confined VMM runs at Low IL, so izba
+# Low-labels the workspace share to let its in-process virtiofs write /workspace
+# (proven by [1]'s host-visible marker). Teardown (stop/rm) must raise the user's
+# project dir back to Medium so it is not left at Low. The dir ($ws) is the
+# user's own — outside the removed sandbox dir — so it still exists here.
+$wsLabel = (& icacls $ws 2>$null) -join "`n"
+Check 'workspace integrity restored to Medium after teardown (no residual Low label)' `
+    ($wsLabel -notmatch 'Low Mandatory Level')
+
 # [9] M3 volumes parity: a named persistent volume is an extra virtio-blk disk
 # (vdc) the OpenVMM driver routes to its own PCIe root port; it must format +
 # mount, survive a stop/start, persist past rm, and be reaped by prune. This is

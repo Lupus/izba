@@ -69,40 +69,102 @@ const SYSTEM_MANDATORY_LABEL_NO_WRITE_UP: u32 = 0x0000_0001;
 /// for `ConvertStringSidToSidW`. `4096 == 0x1000 == SECURITY_MANDATORY_LOW_RID`.
 const LOW_INTEGRITY_SID: &str = "S-1-16-4096\0";
 
+/// `S-1-16-8192` — the Medium integrity SID (`8192 == 0x2000 ==
+/// SECURITY_MANDATORY_MEDIUM_RID`). Medium is the *default* effective IL of an
+/// unlabelled object, so re-applying it as an explicit inheritable label is a
+/// semantically-equivalent restore of a workspace previously lowered to Low.
+const MEDIUM_INTEGRITY_SID: &str = "S-1-16-8192\0";
+
 /// Label `path` (and, via inheritance, every existing and future child) with a
 /// **Low** mandatory integrity label so a Low-IL process — the confined VMM —
-/// can write into it. Without this the VMM, lowered to Low IL, cannot write up
-/// to the Medium-IL files izbad created (`console.log`, `rw.img`, the vsock
-/// socket under `run/`), and the VM never boots (MIC no-write-up).
+/// can write into it. Two distinct surfaces need this:
+///
+///   1. the per-sandbox scratch dir izbad created at Medium IL (`console.log`,
+///      `rw.img`, the vsock socket under `run/`) — without it the VM never boots
+///      (MIC no-write-up, empty console.log, 100% boot failure); and
+///   2. the **virtiofs workspace share** (the user's project dir) — the guest
+///      writes `/workspace` through the in-process virtiofs server, which runs
+///      *inside* the Low-IL VMM, so without a Low label on the share the guest's
+///      writes fail (the core izba function is dead under confinement).
+///
+/// The Low label is inheritable (`OBJECT_INHERIT | CONTAINER_INHERIT`).
+/// Inheritance is robust for the common case: empirically, a *Medium* process
+/// (the user's editor/git) doing a plain create in the labelled tree yields a
+/// Low-labelled child, so the guest can still write user-created-mid-session
+/// files. Residual (documented in the spec / F-06 finding, benign): a host write
+/// performed by **atomic-rename-in** from *outside* the labelled tree (some
+/// editors'/git's temp-then-rename save) keeps the source's non-Low label, which
+/// a Low-IL guest then can't write — narrow (most tools temp within the same
+/// dir, which inherits Low) and fully fixed by the dedicated-account tier.
+/// Restored to ~Medium on teardown by [`restore_integrity_recursive`].
+#[cfg(windows)]
+pub fn set_low_integrity_recursive(path: &Path) -> anyhow::Result<()> {
+    apply_inheritable_integrity_label(path, LOW_INTEGRITY_SID)
+}
+
+/// Restore `path` (and its subtree, via inheritance) to a **Medium** mandatory
+/// integrity label, undoing a prior [`set_low_integrity_recursive`]. Called on
+/// sandbox teardown (graceful stop, force-remove, and the stale-state sweep that
+/// daemon adoption runs) so the user's workspace does not keep a Low label after
+/// the confined VMM is gone.
+///
+/// Best-effort + idempotent: re-applying Medium (the default effective IL) is
+/// safe to run repeatedly, and a missed restore only leaves a *benign* Low label
+/// — Medium-IL tools write *down* to it freely, so the user's workflow is
+/// unaffected; the only cost is a mild integrity weakening until the next
+/// teardown/adoption sweep re-asserts Medium.
+///
+/// This is an *approximate* restore, not a perfect one — accepted residuals,
+/// all benign for the integrity boundary and cleanly closed by the future
+/// dedicated-account hardening tier (which never integrity-relabels the user's
+/// dir at all). Documented in the design spec / F-06 finding:
+///   - It re-asserts an **explicit** Medium label where the dir likely had none
+///     (unlabelled == effective Medium). Equivalent for the common case; it does
+///     NOT capture+restore a pre-existing *non-default* label, so a dir that was
+///     genuinely Low/sub-Medium before izba ran ends up Medium (mildly *more*
+///     restrictive to Low-IL writers). Project dirs are ~always unlabelled, so
+///     this is rare.
+///   - Re-propagation from the root refreshes only *inherited* child ACEs; a
+///     child carrying its **own explicit** Low label — e.g. files the Low-IL VMM
+///     created/modified — keeps it. So after teardown the workspace can hold a
+///     scattering of Low files. Benign (Medium tools write *down* to them
+///     freely); the boundary is unaffected.
+#[cfg(windows)]
+pub fn restore_integrity_recursive(path: &Path) -> anyhow::Result<()> {
+    apply_inheritable_integrity_label(path, MEDIUM_INTEGRITY_SID)
+}
+
+/// Apply `sid_str` (a NUL-terminated integrity SID literal) as an inheritable
+/// `SYSTEM_MANDATORY_LABEL_ACE` (no-write-up) on `path`.
 ///
 /// Implementation choice **(a)** (the spec's preferred, self-contained + unit-
-/// testable path): build a SACL holding one `SYSTEM_MANDATORY_LABEL_ACE` (Low,
-/// no-write-up) flagged `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`, then apply
-/// it with `SetNamedSecurityInfoW(.., SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION,
-/// ..)`. `SetNamedSecurityInfoW` performs inheritance propagation itself: setting
-/// an inheritable label on the container re-applies it to the existing subtree
-/// AND it is inherited by children created later, so no manual recursion is
-/// needed. Lowering the label is a write-DOWN for izbad (Medium → Low), so izbad
-/// keeps full control of the now-Low dir.
+/// testable path): build a SACL holding one `SYSTEM_MANDATORY_LABEL_ACE` flagged
+/// `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`, then apply it with
+/// `SetNamedSecurityInfoW(.., SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, ..)`.
+/// `SetNamedSecurityInfoW` performs inheritance propagation itself: setting an
+/// inheritable label on the container re-applies it to the existing subtree AND
+/// it is inherited by children created later, so no manual recursion is needed.
+/// izbad runs at Medium, so writing either a Low (write-down) or a Medium label
+/// is always within its rights.
 ///
 /// SAFETY: linear FFI. The label SID is `LocalAlloc`'d by
 /// `ConvertStringSidToSidW`; as elsewhere in this file we accept not freeing it
-/// (one small allocation per VMM launch, sandbox lifetime, not per-request).
-/// The ACL lives in a local heap `Vec<u8>` whose lifetime spans the
+/// (one small allocation per VMM launch/teardown, not per-request). The ACL
+/// lives in a local heap `Vec<u8>` whose lifetime spans the
 /// `SetNamedSecurityInfoW` call (the OS copies it), and a NUL-terminated UTF-16
 /// path buffer likewise outlives the call.
 #[cfg(windows)]
-pub fn set_low_integrity_recursive(path: &Path) -> anyhow::Result<()> {
+fn apply_inheritable_integrity_label(path: &Path, sid_str: &str) -> anyhow::Result<()> {
     // SAFETY: a single linear FFI sequence; every buffer handed to the OS
     // outlives the call that reads it, and the only allocation (the label SID)
     // is intentionally leaked per the doc-comment.
     unsafe {
-        // Resolve the Low integrity SID.
-        let sid_str: Vec<u16> = LOW_INTEGRITY_SID.encode_utf16().collect();
+        // Resolve the integrity SID.
+        let sid_str: Vec<u16> = sid_str.encode_utf16().collect();
         let mut sid = std::ptr::null_mut();
         if ConvertStringSidToSidW(sid_str.as_ptr(), &mut sid) == 0 {
             anyhow::bail!(
-                "ConvertStringSidToSidW(Low): {}",
+                "ConvertStringSidToSidW(integrity label): {}",
                 std::io::Error::last_os_error()
             );
         }
@@ -120,9 +182,9 @@ pub fn set_low_integrity_recursive(path: &Path) -> anyhow::Result<()> {
         if InitializeAcl(acl, acl_size as u32, ACL_REVISION) == 0 {
             anyhow::bail!("InitializeAcl: {}", std::io::Error::last_os_error());
         }
-        // The label ACE: Low integrity, no-write-up, inherited by files
-        // (OBJECT_INHERIT) and subdirectories (CONTAINER_INHERIT) so the whole
-        // scratch subtree is writable by the Low-IL VMM.
+        // The label ACE: the requested integrity, no-write-up, inherited by
+        // files (OBJECT_INHERIT) and subdirectories (CONTAINER_INHERIT) so the
+        // whole subtree carries it.
         if AddMandatoryAce(
             acl,
             ACL_REVISION,
@@ -131,7 +193,10 @@ pub fn set_low_integrity_recursive(path: &Path) -> anyhow::Result<()> {
             sid,
         ) == 0
         {
-            anyhow::bail!("AddMandatoryAce(Low): {}", std::io::Error::last_os_error());
+            anyhow::bail!(
+                "AddMandatoryAce(integrity label): {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         // Apply the SACL as the object's mandatory label. SetNamedSecurityInfoW
@@ -620,7 +685,7 @@ impl Drop for OwnedJobHandle {
 mod tests {
     use super::{
         build_command_line, build_confined_token, create_resource_job, quote_arg,
-        set_low_integrity_recursive, spawn_confined,
+        restore_integrity_recursive, set_low_integrity_recursive, spawn_confined,
     };
     use crate::procmgr::confine::{ConfinementMode, ConfinementPolicy};
     use crate::procmgr::windows::kill_pid;
@@ -644,6 +709,10 @@ mod tests {
     /// mandatory-RID constants, so define the fixed value locally (same pattern
     /// as `SE_GROUP_INTEGRITY`). `0x1000` == 4096.
     const SECURITY_MANDATORY_LOW_RID: u32 = 0x0000_1000;
+
+    /// `SECURITY_MANDATORY_MEDIUM_RID` (winnt.h) — the RID of the Medium
+    /// integrity SID `S-1-16-8192`. `0x2000` == 8192.
+    const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x0000_2000;
 
     fn quoted(arg: &str) -> String {
         let mut out = String::new();
@@ -891,6 +960,41 @@ mod tests {
             read_label_rid(&file),
             Some(SECURITY_MANDATORY_LOW_RID),
             "child file must inherit the Low integrity label"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Teardown restore: after lowering a tree to Low, `restore_integrity_recursive`
+    /// must raise the directory AND its **inherited** child back to a **Medium**
+    /// mandatory label. This is the workspace-restore path run on sandbox stop /
+    /// remove / adoption sweep. (A child carrying its OWN *explicit* Low label —
+    /// e.g. a file the Low-IL VMM created — is a documented benign residual that
+    /// re-propagation does not clear; not asserted here. See the function doc.)
+    #[test]
+    fn restore_integrity_recursive_raises_back_to_medium() {
+        let dir = std::env::temp_dir().join(format!("izba-restore-il-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let file = dir.join("rw.img");
+        std::fs::write(&file, b"scratch").expect("create temp file");
+
+        set_low_integrity_recursive(&dir).expect("set Low IL");
+        assert_eq!(
+            read_label_rid(&dir),
+            Some(SECURITY_MANDATORY_LOW_RID),
+            "precondition: directory is Low before restore"
+        );
+
+        restore_integrity_recursive(&dir).expect("restore Medium IL");
+        assert_eq!(
+            read_label_rid(&dir),
+            Some(SECURITY_MANDATORY_MEDIUM_RID),
+            "directory must be restored to a Medium integrity label"
+        );
+        assert_eq!(
+            read_label_rid(&file),
+            Some(SECURITY_MANDATORY_MEDIUM_RID),
+            "child file must inherit the restored Medium label"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
