@@ -63,14 +63,33 @@ pub fn build_invocation(spec: &VmSpec, openvmm: &Path) -> CommandSpec {
         "--pcie-root-complex".to_string(),
         "rc0".to_string(),
     ];
+    push_disk_root_ports(&mut argv, spec);
+    push_share_root_ports(&mut argv, spec);
+    push_virtio_blk(&mut argv, spec);
+    push_virtio_fs(&mut argv, spec);
+    argv.push("--virtio-vsock-path".to_string());
+    argv.push(vsock_sock.display().to_string());
+    CommandSpec { argv }
+}
+
+/// One `--pcie-root-port rc0:vd{a..}` per disk, in disk order.
+fn push_disk_root_ports(argv: &mut Vec<String>, spec: &VmSpec) {
     for i in 0..spec.disks.len() {
         argv.push("--pcie-root-port".to_string());
         argv.push(format!("rc0:{}", disk_port(i)));
     }
+}
+
+/// One `--pcie-root-port rc0:fs-<tag>` per virtiofs share, in share order.
+fn push_share_root_ports(argv: &mut Vec<String>, spec: &VmSpec) {
     for share in &spec.shares {
         argv.push("--pcie-root-port".to_string());
         argv.push(format!("rc0:fs-{}", share.tag));
     }
+}
+
+/// One `--virtio-blk file:<path>[,ro],pcie_port=vd{a..}` per disk, in order.
+fn push_virtio_blk(argv: &mut Vec<String>, spec: &VmSpec) {
     for (i, disk) in spec.disks.iter().enumerate() {
         let ro = if disk.readonly { ",ro" } else { "" };
         argv.push("--virtio-blk".to_string());
@@ -80,6 +99,10 @@ pub fn build_invocation(spec: &VmSpec, openvmm: &Path) -> CommandSpec {
             disk_port(i)
         ));
     }
+}
+
+/// One `--virtio-fs pcie_port=fs-<tag>:<tag>,<host_path>` per share, in order.
+fn push_virtio_fs(argv: &mut Vec<String>, spec: &VmSpec) {
     for share in &spec.shares {
         argv.push("--virtio-fs".to_string());
         argv.push(format!(
@@ -89,9 +112,6 @@ pub fn build_invocation(spec: &VmSpec, openvmm: &Path) -> CommandSpec {
             share.host_path.display()
         ));
     }
-    argv.push("--virtio-vsock-path".to_string());
-    argv.push(vsock_sock.display().to_string());
-    CommandSpec { argv }
 }
 
 /// Spawns openvmm as a single detached process.

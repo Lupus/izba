@@ -107,12 +107,7 @@ fn run_pid1() -> anyhow::Result<()> {
         .get("izba.volumes")
         .map(|s| s.split(',').filter(|p| !p.is_empty()).collect())
         .unwrap_or_default();
-    for i in 0..vols.len() {
-        let dev = mounts::volume_device(i);
-        rwdisk::ensure_formatted(Path::new(&dev))
-            .with_context(|| format!("formatting volume {dev}"))?;
-    }
-    mounts::apply(&mounts::volume_mount_plan(&vols)).context("volume mounts")?;
+    setup_user_volumes(&vols)?;
 
     // Static guest networking: lo + dummy0 with the izba subnet. Log and
     // continue on error — exec/cp/vsock still work without IP networking.
@@ -141,72 +136,7 @@ fn run_pid1() -> anyhow::Result<()> {
         let e = Arc::clone(&engine);
         std::thread::spawn(move || server::serve_streams(streams, e));
     }
-    {
-        // Egress is unconditional: the guest is a pure vsock island, so the
-        // stub IS the only way out. Order matters: listeners first, rules
-        // second — once REDIRECT is in, every guest TCP connect lands on the
-        // stub. The binds happen HERE on the main thread (not inside the
-        // spawned serve loops) so they strictly happen-before apply_nft; the
-        // accept/recv loops then move into threads.
-        let dns_sock = match egress::bind_dns_udp() {
-            Ok(s) => Some(s),
-            Err(e) => {
-                // Bind failed: the udp :53 redirect now blackholes DNS until
-                // fixed, but TCP egress is unaffected — we still apply nft.
-                eprintln!("izba-init: binding dns :53: {e}");
-                None
-            }
-        };
-        // DNS-over-TCP: the loopback retry path a resolver takes after a TC=1
-        // (truncated) UDP answer. Bind before apply_nft like the others; a bind
-        // failure only loses TCP DNS (large/split-horizon answers), not UDP DNS.
-        let dns_tcp_listener = match egress::bind_dns_tcp() {
-            Ok(l) => Some(l),
-            Err(e) => {
-                eprintln!("izba-init: binding dns tcp :53: {e}");
-                None
-            }
-        };
-        let tcp_listener = match egress::bind_tcp_redirect() {
-            Ok(l) => Some(l),
-            Err(e) => {
-                // Bind failed: the TCP REDIRECT now blackholes ALL guest TCP
-                // (loopback RST) — the honest deny posture; DNS is unaffected.
-                // We still apply nft so the deny is enforced, not bypassed.
-                eprintln!(
-                    "izba-init: binding tcp redirect :{}: {e}",
-                    egress::REDIRECT_PORT
-                );
-                None
-            }
-        };
-        if let Some(sock) = dns_sock {
-            std::thread::spawn(move || {
-                if let Err(e) = egress::serve_dns_udp(sock) {
-                    eprintln!("izba-init: dns stub: {e}");
-                }
-            });
-        }
-        if let Some(listener) = dns_tcp_listener {
-            std::thread::spawn(move || {
-                if let Err(e) = egress::serve_dns_tcp(listener) {
-                    eprintln!("izba-init: dns tcp stub: {e}");
-                }
-            });
-        }
-        if let Some(listener) = tcp_listener {
-            std::thread::spawn(move || {
-                if let Err(e) = egress::serve_tcp_redirect(listener) {
-                    eprintln!("izba-init: tcp redirect stub: {e}");
-                }
-            });
-        }
-        if let Err(e) = egress::apply_nft() {
-            // Loud but not fatal: DNS still works via resolv.conf; TCP
-            // egress is dead until fixed. The console log is captured.
-            eprintln!("izba-init: applying nft ruleset: {e}");
-        }
-    }
+    bring_up_egress();
 
     // Zombie policy (v1): every engine exec is reaped by its dedicated
     // waitpid thread. We deliberately do NOT waitpid(-1) here — that would
@@ -220,6 +150,91 @@ fn run_pid1() -> anyhow::Result<()> {
     engine.kill_all();
     nix::unistd::sync();
     power_off();
+}
+
+/// Format-if-blank then mount each user volume (vdc, vdd, …) under /rootfs,
+/// in the host-declared `izba.volumes` order.
+fn setup_user_volumes(vols: &[&str]) -> anyhow::Result<()> {
+    for i in 0..vols.len() {
+        let dev = mounts::volume_device(i);
+        rwdisk::ensure_formatted(Path::new(&dev))
+            .with_context(|| format!("formatting volume {dev}"))?;
+    }
+    mounts::apply(&mounts::volume_mount_plan(vols)).context("volume mounts")
+}
+
+/// Bring up the always-on egress stub.
+///
+/// Egress is unconditional: the guest is a pure vsock island, so the stub IS
+/// the only way out. Order matters: listeners first, rules second — once
+/// REDIRECT is in, every guest TCP connect lands on the stub. The binds happen
+/// HERE on the main thread (not inside the spawned serve loops) so they
+/// strictly happen-before apply_nft; the accept/recv loops then move into
+/// threads.
+fn bring_up_egress() {
+    let dns_sock = match egress::bind_dns_udp() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            // Bind failed: the udp :53 redirect now blackholes DNS until
+            // fixed, but TCP egress is unaffected — we still apply nft.
+            eprintln!("izba-init: binding dns :53: {e}");
+            None
+        }
+    };
+    // DNS-over-TCP: the loopback retry path a resolver takes after a TC=1
+    // (truncated) UDP answer. Bind before apply_nft like the others; a bind
+    // failure only loses TCP DNS (large/split-horizon answers), not UDP DNS.
+    let dns_tcp_listener = match egress::bind_dns_tcp() {
+        Ok(l) => Some(l),
+        Err(e) => {
+            eprintln!("izba-init: binding dns tcp :53: {e}");
+            None
+        }
+    };
+    let tcp_listener = match egress::bind_tcp_redirect() {
+        Ok(l) => Some(l),
+        Err(e) => {
+            // Bind failed: the TCP REDIRECT now blackholes ALL guest TCP
+            // (loopback RST) — the honest deny posture; DNS is unaffected.
+            // We still apply nft so the deny is enforced, not bypassed.
+            eprintln!(
+                "izba-init: binding tcp redirect :{}: {e}",
+                egress::REDIRECT_PORT
+            );
+            None
+        }
+    };
+    spawn_serve(dns_sock, "dns stub", egress::serve_dns_udp);
+    spawn_serve(dns_tcp_listener, "dns tcp stub", egress::serve_dns_tcp);
+    spawn_serve(
+        tcp_listener,
+        "tcp redirect stub",
+        egress::serve_tcp_redirect,
+    );
+    if let Err(e) = egress::apply_nft() {
+        // Loud but not fatal: DNS still works via resolv.conf; TCP
+        // egress is dead until fixed. The console log is captured.
+        eprintln!("izba-init: applying nft ruleset: {e}");
+    }
+}
+
+/// Spawn a serve loop for a bound egress listener, logging a `label`led error if
+/// the loop ever exits with one. No-op when the bind failed (`None`) — the nft
+/// REDIRECT/DROP still enforces the deny, so a missing stub blackholes rather
+/// than leaks.
+fn spawn_serve<T: Send + 'static>(
+    listener: Option<T>,
+    label: &'static str,
+    serve: fn(T) -> std::io::Result<()>,
+) {
+    let Some(l) = listener else {
+        return;
+    };
+    std::thread::spawn(move || {
+        if let Err(e) = serve(l) {
+            eprintln!("izba-init: {label}: {e}");
+        }
+    });
 }
 
 /// The resolver MUST be a loopback address (127.0.0.1) because 127.0.0.0/8
@@ -312,5 +327,67 @@ fn power_off() -> ! {
     // VM); nothing sensible left to do.
     loop {
         std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_serve;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    // `spawn_serve` is generic over the listener type, so these tests use `()` as
+    // a stand-in listener: no socket is bound (some sandboxes deny `bind`), yet
+    // every branch — the None no-op, the spawned serve call, and the error log —
+    // is exercised. Each test owns a distinct counter so the parallel test runner
+    // cannot race them.
+    fn spin_until_nonzero(counter: &AtomicUsize) -> usize {
+        for _ in 0..400 {
+            let n = counter.load(Ordering::SeqCst);
+            if n > 0 {
+                return n;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        counter.load(Ordering::SeqCst)
+    }
+
+    static NONE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn none_serve(_: ()) -> std::io::Result<()> {
+        NONE_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_serve_is_noop_when_listener_is_none() {
+        // A failed bind (`None`) must never spawn a thread or invoke `serve`.
+        spawn_serve(None::<()>, "none", none_serve);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(NONE_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    static OK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn ok_serve(_: ()) -> std::io::Result<()> {
+        OK_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_serve_runs_serve_for_a_bound_listener() {
+        spawn_serve(Some(()), "ok", ok_serve);
+        assert_eq!(spin_until_nonzero(&OK_CALLS), 1);
+    }
+
+    static ERR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn err_serve(_: ()) -> std::io::Result<()> {
+        ERR_CALLS.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::Error::other("simulated serve-loop exit"))
+    }
+
+    #[test]
+    fn spawn_serve_logs_and_survives_a_serve_error() {
+        // A serve loop returning Err is logged inside the thread, not propagated.
+        spawn_serve(Some(()), "err", err_serve);
+        assert_eq!(spin_until_nonzero(&ERR_CALLS), 1);
     }
 }
