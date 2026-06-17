@@ -56,6 +56,25 @@ jobs:
             target/coverage/coverage.json
             target/coverage/html
           if-no-files-found: warn
+      # Frontend (app/) coverage for the same Sonar scan: the Tauri app is a
+      # separate npm project outside the cargo workspace, so cargo-llvm-cov
+      # never sees it. vitest writes app/-relative lcov; rewrite SF paths to be
+      # repo-root-relative so they resolve against the scanned tree. Same
+      # same-repo-PR guard as the scan (fork PRs have no secret anyway).
+      - name: Frontend coverage (vitest lcov)
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        working-directory: app
+        run: |
+          npm ci --ignore-scripts
+          npm run test:coverage
+      # Guard on the file existing rather than on the same-repo PR condition:
+      # if the vitest step above failed (npm/network hiccup) the lcov is absent,
+      # and `sed -i` on a missing file would exit non-zero and fail the job. The
+      # explicit `if:` already dropped the implicit success() check, so this is
+      # the precise "only rewrite when there's something to rewrite" guard.
+      - name: Rewrite frontend lcov paths to repo-root-relative
+        if: ${{ hashFiles('app/coverage/lcov.info') != '' }}
+        run: sed -i 's|^SF:|SF:app/|' app/coverage/lcov.info
       # SonarCloud, pull requests only. This is the per-PR "new code" coverage
       # feed (host workspace; the KVM-gated integration tests self-skip on this
       # NIC-less hosted runner). The richer host+real-VM main-branch analysis is

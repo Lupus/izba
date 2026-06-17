@@ -214,8 +214,8 @@ jobs:
       - name: ttystorm M0 churn gate
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          cargo build --release -p izba-cli
-          cargo build --release -p izba-core --example ttystorm
+          cargo build --locked --release -p izba-cli
+          cargo build --locked --release -p izba-core --example ttystorm
           mkdir -p "$RUNNER_TEMP/storm-data"
           IZBA_DATA_DIR="$RUNNER_TEMP/storm-data" \
           IZBA_EXE="$PWD/target/release/izba" \
@@ -355,6 +355,23 @@ jobs:
             target/coverage/coverage-e2e.json
             target/coverage/html-e2e
           if-no-files-found: warn
+      # Frontend (app/) coverage for the main-branch scan below, so the Tauri
+      # app isn't shown as 0%-covered on the dashboard. The app is a separate
+      # npm project outside the cargo workspace; vitest emits app/-relative
+      # lcov, rewritten to repo-root-relative to resolve against the scanned tree.
+      - name: Frontend coverage (vitest lcov)
+        if: always()
+        working-directory: app
+        run: |
+          npm ci --ignore-scripts
+          npm run test:coverage
+      # Guard on the file existing: if the vitest step above failed the lcov is
+      # absent, and `sed -i` on a missing file would exit non-zero. `if: always()`
+      # (or `!cancelled()`) would still run it after that failure — gating on
+      # hashFiles is the only form that actually skips the missing-file case.
+      - name: Rewrite frontend lcov paths to repo-root-relative
+        if: ${{ hashFiles('app/coverage/lcov.info') != '' }}
+        run: sed -i 's|^SF:|SF:app/|' app/coverage/lcov.info
       # SonarCloud main-branch analysis with the richer host+real-VM report.
       # This job runs on schedule + workflow_dispatch (never on push), so the
       # main coverage on the Sonar dashboard refreshes on that cadence — a
@@ -425,8 +442,8 @@ jobs:
       - name: Build izba.exe + ttystorm.exe (native MSVC)
         shell: bash
         run: |
-          cargo build --release -p izba-cli
-          cargo build --release -p izba-core --example ttystorm
+          cargo build --locked --release -p izba-cli
+          cargo build --locked --release -p izba-core --example ttystorm
       - name: Windows validation suite (21 checks)
         env:
           IZBA_EXE: ${{ github.workspace }}\target\release\izba.exe
@@ -560,7 +577,7 @@ jobs:
           # report. windows-whp remains the authoritative Windows gate.
           set +e
           cargo test -p izba-proto -p izba-core -p izba-cli
-          cargo build --release -p izba-cli
+          cargo build --locked --release -p izba-cli
           pwsh -NoProfile -File hack/spike/validate-izba-windows.ps1
           set -e
           # Separator-agnostic regex: llvm-cov emits backslash paths on Windows.
