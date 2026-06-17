@@ -78,11 +78,15 @@ Key properties:
   CI builds inside a real `.git` checkout, so `izba version` carries the correct
   sha natively. The local script's whole Stage-1 attribution machinery
   disappears.
-- **openvmm pin de-duplication.** `package-windows` fetches openvmm by running
-  `hack/fetch-openvmm.sh` directly — that script *is* the pin's source of
-  truth — instead of copying `release.yml`'s hardcoded `openvmm-run-<id>` cache
-  key. The pin then lives in exactly one place. (Caching openvmm across dispatch
-  runs is an optional later optimization; correctness does not depend on it.)
+- **openvmm pin de-duplication + cache.** `package-windows` fetches openvmm via
+  `hack/fetch-openvmm.sh` — that script *is* the pin's single source of truth —
+  instead of copying `release.yml`'s hardcoded `openvmm-run-<id>` cache key. It
+  is wrapped in an `actions/cache` keyed on `hashFiles('hack/fetch-openvmm.sh')`
+  so the binary isn't re-downloaded every run and survives the upstream
+  microsoft/openvmm artifact's ~90-day expiry (while the cache stays warm); the
+  hash-key auto-invalidates on a re-pin, keeping zero hardcoded run-id
+  duplication. (This is strictly better than `release.yml`'s hardcoded-run-id
+  cache key.)
 - **Artifacts uploaded:** `izba-deb`, `izba-app-deb`, `izba-windows-installer`
   (same artifact names release.yml uses), version-stamped `base~git<sha>`.
 
