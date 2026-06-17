@@ -61,6 +61,16 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
     setHovering(v);
   };
 
+  // A 1-second clock so the Last-activity column stays live even while the
+  // pointer is parked over the table: hover pauses polling, so the rows freeze,
+  // but their relative-time labels must keep ticking. The deterministic order
+  // means these clock re-renders never reshuffle the frozen rows.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const [r, p] = await Promise.all([api.readNetlog(name), api.policyShow(name)]);
@@ -101,7 +111,6 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
   const enforcing = policy?.enforcing ?? false;
   const allowed = allowKeys(policy?.allow ?? []);
   const ordered = orderRows(rows);
-  const now = Date.now();
 
   return (
     <div className="flex h-full flex-col">
