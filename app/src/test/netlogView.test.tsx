@@ -103,6 +103,21 @@ describe("NetlogView", () => {
     expect(screen.getByRole("columnheader", { name: /last activity/i })).toBeInTheDocument();
   });
 
+  it("keeps the Last activity column live via a 1s clock, independent of polling", async () => {
+    // last_seen = render time ⇒ the label starts at "just now". With polling
+    // effectively off (huge interval, so only the immediate first read fires),
+    // the only thing that can advance the relative time is the 1-second clock —
+    // exactly the parked-pointer case where hover-pause freezes the rows but the
+    // Last-activity labels must keep ticking.
+    const fresh = { ...allowedNamed, host: "fresh.example", last_seen_ms: Date.now() };
+    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([fresh]);
+    render(<NetlogView name="web" pollMs={10_000_000} />);
+    await screen.findByText("fresh.example");
+    await waitFor(() => expect(screen.getByText(/\ds ago/)).toBeInTheDocument(), {
+      timeout: 4000,
+    });
+  });
+
   it("pauses polling while the pointer hovers the table", async () => {
     const read = api.readNetlog as ReturnType<typeof vi.fn>;
     render(<NetlogView name="web" pollMs={20} />);
