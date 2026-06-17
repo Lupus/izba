@@ -169,14 +169,26 @@ jobs:
         with:
           name: initramfs
           path: stage/artifacts
-      - name: Fetch pinned openvmm.exe + stage into libexec
+      # Cache openvmm.exe so it isn't re-downloaded every run and survives the
+      # ~90-day expiry of the upstream microsoft/openvmm artifact (while the
+      # cache stays warm). Keyed on the fetch script's content — the pin's single
+      # source of truth — so a re-pin auto-invalidates it, with NO hardcoded
+      # run-id duplicated from release.yml.
+      - name: Restore cached openvmm.exe
+        id: openvmm-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: dist/openvmm.exe
+          key: openvmm-${{ hashFiles('hack/fetch-openvmm.sh') }}
+      - name: Fetch pinned openvmm.exe (cache miss)
+        if: steps.openvmm-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+        run: hack/fetch-openvmm.sh
+      - name: Stage openvmm.exe into libexec
+        shell: bash
         run: |
-          # The pin lives in hack/fetch-openvmm.sh (single source of truth) —
-          # call it directly rather than copying release.yml's cache-key pin.
-          hack/fetch-openvmm.sh
           mkdir -p stage/bin/libexec
           cp dist/openvmm.exe stage/bin/libexec/openvmm.exe
       - name: Build installer with Inno Setup
