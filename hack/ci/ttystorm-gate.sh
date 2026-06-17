@@ -34,7 +34,7 @@ echo "=== ttystorm gate: chop 30 256 ==="
 
 echo "=== ttystorm gate: VM survived? ==="
 OUT="$("$IZBA_EXE" exec "$NAME" -- echo alive)"
-if [ "$OUT" != "alive" ]; then
+if [[ "$OUT" != "alive" ]]; then
     echo "FAIL: exec after churn returned '$OUT' (VM dead or wedged)" >&2
     exit 1
 fi

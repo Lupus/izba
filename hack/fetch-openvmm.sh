@@ -31,13 +31,13 @@ gh run download "$RUN_ID" -R microsoft/openvmm -n "$ARTIFACT" -D "$TMP" \
     || { echo "error: artifact download failed — likely EXPIRED; see re-pin procedure in this script's header" >&2; exit 1; }
 
 EXE="$(find "$TMP" -name openvmm.exe | head -1)"
-[ -n "$EXE" ] || { echo "error: openvmm.exe not found in artifact" >&2; exit 1; }
+[[ -n "$EXE" ]] || { echo "error: openvmm.exe not found in artifact" >&2; exit 1; }
 
 GOT="$(sha256sum "$EXE" | cut -d' ' -f1)"
-if [ -z "$SHA256" ]; then
+if [[ -z "$SHA256" ]]; then
     echo "NOTE: no pinned sha256 yet — record this in fetch-openvmm.sh:"
     echo "  SHA256=\"$GOT\""
-elif [ "$GOT" != "$SHA256" ]; then
+elif [[ "$GOT" != "$SHA256" ]]; then
     echo "error: sha256 mismatch: got $GOT want $SHA256" >&2
     exit 1
 fi
