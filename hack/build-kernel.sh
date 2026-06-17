@@ -56,7 +56,7 @@ for tool in gcc make flex bison bc sha256sum; do
     fi
 done
 # libelf is a library; check for the companion header via its dev package.
-if (! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists libelf 2>/dev/null) \
+if { ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists libelf 2>/dev/null; } \
     && [[ ! -f /usr/include/libelf.h ]] && [[ ! -f /usr/include/gelf.h ]]; then
     # Fall back: header not present either — record the missing dev package.
     MISSING="$MISSING libelf-dev"
