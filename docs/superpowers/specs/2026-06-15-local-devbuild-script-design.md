@@ -1,6 +1,15 @@
 # Local dev build script (`hack/devbuild.sh`) — design
 
-**Status:** approved 2026-06-15. Implementation handed to a subagent.
+> **⚠️ SUPERSEDED 2026-06-16.** The local-build approach described here loaded
+> the laptop (per-worktree Rust `target/` dirs on Linux *and* the Windows host,
+> Tauri/npm builds ×N worktrees → disk + time blowup). `hack/devbuild.sh` was
+> rewritten into a **CI dispatch + download helper**; the installer set is now
+> built entirely in CI. See
+> [2026-06-16-ci-dev-installer-artifacts-design.md](2026-06-16-ci-dev-installer-artifacts-design.md).
+> This document is retained for history only — do **not** reintroduce the local
+> heavy-build flow.
+
+**Status:** SUPERSEDED (see banner). Originally approved 2026-06-15.
 
 ## Goal
 
