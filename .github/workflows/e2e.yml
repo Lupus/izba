@@ -365,8 +365,12 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm run test:coverage
+      # Guard on the file existing: if the vitest step above failed the lcov is
+      # absent, and `sed -i` on a missing file would exit non-zero. `if: always()`
+      # (or `!cancelled()`) would still run it after that failure — gating on
+      # hashFiles is the only form that actually skips the missing-file case.
       - name: Rewrite frontend lcov paths to repo-root-relative
-        if: always()
+        if: ${{ hashFiles('app/coverage/lcov.info') != '' }}
         run: sed -i 's|^SF:|SF:app/|' app/coverage/lcov.info
       # SonarCloud main-branch analysis with the richer host+real-VM report.
       # This job runs on schedule + workflow_dispatch (never on push), so the
