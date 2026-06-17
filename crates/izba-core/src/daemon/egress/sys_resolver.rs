@@ -74,10 +74,19 @@ fn truncated_response(req: &Message) -> anyhow::Result<Vec<u8>> {
 
 /// Build a NOERROR response echoing the question and carrying `records` as the
 /// answer section. Records come straight from hickory's `Lookup`, so no
-/// per-RData destructuring is needed. If the encoded response would exceed the
-/// 512-byte non-EDNS UDP limit, a TC=1 truncated response is returned instead
-/// so the guest retries over TCP:53.
-fn response_with_answers(req: &Message, records: &[Record]) -> anyhow::Result<Vec<u8>> {
+/// per-RData destructuring is needed.
+///
+/// For a UDP-origin query (`over_tcp == false`), an encoded response exceeding
+/// the 512-byte non-EDNS UDP limit is returned as a TC=1 truncated response so
+/// the guest retries over TCP:53. For a TCP-origin query (`over_tcp == true`)
+/// the full answer is returned — DNS-over-TCP allows up to 64 KiB (the 2-byte
+/// length prefix), so there is nothing to truncate to and truncating would
+/// strand any name whose answer is larger than 512 bytes.
+fn response_with_answers(
+    req: &Message,
+    records: &[Record],
+    over_tcp: bool,
+) -> anyhow::Result<Vec<u8>> {
     let mut resp = Message::new(req.id, MessageType::Response, OpCode::Query);
     for q in &req.queries {
         resp.add_query(q.clone());
@@ -89,7 +98,7 @@ fn response_with_answers(req: &Message, records: &[Record]) -> anyhow::Result<Ve
     resp.metadata.recursion_available = true;
     resp.metadata.response_code = ResponseCode::NoError;
     let bytes = resp.to_vec()?;
-    if bytes.len() > MAX_UDP_RESPONSE {
+    if !over_tcp && bytes.len() > MAX_UDP_RESPONSE {
         return truncated_response(req);
     }
     Ok(bytes)
@@ -444,9 +453,10 @@ impl SystemResolver {
         req: Message,
         name: hickory_proto::rr::Name,
         qtype: RecordType,
+        over_tcp: bool,
     ) -> anyhow::Result<Vec<u8>> {
         match self.lookup_once(&name, qtype) {
-            Ok(records) => response_with_answers(&req, &records),
+            Ok(records) => response_with_answers(&req, &records, over_tcp),
             Err(e) if e.is_nx_domain() => response_with_rcode(&req, ResponseCode::NXDomain),
             Err(e) if e.is_no_records_found() => response_with_rcode(&req, ResponseCode::NoError),
             Err(_transient) => {
@@ -454,7 +464,7 @@ impl SystemResolver {
                 // from current system config and retry exactly once.
                 self.try_reload_on_failure();
                 match self.lookup_once(&name, qtype) {
-                    Ok(records) => response_with_answers(&req, &records),
+                    Ok(records) => response_with_answers(&req, &records, over_tcp),
                     Err(e) if e.is_nx_domain() => response_with_rcode(&req, ResponseCode::NXDomain),
                     Err(e) if e.is_no_records_found() => {
                         response_with_rcode(&req, ResponseCode::NoError)
@@ -464,15 +474,27 @@ impl SystemResolver {
             }
         }
     }
+
+    /// Shared front-half for both transports: classify, then resolve with the
+    /// transport's truncation policy (`over_tcp` ⇒ no 512-byte cap).
+    fn handle_transport(&self, query: &[u8], over_tcp: bool) -> anyhow::Result<Vec<u8>> {
+        match classify_query(query, &self.caps) {
+            QueryDecision::Unparseable => anyhow::bail!("unparseable DNS query"),
+            QueryDecision::Unsupported { req } => response_with_rcode(&req, ResponseCode::NotImp),
+            QueryDecision::Answerable { req, name, qtype } => {
+                self.resolve(req, name, qtype, over_tcp)
+            }
+        }
+    }
 }
 
 impl Resolver for SystemResolver {
     fn handle(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        match classify_query(query, &self.caps) {
-            QueryDecision::Unparseable => anyhow::bail!("unparseable DNS query"),
-            QueryDecision::Unsupported { req } => response_with_rcode(&req, ResponseCode::NotImp),
-            QueryDecision::Answerable { req, name, qtype } => self.resolve(req, name, qtype),
-        }
+        self.handle_transport(query, false)
+    }
+
+    fn handle_tcp(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.handle_transport(query, true)
     }
 }
 
@@ -796,7 +818,7 @@ mod tests {
             full_bytes.len()
         );
 
-        let bytes = response_with_answers(&req, &records).unwrap();
+        let bytes = response_with_answers(&req, &records, false).unwrap();
         assert!(
             bytes.len() <= MAX_UDP_RESPONSE,
             "truncated response must fit 512 bytes: {}",
@@ -809,6 +831,39 @@ mod tests {
             "answers must be dropped on truncation"
         );
         assert_eq!(resp.id, 0x55, "id must be echoed");
+    }
+
+    /// The DNS-over-TCP fix: the SAME oversized answer that truncates over UDP
+    /// is returned in FULL over TCP (`over_tcp == true`) — no TC bit, every
+    /// record present. Without this a name whose answer exceeds 512 bytes (a
+    /// CDN / split-horizon record set) is unresolvable: the UDP reply truncates
+    /// and the guest's TCP retry would truncate again, looping forever.
+    #[test]
+    fn oversized_answer_is_returned_in_full_over_tcp() {
+        use hickory_proto::rr::{rdata::A, RData, Record};
+        let req = sample_query(0x66, RecordType::A);
+        let name = Name::from_str("a-fairly-long-cdn-name.example.com.").unwrap();
+        let records: Vec<Record> = (0..40u32)
+            .map(|i| {
+                let ip = std::net::Ipv4Addr::new(203, 0, 113, (i & 0xff) as u8);
+                Record::from_rdata(name.clone(), 30, RData::A(A(ip)))
+            })
+            .collect();
+
+        let bytes = response_with_answers(&req, &records, true).unwrap();
+        assert!(
+            bytes.len() > MAX_UDP_RESPONSE,
+            "the full TCP response must exceed the UDP cap (got {})",
+            bytes.len()
+        );
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert!(!resp.truncation, "TC bit must NOT be set over TCP");
+        assert_eq!(
+            resp.answers.len(),
+            40,
+            "all records must be present in the full TCP answer"
+        );
+        assert_eq!(resp.id, 0x66, "id must be echoed");
     }
 
     #[test]

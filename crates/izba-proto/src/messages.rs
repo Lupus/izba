@@ -102,7 +102,20 @@ pub enum StreamOpen {
     /// Guest DNS (vsock 1027, guest-initiated): DNS-over-TCP framing
     /// follows (see `crate::dns`), request/response alternating;
     /// sequential queries allowed; EOF closes.
+    ///
+    /// `Dns` carries a UDP-origin query: izbad caps the answer at the 512-byte
+    /// non-EDNS UDP limit and sets TC=1 when it would overflow, so the guest
+    /// retries over TCP (see [`StreamOpen::DnsTcp`]).
     Dns,
+    /// Guest DNS over TCP (vsock 1027, guest-initiated): identical framing and
+    /// dispatch to [`StreamOpen::Dns`], but the query reached the guest stub
+    /// over TCP:53 (a UDP TC=1 retry, or a client that prefers TCP). izbad
+    /// returns the full answer — up to the 64 KiB the 2-byte length prefix
+    /// allows — instead of truncating at 512 bytes. Without this the guest can
+    /// never resolve a name whose answer exceeds 512 bytes (e.g. a CDN or
+    /// split-horizon record set): the UDP reply truncates and the TCP retry,
+    /// lacking a path that signals "TCP", would truncate again in a loop.
+    DnsTcp,
 }
 
 pub const CONTROL_PORT: u32 = 1025;
@@ -190,6 +203,7 @@ mod tests {
                 port: 443,
             },
             StreamOpen::Dns,
+            StreamOpen::DnsTcp,
         ] {
             let mut buf = Vec::new();
             crate::write_frame(&mut buf, &open).unwrap();
@@ -215,6 +229,7 @@ mod tests {
                 r#""type":"tcp_connect""#,
             ),
             (StreamOpen::Dns, r#""type":"dns""#),
+            (StreamOpen::DnsTcp, r#""type":"dns_tcp""#),
         ] {
             let s = serde_json::to_string(&open).unwrap();
             assert!(s.contains(tag), "{s}");

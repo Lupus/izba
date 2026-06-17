@@ -157,6 +157,16 @@ fn run_pid1() -> anyhow::Result<()> {
                 None
             }
         };
+        // DNS-over-TCP: the loopback retry path a resolver takes after a TC=1
+        // (truncated) UDP answer. Bind before apply_nft like the others; a bind
+        // failure only loses TCP DNS (large/split-horizon answers), not UDP DNS.
+        let dns_tcp_listener = match egress::bind_dns_tcp() {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("izba-init: binding dns tcp :53: {e}");
+                None
+            }
+        };
         let tcp_listener = match egress::bind_tcp_redirect() {
             Ok(l) => Some(l),
             Err(e) => {
@@ -174,6 +184,13 @@ fn run_pid1() -> anyhow::Result<()> {
             std::thread::spawn(move || {
                 if let Err(e) = egress::serve_dns_udp(sock) {
                     eprintln!("izba-init: dns stub: {e}");
+                }
+            });
+        }
+        if let Some(listener) = dns_tcp_listener {
+            std::thread::spawn(move || {
+                if let Err(e) = egress::serve_dns_tcp(listener) {
+                    eprintln!("izba-init: dns tcp stub: {e}");
                 }
             });
         }
