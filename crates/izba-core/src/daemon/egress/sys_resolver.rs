@@ -105,8 +105,108 @@ pub(crate) trait ConfigSource: Send + Sync {
 pub(crate) struct SystemConfigSource;
 
 impl ConfigSource for SystemConfigSource {
+    /// Unix: resolv.conf is authoritative and already in preference order.
+    #[cfg(unix)]
     fn discover(&self) -> anyhow::Result<(ResolverConfig, ResolverOpts)> {
         Ok(hickory_resolver::system_conf::read_system_conf()?)
+    }
+
+    /// Windows: hickory's `read_system_conf` enumerates adapter DNS servers in
+    /// an order that does NOT match the OS resolver's interface-metric
+    /// preference — with a VPN up it can pick a lower-priority physical NIC's
+    /// resolver (e.g. a home router on metric 25) over the VPN's (metric 1),
+    /// which both resolves the wrong split-horizon view AND can be a broken
+    /// EDNS responder. We mirror Windows: order every connected adapter's DNS
+    /// servers by interface metric (lowest = most preferred), drop unroutable
+    /// site-local/link-local placeholders, and dedupe. Re-run on every reload
+    /// so VPN connect/disconnect is tracked.
+    ///
+    /// Search/suffix domains are intentionally NOT carried (empty search list),
+    /// unlike the Unix `read_system_conf` path: the `ipconfig` 0.3.4 crate
+    /// exposes no per-adapter DNS-suffix accessor (only `dns_servers()`), so
+    /// reading a VPN's split-DNS suffix would mean hand-rolling
+    /// `GetAdaptersAddresses` FFI. Resolving VPN-internal names is a documented
+    /// deferred non-goal, and the guest's resolv.conf carries no search list
+    /// either (so the guest never sends short names expecting expansion);
+    /// fully-qualified internal names still resolve via the metric-selected VPN
+    /// resolver above. Revisit if short-name expansion becomes a requirement.
+    #[cfg(windows)]
+    fn discover(&self) -> anyhow::Result<(ResolverConfig, ResolverOpts)> {
+        use hickory_resolver::config::NameServerConfig;
+        let adapters = ipconfig::get_adapters()?;
+        let mut candidates = Vec::new();
+        for a in &adapters {
+            if a.oper_status() != ipconfig::OperStatus::IfOperStatusUp {
+                continue;
+            }
+            for ip in a.dns_servers() {
+                // Per-server family metric, mirroring how Windows scopes route
+                // preference (Ipv4Metric for v4 resolvers, Ipv6Metric for v6).
+                let metric = if ip.is_ipv4() {
+                    a.ipv4_metric()
+                } else {
+                    a.ipv6_metric()
+                };
+                candidates.push(Candidate { metric, ip: *ip });
+            }
+        }
+        let ordered = order_upstreams(candidates);
+        if ordered.is_empty() {
+            anyhow::bail!("no usable system DNS servers discovered");
+        }
+        let name_servers = ordered
+            .into_iter()
+            .map(NameServerConfig::udp_and_tcp)
+            .collect();
+        let config = ResolverConfig::from_parts(None, vec![], name_servers);
+        Ok((config, ResolverOpts::default()))
+    }
+}
+
+/// One candidate upstream: a DNS server IP plus the routing metric of the
+/// interface that advertised it (lower = more preferred, mirroring Windows).
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug)]
+struct Candidate {
+    metric: u32,
+    ip: std::net::IpAddr,
+}
+
+/// Order DNS upstreams the way the Windows resolver prefers them: ascending
+/// interface metric, dropping unroutable placeholders, deduped preserving
+/// first-seen (lowest-metric) order. Pure, so it is unit-tested without the
+/// Windows adapter APIs. `sort_by_key` is stable, so equal-metric servers keep
+/// the adapter-enumeration order they arrived in.
+#[cfg(any(windows, test))]
+fn order_upstreams(mut candidates: Vec<Candidate>) -> Vec<std::net::IpAddr> {
+    candidates.sort_by_key(|c| c.metric);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for c in candidates {
+        if is_usable_resolver(c.ip) && seen.insert(c.ip) {
+            out.push(c.ip);
+        }
+    }
+    out
+}
+
+/// Reject DNS-server addresses that cannot be a real upstream: unspecified,
+/// loopback, IPv4 link-local (169.254/16), IPv6 link-local (fe80::/10) and
+/// IPv6 site-local (fec0::/10 — the deprecated Windows placeholders such as
+/// `fec0:0:0:ffff::1` that adapters like Tailscale advertise when they have no
+/// real IPv6 resolver).
+#[cfg(any(windows, test))]
+fn is_usable_resolver(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_unspecified() && !v4.is_loopback() && !v4.is_link_local()
+        }
+        std::net::IpAddr::V6(v6) => {
+            let lead = v6.segments()[0];
+            let is_link_local = (lead & 0xffc0) == 0xfe80;
+            let is_site_local = (lead & 0xffc0) == 0xfec0;
+            !v6.is_unspecified() && !v6.is_loopback() && !is_link_local && !is_site_local
+        }
     }
 }
 
@@ -147,12 +247,28 @@ impl ResolverCell {
     }
 }
 
+/// Force plain DNS (no EDNS/OPT) on upstream queries. Some real-world
+/// resolvers — notably consumer routers — answer an EDNS query with a
+/// miscounted section header: they echo an OPT record but report it in the
+/// authority count (NSCOUNT) with ARCOUNT=0, so the OPT lands outside the
+/// ADDITIONAL section. hickory-proto strictly rejects that
+/// (`RecordNotInAdditionalSection(OPT)`), turning every lookup into SERVFAIL.
+/// We gain nothing from EDNS here: answers are re-encoded to the classic
+/// 512-byte non-EDNS form anyway (`response_with_answers`), and anything that
+/// overflows 512 bytes falls back to TCP (`try_tcp_on_error`, on by default).
+/// Centralized so the initial build, the 1.1.1.1 fallback, and every reload
+/// all talk plain DNS.
+fn harden_opts(mut opts: ResolverOpts) -> ResolverOpts {
+    opts.edns0 = false;
+    opts
+}
+
 /// Build a Tokio resolver from explicit config. MUST be called inside a tokio
 /// runtime context (the connection provider uses `Handle::current()`).
 fn build_resolver(config: ResolverConfig, opts: ResolverOpts) -> anyhow::Result<TokioResolver> {
     Ok(
         HickoryResolver::builder_with_config(config, TokioRuntimeProvider::default())
-            .with_options(opts)
+            .with_options(harden_opts(opts))
             .build()?,
     )
 }
@@ -423,6 +539,115 @@ mod tests {
         let b = config_with([8, 8, 8, 8]);
         assert_eq!(fingerprint(&a), fingerprint(&a2));
         assert_ne!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
+    fn harden_opts_disables_upstream_edns() {
+        let mut o = ResolverOpts::default();
+        o.edns0 = true;
+        assert!(
+            !harden_opts(o).edns0,
+            "upstream queries must not carry EDNS/OPT"
+        );
+    }
+
+    #[test]
+    fn upstreams_ordered_by_metric_vpn_before_router() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        // The live izba-test host: GlobalProtect VPN on metric 1, home router
+        // on metric 25, a Tailscale fec0:: site-local placeholder on metric 5.
+        let vpn1: IpAddr = Ipv4Addr::new(10, 64, 139, 51).into();
+        let vpn2: IpAddr = Ipv4Addr::new(10, 21, 231, 4).into();
+        let router: IpAddr = Ipv4Addr::new(192, 168, 1, 1).into();
+        let placeholder: IpAddr = Ipv6Addr::new(0xfec0, 0, 0, 0xffff, 0, 0, 0, 1).into();
+        let ordered = order_upstreams(vec![
+            Candidate {
+                metric: 25,
+                ip: router,
+            },
+            Candidate {
+                metric: 5,
+                ip: placeholder,
+            },
+            Candidate {
+                metric: 1,
+                ip: vpn1,
+            },
+            Candidate {
+                metric: 1,
+                ip: vpn2,
+            },
+            Candidate {
+                metric: 1,
+                ip: vpn1,
+            }, // duplicate across adapters
+        ]);
+        assert_eq!(
+            ordered,
+            vec![vpn1, vpn2, router],
+            "VPN (metric 1) before router (25); fec0:: placeholder dropped; deduped"
+        );
+    }
+
+    #[test]
+    fn unusable_resolver_addresses_are_rejected() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        assert!(is_usable_resolver(Ipv4Addr::new(10, 64, 139, 51).into()));
+        assert!(is_usable_resolver(Ipv4Addr::new(192, 168, 1, 1).into()));
+        assert!(is_usable_resolver(
+            Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111).into()
+        ));
+        assert!(!is_usable_resolver(Ipv4Addr::UNSPECIFIED.into()));
+        assert!(!is_usable_resolver(Ipv4Addr::LOCALHOST.into()));
+        assert!(!is_usable_resolver(Ipv4Addr::new(169, 254, 1, 1).into()));
+        assert!(!is_usable_resolver(
+            Ipv6Addr::new(0xfec0, 0, 0, 0xffff, 0, 0, 0, 1).into()
+        ));
+        assert!(!is_usable_resolver(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into()
+        ));
+        assert!(!is_usable_resolver(Ipv6Addr::LOCALHOST.into()));
+    }
+
+    /// Root-cause regression. A consumer router answers an EDNS query with an
+    /// OPT record but reports NSCOUNT=1/ARCOUNT=0, so the OPT lands in the
+    /// AUTHORITY section — hickory rejects it and we SERVFAIL. The same name
+    /// without a client OPT comes back honestly counted and parses fine, which
+    /// is exactly why disabling upstream EDNS (`harden_opts`) fixes it.
+    #[test]
+    fn miscounted_opt_in_authority_section_is_what_breaks_decode() {
+        // Header: QD=1 AN=0 NS=1 AR=0, then question, then a misplaced OPT RR
+        // (counted as the single authority record).
+        let malformed: &[u8] = &[
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, // header
+            0x06, b'n', b'v', b'i', b'd', b'i', b'a', 0x03, b'c', b'o', b'm',
+            0x00, // nvidia.com
+            0x00, 0x01, 0x00, 0x01, // QTYPE=A QCLASS=IN
+            0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // OPT RR
+        ];
+        let err =
+            Message::from_vec(malformed).expect_err("strict decode must reject misplaced OPT");
+        // hickory-proto 0.26.1 surfaces this as
+        // `DecodeError::RecordNotInAdditionalSection(OPT)`; we match its Display
+        // wording rather than the variant because the kind is buried under
+        // `ProtoErrorKind` and hickory's own tests string-match it too
+        // (see hickory-proto `op/message.rs`). Revisit on a hickory-proto bump.
+        assert!(
+            err.to_string().contains("OPT only allowed in additional"),
+            "unexpected error: {err}"
+        );
+
+        // Same NXDOMAIN answer with no OPT (non-EDNS) → honest counts → parses.
+        let clean: &[u8] = &[
+            0x12, 0x34, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, // AN=0 NS=0 AR=0
+            0x06, b'n', b'v', b'i', b'd', b'i', b'a', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01,
+            0x00, 0x01,
+        ];
+        assert!(
+            Message::from_vec(clean).is_ok(),
+            "non-EDNS response must parse cleanly"
+        );
     }
 
     struct FakeSource {

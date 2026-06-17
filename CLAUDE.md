@@ -202,20 +202,24 @@ likewise unsandboxed.
 **Standard delivery loop for a feature branch:**
 
 1. Push the branch, open/refresh its PR, and start CI.
-2. **While CI runs, bake a local dev build** for manual testing with
-   `bash hack/devbuild.sh` (run unsandboxed — see [the script](hack/devbuild.sh)
-   and [its design](docs/superpowers/specs/2026-06-15-local-devbuild-script-design.md)).
-   It prints the exact output dir `dist/local/<UTC-ts>-<sha>/`. **Record and
-   report that exact path — never `dist/local/latest`**, which a parallel
-   agent's build can repoint out from under you.
-   - **When built from a worktree, copy that dir into the MAIN checkout's
-     `dist/local/`** so the owner (who works in the main checkout) finds it where
-     they expect — a worktree's `dist/` is a separate working tree. Use a plain
-     copy, not a symlink (it must survive the worktree being removed):
-     `MAIN=$(git -C "$(git rev-parse --git-common-dir)/.." rev-parse --show-toplevel)`
-     then `mkdir -p "$MAIN/dist/local" && cp -a dist/local/<ts>-<sha> "$MAIN/dist/local/"`.
-     The copy lands outside the worktree sandbox, so run it unsandboxed. Report
-     the main-checkout path as the canonical one.
+2. **While CI runs, dispatch the CI installer build** for manual testing:
+   `bash hack/devbuild.sh` (run unsandboxed — it needs `gh`; see
+   [the script](hack/devbuild.sh) and
+   [its design](docs/superpowers/specs/2026-06-16-ci-dev-installer-artifacts-design.md)).
+   It dispatches `.github/workflows/devbuild.yml` on the branch, watches the run,
+   and downloads the finished `izba_*.deb` + `izba-app_*.deb` + `izba-setup-*.exe`
+   — **the build runs entirely in CI, in parallel with the PR checks; nothing
+   heavy builds on the laptop or the Windows host** (only ~150 MB of installers
+   is downloaded). It needs the branch **pushed** first (CI builds the pushed
+   tip), and `devbuild.yml` must already be on `main` (GitHub registers
+   `workflow_dispatch` only from the default branch; branches cut from `main`
+   inherit it). It prints the exact output dir
+   `dist/local/<UTC-ts>-<sha>/`. **Record and report that exact path — never
+   `dist/local/latest`**, which a parallel run can repoint out from under you.
+   - **When run from a worktree it auto-copies that dir into the MAIN checkout's
+     `dist/local/`** (a worktree's `dist/` is a separate working tree) and reports
+     the main-checkout path as canonical — a plain copy that survives the worktree
+     being removed.
 3. When **all** CI checks are green, report to the owner: a concise summary of
    the work completed; the PR link to review; and pointers to the local
    artifacts for manual testing — the exact main-checkout `dist/local/<ts>-<sha>/`
