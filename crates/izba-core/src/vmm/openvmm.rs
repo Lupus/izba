@@ -152,65 +152,39 @@ impl VmmDriver for OpenVmmDriver {
             )
         } else {
             // The confined VMM runs at Low integrity, but izbad created the
-            // sandbox's writable files (console.log, rw.img, the vsock socket
-            // under run/) at Medium integrity — and MIC forbids a Low-IL process
-            // from writing UP to Medium-IL objects. Label the per-sandbox
-            // writable scratch dir Low (with object+container inherit) so the
-            // confined VMM can write there; without this the VM never boots
-            // (empty console.log, 100% boot failure under confinement).
+            // sandbox's writable host files at Medium — and MIC forbids a Low-IL
+            // process from writing UP to Medium-IL objects, so the VM would never
+            // boot (empty console.log) and the guest could not write /workspace.
+            // Low-label EVERY host path the confined VMM must write
+            // (`VmSpec::confined_write_surfaces`: the scratch dir, the virtiofs
+            // shares, and writable disk backing files incl. named volumes outside
+            // the scratch). Lowering is a write-DOWN for izbad (Medium → Low), so
+            // izbad keeps full control; the labels are restored to Medium on
+            // teardown (sandbox::restore_confined_workspace). Inheritance is
+            // robust for plain creates; documented residuals (atomic-rename-in,
+            // post-teardown Low files) live in the design spec / F-06 finding.
             //
-            // Target = the sandbox dir (run_dir's parent), the smallest dir that
-            // contains EVERY VMM-writable path: run/ (vsock socket), logs/
-            // (console.log + vmm.log), and rw.img — all siblings under it.
-            // Lowering it is a write-DOWN for izbad (Medium → Low), so izbad
-            // retains full control. We deliberately do NOT touch izbad's own
-            // daemon/socket dir — only this sandbox's scratch.
-            //
-            // FAIL CLOSED: if labeling fails, the VMM would boot into a doomed,
-            // un-writable scratch; propagate the error rather than proceed.
-            let scratch_dir = spec.run_dir.parent().with_context(|| {
-                format!(
-                    "run_dir {} has no parent sandbox directory to label",
-                    spec.run_dir.display()
-                )
-            })?;
-            set_low_integrity_recursive(scratch_dir).with_context(|| {
-                format!(
-                    "labeling sandbox scratch {} Low-integrity for the confined VMM",
-                    scratch_dir.display()
-                )
-            })?;
-
-            // The guest writes /workspace through the virtiofs server, which runs
-            // IN-PROCESS inside the Low-IL VMM — so the share's host dir (the
-            // user's project dir, at Medium IL) must ALSO be Low-labelled or the
-            // guest cannot write it (MIC no-write-up): the core izba function
-            // would be dead under confinement. Inheritance is robust for plain
-            // creates (a Medium tool creating a file in the share yields a Low
-            // child); known residuals (atomic-rename-in, post-teardown Low files)
-            // are documented in the design spec / F-06 finding. The label is
-            // restored to Medium on teardown (sandbox::restore_confined_workspace).
-            //
-            // FAIL CLOSED, but NEVER leave the user's dir Low after a failed
-            // start: relabelling happens BEFORE state.json is written, so the
-            // state.json-gated teardown restore cannot undo it on an early
-            // failure. So if labelling a share OR the confined spawn fails, we
-            // restore every share we touched before propagating the error.
+            // FAIL CLOSED, but NEVER strand a user dir at Low after a failed
+            // start: relabelling precedes state.json, so the state.json-gated
+            // teardown restore cannot undo it on an early failure. So if labelling
+            // ANY surface OR the confined spawn fails, restore every surface we
+            // touched before propagating the error.
+            let surfaces = spec.confined_write_surfaces();
             let mut labelled: Vec<&PathBuf> = Vec::new();
-            for share in &spec.shares {
-                if let Err(e) = set_low_integrity_recursive(&share.host_path) {
-                    for p in &labelled {
-                        let _ = restore_integrity_recursive(p);
+            for p in &surfaces {
+                if let Err(e) = set_low_integrity_recursive(p) {
+                    for done in &labelled {
+                        let _ = restore_integrity_recursive(done);
                     }
                     return Err(e).with_context(|| {
                         format!(
-                            "labeling workspace share {} Low-integrity so the confined \
-                             VMM's in-process virtiofs can write it",
-                            share.host_path.display()
+                            "Low-labelling confined write surface {} so the VMM \
+                             (and its in-process virtiofs) can write it",
+                            p.display()
                         )
                     });
                 }
-                labelled.push(&share.host_path);
+                labelled.push(p);
             }
             match spawn_confined(&inv, &vmm_log, &policy) {
                 // Honest mapping: the resource job is best-effort, so report
@@ -229,9 +203,9 @@ impl VmmDriver for OpenVmmDriver {
                 ),
                 Err(e) => {
                     // The VMM never launched; undo the Low labels so a failed
-                    // confined start does not strand the user's workspace at Low.
-                    for share in &spec.shares {
-                        let _ = restore_integrity_recursive(&share.host_path);
+                    // confined start does not strand any user dir at Low.
+                    for p in &surfaces {
+                        let _ = restore_integrity_recursive(p);
                     }
                     anyhow::bail!(
                         "failed to apply host-side confinement to the VMM: {e}. \
