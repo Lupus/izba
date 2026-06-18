@@ -6,6 +6,8 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::procmgr::jail_linux::ResourceLimits;
+
 /// Spawn a process detached from the current session.
 ///
 /// The child runs in its own session (setsid), with stdin=/dev/null and
@@ -21,6 +23,17 @@ use std::process::{Command, Stdio};
 /// report the process as alive forever. `pid_alive` therefore also checks the
 /// process state field and treats `Z` as dead.
 pub fn spawn_detached(cmd: &CommandSpec, log: &Path) -> anyhow::Result<PidIdentity> {
+    spawn_detached_with_limits(cmd, log, &ResourceLimits { address_space: None, nofile: None, nproc: None })
+}
+
+/// Like `spawn_detached`, but applies best-effort `setrlimit` ceilings in the
+/// child before exec (F-28). Limit failures are swallowed — they must never
+/// block a launch, and the closure stays async-signal-safe (no allocation).
+pub fn spawn_detached_with_limits(
+    cmd: &CommandSpec,
+    log: &Path,
+    limits: &ResourceLimits,
+) -> anyhow::Result<PidIdentity> {
     let logf = File::options()
         .create(true)
         .append(true)
@@ -31,10 +44,12 @@ pub fn spawn_detached(cmd: &CommandSpec, log: &Path) -> anyhow::Result<PidIdenti
         .stdin(Stdio::null())
         .stdout(Stdio::from(logf.try_clone()?))
         .stderr(Stdio::from(logf));
-    // SAFETY: setsid(2) is async-signal-safe; no allocation in pre_exec.
+    let limits = *limits; // Copy into the closure (ResourceLimits: Copy).
+    // SAFETY: setsid(2) and setrlimit(2) are async-signal-safe; no allocation.
     unsafe {
-        c.pre_exec(|| {
+        c.pre_exec(move || {
             nix::unistd::setsid().map_err(std::io::Error::from)?;
+            apply_rlimits(&limits);
             Ok(())
         });
     }
@@ -45,6 +60,20 @@ pub fn spawn_detached(cmd: &CommandSpec, log: &Path) -> anyhow::Result<PidIdenti
     let starttime = proc_starttime(pid)?;
     std::mem::forget(child); // intentional: do not reap; see doc comment above
     Ok(PidIdentity { pid, starttime })
+}
+
+/// Best-effort: set each `Some` ceiling, ignoring errors (a missing limit must
+/// not abort the launch). Soft = hard = requested value.
+fn apply_rlimits(limits: &ResourceLimits) {
+    use nix::sys::resource::{setrlimit, Resource};
+    let set = |res: Resource, v: Option<u64>| {
+        if let Some(v) = v {
+            let _ = setrlimit(res, v, v);
+        }
+    };
+    set(Resource::RLIMIT_AS, limits.address_space);
+    set(Resource::RLIMIT_NOFILE, limits.nofile);
+    set(Resource::RLIMIT_NPROC, limits.nproc);
 }
 
 /// Parse `/proc/<pid>/stat` and return `(state, starttime)`.
@@ -182,5 +211,16 @@ mod tests {
             starttime: 0,
         };
         assert!(kill_pid(&dead).is_ok());
+    }
+
+    #[test]
+    fn spawn_with_limits_runs_and_returns_identity() {
+        use crate::procmgr::jail_linux::ResourceLimits;
+        let log = std::env::temp_dir().join(format!("izba-rlimit-{}.log", std::process::id()));
+        let cmd = CommandSpec { argv: vec!["/bin/true".to_string()] };
+        let limits = ResourceLimits::for_vmm(1024);
+        let id = spawn_detached_with_limits(&cmd, &log, &limits).expect("spawn ok");
+        assert_ne!(id.pid, 0);
+        let _ = std::fs::remove_file(&log);
     }
 }

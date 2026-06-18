@@ -156,6 +156,17 @@ pub fn spawn_detached(cmd: &CommandSpec, log: &Path) -> anyhow::Result<PidIdenti
     Ok(PidIdentity { pid, starttime })
 }
 
+/// Like `spawn_detached`, but accepts resource limit hints that are ignored on
+/// Windows — resource bounds here are enforced by the job object (out of scope
+/// for the Windows VMM confinement path; `ResourceLimits` is a Linux-only concern).
+pub fn spawn_detached_with_limits(
+    cmd: &CommandSpec,
+    log: &Path,
+    _limits: &crate::procmgr::jail_linux::ResourceLimits,
+) -> anyhow::Result<PidIdentity> {
+    spawn_detached(cmd, log)
+}
+
 /// Returns `true` iff the process exists, is still running (not the
 /// exited-with-open-handles zombie analog), and has the recorded creation
 /// time (defeats PID reuse).
