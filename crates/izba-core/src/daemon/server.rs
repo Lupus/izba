@@ -317,7 +317,11 @@ fn dispatch_inner(
         }),
         DaemonRequest::Inspect { name } => handle_inspect(d, name),
         DaemonRequest::GuestRpc { name, req } => handle_guest_rpc(d, name, req),
-        DaemonRequest::PortPublish { name, rule, .. } => handle_port_publish(d, name, rule),
+        DaemonRequest::PortPublish {
+            name,
+            rule,
+            persist,
+        } => handle_port_publish(d, name, rule, persist),
         DaemonRequest::PortUnpublish {
             name,
             bind,
@@ -357,11 +361,12 @@ fn dispatch_inner(
         DaemonRequest::OpenStream { .. } => {
             bail!("OpenStream is handled at the connection layer")
         }
-        // B2 will wire these up; stubs keep the enum exhaustive.
-        DaemonRequest::VolumeList => bail!("VolumeList: not yet implemented"),
-        DaemonRequest::VolumeRemove { .. } => bail!("VolumeRemove: not yet implemented"),
-        DaemonRequest::VolumeAttach { .. } => bail!("VolumeAttach: not yet implemented"),
-        DaemonRequest::VolumeDetach { .. } => bail!("VolumeDetach: not yet implemented"),
+        DaemonRequest::VolumeList => handle_volume_list(d),
+        DaemonRequest::VolumeRemove { name } => handle_volume_remove(d, name),
+        DaemonRequest::VolumeAttach { name, spec } => handle_volume_attach(d, name, spec),
+        DaemonRequest::VolumeDetach { name, guest_path } => {
+            handle_volume_detach(d, name, guest_path)
+        }
     }
 }
 
@@ -511,11 +516,19 @@ fn handle_port_publish(
     d: &Arc<Daemon>,
     name: String,
     rule: crate::state::PortRule,
+    persist: bool,
 ) -> anyhow::Result<DaemonResponse> {
     // Same liveness gate as the old publish_port.
     drop(sandbox::control(&d.paths, &name, d.connector())?);
-    d.relays.publish(&d.paths, &name, rule)?;
+    // Idempotent: re-publishing an identical active rule is a no-op for the
+    // relay (this is what the app's "Make persistent" button does).
+    if !d.relays.active(&name).contains(&rule) {
+        d.relays.publish(&d.paths, &name, rule.clone())?;
+    }
     relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+    if persist {
+        persist_port_rule(&d.paths, &name, &rule)?;
+    }
     Ok(DaemonResponse::Ok)
 }
 
@@ -528,6 +541,75 @@ fn handle_port_unpublish(
     sandbox_must_exist(&d.paths, &name)?;
     d.relays.unpublish(&name, bind, host_port)?;
     relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+    unpersist_port_rule(&d.paths, &name, bind, host_port)?;
+    Ok(DaemonResponse::Ok)
+}
+
+fn persist_port_rule(
+    paths: &Paths,
+    name: &str,
+    rule: &crate::state::PortRule,
+) -> anyhow::Result<()> {
+    let p = paths.sandbox_dir(name).join(CONFIG_FILE);
+    let mut cfg: SandboxConfig =
+        load_json(&p)?.with_context(|| format!("no config for '{name}'"))?;
+    if !cfg
+        .ports
+        .iter()
+        .any(|r| r.bind == rule.bind && r.host_port == rule.host_port)
+    {
+        cfg.ports.push(rule.clone());
+        crate::state::save_json(&p, &cfg)?;
+    }
+    Ok(())
+}
+
+fn unpersist_port_rule(
+    paths: &Paths,
+    name: &str,
+    bind: std::net::Ipv4Addr,
+    host_port: u16,
+) -> anyhow::Result<()> {
+    let p = paths.sandbox_dir(name).join(CONFIG_FILE);
+    let mut cfg: SandboxConfig =
+        load_json(&p)?.with_context(|| format!("no config for '{name}'"))?;
+    let before = cfg.ports.len();
+    cfg.ports
+        .retain(|r| !(r.bind == bind && r.host_port == host_port));
+    if cfg.ports.len() != before {
+        crate::state::save_json(&p, &cfg)?;
+    }
+    Ok(())
+}
+
+fn handle_volume_list(d: &Arc<Daemon>) -> anyhow::Result<DaemonResponse> {
+    let volumes = sandbox::list_volumes(&d.paths)?;
+    Ok(DaemonResponse::Volumes { volumes })
+}
+
+fn handle_volume_remove(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> {
+    let bytes = sandbox::remove_volume(&d.paths, &name)?;
+    Ok(DaemonResponse::Pruned {
+        removed: vec![name],
+        reclaimed_bytes: bytes,
+    })
+}
+
+fn handle_volume_attach(
+    d: &Arc<Daemon>,
+    name: String,
+    spec: crate::volume::VolumeSpec,
+) -> anyhow::Result<DaemonResponse> {
+    sandbox::attach_volume(&d.paths, &name, spec)?;
+    Ok(DaemonResponse::Ok)
+}
+
+fn handle_volume_detach(
+    d: &Arc<Daemon>,
+    name: String,
+    guest_path: std::path::PathBuf,
+) -> anyhow::Result<DaemonResponse> {
+    sandbox::detach_volume(&d.paths, &name, &guest_path)?;
     Ok(DaemonResponse::Ok)
 }
 
@@ -1226,6 +1308,276 @@ mod tests {
         assert_eq!(
             idle_limit_from(&five),
             Some(std::time::Duration::from_secs(5))
+        );
+    }
+
+    // ── B2: volume dispatch + port persist/unpersist ──────────────────────
+
+    /// Helper: create a sandbox via RPC, return the client connection.
+    fn setup_sandbox_with_client(
+        dir: &tempfile::TempDir,
+        d: &Arc<Daemon>,
+        name: &str,
+    ) -> UdsStream {
+        let mut c = client_conn(d);
+        match rpc(&mut c, &create_req(dir, name)) {
+            DaemonResponse::Created { .. } => {}
+            other => panic!("create: {other:?}"),
+        }
+        c
+    }
+
+    #[test]
+    fn volume_list_returns_volumes_listing() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        // Create a sandbox with a persistent volume so the volume image exists.
+        let volumes = vec![crate::volume::VolumeSpec {
+            name: Some("cache".into()),
+            guest_path: "/data".into(),
+            size_bytes: 1 << 20,
+            eph_id: None,
+        }];
+        crate::sandbox::create(
+            &d.paths,
+            "web",
+            &CreateOpts {
+                image_digest: "sha256:abc".into(),
+                image_ref: "ubuntu:24.04".into(),
+                cpus: 1,
+                mem_mb: 256,
+                workspace: dir.path().join("ws"),
+                rw_size_gb: 1,
+                ports: Vec::new(),
+                volumes,
+            },
+        )
+        .unwrap();
+        match rpc(&mut c, &DaemonRequest::VolumeList) {
+            DaemonResponse::Volumes { volumes } => {
+                assert!(
+                    volumes.iter().any(|v| v.name == "cache"),
+                    "expected 'cache' in volume list, got: {volumes:?}"
+                );
+            }
+            other => panic!("volume list: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_attach_shows_in_inspect_detach_removes_it() {
+        let (dir, d) = test_daemon();
+        let mut c = setup_sandbox_with_client(&dir, &d, "web");
+
+        let spec = crate::volume::VolumeSpec {
+            name: Some("cache".into()),
+            guest_path: "/data".into(),
+            size_bytes: 1 << 20,
+            eph_id: None,
+        };
+        // Attach.
+        match rpc(
+            &mut c,
+            &DaemonRequest::VolumeAttach {
+                name: "web".into(),
+                spec: spec.clone(),
+            },
+        ) {
+            DaemonResponse::Ok => {}
+            other => panic!("volume attach: {other:?}"),
+        }
+        // Inspect should show the attached volume.
+        match rpc(&mut c, &DaemonRequest::Inspect { name: "web".into() }) {
+            DaemonResponse::Inspect(det) => {
+                assert!(
+                    det.volumes.iter().any(|v| v.guest_path == spec.guest_path),
+                    "volume not in inspect after attach: {:?}",
+                    det.volumes
+                );
+            }
+            other => panic!("inspect after attach: {other:?}"),
+        }
+        // Detach.
+        match rpc(
+            &mut c,
+            &DaemonRequest::VolumeDetach {
+                name: "web".into(),
+                guest_path: "/data".into(),
+            },
+        ) {
+            DaemonResponse::Ok => {}
+            other => panic!("volume detach: {other:?}"),
+        }
+        // Inspect must no longer list the volume.
+        match rpc(&mut c, &DaemonRequest::Inspect { name: "web".into() }) {
+            DaemonResponse::Inspect(det) => {
+                assert!(
+                    det.volumes.iter().all(|v| v.guest_path != spec.guest_path),
+                    "volume still present after detach: {:?}",
+                    det.volumes
+                );
+            }
+            other => panic!("inspect after detach: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_remove_referenced_returns_error() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        // Create a sandbox that references the "shared" persistent volume.
+        crate::sandbox::create(
+            &d.paths,
+            "web",
+            &CreateOpts {
+                image_digest: "sha256:abc".into(),
+                image_ref: "ubuntu:24.04".into(),
+                cpus: 1,
+                mem_mb: 256,
+                workspace: dir.path().join("ws"),
+                rw_size_gb: 1,
+                ports: Vec::new(),
+                volumes: vec![crate::volume::VolumeSpec {
+                    name: Some("shared".into()),
+                    guest_path: "/share".into(),
+                    size_bytes: 1 << 20,
+                    eph_id: None,
+                }],
+            },
+        )
+        .unwrap();
+        // Remove should fail because "web" references it.
+        match rpc(
+            &mut c,
+            &DaemonRequest::VolumeRemove {
+                name: "shared".into(),
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(
+                    message.contains("in use") || message.contains("referenced"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected Error for referenced volume remove, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn port_publish_persist_writes_to_config() {
+        let (dir, d) = test_daemon();
+        let mut c = setup_sandbox_with_client(&dir, &d, "web");
+        // Make the sandbox look running so PortPublish's liveness gate passes.
+        write_state(&d.paths, "web", live_identity());
+
+        // Pick a port we can try to bind (skip if denied by sandbox).
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0));
+        let (port, _l) = match probe {
+            Ok(l) => {
+                let port = l.local_addr().unwrap().port();
+                // Drop listener so the relay can bind.
+                drop(l);
+                (port, ())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP port_publish_persist_writes_to_config: bind denied");
+                return;
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        };
+
+        let rule = crate::state::PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: port,
+            guest_port: 8080,
+        };
+        match rpc(
+            &mut c,
+            &DaemonRequest::PortPublish {
+                name: "web".into(),
+                rule: rule.clone(),
+                persist: true,
+            },
+        ) {
+            DaemonResponse::Ok => {}
+            other => panic!("port publish: {other:?}"),
+        }
+        // The rule must be persisted in config.json.
+        let cfg: SandboxConfig = load_json(&d.paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .expect("config.json must exist");
+        assert!(
+            cfg.ports
+                .iter()
+                .any(|r| r.bind == rule.bind && r.host_port == rule.host_port),
+            "persisted rule not found in config.ports: {:?}",
+            cfg.ports
+        );
+    }
+
+    #[test]
+    fn port_unpublish_drops_from_config() {
+        let (dir, d) = test_daemon();
+        let mut c = setup_sandbox_with_client(&dir, &d, "web");
+        write_state(&d.paths, "web", live_identity());
+
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0));
+        let port = match probe {
+            Ok(l) => {
+                let port = l.local_addr().unwrap().port();
+                drop(l);
+                port
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP port_unpublish_drops_from_config: bind denied");
+                return;
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        };
+
+        let rule = crate::state::PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: port,
+            guest_port: 8080,
+        };
+        // Publish with persist=true first.
+        assert!(matches!(
+            rpc(
+                &mut c,
+                &DaemonRequest::PortPublish {
+                    name: "web".into(),
+                    rule: rule.clone(),
+                    persist: true,
+                }
+            ),
+            DaemonResponse::Ok
+        ));
+        // Verify it's in config.
+        let cfg: SandboxConfig = load_json(&d.paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .expect("config.json must exist");
+        assert!(cfg.ports.iter().any(|r| r.host_port == rule.host_port));
+
+        // Now unpublish.
+        assert!(matches!(
+            rpc(
+                &mut c,
+                &DaemonRequest::PortUnpublish {
+                    name: "web".into(),
+                    bind: rule.bind,
+                    host_port: rule.host_port,
+                }
+            ),
+            DaemonResponse::Ok
+        ));
+        // Must be removed from config.
+        let cfg: SandboxConfig = load_json(&d.paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .expect("config.json must exist");
+        assert!(
+            !cfg.ports.iter().any(|r| r.host_port == rule.host_port),
+            "rule still present in config.ports after unpublish: {:?}",
+            cfg.ports
         );
     }
 
