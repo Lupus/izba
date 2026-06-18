@@ -111,7 +111,7 @@ export function Detail({ sandbox, onChanged }: Props) {
         ))}
       </div>
 
-      <div className="mt-4 min-h-0 flex-1">
+      <div className="mt-4 flex min-h-0 flex-1 flex-col">
         {tab === "overview" && (
           <div className="flex flex-col gap-3">
             <FirewallStatus name={name} />
