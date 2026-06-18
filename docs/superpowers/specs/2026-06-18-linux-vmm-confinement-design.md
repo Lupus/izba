@@ -107,8 +107,12 @@ izba run --[allow-unconfined]→ VmSpec.allow_unconfined  (EXISTS)
   - floor unmet & `allow_unconfined` ⇒ `status = None` (reason lists what *did*
     apply) but flags still set best-effort.
 - `struct ResourceLimits { address_space: Option<u64>, nofile: Option<u64>, nproc: Option<u64> }`
-  - `ResourceLimits::for_vmm(mem_mb: u64) -> Self`: `address_space = mem_mb + headroom`
-    (generous — CH maps guest RAM), conservative `nofile`/`nproc` ceilings.
+  - `ResourceLimits::for_vmm(mem_mb: u64) -> Self`: conservative `nofile`/`nproc`
+    ceilings. **`address_space = None`** — `RLIMIT_AS` is deliberately NOT set: it
+    caps total virtual address space, and CH with `--memory shared=on` maps guest
+    RAM + the virtiofs DAX window into VA, so any mem-derived ceiling risks
+    OOM-killing a legitimate boot (cf. Firecracker's jailer, which also avoids
+    `RLIMIT_AS`). Host memory bounding is deferred to the cgroup follow-up (F-28).
 
 **Non-Linux compile parity** (`#[cfg(not(target_os = "linux"))]`): a stub
 `Capabilities::probe()` returning all-false and a `plan()` that yields
@@ -126,7 +130,7 @@ Linux needs its own honest reason string. `degraded()` already covers `None`.
 
 Add `spawn_detached_with_limits(cmd, log, limits: &ResourceLimits)` (or extend
 `spawn_detached` with an optional limits arg). In the existing `pre_exec`
-closure, after `setsid`, call `setrlimit(RLIMIT_AS/RLIMIT_NOFILE/RLIMIT_NPROC)`
+closure, after `setsid`, call `setrlimit(RLIMIT_NOFILE/RLIMIT_NPROC)`
 for each `Some` limit. Failures are swallowed (best-effort, D5) — the closure
 must stay async-signal-safe (no allocation; `nix::sys::resource::setrlimit`).
 
@@ -184,7 +188,8 @@ status could overstate the achieved confinement.
   - `jail_linux::plan` floor logic: every `(userns, landlock, seccomp)` combo →
     correct `Restricted`/`Err`/`None`; `allow_unconfined` flips `Err`→`None`;
     error message names each failed leg.
-  - `ResourceLimits::for_vmm` scales with `mem_mb`.
+  - `ResourceLimits::for_vmm` sets the `nofile`/`nproc` ceilings and leaves
+    `address_space` `None` (no `RLIMIT_AS`).
   - `ConfinementStatus::confined` renders an honest `Restricted` summary.
 - **Probe smoke:** `Capabilities::probe()` returns without panicking; values
   are self-consistent (best-effort assertions, environment-dependent).
