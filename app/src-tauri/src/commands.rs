@@ -28,11 +28,14 @@ pub fn version_core(d: &mut dyn DaemonApi) -> Result<VersionView, String> {
     let core = izba_core::build_info::BuildInfoOwned::current();
     let (daemon, proto, mismatch) = match d.version() {
         Ok((build, proto)) => {
-            // Compare git identity only: `git describe` encodes tag + commit sha
-            // + `-dirty`. The app and daemon are separate binaries built at
-            // different instants, so build_timestamp/rustc always differ even for
-            // the same commit — comparing the whole struct would warn constantly.
-            let mismatch = build.git_describe != app.git_describe;
+            // Compare the commit sha only — the same identity the About panel
+            // shows. NOT git_describe: the app's build.rs enables vergen's dirty
+            // flag, and its npm/dist build dirties the tree before vergen runs, so
+            // the app describe gets a `-dirty` suffix the (clean) daemon build
+            // lacks — a false mismatch at the identical commit. NOT the whole
+            // struct either: build_timestamp/rustc always differ across the two
+            // separately-built binaries.
+            let mismatch = build.git_sha != app.git_sha;
             (Some(build), proto, mismatch)
         }
         Err(_) => (None, 0, false),
@@ -224,9 +227,9 @@ mod tests {
 
     #[test]
     fn version_core_flags_mismatch_when_daemon_differs() {
-        // The fake daemon reports a `git describe` that cannot match the app's.
+        // The fake daemon reports a sha that cannot match the real app build.
         let mut d = FakeDaemon {
-            daemon_describe: "v9.9.9-different-gdeadbeef".into(),
+            daemon_sha: "deadbeef".into(),
             ..Default::default()
         };
         let v = version_core(&mut d).unwrap();
@@ -236,20 +239,17 @@ mod tests {
     }
 
     #[test]
-    fn version_core_no_mismatch_when_describe_matches() {
-        // Same commit ⇒ same `git describe`, even though the two binaries were
-        // built at different instants (build_timestamp/rustc differ). The
-        // warning must NOT fire just because the timestamps differ.
+    fn version_core_no_mismatch_when_sha_matches() {
+        // Same commit ⇒ same git_sha, even though the two binaries were built at
+        // different instants (build_timestamp/rustc differ) and the app build may
+        // be `-dirty` while the daemon is clean. The warning must NOT fire.
         let mut d = FakeDaemon {
-            daemon_describe: app_build_info().git_describe,
+            daemon_sha: app_build_info().git_sha,
             ..Default::default()
         };
         let v = version_core(&mut d).unwrap();
         assert!(v.daemon.is_some());
-        assert!(
-            !v.mismatch,
-            "identical git describe must not flag a mismatch"
-        );
+        assert!(!v.mismatch, "identical commit sha must not flag a mismatch");
     }
 
     #[test]
