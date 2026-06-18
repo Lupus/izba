@@ -4,7 +4,7 @@
 > service mesh + credential vault"). Technical rationale lives in the
 > [mesh networking design](superpowers/specs/2026-06-12-izba-mesh-networking-design.md)
 > (its §8 staging is the engineering skeleton this roadmap re-cuts into
-> user-value milestones). Updated **2026-06-13**.
+> user-value milestones). Updated **2026-06-18**.
 
 ## Where we are
 
@@ -13,24 +13,44 @@ sandboxes with lifecycle, `exec -it`, `cp`, port publishing, OCI→erofs images,
 and `izbad` (disk-state adoption, stream splicing, upgrade dance). Linux/KVM
 via Cloud Hypervisor and Windows/WHP via OpenVMM both pass their gates.
 
-**Networking is now unified on izbad** (mesh staging steps 1–3 done, M1
-2026-06-13): all guest egress — TCP and DNS — flows through izbad over
-guest-initiated vsock streams; the guest is a NIC-less vsock island and
-passt/consomme/`izba.ipv4only` are gone from the datapath. See M1 below.
+**M0–M3 are all done and merged to `main`:**
 
-**The agent firewall (M2) has since shipped** (MITM L7 + allow-list +
-DNS-snoop + `izba netlog`): `crates/izba-core/src/daemon/egress/{mitm,
-mitm_runtime,dns_snoop,audit,policy}.rs` + `ca.rs` + guest `trust.rs` are
-in-tree. **Adoption infrastructure (Track T) also landed**: CI six gates +
-real-VM e2e, published artifacts, and `.deb`/Windows installers on `v*` tags.
+- **M1 — one network story** (2026-06-13): all guest egress — TCP and DNS —
+  flows through izbad over guest-initiated vsock streams; the guest is a
+  NIC-less vsock island and passt/consomme/`izba.ipv4only` are gone.
+- **M2 — agent firewall** (+ M2.1): MITM L7 (now a hyper-util h1+h2+WebSocket
+  service, classified by wire peek not port) + port-aware allow-list +
+  DNS-snoop + `izba netlog`, plus the interactive `izba policy show/allow/block/
+  enable/reload` surface and the app's Netlog/Policy tabs.
+- **M3 — sized & stateful sandboxes**: per-member `resources` *and*
+  user-declared **persistent + ephemeral volumes** shipped (PR #19), with
+  KVM + WHP volume persistence/reattach/prune coverage. The Disk-order contract
+  change landed all-ends in one milestone.
+
+**A security-assurance program now exists and is actively burning down**
+(Track S, new): threat model + methodology + a findings register (F-01..F-26)
+on `main`, and the first wave of fixes merged — egress SSRF + MITM bypasses
+(F-01/F-02/F-03), Windows VMM confinement (F-06), host-side `cp` tar
+containment (F-08), 0700 data dirs (F-15), cargo-deny supply-chain gate (F-22),
+CH path-comma rejection (F-24). DNS also hardened: a self-healing
+`SystemResolver` with live config reload (supersedes the start-time-captured
+forwarder), DNS-over-TCP for >512-byte answers, and metric-ordered Windows
+upstream selection.
+
+**Adoption infrastructure (Track T) is largely in place**: CI six gates +
+real-VM e2e, published artifacts, coverage + SonarCloud gates, build-version
+reporting, on-demand devbuild installers. **The one thing missing is the first
+real release tag** — `v0.1.0-rc1`/`-dev1` were validation prereleases; the
+"first tag at M2" plan is now *overdue* (M2 **and** M3 are done).
 
 What does **not** exist yet:
 
-- The mesh/governance staging steps beyond the firewall — no manifest, no
-  project object, no credential vault (M4/M5).
-- **Sized & stateful sandboxes (M3)** is the in-flight milestone: per-member
-  resources are already wired; user-declared **persistent volumes** are landing
-  now (see M3).
+- The mesh/governance staging steps beyond the firewall — no `izba.yaml`
+  manifest, no project object, no east–west mesh, no credential vault (M4/M5).
+- A few security findings remain open — notably the only open **HIGH** is
+  **F-07** (virtiofsd `--sandbox none`), plus F-09 (no izbad peer-cred) and
+  F-05 (DNS resolve-and-pin, now unblocked by the hickory adoption). See
+  Track S.
 
 The **OpenVMM vsock-assert crash** under stream churn (the declared hard gate
 for putting all traffic on vsock) is **fixed** as of 2026-06-12 — see M0 below.
@@ -52,7 +72,9 @@ for putting all traffic on vsock) is **fixed** as of 2026-06-12 — see M0 below
 ## Milestones
 
 Sizes are relative (S/M/L) — recent velocity makes weeks the natural unit, not
-quarters. Order is dependency order; M3 and Track T run in parallel.
+quarters. Order is dependency order. **M0–M3 are done**; M4 is the next big
+build. Track S (security hardening) and Track T (adoption) run continuously
+alongside.
 
 ### M0 — Stability gate: vsock under churn (S–M) — ✅ DONE (2026-06-12)
 
@@ -163,11 +185,11 @@ edits route through one core grammar helper (`EgressPolicyConfig::{allow,block,
 to_yaml}` + `edit_policy_file`/`seed_from_summaries`), so the CLI and app stay
 consistent. Host-side pure logic + UI only — no datapath change.
 
-### M3 — Sized & stateful sandboxes: resources + volumes (M) — 🚧 IN FLIGHT
+### M3 — Sized & stateful sandboxes: resources + volumes (M) — ✅ DONE (2026-06-15)
 
-Per-sandbox `resources` (cpus/memory) **already ship** (CLI → daemon → both
-drivers' memory/processor knobs). The in-flight slice is **user-declared
-persistent block devices** (design §3.4, spec
+Per-sandbox `resources` (cpus/memory) ship (CLI → daemon → both drivers'
+memory/processor knobs) and **user-declared block devices** landed (PR #19,
+design §3.4, spec
 [2026-06-15-izba-m3-volumes-design.md](superpowers/specs/2026-06-15-izba-m3-volumes-design.md)):
 two inline volume classes — ephemeral (anonymous, in the sandbox dir) and
 persistent (named, `<data>/volumes/<name>.img`, survive `rm`, single-writer) —
@@ -178,10 +200,16 @@ prerequisite for M4's stateful members: a dockerd-in-VM needs a sized
 at all ends (host disk assembly, the `izba.volumes` cmdline channel, the guest
 mount plan; both drivers were already order-driven) in one milestone with
 integration coverage. `izba volume prune` reaps unreferenced persistent images.
-**Exit:** a sandbox with a sized docker-state volume runs a real in-guest
-compose stack; data survives stop/start; both platforms.
 
-### M4 — Projects: izba.yaml + lifecycle + mesh (L)
+**Exit — met:** `izba run --volume` + `izba volume prune` shipped; KVM volume
+persistence/reattach/prune tests + a WHP parity case are in-tree (PR `test(m3)`).
+Risk #5 (disk-order contract ripple) is **retired** — the contract change is in
+and both platform gates are green. **Not yet exercised:** a full in-guest docker
+compose stack on a sized `/var/lib/docker` volume — that lands as part of M4's
+docker-in-VM bring-up (and is gated on the hardcoded-external-UDP-resolver DNS
+fix; see risk #3).
+
+### M4 — Projects: izba.yaml + lifecycle + mesh (L) — ⏭️ NEXT (the headline build)
 
 Design step 4 plus the east–west half of step 5 (in this architecture
 "brokering only declared edges" *is* the policy engine — they don't split).
@@ -224,19 +252,72 @@ domain; keys independently revocable/meterable; credential decisions in the OCSF
 flow log. See [egress-firewall-building-blocks.md](egress-firewall-building-blocks.md)
 (salvage map: `secrets.rs`/`token_grant_injection.rs` assessment).
 
+### Track S — Security hardening (continuous, since 2026-06-15)
+
+The security-assurance program (`docs/security/`: threat model, methodology,
+findings register F-01..F-26) is now live and is a standing track — izba's whole
+pitch is a *hostile-guest* sandbox, so the findings burn-down is product work,
+not cleanup. **Fixed + merged:** F-01/F-02/F-03 (egress SSRF floor + MITM
+SNI/Host/keep-alive bypasses), F-06 (Windows VMM confinement), F-08 (host-side
+`cp` tar containment), F-15 (0700 data dirs), F-22 (cargo-deny gate), F-24 (CH
+path-comma reject). **Still open — the near-term floor:**
+
+- **F-07 (HIGH, only open HIGH):** virtiofsd runs `--sandbox none` — no second
+  containment layer over the shared project dir. Pairs with the now-fixed F-06;
+  do before claiming the host-confinement story is complete.
+- **F-09 (MED):** izbad's AF_UNIX control socket has no `SO_PEERCRED` check —
+  any local process gets full sandbox control. Cheap, high-value.
+- **F-05 (MED):** DNS resolve-and-pin + QNAME-gate + rate-limit. **Now
+  unblocked** by the hickory-resolver adoption (the two DNS efforts no longer
+  collide); context stub in `docs/security/egress-firewall-p3-dns-resolve-and-pin.md`.
+- The remaining mediums/lows (F-04/F-10/F-12/F-13/F-17/F-23, F-16/F-18/F-25)
+  batch into a later pass. **Owed across the board:** PoCs for the HIGH
+  guest→host leads + deterministic gates (cargo-fuzz under ASan for the codec/
+  dns/tar parsers, cargo-mutants).
+
 ### Track T — Adoption & release engineering (continuous)
 
-Runs parallel to everything; first slice lands during M0/M1.
+Runs parallel to everything; first slice landed during M0/M1.
 
 - **CI for the six gates** (fmt, clippy×2, test, musl init, win cross-check) —
-  cheap, immediate; KVM-gated suites stay local/self-hosted for now.
-- **Published kernel + initramfs artifacts** (the long-deferred item) so users
-  don't build a kernel to try izba.
-- **Versioned releases** with prebuilt binaries (Linux + Windows) — first tag
-  at M2, the agent-firewall moment, when izba first has a story no container
-  sandbox can match.
+  **done**, plus real-VM e2e, coverage + SonarCloud gates, build-version
+  reporting, on-demand devbuild installers.
+- **Published kernel + initramfs artifacts** — **done** (CI artifact jobs).
+- **Versioned releases** with prebuilt binaries (Linux + Windows) — **the open
+  item.** `v0.1.0-rc1`/`-dev1` were validation prereleases; the planned
+  "first tag at M2" is **overdue** now that M2 *and* M3 are done. Cutting it is
+  the cheapest high-leverage next move (see Next steps).
 - **Quickstart that works from a clean machine**, refreshed each milestone;
   `izba.yaml` reference when M4 lands.
+
+## Next steps (groomed 2026-06-18)
+
+With M0–M3 done, the security program live, and adoption infra in place, the
+recommended ordering — **start the first two now, in parallel; they're small and
+de-risk the release**, then commit to M4 as the next big build:
+
+1. **Cut the first real release tag (Track T) — start now, S.** It's overdue;
+   M2 + M3 give izba a story no container sandbox matches, and the installer/
+   artifact pipeline already exists. Gate the tag on the near-term security
+   floor below so the "hostile-guest sandbox" claim ships honest.
+2. **Close the near-term security floor (Track S) — start now, S–M.** F-07
+   (virtiofsd sandboxing — the last open HIGH) and F-09 (izbad peer-cred —
+   cheap). Both are small and directly back the security pitch. F-05 (DNS
+   pin) is now unblocked but can trail into M4's DNS work.
+3. **M4 — Projects: `izba.yaml` + lifecycle + mesh (L) — the next headline.**
+   The core vision differentiator and the largest remaining build. Begin with
+   the **manifest-grammar working session** (still the one open design decision;
+   it now also carries M5's credential-mapping grammar) so M4 and M5 share one
+   schema. Fold the **hardcoded-external-UDP-resolver DNS fix** (risk #3) in
+   here — it's the docker-in-VM prerequisite M4's stateful members need, and it
+   pairs naturally with F-05. Consider cutting as 4a (project object +
+   lifecycle) / 4b (mesh wiring) if it sprawls.
+4. **M5 — Credential vault (L) — after M4.** Depends on M4's manifest for the
+   role→secret mapping; do not start before the grammar is locked.
+
+**Postpone / not now:** the app UX papercuts (in-flight on a side branch, low
+strategic weight); the remaining medium/low findings batch; presets
+(open/balanced/closed) and org-level governance (explicitly off-roadmap).
 
 ## Risk register
 
@@ -247,10 +328,10 @@ its milestone starts).
 | --- | --- | --- | --- |
 | 1★ | OpenVMM vsock assert survives the graceful-shutdown fix | The whole roadmap blocked (M0 is untimeboxed, parity sacred) | **Plan B prepared up front:** patch the assert + self-build a pinned OpenVMM fork (same pinning shape as today's fetched binary); upstream issue filed in parallel |
 | 2 | izbad is a traffic SPOF — restart/upgrade severs *all* flows, not just port relays | UX regression vs v1 | **Decided:** accepted + documented honest behavior, no drain logic (apps retry). Throughput: **measure, don't gate** — baseline number in the integration suite |
-| 3 | DNS interception edge cases (resolver behaviors, search domains, TCP DNS) | M1 flakiness | Largely closed in M1 (loopback resolv.conf + raw-UDP forwarder; TCP :53 routes to the same resolver). **Concrete realized instance:** the `udp dport 53` REDIRECT *reply* path doesn't work (stub's wildcard-socket source mismatches; conntrack never un-NATs) — so hardcoded external UDP resolvers get no answer. Mitigation: resolv.conf points at loopback (exempt from REDIRECT, works); the gap is flagged as a docker-in-VM (M3/M4) prerequisite (`IP_ORIGDSTADDR` transparent-reply fix) |
-| 4 | MITM datapath risk: cert-pinning breakage, h2/websocket, the vsock↔tokio bridge, OpenVMM churn under the hop | MITM moved *up* to M2 (the leapfrog) — largest part of M2 | **Largely retired by the 2026-06-13 OpenShell-salvage spike** (compiles, 164/164 tests incl. e2e MITM, Windows cross-check green). Pinning breakage = accepted posture. h2 deferred (force http/1.1). Bridge = loopback-hop reusing the proven blocking pump, so the churn invariant is untouched (re-proven by a dedicated integration test). See [specs/2026-06-14-m2-agent-firewall-merged-design.md](superpowers/specs/2026-06-14-m2-agent-firewall-merged-design.md) |
-| 5★ | Disk-order contract change ripples (M3) across driver enum, OpenVMM PCIe routing, init mount plan | Subtle cross-platform boot breakage | **Contract-change spec written before any M3 code**; one-milestone "change all ends" rule; KVM + Windows gates green before M4 consumes volumes |
-| 6★ | izbad scope creep (router + DNS + policy + MITM + vault in one binary) | Maintainability | **Module seams defined in the M1 design doc** (separable planes, daemon proto as the seam) rather than refactored out later |
+| 3 | DNS interception edge cases (resolver behaviors, search domains, TCP DNS) | M1 flakiness → M4 docker-in-VM blocker | Mostly closed: loopback resolv.conf + a self-healing `SystemResolver` with live config reload (replaced the start-time forwarder that went stale on VPN reconnect), DNS-over-TCP for >512-byte answers, metric-ordered Windows upstreams. **Still open — the one realized gap:** the `udp dport 53` REDIRECT *reply* path doesn't work (stub's wildcard-socket source mismatches; conntrack never un-NATs), so apps hardcoding an external UDP resolver get no answer. Mitigation today: resolv.conf points at loopback. **This is the docker-in-VM prerequisite** (dockerd strips loopback resolvers, falls back to `8.8.8.8`) — fold the `IP_ORIGDSTADDR` transparent-reply fix into M4, paired with F-05 |
+| 4 | MITM datapath risk: cert-pinning breakage, h2/websocket, the vsock↔tokio bridge, OpenVMM churn under the hop | Was the largest part of M2 | **Retired.** M2 shipped and the datapath was since rebuilt on a hyper-util h1+h2+WebSocket service (PR #32), with the SSRF floor + SNI/Host bypasses closed (F-01/02/03). Pinning breakage = accepted posture. Bridge churn invariant held under the integration gates |
+| 5★ | Disk-order contract change ripples (M3) across driver enum, OpenVMM PCIe routing, init mount plan | Subtle cross-platform boot breakage | **Retired.** Contract change landed all-ends in M3; KVM + WHP volume tests green |
+| 6★ | izbad scope creep (router + DNS + policy + MITM + vault in one binary) | Maintainability | **Holding.** Module seams from the M1 design doc held through M2's MITM + DNS rewrites (separable planes, daemon proto as the seam). Re-check before M4 folds in the mesh plane + M5 the vault |
 
 ## Decisions log (owner-reviewed 2026-06-12)
 
