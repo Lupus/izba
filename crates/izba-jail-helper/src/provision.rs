@@ -22,7 +22,9 @@
 
 use std::path::{Path, PathBuf};
 
-use izba_core::jail_account::builders::{account_name, gc_orphans, rule_name};
+#[cfg(windows)]
+use izba_jail_naming::ACCOUNT_PREFIX;
+use izba_jail_naming::{account_name, gc_orphans, rule_name};
 
 use crate::dacl::GrantLevel;
 
@@ -117,10 +119,9 @@ impl Ops for WinOps {
 #[cfg(windows)]
 fn win_enumerate_accounts() -> Result<Vec<String>, String> {
     use windows_sys::Win32::NetworkManagement::NetManagement::{
-        FILTER_NORMAL_ACCOUNT, NERR_Success, NetApiBufferFree, NetUserEnum, USER_INFO_0,
+        NERR_Success, NetApiBufferFree, NetUserEnum, FILTER_NORMAL_ACCOUNT, USER_INFO_0,
     };
 
-    const ACCOUNT_PREFIX: &str = "izba-spk-";
     const MAX_PREFERRED_LEN: u32 = u32::MAX;
 
     let mut buf: *mut u8 = std::ptr::null_mut();
@@ -134,8 +135,8 @@ fn win_enumerate_accounts() -> Result<Vec<String>, String> {
         // freed via NetApiBufferFree on every exit path.
         let status = unsafe {
             NetUserEnum(
-                std::ptr::null(),   // local machine
-                0,                  // level 0 = name only
+                std::ptr::null(),      // local machine
+                0,                     // level 0 = name only
                 FILTER_NORMAL_ACCOUNT, // filter: normal accounts
                 &mut buf,
                 MAX_PREFERRED_LEN,
@@ -218,12 +219,11 @@ pub fn provision<O: Ops>(
         Ok(pair) => pair,
         Err(e) => return Err(format!("provision({sandbox}): create_account: {e}")),
     };
-    // Account is now created; rollback below must delete it.
-    let account_created = true;
+    // Account is now created; all rollback paths below must delete it.
 
     // Step 2: hide from sign-in screen.
     if let Err(e) = ops.hide(&acct) {
-        rollback(ops, sandbox, account_created, hidden, 0, &rule);
+        rollback(ops, sandbox, hidden, 0, &rule);
         return Err(format!("provision({sandbox}): hide: {e}"));
     }
     hidden = true;
@@ -231,7 +231,7 @@ pub fn provision<O: Ops>(
     // Step 3: grant each path.
     for path in grants {
         if let Err(e) = ops.grant(path, &sid, GrantLevel::Modify) {
-            rollback(ops, sandbox, account_created, hidden, grants_applied, &rule);
+            rollback(ops, sandbox, hidden, grants_applied, &rule);
             return Err(format!(
                 "provision({sandbox}): grant({}): {e}",
                 path.display()
@@ -242,14 +242,14 @@ pub fn provision<O: Ops>(
 
     // Step 4: install firewall block rule.
     if let Err(e) = ops.block(&rule, &sid) {
-        rollback(ops, sandbox, account_created, hidden, grants_applied, &rule);
+        rollback(ops, sandbox, hidden, grants_applied, &rule);
         return Err(format!("provision({sandbox}): block: {e}"));
     }
 
     // Step 5: write output files.
     if let Err(e) = std::fs::write(sid_out, &sid) {
         // Firewall rule is now live — must roll back including unblock.
-        rollback_with_unblock(ops, sandbox, account_created, hidden, &rule);
+        rollback_with_unblock(ops, sandbox, hidden, &rule);
         return Err(format!(
             "provision({sandbox}): write sid_out({}): {e}",
             sid_out.display()
@@ -258,7 +258,7 @@ pub fn provision<O: Ops>(
     if let Err(e) = std::fs::write(cred_out, &password) {
         // sid_out was written — remove it as part of rollback (best-effort).
         let _ = std::fs::remove_file(sid_out);
-        rollback_with_unblock(ops, sandbox, account_created, hidden, &rule);
+        rollback_with_unblock(ops, sandbox, hidden, &rule);
         return Err(format!(
             "provision({sandbox}): write cred_out({}): {e}",
             cred_out.display()
@@ -269,36 +269,22 @@ pub fn provision<O: Ops>(
 }
 
 /// Roll back steps that completed before `block` was called:
-/// unhide (if hidden), delete_account (if created).
+/// unhide (if hidden), then delete the account unconditionally.
 /// `grants_applied` is unused — DACL ACEs have no per-path undo primitive; the
 /// account deletion itself removes the SID from all future ACL evaluations.
-fn rollback<O: Ops>(
-    ops: &O,
-    sandbox: &str,
-    account_created: bool,
-    hidden: bool,
-    _grants_applied: usize,
-    _rule: &str,
-) {
+fn rollback<O: Ops>(ops: &O, sandbox: &str, hidden: bool, _grants_applied: usize, _rule: &str) {
     if hidden {
         let _ = ops.unhide(&account_name(sandbox));
     }
-    if account_created {
-        let _ = ops.delete_account(&account_name(sandbox));
-    }
+    // The account was always created before this path is reached.
+    let _ = ops.delete_account(&account_name(sandbox));
 }
 
 /// Roll back including unblock (called when firewall block succeeded before
 /// the I/O failure).
-fn rollback_with_unblock<O: Ops>(
-    ops: &O,
-    sandbox: &str,
-    account_created: bool,
-    hidden: bool,
-    rule: &str,
-) {
+fn rollback_with_unblock<O: Ops>(ops: &O, sandbox: &str, hidden: bool, rule: &str) {
     let _ = ops.unblock(rule);
-    rollback(ops, sandbox, account_created, hidden, 0, rule);
+    rollback(ops, sandbox, hidden, 0, rule);
 }
 
 // ── Deprovision ──────────────────────────────────────────────────────────────
@@ -310,6 +296,13 @@ fn rollback_with_unblock<O: Ops>(
 /// 2. Unhide (remove from UserList).
 /// 3. Delete account.
 /// 4. Delete profile (best-effort).
+///
+/// **Intentional DACL residue:** any ACEs previously granted by `provision`
+/// (workspace path `Modify` rights) reference the account SID.  Deleting the
+/// account orphans those SIDs — they become inert tombstones in the DACL that
+/// no longer resolve to a principal and are evaluated as "deny" by the kernel.
+/// This is the same approach used in rollback: no per-ACE removal primitive
+/// exists, and the security impact is nil because the SID no longer exists.
 pub fn deprovision<O: Ops>(ops: &O, sandbox: &str) -> Result<(), String> {
     let acct = account_name(sandbox);
     let rule = rule_name(sandbox);
@@ -848,6 +841,144 @@ mod tests {
         assert!(
             deleted.contains(&"izba-spk-b"),
             "izba-spk-b must be deleted"
+        );
+    }
+
+    // ── GC: truncated-name orphan cleans up matching rule (FIX 2 + FIX 3) ─────
+
+    /// A stored account whose name was truncated at provision time (long sandbox
+    /// name) must be deprovisioned AND the `Unblock` call must use a rule name
+    /// that round-trips from the same truncated slug.
+    ///
+    /// This proves that `rule_name` now truncates consistently with `account_name`
+    /// and that GC no longer leaks the firewall rule for long-named sandboxes.
+    #[test]
+    fn gc_orphaned_truncated_account_cleans_up_matching_rule() {
+        use izba_jail_naming::{account_name as an, rule_name as rn};
+
+        // A very long sandbox name.  At provision time, both account_name and
+        // rule_name truncate its slug to ACCOUNT_SLUG_MAX (11) chars.
+        let long = "my-very-long-sandbox-name-that-exceeds-limit";
+        let stored_account = an(long); // e.g. "izba-spk-my-very-lon" (20 chars)
+        let expected_rule = rn(long); // e.g. "izba-deny-my-very-lon" — same slug
+
+        // Sanity: slugs must match.
+        let acct_slug = stored_account.strip_prefix("izba-spk-").unwrap();
+        let rule_slug = expected_rule.strip_prefix("izba-deny-").unwrap();
+        assert_eq!(
+            acct_slug, rule_slug,
+            "provision and rule slugs must be equal for GC round-trip"
+        );
+
+        // Simulate: the account is in the enumeration list, but NOT in live.
+        let ops = FakeOps::with_accounts(vec![stored_account.clone()]);
+        gc(&ops, &[]).expect("gc should succeed");
+
+        let calls = ops.recorded();
+
+        // Unblock must be called with the rule that matches the truncated slug.
+        let unblocked_rules: Vec<&str> = calls
+            .iter()
+            .filter_map(|c| {
+                if let Call::Unblock(r) = c {
+                    Some(r.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            unblocked_rules,
+            vec![expected_rule.as_str()],
+            "Unblock must use the round-trip rule name '{expected_rule}'; got {unblocked_rules:?}"
+        );
+
+        // The account itself must be deleted.
+        let deleted: Vec<&str> = calls
+            .iter()
+            .filter_map(|c| {
+                if let Call::DeleteAccount(n) = c {
+                    Some(n.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            deleted.contains(&stored_account.as_str()),
+            "DeleteAccount must be called for '{stored_account}'"
+        );
+    }
+
+    // ── Provision: write-failure rollback (FIX 3) ─────────────────────────────
+
+    /// When writing `sid_out` fails (path under non-existent directory),
+    /// the rollback must call Unblock + Unhide + DeleteAccount — i.e. the
+    /// post-block rollback path is exercised.
+    #[test]
+    fn provision_write_sid_failure_triggers_full_rollback() {
+        let ops = FakeOps::new();
+        let tmp = TempDir::new().unwrap();
+        // Point sid_out at a path whose parent doesn't exist.
+        let sid_out = tmp.path().join("nonexistent_dir").join("sid.txt");
+        let cred_out = tmp.path().join("cred.json");
+
+        let err = provision(&ops, "sb", &[], &sid_out, &cred_out).unwrap_err();
+        assert!(err.contains("sid_out"), "error must mention sid_out: {err}");
+
+        let calls = ops.recorded();
+
+        // Block was called (step 4 succeeds before the I/O failure).
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::Block(_, _))),
+            "Block must have been called before the failure: {calls:?}"
+        );
+        // Unblock must be called in rollback.
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::Unblock(_))),
+            "Unblock must be called in rollback after sid_out write failure: {calls:?}"
+        );
+        // Unhide must be called (hide succeeded at step 2).
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::Unhide(_))),
+            "Unhide must be called in rollback: {calls:?}"
+        );
+        // DeleteAccount must be called.
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::DeleteAccount(_))),
+            "DeleteAccount must be called in rollback: {calls:?}"
+        );
+    }
+
+    /// When writing `cred_out` fails, the rollback path must also call
+    /// Unblock + Unhide + DeleteAccount.
+    #[test]
+    fn provision_write_cred_failure_triggers_full_rollback() {
+        let ops = FakeOps::new();
+        let tmp = TempDir::new().unwrap();
+        let sid_out = tmp.path().join("sid.txt");
+        // Point cred_out at a path whose parent doesn't exist.
+        let cred_out = tmp.path().join("nonexistent_dir").join("cred.json");
+
+        let err = provision(&ops, "sb", &[], &sid_out, &cred_out).unwrap_err();
+        assert!(
+            err.contains("cred_out"),
+            "error must mention cred_out: {err}"
+        );
+
+        let calls = ops.recorded();
+
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::Unblock(_))),
+            "Unblock must be called in rollback after cred_out write failure: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::Unhide(_))),
+            "Unhide must be called in rollback: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::DeleteAccount(_))),
+            "DeleteAccount must be called in rollback: {calls:?}"
         );
     }
 }

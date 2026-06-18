@@ -11,7 +11,7 @@ name = "izba-jail-helper"
 path = "src/main.rs"
 
 [dependencies]
-izba-core = { path = "../izba-core" }
+izba-jail-naming = { path = "../izba-jail-naming" }
 serde.workspace = true
 serde_json.workspace = true
 

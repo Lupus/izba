@@ -1,0 +1,8 @@
+[package]
+name = "izba-jail-naming"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+# Internal library — pure std, no dependencies. Shared by izba-core and the
+# ELEVATED izba-jail-helper (keeping the helper's dependency surface minimal).
+publish = false

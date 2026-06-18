@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/izba-proto", "crates/izba-core", "crates/izba-cli", "crates/izba-init", "crates/izba-ttytest", "crates/izba-jail-helper"]
+members = ["crates/izba-proto", "crates/izba-core", "crates/izba-cli", "crates/izba-init", "crates/izba-ttytest", "crates/izba-jail-helper", "crates/izba-jail-naming"]
 exclude = ["app/src-tauri"]
 
 [workspace.package]
