@@ -153,14 +153,9 @@ pub fn plan(
         missing.push("virtiofsd sandbox (needs unprivileged userns or CAP_SYS_CHROOT)");
     }
 
+    let ch_seccomp = caps.seccomp;
+    let ch_landlock = caps.landlock;
     let rlimits = ResourceLimits::for_vmm(mem_mb);
-    let flags = ConfinementPlan {
-        virtiofsd_sandbox: sandbox,
-        ch_seccomp: caps.seccomp,
-        ch_landlock: caps.landlock,
-        rlimits,
-        status: ConfinementStatus::degraded("placeholder"), // overwritten below
-    };
 
     if missing.is_empty() {
         let reason = format!(
@@ -168,8 +163,11 @@ pub fn plan(
             sandbox.as_arg()
         );
         return Ok(ConfinementPlan {
+            virtiofsd_sandbox: sandbox,
+            ch_seccomp,
+            ch_landlock,
+            rlimits,
             status: ConfinementStatus::confined(&reason),
-            ..flags
         });
     }
 
@@ -200,8 +198,11 @@ pub fn plan(
         format!("--allow-unconfined: floor waived (best-effort: {})", applied.join("+"))
     };
     Ok(ConfinementPlan {
+        virtiofsd_sandbox: sandbox,
+        ch_seccomp,
+        ch_landlock,
+        rlimits,
         status: ConfinementStatus::degraded(&detail),
-        ..flags
     })
 }
 
@@ -254,7 +255,12 @@ mod tests {
 
     #[test]
     fn no_userns_falls_back_then_fails_floor() {
-        // No userns and (in test) no chroot capability => sandbox None => floor fails.
+        // Running as root takes the chroot fallback (floor met) instead of failing;
+        // this test only exercises the unprivileged no-userns path.
+        if has_chroot_cap() {
+            eprintln!("skipping: running as root, chroot fallback path taken");
+            return;
+        }
         let err = plan(&caps(false, true, true), false, 2048).unwrap_err().to_string();
         assert!(err.to_lowercase().contains("virtiofs"), "names the sandbox leg: {err}");
     }
