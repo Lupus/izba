@@ -10,6 +10,8 @@ import type {
   EndpointSummary,
   PolicyView,
   AllowEntry,
+  SeedEntry,
+  GitRule,
 } from "./types";
 
 export const api = {
@@ -34,7 +36,10 @@ export const api = {
   policyBlock: (name: string, host: string, port: number) =>
     invoke<void>("policy_block", { name, host, port }),
   policySet: (name: string, allow: AllowEntry[]) => invoke<void>("policy_set", { name, allow }),
-  policyEnable: (name: string) => invoke<number>("policy_enable", { name }),
+  policyAddEndpoints: (name: string, entries: SeedEntry[], enforce: boolean) =>
+    invoke<void>("policy_add_endpoints", { name, entries, enforce }),
+  policySetFull: (name: string, allow: AllowEntry[], git: GitRule[]) =>
+    invoke<void>("policy_set_full", { name, allow, git }),
   policySetEnforce: (name: string, on: boolean) =>
     invoke<void>("policy_set_enforce", { name, on }),
   // `target` is the raw glob string ("host/owner/repo" or "host"); the Rust

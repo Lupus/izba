@@ -11,7 +11,6 @@ vi.mock("../lib/ipc", () => ({
     policyShow: vi.fn(),
     policyAllow: vi.fn(),
     policyBlock: vi.fn(),
-    policyEnable: vi.fn(),
     policyGitAllow: vi.fn(),
     policyGitBlock: vi.fn(),
   },
@@ -76,12 +75,14 @@ describe("NetlogView", () => {
     expect(screen.getByRole("button", { name: /allow 9\.9\.9\.9/i })).toBeDisabled();
   });
 
-  it("shows the enable-firewall banner for a bare sandbox", async () => {
+  it("shows the enable-firewall banner for a bare sandbox (click is no-op until Task 8)", async () => {
     mockPolicy({ enforcing: false, allow: [], git: [] });
     render(<NetlogView name="web" />);
+    // Button must still be present; click is a no-op stub (policyEnable removed; Task 8 wires SeedDialog).
     const btn = await screen.findByRole("button", { name: /enable firewall/i });
     fireEvent.click(btn);
-    await waitFor(() => expect(api.policyEnable).toHaveBeenCalledWith("web"));
+    // No API call expected — onClick is () => {} until Task 8.
+    expect(btn).toBeInTheDocument();
   });
 
   it("orders rows deterministically by recency then host:port, not backend order", async () => {

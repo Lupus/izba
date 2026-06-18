@@ -83,6 +83,10 @@ export type Access = "read" | "read-write";
 /** A git rule from the policy: either a repo URL or a hostname, with optional access level. */
 export type GitRule = ({ repo: string } | { host: string }) & { access?: Access };
 
+export type SeedEntry =
+  | { kind: "http"; host: string; port: number; access: Access }
+  | { kind: "git"; target: string; access: Access };
+
 export interface PolicyView {
   enforcing: boolean;
   allow: AllowEntry[];
