@@ -39,9 +39,11 @@ upstream selection.
 
 **Adoption infrastructure (Track T) is largely in place**: CI six gates +
 real-VM e2e, published artifacts, coverage + SonarCloud gates, build-version
-reporting, on-demand devbuild installers. **The one thing missing is the first
-real release tag** — `v0.1.0-rc1`/`-dev1` were validation prereleases; the
-"first tag at M2" plan is now *overdue* (M2 **and** M3 are done).
+reporting, on-demand devbuild installers. **The first real release tag is held
+back deliberately** — `v0.1.0-rc1`/`-dev1` were validation prereleases; rather
+than tag at M2/M3, the tag now follows the **MVP bundle** below (fine-grained
+policy + real host confinement + verified ports/volumes), so the first release
+is a defensible product, not a demo.
 
 What does **not** exist yet:
 
@@ -72,8 +74,9 @@ for putting all traffic on vsock) is **fixed** as of 2026-06-12 — see M0 below
 ## Milestones
 
 Sizes are relative (S/M/L) — recent velocity makes weeks the natural unit, not
-quarters. Order is dependency order. **M0–M3 are done**; M4 is the next big
-build. Track S (security hardening) and Track T (adoption) run continuously
+quarters. Order is dependency order. **M0–M3 are done.** The **MVP bundle**
+(MVP-A..D, below) is next and gates the first release tag; **M4** follows the
+tag. Track S (security hardening) and Track T (adoption) run continuously
 alongside.
 
 ### M0 — Stability gate: vsock under churn (S–M) — ✅ DONE (2026-06-12)
@@ -209,7 +212,85 @@ compose stack on a sized `/var/lib/docker` volume — that lands as part of M4's
 docker-in-VM bring-up (and is gated on the hardcoded-external-UDP-resolver DNS
 fix; see risk #3).
 
-### M4 — Projects: izba.yaml + lifecycle + mesh (L) — ⏭️ NEXT (the headline build)
+### MVP bundle — production-ready single sandbox (pre-tag) — ⏭️ NEXT
+
+Decided 2026-06-18 (owner). Before the first release tag and before M4, ship the
+cut that makes **one** sandbox genuinely defensible and genuinely usable — a real
+product, not a demo: fine-grained egress control, host confinement that actually
+contains a hostile guest on **both** platforms, and the half-built features made
+real in the UI and owner-verified. **First tag follows this bundle; M4 follows
+the tag.** Four sub-projects, each specced separately (the owner runs a
+dedicated session per piece). They touch different subsystems and largely run
+**in parallel**; the only ordering constraints are the two spikes called out
+below.
+
+```
+   ┌─ MVP-A  L7 git-aware egress policy ──────────────┐
+   ├─ MVP-B  ports + volumes: UI wiring + e2e verify ─┤
+   │                                                   ├──▶ first tag ──▶ M4
+   ├─ MVP-C  Linux host confinement ──────────────────┤
+   │   (scope-gated by WSL2-userns spike)              │
+   └─ MVP-D  Windows per-sandbox identity ────────────┘
+       (build-gated by WHP-under-account spike)
+```
+
+**MVP-A — L7 git-aware egress policy (S–M).** The headline differentiator and
+the smallest effort, because the engine already exists: the hyper-util MITM
+service already passes `{host, method, path}` into regorus (`mitm.rs:587/652`,
+`mitm_runtime.rs:95`, `policy.rs:131`); only the user-facing grammar (`AllowEntry`
+is host+ports only) and the rego rules need extending. Reference design: the
+owner's `Lupus/docker-mitm-bridge` (`opa-policies/policy.rego` + `data.yml`) —
+`allowed_domains` (GET/HEAD), `unrestricted_domains` (all methods), and
+git-smart-HTTP read/write detection (`/info/refs?service=git-upload-pack` vs
+`git-receive-pack`, parse `user/repo` from path). **Must NOT hard-marry GitHub** —
+the grammar must generalize to gitlab/bitbucket/any HTTP git endpoint (host +
+operation + repo-pattern, not a github-only branch). izba additions: pass the
+**query string** into the rego `input` (needed for `service=`); the owner's PoC
+rego was "short-sighted" and gets reworked. **Research first (owner ask):**
+security/UX/best-practices for the rego + `data.yml` shape, and how L7 "smart
+firewalls" organize allow/deny rules UX-wise — to structure the grammar so the
+**YAML editor, the block/unblock buttons, and the netlog tab all click together**
+(this overlaps the in-flight app-UX work). **Consolidation/bug debt to fold in**
+(on `main` the policy is already single-source; these are the residual smells):
+the default-ports `[80,443]` triple-literal (config.rs:43 / router.rs:121 /
+egress_data.json — drift = silent tier-1 bypass) → one constant; remove or
+activate the inert `_upstream_tiers_for_M5` rego stub so M5 doesn't fork a second
+rego; make the empty-vs-missing `policy.yaml` semantics explicit. **Sets up M5**
+(same path-scoping mechanism the credential vault needs).
+
+**MVP-B — ports + volumes: UI wiring + end-to-end verification (M).** The CLI +
+daemon + driver sides shipped (M3 volumes; `izba port` relays) but neither is
+wired into the desktop app, and **neither was owner-verified end-to-end on a real
+build**. Wire ports publishing and volume management into the app (create wizard +
+management views), then the owner runs a real devbuild and confirms both flows
+work. Closes the "built but not real / not verified" debt. Shares the app surface
+with MVP-A's policy-UX work — coordinate to avoid app-tab conflicts.
+
+**MVP-C — Linux host confinement (M–L).** Today the Linux side is **bare**:
+cloud-hypervisor + virtiofsd launch with no `--seccomp`, no `--landlock`,
+virtiofsd `--sandbox none`, running as the full host user (only `setsid()`). This
+is the open Linux half of F-06 + all of F-07 (see Track S). Stage it: **built-ins
+first** (confirm/pin CH's seccomp, add `--landlock` for filesystem scoping,
+switch virtiofsd to `--sandbox chroot`/namespace), then the optional **per-sandbox
+uid jailer** (dedicated uid/gid + cgroups — the Linux mirror of MVP-D's dedicated
+principal). **Spike first:** the WSL2 unprivileged-user-namespace constraint (the
+same `apparmor_restrict_unprivileged_userns` that bit passt) determines how far
+the namespace/jailer path can go and whether a sysctl is a hard requirement.
+
+**MVP-D — Windows per-sandbox identity confinement (L).** The owner's model: a
+dedicated local **account** per sandbox, ACL-granting it only that sandbox's
+resources, running the VMM as it; a **"lock down" button (UAC shield)** that
+prompts elevation to create the identity, and tears it down on `rm` or "unlock."
+This **layers on top of** the existing restricted-token + Low-IL + job confinement
+(PR #37, F-06-Windows) as an opt-in *elevation* — the strongest tier: a sandbox
+that is a distinct security principal owning nothing by default. **Build-gated by
+a spike:** does WHP (`WHvCreatePartition`) actually work when the VMM runs as a
+separate standard local account? (The prior probe showed WHP denied in
+AppContainer but fine under restricted-token+Low-IL — a dedicated account is an
+untested third case.) If WHP needs the interactive user's context, the model
+needs rethinking before any build.
+
+### M4 — Projects: izba.yaml + lifecycle + mesh (L) — after the MVP bundle + first tag
 
 Design step 4 plus the east–west half of step 5 (in this architecture
 "brokering only declared edges" *is* the policy engine — they don't split).
@@ -262,14 +343,25 @@ SNI/Host/keep-alive bypasses), F-06 (Windows VMM confinement), F-08 (host-side
 `cp` tar containment), F-15 (0700 data dirs), F-22 (cargo-deny gate), F-24 (CH
 path-comma reject). **Still open — the near-term floor:**
 
-- **F-07 (HIGH, only open HIGH):** virtiofsd runs `--sandbox none` — no second
-  containment layer over the shared project dir. Pairs with the now-fixed F-06;
-  do before claiming the host-confinement story is complete.
+- **Linux host confinement epic (= MVP-C).** The whole host-side Linux
+  confinement is missing, so the register is widened from the two atomic findings
+  to an epic: **F-06 (Linux half, HIGH — still open)** unjailed VMM + virtiofsd
+  as the full host user; **F-07 (HIGH)** virtiofsd `--sandbox none`; plus new
+  sub-findings **F-27** host-process privilege drop / dedicated uid+gid, **F-28**
+  cgroup resource bounding, **F-29** landlock/seccomp filesystem confinement.
+  Built-ins first, then a per-uid jailer (see MVP-C; numbers tentative until
+  written into the register).
+- **Windows host confinement epic.** F-06-Windows is **done** (PR #37: restricted
+  token + Low IL + job + mitigations). The dedicated-identity model (MVP-D) is a
+  *hardening enhancement* beyond the finding — the next confinement tier, not a
+  new gap.
 - **F-09 (MED):** izbad's AF_UNIX control socket has no `SO_PEERCRED` check —
-  any local process gets full sandbox control. Cheap, high-value.
+  any local process gets full sandbox control. Cheap, high-value; good to land
+  alongside the MVP confinement work.
 - **F-05 (MED):** DNS resolve-and-pin + QNAME-gate + rate-limit. **Now
   unblocked** by the hickory-resolver adoption (the two DNS efforts no longer
   collide); context stub in `docs/security/egress-firewall-p3-dns-resolve-and-pin.md`.
+  Pairs naturally with M4's hardcoded-external-UDP-resolver fix (risk #3).
 - The remaining mediums/lows (F-04/F-10/F-12/F-13/F-17/F-23, F-16/F-18/F-25)
   batch into a later pass. **Owed across the board:** PoCs for the HIGH
   guest→host leads + deterministic gates (cargo-fuzz under ASan for the codec/
@@ -284,40 +376,46 @@ Runs parallel to everything; first slice landed during M0/M1.
   reporting, on-demand devbuild installers.
 - **Published kernel + initramfs artifacts** — **done** (CI artifact jobs).
 - **Versioned releases** with prebuilt binaries (Linux + Windows) — **the open
-  item.** `v0.1.0-rc1`/`-dev1` were validation prereleases; the planned
-  "first tag at M2" is **overdue** now that M2 *and* M3 are done. Cutting it is
-  the cheapest high-leverage next move (see Next steps).
+  item, now gated behind the MVP bundle.** `v0.1.0-rc1`/`-dev1` were validation
+  prereleases; the first real tag follows MVP-A..D so the release ships
+  fine-grained policy + real host confinement + verified ports/volumes (see
+  Next steps).
 - **Quickstart that works from a clean machine**, refreshed each milestone;
   `izba.yaml` reference when M4 lands.
 
 ## Next steps (groomed 2026-06-18)
 
-With M0–M3 done, the security program live, and adoption infra in place, the
-recommended ordering — **start the first two now, in parallel; they're small and
-de-risk the release**, then commit to M4 as the next big build:
+The MVP bundle (above) is the next focus and **redefines the first release** —
+M2+M3 plus fine-grained policy + real host confinement + verified ports/volumes,
+*then* tag, *then* M4. The owner runs a dedicated session per sub-project; they
+touch different subsystems and run **in parallel**, with two spikes as the only
+hard gates:
 
-1. **Cut the first real release tag (Track T) — start now, S.** It's overdue;
-   M2 + M3 give izba a story no container sandbox matches, and the installer/
-   artifact pipeline already exists. Gate the tag on the near-term security
-   floor below so the "hostile-guest sandbox" claim ships honest.
-2. **Close the near-term security floor (Track S) — start now, S–M.** F-07
-   (virtiofsd sandboxing — the last open HIGH) and F-09 (izbad peer-cred —
-   cheap). Both are small and directly back the security pitch. F-05 (DNS
-   pin) is now unblocked but can trail into M4's DNS work.
-3. **M4 — Projects: `izba.yaml` + lifecycle + mesh (L) — the next headline.**
-   The core vision differentiator and the largest remaining build. Begin with
-   the **manifest-grammar working session** (still the one open design decision;
-   it now also carries M5's credential-mapping grammar) so M4 and M5 share one
-   schema. Fold the **hardcoded-external-UDP-resolver DNS fix** (risk #3) in
-   here — it's the docker-in-VM prerequisite M4's stateful members need, and it
-   pairs naturally with F-05. Consider cutting as 4a (project object +
-   lifecycle) / 4b (mesh wiring) if it sprawls.
-4. **M5 — Credential vault (L) — after M4.** Depends on M4's manifest for the
-   role→secret mapping; do not start before the grammar is locked.
+1. **Kick off the two spikes first** (cheap, they gate scope/build):
+   - **WHP-under-dedicated-account** (gates MVP-D's whole model).
+   - **WSL2 unprivileged-userns** (gates how far MVP-C's namespace/jailer goes).
+2. **Run MVP-A..D in parallel.** Recommended emphasis: **MVP-B** (ports/volumes
+   UI + verify) is the cheapest and makes the product verifiable — good to land
+   early. **MVP-A** (L7 git policy) is the headline — start with the rego/UX
+   research and the vendor-neutral (not github-married) grammar. **MVP-C/D** are
+   the security floor; build once their spikes clear. Coordinate MVP-A and MVP-B
+   on the shared app surface (both touch the desktop app). Land **F-09**
+   (izbad peer-cred) alongside the confinement work.
+3. **Cut the first release tag** once the bundle lands — the installer/artifact
+   pipeline already exists.
+4. **M4 — Projects: `izba.yaml` + lifecycle + mesh (L) — the next headline build
+   after the tag.** Begin with the **manifest-grammar working session** (the one
+   open design decision; it now also carries M5's credential-mapping grammar) so
+   M4 and M5 share one schema. Fold the **hardcoded-external-UDP-resolver DNS
+   fix** (risk #3) in here — the docker-in-VM prerequisite, pairing with F-05.
+   Consider cutting as 4a (project object + lifecycle) / 4b (mesh wiring).
+5. **M5 — Credential vault (L) — after M4.** Depends on M4's manifest; MVP-A's
+   path-scoped L7 mechanism is the same machinery, so it's already de-risked.
 
-**Postpone / not now:** the app UX papercuts (in-flight on a side branch, low
-strategic weight); the remaining medium/low findings batch; presets
-(open/balanced/closed) and org-level governance (explicitly off-roadmap).
+**Postpone / not now:** the remaining medium/low findings batch; presets
+(open/balanced/closed) and org-level governance (explicitly off-roadmap). The
+in-flight app UX papercuts (side branch `worktree-app-ux-improvements`) fold
+into MVP-A/B's app work rather than standing alone.
 
 ## Risk register
 
