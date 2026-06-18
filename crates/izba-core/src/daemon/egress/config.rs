@@ -397,6 +397,27 @@ pub fn edit_policy_file(
     Ok(cfg)
 }
 
+impl EgressPolicyConfig {
+    /// Additively merge the currently-allowed, named endpoints from `summaries`
+    /// into this policy's host allow-list (raw-IP rows skipped — SSRF guard).
+    /// Returns the number of host:port pairs newly added. Never removes a rule;
+    /// never touches `git` or `enforce`.
+    pub fn add_observed_allowed(&mut self, summaries: &[EndpointSummary]) -> usize {
+        let mut added = 0;
+        for s in summaries {
+            if s.verdict != Verdict::Allow {
+                continue;
+            }
+            if let Some(host) = &s.host {
+                if self.allow(host, s.port) {
+                    added += 1;
+                }
+            }
+        }
+        added
+    }
+}
+
 /// Build an allow-list from the currently-allowed endpoints in `summaries`
 /// (latest verdict == Allow, **named host only** — a raw IP can't be
 /// allow-listed without defeating the SSRF / DNS-rebind guard). Ports are
@@ -873,6 +894,55 @@ mod tests {
         // File now exists and is explicit.
         let txt = std::fs::read_to_string(EgressPolicyConfig::path_in(dir.path())).unwrap();
         assert!(txt.contains("enforce: false"));
+    }
+
+    #[test]
+    fn add_observed_allowed_is_additive_and_keeps_git() {
+        use crate::daemon::egress::audit::{aggregate, AuditRecord, Tier};
+        let mut allowed = AuditRecord::allow(
+            "web",
+            "1.1.1.1".parse().unwrap(),
+            443,
+            Some("api.x.com"),
+            Tier::L7,
+            "ok",
+        );
+        allowed.ts_ms = 100;
+        let mut denied = AuditRecord::deny(
+            "web",
+            "2.2.2.2".parse().unwrap(),
+            22,
+            Some("evil.com"),
+            Tier::L3,
+            "no",
+        );
+        denied.ts_ms = 100;
+        let summaries = aggregate(vec![allowed, denied]);
+
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Host("existing.com".into())],
+            git: vec![GitRule {
+                target: GitTarget::Repo("github.com/o/a".into()),
+                access: Access::Read,
+            }],
+        };
+        let added = cfg.add_observed_allowed(&summaries);
+        assert_eq!(added, 1, "only the allowed named endpoint is added");
+        assert!(
+            cfg.allow.iter().any(|e| e.host() == "existing.com"),
+            "existing host kept"
+        );
+        assert!(
+            cfg.allow.iter().any(|e| e.host() == "api.x.com"),
+            "observed host added"
+        );
+        assert!(
+            !cfg.allow.iter().any(|e| e.host() == "evil.com"),
+            "denied not added"
+        );
+        assert_eq!(cfg.git.len(), 1, "git rules untouched");
+        assert!(cfg.enforce, "enforce untouched");
     }
 
     // ── GitTarget::parse TESTS ────────────────────────────────────────────────
