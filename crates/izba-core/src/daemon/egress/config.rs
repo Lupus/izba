@@ -464,12 +464,9 @@ mod tests {
         );
     }
 
-    // This test exercises the full into_policy() → rego pipeline. The rego still
-    // uses the old `sandbox_ports` key; it will be updated in Task 3 to consume
-    // the new `sandbox_host_rules`/`sandbox_git_rules` shape. Re-enable once
-    // Task 3 lands.
+    // This test exercises the full into_policy() → rego pipeline with the new
+    // `sandbox_host_rules`/`sandbox_git_rules` data shape from Task 3.
     #[test]
-    #[ignore = "awaits Task 3 rego update (sandbox_ports → sandbox_host_rules)"]
     fn compiled_policy_enforces_ports_and_isolation() {
         let cfg = EgressPolicyConfig {
             enforce: true,

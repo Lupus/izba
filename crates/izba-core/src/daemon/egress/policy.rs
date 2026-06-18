@@ -3,11 +3,13 @@
 //! [`Policy`] trait keeps the daemon growing by extension (roadmap risk #6).
 //!
 //! `FlowDesc` carries the L3 tuple plus optional L7 fields the MITM datapath
-//! fills after TLS termination (host/method/path) — the policy decides on
+//! fills after TLS termination (host/method/path/query) — the policy decides on
 //! whatever is present, so tier-1 (HTTP, hard) and tier-2 (DNS-snoop, soft)
 //! share one engine.
 
 use serde::{Deserialize, Serialize};
+
+use super::config::AllowEntry;
 
 /// One egress connection attempt, as seen at the policy check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
@@ -23,6 +25,9 @@ pub struct FlowDesc {
     pub method: Option<String>,
     /// Tier-1: request path.
     pub path: Option<String>,
+    /// Tier-1: raw query string (e.g. "service=git-receive-pack"), for git
+    /// read/write discrimination. None for tier-2 / pre-MITM.
+    pub query: Option<String>,
 }
 
 impl FlowDesc {
@@ -89,15 +94,52 @@ pub struct RegoPolicy {
     query: String,
 }
 
-impl RegoPolicy {
-    /// The Rego module + data document, embedded so the daemon ships with a
-    /// default policy and needs no on-disk file.
-    const REGO: &'static str = include_str!("egress.rego");
-    const DATA_JSON: &'static str = include_str!("egress_data.json");
+/// Hosts any sandbox may reach with FULL method access (POST-based APIs).
+const GLOBAL_READ_WRITE: &[&str] = &[
+    "api.anthropic.com",
+    "console.anthropic.com",
+    "api.openai.com",
+    "platform.openai.com",
+    "github.com",
+    "api.github.com",
+];
+/// Static mirrors — GET/HEAD only (read).
+const GLOBAL_READ: &[&str] = &[
+    "pypi.org",
+    "files.pythonhosted.org",
+    "registry.npmjs.org",
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+];
 
-    /// Build from the embedded `egress.rego` + `egress_data.json`.
+impl RegoPolicy {
+    const REGO: &'static str = include_str!("egress.rego");
+
+    /// Build from the embedded `egress.rego` + a generated default data document.
+    /// The default doc covers the well-known global hosts; per-sandbox rules
+    /// come from a `--policy` file via [`with_data`].
     pub fn embedded() -> anyhow::Result<Self> {
-        Self::new(Self::REGO, Self::DATA_JSON)
+        let mut hosts = serde_json::Map::new();
+        let ports = serde_json::json!(AllowEntry::DEFAULT_PORTS); // single source of truth
+        for h in GLOBAL_READ_WRITE {
+            hosts.insert(
+                (*h).into(),
+                serde_json::json!({ "ports": ports, "access": "read-write" }),
+            );
+        }
+        for h in GLOBAL_READ {
+            hosts.insert(
+                (*h).into(),
+                serde_json::json!({ "ports": ports, "access": "read" }),
+            );
+        }
+        let data = serde_json::json!({
+            "host_rules": hosts,
+            "sandbox_host_rules": {},
+            "sandbox_git_rules": {},
+        });
+        Self::new(Self::REGO, &data.to_string())
     }
 
     /// Build from the embedded `egress.rego` + a supplied data document — the
@@ -124,7 +166,7 @@ impl RegoPolicy {
     }
 
     /// The input the Rego sees. `addr` becomes `input.dest`; the optional L7
-    /// fields become `input.host`/`method`/`path` and the Rego prefers
+    /// fields become `input.host`/`method`/`path`/`query` and the Rego prefers
     /// `input.host` over `input.dest` when present. Hand-built so the wire
     /// field names match the Rego, decoupled from `FlowDesc`'s serde names;
     /// `serde_json` escapes the strings (no injection via a hostile value).
@@ -143,8 +185,24 @@ impl RegoPolicy {
         if let Some(p) = &flow.path {
             obj["path"] = serde_json::Value::String(p.clone());
         }
+        if let Some(q) = &flow.query {
+            obj["query"] = serde_json::Value::Object(parse_query(q));
+        }
         obj.to_string()
     }
+}
+
+/// Parse a raw `a=b&c=d` query into a flat JSON object for the rego
+/// (`input.query.service`). Percent-decoding is unnecessary: the only key we
+/// read is `service`, whose values are fixed ASCII tokens.
+fn parse_query(q: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    for pair in q.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            m.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        }
+    }
+    m
 }
 
 impl Policy for RegoPolicy {
@@ -179,6 +237,34 @@ mod tests {
         FlowDesc::l3(sandbox, addr, port)
     }
 
+    fn git_flow(
+        sandbox: &str,
+        host: &str,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+    ) -> FlowDesc {
+        FlowDesc {
+            sandbox: sandbox.into(),
+            addr: host.into(),
+            port: 443,
+            host: Some(host.into()),
+            method: Some(method.into()),
+            path: Some(path.into()),
+            query: query.map(|q| q.into()),
+        }
+    }
+
+    fn policy_with_git(sandbox: &str, rules_json: &str, hosts_json: &str) -> RegoPolicy {
+        let data = format!(
+            r#"{{"host_rules":{{}},"sandbox_host_rules":{{"{s}":{h}}},"sandbox_git_rules":{{"{s}":{r}}}}}"#,
+            s = sandbox,
+            h = hosts_json,
+            r = rules_json
+        );
+        RegoPolicy::with_data(&data).unwrap()
+    }
+
     #[test]
     fn allow_all_allows() {
         assert_eq!(AllowAll.check(&flow("web", "1.2.3.4", 443)), Verdict::Allow);
@@ -195,10 +281,12 @@ mod tests {
     #[test]
     fn global_domain_is_allowed() {
         let p = RegoPolicy::embedded().unwrap();
-        assert_eq!(
-            p.check(&flow("web", "api.anthropic.com", 443)),
-            Verdict::Allow
-        );
+        // api.anthropic.com is read-write, so a bare L3 flow (no method) hits the
+        // host_rules allow rule — method check only applies when method is present.
+        let mut f = flow("web", "api.anthropic.com", 443);
+        f.host = Some("api.anthropic.com".into());
+        f.method = Some("GET".into());
+        assert_eq!(p.check(&f), Verdict::Allow);
     }
 
     #[test]
@@ -214,7 +302,11 @@ mod tests {
     #[test]
     fn restricted_tier_domain_is_allowed() {
         let p = RegoPolicy::embedded().unwrap();
-        assert_eq!(p.check(&flow("build", "github.com", 443)), Verdict::Allow);
+        // github.com is read-write in the new embedded doc; a GET flow is allowed
+        let mut f = flow("build", "github.com", 443);
+        f.host = Some("github.com".into());
+        f.method = Some("GET".into());
+        assert_eq!(p.check(&f), Verdict::Allow);
     }
 
     /// Tier-1: the decrypted `Host` drives the decision, preferred over the
@@ -246,22 +338,45 @@ mod tests {
     }
 
     /// M2's per-sandbox allow-lists: `build` may reach an internal registry;
-    /// `web` may not.
+    /// `web` may not. This test uses a custom data doc with the new shape.
     #[test]
     fn per_sandbox_allow_list_is_isolating() {
-        let p = RegoPolicy::embedded().unwrap();
+        // Build a data doc with the new shape that mimics the old embedded sandbox tests.
+        let data = serde_json::json!({
+            "host_rules": {},
+            "sandbox_host_rules": {
+                "build": {
+                    "internal-registry.corp": {"ports": [80, 443], "access": "read-write"}
+                },
+                "web": {
+                    "api.stripe.com": {"ports": [80, 443], "access": "read-write"}
+                }
+            },
+            "sandbox_git_rules": {}
+        });
+        let p = RegoPolicy::new(RegoPolicy::REGO, &data.to_string()).unwrap();
+
+        let mut build_internal = flow("build", "internal-registry.corp", 443);
+        build_internal.host = Some("internal-registry.corp".into());
+        build_internal.method = Some("GET".into());
         assert_eq!(
-            p.check(&flow("build", "internal-registry.corp", 443)),
+            p.check(&build_internal),
             Verdict::Allow,
             "build sandbox is allowed its per-sandbox domain"
         );
+        let mut web_internal = flow("web", "internal-registry.corp", 443);
+        web_internal.host = Some("internal-registry.corp".into());
+        web_internal.method = Some("GET".into());
         assert_eq!(
-            p.check(&flow("web", "internal-registry.corp", 443)),
+            p.check(&web_internal),
             Verdict::Deny,
             "web sandbox must NOT inherit build's per-sandbox grant"
         );
+        let mut web_stripe = flow("web", "api.stripe.com", 443);
+        web_stripe.host = Some("api.stripe.com".into());
+        web_stripe.method = Some("GET".into());
         assert_eq!(
-            p.check(&flow("web", "api.stripe.com", 443)),
+            p.check(&web_stripe),
             Verdict::Allow,
             "web sandbox is allowed its own per-sandbox domain"
         );
@@ -277,7 +392,7 @@ mod tests {
     fn empty_data_denies_everything() {
         let p = RegoPolicy::new(
             RegoPolicy::REGO,
-            r#"{"global_domains": {}, "sandbox_ports": {}}"#,
+            r#"{"host_rules": {}, "sandbox_host_rules": {}, "sandbox_git_rules": {}}"#,
         )
         .unwrap();
         assert_eq!(
@@ -290,13 +405,16 @@ mod tests {
     #[test]
     fn global_host_on_non_web_port_is_denied() {
         let p = RegoPolicy::embedded().unwrap();
+        let mut f443 = flow("web", "api.anthropic.com", 443);
+        f443.host = Some("api.anthropic.com".into());
+        f443.method = Some("GET".into());
+        assert_eq!(p.check(&f443), Verdict::Allow, "web port stays allowed");
+
+        let mut f22 = flow("web", "api.anthropic.com", 22);
+        f22.host = Some("api.anthropic.com".into());
+        f22.method = Some("GET".into());
         assert_eq!(
-            p.check(&flow("web", "api.anthropic.com", 443)),
-            Verdict::Allow,
-            "web port stays allowed"
-        );
-        assert_eq!(
-            p.check(&flow("web", "api.anthropic.com", 22)),
+            p.check(&f22),
             Verdict::Deny,
             "non-web port on an allowed host must be denied"
         );
@@ -308,12 +426,19 @@ mod tests {
     fn scoped_ports_replace_the_web_default() {
         let p = RegoPolicy::new(
             RegoPolicy::REGO,
-            r#"{"global_domains": {}, "sandbox_ports": {"web": {"db.internal": [5432]}}}"#,
+            r#"{"host_rules": {}, "sandbox_host_rules": {"web": {"db.internal": {"ports": [5432], "access": "read-write"}}}, "sandbox_git_rules": {}}"#,
         )
         .unwrap();
-        assert_eq!(p.check(&flow("web", "db.internal", 5432)), Verdict::Allow);
+        let mut f5432 = flow("web", "db.internal", 5432);
+        f5432.host = Some("db.internal".into());
+        f5432.method = Some("GET".into());
+        assert_eq!(p.check(&f5432), Verdict::Allow);
+
+        let mut f443 = flow("web", "db.internal", 443);
+        f443.host = Some("db.internal".into());
+        f443.method = Some("GET".into());
         assert_eq!(
-            p.check(&flow("web", "db.internal", 443)),
+            p.check(&f443),
             Verdict::Deny,
             "explicit ports replace, not extend, the web default"
         );
@@ -325,11 +450,211 @@ mod tests {
         assert_send_sync::<RegoPolicy>();
         let p: std::sync::Arc<dyn Policy> = std::sync::Arc::new(RegoPolicy::embedded().unwrap());
         let p2 = std::sync::Arc::clone(&p);
-        let h = std::thread::spawn(move || p2.check(&flow("web", "api.openai.com", 443)));
+        let h = std::thread::spawn(move || {
+            let mut f = FlowDesc::l3("web", "api.openai.com", 443);
+            f.host = Some("api.openai.com".into());
+            f.method = Some("GET".into());
+            p2.check(&f)
+        });
         assert_eq!(h.join().unwrap(), Verdict::Allow);
         assert_eq!(
             p.check(&flow("web", "evil.example.com", 443)),
             Verdict::Deny
         );
+    }
+
+    // ── Git rule table tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn git_clone_allowed_when_read_granted_any_vendor() {
+        for host in [
+            "github.com",
+            "gitlab.com",
+            "bitbucket.org",
+            "git.example.org",
+        ] {
+            let repo = format!("{host}/myorg/app");
+            let p = policy_with_git(
+                "web",
+                &format!(r#"[{{"repo":"{repo}","access":"read"}}]"#),
+                "{}",
+            );
+            // discovery GET
+            assert_eq!(
+                p.check(&git_flow(
+                    "web",
+                    host,
+                    "GET",
+                    "/myorg/app/info/refs",
+                    Some("service=git-upload-pack")
+                )),
+                Verdict::Allow,
+                "{host}: clone discovery"
+            );
+            // data POST
+            assert_eq!(
+                p.check(&git_flow(
+                    "web",
+                    host,
+                    "POST",
+                    "/myorg/app/git-upload-pack",
+                    None
+                )),
+                Verdict::Allow,
+                "{host}: clone data"
+            );
+        }
+    }
+
+    #[test]
+    fn git_push_denied_when_only_read() {
+        let p = policy_with_git(
+            "web",
+            r#"[{"repo":"github.com/myorg/app","access":"read"}]"#,
+            "{}",
+        );
+        assert_eq!(
+            p.check(&git_flow(
+                "web",
+                "github.com",
+                "GET",
+                "/myorg/app/info/refs",
+                Some("service=git-receive-pack")
+            )),
+            Verdict::Deny,
+            "push discovery denied under read"
+        );
+        assert_eq!(
+            p.check(&git_flow(
+                "web",
+                "github.com",
+                "POST",
+                "/myorg/app/git-receive-pack",
+                None
+            )),
+            Verdict::Deny,
+            "push data denied under read"
+        );
+    }
+
+    #[test]
+    fn git_push_allowed_when_read_write() {
+        let p = policy_with_git(
+            "web",
+            r#"[{"repo":"github.com/myorg/app","access":"read-write"}]"#,
+            "{}",
+        );
+        assert_eq!(
+            p.check(&git_flow(
+                "web",
+                "github.com",
+                "POST",
+                "/myorg/app/git-receive-pack",
+                None
+            )),
+            Verdict::Allow
+        );
+        // read still works (write implies read)
+        assert_eq!(
+            p.check(&git_flow(
+                "web",
+                "github.com",
+                "POST",
+                "/myorg/app/git-upload-pack",
+                None
+            )),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn git_owner_glob_and_dotgit_suffix() {
+        let p = policy_with_git(
+            "web",
+            r#"[{"repo":"gitlab.com/vendor/*","access":"read"}]"#,
+            "{}",
+        );
+        assert_eq!(
+            p.check(&git_flow(
+                "web",
+                "gitlab.com",
+                "POST",
+                "/vendor/lib.git/git-upload-pack",
+                None
+            )),
+            Verdict::Allow,
+            ".git suffix + owner glob"
+        );
+        assert_eq!(
+            p.check(&git_flow(
+                "web",
+                "gitlab.com",
+                "POST",
+                "/other/lib/git-upload-pack",
+                None
+            )),
+            Verdict::Deny,
+            "different owner denied"
+        );
+    }
+
+    #[test]
+    fn git_host_scope_matches_any_repo() {
+        let p = policy_with_git("web", r#"[{"host":"bitbucket.org","access":"read"}]"#, "{}");
+        assert_eq!(
+            p.check(&git_flow(
+                "web",
+                "bitbucket.org",
+                "POST",
+                "/any/repo/git-upload-pack",
+                None
+            )),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn git_rule_does_not_grant_ordinary_http() {
+        // A git read grant must NOT open the web UI / API on the same host.
+        let p = policy_with_git(
+            "web",
+            r#"[{"repo":"github.com/myorg/app","access":"read-write"}]"#,
+            "{}",
+        );
+        assert_eq!(
+            p.check(&git_flow("web", "github.com", "GET", "/myorg/app", None)),
+            Verdict::Deny,
+            "web UI GET not a git wire op -> denied"
+        );
+    }
+
+    #[test]
+    fn http_access_read_allows_get_denies_post() {
+        let p = policy_with_git(
+            "web",
+            "[]",
+            r#"{"pypi.org":{"ports":[80,443],"access":"read"}}"#,
+        );
+        let mut get = flow("web", "pypi.org", 443);
+        get.host = Some("pypi.org".into());
+        get.method = Some("GET".into());
+        assert_eq!(p.check(&get), Verdict::Allow);
+        let mut post = flow("web", "pypi.org", 443);
+        post.host = Some("pypi.org".into());
+        post.method = Some("POST".into());
+        assert_eq!(p.check(&post), Verdict::Deny, "read host denies POST");
+    }
+
+    #[test]
+    fn http_access_read_write_allows_post() {
+        let p = policy_with_git(
+            "web",
+            "[]",
+            r#"{"api.x.com":{"ports":[443],"access":"read-write"}}"#,
+        );
+        let mut post = flow("web", "api.x.com", 443);
+        post.host = Some("api.x.com".into());
+        post.method = Some("POST".into());
+        assert_eq!(p.check(&post), Verdict::Allow);
     }
 }

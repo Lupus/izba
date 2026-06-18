@@ -1,75 +1,84 @@
-# M2 egress policy — adapted from Lupus/docker-mitm-bridge's
-# `opa-policies/policy.rego` (package mitmproxy.policy).
+# izba egress policy — vendor-neutral.
 #
-# LINEAGE: the upstream policy is an HTTP L7 allow-list keyed on
-# `input.request.host` against two data tiers — `data.unrestricted_domains`
-# (all methods) and `data.allowed_domains` (GET/HEAD only) — plus GitHub
-# write-auth logic. izba's M2 FlowDesc carries only {sandbox, addr, port}: no
-# HTTP method/path yet (that lands in M5 when the MITM proxy terminates TLS).
-# So this spike collapses the two HTTP tiers into a single default-deny DOMAIN
-# allow-list and adds the per-sandbox dimension that is M2's actual shape. The
-# tier/data-document structure is preserved verbatim so the method/path L7
-# rules can grow back in without a rewrite (see the commented-out `allow if`
-# block at the bottom — that is upstream, ready to re-enable).
+# HTTP host rules carry an `access` verb (read = GET/HEAD; read-write = all
+# methods). Git rules key on the smart-HTTP wire protocol (info/refs?service +
+# the upload-pack/receive-pack data legs) so read/write control works for ANY
+# git host, not just github.com. Per-sandbox scoped (one engine per sandbox).
 
 package egress
-
 import rego.v1
 
-# Default-deny: nothing leaves unless a rule below says so.
 default allow := false
 
-# The destination to match: the decrypted Host/SNI (tier-1, MITM) when present,
-# else the addr the guest dialed (tier-2 / pre-MITM — an IP, or a DNS-snoop'd
-# FQDN). A guest cannot smuggle past by faking the dialed IP: when MITM gives us
-# the real host, that is what the allow-list judges.
+# Destination for HTTP host matching: decrypted Host (tier-1) else dialed addr.
 dest_name := input.host
-
 dest_name := input.dest if not input.host
 
-# Global allow-list: a host any sandbox may reach, ON ONE OF ITS LISTED PORTS.
-# `data.global_domains[dest_name]` is the port list for the host (undefined when
-# the host is not listed, which makes the membership undefined → rule does not
-# fire → default-deny).
+read_method if input.method in ["GET", "HEAD"]
+
+host_access_ok(access) if access == "read-write"
+host_access_ok(access) if {
+    access == "read"
+    read_method
+}
+
+# --- HTTP host allow-list (access-aware) ---
 allow if {
-	input.port in data.global_domains[dest_name]
+    rule := data.host_rules[dest_name]
+    input.port in rule.ports
+    host_access_ok(rule.access)
 }
-
-# Per-sandbox allow-list: a host only THIS sandbox may reach, on a listed port.
 allow if {
-	input.port in data.sandbox_ports[input.sandbox][dest_name]
+    rule := data.sandbox_host_rules[input.sandbox][dest_name]
+    input.port in rule.ports
+    host_access_ok(rule.access)
 }
 
-# Decision object mirrors upstream's `decision := {"allow", "reason"}` so the
-# audit log + future denial UX have a human-readable cause from day one.
-reason := "allowed: global domain" if {
-	input.port in data.global_domains[dest_name]
+# --- Vendor-neutral git rules ---
+service_kind("git-upload-pack") := "read"
+service_kind("git-receive-pack") := "write"
+
+# Discovery leg: GET <repo>/info/refs?service=<svc>
+git_request := {"service": input.query.service, "repo_path": rp} if {
+    input.method == "GET"
+    endswith(input.path, "/info/refs")
+    rp := trim_suffix(input.path, "/info/refs")
+}
+# Data leg: POST <repo>/git-upload-pack | <repo>/git-receive-pack
+git_request := {"service": svc, "repo_path": rp} if {
+    input.method == "POST"
+    some svc in ["git-upload-pack", "git-receive-pack"]
+    suffix := sprintf("/%s", [svc])
+    endswith(input.path, suffix)
+    rp := trim_suffix(input.path, suffix)
 }
 
-reason := "allowed: per-sandbox domain" if {
-	not input.port in data.global_domains[dest_name]
-	input.port in data.sandbox_ports[input.sandbox][dest_name]
+# Canonical repo id: "<host>/<owner>/<repo>", trimming ".git" and slashes.
+git_repo_id := id if {
+    bare := trim_suffix(trim(git_request.repo_path, "/"), ".git")
+    id := sprintf("%s/%s", [input.host, bare])
 }
 
-default reason := "denied: destination not in any allow-list"
-
-decision := {
-	"allow": allow,
-	"reason": reason,
+git_rule_matches(rule) if {
+    rule.repo
+    glob.match(rule.repo, ["/"], git_repo_id)
+}
+git_rule_matches(rule) if {
+    rule.host
+    rule.host == input.host
 }
 
-# ---------------------------------------------------------------------------
-# M5 horizon (NOT active — FlowDesc has no method/path yet). When the MITM
-# proxy lands, `input.request` regains {host, method, path, query} and these
-# upstream rules re-enable the restricted vs. unrestricted split verbatim:
-#
-#     allow if {
-#         input.request.host in data.unrestricted_domains
-#     }
-#     allow if {
-#         input.request.host in data.allowed_domains
-#         input.request.method in ["GET", "HEAD"]
-#     }
-#
-# plus the GitHub git-upload-pack / git-receive-pack write-auth logic.
-# ---------------------------------------------------------------------------
+git_kind := service_kind(git_request.service)
+
+allow if {
+    some rule in data.sandbox_git_rules[input.sandbox]
+    git_rule_matches(rule)
+    git_kind == "read"
+    rule.access in {"read", "read-write"}
+}
+allow if {
+    some rule in data.sandbox_git_rules[input.sandbox]
+    git_rule_matches(rule)
+    git_kind == "write"
+    rule.access == "read-write"
+}

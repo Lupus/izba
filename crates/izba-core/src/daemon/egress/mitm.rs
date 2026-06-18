@@ -279,13 +279,16 @@ pub(crate) fn looks_like_tls(peek: &[u8]) -> bool {
 // ============================================================================
 
 /// L7 view of one request, as seen AFTER TLS termination. This is the struct a
-/// `RegoPolicy` would evaluate (host + method + path; headers/body would join
-/// it for credential injection).
+/// `RegoPolicy` would evaluate (host + method + path + query; headers/body would
+/// join it for credential injection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct L7Request {
     pub host: String,
     pub method: String,
     pub path: String,
+    /// Raw query string (e.g. `"service=git-receive-pack"`), for git smart-HTTP
+    /// read/write discrimination. `None` when the URI has no `?`.
+    pub query: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,6 +591,7 @@ async fn handle_request(
         host: host.to_string(),
         method: req.method().to_string(),
         path: req.uri().path().to_string(),
+        query: req.uri().query().map(|q| q.to_string()),
     };
 
     // 1. More than one `Host` header is inherently ambiguous — fail closed.
@@ -640,6 +644,7 @@ async fn handle_request(
                     host: host.clone(),
                     method: req.method().to_string(),
                     path: req.uri().path().to_string(),
+                    query: req.uri().query().map(|q| q.to_string()),
                 },
                 "sni-host-mismatch",
             );
@@ -654,6 +659,7 @@ async fn handle_request(
         host: host.clone(),
         method: req.method().to_string(),
         path: req.uri().path().to_string(),
+        query: req.uri().query().map(|q| q.to_string()),
     };
     if let L7Verdict::Deny(body) = policy.check(&l7) {
         return Ok(forbidden(body));
