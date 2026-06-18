@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use izba_core::daemon::egress::audit;
+use izba_core::daemon::egress::audit::git_op_label;
 use izba_core::paths::Paths;
 
 const AUDIT_FILE: &str = "egress-audit.jsonl";
@@ -107,9 +108,12 @@ fn format_summary_row(s: &izba_core::daemon::egress::audit::EndpointSummary) -> 
         izba_core::daemon::egress::audit::Tier::L3 => "l3",
     };
     let target = s.host.clone().unwrap_or_else(|| s.dest_ip.to_string());
-    let req = match (&s.last_method, &s.last_path) {
-        (Some(m), Some(p)) => format!("  {m} {p}"),
-        _ => String::new(),
+    let req = match git_op_label(s.last_method.as_deref(), s.last_path.as_deref()) {
+        Some(label) => format!("  {label}"),
+        None => match (&s.last_method, &s.last_path) {
+            (Some(m), Some(p)) => format!("  {m} {p}"),
+            _ => String::new(),
+        },
     };
     format!(
         "{ts}  {verdict} {tier}  {target}:{port}  a{a}/d{d}{req}",

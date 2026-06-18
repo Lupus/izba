@@ -209,6 +209,22 @@ pub fn format_ts_ms(ms: u64) -> String {
         .unwrap_or_else(|| ms.to_string())
 }
 
+/// Human label for a git wire op, from the request line. The POST data leg is
+/// the definitive signal (clone vs push) and needs no query string.
+pub fn git_op_label(method: Option<&str>, path: Option<&str>) -> Option<&'static str> {
+    let (m, p) = (method?, path?);
+    if m != "POST" {
+        return None;
+    }
+    if p.ends_with("/git-upload-pack") {
+        Some("git clone/fetch")
+    } else if p.ends_with("/git-receive-pack") {
+        Some("git push")
+    } else {
+        None
+    }
+}
+
 /// Render one record as a human-readable `izba netlog` line:
 /// `<utc>  ALLOW/DENY l7  sandbox  host|ip:port  [METHOD path]  (rule)`.
 /// Pure: the timestamp comes from the record, so this is deterministic.
@@ -223,9 +239,12 @@ pub fn format_record(rec: &AuditRecord) -> String {
         Tier::L3 => "l3",
     };
     let target = rec.host.clone().unwrap_or_else(|| rec.dest_ip.to_string());
-    let req = match (&rec.method, &rec.path) {
-        (Some(m), Some(p)) => format!("  {m} {p}"),
-        _ => String::new(),
+    let req = match git_op_label(rec.method.as_deref(), rec.path.as_deref()) {
+        Some(label) => format!("  {label}"),
+        None => match (&rec.method, &rec.path) {
+            (Some(m), Some(p)) => format!("  {m} {p}"),
+            _ => String::new(),
+        },
     };
     format!(
         "{ts}  {verdict} {tier}  {sandbox}  {target}:{port}{req}  ({rule})",
@@ -469,6 +488,20 @@ mod tests {
             !dline.contains("  GET"),
             "no request line when absent: {dline}"
         );
+    }
+
+    #[test]
+    fn git_op_label_from_post_legs() {
+        assert_eq!(
+            git_op_label(Some("POST"), Some("/o/a/git-upload-pack")),
+            Some("git clone/fetch")
+        );
+        assert_eq!(
+            git_op_label(Some("POST"), Some("/o/a.git/git-receive-pack")),
+            Some("git push")
+        );
+        assert_eq!(git_op_label(Some("GET"), Some("/o/a")), None);
+        assert_eq!(git_op_label(None, None), None);
     }
 
     /// The sink appends one JSON line per record and stamps a non-zero time.
