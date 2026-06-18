@@ -7,6 +7,7 @@ import { AccessPicker } from "./AccessPicker";
 interface Row {
   host: string;
   ports: number[];
+  access: Access;
 }
 
 interface GitRow {
@@ -27,8 +28,8 @@ function toGitRow(rule: GitRule): GitRow {
 /** Normalize an `AllowEntry` (string = bare host → web default ports) to a Row. */
 function toRow(e: AllowEntry): Row {
   return typeof e === "string"
-    ? { host: e, ports: [...WEB_DEFAULT_PORTS] }
-    : { host: e.host, ports: e.ports };
+    ? { host: e, ports: [...WEB_DEFAULT_PORTS], access: "read-write" }
+    : { host: e.host, ports: e.ports, access: e.access ?? "read-write" };
 }
 
 /** Per-host ports shown as removable chips plus a numeric "add port" field. */
@@ -173,7 +174,7 @@ export function PolicyEditor({ name }: { name: string }) {
     edit((rs) => rs.map((r, j) => (j === i ? { ...r, ports: r.ports.filter((p) => p !== port) } : r)));
   }
   function addRow() {
-    edit((rs) => [...rs, { host: "", ports: [443] }]);
+    edit((rs) => [...rs, { host: "", ports: [443], access: "read-write" }]);
   }
   function removeRow(i: number) {
     edit((rs) => rs.filter((_, j) => j !== i));
@@ -185,7 +186,7 @@ export function PolicyEditor({ name }: { name: string }) {
     try {
       const allow: AllowEntry[] = rows
         .filter((r) => r.host.trim() !== "")
-        .map((r) => ({ host: r.host.trim(), ports: r.ports }));
+        .map((r) => ({ host: r.host.trim(), ports: r.ports, access: r.access }));
       await api.policySet(name, allow);
       setSaved(true);
     } catch (e) {
@@ -276,6 +277,13 @@ export function PolicyEditor({ name }: { name: string }) {
                   ports={r.ports}
                   onAdd={(p) => addPort(i, p)}
                   onRemove={(p) => removePort(i, p)}
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="w-12 shrink-0 text-xs font-semibold text-ink-2">Access</label>
+                <AccessPicker
+                  value={r.access}
+                  onChange={(v) => edit((rs) => rs.map((row, j) => (j === i ? { ...row, access: v } : row)))}
                 />
               </div>
             </div>

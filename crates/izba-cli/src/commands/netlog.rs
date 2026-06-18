@@ -8,8 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use izba_core::daemon::egress::audit;
-use izba_core::daemon::egress::audit::git_op_label;
+use izba_core::daemon::egress::audit::{self, git_op_label};
 use izba_core::paths::Paths;
 
 const AUDIT_FILE: &str = "egress-audit.jsonl";
