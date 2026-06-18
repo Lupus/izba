@@ -400,7 +400,6 @@ impl ShellSession for RealShell {
     }
 }
 
-
 /// Map a one-shot daemon reply that should be `Ok` into `()`.
 fn expect_ok(resp: DaemonResponse) -> anyhow::Result<()> {
     match resp {
