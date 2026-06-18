@@ -11,6 +11,12 @@ test "${debug}" = "true" && set -x
 # Include library.
 script_dir="$(dirname -- "$(realpath -- "${0}")")"
 source "${script_dir}/lib.sh"
+# lib.sh unconditionally runs `set +e` (it uses exit-status conditionals
+# internally), which cancels the `set -e` above. Re-enable error-exit so a
+# failed cold-cache `apt-get install` aborts the step instead of silently
+# caching an empty ~/cache-apt-pkgs that poisons every future warm run. This
+# mirrors what pre_cache_action.sh does after sourcing lib.sh.
+set -e
 
 # Directory that holds the cached packages.
 cache_dir="${1}"
