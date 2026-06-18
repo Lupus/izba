@@ -7,6 +7,7 @@ import { NetlogView } from "./NetlogView";
 import { PolicyEditor } from "./PolicyEditor";
 import { FirewallStatus } from "./FirewallStatus";
 import { ShellPanel } from "./ShellPanel";
+import { Spinner } from "./Spinner";
 import { api } from "../lib/ipc";
 
 interface Props {
@@ -16,12 +17,22 @@ interface Props {
 
 type Pending = { kind: "stop" | "remove"; name: string } | null;
 type Tab = "overview" | "logs" | "netlog" | "policy" | "shell";
+type Action = "start" | "stop" | "restart" | "remove";
+
+// Present-progressive label shown beside the spinner while an action runs.
+const ACTION_VERB: Record<Action, string> = {
+  start: "Starting…",
+  stop: "Stopping…",
+  restart: "Restarting…",
+  remove: "Removing…",
+};
 
 export function Detail({ sandbox, onChanged }: Props) {
-  const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState<Action | null>(null);
   const [pending, setPending] = useState<Pending>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("overview");
+  const busy = busyAction !== null;
 
   // Reset to Overview whenever the selected sandbox changes.
   useEffect(() => {
@@ -37,8 +48,8 @@ export function Detail({ sandbox, onChanged }: Props) {
   const running = sandbox.state.kind !== "stopped";
   const name = sandbox.name;
 
-  async function act(fn: () => Promise<unknown>) {
-    setBusy(true);
+  async function act(action: Action, fn: () => Promise<unknown>) {
+    setBusyAction(action);
     setError(null);
     try {
       await fn();
@@ -46,9 +57,19 @@ export function Detail({ sandbox, onChanged }: Props) {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(false);
+      setBusyAction(null);
     }
   }
+
+  // A button label that swaps to a spinner + verb while ITS action is running.
+  const label = (action: Action, idle: string) =>
+    busyAction === action ? (
+      <span className="inline-flex items-center gap-1.5">
+        <Spinner /> {ACTION_VERB[action]}
+      </span>
+    ) : (
+      idle
+    );
 
   const tabs: { id: Tab; label: string }[] = [
     { id: "overview", label: "Overview" },
@@ -102,25 +123,25 @@ export function Detail({ sandbox, onChanged }: Props) {
                   onClick={() => setPending({ kind: "stop", name })}
                   className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover disabled:opacity-50"
                 >
-                  Stop
+                  {label("stop", "Stop")}
                 </button>
               ) : (
                 <button
                   type="button"
                   disabled={busy}
-                  onClick={() => void act(() => api.start(name))}
+                  onClick={() => void act("start", () => api.start(name))}
                   className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white shadow-sm disabled:opacity-50"
                 >
-                  Start
+                  {label("start", "Start")}
                 </button>
               )}
               <button
                 type="button"
                 disabled={busy}
-                onClick={() => void act(() => api.restart(name))}
+                onClick={() => void act("restart", () => api.restart(name))}
                 className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover disabled:opacity-50"
               >
-                Restart
+                {label("restart", "Restart")}
               </button>
               <button
                 type="button"
@@ -128,7 +149,7 @@ export function Detail({ sandbox, onChanged }: Props) {
                 onClick={() => setPending({ kind: "remove", name })}
                 className="rounded-lg border border-warn/40 px-3 py-1.5 text-warn hover:bg-warn/5 disabled:opacity-50"
               >
-                Remove
+                {label("remove", "Remove")}
               </button>
             </div>
             {error && <div className="mt-3 text-sm text-warn">{error}</div>}
@@ -157,7 +178,7 @@ export function Detail({ sandbox, onChanged }: Props) {
           onCancel={() => setPending(null)}
           onConfirm={() => {
             setPending(null);
-            void act(() => api.stop(pending.name));
+            void act("stop", () => api.stop(pending.name));
           }}
         />
       )}
@@ -170,7 +191,7 @@ export function Detail({ sandbox, onChanged }: Props) {
           onCancel={() => setPending(null)}
           onConfirm={() => {
             setPending(null);
-            void act(() => api.remove(pending.name, false));
+            void act("remove", () => api.remove(pending.name, false));
           }}
         />
       )}

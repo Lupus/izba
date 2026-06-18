@@ -72,6 +72,23 @@ describe("Detail actions", () => {
     await waitFor(() => expect(api.stop).toHaveBeenCalledWith("web"));
   });
 
+  it("shows a spinner and verb on the triggering button while the action runs", async () => {
+    const { api } = await import("../lib/ipc");
+    let resolve!: () => void;
+    (api.start as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise<void>((r) => (resolve = r)),
+    );
+    const sbx: SandboxView = { name: "db", image: "postgres:16", state: { kind: "stopped" } };
+    render(<Detail sandbox={sbx} onChanged={noop} />);
+    fireEvent.click(screen.getByRole("button", { name: /^start$/i }));
+    // While the start is pending the button shows a spinner + "Starting…".
+    await waitFor(() => expect(screen.getByText(/starting/i)).toBeInTheDocument());
+    expect(screen.getByRole("status")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /restart/i })).toBeDisabled();
+    resolve();
+    await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
+  });
+
   it("Remove requires confirmation then calls api.remove", async () => {
     const { api } = await import("../lib/ipc");
     const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
