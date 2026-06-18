@@ -6,6 +6,8 @@ use izba_core::paths::Paths;
 
 #[derive(Debug, Subcommand)]
 pub enum VolumeCmd {
+    /// List persistent volumes (size, usage, sandboxes referencing them)
+    Ls,
     /// Remove persistent volume images not referenced by any sandbox
     Prune {
         /// Skip the confirmation prompt
@@ -16,7 +18,35 @@ pub enum VolumeCmd {
 
 pub fn run(paths: &Paths, cmd: &VolumeCmd) -> anyhow::Result<i32> {
     match cmd {
+        VolumeCmd::Ls => ls(paths),
         VolumeCmd::Prune { force } => prune(paths, *force),
+    }
+}
+
+fn ls(paths: &Paths) -> anyhow::Result<i32> {
+    let mut client = DaemonClient::connect(paths)?;
+    match client.request(&DaemonRequest::VolumeList, &mut |_| {})? {
+        DaemonResponse::Volumes { volumes } => {
+            if volumes.is_empty() {
+                println!("no persistent volumes");
+            } else {
+                println!("{:<20} {:>10} {:>10}  USED BY", "NAME", "SIZE", "USED");
+                for v in &volumes {
+                    let used_by = if v.referenced_by.is_empty() {
+                        "-".to_string()
+                    } else {
+                        v.referenced_by.join(",")
+                    };
+                    println!(
+                        "{:<20} {:>10} {:>10}  {}",
+                        v.name, v.size_bytes, v.actual_bytes, used_by
+                    );
+                }
+            }
+            Ok(0)
+        }
+        DaemonResponse::Error { message } => bail!(message),
+        other => bail!("unexpected daemon reply: {other:?}"),
     }
 }
 
