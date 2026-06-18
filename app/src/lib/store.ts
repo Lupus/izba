@@ -2,10 +2,19 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { api } from "./ipc";
 import type { SandboxView, DaemonStatusView } from "./types";
 
+/**
+ * Daemon connection phase. `connecting` is the initial state and holds until the
+ * FIRST poll settles — during it the daemon may still be spawning under
+ * `connect_spawning_izba`, so we must not claim it is running yet. After that it
+ * flips between `ready`/`unreachable` per poll outcome.
+ */
+export type DaemonPhase = "connecting" | "ready" | "unreachable";
+
 export interface PollState {
   sandboxes: SandboxView[];
   daemon: DaemonStatusView | null;
   error: string | null;
+  phase: DaemonPhase;
   refresh: () => void;
 }
 
@@ -14,6 +23,7 @@ export function usePolling(intervalMs = 2000): PollState {
   const [sandboxes, setSandboxes] = useState<SandboxView[]>([]);
   const [daemon, setDaemon] = useState<DaemonStatusView | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [phase, setPhase] = useState<DaemonPhase>("connecting");
   // Guards against setState after unmount when a poll resolves late.
   const aliveRef = useRef(true);
 
@@ -26,9 +36,11 @@ export function usePolling(intervalMs = 2000): PollState {
       setSandboxes(sbx);
       setDaemon(st);
       setError(null);
+      setPhase("ready");
     } catch (e) {
       if (!aliveRef.current) return;
       setError(e instanceof Error ? e.message : String(e));
+      setPhase("unreachable");
     }
   }, []);
 
@@ -44,5 +56,5 @@ export function usePolling(intervalMs = 2000): PollState {
   }, [tick, intervalMs]);
 
   const refresh = useCallback(() => void tick(), [tick]);
-  return { sandboxes, daemon, error, refresh };
+  return { sandboxes, daemon, error, phase, refresh };
 }
