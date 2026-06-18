@@ -167,9 +167,14 @@ fn probe_seccomp() -> bool {
 /// false, so a no-userns host fails the virtiofsd floor leg (fail closed).
 #[cfg(target_os = "linux")]
 fn has_chroot_cap() -> bool {
-    // Probed cheaply: an effective-cap query would need libcap; instead infer
-    // from euid (root has it) — the common privileged-host case. Unprivileged
-    // hosts rely on the namespace path.
+    // Probed cheaply via euid (root has CAP_SYS_CHROOT) — the common
+    // privileged-host case; unprivileged hosts rely on the namespace path.
+    // This deliberately MISCLASSIFIES a non-root process that holds
+    // CAP_SYS_CHROOT via file/ambient capabilities as lacking it (a true
+    // effective-cap query would need libcap). The misclassification is
+    // fail-closed-safe — such a host would be forced to `--allow-unconfined`
+    // rather than silently running unconfined — and izba spawns no
+    // setuid/ambient-cap path today; revisit here if that ever changes.
     // SAFETY: geteuid() is always safe; it has no side effects.
     unsafe { libc::geteuid() == 0 }
 }

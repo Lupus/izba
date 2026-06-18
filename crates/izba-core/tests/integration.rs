@@ -255,9 +255,14 @@ fn create_sandbox_with_volumes(
 }
 
 fn start_sandbox(env: &TestEnv, tb: &TestBox, name: &str) -> anyhow::Result<()> {
-    // On hosts without the Landlock LSM the fail-closed floor cannot be met;
-    // opt out automatically so every boot test passes on any compliant host.
-    let allow_unconfined = !izba_core::procmgr::jail_linux::Capabilities::probe().landlock;
+    // Opt out of confinement automatically on any host that cannot meet the
+    // full fail-closed floor (seccomp AND Landlock AND a virtiofsd sandbox —
+    // the last needs unprivileged userns or CAP_SYS_CHROOT). Deriving this from
+    // a single leg (e.g. Landlock alone) would still fail closed on a
+    // Landlock-present-but-no-userns-non-root runner and panic every boot test;
+    // probing the real `plan()` covers all three legs.
+    let caps = izba_core::procmgr::jail_linux::Capabilities::probe();
+    let allow_unconfined = izba_core::procmgr::jail_linux::plan(&caps, false, 0).is_err();
     sandbox::start_with_timeouts(
         &tb.paths,
         name,
@@ -1533,13 +1538,17 @@ fn port_publish_runtime_and_unpublish() {
 #[test]
 fn confined_boot_records_restricted_when_landlock_present() {
     let Some(env) = want() else { return };
-    // A host without the Landlock LSM cannot reach the Restricted floor (the
-    // confinement plan would fail closed before the VMM is even launched);
-    // skip with a clear reason rather than fail.
-    if !izba_core::procmgr::jail_linux::Capabilities::probe().landlock {
+    // This test asserts the VMM actually reaches Restricted, so the host must
+    // meet the FULL confinement floor (seccomp AND Landlock AND a virtiofsd
+    // sandbox). If any leg is missing, `start_sandbox` opts out to
+    // `--allow-unconfined` (mode None) and the assertion below could not hold —
+    // skip with a clear reason rather than fail. (`plan` Ok ⇔ full floor met.)
+    let caps = izba_core::procmgr::jail_linux::Capabilities::probe();
+    if izba_core::procmgr::jail_linux::plan(&caps, false, 0).is_err() {
         eprintln!(
-            "SKIP: host kernel has no Landlock LSM \
-             (enable CONFIG_SECURITY_LANDLOCK + lsm=...,landlock)"
+            "SKIP: host cannot meet the confinement floor \
+             (need seccomp + Landlock LSM + unprivileged userns/CAP_SYS_CHROOT; \
+             enable CONFIG_SECURITY_LANDLOCK + lsm=...,landlock and userns)"
         );
         return;
     }

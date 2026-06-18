@@ -171,7 +171,8 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - **Linux VMM confinement (MVP-C):** on Linux, cloud-hypervisor and virtiofsd
   launch **confined by default** — explicit `--seccomp true`, `--landlock`
   (Landlock v5+), virtiofsd `--sandbox namespace` (fallback `--sandbox chroot`),
-  and best-effort `setrlimit` (RLIMIT_AS/NOFILE/NPROC) applied at spawn.
+  and best-effort `setrlimit` (RLIMIT_NOFILE/RLIMIT_NPROC) applied at spawn
+  (RLIMIT_AS deliberately omitted — see `ResourceLimits::for_vmm`).
   Launch **fails closed** if the floor (seccomp + Landlock + virtiofsd sandbox)
   cannot be met, unless `--allow-unconfined` is passed (loud CLI/status warning).
   Achieved confinement mode is recorded in `state.json` and surfaced by
