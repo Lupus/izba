@@ -9,7 +9,8 @@
 #           [4] exec stdin, [5] networking, [6] console log,
 #           [7] daemon lifecycle (status/kill-adopt/stop-survival),
 #           [8] stop/restart/rm, [9] M3 persistent volume + prune (vdc parity),
-#           [10] VMM confinement (differential PoC + live status).
+#           [10] VMM confinement (differential PoC + live status),
+#           [11] lock-down: per-sandbox account + read-deny + net-block.
 $ErrorActionPreference = 'Continue'
 $exe   = if ($env:IZBA_EXE)   { $env:IZBA_EXE }   else { 'C:\izba\bin\izba.exe' }
 $image = if ($env:IZBA_IMAGE) { $env:IZBA_IMAGE } else { 'alpine:3.20' }
@@ -275,6 +276,174 @@ if (-not $confOk) {
 }
 & $exe stop valid8 2>$null | Out-Null
 & $exe rm --force valid8 2>$null | Out-Null
+
+# [11] lock-down: per-sandbox account + read-deny + net-block.
+#
+# Validates the MVP-D lock-down end-to-end on the real WHP runner:
+#   izba lockdown lk-validate  ->  restart  ->  VMM runs as account,
+#   account is network-dead (firewall rules present)  ->  izba unlock
+#   ->  account + rules gone, no orphan.
+#
+# The CI runner is already elevated (admin), so the helper's ShellExecuteExW
+# runas launches WITHOUT a UAC dialog. If lockdown times out or returns
+# "windows-only" the whole section fails loudly (we ARE on Windows here).
+$lkName    = 'lk-validate'
+$lkAcct    = 'izba-spk-lk-validate'
+$lkRule    = 'izba-deny-lk-validate'
+$lkWs      = "$env:TEMP\izba-lk-validate-ws"
+$lkFails0  = $fails
+
+# Pre-cleanup: remove any leftover from a previous aborted run.
+& $exe stop $lkName 2>$null | Out-Null
+& $exe rm --force $lkName 2>$null | Out-Null
+if (Test-Path $lkWs) { Remove-Item -Recurse -Force $lkWs -ErrorAction SilentlyContinue }
+New-Item -ItemType Directory -Path $lkWs -ErrorAction SilentlyContinue | Out-Null
+# Remove any leftover account/rules from a previous aborted run (best-effort).
+Remove-LocalUser $lkAcct -ErrorAction SilentlyContinue
+powershell.exe -NoProfile -NonInteractive -Command `
+    "Get-NetFirewallRule -DisplayName '$lkRule' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue; Get-NetFirewallRule -DisplayName '$lkRule-in' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue" 2>$null | Out-Null
+
+# Step 1: create the sandbox so lockdown has a config.json to find.
+& $exe run --image $image --name $lkName $lkWs -- /bin/true | Out-Null
+$lkBootOk = ($LASTEXITCODE -eq 0)
+Check 'lock-down: initial sandbox boot (run exits 0)' $lkBootOk
+if (-not $lkBootOk) { Dump-BootLogs $lkName }
+& $exe stop $lkName 2>$null | Out-Null
+
+# Step 2: lockdown -- provision per-sandbox account + firewall rule.
+# On an already-elevated runner ShellExecuteExW runas returns immediately.
+# Guard with a job timeout so a hang does not block CI indefinitely.
+$lkJob = Start-Job -ScriptBlock {
+    param($e, $n)
+    $out = & $e lockdown $n 2>&1 | Out-String
+    [pscustomobject]@{ Output = $out; ExitCode = $LASTEXITCODE }
+} -ArgumentList $exe, $lkName
+$lkDone = $lkJob | Wait-Job -Timeout 120
+if ($null -eq $lkDone) {
+    $lkJob | Stop-Job
+    Check 'lock-down: izba lockdown exits 0' $false
+    [Console]::Error.WriteLine("  izba lockdown $lkName HUNG after 120s (elevated runner; unexpected UAC?)")
+    Dump-BootLogs $lkName
+} else {
+    $lkResult = Receive-Job $lkJob
+    $lkExitRc = $lkResult.ExitCode
+    $lkOutStr = $lkResult.Output.Trim()
+    $lkOk     = ($lkExitRc -eq 0)
+    Check 'lock-down: izba lockdown exits 0' $lkOk
+    if (-not $lkOk) {
+        [Console]::Error.WriteLine("  izba lockdown rc=$lkExitRc out='$lkOutStr'")
+        # Fail loudly if we got a "windows-only" error -- we ARE on Windows.
+        if ($lkOutStr -match 'windows-only') {
+            [Console]::Error.WriteLine("  ERROR: lockdown returned 'windows-only' on a Windows runner -- build/packaging problem")
+        }
+    }
+}
+Remove-Job $lkJob -ErrorAction SilentlyContinue
+
+# Step 3: restart the sandbox so the VMM relaunches as the per-sandbox account.
+$lkStartOk = $false
+foreach ($attempt in 1..3) {
+    & $exe run --name $lkName $lkWs -- /bin/true | Out-Null
+    if ($LASTEXITCODE -eq 0) { $lkStartOk = $true; break }
+    [Console]::Error.WriteLine("  lk-validate restart attempt $attempt/3 timed out (nested-WHP flake); retrying")
+    & $exe stop $lkName 2>$null | Out-Null
+}
+Check 'lock-down: sandbox boots after lockdown (run exits 0)' $lkStartOk
+if (-not $lkStartOk) { Dump-BootLogs $lkName }
+
+# Step 4: assert VMM process runs AS the per-sandbox account.
+# Read the sandbox state.json for the VMM pid, then ask WMI for its owner.
+$lkVmmOwnerOk = $false
+$lkStateFile  = "$env:LOCALAPPDATA\izba\sandboxes\$lkName\state.json"
+if (Test-Path $lkStateFile) {
+    $lkState = Get-Content $lkStateFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+    $lkVmmPid = $lkState.vmm_pid
+    if ($lkVmmPid) {
+        $lkProc = Get-CimInstance Win32_Process -Filter "ProcessId=$lkVmmPid" -ErrorAction SilentlyContinue
+        if ($lkProc) {
+            $lkOwnerResult = Invoke-CimMethod -InputObject $lkProc -MethodName GetOwner -ErrorAction SilentlyContinue
+            $lkOwner       = $lkOwnerResult.User
+            $lkVmmOwnerOk  = ($lkOwner -like 'izba-spk-*')
+            if (-not $lkVmmOwnerOk) {
+                [Console]::Error.WriteLine("  VMM pid=$lkVmmPid owner='$lkOwner' (expected izba-spk-*)")
+            }
+        } else {
+            [Console]::Error.WriteLine("  Win32_Process pid=$lkVmmPid not found (VMM may have exited)")
+        }
+    } else {
+        [Console]::Error.WriteLine("  state.json has no vmm_pid field: $(Get-Content $lkStateFile -Raw -ErrorAction SilentlyContinue)")
+    }
+} else {
+    [Console]::Error.WriteLine("  state.json absent at $lkStateFile")
+}
+Check 'lock-down: VMM runs as per-sandbox account (izba-spk-*)' $lkVmmOwnerOk
+
+# Step 5: assert firewall net-block -- outbound + inbound BLOCK rules exist.
+$lkFwOut = @(Get-NetFirewallRule -DisplayName $lkRule    -ErrorAction SilentlyContinue)
+$lkFwIn  = @(Get-NetFirewallRule -DisplayName "$lkRule-in" -ErrorAction SilentlyContinue)
+$lkFwOk  = ($lkFwOut.Count -ge 1 -and $lkFwIn.Count -ge 1)
+Check 'lock-down: firewall BLOCK rules exist (outbound + inbound)' $lkFwOk
+if (-not $lkFwOk) {
+    [Console]::Error.WriteLine("  outbound rules: $($lkFwOut.Count)  inbound rules: $($lkFwIn.Count)")
+}
+
+# Step 6: assert account exists as a local user.
+$lkAcctExists = $null -ne (Get-LocalUser $lkAcct -ErrorAction SilentlyContinue)
+Check 'lock-down: per-sandbox local account exists' $lkAcctExists
+if (-not $lkAcctExists) {
+    [Console]::Error.WriteLine("  Get-LocalUser $lkAcct returned nothing")
+}
+
+# Step 7: izba unlock -- should remove account + firewall rules.
+& $exe stop $lkName 2>$null | Out-Null
+$lkUnlockJob = Start-Job -ScriptBlock {
+    param($e, $n)
+    $out = & $e unlock $n 2>&1 | Out-String
+    [pscustomobject]@{ Output = $out; ExitCode = $LASTEXITCODE }
+} -ArgumentList $exe, $lkName
+$lkUnlockDone = $lkUnlockJob | Wait-Job -Timeout 120
+if ($null -eq $lkUnlockDone) {
+    $lkUnlockJob | Stop-Job
+    Check 'lock-down: izba unlock exits 0' $false
+    [Console]::Error.WriteLine("  izba unlock $lkName HUNG after 120s")
+} else {
+    $lkUnlockResult = Receive-Job $lkUnlockJob
+    $lkUnlockRc     = $lkUnlockResult.ExitCode
+    $lkUnlockOk     = ($lkUnlockRc -eq 0)
+    Check 'lock-down: izba unlock exits 0' $lkUnlockOk
+    if (-not $lkUnlockOk) {
+        [Console]::Error.WriteLine("  izba unlock rc=$lkUnlockRc out='$($lkUnlockResult.Output.Trim())'")
+    }
+}
+Remove-Job $lkUnlockJob -ErrorAction SilentlyContinue
+
+# Assert account + rules are gone after unlock.
+$lkAcctGone   = $null -eq (Get-LocalUser $lkAcct -ErrorAction SilentlyContinue)
+$lkFwOutGone  = (@(Get-NetFirewallRule -DisplayName $lkRule    -ErrorAction SilentlyContinue)).Count -eq 0
+$lkFwInGone   = (@(Get-NetFirewallRule -DisplayName "$lkRule-in" -ErrorAction SilentlyContinue)).Count -eq 0
+Check 'lock-down: unlock removed account + both firewall rules' ($lkAcctGone -and $lkFwOutGone -and $lkFwInGone)
+if (-not $lkAcctGone)  { [Console]::Error.WriteLine("  account $lkAcct still exists after unlock") }
+if (-not $lkFwOutGone) { [Console]::Error.WriteLine("  outbound firewall rule $lkRule still exists after unlock") }
+if (-not $lkFwInGone)  { [Console]::Error.WriteLine("  inbound firewall rule $lkRule-in still exists after unlock") }
+
+# Step 8: clean up the sandbox dir.
+& $exe rm --force $lkName 2>$null | Out-Null
+Check 'lock-down: sandbox dir removed after rm' (-not (Test-Path "$env:LOCALAPPDATA\izba\sandboxes\$lkName"))
+
+# Best-effort teardown: ensure no orphan account/rules/sandbox remain
+# even if an earlier step failed.  Safe to re-run -- all calls are idempotent.
+& $exe stop  $lkName 2>$null | Out-Null
+& $exe rm --force $lkName 2>$null | Out-Null
+& $exe unlock $lkName 2>$null | Out-Null
+Remove-LocalUser $lkAcct -ErrorAction SilentlyContinue
+powershell.exe -NoProfile -NonInteractive -Command `
+    "Get-NetFirewallRule -DisplayName '$lkRule' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue; Get-NetFirewallRule -DisplayName '$lkRule-in' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue" 2>$null | Out-Null
+if (Test-Path $lkWs) { Remove-Item -Recurse -Force $lkWs -ErrorAction SilentlyContinue }
+
+$lkSectionFails = $fails - $lkFails0
+if ($lkSectionFails -gt 0) {
+    [Console]::Error.WriteLine("  [11] lock-down section: $lkSectionFails check(s) failed")
+}
 
 # Best-effort daemon cleanup so the validation run leaves no daemon behind.
 & $exe daemon stop 2>$null | Out-Null
