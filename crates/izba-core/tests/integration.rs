@@ -1583,14 +1583,33 @@ fn confined_boot_records_restricted_when_landlock_present() {
 
 /// M2 git-egress exit: a sandbox with `enforce: true` +
 /// `git: [{repo: "github.com/octocat/Hello-World", access: read}]` must
-/// (a) allow `git clone` of that repo (exit 0, L7 ALLOW record for the
-/// upload-pack leg) and (b) deny a `git push` attempt (non-zero exit,
-/// L7 DENY record for the receive-pack leg).
+/// (a) allow `git clone` of that repo (exit 0, L7 ALLOW record) and
+/// (b) deny a `git push` attempt (non-zero exit, L7 DENY record).
 ///
 /// This exercises the full end-to-end git egress path through a booted
 /// microVM: izba-init's nft REDIRECT → vsock 1027 → izbad MITM → Rego
-/// git rules → audit log. The assertion is audit-first (immune to busybox
-/// TLS or git version quirks); guest exit codes are secondary corroboration.
+/// git rules → audit log.
+///
+/// ## Assertion strategy
+///
+/// [`AuditRecord`] stores `path` but not the query string, so both the
+/// clone leg (`GET /info/refs?service=git-upload-pack`) and the push leg
+/// (`GET /info/refs?service=git-receive-pack`) produce `path = "/info/refs"`.
+/// This means the audit assertions alone cannot tie a verdict to a specific
+/// git operation — a swapped-logic regression (rego allows receive-pack but
+/// denies upload-pack) would still produce one ALLOW + one DENY at `/info/refs`
+/// and satisfy both audit checks.
+///
+/// The per-leg HTTP outcome IS distinguishable via the `?service=` URL, and
+/// wget's exit code reflects it:
+///   - clone leg (`git-upload-pack`) → MITM ALLOW → 200 → wget exits 0
+///   - push leg  (`git-receive-pack`) → MITM DENY  → 403 → wget exits non-zero
+///
+/// Therefore the **primary** discriminators are the per-leg exit codes
+/// (`clone_rc == 0`, `push_rc != 0`), which together catch swapped-logic,
+/// deny-all, and allow-all regressions. The audit ALLOW+DENY presence at
+/// `/info/refs` is kept as corroboration that the policy layer evaluated
+/// both legs.
 ///
 /// Network note: the test dials real github.com. If the host has no internet
 /// (air-gapped CI), the test will fail in the exec step — not in the policy
@@ -1657,17 +1676,12 @@ fn git_read_only_repo_allows_clone_denies_push() {
     //       → MITM returns synthetic 403 → wget exits non-zero
     //
     // We need no git binary — the smart-HTTP wire protocol is just HTTP GET with
-    // a query string, so wget covers both legs. The retry loop absorbs DNS + first
-    // egress settle time after boot.
-    // Use busybox wget (always present in alpine) to exercise the git smart-HTTP
-    // discovery endpoints via HTTPS. The MITM terminates TLS, reads the Host +
-    // query string, and the Rego git rules decide. busybox wget uses
+    // a query string, so wget covers both legs. busybox wget uses
     // SSL_CERT_FILE=/etc/izba/ca-bundle.pem (set by izba-init's configure_env_defaults
     // when the izba-trust virtiofs share is mounted) to trust the MITM's izba-CA-signed
     // certificate. The retry loop absorbs DNS + first egress settle time after boot.
-    //
-    // We redirect stderr to stdout so the wget error output appears in `stdout`
-    // (captured by exec_collect) for diagnostics.
+    // We redirect stderr to /dev/null so wget's error output does not clutter
+    // the exec_collect stdout; the exit codes are the primary signal.
     let script = "\
         for i in 1 2 3 4 5; do \
           rc=0; \
@@ -1707,6 +1721,46 @@ fn git_read_only_repo_allows_clone_denies_push() {
         )
     };
 
+    // Primary discriminators: per-leg wget exit codes.
+    //
+    // AuditRecord carries `path` but not the query string, so both legs share
+    // `path = "/info/refs"`.  The exit codes are the only assertions that tie
+    // a specific git operation to its verdict and catch swapped-logic,
+    // deny-all, and allow-all regressions.
+    let clone_rc = stdout
+        .lines()
+        .find(|l| l.starts_with("clone-discovery-rc="))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(1); // missing marker → treat as failure
+    assert_eq!(
+        clone_rc,
+        0,
+        "git clone discovery (upload-pack) must succeed (got {clone_rc} — \
+         the MITM may have denied upload-pack or network is down).\n{}",
+        dump()
+    );
+
+    let push_rc = stdout
+        .lines()
+        .find(|l| l.starts_with("push-discovery-rc="))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(0); // missing marker → treat as success (should fail)
+    assert_ne!(
+        push_rc,
+        0,
+        "git push discovery (receive-pack) must return non-zero (got 0 — \
+         the MITM 403 may not have reached wget or policy is too permissive).\n{}",
+        dump()
+    );
+
+    // Corroboration: audit layer must have evaluated both legs and recorded
+    // one ALLOW (clone) and one DENY (push) at /info/refs.  These cannot
+    // distinguish which operation got which verdict on their own (no query
+    // string in AuditRecord), but together with the exit codes above they
+    // confirm the policy layer ran end-to-end.
+
     // Clone discovery (upload-pack): Rego git read → ALLOW.
     assert!(
         l7_git("allow", "/info/refs"),
@@ -1720,21 +1774,6 @@ fn git_read_only_repo_allows_clone_denies_push() {
         l7_git("deny", "/info/refs"),
         "expected an L7 DENY for github.com:443 git-receive-pack discovery \
          (push forbidden under read-only access).\n{}",
-        dump()
-    );
-
-    // Secondary: the push discovery wget must have gotten a non-200 (the MITM
-    // returns a 403). We extract it from stdout. It is informational; the audit
-    // assertion is the primary proof.
-    let push_rc = stdout
-        .lines()
-        .find(|l| l.starts_with("push-discovery-rc="))
-        .and_then(|l| l.split('=').nth(1))
-        .and_then(|v| v.trim().parse::<i32>().ok())
-        .unwrap_or(0);
-    assert_ne!(
-        push_rc, 0,
-        "git push discovery must return non-zero (got 0 — the MITM 403 may not have reached wget).\n{}",
         dump()
     );
 
