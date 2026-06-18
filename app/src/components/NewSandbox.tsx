@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, onCreateProgress } from "../lib/ipc";
 import type { CreateOpts } from "../lib/types";
+import { isValidPort, isValidBind } from "../lib/portvalidate";
 import {
   type VolumeRow,
   isValidVolName,
@@ -102,13 +103,6 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   // empty → the daemon defaults it to 127.0.0.1). The bind contract mirrors
   // izba_core::portfwd::parse_rule, which parses bind as an Ipv4Addr.
   const isBlankRow = (r: PortRow) => !r.bind.trim() && !r.host.trim() && !r.guest.trim();
-  const isValidPort = (v: string) => /^\d+$/.test(v.trim()) && +v >= 1 && +v <= 65535;
-  const isValidBind = (v: string) => {
-    const t = v.trim();
-    if (!t) return true; // empty is allowed; the daemon fills in 127.0.0.1
-    const octets = t.split(".");
-    return octets.length === 4 && octets.every((o) => /^\d+$/.test(o) && +o >= 0 && +o <= 255);
-  };
   const isValidRow = (r: PortRow) =>
     isValidPort(r.host) && isValidPort(r.guest) && isValidBind(r.bind);
   const portsInvalid = ports.some((r) => !isBlankRow(r) && !isValidRow(r));
