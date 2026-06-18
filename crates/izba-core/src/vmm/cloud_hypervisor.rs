@@ -42,7 +42,7 @@ impl VmmTools {
     }
 }
 
-pub fn build_invocations(spec: &VmSpec, tools: &VmmTools) -> anyhow::Result<Invocations> {
+pub fn build_invocations(spec: &VmSpec, tools: &VmmTools, plan: &crate::procmgr::jail_linux::ConfinementPlan) -> anyhow::Result<Invocations> {
     // A comma in a disk or workspace path would silently split into bogus
     // extra CH device options (`--disk path=<p>,readonly=on` / `--fs
     // tag=...,socket=<p>`). Reject before formatting anything (mirrors the
@@ -67,7 +67,7 @@ pub fn build_invocations(spec: &VmSpec, tools: &VmmTools) -> anyhow::Result<Invo
                 "--cache".to_string(),
                 "auto".to_string(),
                 "--sandbox".to_string(),
-                "none".to_string(),
+                plan.virtiofsd_sandbox.as_arg().to_string(),
             ],
         })
         .collect();
@@ -119,6 +119,14 @@ pub fn build_invocations(spec: &VmSpec, tools: &VmmTools) -> anyhow::Result<Invo
         api_sock.display().to_string(),
     ]);
 
+    if plan.ch_seccomp {
+        vmm.push("--seccomp".to_string());
+        vmm.push("true".to_string());
+    }
+    if plan.ch_landlock {
+        vmm.push("--landlock".to_string());
+    }
+
     Ok(Invocations {
         virtiofsd,
         vmm: CommandSpec { argv: vmm },
@@ -146,7 +154,11 @@ impl VmmDriver for CloudHypervisorDriver {
             .with_context(|| format!("creating {}", log_dir.display()))?;
 
         let tools = VmmTools::resolve()?;
-        let inv = build_invocations(spec, &tools)?;
+        // TODO(task-6): replace with a probed plan wired through ChHandle.
+        let caps = crate::procmgr::jail_linux::Capabilities::probe();
+        let plan = crate::procmgr::jail_linux::plan(&caps, spec.allow_unconfined, spec.mem_mb.into())
+            .context("computing VMM confinement plan")?;
+        let inv = build_invocations(spec, &tools, &plan)?;
 
         // A previous crashed run may have left sockets/pid files behind; the
         // socket-wait below would then "succeed" against a dead socket. Clear
@@ -288,6 +300,36 @@ mod tests {
     use crate::vmm::spec::{BlockDisk, FsShare};
     use std::path::{Path, PathBuf};
 
+    fn restricted_plan() -> crate::procmgr::jail_linux::ConfinementPlan {
+        use crate::procmgr::jail_linux::{ConfinementPlan, ResourceLimits, VirtiofsdSandbox};
+        ConfinementPlan {
+            virtiofsd_sandbox: VirtiofsdSandbox::Namespace,
+            ch_seccomp: true,
+            ch_landlock: true,
+            rlimits: ResourceLimits::for_vmm(2048),
+            status: crate::procmgr::ConfinementStatus::confined("test"),
+        }
+    }
+
+    fn i_window(argv: &[String], flag: &str) -> Option<String> {
+        argv.iter().position(|a| a == flag).and_then(|i| argv.get(i + 1).cloned())
+    }
+
+    #[test]
+    fn invocations_apply_confinement_flags() {
+        let spec = base_spec();
+        let inv = build_invocations(&spec, &base_tools(), &restricted_plan()).unwrap();
+        // virtiofsd sandbox is namespace, never "none".
+        let vfsd = &inv.virtiofsd[0].argv;
+        let i = vfsd.iter().position(|a| a == "--sandbox").expect("--sandbox present");
+        assert_eq!(vfsd[i + 1], "namespace");
+        assert!(!vfsd.contains(&"none".to_string()));
+        // CH gets explicit seccomp + landlock.
+        let w = i_window(&inv.vmm.argv, "--seccomp");
+        assert_eq!(w, Some("true".to_string()));
+        assert!(inv.vmm.argv.iter().any(|a| a == "--landlock"));
+    }
+
     fn base_spec() -> VmSpec {
         VmSpec {
             kernel: PathBuf::from("/img/vmlinux"),
@@ -337,7 +379,7 @@ mod tests {
     fn ch_invocations() {
         let spec = base_spec();
         let run = &spec.run_dir;
-        let inv = build_invocations(&spec, &base_tools()).unwrap();
+        let inv = build_invocations(&spec, &base_tools(), &restricted_plan()).unwrap();
 
         assert_eq!(inv.virtiofsd.len(), 1);
         assert_eq!(
@@ -351,7 +393,7 @@ mod tests {
                 "--cache",
                 "auto",
                 "--sandbox",
-                "none",
+                "namespace",
             ])
         );
 
@@ -385,6 +427,9 @@ mod tests {
                 "off",
                 "--api-socket",
                 &run_sock(run, "ch-api.sock"),
+                "--seccomp",
+                "true",
+                "--landlock",
             ])
         );
     }
@@ -403,7 +448,7 @@ mod tests {
             },
         ];
         let run = spec.run_dir.clone();
-        let inv = build_invocations(&spec, &base_tools()).unwrap();
+        let inv = build_invocations(&spec, &base_tools(), &restricted_plan()).unwrap();
 
         assert_eq!(inv.virtiofsd.len(), 2);
         assert_eq!(
@@ -417,7 +462,7 @@ mod tests {
                 "--cache",
                 "auto",
                 "--sandbox",
-                "none",
+                "namespace",
             ])
         );
         assert_eq!(
@@ -431,7 +476,7 @@ mod tests {
                 "--cache",
                 "auto",
                 "--sandbox",
-                "none",
+                "namespace",
             ])
         );
 
@@ -466,6 +511,9 @@ mod tests {
                 "off",
                 "--api-socket",
                 &run_sock(&run, "ch-api.sock"),
+                "--seccomp",
+                "true",
+                "--landlock",
             ])
         );
     }
@@ -477,7 +525,7 @@ mod tests {
         // rather than silently emit a malformed argv (F-24).
         let mut spec = base_spec();
         spec.disks[1].path = PathBuf::from("/sbx/a,b/scratch.img");
-        let err = build_invocations(&spec, &base_tools()).unwrap_err();
+        let err = build_invocations(&spec, &base_tools(), &restricted_plan()).unwrap_err();
         assert!(err.to_string().contains("comma"), "got: {err:#}");
     }
 
@@ -487,13 +535,13 @@ mod tests {
         // option value the same way; refuse it (F-24).
         let mut spec = base_spec();
         spec.shares[0].host_path = PathBuf::from("/home/user/a,b");
-        let err = build_invocations(&spec, &base_tools()).unwrap_err();
+        let err = build_invocations(&spec, &base_tools(), &restricted_plan()).unwrap_err();
         assert!(err.to_string().contains("comma"), "got: {err:#}");
     }
 
     #[test]
     fn comma_free_spec_accepted() {
         // Positive control: comma-free paths still build a valid invocation.
-        assert!(build_invocations(&base_spec(), &base_tools()).is_ok());
+        assert!(build_invocations(&base_spec(), &base_tools(), &restricted_plan()).is_ok());
     }
 }
