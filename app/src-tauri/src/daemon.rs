@@ -67,6 +67,12 @@ pub trait DaemonApi: Send {
     ) -> anyhow::Result<()>;
     /// Seed the allow-list from observed traffic; returns the host count seeded.
     fn policy_enable_from_traffic(&mut self, name: &str) -> anyhow::Result<usize>;
+    /// Authorize a git target (`owner/repo` or bare hostname), then best-effort live-reload.
+    fn policy_git_allow(&mut self, name: &str, target: &str, write: bool) -> anyhow::Result<()>;
+    /// Revoke a git target, then best-effort live-reload.
+    fn policy_git_block(&mut self, name: &str, target: &str) -> anyhow::Result<()>;
+    /// Set the enforcing flag, then best-effort live-reload.
+    fn policy_set_enforce(&mut self, name: &str, on: bool) -> anyhow::Result<()>;
 }
 
 /// Production `DaemonApi`: a lazily-connected `DaemonClient`. Connects via
@@ -268,10 +274,12 @@ impl DaemonApi for RealDaemon {
                 Some(cfg) => crate::views::PolicyView {
                     enforcing: true,
                     allow: cfg.allow,
+                    git: cfg.git,
                 },
                 None => crate::views::PolicyView {
                     enforcing: false,
                     allow: vec![],
+                    git: vec![],
                 },
             },
         )
@@ -307,6 +315,32 @@ impl DaemonApi for RealDaemon {
             *cfg = seeded;
         })?;
         Ok(n)
+    }
+
+    fn policy_git_allow(&mut self, name: &str, target: &str, write: bool) -> anyhow::Result<()> {
+        use izba_core::daemon::egress::config::Access;
+        let gt = parse_git_target(target);
+        let access = if write {
+            Access::ReadWrite
+        } else {
+            Access::Read
+        };
+        self.edit_and_reload(name, move |cfg| {
+            cfg.git_allow(gt, access);
+        })
+    }
+
+    fn policy_git_block(&mut self, name: &str, target: &str) -> anyhow::Result<()> {
+        let gt = parse_git_target(target);
+        self.edit_and_reload(name, move |cfg| {
+            cfg.git_block(&gt);
+        })
+    }
+
+    fn policy_set_enforce(&mut self, name: &str, on: bool) -> anyhow::Result<()> {
+        self.edit_and_reload(name, move |cfg| {
+            cfg.set_enforce(on);
+        })
     }
 }
 
@@ -363,6 +397,17 @@ impl ShellSession for RealShell {
             let _ = h.join();
         }
         Ok(())
+    }
+}
+
+/// Parse a git target: `owner/repo` (contains `/`) → `Repo`, bare hostname → `Host`.
+/// Mirrors the same rule in `izba-cli`'s `policy.rs`.
+fn parse_git_target(s: &str) -> izba_core::daemon::egress::config::GitTarget {
+    use izba_core::daemon::egress::config::GitTarget;
+    if s.contains('/') {
+        GitTarget::Repo(s.to_string())
+    } else {
+        GitTarget::Host(s.to_string())
     }
 }
 

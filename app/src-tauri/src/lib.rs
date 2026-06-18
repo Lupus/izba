@@ -178,6 +178,43 @@ async fn policy_enable(state: State<'_, AppState>, name: String) -> Result<usize
     run_action(&state, move |d| commands::policy_enable_core(d, &name)).await
 }
 
+#[tauri::command]
+async fn policy_git_allow(
+    state: State<'_, AppState>,
+    name: String,
+    target: String,
+    write: bool,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::policy_git_allow_core(d, &name, &target, write)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn policy_git_block(
+    state: State<'_, AppState>,
+    name: String,
+    target: String,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::policy_git_block_core(d, &name, &target)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn policy_set_enforce(
+    state: State<'_, AppState>,
+    name: String,
+    on: bool,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::policy_set_enforce_core(d, &name, on)
+    })
+    .await
+}
+
 #[derive(Clone, serde::Serialize)]
 struct ShellOutput {
     id: String,
@@ -303,6 +340,9 @@ pub fn run() {
             policy_block,
             policy_set,
             policy_enable,
+            policy_git_allow,
+            policy_git_block,
+            policy_set_enforce,
             shell_open,
             shell_write,
             shell_resize,
