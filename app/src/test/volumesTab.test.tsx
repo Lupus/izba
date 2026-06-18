@@ -69,12 +69,12 @@ describe("VolumesTab — seeding from inspect", () => {
   it("shows a null-name volume with 'ephemeral' tag", async () => {
     inspect.mockResolvedValue(
       makeDetail({
-        volumes: [{ name: null, guest_path: "/tmp/scratch", size_bytes: 536870912 }],
+        volumes: [{ name: null, guest_path: "/scratch", size_bytes: 536870912 }],
       }),
     );
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await screen.findByText("ephemeral");
-    expect(screen.getByText(/\/tmp\/scratch/)).toBeInTheDocument();
+    expect(screen.getByText(/\/scratch/)).toBeInTheDocument();
   });
 });
 
