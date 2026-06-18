@@ -18,6 +18,8 @@
 //! and exits with code 2 (mirrors the `confine_probe` example pattern).
 
 pub mod account;
+pub mod dacl;
+pub mod userlist;
 
 // ── Verb definition (all platforms) ─────────────────────────────────────────
 
