@@ -3,75 +3,18 @@
 //! status surface lives in `confine.rs`.
 
 use crate::procmgr::ConfinementStatus;
-use anyhow::bail;
-use nix::libc;
+
+// ---------------------------------------------------------------------------
+// Data types — compiled on every target so the cloud-hypervisor driver (which
+// is cross-checked for `x86_64-pc-windows-gnu`) sees one definition. Only the
+// capability probe and `plan()` bodies below are platform-specific.
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     pub userns: bool,
     pub landlock: bool,
     pub seccomp: bool,
-}
-
-impl Capabilities {
-    pub fn probe() -> Self {
-        Self {
-            userns: probe_userns(),
-            landlock: probe_landlock(),
-            seccomp: probe_seccomp(),
-        }
-    }
-}
-
-/// Fork a child that attempts `unshare(CLONE_NEWUSER)`; the child exits 0 on
-/// success. This is the only reliable cross-distro signal — reading
-/// `user.max_user_namespaces` alone misses AppArmor/seccomp gating.
-fn probe_userns() -> bool {
-    use nix::sched::{unshare, CloneFlags};
-    use nix::sys::wait::{waitpid, WaitStatus};
-    use nix::unistd::{fork, ForkResult};
-
-    // SAFETY: the child does no allocation before _exit; it only calls unshare
-    // and _exit, both async-signal-safe.
-    match unsafe { fork() } {
-        Ok(ForkResult::Child) => {
-            let code = if unshare(CloneFlags::CLONE_NEWUSER).is_ok() {
-                0
-            } else {
-                1
-            };
-            unsafe { libc::_exit(code) };
-        }
-        Ok(ForkResult::Parent { child }) => {
-            matches!(waitpid(child, None), Ok(WaitStatus::Exited(_, 0)))
-        }
-        Err(_) => false,
-    }
-}
-
-/// `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` returns
-/// the ABI version (>=1) when the LSM is active, or -1/ENOSYS/EOPNOTSUPP when it
-/// is absent. The canonical capability probe.
-fn probe_landlock() -> bool {
-    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
-    // SAFETY: a pure capability query; NULL attr + 0 size + the VERSION flag is
-    // the documented no-op probe form and creates no ruleset fd.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<libc::c_void>(),
-            0usize,
-            LANDLOCK_CREATE_RULESET_VERSION,
-        )
-    };
-    ret >= 1
-}
-
-/// `prctl(PR_GET_SECCOMP)` succeeds on any seccomp-capable kernel (returns the
-/// current mode, 0 when unconfined). Failure means no seccomp support.
-fn probe_seccomp() -> bool {
-    // SAFETY: PR_GET_SECCOMP takes no pointer args; pure query.
-    unsafe { libc::prctl(libc::PR_GET_SECCOMP) >= 0 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,10 +52,10 @@ impl ResourceLimits {
     /// the same reason. Host memory bounding is deferred to the cgroup follow-up
     /// (F-28 residual).
     ///
-    /// `address_space` remains on the struct for that future use.
+    /// `address_space` remains on the struct for that future use. `mem_mb` is
+    /// kept in the signature for stability; it is unused until the cgroup
+    /// follow-up lands. (On non-Linux the rlimits are ignored at spawn.)
     pub fn for_vmm(_mem_mb: u64) -> Self {
-        // _mem_mb is kept in the signature for stability; it is unused until
-        // the cgroup follow-up lands.
         Self {
             address_space: None,
             nofile: Some(4096),
@@ -130,9 +73,99 @@ pub struct ConfinementPlan {
     pub status: ConfinementStatus,
 }
 
+// ---------------------------------------------------------------------------
+// Capability probe — Linux uses real syscalls; every other target reports no
+// capabilities (cloud-hypervisor does not run there).
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_os = "linux"))]
+impl Capabilities {
+    pub fn probe() -> Self {
+        Self {
+            userns: false,
+            landlock: false,
+            seccomp: false,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+use nix::libc;
+
+#[cfg(target_os = "linux")]
+impl Capabilities {
+    pub fn probe() -> Self {
+        Self {
+            userns: probe_userns(),
+            landlock: probe_landlock(),
+            seccomp: probe_seccomp(),
+        }
+    }
+}
+
+/// Fork a child that attempts `unshare(CLONE_NEWUSER)`; the child exits 0 on
+/// success. This is the only reliable cross-distro signal — reading
+/// `user.max_user_namespaces` alone misses AppArmor/seccomp gating.
+#[cfg(target_os = "linux")]
+fn probe_userns() -> bool {
+    use nix::sched::{unshare, CloneFlags};
+    use nix::sys::wait::{waitpid, WaitStatus};
+    use nix::unistd::{fork, ForkResult};
+
+    // SAFETY: the child does no allocation before _exit; it only calls unshare
+    // and _exit, both async-signal-safe.
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => {
+            let code = if unshare(CloneFlags::CLONE_NEWUSER).is_ok() {
+                0
+            } else {
+                1
+            };
+            unsafe { libc::_exit(code) };
+        }
+        Ok(ForkResult::Parent { child }) => {
+            matches!(waitpid(child, None), Ok(WaitStatus::Exited(_, 0)))
+        }
+        Err(_) => false,
+    }
+}
+
+/// `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` returns
+/// the ABI version (>=1) when the LSM is active, or -1/ENOSYS/EOPNOTSUPP when it
+/// is absent. The canonical capability probe.
+#[cfg(target_os = "linux")]
+fn probe_landlock() -> bool {
+    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
+    // SAFETY: a pure capability query; NULL attr + 0 size + the VERSION flag is
+    // the documented no-op probe form and creates no ruleset fd.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    ret >= 1
+}
+
+/// `prctl(PR_GET_SECCOMP)` succeeds on any seccomp-capable kernel (returns the
+/// current mode, 0 when unconfined). Failure means no seccomp support.
+#[cfg(target_os = "linux")]
+fn probe_seccomp() -> bool {
+    // SAFETY: PR_GET_SECCOMP takes no pointer args; pure query.
+    unsafe { libc::prctl(libc::PR_GET_SECCOMP) >= 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Confinement plan — the fail-closed floor logic (Linux), plus a non-Linux stub
+// that reports no confinement (cloud-hypervisor does not run there).
+// ---------------------------------------------------------------------------
+
 /// `CAP_SYS_CHROOT` is required for `virtiofsd --sandbox chroot`; an
 /// unprivileged user only holds it inside a userns. Outside one this returns
 /// false, so a no-userns host fails the virtiofsd floor leg (fail closed).
+#[cfg(target_os = "linux")]
 fn has_chroot_cap() -> bool {
     // Probed cheaply: an effective-cap query would need libcap; instead infer
     // from euid (root has it) — the common privileged-host case. Unprivileged
@@ -141,6 +174,7 @@ fn has_chroot_cap() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+#[cfg(target_os = "linux")]
 pub fn plan(
     caps: &Capabilities,
     allow_unconfined: bool,
@@ -185,7 +219,7 @@ pub fn plan(
     }
 
     if !allow_unconfined {
-        bail!(
+        anyhow::bail!(
             "host-side VMM confinement floor not met: missing {}. \
              Enable the Landlock LSM (CONFIG_SECURITY_LANDLOCK + boot param \
              lsm=...,landlock) and/or unprivileged user namespaces, \
@@ -222,7 +256,27 @@ pub fn plan(
     })
 }
 
-#[cfg(test)]
+/// Non-Linux compile parity: cloud-hypervisor only runs on Linux, but the CH
+/// driver (and `izba-core`) are cross-checked for `x86_64-pc-windows-gnu`. This
+/// stub reports no confinement and is never executed.
+#[cfg(not(target_os = "linux"))]
+pub fn plan(
+    _caps: &Capabilities,
+    _allow_unconfined: bool,
+    _mem_mb: u64,
+) -> anyhow::Result<ConfinementPlan> {
+    Ok(ConfinementPlan {
+        virtiofsd_sandbox: VirtiofsdSandbox::None,
+        ch_seccomp: false,
+        ch_landlock: false,
+        rlimits: ResourceLimits::for_vmm(0),
+        status: ConfinementStatus::degraded(
+            "host-side VMM confinement unsupported on this platform",
+        ),
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::procmgr::ConfinementMode;
