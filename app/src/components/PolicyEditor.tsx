@@ -26,6 +26,7 @@ function PortEditor({
   const [err, setErr] = useState<string | null>(null);
   function commit() {
     const t = draft.trim();
+    if (!t) return; // empty field is a no-op, not an error (e.g. a stray Add click)
     if (!/^\d+$/.test(t)) {
       setErr("Enter a port between 1 and 65535.");
       return; // keep the draft so the user can fix it

@@ -78,6 +78,13 @@ describe("PolicyEditor", () => {
     );
   });
 
+  it("does nothing (no error) when Add is clicked with an empty field", async () => {
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("api.x.com");
+    fireEvent.click(screen.getAllByRole("button", { name: /^add$/i })[0]);
+    expect(screen.queryByText(/between 1 and 65535/i)).not.toBeInTheDocument();
+  });
+
   it("rejects a duplicate port already in the list", async () => {
     render(<PolicyEditor name="web" />);
     await screen.findByDisplayValue("api.x.com");
