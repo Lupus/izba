@@ -1416,8 +1416,10 @@ dependencies = [
 name = "izba-jail-helper"
 version = "0.1.0"
 dependencies = [
+ "izba-core",
  "serde",
  "serde_json",
+ "tempfile",
  "windows-sys 0.60.2",
 ]
 
