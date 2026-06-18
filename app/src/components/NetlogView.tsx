@@ -2,57 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { AllowEntry, EndpointSummary, PolicyView } from "../lib/types";
 import { api } from "../lib/ipc";
 import { WEB_DEFAULT_PORTS } from "../lib/ports";
-
-/**
- * Detect whether a path corresponds to a git wire operation and extract the
- * repo glob.  Returns `null` for non-git paths or when host is null.
- *
- * Recognised suffixes (per Git HTTP backend protocol):
- *   /git-receive-pack   → push (write)
- *   /git-upload-pack    → clone/fetch (read)
- *   /info/refs          → negotiation prefix (read)
- *
- * Uses only linear string operations (endsWith / slice / startsWith / split)
- * to avoid backtracking-prone regex patterns (SonarCloud S5852).
- */
-export function git_repo_from_row(host: string | null, path: string | null): string | null {
-  if (!host || !path) return null;
-
-  // Strip query string: take everything before the first '?'
-  const bare = path.split("?")[0];
-
-  // Determine which suffix the path ends with, then slice it off.
-  const GIT_SUFFIXES = ["/info/refs", "/git-upload-pack", "/git-receive-pack"] as const;
-  let repoPath: string | null = null;
-  for (const suffix of GIT_SUFFIXES) {
-    if (bare.endsWith(suffix)) {
-      repoPath = bare.slice(0, bare.length - suffix.length);
-      break;
-    }
-  }
-  if (repoPath === null) return null;
-
-  // Strip optional .git extension from the repo path
-  if (repoPath.endsWith(".git")) {
-    repoPath = repoPath.slice(0, repoPath.length - 4);
-  }
-
-  // Strip leading slashes
-  while (repoPath.startsWith("/")) {
-    repoPath = repoPath.slice(1);
-  }
-
-  return `${host}/${repoPath}`;
-}
-
-/** Returns "push" for write (git-receive-pack), "clone" for read, null for non-git. */
-function git_op_from_path(path: string | null): "push" | "clone" | null {
-  if (!path) return null;
-  const bare = path.split("?")[0];
-  if (bare.endsWith("/git-receive-pack")) return "push";
-  if (bare.endsWith("/git-upload-pack") || bare.endsWith("/info/refs")) return "clone";
-  return null;
-}
+import { git_repo_from_row, git_op_from_path } from "../lib/git";
 
 /** Expand the policy allow-list into a set of `host:port` keys. A bare-host
  *  string permits the web defaults (WEB_DEFAULT_PORTS); a scoped entry permits

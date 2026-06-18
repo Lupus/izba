@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
-import { NetlogView, relTime, git_repo_from_row } from "../components/NetlogView";
+import { NetlogView, relTime } from "../components/NetlogView";
+import { git_repo_from_row } from "../lib/git";
 import { api } from "../lib/ipc";
 import type { PolicyView } from "../lib/types";
 
