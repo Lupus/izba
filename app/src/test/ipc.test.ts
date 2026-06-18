@@ -80,4 +80,17 @@ describe("ipc action wrappers", () => {
     // btoa("hi") === "aGk="
     expect(Array.from(b64ToBytes("aGk="))).toEqual([104, 105]);
   });
+
+  it("policyAddEndpoints invokes policy_add_endpoints with entries + enforce", async () => {
+    await api.policyAddEndpoints(
+      "web",
+      [{ kind: "http", host: "pypi.org", port: 443, access: "read" }],
+      true,
+    );
+    expect(invoke).toHaveBeenCalledWith("policy_add_endpoints", {
+      name: "web",
+      entries: [{ kind: "http", host: "pypi.org", port: 443, access: "read" }],
+      enforce: true,
+    });
+  });
 });

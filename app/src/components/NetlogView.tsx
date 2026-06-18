@@ -124,7 +124,7 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
           <button
             type="button"
             disabled={pending !== null}
-            onClick={() => void act("enable", () => api.policyEnable(name))}
+            onClick={() => {}} // TODO Task 8: open SeedDialog
             className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white disabled:opacity-50"
           >
             Enable firewall — allow these {rows.length}
