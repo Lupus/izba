@@ -27,7 +27,11 @@ pub mod jail_linux {
     }
     impl Capabilities {
         pub fn probe() -> Self {
-            Self { userns: false, landlock: false, seccomp: false }
+            Self {
+                userns: false,
+                landlock: false,
+                seccomp: false,
+            }
         }
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +57,11 @@ pub mod jail_linux {
     }
     impl ResourceLimits {
         pub fn for_vmm(_mem_mb: u64) -> Self {
-            Self { address_space: None, nofile: None, nproc: None }
+            Self {
+                address_space: None,
+                nofile: None,
+                nproc: None,
+            }
         }
     }
     #[derive(Debug, Clone)]

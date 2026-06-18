@@ -35,7 +35,11 @@ fn probe_userns() -> bool {
     // and _exit, both async-signal-safe.
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
-            let code = if unshare(CloneFlags::CLONE_NEWUSER).is_ok() { 0 } else { 1 };
+            let code = if unshare(CloneFlags::CLONE_NEWUSER).is_ok() {
+                0
+            } else {
+                1
+            };
             unsafe { libc::_exit(code) };
         }
         Ok(ForkResult::Parent { child }) => {
@@ -158,10 +162,7 @@ pub fn plan(
     let rlimits = ResourceLimits::for_vmm(mem_mb);
 
     if missing.is_empty() {
-        let reason = format!(
-            "seccomp+landlock+virtiofs:{}+rlimits",
-            sandbox.as_arg()
-        );
+        let reason = format!("seccomp+landlock+virtiofs:{}+rlimits", sandbox.as_arg());
         return Ok(ConfinementPlan {
             virtiofsd_sandbox: sandbox,
             ch_seccomp,
@@ -195,7 +196,10 @@ pub fn plan(
     let detail = if applied.is_empty() {
         "no host-side confinement available".to_string()
     } else {
-        format!("--allow-unconfined: floor waived (best-effort: {})", applied.join("+"))
+        format!(
+            "--allow-unconfined: floor waived (best-effort: {})",
+            applied.join("+")
+        )
     };
     Ok(ConfinementPlan {
         virtiofsd_sandbox: sandbox,
@@ -216,14 +220,21 @@ mod tests {
         // Must not panic in any environment; seccomp is universally available on
         // a seccomp-capable kernel, so it is true wherever the test suite runs.
         let caps = Capabilities::probe();
-        assert!(caps.seccomp, "seccomp filter mode is expected on CI/dev hosts");
+        assert!(
+            caps.seccomp,
+            "seccomp filter mode is expected on CI/dev hosts"
+        );
         // userns/landlock are environment-dependent; just assert they are read
         // without panicking (booleans already are).
         let _ = (caps.userns, caps.landlock);
     }
 
     fn caps(userns: bool, landlock: bool, seccomp: bool) -> Capabilities {
-        Capabilities { userns, landlock, seccomp }
+        Capabilities {
+            userns,
+            landlock,
+            seccomp,
+        }
     }
 
     #[test]
@@ -239,9 +250,17 @@ mod tests {
 
     #[test]
     fn missing_landlock_fails_closed_with_actionable_error() {
-        let err = plan(&caps(true, false, true), false, 2048).unwrap_err().to_string();
-        assert!(err.to_lowercase().contains("landlock"), "names the failed leg: {err}");
-        assert!(err.contains("--allow-unconfined"), "names the override: {err}");
+        let err = plan(&caps(true, false, true), false, 2048)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("landlock"),
+            "names the failed leg: {err}"
+        );
+        assert!(
+            err.contains("--allow-unconfined"),
+            "names the override: {err}"
+        );
     }
 
     #[test]
@@ -261,8 +280,13 @@ mod tests {
             eprintln!("skipping: running as root, chroot fallback path taken");
             return;
         }
-        let err = plan(&caps(false, true, true), false, 2048).unwrap_err().to_string();
-        assert!(err.to_lowercase().contains("virtiofs"), "names the sandbox leg: {err}");
+        let err = plan(&caps(false, true, true), false, 2048)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("virtiofs"),
+            "names the sandbox leg: {err}"
+        );
     }
 
     #[test]

@@ -23,7 +23,15 @@ use crate::procmgr::jail_linux::ResourceLimits;
 /// report the process as alive forever. `pid_alive` therefore also checks the
 /// process state field and treats `Z` as dead.
 pub fn spawn_detached(cmd: &CommandSpec, log: &Path) -> anyhow::Result<PidIdentity> {
-    spawn_detached_with_limits(cmd, log, &ResourceLimits { address_space: None, nofile: None, nproc: None })
+    spawn_detached_with_limits(
+        cmd,
+        log,
+        &ResourceLimits {
+            address_space: None,
+            nofile: None,
+            nproc: None,
+        },
+    )
 }
 
 /// Like `spawn_detached`, but applies best-effort `setrlimit` ceilings in the
@@ -45,7 +53,7 @@ pub fn spawn_detached_with_limits(
         .stdout(Stdio::from(logf.try_clone()?))
         .stderr(Stdio::from(logf));
     let limits = *limits; // Copy into the closure (ResourceLimits: Copy).
-    // SAFETY: setsid(2) and setrlimit(2) are async-signal-safe; no allocation.
+                          // SAFETY: setsid(2) and setrlimit(2) are async-signal-safe; no allocation.
     unsafe {
         c.pre_exec(move || {
             nix::unistd::setsid().map_err(std::io::Error::from)?;
@@ -217,7 +225,9 @@ mod tests {
     fn spawn_with_limits_runs_and_returns_identity() {
         use crate::procmgr::jail_linux::ResourceLimits;
         let log = std::env::temp_dir().join(format!("izba-rlimit-{}.log", std::process::id()));
-        let cmd = CommandSpec { argv: vec!["/bin/true".to_string()] };
+        let cmd = CommandSpec {
+            argv: vec!["/bin/true".to_string()],
+        };
         let limits = ResourceLimits::for_vmm(1024);
         let id = spawn_detached_with_limits(&cmd, &log, &limits).expect("spawn ok");
         assert_ne!(id.pid, 0);
