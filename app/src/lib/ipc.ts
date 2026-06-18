@@ -10,7 +10,6 @@ import type {
   EndpointSummary,
   PolicyView,
   AllowEntry,
-  GitRule,
 } from "./types";
 
 export const api = {
@@ -38,9 +37,12 @@ export const api = {
   policyEnable: (name: string) => invoke<number>("policy_enable", { name }),
   policySetEnforce: (name: string, on: boolean) =>
     invoke<void>("policy_set_enforce", { name, on }),
-  policyGitAllow: (name: string, target: GitRule, write: boolean) =>
+  // `target` is the raw glob string ("host/owner/repo" or "host"); the Rust
+  // command parses it into a GitTarget. Sending a GitRule object would fail
+  // Rust's `String` deserialization.
+  policyGitAllow: (name: string, target: string, write: boolean) =>
     invoke<void>("policy_git_allow", { name, target, write }),
-  policyGitBlock: (name: string, target: GitRule) =>
+  policyGitBlock: (name: string, target: string) =>
     invoke<void>("policy_git_block", { name, target }),
 };
 

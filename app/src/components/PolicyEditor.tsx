@@ -179,7 +179,6 @@ export function PolicyEditor({ name }: { name: string }) {
         <label className="flex cursor-pointer items-center gap-2 text-sm font-semibold">
           <input
             type="checkbox"
-            role="checkbox"
             aria-label="Enforce firewall"
             checked={enforcing}
             onChange={() => void toggleEnforce()}
