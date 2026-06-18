@@ -246,7 +246,10 @@ mod tests {
         };
         let v = version_core(&mut d).unwrap();
         assert!(v.daemon.is_some());
-        assert!(!v.mismatch, "identical git describe must not flag a mismatch");
+        assert!(
+            !v.mismatch,
+            "identical git describe must not flag a mismatch"
+        );
     }
 
     #[test]
