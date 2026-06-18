@@ -17,6 +17,8 @@
 //! The binary is Windows-only. On non-Windows it prints a diagnostic to stderr
 //! and exits with code 2 (mirrors the `confine_probe` example pattern).
 
+pub mod account;
+
 // ── Verb definition (all platforms) ─────────────────────────────────────────
 
 /// A parsed command-line verb, ready for dispatch.
