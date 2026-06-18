@@ -1105,6 +1105,49 @@ pub fn list_volumes(paths: &Paths) -> anyhow::Result<Vec<crate::volume::VolumeIn
     Ok(out)
 }
 
+/// Append a volume to a sandbox's config (applied on next start). Validates the
+/// new set, assigns an eph_id if ephemeral, provisions the backing image.
+pub fn attach_volume(
+    paths: &Paths,
+    name: &str,
+    spec: crate::volume::VolumeSpec,
+) -> anyhow::Result<()> {
+    let cfg_path = paths.sandbox_dir(name).join(CONFIG_FILE);
+    let mut cfg: SandboxConfig =
+        load_json(&cfg_path)?.with_context(|| format!("no such sandbox '{name}'"))?;
+    cfg.volumes.push(spec);
+    crate::volume::validate_volumes(&cfg.volumes)?;
+    crate::volume::assign_eph_ids(&mut cfg.volumes);
+    let v = cfg.volumes.last().unwrap();
+    ensure_volume_image(&v.image_path(paths, name), v.size_bytes, paths.root())
+        .with_context(|| format!("provisioning volume {}", v.guest_path.display()))?;
+    save_json(&cfg_path, &cfg)?;
+    Ok(())
+}
+
+/// Drop the volume mounted at `guest_path` from a sandbox's config (applied on
+/// next start). No image I/O — persistent images survive; an orphaned ephemeral
+/// image is reclaimed at `rm`.
+pub fn detach_volume(
+    paths: &Paths,
+    name: &str,
+    guest_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let cfg_path = paths.sandbox_dir(name).join(CONFIG_FILE);
+    let mut cfg: SandboxConfig =
+        load_json(&cfg_path)?.with_context(|| format!("no such sandbox '{name}'"))?;
+    let before = cfg.volumes.len();
+    cfg.volumes.retain(|v| v.guest_path != guest_path);
+    if cfg.volumes.len() == before {
+        bail!(
+            "no volume mounted at {} in sandbox '{name}'",
+            guest_path.display()
+        );
+    }
+    save_json(&cfg_path, &cfg)?;
+    Ok(())
+}
+
 /// Delete a single persistent volume image. Fails closed if any sandbox config
 /// references it. Returns bytes reclaimed.
 pub fn remove_volume(paths: &Paths, name: &str) -> anyhow::Result<u64> {
@@ -2003,5 +2046,65 @@ mod tests {
         let freed = remove_volume(&paths, "old").unwrap();
         assert!(!paths.volume_image("old").exists());
         assert!(freed > 0);
+    }
+
+    #[test]
+    fn attach_volume_appends_provisions_and_persists() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let spec = crate::volume::parse_volume_flag("/scratch:1g").unwrap();
+        attach_volume(&paths, "web", spec).unwrap();
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.volumes.len(), 1);
+        assert_eq!(cfg.volumes[0].eph_id, Some(0));
+        assert!(paths.sandbox_dir("web").join("volumes/0.img").exists());
+    }
+
+    #[test]
+    fn attach_volume_rejects_duplicate_guest_path() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        attach_volume(
+            &paths,
+            "web",
+            crate::volume::parse_volume_flag("/data:1g").unwrap(),
+        )
+        .unwrap();
+        let err = attach_volume(
+            &paths,
+            "web",
+            crate::volume::parse_volume_flag("x:/data:1g").unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    #[test]
+    fn detach_volume_removes_entry_no_file_io() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        attach_volume(
+            &paths,
+            "web",
+            crate::volume::parse_volume_flag("/data:1g").unwrap(),
+        )
+        .unwrap();
+        let img = paths.sandbox_dir("web").join("volumes/0.img");
+        assert!(img.exists());
+        detach_volume(&paths, "web", std::path::Path::new("/data")).unwrap();
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.volumes.is_empty());
+        assert!(img.exists(), "detach must not delete the backing image");
     }
 }
