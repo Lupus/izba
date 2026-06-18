@@ -1011,53 +1011,13 @@ fn egress_http_via_stub() {
 /// TLS quirks vary by image).
 #[test]
 fn mitm_firewall_allows_and_denies_real_vm() {
-    use izba_core::daemon::egress::audit::AuditSink;
-    use izba_core::daemon::egress::config::EgressPolicyConfig;
-    use izba_core::daemon::egress::mitm::{upstream_client_config_webpki, CertCache};
-    use izba_core::daemon::egress::mitm_runtime::MitmRuntime;
-    use izba_core::daemon::egress::EgressManager;
-
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("mitm");
-    create_sandbox(&env, &mut tb, "mitm", &ws);
-
     // Declare the per-sandbox egress policy (allow example.com only). Persisting
     // it makes `resolve_policy` arm an enforcing RegoPolicy at listen time, so
     // tier-1 HTTPS is routed through the MITM.
-    std::fs::write(
-        EgressPolicyConfig::path_in(&tb.paths.sandbox_dir("mitm")),
-        "allow:\n  - example.com\n",
-    )
-    .expect("write policy.yaml");
-
-    // Build the shared MITM runtime from the SAME persistent CA that
-    // sandbox::start bakes into the guest (both read tb.paths.ca_dir()).
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let ca = izba_core::ca::load_or_create(&tb.paths.ca_dir()).expect("izba CA");
-    let certs = std::sync::Arc::new(CertCache::new(ca));
-    let audit = AuditSink::new(tb.paths.clone());
-    let mitm = std::sync::Arc::new(
-        MitmRuntime::start(certs, upstream_client_config_webpki(), audit.clone())
-            .expect("start MITM runtime"),
-    );
-
-    let mgr = EgressManager::new(
-        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
-        Some(mitm),
-        audit,
-    );
-    mgr.ensure_listening(&tb.paths, "mitm")
-        .expect("bind vsock_1027 listener");
-
-    if let Err(e) = start_sandbox(&env, &tb, "mitm") {
-        mgr.stop(&tb.paths, "mitm");
-        panic!(
-            "boot of 'mitm' failed: {e:#}\nconsole tail:\n{}",
-            console_tail(&tb.paths, "mitm")
-        );
-    }
-
+    let (mgr, _audit) = setup_mitm_sandbox(&env, &mut tb, "mitm", &ws, "allow:\n  - example.com\n");
     // Two datapaths, both routed through the MITM for an enforcing sandbox:
     //
     //   * HTTPS on :443 — a clean TLS handshake to the allowed host (validation
@@ -1139,6 +1099,74 @@ fn mitm_firewall_allows_and_denies_real_vm() {
 
     stop_sandbox(&tb, "mitm");
     mgr.stop(&tb.paths, "mitm");
+}
+
+/// Create a sandbox, write an egress `policy_yaml`, build a MITM-enabled
+/// [`EgressManager`], bind it to the per-sandbox vsock_1027 listener, and
+/// boot the VM.  The MITM runtime uses the same persistent izba CA that
+/// `sandbox::start` bakes into the guest, so the guest trusts the per-SNI
+/// leaves the MITM presents.
+///
+/// Extracted to avoid verbatim repetition across MITM integration tests
+/// (SonarCloud duplication gate).
+///
+/// Returns `(mgr, audit)` — the caller drives assertions against `audit`
+/// records and calls `mgr.stop(paths, name)` after the test.
+fn setup_mitm_sandbox(
+    env: &TestEnv,
+    tb: &mut TestBox,
+    name: &str,
+    ws: &std::path::Path,
+    policy_yaml: &str,
+) -> (
+    izba_core::daemon::egress::EgressManager,
+    izba_core::daemon::egress::audit::AuditSink,
+) {
+    use izba_core::daemon::egress::audit::AuditSink;
+    use izba_core::daemon::egress::config::EgressPolicyConfig;
+    use izba_core::daemon::egress::mitm::{upstream_client_config_webpki, CertCache};
+    use izba_core::daemon::egress::mitm_runtime::MitmRuntime;
+    use izba_core::daemon::egress::EgressManager;
+
+    create_sandbox(env, tb, name, ws);
+
+    // Persist the policy before ensure_listening reads it (resolve_policy arms
+    // an enforcing RegoPolicy at listen time when the file is present).
+    std::fs::write(
+        EgressPolicyConfig::path_in(&tb.paths.sandbox_dir(name)),
+        policy_yaml,
+    )
+    .expect("write policy.yaml");
+
+    // Build the MITM runtime from the SAME persistent CA that
+    // `sandbox::start` bakes into the guest (both read `tb.paths.ca_dir()`),
+    // so the guest trusts the per-SNI leaf the MITM presents.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca = izba_core::ca::load_or_create(&tb.paths.ca_dir()).expect("izba CA");
+    let certs = std::sync::Arc::new(CertCache::new(ca));
+    let audit = AuditSink::new(tb.paths.clone());
+    let mitm = std::sync::Arc::new(
+        MitmRuntime::start(certs, upstream_client_config_webpki(), audit.clone())
+            .expect("start MITM runtime"),
+    );
+
+    let mgr = EgressManager::new(
+        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
+        Some(mitm),
+        audit.clone(),
+    );
+    mgr.ensure_listening(&tb.paths, name)
+        .expect("bind vsock_1027 listener");
+
+    if let Err(e) = start_sandbox(env, tb, name) {
+        mgr.stop(&tb.paths, name);
+        panic!(
+            "boot of {name:?} failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, name)
+        );
+    }
+
+    (mgr, audit)
 }
 
 /// Read + parse the per-sandbox egress audit log, retrying briefly so a record
@@ -1616,54 +1644,19 @@ fn confined_boot_records_restricted_when_landlock_present() {
 /// check. The e2e.yml job runs on hosted runners with internet access.
 #[test]
 fn git_read_only_repo_allows_clone_denies_push() {
-    use izba_core::daemon::egress::audit::AuditSink;
-    use izba_core::daemon::egress::config::EgressPolicyConfig;
-    use izba_core::daemon::egress::mitm::{upstream_client_config_webpki, CertCache};
-    use izba_core::daemon::egress::mitm_runtime::MitmRuntime;
-    use izba_core::daemon::egress::EgressManager;
-
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("git-ro");
-    create_sandbox(&env, &mut tb, "git-ro", &ws);
-
     // Write a per-sandbox policy: enforce=true, one git rule granting read-only
     // access to octocat/Hello-World. No host_rules → all non-git HTTPS is
     // denied; only git smart-HTTP to this repo is allowed (clone OK, push denied).
-    std::fs::write(
-        EgressPolicyConfig::path_in(&tb.paths.sandbox_dir("git-ro")),
+    let (mgr, _audit) = setup_mitm_sandbox(
+        &env,
+        &mut tb,
+        "git-ro",
+        &ws,
         "enforce: true\ngit:\n  - repo: github.com/octocat/Hello-World\n    access: read\n",
-    )
-    .expect("write policy.yaml");
-
-    // Build the MITM from the same persistent CA that sandbox::start bakes into
-    // the guest (both read tb.paths.ca_dir()), so the guest trusts the
-    // per-SNI leaf the MITM presents for github.com.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let ca = izba_core::ca::load_or_create(&tb.paths.ca_dir()).expect("izba CA");
-    let certs = std::sync::Arc::new(CertCache::new(ca));
-    let audit = AuditSink::new(tb.paths.clone());
-    let mitm = std::sync::Arc::new(
-        MitmRuntime::start(certs, upstream_client_config_webpki(), audit.clone())
-            .expect("start MITM runtime"),
     );
-
-    let mgr = EgressManager::new(
-        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
-        Some(mitm),
-        audit,
-    );
-    mgr.ensure_listening(&tb.paths, "git-ro")
-        .expect("bind vsock_1027 listener");
-
-    if let Err(e) = start_sandbox(&env, &tb, "git-ro") {
-        mgr.stop(&tb.paths, "git-ro");
-        panic!(
-            "boot of 'git-ro' failed: {e:#}\nconsole tail:\n{}",
-            console_tail(&tb.paths, "git-ro")
-        );
-    }
-
     // Use busybox wget (always present in alpine) to exercise the git smart-HTTP
     // discovery endpoints via HTTPS. The MITM terminates TLS, reads the Host +
     // query string, and the Rego git rules decide:
