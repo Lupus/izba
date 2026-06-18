@@ -418,7 +418,6 @@ impl EgressPolicyConfig {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
