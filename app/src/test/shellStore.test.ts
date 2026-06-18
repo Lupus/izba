@@ -71,4 +71,21 @@ describe("shellStore", () => {
     expect(term.dispose).toHaveBeenCalled();
     expect(shellStore.snapshot().some((s) => s.id === id)).toBe(false);
   });
+
+  it("remembers the active session per sandbox, independently", async () => {
+    const a = await shellStore.open("web");
+    await shellStore.open("web");
+    await shellStore.open("api");
+    shellStore.setActive("web", a);
+    expect(shellStore.getActive("web")).toBe(a);
+    // A sandbox with no explicit selection has no remembered active id.
+    expect(shellStore.getActive("api")).toBeUndefined();
+  });
+
+  it("forgets the active id when that session is closed", async () => {
+    const a = await shellStore.open("web");
+    shellStore.setActive("web", a);
+    await shellStore.close(a);
+    expect(shellStore.getActive("web")).toBeUndefined();
+  });
 });
