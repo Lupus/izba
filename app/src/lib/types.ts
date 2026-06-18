@@ -37,6 +37,34 @@ export interface VersionView {
   mismatch: boolean;
 }
 
+export interface PortRule {
+  bind: string;
+  host_port: number;
+  guest_port: number;
+}
+
+export interface VolumeSpec {
+  name: string | null;
+  guest_path: string;
+  size_bytes: number;
+  eph_id?: number | null;
+}
+
+export interface VolumeInfo {
+  name: string;
+  size_bytes: number;
+  actual_bytes: number;
+  referenced_by: string[];
+}
+
+export interface SandboxDetail {
+  name: string;
+  image: string;
+  status: string;
+  ports: PortRule[];
+  volumes: VolumeSpec[];
+}
+
 export interface CreateOpts {
   name: string;
   image: string;
@@ -45,6 +73,7 @@ export interface CreateOpts {
   workspace: string;
   rw_size_gb: number;
   ports: string[];
+  volumes: string[];
 }
 
 /** Payload of the `shell-output` event (raw PTY bytes, base64-encoded). */
