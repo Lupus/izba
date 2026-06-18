@@ -193,14 +193,18 @@ jobs:
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           prefix-key: e2e-linux
-      - name: Report host LSM / Landlock availability
+      - name: Report host confinement capabilities (Landlock probe)
         run: |
-          echo "active LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unknown)"
-          if grep -qw landlock /sys/kernel/security/lsm 2>/dev/null; then
+          # Authoritative check via the landlock_create_ruleset ABI probe — NOT
+          # /sys/kernel/security/lsm, which is absent when securityfs is unmounted
+          # even though Landlock works (observed on real WSL2). confine_probe
+          # prints "capabilities: userns=.. landlock=.. seccomp=..".
+          PROBE="$(cargo run -q -p izba-core --example confine_probe 2>/dev/null || true)"
+          echo "$PROBE"
+          if echo "$PROBE" | grep -q 'landlock=true'; then
             echo "Landlock present — confined-boot path WILL be exercised"
           else
-            echo "Landlock ABSENT — integration suite auto-opts-out (--allow-unconfined); confined path NOT exercised"
-            echo "::warning title=Confined path not exercised::Landlock absent on this runner; the integration suite auto-opts-out (--allow-unconfined), so the confined VMM launch path was NOT exercised this run."
+            echo "::warning title=Confined path not exercised::Landlock probe returned false on this runner; the integration suite auto-opts-out (--allow-unconfined), so the confined VMM launch path was NOT exercised this run."
           fi
       - name: Integration suite (real KVM VMs, incl. izbad egress)
         run: |
