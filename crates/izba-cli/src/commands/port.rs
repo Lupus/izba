@@ -15,6 +15,7 @@ pub fn publish(paths: &Paths, name: &str, rule_spec: &str) -> anyhow::Result<i32
         &DaemonRequest::PortPublish {
             name: name.to_string(),
             rule: rule.clone(),
+            persist: false,
         },
         &mut |_| {},
     )?;

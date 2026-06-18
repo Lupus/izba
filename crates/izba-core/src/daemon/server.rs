@@ -317,7 +317,7 @@ fn dispatch_inner(
         }),
         DaemonRequest::Inspect { name } => handle_inspect(d, name),
         DaemonRequest::GuestRpc { name, req } => handle_guest_rpc(d, name, req),
-        DaemonRequest::PortPublish { name, rule } => handle_port_publish(d, name, rule),
+        DaemonRequest::PortPublish { name, rule, .. } => handle_port_publish(d, name, rule),
         DaemonRequest::PortUnpublish {
             name,
             bind,
@@ -357,6 +357,11 @@ fn dispatch_inner(
         DaemonRequest::OpenStream { .. } => {
             bail!("OpenStream is handled at the connection layer")
         }
+        // B2 will wire these up; stubs keep the enum exhaustive.
+        DaemonRequest::VolumeList => bail!("VolumeList: not yet implemented"),
+        DaemonRequest::VolumeRemove { .. } => bail!("VolumeRemove: not yet implemented"),
+        DaemonRequest::VolumeAttach { .. } => bail!("VolumeAttach: not yet implemented"),
+        DaemonRequest::VolumeDetach { .. } => bail!("VolumeDetach: not yet implemented"),
     }
 }
 
@@ -486,6 +491,7 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
         workspace: config.workspace.display().to_string(),
         status,
         ports: config.ports,
+        volumes: config.volumes,
         confinement,
     }))
 }
@@ -1046,6 +1052,7 @@ mod tests {
             &DaemonRequest::PortPublish {
                 name: "web".into(),
                 rule: rule.clone(),
+                persist: false,
             },
         ) {
             DaemonResponse::Ok => {}
