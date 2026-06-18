@@ -81,6 +81,19 @@ pub struct Pruned {
     pub reclaimed_bytes: u64,
 }
 
+/// Snapshot of a single persistent volume image: declared size, on-disk
+/// allocation, and which sandbox configs reference it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeInfo {
+    pub name: String,
+    /// Provisioned (sparse) size in bytes — the file length.
+    pub size_bytes: u64,
+    /// Actual disk allocation in bytes (blocks × 512 on Unix, file length elsewhere).
+    pub actual_bytes: u64,
+    /// Sandbox names whose config declares this volume (sorted).
+    pub referenced_by: Vec<String>,
+}
+
 fn valid_name(s: &str) -> bool {
     match s.chars().next() {
         Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
