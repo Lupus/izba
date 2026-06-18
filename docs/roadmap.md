@@ -49,7 +49,8 @@ What does **not** exist yet:
 
 - The mesh/governance staging steps beyond the firewall — no `izba.yaml`
   manifest, no project object, no east–west mesh, no credential vault (M4/M5).
-- A few security findings remain open — notably the only open **HIGH** is
+- A few security findings remain open — the two open **HIGH**s are **F-06
+  (Linux half)** (unjailed VMM + virtiofsd as the full host user, = MVP-C) and
   **F-07** (virtiofsd `--sandbox none`), plus F-09 (no izbad peer-cred) and
   F-05 (DNS resolve-and-pin, now unblocked by the hickory adoption). See
   Track S.
