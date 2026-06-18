@@ -4,7 +4,11 @@ import { PolicyEditor } from "../components/PolicyEditor";
 import { api } from "../lib/ipc";
 
 vi.mock("../lib/ipc", () => ({
-  api: { policyShow: vi.fn(), policySet: vi.fn() },
+  api: {
+    policyShow: vi.fn(),
+    policySet: vi.fn(),
+    policySetEnforce: vi.fn(),
+  },
 }));
 
 beforeEach(() => {
@@ -12,7 +16,9 @@ beforeEach(() => {
   (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
     enforcing: true,
     allow: ["api.x.com", { host: "db.internal", ports: [5432] }],
+    git: [],
   });
+  (api.policySetEnforce as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 });
 
 describe("PolicyEditor", () => {
@@ -114,5 +120,26 @@ describe("PolicyEditor", () => {
         { host: "db.internal", ports: [5432] },
       ]),
     );
+  });
+
+  it("toggles enforce via the daemon", async () => {
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    // Wait for the component to load the policy
+    const toggle = await screen.findByRole("checkbox", { name: /enforce/i });
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(api.policySetEnforce).toHaveBeenCalledWith("web", false),
+    );
+  });
+
+  it("uses the shared WEB_DEFAULT_PORTS constant", async () => {
+    const { WEB_DEFAULT_PORTS } = await import("../lib/ports");
+    expect(WEB_DEFAULT_PORTS).toEqual([80, 443]);
   });
 });

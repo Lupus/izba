@@ -76,9 +76,15 @@ export interface EndpointSummary {
 }
 
 /** Untagged on the Rust side: a bare host is a string, a scoped host an object. */
-export type AllowEntry = string | { host: string; ports: number[] };
+export type AllowEntry = string | { host: string; ports: number[]; access?: Access };
+
+export type Access = "read" | "read-write";
+
+/** A git rule from the policy: either a repo URL or a hostname, with optional access level. */
+export type GitRule = ({ repo: string } | { host: string }) & { access?: Access };
 
 export interface PolicyView {
   enforcing: boolean;
   allow: AllowEntry[];
+  git: GitRule[];
 }

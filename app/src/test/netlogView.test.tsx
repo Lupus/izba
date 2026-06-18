@@ -31,13 +31,13 @@ function mockPolicy(p: PolicyView) {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockPolicy({ enforcing: true, allow: [] });
+  mockPolicy({ enforcing: true, allow: [], git: [] });
   (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([allowedNamed, deniedRawIp]);
 });
 
 describe("NetlogView", () => {
   it("offers Block on a host the policy already allows", async () => {
-    mockPolicy({ enforcing: true, allow: ["api.x.com"] }); // bare host ⇒ 80, 443
+    mockPolicy({ enforcing: true, allow: ["api.x.com"], git: [] }); // bare host ⇒ 80, 443
     render(<NetlogView name="web" />);
     fireEvent.click(await screen.findByRole("button", { name: /block api\.x\.com/i }));
     await waitFor(() => expect(api.policyBlock).toHaveBeenCalledWith("web", "api.x.com", 443));
@@ -56,6 +56,7 @@ describe("NetlogView", () => {
     (api.policyShow as ReturnType<typeof vi.fn>).mockImplementation(async () => ({
       enforcing: true,
       allow,
+      git: [],
     }));
     (api.policyAllow as ReturnType<typeof vi.fn>).mockImplementation(async () => {
       allow = ["api.x.com"];
@@ -73,7 +74,7 @@ describe("NetlogView", () => {
   });
 
   it("shows the enable-firewall banner for a bare sandbox", async () => {
-    mockPolicy({ enforcing: false, allow: [] });
+    mockPolicy({ enforcing: false, allow: [], git: [] });
     render(<NetlogView name="web" />);
     const btn = await screen.findByRole("button", { name: /enable firewall/i });
     fireEvent.click(btn);

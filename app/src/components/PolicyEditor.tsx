@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { AllowEntry } from "../lib/types";
 import { api } from "../lib/ipc";
+import { WEB_DEFAULT_PORTS } from "../lib/ports";
 
 interface Row {
   host: string;
@@ -9,7 +10,9 @@ interface Row {
 
 /** Normalize an `AllowEntry` (string = bare host → web default ports) to a Row. */
 function toRow(e: AllowEntry): Row {
-  return typeof e === "string" ? { host: e, ports: [80, 443] } : { host: e.host, ports: e.ports };
+  return typeof e === "string"
+    ? { host: e, ports: [...WEB_DEFAULT_PORTS] }
+    : { host: e.host, ports: e.ports };
 }
 
 /** Per-host ports shown as removable chips plus a numeric "add port" field. */
@@ -95,6 +98,7 @@ function PortEditor({
 
 export function PolicyEditor({ name }: { name: string }) {
   const [rows, setRows] = useState<Row[]>([]);
+  const [enforcing, setEnforcing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
@@ -103,7 +107,10 @@ export function PolicyEditor({ name }: { name: string }) {
     void (async () => {
       try {
         const p = await api.policyShow(name);
-        if (alive) setRows(p.allow.map(toRow));
+        if (alive) {
+          setRows(p.allow.map(toRow));
+          setEnforcing(p.enforcing);
+        }
       } catch (e) {
         if (alive) setError(e instanceof Error ? e.message : String(e));
       }
@@ -112,6 +119,18 @@ export function PolicyEditor({ name }: { name: string }) {
       alive = false;
     };
   }, [name]);
+
+  async function toggleEnforce() {
+    const next = !enforcing;
+    setEnforcing(next);
+    try {
+      await api.policySetEnforce(name, next);
+    } catch (e) {
+      // revert on error
+      setEnforcing(!next);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
 
   // Any edit invalidates the "saved" confirmation so it doesn't linger.
   function edit(f: (rs: Row[]) => Row[]) {
@@ -156,61 +175,76 @@ export function PolicyEditor({ name }: { name: string }) {
 
   return (
     <div className="flex h-full flex-col gap-3">
+      <div className="flex items-center gap-3">
+        <label className="flex cursor-pointer items-center gap-2 text-sm font-semibold">
+          <input
+            type="checkbox"
+            role="checkbox"
+            aria-label="Enforce firewall"
+            checked={enforcing}
+            onChange={() => void toggleEnforce()}
+            className="h-4 w-4 rounded border-line"
+          />
+          Enforce firewall
+        </label>
+      </div>
       <p className="text-sm text-ink-2">
         Hosts this sandbox may reach. Add a port to a host, or remove one with its ✕.
       </p>
       {error && <div className="text-sm text-warn">{error}</div>}
-      <div className="flex flex-col gap-2">
-        {rows.map((r, i) => (
-          <div key={i} className="flex flex-col gap-2 rounded-lg border border-line p-3">
-            <div className="flex items-center gap-2">
-              <label className="w-12 shrink-0 text-xs font-semibold text-ink-2">Host</label>
-              <input
-                value={r.host}
-                onChange={(e) => setHost(i, e.target.value)}
-                placeholder="api.example.com"
-                className="flex-1 rounded border border-line px-2 py-1 text-sm font-mono"
-              />
-              <button
-                type="button"
-                aria-label={`Remove host ${r.host}`}
-                onClick={() => removeRow(i)}
-                className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
-              >
-                Remove
-              </button>
+      <fieldset disabled={!enforcing} className="contents">
+        <div className="flex flex-col gap-2">
+          {rows.map((r, i) => (
+            <div key={i} className="flex flex-col gap-2 rounded-lg border border-line p-3">
+              <div className="flex items-center gap-2">
+                <label className="w-12 shrink-0 text-xs font-semibold text-ink-2">Host</label>
+                <input
+                  value={r.host}
+                  onChange={(e) => setHost(i, e.target.value)}
+                  placeholder="api.example.com"
+                  className="flex-1 rounded border border-line px-2 py-1 text-sm font-mono"
+                />
+                <button
+                  type="button"
+                  aria-label={`Remove host ${r.host}`}
+                  onClick={() => removeRow(i)}
+                  className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
+                >
+                  Remove
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="w-12 shrink-0 text-xs font-semibold text-ink-2">Ports</label>
+                <PortEditor
+                  ports={r.ports}
+                  onAdd={(p) => addPort(i, p)}
+                  onRemove={(p) => removePort(i, p)}
+                />
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <label className="w-12 shrink-0 text-xs font-semibold text-ink-2">Ports</label>
-              <PortEditor
-                ports={r.ports}
-                onAdd={(p) => addPort(i, p)}
-                onRemove={(p) => removePort(i, p)}
-              />
-            </div>
-          </div>
-        ))}
-        {rows.length === 0 && (
-          <div className="text-sm text-ink-3">No hosts allowed yet — add one below.</div>
-        )}
-      </div>
-      <div className="flex items-center gap-2">
-        <button
-          type="button"
-          onClick={addRow}
-          className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover"
-        >
-          Add host
-        </button>
-        <button
-          type="button"
-          onClick={() => void save()}
-          className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white"
-        >
-          Save
-        </button>
-        {saved && <span className="self-center text-sm text-ink-2">saved · reloaded</span>}
-      </div>
+          ))}
+          {rows.length === 0 && (
+            <div className="text-sm text-ink-3">No hosts allowed yet — add one below.</div>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={addRow}
+            className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover"
+          >
+            Add host
+          </button>
+          <button
+            type="button"
+            onClick={() => void save()}
+            className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white"
+          >
+            Save
+          </button>
+          {saved && <span className="self-center text-sm text-ink-2">saved · reloaded</span>}
+        </div>
+      </fieldset>
     </div>
   );
 }
