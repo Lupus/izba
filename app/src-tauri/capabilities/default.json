@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default capabilities for the izba app window",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "dialog:allow-open"]
+  "permissions": ["core:default", "dialog:default", "dialog:allow-open", "opener:default", "opener:allow-open-url"]
 }
