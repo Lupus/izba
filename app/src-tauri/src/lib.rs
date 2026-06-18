@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use daemon::{DaemonApi, RealDaemon, ShellSession};
 use tauri::{Emitter, State};
-use views::{CreateOpts, DaemonStatusView, SandboxView, SeedEntry, VersionView};
+use views::{
+    CreateOpts, DaemonStatusView, PortRuleView, SandboxDetailView, SandboxView, SeedEntry,
+    VersionView, VolumeInfoView,
+};
 
 /// A live interactive shell, wrapped so the `shells` map lock is only held for
 /// the lookup — the per-session lock is what guards (blocking) shell I/O.
@@ -236,6 +239,81 @@ async fn policy_set_enforce(
     .await
 }
 
+#[tauri::command]
+async fn inspect(state: State<'_, AppState>, name: String) -> Result<SandboxDetailView, String> {
+    run_action(&state, move |d| commands::inspect_core(d, &name)).await
+}
+
+#[tauri::command]
+async fn port_list(state: State<'_, AppState>, name: String) -> Result<Vec<PortRuleView>, String> {
+    run_action(&state, move |d| commands::port_list_core(d, &name)).await
+}
+
+#[tauri::command]
+async fn port_publish(
+    state: State<'_, AppState>,
+    name: String,
+    rule_spec: String,
+    persist: bool,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::port_publish_core(d, &name, &rule_spec, persist)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn port_unpublish(
+    state: State<'_, AppState>,
+    name: String,
+    bind: std::net::Ipv4Addr,
+    host_port: u16,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::port_unpublish_core(d, &name, bind, host_port)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn volume_list(state: State<'_, AppState>) -> Result<Vec<VolumeInfoView>, String> {
+    run_action(&state, move |d| commands::volume_list_core(d)).await
+}
+
+#[tauri::command]
+async fn volume_remove(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    run_action(&state, move |d| commands::volume_remove_core(d, &name)).await
+}
+
+#[tauri::command]
+async fn volume_prune(state: State<'_, AppState>) -> Result<izba_core::volume::Pruned, String> {
+    run_action(&state, move |d| commands::volume_prune_core(d)).await
+}
+
+#[tauri::command]
+async fn volume_attach(
+    state: State<'_, AppState>,
+    name: String,
+    spec: String,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::volume_attach_core(d, &name, &spec)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn volume_detach(
+    state: State<'_, AppState>,
+    name: String,
+    guest_path: String,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::volume_detach_core(d, &name, guest_path)
+    })
+    .await
+}
+
 #[derive(Clone, serde::Serialize)]
 struct ShellOutput {
     id: String,
@@ -365,6 +443,15 @@ pub fn run() {
             policy_git_allow,
             policy_git_block,
             policy_set_enforce,
+            inspect,
+            port_list,
+            port_publish,
+            port_unpublish,
+            volume_list,
+            volume_remove,
+            volume_prune,
+            volume_attach,
+            volume_detach,
             shell_open,
             shell_write,
             shell_resize,

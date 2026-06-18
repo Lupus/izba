@@ -1,6 +1,8 @@
 use izba_core::build_info::BuildInfoOwned;
 use izba_core::daemon::egress::config::{Access, AllowEntry, GitRule};
-use izba_core::daemon::proto::DaemonCreate;
+use izba_core::daemon::proto::{DaemonCreate, SandboxDetail};
+use izba_core::state::PortRule;
+use izba_core::volume::{VolumeInfo, VolumeSpec};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -42,6 +44,9 @@ pub struct CreateOpts {
     pub rw_size_gb: u64,
     /// Repeatable `[BIND:]HOST:GUEST` port specs (blank entries are ignored).
     pub ports: Vec<String>,
+    /// Repeatable `[NAME:]GUEST_PATH:SIZE` volume specs (blank entries ignored).
+    #[serde(default)]
+    pub volumes: Vec<String>,
 }
 
 impl CreateOpts {
@@ -57,6 +62,14 @@ impl CreateOpts {
             .filter(|s| !s.is_empty())
             .map(izba_core::portfwd::parse_rule)
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let volumes = self
+            .volumes
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(izba_core::volume::parse_volume_flag)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        izba_core::volume::validate_volumes(&volumes)?;
         Ok(DaemonCreate {
             name: self.name,
             image_ref: self.image,
@@ -65,12 +78,7 @@ impl CreateOpts {
             workspace: PathBuf::from(self.workspace),
             rw_size_gb: self.rw_size_gb,
             ports,
-            // The app does not expose volume creation yet (a future "Storage"
-            // tab); send none so the daemon treats it as a volume-less sandbox.
-            volumes: Vec::new(),
-            // The app always creates with confined intent (no unconfined toggle),
-            // so the daemon runs the workspace confinement preflight and surfaces
-            // an actionable error in the create dialog for an unrelabellable dir.
+            volumes,
             allow_unconfined: false,
         })
     }
@@ -175,6 +183,86 @@ impl From<izba_core::daemon::proto::DaemonStatus> for DaemonStatusView {
     }
 }
 
+/// A port-publish rule as the UI sees it. `bind` is stringified (e.g. "127.0.0.1").
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PortRuleView {
+    pub bind: String,
+    pub host_port: u16,
+    pub guest_port: u16,
+}
+
+impl From<PortRule> for PortRuleView {
+    fn from(r: PortRule) -> Self {
+        PortRuleView {
+            bind: r.bind.to_string(),
+            host_port: r.host_port,
+            guest_port: r.guest_port,
+        }
+    }
+}
+
+/// A volume spec as the UI sees it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VolumeSpecView {
+    pub name: Option<String>,
+    pub guest_path: String,
+    pub size_bytes: u64,
+    pub eph_id: Option<u64>,
+}
+
+impl From<VolumeSpec> for VolumeSpecView {
+    fn from(v: VolumeSpec) -> Self {
+        VolumeSpecView {
+            name: v.name,
+            guest_path: v.guest_path.to_string_lossy().into_owned(),
+            size_bytes: v.size_bytes,
+            eph_id: v.eph_id,
+        }
+    }
+}
+
+/// A persistent volume record as the UI sees it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VolumeInfoView {
+    pub name: String,
+    pub size_bytes: u64,
+    pub actual_bytes: u64,
+    pub referenced_by: Vec<String>,
+}
+
+impl From<VolumeInfo> for VolumeInfoView {
+    fn from(v: VolumeInfo) -> Self {
+        VolumeInfoView {
+            name: v.name,
+            size_bytes: v.size_bytes,
+            actual_bytes: v.actual_bytes,
+            referenced_by: v.referenced_by,
+        }
+    }
+}
+
+/// Full sandbox detail for the UI (ports + volumes included).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SandboxDetailView {
+    pub name: String,
+    pub image: String,
+    pub status: String,
+    pub ports: Vec<PortRuleView>,
+    pub volumes: Vec<VolumeSpecView>,
+}
+
+impl From<SandboxDetail> for SandboxDetailView {
+    fn from(d: SandboxDetail) -> Self {
+        SandboxDetailView {
+            name: d.name,
+            image: d.image_ref,
+            status: d.status,
+            ports: d.ports.into_iter().map(PortRuleView::from).collect(),
+            volumes: d.volumes.into_iter().map(VolumeSpecView::from).collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +299,7 @@ mod tests {
             workspace: "/ws".into(),
             rw_size_gb: 8,
             ports: vec!["127.0.0.1:8080:80".into(), "  ".into()],
+            volumes: vec![],
         };
         let dc = opts.into_daemon_create().unwrap();
         assert_eq!(dc.name, "web");
@@ -234,6 +323,7 @@ mod tests {
             workspace: "/ws".into(),
             rw_size_gb: 8,
             ports: vec![],
+            volumes: vec![],
         };
         let err = opts.into_daemon_create().unwrap_err().to_string();
         assert!(err.contains("invalid sandbox name"), "got: {err}");
@@ -269,5 +359,92 @@ mod tests {
                 state: SbxState::Running
             }
         );
+    }
+
+    #[test]
+    fn create_opts_parses_volumes() {
+        let opts = CreateOpts {
+            name: "web".into(),
+            image: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: "/ws".into(),
+            rw_size_gb: 8,
+            ports: vec![],
+            volumes: vec!["cache:/data:1g".into(), "  ".into()],
+        };
+        let dc = opts.into_daemon_create().unwrap();
+        assert_eq!(dc.volumes.len(), 1);
+        assert_eq!(dc.volumes[0].name.as_deref(), Some("cache"));
+    }
+
+    #[test]
+    fn port_rule_view_stringifies_bind() {
+        use std::net::Ipv4Addr;
+        let rule = PortRule {
+            bind: Ipv4Addr::new(127, 0, 0, 1),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let v = PortRuleView::from(rule);
+        assert_eq!(v.bind, "127.0.0.1");
+        assert_eq!(v.host_port, 8080);
+        assert_eq!(v.guest_port, 80);
+    }
+
+    #[test]
+    fn volume_spec_view_maps_fields() {
+        let spec = VolumeSpec {
+            name: Some("cache".into()),
+            guest_path: std::path::PathBuf::from("/data"),
+            size_bytes: 1 << 30,
+            eph_id: None,
+        };
+        let v = VolumeSpecView::from(spec);
+        assert_eq!(v.name.as_deref(), Some("cache"));
+        assert_eq!(v.guest_path, "/data");
+        assert_eq!(v.size_bytes, 1 << 30);
+        assert!(v.eph_id.is_none());
+    }
+
+    #[test]
+    fn volume_info_view_maps_fields() {
+        let info = VolumeInfo {
+            name: "cache".into(),
+            size_bytes: 1 << 30,
+            actual_bytes: 1 << 20,
+            referenced_by: vec!["web".into()],
+        };
+        let v = VolumeInfoView::from(info);
+        assert_eq!(v.name, "cache");
+        assert_eq!(v.referenced_by, vec!["web"]);
+    }
+
+    #[test]
+    fn sandbox_detail_view_maps_fields() {
+        use std::net::Ipv4Addr;
+        let detail = izba_core::daemon::proto::SandboxDetail {
+            name: "web".into(),
+            image_ref: "ubuntu:24.04".into(),
+            image_digest: "sha256:x".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: "/ws".into(),
+            status: "running".into(),
+            ports: vec![PortRule {
+                bind: Ipv4Addr::new(127, 0, 0, 1),
+                host_port: 8080,
+                guest_port: 80,
+            }],
+            volumes: vec![],
+            confinement: None,
+        };
+        let v = SandboxDetailView::from(detail);
+        assert_eq!(v.name, "web");
+        assert_eq!(v.image, "ubuntu:24.04");
+        assert_eq!(v.status, "running");
+        assert_eq!(v.ports.len(), 1);
+        assert_eq!(v.ports[0].host_port, 8080);
+        assert!(v.volumes.is_empty());
     }
 }
