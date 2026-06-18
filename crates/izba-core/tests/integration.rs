@@ -1519,3 +1519,55 @@ fn port_publish_runtime_and_unpublish() {
 
     stop_sandbox(&tb, "portr");
 }
+
+/// Confinement boot test: on a host that has the Landlock LSM, the sandbox
+/// must boot with `ConfinementMode::Restricted` recorded in its `state.json`.
+///
+/// The negative (fail-closed) path is already covered by unit tests in
+/// `crates/izba-core/src/procmgr/jail_linux.rs` — this test proves only the
+/// positive "Landlock present → Restricted actually applied" path with a real
+/// microVM boot.
+#[test]
+fn confined_boot_records_restricted_when_landlock_present() {
+    let Some(env) = want() else { return };
+    // A host without the Landlock LSM cannot reach the Restricted floor (the
+    // confinement plan would fail closed before the VMM is even launched);
+    // skip with a clear reason rather than fail.
+    if !izba_core::procmgr::jail_linux::Capabilities::probe().landlock {
+        eprintln!(
+            "SKIP: host kernel has no Landlock LSM \
+             (enable CONFIG_SECURITY_LANDLOCK + lsm=...,landlock)"
+        );
+        return;
+    }
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("confined");
+    create_sandbox(&env, &mut tb, "confined", &ws);
+    if let Err(e) = start_sandbox(&env, &tb, "confined") {
+        panic!(
+            "confined boot failed: {e:#}\nconsole tail:\n{}",
+            boot_diag(&tb.paths, "confined")
+        );
+    }
+
+    // The recorded confinement must be Restricted (the fail-closed default
+    // reached it — Landlock is present so no degradation path applies).
+    let state_path = tb.paths.sandbox_dir("confined").join(STATE_FILE);
+    let st: RunState = load_json(&state_path)
+        .expect("reading state.json")
+        .expect("state.json present after start");
+    let conf = st.confinement.expect("confinement must be recorded at launch");
+    assert_eq!(
+        conf.mode,
+        izba_core::procmgr::ConfinementMode::Restricted,
+        "expected Restricted, got {conf:?} (summary: {})",
+        conf.summary()
+    );
+    assert!(
+        conf.reason.contains("landlock"),
+        "reason should name landlock: {}",
+        conf.reason
+    );
+
+    stop_sandbox(&tb, "confined");
+}
