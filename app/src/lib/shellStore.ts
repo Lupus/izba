@@ -16,6 +16,10 @@ export interface ShellSession {
 }
 
 const sessions: ShellSession[] = [];
+// The shell tab the user last had open, per sandbox. Survives the panel
+// unmounting (e.g. switching to Netlog and back) so we reopen what they left on
+// instead of jumping to the newest shell.
+const activeBySandbox: Record<string, string> = {};
 const listeners = new Set<() => void>();
 // Client-minted session ids (a plain counter, NOT crypto, for test determinism).
 let seq = 0;
@@ -38,6 +42,15 @@ export const shellStore = {
   },
   forSandbox(sandbox: string) {
     return sessions.filter((s) => s.sandbox === sandbox);
+  },
+
+  /** The remembered active shell id for a sandbox, or undefined if none. */
+  getActive(sandbox: string): string | undefined {
+    return activeBySandbox[sandbox];
+  },
+  /** Remember `id` as the active shell for `sandbox`. */
+  setActive(sandbox: string, id: string) {
+    activeBySandbox[sandbox] = id;
   },
 
   async open(sandbox: string): Promise<string> {
@@ -93,6 +106,9 @@ export const shellStore = {
     if (i < 0) return;
     const s = sessions[i];
     sessions.splice(i, 1);
+    // Drop the remembered-active pointer if it referenced the closed shell, so a
+    // stale id never sticks; the panel then falls back to the newest shell.
+    if (activeBySandbox[s.sandbox] === id) delete activeBySandbox[s.sandbox];
     emit();
     s.unlisten.forEach((u) => u());
     if (s.id) await api.shellClose(s.id).catch(() => {});

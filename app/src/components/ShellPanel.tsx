@@ -5,7 +5,16 @@ import { api } from "../lib/ipc";
 export function ShellPanel({ sandbox }: { sandbox: string }) {
   useSyncExternalStore(shellStore.subscribe, shellStore.snapshot);
   const all = shellStore.forSandbox(sandbox);
-  const [activeId, setActiveId] = useState<string | null>(null);
+  // Restore the shell the user last had open (persisted across unmount), falling
+  // back to the newest only if there is no valid remembered selection.
+  const [activeId, setActiveIdState] = useState<string | null>(() => {
+    const remembered = shellStore.getActive(sandbox);
+    return remembered && all.some((s) => s.id === remembered) ? remembered : null;
+  });
+  const selectShell = (id: string) => {
+    shellStore.setActive(sandbox, id);
+    setActiveIdState(id);
+  };
 
   // Auto-open exactly ONE shell per mount (a ref guards against StrictMode's
   // double-invoke AND the close-the-last-shell reopen loop). Once the user has
@@ -18,7 +27,12 @@ export function ShellPanel({ sandbox }: { sandbox: string }) {
       return;
     }
     if (all.length > 0 && (!activeId || !all.some((s) => s.id === activeId))) {
-      setActiveId(all[all.length - 1].id);
+      const remembered = shellStore.getActive(sandbox);
+      const restore =
+        remembered && all.some((s) => s.id === remembered)
+          ? remembered
+          : all[all.length - 1].id;
+      selectShell(restore);
     }
   }, [sandbox, all.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -35,7 +49,7 @@ export function ShellPanel({ sandbox }: { sandbox: string }) {
               (active && active.id === s.id ? "bg-hover font-semibold" : "text-ink-2")
             }
           >
-            <button type="button" role="tab" onClick={() => setActiveId(s.id)}>
+            <button type="button" role="tab" onClick={() => selectShell(s.id)}>
               {s.label}
               {s.exited ? " (exited)" : ""}
             </button>

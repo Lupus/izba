@@ -95,6 +95,29 @@ describe("ShellPanel", () => {
     await waitFor(() => expect(api.shellClose).toHaveBeenCalled());
   });
 
+  it("restores the previously-active shell after unmount/remount", async () => {
+    const { unmount } = render(<ShellPanel sandbox="web" />);
+    await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(1));
+    fireEvent.click(screen.getByRole("button", { name: /new shell/i }));
+    await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(2));
+
+    // Select the FIRST shell — deliberately NOT the newest, which is the default.
+    const firstTab = screen.getAllByRole("tab")[0];
+    const firstLabel = firstTab.textContent;
+    fireEvent.click(firstTab);
+    await waitFor(() => expect(firstTab.closest("div")?.className).toContain("font-semibold"));
+
+    // Leaving the Shell tab (e.g. for Netlog) unmounts the panel.
+    unmount();
+    render(<ShellPanel sandbox="web" />);
+    await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(2));
+
+    const active = screen
+      .getAllByRole("tab")
+      .find((t) => t.closest("div")?.className.includes("font-semibold"));
+    expect(active?.textContent).toBe(firstLabel);
+  });
+
   it("closing the last shell shows the empty state and does NOT reopen", async () => {
     render(<ShellPanel sandbox="web" />);
     await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(1));
