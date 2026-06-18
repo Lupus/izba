@@ -8,14 +8,14 @@ use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
 use std::net::Ipv4Addr;
 
-pub fn publish(paths: &Paths, name: &str, rule_spec: &str) -> anyhow::Result<i32> {
+pub fn publish(paths: &Paths, name: &str, rule_spec: &str, persist: bool) -> anyhow::Result<i32> {
     let rule = izba_core::portfwd::parse_rule(rule_spec)?;
     let mut client = DaemonClient::connect(paths)?;
     let resp = client.request(
         &DaemonRequest::PortPublish {
             name: name.to_string(),
             rule: rule.clone(),
-            persist: false,
+            persist,
         },
         &mut |_| {},
     )?;

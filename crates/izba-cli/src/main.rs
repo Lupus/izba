@@ -78,6 +78,9 @@ enum PortCmd {
         name: String,
         /// [BIND:]HOST:GUEST
         rule: String,
+        /// Also persist this forward to the sandbox config (survives restart)
+        #[arg(long)]
+        persist: bool,
     },
     /// Remove a published port by its [BIND:]HOST key
     Unpublish {
@@ -246,7 +249,11 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             follow,
         } => commands::netlog::run(paths, &name, summary, follow),
         Cmd::Port(pc) => match pc {
-            PortCmd::Publish { name, rule } => commands::port::publish(paths, &name, &rule),
+            PortCmd::Publish {
+                name,
+                rule,
+                persist,
+            } => commands::port::publish(paths, &name, &rule, persist),
             PortCmd::Unpublish { name, key } => commands::port::unpublish(paths, &name, &key),
             PortCmd::Ls { name } => commands::port::ls(paths, &name),
         },
@@ -478,11 +485,26 @@ mod tests {
     #[test]
     fn parse_port_publish() {
         let cli = Cli::try_parse_from(["izba", "port", "publish", "web", "8080:80"]).unwrap();
-        let Cmd::Port(PortCmd::Publish { name, rule }) = cli.cmd else {
+        let Cmd::Port(PortCmd::Publish {
+            name,
+            rule,
+            persist,
+        }) = cli.cmd
+        else {
             panic!("expected port publish");
         };
         assert_eq!(name, "web");
         assert_eq!(rule, "8080:80");
+        assert!(!persist, "persist must default to false");
+
+        // --persist flag wires through.
+        let with_persist =
+            Cli::try_parse_from(["izba", "port", "publish", "--persist", "web", "8080:80"])
+                .unwrap();
+        let Cmd::Port(PortCmd::Publish { persist, .. }) = with_persist.cmd else {
+            panic!("expected port publish");
+        };
+        assert!(persist);
     }
 
     #[test]
