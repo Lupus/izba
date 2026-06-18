@@ -219,11 +219,7 @@ impl DaemonApi for FakeDaemon {
         use izba_core::daemon::egress::config::{Access, GitTarget};
         self.calls
             .push(format!("git_allow:{name}:{target}:{write}"));
-        let gt = if target.contains('/') {
-            GitTarget::Repo(target.to_string())
-        } else {
-            GitTarget::Host(target.to_string())
-        };
+        let gt = GitTarget::parse(target);
         let access = if write {
             Access::ReadWrite
         } else {
@@ -235,11 +231,7 @@ impl DaemonApi for FakeDaemon {
     fn policy_git_block(&mut self, name: &str, target: &str) -> anyhow::Result<()> {
         use izba_core::daemon::egress::config::GitTarget;
         self.calls.push(format!("git_block:{name}:{target}"));
-        let gt = if target.contains('/') {
-            GitTarget::Repo(target.to_string())
-        } else {
-            GitTarget::Host(target.to_string())
-        };
+        let gt = GitTarget::parse(target);
         self.policy.git_block(&gt);
         Ok(())
     }
