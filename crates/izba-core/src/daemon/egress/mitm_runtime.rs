@@ -105,7 +105,25 @@ struct PolicyAdapter {
 }
 
 impl PolicyAdapter {
-    fn flow_for(&self, req: &L7Request) -> FlowDesc {
+    /// Test-only constructor: builds a `PolicyAdapter` with an `AllowAll` policy
+    /// and a discard `AuditSink` writing to a temp directory.
+    #[cfg(test)]
+    pub(crate) fn test_new(sandbox: &str, ip: IpAddr, port: u16) -> Self {
+        use crate::daemon::egress::policy::AllowAll;
+        use crate::paths::Paths;
+        let audit = AuditSink::new(Paths::with_root(
+            std::env::temp_dir().join("izba-mitm-runtime-test"),
+        ));
+        Self {
+            policy: Arc::new(AllowAll),
+            audit,
+            sandbox: sandbox.into(),
+            ip,
+            port,
+        }
+    }
+
+    pub(crate) fn flow_for(&self, req: &L7Request) -> FlowDesc {
         FlowDesc {
             sandbox: self.sandbox.clone(),
             addr: req.host.clone(),
@@ -309,5 +327,19 @@ mod tests {
     fn dstmap_unknown_port_is_none() {
         let map = DstMap::new();
         assert!(map.claim(12345).is_none());
+    }
+
+    #[test]
+    fn flow_for_threads_query_into_flowdesc() {
+        let adapter = PolicyAdapter::test_new("web", "203.0.113.5".parse().unwrap(), 443);
+        let req = L7Request {
+            host: "github.com".into(),
+            method: "GET".into(),
+            path: "/o/a/info/refs".into(),
+            query: Some("service=git-receive-pack".into()),
+        };
+        let flow = adapter.flow_for(&req);
+        assert_eq!(flow.query.as_deref(), Some("service=git-receive-pack"));
+        assert_eq!(flow.host.as_deref(), Some("github.com"));
     }
 }
