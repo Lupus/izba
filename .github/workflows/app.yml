@@ -19,24 +19,23 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
-      # Bound + retry apt's index fetch against the chronically flaky
-      # azure.archive.ubuntu.com mirror (actions/runner-images#675) so a stalled
-      # connection can't wedge the job until the timeout. Scope: this governs the
-      # `apt-get update` that cache-apt-pkgs-action runs on a cache miss. The
-      # package *downloads* go through the action's apt-fast/aria2c path (see
-      # below), which doesn't read apt.conf.d — those are hardened by aria2c's own
-      # parallel-retry behavior, not by this file.
-      - name: Harden apt index fetch (retries + timeouts)
+      # Bound + retry apt against the chronically flaky azure.archive.ubuntu.com
+      # mirror (actions/runner-images#675) so a stalled connection can't wedge
+      # the job until the timeout. The vendored action below installs via plain
+      # apt-get on a cache miss, so this config governs both its `apt-get update`
+      # and the package downloads themselves.
+      - name: Harden apt (retries + fetch timeouts)
         run: |
           printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
             | sudo tee /etc/apt/apt.conf.d/99izba-ci-retries
       # Cache the libwebkit2gtk-4.1-dev dependency closure (the GStreamer/Pulse
       # multimedia stack — hundreds of packages) so warm runs skip the mirror
-      # entirely instead of re-downloading it every run. Cold runs download via
-      # the action's apt-fast/aria2c downloader, which parallelizes + retries —
-      # already faster and more resilient than the serial apt-get this replaces.
+      # entirely instead of re-downloading it every run (cold runs fall back to
+      # the hardened apt-get above). Uses an in-tree, de-blobbed fork of
+      # awalsh128/cache-apt-pkgs-action — no unpinned curl|bash, no committed
+      # binaries; see .github/actions/cache-apt-pkgs/NOTICE.md.
       - name: Install Tauri system deps
-        uses: awalsh128/cache-apt-pkgs-action@681749ae568c81c2037cb9185e38b709b261bd2f # v1.6.1
+        uses: ./.github/actions/cache-apt-pkgs
         with:
           packages: >-
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
