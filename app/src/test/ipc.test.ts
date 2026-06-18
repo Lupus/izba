@@ -94,4 +94,69 @@ describe("ipc action wrappers", () => {
       enforce: true,
     });
   });
+
+  // ── new bindings added in MVP-B ─────────────────────────────────────────────
+
+  it("inspect invokes inspect with the name", async () => {
+    invoke.mockResolvedValue({});
+    await api.inspect("web");
+    expect(invoke).toHaveBeenCalledWith("inspect", { name: "web" });
+  });
+
+  it("portList invokes port_list with the name", async () => {
+    invoke.mockResolvedValue([]);
+    await api.portList("web");
+    expect(invoke).toHaveBeenCalledWith("port_list", { name: "web" });
+  });
+
+  it("portPublish invokes port_publish with name, rule, persist", async () => {
+    await api.portPublish("web", "0.0.0.0:8080:80", true);
+    expect(invoke).toHaveBeenCalledWith("port_publish", {
+      name: "web",
+      rule: "0.0.0.0:8080:80",
+      persist: true,
+    });
+  });
+
+  it("portUnpublish invokes port_unpublish with name, bind, hostPort", async () => {
+    await api.portUnpublish("web", "0.0.0.0", 8080);
+    expect(invoke).toHaveBeenCalledWith("port_unpublish", {
+      name: "web",
+      bind: "0.0.0.0",
+      hostPort: 8080,
+    });
+  });
+
+  it("volumeList invokes volume_list with no args", async () => {
+    invoke.mockResolvedValue([]);
+    await api.volumeList();
+    expect(invoke).toHaveBeenCalledWith("volume_list");
+  });
+
+  it("volumeRemove invokes volume_remove with the name", async () => {
+    await api.volumeRemove("mydata");
+    expect(invoke).toHaveBeenCalledWith("volume_remove", { name: "mydata" });
+  });
+
+  it("volumePrune invokes volume_prune with no args", async () => {
+    invoke.mockResolvedValue({ removed: [], reclaimed_bytes: 0 });
+    await api.volumePrune();
+    expect(invoke).toHaveBeenCalledWith("volume_prune");
+  });
+
+  it("volumeAttach invokes volume_attach with name and spec", async () => {
+    await api.volumeAttach("web", "cache:/data:1g");
+    expect(invoke).toHaveBeenCalledWith("volume_attach", {
+      name: "web",
+      spec: "cache:/data:1g",
+    });
+  });
+
+  it("volumeDetach invokes volume_detach with name and guestPath", async () => {
+    await api.volumeDetach("web", "/data");
+    expect(invoke).toHaveBeenCalledWith("volume_detach", {
+      name: "web",
+      guestPath: "/data",
+    });
+  });
 });
