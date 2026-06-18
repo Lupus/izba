@@ -1094,8 +1094,7 @@ mod tests {
     fn compute_launch_lockdown_returns_none_on_non_windows() {
         let (_dir, paths) = test_paths();
         // A sandbox dir is not needed — the non-Windows impl ignores paths.
-        let result = compute_launch_lockdown(&paths, "any-name")
-            .expect("must not error");
+        let result = compute_launch_lockdown(&paths, "any-name").expect("must not error");
         assert!(
             result.is_none(),
             "compute_launch_lockdown must return None on non-Windows"

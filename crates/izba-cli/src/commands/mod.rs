@@ -2,6 +2,7 @@ pub mod cp;
 pub mod create;
 pub mod daemon;
 pub mod exec;
+pub mod lockdown;
 pub mod ls;
 pub mod netlog;
 pub mod policy;
