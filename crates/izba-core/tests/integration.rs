@@ -1580,3 +1580,164 @@ fn confined_boot_records_restricted_when_landlock_present() {
 
     stop_sandbox(&tb, "confined");
 }
+
+/// M2 git-egress exit: a sandbox with `enforce: true` +
+/// `git: [{repo: "github.com/octocat/Hello-World", access: read}]` must
+/// (a) allow `git clone` of that repo (exit 0, L7 ALLOW record for the
+/// upload-pack leg) and (b) deny a `git push` attempt (non-zero exit,
+/// L7 DENY record for the receive-pack leg).
+///
+/// This exercises the full end-to-end git egress path through a booted
+/// microVM: izba-init's nft REDIRECT → vsock 1027 → izbad MITM → Rego
+/// git rules → audit log. The assertion is audit-first (immune to busybox
+/// TLS or git version quirks); guest exit codes are secondary corroboration.
+///
+/// Network note: the test dials real github.com. If the host has no internet
+/// (air-gapped CI), the test will fail in the exec step — not in the policy
+/// check. The e2e.yml job runs on hosted runners with internet access.
+#[test]
+fn git_read_only_repo_allows_clone_denies_push() {
+    use izba_core::daemon::egress::audit::AuditSink;
+    use izba_core::daemon::egress::config::EgressPolicyConfig;
+    use izba_core::daemon::egress::mitm::{upstream_client_config_webpki, CertCache};
+    use izba_core::daemon::egress::mitm_runtime::MitmRuntime;
+    use izba_core::daemon::egress::EgressManager;
+
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("git-ro");
+    create_sandbox(&env, &mut tb, "git-ro", &ws);
+
+    // Write a per-sandbox policy: enforce=true, one git rule granting read-only
+    // access to octocat/Hello-World. No host_rules → all non-git HTTPS is
+    // denied; only git smart-HTTP to this repo is allowed (clone OK, push denied).
+    std::fs::write(
+        EgressPolicyConfig::path_in(&tb.paths.sandbox_dir("git-ro")),
+        "enforce: true\ngit:\n  - repo: github.com/octocat/Hello-World\n    access: read\n",
+    )
+    .expect("write policy.yaml");
+
+    // Build the MITM from the same persistent CA that sandbox::start bakes into
+    // the guest (both read tb.paths.ca_dir()), so the guest trusts the
+    // per-SNI leaf the MITM presents for github.com.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca = izba_core::ca::load_or_create(&tb.paths.ca_dir()).expect("izba CA");
+    let certs = std::sync::Arc::new(CertCache::new(ca));
+    let audit = AuditSink::new(tb.paths.clone());
+    let mitm = std::sync::Arc::new(
+        MitmRuntime::start(certs, upstream_client_config_webpki(), audit.clone())
+            .expect("start MITM runtime"),
+    );
+
+    let mgr = EgressManager::new(
+        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
+        Some(mitm),
+        audit,
+    );
+    mgr.ensure_listening(&tb.paths, "git-ro")
+        .expect("bind vsock_1027 listener");
+
+    if let Err(e) = start_sandbox(&env, &tb, "git-ro") {
+        mgr.stop(&tb.paths, "git-ro");
+        panic!(
+            "boot of 'git-ro' failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, "git-ro")
+        );
+    }
+
+    // Use busybox wget (always present in alpine) to exercise the git smart-HTTP
+    // discovery endpoints via HTTPS. The MITM terminates TLS, reads the Host +
+    // query string, and the Rego git rules decide:
+    //
+    //   clone leg: GET .../info/refs?service=git-upload-pack
+    //     → git_kind = "read", rule.access = "read" → ALLOW → MITM proxies to
+    //       github.com → 200 → wget exits 0
+    //   push leg:  GET .../info/refs?service=git-receive-pack
+    //     → git_kind = "write", rule.access = "read" (≠ "read-write") → DENY
+    //       → MITM returns synthetic 403 → wget exits non-zero
+    //
+    // We need no git binary — the smart-HTTP wire protocol is just HTTP GET with
+    // a query string, so wget covers both legs. The retry loop absorbs DNS + first
+    // egress settle time after boot.
+    // Use busybox wget (always present in alpine) to exercise the git smart-HTTP
+    // discovery endpoints via HTTPS. The MITM terminates TLS, reads the Host +
+    // query string, and the Rego git rules decide. busybox wget uses
+    // SSL_CERT_FILE=/etc/izba/ca-bundle.pem (set by izba-init's configure_env_defaults
+    // when the izba-trust virtiofs share is mounted) to trust the MITM's izba-CA-signed
+    // certificate. The retry loop absorbs DNS + first egress settle time after boot.
+    //
+    // We redirect stderr to stdout so the wget error output appears in `stdout`
+    // (captured by exec_collect) for diagnostics.
+    let script = "\
+        for i in 1 2 3 4 5; do \
+          rc=0; \
+          wget -qO /dev/null -T 15 \
+            'https://github.com/octocat/Hello-World/info/refs?service=git-upload-pack' \
+            2>/dev/null || rc=$?; \
+          if [ $rc -eq 0 ]; then break; fi; \
+          sleep 3; \
+        done; \
+        echo clone-discovery-rc=$rc; \
+        wget -qO /dev/null -T 15 \
+          'https://github.com/octocat/Hello-World/info/refs?service=git-receive-pack' \
+          2>/dev/null; echo push-discovery-rc=$?";
+    let (_status, stdout, stderr) = exec_collect(&tb.paths, "git-ro", &["sh", "-lc", script], None)
+        .unwrap_or_else(|(k, m)| panic!("exec rejected ({k:?}): {m}"));
+    eprintln!("guest output:\n{stdout}\n{stderr}");
+
+    // The MITM records synchronously, so by the time exec returns the records
+    // are on disk. Read with a short retry to absorb any filesystem lag.
+    let records = read_audit_with_retry(&tb.paths, "git-ro");
+    let l7_git = |verdict: &str, path_suffix: &str| {
+        records.iter().any(|r| {
+            r.tier == izba_core::daemon::egress::audit::Tier::L7
+                && r.host.as_deref() == Some("github.com")
+                && r.port == 443
+                && format!("{:?}", r.verdict).to_lowercase().contains(verdict)
+                && r.path.as_deref().is_some_and(|p| p.ends_with(path_suffix))
+        })
+    };
+
+    let dump = || {
+        let lines: Vec<String> = records.iter().map(|r| r.to_json()).collect();
+        format!(
+            "audit records:\n{}\nguest stdout:\n{stdout}\nguest stderr:\n{stderr}\nconsole tail:\n{}",
+            lines.join("\n"),
+            console_tail(&tb.paths, "git-ro")
+        )
+    };
+
+    // Clone discovery (upload-pack): Rego git read → ALLOW.
+    assert!(
+        l7_git("allow", "/info/refs"),
+        "expected an L7 ALLOW for github.com:443 git-upload-pack discovery \
+         (clone permitted under read access).\n{}",
+        dump()
+    );
+
+    // Push discovery (receive-pack): Rego git write denied for read-only rule.
+    assert!(
+        l7_git("deny", "/info/refs"),
+        "expected an L7 DENY for github.com:443 git-receive-pack discovery \
+         (push forbidden under read-only access).\n{}",
+        dump()
+    );
+
+    // Secondary: the push discovery wget must have gotten a non-200 (the MITM
+    // returns a 403). We extract it from stdout. It is informational; the audit
+    // assertion is the primary proof.
+    let push_rc = stdout
+        .lines()
+        .find(|l| l.starts_with("push-discovery-rc="))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(0);
+    assert_ne!(
+        push_rc, 0,
+        "git push discovery must return non-zero (got 0 — the MITM 403 may not have reached wget).\n{}",
+        dump()
+    );
+
+    stop_sandbox(&tb, "git-ro");
+    mgr.stop(&tb.paths, "git-ro");
+}
