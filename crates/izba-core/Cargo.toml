@@ -108,4 +108,10 @@ windows-sys = { version = "0.60", features = [
     # WHvCreatePartition/WHvDeletePartition for the confine_probe capability gate
     # (confinement must NOT break WHP). winhvplatform.dll, link-only.
     "Win32_System_Hypervisor",
+    # ShellExecuteExW + SHELLEXECUTEINFOW (requires Win32_System_Registry for the
+    # struct definition) — used by jail_account::helper::run_elevated.
+    "Win32_UI_Shell",
+    "Win32_System_Registry",
+    # SW_HIDE constant for ShellExecuteExW nShow field.
+    "Win32_UI_WindowsAndMessaging",
 ] }
