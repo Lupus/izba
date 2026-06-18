@@ -1413,6 +1413,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "izba-jail-helper"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "izba-proto"
 version = "0.1.0"
 dependencies = [
