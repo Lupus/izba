@@ -418,23 +418,6 @@ impl EgressPolicyConfig {
     }
 }
 
-/// Build an allow-list from the currently-allowed endpoints in `summaries`
-/// (latest verdict == Allow, **named host only** — a raw IP can't be
-/// allow-listed without defeating the SSRF / DNS-rebind guard). Ports are
-/// grouped per host via [`EgressPolicyConfig::allow`]. This is what the
-/// "Enable firewall (seed from traffic)" action writes.
-pub fn seed_from_summaries(summaries: &[EndpointSummary]) -> EgressPolicyConfig {
-    let mut cfg = EgressPolicyConfig::default();
-    for s in summaries {
-        if s.verdict != Verdict::Allow {
-            continue;
-        }
-        if let Some(host) = &s.host {
-            cfg.allow(host, s.port);
-        }
-    }
-    cfg
-}
 
 #[cfg(test)]
 mod tests {
@@ -691,43 +674,6 @@ mod tests {
         // Persisted + re-readable.
         let reloaded = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
         assert_eq!(reloaded, cfg);
-    }
-
-    #[test]
-    fn seed_from_summaries_keeps_only_allowed_named_endpoints() {
-        use crate::daemon::egress::audit::Tier;
-        let mut allowed = AuditRecord::allow(
-            "web",
-            "1.1.1.1".parse().unwrap(),
-            443,
-            Some("api.x.com"),
-            Tier::L7,
-            "ok",
-        );
-        allowed.ts_ms = 100;
-        let mut denied = AuditRecord::deny(
-            "web",
-            "2.2.2.2".parse().unwrap(),
-            22,
-            Some("evil.com"),
-            Tier::L3,
-            "no",
-        );
-        denied.ts_ms = 100;
-        let mut raw_ip =
-            AuditRecord::allow("web", "3.3.3.3".parse().unwrap(), 443, None, Tier::L3, "ok"); // raw IP: skip
-        raw_ip.ts_ms = 100;
-        let summaries = aggregate(vec![allowed, denied, raw_ip]);
-        let cfg = seed_from_summaries(&summaries);
-        assert_eq!(
-            cfg.allow,
-            vec![AllowEntry::Scoped {
-                host: "api.x.com".into(),
-                ports: Some(vec![443]),
-                access: Access::ReadWrite,
-            }],
-            "only the allowed, named endpoint is seeded (denied + raw-IP dropped)"
-        );
     }
 
     // ── NEW GRAMMAR TESTS (Task 1) ────────────────────────────────────────────

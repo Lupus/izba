@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use daemon::{DaemonApi, RealDaemon, ShellSession};
 use tauri::{Emitter, State};
-use views::{CreateOpts, DaemonStatusView, SandboxView, VersionView};
+use views::{CreateOpts, DaemonStatusView, SandboxView, SeedEntry, VersionView};
 
 /// A live interactive shell, wrapped so the `shells` map lock is only held for
 /// the lookup — the per-session lock is what guards (blocking) shell I/O.
@@ -174,8 +174,29 @@ async fn policy_set(
 }
 
 #[tauri::command]
-async fn policy_enable(state: State<'_, AppState>, name: String) -> Result<usize, String> {
-    run_action(&state, move |d| commands::policy_enable_core(d, &name)).await
+async fn policy_add_endpoints(
+    state: State<'_, AppState>,
+    name: String,
+    entries: Vec<SeedEntry>,
+    enforce: bool,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::policy_add_endpoints_core(d, &name, entries, enforce)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn policy_set_full(
+    state: State<'_, AppState>,
+    name: String,
+    allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
+    git: Vec<izba_core::daemon::egress::config::GitRule>,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::policy_set_full_core(d, &name, allow, git)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -339,7 +360,8 @@ pub fn run() {
             policy_allow,
             policy_block,
             policy_set,
-            policy_enable,
+            policy_add_endpoints,
+            policy_set_full,
             policy_git_allow,
             policy_git_block,
             policy_set_enforce,

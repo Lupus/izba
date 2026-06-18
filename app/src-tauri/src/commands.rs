@@ -1,9 +1,9 @@
 use crate::daemon::DaemonApi;
 use crate::views::{
-    app_build_info, CreateOpts, DaemonStatusView, PolicyView, SandboxView, VersionView,
+    app_build_info, CreateOpts, DaemonStatusView, PolicyView, SandboxView, SeedEntry, VersionView,
 };
 use izba_core::daemon::egress::audit::EndpointSummary;
-use izba_core::daemon::egress::config::AllowEntry;
+use izba_core::daemon::egress::config::{AllowEntry, GitRule};
 
 /// Core of the `list` command: maps daemon errors to a UI-friendly string.
 pub fn list_core(d: &mut dyn DaemonApi) -> Result<Vec<SandboxView>, String> {
@@ -120,9 +120,25 @@ pub fn policy_set_core(
     d.policy_set(name, allow).map_err(|e| e.to_string())
 }
 
-/// Core of `policy_enable`: seed the allow-list from traffic; returns host count.
-pub fn policy_enable_core(d: &mut dyn DaemonApi, name: &str) -> Result<usize, String> {
-    d.policy_enable_from_traffic(name)
+/// Core of `policy_add_endpoints`: additively merge entries (enforce only when flag set).
+pub fn policy_add_endpoints_core(
+    d: &mut dyn DaemonApi,
+    name: &str,
+    entries: Vec<SeedEntry>,
+    enforce: bool,
+) -> Result<(), String> {
+    d.policy_add_endpoints(name, entries, enforce)
+        .map_err(|e| e.to_string())
+}
+
+/// Core of `policy_set_full`: replace allow + git rule sets (enforce untouched).
+pub fn policy_set_full_core(
+    d: &mut dyn DaemonApi,
+    name: &str,
+    allow: Vec<AllowEntry>,
+    git: Vec<GitRule>,
+) -> Result<(), String> {
+    d.policy_set_full(name, allow, git)
         .map_err(|e| e.to_string())
 }
 
@@ -297,10 +313,10 @@ mod tests {
         let mut d = crate::fake::FakeDaemon::default();
         policy_allow_core(&mut d, "web", "api.x.com", 443).unwrap();
         policy_block_core(&mut d, "web", "api.x.com", 80).unwrap();
-        policy_enable_core(&mut d, "web").unwrap();
+        policy_add_endpoints_core(&mut d, "web", vec![], false).unwrap();
         assert!(d.calls.iter().any(|c| c == "allow:web:api.x.com:443"));
         assert!(d.calls.iter().any(|c| c == "block:web:api.x.com:80"));
-        assert!(d.calls.iter().any(|c| c == "enable:web"));
+        assert!(d.calls.iter().any(|c| c.starts_with("add_endpoints:web:")));
     }
 
     #[test]

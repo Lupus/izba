@@ -1,8 +1,24 @@
 use izba_core::build_info::BuildInfoOwned;
-use izba_core::daemon::egress::config::{AllowEntry, GitRule};
+use izba_core::daemon::egress::config::{Access, AllowEntry, GitRule};
 use izba_core::daemon::proto::DaemonCreate;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// A single endpoint entry used by the client-side "add from traffic" dialog.
+/// Serialized with `tag = "kind"` so the frontend distinguishes `http` vs `git`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SeedEntry {
+    Http {
+        host: String,
+        port: u16,
+        access: Access,
+    },
+    Git {
+        target: String,
+        access: Access,
+    },
+}
 
 /// A sandbox's egress policy as the UI sees it. `enforcing` is true iff a
 /// `policy.yaml` exists (an absent file = bare AllowAll sandbox; an empty
