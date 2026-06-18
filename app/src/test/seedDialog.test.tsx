@@ -60,4 +60,82 @@ describe("SeedDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: /Add .* selected/ }));
     await waitFor(() => expect(add).toHaveBeenCalledWith("web", expect.anything(), true));
   });
+
+  it("git delta exclusion: covered repo excluded, uncovered repo listed", async () => {
+    const add = api.policyAddEndpoints as Mock;
+    const rows = [
+      // Covered by policy.git — should be excluded from candidates
+      sum({
+        host: "github.com",
+        last_method: "POST",
+        last_path: "/o/a/git-upload-pack",
+      }),
+      // Not covered by policy.git — should appear in candidates
+      sum({
+        host: "github.com",
+        last_method: "POST",
+        last_path: "/o/b/git-upload-pack",
+      }),
+    ];
+    render(
+      <SeedDialog
+        name="web"
+        rows={rows}
+        enforcing={false}
+        policy={{ enforcing: false, allow: [], git: [{ repo: "github.com/o/a", access: "read" }] }}
+        onClose={() => {}}
+        onApplied={() => {}}
+      />
+    );
+    // Covered repo must not appear
+    expect(screen.queryByText(/github\.com\/o\/a/)).toBeNull();
+    // Uncovered repo must appear
+    expect(screen.getByText(/github\.com\/o\/b/)).toBeInTheDocument();
+    // Add the uncovered one
+    fireEvent.click(screen.getByRole("button", { name: /Add .* selected/ }));
+    await waitFor(() =>
+      expect(add).toHaveBeenCalledWith(
+        "web",
+        [{ kind: "git", target: "github.com/o/b", access: "read" }],
+        false
+      )
+    );
+  });
+
+  it("raw-IP row is rendered but disabled and excluded from policyAddEndpoints", async () => {
+    const add = api.policyAddEndpoints as Mock;
+    const rows = [
+      // Raw IP row: host === null
+      sum({ host: null, dest_ip: "10.0.0.1", port: 80, last_method: null, last_path: null }),
+      // Regular HTTP row that is selectable
+      sum({ host: "pypi.org", port: 443, last_method: "GET", last_path: "/" }),
+    ];
+    render(
+      <SeedDialog
+        name="web"
+        rows={rows}
+        enforcing={false}
+        policy={{ enforcing: false, allow: [], git: [] }}
+        onClose={() => {}}
+        onApplied={() => {}}
+      />
+    );
+    // Raw IP row must be visible (shows dest_ip:port)
+    expect(screen.getByText("10.0.0.1:80")).toBeInTheDocument();
+    // Its checkbox must be disabled
+    const checkboxes = screen.getAllByRole("checkbox");
+    // The checkbox for the raw-IP row is disabled
+    const rawIpCheckbox = checkboxes.find((cb) => (cb as HTMLInputElement).disabled && cb.closest("label")?.textContent?.includes("10.0.0.1"));
+    expect(rawIpCheckbox).toBeDefined();
+    expect(rawIpCheckbox).toBeDisabled();
+    // Clicking Add should only include pypi.org, not the raw IP
+    fireEvent.click(screen.getByRole("button", { name: /Add .* selected/ }));
+    await waitFor(() =>
+      expect(add).toHaveBeenCalledWith(
+        "web",
+        [{ kind: "http", host: "pypi.org", port: 443, access: "read" }],
+        false
+      )
+    );
+  });
 });

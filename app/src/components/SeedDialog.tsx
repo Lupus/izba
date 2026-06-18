@@ -56,22 +56,26 @@ function buildCandidates(rows: EndpointSummary[], policy: PolicyView): Candidate
       // Git row: covered if git_access_for returns non-null
       if (git_access_for(gitRepo, policy.git) !== null) continue;
       const defaultAccess: Access = gitOp === "push" ? "read-write" : "read";
+      const countLabel =
+        row.deny_count > 0 ? `${row.allow_count}✓ ${row.deny_count}✕` : `${row.allow_count}✓`;
       candidates.push({
         key: `git:${gitRepo}`,
         kind: "git",
         label: `git ${gitOp} → ${gitRepo}`,
-        countLabel: `${row.allow_count}✓`,
+        countLabel,
         defaultAccess,
         gitTarget: gitRepo,
         disabled: false,
       });
     } else if (row.host === null) {
       // Raw IP: listed but disabled
+      const countLabel =
+        row.deny_count > 0 ? `${row.allow_count}✓ ${row.deny_count}✕` : `${row.allow_count}✓`;
       candidates.push({
         key: `raw-ip:${row.dest_ip}:${row.port}`,
         kind: "raw-ip",
         label: `${row.dest_ip}:${row.port}`,
-        countLabel: `${row.allow_count}✓`,
+        countLabel,
         defaultAccess: "read",
         disabled: true,
       });
@@ -83,11 +87,13 @@ function buildCandidates(rows: EndpointSummary[], policy: PolicyView): Candidate
         row.last_method === "GET" || row.last_method === "HEAD" || row.last_method === null
           ? "read"
           : "read-write";
+      const countLabel =
+        row.deny_count > 0 ? `${row.allow_count}✓ ${row.deny_count}✕` : `${row.allow_count}✓`;
       candidates.push({
         key: `http:${key}`,
         kind: "http",
         label: `${row.host}:${row.port}`,
-        countLabel: `${row.allow_count}✓`,
+        countLabel,
         defaultAccess,
         host: row.host,
         port: row.port,
@@ -219,10 +225,11 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
           </div>
         ) : (
           <div className="mb-4">
-            <label className="flex items-center gap-2 text-sm text-ink-3 cursor-pointer">
+            <label className="flex items-center gap-2 text-sm text-ink-3 cursor-not-allowed">
               <input
                 type="checkbox"
                 checked={enforceAfter}
+                disabled
                 onChange={(e) => setEnforceAfter(e.target.checked)}
                 aria-label="Enforce firewall after adding"
               />
@@ -245,7 +252,7 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
             onClick={() => void handleAdd()}
             className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white disabled:opacity-50"
           >
-            Add {selectedCount} selected to allow-list
+            {selectedCount > 0 ? `Add ${selectedCount} selected to allow-list` : "Add selected to allow-list"}
           </button>
         </div>
       </div>
