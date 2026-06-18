@@ -23,19 +23,40 @@ use super::policy::{RegoPolicy, Verdict};
 /// On-disk policy file name under the sandbox directory.
 pub const POLICY_FILE: &str = "policy.yaml";
 
+/// Read vs full access — the verb shared by HTTP hosts and git repos.
+/// HTTP: read = GET/HEAD only; read-write = all methods.
+/// Git:  read = clone/fetch; read-write = + push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Access {
+    Read,
+    #[default]
+    ReadWrite,
+}
+
+fn is_default_access(a: &Access) -> bool {
+    *a == Access::ReadWrite
+}
+
 /// One entry in a sandbox's egress allow-list: either a bare host (which
-/// authorizes the default web ports) or a host scoped to an explicit port set.
+/// authorizes the default web ports) or a host scoped to explicit ports/access.
 ///
 /// `#[serde(untagged)]` keeps every existing `allow: [<string>...]` file parsing
-/// unchanged — a YAML string deserializes to `Host`, a `{host, ports}` map to
+/// unchanged — a YAML string deserializes to `Host`, a `{host, ...}` map to
 /// `Scoped`. Variant order matters: `Host` is tried first.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum AllowEntry {
-    /// Bare host → implicit web ports [80, 443].
+    /// Bare host → web ports [80, 443], access read-write.
     Host(String),
-    /// Host scoped to an explicit port set (REPLACES the default web ports).
-    Scoped { host: String, ports: Vec<u16> },
+    /// Host with optional explicit ports (default web) and optional access (default read-write).
+    Scoped {
+        host: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ports: Option<Vec<u16>>,
+        #[serde(default, skip_serializing_if = "is_default_access")]
+        access: Access,
+    },
 }
 
 impl AllowEntry {
@@ -50,35 +71,156 @@ impl AllowEntry {
         }
     }
 
-    /// The ports this entry authorizes: `[80, 443]` for a bare host, else the
-    /// explicit set (which REPLACES — not extends — the default).
+    /// The ports this entry authorizes: `[80, 443]` for a bare host or when
+    /// ports are omitted, else the explicit set (which REPLACES the default).
     pub fn ports(&self) -> Vec<u16> {
         match self {
             AllowEntry::Host(_) => AllowEntry::DEFAULT_PORTS.to_vec(),
-            AllowEntry::Scoped { ports, .. } => ports.clone(),
+            AllowEntry::Scoped { ports, .. } => ports
+                .clone()
+                .unwrap_or_else(|| AllowEntry::DEFAULT_PORTS.to_vec()),
+        }
+    }
+
+    /// The access verb for this entry.
+    pub fn access(&self) -> Access {
+        match self {
+            AllowEntry::Host(_) => Access::ReadWrite,
+            AllowEntry::Scoped { access, .. } => *access,
         }
     }
 }
 
-/// A sandbox's egress allow-list, parsed from its `--policy` YAML.
+/// One git rule: a repo/owner glob or a whole-host scope, with an access verb.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GitRule {
+    #[serde(flatten)]
+    pub target: GitTarget,
+    #[serde(default, skip_serializing_if = "is_default_access")]
+    pub access: Access,
+}
+
+/// `repo:` (host/owner/repo glob) or `host:` (any repo on the host).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitTarget {
+    Repo(String),
+    Host(String),
+}
+
+impl GitTarget {
+    #[allow(dead_code)] // used by Task 2 (to_rego_data_json extension)
+    fn key(&self) -> (&'static str, &str) {
+        match self {
+            GitTarget::Repo(s) => ("repo", s),
+            GitTarget::Host(s) => ("host", s),
+        }
+    }
+}
+
+/// A sandbox's egress policy, parsed from its `--policy` YAML.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EgressPolicyConfig {
-    /// Destinations this sandbox may reach (HTTP host for tier-1, DNS-snoop
-    /// FQDN for tier-2). A bare host means web ports (80/443) only; a
-    /// `{host, ports}` entry names the exact ports allowed for that host.
-    #[serde(default)]
+    /// Explicit posture. Always written by izba (smell: empty-vs-missing). A
+    /// present file with no `enforce:` key resolves to `true` (see `from_yaml`).
+    pub enforce: bool,
+    /// HTTP host allow-list (tier-1 MITM + tier-2 DNS-snoop).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<AllowEntry>,
+    /// Git-specific rules (target + access verb).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git: Vec<GitRule>,
+}
+
+/// Parse helper: `enforce` is `Option` so we can tell "key absent" (→ true,
+/// authoring intent) from an explicit value.
+#[derive(Deserialize)]
+struct RawConfig {
+    enforce: Option<bool>,
+    #[serde(default)]
+    allow: Vec<AllowEntry>,
+    #[serde(default)]
+    git: Vec<GitRule>,
 }
 
 impl EgressPolicyConfig {
     /// Parse the YAML policy file. An empty/comment-only file is a valid
-    /// (empty) allow-list — a declared-but-deny-all sandbox.
+    /// deny-all — a declared-but-allow-nothing sandbox. A present file without
+    /// an explicit `enforce:` key defaults to `enforce: true` (authoring intent).
     pub fn from_yaml(s: &str) -> Result<Self> {
         // serde_yaml maps an all-comments/empty document to `null`; treat that
-        // as the default (empty allow-list) rather than an error.
-        let cfg: Option<EgressPolicyConfig> =
+        // as present-but-empty (enforce=true, no rules).
+        let raw: Option<RawConfig> =
             serde_yaml::from_str(s).context("parsing egress policy YAML")?;
-        Ok(cfg.unwrap_or_default())
+        let raw = raw.unwrap_or(RawConfig {
+            enforce: None,
+            allow: vec![],
+            git: vec![],
+        });
+        Ok(Self {
+            // Present file without `enforce:` → enforce (authoring = intent).
+            enforce: raw.enforce.unwrap_or(true),
+            allow: raw.allow,
+            git: raw.git,
+        })
+    }
+
+    /// Toggle enforcement. Returns `true` if the value changed.
+    pub fn set_enforce(&mut self, on: bool) -> bool {
+        if self.enforce == on {
+            false
+        } else {
+            self.enforce = on;
+            true
+        }
+    }
+
+    /// Set the access verb for `host` (adding the entry if absent). Returns
+    /// `true` if the config changed.
+    pub fn set_host_access(&mut self, host: &str, access: Access) -> bool {
+        if let Some(e) = self.allow.iter_mut().find(|e| e.host() == host) {
+            if e.access() == access {
+                return false;
+            }
+            let ports = match e.ports() {
+                p if p == AllowEntry::DEFAULT_PORTS.to_vec() => None,
+                p => Some(p),
+            };
+            *e = AllowEntry::Scoped {
+                host: host.to_string(),
+                ports,
+                access,
+            };
+            true
+        } else {
+            self.allow.push(AllowEntry::Scoped {
+                host: host.to_string(),
+                ports: None,
+                access,
+            });
+            true
+        }
+    }
+
+    /// Upsert a git rule. Returns `true` if added or if the access verb changed.
+    pub fn git_allow(&mut self, target: GitTarget, access: Access) -> bool {
+        if let Some(r) = self.git.iter_mut().find(|r| r.target == target) {
+            if r.access == access {
+                return false;
+            }
+            r.access = access;
+            true
+        } else {
+            self.git.push(GitRule { target, access });
+            true
+        }
+    }
+
+    /// Remove any git rule matching `target`. Returns `true` if one was removed.
+    pub fn git_block(&mut self, target: &GitTarget) -> bool {
+        let before = self.git.len();
+        self.git.retain(|r| &r.target != target);
+        self.git.len() != before
     }
 
     /// The regorus data document for `sandbox`: the allow-list becomes this
@@ -134,13 +276,15 @@ impl EgressPolicyConfig {
             ports.sort_unstable();
             *entry = AllowEntry::Scoped {
                 host: host.to_string(),
-                ports,
+                ports: Some(ports),
+                access: Access::ReadWrite,
             };
             true
         } else {
             self.allow.push(AllowEntry::Scoped {
                 host: host.to_string(),
-                ports: vec![port],
+                ports: Some(vec![port]),
+                access: Access::ReadWrite,
             });
             true
         }
@@ -163,7 +307,8 @@ impl EgressPolicyConfig {
         } else {
             self.allow[idx] = AllowEntry::Scoped {
                 host: host.to_string(),
-                ports,
+                ports: Some(ports),
+                access: Access::ReadWrite,
             };
         }
         true
@@ -233,7 +378,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "db.internal".into(),
-                ports: vec![5432],
+                ports: Some(vec![5432]),
+                access: Access::ReadWrite,
             }]
         );
         assert_eq!(cfg.allow[0].ports(), vec![5432]);
@@ -250,7 +396,8 @@ mod tests {
             cfg.allow[1],
             AllowEntry::Scoped {
                 host: "registry.internal".into(),
-                ports: vec![443, 5000]
+                ports: Some(vec![443, 5000]),
+                access: Access::ReadWrite,
             }
         );
     }
@@ -261,7 +408,8 @@ mod tests {
             AllowEntry::Host("api.anthropic.com".into()),
             AllowEntry::Scoped {
                 host: "db.internal".into(),
-                ports: vec![5432],
+                ports: Some(vec![5432]),
+                access: Access::ReadWrite,
             },
         ];
         let yaml = serde_yaml::to_string(&entries).unwrap();
@@ -284,7 +432,9 @@ mod tests {
     #[test]
     fn data_doc_scopes_ports_to_the_sandbox() {
         let cfg = EgressPolicyConfig {
+            enforce: true,
             allow: vec![AllowEntry::Host("api.anthropic.com".into())],
+            git: vec![],
         };
         let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
         // global stays empty for a declared --policy.
@@ -299,13 +449,16 @@ mod tests {
     #[test]
     fn compiled_policy_enforces_ports_and_isolation() {
         let cfg = EgressPolicyConfig {
+            enforce: true,
             allow: vec![
                 AllowEntry::Host("api.anthropic.com".into()),
                 AllowEntry::Scoped {
                     host: "db.internal".into(),
-                    ports: vec![5432],
+                    ports: Some(vec![5432]),
+                    access: Access::ReadWrite,
                 },
             ],
+            git: vec![],
         };
         let policy = cfg.into_policy("web").unwrap();
         assert!(policy.enforces(), "a declared policy is a firewall");
@@ -358,7 +511,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: vec![443]
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
             }]
         );
         // Idempotent: allowing an already-authorized port is a no-op.
@@ -368,14 +522,17 @@ mod tests {
     #[test]
     fn allow_extends_existing_host_ports_sorted() {
         let mut cfg = EgressPolicyConfig {
+            enforce: true,
             allow: vec![AllowEntry::Host("api.x.com".into())], // {80,443}
+            git: vec![],
         };
         assert!(cfg.allow("api.x.com", 8080));
         assert_eq!(
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: vec![80, 443, 8080]
+                ports: Some(vec![80, 443, 8080]),
+                access: Access::ReadWrite,
             }]
         );
     }
@@ -383,14 +540,17 @@ mod tests {
     #[test]
     fn block_removes_port_then_host_when_last() {
         let mut cfg = EgressPolicyConfig {
+            enforce: true,
             allow: vec![AllowEntry::Host("api.x.com".into())], // {80,443}
+            git: vec![],
         };
         assert!(cfg.block("api.x.com", 443));
         assert_eq!(
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: vec![80]
+                ports: Some(vec![80]),
+                access: Access::ReadWrite,
             }]
         );
         assert!(
@@ -407,13 +567,16 @@ mod tests {
     #[test]
     fn to_yaml_round_trips_through_from_yaml() {
         let cfg = EgressPolicyConfig {
+            enforce: true,
             allow: vec![
                 AllowEntry::Host("api.x.com".into()),
                 AllowEntry::Scoped {
                     host: "db.internal".into(),
-                    ports: vec![5432],
+                    ports: Some(vec![5432]),
+                    access: Access::ReadWrite,
                 },
             ],
+            git: vec![],
         };
         let back = EgressPolicyConfig::from_yaml(&cfg.to_yaml()).unwrap();
         assert_eq!(back, cfg);
@@ -474,9 +637,110 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: vec![443]
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
             }],
             "only the allowed, named endpoint is seeded (denied + raw-IP dropped)"
         );
+    }
+
+    // ── NEW GRAMMAR TESTS (Task 1) ────────────────────────────────────────────
+
+    #[test]
+    fn parses_host_access_read() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: pypi.org\n    access: read\n",
+        )
+        .unwrap();
+        assert!(cfg.enforce);
+        assert_eq!(cfg.allow[0].host(), "pypi.org");
+        assert_eq!(cfg.allow[0].ports(), vec![80, 443]); // ports omitted -> web defaults
+        assert_eq!(cfg.allow[0].access(), Access::Read);
+    }
+
+    #[test]
+    fn bare_string_host_is_read_write() {
+        let cfg = EgressPolicyConfig::from_yaml("allow:\n  - api.anthropic.com\n").unwrap();
+        assert_eq!(cfg.allow[0].access(), Access::ReadWrite);
+    }
+
+    #[test]
+    fn parses_git_block_repo_and_host() {
+        let yaml = "git:\n  - repo: github.com/myorg/app\n    access: read-write\n  - host: bitbucket.org\n    access: read\n";
+        let cfg = EgressPolicyConfig::from_yaml(yaml).unwrap();
+        assert_eq!(
+            cfg.git[0],
+            GitRule {
+                target: GitTarget::Repo("github.com/myorg/app".into()),
+                access: Access::ReadWrite
+            }
+        );
+        assert_eq!(
+            cfg.git[1],
+            GitRule {
+                target: GitTarget::Host("bitbucket.org".into()),
+                access: Access::Read
+            }
+        );
+    }
+
+    #[test]
+    fn present_file_without_enforce_defaults_true() {
+        // Authoring a policy signals intent to enforce.
+        let cfg = EgressPolicyConfig::from_yaml("allow:\n  - api.x.com\n").unwrap();
+        assert!(cfg.enforce);
+    }
+
+    #[test]
+    fn empty_document_is_enforcing_deny_all() {
+        // Empty/comment-only present file = declared deny-all (today's behavior).
+        let cfg = EgressPolicyConfig::from_yaml("").unwrap();
+        assert!(cfg.enforce);
+        assert!(cfg.allow.is_empty() && cfg.git.is_empty());
+    }
+
+    #[test]
+    fn git_helpers_upsert_and_remove() {
+        let mut cfg = EgressPolicyConfig::default();
+        assert!(cfg.git_allow(GitTarget::Repo("github.com/o/a".into()), Access::Read));
+        assert!(!cfg.git_allow(GitTarget::Repo("github.com/o/a".into()), Access::Read)); // idempotent
+        assert!(cfg.git_allow(GitTarget::Repo("github.com/o/a".into()), Access::ReadWrite)); // access change
+        assert_eq!(cfg.git[0].access, Access::ReadWrite);
+        assert!(cfg.git_block(&GitTarget::Repo("github.com/o/a".into())));
+        assert!(cfg.git.is_empty());
+    }
+
+    #[test]
+    fn set_enforce_and_host_access_report_change() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: false,
+            allow: vec![AllowEntry::Host("pypi.org".into())],
+            git: vec![],
+        };
+        assert!(cfg.set_enforce(true));
+        assert!(!cfg.set_enforce(true));
+        assert!(cfg.set_host_access("pypi.org", Access::Read));
+        assert_eq!(cfg.allow[0].access(), Access::Read);
+    }
+
+    #[test]
+    fn new_grammar_round_trips() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Host("api.anthropic.com".into()),
+                AllowEntry::Scoped {
+                    host: "pypi.org".into(),
+                    ports: None,
+                    access: Access::Read,
+                },
+            ],
+            git: vec![GitRule {
+                target: GitTarget::Repo("github.com/o/a".into()),
+                access: Access::ReadWrite,
+            }],
+        };
+        let back = EgressPolicyConfig::from_yaml(&cfg.to_yaml()).unwrap();
+        assert_eq!(back, cfg);
     }
 }
