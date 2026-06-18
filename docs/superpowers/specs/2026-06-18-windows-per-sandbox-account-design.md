@@ -201,8 +201,11 @@ current user** (`CryptProtectData`, `CRYPTPROTECT_LOCAL_MACHINE` *not* set — u
 scope), stored as `lockdown.cred` in the sandbox dir. Rationale: the user is
 already the trust root; a user-scoped DPAPI blob is readable only by that user, and
 persisting it lets izbad relaunch the VM across izbad restarts without re-elevation.
-The helper returns the freshly-generated password to izbad over a one-shot file the
-helper ACLs to the user and izbad deletes after sealing.
+The helper writes the freshly-generated password to a one-shot file in the
+per-sandbox directory. That file inherits the sandbox dir's DACL (the invoking
+user + Administrators), so only they can read it. izbad reads, DPAPI-seals, and
+deletes the file immediately; the plaintext exposure window is brief and within
+the same trust root (the user can already unseal their own DPAPI blob).
 
 ### 5.5 Firewall
 

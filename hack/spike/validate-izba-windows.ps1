@@ -394,6 +394,21 @@ if (-not $lkAcctExists) {
     [Console]::Error.WriteLine("  Get-LocalUser $lkAcct returned nothing")
 }
 
+# Step 6b: structural read-confinement assertion.
+# Assert the account is NOT granted on a path outside its sandbox grants
+# (negative control), and IS granted on its own sandbox dir (positive control).
+# This does not require running code as the account -- icacls output suffices.
+$lkOutsideFile = Join-Path $env:TEMP 'izba-lk-outside.txt'
+Set-Content $lkOutsideFile 'x' -NoNewline
+$lkSbDir = "$env:LOCALAPPDATA\izba\sandboxes\$lkName"
+$lkIcaclsOutside = (icacls $lkOutsideFile 2>$null) -join "`n"
+$lkIcaclsSbDir   = (icacls $lkSbDir   2>$null) -join "`n"
+Check 'lock-down account is NOT granted an out-of-grant path (read-confined)' `
+    (-not ($lkIcaclsOutside -match [regex]::Escape($lkAcct)))
+Check 'lock-down account IS granted its own sandbox dir' `
+    ($lkIcaclsSbDir -match [regex]::Escape($lkAcct))
+if (Test-Path $lkOutsideFile) { Remove-Item $lkOutsideFile -Force -ErrorAction SilentlyContinue }
+
 # Step 7: izba unlock -- should remove account + firewall rules.
 & $exe stop $lkName 2>$null | Out-Null
 $lkUnlockJob = Start-Job -ScriptBlock {

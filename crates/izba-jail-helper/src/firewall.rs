@@ -94,10 +94,10 @@ pub fn unblock_ps_command(rule: &str) -> String {
 /// `Err`.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn run_ps(cmd: &str) -> Result<(), String> {
-    let output = std::process::Command::new("powershell")
+    let output = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", cmd])
         .output()
-        .map_err(|e| format!("powershell spawn failed: {e}"))?;
+        .map_err(|e| format!("powershell.exe spawn failed: {e}"))?;
 
     if output.status.success() {
         return Ok(());
@@ -124,6 +124,19 @@ fn run_ps(cmd: &str) -> Result<(), String> {
 /// On non-Windows returns `Err("windows-only")` without spawning any process.
 #[cfg(windows)]
 pub fn block(rule: &str, sid: &str) -> Result<(), String> {
+    // Injection invariant: rule names are [a-z0-9-] (produced by rule_name()
+    // in izba-jail-naming); the SID is the Windows S-1-5-... form.  Both are
+    // sanitized by callers before reaching here.  These asserts catch
+    // regressions in callers during development.
+    debug_assert!(
+        rule.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "block: rule name must be [a-zA-Z0-9-], got {rule:?}"
+    );
+    debug_assert!(
+        sid.bytes()
+            .all(|b| b.is_ascii_digit() || b == b'S' || b == b'-'),
+        "block: SID must be S-<digits>-... form, got {sid:?}"
+    );
     run_ps(&block_ps_command(rule, sid))
 }
 

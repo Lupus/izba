@@ -62,8 +62,8 @@ impl LockdownState {
 /// `Degraded` is a transient runtime state and is never persisted.
 ///
 /// The `#[serde(default)]` on `state` ensures that a `lockdown.json` written
-/// by a future version with additional fields still deserializes correctly on
-/// older builds.
+/// by an older build without this field still deserializes (the field defaults
+/// to `None`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LockdownFile {
     #[serde(default)]
