@@ -108,7 +108,7 @@ fn entropy() -> u64 {
 #[cfg(windows)]
 mod win {
     use super::random_password;
-    use windows_sys::Win32::Foundation::{LocalFree, ERROR_INSUFFICIENT_BUFFER};
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::NetworkManagement::NetManagement::{
         NERR_Success, NERR_UserNotFound, NetLocalGroupAddMembers, NetUserAdd, NetUserDel,
         LOCALGROUP_MEMBERS_INFO_0, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_ACCOUNT_FLAGS,
@@ -273,6 +273,10 @@ mod win {
             }
 
             // Read the NUL-terminated UTF-16 string, then free the LocalAlloc.
+            debug_assert!(
+                !str_sid_ptr.is_null(),
+                "ConvertSidToStringSidW returned non-zero but left the pointer null"
+            );
             let len = (0..).take_while(|&i| *str_sid_ptr.add(i) != 0).count();
             let slice = std::slice::from_raw_parts(str_sid_ptr, len);
             let result = String::from_utf16(slice)
@@ -294,20 +298,21 @@ mod win {
         unsafe {
             // 1. Build the well-known Users SID (S-1-5-32-545).
             let mut users_sid_size: u32 = 0;
-            // Size query.
+            // Size query: expected to return FALSE and set users_sid_size to the
+            // required buffer length with last-error = ERROR_INSUFFICIENT_BUFFER.
             CreateWellKnownSid(
                 WinBuiltinUsersSid,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 &mut users_sid_size,
             );
+            // The size query must yield a non-zero size; anything else (including
+            // an unexpected last-error) means we cannot allocate a valid buffer.
             if users_sid_size == 0 {
-                let e = std::io::Error::last_os_error();
-                // ERROR_INSUFFICIENT_BUFFER is the expected error from the size query;
-                // any other error is unexpected.
-                if e.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-                    return Err(format!("CreateWellKnownSid size query: {e}"));
-                }
+                return Err(format!(
+                    "CreateWellKnownSid size query returned zero size: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
             let mut users_sid_buf = vec![0u8; users_sid_size as usize];
             let ok = CreateWellKnownSid(
@@ -344,7 +349,9 @@ mod win {
                 ));
             }
             let mut group_name_buf = vec![0u16; name_size as usize];
-            let mut domain_buf = vec![0u16; domain_size as usize];
+            // domain_size from the size query could theoretically be 0 on unusual
+            // configurations; allocate at least 1 element to avoid a dangling pointer.
+            let mut domain_buf = vec![0u16; (domain_size as usize).max(1)];
             let ok = LookupAccountSidW(
                 std::ptr::null(),
                 users_sid_buf.as_ptr() as PSID,
@@ -383,7 +390,9 @@ mod win {
                 ));
             }
             let mut acct_sid_buf = vec![0u8; acct_sid_size as usize];
-            let mut acct_domain_buf = vec![0u16; acct_domain_size as usize];
+            // acct_domain_size from the size query could theoretically be 0; guard
+            // against a dangling pointer on the real call.
+            let mut acct_domain_buf = vec![0u16; (acct_domain_size as usize).max(1)];
             let ok = LookupAccountNameW(
                 std::ptr::null(),
                 acct_name_w.as_ptr(),
@@ -582,7 +591,6 @@ mod tests {
     #[test]
     fn account_create_lookup_delete_roundtrip() {
         use super::{create_account, delete_account};
-        use windows_sys::Win32::NetworkManagement::NetManagement::NERR_Success;
         use windows_sys::Win32::NetworkManagement::NetManagement::NetUserAdd;
 
         // Elevation probe: try to call NetUserAdd with a deliberately-invalid
