@@ -6,7 +6,7 @@
 
 use super::spec::{reject_commas, CommandSpec, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
-use crate::procmgr::{kill_pid, pid_alive, spawn_detached};
+use crate::procmgr::{kill_pid, pid_alive, spawn_detached_with_limits, ConfinementStatus};
 use crate::state::PidIdentity;
 use crate::vsock::hybrid_connect;
 use anyhow::{bail, Context};
@@ -42,7 +42,11 @@ impl VmmTools {
     }
 }
 
-pub fn build_invocations(spec: &VmSpec, tools: &VmmTools, plan: &crate::procmgr::jail_linux::ConfinementPlan) -> anyhow::Result<Invocations> {
+pub fn build_invocations(
+    spec: &VmSpec,
+    tools: &VmmTools,
+    plan: &crate::procmgr::jail_linux::ConfinementPlan,
+) -> anyhow::Result<Invocations> {
     // A comma in a disk or workspace path would silently split into bogus
     // extra CH device options (`--disk path=<p>,readonly=on` / `--fs
     // tag=...,socket=<p>`). Reject before formatting anything (mirrors the
@@ -154,10 +158,10 @@ impl VmmDriver for CloudHypervisorDriver {
             .with_context(|| format!("creating {}", log_dir.display()))?;
 
         let tools = VmmTools::resolve()?;
-        // TODO(task-6): replace with a probed plan wired through ChHandle.
         let caps = crate::procmgr::jail_linux::Capabilities::probe();
-        let plan = crate::procmgr::jail_linux::plan(&caps, spec.allow_unconfined, spec.mem_mb.into())
-            .context("computing VMM confinement plan")?;
+        let plan =
+            crate::procmgr::jail_linux::plan(&caps, spec.allow_unconfined, spec.mem_mb.into())
+                .context("computing VMM confinement plan")?;
         let inv = build_invocations(spec, &tools, &plan)?;
 
         // A previous crashed run may have left sockets/pid files behind; the
@@ -198,7 +202,7 @@ impl VmmDriver for CloudHypervisorDriver {
         for (share, cmd) in spec.shares.iter().zip(&inv.virtiofsd) {
             let role = format!("virtiofsd:{}", share.tag);
             let log = log_dir.join(format!("virtiofsd-{}.log", share.tag));
-            let id = match spawn_detached(cmd, &log) {
+            let id = match spawn_detached_with_limits(cmd, &log, &plan.rlimits) {
                 Ok(id) => id,
                 Err(e) => {
                     kill_all(&sidecars);
@@ -226,19 +230,21 @@ impl VmmDriver for CloudHypervisorDriver {
 
         // The guest serial console goes to spec.console_log (--serial file=);
         // the CH process's own stdout/stderr go to a sibling vmm.log.
-        let vmm_id = match spawn_detached(&inv.vmm, &log_dir.join("vmm.log")) {
-            Ok(id) => id,
-            Err(e) => {
-                kill_all(&sidecars);
-                return Err(e).context("spawning cloud-hypervisor");
-            }
-        };
+        let vmm_id =
+            match spawn_detached_with_limits(&inv.vmm, &log_dir.join("vmm.log"), &plan.rlimits) {
+                Ok(id) => id,
+                Err(e) => {
+                    kill_all(&sidecars);
+                    return Err(e).context("spawning cloud-hypervisor");
+                }
+            };
 
         let mut pids = vec![("vmm".to_string(), vmm_id)];
         pids.extend(sidecars);
         Ok(Box::new(ChHandle {
             vsock_sock: spec.run_dir.join("vsock.sock"),
             pids,
+            confinement: plan.status,
         }))
     }
 }
@@ -247,6 +253,7 @@ impl VmmDriver for CloudHypervisorDriver {
 struct ChHandle {
     vsock_sock: PathBuf,
     pids: Vec<(String, PidIdentity)>,
+    confinement: ConfinementStatus,
 }
 
 impl ChHandle {
@@ -270,12 +277,7 @@ impl VmHandle for ChHandle {
     }
 
     fn confinement(&self) -> crate::procmgr::ConfinementStatus {
-        // The Linux host-side VMM jailer is a separate milestone, not a runtime
-        // failure: report it honestly as not-yet-implemented rather than
-        // claiming confinement that was never applied.
-        crate::procmgr::ConfinementStatus::degraded(
-            "linux host-side VMM jailer not yet implemented",
-        )
+        self.confinement.clone()
     }
 
     fn kill(&mut self) -> anyhow::Result<()> {
@@ -312,7 +314,9 @@ mod tests {
     }
 
     fn i_window(argv: &[String], flag: &str) -> Option<String> {
-        argv.iter().position(|a| a == flag).and_then(|i| argv.get(i + 1).cloned())
+        argv.iter()
+            .position(|a| a == flag)
+            .and_then(|i| argv.get(i + 1).cloned())
     }
 
     #[test]
@@ -321,7 +325,10 @@ mod tests {
         let inv = build_invocations(&spec, &base_tools(), &restricted_plan()).unwrap();
         // virtiofsd sandbox is namespace, never "none".
         let vfsd = &inv.virtiofsd[0].argv;
-        let i = vfsd.iter().position(|a| a == "--sandbox").expect("--sandbox present");
+        let i = vfsd
+            .iter()
+            .position(|a| a == "--sandbox")
+            .expect("--sandbox present");
         assert_eq!(vfsd[i + 1], "namespace");
         assert!(!vfsd.contains(&"none".to_string()));
         // CH gets explicit seccomp + landlock.
@@ -543,5 +550,24 @@ mod tests {
     fn comma_free_spec_accepted() {
         // Positive control: comma-free paths still build a valid invocation.
         assert!(build_invocations(&base_spec(), &base_tools(), &restricted_plan()).is_ok());
+    }
+
+    #[test]
+    fn ch_handle_reports_recorded_confinement() {
+        let h = ChHandle {
+            vsock_sock: std::path::PathBuf::from("/nonexistent/vsock.sock"),
+            pids: vec![(
+                "vmm".to_string(),
+                crate::procmgr::current_identity().unwrap(),
+            )],
+            confinement: crate::procmgr::ConfinementStatus::confined(
+                "seccomp+landlock+virtiofs:namespace",
+            ),
+        };
+        assert_eq!(
+            h.confinement().mode,
+            crate::procmgr::ConfinementMode::Restricted
+        );
+        assert!(h.confinement().reason.contains("landlock"));
     }
 }
