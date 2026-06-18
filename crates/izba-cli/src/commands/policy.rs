@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::Subcommand;
 use izba_core::daemon::egress::config::{
-    edit_policy_file, seed_from_summaries, EgressPolicyConfig,
+    edit_policy_file, seed_from_summaries, Access, EgressPolicyConfig, GitTarget,
 };
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
@@ -18,6 +18,30 @@ pub enum PolicyCmd {
     Enable { name: String },
     /// Re-read a sandbox's policy.yaml and apply it to new connections (no restart)
     Reload { name: String },
+    /// Fine-grained git controls (clone/fetch/push per repo)
+    #[command(subcommand)]
+    Git(GitSub),
+    /// Turn this sandbox's firewall on or off
+    Enforce { name: String, state: EnforceState },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GitSub {
+    /// Allow git on REPO (host/owner/repo, globs ok) or a whole HOST; read unless --write
+    Allow {
+        name: String,
+        target: String,
+        #[arg(long)]
+        write: bool,
+    },
+    /// Remove a git rule for REPO/HOST
+    Block { name: String, target: String },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum EnforceState {
+    On,
+    Off,
 }
 
 /// Which mutation an edit verb performs.
@@ -44,6 +68,49 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
         }
         PolicyCmd::Enable { name } => enable(paths, name),
         PolicyCmd::Reload { name } => reload(paths, name),
+        PolicyCmd::Git(GitSub::Allow {
+            name,
+            target,
+            write,
+        }) => {
+            let access = if *write {
+                Access::ReadWrite
+            } else {
+                Access::Read
+            };
+            let gt = parse_git_target(target);
+            edit_policy_file(&paths.sandbox_dir(name), |c| {
+                c.git_allow(gt.clone(), access);
+            })?;
+            maybe_reload(paths, name);
+            Ok(0)
+        }
+        PolicyCmd::Git(GitSub::Block { name, target }) => {
+            let gt = parse_git_target(target);
+            edit_policy_file(&paths.sandbox_dir(name), |c| {
+                c.git_block(&gt);
+            })?;
+            maybe_reload(paths, name);
+            Ok(0)
+        }
+        PolicyCmd::Enforce { name, state } => {
+            let on = matches!(state, EnforceState::On);
+            edit_policy_file(&paths.sandbox_dir(name), |c| {
+                c.set_enforce(on);
+            })?;
+            maybe_reload(paths, name);
+            Ok(0)
+        }
+    }
+}
+
+/// Parse a git target: a string containing `/` after the host is a `Repo`;
+/// a bare hostname (no `/`) is a `Host`.
+pub(crate) fn parse_git_target(s: &str) -> GitTarget {
+    if s.contains('/') {
+        GitTarget::Repo(s.to_string())
+    } else {
+        GitTarget::Host(s.to_string())
     }
 }
 
@@ -79,25 +146,43 @@ pub(crate) fn apply_edit(
 }
 
 fn show(paths: &Paths, name: &str) -> anyhow::Result<i32> {
+    use izba_core::daemon::egress::config::GitTarget;
     let dir = paths.sandbox_dir(name);
     if !dir.exists() {
         anyhow::bail!("no such sandbox: {name}");
     }
     match EgressPolicyConfig::load(&dir)? {
         None => println!("'{name}' has no egress policy (all egress allowed)"),
-        Some(cfg) if cfg.allow.is_empty() => {
-            println!("'{name}' egress policy: deny all (empty allow-list)")
-        }
         Some(cfg) => {
-            println!("'{name}' egress allow-list:");
-            for e in &cfg.allow {
-                let ports = e
-                    .ports()
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                println!("  {}  [{ports}]", e.host());
+            let enforce_str = if cfg.enforce { "on" } else { "off" };
+            println!("'{name}' egress policy (enforce: {enforce_str}):");
+            if cfg.allow.is_empty() {
+                println!("  http: deny all (empty allow-list)");
+            } else {
+                println!("  http allow-list:");
+                for e in &cfg.allow {
+                    let ports = e
+                        .ports()
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("    {}  [{ports}]", e.host());
+                }
+            }
+            if !cfg.git.is_empty() {
+                println!("  git:");
+                for r in &cfg.git {
+                    let target_str = match &r.target {
+                        GitTarget::Repo(s) => s.as_str(),
+                        GitTarget::Host(s) => s.as_str(),
+                    };
+                    let access_str = match r.access {
+                        Access::Read => "read",
+                        Access::ReadWrite => "read-write",
+                    };
+                    println!("    {target_str} ({access_str})");
+                }
             }
         }
     }
@@ -143,6 +228,43 @@ fn maybe_reload(paths: &Paths, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_policy_git_allow_write() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "izba",
+            "policy",
+            "git",
+            "allow",
+            "web",
+            "github.com/o/a",
+            "--write",
+        ])
+        .unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Git(GitSub::Allow {
+            name,
+            target,
+            write,
+        })) = cli.cmd
+        else {
+            panic!("expected policy git allow");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(target, "github.com/o/a");
+        assert!(write, "--write flag must be true");
+    }
+
+    #[test]
+    fn parse_policy_enforce_on() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["izba", "policy", "enforce", "web", "on"]).unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Enforce { name, state }) = cli.cmd else {
+            panic!("expected policy enforce");
+        };
+        assert_eq!(name, "web");
+        assert!(matches!(state, EnforceState::On));
+    }
 
     #[test]
     fn parse_target_defaults_to_443() {
