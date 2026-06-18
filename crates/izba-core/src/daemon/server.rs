@@ -1581,6 +1581,126 @@ mod tests {
         );
     }
 
+    // ── Direct unit tests for persist_port_rule / unpersist_port_rule ────────
+    //
+    // These tests call the helpers DIRECTLY — no daemon, no socket bind — so
+    // they work even in sandboxed environments that deny TcpListener::bind.
+
+    /// Write a minimal config.json for a named sandbox into `paths`.
+    fn write_config_for_persist(paths: &Paths, name: &str) {
+        let dir = paths.sandbox_dir(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = SandboxConfig {
+            image_digest: "sha256:abc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 1,
+            mem_mb: 256,
+            workspace: dir.join("ws"),
+            ports: Vec::new(),
+            volumes: Vec::new(),
+        };
+        crate::state::save_json(&dir.join(CONFIG_FILE), &cfg).unwrap();
+    }
+
+    fn port_rule(bind: &str, host_port: u16, guest_port: u16) -> crate::state::PortRule {
+        crate::state::PortRule {
+            bind: bind.parse().unwrap(),
+            host_port,
+            guest_port,
+        }
+    }
+
+    fn load_persisted_ports(paths: &Paths, name: &str) -> Vec<crate::state::PortRule> {
+        let p = paths.sandbox_dir(name).join(CONFIG_FILE);
+        let cfg: SandboxConfig = load_json(&p).unwrap().unwrap();
+        cfg.ports
+    }
+
+    #[test]
+    fn persist_port_rule_adds_a_rule() {
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        let r = port_rule("127.0.0.1", 8080, 80);
+        persist_port_rule(&paths, "sb", &r).unwrap();
+
+        let ports = load_persisted_ports(&paths, "sb");
+        assert_eq!(ports, vec![r]);
+    }
+
+    #[test]
+    fn persist_port_rule_same_rule_twice_is_idempotent() {
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        let r = port_rule("127.0.0.1", 8080, 80);
+        persist_port_rule(&paths, "sb", &r).unwrap();
+        persist_port_rule(&paths, "sb", &r).unwrap(); // second call must not dup
+
+        let ports = load_persisted_ports(&paths, "sb");
+        assert_eq!(ports.len(), 1, "expected exactly one rule, got: {ports:?}");
+        assert_eq!(ports[0], r);
+    }
+
+    #[test]
+    fn persist_port_rule_different_rule_appends() {
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        let r1 = port_rule("127.0.0.1", 8080, 80);
+        let r2 = port_rule("0.0.0.0", 9090, 90);
+        persist_port_rule(&paths, "sb", &r1).unwrap();
+        persist_port_rule(&paths, "sb", &r2).unwrap();
+
+        let ports = load_persisted_ports(&paths, "sb");
+        assert_eq!(ports.len(), 2, "expected two rules, got: {ports:?}");
+        assert!(ports.contains(&r1));
+        assert!(ports.contains(&r2));
+    }
+
+    #[test]
+    fn unpersist_port_rule_removes_matching_rule() {
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        let r = port_rule("127.0.0.1", 8080, 80);
+        persist_port_rule(&paths, "sb", &r).unwrap();
+
+        unpersist_port_rule(&paths, "sb", r.bind, r.host_port).unwrap();
+
+        let ports = load_persisted_ports(&paths, "sb");
+        assert!(ports.is_empty(), "rule must be removed, got: {ports:?}");
+    }
+
+    #[test]
+    fn unpersist_port_rule_absent_rule_is_noop() {
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        // No rule persisted yet — unpersist must succeed silently.
+        unpersist_port_rule(&paths, "sb", "127.0.0.1".parse().unwrap(), 8080).unwrap();
+
+        let ports = load_persisted_ports(&paths, "sb");
+        assert!(ports.is_empty());
+    }
+
+    #[test]
+    fn unpersist_port_rule_only_removes_matching_leaving_others() {
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        let r1 = port_rule("127.0.0.1", 8080, 80);
+        let r2 = port_rule("0.0.0.0", 9090, 90);
+        persist_port_rule(&paths, "sb", &r1).unwrap();
+        persist_port_rule(&paths, "sb", &r2).unwrap();
+
+        // Remove only r1.
+        unpersist_port_rule(&paths, "sb", r1.bind, r1.host_port).unwrap();
+
+        let ports = load_persisted_ports(&paths, "sb");
+        assert_eq!(ports, vec![r2], "only r2 must remain, got: {ports:?}");
+    }
+
     #[test]
     fn adopt_rebuilds_view_and_sweeps_debris() {
         let (dir, d) = test_daemon();
