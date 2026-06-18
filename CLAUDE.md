@@ -168,6 +168,15 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   the initramfs via `IZBA_NFT` (`hack/build-nft.sh`) and applies the nat-output
   REDIRECT ruleset at boot. (passt/consomme/`izba.ipv4only` are GONE from the
   datapath as of M1 — all egress flows through izbad over vsock 1027.)
+- **Linux VMM confinement (MVP-C):** on Linux, cloud-hypervisor and virtiofsd
+  launch **confined by default** — explicit `--seccomp true`, `--landlock`
+  (Landlock v5+), virtiofsd `--sandbox namespace` (fallback `--sandbox chroot`),
+  and best-effort `setrlimit` (RLIMIT_AS/NOFILE/NPROC) applied at spawn.
+  Launch **fails closed** if the floor (seccomp + Landlock + virtiofsd sandbox)
+  cannot be met, unless `--allow-unconfined` is passed (loud CLI/status warning).
+  Achieved confinement mode is recorded in `state.json` and surfaced by
+  `izba status`. See `crates/izba-core/src/procmgr/jail_linux.rs` and
+  `docs/superpowers/specs/2026-06-18-linux-vmm-confinement-design.md`.
 - **virtiofs tag** `workspace` (driver `FsShare` ↔ init mount plan) →
   `/workspace` inside the guest, which is also exec's default cwd.
 - **Exit-code mapping:** guest `CommandNotFound` → CLI exit 127;

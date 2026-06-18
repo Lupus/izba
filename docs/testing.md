@@ -146,6 +146,37 @@ cp dist/initramfs.cpio.gz     ~/.local/share/izba/artifacts/initramfs.cpio.gz
 …or skip the copy and point the env vars straight at `dist/` (the
 integration suite requires the env vars either way; see below).
 
+## 3a. Linux confinement requirements (Landlock LSM)
+
+As of MVP-C, cloud-hypervisor and virtiofsd launch **confined by default** on
+Linux. The confinement floor requires the **Landlock LSM** to be active in the
+host kernel. Verify it is present:
+
+```sh
+cat /sys/kernel/security/lsm
+# expected output includes "landlock", e.g.:
+# lockdown,capability,landlock,yama,apparmor
+```
+
+If Landlock is absent the launch **fails closed** with an actionable error
+message. To enable it on a kernel that has the module compiled in but not
+activated, add `landlock` to the `lsm=` boot parameter in your bootloader (e.g.
+`GRUB_CMDLINE_LINUX_DEFAULT="... lsm=lockdown,capability,landlock,yama,apparmor"`
+and `sudo update-grub`), then reboot.
+
+**WSL2 note:** the Microsoft-supplied WSL2 kernel ships with Landlock enabled
+(`CONFIG_SECURITY_LANDLOCK=y`) and it is active in the default LSM list — no
+extra steps are needed on a current WSL2 build. Run `cat /sys/kernel/security/lsm`
+to confirm.
+
+**Landlock-less hosts:** if you cannot enable Landlock (e.g. a locked-down CI
+runner or an old kernel), pass `--allow-unconfined` to `izba run` (or the
+equivalent `allow_unconfined: true` to `sandbox::start_with_timeouts`). The
+**integration suite auto-opts-out** (`start_sandbox` calls
+`Capabilities::probe().landlock` and passes `allow_unconfined` accordingly), so
+the full suite still runs on such hosts — only the
+`confined_boot_records_restricted_when_landlock_present` test will self-skip.
+
 ## 4. Running the integration suite
 
 ```sh

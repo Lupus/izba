@@ -255,6 +255,9 @@ fn create_sandbox_with_volumes(
 }
 
 fn start_sandbox(env: &TestEnv, tb: &TestBox, name: &str) -> anyhow::Result<()> {
+    // On hosts without the Landlock LSM the fail-closed floor cannot be met;
+    // opt out automatically so every boot test passes on any compliant host.
+    let allow_unconfined = !izba_core::procmgr::jail_linux::Capabilities::probe().landlock;
     sandbox::start_with_timeouts(
         &tb.paths,
         name,
@@ -263,7 +266,7 @@ fn start_sandbox(env: &TestEnv, tb: &TestBox, name: &str) -> anyhow::Result<()> 
             kernel: env.kernel.clone(),
             initramfs: env.initramfs.clone(),
         },
-        false,
+        allow_unconfined,
         BOOT_TIMEOUT,
         BOOT_POLL,
     )
@@ -1556,7 +1559,9 @@ fn confined_boot_records_restricted_when_landlock_present() {
     let st: RunState = load_json(&state_path)
         .expect("reading state.json")
         .expect("state.json present after start");
-    let conf = st.confinement.expect("confinement must be recorded at launch");
+    let conf = st
+        .confinement
+        .expect("confinement must be recorded at launch");
     assert_eq!(
         conf.mode,
         izba_core::procmgr::ConfinementMode::Restricted,
