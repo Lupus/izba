@@ -1,5 +1,5 @@
 use izba_core::build_info::BuildInfoOwned;
-use izba_core::daemon::egress::config::AllowEntry;
+use izba_core::daemon::egress::config::{AllowEntry, GitRule};
 use izba_core::daemon::proto::DaemonCreate;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -11,6 +11,7 @@ use std::path::PathBuf;
 pub struct PolicyView {
     pub enforcing: bool,
     pub allow: Vec<AllowEntry>,
+    pub git: Vec<GitRule>,
 }
 
 /// Create-sandbox options coming from the frontend wizard. Mirrors the CLI's
@@ -229,6 +230,7 @@ mod tests {
             allow: vec![izba_core::daemon::egress::config::AllowEntry::Host(
                 "api.x.com".into(),
             )],
+            git: vec![],
         };
         let j = serde_json::to_value(&v).unwrap();
         assert_eq!(j["enforcing"], true);

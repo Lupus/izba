@@ -126,6 +126,31 @@ pub fn policy_enable_core(d: &mut dyn DaemonApi, name: &str) -> Result<usize, St
         .map_err(|e| e.to_string())
 }
 
+/// Core of `policy_git_allow`: authorize a git target (auto-reloads).
+pub fn policy_git_allow_core(
+    d: &mut dyn DaemonApi,
+    name: &str,
+    target: &str,
+    write: bool,
+) -> Result<(), String> {
+    d.policy_git_allow(name, target, write)
+        .map_err(|e| e.to_string())
+}
+
+/// Core of `policy_git_block`: revoke a git target (auto-reloads).
+pub fn policy_git_block_core(
+    d: &mut dyn DaemonApi,
+    name: &str,
+    target: &str,
+) -> Result<(), String> {
+    d.policy_git_block(name, target).map_err(|e| e.to_string())
+}
+
+/// Core of `policy_set_enforce`: set the enforcing flag (auto-reloads).
+pub fn policy_set_enforce_core(d: &mut dyn DaemonApi, name: &str, on: bool) -> Result<(), String> {
+    d.policy_set_enforce(name, on).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

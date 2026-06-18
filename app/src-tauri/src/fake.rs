@@ -2,6 +2,7 @@
 use crate::daemon::{DaemonApi, ShellSession};
 use crate::views::{DaemonStatusView, SandboxView, SbxState};
 use izba_core::build_info::BuildInfoOwned;
+use izba_core::daemon::egress::config::EgressPolicyConfig;
 use izba_core::daemon::proto::DaemonCreate;
 use std::sync::{Arc, Mutex};
 
@@ -49,6 +50,8 @@ pub struct FakeDaemon {
     pub shell_writes: Arc<Mutex<Vec<Vec<u8>>>>,
     pub shell_resizes: Arc<Mutex<Vec<(u16, u16)>>>,
     pub shell_closed: Arc<Mutex<bool>>,
+    /// In-memory policy state for testing git rules and enforce toggle.
+    pub policy: EgressPolicyConfig,
 }
 
 impl Default for FakeDaemon {
@@ -83,6 +86,7 @@ impl Default for FakeDaemon {
             shell_writes: Arc::new(Mutex::new(Vec::new())),
             shell_resizes: Arc::new(Mutex::new(Vec::new())),
             shell_closed: Arc::new(Mutex::new(false)),
+            policy: EgressPolicyConfig::default(),
         }
     }
 }
@@ -186,8 +190,9 @@ impl DaemonApi for FakeDaemon {
     }
     fn policy_show(&mut self, _name: &str) -> anyhow::Result<crate::views::PolicyView> {
         Ok(crate::views::PolicyView {
-            enforcing: false,
-            allow: vec![],
+            enforcing: self.policy.enforce,
+            allow: self.policy.allow.clone(),
+            git: self.policy.git.clone(),
         })
     }
     fn policy_allow(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
@@ -209,6 +214,39 @@ impl DaemonApi for FakeDaemon {
     fn policy_enable_from_traffic(&mut self, name: &str) -> anyhow::Result<usize> {
         self.calls.push(format!("enable:{name}"));
         Ok(1)
+    }
+    fn policy_git_allow(&mut self, name: &str, target: &str, write: bool) -> anyhow::Result<()> {
+        use izba_core::daemon::egress::config::{Access, GitTarget};
+        self.calls
+            .push(format!("git_allow:{name}:{target}:{write}"));
+        let gt = if target.contains('/') {
+            GitTarget::Repo(target.to_string())
+        } else {
+            GitTarget::Host(target.to_string())
+        };
+        let access = if write {
+            Access::ReadWrite
+        } else {
+            Access::Read
+        };
+        self.policy.git_allow(gt, access);
+        Ok(())
+    }
+    fn policy_git_block(&mut self, name: &str, target: &str) -> anyhow::Result<()> {
+        use izba_core::daemon::egress::config::GitTarget;
+        self.calls.push(format!("git_block:{name}:{target}"));
+        let gt = if target.contains('/') {
+            GitTarget::Repo(target.to_string())
+        } else {
+            GitTarget::Host(target.to_string())
+        };
+        self.policy.git_block(&gt);
+        Ok(())
+    }
+    fn policy_set_enforce(&mut self, name: &str, on: bool) -> anyhow::Result<()> {
+        self.calls.push(format!("set_enforce:{name}:{on}"));
+        self.policy.set_enforce(on);
+        Ok(())
     }
 }
 
@@ -296,5 +334,15 @@ mod tests {
         };
         let r = d.open_shell("web", Box::new(|_| {}), Box::new(|| {}));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn fake_policy_git_allow_then_show() {
+        let mut d = FakeDaemon::default();
+        d.policy_set_enforce("web", true).unwrap();
+        d.policy_git_allow("web", "github.com/o/a", true).unwrap();
+        let view = d.policy_show("web").unwrap();
+        assert!(view.enforcing);
+        assert_eq!(view.git.len(), 1);
     }
 }
