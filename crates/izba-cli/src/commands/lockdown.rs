@@ -38,6 +38,13 @@ pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
 /// `izba unlock <name>` — remove the per-sandbox Windows account + firewall
 /// rule (pops a UAC prompt on Windows).
 pub fn unlock(paths: &Paths, name: &str) -> anyhow::Result<i32> {
+    // Validate the sandbox exists by checking for its config.json (same guard
+    // as `run`/lockdown so `izba unlock bad-name` gives a clean error).
+    let config_path = paths.sandbox_dir(name).join(CONFIG_FILE);
+    if !config_path.exists() {
+        bail!("no sandbox named {name:?} (no config.json found)");
+    }
+
     orchestrate::unlock(&WinBackend, paths, name)?;
     println!("Unlocked '{name}' (account + firewall rule removed). Restart to drop the account.");
     Ok(0)
@@ -172,13 +179,47 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn lockdown_unlock_returns_windows_only_on_non_windows() {
+        use izba_core::state::{save_json, SandboxConfig};
+
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(&tmp);
+        let sb_dir = paths.sandbox_dir("test");
+        std::fs::create_dir_all(&sb_dir).unwrap();
+        // Write a minimal valid SandboxConfig so the existence check passes
+        // and we reach the backend's elevate() — which returns "windows-only"
+        // on non-Windows.
+        save_json(
+            &sb_dir.join(CONFIG_FILE),
+            &SandboxConfig {
+                image_digest: "sha256:abc".into(),
+                image_ref: "ubuntu:24.04".into(),
+                cpus: 2,
+                mem_mb: 512,
+                workspace: std::path::PathBuf::from("/workspace"),
+                ports: vec![],
+                volumes: vec![],
+            },
+        )
+        .unwrap();
+
         let result = unlock(&paths, "test");
         let err = result.unwrap_err();
         assert!(
             format!("{err:#}").contains("windows-only"),
             "expected windows-only error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn unlock_rejects_missing_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        // No sandbox dir created — should get a clean "no sandbox named" error.
+        let result = unlock(&paths, "ghost");
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no sandbox named"),
+            "expected 'no sandbox named' error, got: {err:#}"
         );
     }
 
