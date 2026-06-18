@@ -22,6 +22,20 @@ pub enum VolumeCmd {
         #[arg(short, long)]
         force: bool,
     },
+    /// Attach a volume to a sandbox (applied on its next restart)
+    Attach {
+        /// Sandbox name
+        name: String,
+        /// [VNAME:]GUEST_PATH:SIZE
+        spec: String,
+    },
+    /// Detach the volume at GUEST_PATH from a sandbox (applied on next restart)
+    Detach {
+        /// Sandbox name
+        name: String,
+        /// Guest mountpoint of the volume to remove
+        guest_path: String,
+    },
 }
 
 pub fn run(paths: &Paths, cmd: &VolumeCmd) -> anyhow::Result<i32> {
@@ -29,6 +43,8 @@ pub fn run(paths: &Paths, cmd: &VolumeCmd) -> anyhow::Result<i32> {
         VolumeCmd::Ls => ls(paths),
         VolumeCmd::Prune { force } => prune(paths, *force),
         VolumeCmd::Rm { name, force } => rm(paths, name, *force),
+        VolumeCmd::Attach { name, spec } => attach(paths, name, spec),
+        VolumeCmd::Detach { name, guest_path } => detach(paths, name, guest_path),
     }
 }
 
@@ -106,6 +122,33 @@ fn rm(paths: &Paths, name: &str, force: bool) -> anyhow::Result<i32> {
         DaemonResponse::Error { message } => bail!(message),
         other => bail!("unexpected daemon reply: {other:?}"),
     }
+}
+
+fn attach(paths: &Paths, name: &str, spec: &str) -> anyhow::Result<i32> {
+    let spec = izba_core::volume::parse_volume_flag(spec)?;
+    let mut client = DaemonClient::connect(paths)?;
+    super::expect_ok(client.request(
+        &DaemonRequest::VolumeAttach {
+            name: name.to_string(),
+            spec,
+        },
+        &mut |_| {},
+    )?)?;
+    println!("attached (applies on next restart of '{name}')");
+    Ok(0)
+}
+
+fn detach(paths: &Paths, name: &str, guest_path: &str) -> anyhow::Result<i32> {
+    let mut client = DaemonClient::connect(paths)?;
+    super::expect_ok(client.request(
+        &DaemonRequest::VolumeDetach {
+            name: name.to_string(),
+            guest_path: guest_path.into(),
+        },
+        &mut |_| {},
+    )?)?;
+    println!("detached (applies on next restart of '{name}')");
+    Ok(0)
 }
 
 /// Minimal y/N confirmation on stdin. Defaults to no on EOF / anything but y.
