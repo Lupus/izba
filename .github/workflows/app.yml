@@ -19,19 +19,22 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
-      # Harden apt against the chronically flaky azure.archive.ubuntu.com mirror
-      # (actions/runner-images#675): bound each fetch + retry so a stalled
-      # connection can't wedge the job until the timeout. Written to apt.conf.d
-      # so it also governs cache-apt-pkgs-action's internal apt-get on a cache
-      # miss (the cold-cache path that still hits the mirror).
-      - name: Harden apt (retries + fetch timeouts)
+      # Bound + retry apt's index fetch against the chronically flaky
+      # azure.archive.ubuntu.com mirror (actions/runner-images#675) so a stalled
+      # connection can't wedge the job until the timeout. Scope: this governs the
+      # `apt-get update` that cache-apt-pkgs-action runs on a cache miss. The
+      # package *downloads* go through the action's apt-fast/aria2c path (see
+      # below), which doesn't read apt.conf.d — those are hardened by aria2c's own
+      # parallel-retry behavior, not by this file.
+      - name: Harden apt index fetch (retries + timeouts)
         run: |
           printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
             | sudo tee /etc/apt/apt.conf.d/99izba-ci-retries
       # Cache the libwebkit2gtk-4.1-dev dependency closure (the GStreamer/Pulse
       # multimedia stack — hundreds of packages) so warm runs skip the mirror
-      # entirely instead of re-downloading it every time. Cold runs fall back to
-      # apt under the retry/timeout config above.
+      # entirely instead of re-downloading it every run. Cold runs download via
+      # the action's apt-fast/aria2c downloader, which parallelizes + retries —
+      # already faster and more resilient than the serial apt-get this replaces.
       - name: Install Tauri system deps
         uses: awalsh128/cache-apt-pkgs-action@681749ae568c81c2037cb9185e38b709b261bd2f # v1.6.1
         with:
