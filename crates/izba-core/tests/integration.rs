@@ -694,11 +694,13 @@ fn volumes_persist_reattach_and_prune() {
             name: None,
             guest_path: "/eph".into(),
             size_bytes: 64 << 20,
+            eph_id: None,
         },
         izba_core::volume::VolumeSpec {
             name: Some("data".into()),
             guest_path: "/data".into(),
             size_bytes: 64 << 20,
+            eph_id: None,
         },
     ];
     create_sandbox_with_volumes(&env, &mut tb, "vol", &ws, vols);
@@ -759,6 +761,7 @@ fn volumes_persist_reattach_and_prune() {
             name: Some("data".into()),
             guest_path: "/data".into(),
             size_bytes: 64 << 20,
+            eph_id: None,
         }],
     );
     if let Err(e) = start_sandbox(&env, &tb, "vol2") {

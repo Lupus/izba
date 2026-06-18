@@ -21,12 +21,18 @@ pub const MAX_VOLUMES: usize = 24;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeSpec {
     /// `Some` ⇒ persistent (<data>/volumes/<name>.img, survives rm);
-    /// `None` ⇒ ephemeral (<sandbox>/volumes/<index>.img, reaped with rm).
+    /// `None` ⇒ ephemeral (<sandbox>/volumes/<eph_id>.img, reaped with rm).
     pub name: Option<String>,
     /// Absolute guest mountpoint. No commas (the cmdline list delimiter).
     pub guest_path: PathBuf,
     /// Provisioned (sparse) size in bytes.
     pub size_bytes: u64,
+    /// Stable backing id for an ephemeral image (`<sandbox>/volumes/<id>.img`),
+    /// assigned once at provision time and never recomputed from list position.
+    /// `None` for persistent volumes (name-keyed) and for a freshly parsed spec
+    /// (the backend assigns it at create/attach).
+    #[serde(default)]
+    pub eph_id: Option<u64>,
 }
 
 impl VolumeSpec {
@@ -34,15 +40,36 @@ impl VolumeSpec {
         self.name.is_some()
     }
 
-    /// Host path of this volume's backing image. `index` is the volume's
-    /// position in the sandbox's volume list (only used for anonymous ones).
-    pub fn image_path(&self, paths: &Paths, sandbox: &str, index: usize) -> PathBuf {
+    /// Host path of this volume's backing image.
+    /// Ephemeral volumes use their stable `eph_id`; persistent volumes use their name.
+    pub fn image_path(&self, paths: &Paths, sandbox: &str) -> PathBuf {
         match &self.name {
             Some(name) => paths.volume_image(name),
-            None => paths
-                .sandbox_dir(sandbox)
-                .join("volumes")
-                .join(format!("{index}.img")),
+            None => {
+                let id = self
+                    .eph_id
+                    .expect("ephemeral volume has no eph_id; assign at provision time");
+                paths
+                    .sandbox_dir(sandbox)
+                    .join("volumes")
+                    .join(format!("{id}.img"))
+            }
+        }
+    }
+}
+
+/// Assign stable ids to ephemeral volumes lacking one: existing ids are kept,
+/// new ones continue from `max+1` (or 0). Persistent volumes are untouched.
+pub fn assign_eph_ids(volumes: &mut [VolumeSpec]) {
+    let mut next = volumes
+        .iter()
+        .filter_map(|v| v.eph_id)
+        .max()
+        .map_or(0, |m| m + 1);
+    for v in volumes.iter_mut() {
+        if v.name.is_none() && v.eph_id.is_none() {
+            v.eph_id = Some(next);
+            next += 1;
         }
     }
 }
@@ -101,6 +128,7 @@ pub fn parse_volume_flag(s: &str) -> anyhow::Result<VolumeSpec> {
         name,
         guest_path: PathBuf::from(path),
         size_bytes: parse_size(size)?,
+        eph_id: None,
     })
 }
 
@@ -245,14 +273,68 @@ mod tests {
     #[test]
     fn image_path_ephemeral_vs_persistent() {
         let paths = Paths::with_root("/data/izba".into());
-        let eph = parse_volume_flag("/eph:1g").unwrap();
+        let eph = VolumeSpec {
+            name: None,
+            guest_path: "/eph".into(),
+            size_bytes: 1 << 30,
+            eph_id: Some(0),
+        };
         let per = parse_volume_flag("cache:/data:1g").unwrap();
         assert_eq!(
-            eph.image_path(&paths, "web", 0),
+            eph.image_path(&paths, "web"),
             PathBuf::from("/data/izba/sandboxes/web/volumes/0.img")
         );
         assert_eq!(
-            per.image_path(&paths, "web", 1),
+            per.image_path(&paths, "web"),
+            PathBuf::from("/data/izba/volumes/cache.img")
+        );
+    }
+
+    #[test]
+    fn assign_eph_ids_numbers_ephemeral_in_order() {
+        let mut vs = vec![
+            parse_volume_flag("cache:/data:1g").unwrap(), // persistent
+            parse_volume_flag("/eph0:1g").unwrap(),       // ephemeral
+            parse_volume_flag("/eph1:1g").unwrap(),       // ephemeral
+        ];
+        assign_eph_ids(&mut vs);
+        assert_eq!(vs[0].eph_id, None); // persistent untouched
+        assert_eq!(vs[1].eph_id, Some(0));
+        assert_eq!(vs[2].eph_id, Some(1));
+    }
+
+    #[test]
+    fn assign_eph_ids_continues_from_max_and_preserves_existing() {
+        let mut vs = vec![
+            VolumeSpec {
+                name: None,
+                guest_path: "/a".into(),
+                size_bytes: 1 << 30,
+                eph_id: Some(5),
+            },
+            parse_volume_flag("/b:1g").unwrap(), // new ephemeral, eph_id None
+        ];
+        assign_eph_ids(&mut vs);
+        assert_eq!(vs[0].eph_id, Some(5)); // preserved
+        assert_eq!(vs[1].eph_id, Some(6)); // max(5)+1
+    }
+
+    #[test]
+    fn image_path_uses_eph_id_not_position() {
+        let paths = Paths::with_root("/data/izba".into());
+        let eph = VolumeSpec {
+            name: None,
+            guest_path: "/eph".into(),
+            size_bytes: 1 << 30,
+            eph_id: Some(3),
+        };
+        let per = parse_volume_flag("cache:/data:1g").unwrap();
+        assert_eq!(
+            eph.image_path(&paths, "web"),
+            PathBuf::from("/data/izba/sandboxes/web/volumes/3.img")
+        );
+        assert_eq!(
+            per.image_path(&paths, "web"),
             PathBuf::from("/data/izba/volumes/cache.img")
         );
     }

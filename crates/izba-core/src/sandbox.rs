@@ -177,9 +177,9 @@ fn build_vm_disks(
             readonly: false,
         },
     ];
-    for (i, v) in volumes.iter().enumerate() {
+    for v in volumes.iter() {
         disks.push(BlockDisk {
-            path: v.image_path(paths, name, i),
+            path: v.image_path(paths, name),
             readonly: false,
         });
     }
@@ -271,8 +271,8 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
         // User volumes: same sparse-create + best-effort-format pattern.
         // A persistent volume whose image already exists is reused as-is
         // (never reformatted), so its data survives across sandboxes.
-        for (i, v) in opts.volumes.iter().enumerate() {
-            let img = v.image_path(paths, name, i);
+        for v in opts.volumes.iter() {
+            let img = v.image_path(paths, name);
             ensure_volume_image(&img, v.size_bytes, paths.root())
                 .with_context(|| format!("provisioning volume {}", v.guest_path.display()))?;
         }
@@ -1116,11 +1116,13 @@ mod tests {
                 name: None,
                 guest_path: "/eph".into(),
                 size_bytes: 1 << 20,
+                eph_id: None,
             },
             crate::volume::VolumeSpec {
                 name: Some("cache".into()),
                 guest_path: "/data".into(),
                 size_bytes: 1 << 20,
+                eph_id: None,
             },
         ];
         create(&paths, "web", &o).unwrap();
@@ -1144,6 +1146,7 @@ mod tests {
             name: Some("keep".into()),
             guest_path: "/data".into(),
             size_bytes: 1 << 20,
+            eph_id: None,
         }];
         create(&paths, "web", &o).unwrap();
         let data = std::fs::read(paths.volume_image("keep")).unwrap();
@@ -1161,6 +1164,7 @@ mod tests {
             name: Some("kept".into()),
             guest_path: "/data".into(),
             size_bytes: 1 << 20,
+            eph_id: None,
         }];
         create(&paths, "web", &o).unwrap();
         std::fs::write(paths.volume_image("orphan"), vec![0u8; 4096]).unwrap();
@@ -1179,11 +1183,13 @@ mod tests {
                 name: None,
                 guest_path: "/a".into(),
                 size_bytes: 1 << 20,
+                eph_id: None,
             },
             crate::volume::VolumeSpec {
                 name: Some("c".into()),
                 guest_path: "/b".into(),
                 size_bytes: 1 << 20,
+                eph_id: None,
             },
         ];
         let disks = build_vm_disks(&paths, "web", "sha256:x", &vols);
@@ -1202,6 +1208,7 @@ mod tests {
             name: None,
             guest_path: "/a".into(),
             size_bytes: 1 << 20,
+            eph_id: None,
         }];
         assert!(build_cmdline("web", &vols).contains("izba.volumes=/a"));
         assert!(!build_cmdline("web", &[]).contains("izba.volumes"));
@@ -1752,6 +1759,7 @@ mod tests {
             name: Some("data".into()),
             guest_path: "/data".into(),
             size_bytes: 1 << 20,
+            eph_id: None,
         }];
         create(&paths, "web", &o).unwrap();
         // Record a CONFINED status so restore loads config + restores the ws.

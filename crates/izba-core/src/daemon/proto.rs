@@ -233,6 +233,7 @@ mod tests {
                     name: Some("cache".into()),
                     guest_path: "/data".into(),
                     size_bytes: 1 << 30,
+                    eph_id: None,
                 }],
                 allow_unconfined: false,
             }),
