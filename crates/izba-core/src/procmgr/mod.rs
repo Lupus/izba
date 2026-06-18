@@ -7,9 +7,11 @@
 //! unit never crosses platforms.
 
 pub mod confine;
+pub mod logon;
 pub use confine::{
     ConfinementMode, ConfinementPolicy, ConfinementStatus, IntegrityLevel, TokenLevel,
 };
+pub use logon::spawn_confined_as_account;
 
 // Host-side confinement for the cloud-hypervisor driver. The data types compile
 // on every target (the CH driver is cross-checked for `x86_64-pc-windows-gnu`);
