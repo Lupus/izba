@@ -73,7 +73,7 @@ if [ -n "${add_repository}" ]; then
     if [[ "${repository}" =~ [^a-zA-Z0-9:\/.-] ]]; then
       log "aborted"
       log "Repository '${repository}' contains invalid characters." >&2
-      log "Supported formats: 'ppa:user/repo', 'deb http://...', 'http://...', 'multiverse', etc." >&2
+      log "Supported formats: 'ppa:user/repo', 'deb https://...', 'https://...', 'multiverse', etc." >&2
       exit 6
     fi
   done
@@ -113,11 +113,14 @@ fi
 
 log "- Value to hash is '${value}'."
 
-key="$(echo "${value}" | md5sum | cut -f1 -d' ')"
+# izba fork: hash with sha256 instead of upstream's md5. This is a
+# non-cryptographic cache-bucket key (collision resistance is irrelevant here),
+# but md5 trips static-analysis weak-hash rules, and sha256 is a free upgrade.
+key="$(echo "${value}" | sha256sum | cut -f1 -d' ')"
 log "- Value hashed as '${key}'."
 
 log "done"
 
-key_filepath="${cache_dir}/cache_key.md5"
+key_filepath="${cache_dir}/cache_key.txt"
 echo ${key} > ${key_filepath}
 log "Hash value written to ${key_filepath}"

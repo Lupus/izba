@@ -67,8 +67,8 @@ runs:
           "$DEBUG" \
           "$ADD_REPOSITORY" \
           "$PACKAGES"
-        if [ -f ~/cache-apt-pkgs/cache_key.md5 ]; then
-          echo "CACHE_KEY=$(cat ~/cache-apt-pkgs/cache_key.md5)" >> $GITHUB_ENV
+        if [ -f ~/cache-apt-pkgs/cache_key.txt ]; then
+          echo "CACHE_KEY=$(cat ~/cache-apt-pkgs/cache_key.txt)" >> $GITHUB_ENV
         else
           echo "CACHE_KEY=" >> $GITHUB_ENV
         fi
