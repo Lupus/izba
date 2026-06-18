@@ -126,6 +126,7 @@ mod tests {
             name: Some("cache".into()),
             guest_path: "/data".into(),
             size_bytes: 1 << 30,
+            eph_id: None,
         }];
         let s = serde_json::to_string(&c).unwrap();
         let back: SandboxConfig = serde_json::from_str(&s).unwrap();
