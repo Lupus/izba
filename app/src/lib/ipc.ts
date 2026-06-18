@@ -10,6 +10,7 @@ import type {
   EndpointSummary,
   PolicyView,
   AllowEntry,
+  GitRule,
 } from "./types";
 
 export const api = {
@@ -35,6 +36,12 @@ export const api = {
     invoke<void>("policy_block", { name, host, port }),
   policySet: (name: string, allow: AllowEntry[]) => invoke<void>("policy_set", { name, allow }),
   policyEnable: (name: string) => invoke<number>("policy_enable", { name }),
+  policySetEnforce: (name: string, on: boolean) =>
+    invoke<void>("policy_set_enforce", { name, on }),
+  policyGitAllow: (name: string, target: GitRule, write: boolean) =>
+    invoke<void>("policy_git_allow", { name, target, write }),
+  policyGitBlock: (name: string, target: GitRule) =>
+    invoke<void>("policy_git_block", { name, target }),
 };
 
 /** Decode a base64 string to raw bytes (xterm.write accepts Uint8Array). */

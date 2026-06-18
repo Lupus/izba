@@ -1,16 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AllowEntry, EndpointSummary, PolicyView } from "../lib/types";
 import { api } from "../lib/ipc";
+import { WEB_DEFAULT_PORTS } from "../lib/ports";
 
 /** Expand the policy allow-list into a set of `host:port` keys. A bare-host
- *  string permits the web defaults (80, 443); a scoped entry permits its
- *  exact ports. Lets the table reflect *current policy*, not just past traffic. */
+ *  string permits the web defaults (WEB_DEFAULT_PORTS); a scoped entry permits
+ *  its exact ports. Lets the table reflect *current policy*, not just past traffic. */
 function allowKeys(allow: AllowEntry[]): Set<string> {
   const s = new Set<string>();
   for (const e of allow) {
     if (typeof e === "string") {
-      s.add(`${e}:80`);
-      s.add(`${e}:443`);
+      for (const p of WEB_DEFAULT_PORTS) s.add(`${e}:${p}`);
     } else {
       for (const p of e.ports) s.add(`${e.host}:${p}`);
     }

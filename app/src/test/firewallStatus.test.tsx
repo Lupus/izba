@@ -11,7 +11,7 @@ beforeEach(() => vi.clearAllMocks());
 
 describe("FirewallStatus", () => {
   it("shows the bare-sandbox state when not enforcing", async () => {
-    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({ enforcing: false, allow: [] });
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({ enforcing: false, allow: [], git: [] });
     render(<FirewallStatus name="web" />);
     expect(await screen.findByText(/bare sandbox/i)).toBeInTheDocument();
   });
@@ -20,6 +20,7 @@ describe("FirewallStatus", () => {
     (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
       enforcing: true,
       allow: ["api.x.com", { host: "db.internal", ports: [5432] }],
+      git: [],
     });
     render(<FirewallStatus name="web" />);
     expect(await screen.findByText(/firewall enforcing · 2 allow rules/i)).toBeInTheDocument();
