@@ -5,12 +5,16 @@ import { Rail } from "./components/Rail";
 import { Detail } from "./components/Detail";
 import { About } from "./components/About";
 import { NewSandbox } from "./components/NewSandbox";
+import { StorageView } from "./components/StorageView";
+
+type View = "sandboxes" | "storage";
 
 export default function App() {
   const { sandboxes, daemon, phase, refresh } = usePolling(2000);
   const [selected, setSelected] = useState<string | null>(null);
   const [showAbout, setShowAbout] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [view, setView] = useState<View>("sandboxes");
   const current = sandboxes.find((s) => s.name === selected) ?? null;
 
   return (
@@ -22,8 +26,14 @@ export default function App() {
           selected={selected}
           onSelect={setSelected}
           onNew={() => setCreating(true)}
+          view={view}
+          onView={setView}
         />
-        <Detail sandbox={current} onChanged={refresh} />
+        {view === "storage" ? (
+          <StorageView />
+        ) : (
+          <Detail sandbox={current} onChanged={refresh} />
+        )}
       </div>
       {showAbout && <About onClose={() => setShowAbout(false)} />}
       {creating && (
