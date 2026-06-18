@@ -113,7 +113,7 @@ describe("ipc action wrappers", () => {
     await api.portPublish("web", "0.0.0.0:8080:80", true);
     expect(invoke).toHaveBeenCalledWith("port_publish", {
       name: "web",
-      rule: "0.0.0.0:8080:80",
+      ruleSpec: "0.0.0.0:8080:80",
       persist: true,
     });
   });

@@ -55,7 +55,7 @@ export const api = {
   inspect: (name: string) => invoke<SandboxDetail>("inspect", { name }),
   portList: (name: string) => invoke<PortRule[]>("port_list", { name }),
   portPublish: (name: string, rule: string, persist: boolean) =>
-    invoke<void>("port_publish", { name, rule, persist }),
+    invoke<void>("port_publish", { name, ruleSpec: rule, persist }),
   portUnpublish: (name: string, bind: string, hostPort: number) =>
     invoke<void>("port_unpublish", { name, bind, hostPort }),
   volumeList: () => invoke<VolumeInfo[]>("volume_list"),
