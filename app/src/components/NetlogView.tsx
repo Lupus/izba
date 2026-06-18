@@ -3,6 +3,47 @@ import type { AllowEntry, EndpointSummary, PolicyView } from "../lib/types";
 import { api } from "../lib/ipc";
 import { WEB_DEFAULT_PORTS } from "../lib/ports";
 
+/**
+ * Detect whether a path corresponds to a git wire operation and extract the
+ * repo glob.  Returns `null` for non-git paths or when host is null.
+ *
+ * Recognised suffixes (per Git HTTP backend protocol):
+ *   /git-receive-pack   → push (write)
+ *   /git-upload-pack    → clone/fetch (read)
+ *   /info/refs          → negotiation prefix (read)
+ */
+export function git_repo_from_row(host: string | null, path: string | null): string | null {
+  if (!host || !path) return null;
+
+  // Strip query string
+  const bare = path.replace(/\?.*$/, "");
+
+  // /info/refs?service=git-{upload,receive}-pack
+  const infoRefsMatch = /^(.*?)(?:\.git)?\/info\/refs$/.exec(bare);
+  if (infoRefsMatch) {
+    const repo = infoRefsMatch[1].replace(/^\//, "");
+    return `${host}/${repo}`;
+  }
+
+  // /.../<owner>/<name>[.git]/git-upload-pack or /git-receive-pack
+  const packMatch = /^(.*?)(?:\.git)?\/git-(?:upload|receive)-pack$/.exec(bare);
+  if (packMatch) {
+    const repo = packMatch[1].replace(/^\//, "");
+    return `${host}/${repo}`;
+  }
+
+  return null;
+}
+
+/** Returns "push" for write (git-receive-pack), "clone" for read, null for non-git. */
+function git_op_from_path(path: string | null): "push" | "clone" | null {
+  if (!path) return null;
+  const bare = path.replace(/\?.*$/, "");
+  if (/\/git-receive-pack$/.test(bare)) return "push";
+  if (/\/git-upload-pack$/.test(bare) || /\/info\/refs$/.test(bare)) return "clone";
+  return null;
+}
+
 /** Expand the policy allow-list into a set of `host:port` keys. A bare-host
  *  string permits the web defaults (WEB_DEFAULT_PORTS); a scoped entry permits
  *  its exact ports. Lets the table reflect *current policy*, not just past traffic. */
@@ -154,9 +195,28 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
               const key = `${target}:${r.port}`;
               const permitted = !rawIp && allowed.has(`${r.host}:${r.port}`);
               const busy = pending === key;
+
+              // Git-op detection: POST to /git-receive-pack = push, GET/POST to
+              // /git-upload-pack or /info/refs = clone/fetch (read).
+              const gitOp = git_op_from_path(r.last_path);
+              const gitRepo = gitOp ? git_repo_from_row(r.host, r.last_path) : null;
+              const isGit = gitOp !== null && gitRepo !== null;
+
               return (
                 <tr key={key} className="border-t border-line">
-                  <td className="py-1">{target}</td>
+                  <td className="py-1">
+                    {isGit ? (
+                      <span>
+                        <span className="font-semibold text-accent">
+                          git {gitOp}
+                        </span>
+                        {" → "}
+                        <span>{gitRepo}</span>
+                      </span>
+                    ) : (
+                      target
+                    )}
+                  </td>
                   <td>{r.port}</td>
                   <td>{r.tier}</td>
                   <td className={r.verdict === "deny" ? "text-warn" : "text-ok"}>
@@ -172,7 +232,44 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
                   )}
                   {enforcing && (
                     <td>
-                      {permitted ? (
+                      {isGit && gitRepo ? (
+                        // Git row: offer Allow read / Allow write / Block via git API
+                        <span className="flex gap-1">
+                          <button
+                            type="button"
+                            aria-label="Allow read"
+                            disabled={busy}
+                            onClick={() =>
+                              void act(key, () => api.policyGitAllow(name, gitRepo, false))
+                            }
+                            className="rounded border border-line px-2 py-0.5 hover:bg-hover disabled:opacity-40"
+                          >
+                            {busy ? "…" : "Allow read"}
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="Allow write"
+                            disabled={busy}
+                            onClick={() =>
+                              void act(key, () => api.policyGitAllow(name, gitRepo, true))
+                            }
+                            className="rounded border border-line px-2 py-0.5 hover:bg-hover disabled:opacity-40"
+                          >
+                            {busy ? "…" : "Allow write"}
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="Block"
+                            disabled={busy}
+                            onClick={() =>
+                              void act(key, () => api.policyGitBlock(name, gitRepo))
+                            }
+                            className="rounded border border-warn/40 px-2 py-0.5 text-warn hover:bg-warn/5 disabled:opacity-40"
+                          >
+                            {busy ? "…" : "Block"}
+                          </button>
+                        </span>
+                      ) : permitted ? (
                         <button
                           type="button"
                           aria-label={`Block ${target}`}

@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
-import { NetlogView, relTime } from "../components/NetlogView";
+import { NetlogView, relTime, git_repo_from_row } from "../components/NetlogView";
 import { api } from "../lib/ipc";
 import type { PolicyView } from "../lib/types";
 
@@ -11,6 +11,8 @@ vi.mock("../lib/ipc", () => ({
     policyAllow: vi.fn(),
     policyBlock: vi.fn(),
     policyEnable: vi.fn(),
+    policyGitAllow: vi.fn(),
+    policyGitBlock: vi.fn(),
   },
 }));
 
@@ -137,6 +139,67 @@ describe("NetlogView", () => {
     expect(screen.queryByText(/auto-refresh paused/i)).not.toBeInTheDocument();
     await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(frozen));
   });
+
+  it("renders a git push row and offers Allow write", async () => {
+    const gitPushRow = {
+      host: "github.com", dest_ip: "140.82.121.4", port: 443, tier: "l7",
+      verdict: "allow" as const, allow_count: 1, deny_count: 0,
+      first_seen_ms: 1, last_seen_ms: 9,
+      last_method: "POST", last_path: "/o/a/git-receive-pack",
+    };
+    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([gitPushRow]);
+    mockPolicy({ enforcing: true, allow: [], git: [] });
+    (api.policyGitAllow as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    render(<NetlogView name="sb" />);
+    // Should render "git push" label
+    expect(await screen.findByText(/git push/i)).toBeInTheDocument();
+    // Should show destination repo
+    expect(screen.getByText(/github\.com\/o\/a/i)).toBeInTheDocument();
+    // "Allow write" button calls policyGitAllow with write=true
+    const btn = screen.getByRole("button", { name: /allow write/i });
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(api.policyGitAllow).toHaveBeenCalledWith("sb", "github.com/o/a", true),
+    );
+  });
+
+  it("renders a git clone row and offers Allow read", async () => {
+    const gitCloneRow = {
+      host: "github.com", dest_ip: "140.82.121.4", port: 443, tier: "l7",
+      verdict: "deny" as const, allow_count: 0, deny_count: 1,
+      first_seen_ms: 1, last_seen_ms: 9,
+      last_method: "GET", last_path: "/owner/repo.git/info/refs?service=git-upload-pack",
+    };
+    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([gitCloneRow]);
+    mockPolicy({ enforcing: true, allow: [], git: [] });
+    (api.policyGitAllow as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    render(<NetlogView name="sb" />);
+    expect(await screen.findByText(/git clone/i)).toBeInTheDocument();
+    const btn = screen.getByRole("button", { name: /allow read/i });
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(api.policyGitAllow).toHaveBeenCalledWith("sb", "github.com/owner/repo", false),
+    );
+  });
+
+  it("Block on a git row calls policyGitBlock", async () => {
+    const gitPushRow = {
+      host: "github.com", dest_ip: "140.82.121.4", port: 443, tier: "l7",
+      verdict: "allow" as const, allow_count: 1, deny_count: 0,
+      first_seen_ms: 1, last_seen_ms: 9,
+      last_method: "POST", last_path: "/o/a/git-receive-pack",
+    };
+    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([gitPushRow]);
+    mockPolicy({ enforcing: true, allow: [], git: [] });
+    (api.policyGitBlock as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    render(<NetlogView name="sb" />);
+    await screen.findByText(/git push/i);
+    const btn = screen.getByRole("button", { name: /^block$/i });
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(api.policyGitBlock).toHaveBeenCalledWith("sb", "github.com/o/a"),
+    );
+  });
 });
 
 describe("relTime", () => {
@@ -149,5 +212,24 @@ describe("relTime", () => {
     expect(relTime(now - 3 * 60_000, now)).toBe("3m ago");
     expect(relTime(now - 2 * 3_600_000, now)).toBe("2h ago");
     expect(relTime(now - 4 * 86_400_000, now)).toBe("4d ago");
+  });
+});
+
+describe("git_repo_from_row", () => {
+  it("extracts repo from git-receive-pack path", () => {
+    expect(git_repo_from_row("github.com", "/o/a/git-receive-pack")).toBe("github.com/o/a");
+  });
+  it("extracts repo from git-upload-pack path", () => {
+    expect(git_repo_from_row("github.com", "/o/a/git-upload-pack")).toBe("github.com/o/a");
+  });
+  it("extracts repo from info/refs path with .git suffix", () => {
+    expect(git_repo_from_row("github.com", "/owner/repo.git/info/refs?service=git-upload-pack"))
+      .toBe("github.com/owner/repo");
+  });
+  it("returns null for non-git paths", () => {
+    expect(git_repo_from_row("github.com", "/some/other/api")).toBeNull();
+  });
+  it("returns null when host is null", () => {
+    expect(git_repo_from_row(null, "/o/a/git-receive-pack")).toBeNull();
   });
 });

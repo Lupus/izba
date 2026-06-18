@@ -1,11 +1,27 @@
 import { useEffect, useState } from "react";
-import type { AllowEntry } from "../lib/types";
+import type { Access, AllowEntry, GitRule } from "../lib/types";
 import { api } from "../lib/ipc";
 import { WEB_DEFAULT_PORTS } from "../lib/ports";
+import { AccessPicker } from "./AccessPicker";
 
 interface Row {
   host: string;
   ports: number[];
+}
+
+interface GitRow {
+  /** The raw glob string ("host/owner/repo" or "host") */
+  target: string;
+  access: Access;
+}
+
+/** Extract the glob string from a GitRule. */
+function gitRuleTarget(rule: GitRule): string {
+  return "repo" in rule ? rule.repo : rule.host;
+}
+
+function toGitRow(rule: GitRule): GitRow {
+  return { target: gitRuleTarget(rule), access: rule.access ?? "read" };
 }
 
 /** Normalize an `AllowEntry` (string = bare host → web default ports) to a Row. */
@@ -101,6 +117,9 @@ export function PolicyEditor({ name }: { name: string }) {
   const [enforcing, setEnforcing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [gitRows, setGitRows] = useState<GitRow[]>([]);
+  const [gitDraft, setGitDraft] = useState("");
+  const [gitSaved, setGitSaved] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -110,6 +129,7 @@ export function PolicyEditor({ name }: { name: string }) {
         if (alive) {
           setRows(p.allow.map(toRow));
           setEnforcing(p.enforcing);
+          setGitRows(p.git.map(toGitRow));
         }
       } catch (e) {
         if (alive) setError(e instanceof Error ? e.message : String(e));
@@ -168,6 +188,44 @@ export function PolicyEditor({ name }: { name: string }) {
         .map((r) => ({ host: r.host.trim(), ports: r.ports }));
       await api.policySet(name, allow);
       setSaved(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // Git section helpers
+  function editGit(f: (rs: GitRow[]) => GitRow[]) {
+    setGitRows(f);
+    setGitSaved(false);
+  }
+
+  function commitGitDraft() {
+    const t = gitDraft.trim();
+    if (t && !gitRows.some((r) => r.target === t)) {
+      editGit((rs) => [...rs, { target: t, access: "read" }]);
+    }
+    setGitDraft("");
+  }
+
+  async function removeGitRow(target: string) {
+    editGit((rs) => rs.filter((r) => r.target !== target));
+    try {
+      await api.policyGitBlock(name, target);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function saveGit() {
+    setError(null);
+    setGitSaved(false);
+    try {
+      // For each row: call policyGitAllow (the backend upserts).
+      // Rows removed by removeGitRow are already persisted via policyGitBlock.
+      for (const r of gitRows) {
+        await api.policyGitAllow(name, r.target, r.access === "read-write");
+      }
+      setGitSaved(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -242,6 +300,73 @@ export function PolicyEditor({ name }: { name: string }) {
             Save
           </button>
           {saved && <span className="self-center text-sm text-ink-2">saved · reloaded</span>}
+        </div>
+
+        {/* Git repos section */}
+        <div className="mt-2 border-t border-line pt-3">
+          <h3 className="mb-2 text-sm font-semibold">Git repos</h3>
+          <p className="mb-2 text-sm text-ink-2">
+            Git repositories this sandbox may clone or push to. Specify as{" "}
+            <span className="font-mono">host/owner/repo</span> or <span className="font-mono">host</span>.
+          </p>
+          <div className="flex flex-col gap-2">
+            {gitRows.map((gr) => (
+              <div
+                key={gr.target}
+                className="flex items-center gap-2 rounded-lg border border-line p-2"
+              >
+                <span className="flex-1 font-mono text-sm">{gr.target}</span>
+                <AccessPicker
+                  value={gr.access}
+                  onChange={(v) =>
+                    editGit((rs) =>
+                      rs.map((r) => (r.target === gr.target ? { ...r, access: v } : r)),
+                    )
+                  }
+                />
+                <button
+                  type="button"
+                  aria-label={`Remove ${gr.target}`}
+                  onClick={() => void removeGitRow(gr.target)}
+                  className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+            {gitRows.length === 0 && (
+              <div className="text-sm text-ink-3">No git repos allowed yet — add one below.</div>
+            )}
+          </div>
+          <div className="mt-2 flex items-center gap-2">
+            <input
+              value={gitDraft}
+              onChange={(e) => setGitDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitGitDraft();
+                }
+              }}
+              placeholder="github.com/owner/repo"
+              className="flex-1 rounded border border-line px-2 py-1 text-sm font-mono"
+            />
+            <button
+              type="button"
+              onClick={commitGitDraft}
+              className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover"
+            >
+              Add
+            </button>
+            <button
+              type="button"
+              onClick={() => void saveGit()}
+              className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white"
+            >
+              Save git
+            </button>
+            {gitSaved && <span className="self-center text-sm text-ink-2">saved</span>}
+          </div>
         </div>
       </fieldset>
     </div>
