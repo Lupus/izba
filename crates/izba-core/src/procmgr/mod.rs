@@ -11,6 +11,27 @@ pub use confine::{
     ConfinementMode, ConfinementPolicy, ConfinementStatus, IntegrityLevel, TokenLevel,
 };
 
+#[cfg(target_os = "linux")]
+pub mod jail_linux;
+
+/// Non-Linux compile parity: cloud-hypervisor only runs on Linux, but
+/// `izba-core` is cross-checked for `x86_64-pc-windows-gnu`. The CH driver
+/// references these names; on non-Linux they report no capabilities.
+#[cfg(not(target_os = "linux"))]
+pub mod jail_linux {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Capabilities {
+        pub userns: bool,
+        pub landlock: bool,
+        pub seccomp: bool,
+    }
+    impl Capabilities {
+        pub fn probe() -> Self {
+            Self { userns: false, landlock: false, seccomp: false }
+        }
+    }
+}
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
