@@ -68,6 +68,7 @@ mod tests {
             workspace: "/ws".into(),
             status: "running".into(),
             ports: vec![],
+            volumes: vec![],
             confinement: confinement.map(String::from),
         }
     }
