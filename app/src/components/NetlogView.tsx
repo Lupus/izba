@@ -226,8 +226,8 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
                     {relTime(r.last_seen_ms, now)}
                   </td>
                   {enforcing && (
-                    <td className={permitted ? "text-ok" : "text-ink-3"}>
-                      {rawIp ? "—" : permitted ? "allowed" : "blocked"}
+                    <td className={isGit ? "text-ink-3" : permitted ? "text-ok" : "text-ink-3"}>
+                      {isGit ? "git rule" : rawIp ? "—" : permitted ? "allowed" : "blocked"}
                     </td>
                   )}
                   {enforcing && (
