@@ -86,9 +86,9 @@ export function PortsTab({ sandbox }: Props) {
   const persistedKeys = new Set(persisted.map(persistedKey));
   const liveKeys = new Set(live.map(persistedKey));
   const persistedOnly = persisted.filter((r) => !liveKeys.has(persistedKey(r)));
-  const rows: Array<{ rule: PortRule; isPersisted: boolean }> = [
-    ...live.map((r) => ({ rule: r, isPersisted: persistedKeys.has(persistedKey(r)) })),
-    ...persistedOnly.map((r) => ({ rule: r, isPersisted: true })),
+  const rows: Array<{ rule: PortRule; isPersisted: boolean; isLive: boolean }> = [
+    ...live.map((r) => ({ rule: r, isPersisted: persistedKeys.has(persistedKey(r)), isLive: true })),
+    ...persistedOnly.map((r) => ({ rule: r, isPersisted: true, isLive: false })),
   ];
 
   const inputCls =
@@ -112,7 +112,7 @@ export function PortsTab({ sandbox }: Props) {
             </tr>
           </thead>
           <tbody>
-            {rows.map(({ rule: r, isPersisted }) => (
+            {rows.map(({ rule: r, isPersisted, isLive }) => (
               <tr key={persistedKey(r)} className="border-t border-line">
                 <td className="py-2 font-mono">
                   {r.bind}:{r.host_port} → {r.guest_port}
@@ -124,14 +124,16 @@ export function PortsTab({ sandbox }: Props) {
                 </td>
                 <td className="py-2 pl-2">
                   <div className="flex gap-1.5">
-                    <button
-                      type="button"
-                      aria-label={`Open port ${r.host_port} in browser`}
-                      onClick={() => void openUrl(`http://127.0.0.1:${r.host_port}`)}
-                      className="rounded-lg border border-line px-2 py-1 text-xs hover:bg-hover"
-                    >
-                      Open in browser
-                    </button>
+                    {isLive && (
+                      <button
+                        type="button"
+                        aria-label={`Open port ${r.host_port} in browser`}
+                        onClick={() => void openUrl(`http://127.0.0.1:${r.host_port}`)}
+                        className="rounded-lg border border-line px-2 py-1 text-xs hover:bg-hover"
+                      >
+                        Open in browser
+                      </button>
+                    )}
                     {!isPersisted && (
                       <button
                         type="button"

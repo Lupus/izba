@@ -90,6 +90,25 @@ describe("PortsTab", () => {
     await waitFor(() => expect(openUrl).toHaveBeenCalledWith("http://127.0.0.1:8080"));
   });
 
+  it("does NOT show open-in-browser for a persisted-only row (no live relay)", async () => {
+    // portList is empty (sandbox stopped / no live relay), but inspect has a persisted rule
+    portList.mockResolvedValue([]);
+    inspect.mockResolvedValue(detail([rule]));
+    render(<PortsTab sandbox={stopped} />);
+    // Row is rendered (persisted)
+    await screen.findByText(/127\.0\.0\.1:8080/);
+    // But open-in-browser must NOT be shown because there is no live relay
+    expect(screen.queryByRole("button", { name: /open port 8080 in browser/i })).not.toBeInTheDocument();
+  });
+
+  it("shows open-in-browser for a live forward even if sandbox appears running", async () => {
+    portList.mockResolvedValue([rule]);
+    inspect.mockResolvedValue(detail([rule]));
+    render(<PortsTab sandbox={running} />);
+    // Both persisted and live — must show open-in-browser
+    await screen.findByRole("button", { name: /open port 8080 in browser/i });
+  });
+
   it("clicking remove calls portUnpublish then reloads", async () => {
     portList.mockResolvedValue([rule]);
     inspect.mockResolvedValue(detail([rule]));

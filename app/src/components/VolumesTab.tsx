@@ -109,7 +109,8 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
     );
   }
 
-  async function save() {
+  /** Save pending edits. Returns true if the save succeeded (no errors). */
+  async function save(): Promise<boolean> {
     // Validate all new rows (ignore blank rows)
     let hasErr = false;
     const validated = newRows.map((nr) => {
@@ -128,11 +129,12 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
     });
     if (hasErr) {
       setNewRows(validated);
-      return;
+      return false;
     }
 
     setSaving(true);
     setError(null);
+    let succeeded = false;
     try {
       // Detach removed seeded rows
       const toDetach = seeded.filter((s) => s.removed);
@@ -144,16 +146,21 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       for (const nr of toAttach) {
         await api.volumeAttach(name, buildSpec(nr.row));
       }
-      // Reload and clear dirty
-      await load();
+      succeeded = true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
+      // Always re-sync UI to daemon truth, success or partial failure
+      await load();
       setSaving(false);
     }
+    return succeeded;
   }
 
   async function restartNow() {
+    // Save pending edits first; abort restart if save failed
+    const saved = await save();
+    if (!saved) return;
     try {
       await api.restart(name);
       onChanged();
