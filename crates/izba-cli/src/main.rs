@@ -188,6 +188,19 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// (internal) launch a VMM confined; used by the lock-down launcher
+    #[command(name = "__spawn-confined-vmm", hide = true)]
+    SpawnConfinedVmm {
+        /// Path where the spawned VMM's PidIdentity will be written
+        #[arg(long)]
+        pidfile: PathBuf,
+        /// Path to the VMM log file (stdout/stderr)
+        #[arg(long)]
+        log: PathBuf,
+        /// VMM argv (everything after `--`)
+        #[arg(last = true)]
+        vmm_argv: Vec<String>,
+    },
 }
 
 fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
@@ -228,6 +241,19 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             DaemonCmd::Status => commands::daemon::status(paths),
             DaemonCmd::Stop => commands::daemon::stop(paths),
         },
+        Cmd::SpawnConfinedVmm {
+            pidfile,
+            log,
+            vmm_argv,
+        } => {
+            use izba_core::procmgr::{spawn_confined, ConfinementPolicy};
+            use izba_core::vmm::CommandSpec;
+            let spec = CommandSpec { argv: vmm_argv };
+            let (pid_identity, _mode) =
+                spawn_confined(&spec, &log, &ConfinementPolicy::vmm_default())?;
+            izba_core::state::save_json(&pidfile, &pid_identity)?;
+            Ok(0)
+        }
     }
 }
 
@@ -362,6 +388,55 @@ mod tests {
         };
         assert!(summary);
         assert!(!follow);
+    }
+
+    #[test]
+    fn parse_spawn_confined_vmm() {
+        let cli = Cli::try_parse_from([
+            "izba",
+            "__spawn-confined-vmm",
+            "--pidfile",
+            "/tmp/pid.json",
+            "--log",
+            "/tmp/vmm.log",
+            "--",
+            "openvmm.exe",
+            "--config",
+            "foo.json",
+        ])
+        .unwrap();
+        let Cmd::SpawnConfinedVmm {
+            pidfile,
+            log,
+            vmm_argv,
+        } = cli.cmd
+        else {
+            panic!("expected SpawnConfinedVmm");
+        };
+        assert_eq!(pidfile, PathBuf::from("/tmp/pid.json"));
+        assert_eq!(log, PathBuf::from("/tmp/vmm.log"));
+        assert_eq!(
+            vmm_argv,
+            vec![
+                "openvmm.exe".to_string(),
+                "--config".to_string(),
+                "foo.json".to_string()
+            ]
+        );
+        // empty vmm_argv is allowed (no validation at parse time)
+        let cli2 = Cli::try_parse_from([
+            "izba",
+            "__spawn-confined-vmm",
+            "--pidfile",
+            "/tmp/pid.json",
+            "--log",
+            "/tmp/vmm.log",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli2.cmd,
+            Cmd::SpawnConfinedVmm { vmm_argv, .. } if vmm_argv.is_empty()
+        ));
     }
 
     #[test]
