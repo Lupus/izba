@@ -5,6 +5,7 @@ pub mod cp;
 pub mod daemon;
 mod discover;
 pub mod image;
+pub mod jail_account;
 pub mod liveness;
 pub mod paths;
 pub mod portfwd;
