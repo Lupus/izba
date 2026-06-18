@@ -74,23 +74,27 @@ struct EgressSlot {
     policy: Arc<PolicyCell>,
 }
 
-/// Resolve a sandbox's egress policy from its `--policy` file: an enforcing
-/// [`RegoPolicy`](self::policy::RegoPolicy) when declared, else `default`
-/// (a bare, non-enforcing sandbox). A present-but-broken policy fails CLOSED
-/// (an empty enforcing allow-list = deny-all) rather than silently allowing.
-fn resolve_policy(default: &Arc<dyn Policy>, paths: &Paths, name: &str) -> Arc<dyn Policy> {
+/// Resolve a sandbox's egress policy from its `--policy` file, materializing
+/// an explicit `enforce: false` default when no file exists yet. Fails CLOSED
+/// on I/O or compile errors (deny-all enforcing policy) rather than silently
+/// allowing — a present-but-broken policy is never treated as AllowAll.
+fn resolve_policy(paths: &Paths, name: &str) -> Arc<dyn Policy> {
     use self::config::EgressPolicyConfig;
     let deny_all = || -> Arc<dyn Policy> {
         // An enforcing policy with an empty allow-list denies everything.
-        match EgressPolicyConfig::default().into_policy(name) {
-            Ok(p) => Arc::new(p),
-            Err(_) => Arc::clone(default), // unreachable (embedded Rego is valid)
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![],
+            git: vec![],
+        };
+        match cfg.into_policy(name) {
+            Ok(p) => p,
+            Err(_) => Arc::new(self::policy::AllowAll), // unreachable (embedded Rego is valid)
         }
     };
-    match EgressPolicyConfig::load(&paths.sandbox_dir(name)) {
-        Ok(None) => Arc::clone(default),
-        Ok(Some(cfg)) => match cfg.into_policy(name) {
-            Ok(p) => Arc::new(p),
+    match EgressPolicyConfig::load_or_materialize(&paths.sandbox_dir(name)) {
+        Ok(cfg) => match cfg.into_policy(name) {
+            Ok(p) => p,
             Err(e) => {
                 eprintln!("izbad: egress policy for '{name}' failed to compile: {e:#}; deny-all");
                 deny_all()
@@ -108,7 +112,6 @@ fn resolve_policy(default: &Arc<dyn Policy>, paths: &Paths, name: &str) -> Arc<d
 /// adopt rebinds for new ones).
 pub struct EgressManager {
     inner: Mutex<HashMap<String, EgressSlot>>,
-    policy: Arc<dyn Policy>,
     resolver: Arc<dyn Resolver>,
     /// The shared MITM runtime (tier-1 HTTP/S loopback hop). `None` ⇒ no MITM:
     /// all TCP takes the direct-dial path. The policy is sandbox-aware via
@@ -126,14 +129,12 @@ pub struct EgressManager {
 
 impl EgressManager {
     pub fn new(
-        policy: Arc<dyn Policy>,
         resolver: Arc<dyn Resolver>,
         mitm: Option<Arc<MitmRuntime>>,
         audit: AuditSink,
     ) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
-            policy,
             resolver,
             mitm,
             audit,
@@ -178,11 +179,12 @@ impl EgressManager {
             .context("egress listener nonblocking")?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);
-        // Resolve THIS sandbox's policy once, when the listener is armed: its
-        // `--policy` file (if any) compiles to an enforcing RegoPolicy, else the
-        // bare default (AllowAll). The Arc travels into the MITM runtime per
+        // Resolve THIS sandbox's policy once, when the listener is armed.
+        // `load_or_materialize` writes an explicit `enforce:false` when no
+        // file exists yet, then compiles it to AllowAll or RegoPolicy based
+        // on the `enforce` flag. The Arc travels into the MITM runtime per
         // flow, so the shared runtime serves every sandbox's own allow-list.
-        let policy = resolve_policy(&self.policy, paths, name);
+        let policy = resolve_policy(paths, name);
         let cell = Arc::new(PolicyCell::new(policy));
         let cell_for_thread = Arc::clone(&cell);
         let resolver = Arc::clone(&self.resolver);
@@ -264,7 +266,7 @@ impl EgressManager {
     /// already what the next start will read. The resolve (file I/O) happens
     /// off-lock; only the `Arc` swap is under the slot lock.
     pub fn reload_policy(&self, paths: &Paths, name: &str) {
-        let new = resolve_policy(&self.policy, paths, name);
+        let new = resolve_policy(paths, name);
         if let Some(slot) = self.inner.lock().unwrap().get(name) {
             slot.policy.store(new);
         }
@@ -283,7 +285,7 @@ impl EgressManager {
             EgressSlot {
                 stop: Arc::new(AtomicBool::new(false)),
                 thread,
-                policy: Arc::new(PolicyCell::new(Arc::clone(&self.policy))),
+                policy: Arc::new(PolicyCell::new(Arc::new(self::policy::AllowAll))),
             },
         );
     }
@@ -317,7 +319,7 @@ mod tests {
         let audit = AuditSink::new(Paths::with_root(
             std::env::temp_dir().join("izba-audit-test"),
         ));
-        EgressManager::new(Arc::new(AllowAll), Arc::new(EchoResolver), None, audit)
+        EgressManager::new(Arc::new(EchoResolver), None, audit)
     }
 
     fn test_paths() -> (tempfile::TempDir, Paths) {
@@ -394,7 +396,8 @@ mod tests {
         }
         .into_policy("web")
         .unwrap();
-        cell.store(Arc::new(enforcing));
+        // into_policy now returns Arc<dyn Policy> directly — no double-wrapping.
+        cell.store(enforcing);
         assert!(cell.load().enforces(), "swapped-in RegoPolicy enforces");
     }
 

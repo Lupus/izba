@@ -56,7 +56,6 @@ fn interval_from(env: &dyn Fn(&str) -> Option<String>) -> Duration {
 mod tests {
     use super::*;
     use crate::daemon::egress::dns::UdpForwarder;
-    use crate::daemon::egress::policy::AllowAll;
     use crate::daemon::egress::EgressManager;
     use crate::daemon::registry::Registry;
     use crate::daemon::relays::RelayManager;
@@ -68,7 +67,6 @@ mod tests {
     fn test_egress() -> EgressManager {
         use crate::daemon::egress::audit::AuditSink;
         EgressManager::new(
-            Arc::new(AllowAll),
             Arc::new(UdpForwarder::new("127.0.0.1:53".parse().unwrap())),
             None,
             AuditSink::new(crate::paths::Paths::with_root(
