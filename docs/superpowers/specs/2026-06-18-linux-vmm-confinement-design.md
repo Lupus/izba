@@ -32,7 +32,10 @@ host built-ins only (no custom uid/namespace jailer in this milestone).
     kernel.
   - `virtiofsd` v1.13.3 self-confines via `--sandbox namespace` (unprivileged
     user+mount+pid namespace; the upstream default) or `--sandbox chroot`.
-  - Best-effort `setrlimit` at spawn bounds host resource use (→ F-28).
+  - Host resource bounding (→ F-28) was intended via best-effort `setrlimit` at
+    spawn, but **rlimits proved unusable** (per-uid `RLIMIT_NPROC` EAGAINs
+    virtiofsd's sandbox fork; `RLIMIT_AS` OOM-kills CH) and were dropped — see
+    D5; bounding is deferred to a cgroup follow-up.
 - **Spike findings (2026-06-18, real WSL2 host + a cilium CI node):**
   unprivileged user namespaces work without root; **Landlock is frequently
   absent** (`/sys/kernel/security/lsm` did not list it on the CI node); seccomp
@@ -48,7 +51,7 @@ host built-ins only (no custom uid/namespace jailer in this milestone).
 | D2 | **Fail closed** + reuse the existing `--allow-unconfined` escape hatch. | Parity with the Windows jailer; honors the standing "never silently downgrade security" rule. |
 | D3 | **Required floor** = `seccomp ON` **AND** `virtiofsd` real sandbox (`namespace`\|`chroot`) **AND** `Landlock active`. Floor unmet + no `--allow-unconfined` ⇒ refuse to launch. | The owner chose Landlock-in-floor. All three are root-free; Landlock-less hosts fail closed by design with an actionable message. |
 | D4 | **virtiofsd: `--sandbox namespace`, fall back to `chroot`.** If neither is available (no userns), the virtiofsd floor leg fails. | namespace is the root-free upstream default; chroot covers userns-restricted-but-CAP_SYS_CHROOT-capable hosts. |
-| D5 | **rlimits are best-effort, NOT part of the floor.** Applied at spawn; failure to apply is logged, never blocks, never drops below `Restricted`. | F-28 is DoS-hardening, not an escape boundary; making it a hard gate would add fragility for little containment value. |
+| D5 | **No `setrlimit` is applied (revised 2026-06-18).** rlimits were intended as best-effort DoS-hardening, but every ceiling breaks a confined launch: `RLIMIT_NPROC` is a system-wide per-uid cap so virtiofsd's `--sandbox namespace` fork EAGAINs in any real session; `RLIMIT_AS` OOM-kills CH (`--memory shared=on`); `RLIMIT_NOFILE` starves virtiofsd. The `ResourceLimits`/`spawn_detached_with_limits` seam stays but `for_vmm` returns all-`None`. | rlimits are per-process/per-uid, not per-sandbox — the wrong tool in a daemonless shared-uid model. Per-sandbox bounding is deferred to a cgroup follow-up (F-28). |
 | D6 | **Linux `ConfinementMode` is `Restricted` or `None` only — no `Partial`.** With `--allow-unconfined`, report `None` with a reason listing whatever incidentally applied. | Never overstate confinement. A bypassed floor gets no partial credit. Avoids touching the Windows-shaped enum. |
 | D7 | **No proto/state changes.** Reuse `ConfinementStatus`, `VmSpec.allow_unconfined`, the `--allow-unconfined` flag, state.json persistence, and `izba status` display — all already shipped by the Windows jailer. | Minimal blast radius; the seam was built cross-platform on purpose. |
 
@@ -100,19 +103,18 @@ izba run --[allow-unconfined]→ VmSpec.allow_unconfined  (EXISTS)
     probe passes, else `None`.
   - floor met = `seccomp && landlock && sandbox != None`.
   - floor met ⇒ `status = Restricted` with reason
-    `"seccomp+landlock+virtiofs:<mode>[+rlimits]"`.
+    `"seccomp+landlock+virtiofs:<mode>"`.
   - floor unmet & `!allow_unconfined` ⇒ `Err` whose message names **each** failed
     leg and the remediation (enable Landlock: `CONFIG_SECURITY_LANDLOCK` +
     `lsm=...,landlock`; userns sysctl) and ends with "or pass `--allow-unconfined`".
   - floor unmet & `allow_unconfined` ⇒ `status = None` (reason lists what *did*
     apply) but flags still set best-effort.
 - `struct ResourceLimits { address_space: Option<u64>, nofile: Option<u64>, nproc: Option<u64> }`
-  - `ResourceLimits::for_vmm(mem_mb: u64) -> Self`: conservative `nofile`/`nproc`
-    ceilings. **`address_space = None`** — `RLIMIT_AS` is deliberately NOT set: it
-    caps total virtual address space, and CH with `--memory shared=on` maps guest
-    RAM + the virtiofs DAX window into VA, so any mem-derived ceiling risks
-    OOM-killing a legitimate boot (cf. Firecracker's jailer, which also avoids
-    `RLIMIT_AS`). Host memory bounding is deferred to the cgroup follow-up (F-28).
+  - `ResourceLimits::for_vmm(mem_mb: u64) -> Self`: returns **all-`None`** (no
+    `setrlimit` applied). Every ceiling breaks a confined launch (D5): per-uid
+    `RLIMIT_NPROC` EAGAINs virtiofsd's sandbox fork, `RLIMIT_AS` OOM-kills CH
+    under `--memory shared=on`, `RLIMIT_NOFILE` starves virtiofsd. The fields +
+    `mem_mb` are retained for the deferred cgroup follow-up (F-28).
 
 **Non-Linux compile parity** (`#[cfg(not(target_os = "linux"))]`): a stub
 `Capabilities::probe()` returning all-false and a `plan()` that yields
@@ -126,13 +128,14 @@ caller-supplied reason). The existing `applied()` hardcodes Windows token text;
 Linux needs its own honest reason string. `degraded()` already covers `None`.
 `summary()` is unchanged (already renders `Restricted`/`None`).
 
-### 5.3 `crates/izba-core/src/procmgr/unix.rs` — rlimits at spawn
+### 5.3 `crates/izba-core/src/procmgr/unix.rs` — rlimit seam at spawn
 
 Add `spawn_detached_with_limits(cmd, log, limits: &ResourceLimits)` (or extend
 `spawn_detached` with an optional limits arg). In the existing `pre_exec`
-closure, after `setsid`, call `setrlimit(RLIMIT_NOFILE/RLIMIT_NPROC)`
-for each `Some` limit. Failures are swallowed (best-effort, D5) — the closure
-must stay async-signal-safe (no allocation; `nix::sys::resource::setrlimit`).
+closure, after `setsid`, call `setrlimit(...)` for each `Some` limit. Failures
+are swallowed — the closure must stay async-signal-safe (no allocation;
+`nix::sys::resource::setrlimit`). Per D5, `for_vmm` currently supplies no limits,
+so this is a no-op at spawn today; the seam is retained for the cgroup follow-up.
 
 ### 5.4 `crates/izba-core/src/vmm/cloud_hypervisor.rs`
 
@@ -205,7 +208,8 @@ status could overstate the achieved confinement.
 ## 8. Scope boundaries (YAGNI / deferred)
 
 - **Out:** custom userns/uid jailer (F-29 residual — separate follow-up),
-  full cgroup v2 resource control (F-28 covers rlimits only), OpenVMM-on-Linux
+  all host resource bounding (F-28 — rlimits proved unusable, see D5; cgroup
+  control deferred), OpenVMM-on-Linux
   (the Linux driver is cloud-hypervisor; OpenVMM is the Windows/WHP path),
   Landlock custom rule shaping beyond CH's auto-derived config rules.
 
@@ -215,8 +219,9 @@ status could overstate the achieved confinement.
   compromise reaches the full host-user filesystem. *Closed by `--landlock`
   (floor leg).*
 - **F-28 — no host resource bound on the VMM + virtiofsd.** A runaway/hostile
-  guest can exhaust host memory/FDs/PIDs. *Mitigated best-effort by `setrlimit`
-  at spawn; full cgroup control deferred.*
+  guest can exhaust host memory/FDs/PIDs. *`setrlimit` was evaluated and dropped
+  (per-uid/per-process limits break a confined launch — see D5); per-sandbox
+  bounding deferred to a cgroup follow-up.*
 - **F-29 — VMM/virtiofsd run under the invoking user's uid (no per-sandbox uid
   separation).** *Accepted residual for MVP-C (daemonless/no-root); deferred to
   the userns-jailer follow-up.*

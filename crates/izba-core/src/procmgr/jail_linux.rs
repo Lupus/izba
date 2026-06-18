@@ -42,24 +42,33 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    /// Best-effort ceilings (F-28).
+    /// F-28: host resource bounding for the VMM + virtiofsd.
     ///
-    /// RLIMIT_AS is intentionally NOT set here. cloud-hypervisor with
-    /// `--memory shared=on` maps the full guest RAM + virtiofs DAX window +
-    /// thread stacks into its virtual address space. A ceiling of
-    /// `(mem_mb + headroom_mb)` would OOM-kill a legitimate boot at the daemon's
-    /// default 4096 MB. Firecracker's jailer deliberately omits RLIMIT_AS for
-    /// the same reason. Host memory bounding is deferred to the cgroup follow-up
-    /// (F-28 residual).
+    /// **No `setrlimit` is applied** — every rlimit ceiling tried here proved
+    /// actively harmful to a confined launch, because `setrlimit` limits are
+    /// per-process/per-real-uid, not per-sandbox, and fight the components'
+    /// legitimate needs:
+    /// - `RLIMIT_AS` caps virtual address space; cloud-hypervisor with
+    ///   `--memory shared=on` maps the full guest RAM + virtiofs DAX window, so
+    ///   any `mem`-derived ceiling OOM-kills the boot (cf. Firecracker, which
+    ///   omits it too).
+    /// - `RLIMIT_NPROC` is a *system-wide per-real-uid* cap on processes AND
+    ///   threads. In the daemonless model the invoking user already runs many
+    ///   processes (a real session was observed at 436 threads), so any usable
+    ///   ceiling is already exceeded and virtiofsd's `--sandbox namespace`
+    ///   sandbox-entry `fork()` dies with EAGAIN before it can create its socket.
+    /// - `RLIMIT_NOFILE` would force virtiofsd below the ~1M descriptors it
+    ///   raises for itself; both CH and virtiofsd already self-tune their FD
+    ///   limits.
     ///
-    /// `address_space` remains on the struct for that future use. `mem_mb` is
-    /// kept in the signature for stability; it is unused until the cgroup
-    /// follow-up lands. (On non-Linux the rlimits are ignored at spawn.)
+    /// The correct per-sandbox mechanism is a cgroup (pids.max / memory.max),
+    /// deferred to the F-28 cgroup follow-up. The fields and `mem_mb` parameter
+    /// are kept for that work; today every limit is `None` (a no-op at spawn).
     pub fn for_vmm(_mem_mb: u64) -> Self {
         Self {
             address_space: None,
-            nofile: Some(4096),
-            nproc: Some(256),
+            nofile: None,
+            nproc: None,
         }
     }
 }
@@ -210,10 +219,7 @@ pub fn plan(
     let rlimits = ResourceLimits::for_vmm(mem_mb);
 
     if missing.is_empty() {
-        let reason = format!(
-            "seccomp+landlock+virtiofs:{}+rlimits(best-effort)",
-            sandbox.as_arg()
-        );
+        let reason = format!("seccomp+landlock+virtiofs:{}", sandbox.as_arg());
         return Ok(ConfinementPlan {
             virtiofsd_sandbox: sandbox,
             ch_seccomp,
@@ -361,11 +367,14 @@ mod tests {
     }
 
     #[test]
-    fn for_vmm_sets_fd_and_proc_caps_not_address_space() {
-        // RLIMIT_AS is not set (see ResourceLimits::for_vmm doc); mem_mb no
-        // longer drives the address-space limit.
-        assert!(ResourceLimits::for_vmm(2048).address_space.is_none());
-        assert_eq!(ResourceLimits::for_vmm(2048).nofile, Some(4096));
-        assert_eq!(ResourceLimits::for_vmm(2048).nproc, Some(256));
+    fn for_vmm_applies_no_rlimits_pending_cgroups() {
+        // No setrlimit ceiling is applied: per-uid/per-process rlimits break a
+        // confined launch (RLIMIT_NPROC EAGAINs virtiofsd's sandbox fork,
+        // RLIMIT_AS OOM-kills CH, RLIMIT_NOFILE starves virtiofsd). Resource
+        // bounding is deferred to the F-28 cgroup follow-up — see for_vmm doc.
+        let r = ResourceLimits::for_vmm(2048);
+        assert!(r.address_space.is_none());
+        assert!(r.nofile.is_none());
+        assert!(r.nproc.is_none());
     }
 }
