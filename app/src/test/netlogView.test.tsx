@@ -140,14 +140,18 @@ describe("NetlogView", () => {
     await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(frozen));
   });
 
-  it("renders a git push row and offers Allow write", async () => {
-    const gitPushRow = {
+  // Factory for git push row fixtures: only verdict/counts differ across tests.
+  function makeGitPushRow(verdict: "allow" | "deny", allow_count: number, deny_count: number) {
+    return {
       host: "github.com", dest_ip: "140.82.121.4", port: 443, tier: "l7",
-      verdict: "allow" as const, allow_count: 1, deny_count: 0,
+      verdict, allow_count, deny_count,
       first_seen_ms: 1, last_seen_ms: 9,
       last_method: "POST", last_path: "/o/a/git-receive-pack",
     };
-    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([gitPushRow]);
+  }
+
+  it("renders a git push row and offers Allow write", async () => {
+    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([makeGitPushRow("allow", 1, 0)]);
     mockPolicy({ enforcing: true, allow: [], git: [] });
     (api.policyGitAllow as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     render(<NetlogView name="sb" />);
@@ -187,13 +191,7 @@ describe("NetlogView", () => {
     // The host-derived status would be "blocked" (wrong — git ops are governed
     // by view.git rules, not the host allow-list).  The Policy column must show
     // a neutral git indicator instead of either "allowed" or "blocked".
-    const gitPushRow = {
-      host: "github.com", dest_ip: "140.82.121.4", port: 443, tier: "l7",
-      verdict: "deny" as const, allow_count: 0, deny_count: 1,
-      first_seen_ms: 1, last_seen_ms: 9,
-      last_method: "POST", last_path: "/o/a/git-receive-pack",
-    };
-    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([gitPushRow]);
+    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([makeGitPushRow("deny", 0, 1)]);
     // allow: [] → host-derived status would be "blocked", but that's wrong for git rows.
     mockPolicy({ enforcing: true, allow: [], git: [] });
     render(<NetlogView name="sb" />);
@@ -207,13 +205,7 @@ describe("NetlogView", () => {
   });
 
   it("Block on a git row calls policyGitBlock", async () => {
-    const gitPushRow = {
-      host: "github.com", dest_ip: "140.82.121.4", port: 443, tier: "l7",
-      verdict: "allow" as const, allow_count: 1, deny_count: 0,
-      first_seen_ms: 1, last_seen_ms: 9,
-      last_method: "POST", last_path: "/o/a/git-receive-pack",
-    };
-    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([gitPushRow]);
+    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([makeGitPushRow("allow", 1, 0)]);
     mockPolicy({ enforcing: true, allow: [], git: [] });
     (api.policyGitBlock as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     render(<NetlogView name="sb" />);
