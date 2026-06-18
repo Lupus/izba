@@ -12,6 +12,9 @@ import type {
   AllowEntry,
   SeedEntry,
   GitRule,
+  PortRule,
+  VolumeInfo,
+  SandboxDetail,
 } from "./types";
 
 export const api = {
@@ -49,6 +52,18 @@ export const api = {
     invoke<void>("policy_git_allow", { name, target, write }),
   policyGitBlock: (name: string, target: string) =>
     invoke<void>("policy_git_block", { name, target }),
+  inspect: (name: string) => invoke<SandboxDetail>("inspect", { name }),
+  portList: (name: string) => invoke<PortRule[]>("port_list", { name }),
+  portPublish: (name: string, rule: string, persist: boolean) =>
+    invoke<void>("port_publish", { name, rule, persist }),
+  portUnpublish: (name: string, bind: string, hostPort: number) =>
+    invoke<void>("port_unpublish", { name, bind, hostPort }),
+  volumeList: () => invoke<VolumeInfo[]>("volume_list"),
+  volumeRemove: (name: string) => invoke<void>("volume_remove", { name }),
+  volumePrune: () => invoke<{ removed: string[]; reclaimed_bytes: number }>("volume_prune"),
+  volumeAttach: (name: string, spec: string) => invoke<void>("volume_attach", { name, spec }),
+  volumeDetach: (name: string, guestPath: string) =>
+    invoke<void>("volume_detach", { name, guestPath }),
 };
 
 /** Decode a base64 string to raw bytes (xterm.write accepts Uint8Array). */
