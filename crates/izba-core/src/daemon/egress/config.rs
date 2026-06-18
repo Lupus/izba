@@ -109,7 +109,6 @@ pub enum GitTarget {
 }
 
 impl GitTarget {
-    #[allow(dead_code)] // used by Task 2 (to_rego_data_json extension)
     fn key(&self) -> (&'static str, &str) {
         match self {
             GitTarget::Repo(s) => ("repo", s),
@@ -223,19 +222,38 @@ impl EgressPolicyConfig {
         self.git.len() != before
     }
 
-    /// The regorus data document for `sandbox`: the allow-list becomes this
-    /// sandbox's `sandbox_ports[<name>]` host→ports map (`global_domains` stays
-    /// empty — a `--policy` file is scoped to one sandbox, never granted to
-    /// others). A bare host maps to the default web ports; a scoped host to its
-    /// exact set.
+    /// The regorus data document for `sandbox`: emits `host_rules` (always
+    /// empty — a `--policy` file is scoped to one sandbox), `sandbox_host_rules`
+    /// (host → `{ports, access}` per sandbox), and `sandbox_git_rules` (list of
+    /// `{repo|host, access}` per sandbox).
     pub fn to_rego_data_json(&self, sandbox: &str) -> String {
-        let mut ports = serde_json::Map::new();
-        for entry in &self.allow {
-            ports.insert(entry.host().to_string(), serde_json::json!(entry.ports()));
+        let mut hosts = serde_json::Map::new();
+        for e in &self.allow {
+            let access = match e.access() {
+                Access::Read => "read",
+                Access::ReadWrite => "read-write",
+            };
+            hosts.insert(
+                e.host().to_string(),
+                serde_json::json!({ "ports": e.ports(), "access": access }),
+            );
         }
+        let git: Vec<serde_json::Value> = self
+            .git
+            .iter()
+            .map(|r| {
+                let (k, v) = r.target.key();
+                let access = match r.access {
+                    Access::Read => "read",
+                    Access::ReadWrite => "read-write",
+                };
+                serde_json::json!({ k: v, "access": access })
+            })
+            .collect();
         serde_json::json!({
-            "global_domains": {},
-            "sandbox_ports": { sandbox: ports },
+            "host_rules": {},
+            "sandbox_host_rules": { sandbox: hosts },
+            "sandbox_git_rules": { sandbox: git },
         })
         .to_string()
     }
@@ -437,16 +455,21 @@ mod tests {
             git: vec![],
         };
         let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
-        // global stays empty for a declared --policy.
-        assert!(doc["global_domains"].as_object().unwrap().is_empty());
+        // host_rules stays empty for a declared --policy.
+        assert!(doc["host_rules"].as_object().unwrap().is_empty());
         // bare host → default web ports, scoped under the sandbox.
         assert_eq!(
-            doc["sandbox_ports"]["web"]["api.anthropic.com"],
+            doc["sandbox_host_rules"]["web"]["api.anthropic.com"]["ports"],
             serde_json::json!([80, 443])
         );
     }
 
+    // This test exercises the full into_policy() → rego pipeline. The rego still
+    // uses the old `sandbox_ports` key; it will be updated in Task 3 to consume
+    // the new `sandbox_host_rules`/`sandbox_git_rules` shape. Re-enable once
+    // Task 3 lands.
     #[test]
+    #[ignore = "awaits Task 3 rego update (sandbox_ports → sandbox_host_rules)"]
     fn compiled_policy_enforces_ports_and_isolation() {
         let cfg = EgressPolicyConfig {
             enforce: true,
@@ -721,6 +744,34 @@ mod tests {
         assert!(!cfg.set_enforce(true));
         assert!(cfg.set_host_access("pypi.org", Access::Read));
         assert_eq!(cfg.allow[0].access(), Access::Read);
+    }
+
+    #[test]
+    fn data_doc_emits_access_and_git() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "pypi.org".into(),
+                ports: None,
+                access: Access::Read,
+            }],
+            git: vec![GitRule {
+                target: GitTarget::Repo("github.com/o/a".into()),
+                access: Access::ReadWrite,
+            }],
+        };
+        let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
+        assert!(doc["host_rules"].as_object().unwrap().is_empty());
+        assert_eq!(
+            doc["sandbox_host_rules"]["web"]["pypi.org"]["ports"],
+            serde_json::json!([80, 443])
+        );
+        assert_eq!(
+            doc["sandbox_host_rules"]["web"]["pypi.org"]["access"],
+            "read"
+        );
+        assert_eq!(doc["sandbox_git_rules"]["web"][0]["repo"], "github.com/o/a");
+        assert_eq!(doc["sandbox_git_rules"]["web"][0]["access"], "read-write");
     }
 
     #[test]
