@@ -29,9 +29,33 @@
 //! The whole Windows body is `#[cfg(windows)]`; the Linux build compiles a
 //! no-op so the example stays in the cross-checked surface.
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn main() {
-    eprintln!("confine_probe: windows-only");
+    use izba_core::procmgr::jail_linux::{plan, Capabilities};
+    let caps = Capabilities::probe();
+    println!(
+        "capabilities: userns={} landlock={} seccomp={}",
+        caps.userns, caps.landlock, caps.seccomp
+    );
+    match plan(&caps, false, 2048) {
+        Ok(p) => println!(
+            "plan (enforcing): sandbox={:?} seccomp={} landlock={} status={}",
+            p.virtiofsd_sandbox,
+            p.ch_seccomp,
+            p.ch_landlock,
+            p.status.summary()
+        ),
+        Err(e) => println!("plan (enforcing): FAIL CLOSED — {e}"),
+    }
+    match plan(&caps, true, 2048) {
+        Ok(p) => println!("plan (--allow-unconfined): status={}", p.status.summary()),
+        Err(e) => println!("unexpected error with allow_unconfined: {e}"),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn main() {
+    eprintln!("confine_probe: windows-only or linux-only");
 }
 
 #[cfg(windows)]

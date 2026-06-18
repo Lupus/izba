@@ -244,6 +244,14 @@ impl VmmDriver for CloudHypervisorDriver {
         Ok(Box::new(ChHandle {
             vsock_sock: spec.run_dir.join("vsock.sock"),
             pids,
+            // `Restricted` is trustworthy because the two components FAIL CLOSED
+            // on flag-application error: virtiofsd that cannot enter its
+            // `--sandbox` exits before creating its socket (→ the socket-wait
+            // above times out → launch returns Err), and cloud-hypervisor aborts
+            // if `--landlock`/`--seccomp` cannot be applied (→ the VM dies →
+            // health reports unhealthy). If a future CH or virtiofsd release
+            // downgrades such a failure to a warning, this assumption breaks and
+            // the status here could overstate the achieved confinement.
             confinement: plan.status,
         }))
     }

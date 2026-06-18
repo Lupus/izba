@@ -127,6 +127,10 @@ impl ConfinementStatus {
     /// required the workspace to be Low-labelled. Drives the teardown decision to
     /// restore the workspace integrity (`sandbox::restore_confined_workspace`).
     /// `None` (unconfined / no jailer) means no relabel happened, so no restore.
+    ///
+    /// On Linux, `is_confined()` gates a no-op integrity restore (there is no MIC
+    /// label on Linux), so `Restricted` there reflects seccomp+Landlock+sandbox,
+    /// not a token.
     pub fn is_confined(&self) -> bool {
         matches!(
             self.mode,
