@@ -138,4 +138,25 @@ describe("SeedDialog", () => {
       )
     );
   });
+
+  it("surfaces an error and stays open when the apply fails", async () => {
+    (api.policyAddEndpoints as Mock).mockRejectedValue(new Error("daemon offline"));
+    const onApplied = vi.fn();
+    const onClose = vi.fn();
+    render(
+      <SeedDialog
+        name="web"
+        rows={[sum({ host: "pypi.org", port: 443, last_method: "GET", last_path: "/simple/" })]}
+        policy={{ enforcing: false, allow: [], git: [] }}
+        enforcing={false}
+        onClose={onClose}
+        onApplied={onApplied}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Add .* selected/ }));
+    // The error is surfaced and the dialog is NOT dismissed (no silent drop).
+    expect(await screen.findByRole("alert")).toHaveTextContent(/daemon offline/);
+    expect(onApplied).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
 });

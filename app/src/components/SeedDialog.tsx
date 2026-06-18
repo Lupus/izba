@@ -115,6 +115,7 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
 
   const [enforceAfter, setEnforceAfter] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
 
   const toggleChecked = (key: string) => {
     setChecked((prev) => {
@@ -145,10 +146,15 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
       return { kind: "http", host: c.host!, port: c.port!, access: a };
     });
     setSubmitting(true);
+    setApplyError(null);
     try {
       await api.policyAddEndpoints(name, entries, enforceAfter);
       onApplied();
       onClose();
+    } catch (e) {
+      // Keep the dialog open and surface the error — a silently-dropped
+      // firewall rule must never look like success.
+      setApplyError(e instanceof Error ? e.message : String(e));
     } finally {
       setSubmitting(false);
     }
@@ -222,6 +228,12 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
               />
               Enforce firewall after adding
             </label>
+          </div>
+        )}
+
+        {applyError && (
+          <div role="alert" className="text-sm text-warn">
+            Failed to apply: {applyError}
           </div>
         )}
 
