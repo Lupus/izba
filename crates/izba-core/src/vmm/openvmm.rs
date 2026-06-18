@@ -17,7 +17,8 @@ use super::spec::{reject_commas, CommandSpec, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
 use crate::procmgr::{
     kill_pid, pid_alive, restore_integrity_recursive, set_low_integrity_recursive, spawn_confined,
-    spawn_detached, ConfinementMode, ConfinementPolicy, ConfinementStatus,
+    spawn_confined_as_account, spawn_detached, ConfinementMode, ConfinementPolicy,
+    ConfinementStatus,
 };
 use crate::state::PidIdentity;
 use crate::vsock::hybrid_connect;
@@ -160,7 +161,55 @@ impl VmmDriver for OpenVmmDriver {
         // overhead; the job is caps-only and never kill-on-close.
         policy.job_memory_max_mb = Some(spec.mem_mb as u64 + 512);
 
-        let (vmm_id, confinement) = if spec.allow_unconfined {
+        let (vmm_id, confinement) = if let Some(ll) = &spec.lockdown {
+            // LOCKED path: the VMM is launched as the per-sandbox Windows
+            // account.  The account-launched VMM process also runs at Low IL
+            // (the inner launcher calls spawn_confined on behalf of the account),
+            // so we must still Low-label every host path the VMM needs to write —
+            // exactly the same set as the normal confined branch.  The account
+            // already has DACL access from provisioning, but without the Low IL
+            // label MIC would block writes.
+            let surfaces = spec.confined_write_surfaces();
+            let mut labelled: Vec<&PathBuf> = Vec::new();
+            for p in &surfaces {
+                if let Err(e) = set_low_integrity_recursive(p) {
+                    for done in &labelled {
+                        let _ = restore_integrity_recursive(done);
+                    }
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Low-labelling confined write surface {} so the per-account VMM \
+                             (and its in-process virtiofs) can write it",
+                            p.display()
+                        )
+                    });
+                }
+                labelled.push(p);
+            }
+            let pidfile = spec.run_dir.join("vmm-pid.json");
+            match spawn_confined_as_account(ll.account(), ll.password(), &inv, &vmm_log, &pidfile) {
+                Ok((id, ConfinementMode::Restricted)) => (id, ConfinementStatus::applied(&policy)),
+                Ok((id, ConfinementMode::TokenOnly)) => {
+                    (id, ConfinementStatus::token_only(&policy))
+                }
+                Ok((id, ConfinementMode::None)) => (
+                    id,
+                    ConfinementStatus::degraded("confinement unavailable on this platform"),
+                ),
+                Err(e) => {
+                    // Undo Low labels — same fail-closed guarantee as the
+                    // normal confined branch.
+                    for p in &surfaces {
+                        let _ = restore_integrity_recursive(p);
+                    }
+                    anyhow::bail!(
+                        "failed to launch VMM as per-sandbox account {}: {e}. \
+                         Consider removing the lock-down or using --allow-unconfined.",
+                        ll.account()
+                    )
+                }
+            }
+        } else if spec.allow_unconfined {
             // User EXPLICITLY opted out: run unconfined, record it loudly so
             // status never silently claims confinement that was waived.
             let id = spawn_detached(&inv, &vmm_log).context("spawning openvmm")?;
@@ -329,6 +378,7 @@ mod tests {
             console_log: PathBuf::from("/sbx/console.log"),
             run_dir: PathBuf::from("/sbx/run"),
             allow_unconfined: false,
+            lockdown: None,
         }
     }
 

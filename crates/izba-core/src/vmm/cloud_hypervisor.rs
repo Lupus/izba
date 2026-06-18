@@ -156,6 +156,14 @@ const SOCKET_POLL: Duration = Duration::from_millis(50);
 
 impl VmmDriver for CloudHypervisorDriver {
     fn launch(&self, spec: &VmSpec) -> anyhow::Result<Box<dyn VmHandle>> {
+        // Lock-down (per-sandbox account) is Windows-only and handled by the
+        // OpenVMM driver.  The Linux Cloud Hypervisor driver never receives a
+        // locked-down spec — sandbox.rs only sets `lockdown` on Windows.
+        debug_assert!(
+            spec.lockdown.is_none(),
+            "CloudHypervisorDriver received a lockdown spec — \
+             this should be unreachable on Linux"
+        );
         std::fs::create_dir_all(&spec.run_dir)
             .with_context(|| format!("creating {}", spec.run_dir.display()))?;
         let log_dir = spec
@@ -385,6 +393,7 @@ mod tests {
             console_log: PathBuf::from("/sbx/console.log"),
             run_dir: PathBuf::from("/sbx/run"),
             allow_unconfined: false,
+            lockdown: None,
         }
     }
 

@@ -12,11 +12,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use izba_proto::{read_frame, write_frame, Request, Response, CONTROL_PORT, STREAM_PORT};
 
 use crate::image::store::ImageStore;
+#[cfg(windows)]
+use crate::jail_account::orchestrate;
 use crate::liveness::{assess, Liveness, Probes};
 use crate::paths::Paths;
 use crate::procmgr;
 use crate::state::{load_json, save_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
-use crate::vmm::{BlockDisk, FsShare, IoStream, VmHandle, VmSpec, VmmDriver};
+use crate::vmm::{BlockDisk, FsShare, IoStream, LockdownLaunch, VmHandle, VmSpec, VmmDriver};
 
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BOOT_POLL: Duration = Duration::from_millis(200);
@@ -195,6 +197,33 @@ fn build_cmdline(name: &str, volumes: &[crate::volume::VolumeSpec]) -> String {
         ));
     }
     c
+}
+
+/// Resolve the per-sandbox account credentials to use when launching the VMM,
+/// or `None` when the sandbox is not locked down (the normal path).
+///
+/// On Windows: reads `lockdown.json` + unseals `lockdown.cred` via DPAPI.
+/// Returns `Some(LockdownLaunch)` for a `Locked` sandbox, `None` otherwise.
+///
+/// On non-Windows: always `None` — lock-down is Windows-only.
+#[cfg(windows)]
+fn compute_launch_lockdown(paths: &Paths, name: &str) -> anyhow::Result<Option<LockdownLaunch>> {
+    use crate::jail_account::state::LockdownState;
+    match orchestrate::lockdown_state(paths, name) {
+        LockdownState::Locked(info) => {
+            let pw = orchestrate::unseal_password(&orchestrate::WinBackend, paths, name)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("locked sandbox '{name}' has no readable lockdown.cred")
+                })?;
+            Ok(Some(LockdownLaunch::new(info.account, pw)))
+        }
+        LockdownState::Unlocked | LockdownState::Degraded { .. } => Ok(None),
+    }
+}
+
+#[cfg(not(windows))]
+fn compute_launch_lockdown(_paths: &Paths, _name: &str) -> anyhow::Result<Option<LockdownLaunch>> {
+    Ok(None)
 }
 
 pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()> {
@@ -480,6 +509,10 @@ pub fn start_with_timeouts(
     // always on — guest egress rides the izbad-owned vsock 1027 plane.
     // izba.volumes (when present) carries the ordered guest mountpoints.
     let cmdline = build_cmdline(name, &config.volumes);
+    // Resolve per-sandbox account credentials when the sandbox is locked down
+    // (Windows MVP-D).  On non-Windows and for unlocked sandboxes this is None
+    // and the normal confined/unconfined path is used.
+    let lockdown = compute_launch_lockdown(paths, name)?;
     let spec = VmSpec {
         kernel: art.kernel.clone(),
         initramfs: art.initramfs.clone(),
@@ -500,6 +533,7 @@ pub fn start_with_timeouts(
         console_log: console_log.clone(),
         run_dir: paths.run_dir(name),
         allow_unconfined,
+        lockdown,
     };
 
     let mut handle = driver.launch(&spec)?;
@@ -1047,6 +1081,26 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+
+    // -----------------------------------------------------------------------
+    // compute_launch_lockdown (non-Windows: always None)
+    // -----------------------------------------------------------------------
+
+    /// On non-Windows platforms the lock-down feature is a no-op: the helper
+    /// must return `None` unconditionally regardless of what is on disk,
+    /// so the normal confined/unconfined path is always used.
+    #[cfg(not(windows))]
+    #[test]
+    fn compute_launch_lockdown_returns_none_on_non_windows() {
+        let (_dir, paths) = test_paths();
+        // A sandbox dir is not needed — the non-Windows impl ignores paths.
+        let result = compute_launch_lockdown(&paths, "any-name")
+            .expect("must not error");
+        assert!(
+            result.is_none(),
+            "compute_launch_lockdown must return None on non-Windows"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Sandbox-specific helpers (not shared)
