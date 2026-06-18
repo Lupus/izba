@@ -1,8 +1,6 @@
 use anyhow::Context;
 use clap::Subcommand;
-use izba_core::daemon::egress::config::{
-    edit_policy_file, seed_from_summaries, Access, EgressPolicyConfig, GitTarget,
-};
+use izba_core::daemon::egress::config::{edit_policy_file, Access, EgressPolicyConfig, GitTarget};
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
 
@@ -186,11 +184,12 @@ fn enable(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     }
     let audit_path = paths.logs_dir(name).join("egress-audit.jsonl");
     let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
-    let records = text.lines().filter_map(parse_line);
-    let seeded = seed_from_summaries(&aggregate(records));
-    edit_policy_file(&dir, |cfg| *cfg = seeded.clone())?;
-    let n = seeded.allow.len();
-    println!("enabled firewall for '{name}': seeded {n} host(s) from observed traffic");
+    let summaries = aggregate(text.lines().filter_map(parse_line));
+    let mut added = 0usize;
+    edit_policy_file(&dir, |cfg| {
+        added = cfg.add_observed_allowed(&summaries);
+    })?;
+    println!("added {added} observed endpoint(s) to '{name}' allow-list");
     maybe_reload(paths, name);
     Ok(0)
 }
