@@ -30,8 +30,8 @@ describe("PolicyEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() =>
       expect(api.policySet).toHaveBeenCalledWith("web", [
-        { host: "api.x.com", ports: [80, 443] },
-        { host: "db.internal", ports: [5432] },
+        { host: "api.x.com", ports: [80, 443], access: "read-write" },
+        { host: "db.internal", ports: [5432], access: "read-write" },
       ]),
     );
   });
@@ -46,8 +46,8 @@ describe("PolicyEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() =>
       expect(api.policySet).toHaveBeenCalledWith("web", [
-        { host: "api.x.com", ports: [80, 443] },
-        { host: "db.internal", ports: [5432, 8443] },
+        { host: "api.x.com", ports: [80, 443], access: "read-write" },
+        { host: "db.internal", ports: [5432, 8443], access: "read-write" },
       ]),
     );
   });
@@ -118,8 +118,8 @@ describe("PolicyEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() =>
       expect(api.policySet).toHaveBeenCalledWith("web", [
-        { host: "api.x.com", ports: [443] },
-        { host: "db.internal", ports: [5432] },
+        { host: "api.x.com", ports: [443], access: "read-write" },
+        { host: "db.internal", ports: [5432], access: "read-write" },
       ]),
     );
   });
@@ -207,5 +207,31 @@ describe("PolicyEditor", () => {
     await waitFor(() =>
       expect(api.policyGitAllow).toHaveBeenCalledWith("web", "github.com/o/a", true),
     );
+  });
+
+  it("preserves per-host access=read on Save without editing the row", async () => {
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "pypi.org", ports: [80, 443], access: "read" }],
+      git: [],
+    });
+    (api.policySet as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pypi.org");
+    // Click Save without touching the row at all.
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySet).toHaveBeenCalledWith(
+        "web",
+        expect.arrayContaining([
+          expect.objectContaining({ host: "pypi.org", access: "read" }),
+        ]),
+      ),
+    );
+    // Make sure it was NOT called with access: "read-write" for pypi.org.
+    const calls = (api.policySet as ReturnType<typeof vi.fn>).mock.calls;
+    const allow: Array<{ host: string; access?: string }> = calls[0][1];
+    const pypi = allow.find((e) => e.host === "pypi.org");
+    expect(pypi?.access).toBe("read");
   });
 });

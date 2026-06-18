@@ -146,7 +146,6 @@ pub(crate) fn apply_edit(
 }
 
 fn show(paths: &Paths, name: &str) -> anyhow::Result<i32> {
-    use izba_core::daemon::egress::config::GitTarget;
     let dir = paths.sandbox_dir(name);
     if !dir.exists() {
         anyhow::bail!("no such sandbox: {name}");
