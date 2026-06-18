@@ -14,12 +14,21 @@ pub enum VolumeCmd {
         #[arg(short, long)]
         force: bool,
     },
+    /// Remove a single persistent volume (refused if any sandbox references it)
+    Rm {
+        /// Volume name
+        name: String,
+        /// Skip the confirmation prompt (does NOT bypass the in-use guard)
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 pub fn run(paths: &Paths, cmd: &VolumeCmd) -> anyhow::Result<i32> {
     match cmd {
         VolumeCmd::Ls => ls(paths),
         VolumeCmd::Prune { force } => prune(paths, *force),
+        VolumeCmd::Rm { name, force } => rm(paths, name, *force),
     }
 }
 
@@ -69,6 +78,29 @@ fn prune(paths: &Paths, force: bool) -> anyhow::Result<i32> {
                 }
                 println!("reclaimed {reclaimed_bytes} bytes");
             }
+            Ok(0)
+        }
+        DaemonResponse::Error { message } => bail!(message),
+        other => bail!("unexpected daemon reply: {other:?}"),
+    }
+}
+
+fn rm(paths: &Paths, name: &str, force: bool) -> anyhow::Result<i32> {
+    if !force && !confirm(&format!("Remove persistent volume '{name}'?"))? {
+        println!("aborted");
+        return Ok(0);
+    }
+    let mut client = DaemonClient::connect(paths)?;
+    match client.request(
+        &DaemonRequest::VolumeRemove {
+            name: name.to_string(),
+        },
+        &mut |_| {},
+    )? {
+        DaemonResponse::Pruned {
+            reclaimed_bytes, ..
+        } => {
+            println!("removed {name} (reclaimed {reclaimed_bytes} bytes)");
             Ok(0)
         }
         DaemonResponse::Error { message } => bail!(message),
