@@ -11,83 +11,11 @@ pub use confine::{
     ConfinementMode, ConfinementPolicy, ConfinementStatus, IntegrityLevel, TokenLevel,
 };
 
-#[cfg(target_os = "linux")]
+// Host-side confinement for the cloud-hypervisor driver. The data types compile
+// on every target (the CH driver is cross-checked for `x86_64-pc-windows-gnu`);
+// only the capability probe and `plan()` bodies are platform-specific (see the
+// `#[cfg]` split inside the module). cloud-hypervisor itself only runs on Linux.
 pub mod jail_linux;
-
-/// Non-Linux compile parity: cloud-hypervisor only runs on Linux, but
-/// `izba-core` is cross-checked for `x86_64-pc-windows-gnu`. The CH driver
-/// references these names; on non-Linux they report no capabilities.
-#[cfg(not(target_os = "linux"))]
-pub mod jail_linux {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Capabilities {
-        pub userns: bool,
-        pub landlock: bool,
-        pub seccomp: bool,
-    }
-    impl Capabilities {
-        pub fn probe() -> Self {
-            Self {
-                userns: false,
-                landlock: false,
-                seccomp: false,
-            }
-        }
-    }
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum VirtiofsdSandbox {
-        Namespace,
-        Chroot,
-        None,
-    }
-    impl VirtiofsdSandbox {
-        pub fn as_arg(&self) -> &'static str {
-            match self {
-                VirtiofsdSandbox::Namespace => "namespace",
-                VirtiofsdSandbox::Chroot => "chroot",
-                VirtiofsdSandbox::None => "none",
-            }
-        }
-    }
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ResourceLimits {
-        pub address_space: Option<u64>,
-        pub nofile: Option<u64>,
-        pub nproc: Option<u64>,
-    }
-    impl ResourceLimits {
-        pub fn for_vmm(_mem_mb: u64) -> Self {
-            Self {
-                address_space: None,
-                nofile: None,
-                nproc: None,
-            }
-        }
-    }
-    #[derive(Debug, Clone)]
-    pub struct ConfinementPlan {
-        pub virtiofsd_sandbox: VirtiofsdSandbox,
-        pub ch_seccomp: bool,
-        pub ch_landlock: bool,
-        pub rlimits: ResourceLimits,
-        pub status: crate::procmgr::ConfinementStatus,
-    }
-    pub fn plan(
-        _caps: &Capabilities,
-        _allow_unconfined: bool,
-        _mem_mb: u64,
-    ) -> anyhow::Result<ConfinementPlan> {
-        Ok(ConfinementPlan {
-            virtiofsd_sandbox: VirtiofsdSandbox::None,
-            ch_seccomp: false,
-            ch_landlock: false,
-            rlimits: ResourceLimits::for_vmm(0),
-            status: crate::procmgr::ConfinementStatus::degraded(
-                "host-side VMM confinement unsupported on this platform",
-            ),
-        })
-    }
-}
 
 #[cfg(unix)]
 mod unix;
