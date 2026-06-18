@@ -211,9 +211,42 @@ impl DaemonApi for FakeDaemon {
         self.calls.push(format!("set:{name}:{}", allow.len()));
         Ok(())
     }
-    fn policy_enable_from_traffic(&mut self, name: &str) -> anyhow::Result<usize> {
-        self.calls.push(format!("enable:{name}"));
-        Ok(1)
+    fn policy_add_endpoints(
+        &mut self,
+        name: &str,
+        entries: Vec<crate::views::SeedEntry>,
+        enforce: bool,
+    ) -> anyhow::Result<()> {
+        use crate::views::SeedEntry;
+        use izba_core::daemon::egress::config::GitTarget;
+        self.calls
+            .push(format!("add_endpoints:{name}:{}", entries.len()));
+        for e in entries {
+            match e {
+                SeedEntry::Http { host, port, access } => {
+                    self.policy.allow(&host, port);
+                    self.policy.set_host_access(&host, access);
+                }
+                SeedEntry::Git { target, access } => {
+                    self.policy.git_allow(GitTarget::parse(&target), access);
+                }
+            }
+        }
+        if enforce {
+            self.policy.set_enforce(true);
+        }
+        Ok(())
+    }
+    fn policy_set_full(
+        &mut self,
+        name: &str,
+        allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
+        git: Vec<izba_core::daemon::egress::config::GitRule>,
+    ) -> anyhow::Result<()> {
+        self.calls.push(format!("set_full:{name}"));
+        self.policy.allow = allow;
+        self.policy.git = git;
+        Ok(())
     }
     fn policy_git_allow(&mut self, name: &str, target: &str, write: bool) -> anyhow::Result<()> {
         use izba_core::daemon::egress::config::{Access, GitTarget};
@@ -336,5 +369,43 @@ mod tests {
         let view = d.policy_show("web").unwrap();
         assert!(view.enforcing);
         assert_eq!(view.git.len(), 1);
+    }
+
+    #[test]
+    fn policy_add_endpoints_is_additive_and_optionally_enforces() {
+        use crate::views::SeedEntry;
+        use izba_core::daemon::egress::config::{Access, AllowEntry, GitRule, GitTarget};
+        let mut d = FakeDaemon::default();
+        // seed an existing policy with a host + a git rule, enforce off
+        d.policy_set_full(
+            "web",
+            vec![AllowEntry::Host("existing.com".into())],
+            vec![GitRule {
+                target: GitTarget::Repo("github.com/o/a".into()),
+                access: Access::Read,
+            }],
+        )
+        .unwrap();
+        d.policy_add_endpoints(
+            "web",
+            vec![SeedEntry::Http {
+                host: "pypi.org".into(),
+                port: 443,
+                access: Access::Read,
+            }],
+            true,
+        )
+        .unwrap();
+        let v = d.policy_show("web").unwrap();
+        assert!(v.enforcing, "enforce flipped on");
+        assert!(
+            v.allow.iter().any(|e| e.host() == "existing.com"),
+            "existing host kept"
+        );
+        assert!(
+            v.allow.iter().any(|e| e.host() == "pypi.org"),
+            "added host present"
+        );
+        assert_eq!(v.git.len(), 1, "git rule survives the add");
     }
 }

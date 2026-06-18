@@ -65,8 +65,21 @@ pub trait DaemonApi: Send {
         name: &str,
         allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
     ) -> anyhow::Result<()>;
-    /// Seed the allow-list from observed traffic; returns the host count seeded.
-    fn policy_enable_from_traffic(&mut self, name: &str) -> anyhow::Result<usize>;
+    /// Additively merge `entries` into the existing policy. Sets `enforce = true`
+    /// only when `enforce` is true; git rules are never disturbed.
+    fn policy_add_endpoints(
+        &mut self,
+        name: &str,
+        entries: Vec<crate::views::SeedEntry>,
+        enforce: bool,
+    ) -> anyhow::Result<()>;
+    /// Replace the entire allow + git rule sets at once (enforce flag untouched).
+    fn policy_set_full(
+        &mut self,
+        name: &str,
+        allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
+        git: Vec<izba_core::daemon::egress::config::GitRule>,
+    ) -> anyhow::Result<()>;
     /// Authorize a git target (`owner/repo` or bare hostname), then best-effort live-reload.
     fn policy_git_allow(&mut self, name: &str, target: &str, write: bool) -> anyhow::Result<()>;
     /// Revoke a git target, then best-effort live-reload.
@@ -307,14 +320,42 @@ impl DaemonApi for RealDaemon {
         })
     }
 
-    fn policy_enable_from_traffic(&mut self, name: &str) -> anyhow::Result<usize> {
-        let summaries = self.read_netlog(name)?;
-        let seeded = izba_core::daemon::egress::config::seed_from_summaries(&summaries);
-        let n = seeded.allow.len();
+    fn policy_add_endpoints(
+        &mut self,
+        name: &str,
+        entries: Vec<crate::views::SeedEntry>,
+        enforce: bool,
+    ) -> anyhow::Result<()> {
+        use crate::views::SeedEntry;
+        use izba_core::daemon::egress::config::GitTarget;
         self.edit_and_reload(name, move |cfg| {
-            *cfg = seeded;
-        })?;
-        Ok(n)
+            for e in entries {
+                match e {
+                    SeedEntry::Http { host, port, access } => {
+                        cfg.allow(&host, port);
+                        cfg.set_host_access(&host, access);
+                    }
+                    SeedEntry::Git { target, access } => {
+                        cfg.git_allow(GitTarget::parse(&target), access);
+                    }
+                }
+            }
+            if enforce {
+                cfg.set_enforce(true);
+            }
+        })
+    }
+
+    fn policy_set_full(
+        &mut self,
+        name: &str,
+        allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
+        git: Vec<izba_core::daemon::egress::config::GitRule>,
+    ) -> anyhow::Result<()> {
+        self.edit_and_reload(name, move |cfg| {
+            cfg.allow = allow;
+            cfg.git = git;
+        })
     }
 
     fn policy_git_allow(&mut self, name: &str, target: &str, write: bool) -> anyhow::Result<()> {
