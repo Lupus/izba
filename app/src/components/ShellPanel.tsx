@@ -15,6 +15,12 @@ export function ShellPanel({ sandbox }: { sandbox: string }) {
     shellStore.setActive(sandbox, id);
     setActiveIdState(id);
   };
+  // Opening a shell makes it the active tab — that's what the user expects when
+  // clicking "＋" or first entering the panel.
+  const openShell = async () => {
+    const id = await shellStore.open(sandbox);
+    selectShell(id);
+  };
 
   // Auto-open exactly ONE shell per mount (a ref guards against StrictMode's
   // double-invoke AND the close-the-last-shell reopen loop). Once the user has
@@ -23,7 +29,7 @@ export function ShellPanel({ sandbox }: { sandbox: string }) {
   useEffect(() => {
     if (all.length === 0 && !autoOpened.current) {
       autoOpened.current = true;
-      void shellStore.open(sandbox);
+      void openShell();
       return;
     }
     if (all.length > 0 && (!activeId || !all.some((s) => s.id === activeId))) {
@@ -66,7 +72,7 @@ export function ShellPanel({ sandbox }: { sandbox: string }) {
         <button
           type="button"
           aria-label="New shell"
-          onClick={() => void shellStore.open(sandbox)}
+          onClick={() => void openShell()}
           className="rounded px-2 py-1 text-xs text-ink-2 hover:bg-hover"
         >
           +
