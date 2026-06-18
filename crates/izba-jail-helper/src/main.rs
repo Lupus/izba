@@ -19,6 +19,7 @@
 
 pub mod account;
 pub mod dacl;
+pub mod firewall;
 pub mod userlist;
 
 // ── Verb definition (all platforms) ─────────────────────────────────────────
