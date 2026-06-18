@@ -8,6 +8,8 @@ vi.mock("../lib/ipc", () => ({
     policyShow: vi.fn(),
     policySet: vi.fn(),
     policySetEnforce: vi.fn(),
+    policyGitAllow: vi.fn(),
+    policyGitBlock: vi.fn(),
   },
 }));
 
@@ -141,5 +143,69 @@ describe("PolicyEditor", () => {
   it("uses the shared WEB_DEFAULT_PORTS constant", async () => {
     const { WEB_DEFAULT_PORTS } = await import("../lib/ports");
     expect(WEB_DEFAULT_PORTS).toEqual([80, 443]);
+  });
+
+  it("renders existing git rules in a Git repos section", async () => {
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [],
+      git: [{ repo: "github.com/o/a", access: "read" }],
+    });
+    render(<PolicyEditor name="web" />);
+    expect(await screen.findByRole("heading", { name: /git repos/i })).toBeInTheDocument();
+    expect(screen.getByText("github.com/o/a")).toBeInTheDocument();
+  });
+
+  it("calls policyGitAllow when adding a git rule and saving", async () => {
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [],
+      git: [],
+    });
+    (api.policyGitAllow as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    render(<PolicyEditor name="web" />);
+    await screen.findByRole("heading", { name: /git repos/i });
+    // Find and fill the "add repo" input
+    const input = screen.getByPlaceholderText(/github\.com\/owner\/repo/i);
+    fireEvent.change(input, { target: { value: "github.com/o/b" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    // The row should appear; now save it
+    await screen.findByText("github.com/o/b");
+    fireEvent.click(screen.getByRole("button", { name: /^save git$/i }));
+    await waitFor(() =>
+      expect(api.policyGitAllow).toHaveBeenCalledWith("web", "github.com/o/b", false),
+    );
+  });
+
+  it("calls policyGitBlock when removing a git rule", async () => {
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [],
+      git: [{ repo: "github.com/o/a", access: "read" }],
+    });
+    (api.policyGitBlock as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    render(<PolicyEditor name="web" />);
+    await screen.findByText("github.com/o/a");
+    fireEvent.click(screen.getByRole("button", { name: /remove github\.com\/o\/a/i }));
+    await waitFor(() =>
+      expect(api.policyGitBlock).toHaveBeenCalledWith("web", "github.com/o/a"),
+    );
+  });
+
+  it("calls policyGitAllow with write=true when access is changed to read-write", async () => {
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [],
+      git: [{ repo: "github.com/o/a", access: "read" }],
+    });
+    (api.policyGitAllow as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    render(<PolicyEditor name="web" />);
+    await screen.findByText("github.com/o/a");
+    // Click "read-write" in the AccessPicker for that row
+    fireEvent.click(screen.getByRole("button", { name: /read-write/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save git$/i }));
+    await waitFor(() =>
+      expect(api.policyGitAllow).toHaveBeenCalledWith("web", "github.com/o/a", true),
+    );
   });
 });
