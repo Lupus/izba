@@ -119,10 +119,12 @@ impl Ops for WinOps {
 #[cfg(windows)]
 fn win_enumerate_accounts() -> Result<Vec<String>, String> {
     use windows_sys::Win32::NetworkManagement::NetManagement::{
-        NERR_Success, NetApiBufferFree, NetUserEnum, FILTER_NORMAL_ACCOUNT, USER_INFO_0,
+        NERR_Success, NetApiBufferFree, NetUserEnum, FILTER_NORMAL_ACCOUNT,
     };
 
     const MAX_PREFERRED_LEN: u32 = u32::MAX;
+    // ERROR_MORE_DATA (234) means there are more entries — keep looping.
+    const ERROR_MORE_DATA: u32 = 234;
 
     let mut buf: *mut u8 = std::ptr::null_mut();
     let mut entries_read: u32 = 0;
@@ -132,7 +134,8 @@ fn win_enumerate_accounts() -> Result<Vec<String>, String> {
 
     loop {
         // SAFETY: NetUserEnum is called with valid out-parameters; the buffer is
-        // freed via NetApiBufferFree on every exit path.
+        // freed via NetApiBufferFree on every exit path (both the error path
+        // below and inside collect_izba_accounts after each page).
         let status = unsafe {
             NetUserEnum(
                 std::ptr::null(),      // local machine
@@ -147,37 +150,23 @@ fn win_enumerate_accounts() -> Result<Vec<String>, String> {
         };
 
         let done = status == NERR_Success;
-        // ERROR_MORE_DATA (234) means there are more entries — keep looping.
-        const ERROR_MORE_DATA: u32 = 234;
         if status != NERR_Success && status != ERROR_MORE_DATA {
-            // Free buffer if allocated before returning error.
+            // Free buffer if NetUserEnum allocated one before returning error.
             if !buf.is_null() {
+                // SAFETY: buf was allocated by NetUserEnum and has not been freed yet.
                 unsafe { NetApiBufferFree(buf as *mut _) };
             }
             return Err(format!("NetUserEnum: NET_API_STATUS {status}"));
         }
 
-        // SAFETY: buf points to an array of USER_INFO_0 (only the usri0_name
-        // field, a *const u16 NUL-terminated UTF-16 string).
+        // SAFETY: buf points to a valid NetUserEnum-allocated array of
+        // USER_INFO_0 with entries_read elements; we free it inside
+        // collect_izba_accounts before returning.
         unsafe {
-            let entries =
-                std::slice::from_raw_parts(buf as *const USER_INFO_0, entries_read as usize);
-            for entry in entries {
-                if entry.usri0_name.is_null() {
-                    continue;
-                }
-                // Decode the NUL-terminated UTF-16 name.
-                let len = (0..).take_while(|&i| *entry.usri0_name.add(i) != 0).count();
-                let slice = std::slice::from_raw_parts(entry.usri0_name, len);
-                if let Ok(name) = String::from_utf16(slice) {
-                    if name.starts_with(ACCOUNT_PREFIX) {
-                        names.push(name);
-                    }
-                }
-            }
-            NetApiBufferFree(buf as *mut _);
-            buf = std::ptr::null_mut();
+            collect_izba_accounts(buf, entries_read, &mut names);
         }
+        // buf is now freed and set to null inside collect_izba_accounts.
+        buf = std::ptr::null_mut();
 
         if done {
             break;
@@ -185,6 +174,40 @@ fn win_enumerate_accounts() -> Result<Vec<String>, String> {
     }
 
     Ok(names)
+}
+
+/// Walk a `NetUserEnum` level-0 buffer page, append every account whose name
+/// starts with [`ACCOUNT_PREFIX`] to `out`, then free the buffer.
+///
+/// # Safety
+///
+/// - `buf` must be a non-null pointer to a `NetUserEnum` level-0 buffer
+///   containing at least `count` consecutive `USER_INFO_0` records.
+/// - After this function returns `buf` is no longer valid (freed via
+///   `NetApiBufferFree`); the caller must not use it again.
+#[cfg(windows)]
+unsafe fn collect_izba_accounts(buf: *mut u8, count: u32, out: &mut Vec<String>) {
+    use windows_sys::Win32::NetworkManagement::NetManagement::{NetApiBufferFree, USER_INFO_0};
+
+    // SAFETY: caller guarantees buf points to count valid USER_INFO_0 entries.
+    let entries = std::slice::from_raw_parts(buf as *const USER_INFO_0, count as usize);
+    for entry in entries {
+        if entry.usri0_name.is_null() {
+            continue;
+        }
+        // Decode the NUL-terminated UTF-16 name.
+        // SAFETY: usri0_name is a valid NUL-terminated UTF-16 pointer per the
+        // NetUserEnum level-0 contract.
+        let len = (0..).take_while(|&i| *entry.usri0_name.add(i) != 0).count();
+        let slice = std::slice::from_raw_parts(entry.usri0_name, len);
+        if let Ok(name) = String::from_utf16(slice) {
+            if name.starts_with(ACCOUNT_PREFIX) {
+                out.push(name);
+            }
+        }
+    }
+    // SAFETY: buf was allocated by NetUserEnum and has not been freed yet.
+    NetApiBufferFree(buf as *mut _);
 }
 
 // ── Provision ────────────────────────────────────────────────────────────────
