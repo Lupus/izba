@@ -78,14 +78,27 @@ export function NewSandbox({ onClose, onCreated }: Props) {
 
   // A row the user added but left entirely blank is ignored (so a stray
   // "+ Add port" click can't block submit). Any row they started filling must
-  // carry numeric host AND guest ports in 1–65535.
+  // carry numeric host AND guest ports in 1–65535, plus a valid IPv4 bind (or
+  // empty → the daemon defaults it to 127.0.0.1). The bind contract mirrors
+  // izba_core::portfwd::parse_rule, which parses bind as an Ipv4Addr.
   const isBlankRow = (r: PortRow) => !r.bind.trim() && !r.host.trim() && !r.guest.trim();
   const isValidPort = (v: string) => /^\d+$/.test(v.trim()) && +v >= 1 && +v <= 65535;
-  const isValidRow = (r: PortRow) => isValidPort(r.host) && isValidPort(r.guest);
+  const isValidBind = (v: string) => {
+    const t = v.trim();
+    if (!t) return true; // empty is allowed; the daemon fills in 127.0.0.1
+    const octets = t.split(".");
+    return octets.length === 4 && octets.every((o) => /^\d+$/.test(o) && +o >= 0 && +o <= 255);
+  };
+  const isValidRow = (r: PortRow) =>
+    isValidPort(r.host) && isValidPort(r.guest) && isValidBind(r.bind);
   const portsInvalid = ports.some((r) => !isBlankRow(r) && !isValidRow(r));
 
   const canCreate =
     name.trim().length > 0 && workspace.trim().length > 0 && !busy && !portsInvalid;
+
+  // Shared column template so the Bind/Host/Guest headers line up with the
+  // inputs below: [bind grows] [host 5rem] [colon] [guest 5rem] [remove 2rem].
+  const portGrid = "grid grid-cols-[minmax(0,1fr)_5rem_0.75rem_5rem_2rem] items-center gap-1.5";
 
   return (
     <div
@@ -167,27 +180,28 @@ export function NewSandbox({ onClose, onCreated }: Props) {
             <span className="text-ink-2">Ports</span>
             <div className="grid gap-1.5">
               {ports.length > 0 && (
-                <div className="flex items-center gap-1.5 text-xs text-ink-3">
-                  <span className="flex-1">Bind address</span>
-                  <span className="w-20">Host port</span>
-                  <span className="w-2" />
-                  <span className="w-20">Guest port</span>
-                  <span className="w-[34px]" />
+                <div className={portGrid + " text-xs text-ink-3"}>
+                  <span>Bind address</span>
+                  <span>Host port</span>
+                  <span />
+                  <span>Guest port</span>
+                  <span />
                 </div>
               )}
               {ports.map((r, i) => {
                 const invalid = !isBlankRow(r) && !isValidRow(r);
-                const portClass = (bad: boolean) =>
-                  "w-20 min-w-0 rounded-lg border px-2 py-1.5 text-xs " +
+                // Shared cell style; flag the specific field that is wrong.
+                const cell = (bad: boolean) =>
+                  "w-full min-w-0 rounded-lg border px-2 py-1.5 text-xs " +
                   (bad ? "border-warn" : "border-line");
                 return (
-                  <div key={i} className="flex items-center gap-1.5">
+                  <div key={i} className={portGrid}>
                     <input
                       aria-label={`Port ${i + 1} bind`}
                       placeholder="127.0.0.1"
                       value={r.bind}
                       onChange={(e) => setPort(i, { bind: e.target.value })}
-                      className="min-w-0 flex-1 rounded-lg border border-line px-2 py-1.5 text-xs"
+                      className={cell(invalid && !isValidBind(r.bind))}
                     />
                     <input
                       aria-label={`Port ${i + 1} host`}
@@ -195,22 +209,22 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                       inputMode="numeric"
                       value={r.host}
                       onChange={(e) => setPort(i, { host: e.target.value })}
-                      className={portClass(invalid && !isValidPort(r.host))}
+                      className={cell(invalid && !isValidPort(r.host))}
                     />
-                    <span className="text-ink-3">:</span>
+                    <span className="text-center text-ink-3">:</span>
                     <input
                       aria-label={`Port ${i + 1} guest`}
                       placeholder="guest"
                       inputMode="numeric"
                       value={r.guest}
                       onChange={(e) => setPort(i, { guest: e.target.value })}
-                      className={portClass(invalid && !isValidPort(r.guest))}
+                      className={cell(invalid && !isValidPort(r.guest))}
                     />
                     <button
                       type="button"
                       aria-label={`Remove port ${i + 1}`}
                       onClick={() => removePort(i)}
-                      className="rounded-lg border border-line px-2 py-1.5 text-ink-2 hover:bg-hover"
+                      className="w-full rounded-lg border border-line py-1.5 text-ink-2 hover:bg-hover"
                     >
                       ×
                     </button>
@@ -229,7 +243,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
               </span>
               {portsInvalid && (
                 <span className="text-xs text-warn">
-                  Host and guest ports must be numbers in 1–65535.
+                  Each port needs a host and guest in 1–65535, and a valid IPv4 bind (or empty).
                 </span>
               )}
             </div>

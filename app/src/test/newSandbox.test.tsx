@@ -80,6 +80,18 @@ describe("NewSandbox", () => {
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
   });
 
+  it("disables Create when the bind address is not a valid IPv4", () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add port/i }));
+    fireEvent.change(screen.getByLabelText(/port 1 bind/i), { target: { value: "sdsdasdas" } });
+    fireEvent.change(screen.getByLabelText(/port 1 host/i), { target: { value: "8080" } });
+    fireEvent.change(screen.getByLabelText(/port 1 guest/i), { target: { value: "80" } });
+    expect(screen.getByText(/IPv4/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
+  });
+
   it("an empty port row does not block Create", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
