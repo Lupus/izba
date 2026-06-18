@@ -1,5 +1,46 @@
 use std::path::PathBuf;
 
+/// Carries the per-sandbox Windows account credentials needed to launch the
+/// VMM as that account (MVP-D locked-down path).
+///
+/// The password field is intentionally excluded from `Debug` output to prevent
+/// it leaking into logs — `VmSpec` is sometimes logged as `{:?}` and the
+/// password must never appear there.
+///
+/// [`LockdownLaunch`] is `Clone` so it can be embedded in the cloneable
+/// `VmSpec`.
+#[derive(Clone)]
+pub struct LockdownLaunch {
+    account: String,
+    password: String,
+}
+
+impl LockdownLaunch {
+    /// Create a new launch-credential carrier.
+    pub fn new(account: String, password: String) -> Self {
+        Self { account, password }
+    }
+
+    /// The Windows local account name (e.g. `izba-spk-mybox`).
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    /// The account password — **never put this in a log string**.
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+impl std::fmt::Debug for LockdownLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockdownLaunch")
+            .field("account", &self.account)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A block device backed by a host file or device node.
 #[derive(Debug, Clone)]
 pub struct BlockDisk {
@@ -33,6 +74,10 @@ pub struct VmSpec {
     /// Windows OpenVMM driver consults this; the Linux jailer is a separate
     /// milestone.
     pub allow_unconfined: bool,
+    /// If set, the VMM is launched as this per-sandbox Windows account
+    /// (MVP-D locked-down path). `None` means: use the normal confined or
+    /// unconfined launch based on `allow_unconfined`.
+    pub lockdown: Option<LockdownLaunch>,
 }
 
 impl VmSpec {
@@ -121,7 +166,56 @@ mod tests {
             console_log: PathBuf::from("/sbx/web/logs/console.log"),
             run_dir: PathBuf::from("/sbx/web/run"),
             allow_unconfined: false,
+            lockdown: None,
         }
+    }
+
+    /// The password embedded in `LockdownLaunch` must never appear in `{:?}`
+    /// output — `VmSpec` is sometimes logged and the credential must not leak.
+    #[test]
+    fn lockdown_launch_debug_redacts_password() {
+        let ll = LockdownLaunch::new("izba-spk-mybox".into(), "s3cret".into());
+        let s = format!("{ll:?}");
+        assert!(
+            !s.contains("s3cret"),
+            "password must NOT appear in Debug output, got: {s}"
+        );
+        assert!(
+            s.contains("<redacted>"),
+            "Debug output must contain <redacted>, got: {s}"
+        );
+        assert!(
+            s.contains("izba-spk-mybox"),
+            "account must appear in Debug output, got: {s}"
+        );
+    }
+
+    /// The same password-redaction guarantee holds when `LockdownLaunch` is
+    /// embedded inside a `VmSpec` and the spec is formatted as `{:?}`.
+    #[test]
+    fn vmspec_debug_with_lockdown_redacts_password() {
+        let spec = VmSpec {
+            kernel: PathBuf::from("/k"),
+            initramfs: PathBuf::from("/i"),
+            cmdline: String::new(),
+            cpus: 1,
+            mem_mb: 256,
+            disks: vec![],
+            shares: vec![],
+            console_log: PathBuf::from("/sbx/web/logs/console.log"),
+            run_dir: PathBuf::from("/sbx/web/run"),
+            allow_unconfined: false,
+            lockdown: Some(LockdownLaunch::new("acct".into(), "s3cret".into())),
+        };
+        let s = format!("{spec:?}");
+        assert!(
+            !s.contains("s3cret"),
+            "password must NOT appear in VmSpec Debug output, got: {s}"
+        );
+        assert!(
+            s.contains("<redacted>"),
+            "VmSpec Debug output must contain <redacted>, got: {s}"
+        );
     }
 
     #[test]
