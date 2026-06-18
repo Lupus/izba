@@ -96,6 +96,10 @@ pub enum DaemonRequest {
     PortPublish {
         name: String,
         rule: PortRule,
+        /// Persist the rule to `ports.json` so it survives daemon restarts.
+        /// Defaults to false via serde so older client frames still deserialize.
+        #[serde(default)]
+        persist: bool,
     },
     PortUnpublish {
         name: String,
@@ -114,6 +118,22 @@ pub enum DaemonRequest {
     Status,
     /// Remove persistent volume images not referenced by any sandbox config.
     VolumePrune,
+    /// List all named persistent volumes known to the daemon.
+    VolumeList,
+    /// Delete a named persistent volume image.
+    VolumeRemove {
+        name: String,
+    },
+    /// Attach a volume to a running sandbox.
+    VolumeAttach {
+        name: String,
+        spec: crate::volume::VolumeSpec,
+    },
+    /// Detach a volume from a running sandbox by its guest mount-point.
+    VolumeDetach {
+        name: String,
+        guest_path: PathBuf,
+    },
     /// Re-read a sandbox's `policy.yaml` and hot-swap it into the live egress
     /// plane (new flows only; no VM restart).
     ReloadPolicy {
@@ -142,6 +162,10 @@ pub struct SandboxDetail {
     pub workspace: String,
     pub status: String,
     pub ports: Vec<PortRule>,
+    /// Volumes declared for this sandbox. Defaults to empty so frames from
+    /// older daemons still deserialize.
+    #[serde(default)]
+    pub volumes: Vec<crate::volume::VolumeSpec>,
     /// Host-side VMM confinement summary (`ConfinementStatus::summary()`), or
     /// `None` when the sandbox is stopped / its state predates the field — the
     /// CLI renders `None` as "unknown". serde(default) keeps older frames
@@ -202,10 +226,15 @@ pub enum DaemonResponse {
         rules: Vec<PortRule>,
     },
     Status(DaemonStatus),
-    /// Result of a `VolumePrune`: which volumes were removed and bytes freed.
+    /// Result of a `VolumePrune` or `VolumeRemove`: which volumes were removed
+    /// and bytes freed.
     Pruned {
         removed: Vec<String>,
         reclaimed_bytes: u64,
+    },
+    /// Result of a `VolumeList` request.
+    Volumes {
+        volumes: Vec<crate::volume::VolumeInfo>,
     },
 }
 
@@ -264,6 +293,7 @@ mod tests {
                     host_port: 8080,
                     guest_port: 80,
                 },
+                persist: false,
             },
             DaemonRequest::PortUnpublish {
                 name: "web".into(),
@@ -275,6 +305,23 @@ mod tests {
             DaemonRequest::ReloadPolicy { name: "web".into() },
             DaemonRequest::Status,
             DaemonRequest::Shutdown,
+            DaemonRequest::VolumeList,
+            DaemonRequest::VolumeRemove {
+                name: "cache".into(),
+            },
+            DaemonRequest::VolumeAttach {
+                name: "web".into(),
+                spec: crate::volume::VolumeSpec {
+                    name: Some("cache".into()),
+                    guest_path: "/data".into(),
+                    size_bytes: 1 << 30,
+                    eph_id: None,
+                },
+            },
+            DaemonRequest::VolumeDetach {
+                name: "web".into(),
+                guest_path: PathBuf::from("/data"),
+            },
         ] {
             let mut buf = Vec::new();
             write_frame(&mut buf, &req).unwrap();
@@ -318,9 +365,15 @@ mod tests {
                 workspace: "/ws".into(),
                 status: "running".into(),
                 ports: vec![],
+                volumes: vec![],
                 confinement: Some("confined: restricted(limited)+low-il+job".into()),
             }),
             DaemonResponse::Ports { rules: vec![] },
+            DaemonResponse::Pruned {
+                removed: vec!["cache".into()],
+                reclaimed_bytes: 1 << 30,
+            },
+            DaemonResponse::Volumes { volumes: vec![] },
             DaemonResponse::Status(DaemonStatus {
                 version: "0.1.0".into(),
                 proto: DAEMON_PROTO_VERSION,
