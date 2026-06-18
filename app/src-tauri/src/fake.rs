@@ -39,10 +39,6 @@ pub struct FakeDaemon {
     pub fail_status: bool,
     /// Short sha the fake daemon reports (lets a test force an app↔daemon diff).
     pub daemon_sha: String,
-    /// `git describe` the fake daemon reports. The mismatch check compares this
-    /// against the app's describe, so a test sets it to the app's own describe
-    /// to model an identical build, or to anything else to model a different one.
-    pub daemon_describe: String,
     /// When true, `version()` errors as if no daemon were reachable.
     pub daemon_absent: bool,
     pub fail_action: bool,
@@ -79,7 +75,6 @@ impl Default for FakeDaemon {
             fail_list: false,
             fail_status: false,
             daemon_sha: "feedface".into(),
-            daemon_describe: "v0.0.0-fake-gfeedface".into(),
             daemon_absent: false,
             fail_action: false,
             calls: Vec::new(),
@@ -111,7 +106,6 @@ impl DaemonApi for FakeDaemon {
         }
         let build = BuildInfoOwned {
             git_sha: self.daemon_sha.clone(),
-            git_describe: self.daemon_describe.clone(),
             ..BuildInfoOwned::default()
         };
         Ok((build, 1))
