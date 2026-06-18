@@ -25,6 +25,25 @@ beforeEach(() => {
   (api.policySetFull as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 });
 
+describe("PolicyEditor layout", () => {
+  it("root has h-full and flex-col, scroll region has overflow-y-auto and min-h-0", async () => {
+    const { container } = render(<PolicyEditor name="web" />);
+    // Wait for load
+    await screen.findByDisplayValue("api.x.com");
+    // Root div must be h-full flex-col (makes the component fill its parent column)
+    const root = container.firstElementChild as HTMLElement;
+    expect(root.className).toMatch(/\bh-full\b/);
+    expect(root.className).toMatch(/\bflex-col\b/);
+    // Scroll region: a direct child of root with overflow-y-auto and min-h-0
+    const scrollRegion = Array.from(root.children).find(
+      (el) =>
+        el.className.includes("overflow-y-auto") &&
+        el.className.includes("min-h-0"),
+    );
+    expect(scrollRegion).toBeDefined();
+  });
+});
+
 describe("PolicyEditor", () => {
   it("renders entries and saves normalized rows via policySetFull", async () => {
     render(<PolicyEditor name="web" />);

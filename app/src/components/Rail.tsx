@@ -10,7 +10,7 @@ interface Props {
 
 export function Rail({ sandboxes, selected, onSelect, onNew }: Props) {
   return (
-    <nav className="w-56 shrink-0 border-r border-line bg-rail p-3 flex flex-col gap-1">
+    <nav className="flex h-full w-56 shrink-0 flex-col gap-1 overflow-y-auto border-r border-line bg-rail p-3">
       <button
         type="button"
         onClick={onNew}
