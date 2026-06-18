@@ -107,6 +107,15 @@ impl ConfinementStatus {
             ),
         }
     }
+    /// Restricted confinement with a caller-supplied reason. Used by the Linux
+    /// realisation, whose reason text (layer list) differs from the Windows
+    /// token-shaped `applied()`.
+    pub fn confined(reason: &str) -> Self {
+        Self {
+            mode: ConfinementMode::Restricted,
+            reason: reason.to_string(),
+        }
+    }
     pub fn degraded(reason: &str) -> Self {
         Self {
             mode: ConfinementMode::None,
@@ -191,5 +200,14 @@ mod tests {
         assert!(!s.reason.contains("+job"));
         assert!(s.reason.contains("resource job unavailable"));
         assert!(s.summary().starts_with("confined (token only):"));
+    }
+
+    #[test]
+    fn confined_constructor_is_restricted_with_verbatim_reason() {
+        let s = ConfinementStatus::confined("seccomp+landlock+virtiofs:namespace");
+        assert_eq!(s.mode, ConfinementMode::Restricted);
+        assert_eq!(s.reason, "seccomp+landlock+virtiofs:namespace");
+        assert!(s.summary().starts_with("confined: "));
+        assert!(s.is_confined());
     }
 }
