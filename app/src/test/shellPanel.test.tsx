@@ -95,6 +95,18 @@ describe("ShellPanel", () => {
     await waitFor(() => expect(api.shellClose).toHaveBeenCalled());
   });
 
+  it("makes a newly opened shell the active one", async () => {
+    render(<ShellPanel sandbox="web" />);
+    await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(1));
+    fireEvent.click(screen.getByRole("button", { name: /new shell/i }));
+    await waitFor(() => {
+      const tabs = screen.getAllByRole("tab");
+      expect(tabs).toHaveLength(2);
+      // The newest (second) tab is the active one.
+      expect(tabs[1].closest("div")?.className).toContain("font-semibold");
+    });
+  });
+
   it("restores the previously-active shell after unmount/remount", async () => {
     const { unmount } = render(<ShellPanel sandbox="web" />);
     await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(1));
