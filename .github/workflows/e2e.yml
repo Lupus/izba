@@ -200,6 +200,7 @@ jobs:
             echo "Landlock present — confined-boot path WILL be exercised"
           else
             echo "Landlock ABSENT — integration suite auto-opts-out (--allow-unconfined); confined path NOT exercised"
+            echo "::warning title=Confined path not exercised::Landlock absent on this runner; the integration suite auto-opts-out (--allow-unconfined), so the confined VMM launch path was NOT exercised this run."
           fi
       - name: Integration suite (real KVM VMs, incl. izbad egress)
         run: |

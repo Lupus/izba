@@ -99,13 +99,22 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    /// Best-effort ceilings (F-28). address_space covers guest RAM plus generous
-    /// headroom for CH's own mappings, virtiofs DAX window, and stacks.
-    pub fn for_vmm(mem_mb: u64) -> Self {
-        const MIB: u64 = 1024 * 1024;
-        let headroom_mb = 2048; // CH mappings + DAX + slack
+    /// Best-effort ceilings (F-28).
+    ///
+    /// RLIMIT_AS is intentionally NOT set here. cloud-hypervisor with
+    /// `--memory shared=on` maps the full guest RAM + virtiofs DAX window +
+    /// thread stacks into its virtual address space. A ceiling of
+    /// `(mem_mb + headroom_mb)` would OOM-kill a legitimate boot at the daemon's
+    /// default 4096 MB. Firecracker's jailer deliberately omits RLIMIT_AS for
+    /// the same reason. Host memory bounding is deferred to the cgroup follow-up
+    /// (F-28 residual).
+    ///
+    /// `address_space` remains on the struct for that future use.
+    pub fn for_vmm(_mem_mb: u64) -> Self {
+        // _mem_mb is kept in the signature for stability; it is unused until
+        // the cgroup follow-up lands.
         Self {
-            address_space: Some((mem_mb + headroom_mb) * MIB),
+            address_space: None,
             nofile: Some(4096),
             nproc: Some(256),
         }
@@ -162,7 +171,10 @@ pub fn plan(
     let rlimits = ResourceLimits::for_vmm(mem_mb);
 
     if missing.is_empty() {
-        let reason = format!("seccomp+landlock+virtiofs:{}+rlimits", sandbox.as_arg());
+        let reason = format!(
+            "seccomp+landlock+virtiofs:{}+rlimits(best-effort)",
+            sandbox.as_arg()
+        );
         return Ok(ConfinementPlan {
             virtiofsd_sandbox: sandbox,
             ch_seccomp,
@@ -290,10 +302,11 @@ mod tests {
     }
 
     #[test]
-    fn rlimits_scale_with_mem() {
-        let small = ResourceLimits::for_vmm(1024);
-        let big = ResourceLimits::for_vmm(8192);
-        assert!(big.address_space.unwrap() > small.address_space.unwrap());
-        assert!(small.nofile.is_some() && small.nproc.is_some());
+    fn for_vmm_sets_fd_and_proc_caps_not_address_space() {
+        // RLIMIT_AS is not set (see ResourceLimits::for_vmm doc); mem_mb no
+        // longer drives the address-space limit.
+        assert!(ResourceLimits::for_vmm(2048).address_space.is_none());
+        assert_eq!(ResourceLimits::for_vmm(2048).nofile, Some(4096));
+        assert_eq!(ResourceLimits::for_vmm(2048).nproc, Some(256));
     }
 }

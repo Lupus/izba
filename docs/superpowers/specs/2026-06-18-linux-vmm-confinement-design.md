@@ -167,6 +167,15 @@ must stay async-signal-safe (no allocation; `nix::sys::resource::setrlimit`).
   summary `UNCONFINED — …`, and the daemon/CLI surface it).
 - rlimit application failure: logged to `vmm.log`, launch continues (D5).
 
+**Status-honesty assumption:** the `Restricted` status stored in `ChHandle` is
+trustworthy because virtiofsd and cloud-hypervisor **fail closed** on
+flag-application error — virtiofsd that cannot enter its `--sandbox` exits
+before creating its socket (the socket-wait times out → launch returns an
+error), and cloud-hypervisor aborts if `--landlock`/`--seccomp` cannot be
+applied (the VM dies → health reports unhealthy). If a future CH or virtiofsd
+release downgrades such a failure to a warning, this assumption breaks and the
+status could overstate the achieved confinement.
+
 ## 7. Testing (TDD)
 
 - **Unit (host-testable, no KVM):**
