@@ -113,4 +113,68 @@ describe("NewSandbox", () => {
     fireEvent.click(screen.getByRole("button", { name: /create/i }));
     await waitFor(() => expect(screen.getByText(/invalid sandbox name/i)).toBeInTheDocument());
   });
+
+  // ── Volume section (E2) ─────────────────────────────────────────────────
+
+  it("submits a named volume row as name:path:size", async () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /create/i }));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(
+        expect.objectContaining({ volumes: ["cache:/data:1g"] }),
+      ),
+    );
+  });
+
+  it("disables Create when volume path lacks leading slash", () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
+  });
+
+  it("disables Create when volume size is invalid", () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1x" } });
+    expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
+  });
+
+  it("emits ephemeral spec (no name prefix) for empty-name volume row", async () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/scratch" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /create/i }));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(
+        expect.objectContaining({ volumes: ["/scratch:1g"] }),
+      ),
+    );
+  });
+
+  it("ignores fully-blank volume rows on submit", async () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /create/i }));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({ volumes: [] })),
+    );
+  });
 });

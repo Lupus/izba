@@ -36,6 +36,7 @@ describe("ipc action wrappers", () => {
       workspace: "/ws",
       rw_size_gb: 8,
       ports: [],
+      volumes: [],
     };
     await api.create(opts);
     expect(invoke).toHaveBeenCalledWith("create", { opts });
