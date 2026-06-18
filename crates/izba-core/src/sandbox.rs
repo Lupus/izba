@@ -1041,6 +1041,70 @@ pub fn prune_volumes(paths: &Paths) -> anyhow::Result<crate::volume::Pruned> {
     Ok(pruned)
 }
 
+/// Sandboxes whose config references persistent volume `vol`.
+fn referenced_by(paths: &Paths, vol: &str) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let dir = paths.sandboxes_dir();
+    if !dir.is_dir() {
+        return Ok(out);
+    }
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let cfg_path = entry.path().join(CONFIG_FILE);
+        let Some(cfg) = load_json::<SandboxConfig>(&cfg_path)? else {
+            continue;
+        };
+        if cfg.volumes.iter().any(|v| v.name.as_deref() == Some(vol)) {
+            out.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// On-disk allocation: blocks × 512 on Unix, file length elsewhere.
+fn allocated_bytes(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks() * 512
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+/// Enumerate persistent volume images under `<data>/volumes`, with declared
+/// size, on-disk allocation (best-effort), and which sandbox configs use them.
+pub fn list_volumes(paths: &Paths) -> anyhow::Result<Vec<crate::volume::VolumeInfo>> {
+    let dir = paths.volumes_dir();
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = fname.strip_suffix(".img") else {
+            continue;
+        };
+        let meta = entry.metadata()?;
+        let mut refs = referenced_by(paths, name)?;
+        refs.sort();
+        out.push(crate::volume::VolumeInfo {
+            name: name.to_string(),
+            size_bytes: meta.len(),
+            actual_bytes: allocated_bytes(&meta),
+            referenced_by: refs,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
 /// If a *live* sandbox other than `exclude` references persistent volume
 /// `vol_name`, return that sandbox's name. Enforces single-writer at start.
 fn persistent_volume_holder(
@@ -1884,5 +1948,21 @@ mod tests {
     #[test]
     fn boot_timeout_trims_whitespace() {
         assert_eq!(boot_timeout_from_env(Some(" 45 ")), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn list_volumes_reports_size_and_references() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        // Persistent volume referenced by sandbox "web".
+        let mut o = opts(&ws);
+        o.volumes = vec![crate::volume::parse_volume_flag("cache:/data:1g").unwrap()];
+        create(&paths, "web", &o).unwrap();
+        let got = list_volumes(&paths).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "cache");
+        assert_eq!(got[0].size_bytes, 1 << 30);
+        assert_eq!(got[0].referenced_by, vec!["web".to_string()]);
     }
 }
