@@ -24,5 +24,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_NetworkManagement_NetManagement",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_System_Registry",
+    "Win32_System_Threading",
 ] }

@@ -24,6 +24,8 @@ const DIGITS: &[u8] = b"0123456789";
 const SYMBOLS: &[u8] = b"!@#$%^&*()-_=+";
 
 /// All printable password characters (concatenation of the four classes).
+/// Used only by `random_password` (Windows / CSPRNG path).
+#[cfg(windows)]
 const ALPHABET: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+";
 
@@ -46,51 +48,130 @@ pub fn meets_complexity(pw: &str) -> bool {
         >= 3
 }
 
+/// Fill `buf` with cryptographically random bytes from the OS CSPRNG
+/// (`BCryptGenRandom` on Windows). Returns `Err` if the OS call fails.
+///
+/// This is the ONLY random source used in the password generation path.
+/// `entropy()` is intentionally NOT used here — it is clock+counter only
+/// and is unsuitable as a credential randomness source.
+#[cfg(windows)]
+fn csprng_fill(buf: &mut [u8]) -> Result<(), String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    // SAFETY: buf is a valid mutable slice of exactly buf.len() bytes;
+    // BCRYPT_USE_SYSTEM_PREFERRED_RNG lets BCryptGenRandom use the system RNG
+    // without requiring a prior BCryptOpenAlgorithmProvider call (the hAlgorithm
+    // argument is ignored and must be null).
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(), // hAlgorithm: ignored when flag is set
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(format!("BCryptGenRandom failed: NTSTATUS {status:#010x}"));
+    }
+    Ok(())
+}
+
 /// Generate a random password of exactly `len` characters (must be >= [`MIN_PW_LEN`]).
 ///
-/// Uses the same clock+counter entropy as `confine_probe.rs` — no external
-/// crate dependency. The four character classes (upper / lower / digit /
-/// symbol) each seed at least one character in the output, guaranteeing
-/// `meets_complexity` is always satisfied regardless of the random stream.
+/// Uses `BCryptGenRandom` (OS CSPRNG) as the sole source of randomness.
+/// Rejection-sampling maps raw bytes onto the alphabet without modulo bias.
+/// The four character classes (upper / lower / digit / symbol) each seed at
+/// least one character in the output, guaranteeing `meets_complexity` is
+/// always satisfied. A CSPRNG-driven Fisher-Yates shuffle then randomises the
+/// positions of the guaranteed characters.
+///
+/// # Errors
+///
+/// Returns `Err` if `BCryptGenRandom` fails (should never happen on a healthy
+/// Windows system — the error is intentionally NOT silently swallowed).
 ///
 /// # Panics
 ///
 /// Panics if `len < MIN_PW_LEN`.
-pub fn random_password(len: usize) -> String {
+#[cfg(windows)]
+pub fn random_password(len: usize) -> Result<String, String> {
     assert!(
         len >= MIN_PW_LEN,
         "random_password: len {len} < MIN_PW_LEN {MIN_PW_LEN}"
     );
 
-    // We seed the first four positions with one character from each class so
-    // complexity is ALWAYS satisfied, then fill the rest from the full alphabet.
-    // The seeded positions are later shuffled via the same entropy stream.
-    let guaranteed: &[&[u8]] = &[UPPER, LOWER, DIGITS, SYMBOLS];
+    /// Draw one unbiased byte from `class` using CSPRNG rejection-sampling.
+    /// Rejects raw bytes >= `256 - (256 % class.len())` to avoid modulo bias.
+    fn pick_from_class(class: &[u8]) -> Result<u8, String> {
+        let threshold = {
+            let rem = 256usize % class.len();
+            if rem == 0 {
+                256u16
+            } else {
+                (256 - rem) as u16
+            }
+        };
+        // Retry loop: expected iterations < 2 for any class.
+        loop {
+            let mut b = [0u8; 1];
+            csprng_fill(&mut b)?;
+            if (b[0] as u16) < threshold {
+                return Ok(class[(b[0] as usize) % class.len()]);
+            }
+        }
+    }
+
+    // Seed one character from each of the four required classes so that
+    // `meets_complexity` is ALWAYS satisfied regardless of the random stream.
+    let guaranteed_classes: &[&[u8]] = &[UPPER, LOWER, DIGITS, SYMBOLS];
     let mut bytes: Vec<u8> = Vec::with_capacity(len);
 
-    for &class in guaranteed {
-        let idx = (entropy() as usize) % class.len();
-        bytes.push(class[idx]);
-    }
-    while bytes.len() < len {
-        let idx = (entropy() as usize) % ALPHABET.len();
-        bytes.push(ALPHABET[idx]);
+    for &class in guaranteed_classes {
+        bytes.push(pick_from_class(class)?);
     }
 
-    // Fisher-Yates shuffle so the guaranteed characters are not always at
-    // positions 0-3.
+    // Fill the remainder of the password from the full alphabet.
+    while bytes.len() < len {
+        bytes.push(pick_from_class(ALPHABET)?);
+    }
+
+    // Fisher-Yates shuffle (CSPRNG-driven) so the guaranteed characters are
+    // not always at positions 0-3.  For each position i (len-1 down to 1),
+    // draw an unbiased index j in [0, i] and swap bytes[i] with bytes[j].
     for i in (1..len).rev() {
-        let j = (entropy() as usize) % (i + 1);
+        // We need j in [0, i] — draw an unbiased u64 from 4 CSPRNG bytes and
+        // take it mod (i+1).  With i < 256 the bias is negligible, but we
+        // prefer a clean rejection-sample over even a tiny bias.
+        let modulus = i + 1; // 2 .. len
+        let threshold = {
+            let rem = 256usize % modulus;
+            if rem == 0 {
+                256u16
+            } else {
+                (256 - rem) as u16
+            }
+        };
+        let j = loop {
+            let mut b = [0u8; 1];
+            csprng_fill(&mut b)?;
+            let v = b[0] as u16;
+            if v < threshold {
+                break (v as usize) % modulus;
+            }
+        };
         bytes.swap(i, j);
     }
 
-    // SAFETY: every byte comes from printable ASCII slices.
-    String::from_utf8(bytes).expect("password bytes are valid UTF-8 ASCII")
+    // SAFETY: every byte comes from printable ASCII slices (UPPER/LOWER/DIGITS/SYMBOLS/ALPHABET).
+    Ok(String::from_utf8(bytes).expect("password bytes are valid UTF-8 ASCII"))
 }
 
 /// Monotonically increasing per-call entropy: a static counter folded with
-/// the high-res clock. Identical to the `entropy()` in `confine_probe.rs` —
-/// both live in the same binary on Windows.
+/// the high-res clock. Used by NON-credential code (e.g. unique temp-file
+/// suffixes). MUST NOT be used in the password generation path — it is
+/// clock+counter, not a CSPRNG.
+#[allow(dead_code)]
 fn entropy() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -135,7 +216,7 @@ mod win {
     ///
     /// Returns `(sid_string, password)` on success.
     pub fn create_account(name: &str) -> Result<(String, String), String> {
-        let password = random_password(PW_LEN);
+        let password = random_password(PW_LEN)?;
 
         // Encode the account name and password as NUL-terminated UTF-16.
         let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
@@ -478,9 +559,11 @@ pub fn delete_profile(_name: &str) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{meets_complexity, random_password, MIN_PW_LEN};
+    use super::meets_complexity;
+    #[cfg(windows)]
+    use super::{random_password, MIN_PW_LEN};
 
-    // ── Password complexity predicate ────────────────────────────────────────
+    // ── Password complexity predicate (cross-platform) ───────────────────────
 
     #[test]
     fn empty_password_fails_complexity() {
@@ -516,11 +599,12 @@ mod tests {
         assert!(meets_complexity("Abcde1234!@#$AbcX"));
     }
 
-    // ── random_password generator ────────────────────────────────────────────
+    // ── random_password generator (Windows only — BCryptGenRandom) ───────────
 
+    #[cfg(windows)]
     #[test]
     fn random_password_default_length_meets_complexity() {
-        let pw = random_password(MIN_PW_LEN);
+        let pw = random_password(MIN_PW_LEN).expect("BCryptGenRandom should succeed");
         assert_eq!(pw.len(), MIN_PW_LEN);
         assert!(
             meets_complexity(&pw),
@@ -528,9 +612,10 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn random_password_24_chars() {
-        let pw = random_password(24);
+        let pw = random_password(24).expect("BCryptGenRandom should succeed");
         assert_eq!(pw.len(), 24);
         assert!(
             meets_complexity(&pw),
@@ -538,11 +623,12 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn random_password_meets_complexity_many_iterations() {
         // Generate 500 passwords; every one must pass complexity.
         for i in 0..500 {
-            let pw = random_password(24);
+            let pw = random_password(24).expect("BCryptGenRandom should succeed");
             assert!(
                 meets_complexity(&pw),
                 "iteration {i}: password {pw:?} failed complexity"
@@ -550,10 +636,11 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn random_password_is_not_all_same_character() {
         // Statistically impossible given the alphabet, but a useful sanity check.
-        let pw = random_password(24);
+        let pw = random_password(24).expect("BCryptGenRandom should succeed");
         let first = pw.chars().next().unwrap();
         assert!(
             !pw.chars().all(|c| c == first),
@@ -561,17 +648,19 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn random_password_consecutive_calls_differ() {
-        // Entropy is clock+counter — two consecutive calls must not collide.
-        let a = random_password(24);
-        let b = random_password(24);
+        // CSPRNG — two consecutive calls must produce distinct results.
+        let a = random_password(24).expect("BCryptGenRandom should succeed");
+        let b = random_password(24).expect("BCryptGenRandom should succeed");
         assert_ne!(a, b, "two consecutive passwords must differ");
     }
 
+    #[cfg(windows)]
     #[test]
     fn random_password_contains_only_ascii_printable() {
-        let pw = random_password(24);
+        let pw = random_password(24).expect("BCryptGenRandom should succeed");
         assert!(
             pw.is_ascii(),
             "password contains non-ASCII characters: {pw:?}"

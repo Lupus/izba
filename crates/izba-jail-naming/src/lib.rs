@@ -7,11 +7,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// Returns the Windows Firewall SDDL for a single-account inbound CC allow rule.
+/// Returns the Windows Firewall SDDL match condition for a single account.
 ///
 /// Format: `D:(A;;CC;;;<sid>)` — one DACL ACE granting `CC` (create connection)
-/// to the given SID.  This string is passed verbatim to `netsh` or the Windows
-/// Firewall COM API.
+/// to the given SID.  This string is the `-LocalUser` condition that tells the
+/// Firewall rule *which user's traffic to match*.  The actual action (Block or
+/// Allow) is determined by the `-Action` parameter of `New-NetFirewallRule`, not
+/// by the SDDL itself; the rules created by `izba-jail-helper` use `-Action Block`.
 pub fn firewall_sddl(sid: &str) -> String {
     format!("D:(A;;CC;;;{sid})")
 }

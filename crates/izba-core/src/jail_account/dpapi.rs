@@ -149,7 +149,7 @@ pub fn unseal(blob: &[u8]) -> Result<Vec<u8>, String> {
     win::unseal(blob)
 }
 
-/// Decrypt a DPAPI blob previously produced by [`seal`].
+/// Decrypt (unseal) a DPAPI blob previously produced by [`seal`].
 ///
 /// Returns `Err("windows-only")` on non-Windows platforms.
 #[cfg(not(windows))]
