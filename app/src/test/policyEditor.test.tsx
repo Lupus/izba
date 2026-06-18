@@ -192,7 +192,7 @@ describe("PolicyEditor", () => {
     );
   });
 
-  it("calls policyGitAllow with write=true when access is changed to read-write", async () => {
+  it("calls policyGitAllow immediately when access is changed to read-write on an existing row", async () => {
     (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
       enforcing: true,
       allow: [],
@@ -201,9 +201,9 @@ describe("PolicyEditor", () => {
     (api.policyGitAllow as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     render(<PolicyEditor name="web" />);
     await screen.findByText("github.com/o/a");
-    // Click "read-write" in the AccessPicker for that row
+    // Changing access on an existing (already-persisted) row persists immediately;
+    // no "Save git" click is required.
     fireEvent.click(screen.getByRole("button", { name: /read-write/i }));
-    fireEvent.click(screen.getByRole("button", { name: /^save git$/i }));
     await waitFor(() =>
       expect(api.policyGitAllow).toHaveBeenCalledWith("web", "github.com/o/a", true),
     );
