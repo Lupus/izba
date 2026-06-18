@@ -28,7 +28,11 @@ pub fn version_core(d: &mut dyn DaemonApi) -> Result<VersionView, String> {
     let core = izba_core::build_info::BuildInfoOwned::current();
     let (daemon, proto, mismatch) = match d.version() {
         Ok((build, proto)) => {
-            let mismatch = build != app;
+            // Compare git identity only: `git describe` encodes tag + commit sha
+            // + `-dirty`. The app and daemon are separate binaries built at
+            // different instants, so build_timestamp/rustc always differ even for
+            // the same commit — comparing the whole struct would warn constantly.
+            let mismatch = build.git_describe != app.git_describe;
             (Some(build), proto, mismatch)
         }
         Err(_) => (None, 0, false),
@@ -220,15 +224,29 @@ mod tests {
 
     #[test]
     fn version_core_flags_mismatch_when_daemon_differs() {
-        // The fake daemon reports a sha that cannot match the real app build.
+        // The fake daemon reports a `git describe` that cannot match the app's.
         let mut d = FakeDaemon {
-            daemon_sha: "deadbeef".into(),
+            daemon_describe: "v9.9.9-different-gdeadbeef".into(),
             ..Default::default()
         };
         let v = version_core(&mut d).unwrap();
         assert!(v.daemon.is_some());
         assert!(v.mismatch);
         assert!(!v.app.git_describe.is_empty());
+    }
+
+    #[test]
+    fn version_core_no_mismatch_when_describe_matches() {
+        // Same commit ⇒ same `git describe`, even though the two binaries were
+        // built at different instants (build_timestamp/rustc differ). The
+        // warning must NOT fire just because the timestamps differ.
+        let mut d = FakeDaemon {
+            daemon_describe: app_build_info().git_describe,
+            ..Default::default()
+        };
+        let v = version_core(&mut d).unwrap();
+        assert!(v.daemon.is_some());
+        assert!(!v.mismatch, "identical git describe must not flag a mismatch");
     }
 
     #[test]
