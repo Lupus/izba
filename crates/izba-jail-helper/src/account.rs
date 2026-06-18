@@ -77,6 +77,43 @@ fn csprng_fill(buf: &mut [u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Draw one unbiased index in `[0, modulo)` from the OS CSPRNG using
+/// rejection-sampling. Rejects raw bytes `>= 256 - (256 % modulo)` to
+/// eliminate modulo bias.
+///
+/// Expected iterations: < 2 for any `modulo <= 128`.
+#[cfg(windows)]
+fn csprng_index(modulo: usize) -> Result<usize, String> {
+    let threshold = {
+        let rem = 256usize % modulo;
+        if rem == 0 {
+            256u16
+        } else {
+            (256 - rem) as u16
+        }
+    };
+    loop {
+        let mut b = [0u8; 1];
+        csprng_fill(&mut b)?;
+        if (b[0] as u16) < threshold {
+            return Ok((b[0] as usize) % modulo);
+        }
+    }
+}
+
+/// Fisher-Yates shuffle of `v` driven entirely by `csprng_index`.
+///
+/// For each position `i` from `len-1` down to `1`, draws an unbiased index
+/// `j` in `[0, i]` via rejection-sampling and swaps `v[i]` with `v[j]`.
+#[cfg(windows)]
+fn csprng_shuffle<T>(v: &mut [T]) -> Result<(), String> {
+    for i in (1..v.len()).rev() {
+        let j = csprng_index(i + 1)?;
+        v.swap(i, j);
+    }
+    Ok(())
+}
+
 /// Generate a random password of exactly `len` characters (must be >= [`MIN_PW_LEN`]).
 ///
 /// Uses `BCryptGenRandom` (OS CSPRNG) as the sole source of randomness.
@@ -101,67 +138,22 @@ pub fn random_password(len: usize) -> Result<String, String> {
         "random_password: len {len} < MIN_PW_LEN {MIN_PW_LEN}"
     );
 
-    /// Draw one unbiased byte from `class` using CSPRNG rejection-sampling.
-    /// Rejects raw bytes >= `256 - (256 % class.len())` to avoid modulo bias.
-    fn pick_from_class(class: &[u8]) -> Result<u8, String> {
-        let threshold = {
-            let rem = 256usize % class.len();
-            if rem == 0 {
-                256u16
-            } else {
-                (256 - rem) as u16
-            }
-        };
-        // Retry loop: expected iterations < 2 for any class.
-        loop {
-            let mut b = [0u8; 1];
-            csprng_fill(&mut b)?;
-            if (b[0] as u16) < threshold {
-                return Ok(class[(b[0] as usize) % class.len()]);
-            }
-        }
-    }
+    let mut bytes: Vec<u8> = Vec::with_capacity(len);
 
     // Seed one character from each of the four required classes so that
     // `meets_complexity` is ALWAYS satisfied regardless of the random stream.
-    let guaranteed_classes: &[&[u8]] = &[UPPER, LOWER, DIGITS, SYMBOLS];
-    let mut bytes: Vec<u8> = Vec::with_capacity(len);
-
-    for &class in guaranteed_classes {
-        bytes.push(pick_from_class(class)?);
+    for &class in &[UPPER, LOWER, DIGITS, SYMBOLS] {
+        bytes.push(class[csprng_index(class.len())?]);
     }
 
     // Fill the remainder of the password from the full alphabet.
     while bytes.len() < len {
-        bytes.push(pick_from_class(ALPHABET)?);
+        bytes.push(ALPHABET[csprng_index(ALPHABET.len())?]);
     }
 
     // Fisher-Yates shuffle (CSPRNG-driven) so the guaranteed characters are
-    // not always at positions 0-3.  For each position i (len-1 down to 1),
-    // draw an unbiased index j in [0, i] and swap bytes[i] with bytes[j].
-    for i in (1..len).rev() {
-        // We need j in [0, i] — draw an unbiased u64 from 4 CSPRNG bytes and
-        // take it mod (i+1).  With i < 256 the bias is negligible, but we
-        // prefer a clean rejection-sample over even a tiny bias.
-        let modulus = i + 1; // 2 .. len
-        let threshold = {
-            let rem = 256usize % modulus;
-            if rem == 0 {
-                256u16
-            } else {
-                (256 - rem) as u16
-            }
-        };
-        let j = loop {
-            let mut b = [0u8; 1];
-            csprng_fill(&mut b)?;
-            let v = b[0] as u16;
-            if v < threshold {
-                break (v as usize) % modulus;
-            }
-        };
-        bytes.swap(i, j);
-    }
+    // not always at positions 0-3.
+    csprng_shuffle(&mut bytes)?;
 
     // SAFETY: every byte comes from printable ASCII slices (UPPER/LOWER/DIGITS/SYMBOLS/ALPHABET).
     Ok(String::from_utf8(bytes).expect("password bytes are valid UTF-8 ASCII"))
