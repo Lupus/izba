@@ -11,36 +11,46 @@ import { WEB_DEFAULT_PORTS } from "../lib/ports";
  *   /git-receive-pack   → push (write)
  *   /git-upload-pack    → clone/fetch (read)
  *   /info/refs          → negotiation prefix (read)
+ *
+ * Uses only linear string operations (endsWith / slice / startsWith / split)
+ * to avoid backtracking-prone regex patterns (SonarCloud S5852).
  */
 export function git_repo_from_row(host: string | null, path: string | null): string | null {
   if (!host || !path) return null;
 
-  // Strip query string
-  const bare = path.replace(/\?.*$/, "");
+  // Strip query string: take everything before the first '?'
+  const bare = path.split("?")[0];
 
-  // /info/refs?service=git-{upload,receive}-pack
-  const infoRefsMatch = /^(.*?)(?:\.git)?\/info\/refs$/.exec(bare);
-  if (infoRefsMatch) {
-    const repo = infoRefsMatch[1].replace(/^\//, "");
-    return `${host}/${repo}`;
+  // Determine which suffix the path ends with, then slice it off.
+  const GIT_SUFFIXES = ["/info/refs", "/git-upload-pack", "/git-receive-pack"] as const;
+  let repoPath: string | null = null;
+  for (const suffix of GIT_SUFFIXES) {
+    if (bare.endsWith(suffix)) {
+      repoPath = bare.slice(0, bare.length - suffix.length);
+      break;
+    }
+  }
+  if (repoPath === null) return null;
+
+  // Strip optional .git extension from the repo path
+  if (repoPath.endsWith(".git")) {
+    repoPath = repoPath.slice(0, repoPath.length - 4);
   }
 
-  // /.../<owner>/<name>[.git]/git-upload-pack or /git-receive-pack
-  const packMatch = /^(.*?)(?:\.git)?\/git-(?:upload|receive)-pack$/.exec(bare);
-  if (packMatch) {
-    const repo = packMatch[1].replace(/^\//, "");
-    return `${host}/${repo}`;
+  // Strip leading slashes
+  while (repoPath.startsWith("/")) {
+    repoPath = repoPath.slice(1);
   }
 
-  return null;
+  return `${host}/${repoPath}`;
 }
 
 /** Returns "push" for write (git-receive-pack), "clone" for read, null for non-git. */
 function git_op_from_path(path: string | null): "push" | "clone" | null {
   if (!path) return null;
-  const bare = path.replace(/\?.*$/, "");
-  if (/\/git-receive-pack$/.test(bare)) return "push";
-  if (/\/git-upload-pack$/.test(bare) || /\/info\/refs$/.test(bare)) return "clone";
+  const bare = path.split("?")[0];
+  if (bare.endsWith("/git-receive-pack")) return "push";
+  if (bare.endsWith("/git-upload-pack") || bare.endsWith("/info/refs")) return "clone";
   return null;
 }
 
