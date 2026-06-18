@@ -13,7 +13,7 @@
 //! `--processors`/`--memory` are spike-unverified (defaults were used) and
 //! get confirmed against `openvmm.exe --help` during Plan 2 bring-up.
 
-use super::spec::{reject_commas, CommandSpec, VmSpec};
+use super::spec::{reject_commas, CommandSpec, LockdownLaunch, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
 use crate::procmgr::{
     kill_pid, pid_alive, restore_integrity_recursive, set_low_integrity_recursive, spawn_confined,
@@ -115,6 +115,160 @@ fn push_virtio_fs(argv: &mut Vec<String>, spec: &VmSpec) {
     }
 }
 
+/// Applies the three-way confinement decision for the VMM process and returns
+/// the resulting `(PidIdentity, ConfinementStatus)`.
+///
+/// Precedence (highest to lowest):
+/// 1. **Locked** (`spec.lockdown` is `Some`) — launch as the per-sandbox
+///    Windows account; Low-label write surfaces first; fail-closed on error.
+/// 2. **allow_unconfined** — user explicitly opted out; spawn detached with no
+///    labelling; status recorded as degraded.
+/// 3. **Confined** (default) — Low-label write surfaces, spawn with a
+///    restricted token at Low IL; fail-closed on error and restores labels.
+///
+/// FAIL CLOSED: on any labelling or spawn error the surfaces that were
+/// already Low-labelled are restored to Medium before the error is propagated.
+/// The caller never receives a `ConfinementStatus` that claims more than was
+/// actually achieved.
+fn spawn_confined_vmm(
+    spec: &VmSpec,
+    inv: &CommandSpec,
+    vmm_log: &Path,
+    policy: &ConfinementPolicy,
+) -> anyhow::Result<(PidIdentity, ConfinementStatus)> {
+    if let Some(ll) = &spec.lockdown {
+        spawn_locked_vmm(spec, inv, vmm_log, policy, ll)
+    } else if spec.allow_unconfined {
+        // User EXPLICITLY opted out: run unconfined, record it loudly so
+        // status never silently claims confinement that was waived.
+        let id = spawn_detached(inv, vmm_log).context("spawning openvmm")?;
+        Ok((
+            id,
+            ConfinementStatus::degraded(
+                "--allow-unconfined: host-side VMM confinement disabled by user",
+            ),
+        ))
+    } else {
+        spawn_default_confined_vmm(spec, inv, vmm_log, policy)
+    }
+}
+
+/// Low-label surfaces then spawn as the per-sandbox Windows account (locked path).
+///
+/// The account-launched VMM also runs at Low IL (the inner launcher calls
+/// `spawn_confined` on the account's behalf), so we must Low-label every host
+/// path the VMM needs to write — the same set as the normal confined branch.
+/// The account already has DACL access from provisioning, but without the Low
+/// IL label MIC would block writes.
+fn spawn_locked_vmm(
+    spec: &VmSpec,
+    inv: &CommandSpec,
+    vmm_log: &Path,
+    policy: &ConfinementPolicy,
+    ll: &LockdownLaunch,
+) -> anyhow::Result<(PidIdentity, ConfinementStatus)> {
+    let surfaces = spec.confined_write_surfaces();
+    low_label_surfaces(&surfaces).with_context(|| {
+        "Low-labelling confined write surface so the per-account VMM \
+         (and its in-process virtiofs) can write it"
+    })?;
+    let pidfile = spec.run_dir.join("vmm-pid.json");
+    match spawn_confined_as_account(ll.account(), ll.password(), inv, vmm_log, &pidfile) {
+        Ok((id, ConfinementMode::Restricted)) => Ok((id, ConfinementStatus::applied(policy))),
+        Ok((id, ConfinementMode::TokenOnly)) => Ok((id, ConfinementStatus::token_only(policy))),
+        Ok((id, ConfinementMode::None)) => Ok((
+            id,
+            ConfinementStatus::degraded("confinement unavailable on this platform"),
+        )),
+        Err(e) => {
+            // Undo Low labels — same fail-closed guarantee as the
+            // normal confined branch.
+            for p in &surfaces {
+                let _ = restore_integrity_recursive(p);
+            }
+            anyhow::bail!(
+                "failed to launch VMM as per-sandbox account {}: {e}. \
+                 Consider removing the lock-down or using --allow-unconfined.",
+                ll.account()
+            )
+        }
+    }
+}
+
+/// Low-label surfaces then spawn with a restricted token at Low IL (default confined path).
+///
+/// The confined VMM runs at Low integrity, but izbad created the sandbox's
+/// writable host files at Medium — and MIC forbids a Low-IL process from
+/// writing UP to Medium-IL objects, so the VM would never boot (empty
+/// console.log) and the guest could not write /workspace.  Low-label EVERY
+/// host path the confined VMM must write (`VmSpec::confined_write_surfaces`:
+/// the scratch dir, the virtiofs shares, and writable disk backing files incl.
+/// named volumes outside the scratch). Lowering is a write-DOWN for izbad
+/// (Medium → Low), so izbad keeps full control; the labels are restored to
+/// Medium on teardown (sandbox::restore_confined_workspace). Inheritance is
+/// robust for plain creates; documented residuals (atomic-rename-in,
+/// post-teardown Low files) live in the design spec / F-06 finding.
+///
+/// FAIL CLOSED: if labelling ANY surface OR the confined spawn fails, restore
+/// every surface we touched before propagating the error.
+fn spawn_default_confined_vmm(
+    spec: &VmSpec,
+    inv: &CommandSpec,
+    vmm_log: &Path,
+    policy: &ConfinementPolicy,
+) -> anyhow::Result<(PidIdentity, ConfinementStatus)> {
+    let surfaces = spec.confined_write_surfaces();
+    low_label_surfaces(&surfaces).with_context(|| {
+        "Low-labelling confined write surface so the VMM \
+         (and its in-process virtiofs) can write it"
+    })?;
+    match spawn_confined(inv, vmm_log, policy) {
+        // Honest mapping: the resource job is best-effort, so report
+        // TokenOnly when it could not be applied even though token+IL
+        // (the real boundary) succeeded.
+        Ok((id, ConfinementMode::Restricted)) => Ok((id, ConfinementStatus::applied(policy))),
+        Ok((id, ConfinementMode::TokenOnly)) => Ok((id, ConfinementStatus::token_only(policy))),
+        // Unreachable on the confined path (the Windows jailer never
+        // returns None and the Unix stub is not hit here), but map it
+        // defensively rather than silently claiming confinement.
+        Ok((id, ConfinementMode::None)) => Ok((
+            id,
+            ConfinementStatus::degraded("confinement unavailable on this platform"),
+        )),
+        Err(e) => {
+            // The VMM never launched; undo the Low labels so a failed
+            // confined start does not strand any user dir at Low.
+            for p in &surfaces {
+                let _ = restore_integrity_recursive(p);
+            }
+            anyhow::bail!(
+                "failed to apply host-side confinement to the VMM: {e}. \
+                 Re-run with --allow-unconfined to start the VMM WITHOUT host-side \
+                 confinement (NOT recommended)."
+            )
+        }
+    }
+}
+
+/// Low-label each surface in order, restoring all already-labelled surfaces on
+/// the first failure.
+///
+/// Returns `Ok(())` when all surfaces are successfully labelled, or the first
+/// labelling error (with all previously labelled surfaces restored).
+fn low_label_surfaces(surfaces: &[PathBuf]) -> anyhow::Result<()> {
+    let mut labelled: Vec<&PathBuf> = Vec::new();
+    for p in surfaces {
+        if let Err(e) = set_low_integrity_recursive(p) {
+            for done in &labelled {
+                let _ = restore_integrity_recursive(done);
+            }
+            return Err(e).with_context(|| format!("{}", p.display()));
+        }
+        labelled.push(p);
+    }
+    Ok(())
+}
+
 /// Spawns openvmm as a single detached process.
 ///
 /// Integration-tested on the Windows spike host (Plan 2); not unit-tested —
@@ -161,129 +315,7 @@ impl VmmDriver for OpenVmmDriver {
         // overhead; the job is caps-only and never kill-on-close.
         policy.job_memory_max_mb = Some(spec.mem_mb as u64 + 512);
 
-        let (vmm_id, confinement) = if let Some(ll) = &spec.lockdown {
-            // LOCKED path: the VMM is launched as the per-sandbox Windows
-            // account.  The account-launched VMM process also runs at Low IL
-            // (the inner launcher calls spawn_confined on behalf of the account),
-            // so we must still Low-label every host path the VMM needs to write —
-            // exactly the same set as the normal confined branch.  The account
-            // already has DACL access from provisioning, but without the Low IL
-            // label MIC would block writes.
-            let surfaces = spec.confined_write_surfaces();
-            let mut labelled: Vec<&PathBuf> = Vec::new();
-            for p in &surfaces {
-                if let Err(e) = set_low_integrity_recursive(p) {
-                    for done in &labelled {
-                        let _ = restore_integrity_recursive(done);
-                    }
-                    return Err(e).with_context(|| {
-                        format!(
-                            "Low-labelling confined write surface {} so the per-account VMM \
-                             (and its in-process virtiofs) can write it",
-                            p.display()
-                        )
-                    });
-                }
-                labelled.push(p);
-            }
-            let pidfile = spec.run_dir.join("vmm-pid.json");
-            match spawn_confined_as_account(ll.account(), ll.password(), &inv, &vmm_log, &pidfile) {
-                Ok((id, ConfinementMode::Restricted)) => (id, ConfinementStatus::applied(&policy)),
-                Ok((id, ConfinementMode::TokenOnly)) => {
-                    (id, ConfinementStatus::token_only(&policy))
-                }
-                Ok((id, ConfinementMode::None)) => (
-                    id,
-                    ConfinementStatus::degraded("confinement unavailable on this platform"),
-                ),
-                Err(e) => {
-                    // Undo Low labels — same fail-closed guarantee as the
-                    // normal confined branch.
-                    for p in &surfaces {
-                        let _ = restore_integrity_recursive(p);
-                    }
-                    anyhow::bail!(
-                        "failed to launch VMM as per-sandbox account {}: {e}. \
-                         Consider removing the lock-down or using --allow-unconfined.",
-                        ll.account()
-                    )
-                }
-            }
-        } else if spec.allow_unconfined {
-            // User EXPLICITLY opted out: run unconfined, record it loudly so
-            // status never silently claims confinement that was waived.
-            let id = spawn_detached(&inv, &vmm_log).context("spawning openvmm")?;
-            (
-                id,
-                ConfinementStatus::degraded(
-                    "--allow-unconfined: host-side VMM confinement disabled by user",
-                ),
-            )
-        } else {
-            // The confined VMM runs at Low integrity, but izbad created the
-            // sandbox's writable host files at Medium — and MIC forbids a Low-IL
-            // process from writing UP to Medium-IL objects, so the VM would never
-            // boot (empty console.log) and the guest could not write /workspace.
-            // Low-label EVERY host path the confined VMM must write
-            // (`VmSpec::confined_write_surfaces`: the scratch dir, the virtiofs
-            // shares, and writable disk backing files incl. named volumes outside
-            // the scratch). Lowering is a write-DOWN for izbad (Medium → Low), so
-            // izbad keeps full control; the labels are restored to Medium on
-            // teardown (sandbox::restore_confined_workspace). Inheritance is
-            // robust for plain creates; documented residuals (atomic-rename-in,
-            // post-teardown Low files) live in the design spec / F-06 finding.
-            //
-            // FAIL CLOSED, but NEVER strand a user dir at Low after a failed
-            // start: relabelling precedes state.json, so the state.json-gated
-            // teardown restore cannot undo it on an early failure. So if labelling
-            // ANY surface OR the confined spawn fails, restore every surface we
-            // touched before propagating the error.
-            let surfaces = spec.confined_write_surfaces();
-            let mut labelled: Vec<&PathBuf> = Vec::new();
-            for p in &surfaces {
-                if let Err(e) = set_low_integrity_recursive(p) {
-                    for done in &labelled {
-                        let _ = restore_integrity_recursive(done);
-                    }
-                    return Err(e).with_context(|| {
-                        format!(
-                            "Low-labelling confined write surface {} so the VMM \
-                             (and its in-process virtiofs) can write it",
-                            p.display()
-                        )
-                    });
-                }
-                labelled.push(p);
-            }
-            match spawn_confined(&inv, &vmm_log, &policy) {
-                // Honest mapping: the resource job is best-effort, so report
-                // TokenOnly when it could not be applied even though token+IL
-                // (the real boundary) succeeded.
-                Ok((id, ConfinementMode::Restricted)) => (id, ConfinementStatus::applied(&policy)),
-                Ok((id, ConfinementMode::TokenOnly)) => {
-                    (id, ConfinementStatus::token_only(&policy))
-                }
-                // Unreachable on the confined path (the Windows jailer never
-                // returns None and the Unix stub is not hit here), but map it
-                // defensively rather than silently claiming confinement.
-                Ok((id, ConfinementMode::None)) => (
-                    id,
-                    ConfinementStatus::degraded("confinement unavailable on this platform"),
-                ),
-                Err(e) => {
-                    // The VMM never launched; undo the Low labels so a failed
-                    // confined start does not strand any user dir at Low.
-                    for p in &surfaces {
-                        let _ = restore_integrity_recursive(p);
-                    }
-                    anyhow::bail!(
-                        "failed to apply host-side confinement to the VMM: {e}. \
-                         Re-run with --allow-unconfined to start the VMM WITHOUT host-side \
-                         confinement (NOT recommended)."
-                    )
-                }
-            }
-        };
+        let (vmm_id, confinement) = spawn_confined_vmm(spec, &inv, &vmm_log, &policy)?;
 
         Ok(Box::new(OpenVmmHandle {
             vsock_sock,
