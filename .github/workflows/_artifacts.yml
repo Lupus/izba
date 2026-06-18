@@ -162,7 +162,7 @@ jobs:
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           prefix-key: izba-windows-msvc
-      - run: cargo build --release -p izba-cli
+      - run: cargo build --release -p izba-cli -p izba-jail-helper
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: mkfs-erofs-windows
@@ -177,6 +177,7 @@ jobs:
         run: |
           mkdir stage/bin -Force | Out-Null
           Copy-Item target/release/izba.exe stage/bin/
+          Copy-Item target/release/izba-jail-helper.exe stage/bin/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: izba-windows-bundle

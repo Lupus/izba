@@ -62,7 +62,7 @@ mod win {
             }
 
             // From here, `hkey` must be closed on every exit path.
-            let result = (|| {
+            let result = {
                 let value_name_w: Vec<u16> =
                     name.encode_utf16().chain(std::iter::once(0)).collect();
                 let dword_zero: u32 = 0u32;
@@ -81,7 +81,7 @@ mod win {
                 } else {
                     Ok(())
                 }
-            })();
+            };
 
             RegCloseKey(hkey);
             result
@@ -120,7 +120,7 @@ mod win {
             }
 
             // From here, `hkey` must be closed on every exit path.
-            let result = (|| {
+            let result = {
                 let value_name_w: Vec<u16> =
                     name.encode_utf16().chain(std::iter::once(0)).collect();
                 let rc = RegDeleteValueW(hkey, value_name_w.as_ptr());
@@ -132,7 +132,7 @@ mod win {
                         "RegDeleteValueW(UserList, {name:?}): WIN32_ERROR {rc}"
                     ))
                 }
-            })();
+            };
 
             RegCloseKey(hkey);
             result
