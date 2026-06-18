@@ -319,7 +319,7 @@ impl DaemonApi for RealDaemon {
 
     fn policy_git_allow(&mut self, name: &str, target: &str, write: bool) -> anyhow::Result<()> {
         use izba_core::daemon::egress::config::Access;
-        let gt = parse_git_target(target);
+        let gt = izba_core::daemon::egress::config::GitTarget::parse(target);
         let access = if write {
             Access::ReadWrite
         } else {
@@ -331,7 +331,7 @@ impl DaemonApi for RealDaemon {
     }
 
     fn policy_git_block(&mut self, name: &str, target: &str) -> anyhow::Result<()> {
-        let gt = parse_git_target(target);
+        let gt = izba_core::daemon::egress::config::GitTarget::parse(target);
         self.edit_and_reload(name, move |cfg| {
             cfg.git_block(&gt);
         })
@@ -400,16 +400,6 @@ impl ShellSession for RealShell {
     }
 }
 
-/// Parse a git target: `owner/repo` (contains `/`) → `Repo`, bare hostname → `Host`.
-/// Mirrors the same rule in `izba-cli`'s `policy.rs`.
-fn parse_git_target(s: &str) -> izba_core::daemon::egress::config::GitTarget {
-    use izba_core::daemon::egress::config::GitTarget;
-    if s.contains('/') {
-        GitTarget::Repo(s.to_string())
-    } else {
-        GitTarget::Host(s.to_string())
-    }
-}
 
 /// Map a one-shot daemon reply that should be `Ok` into `()`.
 fn expect_ok(resp: DaemonResponse) -> anyhow::Result<()> {

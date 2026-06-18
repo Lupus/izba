@@ -111,6 +111,16 @@ pub enum GitTarget {
 }
 
 impl GitTarget {
+    /// Parse a CLI/UI target string: a `/` (a host/owner[/repo] path) means a
+    /// repo glob; a bare host means the whole-host scope.
+    pub fn parse(s: &str) -> Self {
+        if s.contains('/') {
+            GitTarget::Repo(s.to_string())
+        } else {
+            GitTarget::Host(s.to_string())
+        }
+    }
+
     fn key(&self) -> (&'static str, &str) {
         match self {
             GitTarget::Repo(s) => ("repo", s),
@@ -863,5 +873,23 @@ mod tests {
         // File now exists and is explicit.
         let txt = std::fs::read_to_string(EgressPolicyConfig::path_in(dir.path())).unwrap();
         assert!(txt.contains("enforce: false"));
+    }
+
+    // ── GitTarget::parse TESTS ────────────────────────────────────────────────
+
+    #[test]
+    fn git_target_parse_with_slash_is_repo() {
+        assert_eq!(
+            GitTarget::parse("github.com/owner/repo"),
+            GitTarget::Repo("github.com/owner/repo".into())
+        );
+    }
+
+    #[test]
+    fn git_target_parse_bare_host_is_host() {
+        assert_eq!(
+            GitTarget::parse("github.com"),
+            GitTarget::Host("github.com".into())
+        );
     }
 }

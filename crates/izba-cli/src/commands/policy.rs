@@ -78,7 +78,7 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             } else {
                 Access::Read
             };
-            let gt = parse_git_target(target);
+            let gt = GitTarget::parse(target);
             edit_policy_file(&paths.sandbox_dir(name), |c| {
                 c.git_allow(gt.clone(), access);
             })?;
@@ -86,7 +86,7 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             Ok(0)
         }
         PolicyCmd::Git(GitSub::Block { name, target }) => {
-            let gt = parse_git_target(target);
+            let gt = GitTarget::parse(target);
             edit_policy_file(&paths.sandbox_dir(name), |c| {
                 c.git_block(&gt);
             })?;
@@ -101,16 +101,6 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             maybe_reload(paths, name);
             Ok(0)
         }
-    }
-}
-
-/// Parse a git target: a string containing `/` after the host is a `Repo`;
-/// a bare hostname (no `/`) is a `Host`.
-pub(crate) fn parse_git_target(s: &str) -> GitTarget {
-    if s.contains('/') {
-        GitTarget::Repo(s.to_string())
-    } else {
-        GitTarget::Host(s.to_string())
     }
 }
 
