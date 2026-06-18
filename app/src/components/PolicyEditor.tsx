@@ -120,6 +120,8 @@ export function PolicyEditor({ name }: { name: string }) {
   const [saved, setSaved] = useState(false);
   const [gitRows, setGitRows] = useState<GitRow[]>([]);
   const [gitDraft, setGitDraft] = useState("");
+  // Targets of git rows that have been typed in but not yet persisted via saveGit.
+  const [gitDraftTargets, setGitDraftTargets] = useState<Set<string>>(new Set());
   const [gitSaved, setGitSaved] = useState(false);
 
   useEffect(() => {
@@ -204,12 +206,14 @@ export function PolicyEditor({ name }: { name: string }) {
     const t = gitDraft.trim();
     if (t && !gitRows.some((r) => r.target === t)) {
       editGit((rs) => [...rs, { target: t, access: "read" }]);
+      setGitDraftTargets((prev) => new Set(prev).add(t));
     }
     setGitDraft("");
   }
 
   async function removeGitRow(target: string) {
     editGit((rs) => rs.filter((r) => r.target !== target));
+    setGitDraftTargets((prev) => { const s = new Set(prev); s.delete(target); return s; });
     try {
       await api.policyGitBlock(name, target);
     } catch (e) {
@@ -221,11 +225,13 @@ export function PolicyEditor({ name }: { name: string }) {
     setError(null);
     setGitSaved(false);
     try {
-      // For each row: call policyGitAllow (the backend upserts).
+      // Only newly-added draft rows need to be persisted here.
+      // Access changes on existing rows are persisted immediately by the onChange handler.
       // Rows removed by removeGitRow are already persisted via policyGitBlock.
-      for (const r of gitRows) {
+      for (const r of gitRows.filter((row) => gitDraftTargets.has(row.target))) {
         await api.policyGitAllow(name, r.target, r.access === "read-write");
       }
+      setGitDraftTargets(new Set());
       setGitSaved(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -326,11 +332,23 @@ export function PolicyEditor({ name }: { name: string }) {
                 <span className="flex-1 font-mono text-sm">{gr.target}</span>
                 <AccessPicker
                   value={gr.access}
-                  onChange={(v) =>
+                  onChange={(v) => {
+                    // Optimistically update local state.
                     editGit((rs) =>
                       rs.map((r) => (r.target === gr.target ? { ...r, access: v } : r)),
-                    )
-                  }
+                    );
+                    if (!gitDraftTargets.has(gr.target)) {
+                      // Existing (already-persisted) row: push the change immediately.
+                      void api.policyGitAllow(name, gr.target, v === "read-write").catch((e: unknown) => {
+                        // Revert on error.
+                        editGit((rs) =>
+                          rs.map((r) => (r.target === gr.target ? { ...r, access: gr.access } : r)),
+                        );
+                        setError(e instanceof Error ? e.message : String(e));
+                      });
+                    }
+                    // Draft rows stay buffered until "Save git" is clicked.
+                  }}
                 />
                 <button
                   type="button"
