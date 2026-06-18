@@ -150,24 +150,36 @@ integration suite requires the env vars either way; see below).
 
 As of MVP-C, cloud-hypervisor and virtiofsd launch **confined by default** on
 Linux. The confinement floor requires the **Landlock LSM** to be active in the
-host kernel. Verify it is present:
+host kernel.
+
+**Verify it the authoritative way — the `landlock_create_ruleset` ABI probe**,
+which is exactly what izba uses (`Capabilities::probe()` /
+`cargo run -p izba-core --example confine_probe`, which prints
+`landlock=true/false`):
 
 ```sh
-cat /sys/kernel/security/lsm
-# expected output includes "landlock", e.g.:
-# lockdown,capability,landlock,yama,apparmor
+cargo run -p izba-core --example confine_probe
+# capabilities: userns=true landlock=true seccomp=true
+# plan (enforcing): ... status=confined: seccomp+landlock+virtiofs:namespace
 ```
 
-If Landlock is absent the launch **fails closed** with an actionable error
-message. To enable it on a kernel that has the module compiled in but not
+> ⚠️ **Do NOT rely on `cat /sys/kernel/security/lsm`.** That file only exists if
+> **securityfs is mounted**, which it often is *not* (notably on some WSL2
+> builds) — so a missing file or a list without `landlock` is **not** proof that
+> Landlock is unavailable. The kernel can fully support Landlock with that file
+> absent. The syscall probe above is the only reliable signal.
+
+If Landlock is genuinely absent the launch **fails closed** with an actionable
+error message. To enable it on a kernel that has the module compiled in but not
 activated, add `landlock` to the `lsm=` boot parameter in your bootloader (e.g.
 `GRUB_CMDLINE_LINUX_DEFAULT="... lsm=lockdown,capability,landlock,yama,apparmor"`
 and `sudo update-grub`), then reboot.
 
-**WSL2 note:** the Microsoft-supplied WSL2 kernel ships with Landlock enabled
-(`CONFIG_SECURITY_LANDLOCK=y`) and it is active in the default LSM list — no
-extra steps are needed on a current WSL2 build. Run `cat /sys/kernel/security/lsm`
-to confirm.
+**WSL2 note:** current WSL2 kernels ship with Landlock enabled
+(`CONFIG_SECURITY_LANDLOCK=y`) and active — confirmed working on a real WSL2
+host (`izba status` shows `confined: seccomp+landlock+virtiofs:namespace`) even
+though `/sys/kernel/security/lsm` was absent there (securityfs not mounted). Use
+the `confine_probe` example, not that file, to check.
 
 **Landlock-less hosts:** if you cannot enable Landlock (e.g. a locked-down CI
 runner or an old kernel), pass `--allow-unconfined` to `izba run` (or the
