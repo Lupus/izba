@@ -65,6 +65,24 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
     }
   }
 
+  /**
+   * Re-fetch rows from the daemon without touching the error state.
+   * Used by save()'s finally block so a save error stays visible even
+   * after the UI has been re-synced to daemon truth.
+   */
+  async function refreshRows() {
+    try {
+      const detail = await api.inspect(name);
+      setSeeded(detail.volumes.map((v) => ({ spec: v, removed: false })));
+      setNewRows([]);
+      setDirty(false);
+      // intentionally NOT calling setError here
+    } catch {
+      // silently ignore — the save error (if any) is already set and visible;
+      // a failing re-sync is non-fatal.
+    }
+  }
+
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -135,6 +153,7 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
     setSaving(true);
     setError(null);
     let succeeded = false;
+    let saveError: string | null = null;
     try {
       // Detach removed seeded rows
       const toDetach = seeded.filter((s) => s.removed);
@@ -148,10 +167,17 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       }
       succeeded = true;
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      saveError = e instanceof Error ? e.message : String(e);
     } finally {
-      // Always re-sync UI to daemon truth, success or partial failure
-      await load();
+      // Always re-sync rows to daemon truth (success or partial failure).
+      // Use refreshRows() instead of load() so a save error is not cleared
+      // by the re-sync; on success load() would also work but refreshRows()
+      // is consistent. Set the save error AFTER refreshRows so it is the
+      // final state.
+      await refreshRows();
+      if (saveError !== null) {
+        setError(saveError);
+      }
       setSaving(false);
     }
     return succeeded;

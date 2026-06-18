@@ -265,4 +265,27 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     // inspect must be called a second time — this proves the finally block ran load()
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(2));
   });
+
+  it("save error remains visible after finally re-sync when volumeAttach rejects (inspect succeeds)", async () => {
+    // inspect always succeeds — this is the scenario where the bug manifests:
+    // load() called in finally clears the error that save() just set.
+    const attachError = new Error("disk full");
+    volumeAttach.mockRejectedValue(attachError);
+
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
+
+    // Add a new valid volume row
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    fireEvent.change(screen.getByLabelText(/volume name/i), { target: { value: "cache" } });
+    fireEvent.change(screen.getByLabelText(/guest path/i), { target: { value: "/cache" } });
+    fireEvent.change(screen.getByLabelText(/size/i), { target: { value: "1g" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    // (a) inspect must be called again — rows re-synced from daemon
+    await waitFor(() => expect(inspect).toHaveBeenCalledTimes(2));
+    // (b) the save error must still be visible — NOT cleared by the re-sync load
+    expect(screen.getByText(/disk full/i)).toBeInTheDocument();
+  });
 });
