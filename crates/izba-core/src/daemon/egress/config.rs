@@ -3,9 +3,10 @@
 //! that compiles to the regorus data document the [`RegoPolicy`] evaluates.
 //!
 //! The file is scoped to ONE sandbox (it is supplied at create time), so its
-//! `allow` list becomes that sandbox's `sandbox_ports[<name>]` entry in the
-//! Rego data doc. A sandbox with no policy file stays a bare, non-enforcing
-//! [`AllowAll`](super::policy::AllowAll) — today's permissive behavior.
+//! `allow` list becomes that sandbox's `sandbox_host_rules[<name>]` entry in
+//! the Rego data doc. A sandbox with no policy file gets an explicit
+//! `enforce: false` materialized on first arm — the one-representation
+//! invariant that kills the empty-vs-missing-file footgun.
 //!
 //! Domains are EXACT-match in M2 (the shipped `egress.rego` matches on `in`).
 //! Wildcard rules (`*.`/`**.`, see [`super::dns_snoop::allowlist_matches`]) are
@@ -13,12 +14,13 @@
 //! written today keeps parsing once enforcement lands.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::audit::EndpointSummary;
-use super::policy::{RegoPolicy, Verdict};
+use super::policy::{AllowAll, Policy, RegoPolicy, Verdict};
 
 /// On-disk policy file name under the sandbox directory.
 pub const POLICY_FILE: &str = "policy.yaml";
@@ -258,9 +260,42 @@ impl EgressPolicyConfig {
         .to_string()
     }
 
-    /// Compile to the enforcing [`RegoPolicy`] for `sandbox`.
-    pub fn into_policy(&self, sandbox: &str) -> Result<RegoPolicy> {
-        RegoPolicy::with_data(&self.to_rego_data_json(sandbox))
+    /// Compile to a live policy for `sandbox`.
+    ///
+    /// When `enforce` is `false`, returns an [`AllowAll`] (non-enforcing, bare
+    /// sandbox behavior). When `enforce` is `true`, compiles an enforcing
+    /// [`RegoPolicy`] — an empty allow-list means deny-all (fail-closed).
+    pub fn into_policy(&self, sandbox: &str) -> Result<Arc<dyn Policy>> {
+        if !self.enforce {
+            return Ok(Arc::new(AllowAll));
+        }
+        Ok(Arc::new(RegoPolicy::with_data(
+            &self.to_rego_data_json(sandbox),
+        )?))
+    }
+
+    /// The one-representation path: if no `policy.yaml` exists, write an
+    /// explicit `enforce: false` (bare sandbox default) and return it.
+    /// Otherwise load and return the existing file.
+    ///
+    /// This kills the empty-vs-missing footgun — after first arm every sandbox
+    /// has an explicit `enforce:` on disk, so the posture is always readable
+    /// without inferring it from file presence.
+    pub fn load_or_materialize(sandbox_dir: &Path) -> Result<Self> {
+        match Self::load(sandbox_dir)? {
+            Some(cfg) => Ok(cfg),
+            None => {
+                let cfg = Self {
+                    enforce: false,
+                    allow: vec![],
+                    git: vec![],
+                };
+                let path = Self::path_in(sandbox_dir);
+                std::fs::write(&path, cfg.to_yaml())
+                    .with_context(|| format!("writing {}", path.display()))?;
+                Ok(cfg)
+            }
+        }
     }
 
     /// The policy file path under a sandbox directory.
@@ -374,7 +409,7 @@ pub fn seed_from_summaries(summaries: &[EndpointSummary]) -> EgressPolicyConfig 
 mod tests {
     use super::*;
     use crate::daemon::egress::audit::{aggregate, AuditRecord};
-    use crate::daemon::egress::policy::{FlowDesc, Policy, Verdict};
+    use crate::daemon::egress::policy::{FlowDesc, Verdict};
 
     #[test]
     fn parses_bare_host_as_default_web_ports() {
@@ -790,5 +825,43 @@ mod tests {
         };
         let back = EgressPolicyConfig::from_yaml(&cfg.to_yaml()).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    // ── TASK 4 TESTS ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn enforce_false_is_non_enforcing_allow_all() {
+        let cfg = EgressPolicyConfig {
+            enforce: false,
+            allow: vec![],
+            git: vec![],
+        };
+        let p = cfg.into_policy("web").unwrap();
+        assert!(!p.enforces(), "enforce:false -> AllowAll");
+        assert_eq!(
+            p.check(&FlowDesc::l3("web", "1.2.3.4", 443)),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn enforce_true_is_a_firewall() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Host("api.x.com".into())],
+            git: vec![],
+        };
+        let p = cfg.into_policy("web").unwrap();
+        assert!(p.enforces());
+    }
+
+    #[test]
+    fn load_missing_backfills_explicit_enforce_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = EgressPolicyConfig::load_or_materialize(dir.path()).unwrap();
+        assert!(!cfg.enforce);
+        // File now exists and is explicit.
+        let txt = std::fs::read_to_string(EgressPolicyConfig::path_in(dir.path())).unwrap();
+        assert!(txt.contains("enforce: false"));
     }
 }

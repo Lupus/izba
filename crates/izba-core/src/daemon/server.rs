@@ -90,7 +90,6 @@ pub struct DaemonDeps {
     pub stream_connector: SharedStreamConnector,
     pub artifacts: ArtifactsFn,
     pub resolve_image: ResolveImageFn,
-    pub egress_policy: std::sync::Arc<dyn crate::daemon::egress::policy::Policy>,
     pub egress_resolver: std::sync::Arc<dyn crate::daemon::egress::dns::Resolver>,
 }
 
@@ -107,7 +106,6 @@ impl DaemonDeps {
             stream_connector: Box::new(sandbox::default_stream_connector()),
             artifacts: Box::new(crate::artifacts::locate),
             resolve_image: Box::new(crate::image::ensure_image),
-            egress_policy: std::sync::Arc::new(crate::daemon::egress::policy::AllowAll),
             egress_resolver: crate::daemon::egress::sys_resolver::SystemResolver::new()
                 .expect("build system DNS resolver"),
         }
@@ -135,12 +133,7 @@ impl Daemon {
         // downgrading — logged in `build_mitm_runtime`.
         let audit = crate::daemon::egress::audit::AuditSink::new(paths.clone());
         let mitm = build_mitm_runtime(&paths, audit.clone());
-        let egress = EgressManager::new(
-            Arc::clone(&deps.egress_policy),
-            Arc::clone(&deps.egress_resolver),
-            mitm,
-            audit,
-        );
+        let egress = EgressManager::new(Arc::clone(&deps.egress_resolver), mitm, audit);
         Self {
             paths,
             deps,
@@ -756,7 +749,6 @@ mod tests {
                 })
             }),
             resolve_image: Box::new(|_, _| Ok("sha256:abc".into())),
-            egress_policy: std::sync::Arc::new(crate::daemon::egress::policy::AllowAll),
             egress_resolver: std::sync::Arc::new(crate::daemon::egress::dns::UdpForwarder::new(
                 "127.0.0.1:53".parse().unwrap(),
             )),
