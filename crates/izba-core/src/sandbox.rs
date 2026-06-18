@@ -242,6 +242,12 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
         crate::paths::create_dir_700(&paths.logs_dir(name), paths.root())?;
         crate::paths::create_dir_700(&paths.run_dir(name), paths.root())?;
 
+        // Assign stable ids to ephemeral volumes before building config and
+        // provisioning, so the id is persisted in config.json and stays stable
+        // across starts (the disk slot is keyed off id, not list position).
+        let mut volumes = opts.volumes.clone();
+        crate::volume::assign_eph_ids(&mut volumes);
+
         let config = SandboxConfig {
             image_digest: opts.image_digest.clone(),
             image_ref: opts.image_ref.clone(),
@@ -249,7 +255,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             mem_mb: opts.mem_mb,
             workspace: opts.workspace.clone(),
             ports: opts.ports.clone(),
-            volumes: opts.volumes.clone(),
+            volumes: volumes.clone(),
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 
@@ -271,7 +277,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
         // User volumes: same sparse-create + best-effort-format pattern.
         // A persistent volume whose image already exists is reused as-is
         // (never reformatted), so its data survives across sandboxes.
-        for v in opts.volumes.iter() {
+        for v in volumes.iter() {
             let img = v.image_path(paths, name);
             ensure_volume_image(&img, v.size_bytes, paths.root())
                 .with_context(|| format!("provisioning volume {}", v.guest_path.display()))?;
@@ -1135,6 +1141,25 @@ mod tests {
     }
 
     #[test]
+    fn create_assigns_eph_ids_and_persists_them() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut o = opts(&ws);
+        o.volumes = vec![
+            crate::volume::parse_volume_flag("cache:/data:1g").unwrap(), // persistent
+            crate::volume::parse_volume_flag("/scratch:1g").unwrap(),    // ephemeral
+        ];
+        create(&paths, "web", &o).unwrap();
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.volumes[0].eph_id, None); // persistent: no eph_id
+        assert_eq!(cfg.volumes[1].eph_id, Some(0)); // first ephemeral gets id 0
+        assert!(paths.sandbox_dir("web").join("volumes/0.img").exists());
+    }
+
+    #[test]
     fn create_keeps_existing_persistent_volume() {
         let (_dir, paths) = test_paths();
         let ws = paths.root().join("ws");
@@ -1183,7 +1208,7 @@ mod tests {
                 name: None,
                 guest_path: "/a".into(),
                 size_bytes: 1 << 20,
-                eph_id: None,
+                eph_id: Some(0), // ids must be pre-assigned; build_vm_disks trusts them
             },
             crate::volume::VolumeSpec {
                 name: Some("c".into()),
