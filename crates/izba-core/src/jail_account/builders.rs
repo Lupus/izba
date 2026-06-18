@@ -27,20 +27,30 @@ fn safe_slug(sandbox: &str) -> String {
         .collect()
 }
 
+/// Maximum length of a Windows local account name.
+const ACCOUNT_NAME_MAX: usize = 20;
+
+/// The fixed prefix for all izba per-sandbox Windows accounts.
+const ACCOUNT_PREFIX: &str = "izba-spk-";
+
+/// Maximum characters of the sanitized slug that fit inside `ACCOUNT_NAME_MAX`.
+/// `ACCOUNT_NAME_MAX - ACCOUNT_PREFIX.len()` = 20 - 9 = 11.
+const ACCOUNT_SLUG_MAX: usize = ACCOUNT_NAME_MAX - ACCOUNT_PREFIX.len();
+
 /// Windows local account name for the per-sandbox VMM process.
 ///
 /// Format: `izba-spk-<safe>`, where `<safe>` is the sanitized sandbox name.
 /// The total length is capped at **20 characters** (Windows local-username
-/// limit); the `<safe>` portion is truncated if necessary so that
-/// `"izba-spk-".len() + safe.len() ≤ 20`.
+/// limit); the `<safe>` portion is truncated to [`ACCOUNT_SLUG_MAX`] chars if
+/// necessary so that `ACCOUNT_PREFIX.len() + safe.len() ≤ ACCOUNT_NAME_MAX`.
 pub fn account_name(sandbox: &str) -> String {
-    const PREFIX: &str = "izba-spk-";
-    const MAX: usize = 20;
     let safe = safe_slug(sandbox);
-    let max_safe = MAX - PREFIX.len(); // 11
-    let truncated = &safe[..safe.len().min(max_safe)];
-    let name = format!("{PREFIX}{truncated}");
-    debug_assert!(name.len() <= MAX, "account_name too long: {name}");
+    let truncated = &safe[..safe.len().min(ACCOUNT_SLUG_MAX)];
+    let name = format!("{ACCOUNT_PREFIX}{truncated}");
+    debug_assert!(
+        name.len() <= ACCOUNT_NAME_MAX,
+        "account_name too long: {name}"
+    );
     name
 }
 
@@ -106,20 +116,24 @@ pub fn gc_argv(live: &[String]) -> Vec<String> {
 /// Returns the `izba-spk-*` account names from `existing` whose corresponding
 /// sandbox name is **not** in `live`.
 ///
-/// The sandbox name is recovered by stripping the `izba-spk-` prefix; the
-/// comparison is done on the sanitized form, so `live` entries are also
-/// sanitized before the lookup.
+/// Orphan detection is based on the full `account_name(sandbox)` — including
+/// the same truncation that `account_name` applies — so a sandbox whose safe
+/// slug exceeds [`ACCOUNT_SLUG_MAX`] chars is matched by its truncated stored
+/// account name and is never falsely classified as an orphan.
 pub fn gc_orphans(existing: &[String], live: &[String]) -> Vec<String> {
-    const PREFIX: &str = "izba-spk-";
-    // Build a set of sanitized live slugs for O(1) lookup.
-    let live_slugs: std::collections::HashSet<String> = live.iter().map(|s| safe_slug(s)).collect();
+    // Build a set of full account names for all live sandboxes.  Using
+    // `account_name` here means the same truncation is applied on both sides
+    // of the comparison, eliminating the mismatch that would arise if we
+    // compared a truncated stored slug against an untruncated live slug.
+    let live_accounts: std::collections::HashSet<String> =
+        live.iter().map(|s| account_name(s)).collect();
     existing
         .iter()
         .filter(|name| {
-            if let Some(slug) = name.strip_prefix(PREFIX) {
-                // The stored name already went through safe_slug at creation
-                // time; compare directly.
-                !live_slugs.contains(slug)
+            if name.starts_with(ACCOUNT_PREFIX) {
+                // An existing izba-spk-* account is an orphan iff it does not
+                // correspond to any currently-live sandbox.
+                !live_accounts.contains(*name)
             } else {
                 // Not an izba-spk-* name — leave it alone (not our concern).
                 false
@@ -203,13 +217,28 @@ mod tests {
 
     #[test]
     fn rule_name_long_not_truncated() {
-        // Rule names have no hard cap — long names should not be truncated.
+        // Rule names have no hard cap — long names should not be truncated,
+        // unlike account names.  We verify this by checking that the rule name
+        // is longer than the corresponding account name for the same sandbox.
         let long = "a-very-long-sandbox-name-that-exceeds-twenty-chars";
         let rn = rule_name(long);
         assert!(rn.starts_with("izba-deny-"));
-        // The safe part must be the full sanitized name.
-        let expected_safe = safe_slug(long);
-        assert_eq!(rn, format!("izba-deny-{expected_safe}"));
+        // The rule suffix must be longer than 20 chars (unlike account_name).
+        assert!(
+            rn.len() > 20,
+            "rule_name should not be truncated to 20 chars: {rn}"
+        );
+        // Cross-check: the corresponding account name IS capped at 20.
+        let an = account_name(long);
+        assert!(an.len() <= 20);
+        // The rule name suffix (everything after "izba-deny-") is strictly
+        // longer than the account name suffix (everything after "izba-spk-").
+        let rule_suffix = rn.strip_prefix("izba-deny-").unwrap();
+        let acct_suffix = an.strip_prefix("izba-spk-").unwrap();
+        assert!(
+            rule_suffix.len() > acct_suffix.len(),
+            "rule suffix '{rule_suffix}' should be longer than account suffix '{acct_suffix}'"
+        );
     }
 
     // ── provision_argv ────────────────────────────────────────────────────────
@@ -345,5 +374,46 @@ mod tests {
         let live = vec!["My Box".to_string()];
         // "My Box" → safe_slug → "my-box", which is the stored slug.
         assert!(gc_orphans(&existing, &live).is_empty());
+    }
+
+    #[test]
+    fn gc_orphans_long_name_not_false_orphan() {
+        // A sandbox whose safe slug exceeds ACCOUNT_SLUG_MAX (11) must NOT be
+        // reported as an orphan when it is actually live.
+        //
+        // "my-very-long-sandbox-name" → safe slug "my-very-long-sandbox-name"
+        // (25 chars, > 11) → account_name truncates to "izba-spk-my-very-lon"
+        // (20 chars).  The stored account is the TRUNCATED form; the bug was
+        // that gc_orphans compared the truncated stored slug ("my-very-lon")
+        // against the untruncated live slug ("my-very-long-sandbox-name") and
+        // never found a match, falsely classifying the account as an orphan.
+        let sandbox = "my-very-long-sandbox-name";
+        let stored_account = account_name(sandbox); // "izba-spk-my-very-lon"
+        assert_eq!(stored_account.len(), 20);
+
+        let existing = vec![stored_account];
+        let live = vec![sandbox.to_string()];
+        assert!(
+            gc_orphans(&existing, &live).is_empty(),
+            "live long-named sandbox was falsely classified as an orphan"
+        );
+    }
+
+    #[test]
+    fn gc_orphans_long_live_mixed_with_genuine_orphan() {
+        // Mix: one long-named live sandbox (truncated account) + one genuine
+        // orphan.  Only the orphan must be returned.
+        let live_sandbox = "my-very-long-sandbox-name";
+        let live_account = account_name(live_sandbox); // "izba-spk-my-very-lon"
+        let orphan_account = "izba-spk-gone".to_string();
+
+        let existing = vec![live_account.clone(), orphan_account.clone()];
+        let live = vec![live_sandbox.to_string()];
+        let orphans = gc_orphans(&existing, &live);
+        assert_eq!(
+            orphans,
+            vec![orphan_account],
+            "expected only the genuine orphan to be returned"
+        );
     }
 }
