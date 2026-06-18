@@ -182,6 +182,30 @@ describe("NetlogView", () => {
     );
   });
 
+  it("git row Policy column shows neutral git indicator, not host-derived allowed/blocked", async () => {
+    // A git push row where host is NOT in the host allow-list.
+    // The host-derived status would be "blocked" (wrong — git ops are governed
+    // by view.git rules, not the host allow-list).  The Policy column must show
+    // a neutral git indicator instead of either "allowed" or "blocked".
+    const gitPushRow = {
+      host: "github.com", dest_ip: "140.82.121.4", port: 443, tier: "l7",
+      verdict: "deny" as const, allow_count: 0, deny_count: 1,
+      first_seen_ms: 1, last_seen_ms: 9,
+      last_method: "POST", last_path: "/o/a/git-receive-pack",
+    };
+    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([gitPushRow]);
+    // allow: [] → host-derived status would be "blocked", but that's wrong for git rows.
+    mockPolicy({ enforcing: true, allow: [], git: [] });
+    render(<NetlogView name="sb" />);
+    await screen.findByText(/git push/i);
+    // Must NOT render the host-derived "blocked" badge.
+    expect(screen.queryByText("blocked")).not.toBeInTheDocument();
+    // Must NOT render the host-derived "allowed" badge.
+    expect(screen.queryByText("allowed")).not.toBeInTheDocument();
+    // Must render a neutral git indicator (role-agnostic text match).
+    expect(screen.getByText(/git rule/i)).toBeInTheDocument();
+  });
+
   it("Block on a git row calls policyGitBlock", async () => {
     const gitPushRow = {
       host: "github.com", dest_ip: "140.82.121.4", port: 443, tier: "l7",
