@@ -23,43 +23,71 @@ function PortEditor({
   onRemove: (port: number) => void;
 }) {
   const [draft, setDraft] = useState("");
+  const [err, setErr] = useState<string | null>(null);
   function commit() {
-    const p = parseInt(draft.trim(), 10);
-    if (Number.isFinite(p) && p >= 1 && p <= 65535) onAdd(p);
+    const t = draft.trim();
+    if (!/^\d+$/.test(t)) {
+      setErr("Enter a port between 1 and 65535.");
+      return; // keep the draft so the user can fix it
+    }
+    const p = parseInt(t, 10);
+    if (p < 1 || p > 65535) {
+      setErr("Enter a port between 1 and 65535.");
+      return;
+    }
+    if (ports.includes(p)) {
+      setErr(`Port ${p} is already added.`);
+      return;
+    }
+    onAdd(p);
     setDraft("");
+    setErr(null);
   }
   return (
-    <div className="flex flex-1 flex-wrap items-center gap-1">
-      {ports.map((p) => (
-        <span
-          key={p}
-          className="inline-flex items-center gap-1 rounded bg-hover px-2 py-0.5 text-xs font-mono"
-        >
-          {p}
-          <button
-            type="button"
-            aria-label={`Remove port ${p}`}
-            onClick={() => onRemove(p)}
-            className="text-ink-3 hover:text-warn"
+    <div className="flex flex-1 flex-col gap-1">
+      <div className="flex flex-wrap items-center gap-1">
+        {ports.map((p) => (
+          <span
+            key={p}
+            className="inline-flex items-center gap-1 rounded bg-hover px-2 py-0.5 text-xs font-mono"
           >
-            ✕
-          </button>
-        </span>
-      ))}
-      <input
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            commit();
-          }
-        }}
-        placeholder="add port"
-        aria-label="add port"
-        inputMode="numeric"
-        className="w-20 rounded border border-line px-2 py-1 text-xs"
-      />
+            {p}
+            <button
+              type="button"
+              aria-label={`Remove port ${p}`}
+              onClick={() => onRemove(p)}
+              className="text-ink-3 hover:text-warn"
+            >
+              ✕
+            </button>
+          </span>
+        ))}
+        <input
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            if (err) setErr(null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commit();
+            }
+          }}
+          placeholder="add port"
+          aria-label="add port"
+          inputMode="numeric"
+          className="w-20 rounded border border-line px-2 py-1 text-xs"
+        />
+        <button
+          type="button"
+          onClick={commit}
+          className="rounded border border-line px-2 py-1 text-xs text-ink-2 hover:bg-hover"
+        >
+          Add
+        </button>
+      </div>
+      {err && <span className="text-xs text-warn">{err}</span>}
     </div>
   );
 }
