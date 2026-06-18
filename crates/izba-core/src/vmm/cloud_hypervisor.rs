@@ -129,6 +129,14 @@ pub fn build_invocations(
     }
     if plan.ch_landlock {
         vmm.push("--landlock".to_string());
+        // CH's auto-derived Landlock ruleset covers the disk/kernel/initramfs
+        // paths but NOT socket *creation* in the run dir, so binding the
+        // hybrid-vsock + API unix sockets there fails `UnixBind → EACCES` and
+        // the VM never boots. Grant the run dir rw (which Landlock maps to the
+        // make-socket right) — narrowly the sandbox's own run dir, so CH stays
+        // confined from the rest of the host filesystem.
+        vmm.push("--landlock-rules".to_string());
+        vmm.push(format!("path={},access=rw", run.display()));
     }
 
     Ok(Invocations {
@@ -343,6 +351,14 @@ mod tests {
         let w = i_window(&inv.vmm.argv, "--seccomp");
         assert_eq!(w, Some("true".to_string()));
         assert!(inv.vmm.argv.iter().any(|a| a == "--landlock"));
+        // ...and a landlock-rule granting the run dir rw, so CH can bind its
+        // hybrid-vsock + API sockets (auto-rules don't cover socket creation).
+        let rule = i_window(&inv.vmm.argv, "--landlock-rules").expect("--landlock-rules present");
+        assert_eq!(
+            rule,
+            format!("path={},access=rw", spec.run_dir.display()),
+            "landlock-rules must grant the run dir rw"
+        );
     }
 
     fn base_spec() -> VmSpec {
@@ -445,6 +461,8 @@ mod tests {
                 "--seccomp",
                 "true",
                 "--landlock",
+                "--landlock-rules",
+                &format!("path={},access=rw", run.display()),
             ])
         );
     }
@@ -529,6 +547,8 @@ mod tests {
                 "--seccomp",
                 "true",
                 "--landlock",
+                "--landlock-rules",
+                &format!("path={},access=rw", run.display()),
             ])
         );
     }
