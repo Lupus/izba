@@ -78,6 +78,15 @@ describe("PolicyEditor", () => {
     );
   });
 
+  it("rejects a duplicate port already in the list", async () => {
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("api.x.com");
+    const adder = screen.getAllByLabelText("add port")[0];
+    fireEvent.change(adder, { target: { value: "443" } }); // api.x.com already has 443
+    fireEvent.click(screen.getAllByRole("button", { name: /^add$/i })[0]);
+    expect(screen.getByText(/already added/i)).toBeInTheDocument();
+  });
+
   it("rejects an out-of-range port", async () => {
     render(<PolicyEditor name="web" />);
     await screen.findByDisplayValue("api.x.com");
