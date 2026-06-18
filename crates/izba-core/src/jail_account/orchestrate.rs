@@ -167,43 +167,58 @@ pub fn lockdown<B: LockdownBackend>(
         ElevationOutcome::Ok => {}
     }
 
-    // --- read helper output ---
-    let sid = std::fs::read_to_string(&sid_out)
-        .with_context(|| format!("read sid_out {:?} (helper contract violated)", sid_out))?;
-    let sid = sid.trim().to_string();
+    // All remaining work runs inside a closure so that we can unconditionally
+    // clean up the tmp files (including the plaintext credential) whether the
+    // inner steps succeed or fail.
+    let result: anyhow::Result<LockdownOutcome> = (|| {
+        // --- read helper output ---
+        let sid = std::fs::read_to_string(&sid_out)
+            .with_context(|| format!("read sid_out {:?} (helper contract violated)", sid_out))?;
+        let sid = sid.trim().to_string();
 
-    let password = std::fs::read(&cred_out)
-        .with_context(|| format!("read cred_out {:?} (helper contract violated)", cred_out))?;
+        let password = std::fs::read(&cred_out)
+            .with_context(|| format!("read cred_out {:?} (helper contract violated)", cred_out))?;
 
-    // --- seal the credential ---
-    let sealed = backend
-        .seal(&password)
-        .map_err(|e| anyhow!("DPAPI seal: {e}"))?;
+        // --- seal the credential ---
+        let sealed = backend
+            .seal(&password)
+            .map_err(|e| anyhow!("DPAPI seal: {e}"))?;
 
-    // --- persist sealed credential ---
-    let cred_path = sandbox_dir.join("lockdown.cred");
-    std::fs::write(&cred_path, &sealed).with_context(|| format!("write {:?}", cred_path))?;
+        // --- persist sealed credential ---
+        let cred_path = sandbox_dir.join("lockdown.cred");
+        std::fs::write(&cred_path, &sealed).with_context(|| format!("write {:?}", cred_path))?;
 
-    // --- persist lockdown state ---
-    let info = LockedInfo {
-        account: account_name(name),
-        sid,
-        net_blocked: true,
-    };
-    let lockdown_path = sandbox_dir.join(LOCKDOWN_FILE);
-    save_json(
-        &lockdown_path,
-        &LockdownFile {
-            state: Some(info.clone()),
-        },
-    )
-    .with_context(|| format!("save {:?}", lockdown_path))?;
+        // --- persist lockdown state ---
+        let info = LockedInfo {
+            account: account_name(name),
+            sid,
+            net_blocked: true,
+        };
+        let lockdown_path = sandbox_dir.join(LOCKDOWN_FILE);
+        if let Err(e) = save_json(
+            &lockdown_path,
+            &LockdownFile {
+                state: Some(info.clone()),
+            },
+        )
+        .with_context(|| format!("save {:?}", lockdown_path))
+        {
+            // lockdown.cred was written but lockdown.json failed: remove the
+            // sealed credential so the sandbox is cleanly Unlocked (json absent
+            // = Unlocked is the authoritative sentinel).
+            let _ = std::fs::remove_file(&cred_path);
+            return Err(e);
+        }
 
-    // --- best-effort cleanup of tmp files ---
+        Ok(LockdownOutcome::Locked(info))
+    })();
+
+    // Unconditionally remove tmp files (including the plaintext credential)
+    // regardless of whether the inner work succeeded or failed.
     let _ = std::fs::remove_file(&sid_out);
     let _ = std::fs::remove_file(&cred_out);
 
-    Ok(LockdownOutcome::Locked(info))
+    result
 }
 
 /// Deprovision the per-sandbox Windows account and clear lock-down state.
@@ -314,9 +329,18 @@ mod tests {
     /// arguments and writes fake content to those files so that `lockdown` can
     /// read them back.  For `deprovision` and `gc` argv shapes there are no
     /// output files, so the write step is skipped.
+    ///
+    /// Set `write_tmp_files = false` to simulate a helper that returns `Ok` but
+    /// does not write the output files (contract violation).
+    ///
+    /// Set `seal_err = Some(msg)` to make `seal` return an `Err`.
     struct FakeBackend {
         /// What `elevate` should return.
         outcome: ElevationOutcome,
+        /// Whether the fake helper writes the sid/cred tmp files on `Ok`.
+        write_tmp_files: bool,
+        /// If `Some`, `seal` returns this error message instead of succeeding.
+        seal_err: Option<String>,
         /// Captured argv from the most recent `elevate` call.
         last_argv: Arc<Mutex<Vec<String>>>,
     }
@@ -325,6 +349,8 @@ mod tests {
         fn ok() -> Self {
             Self {
                 outcome: ElevationOutcome::Ok,
+                write_tmp_files: true,
+                seal_err: None,
                 last_argv: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -332,6 +358,8 @@ mod tests {
         fn cancelled() -> Self {
             Self {
                 outcome: ElevationOutcome::Cancelled,
+                write_tmp_files: true,
+                seal_err: None,
                 last_argv: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -339,6 +367,28 @@ mod tests {
         fn failed(msg: &str) -> Self {
             Self {
                 outcome: ElevationOutcome::Failed(msg.to_string()),
+                write_tmp_files: true,
+                seal_err: None,
+                last_argv: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Helper returns `Ok` but does NOT write the output files.
+        fn ok_no_files() -> Self {
+            Self {
+                outcome: ElevationOutcome::Ok,
+                write_tmp_files: false,
+                seal_err: None,
+                last_argv: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Helper writes the tmp files successfully, but `seal` fails.
+        fn ok_seal_err(msg: &str) -> Self {
+            Self {
+                outcome: ElevationOutcome::Ok,
+                write_tmp_files: true,
+                seal_err: Some(msg.to_string()),
                 last_argv: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -352,7 +402,7 @@ mod tests {
         fn elevate(&self, argv: &[String]) -> Result<ElevationOutcome, String> {
             *self.last_argv.lock().unwrap() = argv.to_vec();
 
-            if matches!(self.outcome, ElevationOutcome::Ok) {
+            if matches!(self.outcome, ElevationOutcome::Ok) && self.write_tmp_files {
                 // If this is a provision call, write fake sid/cred tmp files.
                 let mut sid_out: Option<&str> = None;
                 let mut cred_out: Option<&str> = None;
@@ -386,7 +436,11 @@ mod tests {
         }
 
         /// Identity seal: returns the plaintext unchanged, prefixed with `"sealed:"`.
+        /// Returns `Err` when `seal_err` is set.
         fn seal(&self, plain: &[u8]) -> Result<Vec<u8>, String> {
+            if let Some(ref msg) = self.seal_err {
+                return Err(msg.clone());
+            }
             let mut v = b"sealed:".to_vec();
             v.extend_from_slice(plain);
             Ok(v)
@@ -687,5 +741,63 @@ mod tests {
         let backend = FakeBackend::failed("gc failed");
         let result = windows_cleanup(&backend, &paths, &[]);
         assert!(result.is_err());
+    }
+
+    // ── Fix-3: missing output files path ─────────────────────────────────────
+
+    /// When the elevated helper returns `Ok` but does NOT write the sid/cred
+    /// tmp files (helper contract violation), `lockdown` must return `Err` AND
+    /// leave no `lockdown.json` or `lockdown.cred` on disk.
+    #[test]
+    fn lockdown_missing_output_files_errs_and_leaves_no_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        write_config(&paths, SANDBOX_NAME, Vec::new());
+
+        let backend = FakeBackend::ok_no_files();
+        let result = lockdown(&backend, &paths, SANDBOX_NAME);
+        assert!(result.is_err(), "expected Err when helper writes no output");
+
+        let sandbox_dir = paths.sandbox_dir(SANDBOX_NAME);
+        assert!(
+            !sandbox_dir.join(LOCKDOWN_FILE).exists(),
+            "lockdown.json must not exist after error"
+        );
+        assert!(
+            !sandbox_dir.join("lockdown.cred").exists(),
+            "lockdown.cred must not exist after error"
+        );
+    }
+
+    /// When `seal` fails the plaintext credential tmp file must NOT remain on
+    /// disk (Fix-1 guarantee), and `lockdown.json`/`lockdown.cred` must not
+    /// be present either.
+    #[test]
+    fn lockdown_seal_failure_removes_cred_tmp_and_leaves_no_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        write_config(&paths, SANDBOX_NAME, Vec::new());
+
+        let backend = FakeBackend::ok_seal_err("simulated DPAPI failure");
+        let result = lockdown(&backend, &paths, SANDBOX_NAME);
+        assert!(result.is_err(), "expected Err when seal fails");
+
+        let sandbox_dir = paths.sandbox_dir(SANDBOX_NAME);
+        assert!(
+            !sandbox_dir.join(".lockdown.cred.tmp").exists(),
+            "plaintext cred tmp must be removed even on seal failure"
+        );
+        assert!(
+            !sandbox_dir.join(".lockdown.sid.tmp").exists(),
+            "sid tmp must be removed even on seal failure"
+        );
+        assert!(
+            !sandbox_dir.join(LOCKDOWN_FILE).exists(),
+            "lockdown.json must not exist after seal failure"
+        );
+        assert!(
+            !sandbox_dir.join("lockdown.cred").exists(),
+            "lockdown.cred must not exist after seal failure"
+        );
     }
 }
