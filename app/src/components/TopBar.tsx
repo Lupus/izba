@@ -1,12 +1,13 @@
 import type { DaemonStatusView } from "../lib/types";
+import type { DaemonPhase } from "../lib/store";
 
 export function TopBar({
+  phase,
   daemon,
-  error,
   onAbout,
 }: {
+  phase: DaemonPhase;
   daemon: DaemonStatusView | null;
-  error: string | null;
   onAbout: () => void;
 }) {
   return (
@@ -18,14 +19,22 @@ export function TopBar({
         izba
       </div>
       <div className="text-[13px] text-ink-2 flex items-center gap-3">
-        {error ? (
+        {phase === "unreachable" ? (
           <span className="flex items-center gap-2">
             <span className="inline-block w-2 h-2 rounded-full bg-warn" aria-hidden="true" />
             <span className="text-warn">daemon unreachable</span>
           </span>
+        ) : phase === "connecting" ? (
+          <span className="flex items-center gap-2">
+            <span
+              className="inline-block w-2 h-2 rounded-full bg-off animate-pulse"
+              aria-hidden="true"
+            />
+            <span>Connecting…</span>
+          </span>
         ) : (
           <span className="flex items-center gap-2">
-            <span className="inline-block w-2 h-2 rounded-full bg-ok" />
+            <span className="inline-block w-2 h-2 rounded-full bg-ok" aria-hidden="true" />
             daemon running{daemon ? ` · v${daemon.version}` : ""}
           </span>
         )}

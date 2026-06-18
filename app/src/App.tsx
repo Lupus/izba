@@ -7,7 +7,7 @@ import { About } from "./components/About";
 import { NewSandbox } from "./components/NewSandbox";
 
 export default function App() {
-  const { sandboxes, daemon, error, refresh } = usePolling(2000);
+  const { sandboxes, daemon, phase, refresh } = usePolling(2000);
   const [selected, setSelected] = useState<string | null>(null);
   const [showAbout, setShowAbout] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -15,7 +15,7 @@ export default function App() {
 
   return (
     <div className="h-full flex flex-col">
-      <TopBar daemon={daemon} error={error} onAbout={() => setShowAbout(true)} />
+      <TopBar phase={phase} daemon={daemon} onAbout={() => setShowAbout(true)} />
       <div className="flex flex-1 min-h-0">
         <Rail
           sandboxes={sandboxes}
