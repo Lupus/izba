@@ -188,6 +188,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Run this sandbox's VMM under a dedicated, ACL-scoped, network-dead local
+    /// account (Windows). Pops a UAC prompt.
+    Lockdown {
+        /// Sandbox name
+        name: String,
+    },
+    /// Release a sandbox's lock-down account + firewall rule (Windows). Pops a
+    /// UAC prompt.
+    Unlock {
+        /// Sandbox name
+        name: String,
+    },
+    /// Remove orphaned izba lock-down accounts/firewall rules with no live
+    /// sandbox (Windows). Pops a UAC prompt.
+    WindowsCleanup,
     /// (internal) launch a VMM confined; used by the lock-down launcher
     #[command(name = "__spawn-confined-vmm", hide = true)]
     SpawnConfinedVmm {
@@ -241,6 +256,9 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             DaemonCmd::Status => commands::daemon::status(paths),
             DaemonCmd::Stop => commands::daemon::stop(paths),
         },
+        Cmd::Lockdown { name } => commands::lockdown::run(paths, &name),
+        Cmd::Unlock { name } => commands::lockdown::unlock(paths, &name),
+        Cmd::WindowsCleanup => commands::lockdown::cleanup(paths),
         Cmd::SpawnConfinedVmm {
             pidfile,
             log,
@@ -517,5 +535,33 @@ mod tests {
         }
         // Bare `izba daemon` requires a subcommand.
         assert!(Cli::try_parse_from(["izba", "daemon"]).is_err());
+    }
+
+    #[test]
+    fn parse_lockdown() {
+        let cli = Cli::try_parse_from(["izba", "lockdown", "web"]).unwrap();
+        let Cmd::Lockdown { name } = cli.cmd else {
+            panic!("expected lockdown");
+        };
+        assert_eq!(name, "web");
+        // name is required
+        assert!(Cli::try_parse_from(["izba", "lockdown"]).is_err());
+    }
+
+    #[test]
+    fn parse_unlock() {
+        let cli = Cli::try_parse_from(["izba", "unlock", "web"]).unwrap();
+        let Cmd::Unlock { name } = cli.cmd else {
+            panic!("expected unlock");
+        };
+        assert_eq!(name, "web");
+        // name is required
+        assert!(Cli::try_parse_from(["izba", "unlock"]).is_err());
+    }
+
+    #[test]
+    fn parse_windows_cleanup() {
+        let cli = Cli::try_parse_from(["izba", "windows-cleanup"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::WindowsCleanup));
     }
 }

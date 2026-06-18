@@ -4,13 +4,14 @@
 use anyhow::bail;
 use izba_core::daemon::proto::{DaemonRequest, DaemonResponse, SandboxDetail};
 use izba_core::daemon::DaemonClient;
+use izba_core::jail_account::orchestrate::lockdown_state;
 use izba_core::paths::Paths;
 
 pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     let mut client = DaemonClient::connect(paths)?;
     match client.request(&DaemonRequest::Inspect { name: name.into() }, &mut |_| {})? {
         DaemonResponse::Inspect(det) => {
-            print!("{}", render(&det));
+            print!("{}", render(paths, &det));
             Ok(0)
         }
         DaemonResponse::Error { message } => bail!(message),
@@ -22,8 +23,9 @@ pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
 /// sandbox is unconfined the summary already starts with `UNCONFINED — …`, so
 /// it stands out; `None` (stopped / pre-confinement state) renders as
 /// `unknown`.
-fn render(det: &SandboxDetail) -> String {
+fn render(paths: &Paths, det: &SandboxDetail) -> String {
     let confinement = det.confinement.as_deref().unwrap_or("unknown");
+    let lockdown = lockdown_state(paths, &det.name).summary();
     format!(
         "name:        {}\n\
          image:       {}\n\
@@ -32,7 +34,8 @@ fn render(det: &SandboxDetail) -> String {
          mem:         {} MiB\n\
          workspace:   {}\n\
          status:      {}\n\
-         confinement: {}\n",
+         confinement: {}\n\
+         lock-down:   {}\n",
         det.name,
         det.image_ref,
         det.image_digest,
@@ -41,6 +44,7 @@ fn render(det: &SandboxDetail) -> String {
         det.workspace,
         det.status,
         confinement,
+        lockdown,
     )
 }
 
@@ -48,6 +52,11 @@ fn render(det: &SandboxDetail) -> String {
 mod tests {
     use super::*;
     use izba_core::daemon::proto::SandboxDetail;
+    use izba_core::paths::Paths;
+
+    fn test_paths(tmp: &tempfile::TempDir) -> Paths {
+        Paths::with_root(tmp.path().to_path_buf())
+    }
 
     fn detail(confinement: Option<&str>) -> SandboxDetail {
         SandboxDetail {
@@ -65,7 +74,12 @@ mod tests {
 
     #[test]
     fn renders_confined_summary() {
-        let out = render(&detail(Some("confined: restricted(limited)+low-il+job")));
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let out = render(
+            &paths,
+            &detail(Some("confined: restricted(limited)+low-il+job")),
+        );
         assert!(
             out.contains("confinement: confined: restricted(limited)+low-il+job"),
             "{out}"
@@ -75,16 +89,59 @@ mod tests {
 
     #[test]
     fn renders_unconfined_prominently() {
-        let out = render(&detail(Some(
-            "UNCONFINED — --allow-unconfined: host-side VMM confinement disabled by user",
-        )));
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let out = render(
+            &paths,
+            &detail(Some(
+                "UNCONFINED — --allow-unconfined: host-side VMM confinement disabled by user",
+            )),
+        );
         // The prominent UNCONFINED marker must survive verbatim.
         assert!(out.contains("confinement: UNCONFINED — "), "{out}");
     }
 
     #[test]
     fn renders_unknown_when_absent() {
-        let out = render(&detail(None));
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let out = render(&paths, &detail(None));
         assert!(out.contains("confinement: unknown"), "{out}");
+    }
+
+    #[test]
+    fn renders_lockdown_unlocked_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let out = render(&paths, &detail(None));
+        assert!(out.contains("lock-down:   unlocked"), "{out}");
+    }
+
+    #[test]
+    fn renders_lockdown_locked_when_state_file_present() {
+        use izba_core::jail_account::state::{LockdownFile, LockedInfo, LOCKDOWN_FILE};
+        use izba_core::state::save_json;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let sb_dir = paths.sandbox_dir("web");
+        std::fs::create_dir_all(&sb_dir).unwrap();
+        save_json(
+            &sb_dir.join(LOCKDOWN_FILE),
+            &LockdownFile {
+                state: Some(LockedInfo {
+                    account: "izba-spk-web".into(),
+                    sid: "S-1-5-21-1-2-3-1001".into(),
+                    net_blocked: true,
+                }),
+            },
+        )
+        .unwrap();
+
+        let out = render(&paths, &detail(None));
+        assert!(
+            out.contains("lock-down:   locked(account=izba-spk-web"),
+            "{out}"
+        );
     }
 }
