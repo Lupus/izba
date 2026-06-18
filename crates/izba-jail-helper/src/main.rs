@@ -20,6 +20,7 @@
 pub mod account;
 pub mod dacl;
 pub mod firewall;
+pub mod provision;
 pub mod userlist;
 
 // ── Verb definition (all platforms) ─────────────────────────────────────────
@@ -184,37 +185,29 @@ fn handle_provision(
     sid_out: String,
     cred_out: String,
 ) -> Result<(), String> {
-    // Stub: print the parsed args as JSON and exit 0.
-    // Tasks 4–6 will replace this with real account/registry/firewall FFI.
-    let out = serde_json::json!({
-        "verb": "provision",
-        "sandbox": sandbox,
-        "grants": grants,
-        "sid_out": sid_out,
-        "cred_out": cred_out,
-    });
-    println!("{out}");
-    Ok(())
+    use provision::{provision, WinOps};
+    use std::path::{Path, PathBuf};
+
+    let grant_paths: Vec<PathBuf> = grants.iter().map(PathBuf::from).collect();
+    provision(
+        &WinOps,
+        &sandbox,
+        &grant_paths,
+        Path::new(&sid_out),
+        Path::new(&cred_out),
+    )
 }
 
 #[cfg(windows)]
 fn handle_deprovision(sandbox: String) -> Result<(), String> {
-    let out = serde_json::json!({
-        "verb": "deprovision",
-        "sandbox": sandbox,
-    });
-    println!("{out}");
-    Ok(())
+    use provision::{deprovision, WinOps};
+    deprovision(&WinOps, &sandbox)
 }
 
 #[cfg(windows)]
 fn handle_gc(live: Vec<String>) -> Result<(), String> {
-    let out = serde_json::json!({
-        "verb": "gc",
-        "live": live,
-    });
-    println!("{out}");
-    Ok(())
+    use provision::{gc, WinOps};
+    gc(&WinOps, &live)
 }
 
 // ── Unit tests (all platforms, pure parser) ──────────────────────────────────
