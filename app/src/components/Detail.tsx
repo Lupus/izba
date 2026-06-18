@@ -8,6 +8,7 @@ import { PolicyEditor } from "./PolicyEditor";
 import { FirewallStatus } from "./FirewallStatus";
 import { ShellPanel } from "./ShellPanel";
 import { PortsTab } from "./PortsTab";
+import { VolumesTab } from "./VolumesTab";
 import { Spinner } from "./Spinner";
 import { api } from "../lib/ipc";
 
@@ -17,7 +18,7 @@ interface Props {
 }
 
 type Pending = { kind: "stop" | "remove"; name: string } | null;
-type Tab = "overview" | "ports" | "logs" | "netlog" | "policy" | "shell";
+type Tab = "overview" | "ports" | "volumes" | "logs" | "netlog" | "policy" | "shell";
 type Action = "start" | "stop" | "restart" | "remove";
 
 // Present-progressive label shown beside the spinner while an action runs.
@@ -75,6 +76,7 @@ export function Detail({ sandbox, onChanged }: Props) {
   const tabs: { id: Tab; label: string }[] = [
     { id: "overview", label: "Overview" },
     { id: "ports", label: "Ports" },
+    { id: "volumes", label: "Volumes" },
     { id: "logs", label: "Logs" },
     { id: "netlog", label: "Netlog" },
     { id: "policy", label: "Policy" },
@@ -159,6 +161,8 @@ export function Detail({ sandbox, onChanged }: Props) {
         )}
 
         {tab === "ports" && <PortsTab sandbox={sandbox} />}
+
+        {tab === "volumes" && <VolumesTab sandbox={sandbox} onChanged={onChanged} />}
 
         {tab === "logs" && <LogsView name={name} />}
 
