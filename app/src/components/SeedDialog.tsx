@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import type { Access, EndpointSummary, PolicyView, SeedEntry } from "../lib/types";
 import { api } from "../lib/ipc";
 import { git_repo_from_row, git_op_from_path, git_access_for } from "../lib/git";
-import { WEB_DEFAULT_PORTS } from "../lib/ports";
+import { allowKeys } from "../lib/policy";
 import { AccessPicker } from "./AccessPicker";
 
 interface Props {
@@ -12,19 +12,6 @@ interface Props {
   enforcing: boolean;
   onClose: () => void;
   onApplied: () => void;
-}
-
-/** Expand the policy allow-list into a set of `host:port` keys (mirrors NetlogView). */
-function allowKeys(allow: PolicyView["allow"]): Set<string> {
-  const s = new Set<string>();
-  for (const e of allow) {
-    if (typeof e === "string") {
-      for (const p of WEB_DEFAULT_PORTS) s.add(`${e}:${p}`);
-    } else {
-      for (const p of e.ports) s.add(`${e.host}:${p}`);
-    }
-  }
-  return s;
 }
 
 type CandidateKind = "git" | "http" | "raw-ip";

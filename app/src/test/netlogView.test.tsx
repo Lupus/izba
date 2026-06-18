@@ -1,9 +1,9 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { vi, describe, it, expect, beforeEach } from "vitest";
+import { vi, describe, it, expect, beforeEach, type Mock } from "vitest";
 import { NetlogView, relTime } from "../components/NetlogView";
 import { git_repo_from_row } from "../lib/git";
 import { api } from "../lib/ipc";
-import type { PolicyView } from "../lib/types";
+import type { EndpointSummary, PolicyView } from "../lib/types";
 
 vi.mock("../lib/ipc", () => ({
   api: {
@@ -13,6 +13,8 @@ vi.mock("../lib/ipc", () => ({
     policyBlock: vi.fn(),
     policyGitAllow: vi.fn(),
     policyGitBlock: vi.fn(),
+    policySetEnforce: vi.fn(),
+    policyAddEndpoints: vi.fn(),
   },
 }));
 
@@ -27,6 +29,16 @@ const deniedRawIp = {
   last_method: null, last_path: null,
 };
 
+/** Build a minimal EndpointSummary with optional overrides. */
+function sum(overrides: Partial<EndpointSummary>): EndpointSummary {
+  return {
+    host: "a.com", dest_ip: "1.2.3.4", port: 443, tier: "l7", verdict: "allow",
+    allow_count: 1, deny_count: 0, first_seen_ms: 1, last_seen_ms: 9,
+    last_method: "GET", last_path: "/",
+    ...overrides,
+  };
+}
+
 function mockPolicy(p: PolicyView) {
   (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue(p);
 }
@@ -35,6 +47,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockPolicy({ enforcing: true, allow: [], git: [] });
   (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([allowedNamed, deniedRawIp]);
+  (api.policySetEnforce as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+  (api.policyAddEndpoints as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 });
 
 describe("NetlogView", () => {
@@ -75,14 +89,33 @@ describe("NetlogView", () => {
     expect(screen.getByRole("button", { name: /allow 9\.9\.9\.9/i })).toBeDisabled();
   });
 
-  it("shows the enable-firewall banner for a bare sandbox (click is no-op until Task 8)", async () => {
+  it("shows the Firewall OFF banner for a bare sandbox with Review traffic button", async () => {
     mockPolicy({ enforcing: false, allow: [], git: [] });
     render(<NetlogView name="web" />);
-    // Button must still be present; click is a no-op stub (policyEnable removed; Task 8 wires SeedDialog).
-    const btn = await screen.findByRole("button", { name: /enable firewall/i });
-    fireEvent.click(btn);
-    // No API call expected — onClick is () => {} until Task 8.
+    // Banner must mention "Firewall OFF"
+    expect(await screen.findByText(/Firewall OFF/)).toBeInTheDocument();
+    // "Review observed traffic" button must be present
+    const btn = screen.getByRole("button", { name: /review observed traffic/i });
     expect(btn).toBeInTheDocument();
+  });
+
+  it("off-state banner is honest (no 'all allowed', shows blocked-while-enforcing)", async () => {
+    (api.policyShow as Mock).mockResolvedValue({ enforcing: false, allow: [], git: [] });
+    (api.readNetlog as Mock).mockResolvedValue([
+      sum({ host: "a.com", port: 443, deny_count: 3 }), sum({ host: "b.com", port: 443 }),
+    ]);
+    render(<NetlogView name="web" />);
+    expect(await screen.findByText(/Firewall OFF/)).toBeInTheDocument();
+    expect(screen.getByText(/1 were blocked while enforcing/)).toBeInTheDocument();
+    expect(screen.queryByText(/all allowed/)).toBeNull();
+  });
+
+  it("a git row reflects its policy access and offers Block", async () => {
+    (api.policyShow as Mock).mockResolvedValue({ enforcing: true, allow: [], git: [{ repo: "github.com/o/a", access: "read" }] });
+    (api.readNetlog as Mock).mockResolvedValue([ sum({ host: "github.com", port: 443, last_method: "POST", last_path: "/o/a/git-upload-pack" }) ]);
+    render(<NetlogView name="web" />);
+    expect(await screen.findByText("git → github.com/o/a")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Block$/ })).toBeInTheDocument();
   });
 
   it("orders rows deterministically by recency then host:port, not backend order", async () => {
@@ -152,15 +185,13 @@ describe("NetlogView", () => {
     };
   }
 
-  it("renders a git push row and offers Allow write", async () => {
+  it("renders a git push row with 'git → repo' label and offers Allow write", async () => {
     (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([makeGitPushRow("allow", 1, 0)]);
     mockPolicy({ enforcing: true, allow: [], git: [] });
     (api.policyGitAllow as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     render(<NetlogView name="sb" />);
-    // Should render "git push" label
-    expect(await screen.findByText(/git push/i)).toBeInTheDocument();
-    // Should show destination repo
-    expect(screen.getByText(/github\.com\/o\/a/i)).toBeInTheDocument();
+    // Should render "git → repo" label (new format per Task 8)
+    expect(await screen.findByText("git → github.com/o/a")).toBeInTheDocument();
     // "Allow write" button calls policyGitAllow with write=true
     const btn = screen.getByRole("button", { name: /allow write/i });
     fireEvent.click(btn);
@@ -169,7 +200,7 @@ describe("NetlogView", () => {
     );
   });
 
-  it("renders a git clone row and offers Allow read", async () => {
+  it("renders a git clone row with 'git → repo' label and offers Allow read", async () => {
     const gitCloneRow = {
       host: "github.com", dest_ip: "140.82.121.4", port: 443, tier: "l7",
       verdict: "deny" as const, allow_count: 0, deny_count: 1,
@@ -180,7 +211,7 @@ describe("NetlogView", () => {
     mockPolicy({ enforcing: true, allow: [], git: [] });
     (api.policyGitAllow as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     render(<NetlogView name="sb" />);
-    expect(await screen.findByText(/git clone/i)).toBeInTheDocument();
+    expect(await screen.findByText("git → github.com/owner/repo")).toBeInTheDocument();
     const btn = screen.getByRole("button", { name: /allow read/i });
     fireEvent.click(btn);
     await waitFor(() =>
@@ -188,22 +219,19 @@ describe("NetlogView", () => {
     );
   });
 
-  it("git row Policy column shows neutral git indicator, not host-derived allowed/blocked", async () => {
-    // A git push row where host is NOT in the host allow-list.
-    // The host-derived status would be "blocked" (wrong — git ops are governed
-    // by view.git rules, not the host allow-list).  The Policy column must show
-    // a neutral git indicator instead of either "allowed" or "blocked".
+  it("git row Policy column shows access when rule exists, or 'blocked' when enforcing without rule", async () => {
+    // A git push row where host is NOT in the host allow-list, and no git rule exists.
+    // The Policy column must show "blocked" (not the host-derived "blocked" from host rules).
     (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([makeGitPushRow("deny", 0, 1)]);
-    // allow: [] → host-derived status would be "blocked", but that's wrong for git rows.
     mockPolicy({ enforcing: true, allow: [], git: [] });
     render(<NetlogView name="sb" />);
-    await screen.findByText(/git push/i);
-    // Must NOT render the host-derived "blocked" badge.
-    expect(screen.queryByText("blocked")).not.toBeInTheDocument();
-    // Must NOT render the host-derived "allowed" badge.
+    await screen.findByText(/git → github\.com\/o\/a/);
+    // With enforcing=true and no git rule, git rows show "blocked"
+    expect(screen.getByText("blocked")).toBeInTheDocument();
+    // Must NOT render the misleading "git rule" generic text.
+    expect(screen.queryByText("git rule")).not.toBeInTheDocument();
+    // Must NOT render "allowed" from the host allow-list path.
     expect(screen.queryByText("allowed")).not.toBeInTheDocument();
-    // Must render a neutral git indicator (role-agnostic text match).
-    expect(screen.getByText(/git rule/i)).toBeInTheDocument();
   });
 
   it("Block on a git row calls policyGitBlock", async () => {
@@ -211,8 +239,19 @@ describe("NetlogView", () => {
     mockPolicy({ enforcing: true, allow: [], git: [] });
     (api.policyGitBlock as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     render(<NetlogView name="sb" />);
-    await screen.findByText(/git push/i);
-    const btn = screen.getByRole("button", { name: /^block$/i });
+    await screen.findByText(/git → github\.com\/o\/a/);
+    // No git rule → Block button is NOT shown (call-to-action for Allow-read/Allow-write instead)
+    // Block is only shown when access !== null (a rule exists).
+    expect(screen.queryByRole("button", { name: /^Block$/i })).not.toBeInTheDocument();
+  });
+
+  it("Block on a git row with existing rule calls policyGitBlock", async () => {
+    (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([makeGitPushRow("allow", 1, 0)]);
+    mockPolicy({ enforcing: true, allow: [], git: [{ repo: "github.com/o/a", access: "read" }] });
+    (api.policyGitBlock as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    render(<NetlogView name="sb" />);
+    await screen.findByText(/git → github\.com\/o\/a/);
+    const btn = screen.getByRole("button", { name: /^Block$/i });
     fireEvent.click(btn);
     await waitFor(() =>
       expect(api.policyGitBlock).toHaveBeenCalledWith("sb", "github.com/o/a"),
