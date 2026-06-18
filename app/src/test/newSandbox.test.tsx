@@ -61,6 +61,33 @@ describe("NewSandbox", () => {
     );
   });
 
+  it("labels the port columns and explains the bind field", () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: /add port/i }));
+    expect(screen.getByText(/host port/i)).toBeInTheDocument();
+    expect(screen.getByText(/guest port/i)).toBeInTheDocument();
+    expect(screen.getByText(/defaults to 127\.0\.0\.1/i)).toBeInTheDocument();
+  });
+
+  it("disables Create and explains when a port is not a valid number", async () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add port/i }));
+    fireEvent.change(screen.getByLabelText(/port 1 host/i), { target: { value: "sdfsdf" } });
+    fireEvent.change(screen.getByLabelText(/port 1 guest/i), { target: { value: "80" } });
+    expect(screen.getByText(/65535/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
+  });
+
+  it("an empty port row does not block Create", () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add port/i }));
+    expect(screen.getByRole("button", { name: /create/i })).not.toBeDisabled();
+  });
+
   it("disables Create when name is empty", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
