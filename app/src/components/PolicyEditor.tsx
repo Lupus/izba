@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Access, AllowEntry, GitRule } from "../lib/types";
 import { api } from "../lib/ipc";
 import { WEB_DEFAULT_PORTS } from "../lib/ports";
 import { AccessPicker } from "./AccessPicker";
+import { Section } from "./Section";
 
 interface Row {
   host: string;
@@ -30,6 +31,11 @@ function toRow(e: AllowEntry): Row {
   return typeof e === "string"
     ? { host: e, ports: [...WEB_DEFAULT_PORTS], access: "read-write" }
     : { host: e.host, ports: e.ports, access: e.access ?? "read-write" };
+}
+
+/** Convert a target string and access into a GitRule. */
+function toGitRule(target: string, access: Access): GitRule {
+  return target.includes("/") ? { repo: target, access } : { host: target, access };
 }
 
 /** Per-host ports shown as removable chips plus a numeric "add port" field. */
@@ -113,16 +119,23 @@ function PortEditor({
   );
 }
 
+interface LoadedSnapshot {
+  hosts: Row[];
+  git: GitRow[];
+}
+
 export function PolicyEditor({ name }: { name: string }) {
-  const [rows, setRows] = useState<Row[]>([]);
+  const [hosts, setHosts] = useState<Row[]>([]);
+  const [gitRows, setGitRows] = useState<GitRow[]>([]);
   const [enforcing, setEnforcing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
-  const [gitRows, setGitRows] = useState<GitRow[]>([]);
-  const [gitDraft, setGitDraft] = useState("");
-  // Targets of git rows that have been typed in but not yet persisted via saveGit.
-  const [gitDraftTargets, setGitDraftTargets] = useState<Set<string>>(new Set());
-  const [gitSaved, setGitSaved] = useState(false);
+  const loadedRef = useRef<LoadedSnapshot>({ hosts: [], git: [] });
+
+  // Derive dirty: current state differs from the last-saved/loaded snapshot.
+  const dirty =
+    JSON.stringify({ hosts, git: gitRows }) !==
+    JSON.stringify({ hosts: loadedRef.current.hosts, git: loadedRef.current.git });
 
   useEffect(() => {
     let alive = true;
@@ -130,9 +143,12 @@ export function PolicyEditor({ name }: { name: string }) {
       try {
         const p = await api.policyShow(name);
         if (alive) {
-          setRows(p.allow.map(toRow));
+          const loadedHosts = p.allow.map(toRow);
+          const loadedGit = p.git.map(toGitRow);
+          setHosts(loadedHosts);
           setEnforcing(p.enforcing);
-          setGitRows(p.git.map(toGitRow));
+          setGitRows(loadedGit);
+          loadedRef.current = { hosts: loadedHosts, git: loadedGit };
         }
       } catch (e) {
         if (alive) setError(e instanceof Error ? e.message : String(e));
@@ -155,16 +171,16 @@ export function PolicyEditor({ name }: { name: string }) {
     }
   }
 
-  // Any edit invalidates the "saved" confirmation so it doesn't linger.
-  function edit(f: (rs: Row[]) => Row[]) {
-    setRows(f);
+  // Host row helpers
+  function editHosts(f: (rs: Row[]) => Row[]) {
+    setHosts(f);
     setSaved(false);
   }
   function setHost(i: number, host: string) {
-    edit((rs) => rs.map((r, j) => (j === i ? { ...r, host } : r)));
+    editHosts((rs) => rs.map((r, j) => (j === i ? { ...r, host } : r)));
   }
   function addPort(i: number, port: number) {
-    edit((rs) =>
+    editHosts((rs) =>
       rs.map((r, j) =>
         j === i && !r.ports.includes(port)
           ? { ...r, ports: [...r.ports, port].sort((a, b) => a - b) }
@@ -173,66 +189,50 @@ export function PolicyEditor({ name }: { name: string }) {
     );
   }
   function removePort(i: number, port: number) {
-    edit((rs) => rs.map((r, j) => (j === i ? { ...r, ports: r.ports.filter((p) => p !== port) } : r)));
+    editHosts((rs) => rs.map((r, j) => (j === i ? { ...r, ports: r.ports.filter((p) => p !== port) } : r)));
   }
   function addRow() {
-    edit((rs) => [...rs, { host: "", ports: [443], access: "read-write" }]);
+    editHosts((rs) => [...rs, { host: "", ports: [443], access: "read-write" }]);
   }
   function removeRow(i: number) {
-    edit((rs) => rs.filter((_, j) => j !== i));
+    editHosts((rs) => rs.filter((_, j) => j !== i));
+  }
+  function setHostAccess(i: number, access: Access) {
+    editHosts((rs) => rs.map((r, j) => (j === i ? { ...r, access } : r)));
+  }
+
+  // Git row helpers
+  function editGit(f: (rs: GitRow[]) => GitRow[]) {
+    setGitRows(f);
+    setSaved(false);
+  }
+  function addGitRow() {
+    editGit((rs) => [...rs, { target: "", access: "read" }]);
+  }
+  function removeGitRow(i: number) {
+    editGit((rs) => rs.filter((_, j) => j !== i));
+  }
+  function setGitTarget(i: number, target: string) {
+    editGit((rs) => rs.map((r, j) => (j === i ? { ...r, target } : r)));
+  }
+  function setGitAccess(i: number, access: Access) {
+    editGit((rs) => rs.map((r, j) => (j === i ? { ...r, access } : r)));
   }
 
   async function save() {
     setError(null);
     setSaved(false);
     try {
-      const allow: AllowEntry[] = rows
+      const allow: AllowEntry[] = hosts
         .filter((r) => r.host.trim() !== "")
         .map((r) => ({ host: r.host.trim(), ports: r.ports, access: r.access }));
-      await api.policySet(name, allow);
+      const git: GitRule[] = gitRows
+        .filter((r) => r.target.trim() !== "")
+        .map((r) => toGitRule(r.target.trim(), r.access));
+      await api.policySetFull(name, allow, git);
+      // Refresh the loaded snapshot and mark saved.
+      loadedRef.current = { hosts, git: gitRows };
       setSaved(true);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  // Git section helpers
-  function editGit(f: (rs: GitRow[]) => GitRow[]) {
-    setGitRows(f);
-    setGitSaved(false);
-  }
-
-  function commitGitDraft() {
-    const t = gitDraft.trim();
-    if (t && !gitRows.some((r) => r.target === t)) {
-      editGit((rs) => [...rs, { target: t, access: "read" }]);
-      setGitDraftTargets((prev) => new Set(prev).add(t));
-    }
-    setGitDraft("");
-  }
-
-  async function removeGitRow(target: string) {
-    editGit((rs) => rs.filter((r) => r.target !== target));
-    setGitDraftTargets((prev) => { const s = new Set(prev); s.delete(target); return s; });
-    try {
-      await api.policyGitBlock(name, target);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  async function saveGit() {
-    setError(null);
-    setGitSaved(false);
-    try {
-      // Only newly-added draft rows need to be persisted here.
-      // Access changes on existing rows are persisted immediately by the onChange handler.
-      // Rows removed by removeGitRow are already persisted via policyGitBlock.
-      for (const r of gitRows.filter((row) => gitDraftTargets.has(row.target))) {
-        await api.policyGitAllow(name, r.target, r.access === "read-write");
-      }
-      setGitDraftTargets(new Set());
-      setGitSaved(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -252,13 +252,14 @@ export function PolicyEditor({ name }: { name: string }) {
           Enforce firewall
         </label>
       </div>
-      <p className="text-sm text-ink-2">
-        Hosts this sandbox may reach. Add a port to a host, or remove one with its ✕.
-      </p>
       {error && <div className="text-sm text-warn">{error}</div>}
-      <fieldset disabled={!enforcing} className="contents">
+
+      <Section title="Hosts">
+        <p className="mb-2 text-sm text-ink-2">
+          Hosts this sandbox may reach. Add a port to a host, or remove one with its ✕.
+        </p>
         <div className="flex flex-col gap-2">
-          {rows.map((r, i) => (
+          {hosts.map((r, i) => (
             <div key={i} className="flex flex-col gap-2 rounded-lg border border-line p-3">
               <div className="flex items-center gap-2">
                 <label className="w-12 shrink-0 text-xs font-semibold text-ink-2">Host</label>
@@ -289,16 +290,16 @@ export function PolicyEditor({ name }: { name: string }) {
                 <label className="w-12 shrink-0 text-xs font-semibold text-ink-2">Access</label>
                 <AccessPicker
                   value={r.access}
-                  onChange={(v) => edit((rs) => rs.map((row, j) => (j === i ? { ...row, access: v } : row)))}
+                  onChange={(v) => setHostAccess(i, v)}
                 />
               </div>
             </div>
           ))}
-          {rows.length === 0 && (
+          {hosts.length === 0 && (
             <div className="text-sm text-ink-3">No hosts allowed yet — add one below.</div>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="mt-2 flex items-center gap-2">
           <button
             type="button"
             onClick={addRow}
@@ -306,95 +307,66 @@ export function PolicyEditor({ name }: { name: string }) {
           >
             Add host
           </button>
+        </div>
+      </Section>
+
+      <Section title="Git repos">
+        <p className="mb-2 text-sm text-ink-2">
+          Git repositories this sandbox may clone or push to. Specify as{" "}
+          <span className="font-mono">host/owner/repo</span> or <span className="font-mono">host</span>.
+        </p>
+        <div className="flex flex-col gap-2">
+          {gitRows.map((gr, i) => (
+            <div
+              key={i}
+              className="flex items-center gap-2 rounded-lg border border-line p-2"
+            >
+              <input
+                value={gr.target}
+                onChange={(e) => setGitTarget(i, e.target.value)}
+                placeholder="github.com/owner/repo"
+                className="flex-1 rounded border border-line px-2 py-1 text-sm font-mono"
+              />
+              <AccessPicker
+                value={gr.access}
+                onChange={(v) => setGitAccess(i, v)}
+              />
+              <button
+                type="button"
+                aria-label={`Remove git row ${i}`}
+                onClick={() => removeGitRow(i)}
+                className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+          {gitRows.length === 0 && (
+            <div className="text-sm text-ink-3">No git repos allowed yet — add one below.</div>
+          )}
+        </div>
+        <div className="mt-2 flex items-center gap-2">
           <button
             type="button"
-            onClick={() => void save()}
-            className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white"
+            onClick={addGitRow}
+            className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover"
           >
-            Save
+            Add repo
           </button>
-          {saved && <span className="self-center text-sm text-ink-2">saved · reloaded</span>}
         </div>
+      </Section>
 
-        {/* Git repos section */}
-        <div className="mt-2 border-t border-line pt-3">
-          <h3 className="mb-2 text-sm font-semibold">Git repos</h3>
-          <p className="mb-2 text-sm text-ink-2">
-            Git repositories this sandbox may clone or push to. Specify as{" "}
-            <span className="font-mono">host/owner/repo</span> or <span className="font-mono">host</span>.
-          </p>
-          <div className="flex flex-col gap-2">
-            {gitRows.map((gr) => (
-              <div
-                key={gr.target}
-                className="flex items-center gap-2 rounded-lg border border-line p-2"
-              >
-                <span className="flex-1 font-mono text-sm">{gr.target}</span>
-                <AccessPicker
-                  value={gr.access}
-                  onChange={(v) => {
-                    // Optimistically update local state.
-                    editGit((rs) =>
-                      rs.map((r) => (r.target === gr.target ? { ...r, access: v } : r)),
-                    );
-                    if (!gitDraftTargets.has(gr.target)) {
-                      // Existing (already-persisted) row: push the change immediately.
-                      void api.policyGitAllow(name, gr.target, v === "read-write").catch((e: unknown) => {
-                        // Revert on error.
-                        editGit((rs) =>
-                          rs.map((r) => (r.target === gr.target ? { ...r, access: gr.access } : r)),
-                        );
-                        setError(e instanceof Error ? e.message : String(e));
-                      });
-                    }
-                    // Draft rows stay buffered until "Save git" is clicked.
-                  }}
-                />
-                <button
-                  type="button"
-                  aria-label={`Remove ${gr.target}`}
-                  onClick={() => void removeGitRow(gr.target)}
-                  className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
-                >
-                  Remove
-                </button>
-              </div>
-            ))}
-            {gitRows.length === 0 && (
-              <div className="text-sm text-ink-3">No git repos allowed yet — add one below.</div>
-            )}
-          </div>
-          <div className="mt-2 flex items-center gap-2">
-            <input
-              value={gitDraft}
-              onChange={(e) => setGitDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  commitGitDraft();
-                }
-              }}
-              placeholder="github.com/owner/repo"
-              className="flex-1 rounded border border-line px-2 py-1 text-sm font-mono"
-            />
-            <button
-              type="button"
-              onClick={commitGitDraft}
-              className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover"
-            >
-              Add
-            </button>
-            <button
-              type="button"
-              onClick={() => void saveGit()}
-              className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white"
-            >
-              Save git
-            </button>
-            {gitSaved && <span className="self-center text-sm text-ink-2">saved</span>}
-          </div>
-        </div>
-      </fieldset>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => void save()}
+          className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white"
+        >
+          Save
+        </button>
+        {dirty && <span className="self-center text-sm text-ink-2">● unsaved changes</span>}
+        {saved && !dirty && <span className="self-center text-sm text-ink-2">saved · reloaded</span>}
+      </div>
     </div>
   );
 }

@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { vi, describe, it, expect, beforeEach } from "vitest";
+import { vi, describe, it, expect, beforeEach, type Mock } from "vitest";
 import { PolicyEditor } from "../components/PolicyEditor";
 import { api } from "../lib/ipc";
 
@@ -7,6 +7,7 @@ vi.mock("../lib/ipc", () => ({
   api: {
     policyShow: vi.fn(),
     policySet: vi.fn(),
+    policySetFull: vi.fn(),
     policySetEnforce: vi.fn(),
     policyGitAllow: vi.fn(),
     policyGitBlock: vi.fn(),
@@ -21,18 +22,23 @@ beforeEach(() => {
     git: [],
   });
   (api.policySetEnforce as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+  (api.policySetFull as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 });
 
 describe("PolicyEditor", () => {
-  it("renders entries and saves normalized rows", async () => {
+  it("renders entries and saves normalized rows via policySetFull", async () => {
     render(<PolicyEditor name="web" />);
     await screen.findByDisplayValue("api.x.com");
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() =>
-      expect(api.policySet).toHaveBeenCalledWith("web", [
-        { host: "api.x.com", ports: [80, 443], access: "read-write" },
-        { host: "db.internal", ports: [5432], access: "read-write" },
-      ]),
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [
+          { host: "api.x.com", ports: [80, 443], access: "read-write" },
+          { host: "db.internal", ports: [5432], access: "read-write" },
+        ],
+        [],
+      ),
     );
   });
 
@@ -45,10 +51,14 @@ describe("PolicyEditor", () => {
     fireEvent.keyDown(adders[1], { key: "Enter" });
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() =>
-      expect(api.policySet).toHaveBeenCalledWith("web", [
-        { host: "api.x.com", ports: [80, 443], access: "read-write" },
-        { host: "db.internal", ports: [5432, 8443], access: "read-write" },
-      ]),
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [
+          { host: "api.x.com", ports: [80, 443], access: "read-write" },
+          { host: "db.internal", ports: [5432, 8443], access: "read-write" },
+        ],
+        [],
+      ),
     );
   });
 
@@ -117,10 +127,14 @@ describe("PolicyEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: /remove port 80/i }));
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() =>
-      expect(api.policySet).toHaveBeenCalledWith("web", [
-        { host: "api.x.com", ports: [443], access: "read-write" },
-        { host: "db.internal", ports: [5432], access: "read-write" },
-      ]),
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [
+          { host: "api.x.com", ports: [443], access: "read-write" },
+          { host: "db.internal", ports: [5432], access: "read-write" },
+        ],
+        [],
+      ),
     );
   });
 
@@ -152,61 +166,31 @@ describe("PolicyEditor", () => {
       git: [{ repo: "github.com/o/a", access: "read" }],
     });
     render(<PolicyEditor name="web" />);
-    expect(await screen.findByRole("heading", { name: /git repos/i })).toBeInTheDocument();
-    expect(screen.getByText("github.com/o/a")).toBeInTheDocument();
+    // Section renders a button with title as accessible name (the heading-like element)
+    expect(await screen.findByRole("button", { name: /git repos/i })).toBeInTheDocument();
+    expect(screen.getByDisplayValue("github.com/o/a")).toBeInTheDocument();
   });
 
-  it("calls policyGitAllow when adding a git rule and saving", async () => {
-    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
-      enforcing: true,
-      allow: [],
-      git: [],
-    });
-    (api.policyGitAllow as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+  // Staged save: adding a git row and saving uses policySetFull, not policyGitAllow
+  it("one Save persists hosts and git together via policySetFull", async () => {
+    (api.policyShow as Mock).mockResolvedValue({ enforcing: false, allow: [{host:"a.com",ports:[443]}], git: [] });
+    const setFull = api.policySetFull as Mock;
     render(<PolicyEditor name="web" />);
-    await screen.findByRole("heading", { name: /git repos/i });
-    // Find and fill the "add repo" input
-    const input = screen.getByPlaceholderText(/github\.com\/owner\/repo/i);
-    fireEvent.change(input, { target: { value: "github.com/o/b" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    // The row should appear; now save it
-    await screen.findByText("github.com/o/b");
-    fireEvent.click(screen.getByRole("button", { name: /^save git$/i }));
-    await waitFor(() =>
-      expect(api.policyGitAllow).toHaveBeenCalledWith("web", "github.com/o/b", false),
-    );
+    // add a git repo row, type a target, pick read-write
+    fireEvent.click(await screen.findByRole("button", { name: /Add repo/ }));
+    fireEvent.change(screen.getByPlaceholderText("github.com/owner/repo"), { target: { value: "github.com/o/a" } });
+    fireEvent.click(screen.getByRole("button", { name: /Save/ }));
+    await waitFor(() => expect(setFull).toHaveBeenCalledWith("web",
+      [{ host: "a.com", ports: [443], access: "read-write" }],
+      [{ repo: "github.com/o/a", access: "read" }]));
   });
 
-  it("calls policyGitBlock when removing a git rule", async () => {
-    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
-      enforcing: true,
-      allow: [],
-      git: [{ repo: "github.com/o/a", access: "read" }],
-    });
-    (api.policyGitBlock as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+  it("git target input is editable even when firewall is off", async () => {
+    (api.policyShow as Mock).mockResolvedValue({ enforcing: false, allow: [], git: [] });
     render(<PolicyEditor name="web" />);
-    await screen.findByText("github.com/o/a");
-    fireEvent.click(screen.getByRole("button", { name: /remove github\.com\/o\/a/i }));
-    await waitFor(() =>
-      expect(api.policyGitBlock).toHaveBeenCalledWith("web", "github.com/o/a"),
-    );
-  });
-
-  it("calls policyGitAllow immediately when access is changed to read-write on an existing row", async () => {
-    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
-      enforcing: true,
-      allow: [],
-      git: [{ repo: "github.com/o/a", access: "read" }],
-    });
-    (api.policyGitAllow as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
-    render(<PolicyEditor name="web" />);
-    await screen.findByText("github.com/o/a");
-    // Changing access on an existing (already-persisted) row persists immediately;
-    // no "Save git" click is required.
-    fireEvent.click(screen.getByRole("button", { name: /read-write/i }));
-    await waitFor(() =>
-      expect(api.policyGitAllow).toHaveBeenCalledWith("web", "github.com/o/a", true),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: /Add repo/ }));
+    const input = screen.getByPlaceholderText("github.com/owner/repo") as HTMLInputElement;
+    expect(input.disabled).toBe(false);
   });
 
   it("preserves per-host access=read on Save without editing the row", async () => {
@@ -215,21 +199,21 @@ describe("PolicyEditor", () => {
       allow: [{ host: "pypi.org", ports: [80, 443], access: "read" }],
       git: [],
     });
-    (api.policySet as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     render(<PolicyEditor name="web" />);
     await screen.findByDisplayValue("pypi.org");
     // Click Save without touching the row at all.
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() =>
-      expect(api.policySet).toHaveBeenCalledWith(
+      expect(api.policySetFull).toHaveBeenCalledWith(
         "web",
         expect.arrayContaining([
           expect.objectContaining({ host: "pypi.org", access: "read" }),
         ]),
+        [],
       ),
     );
     // Make sure it was NOT called with access: "read-write" for pypi.org.
-    const calls = (api.policySet as ReturnType<typeof vi.fn>).mock.calls;
+    const calls = (api.policySetFull as ReturnType<typeof vi.fn>).mock.calls;
     const allow: Array<{ host: string; access?: string }> = calls[0][1];
     const pypi = allow.find((e) => e.host === "pypi.org");
     expect(pypi?.access).toBe("read");
