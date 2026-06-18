@@ -86,6 +86,38 @@ pub trait DaemonApi: Send {
     fn policy_git_block(&mut self, name: &str, target: &str) -> anyhow::Result<()>;
     /// Set the enforcing flag, then best-effort live-reload.
     fn policy_set_enforce(&mut self, name: &str, on: bool) -> anyhow::Result<()>;
+    /// Full sandbox detail (ports + volumes included).
+    fn inspect(&mut self, name: &str) -> anyhow::Result<izba_core::daemon::proto::SandboxDetail>;
+    /// List active port-publish rules for `name`.
+    fn port_list(&mut self, name: &str) -> anyhow::Result<Vec<izba_core::state::PortRule>>;
+    /// Publish a port rule for `name`.
+    fn port_publish(
+        &mut self,
+        name: &str,
+        rule: izba_core::state::PortRule,
+        persist: bool,
+    ) -> anyhow::Result<()>;
+    /// Unpublish the rule identified by `(bind, host_port)` for `name`.
+    fn port_unpublish(
+        &mut self,
+        name: &str,
+        bind: std::net::Ipv4Addr,
+        host_port: u16,
+    ) -> anyhow::Result<()>;
+    /// List all persistent volumes known to the daemon.
+    fn volume_list(&mut self) -> anyhow::Result<Vec<izba_core::volume::VolumeInfo>>;
+    /// Remove a named persistent volume (must be detached from all sandboxes).
+    fn volume_remove(&mut self, name: &str) -> anyhow::Result<()>;
+    /// Prune all unreferenced persistent volumes.
+    fn volume_prune(&mut self) -> anyhow::Result<izba_core::volume::Pruned>;
+    /// Attach a volume spec to sandbox `name`.
+    fn volume_attach(
+        &mut self,
+        name: &str,
+        spec: izba_core::volume::VolumeSpec,
+    ) -> anyhow::Result<()>;
+    /// Detach the volume at `guest_path` from sandbox `name`.
+    fn volume_detach(&mut self, name: &str, guest_path: String) -> anyhow::Result<()>;
 }
 
 /// Production `DaemonApi`: a lazily-connected `DaemonClient`. Connects via
@@ -381,6 +413,127 @@ impl DaemonApi for RealDaemon {
     fn policy_set_enforce(&mut self, name: &str, on: bool) -> anyhow::Result<()> {
         self.edit_and_reload(name, move |cfg| {
             cfg.set_enforce(on);
+        })
+    }
+
+    fn inspect(&mut self, name: &str) -> anyhow::Result<izba_core::daemon::proto::SandboxDetail> {
+        let name = name.to_string();
+        self.with_client(
+            |c| match c.request(&DaemonRequest::Inspect { name }, &mut |_| {})? {
+                DaemonResponse::Inspect(d) => Ok(d),
+                DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected Inspect reply: {other:?}"),
+            },
+        )
+    }
+
+    fn port_list(&mut self, name: &str) -> anyhow::Result<Vec<izba_core::state::PortRule>> {
+        let name = name.to_string();
+        self.with_client(
+            |c| match c.request(&DaemonRequest::PortList { name }, &mut |_| {})? {
+                DaemonResponse::Ports { rules } => Ok(rules),
+                DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected PortList reply: {other:?}"),
+            },
+        )
+    }
+
+    fn port_publish(
+        &mut self,
+        name: &str,
+        rule: izba_core::state::PortRule,
+        persist: bool,
+    ) -> anyhow::Result<()> {
+        let name = name.to_string();
+        self.with_client(|c| {
+            expect_ok(c.request(
+                &DaemonRequest::PortPublish {
+                    name,
+                    rule,
+                    persist,
+                },
+                &mut |_| {},
+            )?)
+        })
+    }
+
+    fn port_unpublish(
+        &mut self,
+        name: &str,
+        bind: std::net::Ipv4Addr,
+        host_port: u16,
+    ) -> anyhow::Result<()> {
+        let name = name.to_string();
+        self.with_client(|c| {
+            expect_ok(c.request(
+                &DaemonRequest::PortUnpublish {
+                    name,
+                    bind,
+                    host_port,
+                },
+                &mut |_| {},
+            )?)
+        })
+    }
+
+    fn volume_list(&mut self) -> anyhow::Result<Vec<izba_core::volume::VolumeInfo>> {
+        self.with_client(
+            |c| match c.request(&DaemonRequest::VolumeList, &mut |_| {})? {
+                DaemonResponse::Volumes { volumes } => Ok(volumes),
+                DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected VolumeList reply: {other:?}"),
+            },
+        )
+    }
+
+    fn volume_remove(&mut self, name: &str) -> anyhow::Result<()> {
+        let name = name.to_string();
+        self.with_client(|c| {
+            match c.request(&DaemonRequest::VolumeRemove { name }, &mut |_| {})? {
+                DaemonResponse::Pruned { .. } => Ok(()),
+                DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected VolumeRemove reply: {other:?}"),
+            }
+        })
+    }
+
+    fn volume_prune(&mut self) -> anyhow::Result<izba_core::volume::Pruned> {
+        self.with_client(
+            |c| match c.request(&DaemonRequest::VolumePrune, &mut |_| {})? {
+                DaemonResponse::Pruned {
+                    removed,
+                    reclaimed_bytes,
+                } => Ok(izba_core::volume::Pruned {
+                    removed,
+                    reclaimed_bytes,
+                }),
+                DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected VolumePrune reply: {other:?}"),
+            },
+        )
+    }
+
+    fn volume_attach(
+        &mut self,
+        name: &str,
+        spec: izba_core::volume::VolumeSpec,
+    ) -> anyhow::Result<()> {
+        let name = name.to_string();
+        self.with_client(|c| {
+            expect_ok(c.request(&DaemonRequest::VolumeAttach { name, spec }, &mut |_| {})?)
+        })
+    }
+
+    fn volume_detach(&mut self, name: &str, guest_path: String) -> anyhow::Result<()> {
+        let name = name.to_string();
+        self.with_client(|c| {
+            expect_ok(c.request(
+                &DaemonRequest::VolumeDetach {
+                    name,
+                    guest_path: guest_path.into(),
+                },
+                &mut |_| {},
+            )?)
         })
     }
 }
