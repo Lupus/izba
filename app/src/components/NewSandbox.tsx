@@ -76,7 +76,16 @@ export function NewSandbox({ onClose, onCreated }: Props) {
     }
   }
 
-  const canCreate = name.trim().length > 0 && workspace.trim().length > 0 && !busy;
+  // A row the user added but left entirely blank is ignored (so a stray
+  // "+ Add port" click can't block submit). Any row they started filling must
+  // carry numeric host AND guest ports in 1–65535.
+  const isBlankRow = (r: PortRow) => !r.bind.trim() && !r.host.trim() && !r.guest.trim();
+  const isValidPort = (v: string) => /^\d+$/.test(v.trim()) && +v >= 1 && +v <= 65535;
+  const isValidRow = (r: PortRow) => isValidPort(r.host) && isValidPort(r.guest);
+  const portsInvalid = ports.some((r) => !isBlankRow(r) && !isValidRow(r));
+
+  const canCreate =
+    name.trim().length > 0 && workspace.trim().length > 0 && !busy && !portsInvalid;
 
   return (
     <div
@@ -157,42 +166,57 @@ export function NewSandbox({ onClose, onCreated }: Props) {
           <div className="grid gap-1">
             <span className="text-ink-2">Ports</span>
             <div className="grid gap-1.5">
-              {ports.map((r, i) => (
-                <div key={i} className="flex items-center gap-1.5">
-                  <input
-                    aria-label={`Port ${i + 1} bind`}
-                    placeholder="127.0.0.1 (optional)"
-                    value={r.bind}
-                    onChange={(e) => setPort(i, { bind: e.target.value })}
-                    className="min-w-0 flex-1 rounded-lg border border-line px-2 py-1.5 text-xs"
-                  />
-                  <input
-                    aria-label={`Port ${i + 1} host`}
-                    placeholder="host"
-                    inputMode="numeric"
-                    value={r.host}
-                    onChange={(e) => setPort(i, { host: e.target.value })}
-                    className="w-20 min-w-0 rounded-lg border border-line px-2 py-1.5 text-xs"
-                  />
-                  <span className="text-ink-3">:</span>
-                  <input
-                    aria-label={`Port ${i + 1} guest`}
-                    placeholder="guest"
-                    inputMode="numeric"
-                    value={r.guest}
-                    onChange={(e) => setPort(i, { guest: e.target.value })}
-                    className="w-20 min-w-0 rounded-lg border border-line px-2 py-1.5 text-xs"
-                  />
-                  <button
-                    type="button"
-                    aria-label={`Remove port ${i + 1}`}
-                    onClick={() => removePort(i)}
-                    className="rounded-lg border border-line px-2 py-1.5 text-ink-2 hover:bg-hover"
-                  >
-                    ×
-                  </button>
+              {ports.length > 0 && (
+                <div className="flex items-center gap-1.5 text-xs text-ink-3">
+                  <span className="flex-1">Bind address</span>
+                  <span className="w-20">Host port</span>
+                  <span className="w-2" />
+                  <span className="w-20">Guest port</span>
+                  <span className="w-[34px]" />
                 </div>
-              ))}
+              )}
+              {ports.map((r, i) => {
+                const invalid = !isBlankRow(r) && !isValidRow(r);
+                const portClass = (bad: boolean) =>
+                  "w-20 min-w-0 rounded-lg border px-2 py-1.5 text-xs " +
+                  (bad ? "border-warn" : "border-line");
+                return (
+                  <div key={i} className="flex items-center gap-1.5">
+                    <input
+                      aria-label={`Port ${i + 1} bind`}
+                      placeholder="127.0.0.1"
+                      value={r.bind}
+                      onChange={(e) => setPort(i, { bind: e.target.value })}
+                      className="min-w-0 flex-1 rounded-lg border border-line px-2 py-1.5 text-xs"
+                    />
+                    <input
+                      aria-label={`Port ${i + 1} host`}
+                      placeholder="host"
+                      inputMode="numeric"
+                      value={r.host}
+                      onChange={(e) => setPort(i, { host: e.target.value })}
+                      className={portClass(invalid && !isValidPort(r.host))}
+                    />
+                    <span className="text-ink-3">:</span>
+                    <input
+                      aria-label={`Port ${i + 1} guest`}
+                      placeholder="guest"
+                      inputMode="numeric"
+                      value={r.guest}
+                      onChange={(e) => setPort(i, { guest: e.target.value })}
+                      className={portClass(invalid && !isValidPort(r.guest))}
+                    />
+                    <button
+                      type="button"
+                      aria-label={`Remove port ${i + 1}`}
+                      onClick={() => removePort(i)}
+                      className="rounded-lg border border-line px-2 py-1.5 text-ink-2 hover:bg-hover"
+                    >
+                      ×
+                    </button>
+                  </div>
+                );
+              })}
               <button
                 type="button"
                 onClick={addPort}
@@ -200,6 +224,14 @@ export function NewSandbox({ onClose, onCreated }: Props) {
               >
                 + Add port
               </button>
+              <span className="text-xs text-ink-3">
+                Bind address defaults to 127.0.0.1 when left empty.
+              </span>
+              {portsInvalid && (
+                <span className="text-xs text-warn">
+                  Host and guest ports must be numbers in 1–65535.
+                </span>
+              )}
             </div>
           </div>
         </div>
