@@ -1105,6 +1105,22 @@ pub fn list_volumes(paths: &Paths) -> anyhow::Result<Vec<crate::volume::VolumeIn
     Ok(out)
 }
 
+/// Delete a single persistent volume image. Fails closed if any sandbox config
+/// references it. Returns bytes reclaimed.
+pub fn remove_volume(paths: &Paths, name: &str) -> anyhow::Result<u64> {
+    let refs = referenced_by(paths, name)?;
+    if !refs.is_empty() {
+        bail!("volume '{name}' is in use by: {}", refs.join(", "));
+    }
+    let img = paths.volume_image(name);
+    if !img.exists() {
+        bail!("no such volume '{name}'");
+    }
+    let bytes = fs::metadata(&img).map(|m| m.len()).unwrap_or(0);
+    fs::remove_file(&img).with_context(|| format!("removing {}", img.display()))?;
+    Ok(bytes)
+}
+
 /// If a *live* sandbox other than `exclude` references persistent volume
 /// `vol_name`, return that sandbox's name. Enforces single-writer at start.
 fn persistent_volume_holder(
@@ -1964,5 +1980,28 @@ mod tests {
         assert_eq!(got[0].name, "cache");
         assert_eq!(got[0].size_bytes, 1 << 30);
         assert_eq!(got[0].referenced_by, vec!["web".to_string()]);
+    }
+
+    #[test]
+    fn remove_volume_refuses_when_referenced() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut o = opts(&ws);
+        o.volumes = vec![crate::volume::parse_volume_flag("cache:/data:1g").unwrap()];
+        create(&paths, "web", &o).unwrap();
+        let err = remove_volume(&paths, "cache").unwrap_err().to_string();
+        assert!(err.contains("in use"), "got: {err}");
+        assert!(paths.volume_image("cache").exists());
+    }
+
+    #[test]
+    fn remove_volume_deletes_unreferenced() {
+        let (_dir, paths) = test_paths();
+        std::fs::create_dir_all(paths.volumes_dir()).unwrap();
+        std::fs::write(paths.volume_image("old"), vec![0u8; 4096]).unwrap();
+        let freed = remove_volume(&paths, "old").unwrap();
+        assert!(!paths.volume_image("old").exists());
+        assert!(freed > 0);
     }
 }
