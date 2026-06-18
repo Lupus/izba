@@ -272,7 +272,7 @@ impl DaemonApi for RealDaemon {
         Ok(
             match EgressPolicyConfig::load(&self.paths.sandbox_dir(name))? {
                 Some(cfg) => crate::views::PolicyView {
-                    enforcing: true,
+                    enforcing: cfg.enforce,
                     allow: cfg.allow,
                     git: cfg.git,
                 },
@@ -417,5 +417,40 @@ fn expect_ok(resp: DaemonResponse) -> anyhow::Result<()> {
         DaemonResponse::Ok => Ok(()),
         DaemonResponse::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `policy_show` must reflect the `enforce:` value written to disk, not
+    /// hard-code `true` whenever a `policy.yaml` is present.
+    #[test]
+    fn real_policy_show_reflects_enforce_false_on_disk() {
+        // Use a uniquely-named temp directory so parallel test runs don't clash.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let tmp = std::env::temp_dir().join(format!("izba-app-test-{nanos}"));
+        let sandbox_dir = tmp.join("sandboxes").join("sb");
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        // Write a policy.yaml with enforce: false plus an allow rule and a git rule.
+        let yaml = "enforce: false\nallow:\n  - example.com\ngit:\n  - repo: github.com/o/r\n    access: read\n";
+        std::fs::write(sandbox_dir.join("policy.yaml"), yaml).unwrap();
+
+        let mut daemon = RealDaemon {
+            paths: Paths::with_root(tmp.clone()),
+            client: None,
+        };
+        let view = daemon.policy_show("sb").unwrap();
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort cleanup
+        assert!(
+            !view.enforcing,
+            "enforcing should be false when policy.yaml has enforce: false, got true"
+        );
+        assert_eq!(view.allow.len(), 1, "allow rules should be loaded");
+        assert_eq!(view.git.len(), 1, "git rules should be loaded");
     }
 }
