@@ -11,8 +11,9 @@ pub fn run(paths: &Paths, name: &str, force: bool) -> anyhow::Result<i32> {
     if matches!(lockdown_state(paths, name), LockdownState::Locked(_)) {
         if let Err(e) = unlock(&WinBackend, paths, name) {
             eprintln!(
-                "izba: warning: failed to release lock-down account for '{name}': {e:#}\n\
-                 The Windows account may be orphaned. Run `izba windows-cleanup` to sweep it."
+                "warning: could not release the lock-down account for '{name}' \
+                 (UAC declined or helper error: {e:#}); the account + firewall rule may still \
+                 exist. Run `izba unlock {name}` or `izba windows-cleanup` to release it later."
             );
         }
     }
