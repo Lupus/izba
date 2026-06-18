@@ -158,6 +158,23 @@ mod win {
             return ExitCode::from(0);
         }
 
+        // `net-connect` reports a network-reachability classification (ALLOWED /
+        // BLOCKED / ALLOWED-ERR:<code>), not an OK/DENIED verdict, because a
+        // WFP/Firewall block has a SPECIFIC signature (WSAEACCES) distinct from
+        // refused/timeout. Like self-il it writes a custom payload and exits 0.
+        if attempt == "net-connect" {
+            let Some(t) = target else {
+                eprintln!("confine_probe child: net-connect requires --target ip:port");
+                return ExitCode::from(2);
+            };
+            let payload = attempt_net_connect(&t);
+            if let Err(e) = std::fs::write(&result, format!("{nonce}:{payload}")) {
+                eprintln!("confine_probe child: writing result {result}: {e}");
+                return ExitCode::from(2);
+            }
+            return ExitCode::from(0);
+        }
+
         let allowed = match attempt.as_str() {
             "write-up" => {
                 let Some(t) = target else {
@@ -168,6 +185,7 @@ mod win {
             }
             "acquire-priv" => attempt_acquire_priv(),
             "whp" => attempt_whp(),
+            "confined-whp" => attempt_confined_whp(),
             other => {
                 eprintln!("confine_probe child: unknown attempt {other:?}");
                 return ExitCode::from(2);
@@ -280,6 +298,102 @@ mod win {
             } else {
                 false
             }
+        }
+    }
+
+    /// confined-whp: the full MVP-D-stack probe. We are ALREADY running as the
+    /// target principal (the spike orchestrator launches us via
+    /// CreateProcessWithLogonW as a dedicated standard local account). Spawn a
+    /// grandchild CONFINED — restricted token + Low IL derived from OUR (the
+    /// local account's) token, exactly `spawn_confined`'s `vmm_default` policy —
+    /// running `child --attempt whp`, and report whether `WHvCreatePartition`
+    /// still succeeds. This answers "does layering PR #37's confinement on top
+    /// of a separate local account leave WHP working?" Returns true iff the
+    /// confined grandchild's whp succeeded.
+    fn attempt_confined_whp() -> bool {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("confined-whp: current_exe: {e}");
+                return false;
+            }
+        };
+        // Grandchild verdict file lives in the Low-labelled result dir so the
+        // Low-IL confined grandchild can actually write it (same channel the
+        // harness uses for confined legs).
+        let result = unique_result("izba-cwhp-grandchild");
+        let _ = std::fs::remove_file(&result);
+        let nonce = unique_nonce();
+        let argv = vec![
+            exe.to_string_lossy().into_owned(),
+            "child".into(),
+            "--attempt".into(),
+            "whp".into(),
+            "--result".into(),
+            result.to_string_lossy().into_owned(),
+            "--nonce".into(),
+            nonce.clone(),
+        ];
+        let spec = CommandSpec { argv };
+        let log = std::env::temp_dir().join("izba-cwhp-grandchild.log");
+        let id = match spawn_confined(&spec, &log, &ConfinementPolicy::vmm_default()) {
+            Ok((id, _mode)) => id,
+            Err(e) => {
+                eprintln!("confined-whp: spawn_confined: {e}");
+                return false;
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while pid_alive(&id) {
+            if Instant::now() >= deadline {
+                eprintln!("confined-whp: grandchild did not exit before deadline");
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let raw = match std::fs::read_to_string(&result) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "confined-whp: no grandchild result {}: {e}",
+                    result.display()
+                );
+                return false;
+            }
+        };
+        let _ = std::fs::remove_file(&result);
+        match raw.trim().split_once(':') {
+            Some((got, payload)) => got == nonce && payload == OK,
+            None => false,
+        }
+    }
+
+    /// net-connect: attempt an outbound TCP connect to `target` (a NUMERIC
+    /// ip:port — no DNS, since DNS itself is network and would muddy the result)
+    /// and classify the outcome. A Windows Defender Firewall / WFP ALE outbound
+    /// BLOCK scoped to the calling account makes `connect()` fail SPECIFICALLY
+    /// with `WSAEACCES` (10013) — distinct from connection-refused (10061),
+    /// timeout (10060), or unreachable. So `WSAEACCES` is the unambiguous
+    /// signature we report as `BLOCKED`; a successful connect is `ALLOWED`, and
+    /// any other error is `ALLOWED-ERR:<code>` (the firewall did NOT block it —
+    /// the SYN was permitted out, it just didn't complete). This lets the spike
+    /// prove a per-SID firewall rule actually blocks, without depending on the
+    /// target being reachable.
+    fn attempt_net_connect(target: &str) -> String {
+        use std::net::{SocketAddr, TcpStream};
+        use std::time::Duration;
+        const WSAEACCES: i32 = 10013;
+        let addr: SocketAddr = match target.parse() {
+            Ok(a) => a,
+            Err(e) => return format!("ERR-parse:{e}"),
+        };
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            Ok(_) => "ALLOWED".to_string(),
+            Err(e) => match e.raw_os_error() {
+                Some(WSAEACCES) => "BLOCKED".to_string(),
+                Some(code) => format!("ALLOWED-ERR:{code}"),
+                None => "ALLOWED-ERR:none".to_string(),
+            },
         }
     }
 
