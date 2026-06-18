@@ -52,6 +52,12 @@ pub struct FakeDaemon {
     pub shell_closed: Arc<Mutex<bool>>,
     /// In-memory policy state for testing git rules and enforce toggle.
     pub policy: EgressPolicyConfig,
+    /// Active port-publish rules echoed by `port_list` / mutated by publish/unpublish.
+    pub ports: Vec<izba_core::state::PortRule>,
+    /// Persistent volume infos echoed by `volume_list`.
+    pub volumes: Vec<izba_core::volume::VolumeInfo>,
+    /// Volume specs echoed inside `inspect`'s detail response.
+    pub detail_volumes: Vec<izba_core::volume::VolumeSpec>,
 }
 
 impl Default for FakeDaemon {
@@ -87,6 +93,14 @@ impl Default for FakeDaemon {
             shell_resizes: Arc::new(Mutex::new(Vec::new())),
             shell_closed: Arc::new(Mutex::new(false)),
             policy: EgressPolicyConfig::default(),
+            ports: vec![],
+            volumes: vec![izba_core::volume::VolumeInfo {
+                name: "cache".into(),
+                size_bytes: 1 << 30,
+                actual_bytes: 1 << 20,
+                referenced_by: vec!["web".into()],
+            }],
+            detail_volumes: vec![],
         }
     }
 }
@@ -271,6 +285,84 @@ impl DaemonApi for FakeDaemon {
     fn policy_set_enforce(&mut self, name: &str, on: bool) -> anyhow::Result<()> {
         self.calls.push(format!("set_enforce:{name}:{on}"));
         self.policy.set_enforce(on);
+        Ok(())
+    }
+
+    fn inspect(&mut self, name: &str) -> anyhow::Result<izba_core::daemon::proto::SandboxDetail> {
+        Ok(izba_core::daemon::proto::SandboxDetail {
+            name: name.to_string(),
+            image_ref: "ubuntu:24.04".into(),
+            image_digest: "sha256:x".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: "/ws".into(),
+            status: "running".into(),
+            ports: self.ports.clone(),
+            volumes: self.detail_volumes.clone(),
+            confinement: None,
+        })
+    }
+
+    fn port_list(&mut self, _name: &str) -> anyhow::Result<Vec<izba_core::state::PortRule>> {
+        Ok(self.ports.clone())
+    }
+
+    fn port_publish(
+        &mut self,
+        name: &str,
+        rule: izba_core::state::PortRule,
+        persist: bool,
+    ) -> anyhow::Result<()> {
+        self.calls.push(format!(
+            "publish:{name}:{}:{}:{persist}",
+            rule.host_port, rule.guest_port
+        ));
+        self.ports.push(rule);
+        Ok(())
+    }
+
+    fn port_unpublish(
+        &mut self,
+        name: &str,
+        bind: std::net::Ipv4Addr,
+        host_port: u16,
+    ) -> anyhow::Result<()> {
+        self.calls
+            .push(format!("unpublish:{name}:{bind}:{host_port}"));
+        self.ports
+            .retain(|r| !(r.bind == bind && r.host_port == host_port));
+        Ok(())
+    }
+
+    fn volume_list(&mut self) -> anyhow::Result<Vec<izba_core::volume::VolumeInfo>> {
+        Ok(self.volumes.clone())
+    }
+
+    fn volume_remove(&mut self, name: &str) -> anyhow::Result<()> {
+        self.calls.push(format!("vrm:{name}"));
+        Ok(())
+    }
+
+    fn volume_prune(&mut self) -> anyhow::Result<izba_core::volume::Pruned> {
+        self.calls.push("vprune".into());
+        Ok(izba_core::volume::Pruned {
+            removed: vec!["old".into()],
+            reclaimed_bytes: 1024,
+        })
+    }
+
+    fn volume_attach(
+        &mut self,
+        name: &str,
+        spec: izba_core::volume::VolumeSpec,
+    ) -> anyhow::Result<()> {
+        self.calls
+            .push(format!("vattach:{name}:{}", spec.guest_path.display()));
+        Ok(())
+    }
+
+    fn volume_detach(&mut self, name: &str, guest_path: String) -> anyhow::Result<()> {
+        self.calls.push(format!("vdetach:{name}:{guest_path}"));
         Ok(())
     }
 }
