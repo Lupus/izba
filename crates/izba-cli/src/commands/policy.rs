@@ -164,11 +164,13 @@ mod tests {
         // `apply_edit` is the daemon-free core of the allow/block verbs.
         apply_edit(dir.path(), Edit::Allow, "api.x.com", 443).unwrap();
         let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
+        use izba_core::daemon::egress::config::Access;
         assert_eq!(
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: vec![443]
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
             }]
         );
         apply_edit(dir.path(), Edit::Block, "api.x.com", 443).unwrap();

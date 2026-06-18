@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn decide_tier2_enforcing_allows_explicitly_listed_lan_ip() {
         let snoop = SnoopStore::new();
-        let data = r#"{"global_domains": {"10.1.0.124": [8080]}, "sandbox_ports": {}}"#;
+        let data = r#"{"host_rules": {"10.1.0.124": {"ports": [8080], "access": "read-write"}}, "sandbox_host_rules": {}, "sandbox_git_rules": {}}"#;
         let p = RegoPolicy::with_data(data).unwrap();
         let ip: IpAddr = "10.1.0.124".parse().unwrap();
         let (v, f, rule) = decide_tier2(&p, &snoop, "web", ip, 8080);
@@ -659,7 +659,7 @@ mod tests {
         let (v2, _f2, _r) = decide_tier2(&p, &snoop, "web", "10.1.0.200".parse().unwrap(), 8080);
         assert_eq!(v2, Verdict::Deny);
         // Loopback stays denied even if (absurdly) listed — the hard floor wins.
-        let data2 = r#"{"global_domains": {"127.0.0.1": [8080]}, "sandbox_ports": {}}"#;
+        let data2 = r#"{"host_rules": {"127.0.0.1": {"ports": [8080], "access": "read-write"}}, "sandbox_host_rules": {}, "sandbox_git_rules": {}}"#;
         let p2 = RegoPolicy::with_data(data2).unwrap();
         let (v3, _f3, r3) = decide_tier2(&p2, &snoop, "web", "127.0.0.1".parse().unwrap(), 8080);
         assert_eq!(v3, Verdict::Deny, "hard floor is non-overridable by policy");
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn tier2_scoped_port_is_honored() {
         let p = RegoPolicy::with_data(
-            r#"{"global_domains": {}, "sandbox_ports": {"web": {"db.internal": [5432]}}}"#,
+            r#"{"host_rules": {}, "sandbox_host_rules": {"web": {"db.internal": {"ports": [5432], "access": "read-write"}}}, "sandbox_git_rules": {}}"#,
         )
         .unwrap();
         let snoop = SnoopStore::new();

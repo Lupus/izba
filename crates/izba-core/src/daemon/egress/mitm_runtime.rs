@@ -113,6 +113,7 @@ impl PolicyAdapter {
             host: Some(req.host.clone()),
             method: Some(req.method.clone()),
             path: Some(req.path.clone()),
+            query: req.query.clone(),
         }
     }
 }

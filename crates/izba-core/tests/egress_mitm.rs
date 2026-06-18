@@ -174,7 +174,7 @@ fn mitm_firewall_allows_and_denies_by_decrypted_host() {
         // M2.1 port-aware: a host is allowed only on its listed ports, so the
         // data doc names the (ephemeral) upstream port this test actually dials.
         let data = format!(
-            r#"{{"global_domains": {{"api.anthropic.com": [{up_port}]}}, "sandbox_ports": {{}}}}"#
+            r#"{{"host_rules": {{"api.anthropic.com": {{"ports": [{up_port}], "access": "read-write"}}}}, "sandbox_host_rules": {{}}, "sandbox_git_rules": {{}}}}"#
         );
         let policy: Arc<dyn izba_core::daemon::egress::policy::Policy> =
             Arc::new(RegoPolicy::with_data(&data).unwrap());
