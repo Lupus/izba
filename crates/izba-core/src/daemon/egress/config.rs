@@ -422,7 +422,6 @@ impl EgressPolicyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::egress::audit::{aggregate, AuditRecord};
     use crate::daemon::egress::policy::{FlowDesc, Verdict};
 
     #[test]
