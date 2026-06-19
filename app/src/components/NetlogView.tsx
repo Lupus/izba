@@ -4,6 +4,7 @@ import { api } from "../lib/ipc";
 import { git_repo_from_row, git_op_from_path, git_access_for } from "../lib/git";
 import { allowKeys } from "../lib/policy";
 import { SeedDialog } from "./SeedDialog";
+import { EnforceToggle } from "./EnforceToggle";
 
 /** Human-readable "time since" for the Last-activity column. `now` is injected
  *  so the formatting is pure and unit-testable. */
@@ -138,17 +139,12 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
           )}
         </div>
         <div className="flex items-center gap-2">
-          {/* Enforce toggle */}
-          <label className="flex items-center gap-1.5 cursor-pointer select-none text-xs">
-            <input
-              type="checkbox"
-              checked={enforcing}
-              onChange={() => void toggleEnforce()}
-              disabled={pending !== null}
-              className="accent-accent"
-            />
-            {enforcing ? "ON" : "OFF"}
-          </label>
+          {/* Enforce toggle — a clear on/off switch, not an ambiguous checkbox */}
+          <EnforceToggle
+            enforcing={enforcing}
+            disabled={pending !== null}
+            onToggle={() => void toggleEnforce()}
+          />
           {/* Review observed traffic button (always available) */}
           <button
             type="button"
