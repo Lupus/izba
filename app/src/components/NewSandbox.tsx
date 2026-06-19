@@ -1,16 +1,16 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, onCreateProgress } from "../lib/ipc";
-import type { CreateOpts } from "../lib/types";
+import type { CreateOpts, VolumeInfo } from "../lib/types";
 import { isValidPort, isValidBind } from "../lib/portvalidate";
 import {
   type VolumeRow,
-  isValidVolName,
-  isValidVolPath,
-  isValidVolSize,
+  defaultVolumeRow,
+  buildVolSpec,
   isBlankVolRow,
   isValidVolRow,
 } from "../lib/volumevalidate";
+import { VolumeRowEditor } from "./VolumeRowEditor";
 
 interface Props {
   onClose: () => void;
@@ -32,6 +32,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const [workspace, setWorkspace] = useState("");
   const [ports, setPorts] = useState<PortRow[]>([]);
   const [volumes, setVolumes] = useState<VolumeRow[]>([]);
+  const [freeVolumes, setFreeVolumes] = useState<VolumeInfo[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<string[]>([]);
@@ -40,6 +41,18 @@ export function NewSandbox({ onClose, onCreated }: Props) {
     let unlisten: (() => void) | undefined;
     void onCreateProgress((m) => setProgress((p) => [...p, m])).then((u) => (unlisten = u));
     return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const all = await api.volumeList();
+        // Nothing is attached yet in the create wizard — only filter by usage.
+        setFreeVolumes(all.filter((v) => v.referenced_by.length === 0));
+      } catch {
+        // Non-fatal: the existing-persistent dropdown simply shows empty.
+      }
+    })();
   }, []);
 
   async function pickDir() {
@@ -58,9 +71,9 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const addPort = () => setPorts((rows) => [...rows, { bind: "", host: "", guest: "" }]);
   const removePort = (i: number) => setPorts((rows) => rows.filter((_, j) => j !== i));
 
-  const setVolume = (i: number, patch: Partial<VolumeRow>) =>
-    setVolumes((rows) => rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-  const addVolume = () => setVolumes((rows) => [...rows, { name: "", path: "", size: "" }]);
+  const setVolume = (i: number, row: VolumeRow) =>
+    setVolumes((rows) => rows.map((r, j) => (j === i ? row : r)));
+  const addVolume = () => setVolumes((rows) => [...rows, defaultVolumeRow()]);
   const removeVolume = (i: number) => setVolumes((rows) => rows.filter((_, j) => j !== i));
 
   async function submit() {
@@ -82,10 +95,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
         ),
       volumes: volumes
         .filter((r) => !isBlankVolRow(r))
-        .map(
-          (r) =>
-            `${r.name.trim() ? `${r.name.trim()}:` : ""}${r.path.trim()}:${r.size.trim()}`,
-        ),
+        .map((r) => buildVolSpec(r, freeVolumes)),
     };
     try {
       const created = await api.create(opts);
@@ -118,10 +128,6 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   // Shared column template so the Bind/Host/Guest headers line up with the
   // inputs below: [bind grows] [host 5rem] [colon] [guest 5rem] [remove 2rem].
   const portGrid = "grid grid-cols-[minmax(0,1fr)_5rem_0.75rem_5rem_2rem] items-center gap-1.5";
-
-  // Volume grid: [name grows] [path grows] [size 5rem] [tag 5rem] [remove 2rem].
-  const volumeGrid =
-    "grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_5rem_5rem_2rem] items-center gap-1.5";
 
   return (
     <div
@@ -274,57 +280,16 @@ export function NewSandbox({ onClose, onCreated }: Props) {
           <div className="grid gap-1">
             <span className="text-ink-2">Volumes</span>
             <div className="grid gap-1.5">
-              {volumes.length > 0 && (
-                <div className={volumeGrid + " text-xs text-ink-3"}>
-                  <span>Name</span>
-                  <span>Guest path</span>
-                  <span>Size</span>
-                  <span />
-                  <span />
-                </div>
-              )}
-              {volumes.map((r, i) => {
-                const invalid = !isBlankVolRow(r) && !isValidVolRow(r);
-                const cell = (bad: boolean) =>
-                  "w-full min-w-0 rounded-lg border px-2 py-1.5 text-xs " +
-                  (bad ? "border-warn" : "border-line");
-                const tag =
-                  r.name.trim() === "" ? "ephemeral" : "persistent";
-                return (
-                  <div key={i} className={volumeGrid}>
-                    <input
-                      aria-label={`Volume ${i + 1} name`}
-                      placeholder="vol-name"
-                      value={r.name}
-                      onChange={(e) => setVolume(i, { name: e.target.value })}
-                      className={cell(invalid && !isValidVolName(r.name.trim()))}
-                    />
-                    <input
-                      aria-label={`Volume ${i + 1} path`}
-                      placeholder="/data"
-                      value={r.path}
-                      onChange={(e) => setVolume(i, { path: e.target.value })}
-                      className={cell(invalid && !isValidVolPath(r.path.trim()))}
-                    />
-                    <input
-                      aria-label={`Volume ${i + 1} size`}
-                      placeholder="1g"
-                      value={r.size}
-                      onChange={(e) => setVolume(i, { size: e.target.value })}
-                      className={cell(invalid && !isValidVolSize(r.size.trim()))}
-                    />
-                    <span className="text-center text-xs text-ink-3">{tag}</span>
-                    <button
-                      type="button"
-                      aria-label={`Remove volume ${i + 1}`}
-                      onClick={() => removeVolume(i)}
-                      className="w-full rounded-lg border border-line py-1.5 text-ink-2 hover:bg-hover"
-                    >
-                      ×
-                    </button>
-                  </div>
-                );
-              })}
+              {volumes.map((r, i) => (
+                <VolumeRowEditor
+                  key={i}
+                  row={r}
+                  index={i}
+                  freeVolumes={freeVolumes}
+                  onChange={(row) => setVolume(i, row)}
+                  onRemove={() => removeVolume(i)}
+                />
+              ))}
               <button
                 type="button"
                 onClick={addVolume}
@@ -334,7 +299,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
               </button>
               {volumesInvalid && (
                 <span className="text-xs text-warn">
-                  Each volume needs a valid guest path (starts with /) and size (e.g. 1g, 512m).
+                  Each volume needs valid fields for its type (e.g. path /data, size 1g).
                 </span>
               )}
             </div>
