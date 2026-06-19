@@ -6,6 +6,13 @@ set -e
 # Include library.
 script_dir="$(dirname -- "$(realpath -- "${0}")")"
 source "${script_dir}/lib.sh"
+# lib.sh unconditionally runs `set +e` (it uses exit-status conditionals
+# internally), which cancels the `set -e` above. Re-enable it so a non-zero
+# exit from the restore_pkgs.sh / install_and_cache_pkgs.sh subprocess dispatched
+# below aborts this step instead of letting save-cache persist an empty
+# ~/cache-apt-pkgs that poisons every future warm run. Mirrors the same fix in
+# install_and_cache_pkgs.sh and pre_cache_action.sh.
+set -e
 
 # Directory that holds the cached packages.
 cache_dir="${1}"
