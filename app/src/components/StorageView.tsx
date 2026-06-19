@@ -84,6 +84,11 @@ export function StorageView() {
         </div>
       )}
 
+      <p className="text-sm text-ink-3">
+        Persistent volumes are created when you attach a new persistent volume from a sandbox&apos;s{" "}
+        <span className="font-medium text-ink-2">Volumes</span> tab.
+      </p>
+
       {volumes.length === 0 ? (
         <div className="text-sm text-ink-3">No named volumes.</div>
       ) : (
@@ -92,7 +97,6 @@ export function StorageView() {
             <tr className="border-b border-line text-left text-xs uppercase tracking-wide text-ink-3">
               <th className="pb-2 pr-4 font-semibold">Name</th>
               <th className="pb-2 pr-4 font-semibold">Size</th>
-              <th className="pb-2 pr-4 font-semibold">Used</th>
               <th className="pb-2 pr-4 font-semibold">In use by</th>
               <th className="pb-2 font-semibold"></th>
             </tr>
@@ -104,7 +108,6 @@ export function StorageView() {
                 <tr key={v.name} className="border-b border-line/50 hover:bg-hover/30">
                   <td className="py-2 pr-4 font-mono">{v.name}</td>
                   <td className="py-2 pr-4">{formatBytes(v.size_bytes)}</td>
-                  <td className="py-2 pr-4">{formatBytes(v.actual_bytes)}</td>
                   <td className="py-2 pr-4">
                     <div className="flex flex-wrap gap-1">
                       {v.referenced_by.map((ref) => (

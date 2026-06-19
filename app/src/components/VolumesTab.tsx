@@ -179,14 +179,19 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       {/* Dirty banner */}
       {dirty && (
         <div className="flex items-center gap-3 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 text-sm">
-          <span className="flex-1">These changes apply on next restart.</span>
+          <span className="flex-1">
+            Unsaved changes.{" "}
+            <span className="text-ink-3">
+              Changes are saved to the sandbox config and applied on next restart.
+            </span>
+          </span>
           <button
             type="button"
             disabled={saving}
             onClick={() => void save()}
             className="rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-50"
           >
-            Save
+            Save changes
           </button>
           {running && (
             <button
@@ -195,7 +200,7 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
               onClick={() => void restartNow()}
               className="rounded-lg border border-line px-3 py-1.5 text-sm hover:bg-hover disabled:opacity-50"
             >
-              Restart now
+              Save &amp; restart now
             </button>
           )}
         </div>
