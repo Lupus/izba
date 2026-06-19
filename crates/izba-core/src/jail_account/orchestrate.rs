@@ -118,20 +118,27 @@ pub fn compute_grants(config: &SandboxConfig, paths: &Paths, name: &str) -> Vec<
     grants
 }
 
-/// Compute the set of host paths the sandbox account must be able to read
-/// (read-only, `ReadExec` DACL level).
+/// Compute the shared read-only artifacts the VMM opens that live OUTSIDE the
+/// sandbox dir, granted at the `ReadExec` DACL level.
 ///
-/// Returns those of `[images_dir, artifacts_dir]` that currently **exist** on
-/// disk.  These are shared, non-sensitive OCI base-image and kernel/initrd
-/// directories — granting read-only access to them does NOT weaken
-/// read-confinement of the per-sandbox account because they contain only
-/// pre-built artifact files, never the user's project workspace or credentials.
+/// Returns those of `[<this image's rootfs.erofs>, artifacts_dir]` that currently
+/// **exist** on disk. Granularity matters for read-confinement, so:
+/// - the **erofs** is THIS sandbox's specific base-image layer (via the image
+///   digest), NOT the whole `images/` dir — a compromised VMM cannot read other
+///   images' base layers. It is a public OCI base layer anyway; per-sandbox data
+///   lives in `rw.img`/volumes/workspace, never in the shared base erofs.
+/// - `artifacts_dir` holds the **global** kernel + initramfs, identical for every
+///   sandbox, so it exposes nothing sandbox-specific.
 ///
-/// `artifacts_dir` may be absent on developer machines where kernel/initrd
-/// are sourced from another location; such absent paths are filtered out so
-/// provisioning does not fail on those hosts.
-pub fn compute_ro_grants(paths: &Paths) -> Vec<PathBuf> {
-    [paths.images_dir(), paths.artifacts_dir()]
+/// Per-sandbox **drives** are deliberately absent here: `rw.img` is inside the
+/// (separately granted) sandbox dir, and named-volume images are granted
+/// individually in [`compute_grants`] — so the account can never read another
+/// sandbox's drives. `artifacts_dir` may be absent on hosts where kernel/initrd
+/// come from elsewhere; such missing paths are filtered out so provisioning does
+/// not fail.
+pub fn compute_ro_grants(config: &SandboxConfig, paths: &Paths) -> Vec<PathBuf> {
+    let erofs = crate::image::ImageStore::new(paths).rootfs_path(&config.image_digest);
+    [erofs, paths.artifacts_dir()]
         .into_iter()
         .filter(|p| p.exists())
         .collect()
@@ -167,7 +174,7 @@ pub fn lockdown<B: LockdownBackend>(
         .ok_or_else(|| anyhow!("no config.json for sandbox {name:?}"))?;
 
     let grants = compute_grants(&config, paths, name);
-    let ro = compute_ro_grants(paths);
+    let ro = compute_ro_grants(&config, paths);
 
     // --- temporary output files for the helper ---
     let sid_out = sandbox_dir.join(".lockdown.sid.tmp");
@@ -500,48 +507,70 @@ mod tests {
 
     // ── compute_ro_grants ─────────────────────────────────────────────────────
 
+    fn ro_test_config() -> SandboxConfig {
+        SandboxConfig {
+            image_digest: "sha256:abc".to_string(),
+            image_ref: "ubuntu:22.04".to_string(),
+            cpus: 2,
+            mem_mb: 512,
+            workspace: PathBuf::from("/workspace"),
+            ports: Vec::new(),
+            volumes: Vec::new(),
+        }
+    }
+
+    fn make_erofs(paths: &Paths, cfg: &SandboxConfig) -> PathBuf {
+        let erofs = crate::image::ImageStore::new(paths).rootfs_path(&cfg.image_digest);
+        std::fs::create_dir_all(erofs.parent().unwrap()).unwrap();
+        std::fs::write(&erofs, b"erofs").unwrap();
+        erofs
+    }
+
     #[test]
-    fn compute_ro_grants_returns_existing_images_dir() {
+    fn compute_ro_grants_includes_this_images_erofs_not_whole_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
+        let cfg = ro_test_config();
+        let erofs = make_erofs(&paths, &cfg);
+        // artifacts_dir absent.
 
-        // Create images dir but not artifacts dir.
-        let images = paths.images_dir();
-        std::fs::create_dir_all(&images).unwrap();
-
-        let ro = compute_ro_grants(&paths);
+        let ro = compute_ro_grants(&cfg, &paths);
         assert!(
-            ro.contains(&images),
-            "existing images_dir must be in RO grants: {ro:?}"
+            ro.contains(&erofs),
+            "this image's erofs must be granted: {ro:?}"
         );
-        // artifacts_dir does not exist → must be filtered out.
+        // Granularity: NOT the whole images dir, NOT the absent artifacts dir.
+        assert!(
+            !ro.contains(&paths.images_dir()),
+            "must not grant the whole images dir: {ro:?}"
+        );
         assert!(
             !ro.contains(&paths.artifacts_dir()),
-            "non-existent artifacts_dir must not appear in RO grants: {ro:?}"
+            "non-existent artifacts_dir must be filtered out: {ro:?}"
         );
     }
 
     #[test]
-    fn compute_ro_grants_returns_both_when_both_exist() {
+    fn compute_ro_grants_adds_artifacts_dir_when_present() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
-
-        std::fs::create_dir_all(paths.images_dir()).unwrap();
+        let cfg = ro_test_config();
+        let erofs = make_erofs(&paths, &cfg);
         std::fs::create_dir_all(paths.artifacts_dir()).unwrap();
 
-        let ro = compute_ro_grants(&paths);
-        assert!(ro.contains(&paths.images_dir()));
+        let ro = compute_ro_grants(&cfg, &paths);
+        assert!(ro.contains(&erofs));
         assert!(ro.contains(&paths.artifacts_dir()));
         assert_eq!(ro.len(), 2);
     }
 
     #[test]
-    fn compute_ro_grants_empty_when_neither_exists() {
+    fn compute_ro_grants_empty_when_nothing_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
-        // Neither images nor artifacts dir created.
-        let ro = compute_ro_grants(&paths);
-        assert!(ro.is_empty(), "must be empty when no dirs exist: {ro:?}");
+        // Neither the erofs nor the artifacts dir created.
+        let ro = compute_ro_grants(&ro_test_config(), &paths);
+        assert!(ro.is_empty(), "must be empty when nothing exists: {ro:?}");
     }
 
     // ── compute_grants ────────────────────────────────────────────────────────
