@@ -147,6 +147,34 @@ impl ConfinementStatus {
     }
 }
 
+/// Actionable error text for a directory that cannot be Low-integrity-relabelled
+/// for a confined sandbox. The confined VMM runs at Low integrity and izba must
+/// relabel every host write surface (the workspace share, scratch, writable
+/// disks) to Low — which needs `WRITE_OWNER` (Full Control) on the object. A
+/// folder at the **root of a drive** (e.g. `C:\name`) inherits only
+/// `Authenticated Users: Modify` and grants `WRITE_OWNER` to no one (not even its
+/// owner, who gets only implicit `READ_CONTROL` + `WRITE_DAC`), so the relabel is
+/// denied. Surfaced both as a create-time preflight (before the sandbox is
+/// written to disk) and, for sandboxes already pointing at such a dir, wrapped
+/// around the start-time relabel failure.
+///
+/// Kept here (cross-platform) so it is a single source of truth, unit-testable on
+/// any host even though the denial only arises on Windows.
+pub fn workspace_confinement_denied_msg(path: &std::path::Path) -> String {
+    let p = path.display();
+    format!(
+        "directory {p} cannot be secured for a confined sandbox: izba runs the VM at \
+         Low integrity and must relabel this directory, which requires Full Control \
+         (the WRITE_OWNER right) on it. A folder at the root of a drive (e.g. C:\\name) \
+         does not grant this even to its owner. Fix it by either:\n  \
+         - choosing a workspace under your user profile (e.g. C:\\Users\\<you>\\<project>), or\n  \
+         - granting your account Full Control:\n      \
+         icacls \"{p}\" /grant \"%USERNAME%:(OI)(CI)F\"\n\
+         Alternatively, create/run the sandbox with --allow-unconfined to skip host-side \
+         confinement (reduced isolation)."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +241,21 @@ mod tests {
         assert_eq!(s.reason, "seccomp+landlock+virtiofs:namespace");
         assert!(s.summary().starts_with("confined: "));
         assert!(s.is_confined());
+    }
+
+    #[test]
+    fn workspace_confinement_denied_msg_is_actionable() {
+        let msg = workspace_confinement_denied_msg(std::path::Path::new(r"C:\izba-src"));
+        // Names the offending path so the user knows which dir to fix.
+        assert!(msg.contains(r"C:\izba-src"), "{msg}");
+        // Explains the underlying access requirement (WRITE_OWNER / Full Control).
+        assert!(msg.contains("Full Control"), "{msg}");
+        assert!(msg.contains("WRITE_OWNER"), "{msg}");
+        // Offers the two concrete remedies: relocate under the profile ...
+        assert!(msg.to_lowercase().contains("profile"), "{msg}");
+        // ... or grant access with a copy-pasteable icacls command on THIS path.
+        assert!(msg.contains(r#"icacls "C:\izba-src" /grant"#), "{msg}");
+        // And the explicit escape hatch.
+        assert!(msg.contains("--allow-unconfined"), "{msg}");
     }
 }

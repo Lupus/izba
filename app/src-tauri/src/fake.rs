@@ -226,6 +226,7 @@ mod tests {
             rw_size_gb: 4,
             ports: vec![],
             volumes: vec![],
+            allow_unconfined: false,
         }
     }
 

@@ -20,6 +20,10 @@ pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32>
         rw_size_gb: opts.rw_size_gb,
         ports,
         volumes,
+        // `izba create` has no unconfined opt-out (that is a run/start flag), so
+        // it always creates with confined intent: the daemon runs the workspace
+        // confinement preflight and refuses an unrelabellable dir up front.
+        allow_unconfined: false,
     });
     match client.request(&req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Created { name } => {

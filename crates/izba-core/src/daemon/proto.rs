@@ -52,6 +52,15 @@ pub struct DaemonCreate {
     /// still deserializes.
     #[serde(default)]
     pub volumes: Vec<crate::volume::VolumeSpec>,
+    /// Opt out of host-side VMM confinement (mirrors `Start::allow_unconfined`).
+    /// When false (the default), the daemon runs the confinement preflight on
+    /// the workspace before creating anything — a workspace that cannot be
+    /// relabelled (e.g. a folder at a drive root) is rejected so the sandbox is
+    /// never created in an unstartable state. When true, the preflight is skipped
+    /// because the VMM will not relabel the workspace. Defaults to false via
+    /// serde so an older client's frame (no field) still deserializes confined.
+    #[serde(default)]
+    pub allow_unconfined: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +234,7 @@ mod tests {
                     guest_path: "/data".into(),
                     size_bytes: 1 << 30,
                 }],
+                allow_unconfined: false,
             }),
             DaemonRequest::VolumePrune,
             DaemonRequest::Start {
@@ -367,6 +377,25 @@ mod tests {
                 assert!(!allow_unconfined, "missing field must default to confine");
             }
             other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_create_without_allow_unconfined_defaults_false() {
+        // A pre-confinement client's Create frame has no allow_unconfined key;
+        // serde(default) must read it as false so the daemon runs the confinement
+        // preflight (the common case) rather than silently skipping it.
+        let json = r#"{"type":"create","name":"web","image_ref":"ubuntu:24.04","cpus":2,"mem_mb":4096,"workspace":"/w","rw_size_gb":8,"ports":[]}"#;
+        let back: DaemonRequest = serde_json::from_str(json).unwrap();
+        match back {
+            DaemonRequest::Create(c) => {
+                assert_eq!(c.name, "web");
+                assert!(
+                    !c.allow_unconfined,
+                    "missing field must default to confined intent"
+                );
+            }
+            other => panic!("expected Create, got {other:?}"),
         }
     }
 

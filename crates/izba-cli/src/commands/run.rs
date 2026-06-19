@@ -15,7 +15,7 @@ pub fn run(
     cmd: Vec<String>,
 ) -> anyhow::Result<i32> {
     let mut client = DaemonClient::connect(paths)?;
-    let name = resolve_or_create(&mut client, paths, opts, name_or_dir)?;
+    let name = resolve_or_create(&mut client, paths, opts, name_or_dir, allow_unconfined)?;
     if allow_unconfined {
         // Loud, BEFORE start: the user is waiving the host-side jail, so a VM
         // escape would run with their full user privileges.
@@ -55,6 +55,7 @@ fn resolve_or_create(
     paths: &Paths,
     opts: &SandboxOpts,
     name_or_dir: &str,
+    allow_unconfined: bool,
 ) -> anyhow::Result<String> {
     // Case A: an existing sandbox addressed directly by name.
     if sandbox::validate_name(name_or_dir).is_ok()
@@ -81,6 +82,10 @@ fn resolve_or_create(
         rw_size_gb: opts.rw_size_gb,
         ports,
         volumes,
+        // Carry the run's confinement intent into create: `run --allow-unconfined`
+        // on a workspace that can't be relabelled must still create (the VMM will
+        // run unconfined and never relabel it), so skip the create-time preflight.
+        allow_unconfined,
     });
     match client.request(&req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Created { .. } => {}
