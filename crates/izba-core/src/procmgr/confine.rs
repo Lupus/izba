@@ -163,6 +163,10 @@ impl ConfinementStatus {
 /// copy-pasteable in BOTH cmd.exe and PowerShell — a `%USERNAME%` literal would
 /// not expand in PowerShell and would silently grant to a non-existent principal.
 ///
+/// Deliberately a single line (no embedded newlines): the CLI prints it to stderr
+/// and the app shows it in a plain element where HTML would collapse newlines
+/// anyway, so a flowing sentence reads correctly in both without per-surface CSS.
+///
 /// Kept here (cross-platform) so it is a single source of truth, unit-testable on
 /// any host even though the denial only arises on Windows.
 pub fn workspace_confinement_denied_msg(path: &std::path::Path, account: &str) -> String {
@@ -171,12 +175,10 @@ pub fn workspace_confinement_denied_msg(path: &std::path::Path, account: &str) -
         "directory {p} cannot be secured for a confined sandbox: izba runs the VM at \
          Low integrity and must relabel this directory, which requires Full Control \
          (the WRITE_OWNER right) on it. A folder at the root of a drive (e.g. C:\\name) \
-         does not grant this even to its owner. Fix it by either:\n  \
-         - choosing a workspace under your user profile (e.g. C:\\Users\\<you>\\<project>), or\n  \
-         - granting your account Full Control:\n      \
-         icacls \"{p}\" /grant \"{account}:(OI)(CI)F\"\n\
-         Alternatively, create/run the sandbox with --allow-unconfined to skip host-side \
-         confinement (reduced isolation)."
+         does not grant this even to its owner. Two fixes: (1) use a workspace under your \
+         user profile (e.g. C:\\Users\\<you>\\<project>); or (2) grant your account Full \
+         Control with: icacls \"{p}\" /grant \"{account}:(OI)(CI)F\". Or create/run the \
+         sandbox with --allow-unconfined to skip host-side confinement (reduced isolation)."
     )
 }
 
@@ -272,5 +274,8 @@ mod tests {
         );
         // And the explicit escape hatch.
         assert!(msg.contains("--allow-unconfined"), "{msg}");
+        // Single line: it renders correctly in the CLI AND the app dialog (where
+        // HTML would collapse newlines) without any per-surface whitespace CSS.
+        assert!(!msg.contains('\n'), "message must stay single-line: {msg}");
     }
 }
