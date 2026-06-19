@@ -118,7 +118,7 @@ pub fn ensure_confinable(path: &Path) -> anyhow::Result<()> {
         );
         if h == INVALID_HANDLE_VALUE {
             if GetLastError() == ERROR_ACCESS_DENIED {
-                anyhow::bail!(workspace_confinement_denied_msg(path));
+                anyhow::bail!(workspace_confinement_denied_msg(path, &current_account()));
             }
             // Not an access problem — don't false-block create/start.
             return Ok(());
@@ -126,6 +126,23 @@ pub fn ensure_confinable(path: &Path) -> anyhow::Result<()> {
         CloseHandle(h);
     }
     Ok(())
+}
+
+/// The current Windows account (`DOMAIN\user`) to embed in the remedy `icacls`
+/// command, so it is copy-pasteable as-is. The daemon/CLI runs as the user, so
+/// the `USERDOMAIN`/`USERNAME` env vars name them; `icacls` accepts the
+/// `DOMAIN\user` form on both domain-joined and standalone (`COMPUTER\user`)
+/// hosts. Falls back to a bare username, then a placeholder, if either is unset.
+#[cfg(windows)]
+fn current_account() -> String {
+    match (
+        std::env::var("USERDOMAIN").ok().filter(|s| !s.is_empty()),
+        std::env::var("USERNAME").ok().filter(|s| !s.is_empty()),
+    ) {
+        (Some(domain), Some(user)) => format!("{domain}\\{user}"),
+        (None, Some(user)) => user,
+        _ => "<your-username>".to_string(),
+    }
 }
 
 /// Label `path` (and, via inheritance, every existing and future child) with a

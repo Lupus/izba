@@ -158,9 +158,14 @@ impl ConfinementStatus {
 /// written to disk) and, for sandboxes already pointing at such a dir, wrapped
 /// around the start-time relabel failure.
 ///
+/// `account` is the Windows account to grant in the remedy `icacls` command,
+/// expanded by the caller (the daemon/CLI runs as the user) so the command is
+/// copy-pasteable in BOTH cmd.exe and PowerShell — a `%USERNAME%` literal would
+/// not expand in PowerShell and would silently grant to a non-existent principal.
+///
 /// Kept here (cross-platform) so it is a single source of truth, unit-testable on
 /// any host even though the denial only arises on Windows.
-pub fn workspace_confinement_denied_msg(path: &std::path::Path) -> String {
+pub fn workspace_confinement_denied_msg(path: &std::path::Path, account: &str) -> String {
     let p = path.display();
     format!(
         "directory {p} cannot be secured for a confined sandbox: izba runs the VM at \
@@ -169,7 +174,7 @@ pub fn workspace_confinement_denied_msg(path: &std::path::Path) -> String {
          does not grant this even to its owner. Fix it by either:\n  \
          - choosing a workspace under your user profile (e.g. C:\\Users\\<you>\\<project>), or\n  \
          - granting your account Full Control:\n      \
-         icacls \"{p}\" /grant \"%USERNAME%:(OI)(CI)F\"\n\
+         icacls \"{p}\" /grant \"{account}:(OI)(CI)F\"\n\
          Alternatively, create/run the sandbox with --allow-unconfined to skip host-side \
          confinement (reduced isolation)."
     )
@@ -245,7 +250,8 @@ mod tests {
 
     #[test]
     fn workspace_confinement_denied_msg_is_actionable() {
-        let msg = workspace_confinement_denied_msg(std::path::Path::new(r"C:\izba-src"));
+        let msg =
+            workspace_confinement_denied_msg(std::path::Path::new(r"C:\izba-src"), r"CORP\me");
         // Names the offending path so the user knows which dir to fix.
         assert!(msg.contains(r"C:\izba-src"), "{msg}");
         // Explains the underlying access requirement (WRITE_OWNER / Full Control).
@@ -253,8 +259,17 @@ mod tests {
         assert!(msg.contains("WRITE_OWNER"), "{msg}");
         // Offers the two concrete remedies: relocate under the profile ...
         assert!(msg.to_lowercase().contains("profile"), "{msg}");
-        // ... or grant access with a copy-pasteable icacls command on THIS path.
-        assert!(msg.contains(r#"icacls "C:\izba-src" /grant"#), "{msg}");
+        // ... or grant access with a copy-pasteable icacls command on THIS path,
+        // targeting the EXPANDED account so it works in cmd.exe AND PowerShell
+        // (a literal `%USERNAME%` would not expand in PowerShell).
+        assert!(
+            msg.contains(r#"icacls "C:\izba-src" /grant "CORP\me:(OI)(CI)F""#),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("%USERNAME%"),
+            "must not embed a cmd-only variable: {msg}"
+        );
         // And the explicit escape hatch.
         assert!(msg.contains("--allow-unconfined"), "{msg}");
     }
