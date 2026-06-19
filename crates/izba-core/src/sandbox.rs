@@ -248,6 +248,13 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
         let mut volumes = opts.volumes.clone();
         crate::volume::assign_eph_ids(&mut volumes);
 
+        // Single-writer guard: persistent volumes may only be referenced by one sandbox.
+        crate::volume::validate_volumes(&volumes)?;
+        for v in volumes.iter().filter(|v| v.is_persistent()) {
+            let vol_name = v.name.as_deref().unwrap();
+            ensure_volume_not_shared(paths, vol_name, name)?;
+        }
+
         let config = SandboxConfig {
             image_digest: opts.image_digest.clone(),
             image_ref: opts.image_ref.clone(),
@@ -1064,6 +1071,24 @@ fn referenced_by(paths: &Paths, vol: &str) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+/// Fail if a persistent volume is already referenced by a sandbox OTHER than `current`.
+///
+/// Enforces the single-writer invariant: a named (persistent) volume may be
+/// attached to at most one sandbox config at a time. Ephemeral volumes have no
+/// name and are never subject to this check.
+fn ensure_volume_not_shared(paths: &Paths, vol: &str, current: &str) -> anyhow::Result<()> {
+    let others: Vec<String> = referenced_by(paths, vol)?
+        .into_iter()
+        .filter(|s| s != current)
+        .collect();
+    if !others.is_empty() {
+        bail!(
+            "persistent volume '{vol}' is already in use by: {} (detach it there first)",
+            others.join(", ")
+        );
+    }
+    Ok(())
+}
 /// On-disk allocation: blocks × 512 on Unix, file length elsewhere.
 fn allocated_bytes(meta: &fs::Metadata) -> u64 {
     #[cfg(unix)]
@@ -1117,6 +1142,12 @@ pub fn attach_volume(
         load_json(&cfg_path)?.with_context(|| format!("no such sandbox '{name}'"))?;
     cfg.volumes.push(spec);
     crate::volume::validate_volumes(&cfg.volumes)?;
+    // Single-writer guard: check the last-added spec (the one we just pushed).
+    let new_spec = cfg.volumes.last().unwrap();
+    if new_spec.is_persistent() {
+        let vol_name = new_spec.name.as_deref().unwrap();
+        ensure_volume_not_shared(paths, vol_name, name)?;
+    }
     crate::volume::assign_eph_ids(&mut cfg.volumes);
     let v = cfg.volumes.last().unwrap();
     ensure_volume_image(&v.image_path(paths, name), v.size_bytes, paths.root())
@@ -2106,5 +2137,126 @@ mod tests {
             .unwrap();
         assert!(cfg.volumes.is_empty());
         assert!(img.exists(), "detach must not delete the backing image");
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-writer guard: one sandbox per persistent volume
+    // -----------------------------------------------------------------------
+
+    /// attach_volume must refuse if a persistent volume is already referenced
+    /// by a different sandbox's config.
+    #[test]
+    fn attach_volume_refuses_volume_in_use_by_another_sandbox() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // Sandbox A already has "shared" in its config.
+        let mut o = opts(&ws);
+        o.volumes = vec![crate::volume::parse_volume_flag("shared:/data:1g").unwrap()];
+        create(&paths, "sandbox-a", &o).unwrap();
+
+        // Sandbox B has no volumes.
+        create(&paths, "sandbox-b", &opts(&ws)).unwrap();
+
+        // Attempting to attach "shared" to B must fail with "in use".
+        let err = attach_volume(
+            &paths,
+            "sandbox-b",
+            crate::volume::parse_volume_flag("shared:/data:1g").unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("in use"), "expected 'in use', got: {err}");
+    }
+
+    /// attach_volume must succeed when a persistent volume is referenced by
+    /// nobody at all.
+    #[test]
+    fn attach_volume_allows_free_persistent_volume() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        create(&paths, "sandbox-a", &opts(&ws)).unwrap();
+
+        attach_volume(
+            &paths,
+            "sandbox-a",
+            crate::volume::parse_volume_flag("fresh:/data:1g").unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// After detaching a persistent volume from sandbox A, attaching it to B
+    /// must succeed (it is now free).
+    #[test]
+    fn attach_volume_allows_reattach_after_detach() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // Sandbox A holds "shared".
+        let mut o = opts(&ws);
+        o.volumes = vec![crate::volume::parse_volume_flag("shared:/data:1g").unwrap()];
+        create(&paths, "sandbox-a", &o).unwrap();
+
+        // Sandbox B exists with no volumes.
+        create(&paths, "sandbox-b", &opts(&ws)).unwrap();
+
+        // Detach from A -- now the volume is free.
+        detach_volume(&paths, "sandbox-a", std::path::Path::new("/data")).unwrap();
+
+        // Attaching to B must now succeed.
+        attach_volume(
+            &paths,
+            "sandbox-b",
+            crate::volume::parse_volume_flag("shared:/data:1g").unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// create must refuse if a persistent volume in opts.volumes is already
+    /// referenced by another sandbox's config.
+    #[test]
+    fn create_refuses_persistent_volume_in_use() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // Sandbox A holds "shared".
+        let mut o = opts(&ws);
+        o.volumes = vec![crate::volume::parse_volume_flag("shared:/data:1g").unwrap()];
+        create(&paths, "sandbox-a", &o).unwrap();
+
+        // Creating sandbox B with the same persistent volume must fail.
+        let mut o2 = opts(&ws);
+        o2.volumes = vec![crate::volume::parse_volume_flag("shared:/data:1g").unwrap()];
+        let err = create(&paths, "sandbox-b", &o2).unwrap_err().to_string();
+        assert!(err.contains("in use"), "expected 'in use', got: {err}");
+    }
+
+    /// Ephemeral volumes (no name) are not subject to the single-writer guard;
+    /// two sandboxes may both declare an ephemeral volume without conflict.
+    #[test]
+    fn attach_volume_ephemeral_not_blocked_by_guard() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // Sandbox A has an ephemeral volume at /scratch.
+        let mut o = opts(&ws);
+        o.volumes = vec![crate::volume::parse_volume_flag("/scratch:1g").unwrap()];
+        create(&paths, "sandbox-a", &o).unwrap();
+
+        // Sandbox B has no volumes yet.
+        create(&paths, "sandbox-b", &opts(&ws)).unwrap();
+
+        // Attaching an ephemeral volume to B must succeed -- no cross-sandbox guard.
+        attach_volume(
+            &paths,
+            "sandbox-b",
+            crate::volume::parse_volume_flag("/scratch:1g").unwrap(),
+        )
+        .unwrap();
     }
 }
