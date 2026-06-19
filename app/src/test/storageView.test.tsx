@@ -48,15 +48,27 @@ describe("StorageView — renders volumes", () => {
     expect(screen.getByText("data")).toBeInTheDocument();
   });
 
-  it("formats size_bytes and actual_bytes human-readable", async () => {
+  it("formats size_bytes human-readable (Used column is not displayed)", async () => {
     volumeList.mockResolvedValue([
       makeVolume({ name: "cache", size_bytes: 1073741824, actual_bytes: 536870912 }),
     ]);
     render(<StorageView />);
     await screen.findByText("cache");
-    // 1073741824 = 1.0 GiB, 536870912 = 512 MiB
+    // 1073741824 = 1.0 GiB — Size column is present
     expect(screen.getByText(/1\.0 GiB|1\.00 GiB|1 GiB/)).toBeInTheDocument();
-    expect(screen.getByText(/512 MiB|512\.0 MiB|0\.5 GiB/)).toBeInTheDocument();
+    // actual_bytes (512 MiB) is NOT rendered — the Used column was removed
+    expect(screen.queryByText(/512 MiB|512\.0 MiB|0\.5 GiB/)).not.toBeInTheDocument();
+    // No "Used" column header
+    expect(screen.queryByRole("columnheader", { name: /^used$/i })).not.toBeInTheDocument();
+  });
+
+  it("shows a hint explaining how to create persistent volumes", async () => {
+    volumeList.mockResolvedValue([]);
+    render(<StorageView />);
+    await waitFor(() => expect(volumeList).toHaveBeenCalled());
+    expect(
+      screen.getByText(/persistent volumes are created when you attach/i),
+    ).toBeInTheDocument();
   });
 
   it("shows in-use chips when referenced_by is non-empty", async () => {

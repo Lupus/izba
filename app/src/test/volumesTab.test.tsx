@@ -81,19 +81,19 @@ describe("VolumesTab — seeding from inspect", () => {
 });
 
 describe("VolumesTab — dirty banner", () => {
-  it("shows 'applies on next restart' banner when a row is added", async () => {
+  it("shows 'applied on next restart' banner when a row is added", async () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     // Wait for inspect to resolve and component to render
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-    expect(await screen.findByText(/apply on next restart/i)).toBeInTheDocument();
+    expect(await screen.findByText(/applied on next restart/i)).toBeInTheDocument();
   });
 
   it("does not show the banner before any edit", async () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
-    expect(screen.queryByText(/apply on next restart/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/applied on next restart/i)).not.toBeInTheDocument();
   });
 });
 
@@ -114,7 +114,7 @@ describe("VolumesTab — Save: attach a new volume", () => {
     fireEvent.change(pathInput, { target: { value: "/data" } });
     fireEvent.change(sizeInput, { target: { value: "1g" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
 
     await waitFor(() =>
       expect(volumeAttach).toHaveBeenCalledWith("mysbx", "cache:/data:1g"),
@@ -136,10 +136,10 @@ describe("VolumesTab — Save: detach a removed seeded volume", () => {
     fireEvent.click(screen.getByRole("button", { name: /remove.*\/data/i }));
 
     // Banner should appear
-    expect(screen.getByText(/apply on next restart/i)).toBeInTheDocument();
+    expect(screen.getByText(/applied on next restart/i)).toBeInTheDocument();
 
     // Save
-    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
 
     await waitFor(() =>
       expect(volumeDetach).toHaveBeenCalledWith("mysbx", "/data"),
@@ -154,7 +154,7 @@ describe("VolumesTab — Restart now", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
 
-    expect(await screen.findByRole("button", { name: /restart now/i })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /save & restart now/i })).toBeInTheDocument();
   });
 
   it("does not show Restart now when stopped even if dirty", async () => {
@@ -163,8 +163,8 @@ describe("VolumesTab — Restart now", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
 
-    await screen.findByText(/apply on next restart/i);
-    expect(screen.queryByRole("button", { name: /restart now/i })).not.toBeInTheDocument();
+    await screen.findByText(/applied on next restart/i);
+    expect(screen.queryByRole("button", { name: /save & restart now/i })).not.toBeInTheDocument();
   });
 
   it("calls api.restart and onChanged when Restart now is clicked (no pending edits)", async () => {
@@ -175,7 +175,7 @@ describe("VolumesTab — Restart now", () => {
     // Click "Add volume" to make the component dirty (shows Restart now button)
     // but leave all fields blank so save() treats the row as a no-op and returns true
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-    const restartBtn = await screen.findByRole("button", { name: /restart now/i });
+    const restartBtn = await screen.findByRole("button", { name: /save & restart now/i });
     fireEvent.click(restartBtn);
 
     await waitFor(() => expect(restart).toHaveBeenCalledWith("mysbx"));
@@ -198,7 +198,7 @@ describe("VolumesTab — Restart now", () => {
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "2g" } });
 
-    const restartBtn = await screen.findByRole("button", { name: /restart now/i });
+    const restartBtn = await screen.findByRole("button", { name: /save & restart now/i });
     fireEvent.click(restartBtn);
 
     await waitFor(() => expect(restart).toHaveBeenCalledWith("mysbx"));
@@ -217,7 +217,7 @@ describe("VolumesTab — Restart now", () => {
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     // leave size blank — should fail validation
 
-    const restartBtn = await screen.findByRole("button", { name: /restart now/i });
+    const restartBtn = await screen.findByRole("button", { name: /save & restart now/i });
     fireEvent.click(restartBtn);
 
     // restart should NOT be called because save() returned false
@@ -246,7 +246,7 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
 
     // inspect must be called again (the finally-block re-sync load)
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(2));
@@ -269,7 +269,7 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
 
     // inspect must be called a second time — this proves the finally block ran load()
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(2));
@@ -291,7 +291,7 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
 
     // (a) inspect must be called again — rows re-synced from daemon
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(2));
@@ -314,7 +314,7 @@ describe("VolumesTab — 3-way volume type selector", () => {
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/scratch" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
     await waitFor(() =>
       expect(volumeAttach).toHaveBeenCalledWith("mysbx", "/scratch:1g"),
     );
@@ -333,7 +333,7 @@ describe("VolumesTab — 3-way volume type selector", () => {
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "2g" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
     await waitFor(() =>
       expect(volumeAttach).toHaveBeenCalledWith("mysbx", "cache:/data:2g"),
     );
@@ -357,7 +357,7 @@ describe("VolumesTab — 3-way volume type selector", () => {
 
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/arch" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
     await waitFor(() =>
       expect(volumeAttach).toHaveBeenCalledWith("mysbx", "archive:/arch:1024m"),
     );
