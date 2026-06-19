@@ -1,26 +1,18 @@
 import { useEffect, useState } from "react";
-import type { SandboxView, VolumeSpec } from "../lib/types";
+import type { SandboxView, VolumeSpec, VolumeInfo } from "../lib/types";
 import { api } from "../lib/ipc";
 import {
   type VolumeRow,
-  isValidVolName,
-  isValidVolPath,
-  isValidVolSize,
+  defaultVolumeRow,
+  buildVolSpec,
   isBlankVolRow,
   isValidVolRow,
 } from "../lib/volumevalidate";
+import { VolumeRowEditor } from "./VolumeRowEditor";
 
 interface Props {
   sandbox: SandboxView;
   onChanged: () => void;
-}
-
-/** Build the volumeAttach spec string: "[name:]path:size" */
-function buildSpec(row: VolumeRow): string {
-  const name = row.name.trim();
-  const path = row.path.trim();
-  const size = row.size.trim();
-  return name ? `${name}:${path}:${size}` : `${path}:${size}`;
 }
 
 /** Format bytes into a human-readable string (best-effort, display only). */
@@ -35,17 +27,10 @@ interface SeededRow {
   removed: boolean;
 }
 
-interface NewRow {
-  row: VolumeRow;
-  /** Per-field validation error message, or null if the field is okay. */
-  nameErr: string | null;
-  pathErr: string | null;
-  sizeErr: string | null;
-}
-
 export function VolumesTab({ sandbox, onChanged }: Props) {
   const [seeded, setSeeded] = useState<SeededRow[]>([]);
-  const [newRows, setNewRows] = useState<NewRow[]>([]);
+  const [newRows, setNewRows] = useState<VolumeRow[]>([]);
+  const [allVolumes, setAllVolumes] = useState<VolumeInfo[]>([]);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -88,6 +73,25 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name]);
 
+  useEffect(() => {
+    void (async () => {
+      try {
+        setAllVolumes(await api.volumeList());
+      } catch {
+        // Non-fatal: the existing-persistent dropdown simply shows empty.
+      }
+    })();
+  }, []);
+
+  // Free volumes available to attach: not referenced by any sandbox, and not
+  // already seeded (non-removed) on THIS sandbox.
+  const seededNames = new Set(
+    seeded.filter((s) => !s.removed && s.spec.name).map((s) => s.spec.name as string),
+  );
+  const freeVolumes = allVolumes.filter(
+    (v) => v.referenced_by.length === 0 && !seededNames.has(v.name),
+  );
+
   function markDirty() {
     setDirty(true);
   }
@@ -99,54 +103,29 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
 
   function restoreSeeded(idx: number) {
     setSeeded((prev) => prev.map((s, i) => (i === idx ? { ...s, removed: false } : s)));
-    // re-check dirty: any removed row still removed?
     setDirty(true);
   }
 
   function addRow() {
-    setNewRows((prev) => [
-      ...prev,
-      { row: { name: "", path: "", size: "" }, nameErr: null, pathErr: null, sizeErr: null },
-    ]);
+    setNewRows((prev) => [...prev, defaultVolumeRow()]);
     markDirty();
   }
 
   function removeNewRow(idx: number) {
     setNewRows((prev) => prev.filter((_, i) => i !== idx));
-    // if no more changes dirty might be wrong, but simpler to keep dirty=true
-    // (user can discard by navigating away)
   }
 
-  function updateNewRow(idx: number, field: keyof VolumeRow, value: string) {
-    setNewRows((prev) =>
-      prev.map((nr, i) => {
-        if (i !== idx) return nr;
-        const row = { ...nr.row, [field]: value };
-        return { ...nr, row };
-      }),
-    );
+  function updateNewRow(idx: number, row: VolumeRow) {
+    setNewRows((prev) => prev.map((r, i) => (i === idx ? row : r)));
   }
 
   /** Save pending edits. Returns true if the save succeeded (no errors). */
   async function save(): Promise<boolean> {
-    // Validate all new rows (ignore blank rows)
-    let hasErr = false;
-    const validated = newRows.map((nr) => {
-      if (isBlankVolRow(nr.row)) return nr;
-      const nameErr = isValidVolName(nr.row.name.trim())
-        ? null
-        : "Name must be lowercase alphanumeric, _, or -.";
-      const pathErr = isValidVolPath(nr.row.path.trim())
-        ? null
-        : "Path must start with / and contain no commas.";
-      const sizeErr = isValidVolSize(nr.row.size.trim())
-        ? null
-        : "Size must be a positive integer followed by g/m/G/M.";
-      if (nameErr || pathErr || sizeErr) hasErr = true;
-      return { ...nr, nameErr, pathErr, sizeErr };
-    });
+    // Validate all new rows (ignore blank rows). A started-but-invalid row
+    // blocks the save.
+    const hasErr = newRows.some((r) => !isBlankVolRow(r) && !isValidVolRow(r));
     if (hasErr) {
-      setNewRows(validated);
+      setError("Each volume needs valid fields for its type.");
       return false;
     }
 
@@ -161,9 +140,9 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
         await api.volumeDetach(name, s.spec.guest_path);
       }
       // Attach new valid rows
-      const toAttach = newRows.filter((nr) => !isBlankVolRow(nr.row) && isValidVolRow(nr.row));
-      for (const nr of toAttach) {
-        await api.volumeAttach(name, buildSpec(nr.row));
+      const toAttach = newRows.filter((r) => !isBlankVolRow(r) && isValidVolRow(r));
+      for (const r of toAttach) {
+        await api.volumeAttach(name, buildVolSpec(r, freeVolumes));
       }
       succeeded = true;
     } catch (e) {
@@ -171,9 +150,7 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
     } finally {
       // Always re-sync rows to daemon truth (success or partial failure).
       // Use refreshRows() instead of load() so a save error is not cleared
-      // by the re-sync; on success load() would also work but refreshRows()
-      // is consistent. Set the save error AFTER refreshRows so it is the
-      // final state.
+      // by the re-sync; set the save error AFTER refreshRows so it is final.
       await refreshRows();
       if (saveError !== null) {
         setError(saveError);
@@ -194,8 +171,6 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }
-
-  const inputCls = "rounded border border-line px-2 py-1 text-sm font-mono";
 
   return (
     <div className="flex flex-col gap-4">
@@ -246,9 +221,7 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
               <span
                 className={
                   "rounded px-1.5 py-0.5 text-xs font-semibold " +
-                  (isPersistent
-                    ? "bg-accent/10 text-accent"
-                    : "bg-hover text-ink-2")
+                  (isPersistent ? "bg-accent/10 text-accent" : "bg-hover text-ink-2")
                 }
               >
                 {isPersistent ? "persistent" : "ephemeral"}
@@ -287,63 +260,15 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       })}
 
       {/* New rows being added */}
-      {newRows.map((nr, i) => (
-        <div key={`new-${i}`} className="flex flex-col gap-2 rounded-lg border border-line p-3">
-          <div className="flex items-center gap-2">
-            <label className="w-24 shrink-0 text-xs font-semibold text-ink-2" htmlFor={`vol-name-${i}`}>
-              Volume name
-            </label>
-            <input
-              id={`vol-name-${i}`}
-              aria-label="Volume name"
-              value={nr.row.name}
-              onChange={(e) => updateNewRow(i, "name", e.target.value)}
-              placeholder="cache (empty = ephemeral)"
-              className={inputCls + " flex-1"}
-            />
-          </div>
-          {nr.nameErr && <span className="text-xs text-warn">{nr.nameErr}</span>}
-
-          <div className="flex items-center gap-2">
-            <label className="w-24 shrink-0 text-xs font-semibold text-ink-2" htmlFor={`vol-path-${i}`}>
-              Guest path
-            </label>
-            <input
-              id={`vol-path-${i}`}
-              aria-label="Guest path"
-              value={nr.row.path}
-              onChange={(e) => updateNewRow(i, "path", e.target.value)}
-              placeholder="/data"
-              className={inputCls + " flex-1"}
-            />
-          </div>
-          {nr.pathErr && <span className="text-xs text-warn">{nr.pathErr}</span>}
-
-          <div className="flex items-center gap-2">
-            <label className="w-24 shrink-0 text-xs font-semibold text-ink-2" htmlFor={`vol-size-${i}`}>
-              Size
-            </label>
-            <input
-              id={`vol-size-${i}`}
-              aria-label="Size"
-              value={nr.row.size}
-              onChange={(e) => updateNewRow(i, "size", e.target.value)}
-              placeholder="1g"
-              className={inputCls + " w-24"}
-            />
-          </div>
-          {nr.sizeErr && <span className="text-xs text-warn">{nr.sizeErr}</span>}
-
-          <div className="flex justify-end">
-            <button
-              type="button"
-              onClick={() => removeNewRow(i)}
-              className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
+      {newRows.map((r, i) => (
+        <VolumeRowEditor
+          key={`new-${i}`}
+          row={r}
+          index={i}
+          freeVolumes={freeVolumes}
+          onChange={(row) => updateNewRow(i, row)}
+          onRemove={() => removeNewRow(i)}
+        />
       ))}
 
       <div>

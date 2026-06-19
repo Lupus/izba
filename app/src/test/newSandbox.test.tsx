@@ -1,11 +1,12 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { create, onCreateProgress } = vi.hoisted(() => ({
+const { create, onCreateProgress, volumeList } = vi.hoisted(() => ({
   create: vi.fn(),
   onCreateProgress: vi.fn(),
+  volumeList: vi.fn(),
 }));
-vi.mock("../lib/ipc", () => ({ api: { create }, onCreateProgress }));
+vi.mock("../lib/ipc", () => ({ api: { create, volumeList }, onCreateProgress }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn().mockResolvedValue("/picked/ws") }));
 
 import { NewSandbox } from "../components/NewSandbox";
@@ -15,6 +16,7 @@ describe("NewSandbox", () => {
     vi.clearAllMocks();
     create.mockResolvedValue("web");
     onCreateProgress.mockResolvedValue(() => {});
+    volumeList.mockResolvedValue([]);
   });
 
   it("submits create with form values", async () => {
@@ -121,6 +123,8 @@ describe("NewSandbox", () => {
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    // Switch to new persistent type
+    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
@@ -137,6 +141,8 @@ describe("NewSandbox", () => {
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
@@ -147,6 +153,8 @@ describe("NewSandbox", () => {
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1x" } });
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
@@ -157,12 +165,40 @@ describe("NewSandbox", () => {
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    // Ephemeral is the default type
+    fireEvent.click(screen.getByRole("button", { name: /ephemeral/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/scratch" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
     fireEvent.click(screen.getByRole("button", { name: /create/i }));
     await waitFor(() =>
       expect(create).toHaveBeenCalledWith(
         expect.objectContaining({ volumes: ["/scratch:1g"] }),
+      ),
+    );
+  });
+
+  it("existing persistent: emits name:path:sizeMiB m spec on Create", async () => {
+    volumeList.mockResolvedValue([
+      { name: "archive", size_bytes: 1073741824, actual_bytes: 0, referenced_by: [] },
+    ]);
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+
+    // Switch to existing persistent type
+    fireEvent.click(screen.getByRole("button", { name: /existing/i }));
+
+    await waitFor(() => expect(volumeList).toHaveBeenCalled());
+    const select = screen.getByRole("combobox", { name: /existing volume/i });
+    fireEvent.change(select, { target: { value: "archive" } });
+
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/arch" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /create/i }));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(
+        expect.objectContaining({ volumes: ["archive:/arch:1024m"] }),
       ),
     );
   });

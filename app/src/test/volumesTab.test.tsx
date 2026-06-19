@@ -4,15 +4,16 @@ import type { SandboxView, SandboxDetail } from "../lib/types";
 
 // ── hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { inspect, volumeAttach, volumeDetach, restart } = vi.hoisted(() => ({
+const { inspect, volumeAttach, volumeDetach, restart, volumeList } = vi.hoisted(() => ({
   inspect: vi.fn(),
   volumeAttach: vi.fn(),
   volumeDetach: vi.fn(),
   restart: vi.fn(),
+  volumeList: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", () => ({
-  api: { inspect, volumeAttach, volumeDetach, restart },
+  api: { inspect, volumeAttach, volumeDetach, restart, volumeList },
 }));
 
 import { VolumesTab } from "../components/VolumesTab";
@@ -49,6 +50,7 @@ beforeEach(() => {
   volumeAttach.mockResolvedValue(undefined);
   volumeDetach.mockResolvedValue(undefined);
   restart.mockResolvedValue(undefined);
+  volumeList.mockResolvedValue([]);
 });
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -102,10 +104,12 @@ describe("VolumesTab — Save: attach a new volume", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
 
-    // Fill in the new row
-    const nameInput = screen.getByLabelText(/volume name/i);
-    const pathInput = screen.getByLabelText(/guest path/i);
-    const sizeInput = screen.getByLabelText(/size/i);
+    // Switch to new persistent type
+    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
+
+    const nameInput = screen.getByLabelText(/volume 1 name/i);
+    const pathInput = screen.getByLabelText(/volume 1 path/i);
+    const sizeInput = screen.getByLabelText(/volume 1 size/i);
     fireEvent.change(nameInput, { target: { value: "cache" } });
     fireEvent.change(pathInput, { target: { value: "/data" } });
     fireEvent.change(sizeInput, { target: { value: "1g" } });
@@ -189,9 +193,10 @@ describe("VolumesTab — Restart now", () => {
 
     // Add a new valid volume row
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-    fireEvent.change(screen.getByLabelText(/volume name/i), { target: { value: "data" } });
-    fireEvent.change(screen.getByLabelText(/guest path/i), { target: { value: "/data" } });
-    fireEvent.change(screen.getByLabelText(/size/i), { target: { value: "2g" } });
+    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "2g" } });
 
     const restartBtn = await screen.findByRole("button", { name: /restart now/i });
     fireEvent.click(restartBtn);
@@ -207,7 +212,9 @@ describe("VolumesTab — Restart now", () => {
 
     // Add a row with invalid data so validation fails
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-    fireEvent.change(screen.getByLabelText(/guest path/i), { target: { value: "/data" } });
+    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     // leave size blank — should fail validation
 
     const restartBtn = await screen.findByRole("button", { name: /restart now/i });
@@ -234,9 +241,10 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
 
     // Add a new valid volume row
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-    fireEvent.change(screen.getByLabelText(/volume name/i), { target: { value: "cache" } });
-    fireEvent.change(screen.getByLabelText(/guest path/i), { target: { value: "/cache" } });
-    fireEvent.change(screen.getByLabelText(/size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
 
@@ -256,9 +264,10 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
 
     // Add a new valid volume row
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-    fireEvent.change(screen.getByLabelText(/volume name/i), { target: { value: "cache" } });
-    fireEvent.change(screen.getByLabelText(/guest path/i), { target: { value: "/cache" } });
-    fireEvent.change(screen.getByLabelText(/size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
 
@@ -277,9 +286,10 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
 
     // Add a new valid volume row
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-    fireEvent.change(screen.getByLabelText(/volume name/i), { target: { value: "cache" } });
-    fireEvent.change(screen.getByLabelText(/guest path/i), { target: { value: "/cache" } });
-    fireEvent.change(screen.getByLabelText(/size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
 
@@ -287,5 +297,113 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(2));
     // (b) the save error must still be visible — NOT cleared by the re-sync load
     expect(screen.getByText(/disk full/i)).toBeInTheDocument();
+  });
+});
+
+describe("VolumesTab — 3-way volume type selector", () => {
+  it("ephemeral type: emits path:size spec on Save", async () => {
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+
+    // Choose Ephemeral (should be default, or click the button)
+    const ephBtn = screen.getByRole("button", { name: /ephemeral/i });
+    fireEvent.click(ephBtn);
+
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/scratch" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(volumeAttach).toHaveBeenCalledWith("mysbx", "/scratch:1g"),
+    );
+  });
+
+  it("new persistent type: emits name:path:size spec on Save", async () => {
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+
+    const newPersBtn = screen.getByRole("button", { name: /new persistent/i });
+    fireEvent.click(newPersBtn);
+
+    fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "2g" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(volumeAttach).toHaveBeenCalledWith("mysbx", "cache:/data:2g"),
+    );
+  });
+
+  it("existing persistent type: emits name:path:sizeMiB m spec on Save", async () => {
+    volumeList.mockResolvedValue([
+      { name: "archive", size_bytes: 1073741824, actual_bytes: 0, referenced_by: [] },
+    ]);
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+
+    const existingBtn = screen.getByRole("button", { name: /existing/i });
+    fireEvent.click(existingBtn);
+
+    // Select from dropdown
+    const select = screen.getByRole("combobox", { name: /existing volume/i });
+    fireEvent.change(select, { target: { value: "archive" } });
+
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/arch" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(volumeAttach).toHaveBeenCalledWith("mysbx", "archive:/arch:1024m"),
+    );
+  });
+
+  it("existing persistent dropdown excludes in-use volumes (referenced_by non-empty)", async () => {
+    volumeList.mockResolvedValue([
+      { name: "archive", size_bytes: 1073741824, actual_bytes: 0, referenced_by: [] },
+      { name: "inuse", size_bytes: 1073741824, actual_bytes: 0, referenced_by: ["other-sbx"] },
+    ]);
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /existing/i }));
+
+    await waitFor(() => expect(volumeList).toHaveBeenCalled());
+    const select = screen.getByRole("combobox", { name: /existing volume/i });
+    // "archive" option should be present, "inuse" should not
+    expect(select).toBeInTheDocument();
+    const opts = select.querySelectorAll('option');
+    const optTexts = Array.from(opts).map(o => o.textContent);
+    expect(optTexts.some(t => t?.includes("archive"))).toBe(true);
+    expect(optTexts.some(t => t?.includes("inuse"))).toBe(false);
+  });
+
+  it("existing persistent dropdown excludes volumes already seeded on this sandbox", async () => {
+    volumeList.mockResolvedValue([
+      { name: "cache", size_bytes: 1073741824, actual_bytes: 0, referenced_by: [] },
+      { name: "archive", size_bytes: 1073741824, actual_bytes: 0, referenced_by: [] },
+    ]);
+    inspect.mockResolvedValue(makeDetail({
+      volumes: [{ name: "cache", guest_path: "/data", size_bytes: 1073741824 }],
+    }));
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await screen.findByText(/\/data/);
+
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /existing/i }));
+
+    await waitFor(() => expect(volumeList).toHaveBeenCalled());
+    const select = screen.getByRole("combobox", { name: /existing volume/i });
+    const opts = select.querySelectorAll('option');
+    const optTexts = Array.from(opts).map(o => o.textContent);
+    // "cache" is already seeded, should not appear
+    expect(optTexts.some(t => t?.includes("archive"))).toBe(true);
+    expect(optTexts.some(t => t?.includes("cache"))).toBe(false);
   });
 });
