@@ -89,11 +89,19 @@ pub fn rule_name(sandbox: &str) -> String {
 ///
 /// Produces:
 /// ```text
-/// provision --sandbox <name> --grant <path0> [--grant <pathN>…] --sid-out <file> --cred-out <file>
+/// provision --sandbox <name> --grant <rw0> [--grant <rwN>…] --grant-ro <ro0> [--grant-ro <roN>…] --sid-out <file> --cred-out <file>
 /// ```
+///
+/// `grants_rw` paths receive `Modify` (read/write) access — sandbox-specific
+/// paths such as the workspace, sandbox dir, and named volume images.
+///
+/// `grants_ro` paths receive `ReadExec` (read-only) access — shared RO
+/// artifacts such as `images_dir` (erofs base images) and `artifacts_dir`
+/// (kernel + initrd).
 pub fn provision_argv(
     sandbox: &str,
-    grants: &[PathBuf],
+    grants_rw: &[PathBuf],
+    grants_ro: &[PathBuf],
     sid_out: &Path,
     cred_out: &Path,
 ) -> Vec<String> {
@@ -102,8 +110,12 @@ pub fn provision_argv(
         "--sandbox".to_string(),
         sandbox.to_string(),
     ];
-    for g in grants {
+    for g in grants_rw {
         argv.push("--grant".to_string());
+        argv.push(g.to_string_lossy().into_owned());
+    }
+    for g in grants_ro {
+        argv.push("--grant-ro".to_string());
         argv.push(g.to_string_lossy().into_owned());
     }
     argv.push("--sid-out".to_string());
@@ -287,6 +299,7 @@ mod tests {
         let argv = provision_argv(
             "my-sandbox",
             &[PathBuf::from("/run/vm/my-sandbox")],
+            &[],
             Path::new("/tmp/sid.txt"),
             Path::new("/tmp/cred.json"),
         );
@@ -315,21 +328,24 @@ mod tests {
                 PathBuf::from("/b"),
                 PathBuf::from("/c"),
             ],
+            &[],
             Path::new("/x/sid"),
             Path::new("/x/cred"),
         );
-        // Spot-check the grant flags appear in order.
+        // Spot-check the --grant flags appear in order.
         let grants: Vec<&str> = argv
             .windows(2)
             .filter(|w| w[0] == "--grant")
             .map(|w| w[1].as_str())
             .collect();
         assert_eq!(grants, vec!["/a", "/b", "/c"]);
+        // No --grant-ro flags present.
+        assert!(!argv.iter().any(|s| s == "--grant-ro"));
     }
 
     #[test]
     fn provision_argv_no_grants() {
-        let argv = provision_argv("sb", &[], Path::new("/sid"), Path::new("/cred"));
+        let argv = provision_argv("sb", &[], &[], Path::new("/sid"), Path::new("/cred"));
         assert_eq!(
             argv,
             vec![
@@ -341,6 +357,61 @@ mod tests {
                 "--cred-out",
                 "/cred"
             ]
+        );
+    }
+
+    #[test]
+    fn provision_argv_ro_grants_emitted() {
+        let argv = provision_argv(
+            "sb",
+            &[PathBuf::from("/rw/sandbox")],
+            &[PathBuf::from("/ro/images"), PathBuf::from("/ro/artifacts")],
+            Path::new("/sid"),
+            Path::new("/cred"),
+        );
+        // --grant-ro must appear for each RO path.
+        let ro_grants: Vec<&str> = argv
+            .windows(2)
+            .filter(|w| w[0] == "--grant-ro")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(ro_grants, vec!["/ro/images", "/ro/artifacts"]);
+        // --grant (RW) still present for the rw path.
+        let rw_grants: Vec<&str> = argv
+            .windows(2)
+            .filter(|w| w[0] == "--grant")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(rw_grants, vec!["/rw/sandbox"]);
+    }
+
+    #[test]
+    fn provision_argv_ro_grants_after_rw_grants() {
+        // RO grants must appear AFTER all RW grants in the argv vector, before
+        // --sid-out / --cred-out.
+        let argv = provision_argv(
+            "sb",
+            &[PathBuf::from("/rw/a"), PathBuf::from("/rw/b")],
+            &[PathBuf::from("/ro/images")],
+            Path::new("/sid"),
+            Path::new("/cred"),
+        );
+        let last_grant_idx = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.as_str() == "--grant")
+            .map(|(i, _)| i)
+            .next_back()
+            .unwrap();
+        let first_grant_ro_idx = argv
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.as_str() == "--grant-ro")
+            .map(|(i, _)| i)
+            .unwrap();
+        assert!(
+            first_grant_ro_idx > last_grant_idx,
+            "--grant-ro must appear after all --grant flags"
         );
     }
 
