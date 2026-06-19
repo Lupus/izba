@@ -12,19 +12,14 @@
 //! deprivileged. Restricting/deny-only SID shaping per `policy.token` is a
 //! follow-up — dropping privileges is the proven precondition.
 
-use crate::procmgr::confine::{
-    workspace_confinement_denied_msg, ConfinementMode, ConfinementPolicy, IntegrityLevel,
-};
+use crate::procmgr::confine::{ConfinementMode, ConfinementPolicy, IntegrityLevel};
 use crate::procmgr::windows::creation_time;
 use crate::state::PidIdentity;
 use crate::vmm::CommandSpec;
 use anyhow::Context;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_SUCCESS, HANDLE,
-    INVALID_HANDLE_VALUE,
-};
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSidToSidW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
@@ -35,8 +30,8 @@ use windows_sys::Win32::Security::{
     TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
+    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_ALWAYS,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -80,71 +75,6 @@ const LOW_INTEGRITY_SID: &str = "S-1-16-4096\0";
 /// semantically-equivalent restore of a workspace previously lowered to Low.
 const MEDIUM_INTEGRITY_SID: &str = "S-1-16-8192\0";
 
-/// `WRITE_OWNER` (winnt.h `0x0008_0000`) — the standard access right required to
-/// set an object's mandatory integrity label via `SetNamedSecurityInfoW`.
-/// windows-sys only exports the standard-rights constants from un-enabled
-/// features, so define it locally (same rationale as `SE_GROUP_INTEGRITY`).
-const WRITE_OWNER: u32 = 0x0008_0000;
-
-/// Preflight a confinement write surface: can the confined (Low-IL) launch
-/// relabel `path`? Setting the mandatory integrity label needs `WRITE_OWNER` on
-/// the object (see [`apply_inheritable_integrity_label`]); probe for exactly that
-/// right WITHOUT mutating anything by opening a handle that requests `WRITE_OWNER`
-/// and closing it. A directory at the **root of a drive** grants this to no one —
-/// not even its owner, who gets only implicit `READ_CONTROL` + `WRITE_DAC` — so
-/// the open is denied and we return the actionable
-/// [`workspace_confinement_denied_msg`].
-///
-/// Only `ERROR_ACCESS_DENIED` means "not confinable". Any other failure (a
-/// transient sharing violation, an exotic path) is NOT a reason to block the
-/// sandbox, so it returns `Ok` and lets the real relabel — if it runs — speak for
-/// itself. Used as a create-time preflight and, via
-/// [`set_low_integrity_recursive`], as the start-time guard.
-#[cfg(windows)]
-pub fn ensure_confinable(path: &Path) -> anyhow::Result<()> {
-    // SAFETY: linear FFI. The NUL-terminated UTF-16 path outlives the call, and a
-    // successfully opened handle is closed before return.
-    unsafe {
-        let mut path_w: Vec<u16> = path.as_os_str().encode_wide().collect();
-        path_w.push(0);
-        let h = CreateFileW(
-            path_w.as_ptr(),
-            WRITE_OWNER,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS, // required to obtain a *directory* handle
-            std::ptr::null_mut(),
-        );
-        if h == INVALID_HANDLE_VALUE {
-            if GetLastError() == ERROR_ACCESS_DENIED {
-                anyhow::bail!(workspace_confinement_denied_msg(path, &current_account()));
-            }
-            // Not an access problem — don't false-block create/start.
-            return Ok(());
-        }
-        CloseHandle(h);
-    }
-    Ok(())
-}
-
-/// The current Windows account (`DOMAIN\user`) to embed in the remedy `icacls`
-/// command, so it is copy-pasteable as-is. The daemon/CLI runs as the user, so
-/// the `USERDOMAIN`/`USERNAME` env vars name them; `icacls` accepts the
-/// `DOMAIN\user` form on both domain-joined and standalone (`COMPUTER\user`)
-/// hosts. Falls back to a bare username, then a placeholder, if either is unset.
-#[cfg(windows)]
-fn current_account() -> String {
-    match (
-        std::env::var("USERDOMAIN").ok().filter(|s| !s.is_empty()),
-        std::env::var("USERNAME").ok().filter(|s| !s.is_empty()),
-    ) {
-        (Some(domain), Some(user)) => format!("{domain}\\{user}"),
-        (None, Some(user)) => user,
-        _ => "<your-username>".to_string(),
-    }
-}
-
 /// Label `path` (and, via inheritance, every existing and future child) with a
 /// **Low** mandatory integrity label so a Low-IL process — the confined VMM —
 /// can write into it. Two distinct surfaces need this:
@@ -169,11 +99,6 @@ fn current_account() -> String {
 /// Restored to ~Medium on teardown by [`restore_integrity_recursive`].
 #[cfg(windows)]
 pub fn set_low_integrity_recursive(path: &Path) -> anyhow::Result<()> {
-    // Fail fast with an actionable message when the dir cannot be relabelled at
-    // all (e.g. a workspace at a drive root): otherwise the relabel below bails
-    // with an opaque `SetNamedSecurityInfoW(..): WIN32_ERROR 5`. This makes the
-    // start path explain the fix for a sandbox already pointing at such a dir.
-    ensure_confinable(path)?;
     apply_inheritable_integrity_label(path, LOW_INTEGRITY_SID)
 }
 
@@ -778,8 +703,8 @@ impl Drop for OwnedJobHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_command_line, build_confined_token, create_resource_job, ensure_confinable,
-        quote_arg, restore_integrity_recursive, set_low_integrity_recursive, spawn_confined,
+        build_command_line, build_confined_token, create_resource_job, quote_arg,
+        restore_integrity_recursive, set_low_integrity_recursive, spawn_confined,
     };
     use crate::procmgr::confine::{ConfinementMode, ConfinementPolicy};
     use crate::procmgr::windows::kill_pid;
@@ -1156,94 +1081,5 @@ mod tests {
         let ok = unsafe { LookupPrivilegeValueW(std::ptr::null(), name_w.as_ptr(), &mut luid) };
         assert!(ok != 0, "LookupPrivilegeValueW({name}): {}", last_err());
         luid
-    }
-
-    /// `domain\user` of the account running the tests, for icacls grants.
-    fn current_user() -> String {
-        let out = std::process::Command::new("whoami")
-            .output()
-            .expect("run whoami");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    /// Re-grant Full Control to `user` (so cleanup can delete) and remove `dir`.
-    fn restore_and_remove(dir: &std::path::Path, user: &str) {
-        let _ = std::process::Command::new("icacls")
-            .arg(dir)
-            .arg("/grant")
-            .arg(format!("{user}:(F)"))
-            .status();
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// Build a directory the test account OWNS but on which it lacks `WRITE_OWNER`
-    /// — the exact condition of a folder at a drive root. Strip all inherited
-    /// ACEs and grant the owner only Read&Execute via icacls: the owner keeps
-    /// implicit `READ_CONTROL`+`WRITE_DAC` but NOT `WRITE_OWNER`, so the relabel
-    /// probe is denied. Returns `None` (test skips) if the environment can't
-    /// reproduce the denial — e.g. a privileged runner token that bypasses the
-    /// DACL — so the suite never false-fails on an unusual account.
-    fn make_non_confinable_dir(tag: &str) -> Option<std::path::PathBuf> {
-        let dir = std::env::temp_dir().join(format!("izba-noown-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let user = current_user();
-        let ok = std::process::Command::new("icacls")
-            .arg(&dir)
-            .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg(format!("{user}:(RX)"))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            let _ = std::fs::remove_dir_all(&dir);
-            return None;
-        }
-        // Confirm the denial actually reproduced before relying on it.
-        if ensure_confinable(&dir).is_ok() {
-            restore_and_remove(&dir, &user);
-            return None;
-        }
-        Some(dir)
-    }
-
-    /// A freshly created profile-temp dir inherits Full Control (hence
-    /// `WRITE_OWNER`), so the confinement preflight accepts it.
-    #[test]
-    fn ensure_confinable_accepts_owned_temp_dir() {
-        let dir = std::env::temp_dir().join(format!("izba-confinable-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        ensure_confinable(&dir).expect("a profile-temp dir must be confinable");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The reported bug: a workspace the user owns but cannot relabel (no
-    /// `WRITE_OWNER`) must be rejected at preflight with the actionable message,
-    /// not the opaque `WIN32_ERROR 5`.
-    #[test]
-    fn ensure_confinable_rejects_dir_without_write_owner() {
-        let Some(dir) = make_non_confinable_dir("ensure") else {
-            eprintln!("skipped: environment could not produce a no-WRITE_OWNER dir");
-            return;
-        };
-        let err = ensure_confinable(&dir).expect_err("must reject a non-WRITE_OWNER dir");
-        let msg = format!("{err}");
-        assert!(msg.contains("Full Control"), "actionable: {msg}");
-        assert!(msg.contains("icacls"), "actionable: {msg}");
-        restore_and_remove(&dir, &current_user());
-    }
-
-    /// Start-time guard: `set_low_integrity_recursive` (run per write surface at
-    /// launch) must fail closed with the actionable message for an existing
-    /// sandbox whose workspace can't be relabelled — not the opaque WIN32 error.
-    #[test]
-    fn set_low_integrity_recursive_rejects_non_confinable_dir() {
-        let Some(dir) = make_non_confinable_dir("setlow") else {
-            eprintln!("skipped: environment could not produce a no-WRITE_OWNER dir");
-            return;
-        };
-        let err = set_low_integrity_recursive(&dir).expect_err("relabel must fail closed");
-        assert!(format!("{err}").contains("Full Control"), "{err}");
-        restore_and_remove(&dir, &current_user());
     }
 }

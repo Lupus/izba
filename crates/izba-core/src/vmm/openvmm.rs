@@ -16,9 +16,9 @@
 use super::spec::{reject_commas, CommandSpec, LockdownLaunch, VmSpec};
 use super::{IoStream, VmHandle, VmmDriver};
 use crate::procmgr::{
-    kill_pid, pid_alive, restore_integrity_recursive, set_low_integrity_recursive, spawn_confined,
-    spawn_confined_as_account, spawn_detached, ConfinementMode, ConfinementPolicy,
-    ConfinementStatus,
+    ensure_confinable, kill_pid, pid_alive, restore_integrity_recursive,
+    set_low_integrity_recursive, spawn_confined, spawn_confined_as_account, spawn_detached,
+    ConfinementMode, ConfinementPolicy, ConfinementStatus,
 };
 use crate::state::PidIdentity;
 use crate::vsock::hybrid_connect;
@@ -258,7 +258,11 @@ fn spawn_default_confined_vmm(
 fn low_label_surfaces(surfaces: &[PathBuf]) -> anyhow::Result<()> {
     let mut labelled: Vec<&PathBuf> = Vec::new();
     for p in surfaces {
-        if let Err(e) = set_low_integrity_recursive(p) {
+        // Preflight then relabel: `ensure_confinable` fails fast with an
+        // actionable message when a surface (e.g. a workspace at a drive root)
+        // cannot be relabelled at all, instead of the opaque `WIN32_ERROR 5` the
+        // relabel itself would bail with. No-op off Windows.
+        if let Err(e) = ensure_confinable(p).and_then(|()| set_low_integrity_recursive(p)) {
             for done in &labelled {
                 let _ = restore_integrity_recursive(done);
             }

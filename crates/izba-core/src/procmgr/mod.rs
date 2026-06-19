@@ -29,9 +29,11 @@ pub use unix::{kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits};
 #[cfg(windows)]
 mod jail_windows;
 #[cfg(windows)]
-pub use jail_windows::{
-    ensure_confinable, restore_integrity_recursive, set_low_integrity_recursive, spawn_confined,
-};
+pub use jail_windows::{restore_integrity_recursive, set_low_integrity_recursive, spawn_confined};
+#[cfg(windows)]
+mod confinable;
+#[cfg(windows)]
+pub use confinable::ensure_confinable;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
