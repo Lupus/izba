@@ -11,6 +11,13 @@ test ${debug} == "true" && set -x
 # Include library.
 script_dir="$(dirname -- "$(realpath -- "${0}")")"
 source "${script_dir}/lib.sh"
+# lib.sh unconditionally runs `set +e` (it uses exit-status conditionals
+# internally), which cancels the `set -e` above. Re-enable it so a failed
+# `sudo tar -xf` in the restore loop below aborts this warm-path step instead of
+# silently leaving packages unextracted and letting the Tauri build fail far
+# downstream with missing headers. Mirrors install_and_cache_pkgs.sh /
+# post_cache_action.sh / pre_cache_action.sh.
+set -e
 
 # Directory that holds the cached packages.
 cache_dir="${1}"
