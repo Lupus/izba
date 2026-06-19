@@ -4,6 +4,7 @@ import { api } from "../lib/ipc";
 import { WEB_DEFAULT_PORTS } from "../lib/ports";
 import { AccessPicker } from "./AccessPicker";
 import { Section } from "./Section";
+import { EnforceToggle } from "./EnforceToggle";
 
 interface Row {
   host: string;
@@ -30,7 +31,7 @@ function toGitRow(rule: GitRule): GitRow {
 function toRow(e: AllowEntry): Row {
   return typeof e === "string"
     ? { host: e, ports: [...WEB_DEFAULT_PORTS], access: "read-write" }
-    : { host: e.host, ports: e.ports, access: e.access ?? "read-write" };
+    : { host: e.host, ports: e.ports ?? [...WEB_DEFAULT_PORTS], access: e.access ?? "read-write" };
 }
 
 /** Convert a target string and access into a GitRule. */
@@ -242,16 +243,7 @@ export function PolicyEditor({ name }: { name: string }) {
     <div className="flex h-full flex-col">
       {/* Enforce toggle — always visible above the scroll area */}
       <div className="flex shrink-0 items-center gap-3 pb-3">
-        <label className="flex cursor-pointer items-center gap-2 text-sm font-semibold">
-          <input
-            type="checkbox"
-            aria-label="Enforce firewall"
-            checked={enforcing}
-            onChange={() => void toggleEnforce()}
-            className="h-4 w-4 rounded border-line"
-          />
-          Enforce firewall
-        </label>
+        <EnforceToggle enforcing={enforcing} onToggle={() => void toggleEnforce()} />
       </div>
       {error && <div className="shrink-0 pb-3 text-sm text-warn">{error}</div>}
 

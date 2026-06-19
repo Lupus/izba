@@ -257,6 +257,21 @@ describe("NetlogView", () => {
       expect(api.policyGitBlock).toHaveBeenCalledWith("sb", "github.com/o/a"),
     );
   });
+
+  it("does not crash (white screen) when an allow entry omits ports", async () => {
+    // Regression: the backend serializes a Scoped entry whose ports equal the
+    // web defaults with NO `ports` field. allowKeys must not blow up rendering.
+    mockPolicy({
+      enforcing: true,
+      allow: [{ host: "pypi.org", access: "read" } as unknown as PolicyView["allow"][number]],
+      git: [],
+    });
+    (api.readNetlog as Mock).mockResolvedValue([sum({ host: "pypi.org", port: 443 })]);
+    render(<NetlogView name="web" />);
+    expect(await screen.findByText(/Firewall ON/)).toBeInTheDocument();
+    // pypi.org:443 should read as "allowed" (web-default ports applied).
+    expect(await screen.findByText(/^allowed$/)).toBeInTheDocument();
+  });
 });
 
 describe("relTime", () => {
