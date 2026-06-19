@@ -24,7 +24,7 @@ pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
         LockdownOutcome::Locked(info) => {
             println!(
                 "Locked down '{name}' as {} (network-blocked). \
-                 Restart the sandbox (izba stop {name} && izba start {name}) to apply.",
+                 Restart the sandbox (izba stop {name} && izba run {name}) to apply.",
                 info.account
             );
         }

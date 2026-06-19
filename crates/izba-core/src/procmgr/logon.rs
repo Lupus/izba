@@ -110,6 +110,20 @@ pub fn spawn_confined_as_account(
         .chain(std::iter::once(0))
         .collect();
 
+    // lpCurrentDirectory MUST be a directory the TARGET account can access.
+    // CreateProcessWithLogonW launches as a DIFFERENT user; a NULL cwd inherits
+    // the CALLER's working directory, which the dedicated per-sandbox account is
+    // NOT ACL-granted (e.g. the caller's home under another user's profile) — the
+    // logon then fails with ERROR_INVALID_PARAMETER / ERROR_INVALID_NAME. Use the
+    // sandbox run dir (the pidfile's parent): the account IS granted the sandbox
+    // dir (inherited) and the run dir already exists. Verified on the real host.
+    let cwd = pidfile.parent().unwrap_or(pidfile);
+    let cwd_w: Vec<u16> = cwd
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
     // SAFETY: linear FFI. All buffers outlive the call. pi.hProcess/hThread are
     // closed on all exit paths. We do NOT call CreateProcessAsUserW here — the
     // caller (izbad) is unprivileged and cannot build a token for the other
@@ -129,7 +143,8 @@ pub fn spawn_confined_as_account(
             cmdline_w.as_mut_ptr(), // lpCommandLine (PWSTR — must be mutable)
             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
             std::ptr::null(), // inherit environment
-            std::ptr::null(), // inherit current directory
+            cwd_w.as_ptr(),   // run dir (account-accessible); NULL would inherit
+            // the caller's cwd, which the per-sandbox account cannot access
             &si,
             &mut pi,
         );
