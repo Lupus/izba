@@ -14,28 +14,27 @@ use std::path::Path;
 /// This is a PURE function: it takes all inputs by value/reference and returns
 /// a `Vec<String>`.  Testable on every platform — no OS calls.
 ///
-/// The returned vector is:
+/// The full VMM argv is NOT passed on the command line: `CreateProcessWithLogonW`
+/// caps `lpCommandLine` at 1024 characters and a real OpenVMM invocation (kernel,
+/// initrd, per-disk/-share root ports, virtio-blk/-fs, vsock — ~1.5 KB) exceeds
+/// that, failing with `ERROR_INVALID_PARAMETER`. Instead the argv is written to
+/// `specfile` (a JSON array the account can read) and only the short path rides
+/// the command line:
 /// ```text
 /// [ <exe>, "__spawn-confined-vmm", "--pidfile", <pidfile>, "--log", <log>,
-///   "--", <vmm_argv[0]>, <vmm_argv[1]>, … ]
+///   "--spec", <specfile> ]
 /// ```
-pub fn inner_launcher_argv(
-    exe: &Path,
-    pidfile: &Path,
-    log: &Path,
-    vmm_argv: &[String],
-) -> Vec<String> {
-    let mut argv = vec![
+pub fn inner_launcher_argv(exe: &Path, pidfile: &Path, log: &Path, specfile: &Path) -> Vec<String> {
+    vec![
         exe.to_string_lossy().into_owned(),
         "__spawn-confined-vmm".to_string(),
         "--pidfile".to_string(),
         pidfile.to_string_lossy().into_owned(),
         "--log".to_string(),
         log.to_string_lossy().into_owned(),
-        "--".to_string(),
-    ];
-    argv.extend(vmm_argv.iter().cloned());
-    argv
+        "--spec".to_string(),
+        specfile.to_string_lossy().into_owned(),
+    ]
 }
 
 /// Launch the VMM as the given standard local account via `CreateProcessWithLogonW`,
@@ -47,8 +46,9 @@ pub fn inner_launcher_argv(
 /// 1. izbad calls this function with the account credentials and VMM spec.
 /// 2. This function resolves `std::env::current_exe()` as the inner launcher.
 /// 3. `CreateProcessWithLogonW(account, ".", password, LOGON_WITH_PROFILE, …)`
-///    launches `izba __spawn-confined-vmm --pidfile <P> --log <L> -- <vmm_argv…>`
-///    as the per-sandbox account.
+///    launches `izba __spawn-confined-vmm --pidfile <P> --log <L> --spec <S>`
+///    as the per-sandbox account (the VMM argv is written to `<S>`, not passed
+///    inline — see `inner_launcher_argv`).
 /// 4. That inner `izba` process — now running AS the account — calls
 ///    `spawn_confined(vmm_spec, log, vmm_default())` which self-derives the
 ///    restricted/Low-IL token from its OWN (account) token, then writes the
@@ -80,7 +80,15 @@ pub fn spawn_confined_as_account(
     };
 
     let exe = std::env::current_exe().context("current_exe")?;
-    let inner_argv = inner_launcher_argv(&exe, pidfile, log, &vmm.argv);
+
+    // Write the VMM argv to a spec file in the (account-readable) run dir and pass
+    // it by PATH: CreateProcessWithLogonW caps lpCommandLine at 1024 chars, which a
+    // real OpenVMM invocation exceeds. The inner launcher reads it and hands it to
+    // spawn_confined (CreateProcessAsUserW — no such cap).
+    let specfile = pidfile.parent().unwrap_or(pidfile).join("vmm-spec.json");
+    crate::state::save_json(&specfile, &vmm.argv)
+        .with_context(|| format!("writing VMM spec {}", specfile.display()))?;
+    let inner_argv = inner_launcher_argv(&exe, pidfile, log, &specfile);
 
     // Delete any stale pidfile so we cannot accidentally read stale data on failure.
     let _ = std::fs::remove_file(pidfile);
@@ -232,49 +240,49 @@ mod tests {
         let exe = PathBuf::from("/usr/bin/izba");
         let pidfile = PathBuf::from("/tmp/sandbox/pid.json");
         let log = PathBuf::from("/tmp/sandbox/vmm.log");
-        let vmm_argv = vec![
-            "openvmm.exe".to_string(),
-            "--config".to_string(),
-            "vm.json".to_string(),
-        ];
+        let spec = PathBuf::from("/tmp/sandbox/vmm-spec.json");
 
-        let got = inner_launcher_argv(&exe, &pidfile, &log, &vmm_argv);
+        let got = inner_launcher_argv(&exe, &pidfile, &log, &spec);
 
-        // Verify structure: exe, subcommand, --pidfile, pidfile, --log, log, --, vmm_argv...
-        assert_eq!(got[0], exe.to_string_lossy());
-        assert_eq!(got[1], "__spawn-confined-vmm");
-        assert_eq!(got[2], "--pidfile");
-        assert_eq!(got[3], pidfile.to_string_lossy());
-        assert_eq!(got[4], "--log");
-        assert_eq!(got[5], log.to_string_lossy());
-        assert_eq!(got[6], "--");
-        assert_eq!(got[7], "openvmm.exe");
-        assert_eq!(got[8], "--config");
-        assert_eq!(got[9], "vm.json");
-        assert_eq!(got.len(), 10);
+        // Fixed-length, short command line (the VMM argv is passed by file path,
+        // not inline — CreateProcessWithLogonW caps lpCommandLine at 1024 chars).
+        assert_eq!(
+            got,
+            vec![
+                exe.to_string_lossy().into_owned(),
+                "__spawn-confined-vmm".to_string(),
+                "--pidfile".to_string(),
+                pidfile.to_string_lossy().into_owned(),
+                "--log".to_string(),
+                log.to_string_lossy().into_owned(),
+                "--spec".to_string(),
+                spec.to_string_lossy().into_owned(),
+            ]
+        );
     }
 
     #[test]
-    fn inner_launcher_argv_empty_vmm_argv() {
-        let exe = PathBuf::from("/usr/bin/izba");
-        let pidfile = PathBuf::from("/tmp/pid.json");
-        let log = PathBuf::from("/tmp/vmm.log");
-
-        let got = inner_launcher_argv(&exe, &pidfile, &log, &[]);
-
-        // Separator `--` is always present; nothing after it.
-        assert_eq!(got[6], "--");
-        assert_eq!(got.len(), 7);
+    fn inner_launcher_argv_is_bounded_short() {
+        // The whole point: the command line stays short regardless of the VMM
+        // invocation size, so it never trips the 1024-char CreateProcessWithLogonW
+        // limit. There are exactly 8 fixed elements; none carries the VMM argv.
+        let got = inner_launcher_argv(
+            &PathBuf::from("/usr/bin/izba"),
+            &PathBuf::from("/tmp/pid.json"),
+            &PathBuf::from("/tmp/vmm.log"),
+            &PathBuf::from("/tmp/vmm-spec.json"),
+        );
+        assert_eq!(got.len(), 8);
+        assert!(!got.contains(&"--".to_string()), "VMM argv is not inline");
     }
 
     #[test]
     fn inner_launcher_argv_contains_subcommand() {
-        let exe = PathBuf::from("/bin/izba");
         let got = inner_launcher_argv(
-            &exe,
+            &PathBuf::from("/bin/izba"),
             &PathBuf::from("/p"),
             &PathBuf::from("/l"),
-            &["a".to_string()],
+            &PathBuf::from("/s"),
         );
         assert!(
             got.contains(&"__spawn-confined-vmm".to_string()),
@@ -282,7 +290,7 @@ mod tests {
         );
         assert!(got.contains(&"--pidfile".to_string()));
         assert!(got.contains(&"--log".to_string()));
-        assert!(got.contains(&"--".to_string()));
+        assert!(got.contains(&"--spec".to_string()));
     }
 
     #[test]
