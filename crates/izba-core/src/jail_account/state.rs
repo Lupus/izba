@@ -5,7 +5,7 @@ pub const LOCKDOWN_FILE: &str = "lockdown.json";
 /// Information about a successfully locked-down sandbox account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockedInfo {
-    /// Windows local account name, e.g. `izba-spk-<sandbox>`.
+    /// Windows local account name, e.g. `izba-sb-<sandbox>`.
     pub account: String,
     /// SID string, e.g. `S-1-5-21-…`.
     pub sid: String,
@@ -76,7 +76,7 @@ mod tests {
 
     fn locked_info() -> LockedInfo {
         LockedInfo {
-            account: "izba-spk-foo".to_string(),
+            account: "izba-sb-foo".to_string(),
             sid: "S-1-5-21-1234567890-1234567890-1234567890-1001".to_string(),
             net_blocked: true,
         }

@@ -283,7 +283,7 @@ pub fn unlock<B: LockdownBackend>(backend: &B, paths: &Paths, name: &str) -> any
 /// Run the GC sub-command of the elevated helper to clean up orphaned accounts.
 ///
 /// `live` is the list of sandbox names that are currently active; the helper
-/// will delete any `izba-spk-*` accounts not in this list.
+/// will delete any `izba-sb-*` accounts not in this list.
 pub fn windows_cleanup<B: LockdownBackend>(
     backend: &B,
     paths: &Paths,

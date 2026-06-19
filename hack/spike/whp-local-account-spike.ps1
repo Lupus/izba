@@ -39,7 +39,7 @@ Write-Output "izba MVP-D WHP gating spike -- host $env:COMPUTERNAME -- $(Get-Dat
 
 # Randomized account name + a complexity-meeting random password (no external
 # assembly dependency so this works on Windows PowerShell 5.1 cleanly).
-$acct = 'izba-spk-' + (Get-Random -Minimum 10000 -Maximum 99999)
+$acct = 'izba-sb-' + (Get-Random -Minimum 10000 -Maximum 99999)
 $pwRaw = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 18 | ForEach-Object {[char]$_})
 $pwRaw = $pwRaw + 'aZ9!'   # guarantee upper/lower/digit/symbol
 $sec = ConvertTo-SecureString $pwRaw -AsPlainText -Force

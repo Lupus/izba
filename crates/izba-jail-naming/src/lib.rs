@@ -40,13 +40,13 @@ fn safe_slug(sandbox: &str) -> String {
 const ACCOUNT_NAME_MAX: usize = 20;
 
 /// The fixed prefix for all izba per-sandbox Windows accounts.
-pub const ACCOUNT_PREFIX: &str = "izba-spk-";
+pub const ACCOUNT_PREFIX: &str = "izba-sb-";
 
 /// The fixed prefix for all izba per-sandbox Windows Firewall deny rules.
 pub const RULE_PREFIX: &str = "izba-deny-";
 
 /// Maximum characters of the sanitized slug that fit inside `ACCOUNT_NAME_MAX`.
-/// `ACCOUNT_NAME_MAX - ACCOUNT_PREFIX.len()` = 20 - 9 = 11.
+/// `ACCOUNT_NAME_MAX - ACCOUNT_PREFIX.len()` = 20 - 8 = 12.
 ///
 /// Both `account_name` and `rule_name` truncate to this length so that the slug
 /// embedded in the rule name round-trips with the slug embedded in the account
@@ -56,7 +56,7 @@ pub const ACCOUNT_SLUG_MAX: usize = ACCOUNT_NAME_MAX - ACCOUNT_PREFIX.len();
 
 /// Windows local account name for the per-sandbox VMM process.
 ///
-/// Format: `izba-spk-<safe>`, where `<safe>` is the sanitized sandbox name.
+/// Format: `izba-sb-<safe>`, where `<safe>` is the sanitized sandbox name.
 /// The total length is capped at **20 characters** (Windows local-username
 /// limit); the `<safe>` portion is truncated to [`ACCOUNT_SLUG_MAX`] chars if
 /// necessary so that `ACCOUNT_PREFIX.len() + safe.len() ≤ ACCOUNT_NAME_MAX`.
@@ -148,7 +148,7 @@ pub fn gc_argv(live: &[String]) -> Vec<String> {
     argv
 }
 
-/// Returns the `izba-spk-*` account names from `existing` whose corresponding
+/// Returns the `izba-sb-*` account names from `existing` whose corresponding
 /// sandbox name is **not** in `live`.
 ///
 /// Orphan detection is based on the full `account_name(sandbox)` — including
@@ -166,11 +166,11 @@ pub fn gc_orphans(existing: &[String], live: &[String]) -> Vec<String> {
         .iter()
         .filter(|name| {
             if name.starts_with(ACCOUNT_PREFIX) {
-                // An existing izba-spk-* account is an orphan iff it does not
+                // An existing izba-sb-* account is an orphan iff it does not
                 // correspond to any currently-live sandbox.
                 !live_accounts.contains(*name)
             } else {
-                // Not an izba-spk-* name — leave it alone (not our concern).
+                // Not an izba-sb-* name — leave it alone (not our concern).
                 false
             }
         })
@@ -199,19 +199,19 @@ mod tests {
 
     #[test]
     fn account_name_simple() {
-        assert_eq!(account_name("my-box"), "izba-spk-my-box");
+        assert_eq!(account_name("my-box"), "izba-sb-my-box");
     }
 
     #[test]
     fn account_name_uppercase_spaces() {
         // "My Box" → lowercase + space→dash
-        assert_eq!(account_name("My Box"), "izba-spk-my-box");
+        assert_eq!(account_name("My Box"), "izba-sb-my-box");
     }
 
     #[test]
     fn account_name_special_chars() {
         // Special chars → dash
-        assert_eq!(account_name("foo_bar.baz"), "izba-spk-foo-bar-baz");
+        assert_eq!(account_name("foo_bar.baz"), "izba-sb-foo-bar-baz");
     }
 
     #[test]
@@ -224,24 +224,24 @@ mod tests {
             "account_name too long ({} chars): {name}",
             name.len()
         );
-        assert!(name.starts_with("izba-spk-"));
+        assert!(name.starts_with("izba-sb-"));
     }
 
     #[test]
     fn account_name_max_boundary() {
-        // Exactly 11-char safe part should yield exactly 20-char account.
-        let sandbox = "12345678901"; // 11 chars, all alnum
+        // Exactly 12-char safe part should yield exactly 20-char account.
+        let sandbox = "123456789012"; // 12 chars, all alnum
         let name = account_name(sandbox);
         assert_eq!(name.len(), 20);
-        assert_eq!(name, "izba-spk-12345678901");
+        assert_eq!(name, "izba-sb-123456789012");
     }
 
     #[test]
     fn account_name_truncation_correctness() {
         // safe slug of "abcdefghijklmnopqrstuvwxyz" is itself (26 lowercase alpha).
-        // Truncated to 11: "abcdefghijk".
+        // Truncated to 12: "abcdefghijkl".
         let name = account_name("abcdefghijklmnopqrstuvwxyz");
-        assert_eq!(name, "izba-spk-abcdefghijk");
+        assert_eq!(name, "izba-sb-abcdefghijkl");
         assert_eq!(name.len(), 20);
     }
 
@@ -255,10 +255,10 @@ mod tests {
     /// what lets GC reconstruct the correct firewall rule name from a stored
     /// truncated account name.
     ///
-    /// The slug length cap (`ACCOUNT_SLUG_MAX` = 11) is what matters, not the
+    /// The slug length cap (`ACCOUNT_SLUG_MAX` = 12) is what matters, not the
     /// total length of the rule name.  The rule prefix is 10 chars
-    /// (`"izba-deny-"`) vs the account prefix's 9 (`"izba-spk-"`), so the rule
-    /// name will always be one character longer than the account name — the
+    /// (`"izba-deny-"`) vs the account prefix's 8 (`"izba-sb-"`), so the rule
+    /// name will always be two characters longer than the account name — the
     /// important invariant is slug equality, not overall-name equality.
     #[test]
     fn rule_name_long_truncated_consistently() {
@@ -272,13 +272,13 @@ mod tests {
             "rule_name must start with izba-deny-: {rn}"
         );
         assert!(
-            an.starts_with("izba-spk-"),
-            "account_name must start with izba-spk-: {an}"
+            an.starts_with("izba-sb-"),
+            "account_name must start with izba-sb-: {an}"
         );
 
-        // Both slugs must be equal (same truncation to ACCOUNT_SLUG_MAX = 11).
+        // Both slugs must be equal (same truncation to ACCOUNT_SLUG_MAX = 12).
         let rule_slug = rn.strip_prefix("izba-deny-").unwrap();
-        let acct_slug = an.strip_prefix("izba-spk-").unwrap();
+        let acct_slug = an.strip_prefix("izba-sb-").unwrap();
         assert_eq!(
             rule_slug, acct_slug,
             "rule_name slug '{rule_slug}' must match account_name slug '{acct_slug}'"
@@ -447,40 +447,40 @@ mod tests {
 
     #[test]
     fn gc_orphans_basic() {
-        let existing = vec!["izba-spk-a".to_string(), "izba-spk-b".to_string()];
+        let existing = vec!["izba-sb-a".to_string(), "izba-sb-b".to_string()];
         let live = vec!["a".to_string()];
         let orphans = gc_orphans(&existing, &live);
-        assert_eq!(orphans, vec!["izba-spk-b"]);
+        assert_eq!(orphans, vec!["izba-sb-b"]);
     }
 
     #[test]
     fn gc_orphans_all_live() {
-        let existing = vec!["izba-spk-a".to_string(), "izba-spk-b".to_string()];
+        let existing = vec!["izba-sb-a".to_string(), "izba-sb-b".to_string()];
         let live = vec!["a".to_string(), "b".to_string()];
         assert!(gc_orphans(&existing, &live).is_empty());
     }
 
     #[test]
     fn gc_orphans_none_live() {
-        let existing = vec!["izba-spk-x".to_string(), "izba-spk-y".to_string()];
+        let existing = vec!["izba-sb-x".to_string(), "izba-sb-y".to_string()];
         let orphans = gc_orphans(&existing, &[]);
         assert_eq!(orphans.len(), 2);
     }
 
     #[test]
     fn gc_orphans_ignores_non_izba_names() {
-        // Accounts not prefixed with izba-spk- should be left alone (not returned).
-        let existing = vec!["izba-spk-a".to_string(), "some-other-account".to_string()];
+        // Accounts not prefixed with izba-sb- should be left alone (not returned).
+        let existing = vec!["izba-sb-a".to_string(), "some-other-account".to_string()];
         let live: Vec<String> = vec![];
         let orphans = gc_orphans(&existing, &live);
-        // Only the izba-spk-a is an orphan; some-other-account is ignored.
-        assert_eq!(orphans, vec!["izba-spk-a"]);
+        // Only the izba-sb-a is an orphan; some-other-account is ignored.
+        assert_eq!(orphans, vec!["izba-sb-a"]);
     }
 
     #[test]
     fn gc_orphans_live_unsanitized_matches() {
         // Live names go through safe_slug, so "My Box" matches stored "my-box".
-        let existing = vec!["izba-spk-my-box".to_string()];
+        let existing = vec!["izba-sb-my-box".to_string()];
         let live = vec!["My Box".to_string()];
         // "My Box" → safe_slug → "my-box", which is the stored slug.
         assert!(gc_orphans(&existing, &live).is_empty());
@@ -488,17 +488,17 @@ mod tests {
 
     #[test]
     fn gc_orphans_long_name_not_false_orphan() {
-        // A sandbox whose safe slug exceeds ACCOUNT_SLUG_MAX (11) must NOT be
+        // A sandbox whose safe slug exceeds ACCOUNT_SLUG_MAX (12) must NOT be
         // reported as an orphan when it is actually live.
         //
         // "my-very-long-sandbox-name" → safe slug "my-very-long-sandbox-name"
-        // (25 chars, > 11) → account_name truncates to "izba-spk-my-very-lon"
-        // (20 chars).  The stored account is the TRUNCATED form; the bug was
+        // (25 chars, > 12) → account_name truncates to "izba-sb-my-very-lon"
+        // (19 chars).  The stored account is the TRUNCATED form; the bug was
         // that gc_orphans compared the truncated stored slug ("my-very-lon")
         // against the untruncated live slug ("my-very-long-sandbox-name") and
         // never found a match, falsely classifying the account as an orphan.
         let sandbox = "my-very-long-sandbox-name";
-        let stored_account = account_name(sandbox); // "izba-spk-my-very-lon"
+        let stored_account = account_name(sandbox); // "izba-sb-my-very-long"
         assert_eq!(stored_account.len(), 20);
 
         let existing = vec![stored_account];
@@ -514,8 +514,8 @@ mod tests {
         // Mix: one long-named live sandbox (truncated account) + one genuine
         // orphan.  Only the orphan must be returned.
         let live_sandbox = "my-very-long-sandbox-name";
-        let live_account = account_name(live_sandbox); // "izba-spk-my-very-lon"
-        let orphan_account = "izba-spk-gone".to_string();
+        let live_account = account_name(live_sandbox); // "izba-sb-my-very-long"
+        let orphan_account = "izba-sb-gone".to_string();
 
         let existing = vec![live_account.clone(), orphan_account.clone()];
         let live = vec![live_sandbox.to_string()];

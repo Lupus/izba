@@ -100,7 +100,7 @@ pub fn spawn_confined_as_account(
 
     let username_w = to_wide_nul(account);
     let domain_w = to_wide_nul(".");
-    let password_w = to_wide_nul(password);
+    let mut password_w = to_wide_nul(password);
 
     // Build the command line using the existing quoted builder from jail_windows.
     let cmdline_str = crate::jail_account::helper::join_args(&inner_argv);
@@ -156,6 +156,13 @@ pub fn spawn_confined_as_account(
             &si,
             &mut pi,
         );
+        // Zero the wide password buffer immediately after CreateProcessWithLogonW
+        // returns — the API has either consumed the credential or returned an
+        // error; either way we no longer need the plaintext in memory.
+        // NOTE: the `&str` source (`password`) still holds the UTF-8 bytes and
+        // is a deferred follow-up (would require a `SecretString` wrapper or
+        // `zeroize` crate); this manual wipe covers the wide-char copy we own.
+        password_w.iter_mut().for_each(|w| *w = 0);
         if ok == 0 {
             anyhow::bail!(
                 "CreateProcessWithLogonW(account={account:?}): {}",

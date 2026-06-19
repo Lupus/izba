@@ -288,7 +288,7 @@ if (-not $confOk) {
 # runas launches WITHOUT a UAC dialog. If lockdown times out or returns
 # "windows-only" the whole section fails loudly (we ARE on Windows here).
 $lkName    = 'lk-validate'
-$lkAcct    = 'izba-spk-lk-validate'
+$lkAcct    = 'izba-sb-lk-validate'
 $lkRule    = 'izba-deny-lk-validate'
 $lkWs      = "$env:TEMP\izba-lk-validate-ws"
 $lkFails0  = $fails
@@ -365,9 +365,9 @@ if (Test-Path $lkStateFile) {
         if ($lkProc) {
             $lkOwnerResult = Invoke-CimMethod -InputObject $lkProc -MethodName GetOwner -ErrorAction SilentlyContinue
             $lkOwner       = $lkOwnerResult.User
-            $lkVmmOwnerOk  = ($lkOwner -like 'izba-spk-*')
+            $lkVmmOwnerOk  = ($lkOwner -like 'izba-sb-*')
             if (-not $lkVmmOwnerOk) {
-                [Console]::Error.WriteLine("  VMM pid=$lkVmmPid owner='$lkOwner' (expected izba-spk-*)")
+                [Console]::Error.WriteLine("  VMM pid=$lkVmmPid owner='$lkOwner' (expected izba-sb-*)")
             }
         } else {
             [Console]::Error.WriteLine("  Win32_Process pid=$lkVmmPid not found (VMM may have exited)")
@@ -378,7 +378,7 @@ if (Test-Path $lkStateFile) {
 } else {
     [Console]::Error.WriteLine("  state.json absent at $lkStateFile")
 }
-Check 'lock-down: VMM runs as per-sandbox account (izba-spk-*)' $lkVmmOwnerOk
+Check 'lock-down: VMM runs as per-sandbox account (izba-sb-*)' $lkVmmOwnerOk
 
 # Step 5: assert firewall net-block -- outbound + inbound BLOCK rules exist.
 $lkFwOut = @(Get-NetFirewallRule -DisplayName $lkRule    -ErrorAction SilentlyContinue)
