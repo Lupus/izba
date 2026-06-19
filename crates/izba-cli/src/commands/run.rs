@@ -1,6 +1,6 @@
 use crate::{terminal, SandboxOpts};
 use anyhow::bail;
-use izba_core::daemon::proto::{DaemonCreate, DaemonRequest, DaemonResponse};
+use izba_core::daemon::proto::{DaemonRequest, DaemonResponse};
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
 use izba_core::sandbox;
@@ -73,20 +73,17 @@ fn resolve_or_create(
     }
     let ports = super::parse_publish(&opts.publish)?;
     let volumes = super::parse_volumes(&opts.volumes)?;
-    let req = DaemonRequest::Create(DaemonCreate {
-        name: name.clone(),
-        image_ref: opts.image.clone(),
-        cpus: opts.cpus,
-        mem_mb: opts.mem,
+    // Carry the run's confinement intent into create: `run --allow-unconfined`
+    // on a workspace that can't be relabelled must still create (the VMM will run
+    // unconfined and never relabel it), so skip the create-time preflight.
+    let req = DaemonRequest::Create(super::build_create_request(
+        name.clone(),
+        opts,
         workspace,
-        rw_size_gb: opts.rw_size_gb,
         ports,
         volumes,
-        // Carry the run's confinement intent into create: `run --allow-unconfined`
-        // on a workspace that can't be relabelled must still create (the VMM will
-        // run unconfined and never relabel it), so skip the create-time preflight.
         allow_unconfined,
-    });
+    ));
     match client.request(&req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Created { .. } => {}
         DaemonResponse::Error { message } => bail!(message),

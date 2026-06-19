@@ -70,6 +70,34 @@ pub fn parse_volumes(specs: &[String]) -> anyhow::Result<Vec<izba_core::volume::
     Ok(volumes)
 }
 
+/// Assemble the daemon `Create` request from already-parsed inputs. Centralized
+/// (and unit-tested) so `create` and `run` build the frame identically — in
+/// particular both carry the **confinement intent**: `allow_unconfined = false`
+/// (the `create` default) makes the daemon run the workspace confinement
+/// preflight and reject a workspace it cannot relabel before anything is
+/// created; `run --allow-unconfined` threads `true` so that preflight is skipped
+/// (the VMM will not relabel the workspace).
+pub(crate) fn build_create_request(
+    name: String,
+    opts: &SandboxOpts,
+    workspace: PathBuf,
+    ports: Vec<PortRule>,
+    volumes: Vec<izba_core::volume::VolumeSpec>,
+    allow_unconfined: bool,
+) -> izba_core::daemon::proto::DaemonCreate {
+    izba_core::daemon::proto::DaemonCreate {
+        name,
+        image_ref: opts.image.clone(),
+        cpus: opts.cpus,
+        mem_mb: opts.mem,
+        workspace,
+        rw_size_gb: opts.rw_size_gb,
+        ports,
+        volumes,
+        allow_unconfined,
+    }
+}
+
 /// Validate a `--policy` file and persist it into the sandbox directory as
 /// `policy.yaml` (the daemon loads it when arming the sandbox's egress plane).
 /// No-op when no policy was given. Must run after the sandbox dir exists.
@@ -90,4 +118,49 @@ pub(crate) fn persist_policy(
     let dst = EgressPolicyConfig::path_in(&paths.sandbox_dir(name));
     std::fs::write(&dst, raw).with_context(|| format!("writing {}", dst.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts() -> SandboxOpts {
+        SandboxOpts {
+            image: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem: 4096,
+            rw_size_gb: 8,
+            name: None,
+            publish: vec![],
+            policy: None,
+            volumes: vec![],
+        }
+    }
+
+    #[test]
+    fn build_create_request_maps_opts_and_carries_confinement_intent() {
+        let o = opts();
+        let confined = build_create_request(
+            "web".into(),
+            &o,
+            PathBuf::from("/ws"),
+            vec![],
+            vec![],
+            false,
+        );
+        assert_eq!(confined.name, "web");
+        assert_eq!(confined.image_ref, "ubuntu:24.04");
+        assert_eq!(confined.cpus, 2);
+        assert_eq!(confined.mem_mb, 4096);
+        assert_eq!(confined.workspace, PathBuf::from("/ws"));
+        assert_eq!(confined.rw_size_gb, 8);
+        // `create` (and a plain `run`) default to confined intent, so the daemon
+        // runs the workspace preflight.
+        assert!(!confined.allow_unconfined);
+
+        // `run --allow-unconfined` threads the opt-out so the preflight is skipped.
+        let unconfined =
+            build_create_request("web".into(), &o, PathBuf::from("/ws"), vec![], vec![], true);
+        assert!(unconfined.allow_unconfined);
+    }
 }
