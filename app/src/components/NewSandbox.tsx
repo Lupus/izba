@@ -257,7 +257,9 @@ export function NewSandbox({ onClose, onCreated }: Props) {
             ))}
           </div>
         )}
-        {error && <div className="mt-3 text-warn text-sm">{error}</div>}
+        {error && (
+          <div className="mt-3 text-warn text-sm whitespace-pre-line">{error}</div>
+        )}
 
         <div className="mt-5 flex justify-end gap-2">
           <button

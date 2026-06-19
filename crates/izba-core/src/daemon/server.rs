@@ -373,6 +373,15 @@ fn handle_create(
     progress: &mut dyn FnMut(String),
 ) -> anyhow::Result<DaemonResponse> {
     crate::volume::validate_volumes(&c.volumes)?;
+    // Preflight (confined intent only): reject a workspace that cannot be
+    // Low-integrity-relabelled for the confined VMM (e.g. a folder at a drive
+    // root) BEFORE anything is written to disk, with an actionable message —
+    // never leave the user a created-but-unstartable sandbox. Skipped under
+    // --allow-unconfined, where the VMM never relabels the workspace. No-op off
+    // Windows. Fails fast, before the (possibly slow) image pull.
+    if !c.allow_unconfined {
+        crate::procmgr::ensure_confinable(&c.workspace)?;
+    }
     progress(format!(
         "resolving {} (pulls if not cached)...",
         c.image_ref
@@ -841,6 +850,7 @@ mod tests {
             rw_size_gb: 1,
             ports: Vec::new(),
             volumes: Vec::new(),
+            allow_unconfined: false,
         })
     }
 

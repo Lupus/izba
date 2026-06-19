@@ -29,7 +29,9 @@ pub use unix::{kill_pid, pid_alive, spawn_detached, spawn_detached_with_limits};
 #[cfg(windows)]
 mod jail_windows;
 #[cfg(windows)]
-pub use jail_windows::{restore_integrity_recursive, set_low_integrity_recursive, spawn_confined};
+pub use jail_windows::{
+    ensure_confinable, restore_integrity_recursive, set_low_integrity_recursive, spawn_confined,
+};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -63,6 +65,15 @@ pub fn set_low_integrity_recursive(_path: &std::path::Path) -> anyhow::Result<()
 /// `set_low_integrity_recursive`'s stub: there is no MIC label to undo here.
 #[cfg(not(windows))]
 pub fn restore_integrity_recursive(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Non-Windows no-op for the confinement preflight. The Low-integrity relabel
+/// (and its `WRITE_OWNER` requirement) is a Windows MIC concept with no
+/// equivalent here, so every workspace is acceptable; the Linux jailer handles
+/// its own filesystem confinement and never relabels the user's dir.
+#[cfg(not(windows))]
+pub fn ensure_confinable(_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -105,6 +116,13 @@ mod non_windows_stub_tests {
         let dir = std::env::temp_dir();
         set_low_integrity_recursive(&dir).expect("set_low stub returns Ok");
         restore_integrity_recursive(&dir).expect("restore stub returns Ok");
+    }
+
+    #[test]
+    fn ensure_confinable_is_a_noop_off_windows() {
+        // The WRITE_OWNER relabel constraint is Windows-only; everywhere else the
+        // preflight must accept any workspace so create/start are never blocked.
+        ensure_confinable(&std::env::temp_dir()).expect("stub returns Ok");
     }
 
     #[test]

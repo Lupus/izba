@@ -51,6 +51,10 @@ impl CreateOpts {
             // The app does not expose volume creation yet (a future "Storage"
             // tab); send none so the daemon treats it as a volume-less sandbox.
             volumes: Vec::new(),
+            // The app always creates with confined intent (no unconfined toggle),
+            // so the daemon runs the workspace confinement preflight and surfaces
+            // an actionable error in the create dialog for an unrelabellable dir.
+            allow_unconfined: false,
         })
     }
 }
