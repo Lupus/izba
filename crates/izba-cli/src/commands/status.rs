@@ -130,7 +130,7 @@ mod tests {
             &sb_dir.join(LOCKDOWN_FILE),
             &LockdownFile {
                 state: Some(LockedInfo {
-                    account: "izba-spk-web".into(),
+                    account: "izba-sb-web".into(),
                     sid: "S-1-5-21-1-2-3-1001".into(),
                     net_blocked: true,
                 }),
@@ -140,7 +140,7 @@ mod tests {
 
         let out = render(&paths, &detail(None));
         assert!(
-            out.contains("lock-down:   locked(account=izba-spk-web"),
+            out.contains("lock-down:   locked(account=izba-sb-web"),
             "{out}"
         );
     }

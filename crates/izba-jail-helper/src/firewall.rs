@@ -52,25 +52,35 @@ fn firewall_sddl(sid: &str) -> String {
 ///
 /// The outbound rule is named `<rule>` and the inbound rule `<rule>-in`.
 ///
+/// Both `New-NetFirewallRule` calls carry `-ErrorAction Stop` so that a
+/// non-terminating PowerShell error (e.g. rule already exists, insufficient
+/// privilege) is promoted to a terminating one and the chain exits non-zero.
+/// Without `-ErrorAction Stop` a failed first rule would still exit 0 and
+/// `block()` would return `Ok` while the account remains network-live.
+///
 /// The returned string is safe to pass directly as the argument to
 /// `powershell -NoProfile -NonInteractive -Command <output>`.
 pub fn block_ps_command(rule: &str, sid: &str) -> String {
     let sddl = firewall_sddl(sid);
     // Use a semicolon to chain the two New-NetFirewallRule calls in one
     // -Command invocation so we make only one powershell.exe process.
+    // -ErrorAction Stop on each call ensures a non-terminating error is
+    // promoted to terminating so the process exits non-zero on any failure.
     format!(
         "New-NetFirewallRule \
             -DisplayName '{rule}' \
             -Direction Outbound \
             -Action Block \
             -Profile Any \
-            -LocalUser \"{sddl}\"; \
+            -LocalUser \"{sddl}\" \
+            -ErrorAction Stop; \
         New-NetFirewallRule \
             -DisplayName '{rule}-in' \
             -Direction Inbound \
             -Action Block \
             -Profile Any \
-            -LocalUser \"{sddl}\"",
+            -LocalUser \"{sddl}\" \
+            -ErrorAction Stop",
     )
 }
 
@@ -111,6 +121,33 @@ fn run_ps(cmd: &str) -> Result<(), String> {
     ))
 }
 
+// ── Input validation ──────────────────────────────────────────────────────────
+
+/// Validate `rule` and `sid` for use in a PowerShell `New-NetFirewallRule`
+/// invocation.
+///
+/// Returns `Ok(())` when both values are safe to interpolate into the command
+/// string, or `Err(message)` when they contain characters that could allow
+/// PowerShell command injection.
+///
+/// Valid forms:
+/// - `rule`: `[a-zA-Z0-9-]+`  (produced by `rule_name()` in `izba-jail-naming`)
+/// - `sid`:  `[S0-9-]+`       (Windows `S-1-5-…` form)
+fn validate_block_inputs(rule: &str, sid: &str) -> Result<(), String> {
+    if !rule.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err(format!(
+            "block: rule name must be [a-zA-Z0-9-], got {rule:?}"
+        ));
+    }
+    if !sid
+        .bytes()
+        .all(|b| b.is_ascii_digit() || b == b'S' || b == b'-')
+    {
+        return Err(format!("block: SID must be S-...-... form, got {sid:?}"));
+    }
+    Ok(())
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Install outbound + inbound BLOCK rules for the account identified by `sid`.
@@ -121,30 +158,24 @@ fn run_ps(cmd: &str) -> Result<(), String> {
 ///
 /// Requires administrator/elevated privileges.
 ///
+/// Returns `Err` if `rule` contains characters outside `[a-zA-Z0-9-]` or if
+/// `sid` contains characters outside `S`, digits, and `-` — both of which
+/// would allow PowerShell injection.
+///
 /// On non-Windows returns `Err("windows-only")` without spawning any process.
 #[cfg(windows)]
 pub fn block(rule: &str, sid: &str) -> Result<(), String> {
-    // Injection invariant: rule names are [a-z0-9-] (produced by rule_name()
-    // in izba-jail-naming); the SID is the Windows S-1-5-... form.  Both are
-    // sanitized by callers before reaching here.  These asserts catch
-    // regressions in callers during development.
-    debug_assert!(
-        rule.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
-        "block: rule name must be [a-zA-Z0-9-], got {rule:?}"
-    );
-    debug_assert!(
-        sid.bytes()
-            .all(|b| b.is_ascii_digit() || b == b'S' || b == b'-'),
-        "block: SID must be S-<digits>-... form, got {sid:?}"
-    );
+    validate_block_inputs(rule, sid)?;
     run_ps(&block_ps_command(rule, sid))
 }
 
 /// Install outbound + inbound BLOCK rules — stub on non-Windows.
 ///
-/// Returns `Err("windows-only")`.
+/// Performs the same input validation as the Windows path (so callers receive
+/// consistent errors regardless of platform), then returns `Err("windows-only")`.
 #[cfg(not(windows))]
-pub fn block(_rule: &str, _sid: &str) -> Result<(), String> {
+pub fn block(rule: &str, sid: &str) -> Result<(), String> {
+    validate_block_inputs(rule, sid)?;
     Err("windows-only".into())
 }
 
@@ -259,6 +290,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn block_cmd_error_action_stop_on_both_rules() {
+        // Each New-NetFirewallRule invocation must carry -ErrorAction Stop so
+        // that a non-terminating error is promoted and block() returns Err.
+        let cmd = block_ps_command("izba-deny-mybox", "S-1-5-21-111-222-333-1001");
+        let count = cmd.matches("-ErrorAction Stop").count();
+        assert_eq!(
+            count, 2,
+            "block command must contain -ErrorAction Stop exactly twice (once per rule), got {count}: {cmd:?}"
+        );
+    }
+
     // ── unblock_ps_command ───────────────────────────────────────────────────
 
     #[test]
@@ -303,6 +346,37 @@ mod tests {
         assert!(
             cmd.contains("SilentlyContinue"),
             "unblock command must use -ErrorAction SilentlyContinue for idempotency: {cmd:?}"
+        );
+    }
+
+    // ── Input validation (all platforms) ────────────────────────────────────
+
+    #[test]
+    fn block_bad_rule_name_returns_err() {
+        // A rule name containing a semicolon would allow PowerShell injection.
+        // validate_block_inputs must reject it before building any command.
+        let err =
+            super::validate_block_inputs("bad;rule", "S-1-5-21-111-222-333-1001").unwrap_err();
+        assert!(
+            err.contains("rule name must be"),
+            "error must mention rule name: {err}"
+        );
+        assert!(
+            err.contains("bad;rule"),
+            "error must include the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn block_bad_sid_returns_err() {
+        let err = super::validate_block_inputs("izba-deny-ok", "S-1-5-$(evil)").unwrap_err();
+        assert!(err.contains("SID must be"), "error must mention SID: {err}");
+    }
+
+    #[test]
+    fn block_valid_inputs_ok() {
+        assert!(
+            super::validate_block_inputs("izba-deny-mybox", "S-1-5-21-111-222-333-1001").is_ok()
         );
     }
 

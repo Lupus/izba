@@ -54,10 +54,20 @@ pub fn helper_path() -> Result<PathBuf, String> {
 /// Join `argv` into a single `lpParameters` string suitable for
 /// `ShellExecuteExW`.
 ///
-/// Each argument that is empty, contains ASCII whitespace, or contains a
-/// double-quote character is wrapped in double-quotes with internal
-/// double-quotes escaped as `\"`.  Arguments that need no quoting are passed
-/// through verbatim.
+/// Implements the MSDN `CommandLineToArgvW` quoting algorithm:
+///
+/// - Arguments that need no quoting (non-empty, no whitespace, no `"`) are
+///   passed through verbatim.
+/// - Arguments that are empty, contain ASCII whitespace, or contain a
+///   double-quote are wrapped in double-quotes.  Inside a quoted argument:
+///   - Each `"` is emitted as `\"` (with any immediately-preceding run of `k`
+///     backslashes doubled to `2k` before the `\"`).
+///   - A run of `k` backslashes at the very end of the argument (immediately
+///     before the closing `"`) is doubled to `2k` so that the closing `"` is
+///     not accidentally consumed by `CommandLineToArgvW`.
+///
+/// This matches the exact quoting rules described in the Windows documentation
+/// for `CommandLineToArgvW` / `CreateProcess lpCommandLine`.
 ///
 /// This function is pure and available on all platforms.
 pub fn join_args(argv: &[String]) -> String {
@@ -70,11 +80,43 @@ pub fn join_args(argv: &[String]) -> String {
             arg.is_empty() || arg.bytes().any(|b| b == b' ' || b == b'\t' || b == b'"');
         if needs_quoting {
             out.push('"');
-            for ch in arg.chars() {
-                if ch == '"' {
-                    out.push('\\');
+            // Walk the argument byte-by-byte, counting consecutive backslashes.
+            // Flush the pending backslash run when we hit a `"` or end-of-arg.
+            let bytes = arg.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                // Count a run of backslashes.
+                let bs_start = i;
+                while i < bytes.len() && bytes[i] == b'\\' {
+                    i += 1;
                 }
-                out.push(ch);
+                let bs_count = i - bs_start;
+
+                if i == bytes.len() {
+                    // End of argument: double all trailing backslashes so that
+                    // the closing `"` we are about to emit is not consumed.
+                    for _ in 0..bs_count * 2 {
+                        out.push('\\');
+                    }
+                } else if bytes[i] == b'"' {
+                    // Before an embedded quote: double the preceding backslashes
+                    // and escape the quote itself.
+                    for _ in 0..bs_count * 2 {
+                        out.push('\\');
+                    }
+                    out.push('\\');
+                    out.push('"');
+                    i += 1;
+                } else {
+                    // Regular character (not a backslash or quote): emit the
+                    // backslashes verbatim then the character.
+                    for _ in 0..bs_count {
+                        out.push('\\');
+                    }
+                    // SAFETY: bytes[i] is a valid byte; push it as char.
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
             }
             out.push('"');
         } else {
@@ -305,6 +347,56 @@ mod tests {
             join_args(&args),
             r#"create-account "name with space" plain"#
         );
+    }
+
+    #[test]
+    fn join_args_trailing_backslash_in_quoted_arg_is_doubled() {
+        // A path with a space (forces quoting) AND a trailing backslash:
+        // CommandLineToArgvW would interpret `"C:\path\"` as an unmatched open
+        // quote because the `\"` sequence escapes the closing double-quote.
+        // The correct encoding is `"C:\path\\"` (trailing backslash doubled).
+        let args = vec!["C:\\Program Files\\izba\\x\\".to_string()];
+        let result = join_args(&args);
+        assert_eq!(
+            result, "\"C:\\Program Files\\izba\\x\\\\\"",
+            "trailing backslash must be doubled before the closing quote"
+        );
+        // The result must end with `\\` then `"` — i.e. the closing `"` is NOT
+        // preceded by an odd number of backslashes.
+        assert!(
+            result.ends_with("\\\\\""),
+            "closing quote must be preceded by an even number of backslashes: {result}"
+        );
+    }
+
+    #[test]
+    fn join_args_multiple_trailing_backslashes_doubled() {
+        // Two trailing backslashes → four in the output.
+        let args = vec!["path with spaces\\\\".to_string()];
+        let result = join_args(&args);
+        // Encoded: "path with spaces\\\\"  (2 backslashes → 4, then closing ")
+        assert!(
+            result.ends_with("\\\\\\\\\""),
+            "two trailing backslashes must become four: {result}"
+        );
+    }
+
+    #[test]
+    fn join_args_backslash_before_embedded_quote_doubled() {
+        // A backslash immediately before an embedded double-quote must be
+        // doubled per the MSDN algorithm:  `a\"b`  must encode as  `"a\\\"b"`.
+        let args = vec!["a\\\"b".to_string()];
+        let result = join_args(&args);
+        // The `\"` inside the argument: backslash is doubled → `\\`, quote → `\"`
+        // So the full encoding is `"a\\\"b"`.
+        assert_eq!(result, "\"a\\\\\\\"b\"");
+    }
+
+    #[test]
+    fn join_args_no_quoting_leaves_backslashes_verbatim() {
+        // An argument with backslashes but no spaces/quotes: no quoting, no doubling.
+        let args = vec!["C:\\Windows\\System32\\cmd.exe".to_string()];
+        assert_eq!(join_args(&args), "C:\\Windows\\System32\\cmd.exe");
     }
 
     // ── ElevationOutcome display/equality ────────────────────────────────────

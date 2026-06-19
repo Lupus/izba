@@ -21,7 +21,7 @@ impl LockdownLaunch {
         Self { account, password }
     }
 
-    /// The Windows local account name (e.g. `izba-spk-mybox`).
+    /// The Windows local account name (e.g. `izba-sb-mybox`).
     pub fn account(&self) -> &str {
         &self.account
     }
@@ -174,7 +174,7 @@ mod tests {
     /// output — `VmSpec` is sometimes logged and the credential must not leak.
     #[test]
     fn lockdown_launch_debug_redacts_password() {
-        let ll = LockdownLaunch::new("izba-spk-mybox".into(), "s3cret".into());
+        let ll = LockdownLaunch::new("izba-sb-mybox".into(), "s3cret".into());
         let s = format!("{ll:?}");
         assert!(
             !s.contains("s3cret"),
@@ -185,7 +185,7 @@ mod tests {
             "Debug output must contain <redacted>, got: {s}"
         );
         assert!(
-            s.contains("izba-spk-mybox"),
+            s.contains("izba-sb-mybox"),
             "account must appear in Debug output, got: {s}"
         );
     }

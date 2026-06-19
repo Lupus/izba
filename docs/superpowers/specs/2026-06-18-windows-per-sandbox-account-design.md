@@ -13,7 +13,7 @@ WHP/AppContainer probe deferred as "out of scope (admin)".
 ## 1. Summary
 
 Add an opt-in, per-sandbox hardening for Windows: run a sandbox's VMM under a
-**dedicated standard local account** (`izba-spk-<sandbox>`) that is ACL-scoped to
+**dedicated standard local account** (`izba-sb-<sandbox>`) that is ACL-scoped to
 *only that sandbox's files* and made **network-dead** with a per-SID firewall
 block. A "lock down" action (UAC-shielded button / CLI verb) provisions the
 identity; teardown on `unlock` / `rm` removes it. izbad itself stays unprivileged;
@@ -87,7 +87,7 @@ for the e2e assertion.
 ## 4. Threat model delta
 
 A hostile guest that escapes the VM into the **host-side VMM process** (running as
-`izba-spk-<sandbox>` + restricted token + Low IL + job) can reach:
+`izba-sb-<sandbox>` + restricted token + Low IL + job) can reach:
 
 **Blast radius (what it CAN touch):**
 
@@ -130,7 +130,7 @@ A hostile guest that escapes the VM into the **host-side VMM process** (running 
     paths, add the per-SID firewall block. Idempotent.
   - `deprovision --sandbox <name>` — remove firewall rule, unhide, delete account
     + profile. Idempotent (safe if already gone).
-  - `gc --live <name>…` — sweep `izba-spk-*` accounts / `izba-deny-*` rules whose
+  - `gc --live <name>…` — sweep `izba-sb-*` accounts / `izba-deny-*` rules whose
     sandbox is not in the live set; deprovision each.
   It is invoked with elevation (`ShellExecute`/`runas` → UAC) exactly at the
   lock-down / unlock / cleanup moments. It does **not** stay resident.
@@ -226,7 +226,7 @@ If izbad / the app dies with a locked-down sandbox live, the account + rule pers
   elevated action.
 - **explicit sweep:** `izba windows-cleanup` elevates and runs `gc` against the
   current live sandbox set; surfaced as a remediation hint in `izba status` when
-  orphans are detected (izbad can *detect* `izba-spk-*` accounts unprivileged via
+  orphans are detected (izbad can *detect* `izba-sb-*` accounts unprivileged via
   enumeration, even though it cannot *remove* them).
 
 No standing privileged GC service (keeps with the unprivileged-izbad ethos).

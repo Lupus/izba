@@ -16,7 +16,7 @@
 - Touching `izba-core`/`izba-proto` public types ⇒ run the app gate locally (`cd app && npm ci && npm run build && (cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test)`).
 - Any wire-breaking frame change ⇒ bump `DAEMON_PROTO_VERSION`; keep `proto`/`build` `#[serde(default)]`.
 - Conventional commits; TDD (test first); frequent commits.
-- Naming: account `izba-spk-<sandbox>`, firewall rule `izba-deny-<sandbox>`, state file `lockdown.json`, sealed cred `lockdown.cred`.
+- Naming: account `izba-sb-<sandbox>`, firewall rule `izba-deny-<sandbox>`, state file `lockdown.json`, sealed cred `lockdown.cred`.
 - Loud on degradation: a failed provision fails the lock-down loudly and leaves the sandbox **unlocked**; never run a "locked" sandbox unconfined.
 
 ---
@@ -56,7 +56,7 @@
   - `impl LockdownState { pub fn summary(&self) -> String; pub fn is_locked(&self) -> bool; }`
   - `#[derive(Serialize, Deserialize, Default)] pub struct LockdownFile { #[serde(default)] pub state: Option<LockedInfo> }` persisted as `lockdown.json`.
 
-- [ ] **Step 1: Failing test** — serde round-trip of `LockdownFile { state: Some(LockedInfo{account:"izba-spk-foo",sid:"S-1-5-...",net_blocked:true}) }` and `summary()` strings (`unlocked`, `locked(account=…, sid=…, net=blocked)`, `degraded: …`).
+- [ ] **Step 1: Failing test** — serde round-trip of `LockdownFile { state: Some(LockedInfo{account:"izba-sb-foo",sid:"S-1-5-...",net_blocked:true}) }` and `summary()` strings (`unlocked`, `locked(account=…, sid=…, net=blocked)`, `degraded: …`).
 - [ ] **Step 2:** Run `cargo test -p izba-core jail_account::state` → FAIL (module missing).
 - [ ] **Step 3:** Implement the types + `summary()`/`is_locked()` + `Default`.
 - [ ] **Step 4:** `cargo test -p izba-core jail_account::state` → PASS.
@@ -72,11 +72,11 @@
 - Consumes: `LockedInfo` (Task 1).
 - Produces:
   - `pub fn firewall_sddl(sid: &str) -> String` → `D:(A;;CC;;;<sid>)`.
-  - `pub fn account_name(sandbox: &str) -> String` / `pub fn rule_name(sandbox: &str) -> String` (sanitize to `izba-spk-<safe>` / `izba-deny-<safe>`; assert length ≤ 20 for the account, the Windows local-username limit).
+  - `pub fn account_name(sandbox: &str) -> String` / `pub fn rule_name(sandbox: &str) -> String` (sanitize to `izba-sb-<safe>` / `izba-deny-<safe>`; assert length ≤ 20 for the account, the Windows local-username limit).
   - `pub fn provision_argv(sandbox: &str, grants: &[PathBuf], sid_out: &Path, cred_out: &Path) -> Vec<String>` and `deprovision_argv`, `gc_argv(live: &[String])`.
-  - `pub fn gc_orphans(existing: &[String], live: &[String]) -> Vec<String>` — `izba-spk-*` names whose sandbox ∉ live.
+  - `pub fn gc_orphans(existing: &[String], live: &[String]) -> Vec<String>` — `izba-sb-*` names whose sandbox ∉ live.
 
-- [ ] **Step 1: Failing tests** — `firewall_sddl("S-1-5-21-1")=="D:(A;;CC;;;S-1-5-21-1)"`; `account_name("My Box")=="izba-spk-my-box"` and length cap; `gc_orphans(["izba-spk-a","izba-spk-b"],["a"])==["izba-spk-b"]`; argv vectors contain the expected flags/paths.
+- [ ] **Step 1: Failing tests** — `firewall_sddl("S-1-5-21-1")=="D:(A;;CC;;;S-1-5-21-1)"`; `account_name("My Box")=="izba-sb-my-box"` and length cap; `gc_orphans(["izba-sb-a","izba-sb-b"],["a"])==["izba-sb-b"]`; argv vectors contain the expected flags/paths.
 - [ ] **Step 2:** Run → FAIL.
 - [ ] **Step 3:** Implement pure builders.
 - [ ] **Step 4:** Run → PASS.
@@ -131,7 +131,7 @@
 **Files:** Create `provision.rs`; wire into `main.rs`
 
 **Interfaces:**
-- Produces: `pub fn provision(sandbox,grants,sid_out,cred_out)->Result<()>` running account→hide→DACL→firewall in order, **rolling back** created artifacts on any failure, then writing SID to `sid_out` and the password to `cred_out` (ACL'd to the invoking user). `deprovision(sandbox)` reverses idempotently. `gc(live)` enumerates `izba-spk-*` (NetUserEnum) + `izba-deny-*` rules and deprovisions orphans.
+- Produces: `pub fn provision(sandbox,grants,sid_out,cred_out)->Result<()>` running account→hide→DACL→firewall in order, **rolling back** created artifacts on any failure, then writing SID to `sid_out` and the password to `cred_out` (ACL'd to the invoking user). `deprovision(sandbox)` reverses idempotently. `gc(live)` enumerates `izba-sb-*` (NetUserEnum) + `izba-deny-*` rules and deprovisions orphans.
 
 - [ ] Steps: orchestration ordering + rollback decision tree is testable with injected fakes (trait `Ops` with create/hide/dacl/firewall; a fake records calls and forces a failure at step k → assert rollback unwinds k-1..0). Implement real `WinOps` over Tasks 4-6. Commit `feat(jail-helper): transactional provision/deprovision/gc`.
 
@@ -172,7 +172,7 @@
 
 **Interfaces:**
 - Consumes: Tasks 1-10.
-- Produces: `pub fn lockdown(name)->Result<LockdownOutcome>` (compute grants = [workspace share, sandbox dir, this sandbox's named volumes]; call `run_elevated(provision_argv…)`; seal cred; persist `lockdown.json`); `pub fn unlock(name)` (`deprovision_argv` + clear state + `restore_confined_workspace`); start path consults `lockdown.json` and uses `spawn_confined_as`; `pub fn reconcile_lockdown_on_start()` re-derives state from disk + detects orphans (enumerate `izba-spk-*` unprivileged, diff vs live); status surfaces `LockdownState`.
+- Produces: `pub fn lockdown(name)->Result<LockdownOutcome>` (compute grants = [workspace share, sandbox dir, this sandbox's named volumes]; call `run_elevated(provision_argv…)`; seal cred; persist `lockdown.json`); `pub fn unlock(name)` (`deprovision_argv` + clear state + `restore_confined_workspace`); start path consults `lockdown.json` and uses `spawn_confined_as`; `pub fn reconcile_lockdown_on_start()` re-derives state from disk + detects orphans (enumerate `izba-sb-*` unprivileged, diff vs live); status surfaces `LockdownState`.
 
 - [ ] Steps: grants computation + state transitions + orphan detection are host-testable with a fake elevation client (trait seam). Implement. Commit `feat(core): sandbox lock-down orchestration + startup reconcile`.
 

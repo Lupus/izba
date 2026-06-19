@@ -22,9 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
-use izba_jail_naming::ACCOUNT_PREFIX;
-use izba_jail_naming::{account_name, gc_orphans, rule_name};
+use izba_jail_naming::{account_name, gc_orphans, rule_name, ACCOUNT_PREFIX};
 
 use crate::dacl::GrantLevel;
 
@@ -62,7 +60,7 @@ pub trait Ops {
     /// Remove the firewall rules for `rule` (idempotent — absent is Ok).
     fn unblock(&self, rule: &str) -> Result<(), String>;
 
-    /// Return all local account names matching the `izba-spk-*` prefix.
+    /// Return all local account names matching the `izba-sb-*` prefix.
     ///
     /// The real implementation uses `NetUserEnum`; the fake returns a
     /// pre-loaded list.
@@ -115,7 +113,7 @@ impl Ops for WinOps {
 }
 
 /// Enumerate local accounts via `NetUserEnum` level 0 and return those whose
-/// names start with `izba-spk-`.
+/// names start with `izba-sb-`.
 #[cfg(windows)]
 fn win_enumerate_accounts() -> Result<Vec<String>, String> {
     use windows_sys::Win32::NetworkManagement::NetManagement::{
@@ -159,14 +157,25 @@ fn win_enumerate_accounts() -> Result<Vec<String>, String> {
             return Err(format!("NetUserEnum: NET_API_STATUS {status}"));
         }
 
-        // SAFETY: buf points to a valid NetUserEnum-allocated array of
-        // USER_INFO_0 with entries_read elements; we free it inside
-        // collect_izba_accounts before returning.
-        unsafe {
-            collect_izba_accounts(buf, entries_read, &mut names);
+        // Guard: only call collect_izba_accounts when NetUserEnum actually
+        // populated the buffer.  When entries_read == 0 or buf is null the
+        // buffer may be null even on a NERR_Success return; passing a null
+        // pointer to slice::from_raw_parts would be UB even with count==0.
+        if !buf.is_null() && entries_read > 0 {
+            // SAFETY: buf points to a valid NetUserEnum-allocated array of
+            // USER_INFO_0 with entries_read elements; we free it inside
+            // collect_izba_accounts before returning.
+            unsafe {
+                collect_izba_accounts(buf, entries_read, &mut names);
+            }
+            // buf is now freed and set to null inside collect_izba_accounts.
+            buf = std::ptr::null_mut();
+        } else if !buf.is_null() {
+            // entries_read == 0 but buffer was allocated; free it here.
+            // SAFETY: buf was allocated by NetUserEnum and has not been freed yet.
+            unsafe { NetApiBufferFree(buf as *mut _) };
+            buf = std::ptr::null_mut();
         }
-        // buf is now freed and set to null inside collect_izba_accounts.
-        buf = std::ptr::null_mut();
 
         if done {
             break;
@@ -188,6 +197,21 @@ fn win_enumerate_accounts() -> Result<Vec<String>, String> {
 #[cfg(windows)]
 unsafe fn collect_izba_accounts(buf: *mut u8, count: u32, out: &mut Vec<String>) {
     use windows_sys::Win32::NetworkManagement::NetManagement::{NetApiBufferFree, USER_INFO_0};
+
+    // Defense-in-depth: if buf is null or count is 0 there is nothing to
+    // iterate.  A null buf with count==0 is UB for slice::from_raw_parts even
+    // though the slice would be empty, so return early.  Free the buffer first
+    // if it is non-null to avoid leaking the NetUserEnum allocation.
+    if count == 0 {
+        if !buf.is_null() {
+            // SAFETY: buf was allocated by NetUserEnum and has not been freed.
+            NetApiBufferFree(buf as *mut _);
+        }
+        return;
+    }
+    if buf.is_null() {
+        return;
+    }
 
     // SAFETY: caller guarantees buf points to count valid USER_INFO_0 entries.
     let entries = std::slice::from_raw_parts(buf as *const USER_INFO_0, count as usize);
@@ -215,7 +239,7 @@ unsafe fn collect_izba_accounts(buf: *mut u8, count: u32, out: &mut Vec<String>)
 /// Provision a per-sandbox Windows local account.
 ///
 /// Steps (in order):
-/// 1. Create the account (`izba-spk-<slug>`).
+/// 1. Create the account (`izba-sb-<slug>`).
 /// 2. Hide it from the Windows sign-in screen.
 /// 3. Grant `Modify` access to each path in `grants` (sandbox-specific RW paths).
 /// 4. Grant `ReadExec` access to each path in `grants_ro` (shared RO artifacts:
@@ -379,7 +403,7 @@ pub fn deprovision<O: Ops>(ops: &O, sandbox: &str) -> Result<(), String> {
 
 /// Garbage-collect orphaned per-sandbox accounts.
 ///
-/// Enumerates `izba-spk-*` accounts via [`Ops::enumerate_accounts`], computes
+/// Enumerates `izba-sb-*` accounts via [`Ops::enumerate_accounts`], computes
 /// the orphan set (those not in `live`) via [`gc_orphans`], and deprovisions
 /// each orphan.
 ///
@@ -391,7 +415,7 @@ pub fn gc<O: Ops>(ops: &O, live: &[String]) -> Result<(), String> {
 
     let mut errors: Vec<String> = Vec::new();
     for orphan_account in &orphans {
-        // gc receives full account names like "izba-spk-foo"; we need to derive
+        // gc receives full account names like "izba-sb-foo"; we need to derive
         // the sandbox name from the account name to call deprovision.  We use
         // the account name directly as a sandbox identifier here because
         // `account_name(account_name_as_sandbox)` == account_name_as_sandbox
@@ -399,9 +423,9 @@ pub fn gc<O: Ops>(ops: &O, live: &[String]) -> Result<(), String> {
         //
         // Actually: deprovision calls `account_name(sandbox)` internally.
         // To get back to the right account we pass the orphan account name
-        // itself with the "izba-spk-" prefix stripped.
+        // itself with the "izba-sb-" prefix stripped.
         let sandbox_slug = orphan_account
-            .strip_prefix("izba-spk-")
+            .strip_prefix(ACCOUNT_PREFIX)
             .unwrap_or(orphan_account.as_str());
         if let Err(e) = deprovision(ops, sandbox_slug) {
             errors.push(e);
@@ -597,12 +621,12 @@ mod tests {
         let calls = ops.recorded();
         // Expected order: CreateAccount, Hide, Grant(Modify), Block.
         assert!(
-            matches!(&calls[0], Call::CreateAccount(n) if n == "izba-spk-my-sandbox"),
+            matches!(&calls[0], Call::CreateAccount(n) if n == "izba-sb-my-sandbox"),
             "first call must be CreateAccount: {:?}",
             calls[0]
         );
         assert!(
-            matches!(&calls[1], Call::Hide(n) if n == "izba-spk-my-sandbox"),
+            matches!(&calls[1], Call::Hide(n) if n == "izba-sb-my-sandbox"),
             "second call must be Hide: {:?}",
             calls[1]
         );
@@ -901,17 +925,17 @@ mod tests {
             calls[0]
         );
         assert!(
-            matches!(&calls[1], Call::Unhide(n) if n == "izba-spk-my-sandbox"),
+            matches!(&calls[1], Call::Unhide(n) if n == "izba-sb-my-sandbox"),
             "second call must be Unhide: {:?}",
             calls[1]
         );
         assert!(
-            matches!(&calls[2], Call::DeleteAccount(n) if n == "izba-spk-my-sandbox"),
+            matches!(&calls[2], Call::DeleteAccount(n) if n == "izba-sb-my-sandbox"),
             "third call must be DeleteAccount: {:?}",
             calls[2]
         );
         assert!(
-            matches!(&calls[3], Call::DeleteProfile(n) if n == "izba-spk-my-sandbox"),
+            matches!(&calls[3], Call::DeleteProfile(n) if n == "izba-sb-my-sandbox"),
             "fourth call must be DeleteProfile: {:?}",
             calls[3]
         );
@@ -923,8 +947,8 @@ mod tests {
     #[test]
     fn gc_deprovisions_orphans_only() {
         let ops = FakeOps::with_accounts(vec![
-            "izba-spk-alive".to_string(),
-            "izba-spk-orphan".to_string(),
+            "izba-sb-alive".to_string(),
+            "izba-sb-orphan".to_string(),
             "other-account".to_string(),
         ]);
 
@@ -964,12 +988,12 @@ mod tests {
         );
     }
 
-    /// Long sandbox name: stored as truncated account "izba-spk-my-very-lon",
+    /// Long sandbox name: stored as truncated account "izba-sb-my-very-long",
     /// live name "my-very-long-sandbox-name" → must NOT be orphan.
     #[test]
     fn gc_long_name_not_false_orphan() {
         let sandbox = "my-very-long-sandbox-name";
-        let stored = account_name(sandbox); // "izba-spk-my-very-lon"
+        let stored = account_name(sandbox); // "izba-sb-my-very-long"
         assert_eq!(stored.len(), 20);
 
         let ops = FakeOps::with_accounts(vec![stored.clone()]);
@@ -990,7 +1014,7 @@ mod tests {
 
     #[test]
     fn gc_no_live_deprovisions_all_izba_accounts() {
-        let ops = FakeOps::with_accounts(vec!["izba-spk-a".to_string(), "izba-spk-b".to_string()]);
+        let ops = FakeOps::with_accounts(vec!["izba-sb-a".to_string(), "izba-sb-b".to_string()]);
 
         gc(&ops, &[]).expect("gc should succeed");
 
@@ -1006,14 +1030,8 @@ mod tests {
             })
             .collect();
         // Both must be deprovisioned (order may vary but both must appear).
-        assert!(
-            deleted.contains(&"izba-spk-a"),
-            "izba-spk-a must be deleted"
-        );
-        assert!(
-            deleted.contains(&"izba-spk-b"),
-            "izba-spk-b must be deleted"
-        );
+        assert!(deleted.contains(&"izba-sb-a"), "izba-sb-a must be deleted");
+        assert!(deleted.contains(&"izba-sb-b"), "izba-sb-b must be deleted");
     }
 
     // ── GC: truncated-name orphan cleans up matching rule (FIX 2 + FIX 3) ─────
@@ -1031,11 +1049,11 @@ mod tests {
         // A very long sandbox name.  At provision time, both account_name and
         // rule_name truncate its slug to ACCOUNT_SLUG_MAX (11) chars.
         let long = "my-very-long-sandbox-name-that-exceeds-limit";
-        let stored_account = an(long); // e.g. "izba-spk-my-very-lon" (20 chars)
+        let stored_account = an(long); // e.g. "izba-sb-my-very-long" (20 chars)
         let expected_rule = rn(long); // e.g. "izba-deny-my-very-lon" — same slug
 
         // Sanity: slugs must match.
-        let acct_slug = stored_account.strip_prefix("izba-spk-").unwrap();
+        let acct_slug = stored_account.strip_prefix("izba-sb-").unwrap();
         let rule_slug = expected_rule.strip_prefix("izba-deny-").unwrap();
         assert_eq!(
             acct_slug, rule_slug,
