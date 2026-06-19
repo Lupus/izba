@@ -11,7 +11,10 @@ export function allowKeys(allow: AllowEntry[]): Set<string> {
     if (typeof e === "string") {
       for (const p of WEB_DEFAULT_PORTS) s.add(`${e}:${p}`);
     } else {
-      for (const p of e.ports) s.add(`${e.host}:${p}`);
+      // `ports` may be absent (backend omits it when it equals the web
+      // defaults) — treat a missing list as the web defaults, never iterate
+      // undefined.
+      for (const p of e.ports ?? WEB_DEFAULT_PORTS) s.add(`${e.host}:${p}`);
     }
   }
   return s;

@@ -165,7 +165,7 @@ describe("PolicyEditor", () => {
     });
     render(<PolicyEditor name="web" />);
     // Wait for the component to load the policy
-    const toggle = await screen.findByRole("checkbox", { name: /enforce/i });
+    const toggle = await screen.findByRole("switch", { name: /enforce/i });
     expect(toggle).toBeChecked();
     fireEvent.click(toggle);
     await waitFor(() =>
@@ -236,5 +236,26 @@ describe("PolicyEditor", () => {
     const allow: Array<{ host: string; access?: string }> = calls[0][1];
     const pypi = allow.find((e) => e.host === "pypi.org");
     expect(pypi?.access).toBe("read");
+  });
+
+  it("loads a ports-less allow entry (backend None) without crashing", async () => {
+    // Regression: a Scoped entry whose ports == web defaults comes back with no
+    // `ports` field. toRow must default to the web ports, not undefined.
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "pypi.org", access: "read" }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    expect(await screen.findByDisplayValue("pypi.org")).toBeInTheDocument();
+    // Saving sends the web-default ports for the ports-less entry.
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [{ host: "pypi.org", ports: [80, 443], access: "read" }],
+        [],
+      ),
+    );
   });
 });

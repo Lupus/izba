@@ -75,8 +75,12 @@ export interface EndpointSummary {
   last_path: string | null;
 }
 
-/** Untagged on the Rust side: a bare host is a string, a scoped host an object. */
-export type AllowEntry = string | { host: string; ports: number[]; access?: Access };
+/** Untagged on the Rust side: a bare host is a string, a scoped host an object.
+ *  `ports` is OPTIONAL: the backend serializes `ports: Option<Vec<u16>>` with
+ *  `skip_serializing_if = "Option::is_none"`, so a scoped entry whose ports
+ *  equal the web defaults comes back with NO `ports` field. A missing `ports`
+ *  means the web defaults (matching Rust's `AllowEntry::ports()`). */
+export type AllowEntry = string | { host: string; ports?: number[]; access?: Access };
 
 export type Access = "read" | "read-write";
 
