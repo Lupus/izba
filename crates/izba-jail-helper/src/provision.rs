@@ -217,9 +217,13 @@ unsafe fn collect_izba_accounts(buf: *mut u8, count: u32, out: &mut Vec<String>)
 /// Steps (in order):
 /// 1. Create the account (`izba-spk-<slug>`).
 /// 2. Hide it from the Windows sign-in screen.
-/// 3. Grant `Modify` access to each path in `grants`.
-/// 4. Install the firewall deny rule (`izba-deny-<slug>`) keyed to the SID.
-/// 5. Write the SID to `sid_out` and the password to `cred_out`.
+/// 3. Grant `Modify` access to each path in `grants` (sandbox-specific RW paths).
+/// 4. Grant `ReadExec` access to each path in `grants_ro` (shared RO artifacts:
+///    erofs base images, kernel, initrd). Paths that do not exist are silently
+///    skipped — `artifacts_dir` may be absent on developer hosts that use
+///    pre-existing kernel binaries from another location.
+/// 5. Install the firewall deny rule (`izba-deny-<slug>`) keyed to the SID.
+/// 6. Write the SID to `sid_out` and the password to `cred_out`.
 ///
 /// On any failure, everything created so far is rolled back in reverse order
 /// before the error is returned.
@@ -227,6 +231,7 @@ pub fn provision<O: Ops>(
     ops: &O,
     sandbox: &str,
     grants: &[PathBuf],
+    grants_ro: &[PathBuf],
     sid_out: &Path,
     cred_out: &Path,
 ) -> Result<(), String> {
@@ -251,7 +256,7 @@ pub fn provision<O: Ops>(
     }
     hidden = true;
 
-    // Step 3: grant each path.
+    // Step 3: grant RW (Modify) access to each sandbox-specific path.
     for path in grants {
         if let Err(e) = ops.grant(path, &sid, GrantLevel::Modify) {
             rollback(ops, sandbox, hidden, grants_applied, &rule);
@@ -263,13 +268,31 @@ pub fn provision<O: Ops>(
         grants_applied += 1;
     }
 
-    // Step 4: install firewall block rule.
+    // Step 4: grant ReadExec (read-only) access to shared artifact directories.
+    // A path that does not exist is silently skipped: `artifacts_dir` may be
+    // absent on developer hosts that locate kernel/initrd elsewhere.
+    for path in grants_ro {
+        if !path.exists() {
+            // Non-existent RO path — skip rather than hard-fail provisioning.
+            continue;
+        }
+        if let Err(e) = ops.grant(path, &sid, GrantLevel::ReadExec) {
+            rollback(ops, sandbox, hidden, grants_applied, &rule);
+            return Err(format!(
+                "provision({sandbox}): grant-ro({}): {e}",
+                path.display()
+            ));
+        }
+        grants_applied += 1;
+    }
+
+    // Step 5: install firewall block rule.
     if let Err(e) = ops.block(&rule, &sid) {
         rollback(ops, sandbox, hidden, grants_applied, &rule);
         return Err(format!("provision({sandbox}): block: {e}"));
     }
 
-    // Step 5: write output files.
+    // Step 6: write output files.
     if let Err(e) = std::fs::write(sid_out, &sid) {
         // Firewall rule is now live — must roll back including unblock.
         rollback_with_unblock(ops, sandbox, hidden, &rule);
@@ -565,13 +588,14 @@ mod tests {
             &ops,
             "my-sandbox",
             std::slice::from_ref(&grant_path),
+            &[],
             &sid_out,
             &cred_out,
         )
         .expect("provision should succeed");
 
         let calls = ops.recorded();
-        // Expected order: CreateAccount, Hide, Grant, Block.
+        // Expected order: CreateAccount, Hide, Grant(Modify), Block.
         assert!(
             matches!(&calls[0], Call::CreateAccount(n) if n == "izba-spk-my-sandbox"),
             "first call must be CreateAccount: {:?}",
@@ -602,7 +626,7 @@ mod tests {
         let sid_out = tmp.path().join("sid.txt");
         let cred_out = tmp.path().join("cred.json");
 
-        provision(&ops, "sb", &[], &sid_out, &cred_out).unwrap();
+        provision(&ops, "sb", &[], &[], &sid_out, &cred_out).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&sid_out).unwrap(),
@@ -611,6 +635,86 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&cred_out).unwrap(),
             "FakePassword1!"
+        );
+    }
+
+    /// RO grant paths that exist receive a Grant(ReadExec) call; non-existent RO
+    /// paths are silently skipped.
+    #[test]
+    fn provision_ro_grant_existing_path_receives_read_exec() {
+        let ops = FakeOps::new();
+        let tmp = TempDir::new().unwrap();
+        let sid_out = tmp.path().join("sid.txt");
+        let cred_out = tmp.path().join("cred.json");
+
+        // Create an images dir (represents images_dir).
+        let images_dir = tmp.path().join("images");
+        std::fs::create_dir_all(&images_dir).unwrap();
+        // artifacts_dir does NOT exist — must be silently skipped.
+        let artifacts_dir = tmp.path().join("artifacts");
+
+        provision(
+            &ops,
+            "sb",
+            &[],
+            &[images_dir.clone(), artifacts_dir.clone()],
+            &sid_out,
+            &cred_out,
+        )
+        .expect("provision should succeed");
+
+        let calls = ops.recorded();
+        // Must have a Grant(ReadExec) for images_dir.
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, Call::Grant(p, _, lvl) if p == &images_dir && lvl == "ReadExec")
+            ),
+            "Grant(ReadExec) for images_dir must be recorded: {calls:?}"
+        );
+        // Must NOT have any Grant for artifacts_dir (path does not exist).
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::Grant(p, _, _) if p == &artifacts_dir)),
+            "Grant for non-existent artifacts_dir must be skipped: {calls:?}"
+        );
+    }
+
+    /// RO Grant(ReadExec) must come AFTER all RW Grant(Modify) calls.
+    #[test]
+    fn provision_ro_grant_after_rw_grant() {
+        let ops = FakeOps::new();
+        let tmp = TempDir::new().unwrap();
+        let sid_out = tmp.path().join("sid.txt");
+        let cred_out = tmp.path().join("cred.json");
+
+        let rw_path = tmp.path().join("sandbox");
+        let ro_path = tmp.path().join("images");
+        std::fs::create_dir_all(&rw_path).unwrap();
+        std::fs::create_dir_all(&ro_path).unwrap();
+
+        provision(
+            &ops,
+            "sb",
+            std::slice::from_ref(&rw_path),
+            std::slice::from_ref(&ro_path),
+            &sid_out,
+            &cred_out,
+        )
+        .expect("provision should succeed");
+
+        let calls = ops.recorded();
+        let rw_idx = calls
+            .iter()
+            .position(|c| matches!(c, Call::Grant(p, _, lvl) if p == &rw_path && lvl == "Modify"))
+            .expect("RW grant must be recorded");
+        let ro_idx = calls
+            .iter()
+            .position(|c| matches!(c, Call::Grant(p, _, lvl) if p == &ro_path && lvl == "ReadExec"))
+            .expect("RO grant must be recorded");
+        assert!(
+            ro_idx > rw_idx,
+            "RO grant must come after RW grant in call order"
         );
     }
 
@@ -625,6 +729,7 @@ mod tests {
         let err = provision(
             &ops,
             "sb",
+            &[],
             &[],
             &tmp.path().join("sid"),
             &tmp.path().join("cred"),
@@ -653,6 +758,7 @@ mod tests {
             &ops,
             "sb",
             &[],
+            &[],
             &tmp.path().join("sid"),
             &tmp.path().join("cred"),
         )
@@ -671,7 +777,7 @@ mod tests {
         );
     }
 
-    /// Step 2 = block fails (after create_account + hide + grant) → must roll
+    /// Step 2 = block fails (after create_account + hide, no grants) → must roll
     /// back: Unhide + DeleteAccount (no Unblock because block never succeeded).
     #[test]
     fn provision_fail_block_rolls_back_hide_and_account() {
@@ -681,6 +787,7 @@ mod tests {
         let err = provision(
             &ops,
             "sb",
+            &[],
             &[],
             &tmp.path().join("sid"),
             &tmp.path().join("cred"),
@@ -703,7 +810,7 @@ mod tests {
         );
     }
 
-    /// With one grant path: step 2 = grant fails → Unhide + DeleteAccount; no Unblock.
+    /// With one RW grant path: step 2 = grant fails → Unhide + DeleteAccount; no Unblock.
     #[test]
     fn provision_fail_grant_rolls_back_properly() {
         let ops = FakeOps::with_fail_at(2); // step 0=create,1=hide,2=grant
@@ -715,11 +822,53 @@ mod tests {
             &ops,
             "sb",
             &[grant_path],
+            &[],
             &tmp.path().join("sid"),
             &tmp.path().join("cred"),
         )
         .unwrap_err();
         assert!(err.contains("grant"), "error must mention grant: {err}");
+
+        let calls = ops.recorded();
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::Unhide(_))),
+            "Unhide must be called in rollback: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::DeleteAccount(_))),
+            "DeleteAccount must be called in rollback: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::Unblock(_))),
+            "Unblock must NOT be called (block never reached): {calls:?}"
+        );
+    }
+
+    /// An RO grant failure (existing path, grant returns error) must roll back
+    /// like a RW grant failure: Unhide + DeleteAccount, no Unblock.
+    #[test]
+    fn provision_fail_ro_grant_rolls_back_properly() {
+        // Steps: 0=create_account, 1=hide, 2=grant(RW), 3=grant(RO) — fail at 3.
+        let ops = FakeOps::with_fail_at(3);
+        let tmp = TempDir::new().unwrap();
+        let rw_path = tmp.path().join("sandbox");
+        std::fs::create_dir_all(&rw_path).unwrap();
+        let ro_path = tmp.path().join("images");
+        std::fs::create_dir_all(&ro_path).unwrap(); // must exist to be granted
+
+        let err = provision(
+            &ops,
+            "sb",
+            &[rw_path],
+            &[ro_path],
+            &tmp.path().join("sid"),
+            &tmp.path().join("cred"),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("grant-ro"),
+            "error must mention grant-ro: {err}"
+        );
 
         let calls = ops.recorded();
         assert!(
@@ -946,7 +1095,7 @@ mod tests {
         let sid_out = tmp.path().join("nonexistent_dir").join("sid.txt");
         let cred_out = tmp.path().join("cred.json");
 
-        let err = provision(&ops, "sb", &[], &sid_out, &cred_out).unwrap_err();
+        let err = provision(&ops, "sb", &[], &[], &sid_out, &cred_out).unwrap_err();
         assert!(err.contains("sid_out"), "error must mention sid_out: {err}");
 
         let calls = ops.recorded();
@@ -983,7 +1132,7 @@ mod tests {
         // Point cred_out at a path whose parent doesn't exist.
         let cred_out = tmp.path().join("nonexistent_dir").join("cred.json");
 
-        let err = provision(&ops, "sb", &[], &sid_out, &cred_out).unwrap_err();
+        let err = provision(&ops, "sb", &[], &[], &sid_out, &cred_out).unwrap_err();
         assert!(
             err.contains("cred_out"),
             "error must mention cred_out: {err}"

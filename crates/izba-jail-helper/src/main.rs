@@ -30,7 +30,13 @@ pub mod userlist;
 pub enum Verb {
     Provision {
         sandbox: String,
+        /// Paths that receive `Modify` (read/write) access — sandbox-specific
+        /// paths (workspace, sandbox dir, named volumes).
         grants: Vec<String>,
+        /// Paths that receive `ReadExec` (read-only) access — shared RO
+        /// artifacts: erofs base images (`images_dir`) and kernel/initrd
+        /// (`artifacts_dir`).
+        grants_ro: Vec<String>,
         sid_out: String,
         cred_out: String,
     },
@@ -49,7 +55,7 @@ pub enum Verb {
 /// The flag names here MUST match the argv builders in
 /// `izba-core/src/jail_account/builders.rs` exactly:
 ///
-/// - `provision --sandbox <name> --grant <path>… --sid-out <file> --cred-out <file>`
+/// - `provision --sandbox <name> --grant <path>… --grant-ro <path>… --sid-out <file> --cred-out <file>`
 /// - `deprovision --sandbox <name>`
 /// - `gc --live <name>…`
 pub fn parse_args(argv: &[String]) -> Result<Verb, String> {
@@ -71,6 +77,7 @@ pub fn parse_args(argv: &[String]) -> Result<Verb, String> {
 fn parse_provision(args: &[String]) -> Result<Verb, String> {
     let mut sandbox: Option<String> = None;
     let mut grants: Vec<String> = Vec::new();
+    let mut grants_ro: Vec<String> = Vec::new();
     let mut sid_out: Option<String> = None;
     let mut cred_out: Option<String> = None;
 
@@ -82,6 +89,9 @@ fn parse_provision(args: &[String]) -> Result<Verb, String> {
             }
             "--grant" => {
                 grants.push(it.next().ok_or("--grant requires a value")?.clone());
+            }
+            "--grant-ro" => {
+                grants_ro.push(it.next().ok_or("--grant-ro requires a value")?.clone());
             }
             "--sid-out" => {
                 sid_out = Some(it.next().ok_or("--sid-out requires a value")?.clone());
@@ -96,6 +106,7 @@ fn parse_provision(args: &[String]) -> Result<Verb, String> {
     Ok(Verb::Provision {
         sandbox: sandbox.ok_or("provision: --sandbox is required")?,
         grants,
+        grants_ro,
         sid_out: sid_out.ok_or("provision: --sid-out is required")?,
         cred_out: cred_out.ok_or("provision: --cred-out is required")?,
     })
@@ -170,9 +181,10 @@ fn dispatch(verb: Verb) -> Result<(), String> {
         Verb::Provision {
             sandbox,
             grants,
+            grants_ro,
             sid_out,
             cred_out,
-        } => handle_provision(sandbox, grants, sid_out, cred_out),
+        } => handle_provision(sandbox, grants, grants_ro, sid_out, cred_out),
         Verb::Deprovision { sandbox } => handle_deprovision(sandbox),
         Verb::Gc { live } => handle_gc(live),
     }
@@ -182,6 +194,7 @@ fn dispatch(verb: Verb) -> Result<(), String> {
 fn handle_provision(
     sandbox: String,
     grants: Vec<String>,
+    grants_ro: Vec<String>,
     sid_out: String,
     cred_out: String,
 ) -> Result<(), String> {
@@ -189,10 +202,12 @@ fn handle_provision(
     use std::path::{Path, PathBuf};
 
     let grant_paths: Vec<PathBuf> = grants.iter().map(PathBuf::from).collect();
+    let grant_ro_paths: Vec<PathBuf> = grants_ro.iter().map(PathBuf::from).collect();
     provision(
         &WinOps,
         &sandbox,
         &grant_paths,
+        &grant_ro_paths,
         Path::new(&sid_out),
         Path::new(&cred_out),
     )
@@ -241,6 +256,7 @@ mod tests {
             Verb::Provision {
                 sandbox: "my-sandbox".into(),
                 grants: vec!["/run/vm/my-sandbox".into()],
+                grants_ro: vec![],
                 sid_out: "/tmp/sid.txt".into(),
                 cred_out: "/tmp/cred.json".into(),
             }
@@ -286,8 +302,65 @@ mod tests {
         ]))
         .unwrap();
         match v {
-            Verb::Provision { grants, .. } => {
+            Verb::Provision {
+                grants, grants_ro, ..
+            } => {
                 assert!(grants.is_empty());
+                assert!(grants_ro.is_empty());
+            }
+            _ => panic!("expected Provision"),
+        }
+    }
+
+    #[test]
+    fn provision_grant_ro_parsed() {
+        let v = parse_args(&argv(&[
+            "provision",
+            "--sandbox",
+            "sb",
+            "--grant",
+            "/rw/sandbox",
+            "--grant-ro",
+            "/ro/images",
+            "--grant-ro",
+            "/ro/artifacts",
+            "--sid-out",
+            "/sid",
+            "--cred-out",
+            "/cred",
+        ]))
+        .unwrap();
+        match v {
+            Verb::Provision {
+                grants, grants_ro, ..
+            } => {
+                assert_eq!(grants, vec!["/rw/sandbox"]);
+                assert_eq!(grants_ro, vec!["/ro/images", "/ro/artifacts"]);
+            }
+            _ => panic!("expected Provision"),
+        }
+    }
+
+    #[test]
+    fn provision_grant_ro_only() {
+        let v = parse_args(&argv(&[
+            "provision",
+            "--sandbox",
+            "sb",
+            "--grant-ro",
+            "/ro/images",
+            "--sid-out",
+            "/sid",
+            "--cred-out",
+            "/cred",
+        ]))
+        .unwrap();
+        match v {
+            Verb::Provision {
+                grants, grants_ro, ..
+            } => {
+                assert!(grants.is_empty(), "no RW grants expected");
+                assert_eq!(grants_ro, vec!["/ro/images"]);
             }
             _ => panic!("expected Provision"),
         }

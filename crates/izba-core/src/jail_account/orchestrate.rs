@@ -95,7 +95,8 @@ pub enum LockdownOutcome {
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
 
-/// Compute the set of host paths the sandbox account must be able to read/write.
+/// Compute the set of host paths the sandbox account must be able to read/write
+/// (`Modify` DACL level).
 ///
 /// Returns `[workspace, sandbox_dir]` plus the image path for every
 /// **persistent** (named) volume.  Anonymous volumes live under `sandbox_dir`
@@ -115,6 +116,25 @@ pub fn compute_grants(config: &SandboxConfig, paths: &Paths, name: &str) -> Vec<
         }
     }
     grants
+}
+
+/// Compute the set of host paths the sandbox account must be able to read
+/// (read-only, `ReadExec` DACL level).
+///
+/// Returns those of `[images_dir, artifacts_dir]` that currently **exist** on
+/// disk.  These are shared, non-sensitive OCI base-image and kernel/initrd
+/// directories — granting read-only access to them does NOT weaken
+/// read-confinement of the per-sandbox account because they contain only
+/// pre-built artifact files, never the user's project workspace or credentials.
+///
+/// `artifacts_dir` may be absent on developer machines where kernel/initrd
+/// are sourced from another location; such absent paths are filtered out so
+/// provisioning does not fail on those hosts.
+pub fn compute_ro_grants(paths: &Paths) -> Vec<PathBuf> {
+    [paths.images_dir(), paths.artifacts_dir()]
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect()
 }
 
 // ── Orchestration functions ───────────────────────────────────────────────────
@@ -147,6 +167,7 @@ pub fn lockdown<B: LockdownBackend>(
         .ok_or_else(|| anyhow!("no config.json for sandbox {name:?}"))?;
 
     let grants = compute_grants(&config, paths, name);
+    let ro = compute_ro_grants(paths);
 
     // --- temporary output files for the helper ---
     let sid_out = sandbox_dir.join(".lockdown.sid.tmp");
@@ -157,7 +178,7 @@ pub fn lockdown<B: LockdownBackend>(
     let _ = std::fs::remove_file(&cred_out);
 
     // --- invoke the elevated helper ---
-    let argv = provision_argv(name, &grants, &sid_out, &cred_out);
+    let argv = provision_argv(name, &grants, &ro, &sid_out, &cred_out);
     match backend
         .elevate(&argv)
         .map_err(|e| anyhow!("elevate provision: {e}"))?
@@ -475,6 +496,52 @@ mod tests {
             volumes,
         };
         core_save_json(&sandbox_dir.join(CONFIG_FILE), &cfg).unwrap();
+    }
+
+    // ── compute_ro_grants ─────────────────────────────────────────────────────
+
+    #[test]
+    fn compute_ro_grants_returns_existing_images_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+
+        // Create images dir but not artifacts dir.
+        let images = paths.images_dir();
+        std::fs::create_dir_all(&images).unwrap();
+
+        let ro = compute_ro_grants(&paths);
+        assert!(
+            ro.contains(&images),
+            "existing images_dir must be in RO grants: {ro:?}"
+        );
+        // artifacts_dir does not exist → must be filtered out.
+        assert!(
+            !ro.contains(&paths.artifacts_dir()),
+            "non-existent artifacts_dir must not appear in RO grants: {ro:?}"
+        );
+    }
+
+    #[test]
+    fn compute_ro_grants_returns_both_when_both_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+
+        std::fs::create_dir_all(paths.images_dir()).unwrap();
+        std::fs::create_dir_all(paths.artifacts_dir()).unwrap();
+
+        let ro = compute_ro_grants(&paths);
+        assert!(ro.contains(&paths.images_dir()));
+        assert!(ro.contains(&paths.artifacts_dir()));
+        assert_eq!(ro.len(), 2);
+    }
+
+    #[test]
+    fn compute_ro_grants_empty_when_neither_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        // Neither images nor artifacts dir created.
+        let ro = compute_ro_grants(&paths);
+        assert!(ro.is_empty(), "must be empty when no dirs exist: {ro:?}");
     }
 
     // ── compute_grants ────────────────────────────────────────────────────────
