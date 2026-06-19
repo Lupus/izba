@@ -357,7 +357,9 @@ $lkVmmOwnerOk = $false
 $lkStateFile  = "$env:LOCALAPPDATA\izba\sandboxes\$lkName\state.json"
 if (Test-Path $lkStateFile) {
     $lkState = Get-Content $lkStateFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-    $lkVmmPid = $lkState.vmm_pid
+    # state.json's vmm_pid is a PidIdentity object { pid, starttime }; WMI wants
+    # the integer pid. (Tolerate a bare int too, for forward-compat.)
+    $lkVmmPid = if ($null -ne $lkState.vmm_pid.pid) { $lkState.vmm_pid.pid } else { $lkState.vmm_pid }
     if ($lkVmmPid) {
         $lkProc = Get-CimInstance Win32_Process -Filter "ProcessId=$lkVmmPid" -ErrorAction SilentlyContinue
         if ($lkProc) {
