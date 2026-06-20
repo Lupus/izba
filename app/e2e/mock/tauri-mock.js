@@ -113,7 +113,11 @@
       case "policy_show":
         calls.push("policy_show:" + args.name);
         return Promise.resolve(
-          (scenario.policy && scenario.policy[args.name]) || { enforcing: false, allow: [] }
+          (scenario.policy && scenario.policy[args.name]) || {
+            enforcing: false,
+            allow: [],
+            git: [],
+          }
         );
       case "policy_allow":
         calls.push("policy_allow:" + args.name + ":" + args.host + ":" + args.port);
