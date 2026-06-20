@@ -18,7 +18,9 @@ export default defineConfig({
     { name: "webkit", use: { ...devices["Desktop Safari"] } },
   ],
   webServer: {
-    command: `npm run preview -- --port ${PORT} --strictPort`,
+    // Build first so a clean tree never serves a stale/absent dist/. In CI the
+    // dist/ already exists from the build step; this rebuild is cheap.
+    command: `npm run build && npm run preview -- --port ${PORT} --strictPort`,
     url: `http://localhost:${PORT}`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

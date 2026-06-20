@@ -28,6 +28,19 @@
   const listeners = new Map(); // event name -> Set<handler id>
   let deferredCreate = null;
 
+  // The event module's unlisten() calls
+  // __TAURI_EVENT_PLUGIN_INTERNALS__.unregisterListener(event, id) BEFORE the
+  // `plugin:event|unlisten` invoke (see @tauri-apps/api/event.js), so the real
+  // mocks.js defines it too. Without it every unlisten throws (e.g. NewSandbox
+  // dialog cleanup). Drop both the global handler and the registry entry.
+  const eventInternals = (window.__TAURI_EVENT_PLUGIN_INTERNALS__ =
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ || {});
+  eventInternals.unregisterListener = function (event, id) {
+    const set = listeners.get(event);
+    if (set) set.delete(id);
+    Reflect.deleteProperty(window, "_" + id);
+  };
+
   function err(msg) {
     return Promise.reject(new Error(msg));
   }
