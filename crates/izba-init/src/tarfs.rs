@@ -899,9 +899,10 @@ mod tests {
 
     // ── Property tests ──────────────────────────────────────────────────────
 
-    /// Build a malicious raw tar entry: writes the name bytes directly into the
-    /// GNU header (bypassing tar's own path-safety checks) and appends the
-    /// entry. This is the same technique used in `extract_rejects_escaping_entry`.
+    /// Build a malicious raw regular-file entry: writes the name bytes directly
+    /// into the GNU header (bypassing tar's own path-safety checks) and appends
+    /// the entry. This is the same technique used in
+    /// `extract_rejects_escaping_entry`.
     fn forge_entry(name_bytes: &[u8], data: &[u8]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
         let mut h = tar::Header::new_gnu();
@@ -915,6 +916,60 @@ mod tests {
         h.set_cksum();
         b.append(&h, data).unwrap();
         b.into_inner().unwrap()
+    }
+
+    /// Build a malicious raw symlink entry: writes `name_bytes` as the entry
+    /// name and `link_bytes` as the link target, both directly into the GNU
+    /// header (bypassing tar's path-safety checks). Used to forge symlinks with
+    /// hazardous targets (absolute paths, `..`-escaping) without tar rejecting
+    /// them during construction.
+    fn forge_symlink_entry(name_bytes: &[u8], link_bytes: &[u8]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        h.set_mtime(0);
+        let gnu = h.as_gnu_mut().unwrap();
+        let name_copy = name_bytes.len().min(gnu.name.len() - 1);
+        gnu.name[..name_copy].copy_from_slice(&name_bytes[..name_copy]);
+        let link_copy = link_bytes.len().min(gnu.linkname.len() - 1);
+        gnu.linkname[..link_copy].copy_from_slice(&link_bytes[..link_copy]);
+        h.set_cksum();
+        b.append(&h, &[][..]).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    /// Append a raw regular-file entry (with forged name bytes) onto an
+    /// existing `tar::Builder<Vec<u8>>`. Used when building multi-entry archives.
+    fn append_forge_entry(b: &mut tar::Builder<Vec<u8>>, name_bytes: &[u8], data: &[u8]) {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_mtime(0);
+        let gnu = h.as_gnu_mut().unwrap();
+        let copy_len = name_bytes.len().min(gnu.name.len() - 1);
+        gnu.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        h.set_cksum();
+        b.append(&h, data).unwrap();
+    }
+
+    /// Append a raw symlink entry (with forged name and link bytes) onto an
+    /// existing `tar::Builder<Vec<u8>>`.
+    fn append_forge_symlink(b: &mut tar::Builder<Vec<u8>>, name_bytes: &[u8], link_bytes: &[u8]) {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        h.set_mtime(0);
+        let gnu = h.as_gnu_mut().unwrap();
+        let name_copy = name_bytes.len().min(gnu.name.len() - 1);
+        gnu.name[..name_copy].copy_from_slice(&name_bytes[..name_copy]);
+        let link_copy = link_bytes.len().min(gnu.linkname.len() - 1);
+        gnu.linkname[..link_copy].copy_from_slice(&link_bytes[..link_copy]);
+        h.set_cksum();
+        b.append(&h, &[][..]).unwrap();
     }
 
     /// Walk `start` recursively; return absolute paths of every filesystem
@@ -960,15 +1015,133 @@ mod tests {
         ]
     }
 
-    /// Returns true if `name_bytes` contains a byte sequence that constitutes
-    /// a lexical escape attempt: a `..` component, a leading `/`, or a
-    /// path component that looks like `/` absolute path.
-    fn is_known_lexical_escape(name_bytes: &[u8]) -> bool {
-        if name_bytes.starts_with(b"/") {
-            return true;
+    /// Hazardous symlink TARGETS: absolute paths and relative-escaping paths
+    /// that a malicious archive might use to plant a symlink pointing outside
+    /// the root.
+    fn hazardous_symlink_targets() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            // absolute — chroot-semantics clamp these inside root
+            Just(b"/etc/passwd".to_vec()),
+            Just(b"/secret".to_vec()),
+            // relative-escaping (above parent of root — the deepest threat)
+            Just(b"../../x".to_vec()),
+            Just(b"../../../escape".to_vec()),
+            // relative non-escaping (in-root; allowed content)
+            Just(b"safe_target".to_vec()),
+            Just(b"a/b".to_vec()),
+        ]
+    }
+
+    /// The archive shape to feed to the containment property. Covers:
+    ///   A) single regular file with hazardous name (original vector)
+    ///   B) single symlink with hazardous target
+    ///   C) plant-then-write-through: symlink with hazardous target, then a
+    ///      regular file AT THE SAME NAME (write-through attack — the production
+    ///      code defends against this by replacing the symlink, not following it)
+    ///   D) out-of-order: regular file whose parent dir was never emitted
+    ///      (a common adversarial archive construction)
+    #[derive(Debug, Clone)]
+    enum ContainmentArchive {
+        /// Single regular file entry with a forged (possibly hazardous) name.
+        SingleFile { name: Vec<u8> },
+        /// Single symlink entry with a safe name but hazardous target.
+        SingleSymlink { name: Vec<u8>, target: Vec<u8> },
+        /// Plant-then-write-through: symlink(name→hazardous_target) followed
+        /// by a regular file at the same name.  The production code must replace
+        /// the symlink rather than writing through it.
+        PlantThenWriteThrough { name: Vec<u8>, target: Vec<u8> },
+        /// Regular file whose parent directory was never emitted (out-of-order).
+        OutOfOrderChild {
+            parent: Vec<u8>,
+            child_name: Vec<u8>,
+        },
+    }
+
+    fn arb_containment_archive() -> impl Strategy<Value = ContainmentArchive> {
+        prop_oneof![
+            // A: single file with hazardous name
+            hazardous_entry_names().prop_map(|name| ContainmentArchive::SingleFile { name }),
+            // B: symlink with hazardous target
+            (hazardous_entry_names(), hazardous_symlink_targets())
+                .prop_map(|(name, target)| ContainmentArchive::SingleSymlink { name, target }),
+            // C: plant-then-write-through (core symlink attack class)
+            (
+                prop::sample::select(vec![
+                    b"f".to_vec(),
+                    b"a".to_vec(),
+                    b"b".to_vec(),
+                    b"link".to_vec(),
+                ]),
+                hazardous_symlink_targets(),
+            )
+                .prop_map(|(name, target)| ContainmentArchive::PlantThenWriteThrough {
+                    name,
+                    target,
+                }),
+            // D: out-of-order (child before parent dir)
+            (
+                prop::sample::select(vec![b"missing_parent".to_vec(), b"no_such_dir".to_vec(),]),
+                prop::sample::select(vec![b"child.txt".to_vec(), b"x".to_vec()]),
+            )
+                .prop_map(|(parent, child_name)| ContainmentArchive::OutOfOrderChild {
+                    parent,
+                    child_name,
+                }),
+        ]
+    }
+
+    /// Build the raw tar bytes for a `ContainmentArchive` variant.
+    fn build_containment_archive(ca: &ContainmentArchive) -> Vec<u8> {
+        match ca {
+            ContainmentArchive::SingleFile { name } => forge_entry(name, b"payload"),
+            ContainmentArchive::SingleSymlink { name, target } => forge_symlink_entry(name, target),
+            ContainmentArchive::PlantThenWriteThrough { name, target } => {
+                // Two entries: first a symlink(name→target), then a regular
+                // file at the same name.  The extractor must replace the symlink
+                // rather than following it to write outside root.
+                let mut b = tar::Builder::new(Vec::new());
+                append_forge_symlink(&mut b, name, target);
+                append_forge_entry(&mut b, name, b"overwrite");
+                b.into_inner().unwrap()
+            }
+            ContainmentArchive::OutOfOrderChild { parent, child_name } => {
+                // Child path "parent/child_name" with no prior directory entry
+                // for "parent".
+                let mut full_path = parent.clone();
+                full_path.push(b'/');
+                full_path.extend_from_slice(child_name);
+                forge_entry(&full_path, b"orphan")
+            }
         }
-        let s = std::str::from_utf8(name_bytes).unwrap_or("");
-        s.split('/').any(|c| c == "..")
+    }
+
+    /// Returns true if the archive contains an entry (by name or link) that
+    /// constitutes a known lexical escape attempt.
+    fn archive_has_lexical_escape(ca: &ContainmentArchive) -> bool {
+        let name_escapes = |name: &[u8]| -> bool {
+            if name.starts_with(b"/") {
+                return true;
+            }
+            let s = std::str::from_utf8(name).unwrap_or("");
+            s.split('/').any(|c| c == "..")
+        };
+        match ca {
+            ContainmentArchive::SingleFile { name } => name_escapes(name),
+            // A symlink entry's NAME is safe (we use plain names for B/C); the
+            // *target* may escape but that is allowed content, not a name escape.
+            ContainmentArchive::SingleSymlink { name, .. } => name_escapes(name),
+            // The symlink name in PlantThenWriteThrough is always a safe ASCII
+            // identifier, so no lexical escape in the entry names themselves.
+            ContainmentArchive::PlantThenWriteThrough { .. } => false,
+            // Out-of-order: "parent/child" — no `..` components.
+            ContainmentArchive::OutOfOrderChild { .. } => false,
+        }
+    }
+
+    /// Returns true if the archive is expected to always return Err (even if no
+    /// lexical escape in entry names) — e.g. out-of-order archives.
+    fn archive_always_errors(ca: &ContainmentArchive) -> bool {
+        matches!(ca, ContainmentArchive::OutOfOrderChild { .. })
     }
 
     proptest! {
@@ -979,65 +1152,92 @@ mod tests {
         /// is allowed as content; what is forbidden is a real object (file, dir,
         /// symlink) whose *location* is outside the root.
         ///
-        /// Additionally, any archive entry that contains a known lexical escape
-        /// (`..` or leading `/`) MUST result in `Err(BadRequest)` — never a
-        /// silent Ok. This second assertion is the one that becomes non-vacuous
-        /// when `reject_lexical_escape` is weakened (RESOLVE_IN_ROOT clamps the
-        /// filesystem escape, but the spec requires the observable Err).
+        /// The generator covers four attack classes:
+        ///   A) Regular file with hazardous name (`..`/absolute — original vector)
+        ///   B) Symlink with hazardous target (absolute or `..`-escaping)
+        ///   C) Plant-then-write-through: first plant a symlink(name→escape_target),
+        ///      then write a regular file at the same name — the extractor must
+        ///      REPLACE the symlink rather than follow it.
+        ///   D) Out-of-order: regular file whose parent dir was never emitted.
+        ///
+        /// The root is nested three levels deep inside the tempdir (`<tmp>/a/b/root`)
+        /// so that a `../../x` escape from root lands in `<tmp>/a/`, which is still
+        /// INSIDE the walked tree — making the location assertion catch above-parent
+        /// escapes, not just the single-parent-level ones.
+        ///
+        /// Additionally, any archive entry with a lexical escape in its name
+        /// (`..'` component or leading `/`) MUST result in `Err(BadRequest)`.
+        /// This assertion becomes non-vacuous when `reject_lexical_escape` is
+        /// weakened: RESOLVE_IN_ROOT clamps the path but doesn't error.
         #[test]
-        fn prop_containment_no_escape(name in hazardous_entry_names()) {
-            // Two-level tempdir: outer is the parent of root; secret lives in
-            // the outer but outside root. Nothing must be written to the outer
-            // or above it.
+        fn prop_containment_no_escape(ca in arb_containment_archive()) {
+            // Nest root three levels deep: <tmp>/a/b/root
+            // A "../../x" escape from root lands in <tmp>/a/ — still inside the
+            // walked tree rooted at <tmp>/a/ (the walk starts at <tmp>/a/).
+            // Sentinels are placed at every level so any out-of-root write is caught.
             let outer = tempfile::tempdir().unwrap();
-            let root = outer.path().join("root");
+            // Walk starts here so ../../ escapes from root land inside it.
+            let walk_top = outer.path().join("a");
+            let root = walk_top.join("b").join("root");
             fs::create_dir_all(&root).unwrap();
-            // A sentinel file in the outer so we can detect writes there.
-            let sentinel = outer.path().join("sentinel.txt");
-            fs::write(&sentinel, b"untouched").unwrap();
 
-            let archive = forge_entry(&name, b"payload");
+            // Sentinels at each non-root level so we detect writes anywhere above root.
+            let sentinel_a = walk_top.join("sentinel_a.txt");
+            let sentinel_b = walk_top.join("b").join("sentinel_b.txt");
+            fs::write(&sentinel_a, b"untouched_a").unwrap();
+            fs::write(&sentinel_b, b"untouched_b").unwrap();
+
+            let archive = build_containment_archive(&ca);
             let result = extract(&root, "/", &mut &archive[..]);
 
-            // Walk everything in the OUTER directory (one level up from root).
-            // Any path that is NOT under root (and not the sentinel itself which
-            // was there before) is an escape.
-            let all = walk_all(outer.path());
+            // Walk everything under walk_top (<tmp>/a).
+            // Anything not under root (and not a pre-placed sentinel/dir) is an escape.
+            let all = walk_all(&walk_top);
             for p in &all {
-                // The root itself and things under it are fine.
                 if p.starts_with(&root) {
                     continue;
                 }
-                // The sentinel we placed (pre-existing) is fine.
-                if p == &sentinel {
+                // Pre-placed sentinels and their ancestor directories are fine.
+                if p == &sentinel_a || p == &sentinel_b {
                     continue;
                 }
-                // The root directory entry itself is fine.
-                if *p == outer.path().join("root") {
+                // The b/ and root/ directory entries themselves are fine.
+                if *p == walk_top.join("b") || *p == root {
                     continue;
                 }
                 panic!(
-                    "ESCAPE DETECTED: path {:?} exists outside root {:?}",
-                    p, root
+                    "ESCAPE DETECTED: path {:?} exists outside root {:?} (archive={:?})",
+                    p, root, ca
                 );
             }
-            // The sentinel must be untouched.
+            // Sentinels must be untouched.
             prop_assert_eq!(
-                fs::read(&sentinel).unwrap(),
-                b"untouched",
-                "sentinel was modified — escape occurred"
+                fs::read(&sentinel_a).unwrap(),
+                b"untouched_a",
+                "sentinel_a was modified — escape occurred (archive={:?})",
+                ca
             );
-            // An entry with a lexical escape attempt (`..'` component or leading
-            // `/`) MUST surface as Err(BadRequest) — never a silent Ok.
-            // This is the assertion that makes the property non-vacuous with
-            // respect to `reject_lexical_escape`: removing that check allows
-            // a silent Ok (RESOLVE_IN_ROOT clamps the path but doesn't error).
-            if is_known_lexical_escape(&name) {
+            prop_assert_eq!(
+                fs::read(&sentinel_b).unwrap(),
+                b"untouched_b",
+                "sentinel_b was modified — escape occurred (archive={:?})",
+                ca
+            );
+            // An entry with a lexical escape attempt in its NAME MUST return BadRequest.
+            if archive_has_lexical_escape(&ca) {
                 prop_assert!(
                     matches!(result, Err((ErrorKind::BadRequest, _))),
-                    "lexical escape {:?} must return BadRequest, got {:?}",
-                    String::from_utf8_lossy(&name),
-                    result.err()
+                    "lexical escape must return BadRequest, got {:?} (archive={:?})",
+                    result.err(),
+                    ca
+                );
+            }
+            // Out-of-order archives always error.
+            if archive_always_errors(&ca) {
+                prop_assert!(
+                    result.is_err(),
+                    "out-of-order archive must return Err, got Ok (archive={:?})",
+                    ca
                 );
             }
         }
