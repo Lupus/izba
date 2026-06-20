@@ -13,6 +13,7 @@ cd "$(dirname "$0")/.."
 
 BASE_REF="${1:?usage: mutants-gate.sh <base_ref>}"
 OUT="$(mktemp -d)"
+trap 'rm -rf "$OUT"' EXIT   # mutants.out can be hundreds of MB; clean up on any exit
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
 # Produce this platform's mutants.out (exits 1 on a baseline failure).
