@@ -133,7 +133,7 @@ describe("VolumesTab — Save: detach a removed seeded volume", () => {
     await screen.findByText(/\/data/);
 
     // Remove the seeded row
-    fireEvent.click(screen.getByRole("button", { name: /remove.*\/data/i }));
+    fireEvent.click(screen.getByRole("button", { name: /detach.*\/data/i }));
 
     // Banner should appear
     expect(screen.getByText(/applied on next restart/i)).toBeInTheDocument();
@@ -405,5 +405,23 @@ describe("VolumesTab — 3-way volume type selector", () => {
     // "cache" is already seeded, should not appear
     expect(optTexts.some(t => t?.includes("archive"))).toBe(true);
     expect(optTexts.some(t => t?.includes("cache"))).toBe(false);
+  });
+});
+
+describe("VolumesTab — persistent caveat tooltip", () => {
+  it("persistent tag has single-writer tooltip, not a visible paragraph", async () => {
+    inspect.mockResolvedValue(makeDetail({
+      volumes: [
+        { name: "cache", guest_path: "/data", size_bytes: 1073741824 },
+        { name: "other", guest_path: "/other", size_bytes: 1073741824 },
+      ],
+    }));
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await screen.findAllByText("persistent");
+    // The caveat text must NOT be a visible paragraph (not in the document)
+    expect(screen.queryByText(/single-writer/i)).not.toBeInTheDocument();
+    // The badge must carry the tooltip
+    const badges = screen.getAllByText("persistent");
+    expect(badges[0]).toHaveAttribute("title", expect.stringMatching(/single-writer/i));
   });
 });
