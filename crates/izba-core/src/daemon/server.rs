@@ -539,9 +539,19 @@ fn handle_port_unpublish(
     host_port: u16,
 ) -> anyhow::Result<DaemonResponse> {
     sandbox_must_exist(&d.paths, &name)?;
-    d.relays.unpublish(&name, bind, host_port)?;
-    relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
-    unpersist_port_rule(&d.paths, &name, bind, host_port)?;
+    // Always drop the persisted rule from config — works even when the sandbox
+    // is stopped (the relay map has no entry), so a persisted-only port can be
+    // removed. (Greptile P1.)
+    let unpersisted = unpersist_port_rule(&d.paths, &name, bind, host_port)?;
+    // Tear down a live relay if one exists; a missing relay (stopped sandbox /
+    // post-restart) is NOT an error.
+    let relay_removed = d.relays.unpublish(&name, bind, host_port).is_ok();
+    if relay_removed {
+        relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+    }
+    if !unpersisted && !relay_removed {
+        bail!("no such published port: {bind}:{host_port}");
+    }
     Ok(DaemonResponse::Ok)
 }
 
@@ -569,17 +579,18 @@ fn unpersist_port_rule(
     name: &str,
     bind: std::net::Ipv4Addr,
     host_port: u16,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let p = paths.sandbox_dir(name).join(CONFIG_FILE);
     let mut cfg: SandboxConfig =
         load_json(&p)?.with_context(|| format!("no config for '{name}'"))?;
     let before = cfg.ports.len();
     cfg.ports
         .retain(|r| !(r.bind == bind && r.host_port == host_port));
-    if cfg.ports.len() != before {
+    let removed = cfg.ports.len() != before;
+    if removed {
         crate::state::save_json(&p, &cfg)?;
     }
-    Ok(())
+    Ok(removed)
 }
 
 fn handle_volume_list(d: &Arc<Daemon>) -> anyhow::Result<DaemonResponse> {
@@ -1699,6 +1710,58 @@ mod tests {
 
         let ports = load_persisted_ports(&paths, "sb");
         assert_eq!(ports, vec![r2], "only r2 must remain, got: {ports:?}");
+    }
+
+    // ── FIX 1 (Greptile P1): port_unpublish works on stopped sandbox ──────────
+    //
+    // These tests call handle_port_unpublish directly — no relay bind needed —
+    // so they work even in sandboxed environments that deny TcpListener::bind.
+    // Mirrors the adopt_rebuilds_view… and persist_port_rule_* test patterns.
+
+    /// A stopped sandbox (no relay ever started) with a persisted port rule:
+    /// handle_port_unpublish must return Ok and remove the persisted rule.
+    #[test]
+    fn port_unpublish_removes_persisted_rule_when_stopped() {
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        let bind: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let host_port = 8080u16;
+        let r = port_rule("127.0.0.1", host_port, 80);
+        // Persist a rule directly into config (simulates a rule saved at publish time).
+        persist_port_rule(&paths, "sb", &r).unwrap();
+        assert_eq!(load_persisted_ports(&paths, "sb"), vec![r.clone()]);
+
+        // Build a daemon (no relay published — sandbox is "stopped").
+        let d = Arc::new(Daemon::new(paths.clone(), test_deps()));
+        // handle_port_unpublish must succeed and remove the persisted rule.
+        let result = handle_port_unpublish(&d, "sb".into(), bind, host_port);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+
+        let remaining = load_persisted_ports(&paths, "sb");
+        assert!(
+            remaining.is_empty(),
+            "persisted rule must be removed, got: {remaining:?}"
+        );
+    }
+
+    /// No persisted rule AND no live relay → handle_port_unpublish must return
+    /// an error containing "no such published port".
+    #[test]
+    fn port_unpublish_unknown_rule_errors() {
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        let bind: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let host_port = 9999u16;
+        // Nothing persisted, no relay running.
+        let d = Arc::new(Daemon::new(paths.clone(), test_deps()));
+        let result = handle_port_unpublish(&d, "sb".into(), bind, host_port);
+        let err = result.expect_err("expected Err for unknown port");
+        assert!(
+            err.to_string().contains("no such published port"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
