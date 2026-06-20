@@ -213,6 +213,16 @@ These need the Bash sandbox disabled and a `gh` token with `repo`+`workflow`
 scope; the Windows-host build path (`powershell.exe`, `/mnt/c`, `~/.cache`) is
 likewise unsandboxed.
 
+**CI not starting ⇒ it's a MERGE CONFLICT, never an Actions quota.** izba is a
+public OSS repo with **no GitHub Actions minutes/spending limits**. If a PR's
+required checks won't start — `gh pr checks` shows only "Greptile Review" (a
+GitHub App, not Actions), `mergeStateStatus` is `DIRTY`, and no new Actions runs
+appear repo-wide after a push — GitHub is holding them under "Checks awaiting
+conflict resolution" until the conflict is fixed. Do NOT diagnose this as a
+billing/quota issue. Check `gh pr view <n> --json mergeStateStatus,mergeable`,
+then rebase on `origin/main`, resolve, and `git push --force-with-lease` to clear
+the hold.
+
 **Standard delivery loop for a feature branch:**
 
 1. Push the branch, open/refresh its PR, and start CI.
