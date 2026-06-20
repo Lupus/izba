@@ -59,7 +59,7 @@ jobs:
       # webkit (≈ WebKitGTK) approximate both real webview engine families.
       - name: install Playwright browsers (chromium + webkit)
         working-directory: app
-        run: npx playwright install --with-deps chromium webkit
+        run: npm run e2e:install
       - name: Playwright e2e (chromium + webkit)
         working-directory: app
         run: npm run e2e
@@ -103,7 +103,7 @@ jobs:
       # webkit coverage comes from the linux job.
       - name: install Playwright browser (chromium)
         working-directory: app
-        run: npx playwright install chromium
+        run: npm run e2e:install:chromium
       - name: Playwright e2e (chromium)
         working-directory: app
         run: npm run e2e -- --project=chromium
