@@ -1,0 +1,19 @@
+[package]
+name = "izba-core-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+izba-core = { path = ".." }
+
+# Fuzz targets are binaries — not part of the workspace, not tested, not documented.
+[[bin]]
+name = "flatten"
+path = "fuzz_targets/flatten.rs"
+test = false
+doc = false

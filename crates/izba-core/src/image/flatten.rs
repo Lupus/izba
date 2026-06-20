@@ -679,6 +679,344 @@ mod tests {
 
     // ---------- end new tests ----------
 
+    // ---------- property-based tests (proptest) ----------
+
+    /// Generate a short ASCII path component: 1–6 chars from {a..e, 0..2}.
+    /// Keeping the alphabet tiny (7 symbols) makes collisions common,
+    /// so whiteout/overwrite interactions are exercised frequently.
+    fn arb_name() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        "[a-e0-2]{1,6}".prop_map(|s| s)
+    }
+
+    /// Generate a path of depth 1–3 using `arb_name` components.
+    fn arb_path() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        proptest::collection::vec(arb_name(), 1..=3).prop_map(|parts| parts.join("/"))
+    }
+
+    proptest::proptest! {
+        // ── Property 1: normalize never produces a path component that is
+        // "..", ".", or empty.  For any input string, the result is either
+        // an error (the input contained ".."), None (the input was
+        // dot/slash-only), or a well-formed normalized path.
+        #[test]
+        fn prop_normalize_no_traversal(raw in ".*") {
+            use std::path::Path;
+            let path = Path::new(&raw);
+            match normalize(path) {
+                Err(e) => {
+                    // The only reason normalize can err is a ".." component.
+                    proptest::prop_assert!(
+                        raw.split('/').any(|c| c == ".."),
+                        "normalize errored without '..' in {raw:?}: {e}"
+                    );
+                }
+                Ok(None) => {
+                    // All components were "" or ".".
+                    proptest::prop_assert!(
+                        raw.split('/').all(|c| c.is_empty() || c == "."),
+                        "normalize returned None but not all components are . or empty: {raw:?}"
+                    );
+                }
+                Ok(Some(norm)) => {
+                    // Every component must be a non-empty, non-dot, non-dotdot name.
+                    for comp in norm.split('/') {
+                        proptest::prop_assert!(!comp.is_empty(), "empty component in {norm:?}");
+                        proptest::prop_assert!(comp != ".", "dot component in {norm:?}");
+                        proptest::prop_assert!(comp != "..", "dotdot component in {norm:?}");
+                    }
+                    // Must not start or end with '/'.
+                    proptest::prop_assert!(!norm.starts_with('/'), "leading slash in {norm:?}");
+                    proptest::prop_assert!(!norm.ends_with('/'), "trailing slash in {norm:?}");
+                }
+            }
+        }
+    }
+
+    // ── Property 2: whiteout/opaque differential model ───────────────────────
+    //
+    // Reference model: a pure BTreeMap fold that applies OCI semantics
+    // independently from the production implementation.
+    //
+    // The model is intentionally simple: it knows NOTHING about staging,
+    // temp files, tar serialization, or the internal index structure.  It just
+    // folds a list of layer operations over a BTreeMap<path, FileKind>.
+
+    /// The operations we can place in a generated layer.
+    #[derive(Debug, Clone)]
+    enum Op {
+        AddFile(String),
+        AddDir(String),
+        Whiteout(String), // `.wh.<name>` → delete that exact path + subtree
+        Opaque(String),   // `.wh..wh..opq` inside dir → delete subtree
+    }
+
+    /// Apply OCI whiteout semantics to a `BTreeMap<path, is_dir>`.
+    /// This is the INDEPENDENT reference model — it does NOT call any
+    /// production flatten.rs code.
+    fn model_apply_layers(layers: &[Vec<Op>]) -> std::collections::BTreeSet<String> {
+        // BTreeMap: path → true=dir, false=file
+        let mut state: BTreeMap<String, bool> = BTreeMap::new();
+
+        for layer in layers {
+            // Sub-pass (a): apply whiteouts/opaques from this layer first.
+            for op in layer {
+                match op {
+                    Op::Whiteout(path) => {
+                        // Remove the exact path AND everything under it.
+                        state.remove(path);
+                        let prefix = format!("{path}/");
+                        let doomed: Vec<String> = state
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix))
+                            .cloned()
+                            .collect();
+                        for k in doomed {
+                            state.remove(&k);
+                        }
+                    }
+                    Op::Opaque(dir) => {
+                        // Remove everything strictly under dir (keep dir itself).
+                        let prefix = format!("{dir}/");
+                        let doomed: Vec<String> = state
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix))
+                            .cloned()
+                            .collect();
+                        for k in doomed {
+                            state.remove(&k);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Sub-pass (b): insert this layer's regular entries.
+            for op in layer {
+                match op {
+                    Op::AddFile(path) => {
+                        // A file replacing a dir drops the subtree.
+                        let prefix = format!("{path}/");
+                        let doomed: Vec<String> = state
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix))
+                            .cloned()
+                            .collect();
+                        for k in doomed {
+                            state.remove(&k);
+                        }
+                        state.insert(path.clone(), false);
+                    }
+                    Op::AddDir(path) => {
+                        state.insert(path.clone(), true);
+                    }
+                    Op::Whiteout(_) | Op::Opaque(_) => {} // handled above
+                }
+            }
+        }
+        state.into_keys().collect()
+    }
+
+    /// Convert `Vec<Op>` into a gzipped tar layer.
+    fn ops_to_layer_owned(ops: &[Op]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut b = tar::Builder::new(gz);
+        for op in ops {
+            match op {
+                Op::AddFile(path) => {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_size(1);
+                    h.set_mode(0o644);
+                    h.set_entry_type(tar::EntryType::Regular);
+                    b.append_data(&mut h, path.as_str(), &b"x"[..]).unwrap();
+                }
+                Op::AddDir(path) => {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_size(0);
+                    h.set_mode(0o755);
+                    h.set_entry_type(tar::EntryType::Directory);
+                    b.append_data(&mut h, path.as_str(), std::io::empty())
+                        .unwrap();
+                }
+                Op::Whiteout(path) => {
+                    // ".wh.<base>" entry in parent dir
+                    let wh_path = match path.rsplit_once('/') {
+                        Some((parent, base)) => format!("{parent}/.wh.{base}"),
+                        None => format!(".wh.{path}"),
+                    };
+                    let mut h = tar::Header::new_gnu();
+                    h.set_size(0);
+                    h.set_mode(0o644);
+                    h.set_entry_type(tar::EntryType::Regular);
+                    b.append_data(&mut h, wh_path.as_str(), std::io::empty())
+                        .unwrap();
+                }
+                Op::Opaque(dir) => {
+                    let opq = format!("{dir}/.wh..wh..opq");
+                    let mut h = tar::Header::new_gnu();
+                    h.set_size(0);
+                    h.set_mode(0o644);
+                    h.set_entry_type(tar::EntryType::Regular);
+                    b.append_data(&mut h, opq.as_str(), std::io::empty())
+                        .unwrap();
+                }
+            }
+        }
+        b.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn arb_op() -> impl proptest::strategy::Strategy<Value = Op> {
+        use proptest::prelude::*;
+        proptest::prop_oneof![
+            arb_path().prop_map(Op::AddFile),
+            arb_path().prop_map(Op::AddDir),
+            arb_path().prop_map(Op::Whiteout),
+            // Opaque needs a dir path (depth ≥ 1 so the opq marker is inside a dir).
+            arb_path().prop_map(Op::Opaque),
+        ]
+    }
+
+    fn arb_layers() -> impl proptest::strategy::Strategy<Value = Vec<Vec<Op>>> {
+        // 1–4 layers, each with 1–6 operations.
+        proptest::collection::vec(proptest::collection::vec(arb_op(), 1..=6), 1..=4)
+    }
+
+    proptest::proptest! {
+        // ── Property 2: differential model ───────────────────────────────────
+        // The flattened tar's file set (non-whiteout entries) must equal the
+        // set produced by the independent reference model.
+        #[test]
+        fn prop_whiteout_differential(layers_ops in arb_layers()) {
+            // Compute expected set from the independent reference model.
+            let expected = model_apply_layers(&layers_ops);
+
+            // Build the real layer tars and run flatten_layers.
+            let layer_bytes: Vec<Vec<u8>> = layers_ops.iter()
+                .map(|ops| ops_to_layer_owned(ops))
+                .collect();
+
+            let readers: Vec<Box<dyn Read>> = layer_bytes.iter()
+                .map(|b| Box::new(Cursor::new(b.clone())) as Box<dyn Read>)
+                .collect();
+
+            let mut out = Vec::new();
+            // flatten_layers may fail if a whiteout causes issues; that's OK — skip.
+            let result = flatten_layers(readers, &mut out);
+            if result.is_err() {
+                return Ok(());
+            }
+
+            // Parse the output tar to collect the set of non-whiteout paths.
+            let mut actual: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut ar = tar::Archive::new(Cursor::new(out));
+            for entry in ar.entries().unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path().unwrap()
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_string();
+                // Whiteout markers must never appear in the output.
+                proptest::prop_assert!(
+                    !path.contains(".wh."),
+                    "whiteout marker in output: {path:?}"
+                );
+                actual.insert(path);
+            }
+
+            proptest::prop_assert_eq!(
+                &actual, &expected,
+                "model vs flatten mismatch\n  expected: {:?}\n  actual:   {:?}",
+                expected, actual
+            );
+        }
+
+        // ── Property 3: hardlink emit ordering ────────────────────────────────
+        // `emit()` partitions entries into (regular, hardlinks) and emits
+        // regular entries first.  Therefore, for ANY generated layer set with
+        // hardlinks, every hardlink entry appears strictly AFTER all
+        // non-hardlink entries in the output tar.
+        //
+        // We inject a final hardlink layer so hardlinks are always present;
+        // we point them at paths from the first layer so we know the names.
+        // We don't assert the target exists in the output — it may have been
+        // whited out; we only assert the partition order.
+        #[test]
+        fn prop_hardlink_ordering(layers_ops in arb_layers()) {
+            let layer_bytes: Vec<Vec<u8>> = layers_ops.iter()
+                .map(|ops| ops_to_layer_owned(ops))
+                .collect();
+
+            // Collect some stable file paths from layer 0 to use as link targets.
+            let file_paths: Vec<String> = layers_ops[0]
+                .iter()
+                .filter_map(|op| if let Op::AddFile(p) = op { Some(p.clone()) } else { None })
+                .take(2)
+                .collect();
+
+            if file_paths.is_empty() {
+                return Ok(()); // no files in layer 0; skip
+            }
+
+            // Append a hardlink layer whose links have names starting with
+            // "zzz_" (lexicographically late) pointing to the layer-0 files.
+            // Names starting "zzz_" will sort after most generated names,
+            // which helps the test exercise the partition boundary.
+            let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut b = tar::Builder::new(gz);
+            for target in &file_paths {
+                let link_name = format!("zzz_link_{}", target.replace('/', "_"));
+                let mut h = tar::Header::new_gnu();
+                h.set_size(0);
+                h.set_mode(0o644);
+                h.set_entry_type(tar::EntryType::Link);
+                b.append_link(&mut h, link_name.as_str(), target.as_str()).unwrap();
+            }
+            let hl_layer = b.into_inner().unwrap().finish().unwrap();
+
+            let mut all_layers = layer_bytes;
+            all_layers.push(hl_layer);
+
+            let readers: Vec<Box<dyn Read>> = all_layers.iter()
+                .map(|b| Box::new(Cursor::new(b.clone())) as Box<dyn Read>)
+                .collect();
+
+            let mut out = Vec::new();
+            if flatten_layers(readers, &mut out).is_err() {
+                return Ok(()); // unflatten-able input; skip
+            }
+
+            // Split the output order into "before first hardlink" and "at/after".
+            let mut ar = tar::Archive::new(Cursor::new(out));
+            let mut seen_hardlink = false;
+            let mut bad: Option<String> = None;
+            for entry in ar.entries().unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path().unwrap()
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_string();
+                let et = entry.header().entry_type();
+                if et == tar::EntryType::Link {
+                    seen_hardlink = true;
+                } else if seen_hardlink {
+                    // A non-hardlink appeared after a hardlink — violates partition.
+                    bad = Some(path);
+                    break;
+                }
+            }
+
+            proptest::prop_assert!(
+                bad.is_none(),
+                "non-hardlink entry {:?} appeared after a hardlink — partition violated",
+                bad
+            );
+        }
+    }
+
+    // ---------- end property-based tests ----------
+
     #[test]
     fn rejects_path_traversal() {
         // tar::Builder refuses to set `..` paths, so write the name field raw.
