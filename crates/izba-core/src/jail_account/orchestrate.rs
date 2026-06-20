@@ -608,6 +608,7 @@ mod tests {
                 name: Some("cache".to_string()),
                 guest_path: PathBuf::from("/data"),
                 size_bytes: 1 << 30,
+                eph_id: None,
             }],
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
@@ -629,6 +630,7 @@ mod tests {
                 name: None, // anonymous
                 guest_path: PathBuf::from("/ephemeral"),
                 size_bytes: 1 << 20,
+                eph_id: None,
             }],
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
