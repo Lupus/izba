@@ -54,6 +54,22 @@ jobs:
       - name: frontend tests
         working-directory: app
         run: npm run test
+      # E2E UI tests: Playwright drives the built frontend (vite preview) against
+      # the in-page Tauri IPC mock — no izbad, no VMMs. chromium (≈ WebView2) +
+      # webkit (≈ WebKitGTK) approximate both real webview engine families.
+      - name: install Playwright browsers (chromium + webkit)
+        working-directory: app
+        run: npx playwright install --with-deps chromium webkit
+      - name: Playwright e2e (chromium + webkit)
+        working-directory: app
+        run: npm run e2e
+      - name: upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report-linux
+          path: app/playwright-report/
+          retention-days: 7
       - name: backend fmt
         working-directory: app/src-tauri
         run: cargo fmt --check
@@ -83,6 +99,21 @@ jobs:
       - name: frontend tests
         working-directory: app
         run: npm run test
+      # chromium only on Windows (≈ the WebView2 engine the app ships there);
+      # webkit coverage comes from the linux job.
+      - name: install Playwright browser (chromium)
+        working-directory: app
+        run: npx playwright install chromium
+      - name: Playwright e2e (chromium)
+        working-directory: app
+        run: npm run e2e -- --project=chromium
+      - name: upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report-windows
+          path: app/playwright-report/
+          retention-days: 7
       - name: backend clippy
         working-directory: app/src-tauri
         run: cargo clippy --all-targets -- -D warnings
