@@ -241,4 +241,29 @@ describe("NewSandbox", () => {
       expect(create).toHaveBeenCalledWith(expect.objectContaining({ volumes: [] })),
     );
   });
+
+  it("existing persistent dropdown excludes volumes already staged in the wizard", async () => {
+    volumeList.mockResolvedValue([
+      { name: "archive", size_bytes: 1073741824, actual_bytes: 0, referenced_by: [] },
+      { name: "other", size_bytes: 1073741824, actual_bytes: 0, referenced_by: [] },
+    ]);
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+
+    // Switch to existing persistent type and stage "archive"
+    fireEvent.click(screen.getByRole("button", { name: /existing/i }));
+    await waitFor(() => expect(volumeList).toHaveBeenCalled());
+    const select = screen.getByRole("combobox", { name: /existing volume/i });
+    fireEvent.change(select, { target: { value: "archive" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/arch" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/arch/i });
+
+    // Now check the dropdown for a second add — "archive" must be absent
+    fireEvent.click(screen.getByRole("button", { name: /existing/i }));
+    const select2 = screen.getByRole("combobox", { name: /existing volume/i });
+    const opts = select2.querySelectorAll("option");
+    const optTexts = Array.from(opts).map((o) => o.textContent);
+    expect(optTexts.some((t) => t?.includes("other"))).toBe(true);
+    expect(optTexts.some((t) => t?.includes("archive"))).toBe(false);
+  });
 });

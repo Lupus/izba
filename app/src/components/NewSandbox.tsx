@@ -37,7 +37,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const [stagedVolumes, setStagedVolumes] = useState<VolumeRow[]>([]);
   const [draft, setDraft] = useState<VolumeRow>(defaultVolumeRow());
   const [addAttempted, setAddAttempted] = useState(false);
-  const [freeVolumes, setFreeVolumes] = useState<VolumeInfo[]>([]);
+  const [allVolumes, setAllVolumes] = useState<VolumeInfo[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<string[]>([]);
@@ -51,14 +51,23 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   useEffect(() => {
     void (async () => {
       try {
-        const all = await api.volumeList();
-        // Nothing is attached yet in the create wizard — only filter by usage.
-        setFreeVolumes(all.filter((v) => v.referenced_by.length === 0));
+        setAllVolumes(await api.volumeList());
       } catch {
         // Non-fatal: the existing-persistent dropdown simply shows empty.
       }
     })();
   }, []);
+
+  // Free volumes available to attach: not referenced by any sandbox, and not
+  // already staged in the wizard as existing_persistent.
+  const stagedNames = new Set(
+    stagedVolumes
+      .filter((r) => r.kind === "existing_persistent")
+      .map((r) => r.selectedVolName),
+  );
+  const freeVolumes = allVolumes.filter(
+    (v) => v.referenced_by.length === 0 && !stagedNames.has(v.name),
+  );
 
   async function pickDir() {
     const picked = await open({ directory: true, multiple: false });
@@ -111,7 +120,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
           (r) =>
             `${r.bind.trim() ? `${r.bind.trim()}:` : ""}${r.host.trim()}:${r.guest.trim()}`,
         ),
-      volumes: stagedVolumes.map((r) => buildVolSpec(r, freeVolumes)),
+      volumes: stagedVolumes.map((r) => buildVolSpec(r, allVolumes)),
     };
     try {
       const created = await api.create(opts);
