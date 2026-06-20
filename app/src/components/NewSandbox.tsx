@@ -7,6 +7,7 @@ import {
   type VolumeRow,
   defaultVolumeRow,
   buildVolSpec,
+  isBlankVolRow,
   isValidVolRow,
   volNameError,
   volPathError,
@@ -34,9 +35,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const [rwSizeGb, setRwSizeGb] = useState(8);
   const [workspace, setWorkspace] = useState("");
   const [ports, setPorts] = useState<PortRow[]>([]);
-  const [stagedVolumes, setStagedVolumes] = useState<VolumeRow[]>([]);
-  const [draft, setDraft] = useState<VolumeRow>(defaultVolumeRow());
-  const [addAttempted, setAddAttempted] = useState(false);
+  const [volumeRows, setVolumeRowsState] = useState<VolumeRow[]>([]);
   const [allVolumes, setAllVolumes] = useState<VolumeInfo[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -58,16 +57,14 @@ export function NewSandbox({ onClose, onCreated }: Props) {
     })();
   }, []);
 
-  // Free volumes available to attach: not referenced by any sandbox, and not
-  // already staged in the wizard as existing_persistent.
-  const stagedNames = new Set(
-    stagedVolumes
-      .filter((r) => r.kind === "existing_persistent")
-      .map((r) => r.selectedVolName),
-  );
-  const freeVolumes = allVolumes.filter(
-    (v) => v.referenced_by.length === 0 && !stagedNames.has(v.name),
-  );
+  // Escape key and backdrop close
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [onClose]);
 
   async function pickDir() {
     const picked = await open({ directory: true, multiple: false });
@@ -85,22 +82,20 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const addPort = () => setPorts((rows) => [...rows, { bind: "", host: "", guest: "" }]);
   const removePort = (i: number) => setPorts((rows) => rows.filter((_, j) => j !== i));
 
-  // Derived inline error messages — only shown when addAttempted is true.
-  const draftNameErr = addAttempted ? volNameError(draft.kind, draft.name.trim()) : null;
-  const draftPathErr = addAttempted ? volPathError(draft.path.trim()) : null;
-  const draftSizeErr = addAttempted ? volSizeError(draft.kind, draft.size.trim()) : null;
-  const draftPickErr = addAttempted ? volPickError(draft.kind, draft.selectedVolName) : null;
+  const addVolume = () => setVolumeRowsState((rows) => [...rows, defaultVolumeRow()]);
+  const removeVolume = (i: number) => setVolumeRowsState((rows) => rows.filter((_, j) => j !== i));
+  const setVolumeRow = (i: number, row: VolumeRow) =>
+    setVolumeRowsState((rows) => rows.map((r, j) => (j === i ? row : r)));
 
-  function addToStaged() {
-    setAddAttempted(true);
-    if (!isValidVolRow(draft)) return; // keep draft, errors now shown
-    setStagedVolumes((prev) => [...prev, draft]);
-    setDraft(defaultVolumeRow());
-    setAddAttempted(false);
-  }
-
-  function removeStaged(i: number) {
-    setStagedVolumes((prev) => prev.filter((_, j) => j !== i));
+  // Free volumes for each row: exclude referenced + names used in other rows as existing_persistent.
+  function freeVolumesFor(rowIdx: number): VolumeInfo[] {
+    const usedNames = new Set(
+      volumeRows
+        .filter((r, i) => i !== rowIdx && r.kind === "existing_persistent")
+        .map((r) => r.selectedVolName)
+        .filter(Boolean),
+    );
+    return allVolumes.filter((v) => v.referenced_by.length === 0 && !usedNames.has(v.name));
   }
 
   async function submit() {
@@ -120,7 +115,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
           (r) =>
             `${r.bind.trim() ? `${r.bind.trim()}:` : ""}${r.host.trim()}:${r.guest.trim()}`,
         ),
-      volumes: stagedVolumes.map((r) => buildVolSpec(r, allVolumes)),
+      volumes: volumeRows.filter((r) => !isBlankVolRow(r)).map((r) => buildVolSpec(r, allVolumes)),
     };
     try {
       const created = await api.create(opts);
@@ -142,11 +137,14 @@ export function NewSandbox({ onClose, onCreated }: Props) {
     isValidPort(r.host) && isValidPort(r.guest) && isValidBind(r.bind);
   const portsInvalid = ports.some((r) => !isBlankRow(r) && !isValidRow(r));
 
+  const volumesInvalid = volumeRows.some((r) => !isBlankVolRow(r) && !isValidVolRow(r));
+
   const canCreate =
     name.trim().length > 0 &&
     workspace.trim().length > 0 &&
     !busy &&
-    !portsInvalid;
+    !portsInvalid &&
+    !volumesInvalid;
 
   // Shared column template so the Bind/Host/Guest headers line up with the
   // inputs below: [bind grows] [host 5rem] [colon] [guest 5rem] [remove 2rem].
@@ -158,8 +156,12 @@ export function NewSandbox({ onClose, onCreated }: Props) {
       role="dialog"
       aria-modal="true"
       aria-label="New sandbox"
+      onClick={onClose}
     >
-      <div className="w-[32rem] max-w-[92vw] rounded-xl bg-surface p-5 shadow-xl">
+      <div
+        className="w-[32rem] max-w-[92vw] rounded-xl bg-surface p-5 shadow-xl max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
         <h2 className="text-lg font-semibold">New sandbox</h2>
         <div className="mt-4 grid gap-3 text-sm">
           <label className="grid gap-1">
@@ -303,55 +305,44 @@ export function NewSandbox({ onClose, onCreated }: Props) {
           <div className="grid gap-1">
             <span className="text-ink-2">Volumes</span>
             <div className="grid gap-1.5">
-              {/* Staged volumes (validated, waiting to be created) */}
-              {stagedVolumes.map((r, i) => (
-                <div
-                  key={`staged-${i}`}
-                  className="flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-sm"
-                >
-                  <span className="flex-1 font-mono">{r.path}</span>
-                  <span className="text-xs text-ink-2">
-                    {r.kind === "ephemeral"
-                      ? "ephemeral"
-                      : r.kind === "new_persistent"
-                        ? `persistent · ${r.name}`
-                        : `existing · ${r.selectedVolName}`}
-                  </span>
-                  {(r.kind === "ephemeral" || r.kind === "new_persistent") && (
-                    <span className="text-xs text-ink-3">{r.size}</span>
-                  )}
-                  <button
-                    type="button"
-                    aria-label={`Remove staged volume ${r.path}`}
-                    onClick={() => removeStaged(i)}
-                    className="text-ink-3 hover:text-warn"
-                  >
-                    ✕
-                  </button>
-                </div>
-              ))}
-              {/* Draft editor — always visible */}
-              <VolumeRowEditor
-                row={draft}
-                index={0}
-                freeVolumes={freeVolumes}
-                onChange={setDraft}
-                onRemove={() => {
-                  setDraft(defaultVolumeRow());
-                  setAddAttempted(false);
-                }}
-              />
-              {/* Inline error messages — shown after first Add attempt */}
-              {draftNameErr && <span className="text-xs text-warn">{draftNameErr}</span>}
-              {draftPathErr && <span className="text-xs text-warn">{draftPathErr}</span>}
-              {draftSizeErr && <span className="text-xs text-warn">{draftSizeErr}</span>}
-              {draftPickErr && <span className="text-xs text-warn">{draftPickErr}</span>}
+              {volumeRows.map((row, i) => {
+                const nameErr =
+                  row.kind === "new_persistent" && row.name.trim() !== ""
+                    ? volNameError(row.kind, row.name.trim())
+                    : null;
+                const pathErr =
+                  row.path.trim() !== "" ? volPathError(row.path.trim()) : null;
+                const sizeErr =
+                  (row.kind === "ephemeral" || row.kind === "new_persistent") &&
+                  row.size.trim() !== ""
+                    ? volSizeError(row.kind, row.size.trim())
+                    : null;
+                const pickErr =
+                  row.kind === "existing_persistent" && row.path.trim() !== ""
+                    ? volPickError(row.kind, row.selectedVolName)
+                    : null;
+                return (
+                  <div key={i} className="grid gap-1">
+                    <VolumeRowEditor
+                      row={row}
+                      index={i}
+                      freeVolumes={freeVolumesFor(i)}
+                      onChange={(r) => setVolumeRow(i, r)}
+                      onRemove={() => removeVolume(i)}
+                    />
+                    {nameErr && <span className="text-xs text-warn">{nameErr}</span>}
+                    {pathErr && <span className="text-xs text-warn">{pathErr}</span>}
+                    {sizeErr && <span className="text-xs text-warn">{sizeErr}</span>}
+                    {pickErr && <span className="text-xs text-warn">{pickErr}</span>}
+                  </div>
+                );
+              })}
               <button
                 type="button"
-                onClick={addToStaged}
+                onClick={addVolume}
                 className="justify-self-start rounded-lg border border-line px-2 py-1 text-xs text-ink-2 hover:bg-hover"
               >
-                Add
+                + Add volume
               </button>
             </div>
           </div>

@@ -171,7 +171,7 @@ export function VolumeRowEditor({ row, freeVolumes, onChange, onRemove, index }:
           onClick={onRemove}
           className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
         >
-          Cancel
+          ×
         </button>
       </div>
     </div>
