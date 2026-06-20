@@ -121,8 +121,7 @@ pub fn reconcile(
 
     // Orphan relays: relay liveness must track sandbox liveness.
     for name in &disk {
-        let ports: Option<Vec<PortRecord>> =
-            load_json(&paths.sandbox_dir(name).join(PORTS_FILE))?;
+        let ports: Option<Vec<PortRecord>> = load_json(&paths.sandbox_dir(name).join(PORTS_FILE))?;
         let Some(ports) = ports else { continue };
         let sandbox_alive = sandboxes
             .iter()
@@ -155,9 +154,7 @@ pub fn reconcile(
     // Orphan (unreferenced) named volume images — informational only.
     let mut referenced: HashSet<String> = HashSet::new();
     for name in &disk {
-        if let Some(cfg) =
-            load_json::<SandboxConfig>(&paths.sandbox_dir(name).join(CONFIG_FILE))?
-        {
+        if let Some(cfg) = load_json::<SandboxConfig>(&paths.sandbox_dir(name).join(CONFIG_FILE))? {
             for vol in cfg.volumes {
                 if let Some(n) = vol.name {
                     referenced.insert(n);
@@ -229,9 +226,9 @@ mod tests {
             control: true,
         };
         let report = reconcile(&paths, Some(&view), &probes).unwrap();
-        assert!(report.violations.iter().any(|v| v.kind
-            == ViolationKind::ListMismatch
-            && v.sandbox.as_deref() == Some("ghost")));
+        assert!(report.violations.iter().any(
+            |v| v.kind == ViolationKind::ListMismatch && v.sandbox.as_deref() == Some("ghost")
+        ));
     }
 
     #[test]
@@ -244,9 +241,9 @@ mod tests {
             control: true,
         };
         let report = reconcile(&paths, Some(&view), &probes).unwrap();
-        assert!(report.violations.iter().any(|v| v.kind
-            == ViolationKind::ListMismatch
-            && v.sandbox.as_deref() == Some("orphan")));
+        assert!(report.violations.iter().any(
+            |v| v.kind == ViolationKind::ListMismatch && v.sandbox.as_deref() == Some("orphan")
+        ));
     }
 
     #[test]
@@ -260,9 +257,11 @@ mod tests {
             control: true,
         };
         let report = reconcile(&paths, Some(&view), &probes).unwrap();
-        assert!(report.violations.iter().any(|v| v.kind
-            == ViolationKind::DiskLiveMismatch
-            && v.sandbox.as_deref() == Some("box")));
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::DiskLiveMismatch
+                && v.sandbox.as_deref() == Some("box")));
         let snap = report.sandboxes.iter().find(|s| s.name == "box").unwrap();
         assert_eq!(snap.status_daemon.as_deref(), Some("running"));
         assert_eq!(snap.status_disk, "stopped");
@@ -311,9 +310,10 @@ mod tests {
             control: true,
         };
         let report = reconcile(&paths, Some(&view), &probes).unwrap();
-        assert!(report.violations.iter().any(|v| v.kind
-            == ViolationKind::OrphanRelay
-            && v.sandbox.as_deref() == Some("box")));
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::OrphanRelay && v.sandbox.as_deref() == Some("box")));
     }
 
     #[test]
