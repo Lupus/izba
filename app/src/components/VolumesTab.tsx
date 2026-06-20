@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { SandboxView, VolumeSpec, VolumeInfo } from "../lib/types";
 import { api } from "../lib/ipc";
 import {
@@ -31,9 +31,9 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
   const [seeded, setSeeded] = useState<SeededRow[]>([]);
   const [newRows, setNewRows] = useState<VolumeRow[]>([]);
   const [allVolumes, setAllVolumes] = useState<VolumeInfo[]>([]);
-  const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const loadedRef = useRef<VolumeSpec[]>([]);
 
   const running = sandbox.state.kind !== "stopped";
   const name = sandbox.name;
@@ -41,9 +41,9 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
   async function load() {
     try {
       const detail = await api.inspect(name);
+      loadedRef.current = detail.volumes;
       setSeeded(detail.volumes.map((v) => ({ spec: v, removed: false })));
       setNewRows([]);
-      setDirty(false);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -58,9 +58,9 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
   async function refreshRows() {
     try {
       const detail = await api.inspect(name);
+      loadedRef.current = detail.volumes;
       setSeeded(detail.volumes.map((v) => ({ spec: v, removed: false })));
       setNewRows([]);
-      setDirty(false);
       // intentionally NOT calling setError here
     } catch {
       // silently ignore — the save error (if any) is already set and visible;
@@ -92,23 +92,22 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
     (v) => v.referenced_by.length === 0 && !seededNames.has(v.name),
   );
 
-  function markDirty() {
-    setDirty(true);
-  }
+  // Derived dirty: seeded set changed from what was loaded, OR new rows are staged.
+  const seededDesired = seeded.filter((s) => !s.removed).map((s) => s.spec);
+  const dirty =
+    JSON.stringify(seededDesired) !== JSON.stringify(loadedRef.current) ||
+    newRows.length > 0;
 
   function removeSeeded(idx: number) {
     setSeeded((prev) => prev.map((s, i) => (i === idx ? { ...s, removed: true } : s)));
-    markDirty();
   }
 
   function restoreSeeded(idx: number) {
     setSeeded((prev) => prev.map((s, i) => (i === idx ? { ...s, removed: false } : s)));
-    setDirty(true);
   }
 
   function addRow() {
     setNewRows((prev) => [...prev, defaultVolumeRow()]);
-    markDirty();
   }
 
   function removeNewRow(idx: number) {
@@ -228,6 +227,11 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
                   "rounded px-1.5 py-0.5 text-xs font-semibold " +
                   (isPersistent ? "bg-accent/10 text-accent" : "bg-hover text-ink-2")
                 }
+                title={
+                  isPersistent
+                    ? "Persistent volumes are single-writer — only one sandbox may attach this volume at a time."
+                    : undefined
+                }
               >
                 {isPersistent ? "persistent" : "ephemeral"}
               </span>
@@ -238,11 +242,11 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
               {!s.removed ? (
                 <button
                   type="button"
-                  aria-label={`Remove ${s.spec.guest_path}`}
+                  aria-label={`Detach ${s.spec.guest_path}`}
                   onClick={() => removeSeeded(i)}
                   className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
                 >
-                  Remove
+                  Detach
                 </button>
               ) : (
                 <button
@@ -254,12 +258,6 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
                 </button>
               )}
             </div>
-            {isPersistent && !s.removed && (
-              <p className="text-xs text-ink-3">
-                Persistent volumes are single-writer — only one sandbox may attach this volume at a
-                time.
-              </p>
-            )}
           </div>
         );
       })}
