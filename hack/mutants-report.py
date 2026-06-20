@@ -90,6 +90,40 @@ def render_markdown(mutants, tested=None):
     return "\n".join(lines)
 
 
+def render_issue_summary(mutants, tested=None, max_chars=60000):
+    """Compact per-file summary for the tracking issue (GitHub caps bodies at
+    65536 chars; a full 785-item checklist overflows). Lists every file with its
+    survivor count and points at the artifact for per-mutant detail. Defensively
+    truncates the file table if even the summary would overflow.
+    """
+    head = []
+    if tested is not None:
+        head.append(f"_Tested {tested} mutant(s)._")
+    if not mutants:
+        head.append("No surviving mutants. 🎉")
+        return "\n".join(head) + "\n"
+    by_file = collections.Counter(m.path for m in mutants)
+    head.append(f"**{len(mutants)} surviving mutant(s)** across {len(by_file)} file(s). "
+                "Per-mutant detail (file, line, mutation, id_hash) is in the "
+                "`mutants-report.json` artifact — see "
+                "`docs/quality/mutation-gaps-runbook.md`.")
+    head.append("")
+    head.append("| survivors | file |")
+    head.append("| ---: | :--- |")
+    body = "\n".join(head) + "\n"
+    rows, shown = [], 0
+    for path, n in sorted(by_file.items(), key=lambda kv: (-kv[1], kv[0])):
+        row = f"| {n} | `{path}` |\n"
+        if len(body) + len("".join(rows)) + len(row) > max_chars:
+            break
+        rows.append(row)
+        shown += 1
+    out = body + "".join(rows)
+    if shown < len(by_file):
+        out += f"\n_… {len(by_file) - shown} more file(s) omitted — see the artifact._\n"
+    return out
+
+
 def _mutant_to_dict(m):
     return {"path": m.path, "line": m.line, "col": m.col, "desc": m.desc, "id_hash": m.id_hash}
 
@@ -99,6 +133,7 @@ def main(argv=None):
     ap.add_argument("--mode", choices=["gate", "full"], required=True)
     ap.add_argument("--json-out")
     ap.add_argument("--md-out")
+    ap.add_argument("--issue-out", help="compact per-file summary for the tracking issue (size-capped)")
     ap.add_argument("out_dirs", nargs="+", help="paths whose `mutants.out` subdir is read")
     args = ap.parse_args(argv)
 
@@ -125,6 +160,9 @@ def main(argv=None):
     if args.md_out:
         with open(args.md_out, "w") as f:
             f.write(md)
+    if args.issue_out:
+        with open(args.issue_out, "w") as f:
+            f.write(render_issue_summary(mutants, tested=tested))
     return 0
 
 
