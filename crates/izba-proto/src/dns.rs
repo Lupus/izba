@@ -78,4 +78,86 @@ mod tests {
     fn servfail_on_runt_query_does_not_panic() {
         assert_eq!(servfail(&[0x01]), vec![0x01]);
     }
+
+    // -------------------------------------------------------------------------
+    // proptest: property-based tests
+    // -------------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// For any payload in 0..=65535 bytes, write_dns_msg then read_dns_msg
+        /// is the identity.  Can fail if the u16-BE length prefix is
+        /// misencoded or if read_dns_msg reads the wrong number of bytes.
+        #[test]
+        fn prop_dns_frame_roundtrip(
+            payload in proptest::collection::vec(any::<u8>(), 0..=65535usize),
+        ) {
+            let mut buf = Vec::new();
+            write_dns_msg(&mut buf, &payload).unwrap();
+            let mut c = Cursor::new(&buf);
+            let decoded = read_dns_msg(&mut c).unwrap().unwrap();
+            prop_assert_eq!(decoded, payload);
+            // After one message, reading again must return None (clean EOF).
+            let eof = read_dns_msg(&mut c).unwrap();
+            prop_assert!(eof.is_none(), "expected clean EOF, got {eof:?}");
+        }
+
+        /// servfail on arbitrary query bytes must never panic.  Additionally:
+        /// - The output always has the same length as the input.
+        /// - When the input has >= 4 bytes (enough to have ID + partial flags),
+        ///   byte [2] must have QR (bit 7) set.
+        /// - When the input has >= 4 bytes, byte [3] must have RA (bit 7) set
+        ///   and RCODE bits (low 4) equal to 2 (SERVFAIL).
+        /// - The first 2 bytes (DNS ID) are always preserved verbatim.
+        /// - When the input has >= 6 bytes (full header through QDCOUNT), the
+        ///   QDCOUNT field (bytes 4..6) is preserved (servfail does not touch it).
+        ///
+        /// Can fail if servfail incorrectly modifies bytes it should not touch
+        /// or fails to set the required flag bits.
+        #[test]
+        fn prop_servfail_robustness(query in proptest::collection::vec(any::<u8>(), 0..=512usize)) {
+            let resp = servfail(&query);
+
+            // Length preserved: servfail copies and modifies in place.
+            prop_assert_eq!(resp.len(), query.len(), "length must be preserved");
+
+            if query.len() >= 2 {
+                // ID (bytes 0..2) must be preserved verbatim.
+                prop_assert_eq!(&resp[..2], &query[..2], "ID (bytes 0..2) must be preserved");
+            }
+
+            if query.len() >= 4 {
+                // QR bit (bit 7 of byte 2) must be set.
+                prop_assert!(
+                    resp[2] & 0x80 != 0,
+                    "QR bit must be set in byte 2, got {:#04x}",
+                    resp[2]
+                );
+                // RA bit (bit 7 of byte 3) must be set.
+                prop_assert!(
+                    resp[3] & 0x80 != 0,
+                    "RA bit must be set in byte 3, got {:#04x}",
+                    resp[3]
+                );
+                // RCODE (low 4 bits of byte 3) must be 2 (SERVFAIL).
+                prop_assert_eq!(
+                    resp[3] & 0x0f,
+                    0x02,
+                    "RCODE must be 2 (SERVFAIL), byte[3]={:#04x}",
+                    resp[3]
+                );
+            }
+
+            if query.len() >= 6 {
+                // QDCOUNT (bytes 4..6) must be preserved — servfail keeps the
+                // question section intact so the client can match responses.
+                prop_assert_eq!(
+                    &resp[4..6],
+                    &query[4..6],
+                    "QDCOUNT (bytes 4..6) must be preserved"
+                );
+            }
+        }
+    }
 }
