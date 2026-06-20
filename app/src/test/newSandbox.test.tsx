@@ -324,15 +324,16 @@ describe("NewSandbox", () => {
   it("backdrop click calls onClose", () => {
     const onClose = vi.fn();
     render(<NewSandbox onClose={onClose} onCreated={() => {}} />);
-    const overlay = screen.getByRole("dialog");
-    fireEvent.click(overlay);
+    // The backdrop is now a native <button> with aria-label "Close dialog"
+    const backdrop = screen.getByRole("button", { name: /close dialog/i });
+    fireEvent.click(backdrop);
     expect(onClose).toHaveBeenCalled();
   });
 
   it("clicking inside panel does NOT call onClose", () => {
     const onClose = vi.fn();
     render(<NewSandbox onClose={onClose} onCreated={() => {}} />);
-    // Click on the heading inside the panel
+    // Click on the heading inside the panel (not the backdrop button)
     fireEvent.click(screen.getByText("New sandbox"));
     expect(onClose).not.toHaveBeenCalled();
   });

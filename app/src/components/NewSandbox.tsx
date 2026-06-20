@@ -156,11 +156,17 @@ export function NewSandbox({ onClose, onCreated }: Props) {
       role="dialog"
       aria-modal="true"
       aria-label="New sandbox"
-      onClick={onClose}
     >
+      {/* Full-screen backdrop button: click outside the panel closes. Native button = keyboard+screenreader accessible. */}
+      <button
+        type="button"
+        aria-label="Close dialog"
+        onClick={onClose}
+        className="absolute inset-0 cursor-default"
+        tabIndex={-1}
+      />
       <div
-        className="w-[32rem] max-w-[92vw] rounded-xl bg-surface p-5 shadow-xl max-h-[90vh] overflow-y-auto"
-        onClick={(e) => e.stopPropagation()}
+        className="relative w-[32rem] max-w-[92vw] rounded-xl bg-surface p-5 shadow-xl max-h-[90vh] overflow-y-auto"
       >
         <h2 className="text-lg font-semibold">New sandbox</h2>
         <div className="mt-4 grid gap-3 text-sm">
