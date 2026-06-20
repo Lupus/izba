@@ -44,6 +44,22 @@ SYSTEM_PROMPT = (
     "smallest command that makes progress. Do not wrap the JSON in markdown."
 )
 
+def _system_content(cli_help: str = "") -> str:
+    """System prompt, optionally seeded with the real `izba --help` surface so the
+    Actor uses documented subcommands instead of guessing (start/init/list/...)."""
+    if not (cli_help or "").strip():
+        return SYSTEM_PROMPT
+    return (
+        SYSTEM_PROMPT
+        + "\n\nUse ONLY the subcommands and flags documented in the `izba --help` "
+        "output below — do NOT invent commands (there is no `start`, `init`, "
+        "`list`, ...). Note exec/run take the guest command after `--` "
+        "(e.g. `izba run -- uname -s`). If a step cannot be done with the "
+        'documented surface, reply {"done": true}.\n\n'
+        "=== izba help ===\n" + cli_help.strip()
+    )
+
+
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
@@ -105,11 +121,13 @@ class OpenRouterModel:
     """Calls OpenRouter chat-completions. Report-only: on error returns done."""
 
     def __init__(self, api_key: str, model_id: str,
-                 url: str = OPENROUTER_URL, timeout_s: float = 60.0):
+                 url: str = OPENROUTER_URL, timeout_s: float = 60.0,
+                 cli_help: str = ""):
         self.api_key = api_key
         self.model_id = model_id
         self.url = url
         self.timeout_s = timeout_s
+        self.cli_help = cli_help
         self.last_cost_usd = 0.0
 
     def next_command(self, journey, step, observations) -> Dict[str, Any]:
@@ -117,7 +135,7 @@ class OpenRouterModel:
         payload = {
             "model": self.model_id,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": _system_content(self.cli_help)},
                 {"role": "user",
                  "content": _build_user_message(journey, step, observations)},
             ],

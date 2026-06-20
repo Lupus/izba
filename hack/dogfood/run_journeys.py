@@ -28,6 +28,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import subprocess
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -74,6 +76,36 @@ def _argv_from_command(command: str) -> List[str]:
     if parts and parts[0] == "izba":
         parts = parts[1:]
     return parts
+
+
+def gather_cli_help(izba_bin: str, timeout_s: float = 10.0) -> str:
+    """Best-effort `izba --help` (+ a few key subcommands) to seed the Actor so it
+    uses real commands instead of guessing (start/init/list/...). Report-only:
+    returns '' on any error."""
+    chunks: List[str] = []
+    targets = [["--help"], ["create", "--help"], ["run", "--help"],
+               ["exec", "--help"], ["stop", "--help"], ["rm", "--help"],
+               ["ls", "--help"]]
+    for tgt in targets:
+        try:
+            p = subprocess.run([izba_bin, *tgt], capture_output=True, text=True,
+                               timeout=timeout_s)
+            text = (p.stdout or "") + (p.stderr or "")
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if text.strip():
+            chunks.append(f"$ izba {' '.join(tgt)}\n{text.strip()}")
+    return "\n\n".join(chunks)
+
+
+_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _journey_data_dir(base: str, journey_id: str) -> str:
+    """Per-journey IZBA_DATA_DIR so one journey's leftover state can't contaminate
+    the next (e.g. a stray sandbox breaking a 'clean data dir' journey)."""
+    safe = _SAFE_RE.sub("-", journey_id) or "journey"
+    return os.path.join(base, safe)
 
 
 class BudgetExceeded(Exception):
@@ -202,7 +234,12 @@ def build_model(args) -> Any:
     if not api_key:
         raise SystemExit("OPENROUTER_API_KEY is required for the real model "
                          "(or pass --fake-model for offline runs)")
-    return OpenRouterModel(api_key, args.model)
+    cli_help = gather_cli_help(args.izba_bin)
+    if cli_help:
+        log(f"seeded Actor with {len(cli_help)} chars of `izba --help`")
+    else:
+        log("WARNING: could not capture `izba --help`; Actor runs unseeded")
+    return OpenRouterModel(api_key, args.model, cli_help=cli_help)
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -249,9 +286,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     budget = {"usd": 0.0}
     results: List[Dict[str, Any]] = []
     for journey in mine:
+        # Each journey gets its OWN data dir (own daemon + state) so a leftover
+        # sandbox from one journey can't contaminate the next.
+        jdir = _journey_data_dir(args.data_dir, journey.get("journey_id", ""))
+        os.makedirs(jdir, exist_ok=True)
         try:
             res = run_journey(
-                model, journey, args.izba_bin, args.data_dir,
+                model, journey, args.izba_bin, jdir,
                 max_turns=args.max_turns, step_cap=args.step_cap,
                 action_timeout_s=args.action_timeout_s,
                 latency_budget_ms=args.latency_budget_ms,

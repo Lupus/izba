@@ -190,5 +190,57 @@ class FakeModelTests(unittest.TestCase):
         self.assertEqual(m.last_cost_usd, 0.0)
 
 
+class HarnessImprovementTests(unittest.TestCase):
+    def test_journey_data_dir_is_per_journey_and_sanitized(self):
+        a = run_journeys._journey_data_dir("/base", "lifecycle-happy-path")
+        b = run_journeys._journey_data_dir("/base", "clean-data-dir")
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.startswith("/base/"))
+        seg = os.path.basename(run_journeys._journey_data_dir("/base", "weird id/with..x"))
+        self.assertNotIn(" ", seg)
+        self.assertNotIn("/", seg)
+
+    def test_gather_cli_help_captures_stub_help(self):
+        with tempfile.TemporaryDirectory() as d:
+            izba = _write_stub_izba(d)
+            help_text = run_journeys.gather_cli_help(izba)
+            self.assertIn("izba --help", help_text)
+            self.assertIn("ok", help_text)
+
+    def test_gather_cli_help_returns_empty_on_bad_binary(self):
+        self.assertEqual(run_journeys.gather_cli_help("/no/such/izba-binary"), "")
+
+    def test_system_content_seeds_help_and_warns_against_inventing(self):
+        from model import SYSTEM_PROMPT, _system_content
+        self.assertEqual(_system_content(""), SYSTEM_PROMPT)
+        seeded = _system_content("$ izba --help\nCommands: create, run, exec")
+        self.assertIn("create, run, exec", seeded)
+        self.assertIn("do NOT invent", seeded)
+
+    def test_main_isolates_data_dir_per_journey(self):
+        with tempfile.TemporaryDirectory() as d:
+            izba = _write_stub_izba(d)
+            journeys = {"feature": "iso", "journeys": [
+                {"journey_id": "j-one", "rationale": "",
+                 "source": {"kind": "x", "ref": "y"},
+                 "steps": [{"intent": "ls", "expect": "ok"}]},
+                {"journey_id": "j-two", "rationale": "",
+                 "source": {"kind": "x", "ref": "y"},
+                 "steps": [{"intent": "ls", "expect": "ok"}]},
+            ]}
+            jpath = os.path.join(d, "journeys.json")
+            with open(jpath, "w") as f:
+                json.dump(journeys, f)
+            data_dir = os.path.join(d, "data")
+            out = os.path.join(d, "traj.json")
+            run_journeys.main([
+                "--journeys", jpath, "--shard", "0", "--shards", "1",
+                "--izba-bin", izba, "--data-dir", data_dir, "--out", out,
+                "--fake-model", json.dumps([{"command": "izba ls"}, {"done": True}]),
+            ])
+            self.assertTrue(os.path.isdir(os.path.join(data_dir, "j-one")))
+            self.assertTrue(os.path.isdir(os.path.join(data_dir, "j-two")))
+
+
 if __name__ == "__main__":
     unittest.main()
