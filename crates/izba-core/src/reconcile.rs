@@ -116,6 +116,75 @@ pub fn reconcile(
         });
     }
 
+    use crate::state::{PortRecord, SandboxConfig, CONFIG_FILE, PORTS_FILE};
+    use std::collections::HashSet;
+
+    // Orphan relays: relay liveness must track sandbox liveness.
+    for name in &disk {
+        let ports: Option<Vec<PortRecord>> =
+            load_json(&paths.sandbox_dir(name).join(PORTS_FILE))?;
+        let Some(ports) = ports else { continue };
+        let sandbox_alive = sandboxes
+            .iter()
+            .any(|s| &s.name == name && s.status_disk != "stopped");
+        for rec in ports {
+            let relay_alive = probes.pid_alive(&rec.relay);
+            if sandbox_alive && !relay_alive {
+                violations.push(Violation {
+                    kind: ViolationKind::OrphanRelay,
+                    sandbox: Some(name.clone()),
+                    detail: format!(
+                        "relay for host_port {} dead while sandbox is alive",
+                        rec.rule.host_port
+                    ),
+                });
+            }
+            if !sandbox_alive && relay_alive {
+                violations.push(Violation {
+                    kind: ViolationKind::OrphanRelay,
+                    sandbox: Some(name.clone()),
+                    detail: format!(
+                        "relay for host_port {} alive while sandbox is stopped",
+                        rec.rule.host_port
+                    ),
+                });
+            }
+        }
+    }
+
+    // Orphan (unreferenced) named volume images — informational only.
+    let mut referenced: HashSet<String> = HashSet::new();
+    for name in &disk {
+        if let Some(cfg) =
+            load_json::<SandboxConfig>(&paths.sandbox_dir(name).join(CONFIG_FILE))?
+        {
+            for vol in cfg.volumes {
+                if let Some(n) = vol.name {
+                    referenced.insert(n);
+                }
+            }
+        }
+    }
+    let vdir = paths.volumes_dir();
+    if vdir.is_dir() {
+        for entry in std::fs::read_dir(&vdir)? {
+            let entry = entry?;
+            let fname = entry.file_name();
+            let Some(stem) = fname.to_str().and_then(|s| s.strip_suffix(".img")) else {
+                continue;
+            };
+            if !referenced.contains(stem) {
+                violations.push(Violation {
+                    kind: ViolationKind::OrphanVolume,
+                    sandbox: None,
+                    detail: format!(
+                        "informational: named volume '{stem}' is unreferenced (persistent volumes survive rm)"
+                    ),
+                });
+            }
+        }
+    }
+
     Ok(ReconcileReport {
         violations,
         sandboxes,
@@ -216,5 +285,53 @@ mod tests {
             "unexpected: {:?}",
             report.violations
         );
+    }
+
+    #[test]
+    fn relay_dead_while_sandbox_running_is_orphan_relay() {
+        use crate::state::{save_json, PortRecord, PortRule, PORTS_FILE};
+        use std::net::Ipv4Addr;
+
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("box")).unwrap();
+        let vmm = live_identity();
+        write_state(&paths, "box", vmm.clone());
+        let rec = PortRecord {
+            rule: PortRule {
+                bind: Ipv4Addr::LOCALHOST,
+                host_port: 8080,
+                guest_port: 80,
+            },
+            relay: dead_identity(),
+        };
+        save_json(&paths.sandbox_dir("box").join(PORTS_FILE), &vec![rec]).unwrap();
+        let view = vec![summary("box", "running")];
+        let probes = FakeProbes {
+            alive: vec![vmm],
+            control: true,
+        };
+        let report = reconcile(&paths, Some(&view), &probes).unwrap();
+        assert!(report.violations.iter().any(|v| v.kind
+            == ViolationKind::OrphanRelay
+            && v.sandbox.as_deref() == Some("box")));
+    }
+
+    #[test]
+    fn unreferenced_named_volume_is_informational_orphan_volume() {
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.volumes_dir()).unwrap();
+        std::fs::write(paths.volume_image("leftover"), b"x").unwrap();
+        let view: Vec<SandboxSummary> = vec![];
+        let probes = FakeProbes {
+            alive: vec![],
+            control: true,
+        };
+        let report = reconcile(&paths, Some(&view), &probes).unwrap();
+        let v = report
+            .violations
+            .iter()
+            .find(|v| v.kind == ViolationKind::OrphanVolume)
+            .unwrap();
+        assert!(v.detail.contains("informational"));
     }
 }
