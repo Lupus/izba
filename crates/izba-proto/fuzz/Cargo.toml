@@ -23,3 +23,6 @@ name = "dns"
 path = "fuzz_targets/dns.rs"
 test = false
 doc = false
+
+# Prevent this from interfering with the workspace.
+[workspace]
