@@ -115,9 +115,14 @@ def _journey_data_dir(base: str, journey_id: str) -> str:
     The segment is sanitized AND suffixed with a short hash of the original id:
     stripping leading/trailing dots prevents ``..`` escaping ``base`` (path
     traversal), and the hash keeps ids that sanitize identically (e.g.
-    ``"a b"`` vs ``"a-b"``) in distinct dirs rather than silently sharing state."""
+    ``"a b"`` vs ``"a-b"``) in distinct dirs rather than silently sharing state.
+
+    The readable prefix is capped so the per-journey component stays short: the
+    sandbox runtime socket (``<dir>/sandboxes/<name>/run/vsock.sock_1027``) must
+    fit the ~108-byte AF_UNIX ``sun_path`` limit, and a long journey id otherwise
+    pushes it over (see izba#71)."""
     journey_id = journey_id or ""  # tolerate None/empty
-    safe = _SAFE_RE.sub("-", journey_id).strip(".-") or "journey"
+    safe = (_SAFE_RE.sub("-", journey_id).strip(".-") or "journey")[:16]
     short = hashlib.sha256(journey_id.encode("utf-8")).hexdigest()[:8]
     return os.path.join(base, f"{safe}-{short}")
 

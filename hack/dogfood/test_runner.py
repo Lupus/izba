@@ -209,6 +209,12 @@ class HarnessImprovementTests(unittest.TestCase):
     def test_journey_data_dir_tolerates_none_id(self):
         self.assertTrue(run_journeys._journey_data_dir("/base", None).startswith("/base/"))
 
+    def test_journey_data_dir_component_is_short(self):
+        # Long ids must not blow the AF_UNIX sun_path budget (izba#71): the
+        # per-journey component stays bounded (<=16 prefix + '-' + 8 hash).
+        seg = os.path.basename(run_journeys._journey_data_dir("/base", "x" * 200))
+        self.assertLessEqual(len(seg), 25)
+
     def test_null_journey_id_does_not_break_report_only(self):
         with tempfile.TemporaryDirectory() as d:
             izba = _write_stub_izba(d)
