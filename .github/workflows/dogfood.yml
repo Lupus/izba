@@ -222,19 +222,26 @@ jobs:
       - name: Build izba binary
         run: cargo build --locked --release -p izba-cli
       - name: Run dogfood journeys (report-only)
+        # workflow_dispatch inputs are user-controlled: pass them through `env:`
+        # and reference shell vars in the script (never interpolate `${{ inputs.* }}`
+        # straight into a run block) to avoid script injection (githubactions:S7630).
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+          MODEL: ${{ inputs.model }}
+          MAX_USD: ${{ inputs.max_usd }}
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           python3 hack/dogfood/run_journeys.py \
             --journeys journeys.json \
-            --shard ${{ matrix.shard }} \
-            --shards ${{ inputs.shards }} \
+            --shard "$SHARD" \
+            --shards "$SHARDS" \
             --izba-bin "$PWD/target/release/izba" \
-            --data-dir "$RUNNER_TEMP/izba-dogfood-${{ matrix.shard }}" \
-            --out "traj-${{ matrix.shard }}.json" \
-            --model "${{ inputs.model }}" \
-            --max-usd "${{ inputs.max_usd }}" \
+            --data-dir "$RUNNER_TEMP/izba-dogfood-$SHARD" \
+            --out "traj-$SHARD.json" \
+            --model "$MODEL" \
+            --max-usd "$MAX_USD" \
             --action-timeout-s 120 \
             --step-cap 25
       - name: Upload trajectory bundle
