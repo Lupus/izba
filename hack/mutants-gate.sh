@@ -17,6 +17,14 @@ BASE_REF="${1:?usage: mutants-gate.sh <base_ref>}"
 OUT="$(mktemp -d)"
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
+# The base ref must resolve, else the 3-dot diff below is a fatal git error that
+# set -e would surface opaquely. A bare `git fetch origin <base>` only updates
+# FETCH_HEAD, so the workflow must fetch into refs/remotes/origin/<base>.
+if ! git rev-parse --verify --quiet "$BASE_REF" >/dev/null; then
+  echo "## ⚠️ Mutation gate: base ref '$BASE_REF' does not resolve (fetch it into a ref first)" >> "$SUMMARY"
+  exit 1
+fi
+
 # 3-dot diff = changes since the merge-base (what the PR actually introduces).
 git diff "${BASE_REF}...HEAD" > "$OUT/pr.diff"
 
