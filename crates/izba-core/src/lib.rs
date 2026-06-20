@@ -10,6 +10,7 @@ pub mod liveness;
 pub mod paths;
 pub mod portfwd;
 pub mod procmgr;
+pub mod reconcile;
 pub mod sandbox;
 pub mod state;
 #[cfg(test)]
