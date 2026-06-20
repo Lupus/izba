@@ -2,6 +2,9 @@ name: CI
 
 on:
   pull_request:
+    # Dispatch branches carry an ad-hoc journeys.json and are exercised only via
+    # the Dogfood workflow_dispatch; an accidental PR off one must fire no gates.
+    branches-ignore: ['dogfood-run/**']
   push:
     branches: [main]
 
