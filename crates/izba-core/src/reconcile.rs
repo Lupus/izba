@@ -85,9 +85,37 @@ pub fn reconcile(
         });
     }
 
-    // sandboxes snapshot filled in A2; empty for now keeps the type stable.
-    let sandboxes = Vec::new();
-    let _ = (assess, load_json::<RunState>, STATE_FILE); // referenced in A2
+    let mut sandboxes = Vec::new();
+    for name in &disk {
+        let state: Option<RunState> = load_json(&paths.sandbox_dir(name).join(STATE_FILE))?;
+        let disk_status = assess(state.as_ref(), probes);
+        let status_disk = disk_status.describe();
+        let status_daemon = daemon_view
+            .and_then(|v| v.iter().find(|s| &s.name == name))
+            .map(|s| s.status.clone());
+
+        // Lenient: flag only the unambiguous alive⇄stopped disagreement.
+        if let Some(d) = &status_daemon {
+            let daemon_thinks_alive = d != "stopped";
+            let disk_thinks_alive = !matches!(disk_status, crate::liveness::Liveness::Stopped);
+            if daemon_thinks_alive != disk_thinks_alive {
+                violations.push(Violation {
+                    kind: ViolationKind::DiskLiveMismatch,
+                    sandbox: Some(name.clone()),
+                    detail: format!(
+                        "daemon status {d:?} but disk/pid assessment is {status_disk:?}"
+                    ),
+                });
+            }
+        }
+        sandboxes.push(SandboxSnapshot {
+            name: name.clone(),
+            status_daemon,
+            status_disk,
+            vmm: state.as_ref().map(|r| r.vmm_pid.clone()),
+        });
+    }
+
     Ok(ReconcileReport {
         violations,
         sandboxes,
@@ -150,5 +178,43 @@ mod tests {
         assert!(report.violations.iter().any(|v| v.kind
             == ViolationKind::ListMismatch
             && v.sandbox.as_deref() == Some("orphan")));
+    }
+
+    #[test]
+    fn daemon_running_but_vmm_pid_dead_is_disk_live_mismatch() {
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("box")).unwrap();
+        write_state(&paths, "box", dead_identity()); // state.json references a dead pid
+        let view = vec![summary("box", "running")]; // daemon thinks it's running
+        let probes = FakeProbes {
+            alive: vec![],
+            control: true,
+        };
+        let report = reconcile(&paths, Some(&view), &probes).unwrap();
+        assert!(report.violations.iter().any(|v| v.kind
+            == ViolationKind::DiskLiveMismatch
+            && v.sandbox.as_deref() == Some("box")));
+        let snap = report.sandboxes.iter().find(|s| s.name == "box").unwrap();
+        assert_eq!(snap.status_daemon.as_deref(), Some("running"));
+        assert_eq!(snap.status_disk, "stopped");
+    }
+
+    #[test]
+    fn daemon_running_and_vmm_alive_is_clean() {
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("box")).unwrap();
+        let vmm = live_identity();
+        write_state(&paths, "box", vmm.clone());
+        let view = vec![summary("box", "running")];
+        let probes = FakeProbes {
+            alive: vec![vmm],
+            control: true,
+        };
+        let report = reconcile(&paths, Some(&view), &probes).unwrap();
+        assert!(
+            report.violations.is_empty(),
+            "unexpected: {:?}",
+            report.violations
+        );
     }
 }
