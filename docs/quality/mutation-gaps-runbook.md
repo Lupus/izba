@@ -14,9 +14,10 @@ This runbook is the tests-only loop for closing those gaps.
    already targets (match by `id_hash`).
 3. Pick a batch (default cap: 10 mutants per PR run).
 4. For each mutant, write a **killing test** (TDD): confirm it FAILS against the
-   mutation's intent and PASSES against the real code. Reproduce a mutant locally
-   by reading its diff in the artifact, or by running cargo-mutants scoped to the
-   file: `cargo mutants -f <file>`.
+   mutation's intent and PASSES against the real code. Reproduce a single mutant
+   locally by reading its diff in the artifact, or by scoping cargo-mutants to
+   that line: `cargo mutants -f <file> --line-in-diff <n>` (`<n>` is the `line`
+   from the artifact) — plain `-f <file>` reruns every mutant in the file.
 5. Run the six workspace gates before proposing: `cargo fmt --check`,
    `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
    `cargo build -p izba-init --target x86_64-unknown-linux-musl --release`,

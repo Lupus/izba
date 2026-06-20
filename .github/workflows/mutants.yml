@@ -11,8 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
-  issues: write   # collect job upserts the mutation-gaps tracking issue
+  contents: read   # issues:write is granted only to the collect job that needs it
 
 # cargo-mutants cannot see #[cfg] (documented limitation): it reports another
 # platform's code as "missed" on the host where that code is cfg'd out. So we run
@@ -22,6 +21,16 @@ permissions:
 # NO platform's tests caught it. A mutant killed on either platform is not a gap.
 
 jobs:
+  # ---------- reporter unit tests (the caught-nowhere reconciliation logic) ----------
+  reporter-tests:
+    name: reporter tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Run mutants-report.py tests
+        run: python3 hack/mutants-report.test.py
+
   # ---------- incremental PR gate (both platforms + aggregator) ----------
   gate-linux:
     name: gate run (linux)
@@ -184,6 +193,9 @@ jobs:
     needs: [full-linux, full-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write   # upserts the mutation-gaps tracking issue
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -212,7 +224,8 @@ jobs:
             mutants-report.md
           if-no-files-found: warn
       - name: Upsert tracking issue
-        # Only when shards actually contributed results — tested==0 means a broken
-        # run (no shard artifacts), and we must not post a misleading "no gaps" issue.
-        if: ${{ steps.merge.outputs.tested != '0' }}
+        # success() so a failed merge step doesn't trip this (its empty `tested`
+        # output is != '0'); and tested==0 means a broken run (no shard artifacts),
+        # so we must not post a misleading "no gaps" issue.
+        if: ${{ success() && steps.merge.outputs.tested != '0' }}
         run: hack/mutants-issue.sh mutants-issue.md
