@@ -116,8 +116,9 @@ def _journey_data_dir(base: str, journey_id: str) -> str:
     stripping leading/trailing dots prevents ``..`` escaping ``base`` (path
     traversal), and the hash keeps ids that sanitize identically (e.g.
     ``"a b"`` vs ``"a-b"``) in distinct dirs rather than silently sharing state."""
+    journey_id = journey_id or ""  # tolerate None/empty
     safe = _SAFE_RE.sub("-", journey_id).strip(".-") or "journey"
-    short = hashlib.sha256((journey_id or "").encode("utf-8")).hexdigest()[:8]
+    short = hashlib.sha256(journey_id.encode("utf-8")).hexdigest()[:8]
     return os.path.join(base, f"{safe}-{short}")
 
 
@@ -299,11 +300,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     budget = {"usd": 0.0}
     results: List[Dict[str, Any]] = []
     for journey in mine:
-        # Each journey gets its OWN data dir (own daemon + state) so a leftover
-        # sandbox from one journey can't contaminate the next.
-        jdir = _journey_data_dir(args.data_dir, journey.get("journey_id", ""))
-        os.makedirs(jdir, exist_ok=True)
+        jid = journey.get("journey_id") or ""  # tolerate a JSON null id
         try:
+            # Per-journey setup is INSIDE the report-only guard: each journey gets
+            # its OWN data dir (own daemon + state) so leftover state can't
+            # contaminate the next, and a setup failure (bad id, makedirs error)
+            # is captured here rather than crashing the whole run.
+            jdir = _journey_data_dir(args.data_dir, jid)
+            os.makedirs(jdir, exist_ok=True)
             res = run_journey(
                 model, journey, args.izba_bin, jdir,
                 max_turns=args.max_turns, step_cap=args.step_cap,
@@ -316,9 +320,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             log("global USD budget exhausted; stopping remaining journeys")
             break
         except Exception as e:  # report-only: never let one journey kill the run
-            log(f"journey {journey.get('journey_id')!r} crashed: {e!r}; continuing")
-            results.append({"journey_id": journey.get("journey_id", ""),
-                            "actions": [], "candidates": []})
+            log(f"journey {jid!r} crashed: {e!r}; continuing")
+            results.append({"journey_id": jid, "actions": [], "candidates": []})
 
     bundle = {"shard": args.shard, "feature": feature, "results": results}
     with open(args.out, "w") as f:

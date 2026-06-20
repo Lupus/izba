@@ -206,6 +206,29 @@ class HarnessImprovementTests(unittest.TestCase):
         self.assertEqual(os.path.dirname(trav), "/base")
         self.assertNotEqual(os.path.basename(trav), "..")
 
+    def test_journey_data_dir_tolerates_none_id(self):
+        self.assertTrue(run_journeys._journey_data_dir("/base", None).startswith("/base/"))
+
+    def test_null_journey_id_does_not_break_report_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            izba = _write_stub_izba(d)
+            journeys = {"feature": "n", "journeys": [
+                {"journey_id": None, "rationale": "",
+                 "source": {"kind": "x", "ref": "y"},
+                 "steps": [{"intent": "ls", "expect": "ok"}]},
+            ]}
+            jpath = os.path.join(d, "journeys.json")
+            with open(jpath, "w") as f:
+                json.dump(journeys, f)
+            out = os.path.join(d, "traj.json")
+            rc = run_journeys.main([
+                "--journeys", jpath, "--shard", "0", "--shards", "1",
+                "--izba-bin", izba, "--data-dir", os.path.join(d, "data"),
+                "--out", out, "--fake-model", json.dumps([{"done": True}]),
+            ])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(out))  # report-only: bundle written
+
     def test_journey_data_dir_distinguishes_punctuation_only_ids(self):
         # ids that sanitize identically must NOT share a dir (hash suffix).
         self.assertNotEqual(
