@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/izba-proto", "crates/izba-core", "crates/izba-cli", "crates/izba-init", "crates/izba-ttytest", "crates/izba-jail-helper", "crates/izba-jail-naming"]
-exclude = ["app/src-tauri", "crates/izba-proto/fuzz", "crates/izba-core/fuzz"]
+exclude = ["app/src-tauri", "crates/izba-proto/fuzz", "crates/izba-core/fuzz", "crates/izba-init/fuzz"]
 
 [workspace.package]
 edition = "2021"

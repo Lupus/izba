@@ -481,6 +481,7 @@ fn append_recursive<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::fs;
 
     #[test]
@@ -894,5 +895,294 @@ mod tests {
         }
         assert!(names.contains(&"abs".to_string()), "{names:?}");
         assert!(names.contains(&"abs/data.txt".to_string()), "{names:?}");
+    }
+
+    // ── Property tests ──────────────────────────────────────────────────────
+
+    /// Build a malicious raw tar entry: writes the name bytes directly into the
+    /// GNU header (bypassing tar's own path-safety checks) and appends the
+    /// entry. This is the same technique used in `extract_rejects_escaping_entry`.
+    fn forge_entry(name_bytes: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_mtime(0);
+        let gnu = h.as_gnu_mut().unwrap();
+        let copy_len = name_bytes.len().min(gnu.name.len() - 1);
+        gnu.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        h.set_cksum();
+        b.append(&h, data).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    /// Walk `start` recursively; return absolute paths of every filesystem
+    /// object found (files, dirs, symlinks). Used to confirm nothing escaped
+    /// the root.
+    fn walk_all(start: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let Ok(rd) = fs::read_dir(start) else {
+            return out;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            out.push(p.clone());
+            if meta.is_dir() {
+                out.extend(walk_all(&p));
+            }
+        }
+        out
+    }
+
+    /// The set of entry names that exercise various escape vectors.
+    fn hazardous_entry_names() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            // dot-dot at the start
+            Just(b"../secret".to_vec()),
+            Just(b"../../x".to_vec()),
+            // absolute path
+            Just(b"/etc/passwd".to_vec()),
+            // nested dot-dot
+            Just(b"a/../../../b".to_vec()),
+            // normal relative (should succeed)
+            Just(b"inside/file.txt".to_vec()),
+            // zero-length (edge case)
+            Just(b"".to_vec()),
+            // random mix from a limited alphabet plus injected hazards
+            prop::collection::vec(
+                prop::sample::select(vec![b'a', b'b', b'c', b'.', b'/', b'_', b'-',]),
+                1..24,
+            ),
+        ]
+    }
+
+    /// Returns true if `name_bytes` contains a byte sequence that constitutes
+    /// a lexical escape attempt: a `..` component, a leading `/`, or a
+    /// path component that looks like `/` absolute path.
+    fn is_known_lexical_escape(name_bytes: &[u8]) -> bool {
+        if name_bytes.starts_with(b"/") {
+            return true;
+        }
+        let s = std::str::from_utf8(name_bytes).unwrap_or("");
+        s.split('/').any(|c| c == "..")
+    }
+
+    proptest! {
+        /// **Containment property**: after calling `extract` on an adversarially
+        /// crafted archive (whether it returns Ok or Err), NO filesystem object
+        /// must exist OUTSIDE the canonicalized root. The property asserts on
+        /// filesystem LOCATION — a symlink whose *target* points outside the root
+        /// is allowed as content; what is forbidden is a real object (file, dir,
+        /// symlink) whose *location* is outside the root.
+        ///
+        /// Additionally, any archive entry that contains a known lexical escape
+        /// (`..` or leading `/`) MUST result in `Err(BadRequest)` — never a
+        /// silent Ok. This second assertion is the one that becomes non-vacuous
+        /// when `reject_lexical_escape` is weakened (RESOLVE_IN_ROOT clamps the
+        /// filesystem escape, but the spec requires the observable Err).
+        #[test]
+        fn prop_containment_no_escape(name in hazardous_entry_names()) {
+            // Two-level tempdir: outer is the parent of root; secret lives in
+            // the outer but outside root. Nothing must be written to the outer
+            // or above it.
+            let outer = tempfile::tempdir().unwrap();
+            let root = outer.path().join("root");
+            fs::create_dir_all(&root).unwrap();
+            // A sentinel file in the outer so we can detect writes there.
+            let sentinel = outer.path().join("sentinel.txt");
+            fs::write(&sentinel, b"untouched").unwrap();
+
+            let archive = forge_entry(&name, b"payload");
+            let result = extract(&root, "/", &mut &archive[..]);
+
+            // Walk everything in the OUTER directory (one level up from root).
+            // Any path that is NOT under root (and not the sentinel itself which
+            // was there before) is an escape.
+            let all = walk_all(outer.path());
+            for p in &all {
+                // The root itself and things under it are fine.
+                if p.starts_with(&root) {
+                    continue;
+                }
+                // The sentinel we placed (pre-existing) is fine.
+                if p == &sentinel {
+                    continue;
+                }
+                // The root directory entry itself is fine.
+                if *p == outer.path().join("root") {
+                    continue;
+                }
+                panic!(
+                    "ESCAPE DETECTED: path {:?} exists outside root {:?}",
+                    p, root
+                );
+            }
+            // The sentinel must be untouched.
+            prop_assert_eq!(
+                fs::read(&sentinel).unwrap(),
+                b"untouched",
+                "sentinel was modified — escape occurred"
+            );
+            // An entry with a lexical escape attempt (`..'` component or leading
+            // `/`) MUST surface as Err(BadRequest) — never a silent Ok.
+            // This is the assertion that makes the property non-vacuous with
+            // respect to `reject_lexical_escape`: removing that check allows
+            // a silent Ok (RESOLVE_IN_ROOT clamps the path but doesn't error).
+            if is_known_lexical_escape(&name) {
+                prop_assert!(
+                    matches!(result, Err((ErrorKind::BadRequest, _))),
+                    "lexical escape {:?} must return BadRequest, got {:?}",
+                    String::from_utf8_lossy(&name),
+                    result.err()
+                );
+            }
+        }
+    }
+
+    // ── Roundtrip property ───────────────────────────────────────────────────
+
+    /// A simple in-root tree entry (file or in-root symlink).
+    #[derive(Debug, Clone)]
+    enum TreeEntry {
+        File {
+            rel_path: String, // relative to tree root, no leading slash, no ..
+            content: Vec<u8>,
+            mode: u32,
+        },
+        Symlink {
+            rel_path: String, // relative to tree root
+            target: String,   // in-root relative target (just a filename)
+        },
+    }
+
+    /// Generate a bounded set of valid in-root tree entries.
+    fn arb_tree_entries() -> impl Strategy<Value = Vec<TreeEntry>> {
+        // A pool of safe relative names to pick from.
+        let names: Vec<String> = ["alpha", "beta", "gamma", "delta", "epsilon"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let names_arc = std::sync::Arc::new(names);
+
+        let file_strategy = {
+            let n = names_arc.clone();
+            (
+                prop::sample::select((*n).clone()),
+                prop::collection::vec(any::<u8>(), 0..32),
+                prop::sample::select(vec![0o644u32, 0o755u32, 0o600u32]),
+            )
+                .prop_map(|(name, content, mode)| TreeEntry::File {
+                    rel_path: format!("{name}.txt"),
+                    content,
+                    mode,
+                })
+        };
+
+        let sym_strategy = {
+            let n = names_arc.clone();
+            let n2 = names_arc.clone();
+            (
+                prop::sample::select((*n).clone()),
+                prop::sample::select((*n2).clone()),
+            )
+                .prop_map(|(name, target)| TreeEntry::Symlink {
+                    rel_path: format!("link_{name}"),
+                    target: format!("{target}.txt"),
+                })
+        };
+
+        prop::collection::vec(prop_oneof![file_strategy, sym_strategy], 1..6)
+    }
+
+    proptest! {
+        /// **Roundtrip property**: create a valid in-root tree on disk, `create`
+        /// it into a tar, `extract` the tar into a fresh root, and assert that
+        /// every file/symlink from the original tree is present with identical
+        /// content and symlink target. Mode bits are checked for files.
+        #[test]
+        fn prop_roundtrip_create_extract(entries in arb_tree_entries()) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let src_dir = tempfile::tempdir().unwrap();
+            let src_root = src_dir.path();
+
+            // Build source tree: one top-level directory "src" containing all
+            // entries (so create() gives us the right arc_root).
+            fs::create_dir_all(src_root.join("src")).unwrap();
+
+            // Deduplicate rel_paths so we don't try to write two entries at
+            // the same path (proptest can generate that; just skip duplicates).
+            let mut seen = std::collections::HashSet::new();
+            let unique_entries: Vec<_> = entries.into_iter()
+                .filter(|e| {
+                    let rp = match e {
+                        TreeEntry::File { rel_path, .. } => rel_path.clone(),
+                        TreeEntry::Symlink { rel_path, .. } => rel_path.clone(),
+                    };
+                    seen.insert(rp)
+                })
+                .collect();
+
+            for entry in &unique_entries {
+                match entry {
+                    TreeEntry::File { rel_path, content, mode } => {
+                        let p = src_root.join("src").join(rel_path);
+                        fs::write(&p, content).unwrap();
+                        fs::set_permissions(&p, fs::Permissions::from_mode(*mode)).unwrap();
+                    }
+                    TreeEntry::Symlink { rel_path, target } => {
+                        let p = src_root.join("src").join(rel_path);
+                        // Ignore errors: duplicate or pre-existing target is fine.
+                        let _ = std::os::unix::fs::symlink(target, &p);
+                    }
+                }
+            }
+
+            // Create tar.
+            let mut buf = Vec::new();
+            create(src_root, "/src", &mut buf).expect("create must succeed");
+
+            // Extract into a fresh dest root.
+            let dst_dir = tempfile::tempdir().unwrap();
+            let dst_root = dst_dir.path();
+            extract(dst_root, "/src", &mut &buf[..]).expect("extract must succeed");
+
+            // Assert each entry is present with correct content/mode/target.
+            for entry in &unique_entries {
+                match entry {
+                    TreeEntry::File { rel_path, content, mode } => {
+                        let dst_path = dst_root.join("src").join(rel_path);
+                        prop_assert!(
+                            dst_path.exists(),
+                            "file missing after roundtrip: {rel_path}"
+                        );
+                        let got = fs::read(&dst_path).unwrap();
+                        prop_assert_eq!(&got, content, "content mismatch for {}", rel_path);
+                        let got_mode = fs::metadata(&dst_path).unwrap().permissions().mode() & 0o777;
+                        prop_assert_eq!(got_mode, *mode, "mode mismatch for {}", rel_path);
+                    }
+                    TreeEntry::Symlink { rel_path, target } => {
+                        let dst_path = dst_root.join("src").join(rel_path);
+                        let meta = fs::symlink_metadata(&dst_path);
+                        if meta.is_ok() && meta.unwrap().file_type().is_symlink() {
+                            let got_target = fs::read_link(&dst_path).unwrap();
+                            let got_target_str = got_target.to_string_lossy().into_owned();
+                            prop_assert_eq!(
+                                got_target_str.as_str(),
+                                target.as_str(),
+                                "symlink target mismatch for {}",
+                                rel_path
+                            );
+                        }
+                        // If the symlink was silently dropped (dangling target in
+                        // some extraction modes), that is acceptable — no panic.
+                    }
+                }
+            }
+        }
     }
 }

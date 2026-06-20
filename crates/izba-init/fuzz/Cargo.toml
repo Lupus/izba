@@ -1,0 +1,23 @@
+[package]
+name = "izba-init-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+izba-init = { path = ".." }
+tempfile = "3"
+
+# Fuzz targets are binaries — not part of the workspace, not tested, not documented.
+[[bin]]
+name = "tar_extract"
+path = "fuzz_targets/tar_extract.rs"
+test = false
+doc = false
+
+# Prevent this from interfering with the workspace.
+[workspace]
