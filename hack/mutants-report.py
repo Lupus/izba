@@ -61,11 +61,43 @@ def read_tested(out_dir):
         return 0
 
 
+def read_caught(out_dir):
+    """Set of id_hashes for mutants CAUGHT in this run (<out_dir>/caught.txt).
+
+    caught.txt uses the same `path:line:col: description` format as missed.txt,
+    so a mutant's id_hash matches across runs/platforms. This is the key to the
+    cross-platform merge: cargo-mutants cannot see #[cfg], so a cfg(windows)
+    mutant is reported "missed" on Linux (cfg'd out) but "caught" on Windows —
+    the union of caught ids lets us drop those Linux false positives.
+    """
+    fp = os.path.join(out_dir, "caught.txt")
+    if not os.path.exists(fp):
+        return set()
+    ids = set()
+    with open(fp) as f:
+        for raw in f:
+            m = _parse_line(raw)
+            if m:
+                ids.add(m.id_hash)
+    return ids
+
+
 def merge(dirs):
+    """Real survivors across one or more runs (shards and/or platforms).
+
+    A mutant is a real survivor iff it was MISSED somewhere and CAUGHT NOWHERE.
+    Within a platform the shards partition the mutant set (union). Across
+    platforms this reconciles cargo-mutants' cfg blindness: a mutant killed by
+    ANY platform's tests is not a gap, even if another platform (where the code
+    is cfg'd out) reported it missed.
+    """
+    caught_ids = set()
+    for d in dirs:
+        caught_ids |= read_caught(d)
     seen = {}
     for d in dirs:
         for m in read_missed(d):
-            if m.id_hash not in seen:
+            if m.id_hash not in caught_ids and m.id_hash not in seen:
                 seen[m.id_hash] = m
     out = list(seen.values())
     out.sort(key=lambda m: (m.path, m.line, m.col))

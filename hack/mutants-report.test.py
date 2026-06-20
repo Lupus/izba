@@ -5,11 +5,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("mr", os.path.join(HERE, "mutants-report.py"))
 mr = importlib.util.module_from_spec(spec); spec.loader.exec_module(mr)
 
-def _outdir(tmp, name, missed_lines, total_mutants=None):
+def _outdir(tmp, name, missed_lines, total_mutants=None, caught_lines=None):
     d = os.path.join(tmp, name, "mutants.out")
     os.makedirs(d)
     with open(os.path.join(d, "missed.txt"), "w") as f:
         f.write("\n".join(missed_lines) + ("\n" if missed_lines else ""))
+    if caught_lines is not None:
+        with open(os.path.join(d, "caught.txt"), "w") as f:
+            f.write("\n".join(caught_lines) + ("\n" if caught_lines else ""))
     if total_mutants is not None:
         with open(os.path.join(d, "outcomes.json"), "w") as f:
             json.dump({"total_mutants": total_mutants}, f)
@@ -85,6 +88,28 @@ def test_full_mode_sums_tested_count_across_shards():
         data = json.load(open(jp))
         assert data["tested"] == 25            # 12 + 13 summed from outcomes.json
         assert "25" in open(wp).read()         # surfaced in the markdown header
+
+def test_caught_on_other_platform_suppresses_survivor():
+    # cfg(windows) mutant: MISSED on Linux (cfg'd out, false positive),
+    # CAUGHT on Windows -> must NOT be reported as a survivor.
+    cfg_win = "crates/izba-core/src/procmgr/jail_windows.rs:10:5: replace spawn -> Result<()> with Ok(())"
+    real_gap = "crates/izba-core/src/sandbox.rs:20:5: replace go -> Result<()> with Ok(())"
+    with tempfile.TemporaryDirectory() as t:
+        linux = _outdir(t, "lin", [cfg_win, real_gap])          # both missed on Linux
+        windows = _outdir(t, "win", [], caught_lines=[cfg_win])  # Windows caught the cfg(windows) one
+        survivors = mr.merge([linux, windows])
+        paths = [m.path for m in survivors]
+        assert "crates/izba-core/src/procmgr/jail_windows.rs" not in paths  # suppressed
+        assert "crates/izba-core/src/sandbox.rs" in paths                    # genuine gap kept
+        assert len(survivors) == 1
+
+def test_missed_on_both_platforms_is_a_real_gap():
+    line = "crates/izba-core/src/sandbox.rs:20:5: replace go -> Result<()> with Ok(())"
+    with tempfile.TemporaryDirectory() as t:
+        linux = _outdir(t, "lin", [line], caught_lines=[])
+        windows = _outdir(t, "win", [line], caught_lines=[])
+        survivors = mr.merge([linux, windows])
+        assert len(survivors) == 1  # missed everywhere, caught nowhere -> real gap
 
 def test_issue_summary_is_compact_and_per_file():
     # Many survivors across many files must still fit GitHub's 65536-char issue cap.

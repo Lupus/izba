@@ -34,6 +34,22 @@ noise in the full run and **false blocks** in the incremental gate.
 The design therefore treats *scoping* as the central concern, solved once by a
 shared skip-list (§1) that both pipelines consume.
 
+> **Revision (2026-06-20): cross-platform model.** The original design excluded
+> platform-specific (`#[cfg(windows)]`) code by path, treating it like KVM code.
+> That under-covers it: cargo-mutants **cannot see `#[cfg]`**
+> ([upstream limitation](https://mutants.rs/limitations.html)) and reports
+> another platform's code as "missed" wherever it is cfg'd out — but the Windows
+> *tests* genuinely cover that code. So instead of excluding platform-cfg code,
+> we run the **same mutant set on BOTH Linux and Windows** (gate *and* full run)
+> and reconcile with the **caught-nowhere rule**: a mutant is a real survivor
+> only if **no platform caught it**. A `#[cfg(windows)]` mutant is "missed" on
+> Linux (cfg'd out, false positive) but "caught" on Windows → dropped; a
+> genuine gap is missed on both → kept. The shared skip-list (§1) now excludes
+> **only** real-VM (KVM/WHP) code — *not* platform-cfg code. The cross-platform
+> reconciliation lives in the shared reporter (`hack/mutants-report.py`) and
+> serves both the gate aggregator and the full-run collect job. Sections below
+> that say "exclude platform glue" are superseded by this rule.
+
 ## 1. Unifying mechanism: one skip-list, two consumers
 
 A single committed `.cargo/mutants.toml` is the source of truth for *what is
