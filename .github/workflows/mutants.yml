@@ -94,6 +94,7 @@ jobs:
         run: |
           python3 hack/mutants-report.py --mode full \
             --json-out mutants-report.json --md-out mutants-report.md \
+            --issue-out mutants-issue.md \
             shards/mutants-shard-*
           cat mutants-report.md >> "$GITHUB_STEP_SUMMARY"
           tested=$(python3 -c "import json;print(json.load(open('mutants-report.json'))['tested'])")
@@ -110,4 +111,4 @@ jobs:
         # Only when shards actually contributed results — tested==0 means a broken
         # run (no shard artifacts), and we must not post a misleading "no gaps" issue.
         if: ${{ steps.merge.outputs.tested != '0' }}
-        run: hack/mutants-issue.sh mutants-report.md
+        run: hack/mutants-issue.sh mutants-issue.md

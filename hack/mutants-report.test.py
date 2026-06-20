@@ -86,6 +86,24 @@ def test_full_mode_sums_tested_count_across_shards():
         assert data["tested"] == 25            # 12 + 13 summed from outcomes.json
         assert "25" in open(wp).read()         # surfaced in the markdown header
 
+def test_issue_summary_is_compact_and_per_file():
+    # Many survivors across many files must still fit GitHub's 65536-char issue cap.
+    lines = []
+    for fi in range(200):
+        for li in range(20):
+            lines.append(f"crates/c{fi}/src/f{fi}.rs:{li+1}:5: replace + with - in func{li}")
+    with tempfile.TemporaryDirectory() as t:
+        d = _outdir(t, "s1", lines, total_mutants=5000)
+        ip = os.path.join(t, "issue.md")
+        r = subprocess.run([sys.executable, os.path.join(HERE, "mutants-report.py"),
+                            "--mode", "full", "--issue-out", ip, os.path.dirname(d)],
+                           capture_output=True, text=True)
+        assert r.returncode == 0
+        body = open(ip).read()
+        assert len(body) < 65536, f"issue body too long: {len(body)}"
+        assert "4000" in body            # total survivor count surfaced (200*20)
+        assert "mutants-report.json" in body  # points to the artifact for detail
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
