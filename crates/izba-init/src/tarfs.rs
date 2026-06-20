@@ -1205,9 +1205,14 @@ mod tests {
                 if *p == walk_top.join("b") || *p == root {
                     continue;
                 }
-                panic!(
+                // prop_assert! (not panic!) so the shrinker keeps the Result-based
+                // failure path and reports the minimal escaping archive.
+                prop_assert!(
+                    false,
                     "ESCAPE DETECTED: path {:?} exists outside root {:?} (archive={:?})",
-                    p, root, ca
+                    p,
+                    root,
+                    ca
                 );
             }
             // Sentinels must be untouched.
@@ -1336,8 +1341,11 @@ mod tests {
                     }
                     TreeEntry::Symlink { rel_path, target } => {
                         let p = src_root.join("src").join(rel_path);
-                        // Ignore errors: duplicate or pre-existing target is fine.
-                        let _ = std::os::unix::fs::symlink(target, &p);
+                        // rel_paths are deduped and the "src" parent exists, so this
+                        // always succeeds; assert it so a generator change can't
+                        // silently skip planting the symlink (which would make the
+                        // roundtrip check below pass vacuously).
+                        std::os::unix::fs::symlink(target, &p).unwrap();
                     }
                 }
             }
@@ -1367,19 +1375,31 @@ mod tests {
                     }
                     TreeEntry::Symlink { rel_path, target } => {
                         let dst_path = dst_root.join("src").join(rel_path);
+                        // The symlink targets are in-root filenames, so extract must
+                        // reproduce the symlink — a missing node is a real drop bug,
+                        // not an acceptable outcome. Assert presence + type + target.
                         let meta = fs::symlink_metadata(&dst_path);
-                        if meta.is_ok() && meta.unwrap().file_type().is_symlink() {
-                            let got_target = fs::read_link(&dst_path).unwrap();
-                            let got_target_str = got_target.to_string_lossy().into_owned();
-                            prop_assert_eq!(
-                                got_target_str.as_str(),
-                                target.as_str(),
-                                "symlink target mismatch for {}",
-                                rel_path
-                            );
-                        }
-                        // If the symlink was silently dropped (dangling target in
-                        // some extraction modes), that is acceptable — no panic.
+                        prop_assert!(
+                            meta.is_ok(),
+                            "symlink missing after roundtrip: {} ({:?})",
+                            rel_path,
+                            meta.err()
+                        );
+                        let meta = meta.unwrap();
+                        prop_assert!(
+                            meta.file_type().is_symlink(),
+                            "expected a symlink at {}, got {:?}",
+                            rel_path,
+                            meta.file_type()
+                        );
+                        let got_target = fs::read_link(&dst_path).unwrap();
+                        let got_target_str = got_target.to_string_lossy().into_owned();
+                        prop_assert_eq!(
+                            got_target_str.as_str(),
+                            target.as_str(),
+                            "symlink target mismatch for {}",
+                            rel_path
+                        );
                     }
                 }
             }

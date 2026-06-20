@@ -685,8 +685,8 @@ mod tests {
     /// Keeping the alphabet tiny (7 symbols) makes collisions common,
     /// so whiteout/overwrite interactions are exercised frequently.
     fn arb_name() -> impl proptest::strategy::Strategy<Value = String> {
-        use proptest::prelude::*;
-        "[a-e0-2]{1,6}".prop_map(|s| s)
+        // A regex string is itself a `Strategy<Value = String>`.
+        "[a-e0-2]{1,6}"
     }
 
     /// Generate a path of depth 1–3 using `arb_name` components.
