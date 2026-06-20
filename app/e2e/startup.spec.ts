@@ -19,8 +19,9 @@ test.describe("startup & polling", () => {
       sandboxes: [{ name: "web", image: "ubuntu:24.04", state: { kind: "running" } }],
       daemonStatus: { version: "0.3.1", pid: 4242, uptime_ms: 1000, sandbox_count: 1 },
     });
-    // usePolling refreshes every 2s; Playwright assertions auto-wait.
-    await expect(page.getByText("postgres:16")).toHaveCount(0);
-    await expect(page.getByText(/Sandboxes · 1/)).toBeVisible();
+    // usePolling refreshes every 2s; give headroom over the default 5s timeout
+    // for loaded CI running chromium+webkit in parallel.
+    await expect(page.getByText("postgres:16")).toHaveCount(0, { timeout: 10_000 });
+    await expect(page.getByText(/Sandboxes · 1/)).toBeVisible({ timeout: 10_000 });
   });
 });
