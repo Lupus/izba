@@ -89,10 +89,14 @@ describe("PolicyEditor", () => {
     fireEvent.click(screen.getAllByRole("button", { name: /^add$/i })[1]);
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() =>
-      expect(api.policySet).toHaveBeenCalledWith("web", [
-        { host: "api.x.com", ports: [80, 443] },
-        { host: "db.internal", ports: [5432, 8443] },
-      ]),
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [
+          { host: "api.x.com", ports: [80, 443], access: "read-write" },
+          { host: "db.internal", ports: [5432, 8443], access: "read-write" },
+        ],
+        [],
+      ),
     );
   });
 
@@ -108,10 +112,14 @@ describe("PolicyEditor", () => {
     // Nothing was added: saving yields the original ports.
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() =>
-      expect(api.policySet).toHaveBeenCalledWith("web", [
-        { host: "api.x.com", ports: [80, 443] },
-        { host: "db.internal", ports: [5432] },
-      ]),
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [
+          { host: "api.x.com", ports: [80, 443], access: "read-write" },
+          { host: "db.internal", ports: [5432], access: "read-write" },
+        ],
+        [],
+      ),
     );
   });
 
