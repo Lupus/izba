@@ -142,12 +142,16 @@ export function VolumeRowEditor({ row, freeVolumes, onChange, onRemove, index }:
 
       {/* Size: editable for ephemeral/new, read-only display for existing */}
       <div className="flex items-center gap-2">
-        <label
-          className="w-24 shrink-0 text-xs font-semibold text-ink-2"
-          htmlFor={isExisting ? undefined : `vol-size-${index}`}
-        >
-          Size
-        </label>
+        {isExisting ? (
+          <span className="w-24 shrink-0 text-xs font-semibold text-ink-2">Size</span>
+        ) : (
+          <label
+            className="w-24 shrink-0 text-xs font-semibold text-ink-2"
+            htmlFor={`vol-size-${index}`}
+          >
+            Size
+          </label>
+        )}
         {isExisting ? (
           <span className="flex-1 font-mono text-sm text-ink-2">
             {selectedVol ? fmtBytes(selectedVol.size_bytes) : "—"}
