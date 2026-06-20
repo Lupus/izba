@@ -81,12 +81,15 @@ describe("VolumesTab — seeding from inspect", () => {
 });
 
 describe("VolumesTab — dirty banner", () => {
-  it("shows 'applied on next restart' banner when a row is added", async () => {
+  it("shows 'applied on next restart' banner when a valid draft is added", async () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
-    // Wait for inspect to resolve and component to render
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    // Fill draft fields and click Add
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+
     expect(await screen.findByText(/applied on next restart/i)).toBeInTheDocument();
   });
 
@@ -95,14 +98,106 @@ describe("VolumesTab — dirty banner", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
     expect(screen.queryByText(/applied on next restart/i)).not.toBeInTheDocument();
   });
+
+  it("banner gone after add-then-remove staged volume", async () => {
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    // Add a valid draft
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByText(/applied on next restart/i);
+
+    // Remove the staged item
+    fireEvent.click(screen.getByRole("button", { name: /remove staged volume \/data/i }));
+    expect(screen.queryByText(/applied on next restart/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("VolumesTab — Add button validation", () => {
+  it("Add with invalid fields shows inline error and does NOT stage", async () => {
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    // Fill only path, leave size blank — invalid ephemeral
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+
+    // Error message shown
+    expect(
+      screen.getByText(/size must be a number followed by g or m/i),
+    ).toBeInTheDocument();
+    // Banner NOT shown (nothing staged)
+    expect(screen.queryByText(/applied on next restart/i)).not.toBeInTheDocument();
+  });
+
+  it("Add with valid fields stages it, resets draft, and clears errors", async () => {
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "2g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+
+    // Staged row appears
+    await screen.findByRole("button", { name: /remove staged volume \/data/i });
+    // Error messages gone
+    expect(screen.queryByText(/size must be a number/i)).not.toBeInTheDocument();
+    // Draft is reset (path input is blank again)
+    expect(screen.getByLabelText(/volume 1 path/i)).toHaveValue("");
+  });
+
+  it("shows name error when new_persistent name is invalid", async () => {
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
+    // Leave name blank, fill path and size
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+
+    expect(screen.getByText(/name must match/i)).toBeInTheDocument();
+  });
+
+  it("shows path error when path lacks leading slash", async () => {
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+
+    expect(screen.getByText(/guest path must be absolute/i)).toBeInTheDocument();
+  });
+
+  it("shows pick error when existing_persistent has no volume selected", async () => {
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: /existing/i }));
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/arch" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+
+    expect(screen.getByText(/select a volume/i)).toBeInTheDocument();
+  });
+
+  it("error messages not shown before first Add attempt", async () => {
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    // Don't click Add at all — no errors should appear
+    expect(screen.queryByText(/must be a number/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/must be absolute/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/name must match/i)).not.toBeInTheDocument();
+  });
 });
 
 describe("VolumesTab — Save: attach a new volume", () => {
   it("calls volumeAttach with correct spec string when a new row is saved", async () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
-
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
 
     // Switch to new persistent type
     fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
@@ -113,6 +208,10 @@ describe("VolumesTab — Save: attach a new volume", () => {
     fireEvent.change(nameInput, { target: { value: "cache" } });
     fireEvent.change(pathInput, { target: { value: "/data" } });
     fireEvent.change(sizeInput, { target: { value: "1g" } });
+
+    // Click Add to stage
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/data/i });
 
     fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
 
@@ -152,7 +251,10 @@ describe("VolumesTab — Restart now", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    // Stage a valid draft to make dirty
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
 
     expect(await screen.findByRole("button", { name: /save & restart now/i })).toBeInTheDocument();
   });
@@ -161,20 +263,25 @@ describe("VolumesTab — Restart now", () => {
     render(<VolumesTab sandbox={stopped} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    // Stage a valid draft to make dirty
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
 
     await screen.findByText(/applied on next restart/i);
     expect(screen.queryByRole("button", { name: /save & restart now/i })).not.toBeInTheDocument();
   });
 
-  it("calls api.restart and onChanged when Restart now is clicked (no pending edits)", async () => {
+  it("calls api.restart and onChanged when Restart now is clicked (with staged volume)", async () => {
     const onChanged = vi.fn();
     render(<VolumesTab sandbox={running} onChanged={onChanged} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    // Click "Add volume" to make the component dirty (shows Restart now button)
-    // but leave all fields blank so save() treats the row as a no-op and returns true
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    // Stage a valid draft to make dirty and show Restart now
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+
     const restartBtn = await screen.findByRole("button", { name: /save & restart now/i });
     fireEvent.click(restartBtn);
 
@@ -192,11 +299,12 @@ describe("VolumesTab — Restart now", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     // Add a new valid volume row
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "2g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/data/i });
 
     const restartBtn = await screen.findByRole("button", { name: /save & restart now/i });
     fireEvent.click(restartBtn);
@@ -206,21 +314,22 @@ describe("VolumesTab — Restart now", () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
   });
 
-  it("Restart now does NOT call restart if save fails (validation error)", async () => {
+  it("Restart now does NOT call restart if save fails (API error)", async () => {
+    volumeAttach.mockRejectedValue(new Error("disk full"));
     render(<VolumesTab sandbox={running} onChanged={vi.fn()} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    // Add a row with invalid data so validation fails
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-    fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
-    fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "data" } });
+    // Stage a valid row
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
-    // leave size blank — should fail validation
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "2g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/data/i });
 
     const restartBtn = await screen.findByRole("button", { name: /save & restart now/i });
     fireEvent.click(restartBtn);
 
-    // restart should NOT be called because save() returned false
+    // restart should NOT be called because save() failed (volumeAttach threw)
+    await waitFor(() => expect(volumeAttach).toHaveBeenCalled());
     await new Promise((r) => setTimeout(r, 50));
     expect(restart).not.toHaveBeenCalled();
   });
@@ -240,11 +349,12 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
 
     // Add a new valid volume row
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/cache/i });
 
     fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
 
@@ -263,11 +373,12 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
 
     // Add a new valid volume row
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/cache/i });
 
     fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
 
@@ -285,11 +396,12 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
 
     // Add a new valid volume row
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/cache/i });
 
     fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
 
@@ -305,14 +417,15 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-
     // Choose Ephemeral (should be default, or click the button)
     const ephBtn = screen.getByRole("button", { name: /ephemeral/i });
     fireEvent.click(ephBtn);
 
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/scratch" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/scratch/i });
 
     fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
     await waitFor(() =>
@@ -324,14 +437,15 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-
     const newPersBtn = screen.getByRole("button", { name: /new persistent/i });
     fireEvent.click(newPersBtn);
 
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "2g" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/data/i });
 
     fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
     await waitFor(() =>
@@ -346,8 +460,6 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
-
     const existingBtn = screen.getByRole("button", { name: /existing/i });
     fireEvent.click(existingBtn);
 
@@ -356,6 +468,9 @@ describe("VolumesTab — 3-way volume type selector", () => {
     fireEvent.change(select, { target: { value: "archive" } });
 
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/arch" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/arch/i });
 
     fireEvent.click(screen.getByRole("button", { name: /^save changes$/i }));
     await waitFor(() =>
@@ -371,7 +486,6 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("button", { name: /existing/i }));
 
     await waitFor(() => expect(volumeList).toHaveBeenCalled());
@@ -395,7 +509,6 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await screen.findByText(/\/data/);
 
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("button", { name: /existing/i }));
 
     await waitFor(() => expect(volumeList).toHaveBeenCalled());
@@ -405,6 +518,32 @@ describe("VolumesTab — 3-way volume type selector", () => {
     // "cache" is already seeded, should not appear
     expect(optTexts.some(t => t?.includes("archive"))).toBe(true);
     expect(optTexts.some(t => t?.includes("cache"))).toBe(false);
+  });
+
+  it("existing persistent dropdown excludes volumes already in toAdd", async () => {
+    volumeList.mockResolvedValue([
+      { name: "vol1", size_bytes: 1073741824, actual_bytes: 0, referenced_by: [] },
+      { name: "vol2", size_bytes: 1073741824, actual_bytes: 0, referenced_by: [] },
+    ]);
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalled());
+
+    // Stage vol1 as existing_persistent
+    fireEvent.click(screen.getByRole("button", { name: /existing/i }));
+    await waitFor(() => expect(volumeList).toHaveBeenCalled());
+    const select = screen.getByRole("combobox", { name: /existing volume/i });
+    fireEvent.change(select, { target: { value: "vol1" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/v1" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/v1/i });
+
+    // Now check the dropdown for a second add — vol1 should be excluded
+    fireEvent.click(screen.getByRole("button", { name: /existing/i }));
+    const select2 = screen.getByRole("combobox", { name: /existing volume/i });
+    const opts = select2.querySelectorAll('option');
+    const optTexts = Array.from(opts).map(o => o.textContent);
+    expect(optTexts.some(t => t?.includes("vol2"))).toBe(true);
+    expect(optTexts.some(t => t?.includes("vol1"))).toBe(false);
   });
 });
 

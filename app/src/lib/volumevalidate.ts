@@ -57,6 +57,33 @@ export function isValidVolRow(r: VolumeRow): boolean {
   }
 }
 
+/** Returns an error string or null. name is the trimmed value. */
+export function volNameError(kind: VolumeKind, name: string): string | null {
+  if (kind !== "new_persistent") return null;
+  if (!isValidVolNameNonEmpty(name)) return "Name must match [a-z0-9][a-z0-9_-]*";
+  return null;
+}
+
+/** Returns an error string or null. path is the trimmed value. */
+export function volPathError(path: string): string | null {
+  if (!isValidVolPath(path)) return "Guest path must be absolute (start with /) and have no commas";
+  return null;
+}
+
+/** Returns an error string or null. size is the trimmed value. */
+export function volSizeError(kind: VolumeKind, size: string): string | null {
+  if (kind === "existing_persistent") return null;
+  if (!isValidVolSize(size)) return "Size must be a number followed by g or m (e.g. 1g)";
+  return null;
+}
+
+/** Returns an error string or null. */
+export function volPickError(kind: VolumeKind, selectedVolName: string): string | null {
+  if (kind !== "existing_persistent") return null;
+  if (!selectedVolName) return "Select a volume";
+  return null;
+}
+
 /** Build the spec string to pass to volumeAttach / CreateOpts.volumes. */
 export function buildVolSpec(r: VolumeRow, freeVolumes: VolumeInfo[]): string {
   const path = r.path.trim();
