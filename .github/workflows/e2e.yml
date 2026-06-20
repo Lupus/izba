@@ -147,9 +147,23 @@ jobs:
           sudo udevadm trigger --name-match=kvm || true
           ls -l /dev/kvm
           [ -r /dev/kvm ] && [ -w /dev/kvm ]
-      # passt is gone as of M1 — egress now rides izbad over vsock, so the
-      # guest is a NIC-less vsock island and no host NAT helper is needed
-      # (the apparmor userns workaround that static passt required is gone too).
+      # Host-side VMM confinement (MVP-C jailer) runs virtiofsd with
+      # `--sandbox namespace`: it creates an unprivileged user+mount namespace
+      # and mounts inside it. On Ubuntu 24.04 hosted runners the default
+      # AppArmor restriction lets the userns be created (so the in-process
+      # userns probe passes) but blocks the mount() inside it, so virtiofsd
+      # dies with `CleanMount: Permission denied` and never creates its socket
+      # → boot fails. Relax the restriction so the real namespace sandbox can
+      # run. (passt needed this same userns knob before M1; it left with passt
+      # and returned with the jailer.) Guarded: the knob only exists on
+      # AppArmor-enabled kernels.
+      - name: Allow unprivileged user namespaces (virtiofsd --sandbox namespace)
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "apparmor_restrict_unprivileged_userns knob absent — nothing to relax"
+          fi
       - name: Restore runtime tools
         id: tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -278,6 +292,16 @@ jobs:
           sudo udevadm trigger --name-match=kvm || true
           ls -l /dev/kvm
           [ -r /dev/kvm ] && [ -w /dev/kvm ]
+      # Same userns relaxation as the linux-kvm gate: virtiofsd --sandbox
+      # namespace must be able to mount inside an unprivileged user namespace,
+      # which the default Ubuntu 24.04 AppArmor restriction blocks.
+      - name: Allow unprivileged user namespaces (virtiofsd --sandbox namespace)
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "apparmor_restrict_unprivileged_userns knob absent — nothing to relax"
+          fi
       - name: Restore runtime tools
         id: tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
