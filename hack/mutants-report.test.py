@@ -5,11 +5,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("mr", os.path.join(HERE, "mutants-report.py"))
 mr = importlib.util.module_from_spec(spec); spec.loader.exec_module(mr)
 
-def _outdir(tmp, name, missed_lines):
+def _outdir(tmp, name, missed_lines, total_mutants=None):
     d = os.path.join(tmp, name, "mutants.out")
     os.makedirs(d)
     with open(os.path.join(d, "missed.txt"), "w") as f:
         f.write("\n".join(missed_lines) + ("\n" if missed_lines else ""))
+    if total_mutants is not None:
+        with open(os.path.join(d, "outcomes.json"), "w") as f:
+            json.dump({"total_mutants": total_mutants}, f)
     return d
 
 def test_read_missed_parses_lines():
@@ -69,6 +72,19 @@ def test_full_mode_writes_json_and_md():
         assert data["survivors"][0]["path"].endswith("dns.rs")
         assert "id_hash" in data["survivors"][0]
         assert "dns.rs" in open(wp).read()
+
+def test_full_mode_sums_tested_count_across_shards():
+    with tempfile.TemporaryDirectory() as t:
+        d1 = _outdir(t, "s1", ["crates/a/src/x.rs:1:1: replace + with -"], total_mutants=12)
+        d2 = _outdir(t, "s2", [], total_mutants=13)
+        jp = os.path.join(t, "r.json"); wp = os.path.join(t, "w.md")
+        r = subprocess.run([sys.executable, os.path.join(HERE, "mutants-report.py"),
+                            "--mode", "full", "--json-out", jp, "--md-out", wp,
+                            os.path.dirname(d1), os.path.dirname(d2)], capture_output=True, text=True)
+        assert r.returncode == 0
+        data = json.load(open(jp))
+        assert data["tested"] == 25            # 12 + 13 summed from outcomes.json
+        assert "25" in open(wp).read()         # surfaced in the markdown header
 
 if __name__ == "__main__":
     import traceback
