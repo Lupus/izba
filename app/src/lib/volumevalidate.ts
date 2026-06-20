@@ -27,7 +27,7 @@ export const isValidVolNameNonEmpty = (s: string) => /^[a-z0-9][a-z0-9_-]*$/.tes
 export const isValidVolPath = (s: string) => s.startsWith("/") && !s.includes(",");
 
 /** Size must be a positive integer followed by g, m, G, or M. */
-export const isValidVolSize = (s: string) => /^\d+[gmGM]$/.test(s);
+export const isValidVolSize = (s: string) => /^[1-9]\d*[gmGM]$/.test(s);
 
 /** A row the user added but left entirely blank is silently ignored on submit. */
 export function isBlankVolRow(r: VolumeRow): boolean {
@@ -73,7 +73,7 @@ export function volPathError(path: string): string | null {
 /** Returns an error string or null. size is the trimmed value. */
 export function volSizeError(kind: VolumeKind, size: string): string | null {
   if (kind === "existing_persistent") return null;
-  if (!isValidVolSize(size)) return "Size must be a number followed by g or m (e.g. 1g)";
+  if (!isValidVolSize(size)) return "Size must be a positive number followed by g or m (e.g. 1g)";
   return null;
 }
 
