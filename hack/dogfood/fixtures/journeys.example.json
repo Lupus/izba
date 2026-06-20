@@ -1,0 +1,25 @@
+{
+  "feature": "port publishing + sandbox lifecycle",
+  "journeys": [
+    {
+      "journey_id": "publish-port-and-reach-it",
+      "rationale": "Spec promises `-p HOST:GUEST` makes a guest service reachable from the host.",
+      "source": { "kind": "spec", "ref": "2026-06-12-izba-mesh-networking-design.md §4" },
+      "steps": [
+        { "intent": "create a sandbox publishing host port 8080 to guest port 80", "expect": "create succeeds and `izba ls` shows the published port" },
+        { "intent": "run a tiny http server in the guest listening on :80", "expect": "exec returns 0 and the server is listening" },
+        { "intent": "fetch http://localhost:8080 from the host", "expect": "HTTP 200 returned within a few seconds" }
+      ]
+    },
+    {
+      "journey_id": "create-run-rm-leaves-no-trace",
+      "rationale": "Disk-state invariant: `rm` of a sandbox must remove its on-disk directory and leave the daemon list consistent.",
+      "source": { "kind": "spec", "ref": "CLAUDE.md — disk-state invariant" },
+      "steps": [
+        { "intent": "create a fresh sandbox from a small image", "expect": "create succeeds and the sandbox appears in `izba ls`" },
+        { "intent": "run a trivial command in the sandbox", "expect": "exec returns 0 with expected output" },
+        { "intent": "remove the sandbox", "expect": "`rm` succeeds, `izba ls` no longer lists it, and the reconciler reports no list/disk mismatch" }
+      ]
+    }
+  ]
+}
