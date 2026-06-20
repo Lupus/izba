@@ -189,6 +189,37 @@ equivalent `allow_unconfined: true` to `sandbox::start_with_timeouts`). The
 the full suite still runs on such hosts — only the
 `confined_boot_records_restricted_when_landlock_present` test will self-skip.
 
+### Unprivileged user namespaces (the virtiofsd sandbox leg)
+
+The confinement floor also runs virtiofsd with `--sandbox namespace`, which
+creates an **unprivileged user + mount namespace** and mounts inside it
+(virtiofsd's first step is a recursive private remount of `/`). So in addition to
+Landlock, the host must allow an unprivileged process to **mount inside a user
+namespace**, not merely to create one.
+
+> ⚠️ **Ubuntu 24.04 / Debian 13 / hosted GitHub runners gotcha.** These ship
+> `kernel.apparmor_restrict_unprivileged_userns=1` by default. Under it the
+> `unshare(CLONE_NEWUSER)` *succeeds* but the capabilities inside the namespace
+> are nerfed, so virtiofsd's `mount()` is **denied** and it dies at boot with
+> `Error entering sandbox: CleanMount(... Permission denied)` — the fs socket is
+> never created and the guest fails to boot. `izba`'s `userns` probe attempts the
+> real mount (not just the `unshare`), so it reports this honestly and the launch
+> **fails closed** up front with a message naming the sysctl.
+
+Enable it (the throwaway-CI-runner remedy; izba's `e2e.yml` does exactly this):
+
+```sh
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+# persist: echo 'kernel.apparmor_restrict_unprivileged_userns = 0' \
+#   | sudo tee /etc/sysctl.d/99-izba-userns.conf
+```
+
+Or, if you cannot relax the host, pass `--allow-unconfined` (same opt-out as the
+Landlock-less path above). **WSL2 has no such knob**, so the namespace sandbox
+works out of the box there. As with Landlock, check the live verdict with
+`cargo run -p izba-core --example confine_probe` (`userns=true` means the real
+mount-in-userns probe passed, i.e. the namespace sandbox will work).
+
 ## 4. Running the integration suite
 
 ```sh

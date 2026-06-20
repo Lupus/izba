@@ -150,13 +150,13 @@ jobs:
       # Host-side VMM confinement (MVP-C jailer) runs virtiofsd with
       # `--sandbox namespace`: it creates an unprivileged user+mount namespace
       # and mounts inside it. On Ubuntu 24.04 hosted runners the default
-      # AppArmor restriction lets the userns be created (so the in-process
-      # userns probe passes) but blocks the mount() inside it, so virtiofsd
-      # dies with `CleanMount: Permission denied` and never creates its socket
-      # → boot fails. Relax the restriction so the real namespace sandbox can
-      # run. (passt needed this same userns knob before M1; it left with passt
-      # and returned with the jailer.) Guarded: the knob only exists on
-      # AppArmor-enabled kernels.
+      # AppArmor restriction lets the userns be created but blocks the mount()
+      # inside it. Without this relaxation izba's userns probe (which attempts
+      # the real mount) fails closed up front, and bare virtiofsd would die with
+      # `CleanMount: Permission denied`. Relax the restriction so the real
+      # namespace sandbox can run and be exercised here. (passt needed this same
+      # userns knob before M1; it left with passt and returned with the jailer.)
+      # Guarded: the knob only exists on AppArmor-enabled kernels.
       - name: Allow unprivileged user namespaces (virtiofsd --sandbox namespace)
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then

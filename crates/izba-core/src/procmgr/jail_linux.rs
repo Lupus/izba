@@ -112,30 +112,76 @@ impl Capabilities {
     }
 }
 
-/// Fork a child that attempts `unshare(CLONE_NEWUSER)`; the child exits 0 on
-/// success. This is the only reliable cross-distro signal — reading
-/// `user.max_user_namespaces` alone misses AppArmor/seccomp gating.
+/// Fork a child that creates an unprivileged user+mount namespace and then
+/// performs the *same* mount `virtiofsd --sandbox namespace` does first — the
+/// recursive private remount of `/` (virtiofsd's `Error::CleanMount`). The child
+/// exits 0 only when BOTH succeed.
+///
+/// Testing only `unshare(CLONE_NEWUSER)` (the previous probe) is a false
+/// positive on AppArmor-restricted hosts (the default on Ubuntu 24.04 / hosted
+/// GitHub runners with `kernel.apparmor_restrict_unprivileged_userns=1`): the
+/// userns is created but the capabilities inside it are nerfed, so the mount is
+/// denied. The old probe reported `userns = true`, the plan selected the
+/// `Namespace` sandbox, and virtiofsd then died at boot with
+/// `CleanMount: Permission denied`. Probing the actual mount makes the
+/// capability honest: a host that cannot mount-in-userns fails the virtiofsd
+/// floor leg up front (fail closed) instead of crashing the guest boot.
+///
+/// Reading `user.max_user_namespaces` / the sysctl alone can't capture this —
+/// only attempting the operation does.
 #[cfg(target_os = "linux")]
 fn probe_userns() -> bool {
     use nix::sched::{unshare, CloneFlags};
     use nix::sys::wait::{waitpid, WaitStatus};
     use nix::unistd::{fork, ForkResult};
 
-    // SAFETY: the child does no allocation before _exit; it only calls unshare
-    // and _exit, both async-signal-safe.
+    // SAFETY: the child does no allocation and takes no locks before `_exit`; it
+    // calls only `unshare`, `libc::mount`, and `libc::_exit`, all
+    // async-signal-safe. The root path is a `'static` NUL-terminated literal, so
+    // forming its pointer allocates nothing. Every effect is confined to the
+    // child's own throwaway namespaces and vanishes on exit.
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
-            let code = if unshare(CloneFlags::CLONE_NEWUSER).is_ok() {
-                0
-            } else {
-                1
-            };
-            unsafe { libc::_exit(code) };
+            // A fresh mount namespace owned by the fresh user namespace: that is
+            // where the unprivileged caps (if granted) let us mount.
+            let made_ns = unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS).is_ok();
+            let mounted = made_ns
+                && unsafe {
+                    libc::mount(
+                        std::ptr::null(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+                        std::ptr::null(),
+                    ) == 0
+                };
+            unsafe { libc::_exit(i32::from(!mounted)) };
         }
         Ok(ForkResult::Parent { child }) => {
             matches!(waitpid(child, None), Ok(WaitStatus::Exited(_, 0)))
         }
         Err(_) => false,
+    }
+}
+
+/// Reads the AppArmor unprivileged-user-namespace restriction sysctl.
+/// `Some(true)` when it is set (the default on Ubuntu 24.04+, which blocks the
+/// mount inside an unprivileged userns), `Some(false)` when explicitly off, and
+/// `None` when the knob is absent (older kernels / non-AppArmor hosts such as
+/// WSL2). Used only to enrich the fail-closed message with a precise remedy.
+#[cfg(target_os = "linux")]
+fn apparmor_userns_restricted() -> Option<bool> {
+    apparmor_userns_restricted_at("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+}
+
+#[cfg(target_os = "linux")]
+fn apparmor_userns_restricted_at(path: &str) -> Option<bool> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    match raw.trim() {
+        "" => None,
+        "0" => Some(false),
+        // Any non-zero value counts as restricted (fail-closed messaging).
+        _ => Some(true),
     }
 }
 
@@ -188,6 +234,30 @@ fn has_chroot_cap() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Builds the fail-closed "floor not met" error. When `apparmor_hint` is set,
+/// it appends the precise AppArmor sysctl remedy (the common Ubuntu 24.04 case
+/// where the userns is creatable but virtiofsd's mount inside it is denied).
+#[cfg(target_os = "linux")]
+fn floor_not_met_error(missing: &[&str], apparmor_hint: bool) -> anyhow::Error {
+    let mut msg = format!(
+        "host-side VMM confinement floor not met: missing {}. \
+         Enable the Landlock LSM (CONFIG_SECURITY_LANDLOCK + boot param \
+         lsm=...,landlock) and/or unprivileged user namespaces, \
+         or pass --allow-unconfined to launch without confinement (NOT recommended).",
+        missing.join(", ")
+    );
+    if apparmor_hint {
+        msg.push_str(
+            " Unprivileged user namespaces are restricted by AppArmor on this host \
+             (kernel.apparmor_restrict_unprivileged_userns=1): the namespace can be \
+             created but virtiofsd's mount inside it is denied. Enable it with \
+             `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` \
+             (persist via /etc/sysctl.d) to use the namespace sandbox.",
+        );
+    }
+    anyhow::anyhow!(msg)
+}
+
 #[cfg(target_os = "linux")]
 pub fn plan(
     caps: &Capabilities,
@@ -230,13 +300,11 @@ pub fn plan(
     }
 
     if !allow_unconfined {
-        anyhow::bail!(
-            "host-side VMM confinement floor not met: missing {}. \
-             Enable the Landlock LSM (CONFIG_SECURITY_LANDLOCK + boot param \
-             lsm=...,landlock) and/or unprivileged user namespaces, \
-             or pass --allow-unconfined to launch without confinement (NOT recommended).",
-            missing.join(", ")
-        );
+        // Surface the AppArmor sysctl as the specific remedy only when the
+        // virtiofsd sandbox leg is what failed AND that knob is the likely cause.
+        let apparmor_hint =
+            sandbox == VirtiofsdSandbox::None && matches!(apparmor_userns_restricted(), Some(true));
+        return Err(floor_not_met_error(&missing, apparmor_hint));
     }
 
     // Opted out: report None honestly, listing what DID apply.
@@ -304,6 +372,56 @@ mod tests {
         // userns/landlock are environment-dependent; just assert they are read
         // without panicking (booleans already are).
         let _ = (caps.userns, caps.landlock);
+    }
+
+    #[test]
+    fn apparmor_userns_restricted_reads_the_sysctl_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let knob = dir.path().join("apparmor_restrict_unprivileged_userns");
+        let path = knob.to_str().unwrap();
+
+        std::fs::write(&knob, "1\n").unwrap();
+        assert_eq!(apparmor_userns_restricted_at(path), Some(true));
+
+        std::fs::write(&knob, "0\n").unwrap();
+        assert_eq!(apparmor_userns_restricted_at(path), Some(false));
+
+        // A non-zero value other than 1 still counts as restricted (fail-closed).
+        std::fs::write(&knob, "2").unwrap();
+        assert_eq!(apparmor_userns_restricted_at(path), Some(true));
+
+        // Absent knob (older / non-AppArmor kernels, e.g. WSL2) => unknown.
+        assert_eq!(
+            apparmor_userns_restricted_at(&dir.path().join("missing").display().to_string()),
+            None
+        );
+    }
+
+    #[test]
+    fn floor_error_flags_apparmor_sysctl_only_when_it_is_the_blocker() {
+        let sandbox_leg = "virtiofsd sandbox (needs unprivileged userns or CAP_SYS_CHROOT)";
+
+        let with = floor_not_met_error(&[sandbox_leg], true).to_string();
+        assert!(
+            with.contains("apparmor_restrict_unprivileged_userns"),
+            "names the sysctl: {with}"
+        );
+        assert!(
+            with.contains("sysctl -w"),
+            "gives the remediation command: {with}"
+        );
+
+        // When the apparmor knob is not the blocker (e.g. only Landlock missing),
+        // do not emit the misleading userns note.
+        let without = floor_not_met_error(&["Landlock LSM"], false).to_string();
+        assert!(
+            !without.contains("apparmor_restrict_unprivileged_userns"),
+            "no apparmor note when not the blocker: {without}"
+        );
+        assert!(
+            without.contains("--allow-unconfined"),
+            "still names the override: {without}"
+        );
     }
 
     fn caps(userns: bool, landlock: bool, seccomp: bool) -> Capabilities {
