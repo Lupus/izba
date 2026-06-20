@@ -205,7 +205,7 @@ fn tar_extract<C: Read + Write>(conn: &mut C, engine: &ExecEngine, dest: &str) {
     // With no chroot (tests), resolve against `/` so absolute guest paths
     // still work; the real guest always has Some("/rootfs").
     let root = engine.root().unwrap_or_else(|| std::path::Path::new("/"));
-    let resp = match crate::tarfs::extract(root, dest, conn) {
+    let resp = match izba_init::tarfs::extract(root, dest, conn) {
         Ok(()) => Response::Ok,
         Err((kind, message)) => Response::Error { kind, message },
     };
@@ -220,7 +220,7 @@ fn tar_extract<C: Read + Write>(conn: &mut C, engine: &ExecEngine, dest: &str) {
 /// the host sees the missing EOF and reports "transfer truncated".
 fn tar_create<C: Read + Write>(conn: &mut C, engine: &ExecEngine, src: &str) {
     let root = engine.root().unwrap_or_else(|| std::path::Path::new("/"));
-    let resolved = match crate::tarfs::resolve_src(root, src) {
+    let resolved = match izba_init::tarfs::resolve_src(root, src) {
         Ok(r) => r,
         Err((kind, message)) => {
             let _ = write_frame(conn, &Response::Error { kind, message });
@@ -232,7 +232,7 @@ fn tar_create<C: Read + Write>(conn: &mut C, engine: &ExecEngine, src: &str) {
     }
     // Stream straight onto the connection; an error here aborts mid-archive
     // (no trailing frame exists in this direction by design).
-    let _ = crate::tarfs::stream_tar(&resolved, conn);
+    let _ = izba_init::tarfs::stream_tar(&resolved, conn);
 }
 
 /// Init side of `StreamOpen::TcpDial`: dial `127.0.0.1:port` inside the guest,

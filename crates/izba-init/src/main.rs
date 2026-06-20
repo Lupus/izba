@@ -11,7 +11,6 @@ mod mounts;
 mod net;
 mod rwdisk;
 mod server;
-mod tarfs;
 mod trust;
 
 use anyhow::Context;

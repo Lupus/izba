@@ -1423,6 +1423,7 @@ dependencies = [
  "izba-proto",
  "libc",
  "nix 0.29.0",
+ "proptest",
  "tar",
  "tempfile",
  "vergen-gitcl",
