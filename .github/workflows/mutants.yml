@@ -73,7 +73,10 @@ jobs:
 
   collect:
     name: collect + publish worklist
-    if: github.event_name != 'pull_request'
+    # Run as long as the workflow wasn't cancelled, even if some shards failed or
+    # timed out — publish a partial worklist from whatever shards uploaded rather
+    # than nothing. The "tested N mutants" line makes partial coverage visible.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     needs: full-shard
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -87,11 +90,14 @@ jobs:
           pattern: mutants-shard-*
           path: shards
       - name: Merge shards into report
+        id: merge
         run: |
           python3 hack/mutants-report.py --mode full \
             --json-out mutants-report.json --md-out mutants-report.md \
             shards/mutants-shard-*
           cat mutants-report.md >> "$GITHUB_STEP_SUMMARY"
+          tested=$(python3 -c "import json;print(json.load(open('mutants-report.json'))['tested'])")
+          echo "tested=$tested" >> "$GITHUB_OUTPUT"
       - name: Upload merged report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -101,4 +107,7 @@ jobs:
             mutants-report.md
           if-no-files-found: warn
       - name: Upsert tracking issue
+        # Only when shards actually contributed results — tested==0 means a broken
+        # run (no shard artifacts), and we must not post a misleading "no gaps" issue.
+        if: ${{ steps.merge.outputs.tested != '0' }}
         run: hack/mutants-issue.sh mutants-report.md
