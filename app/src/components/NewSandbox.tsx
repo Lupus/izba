@@ -7,8 +7,11 @@ import {
   type VolumeRow,
   defaultVolumeRow,
   buildVolSpec,
-  isBlankVolRow,
   isValidVolRow,
+  volNameError,
+  volPathError,
+  volSizeError,
+  volPickError,
 } from "../lib/volumevalidate";
 import { VolumeRowEditor } from "./VolumeRowEditor";
 
@@ -31,7 +34,9 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const [rwSizeGb, setRwSizeGb] = useState(8);
   const [workspace, setWorkspace] = useState("");
   const [ports, setPorts] = useState<PortRow[]>([]);
-  const [volumes, setVolumes] = useState<VolumeRow[]>([]);
+  const [stagedVolumes, setStagedVolumes] = useState<VolumeRow[]>([]);
+  const [draft, setDraft] = useState<VolumeRow>(defaultVolumeRow());
+  const [addAttempted, setAddAttempted] = useState(false);
   const [freeVolumes, setFreeVolumes] = useState<VolumeInfo[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -71,10 +76,23 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const addPort = () => setPorts((rows) => [...rows, { bind: "", host: "", guest: "" }]);
   const removePort = (i: number) => setPorts((rows) => rows.filter((_, j) => j !== i));
 
-  const setVolume = (i: number, row: VolumeRow) =>
-    setVolumes((rows) => rows.map((r, j) => (j === i ? row : r)));
-  const addVolume = () => setVolumes((rows) => [...rows, defaultVolumeRow()]);
-  const removeVolume = (i: number) => setVolumes((rows) => rows.filter((_, j) => j !== i));
+  // Derived inline error messages — only shown when addAttempted is true.
+  const draftNameErr = addAttempted ? volNameError(draft.kind, draft.name.trim()) : null;
+  const draftPathErr = addAttempted ? volPathError(draft.path.trim()) : null;
+  const draftSizeErr = addAttempted ? volSizeError(draft.kind, draft.size.trim()) : null;
+  const draftPickErr = addAttempted ? volPickError(draft.kind, draft.selectedVolName) : null;
+
+  function addToStaged() {
+    setAddAttempted(true);
+    if (!isValidVolRow(draft)) return; // keep draft, errors now shown
+    setStagedVolumes((prev) => [...prev, draft]);
+    setDraft(defaultVolumeRow());
+    setAddAttempted(false);
+  }
+
+  function removeStaged(i: number) {
+    setStagedVolumes((prev) => prev.filter((_, j) => j !== i));
+  }
 
   async function submit() {
     setBusy(true);
@@ -93,9 +111,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
           (r) =>
             `${r.bind.trim() ? `${r.bind.trim()}:` : ""}${r.host.trim()}:${r.guest.trim()}`,
         ),
-      volumes: volumes
-        .filter((r) => !isBlankVolRow(r))
-        .map((r) => buildVolSpec(r, freeVolumes)),
+      volumes: stagedVolumes.map((r) => buildVolSpec(r, freeVolumes)),
     };
     try {
       const created = await api.create(opts);
@@ -116,14 +132,12 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const isValidRow = (r: PortRow) =>
     isValidPort(r.host) && isValidPort(r.guest) && isValidBind(r.bind);
   const portsInvalid = ports.some((r) => !isBlankRow(r) && !isValidRow(r));
-  const volumesInvalid = volumes.some((r) => !isBlankVolRow(r) && !isValidVolRow(r));
 
   const canCreate =
     name.trim().length > 0 &&
     workspace.trim().length > 0 &&
     !busy &&
-    !portsInvalid &&
-    !volumesInvalid;
+    !portsInvalid;
 
   // Shared column template so the Bind/Host/Guest headers line up with the
   // inputs below: [bind grows] [host 5rem] [colon] [guest 5rem] [remove 2rem].
@@ -280,28 +294,56 @@ export function NewSandbox({ onClose, onCreated }: Props) {
           <div className="grid gap-1">
             <span className="text-ink-2">Volumes</span>
             <div className="grid gap-1.5">
-              {volumes.map((r, i) => (
-                <VolumeRowEditor
-                  key={i}
-                  row={r}
-                  index={i}
-                  freeVolumes={freeVolumes}
-                  onChange={(row) => setVolume(i, row)}
-                  onRemove={() => removeVolume(i)}
-                />
+              {/* Staged volumes (validated, waiting to be created) */}
+              {stagedVolumes.map((r, i) => (
+                <div
+                  key={`staged-${i}`}
+                  className="flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-sm"
+                >
+                  <span className="flex-1 font-mono">{r.path}</span>
+                  <span className="text-xs text-ink-2">
+                    {r.kind === "ephemeral"
+                      ? "ephemeral"
+                      : r.kind === "new_persistent"
+                        ? `persistent · ${r.name}`
+                        : `existing · ${r.selectedVolName}`}
+                  </span>
+                  {(r.kind === "ephemeral" || r.kind === "new_persistent") && (
+                    <span className="text-xs text-ink-3">{r.size}</span>
+                  )}
+                  <button
+                    type="button"
+                    aria-label={`Remove staged volume ${r.path}`}
+                    onClick={() => removeStaged(i)}
+                    className="text-ink-3 hover:text-warn"
+                  >
+                    ✕
+                  </button>
+                </div>
               ))}
+              {/* Draft editor — always visible */}
+              <VolumeRowEditor
+                row={draft}
+                index={0}
+                freeVolumes={freeVolumes}
+                onChange={setDraft}
+                onRemove={() => {
+                  setDraft(defaultVolumeRow());
+                  setAddAttempted(false);
+                }}
+              />
+              {/* Inline error messages — shown after first Add attempt */}
+              {draftNameErr && <span className="text-xs text-warn">{draftNameErr}</span>}
+              {draftPathErr && <span className="text-xs text-warn">{draftPathErr}</span>}
+              {draftSizeErr && <span className="text-xs text-warn">{draftSizeErr}</span>}
+              {draftPickErr && <span className="text-xs text-warn">{draftPickErr}</span>}
               <button
                 type="button"
-                onClick={addVolume}
+                onClick={addToStaged}
                 className="justify-self-start rounded-lg border border-line px-2 py-1 text-xs text-ink-2 hover:bg-hover"
               >
-                + Add volume
+                Add
               </button>
-              {volumesInvalid && (
-                <span className="text-xs text-warn">
-                  Each volume needs valid fields for its type (e.g. path /data, size 1g).
-                </span>
-              )}
             </div>
           </div>
         </div>

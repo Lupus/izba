@@ -116,18 +116,20 @@ describe("NewSandbox", () => {
     await waitFor(() => expect(screen.getByText(/invalid sandbox name/i)).toBeInTheDocument());
   });
 
-  // ── Volume section (E2) ─────────────────────────────────────────────────
+  // ── Volume section (E2) — draft+Add+staged flow ──────────────────────────────
 
   it("submits a named volume row as name:path:size", async () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     // Switch to new persistent type
     fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    // Click Add to stage
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/data/i });
     fireEvent.click(screen.getByRole("button", { name: /create/i }));
     await waitFor(() =>
       expect(create).toHaveBeenCalledWith(
@@ -136,39 +138,46 @@ describe("NewSandbox", () => {
     );
   });
 
-  it("disables Create when volume path lacks leading slash", () => {
+  it("shows error on Add when volume path lacks leading slash (does not block Create)", async () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
-    expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    // Error shown, nothing staged
+    expect(screen.getByText(/guest path must be absolute/i)).toBeInTheDocument();
+    // Create button is NOT disabled (invalid draft does NOT block create)
+    expect(screen.getByRole("button", { name: /create/i })).not.toBeDisabled();
   });
 
-  it("disables Create when volume size is invalid", () => {
+  it("shows error on Add when volume size is invalid (does not block Create)", async () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("button", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1x" } });
-    expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    // Error shown
+    expect(screen.getByText(/size must be a number followed by g or m/i)).toBeInTheDocument();
+    // Create button is NOT disabled
+    expect(screen.getByRole("button", { name: /create/i })).not.toBeDisabled();
   });
 
-  it("emits ephemeral spec (no name prefix) for empty-name volume row", async () => {
+  it("emits ephemeral spec (no name prefix) for ephemeral volume row", async () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     // Ephemeral is the default type
     fireEvent.click(screen.getByRole("button", { name: /ephemeral/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/scratch" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/scratch/i });
     fireEvent.click(screen.getByRole("button", { name: /create/i }));
     await waitFor(() =>
       expect(create).toHaveBeenCalledWith(
@@ -184,7 +193,6 @@ describe("NewSandbox", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
 
     // Switch to existing persistent type
     fireEvent.click(screen.getByRole("button", { name: /existing/i }));
@@ -195,6 +203,9 @@ describe("NewSandbox", () => {
 
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/arch" } });
 
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/arch/i });
+
     fireEvent.click(screen.getByRole("button", { name: /create/i }));
     await waitFor(() =>
       expect(create).toHaveBeenCalledWith(
@@ -203,11 +214,28 @@ describe("NewSandbox", () => {
     );
   });
 
-  it("ignores fully-blank volume rows on submit", async () => {
+  it("ignores non-staged (blank draft) volume on submit", async () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
+    // Draft is always visible but don't click Add — submit directly
+    fireEvent.click(screen.getByRole("button", { name: /create/i }));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({ volumes: [] })),
+    );
+  });
+
+  it("staged volume can be removed before Create", async () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
+    fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    await screen.findByRole("button", { name: /remove staged volume \/data/i });
+    // Remove it
+    fireEvent.click(screen.getByRole("button", { name: /remove staged volume \/data/i }));
+    // Now create — volumes should be empty
     fireEvent.click(screen.getByRole("button", { name: /create/i }));
     await waitFor(() =>
       expect(create).toHaveBeenCalledWith(expect.objectContaining({ volumes: [] })),

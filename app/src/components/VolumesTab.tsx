@@ -5,8 +5,11 @@ import {
   type VolumeRow,
   defaultVolumeRow,
   buildVolSpec,
-  isBlankVolRow,
   isValidVolRow,
+  volNameError,
+  volPathError,
+  volSizeError,
+  volPickError,
 } from "../lib/volumevalidate";
 import { VolumeRowEditor } from "./VolumeRowEditor";
 
@@ -29,7 +32,9 @@ interface SeededRow {
 
 export function VolumesTab({ sandbox, onChanged }: Props) {
   const [seeded, setSeeded] = useState<SeededRow[]>([]);
-  const [newRows, setNewRows] = useState<VolumeRow[]>([]);
+  const [toAdd, setToAdd] = useState<VolumeRow[]>([]);
+  const [draft, setDraft] = useState<VolumeRow>(defaultVolumeRow());
+  const [addAttempted, setAddAttempted] = useState(false);
   const [allVolumes, setAllVolumes] = useState<VolumeInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -43,7 +48,9 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       const detail = await api.inspect(name);
       loadedRef.current = detail.volumes;
       setSeeded(detail.volumes.map((v) => ({ spec: v, removed: false })));
-      setNewRows([]);
+      setToAdd([]);
+      setDraft(defaultVolumeRow());
+      setAddAttempted(false);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -60,7 +67,9 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       const detail = await api.inspect(name);
       loadedRef.current = detail.volumes;
       setSeeded(detail.volumes.map((v) => ({ spec: v, removed: false })));
-      setNewRows([]);
+      setToAdd([]);
+      setDraft(defaultVolumeRow());
+      setAddAttempted(false);
       // intentionally NOT calling setError here
     } catch {
       // silently ignore — the save error (if any) is already set and visible;
@@ -84,19 +93,28 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
   }, []);
 
   // Free volumes available to attach: not referenced by any sandbox, and not
-  // already seeded (non-removed) on THIS sandbox.
+  // already seeded (non-removed) on THIS sandbox, and not already in toAdd.
   const seededNames = new Set(
     seeded.filter((s) => !s.removed && s.spec.name).map((s) => s.spec.name as string),
   );
+  const toAddNames = new Set(
+    toAdd.filter((r) => r.kind === "existing_persistent").map((r) => r.selectedVolName),
+  );
   const freeVolumes = allVolumes.filter(
-    (v) => v.referenced_by.length === 0 && !seededNames.has(v.name),
+    (v) => v.referenced_by.length === 0 && !seededNames.has(v.name) && !toAddNames.has(v.name),
   );
 
-  // Derived dirty: seeded set changed from what was loaded, OR new rows are staged.
+  // Derived dirty: seeded set changed from what was loaded, OR staged volumes exist.
   const seededDesired = seeded.filter((s) => !s.removed).map((s) => s.spec);
   const dirty =
     JSON.stringify(seededDesired) !== JSON.stringify(loadedRef.current) ||
-    newRows.length > 0;
+    toAdd.length > 0;
+
+  // Derived inline error messages — only shown when addAttempted is true.
+  const draftNameErr = addAttempted ? volNameError(draft.kind, draft.name.trim()) : null;
+  const draftPathErr = addAttempted ? volPathError(draft.path.trim()) : null;
+  const draftSizeErr = addAttempted ? volSizeError(draft.kind, draft.size.trim()) : null;
+  const draftPickErr = addAttempted ? volPickError(draft.kind, draft.selectedVolName) : null;
 
   function removeSeeded(idx: number) {
     setSeeded((prev) => prev.map((s, i) => (i === idx ? { ...s, removed: true } : s)));
@@ -106,28 +124,20 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
     setSeeded((prev) => prev.map((s, i) => (i === idx ? { ...s, removed: false } : s)));
   }
 
-  function addRow() {
-    setNewRows((prev) => [...prev, defaultVolumeRow()]);
+  function handleAdd() {
+    setAddAttempted(true);
+    if (!isValidVolRow(draft)) return; // keep draft, errors now shown
+    setToAdd((prev) => [...prev, draft]);
+    setDraft(defaultVolumeRow());
+    setAddAttempted(false);
   }
 
-  function removeNewRow(idx: number) {
-    setNewRows((prev) => prev.filter((_, i) => i !== idx));
-  }
-
-  function updateNewRow(idx: number, row: VolumeRow) {
-    setNewRows((prev) => prev.map((r, i) => (i === idx ? row : r)));
+  function removeToAdd(idx: number) {
+    setToAdd((prev) => prev.filter((_, i) => i !== idx));
   }
 
   /** Save pending edits. Returns true if the save succeeded (no errors). */
   async function save(): Promise<boolean> {
-    // Validate all new rows (ignore blank rows). A started-but-invalid row
-    // blocks the save.
-    const hasErr = newRows.some((r) => !isBlankVolRow(r) && !isValidVolRow(r));
-    if (hasErr) {
-      setError("Each volume needs valid fields for its type.");
-      return false;
-    }
-
     setSaving(true);
     setError(null);
     let succeeded = false;
@@ -138,10 +148,11 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       for (const s of toDetach) {
         await api.volumeDetach(name, s.spec.guest_path);
       }
-      // Attach new valid rows
-      const toAttach = newRows.filter((r) => !isBlankVolRow(r) && isValidVolRow(r));
-      for (const r of toAttach) {
-        await api.volumeAttach(name, buildVolSpec(r, freeVolumes));
+      // Attach staged valid rows (toAdd only contains valid rows — validated at Add time).
+      // Use allVolumes (not freeVolumes) so that existing_persistent size lookup still
+      // works even though the staged volume was removed from freeVolumes by toAddNames.
+      for (const r of toAdd) {
+        await api.volumeAttach(name, buildVolSpec(r, allVolumes));
       }
       succeeded = true;
     } catch (e) {
@@ -206,7 +217,7 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       )}
 
       {/* Seeded rows (from inspect) */}
-      {seeded.length === 0 && newRows.length === 0 && (
+      {seeded.length === 0 && toAdd.length === 0 && (
         <div className="text-sm text-ink-3">No volumes attached.</div>
       )}
 
@@ -262,26 +273,60 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
         );
       })}
 
-      {/* New rows being added */}
-      {newRows.map((r, i) => (
-        <VolumeRowEditor
-          key={`new-${i}`}
-          row={r}
-          index={i}
-          freeVolumes={freeVolumes}
-          onChange={(row) => updateNewRow(i, row)}
-          onRemove={() => removeNewRow(i)}
-        />
+      {/* Staged volumes (validated, waiting to be saved) */}
+      {toAdd.map((r, i) => (
+        <div
+          key={`staged-${i}`}
+          className="flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-sm"
+        >
+          <span className="flex-1 font-mono">{r.path}</span>
+          <span className="text-xs text-ink-2">
+            {r.kind === "ephemeral"
+              ? "ephemeral"
+              : r.kind === "new_persistent"
+                ? `persistent · ${r.name}`
+                : `existing · ${r.selectedVolName}`}
+          </span>
+          {(r.kind === "ephemeral" || r.kind === "new_persistent") && (
+            <span className="text-xs text-ink-3">{r.size}</span>
+          )}
+          <button
+            type="button"
+            aria-label={`Remove staged volume ${r.path}`}
+            onClick={() => removeToAdd(i)}
+            className="text-ink-3 hover:text-warn"
+          >
+            ✕
+          </button>
+        </div>
       ))}
 
-      <div>
-        <button
-          type="button"
-          onClick={addRow}
-          className="rounded-lg border border-line px-3 py-1.5 text-sm hover:bg-hover"
-        >
-          Add volume
-        </button>
+      {/* Draft editor — always visible */}
+      <div className="flex flex-col gap-2">
+        <VolumeRowEditor
+          row={draft}
+          index={0}
+          freeVolumes={freeVolumes}
+          onChange={setDraft}
+          onRemove={() => {
+            setDraft(defaultVolumeRow());
+            setAddAttempted(false);
+          }}
+        />
+        {/* Inline error messages — shown after first Add attempt */}
+        {draftNameErr && <span className="text-xs text-warn">{draftNameErr}</span>}
+        {draftPathErr && <span className="text-xs text-warn">{draftPathErr}</span>}
+        {draftSizeErr && <span className="text-xs text-warn">{draftSizeErr}</span>}
+        {draftPickErr && <span className="text-xs text-warn">{draftPickErr}</span>}
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={handleAdd}
+            className="rounded-lg border border-line px-3 py-1.5 text-sm hover:bg-hover"
+          >
+            Add
+          </button>
+        </div>
       </div>
     </div>
   );
