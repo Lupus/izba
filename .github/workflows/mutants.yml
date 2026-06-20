@@ -145,7 +145,7 @@ jobs:
           if-no-files-found: warn
 
   full-windows:
-    name: full run (windows shard ${{ matrix.shard }}/12)
+    name: full run (windows shard ${{ matrix.shard }}/16)
     if: github.event_name != 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 120
@@ -155,7 +155,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]   # more shards: Windows builds are slower
+        # 16 shards: Windows builds are slower; 12 left the heaviest shard just
+        # over the 120-min cap in the first real run. More shards = less per shard.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
@@ -166,7 +168,7 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Run shard (survivor exit code is expected; do not fail)
-        run: cargo mutants --no-shuffle --shard ${{ matrix.shard }}/12 -o shard-out || true
+        run: cargo mutants --no-shuffle --shard ${{ matrix.shard }}/16 -o shard-out || true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mutants-shard-win-${{ matrix.shard }}
