@@ -41,7 +41,7 @@ test.describe("shell", () => {
   test("a shell-exit event marks the session as exited", async ({ page, mock }) => {
     const id = await openShellTab(page, mock);
     await mock.fireShellExit(id);
-    // ShellPanel appends " (exited)" to the tab label on exit
-    await expect(page.getByText(/exited/i)).toBeVisible();
+    // ShellPanel appends " (exited)" to the shell tab button
+    await expect(page.getByRole("tab", { name: /exited/i })).toBeVisible();
   });
 });
