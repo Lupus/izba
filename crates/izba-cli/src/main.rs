@@ -206,6 +206,12 @@ enum Cmd {
     /// Remove orphaned izba lock-down accounts/firewall rules with no live
     /// sandbox (Windows). Pops a UAC prompt.
     WindowsCleanup,
+    /// Internal: print state-consistency report (used by the dogfooding harness).
+    #[command(hide = true, name = "__reconcile")]
+    Reconcile {
+        #[arg(long)]
+        json: bool,
+    },
     /// (internal) launch a VMM confined; used by the lock-down launcher
     #[command(name = "__spawn-confined-vmm", hide = true)]
     SpawnConfinedVmm {
@@ -265,6 +271,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             DaemonCmd::Status => commands::daemon::status(paths),
             DaemonCmd::Stop => commands::daemon::stop(paths),
         },
+        Cmd::Reconcile { json } => commands::reconcile::run(paths, json),
         Cmd::Lockdown { name } => commands::lockdown::run(paths, &name),
         Cmd::Unlock { name } => commands::lockdown::unlock(paths, &name),
         Cmd::WindowsCleanup => commands::lockdown::cleanup(paths),
