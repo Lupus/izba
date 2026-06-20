@@ -17,6 +17,7 @@ Everything here is pure/stdlib so it is unit-testable anywhere (see
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -83,7 +84,9 @@ def run_action(
     if env:
         run_env.update(env)
 
-    command = "izba " + " ".join(argv)
+    # shlex.join preserves argument boundaries in the trajectory (e.g. an arg
+    # with a space round-trips as one token, not several).
+    command = "izba " + shlex.join(argv)
     start = time.monotonic()
     try:
         proc = subprocess.run(
@@ -145,7 +148,9 @@ def _snapshot_reconcile(
 
 # panic / assert / anchored ERROR|FATAL / rust panic / sanitizer markers.
 _IMPLICIT_RE = re.compile(
-    r"panic|assertion failed|^ERROR|^FATAL|thread '.*' panicked|AddressSanitizer",
+    # \bpanic\b so benign substrings ("no panic occurred") don't fire; the other
+    # arms are already anchored (^ERROR/^FATAL line-start, the panicked phrase).
+    r"\bpanic\b|assertion failed|^ERROR|^FATAL|thread '.*' panicked|AddressSanitizer",
     re.MULTILINE,
 )
 
