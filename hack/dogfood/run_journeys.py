@@ -97,7 +97,6 @@ def run_journey(
     journey_id = journey.get("journey_id", "")
     actions: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
-    seen: set = set()
     prev_reconcile: Optional[Dict[str, Any]] = None
     turns = 0
 
@@ -106,6 +105,10 @@ def run_journey(
 
     for step in steps:
         expect = step.get("expect", "")
+        # Loop-dedup is scoped PER STEP: it stops the Actor repeating the same
+        # command within a step's turn loop, without killing a later step that
+        # legitimately re-issues a common verify command (e.g. `izba ls`).
+        seen: set = set()
         # Inner Actor loop for this step.
         while True:
             if len(actions) >= step_cap:

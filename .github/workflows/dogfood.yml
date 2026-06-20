@@ -154,6 +154,17 @@ jobs:
       IZBA_TEST_CACHE: /home/runner/.cache/izba-itest
       IZBA_BOOT_TIMEOUT_SECS: '120'
     steps:
+      # The matrix is hardcoded to 3 shards (GitHub can't derive a matrix from a
+      # dispatch input). Fail loudly if `shards` != 3 so journeys for shard>=3
+      # aren't silently dropped — extend the matrix here if you raise `shards`.
+      - name: Guard — matrix is fixed at 3 shards
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          if [ "$SHARDS" != "3" ]; then
+            echo "::error::dogfood.yml matrix is fixed at 3 shards but shards=$SHARDS — journeys for shard>=3 would be silently skipped. Use shards=3 or extend the matrix."
+            exit 1
+          fi
       # Check out the DISPATCHED ref so journeys.json committed on the
       # dogfood-run/<feature> branch is present at the repo root.
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
