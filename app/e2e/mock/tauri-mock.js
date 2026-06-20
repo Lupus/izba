@@ -174,14 +174,16 @@
     },
     fireEvent: fireEvent,
     pushCreateProgress: function (msg) {
-      return fireEvent("create-progress", msg);
+      // `void` makes the discard explicit: these helpers are typed `void` in
+      // helpers.ts, so callers must not depend on fireEvent's listener count.
+      void fireEvent("create-progress", msg);
     },
     pushShellOutput: function (id, text) {
       // btoa handles ASCII test strings; that is all the specs use.
-      return fireEvent("shell-output", { id: id, data: btoa(text) });
+      void fireEvent("shell-output", { id: id, data: btoa(text) });
     },
     fireShellExit: function (id) {
-      return fireEvent("shell-exit", { id: id });
+      void fireEvent("shell-exit", { id: id });
     },
     resolveCreate: function (name) {
       if (deferredCreate) deferredCreate.resolve(name);

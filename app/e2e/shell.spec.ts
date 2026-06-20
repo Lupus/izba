@@ -24,14 +24,19 @@ test.describe("shell", () => {
   test("opens a session and renders streamed output in xterm", async ({ page, mock }) => {
     const id = await openShellTab(page, mock);
     await mock.pushShellOutput(id, "hello-from-guest\r\n");
-    // xterm DOM renderer puts text into .xterm-rows
-    await expect(page.locator(".xterm-rows")).toContainText("hello-from-guest");
+    // Assert on the app's own stable container (ShellViewer's data-testid) rather
+    // than xterm's private `.xterm-rows` class, which a minor xterm release could
+    // rename without a semver-breaking change and make this pass vacuously.
+    await expect(page.getByTestId("shell-host")).toContainText("hello-from-guest");
   });
 
   test("typing into the terminal sends shell_write", async ({ page, mock }) => {
     const id = await openShellTab(page, mock);
-    // Focus the xterm hidden textarea that captures keyboard input
-    await page.locator(".xterm-helper-textarea").focus();
+    // Focus xterm's keyboard-capture textarea. Scope by element type within our
+    // stable shell-host container instead of xterm's private
+    // `.xterm-helper-textarea` class: the input element stays a <textarea> across
+    // xterm versions even if the class name changes, so this can't silently no-op.
+    await page.getByTestId("shell-host").locator("textarea").focus();
     await page.keyboard.type("ls");
     await expect.poll(() => mock.calls()).toEqual(
       expect.arrayContaining([expect.stringMatching(new RegExp(`^shell_write:${id}:`))]),
