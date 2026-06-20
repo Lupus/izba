@@ -14,82 +14,184 @@ permissions:
   contents: read
   issues: write   # collect job upserts the mutation-gaps tracking issue
 
+# cargo-mutants cannot see #[cfg] (documented limitation): it reports another
+# platform's code as "missed" on the host where that code is cfg'd out. So we run
+# the gate AND the full run on BOTH Linux and Windows over the same mutant set
+# (excluding only real-VM KVM/WHP code in .cargo/mutants.toml), and a shared
+# reporter applies the caught-nowhere rule: a mutant is a real survivor only if
+# NO platform's tests caught it. A mutant killed on either platform is not a gap.
+
 jobs:
-  incremental:
-    name: mutation gate (incremental)
+  # ---------- incremental PR gate (both platforms + aggregator) ----------
+  gate-linux:
+    name: gate run (linux)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
         with:
-          fetch-depth: 0   # need the base branch to compute the merge-base diff
+          fetch-depth: 0
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
-          prefix-key: mutants-incremental
+          prefix-key: mutants-gate-linux
       - name: Install cargo-mutants
         uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
         with:
           tool: cargo-mutants
       - name: Fetch base ref
-        # Explicit refspec so the base lands in refs/remotes/origin/<base> — a
-        # bare `git fetch origin <base>` only updates FETCH_HEAD, leaving
-        # `origin/<base>` unresolvable and the gate's `git diff` fatal.
         run: git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
-      - name: Incremental mutation gate
-        run: hack/mutants-gate.sh "origin/${{ github.base_ref }}"
+      - name: Run changed-line mutants (linux)
+        run: hack/mutants-gate-run.sh "origin/${{ github.base_ref }}" gate-out
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-linux
+          path: gate-out/mutants.out
+          if-no-files-found: error
 
-  full-shard:
-    name: full mutation run (shard ${{ matrix.shard }}/8)
+  gate-windows:
+    name: gate run (windows)
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: mutants-gate-windows
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        with:
+          tool: cargo-mutants
+      - name: Fetch base ref
+        run: git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+      - name: Run changed-line mutants (windows)
+        run: hack/mutants-gate-run.sh "origin/${{ github.base_ref }}" gate-out
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-windows
+          path: gate-out/mutants.out
+          if-no-files-found: error
+
+  gate:
+    name: mutation gate (incremental)
+    # Always run (unless cancelled) so this single required check correctly fails
+    # when a platform run failed, instead of being silently skipped.
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    needs: [gate-linux, gate-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fail if a platform gate run failed
+        run: |
+          echo "linux=${{ needs.gate-linux.result }} windows=${{ needs.gate-windows.result }}"
+          if [[ "${{ needs.gate-linux.result }}" != "success" || "${{ needs.gate-windows.result }}" != "success" ]]; then
+            echo "::error::a platform gate run failed (baseline/build) — see the gate-run jobs"
+            exit 1
+          fi
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gate-linux
+          path: g-linux
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gate-windows
+          path: g-windows
+      - name: Reconcile survivors across platforms (caught-nowhere)
+        run: |
+          echo "## Mutation gate (incremental, Linux + Windows)" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          python3 hack/mutants-report.py --mode gate g-linux g-windows >> "$GITHUB_STEP_SUMMARY"
+          rc=$?
+          set -e
+          if [[ $rc -ne 0 ]]; then
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ Surviving mutants on changed lines (uncaught on every platform). Add a killing test, or apply \`#[mutants::skip]\` with a justification comment (see CONTRIBUTING.md)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $rc
+
+  # ---------- scheduled full run (both platforms, sharded) ----------
+  full-linux:
+    name: full run (linux shard ${{ matrix.shard }}/8)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        # cargo-mutants --shard is 0-INDEXED (0/8..7/8). The docs' "1/4" example
-        # is misleading: shard N/N is always empty and the i%N==0 class is dropped,
-        # so 1/8..8/8 would silently lose 1/8 of all mutants. Verified 0/8..7/8 is a
-        # complete, non-overlapping partition. The collect job reports the tested
-        # count so any future partition gap is loud, not silent.
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]   # 0-INDEXED (see .cargo/mutants.toml notes)
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
-          prefix-key: mutants-full
+          prefix-key: mutants-full-linux
       - name: Install cargo-mutants
         uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
         with:
           tool: cargo-mutants
-      - name: Run shard (non-zero exit on survivors is expected; do not fail)
-        run: cargo mutants --shard ${{ matrix.shard }}/8 -o shard-out || true
-      - name: Upload shard results
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Run shard (survivor exit code is expected; do not fail)
+        run: cargo mutants --no-shuffle --shard ${{ matrix.shard }}/8 -o shard-out || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutants-shard-${{ matrix.shard }}
+          name: mutants-shard-lin-${{ matrix.shard }}
+          path: shard-out/mutants.out
+          if-no-files-found: warn
+
+  full-windows:
+    name: full run (windows shard ${{ matrix.shard }}/12)
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]   # more shards: Windows builds are slower
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: mutants-full-windows
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        with:
+          tool: cargo-mutants
+      - name: Run shard (survivor exit code is expected; do not fail)
+        run: cargo mutants --no-shuffle --shard ${{ matrix.shard }}/12 -o shard-out || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-shard-win-${{ matrix.shard }}
           path: shard-out/mutants.out
           if-no-files-found: warn
 
   collect:
     name: collect + publish worklist
     # Run as long as the workflow wasn't cancelled, even if some shards failed or
-    # timed out — publish a partial worklist from whatever shards uploaded rather
-    # than nothing. The "tested N mutants" line makes partial coverage visible.
+    # timed out — publish a partial worklist from whatever shards uploaded. The
+    # "tested N mutants" line makes partial coverage visible.
     if: ${{ !cancelled() && github.event_name != 'pull_request' }}
-    needs: full-shard
+    needs: [full-linux, full-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
-      - name: Download all shard results
+      - name: Download all shard results (both platforms)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: mutants-shard-*
           path: shards
-      - name: Merge shards into report
+      - name: Merge shards into report (caught-nowhere across platforms)
         id: merge
         run: |
           python3 hack/mutants-report.py --mode full \

@@ -8,6 +8,21 @@
 
 **Tech Stack:** `cargo-mutants` 27.1.0, GitHub Actions (matrix sharding + artifacts), Python 3 (stdlib only) for the reporter, `gh` CLI for the tracking issue, bash for the thin wrappers.
 
+> **Revision (2026-06-20): cross-platform caught-nowhere model.** cargo-mutants
+> cannot see `#[cfg]`, so platform-specific code shows as "missed" on the OS
+> where it is cfg'd out. Rather than excluding it by path, the gate AND the full
+> run now execute on **both Linux and Windows** over the same mutant set
+> (excluding only real-VM KVM/WHP code), and the reporter reports a mutant as a
+> real survivor only if **no platform caught it** (`merge()` subtracts the union
+> of `caught.txt` ids; `read_caught()` added). New/changed files vs the tasks
+> below: `hack/mutants-gate-run.sh` (per-platform gate run → `mutants.out`);
+> `hack/mutants-gate.sh` (now a thin local single-platform wrapper);
+> `mutants.yml` gains `gate-linux`/`gate-windows`/`gate` (aggregator) and
+> `full-linux`/`full-windows`/`collect`. The `.cargo/mutants.toml` excludes are
+> real-VM-only (no platform-cfg paths). Verified: `--shard` is 0-indexed;
+> `caught.txt`/`missed.txt` share the `path:line:col: desc` format so a mutant's
+> id-hash matches across platforms.
+
 ## Global Constraints
 
 These apply to **every** task below; copied verbatim from repo conventions and the spec.

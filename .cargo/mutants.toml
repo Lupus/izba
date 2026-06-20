@@ -1,25 +1,27 @@
 # .cargo/mutants.toml — single source of truth for what cargo-mutants may mutate.
 #
-# cargo-mutants runs the HOST test suite against each mutant. Large parts of
-# izba-core are KVM/VMM/real-VM code exercised ONLY by env-gated tests
-# (IZBA_INTEGRATION=1) that SELF-SKIP on hosted CI runners. A mutant planted
-# there can never be killed on a hosted runner — not because the tests are weak,
-# but because the tests that would catch it never run. Excluding that code keeps
-# BOTH the incremental PR gate and the scheduled full run honest (these globs
-# apply in --in-diff and --shard modes too). Per-item exceptions use
-# `#[mutants::skip]` WITH a justification comment (see CONTRIBUTING.md).
+# We exclude ONLY the class of code with a hard requirement on a real VM
+# (KVM/WHP): the VMM drivers and the env-gated integration/e2e harnesses. Their
+# tests SELF-SKIP on hosted runners, so a mutant there can never be killed on any
+# hosted runner — on either platform.
 #
-# This list is SEEDED from an initial local full run (see the implementation
-# plan, Task 8): every survivor is triaged into "untestable on host" (-> here /
-# #[mutants::skip]) vs "real test gap" (-> left mutable, becomes the agent
-# worklist).
+# We deliberately do NOT exclude platform-specific (#[cfg(windows)] /
+# #[cfg(unix)]) code. cargo-mutants cannot see #[cfg] (documented limitation:
+# https://mutants.rs/limitations.html) and reports another platform's code as
+# "missed" where it is cfg'd out. Instead of excluding it, mutants.yml runs the
+# SAME mutant set on BOTH Linux and Windows and the reporter applies the
+# caught-nowhere rule: a mutant is a real survivor only if NO platform caught it.
+# So a cfg(windows) mutant is "missed" on Linux (cfg'd out) but "caught" on
+# Windows — and correctly dropped. Per-item exceptions still use
+# `#[mutants::skip]` WITH a justification comment (see CONTRIBUTING.md).
 
 exclude_globs = [
     "crates/izba-core/src/vmm/**",        # Cloud Hypervisor / OpenVMM drivers — need a real VM
     "crates/izba-core/tests/**",          # KVM-gated integration harness
     "crates/izba-cli/tests/**",           # daemon_e2e + tty e2e: KVM/PTY-gated
     "crates/izba-ttytest/**",             # drives a real binary through a PTY
-    # NOTE: extend during seeding (plan Task 8) with any other host-unkillable survivors.
+    # NOTE: only real-VM (KVM/WHP) code belongs here — NOT platform-cfg code,
+    # which the two-platform caught-nowhere run handles.
 ]
 
 # Give the suite headroom: some host tests spawn processes / do timed I/O.
