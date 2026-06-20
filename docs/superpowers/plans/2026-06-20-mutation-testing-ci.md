@@ -22,7 +22,7 @@ These apply to **every** task below; copied verbatim from repo conventions and t
 - **Weekly cron convention**: `0 3 * * 1` (Mon 03:00 UTC), as in `e2e.yml`.
 - **`cargo-mutants` 27.1.0 verified facts** (do NOT re-derive — confirmed against the installed binary):
   - Config file default path: `.cargo/mutants.toml`. Keys are snake_case: `exclude_globs`, `exclude_re`, `examine_globs`, `timeout_multiplier`, `minimum_test_timeout`, `test_workspace`, `additional_cargo_test_args`. Config excludes apply in ALL modes including `--in-diff` and `--shard`.
-  - `--shard K/N` is **1-indexed** (`1/8` … `8/8`), NOT 0-indexed. Default sharding method is round-robin (`--sharding round-robin`); mutant `i` runs on shard `i % N`.
+  - `--shard K/N` is **0-INDEXED** (`0/8` … `7/8`) — VERIFIED empirically. The docs' `1/4` example is misleading: cargo-mutants matches `i % N == K`, so shard `N/N` is always EMPTY and the `i%N==0` class is matched by no shard. Using `1/8..8/8` silently drops 1/8 of all mutants (union = `(N-1)/N` of the full set; `--shard 1/1` returns ZERO mutants). Always use `0/N..(N-1)/N`. Default sharding method is round-robin; mutant `i` runs on shard `i % N`. The collect job sums each shard's `outcomes.json` `total_mutants` into a visible "tested N mutants" line so any future partition gap is loud, not silent.
   - `--in-diff <file>` takes a unified diff; it is line-precise for operator/value mutants and additionally includes a function's body-replacement mutant if any line of that function is in the diff.
   - Output: `<-o path>/mutants.out/` contains `missed.txt`, `caught.txt`, `timeout.txt`, `unviable.txt` (one mutant per line, format `path:line:col: description`), plus `outcomes.json`, `mutants.json`, and a `diff/` dir.
   - **Worklist source of truth is `missed.txt`** — one clean line per surviving mutant. The full `mutants.out/` is shipped as the machine-readable artifact.
@@ -638,7 +638,7 @@ permissions:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]   # 0-INDEXED — see Global Constraints
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
@@ -825,7 +825,7 @@ triage note; it does NOT try to fix gaps (that is the agent loop's job).
 
 ```bash
 cargo mutants -o target/mutants-seed 2>&1 | tail -5
-# or, to parallelize locally, run shards 1/4..4/4 into separate dirs and merge.
+# or, to parallelize locally, run shards 0/4..3/4 (0-INDEXED) into separate dirs and merge.
 ```
 Expected: completes; `target/mutants-seed/mutants.out/missed.txt` lists all survivors.
 

@@ -44,7 +44,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        # cargo-mutants --shard is 0-INDEXED (0/8..7/8). The docs' "1/4" example
+        # is misleading: shard N/N is always empty and the i%N==0 class is dropped,
+        # so 1/8..8/8 would silently lose 1/8 of all mutants. Verified 0/8..7/8 is a
+        # complete, non-overlapping partition. The collect job reports the tested
+        # count so any future partition gap is loud, not silent.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1

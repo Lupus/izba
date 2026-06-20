@@ -44,6 +44,23 @@ def read_missed(out_dir):
     return out
 
 
+def read_tested(out_dir):
+    """Total mutants TESTED in this shard, from <out_dir>/outcomes.json.
+
+    Lets the collect job surface how many mutants the shards actually covered, so
+    a sharding partition gap (e.g. cargo-mutants' 0-vs-1-indexed --shard footgun)
+    is loud in the report rather than a silent worklist truncation.
+    """
+    fp = os.path.join(out_dir, "outcomes.json")
+    if not os.path.exists(fp):
+        return 0
+    try:
+        with open(fp) as f:
+            return int(json.load(f).get("total_mutants", 0))
+    except (ValueError, OSError):
+        return 0
+
+
 def merge(dirs):
     seen = {}
     for d in dirs:
@@ -55,13 +72,16 @@ def merge(dirs):
     return out
 
 
-def render_markdown(mutants):
+def render_markdown(mutants, tested=None):
+    header = ""
+    if tested is not None:
+        header = f"_Tested {tested} mutant(s) across the run._\n\n"
     if not mutants:
-        return "No surviving mutants. 🎉\n"
+        return header + "No surviving mutants. 🎉\n"
     by_file = collections.OrderedDict()
     for m in mutants:
         by_file.setdefault(m.path, []).append(m)
-    lines = [f"**{len(mutants)} surviving mutant(s)** across {len(by_file)} file(s).", ""]
+    lines = [header + f"**{len(mutants)} surviving mutant(s)** across {len(by_file)} file(s).", ""]
     for path, ms in by_file.items():
         lines.append(f"### `{path}`")
         for m in ms:
@@ -89,16 +109,19 @@ def main(argv=None):
         dirs.append(cand if os.path.isdir(cand) else d)
 
     mutants = merge(dirs)
-    md = render_markdown(mutants)
 
     if args.mode == "gate":
-        sys.stdout.write(md)
+        # Gate runs over a single dir; a tested-count header is noise here.
+        sys.stdout.write(render_markdown(mutants))
         return 1 if mutants else 0
 
-    # full mode
+    # full mode: sum tested mutants across shards so partition gaps are visible.
+    tested = sum(read_tested(d) for d in dirs)
+    md = render_markdown(mutants, tested=tested)
     if args.json_out:
         with open(args.json_out, "w") as f:
-            json.dump({"count": len(mutants), "survivors": [_mutant_to_dict(m) for m in mutants]}, f, indent=2)
+            json.dump({"count": len(mutants), "tested": tested,
+                       "survivors": [_mutant_to_dict(m) for m in mutants]}, f, indent=2)
     if args.md_out:
         with open(args.md_out, "w") as f:
             f.write(md)
