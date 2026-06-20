@@ -7,6 +7,7 @@ pub mod ls;
 pub mod netlog;
 pub mod policy;
 pub mod port;
+pub mod reconcile;
 pub mod rm;
 pub mod run;
 pub mod status;
