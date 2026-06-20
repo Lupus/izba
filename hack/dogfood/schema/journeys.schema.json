@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/Lupus/izba/hack/dogfood/schema/journeys.schema.json",
+  "title": "izba dogfood journeys (Phase 1 output / Phase 2 input)",
+  "description": "A feature's user journeys: goals a real user would have given the spec's promises, decomposed into ordered intent+expectation steps. Produced by the local Phase 1 (intent extraction) harness; consumed by the Phase 2 (journey execution) runner.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["feature", "journeys"],
+  "properties": {
+    "feature": {
+      "type": "string",
+      "description": "Human-readable name of the feature under test."
+    },
+    "journeys": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/journey" }
+    }
+  },
+  "definitions": {
+    "journey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["journey_id", "rationale", "source", "steps"],
+      "properties": {
+        "journey_id": {
+          "type": "string",
+          "description": "Stable, unique-within-feature kebab-case id. Used for sharding and loop-dedup."
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Why this journey exists: the spec promise / expectation it probes."
+        },
+        "source": { "$ref": "#/definitions/source" },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/step" }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["spec", "pr", "greptile", "help"],
+          "description": "Where the expectation was traced from."
+        },
+        "ref": {
+          "type": "string",
+          "description": "Pointer into the source (doc + section, PR number, review id, help topic)."
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intent", "expect"],
+      "properties": {
+        "intent": {
+          "type": "string",
+          "description": "What the user wants to do at this step (intent, NOT a literal command). The Actor chooses the concrete izba invocation."
+        },
+        "expect": {
+          "type": "string",
+          "description": "The expected observable outcome of this step."
+        }
+      }
+    }
+  }
+}

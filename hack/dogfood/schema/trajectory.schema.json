@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/Lupus/izba/hack/dogfood/schema/trajectory.schema.json",
+  "title": "izba dogfood trajectory bundle (Phase 2 output / Phase 3 input)",
+  "description": "Per-shard trajectory bundle: for each journey this shard ran, the ordered actions (with outputs, timings, and the reconciler snapshot after each) plus the deterministic+model oracle candidates. Produced by run_journeys.py; consumed by the local Phase 3 skeptic/synthesis.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["shard", "feature", "results"],
+  "properties": {
+    "shard": {
+      "type": "integer",
+      "description": "Shard index this bundle was produced by (0-based)."
+    },
+    "feature": {
+      "type": "string",
+      "description": "Feature name copied from the journeys file."
+    },
+    "results": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/journey_result" }
+    }
+  },
+  "definitions": {
+    "journey_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["journey_id", "actions", "candidates"],
+      "properties": {
+        "journey_id": { "type": "string" },
+        "actions": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/action" }
+        },
+        "candidates": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/candidate" }
+        }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intent", "command", "exit_code", "stdout_tail", "stderr_tail", "latency_ms", "reconcile"],
+      "properties": {
+        "intent": { "type": "string", "description": "The step intent this action was taken for." },
+        "command": { "type": "string", "description": "The concrete shell command the Actor chose (e.g. 'izba ls')." },
+        "exit_code": { "type": "integer" },
+        "stdout_tail": { "type": "string", "description": "Last ~4 KB of stdout." },
+        "stderr_tail": { "type": "string", "description": "Last ~4 KB of stderr." },
+        "latency_ms": { "type": "integer", "description": "Wall-clock duration of the action in milliseconds." },
+        "reconcile": {
+          "type": "object",
+          "description": "The izba __reconcile --json snapshot taken right after the action.",
+          "required": ["violations"],
+          "properties": {
+            "violations": { "type": "array", "items": { "type": "object" } },
+            "sandboxes": { "type": "array", "items": { "type": "object" } }
+          }
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "detail", "violated_expectation", "source", "trajectory_ref"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["functional", "latency", "implicit", "reconcile_seq"],
+          "description": "Which oracle produced the candidate."
+        },
+        "detail": { "type": "string", "description": "What was observed." },
+        "violated_expectation": { "type": "string", "description": "The expectation the observation contradicts." },
+        "source": { "type": "string", "description": "Where that expectation is traced from (spec/pr/help/contract)." },
+        "trajectory_ref": {
+          "type": "object",
+          "description": "Pointer back into this bundle that reproduces the candidate.",
+          "required": ["journey_id", "action_index"],
+          "properties": {
+            "journey_id": { "type": "string" },
+            "action_index": { "type": "integer", "description": "Index into the journey's actions array (-1 if not tied to a single action)." }
+          }
+        }
+      }
+    }
+  }
+}
