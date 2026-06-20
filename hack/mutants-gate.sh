@@ -26,13 +26,21 @@ if [[ ! -s "$OUT/pr.diff" ]]; then
 fi
 
 # Run the gate. cargo-mutants exits non-zero if mutants survive OR on a baseline
-# failure; we distinguish the two by whether the output dir was produced.
+# failure; we distinguish those (and the "nothing to mutate" case) below.
 set +e
 cargo mutants --in-diff "$OUT/pr.diff" -o "$OUT/run" 2> "$OUT/stderr"
+CM_RC=$?
 set -e
 
 if [[ ! -d "$OUT/run/mutants.out" ]]; then
-  # cargo-mutants never reached the testing phase -> baseline/build failure.
+  if [[ $CM_RC -eq 0 ]]; then
+    # No mutable Rust lines in the diff (e.g. docs/CI-only change) -> clean pass.
+    # cargo-mutants exits 0 and writes no mutants.out in this case.
+    echo "## Mutation gate: no mutable Rust changes in the diff — passed" >> "$SUMMARY"
+    exit 0
+  fi
+  # Non-zero exit with no output dir -> cargo-mutants never reached the testing
+  # phase -> baseline/build failure.
   {
     echo "## ⚠️ Mutation gate: baseline failure (not a survivor failure)"
     echo '```'
