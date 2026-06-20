@@ -24,6 +24,29 @@ exclude_globs = [
     # which the two-platform caught-nowhere run handles.
 ]
 
+# Per-mutant exclusions for mutants that are NOT worth (or cannot have) a killing
+# test. Unlike `exclude_globs` (whole real-VM files) these drop a single mutant by
+# NAME — the regex matches `<path>:<line>:<col>: <description>`, anchored on file +
+# operator (or function name), never on a bare line number, so it survives line
+# drift.
+#
+# RISK: cargo-mutants does NOT warn if an exclude_re goes stale (matches nothing)
+# or broadens (matches a new, real mutant) — it would silently hide a survivor.
+# So EVERY entry here is pinned to the exact mutant(s) it may match in
+# `hack/mutants-check-excludes.py`, which fails CI on any drift (stale or
+# over-broad). Adding/changing a pattern here REQUIRES updating that pin.
+# Each entry also justifies itself at its in-source site.
+exclude_re = [
+    # codec.rs MAX_FRAME = 16 * 1024 * 1024: `* -> +`/`* -> /` on a size literal —
+    # only a tautological `assert_eq!(MAX_FRAME, 16_777_216)` could "kill" it.
+    "codec\\.rs:\\d+:\\d+: replace \\* with",
+    # dns.rs servfail `(resp[3] & 0xf0) | 0x02`: the `| -> ^` mutant is EQUIVALENT
+    # (the mask clears bit 0x02, so `|` and `^` always agree) and thus unkillable.
+    # Named exclusion keeps servfail's other mutants under test, unlike a
+    # function-wide `#[mutants::skip]`.
+    "replace \\| with \\^ in servfail",
+]
+
 # Give the suite headroom: some host tests spawn processes / do timed I/O.
 timeout_multiplier = 3.0
 minimum_test_timeout = 60

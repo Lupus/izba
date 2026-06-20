@@ -30,6 +30,8 @@ jobs:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - name: Run mutants-report.py tests
         run: python3 hack/mutants-report.test.py
+      - name: Run exclude-pin guard tests
+        run: python3 hack/mutants-check-excludes.test.py
 
   # ---------- incremental PR gate (both platforms + aggregator) ----------
   gate-linux:
@@ -48,6 +50,12 @@ jobs:
         uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
         with:
           tool: cargo-mutants
+      # Fail fast if any `exclude_re` in .cargo/mutants.toml has drifted (gone
+      # stale or over-broad) vs its pin in hack/mutants-check-excludes.py. The
+      # full, cfg-blind `--list` here sees mutants from every platform's code, so
+      # one Linux run covers the cross-platform inventory.
+      - name: Check exclude_re pins (no stale/over-broad)
+        run: python3 hack/mutants-check-excludes.py
       - name: Fetch base ref
         run: git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
       - name: Run changed-line mutants (linux)

@@ -1,6 +1,11 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{Read, Write};
 
+// The `* -> +`/`* -> /` mutants of this size literal are excluded in
+// `.cargo/mutants.toml` (`exclude_re`): mutation-testing a constant only admits a
+// tautological `assert_eq!(MAX_FRAME, 16_777_216)`. That exclusion is pinned and
+// drift-checked by `hack/mutants-check-excludes.py` (CI fails if it ever matches a
+// different mutant), so it cannot silently broaden.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +118,40 @@ mod tests {
             matches!(r, Err(FrameError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
             "expected UnexpectedEof, got {r:?}"
         );
+    }
+
+    #[test]
+    fn write_frame_accepts_exactly_max_and_rejects_one_over() {
+        // A JSON string of N ASCII bytes serializes to N+2 bytes (the quotes),
+        // so this lands a payload of EXACTLY MAX_FRAME bytes — the boundary that
+        // distinguishes `len > MAX_FRAME` from its `>=`/`==` mutations. The
+        // roundtrip proptests only carry small payloads, so they never reach it.
+        let at_max = "a".repeat(MAX_FRAME as usize - 2);
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &at_max).expect("payload of exactly MAX_FRAME must be accepted");
+        assert_eq!(buf.len(), 4 + MAX_FRAME as usize);
+
+        // One byte over the limit must be rejected (catches `>` -> `==`).
+        let one_over = "a".repeat(MAX_FRAME as usize - 1);
+        let mut buf2 = Vec::new();
+        assert!(matches!(
+            write_frame(&mut buf2, &one_over),
+            Err(FrameError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn read_frame_accepts_exactly_max() {
+        // Header length of exactly MAX_FRAME must be read, not rejected: catches
+        // the `len > MAX_FRAME` -> `>=` mutation of the read-side guard.
+        // `prop_no_panic_on_arbitrary_bytes` can't reach this — hitting the exact
+        // 0x0100_0000 length from random bytes is a ~1-in-2^32 event.
+        let at_max = "a".repeat(MAX_FRAME as usize - 2);
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &at_max).unwrap();
+        let got: String = read_frame(&mut Cursor::new(&buf))
+            .expect("frame of exactly MAX_FRAME must be readable");
+        assert_eq!(got.len(), MAX_FRAME as usize - 2);
     }
 
     // -------------------------------------------------------------------------
