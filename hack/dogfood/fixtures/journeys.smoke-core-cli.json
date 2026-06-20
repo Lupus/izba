@@ -1,0 +1,51 @@
+{
+  "feature": "core-cli-smoke",
+  "journeys": [
+    {
+      "journey_id": "lifecycle-happy-path",
+      "rationale": "README/--help promise the core lifecycle: create a sandbox, list it, exec a command in it, stop it, remove it. The whole loop should work and leave consistent state at every step.",
+      "source": { "kind": "readme", "ref": "README.md (command surface) + `izba --help`" },
+      "steps": [
+        { "intent": "create a sandbox from a small image (e.g. alpine:3.20) with a given name", "expect": "create succeeds with a non-error exit; the daemon/state reflect a new sandbox" },
+        { "intent": "list sandboxes", "expect": "the newly created sandbox appears in `izba ls`" },
+        { "intent": "exec a trivial command that prints a known string in the sandbox (e.g. echo hello-izba)", "expect": "exit 0 and the known string appears in stdout" },
+        { "intent": "stop the sandbox", "expect": "stop succeeds; subsequent state shows it not running" },
+        { "intent": "remove the sandbox", "expect": "rm succeeds and the sandbox no longer appears in `izba ls`; reconciler reports no orphaned resources" }
+      ]
+    },
+    {
+      "journey_id": "run-shortcut-one-shot",
+      "rationale": "README describes `izba run` as create-if-needed + start-if-needed + exec in one shot. A user expects a single `run` to get a command executing without separate create/start.",
+      "source": { "kind": "readme", "ref": "README.md `izba run` description + `izba run --help`" },
+      "steps": [
+        { "intent": "run a one-shot command in a fresh sandbox via `izba run` (e.g. print the kernel name with uname)", "expect": "the command executes and returns output with exit 0, having implicitly created+started the sandbox" }
+      ]
+    },
+    {
+      "journey_id": "exec-missing-command-exit-127",
+      "rationale": "CLAUDE.md/--help document the exit-code contract: a command-not-found in the guest maps to CLI exit 127. A user relies on standard shell exit semantics.",
+      "source": { "kind": "help", "ref": "documented exit-code mapping: CommandNotFound -> 127" },
+      "steps": [
+        { "intent": "in a running sandbox, exec a command that does not exist (e.g. this-binary-does-not-exist)", "expect": "the CLI exits with code 127 (not a panic, not 0, not a generic 1)" }
+      ]
+    },
+    {
+      "journey_id": "remove-and-double-remove-graceful",
+      "rationale": "Removing a sandbox should fully clean it up, and removing/stopping something already gone should fail gracefully (clear message, sane exit) rather than panic or corrupt state — basic idempotency a user expects.",
+      "source": { "kind": "help", "ref": "`izba rm`/`izba stop` semantics" },
+      "steps": [
+        { "intent": "create then remove a sandbox", "expect": "rm succeeds; reconciler shows no orphaned relay/volume/process for it" },
+        { "intent": "attempt to remove the same (now-gone) sandbox again", "expect": "a clear not-found error with a non-zero, non-panic exit; no stack trace; state stays consistent" }
+      ]
+    },
+    {
+      "journey_id": "clean-data-dir-is-consistent",
+      "rationale": "On a fresh install with nothing created, the tool should report an empty, consistent world — no phantom sandboxes, no orphaned resources.",
+      "source": { "kind": "readme", "ref": "first-run expectations" },
+      "steps": [
+        { "intent": "list sandboxes before creating anything", "expect": "an empty list (or a clear 'no sandboxes' message), exit 0" },
+        { "intent": "run the consistency reconciler", "expect": "zero violations" }
+      ]
+    }
+  ]
+}
