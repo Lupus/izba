@@ -883,6 +883,27 @@ mod tests {
         proptest::collection::vec(proptest::collection::vec(arb_op(), 1..=6), 1..=4)
     }
 
+    /// Like `arb_layers` but guarantees layer 0 contains at least one
+    /// `AddFile`.  This eliminates the `prop_assume!` skip in
+    /// `prop_hardlink_ordering` (layer 0 files are used as hardlink targets)
+    /// and keeps the rejection rate near zero.
+    fn arb_layers_with_file_in_layer0() -> impl proptest::strategy::Strategy<Value = Vec<Vec<Op>>> {
+        use proptest::prelude::*;
+        (
+            // One guaranteed AddFile for layer 0 …
+            arb_path().prop_map(Op::AddFile),
+            // … plus the rest of the ops for layer 0 …
+            proptest::collection::vec(arb_op(), 0..=5),
+            // … and the remaining 0–3 layers.
+            proptest::collection::vec(proptest::collection::vec(arb_op(), 1..=6), 0..=3),
+        )
+            .prop_map(|(guaranteed, mut rest_ops, mut rest_layers)| {
+                rest_ops.insert(0, guaranteed);
+                rest_layers.insert(0, rest_ops);
+                rest_layers
+            })
+    }
+
     proptest::proptest! {
         // ── Property 2: differential model ───────────────────────────────────
         // The flattened tar's file set (non-whiteout entries) must equal the
@@ -902,11 +923,16 @@ mod tests {
                 .collect();
 
             let mut out = Vec::new();
-            // flatten_layers may fail if a whiteout causes issues; that's OK — skip.
+            // The generated input space (ASCII names, no `..`, no GNU-sparse
+            // entries) provides no legitimate reason for flatten_layers to error.
+            // A silent skip here would let real bugs in the production code go
+            // unnoticed; assert success so failures surface immediately.
             let result = flatten_layers(readers, &mut out);
-            if result.is_err() {
-                return Ok(());
-            }
+            proptest::prop_assert!(
+                result.is_ok(),
+                "unexpected flatten_layers error: {:?}",
+                result
+            );
 
             // Parse the output tar to collect the set of non-whiteout paths.
             let mut actual: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -943,7 +969,7 @@ mod tests {
         // We don't assert the target exists in the output — it may have been
         // whited out; we only assert the partition order.
         #[test]
-        fn prop_hardlink_ordering(layers_ops in arb_layers()) {
+        fn prop_hardlink_ordering(layers_ops in arb_layers_with_file_in_layer0()) {
             let layer_bytes: Vec<Vec<u8>> = layers_ops.iter()
                 .map(|ops| ops_to_layer_owned(ops))
                 .collect();
@@ -955,9 +981,9 @@ mod tests {
                 .take(2)
                 .collect();
 
-            if file_paths.is_empty() {
-                return Ok(()); // no files in layer 0; skip
-            }
+            // arb_layers_with_file_in_layer0 guarantees ≥1 AddFile in layer 0,
+            // so file_paths is always non-empty here.
+            debug_assert!(!file_paths.is_empty(), "strategy must provide ≥1 AddFile in layer 0");
 
             // Append a hardlink layer whose links have names starting with
             // "zzz_" (lexicographically late) pointing to the layer-0 files.
@@ -983,9 +1009,14 @@ mod tests {
                 .collect();
 
             let mut out = Vec::new();
-            if flatten_layers(readers, &mut out).is_err() {
-                return Ok(()); // unflatten-able input; skip
-            }
+            // Same rationale as prop_whiteout_differential: ASCII names + no
+            // `..` + no GNU-sparse entries give no legitimate error path.
+            let result = flatten_layers(readers, &mut out);
+            proptest::prop_assert!(
+                result.is_ok(),
+                "unexpected flatten_layers error: {:?}",
+                result
+            );
 
             // Split the output order into "before first hardlink" and "at/after".
             let mut ar = tar::Archive::new(Cursor::new(out));
