@@ -32,7 +32,10 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Fetch base ref
-        run: git fetch --no-tags origin "${{ github.base_ref }}"
+        # Explicit refspec so the base lands in refs/remotes/origin/<base> — a
+        # bare `git fetch origin <base>` only updates FETCH_HEAD, leaving
+        # `origin/<base>` unresolvable and the gate's `git diff` fatal.
+        run: git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
       - name: Incremental mutation gate
         run: hack/mutants-gate.sh "origin/${{ github.base_ref }}"
 
