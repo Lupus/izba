@@ -28,6 +28,13 @@ pub fn read_dns_msg<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
 
 /// Turn `query` into a SERVFAIL response in place: QR=1, RA=1, RCODE=2.
 /// ID and question section are preserved so the client can match it.
+//
+// Mutation note: the `| -> ^` mutant of `(resp[3] & 0xf0) | 0x02` below is
+// EQUIVALENT — the `& 0xf0` clears bit 0x02, so `| 0x02` and `^ 0x02` always
+// agree — hence unkillable, and excluded by name in `.cargo/mutants.toml`
+// (pinned + drift-checked by `hack/mutants-check-excludes.py`). The exclusion is
+// surgical, so servfail's other mutants stay under test (e.g. `| -> &` is NOT
+// equivalent and is killed by the byte[3] assertions).
 pub fn servfail(query: &[u8]) -> Vec<u8> {
     let mut resp = query.to_vec();
     if resp.len() >= 4 {
