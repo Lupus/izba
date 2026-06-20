@@ -1,0 +1,96 @@
+name: Mutants
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 3 * * 1'   # weekly full run, Mon 03:00 UTC (matches e2e.yml)
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write   # collect job upserts the mutation-gaps tracking issue
+
+jobs:
+  incremental:
+    name: mutation gate (incremental)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          fetch-depth: 0   # need the base branch to compute the merge-base diff
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: mutants-incremental
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        with:
+          tool: cargo-mutants
+      - name: Fetch base ref
+        run: git fetch --no-tags origin "${{ github.base_ref }}"
+      - name: Incremental mutation gate
+        run: hack/mutants-gate.sh "origin/${{ github.base_ref }}"
+
+  full-shard:
+    name: full mutation run (shard ${{ matrix.shard }}/8)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: mutants-full
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        with:
+          tool: cargo-mutants
+      - name: Run shard (non-zero exit on survivors is expected; do not fail)
+        run: cargo mutants --shard ${{ matrix.shard }}/8 -o shard-out || true
+      - name: Upload shard results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: shard-out/mutants.out
+          if-no-files-found: warn
+
+  collect:
+    name: collect + publish worklist
+    if: github.event_name != 'pull_request'
+    needs: full-shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Download all shard results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mutants-shard-*
+          path: shards
+      - name: Merge shards into report
+        run: |
+          python3 hack/mutants-report.py --mode full \
+            --json-out mutants-report.json --md-out mutants-report.md \
+            shards/mutants-shard-*
+          cat mutants-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload merged report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-report
+          path: |
+            mutants-report.json
+            mutants-report.md
+          if-no-files-found: warn
+      - name: Upsert tracking issue
+        run: hack/mutants-issue.sh mutants-report.md
