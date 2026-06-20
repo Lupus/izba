@@ -244,12 +244,15 @@ jobs:
           MAX_USD: ${{ inputs.max_usd }}
         run: |
           export PATH="$HOME/.local/bin:$PATH"
+          # Short data-dir base: the sandbox runtime socket lives under
+          # <data-dir>/sandboxes/<name>/run/vsock.sock_1027 and must fit the
+          # ~108-byte AF_UNIX sun_path limit; $RUNNER_TEMP is too deep (izba#71).
           python3 hack/dogfood/run_journeys.py \
             --journeys journeys.json \
             --shard "$SHARD" \
             --shards "$SHARDS" \
             --izba-bin "$PWD/target/release/izba" \
-            --data-dir "$RUNNER_TEMP/izba-dogfood-$SHARD" \
+            --data-dir "/tmp/izd-$SHARD" \
             --out "traj-$SHARD.json" \
             --model "$MODEL" \
             --max-usd "$MAX_USD" \
