@@ -128,10 +128,14 @@ mod tests {
             }
 
             if query.len() >= 4 {
-                // QR bit (bit 7 of byte 2) must be set.
-                prop_assert!(
-                    resp[2] & 0x80 != 0,
-                    "QR bit must be set in byte 2, got {:#04x}",
+                // QR bit (bit 7 of byte 2) must be set AND all other bits in
+                // byte[2] must be preserved verbatim — servfail uses |= not =.
+                prop_assert_eq!(
+                    resp[2],
+                    query[2] | 0x80,
+                    "byte[2]: QR must be set and all other bits preserved; \
+                     query[2]={:#04x} resp[2]={:#04x}",
+                    query[2],
                     resp[2]
                 );
                 // RA bit (bit 7 of byte 3) must be set.
