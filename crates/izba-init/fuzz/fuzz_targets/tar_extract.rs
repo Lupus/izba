@@ -1,8 +1,13 @@
 //! Fuzz target for `izba_init::tarfs::extract`.
 //!
-//! Feeds arbitrary bytes to `extract` as a tar stream and checks that:
-//!   - no panic occurs
-//!   - no file is created outside the tempdir root
+//! Feeds arbitrary bytes to `extract` as a tar stream and asserts:
+//!   - no panic, hang, or OOM occurs
+//!
+//! Out-of-root containment is enforced by `openat2(RESOLVE_IN_ROOT)` at the
+//! kernel level and is exercised deterministically by the `prop_containment_no_escape`
+//! proptest in `tarfs.rs`, which covers symlink-write-through, `..`/absolute-path
+//! entry names, and out-of-order archives. This target focuses on parser robustness
+//! against truly malformed/truncated byte streams, not on containment logic.
 //!
 //! Note: each run involves real filesystem I/O (tmpfs on Linux), which makes
 //! this slower than a purely in-memory fuzzer. This is acceptable for a 60s
