@@ -65,7 +65,14 @@ jobs:
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - name: Install nightly toolchain
-        run: rustup toolchain install nightly
+        # rust-toolchain.toml lists the musl target, which rustup also adds to
+        # nightly here. cargo-fuzz would then build for musl, where ASAN can't
+        # link against the static libc ("sanitizer is incompatible with
+        # statically linked libc"). Ensure the gnu target is present and pass
+        # --target x86_64-unknown-linux-gnu explicitly on every run below.
+        run: |
+          rustup toolchain install nightly
+          rustup target add x86_64-unknown-linux-gnu --toolchain nightly
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
         with:
@@ -76,16 +83,16 @@ jobs:
       - name: fuzz izba-proto (frame, dns)
         run: |
           cd crates/izba-proto
-          cargo +nightly fuzz run frame -- -max_total_time=45
-          cargo +nightly fuzz run dns   -- -max_total_time=45
+          cargo +nightly fuzz run frame --target x86_64-unknown-linux-gnu -- -max_total_time=45
+          cargo +nightly fuzz run dns   --target x86_64-unknown-linux-gnu -- -max_total_time=45
       - name: fuzz izba-core (flatten)
         run: |
           cd crates/izba-core
-          cargo +nightly fuzz run flatten -- -max_total_time=45
+          cargo +nightly fuzz run flatten --target x86_64-unknown-linux-gnu -- -max_total_time=45
       - name: fuzz izba-init (tar_extract)
         run: |
           cd crates/izba-init
-          cargo +nightly fuzz run tar_extract -- -max_total_time=45
+          cargo +nightly fuzz run tar_extract --target x86_64-unknown-linux-gnu -- -max_total_time=45
 
   cargo-deny:
     name: cargo-deny (supply-chain gate, F-22)

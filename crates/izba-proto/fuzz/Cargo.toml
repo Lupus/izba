@@ -10,6 +10,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 izba-proto = { path = ".." }
+# read_frame is generic over the payload type; the `frame` target fuzzes the
+# framing with arbitrary JSON via serde_json::Value (izba-proto parses frame
+# payloads with serde_json, so this matches the real decode path).
+serde_json = "1"
 
 # Fuzz targets are binaries — not part of the workspace, not tested, not documented.
 [[bin]]
