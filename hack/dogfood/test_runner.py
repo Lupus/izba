@@ -200,6 +200,19 @@ class HarnessImprovementTests(unittest.TestCase):
         self.assertNotIn(" ", seg)
         self.assertNotIn("/", seg)
 
+    def test_journey_data_dir_resists_path_traversal(self):
+        # ".." must not escape base; it sanitizes to a safe segment under base.
+        trav = os.path.normpath(run_journeys._journey_data_dir("/base", ".."))
+        self.assertEqual(os.path.dirname(trav), "/base")
+        self.assertNotEqual(os.path.basename(trav), "..")
+
+    def test_journey_data_dir_distinguishes_punctuation_only_ids(self):
+        # ids that sanitize identically must NOT share a dir (hash suffix).
+        self.assertNotEqual(
+            run_journeys._journey_data_dir("/base", "a b"),
+            run_journeys._journey_data_dir("/base", "a-b"),
+        )
+
     def test_gather_cli_help_captures_stub_help(self):
         with tempfile.TemporaryDirectory() as d:
             izba = _write_stub_izba(d)
@@ -238,8 +251,8 @@ class HarnessImprovementTests(unittest.TestCase):
                 "--izba-bin", izba, "--data-dir", data_dir, "--out", out,
                 "--fake-model", json.dumps([{"command": "izba ls"}, {"done": True}]),
             ])
-            self.assertTrue(os.path.isdir(os.path.join(data_dir, "j-one")))
-            self.assertTrue(os.path.isdir(os.path.join(data_dir, "j-two")))
+            self.assertTrue(os.path.isdir(run_journeys._journey_data_dir(data_dir, "j-one")))
+            self.assertTrue(os.path.isdir(run_journeys._journey_data_dir(data_dir, "j-two")))
 
 
 if __name__ == "__main__":

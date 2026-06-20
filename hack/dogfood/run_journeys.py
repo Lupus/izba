@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -78,18 +79,24 @@ def _argv_from_command(command: str) -> List[str]:
     return parts
 
 
-def gather_cli_help(izba_bin: str, timeout_s: float = 10.0) -> str:
+def gather_cli_help(izba_bin: str, timeout_s: float = 8.0,
+                    total_timeout_s: float = 20.0) -> str:
     """Best-effort `izba --help` (+ a few key subcommands) to seed the Actor so it
     uses real commands instead of guessing (start/init/list/...). Report-only:
-    returns '' on any error."""
+    returns '' on any error. Bounded by an aggregate ``total_timeout_s`` so a
+    binary that hangs on every call can't impose a 7×timeout startup penalty."""
     chunks: List[str] = []
     targets = [["--help"], ["create", "--help"], ["run", "--help"],
                ["exec", "--help"], ["stop", "--help"], ["rm", "--help"],
                ["ls", "--help"]]
+    deadline = time.monotonic() + total_timeout_s
     for tgt in targets:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             p = subprocess.run([izba_bin, *tgt], capture_output=True, text=True,
-                               timeout=timeout_s)
+                               timeout=min(timeout_s, remaining))
             text = (p.stdout or "") + (p.stderr or "")
         except (OSError, subprocess.SubprocessError):
             continue
@@ -103,9 +110,15 @@ _SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 def _journey_data_dir(base: str, journey_id: str) -> str:
     """Per-journey IZBA_DATA_DIR so one journey's leftover state can't contaminate
-    the next (e.g. a stray sandbox breaking a 'clean data dir' journey)."""
-    safe = _SAFE_RE.sub("-", journey_id) or "journey"
-    return os.path.join(base, safe)
+    the next (e.g. a stray sandbox breaking a 'clean data dir' journey).
+
+    The segment is sanitized AND suffixed with a short hash of the original id:
+    stripping leading/trailing dots prevents ``..`` escaping ``base`` (path
+    traversal), and the hash keeps ids that sanitize identically (e.g.
+    ``"a b"`` vs ``"a-b"``) in distinct dirs rather than silently sharing state."""
+    safe = _SAFE_RE.sub("-", journey_id).strip(".-") or "journey"
+    short = hashlib.sha256((journey_id or "").encode("utf-8")).hexdigest()[:8]
+    return os.path.join(base, f"{safe}-{short}")
 
 
 class BudgetExceeded(Exception):
