@@ -962,4 +962,124 @@ mod tests {
             other => panic!("expected hard-floor deny, got {other:?}"),
         }
     }
+
+    // --- proptest property-based tests for the SSRF hard-floor classifier ---
+
+    use proptest::prelude::*;
+    use std::net::Ipv6Addr;
+
+    // Property 1: embedded-v4 canonicalization consistency (the SSRF-bypass property).
+    // For an arbitrary IPv4 address, construct its three bypass-prone IPv6 embeddings
+    // and assert each classifies identically to the bare IPv4. If `embedded_v4` dropped
+    // a branch (e.g. forgot NAT64), the embedded form would mis-classify as a benign
+    // global address while the bare IPv4 is denied.
+    //
+    // The IPv4-compatible form (::a.b.c.d) deliberately excludes 0.0.0.0 and 0.0.0.1
+    // because the impl skips those to keep :: and ::1 as pure-v6 specials.
+    proptest! {
+        #[test]
+        fn embedded_v4_canonicalization_consistency(octets in any::<[u8; 4]>()) {
+            let v4 = std::net::Ipv4Addr::from(octets);
+            let v4_ip = IpAddr::V4(v4);
+
+            let [o0, o1, o2, o3] = octets;
+            let hi = ((o0 as u16) << 8) | o1 as u16;
+            let lo = ((o2 as u16) << 8) | o3 as u16;
+
+            // Form 1: IPv4-mapped ::ffff:a.b.c.d (via to_ipv6_mapped).
+            let mapped = v4.to_ipv6_mapped();
+            let mapped_ip = IpAddr::V6(mapped);
+            prop_assert_eq!(
+                is_hard_denied(mapped_ip),
+                is_hard_denied(v4_ip),
+                "mapped form hard_denied mismatch for {}",
+                v4
+            );
+            prop_assert_eq!(
+                is_lan(mapped_ip),
+                is_lan(v4_ip),
+                "mapped form lan mismatch for {}",
+                v4
+            );
+
+            // Form 2: NAT64 64:ff9b::a.b.c.d (RFC 6052 well-known prefix).
+            let nat64 = Ipv6Addr::from([0x0064, 0xff9b, 0, 0, 0, 0, hi, lo]);
+            let nat64_ip = IpAddr::V6(nat64);
+            prop_assert_eq!(
+                is_hard_denied(nat64_ip),
+                is_hard_denied(v4_ip),
+                "NAT64 form hard_denied mismatch for {}",
+                v4
+            );
+            prop_assert_eq!(
+                is_lan(nat64_ip),
+                is_lan(v4_ip),
+                "NAT64 form lan mismatch for {}",
+                v4
+            );
+
+            // Form 3: IPv4-compatible ::a.b.c.d — excluding 0.0.0.0 and 0.0.0.1
+            // (the impl intentionally skips those so :: and ::1 stay pure-v6).
+            prop_assume!(v4 != std::net::Ipv4Addr::new(0, 0, 0, 0));
+            prop_assume!(v4 != std::net::Ipv4Addr::new(0, 0, 0, 1));
+            let compat = Ipv6Addr::from([0u16, 0, 0, 0, 0, 0, hi, lo]);
+            let compat_ip = IpAddr::V6(compat);
+            prop_assert_eq!(
+                is_hard_denied(compat_ip),
+                is_hard_denied(v4_ip),
+                "IPv4-compat form hard_denied mismatch for {}",
+                v4
+            );
+            prop_assert_eq!(
+                is_lan(compat_ip),
+                is_lan(v4_ip),
+                "IPv4-compat form lan mismatch for {}",
+                v4
+            );
+        }
+    }
+
+    // Property 2: totality / no-panic.
+    // `is_hard_denied` and `is_lan` must not panic on any arbitrary IpAddr.
+    // The `let _ = ...` sinks prevent the calls from being dead-code optimized away.
+    proptest! {
+        #[test]
+        fn classifier_totality_no_panic_v4(raw in any::<u32>()) {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(raw));
+            let _ = is_hard_denied(ip) | is_lan(ip);
+        }
+
+        #[test]
+        fn classifier_totality_no_panic_v6(raw in any::<u128>()) {
+            let ip = IpAddr::V6(Ipv6Addr::from(raw));
+            let _ = is_hard_denied(ip) | is_lan(ip);
+        }
+    }
+
+    // Property 3: disjointness (F-01 split).
+    // `is_hard_denied` and `is_lan` are disjoint — no address can be both.
+    // Hard-floor ranges (loopback / link-local / unspecified / broadcast / documentation)
+    // and LAN ranges (RFC1918 / unique-local) must not overlap. A future edit that
+    // accidentally moved RFC1918 into the hard floor would fire this property.
+    proptest! {
+        #[test]
+        fn hard_denied_and_lan_are_disjoint_v4(raw in any::<u32>()) {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(raw));
+            prop_assert!(
+                !(is_hard_denied(ip) && is_lan(ip)),
+                "address {} is both hard_denied and lan",
+                ip
+            );
+        }
+
+        #[test]
+        fn hard_denied_and_lan_are_disjoint_v6(raw in any::<u128>()) {
+            let ip = IpAddr::V6(Ipv6Addr::from(raw));
+            prop_assert!(
+                !(is_hard_denied(ip) && is_lan(ip)),
+                "address {} is both hard_denied and lan",
+                ip
+            );
+        }
+    }
 }
