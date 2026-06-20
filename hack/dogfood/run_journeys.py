@@ -131,6 +131,95 @@ class BudgetExceeded(Exception):
     """Raised internally to unwind to the writer when --max-usd is hit."""
 
 
+def _collect_candidates(action, command, action_index, prev_reconcile,
+                        latency_budget_ms, journey, step, journey_id):
+    """All oracles for one action -> a list of candidate dicts (with refs)."""
+    ref = {"journey_id": journey_id, "action_index": action_index}
+    found = implicit_oracle(action) + latency_oracle(action, latency_budget_ms)
+    if prev_reconcile is not None:
+        found += reconcile_seq_oracle(prev_reconcile, action.reconcile)
+    out = []
+    for c in found:
+        cd = c.to_dict()
+        cd["trajectory_ref"] = ref
+        out.append(cd)
+    # Functional oracle (cheap proxy): a non-zero exit on a step that expects
+    # success is a divergence from the expectation.
+    expect = step.get("expect", "")
+    if action.exit_code != 0 and expect:
+        out.append({
+            "kind": "functional",
+            "detail": (f"command {command!r} exited {action.exit_code} "
+                       f"while step expected: {expect!r}"),
+            "violated_expectation": expect,
+            "source": journey.get("source", {}).get("ref", "journey step"),
+            "trajectory_ref": ref,
+        })
+    return out
+
+
+def _next_command(model, journey, step, actions, budget, journey_id):
+    """One model turn -> a command string, or None to end the step."""
+    try:
+        reply = model.next_command(journey, step, actions)
+        budget["usd"] += float(getattr(model, "last_cost_usd", 0.0) or 0.0)
+    except Exception as e:  # report-only: model failure ends the step
+        log(f"{journey_id}: model error: {e!r}; ending step")
+        return None
+    if not isinstance(reply, dict) or reply.get("done"):
+        return None
+    command = reply.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    return command
+
+
+def _run_step(model, journey, step, izba_bin, data_dir, *, action_timeout_s,
+              latency_budget_ms, budget, max_usd, max_turns, step_cap,
+              journey_id, actions, candidates, ctx) -> bool:
+    """Run one step's Actor loop. Mutates ``actions``/``candidates``/``ctx``.
+    Returns True if a journey-level cap (step-cap/max-turns) tripped (caller
+    should stop the whole journey). Raises BudgetExceeded on the $ cap.
+
+    Loop-dedup (``seen``) is scoped PER STEP so a later step can legitimately
+    re-issue a common verify command (e.g. ``izba ls``)."""
+    seen: set = set()
+    while True:
+        if len(actions) >= step_cap:
+            log(f"{journey_id}: step-cap {step_cap} reached; stopping journey")
+            return True
+        if ctx["turns"] >= max_turns:
+            log(f"{journey_id}: max-turns {max_turns} reached; stopping journey")
+            return True
+        if budget["usd"] >= max_usd:
+            log(f"{journey_id}: budget ${budget['usd']:.4f} >= ${max_usd}; aborting")
+            raise BudgetExceeded()
+
+        ctx["turns"] += 1
+        command = _next_command(model, journey, step, actions, budget, journey_id)
+        if command is None:
+            return False
+        h = _cmd_hash(journey_id, command)
+        if h in seen:
+            log(f"{journey_id}: loop-dedup hit on {command!r}; ending step")
+            return False
+        seen.add(h)
+
+        try:  # report-only; run_action never raises in practice
+            action = run_action(izba_bin, _argv_from_command(command), data_dir,
+                                action_timeout_s, intent=step.get("intent", ""))
+        except Exception as e:  # defensive: should not happen
+            log(f"{journey_id}: run_action error: {e!r}; skipping")
+            return False
+
+        action_index = len(actions)
+        actions.append(action.to_dict())
+        candidates.extend(_collect_candidates(
+            action, command, action_index, ctx["prev_reconcile"],
+            latency_budget_ms, journey, step, journey_id))
+        ctx["prev_reconcile"] = action.reconcile
+
+
 def run_journey(
     model,
     journey: Dict[str, Any],
@@ -148,94 +237,17 @@ def run_journey(
     journey_id = journey.get("journey_id", "")
     actions: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
-    prev_reconcile: Optional[Dict[str, Any]] = None
-    turns = 0
-
+    ctx: Dict[str, Any] = {"turns": 0, "prev_reconcile": None}
     steps = journey.get("steps", []) or [{"intent": journey.get("rationale", ""),
                                           "expect": ""}]
-
     for step in steps:
-        expect = step.get("expect", "")
-        # Loop-dedup is scoped PER STEP: it stops the Actor repeating the same
-        # command within a step's turn loop, without killing a later step that
-        # legitimately re-issues a common verify command (e.g. `izba ls`).
-        seen: set = set()
-        # Inner Actor loop for this step.
-        while True:
-            if len(actions) >= step_cap:
-                log(f"{journey_id}: step-cap {step_cap} reached; stopping journey")
-                return {"journey_id": journey_id, "actions": actions,
-                        "candidates": candidates}
-            if turns >= max_turns:
-                log(f"{journey_id}: max-turns {max_turns} reached; stopping journey")
-                return {"journey_id": journey_id, "actions": actions,
-                        "candidates": candidates}
-            if budget["usd"] >= max_usd:
-                log(f"{journey_id}: budget ${budget['usd']:.4f} >= ${max_usd}; aborting")
-                raise BudgetExceeded()
-
-            turns += 1
-            try:
-                reply = model.next_command(journey, step, actions)
-                budget["usd"] += float(getattr(model, "last_cost_usd", 0.0) or 0.0)
-            except Exception as e:  # report-only: model failure ends the step
-                log(f"{journey_id}: model error: {e!r}; ending step")
-                break
-
-            if not isinstance(reply, dict) or reply.get("done"):
-                break
-            command = reply.get("command")
-            if not isinstance(command, str) or not command.strip():
-                break
-
-            h = _cmd_hash(journey_id, command)
-            if h in seen:
-                log(f"{journey_id}: loop-dedup hit on {command!r}; ending step")
-                break
-            seen.add(h)
-
-            # Run the action (report-only; run_action never raises).
-            try:
-                action = run_action(
-                    izba_bin, _argv_from_command(command), data_dir,
-                    action_timeout_s, intent=step.get("intent", ""),
-                )
-            except Exception as e:  # defensive: should not happen
-                log(f"{journey_id}: run_action error: {e!r}; skipping")
-                break
-
-            action_index = len(actions)
-            adict = action.to_dict()
-            actions.append(adict)
-
-            # Deterministic oracles.
-            new_candidates = []
-            new_candidates += implicit_oracle(action)
-            new_candidates += latency_oracle(action, latency_budget_ms)
-            if prev_reconcile is not None:
-                new_candidates += reconcile_seq_oracle(prev_reconcile, action.reconcile)
-            prev_reconcile = action.reconcile
-
-            # Stamp the trajectory_ref + functional expectation onto each candidate.
-            for c in new_candidates:
-                cd = c.to_dict()
-                cd["trajectory_ref"] = {"journey_id": journey_id,
-                                        "action_index": action_index}
-                candidates.append(cd)
-
-            # Functional oracle (cheap, deterministic proxy): a non-zero exit on
-            # a step that expects success is a divergence from the expectation.
-            if action.exit_code != 0 and expect:
-                candidates.append({
-                    "kind": "functional",
-                    "detail": (f"command {command!r} exited {action.exit_code} "
-                               f"while step expected: {expect!r}"),
-                    "violated_expectation": expect,
-                    "source": journey.get("source", {}).get("ref", "journey step"),
-                    "trajectory_ref": {"journey_id": journey_id,
-                                       "action_index": action_index},
-                })
-
+        stop = _run_step(
+            model, journey, step, izba_bin, data_dir,
+            action_timeout_s=action_timeout_s, latency_budget_ms=latency_budget_ms,
+            budget=budget, max_usd=max_usd, max_turns=max_turns, step_cap=step_cap,
+            journey_id=journey_id, actions=actions, candidates=candidates, ctx=ctx)
+        if stop:
+            break
     return {"journey_id": journey_id, "actions": actions, "candidates": candidates}
 
 
