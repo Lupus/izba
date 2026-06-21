@@ -33,6 +33,7 @@ anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true
+mutants = "0.0.4"
 
 [dev-dependencies]
 izba-ttytest = { path = "../izba-ttytest" }

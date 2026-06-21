@@ -77,6 +77,10 @@ fn ls(paths: &Paths) -> anyhow::Result<i32> {
     }
 }
 
+// reason: daemon-wired glue — the confirm decision is unit-tested via
+// `confirm_with`; the DaemonClient request/response path is exercised by the
+// KVM-gated `daemon_e2e` (which cargo-mutants cannot run on hosted runners).
+#[mutants::skip]
 fn prune(paths: &Paths, force: bool) -> anyhow::Result<i32> {
     if !confirm_destructive(
         "remove all persistent volumes not used by any sandbox",
@@ -106,6 +110,10 @@ fn prune(paths: &Paths, force: bool) -> anyhow::Result<i32> {
     }
 }
 
+// reason: daemon-wired glue — the confirm decision is unit-tested via
+// `confirm_with`; the DaemonClient request/response path is exercised by the
+// KVM-gated `daemon_e2e` (which cargo-mutants cannot run on hosted runners).
+#[mutants::skip]
 fn rm(paths: &Paths, name: &str, force: bool) -> anyhow::Result<i32> {
     if !confirm_destructive(&format!("remove persistent volume '{name}'"), force)? {
         eprintln!("aborted");
@@ -167,6 +175,9 @@ fn detach(paths: &Paths, name: &str, guest_path: &str) -> anyhow::Result<i32> {
 ///
 /// Returns `Ok(true)` to proceed, `Ok(false)` if the user declined at the
 /// prompt; `Err` if running non-interactively without `--force`.
+// reason: thin real-stdin/TTY wrapper (injects `is_terminal()` + `stdin().lock()`)
+// — the decision logic is fully unit-tested through `confirm_with`.
+#[mutants::skip]
 fn confirm_destructive(action: &str, force: bool) -> anyhow::Result<bool> {
     confirm_with(
         action,
