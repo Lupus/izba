@@ -1,3 +1,5 @@
+use std::io::{BufRead, IsTerminal, Write};
+
 use anyhow::bail;
 use clap::Subcommand;
 use izba_core::daemon::proto::{DaemonRequest, DaemonResponse};
@@ -26,7 +28,7 @@ pub enum VolumeCmd {
     Attach {
         /// Sandbox name
         name: String,
-        /// [VNAME:]GUEST_PATH:SIZE
+        /// [VNAME:]GUEST_PATH:SIZE — SIZE needs a `g`/`m` suffix, e.g. `10g`, `512m`
         spec: String,
     },
     /// Detach the volume at GUEST_PATH from a sandbox (applied on next restart)
@@ -76,9 +78,12 @@ fn ls(paths: &Paths) -> anyhow::Result<i32> {
 }
 
 fn prune(paths: &Paths, force: bool) -> anyhow::Result<i32> {
-    if !force && !confirm("Remove all persistent volumes not used by any sandbox?")? {
-        println!("aborted");
-        return Ok(0);
+    if !confirm_destructive(
+        "remove all persistent volumes not used by any sandbox",
+        force,
+    )? {
+        eprintln!("aborted");
+        return Ok(1);
     }
     let mut client = DaemonClient::connect(paths)?;
     match client.request(&DaemonRequest::VolumePrune, &mut |m| eprintln!("{m}"))? {
@@ -102,9 +107,9 @@ fn prune(paths: &Paths, force: bool) -> anyhow::Result<i32> {
 }
 
 fn rm(paths: &Paths, name: &str, force: bool) -> anyhow::Result<i32> {
-    if !force && !confirm(&format!("Remove persistent volume '{name}'?"))? {
-        println!("aborted");
-        return Ok(0);
+    if !confirm_destructive(&format!("remove persistent volume '{name}'"), force)? {
+        eprintln!("aborted");
+        return Ok(1);
     }
     let mut client = DaemonClient::connect(paths)?;
     match client.request(
@@ -151,12 +156,100 @@ fn detach(paths: &Paths, name: &str, guest_path: &str) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-/// Minimal y/N confirmation on stdin. Defaults to no on EOF / anything but y.
-fn confirm(prompt: &str) -> anyhow::Result<bool> {
-    use std::io::Write;
-    print!("{prompt} [y/N] ");
+/// Gate a destructive `volume` operation.
+///
+/// - `--force` ⇒ proceed without asking.
+/// - interactive terminal ⇒ prompt `[y/N]`, default No.
+/// - non-interactive (piped/script) without `--force` ⇒ refuse with a clear
+///   error naming the flag, instead of silently aborting at exit 0. A script
+///   can't answer a prompt, so we tell it the flag to pass (clig.dev: only
+///   prompt when stdin is a TTY; never *require* a prompt).
+///
+/// Returns `Ok(true)` to proceed, `Ok(false)` if the user declined at the
+/// prompt; `Err` if running non-interactively without `--force`.
+fn confirm_destructive(action: &str, force: bool) -> anyhow::Result<bool> {
+    confirm_with(
+        action,
+        force,
+        std::io::stdin().is_terminal(),
+        &mut std::io::stdin().lock(),
+    )
+}
+
+/// Pure core of [`confirm_destructive`] with the TTY decision and input reader
+/// injected, so the script-relevant branches are unit-testable without a real
+/// terminal.
+fn confirm_with(
+    action: &str,
+    force: bool,
+    is_tty: bool,
+    reader: &mut impl BufRead,
+) -> anyhow::Result<bool> {
+    if force {
+        return Ok(true);
+    }
+    if !is_tty {
+        bail!(
+            "refusing to {action} without confirmation: stdin is not a terminal \
+             — re-run with --force"
+        );
+    }
+    print!("{action}? [y/N] ");
     std::io::stdout().flush()?;
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+    reader.read_line(&mut line)?;
+    Ok(is_affirmative(&line))
+}
+
+/// True for an affirmative reply (`y`/`yes`, case-insensitive); anything else,
+/// including empty input / EOF, is a No.
+fn is_affirmative(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_proceeds_even_without_tty() {
+        let mut input: &[u8] = b"";
+        assert!(confirm_with("remove x", true, false, &mut input).unwrap());
+    }
+
+    #[test]
+    fn non_tty_without_force_errors_naming_the_flag() {
+        let mut input: &[u8] = b"";
+        let err = confirm_with("remove persistent volume 'v'", false, false, &mut input)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--force"), "{err}");
+        assert!(err.contains("not a terminal"), "{err}");
+    }
+
+    #[test]
+    fn tty_yes_proceeds() {
+        let mut yes: &[u8] = b"y\n";
+        assert!(confirm_with("remove x", false, true, &mut yes).unwrap());
+        let mut upper: &[u8] = b"YES\n";
+        assert!(confirm_with("remove x", false, true, &mut upper).unwrap());
+    }
+
+    #[test]
+    fn tty_no_or_empty_declines() {
+        for raw in [&b"n\n"[..], &b"\n"[..], &b""[..]] {
+            let mut input = raw;
+            assert!(!confirm_with("remove x", false, true, &mut input).unwrap());
+        }
+    }
+
+    #[test]
+    fn is_affirmative_variants() {
+        for s in ["y", "Y", "yes", " Yes ", "YES\n"] {
+            assert!(is_affirmative(s), "{s:?}");
+        }
+        for s in ["", "n", "no", "nope", "yeah"] {
+            assert!(!is_affirmative(s), "{s:?}");
+        }
+    }
 }
