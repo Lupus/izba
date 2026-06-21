@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model import FakeModel, OpenRouterModel  # noqa: E402
 from oracles import (  # noqa: E402
+    capture_state_evidence,
     functional_oracle,
     implicit_oracle,
     latency_oracle,
@@ -66,18 +67,6 @@ def select_shard(journeys: List[Dict[str, Any]], shard: int,
 def _cmd_hash(journey_id: str, command: str) -> str:
     return hashlib.sha256(f"{journey_id}\0{command}".encode("utf-8")).hexdigest()
 
-
-def _argv_from_command(command: str) -> List[str]:
-    """Turn a model command string into argv for izba, dropping a leading 'izba'."""
-    import shlex
-
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        parts = command.split()
-    if parts and parts[0] == "izba":
-        parts = parts[1:]
-    return parts
 
 
 # A clap "Commands:" / "SUBCOMMANDS:" section header (nothing after the colon).
@@ -224,7 +213,8 @@ def _next_command(model, journey, step, actions, budget, journey_id):
     return command
 
 
-def _run_step(model, journey, step, izba_bin, data_dir, *, action_timeout_s,
+def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
+              action_timeout_s,
               latency_budget_ms, budget, max_usd, max_turns, step_cap,
               journey_id, actions, candidates, ctx) -> bool:
     """Run one step's Actor loop. Mutates ``actions``/``candidates``/``ctx``.
@@ -256,8 +246,9 @@ def _run_step(model, journey, step, izba_bin, data_dir, *, action_timeout_s,
         seen.add(h)
 
         try:  # report-only; run_action never raises in practice
-            action = run_action(izba_bin, _argv_from_command(command), data_dir,
-                                action_timeout_s, intent=step.get("intent", ""))
+            action = run_action(command, izba_bin=izba_bin, workdir=workdir,
+                                data_dir=data_dir, timeout_s=action_timeout_s,
+                                intent=step.get("intent", ""))
         except Exception as e:  # defensive: should not happen
             log(f"{journey_id}: run_action error: {e!r}; skipping")
             return False
@@ -288,17 +279,30 @@ def run_journey(
     actions: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
     ctx: Dict[str, Any] = {"turns": 0, "prev_reconcile": None}
+    # The Actor's shell cwd — a real project dir, kept OUT of the izba data dir
+    # so the user's files (e.g. a policy.yaml they write) don't mingle with
+    # izba's internal sandbox state. izba run/cp share this as /workspace.
+    workdir = os.path.join(data_dir, "proj")
+    os.makedirs(workdir, exist_ok=True)
     steps = journey.get("steps", []) or [{"intent": journey.get("rationale", ""),
                                           "expect": ""}]
     for step in steps:
         stop = _run_step(
-            model, journey, step, izba_bin, data_dir,
+            model, journey, step, izba_bin, data_dir, workdir,
             action_timeout_s=action_timeout_s, latency_budget_ms=latency_budget_ms,
             budget=budget, max_usd=max_usd, max_turns=max_turns, step_cap=step_cap,
             journey_id=journey_id, actions=actions, candidates=candidates, ctx=ctx)
         if stop:
             break
-    return {"journey_id": journey_id, "actions": actions, "candidates": candidates}
+    # State-based oracle: snapshot izba's OWN audit/policy/lifecycle state so the
+    # rubric judge grades the outcome from ground truth, not guest exit codes.
+    try:
+        state_evidence = capture_state_evidence(izba_bin, data_dir, action_timeout_s)
+    except Exception as e:  # report-only: never let evidence capture fail a run
+        log(f"{journey_id}: state-evidence capture error: {e!r}")
+        state_evidence = {"sandboxes": [], "reconcile": {}, "per_sandbox": {}}
+    return {"journey_id": journey_id, "actions": actions, "candidates": candidates,
+            "state_evidence": state_evidence}
 
 
 def build_model(args) -> Any:
@@ -320,7 +324,15 @@ def build_model(args) -> Any:
         log(f"seeded Actor with {len(cli_help)} chars of `izba --help`")
     else:
         log("WARNING: could not capture `izba --help`; Actor runs unseeded")
-    return OpenRouterModel(api_key, args.model, cli_help=cli_help)
+    readme = _read_optional(getattr(args, "readme", ""))
+    if readme:
+        log(f"seeded Actor with {len(readme)} chars of README ({args.readme})")
+    context_pack = _read_optional(getattr(args, "context_pack", ""))
+    if context_pack:
+        log(f"seeded Actor with {len(context_pack)} chars of run context "
+            f"({args.context_pack})")
+    return OpenRouterModel(api_key, args.model, cli_help=cli_help,
+                           readme=readme, context_pack=context_pack)
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -348,7 +360,27 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="human-normal per-action latency budget for the oracle")
     p.add_argument("--fake-model", default=None,
                    help="JSON array of scripted replies; offline mode, no API key")
+    p.add_argument("--readme", default="README.md",
+                   help="product README to seed the Actor with (the docs a real "
+                        "user reads); skipped if the file is absent")
+    p.add_argument("--context-pack", default="dogfood-context.md",
+                   help="run-specific shared notes for the Actor (guest "
+                        "environment + harness conventions); skipped if absent")
     return p.parse_args(argv)
+
+
+def _read_optional(path: str) -> str:
+    """Read a seed file (README / context-pack), or '' if missing/unreadable.
+
+    Report-only: a missing seed must never abort a run — it just means the Actor
+    runs with a thinner surface (which is itself a fair-test condition)."""
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
 
 
 def main(argv: Optional[List[str]] = None) -> int:

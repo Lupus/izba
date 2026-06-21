@@ -183,34 +183,66 @@ class ReconcileSeqOracleTests(unittest.TestCase):
         self.assertEqual(reconcile_seq_oracle({}, {}), [])
 
 
+def _write_stub(d, body):
+    """Write a stub `izba` (named `izba`, so it resolves on PATH) with BODY."""
+    stub = os.path.join(d, "izba")
+    with open(stub, "w") as f:
+        f.write("#!/bin/sh\n"
+                'if [ "$1" = "__reconcile" ]; then echo \'{"violations":[],"sandboxes":[]}\'; exit 0; fi\n'
+                + body)
+    os.chmod(stub, 0o755)
+    return stub
+
+
 class RunActionTests(unittest.TestCase):
-    def test_run_action_captures_exit_and_latency(self):
-        # Use a stub "izba" that exits 0 for the reconcile call and our command.
+    def test_run_action_runs_via_shell_with_izba_on_path(self):
+        # The Actor command is a real shell line; izba resolves on PATH.
         with tempfile.TemporaryDirectory() as d:
-            stub = os.path.join(d, "izba")
-            with open(stub, "w") as f:
-                f.write("#!/bin/sh\n"
-                        'if [ "$1" = "__reconcile" ]; then echo \'{"violations":[]}\'; exit 0; fi\n'
-                        'echo hello; exit 0\n')
-            os.chmod(stub, 0o755)
-            a = run_action(stub, ["ls"], data_dir=d, timeout_s=10, intent="list")
+            stub = _write_stub(d, "echo hello; exit 0\n")
+            a = run_action("izba ls", izba_bin=stub, workdir=d, data_dir=d,
+                           timeout_s=10, intent="list")
             self.assertEqual(a.exit_code, 0)
             self.assertIn("hello", a.stdout_tail)
             self.assertGreaterEqual(a.latency_ms, 0)
-            self.assertEqual(a.reconcile, {"violations": []})
+            self.assertEqual(a.reconcile, {"violations": [], "sandboxes": []})
             self.assertEqual(a.command, "izba ls")
+
+    def test_run_action_supports_real_shell_file_ops(self):
+        # Faithful "user at a shell": heredocs/redirects/pipes work; the Actor
+        # can write files (e.g. a policy.yaml) — not just call one binary.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub(d, "echo ok; exit 0\n")
+            a = run_action("printf 'hi\\n' > note.txt && cat note.txt",
+                           izba_bin=stub, workdir=d, data_dir=d, timeout_s=10)
+            self.assertEqual(a.exit_code, 0)
+            self.assertIn("hi", a.stdout_tail)
+            self.assertTrue(os.path.exists(os.path.join(d, "note.txt")))
 
     def test_run_action_timeout_is_reported_not_raised(self):
         with tempfile.TemporaryDirectory() as d:
-            stub = os.path.join(d, "izba")
-            with open(stub, "w") as f:
-                f.write("#!/bin/sh\n"
-                        'if [ "$1" = "__reconcile" ]; then echo \'{"violations":[]}\'; exit 0; fi\n'
-                        "sleep 30\n")
-            os.chmod(stub, 0o755)
-            a = run_action(stub, ["hang"], data_dir=d, timeout_s=1, intent="hang")
+            stub = _write_stub(d, "sleep 30\n")
+            a = run_action("izba hang", izba_bin=stub, workdir=d, data_dir=d,
+                           timeout_s=1, intent="hang")
             # report-only: timeout must not raise; exit_code reflects the timeout.
             self.assertNotEqual(a.exit_code, 0)
+
+    def test_capture_state_evidence_snapshots_policy_and_netlog(self):
+        from oracles import capture_state_evidence
+        with tempfile.TemporaryDirectory() as d:
+            # Stub: reconcile reports one sandbox; policy/netlog echo identifiable text.
+            stub = os.path.join(d, "izba")
+            with open(stub, "w") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'if [ "$1" = "__reconcile" ]; then echo \'{"sandboxes":[{"name":"sb1"}]}\'; exit 0; fi\n'
+                    'if [ "$1" = "policy" ]; then echo "enforce: on"; exit 0; fi\n'
+                    'if [ "$1" = "netlog" ]; then echo "ALLOW example.com"; exit 0; fi\n'
+                    "exit 0\n")
+            os.chmod(stub, 0o755)
+            ev = capture_state_evidence(stub, d, timeout_s=10)
+            self.assertEqual(ev["sandboxes"], ["sb1"])
+            self.assertIn("enforce: on", ev["per_sandbox"]["sb1"]["policy_show"]["stdout"])
+            self.assertIn("ALLOW", ev["per_sandbox"]["sb1"]["netlog"]["stdout"])
 
     def test_action_round_trips_to_dict(self):
         a = act()

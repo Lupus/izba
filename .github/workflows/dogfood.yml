@@ -22,9 +22,9 @@ on:
         required: false
         default: '3'
       model:
-        description: 'OpenRouter model id (cheap by default)'
+        description: 'OpenRouter model id (cheap but tool-capable by default; deepseek-chat was too weak to drive the shell-agent loop reliably)'
         required: false
-        default: 'deepseek/deepseek-chat'
+        default: 'google/gemini-2.5-flash'
       max_usd:
         description: 'Cumulative estimated USD budget for the whole run'
         required: false
@@ -247,6 +247,9 @@ jobs:
           # Short data-dir base: the sandbox runtime socket lives under
           # <data-dir>/sandboxes/<name>/run/vsock.sock_1027 and must fit the
           # ~108-byte AF_UNIX sun_path limit; $RUNNER_TEMP is too deep (izba#71).
+          # The Actor (a real shell user) reads the same docs a user would: the
+          # product README + the run-specific context pack (its environment).
+          # Both live at the repo root on the dispatched branch.
           python3 hack/dogfood/run_journeys.py \
             --journeys journeys.json \
             --shard "$SHARD" \
@@ -256,6 +259,8 @@ jobs:
             --out "traj-$SHARD.json" \
             --model "$MODEL" \
             --max-usd "$MAX_USD" \
+            --readme README.md \
+            --context-pack dogfood-context.md \
             --action-timeout-s 120 \
             --step-cap 25
       - name: Upload trajectory bundle

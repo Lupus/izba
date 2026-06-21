@@ -21,7 +21,6 @@ Everything here is pure/stdlib so it is unit-testable anywhere (see
 from __future__ import annotations
 
 import re
-import shlex
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -68,33 +67,53 @@ def _tail(text: str, limit: int = TAIL_BYTES) -> str:
     return text[-limit:]
 
 
-def run_action(
-    izba_bin: str,
-    argv: List[str],
-    data_dir: str,
-    timeout_s: float,
-    intent: str = "",
-    env: Optional[Dict[str, str]] = None,
-) -> Action:
-    """Run one ``izba`` command, then snapshot ``izba __reconcile --json``.
+def _shell_env(izba_bin: str, data_dir: str,
+               env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Environment for the Actor's shell: izba on PATH + this journey's data dir.
 
-    Report-only: a timeout or any OS error is captured into the Action (exit_code
-    set to a non-zero sentinel); this never raises.
+    The Actor is a real user at a terminal, so its commands run through ``bash``
+    with ``izba`` resolvable on ``PATH`` (not a hard-coded binary path). Each
+    journey gets its own ``IZBA_DATA_DIR`` so state can't leak between journeys.
     """
     import os
 
     run_env = dict(os.environ)
     run_env["IZBA_DATA_DIR"] = data_dir
+    bindir = os.path.dirname(os.path.abspath(izba_bin))
+    run_env["PATH"] = bindir + os.pathsep + run_env.get("PATH", "")
     if env:
         run_env.update(env)
+    return run_env
 
-    # shlex.join preserves argument boundaries in the trajectory (e.g. an arg
-    # with a space round-trips as one token, not several).
-    command = "izba " + shlex.join(argv)
+
+def run_action(
+    command: str,
+    *,
+    izba_bin: str,
+    workdir: str,
+    data_dir: str,
+    timeout_s: float,
+    intent: str = "",
+    env: Optional[Dict[str, str]] = None,
+) -> Action:
+    """Run ONE Actor command as a real shell line, then snapshot reconcile.
+
+    The command is whatever the Actor (a user at a terminal) chose — an ``izba``
+    invocation, a file-creating heredoc, a ``curl``, an ``izba exec … -- sh -c
+    '…'`` — run via ``bash -c`` with ``cwd=workdir`` and ``izba`` on ``PATH``.
+    This is the faithful "real user with a shell" model: the Actor can write
+    files and compose pipelines, not just call one binary.
+
+    Report-only: a timeout or any OS error is captured into the Action (exit_code
+    set to a non-zero sentinel); this never raises.
+    """
+    run_env = _shell_env(izba_bin, data_dir, env)
+
     start = time.monotonic()
     try:
         proc = subprocess.run(
-            [izba_bin, *argv],
+            ["bash", "-c", command],
+            cwd=workdir,
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -111,7 +130,7 @@ def run_action(
     except OSError as e:
         exit_code = 125
         stdout = ""
-        stderr = f"[harness] failed to spawn {izba_bin!r}: {e}"
+        stderr = f"[harness] failed to run command via bash: {e}"
     latency_ms = int((time.monotonic() - start) * 1000)
 
     reconcile = _snapshot_reconcile(izba_bin, data_dir, timeout_s, run_env)
@@ -146,6 +165,51 @@ def _snapshot_reconcile(
     except (subprocess.TimeoutExpired, OSError, ValueError):
         pass
     return {"violations": [], "sandboxes": []}
+
+
+def _izba_capture(izba_bin: str, argv: List[str], data_dir: str,
+                  timeout_s: float, env: Dict[str, str]) -> Dict[str, Any]:
+    """Run a read-only `izba` command directly (no shell) and capture its text.
+
+    Used for state evidence — we invoke izba ourselves (not through the Actor) so
+    the snapshot is trustworthy. Report-only: errors become an `error` result
+    rather than raising."""
+    try:
+        proc = subprocess.run(
+            [izba_bin, *argv], capture_output=True, text=True,
+            timeout=timeout_s, env=env,
+        )
+        return {"argv": argv, "exit_code": proc.returncode,
+                "stdout": _tail(proc.stdout or ""), "stderr": _tail(proc.stderr or "")}
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return {"argv": argv, "exit_code": 124, "stdout": "", "stderr": f"[harness] {e}"}
+
+
+def capture_state_evidence(
+    izba_bin: str, data_dir: str, timeout_s: float,
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Snapshot the product's OWN authoritative state after a journey, for the
+    rubric judge to grade outcomes against (the τ-bench "end-state" oracle).
+
+    For an egress-firewall run the ground truth is izba's own observability — NOT
+    a guest command's exit code. Per sandbox the journey created we capture
+    ``izba policy show`` (effective allow-list + enforce posture) and
+    ``izba netlog --summary`` (what the firewall actually allowed/denied), plus
+    the lifecycle ``__reconcile`` snapshot. Report-only."""
+    run_env = _shell_env(izba_bin, data_dir, env)
+    reconcile = _snapshot_reconcile(izba_bin, data_dir, timeout_s, run_env)
+    names = [s.get("name") for s in (reconcile.get("sandboxes") or [])
+             if s.get("name")]
+    per_sandbox: Dict[str, Any] = {}
+    for name in names:
+        per_sandbox[name] = {
+            "policy_show": _izba_capture(izba_bin, ["policy", "show", name],
+                                         data_dir, timeout_s, run_env),
+            "netlog": _izba_capture(izba_bin, ["netlog", name, "--summary"],
+                                    data_dir, timeout_s, run_env),
+        }
+    return {"sandboxes": names, "reconcile": reconcile, "per_sandbox": per_sandbox}
 
 
 # --- Implicit oracle ---------------------------------------------------------
@@ -202,6 +266,15 @@ def implicit_oracle(action: Action) -> List[Candidate]:
 # refused/rejected), so a non-zero exit is the success case — not a divergence.
 # Kept deliberately narrow (no bare "error", which appears in success expects
 # like "succeeds with no error") so we don't misclassify an expect-success step.
+#
+# NOTE (loop-2 redesign): this keyword oracle is intentionally NOT extended to
+# adjudicate egress outcomes ("is host X blocked?"). Inferring a firewall verdict
+# from a guest command's exit code is a known-weak oracle — exit 6 from `nc`/curl
+# means DNS-resolution failure, not necessarily a policy block, producing both
+# false positives and false negatives (see references/methodology.md, "state vs
+# exit-code oracles"). Egress outcomes are judged from the product's own audit
+# state (`izba netlog` / `policy show`) captured as state evidence, then graded by
+# the rubric judge — not here.
 _EXPECT_FAILURE_RE = re.compile(
     r"\brefus(?:e|es|ed|al)\b"
     r"|\breject(?:s|ed)?\b"
@@ -236,6 +309,12 @@ def functional_oracle(
     - expect describes a REFUSAL and the command exited non-zero -> PASS. This is
       what kills the bulk of the false positives the old check produced on
       grammar-rejection / in-use-guard journeys (whose whole point is a refusal).
+
+    This is a deliberately WEAK proposer, not an outcome verdict: an exit code is
+    a poor oracle for "did the user's goal happen" (a command can exit 0 without
+    achieving it, or non-zero via a valid alternative path). Egress/UX outcomes
+    are judged from product state + the rubric judge; this only catches the gross
+    "expected success, hard error" / "expected refusal, silent success" cases.
     """
     if not expect:
         return []

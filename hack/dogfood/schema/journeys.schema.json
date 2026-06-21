@@ -64,7 +64,7 @@
         },
         "expect": {
           "type": "string",
-          "description": "The expected observable outcome of this step."
+          "description": "The expected observable outcome of this step, in user-observable terms (judged by the rubric judge against product state — NOT a literal exit-code assertion)."
         }
       }
     }
