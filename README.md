@@ -74,9 +74,10 @@ Key properties:
     - host: docs.internal
       access: read               # HTTP GET/HEAD only; writes (POST/PUT/…) blocked
   git:
-    - target: github.com/myorg/myrepo   # clone/fetch; read-only (no push) by default
-    - target: github.com/myorg/deploy
-      access: read-write                # also allow git push
+    - repo: github.com/myorg/myrepo    # clone/fetch; read-only (no push) by default
+    - repo: github.com/myorg/deploy
+      access: read-write               # also allow git push
+    - host: github.com                 # or scope a whole host instead of a repo
   ```
 
   A bare host authorizes ports 80 and 443 only. To reach any other port,
