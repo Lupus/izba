@@ -34,6 +34,18 @@
         "candidates": {
           "type": "array",
           "items": { "$ref": "#/definitions/candidate" }
+        },
+        "state_evidence": {
+          "type": "object",
+          "description": "The product's OWN authoritative end-state after the journey — the state-based oracle the rubric judge grades outcomes against (NOT guest exit codes). Per sandbox the journey created: `izba policy show` (allow-list + enforce posture) and `izba netlog --summary` (what the firewall actually allowed/denied), plus the final reconcile snapshot.",
+          "properties": {
+            "sandboxes": { "type": "array", "items": { "type": "string" } },
+            "reconcile": { "type": "object" },
+            "per_sandbox": {
+              "type": "object",
+              "description": "Keyed by sandbox name; each has policy_show + netlog capture results (argv/exit_code/stdout/stderr)."
+            }
+          }
         }
       }
     },
