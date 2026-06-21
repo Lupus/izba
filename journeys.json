@@ -1,0 +1,212 @@
+{
+  "feature": "egress-firewall",
+  "journeys": [
+    {
+      "journey_id": "discover-how-to-turn-firewall-on",
+      "rationale": "Loop-1 D1: there was no discoverable 'turn the firewall on' story. README/--help now document the enforce posture; a user should be able to discover and turn enforcement on from docs alone.",
+      "source": { "kind": "spec", "ref": "2026-06-18-policy-netlog-ux-redesign-design.md (enforce posture); README 'Off by default; opt in to enforce'" },
+      "steps": [
+        { "intent": "create a sandbox for the current workspace", "expect": "a sandbox exists and is listed" },
+        { "intent": "find out from the docs/help how to make this sandbox actually restrict outbound network access, then turn that restriction on", "expect": "checking the sandbox's policy shows the enforce posture is on" }
+      ]
+    },
+    {
+      "journey_id": "enforce-on-blocks-unlisted-host",
+      "rationale": "Never-reached-in-loop-1: enforce-on default-deny must actually block an unlisted host, verified via the audit log showing a DENY. Core promise of the firewall.",
+      "source": { "kind": "spec", "ref": "2026-06-14-m2-agent-firewall-merged-design.md (default-deny enforcement); README 'anything not on the allow-list is blocked'" },
+      "steps": [
+        { "intent": "create a sandbox and turn its firewall on so only allow-listed hosts are reachable, allowing one specific host like example.com", "expect": "policy shows enforce on with example.com on the allow-list" },
+        { "intent": "start the sandbox, then from inside the guest try to reach a host that is NOT on the allow-list (e.g. a different domain)", "expect": "the connection to the unlisted host does not succeed" },
+        { "intent": "inspect the egress audit log for this sandbox", "expect": "the audit log shows the unlisted host was denied" }
+      ]
+    },
+    {
+      "journey_id": "enforce-on-allows-listed-host",
+      "rationale": "Counterpart to default-deny: a host that IS on the allow-list must remain reachable under enforcement, verified via the audit log showing it allowed.",
+      "source": { "kind": "spec", "ref": "2026-06-14-m2-agent-firewall-merged-design.md (allow-list permits listed hosts); README allow-list semantics" },
+      "steps": [
+        { "intent": "create an enforcing sandbox whose allow-list includes a specific reachable host, then start it", "expect": "policy shows enforce on with that host listed" },
+        { "intent": "from inside the guest, check that the allow-listed host can be reached on its web port", "expect": "the allow-listed host is reachable" },
+        { "intent": "review the audit log", "expect": "the audit log records the allow-listed host as allowed" }
+      ]
+    },
+    {
+      "journey_id": "empty-allowlist-enforce-denies-all",
+      "rationale": "Never-reached-in-loop-1: an empty allow-list with enforce on denies ALL egress. Explicitly promised edge case.",
+      "source": { "kind": "spec", "ref": "README 'an empty allow-list under enforcement denies all egress'; 2026-06-18-policy-netlog-ux-redesign-design.md" },
+      "steps": [
+        { "intent": "create a sandbox with the firewall turned on but with no hosts allowed at all, then start it", "expect": "policy shows enforce on with an empty (deny-all) allow-list" },
+        { "intent": "from inside the guest, try to reach any external host", "expect": "no external host is reachable" },
+        { "intent": "check the audit log", "expect": "outbound attempts are recorded as denied" }
+      ]
+    },
+    {
+      "journey_id": "bare-host-allows-only-web-ports",
+      "rationale": "Never-reached-in-loop-1: a bare allow-list host authorizes only ports 80/443; other ports are blocked under enforcement (the M2.1 'closed loophole').",
+      "source": { "kind": "spec", "ref": "2026-06-15-m2.1-interactive-firewall-design.md (bare host = 80/443 only); README 'A bare host authorizes ports 80 and 443 only'" },
+      "steps": [
+        { "intent": "create an enforcing sandbox that allows a host by its bare name only (no explicit ports), then start it", "expect": "policy shows the host allowed on the default web ports only" },
+        { "intent": "from inside the guest, try to reach that same host on a non-web port such as a database port", "expect": "the non-web port to that host is not reachable" },
+        { "intent": "from inside the guest, confirm the host is still reachable on its standard web port", "expect": "the web port to that host succeeds" },
+        { "intent": "inspect the audit log", "expect": "the non-web-port attempt is recorded as denied while the web-port attempt is allowed" }
+      ]
+    },
+    {
+      "journey_id": "explicit-ports-replace-web-default",
+      "rationale": "Never-reached-in-loop-1: an explicit ports: list REPLACES (not extends) the web default. Listing only 5432 should block 80/443 to that host.",
+      "source": { "kind": "spec", "ref": "README 'explicit ports replace, not extend, the web default'; 2026-06-15-m2.1-interactive-firewall-design.md" },
+      "steps": [
+        { "intent": "create an enforcing sandbox that allows a host on one specific non-web port only (e.g. 5432), then start it", "expect": "policy shows that host allowed on exactly the one listed port" },
+        { "intent": "from inside the guest, try to reach that host on a standard web port", "expect": "the web port to that host is not reachable because the explicit port replaced the web default" }
+      ]
+    },
+    {
+      "journey_id": "policy-file-enforce-honored-at-create",
+      "rationale": "Never-reached-in-loop-1: a --policy file with enforce: true must be honored at create. The actor can now author the YAML itself.",
+      "source": { "kind": "help", "ref": "izba create --policy --help: 'Egress policy YAML: turns the firewall ON (default-deny)'; README --policy" },
+      "steps": [
+        { "intent": "write a policy file that enforces a default-deny allow-list permitting just one host, then create a sandbox using that policy file", "expect": "the sandbox is created with that enforcing policy applied" },
+        { "intent": "check the sandbox's policy", "expect": "policy show reflects enforce on and the one allowed host from the file" }
+      ]
+    },
+    {
+      "journey_id": "http-access-read-blocks-writes",
+      "rationale": "Loop-1 D2 + never-reached: HTTP access: read allows GET/HEAD but blocks POST/PUT. The YAML grammar for access: is now documented; the user must discover and apply it.",
+      "source": { "kind": "spec", "ref": "2026-06-18-vendor-neutral-git-http-egress-controls-design.md (HTTP access read|read-write); README 'access: read  # HTTP GET/HEAD only; writes blocked'" },
+      "steps": [
+        { "intent": "create an enforcing sandbox that allows a host for HTTP reads only (GET/HEAD), not writes, then start it", "expect": "policy shows that host with read-only access" },
+        { "intent": "from inside the guest, perform an HTTP write (e.g. a POST) to that host", "expect": "the write is rejected by the firewall" },
+        { "intent": "review the audit log", "expect": "the write attempt is recorded as denied for that host" }
+      ]
+    },
+    {
+      "journey_id": "git-clone-allowed-push-denied-readonly",
+      "rationale": "Never-reached-in-loop-1: git allow on a repo is read-only by default — clone/fetch allowed but push denied. The actor with git+curl can exercise this.",
+      "source": { "kind": "spec", "ref": "2026-06-18-vendor-neutral-git-http-egress-controls-design.md (git read default); README 'git rules ... read-only unless access: read-write'" },
+      "steps": [
+        { "intent": "create an enforcing sandbox that allows git read access to one specific repository host/repo, then start it", "expect": "policy shows the git rule with read access" },
+        { "intent": "from inside the guest, clone or fetch from the allowed repo", "expect": "the read (clone/fetch) succeeds" },
+        { "intent": "from inside the guest, attempt to push to that same repo", "expect": "the push is rejected because the repo is read-only" }
+      ]
+    },
+    {
+      "journey_id": "git-readwrite-allows-push",
+      "rationale": "Never-reached-in-loop-1: git allow with --write (read-write) must permit push. Asymmetry counterpart to the read-only case.",
+      "source": { "kind": "help", "ref": "izba policy git allow --help: 'read unless --write'; README 'git allow NAME TARGET [--write] ... --write adds push'" },
+      "steps": [
+        { "intent": "create an enforcing sandbox that grants read-write git access to a specific repo, then start it", "expect": "policy shows the git rule with read-write access" },
+        { "intent": "from inside the guest, push to that repo", "expect": "the push is permitted" }
+      ]
+    },
+    {
+      "journey_id": "enforce-off-restores-open-egress",
+      "rationale": "Never-reached-in-loop-1: turning enforce off restores open egress (log-only). Asymmetry: if you can turn it on, you can turn it off.",
+      "source": { "kind": "help", "ref": "izba policy enforce --help: 'on (default-deny) or off (log-only: everything allowed)'; README 'Turn it back off'" },
+      "steps": [
+        { "intent": "create an enforcing sandbox with a narrow allow-list and start it, then confirm an unlisted host is blocked", "expect": "the unlisted host is blocked while enforcing" },
+        { "intent": "turn the firewall off for this sandbox", "expect": "policy show reports enforce off" },
+        { "intent": "from inside the guest, try the previously-blocked host again", "expect": "the host is now reachable because egress is open (log-only)" }
+      ]
+    },
+    {
+      "journey_id": "live-allow-reaches-host-without-restart",
+      "rationale": "Spec: policy allow live-reloads against a running sandbox (applies to new connections, no restart). Probes the auto-reload path.",
+      "source": { "kind": "help", "ref": "izba policy allow --help: 'Auto-reloads a running sandbox'; README 'allow ... live-reloads'" },
+      "steps": [
+        { "intent": "create an enforcing sandbox allowing only one host and start it, then confirm a second host is currently blocked", "expect": "the second host is blocked" },
+        { "intent": "while the sandbox is running, add the second host to the allow-list", "expect": "policy show now lists the second host and reports the policy was reloaded" },
+        { "intent": "from inside the guest, try the second host again", "expect": "the second host is now reachable" }
+      ]
+    },
+    {
+      "journey_id": "live-block-removes-host",
+      "rationale": "Asymmetry + live-reload: policy block removes a destination and live-reloads. Counterpart to allow.",
+      "source": { "kind": "help", "ref": "izba policy block --help: 'Block a destination ...; auto-reloads'; README 'block ... live-reloads'" },
+      "steps": [
+        { "intent": "create an enforcing sandbox allowing two hosts and start it, then confirm both are reachable", "expect": "both hosts are reachable" },
+        { "intent": "remove one of the two hosts from the allow-list while running", "expect": "policy show no longer lists the removed host" },
+        { "intent": "from inside the guest, try the removed host again", "expect": "the removed host is no longer reachable" }
+      ]
+    },
+    {
+      "journey_id": "netlog-summary-aggregates-endpoints",
+      "rationale": "Spec: izba netlog --summary aggregates per endpoint with allow/deny counts and verdict. Distinct view from the line-by-line tail.",
+      "source": { "kind": "help", "ref": "izba netlog --summary --help: 'Aggregate into a per-endpoint summary'; README 'netlog ... --summary aggregates per endpoint'" },
+      "steps": [
+        { "intent": "create an enforcing sandbox allowing one host, start it, and generate both an allowed connection and a denied connection from the guest", "expect": "both connection attempts happen" },
+        { "intent": "view the egress audit log as a per-endpoint summary", "expect": "the summary lists each endpoint once with its allow/deny counts and verdict" }
+      ]
+    },
+    {
+      "journey_id": "netlog-records-on-unrestricted-sandbox",
+      "rationale": "Spec: a bare (off) sandbox still logs every connection (log-only). Probes that auditing happens even when nothing is enforced.",
+      "source": { "kind": "spec", "ref": "README 'A bare sandbox does not restrict egress — everything is allowed and merely logged'; 2026-06-12-izba-m1-egress-design.md" },
+      "steps": [
+        { "intent": "create a plain sandbox with no firewall and start it, then make an outbound connection from the guest to some host", "expect": "the connection succeeds (nothing is restricted)" },
+        { "intent": "view the egress audit log for this sandbox", "expect": "the audit log shows the connection that was made, recorded as allowed" }
+      ]
+    },
+    {
+      "journey_id": "policy-show-bare-sandbox-no-policy",
+      "rationale": "Spec/UX: policy show on a bare sandbox communicates that there is no policy / all egress allowed, so a user understands the default state.",
+      "source": { "kind": "spec", "ref": "policy.rs show: \"'NAME' has no egress policy (all egress allowed)\"; README 'policy show ... enforce posture'" },
+      "steps": [
+        { "intent": "create a plain sandbox without any policy", "expect": "the sandbox exists" },
+        { "intent": "ask to see the sandbox's egress policy", "expect": "the output clearly indicates there is no policy and all egress is allowed (firewall off)" }
+      ]
+    },
+    {
+      "journey_id": "edit-policy-before-sandbox-exists",
+      "rationale": "Loop-1 R1/R2 confirmed bug: policy mutating verbs (allow/block/git/enforce) on an UNKNOWN sandbox leak a raw OS error instead of 'no such sandbox'. Naturally hit by editing a policy before the sandbox exists.",
+      "source": { "kind": "spec", "ref": "policy.rs show/enable guard with 'no such sandbox: {name}'; mutating verbs (allow/block/git/enforce) lack this guard (R1/R2)" },
+      "steps": [
+        { "intent": "before creating any sandbox, try to add an allowed host to a sandbox name that does not exist yet", "expect": "a clear error that says there is no such sandbox" }
+      ]
+    },
+    {
+      "journey_id": "enable-seeds-allowlist-from-observed",
+      "rationale": "Spec: policy enable seeds the allow-list from the sandbox's observed allowed traffic, then reloads — a workflow for moving from log-only to enforcing without hand-listing.",
+      "source": { "kind": "help", "ref": "izba policy enable --help: 'Seed the allow-list from the sandbox's currently-allowed traffic'; README 'enable ... seed the allow-list from observed allowed traffic'" },
+      "steps": [
+        { "intent": "create a plain (off) sandbox, start it, and from the guest make outbound connections to a couple of hosts so they get observed", "expect": "the connections are recorded in the audit log" },
+        { "intent": "seed the allow-list from the sandbox's observed traffic", "expect": "the previously-observed hosts now appear on the allow-list" }
+      ]
+    },
+    {
+      "journey_id": "policy-file-log-only-allows-everything",
+      "rationale": "Spec: a --policy file with enforce: false (or omitted) is log-only — everything allowed but recorded. Distinguishes enforce flag from mere presence of a policy.",
+      "source": { "kind": "spec", "ref": "README 'enforce: false (or omitted) = log-only, allow everything'; main.rs --policy help 'enforce: false makes it log-only'" },
+      "steps": [
+        { "intent": "write a policy file that lists one allowed host but with enforcement disabled, create a sandbox with it, and start it", "expect": "policy show reports enforce off" },
+        { "intent": "from inside the guest, reach a host that is NOT in the policy's allow-list", "expect": "the host is still reachable because enforcement is off" }
+      ]
+    },
+    {
+      "journey_id": "explicit-port-host-reachable",
+      "rationale": "Spec: an explicit host+ports allow entry permits that exact port under enforcement. Positive counterpart to explicit-ports-replace-web-default.",
+      "source": { "kind": "spec", "ref": "README 'host: db.internal / ports: [5432]'; izba policy allow --help HOST:PORT" },
+      "steps": [
+        { "intent": "create an enforcing sandbox that allows a reachable host on a specific non-web port and start it", "expect": "policy shows that host allowed on that exact port" },
+        { "intent": "from inside the guest, connect to that host on that exact port", "expect": "the connection on the allowed port succeeds" }
+      ]
+    },
+    {
+      "journey_id": "dns-resolves-under-enforcement",
+      "rationale": "Spec: DNS resolution still works for the guest under enforcement (resolver is izbad-owned); a user must be able to resolve names to reach allow-listed hosts.",
+      "source": { "kind": "spec", "ref": "2026-06-16-izba-dns-resolver-reload-design.md (izbad DNS resolver); README 'DNS to izbad over vsock 1027'" },
+      "steps": [
+        { "intent": "create an enforcing sandbox allowing one host and start it", "expect": "the sandbox is enforcing" },
+        { "intent": "from inside the guest, resolve the allow-listed host's name to an address", "expect": "the name resolves successfully" }
+      ]
+    },
+    {
+      "journey_id": "git-block-removes-rule",
+      "rationale": "Asymmetry: git block removes a previously-added git rule. Counterpart to git allow.",
+      "source": { "kind": "help", "ref": "izba policy git block --help: 'Remove a git rule for REPO/HOST'; README 'git block NAME TARGET'" },
+      "steps": [
+        { "intent": "create a sandbox, allow git access to a repo, then confirm the git rule is present", "expect": "policy show lists the git rule" },
+        { "intent": "remove that git rule", "expect": "policy show no longer lists the git rule" }
+      ]
+    }
+  ]
+}
