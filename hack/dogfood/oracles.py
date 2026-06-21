@@ -167,7 +167,7 @@ def _snapshot_reconcile(
     return {"violations": [], "sandboxes": []}
 
 
-def _izba_capture(izba_bin: str, argv: List[str], data_dir: str,
+def _izba_capture(izba_bin: str, argv: List[str],
                   timeout_s: float, env: Dict[str, str]) -> Dict[str, Any]:
     """Run a read-only `izba` command directly (no shell) and capture its text.
 
@@ -205,9 +205,9 @@ def capture_state_evidence(
     for name in names:
         per_sandbox[name] = {
             "policy_show": _izba_capture(izba_bin, ["policy", "show", name],
-                                         data_dir, timeout_s, run_env),
+                                         timeout_s, run_env),
             "netlog": _izba_capture(izba_bin, ["netlog", name, "--summary"],
-                                    data_dir, timeout_s, run_env),
+                                    timeout_s, run_env),
         }
     return {"sandboxes": names, "reconcile": reconcile, "per_sandbox": per_sandbox}
 
