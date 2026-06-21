@@ -50,8 +50,9 @@ struct SandboxOpts {
     /// Publish a host port to the guest: [BIND:]HOST:GUEST (repeatable)
     #[arg(short = 'p', long = "publish", value_name = "[BIND:]HOST:GUEST")]
     publish: Vec<String>,
-    /// Attach a volume: [NAME:]GUEST_PATH:SIZE (named => persistent under
-    /// <data>/volumes and survives rm; anonymous => ephemeral). Repeatable.
+    /// Attach a volume: [NAME:]GUEST_PATH:SIZE — SIZE needs a `g` or `m`
+    /// suffix, e.g. `10g` or `512m`. Named => persistent under <data>/volumes
+    /// (survives rm); anonymous => ephemeral. Repeatable.
     #[arg(long = "volume", value_name = "[NAME:]GUEST_PATH:SIZE")]
     volumes: Vec<String>,
     /// Egress policy YAML: a domain allow-list this sandbox may reach. Without

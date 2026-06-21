@@ -109,7 +109,7 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
     let (num, mult) = match s.chars().last() {
         Some('g') | Some('G') => (&s[..s.len() - 1], 1u64 << 30),
         Some('m') | Some('M') => (&s[..s.len() - 1], 1u64 << 20),
-        _ => bail!("size {s:?} must end in 'g' or 'm'"),
+        _ => bail!("size {s:?} must end in a 'g' or 'm' suffix, e.g. 10g or 512m"),
     };
     let n: u64 = num.parse().with_context(|| format!("bad size {s:?}"))?;
     if n == 0 {

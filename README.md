@@ -123,6 +123,11 @@ izba policy  enable NAME                 # seed the allow-list from observed all
 izba policy  reload NAME                 # re-read policy.yaml and apply to new connections (no restart)
 ```
 
+Volume `SIZE` takes a `g` or `m` suffix (e.g. `10g`, `512m`). A named volume is
+persistent (lives under `<data>/volumes`, survives `rm`, single-writer); an
+anonymous volume (no `NAME:`) is ephemeral. `izba volume rm`/`prune` ask for
+confirmation on a terminal and otherwise need `-f/--force`.
+
 ## Project layout
 
 ```
