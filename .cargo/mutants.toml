@@ -45,6 +45,23 @@ exclude_re = [
     # Named exclusion keeps servfail's other mutants under test, unlike a
     # function-wide `#[mutants::skip]`.
     "replace \\| with \\^ in servfail",
+    # tarfs.rs (guest cp extract/create) — see the "Mutation note" blocks there.
+    # The open-flag `| -> ^` mutants are EQUIVALENT: `O_RDONLY` is 0
+    # (`0 ^ x == 0 | x`) and `O_DIRECTORY`/`O_CLOEXEC` are disjoint bits
+    # (`^ == |`). The killable `| -> &` mutants (which DROP `O_DIRECTORY`) stay
+    # under test — they are caught by the new open_root_dir/unpack_one tests.
+    "tarfs\\.rs:\\d+:\\d+: replace \\| with \\^ in open_root_dir",
+    "tarfs\\.rs:\\d+:\\d+: replace \\| with \\^ in classify",
+    "tarfs\\.rs:\\d+:\\d+: replace \\| with \\^ in unpack_one",
+    "tarfs\\.rs:\\d+:\\d+: replace \\| with \\^ in extract",
+    # extract's `Missing` branch: `| -> &` (dropping O_DIRECTORY) is EQUIVALENT —
+    # reaching `Missing` means `classify` already resolved the dest to ENOENT,
+    # which proves every prefix (this parent) is a traversable directory.
+    "tarfs\\.rs:\\d+:\\d+: replace \\| with & in extract",
+    # classify's ENOTDIR guard forced true is EQUIVALENT — the only error
+    # `O_DIRECTORY` adds is ENOTDIR; any other Internal errno also fails the
+    # plain retry, so it propagates identically with or without the guard.
+    "tarfs\\.rs:\\d+:\\d+: replace match guard msg.contains\\(\"ENOTDIR\"\\) with true in classify",
 ]
 
 # Give the suite headroom: some host tests spawn processes / do timed I/O.

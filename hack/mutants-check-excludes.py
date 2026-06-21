@@ -57,6 +57,55 @@ EXPECTED = {
             ("crates/izba-proto/src/dns.rs", "replace | with ^ in servfail"): 1,
         },
     },
+    # tarfs.rs open-flag `| -> ^` mutants: EQUIVALENT (O_RDONLY is 0, so
+    # `0 ^ x == 0 | x`; O_DIRECTORY/O_CLOEXEC are disjoint bits, so `^ == |`).
+    # `open_root_dir` has TWO such `|` (count 2); the others have one each.
+    r"tarfs\.rs:\d+:\d+: replace \| with \^ in open_root_dir": {
+        "reason": "O_RDONLY | O_DIRECTORY | O_CLOEXEC — both `| -> ^` are "
+        "equivalent (0^x==0|x; disjoint bits). Two `|` => count 2.",
+        "matches": {
+            ("crates/izba-init/src/tarfs.rs", "replace | with ^ in open_root_dir"): 2,
+        },
+    },
+    r"tarfs\.rs:\d+:\d+: replace \| with \^ in classify": {
+        "reason": "O_RDONLY | O_DIRECTORY — `| -> ^` is equivalent (0^x==0|x).",
+        "matches": {
+            ("crates/izba-init/src/tarfs.rs", "replace | with ^ in classify"): 1,
+        },
+    },
+    r"tarfs\.rs:\d+:\d+: replace \| with \^ in unpack_one": {
+        "reason": "O_RDONLY | O_DIRECTORY — `| -> ^` is equivalent (0^x==0|x).",
+        "matches": {
+            ("crates/izba-init/src/tarfs.rs", "replace | with ^ in unpack_one"): 1,
+        },
+    },
+    r"tarfs\.rs:\d+:\d+: replace \| with \^ in extract": {
+        "reason": "O_RDONLY | O_DIRECTORY — `| -> ^` is equivalent (0^x==0|x).",
+        "matches": {
+            ("crates/izba-init/src/tarfs.rs", "replace | with ^ in extract"): 1,
+        },
+    },
+    # extract `Missing` branch `| -> &` (drops O_DIRECTORY): EQUIVALENT —
+    # classify already proved the parent is a traversable directory.
+    r"tarfs\.rs:\d+:\d+: replace \| with & in extract": {
+        "reason": "extract Missing branch: dropping O_DIRECTORY is equivalent — "
+        "classify resolved dest to ENOENT, proving the parent is a directory.",
+        "matches": {
+            ("crates/izba-init/src/tarfs.rs", "replace | with & in extract"): 1,
+        },
+    },
+    # classify ENOTDIR guard forced true: EQUIVALENT (any non-ENOTDIR Internal
+    # errno also fails the plain retry, propagating identically).
+    r'tarfs\.rs:\d+:\d+: replace match guard msg.contains\("ENOTDIR"\) with true in classify': {
+        "reason": "classify ENOTDIR guard -> true is equivalent — O_DIRECTORY's "
+        "only added error is ENOTDIR; other Internal errnos also fail the retry.",
+        "matches": {
+            (
+                "crates/izba-init/src/tarfs.rs",
+                'replace match guard msg.contains("ENOTDIR") with true in classify',
+            ): 1,
+        },
+    },
 }
 
 
