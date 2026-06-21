@@ -318,6 +318,16 @@ mod tests {
             vec!["api.anthropic.com".to_string()],
             "the same fqdn must be stored once, not duplicated"
         );
+        // The refresh must also MOVE the expiry: the second record (at base+10s,
+        // TTL clamped to the 60s floor) extends expiry to base+70s, so the entry
+        // is still live at base+65s — past the FIRST record's base+60s expiry.
+        // This pins the `e.expiry = expiry` refresh itself (a dropped assignment
+        // would let the entry expire at base+60s and fail here).
+        assert_eq!(
+            store.fqdns_for_at("web", ip, base + Duration::from_secs(65)),
+            vec!["api.anthropic.com".to_string()],
+            "the second record must refresh expiry to base+70s, not leave base+60s"
+        );
     }
 
     #[test]
