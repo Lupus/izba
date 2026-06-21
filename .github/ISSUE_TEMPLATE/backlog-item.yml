@@ -1,0 +1,58 @@
+---
+name: Backlog Item
+description: Add a new item to the project backlog
+labels: []
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: Clear and specific description of the work.
+      placeholder: A concise description of what is being delivered.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: Business value, user impact, or technical justification.
+      placeholder: Why this item matters and what outcome it produces.
+    validations:
+      required: true
+  - type: textarea
+    id: in-scope
+    attributes:
+      label: In Scope
+      description: What is explicitly included in this item.
+      placeholder: |
+        - Item A
+        - Item B
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of Scope
+      description: What is explicitly excluded (when relevant).
+      placeholder: |
+        - Item X (handled separately)
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Concrete, testable, unambiguous conditions. Use a checklist.
+      placeholder: |
+        - [ ] Criterion 1
+        - [ ] Criterion 2
+    validations:
+      required: true
+  - type: textarea
+    id: invest-notes
+    attributes:
+      label: INVEST Notes
+      description: Open questions, "NEEDS CLARIFICATION" markers, INVEST violations to be resolved.
+      placeholder: Leave blank if the item is fully specified.
+    validations:
+      required: false

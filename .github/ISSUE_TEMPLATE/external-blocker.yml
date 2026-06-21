@@ -1,0 +1,30 @@
+---
+name: External Blocker
+description: Record an external constraint (API limitation, vendor issue, regulatory hold, etc.) blocking a backlog item
+title: "External blocker: "
+labels: ["type:external-blocker"]
+body:
+  - type: textarea
+    id: reason
+    attributes:
+      label: Reason
+      description: What external constraint is causing the block?
+      placeholder: e.g. "Vendor API does not support X; waiting for SDK v3 release"
+    validations:
+      required: true
+  - type: input
+    id: external-reference
+    attributes:
+      label: External Reference / URL
+      description: Link to vendor issue, RFC, ticket, or documentation (optional).
+      placeholder: https://...
+    validations:
+      required: false
+  - type: textarea
+    id: resolution-path
+    attributes:
+      label: Expected Resolution Path
+      description: How is this expected to be resolved? (optional)
+      placeholder: e.g. "Monitor vendor release notes; re-evaluate in next sprint"
+    validations:
+      required: false
