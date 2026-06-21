@@ -252,6 +252,59 @@ class HarnessImprovementTests(unittest.TestCase):
     def test_gather_cli_help_returns_empty_on_bad_binary(self):
         self.assertEqual(run_journeys.gather_cli_help("/no/such/izba-binary"), "")
 
+    def test_parse_subcommands_extracts_names_skipping_help(self):
+        top = ("Usage: izba <COMMAND>\n\n"
+               "Commands:\n"
+               "  volume   Manage volumes\n"
+               "  ls       List sandboxes\n"
+               "  help     Print help\n\n"
+               "Options:\n"
+               "  -h, --help  Print help\n")
+        self.assertEqual(run_journeys._parse_subcommands(top), ["volume", "ls"])
+
+    def test_parse_subcommands_empty_on_no_commands_section(self):
+        self.assertEqual(run_journeys._parse_subcommands("just some text\nok"), [])
+
+    def test_parse_subcommands_ignores_indented_commands_header(self):
+        # An indented "Commands:" (e.g. quoted in a description) is NOT a real
+        # clap header and must not open a block (header invariant: non-indented).
+        text = ("Some description mentioning Commands: below\n"
+                "    Commands:\n"
+                "      not-a-real-cmd  oops\n")
+        self.assertEqual(run_journeys._parse_subcommands(text), [])
+
+    def test_gather_cli_help_recurses_into_subcommands(self):
+        # A stub that emits a clap-style nested `volume` namespace; the gather
+        # must discover `volume` AND recurse into `volume attach` (the exact verb
+        # the M3 run never saw).
+        with tempfile.TemporaryDirectory() as d:
+            izba = os.path.join(d, "izba")
+            with open(izba, "w") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'if [ "$1" = "--help" ]; then\n'
+                    "  printf 'Usage: izba <COMMAND>\\n\\nCommands:\\n"
+                    "  volume   Manage volumes\\n  help     Print help\\n\\n"
+                    "Options:\\n  -h\\n'\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    'if [ "$1" = "volume" ] && [ "$2" = "--help" ]; then\n'
+                    "  printf 'Manage volumes\\n\\nUsage: izba volume <COMMAND>\\n\\n"
+                    "Commands:\\n  attach   Attach a volume\\n  help     Print help\\n'\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    'if [ "$1" = "volume" ] && [ "$2" = "attach" ] && [ "$3" = "--help" ]; then\n'
+                    "  printf 'Attach a volume\\n\\nUsage: izba volume attach <NAME> <[VNAME:]GUEST_PATH:SIZE>\\n'\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "echo ok\n"
+                )
+            os.chmod(izba, 0o755)
+            help_text = run_journeys.gather_cli_help(izba)
+            self.assertIn("$ izba volume --help", help_text)
+            self.assertIn("$ izba volume attach --help", help_text)
+            self.assertIn("GUEST_PATH:SIZE", help_text)
+
     def test_system_content_seeds_help_and_warns_against_inventing(self):
         from model import SYSTEM_PROMPT, _system_content
         self.assertEqual(_system_content(""), SYSTEM_PROMPT)

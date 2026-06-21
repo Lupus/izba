@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from oracles import (  # noqa: E402
     Action,
     Candidate,
+    expects_failure,
+    functional_oracle,
     implicit_oracle,
     latency_oracle,
     reconcile_seq_oracle,
@@ -72,6 +74,59 @@ class OracleTests(unittest.TestCase):
         c = implicit_oracle(act(command="izba foo", stderr_tail="panic"))
         self.assertTrue(c)
         self.assertIsInstance(c[0], Candidate)
+
+
+class FunctionalOracleTests(unittest.TestCase):
+    def test_expects_failure_detects_refusal_phrasing(self):
+        for s in [
+            "rejected with a clear grammar error and a nonzero exit",
+            "the removal is refused with a clear in-use error",
+            "starting B is refused with a clear single-writer error",
+            "the request is denied",
+            "create must not succeed",
+        ]:
+            self.assertTrue(expects_failure(s), s)
+
+    def test_expects_failure_false_on_success_phrasing(self):
+        for s in [
+            "create succeeds (exit 0) and the volume is listed",
+            "rm succeeds with no error",
+            "the named volume is still listed after rm",
+            "",
+        ]:
+            self.assertFalse(expects_failure(s), s)
+
+    def test_success_step_nonzero_exit_is_candidate(self):
+        c = functional_oracle("izba create x", 1, "create succeeds and is listed")
+        self.assertTrue(any(x.kind == "functional" for x in c))
+
+    def test_success_step_zero_exit_is_clean(self):
+        self.assertEqual(functional_oracle("izba create x", 0, "create succeeds"), [])
+
+    def test_failure_step_nonzero_exit_is_clean(self):
+        # The whole point of the step is a refusal; a non-zero exit is the PASS.
+        self.assertEqual(
+            functional_oracle("izba create Bad:/d:1g", 1,
+                              "rejected with a clear grammar error and nonzero exit"),
+            [],
+        )
+
+    def test_failure_step_zero_exit_is_candidate(self):
+        # A guard that should have fired but the command succeeded == real bug.
+        c = functional_oracle("izba volume rm in-use", 0,
+                              "the removal is refused with a clear in-use error")
+        self.assertTrue(any(x.kind == "functional" for x in c))
+        self.assertIn("unexpectedly succeeded", c[0].detail)
+
+    def test_empty_expect_never_fires(self):
+        self.assertEqual(functional_oracle("izba ls", 1, ""), [])
+
+    def test_candidate_is_dataclass_with_ref(self):
+        c = functional_oracle("izba x", 1, "succeeds",
+                              source="spec §1", ref={"journey_id": "j", "action_index": 2})
+        self.assertIsInstance(c[0], Candidate)
+        self.assertEqual(c[0].trajectory_ref["journey_id"], "j")
+        self.assertEqual(c[0].source, "spec §1")
 
 
 class ReconcileSeqOracleTests(unittest.TestCase):
