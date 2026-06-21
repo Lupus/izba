@@ -6,9 +6,11 @@ use izba_core::paths::Paths;
 
 #[derive(Debug, Subcommand)]
 pub enum PolicyCmd {
-    /// Print the effective egress allow-list (host + ports) for a sandbox
+    /// Print the effective allow-list (host + ports) and enforce posture (on/off)
     Show { name: String },
-    /// Allow a destination: HOST or HOST:PORT (port defaults to 443); auto-reloads
+    /// Allow an HTTP(S) destination: HOST or HOST:PORT (port defaults to 443;
+    /// access is read-write). To actually block anything else, enforcement must
+    /// be on (see `enforce`). Auto-reloads a running sandbox.
     Allow { name: String, target: String },
     /// Block a destination: HOST or HOST:PORT (port defaults to 443); auto-reloads
     Block { name: String, target: String },
@@ -19,7 +21,9 @@ pub enum PolicyCmd {
     /// Fine-grained git controls (clone/fetch/push per repo)
     #[command(subcommand)]
     Git(GitSub),
-    /// Turn this sandbox's firewall on or off
+    /// Turn the firewall on (default-deny: only allow-listed egress) or off
+    /// (log-only: everything allowed). A bare sandbox is off; an empty
+    /// allow-list with enforce on denies all egress.
     Enforce { name: String, state: EnforceState },
 }
 

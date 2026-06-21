@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List
@@ -32,32 +33,59 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 APPROX_USD_PER_1M_TOKENS = 1.0
 
 SYSTEM_PROMPT = (
-    "You are the Actor in an automated izba dogfooding loop. izba is a CLI that "
-    "runs per-project microVM sandboxes for AI coding agents. You are given ONE "
+    "You are the Actor in an automated izba dogfooding loop: a developer sitting "
+    "at a normal Linux shell, trying to accomplish a task with izba (a CLI that "
+    "runs per-project microVM sandboxes for AI coding agents). You are given ONE "
     "user-journey step (an intent and its expected outcome) plus the observations "
-    "from the commands run so far. Decide the SINGLE next concrete shell command "
-    "to advance this step — it should normally start with `izba`. "
+    "from the commands run so far. Decide the SINGLE next shell command to run. "
+    "Each command is executed via `bash -c` in your working directory, so you have "
+    "a real shell: izba is on your PATH, and you can use ordinary tools (cat, "
+    "echo/heredocs to create files, curl, git, …) and shell features (pipes, "
+    "redirects, quoting). To run a compound command INSIDE a guest use "
+    "`izba exec NAME -- sh -c '...'` (and likewise `izba run`). "
     "Respond with ONLY a JSON object, no prose, in one of these two forms:\n"
-    '  {"command": "izba ..."}   to run the next command\n'
-    '  {"done": true}            when the step is satisfied (or cannot proceed).\n'
+    '  {"command": "<shell command>"}   to run the next command\n'
+    '  {"done": true}                   when the step is satisfied (or cannot proceed).\n'
     "Never repeat a command that already ran with the same result. Prefer the "
-    "smallest command that makes progress. Do not wrap the JSON in markdown."
+    "smallest command that makes progress. Mind shell quoting/escaping. Do not "
+    "wrap the JSON in markdown."
 )
 
-def _system_content(cli_help: str = "") -> str:
-    """System prompt, optionally seeded with the real `izba --help` surface so the
-    Actor uses documented subcommands instead of guessing (start/init/list/...)."""
-    if not (cli_help or "").strip():
+def _system_content(cli_help: str = "", readme: str = "",
+                    context_pack: str = "") -> str:
+    """Assemble the Actor system prompt from the fair-test surfaces a real user
+    has: run-specific notes (``context_pack``), the product ``README``, and the
+    live ``izba --help`` output. Each is optional; with all three empty this
+    returns the bare ``SYSTEM_PROMPT`` (keeps the no-seed path stable).
+
+    Layering mirrors how a user actually onboards: first the environment they are
+    operating in (context pack), then the docs they read (README), then the exact
+    command surface (``--help``). None of these carry spec/source/PR internals —
+    that laundering is enforced upstream in Phase 1.
+    """
+    cli_help = (cli_help or "").strip()
+    readme = (readme or "").strip()
+    context_pack = (context_pack or "").strip()
+    if not (cli_help or readme or context_pack):
         return SYSTEM_PROMPT
-    return (
-        SYSTEM_PROMPT
-        + "\n\nUse ONLY the subcommands and flags documented in the `izba --help` "
-        "output below — do NOT invent commands (there is no `start`, `init`, "
-        "`list`, ...). Note exec/run take the guest command after `--` "
-        "(e.g. `izba run -- uname -s`). If a step cannot be done with the "
-        'documented surface, reply {"done": true}.\n\n'
-        "=== izba help ===\n" + cli_help.strip()
-    )
+
+    parts = [SYSTEM_PROMPT]
+    if cli_help:
+        parts.append(
+            "For izba itself, use ONLY the subcommands and flags documented in the "
+            "`izba --help` output below — do NOT invent izba commands (there is no "
+            "`start`, `init`, `list`, ...). You may freely use normal shell tools "
+            "around it. Note exec/run take the guest command after `--` (e.g. "
+            "`izba run -- uname -s`). If a step truly cannot be done with the "
+            'documented surface, reply {"done": true} — do not invent izba flags.'
+        )
+    if context_pack:
+        parts.append("=== run notes (your environment) ===\n" + context_pack)
+    if readme:
+        parts.append("=== README (product documentation) ===\n" + readme)
+    if cli_help:
+        parts.append("=== izba help ===\n" + cli_help)
+    return "\n\n".join(parts)
 
 
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -122,12 +150,20 @@ class OpenRouterModel:
 
     def __init__(self, api_key: str, model_id: str,
                  url: str = OPENROUTER_URL, timeout_s: float = 60.0,
-                 cli_help: str = ""):
+                 cli_help: str = "", readme: str = "", context_pack: str = "",
+                 max_retries: int = 2, retry_backoff_s: float = 2.0):
         self.api_key = api_key
         self.model_id = model_id
         self.url = url
         self.timeout_s = timeout_s
         self.cli_help = cli_help
+        self.readme = readme
+        self.context_pack = context_pack
+        self._max_retries = max_retries
+        self._retry_backoff_s = retry_backoff_s
+        # Compute the system prompt once: it is identical across every turn, so
+        # there is no reason to re-concatenate the README on each API call.
+        self._system = _system_content(cli_help, readme, context_pack)
         self.last_cost_usd = 0.0
 
     def next_command(self, journey, step, observations) -> Dict[str, Any]:
@@ -135,7 +171,7 @@ class OpenRouterModel:
         payload = {
             "model": self.model_id,
             "messages": [
-                {"role": "system", "content": _system_content(self.cli_help)},
+                {"role": "system", "content": self._system},
                 {"role": "user",
                  "content": _build_user_message(journey, step, observations)},
             ],
@@ -152,11 +188,20 @@ class OpenRouterModel:
                 "X-Title": "izba-dogfood",
             },
         )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, ValueError, OSError):
-            # Infra error: report-only -> signal done so the loop moves on.
+        # Cheap OpenRouter tiers are flaky (transient 429/5xx/timeouts). Retry a
+        # few times with linear backoff before giving up — a single blip should
+        # not silently end an otherwise-good journey. Report-only on exhaustion.
+        body = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                break
+            except (urllib.error.URLError, ValueError, OSError):
+                if attempt >= self._max_retries:
+                    return {"done": True}
+                time.sleep(self._retry_backoff_s * (attempt + 1))
+        if body is None:
             return {"done": True}
 
         self.last_cost_usd = self._estimate_cost(body)

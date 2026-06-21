@@ -50,20 +50,41 @@ Key properties:
   DNS to `izbad` over vsock 1027; `izbad` is the single point that dials the
   outside world. The **agent firewall** (`--policy policy.yaml`,
   `izba netlog`) enforces a per-sandbox egress allow-list and logs every
-  connection. A `policy.yaml` allow entry is a bare host (web ports 80/443
-  only) or an explicit host+ports pair:
+  connection.
+
+  **Off by default; opt in to enforce.** A bare sandbox does **not** restrict
+  egress — everything is allowed and merely logged. The firewall starts
+  *enforcing* a default-deny allow-list only once you turn it on, either by
+  creating with `--policy policy.yaml` or by running
+  `izba policy enforce NAME on`. While enforcing, anything not on the allow-list
+  is blocked; an **empty** allow-list under enforcement denies all egress. Turn
+  it back off with `izba policy enforce NAME off`, and check the current posture
+  with `izba policy show NAME` (prints `enforce: on|off`).
+
+  A `policy.yaml` allow entry is a bare host (web ports 80/443 only) or an
+  explicit host+ports pair, and the file carries the enforce posture plus
+  optional per-host access and git rules:
 
   ```yaml
+  enforce: true                  # false (or omitted) = log-only, allow everything
   allow:
     - api.anthropic.com          # web ports only: 80 and 443
     - host: db.internal
       ports: [5432]              # exactly 5432 — explicit ports replace the default
+    - host: docs.internal
+      access: read               # HTTP GET/HEAD only; writes (POST/PUT/…) blocked
+  git:
+    - target: github.com/myorg/myrepo   # clone/fetch; read-only (no push) by default
+    - target: github.com/myorg/deploy
+      access: read-write                # also allow git push
   ```
 
   A bare host authorizes ports 80 and 443 only. To reach any other port,
   list it explicitly with `ports:` — explicit ports replace, not extend, the
   web default. (Before M2.1 a bare allow-list host reached every TCP port;
-  that loophole is now closed.)
+  that loophole is now closed.) `access:` defaults to `read-write` for HTTP
+  hosts; `git:` rules are vendor-neutral (keyed on the git wire protocol, not a
+  hostname) and read-only unless `access: read-write`.
 - **OCI → erofs + overlay rootfs.** Images are pulled, flattened to a single
   erofs image (read-only), and combined with a sparse ext4 rw disk via
   overlayfs inside the guest. The erofs is content-addressed and shared across
@@ -116,11 +137,14 @@ izba daemon run                         # run the daemon in the foreground (auto
 izba daemon status                      # daemon health + supervised sandboxes
 izba daemon stop                        # stop the daemon; sandboxes keep running, published ports pause
 izba netlog  NAME [--summary] [--follow]   # egress audit log; --summary aggregates per endpoint
-izba policy  show NAME                   # print the effective egress allow-list (host + ports)
-izba policy  allow NAME HOST[:PORT]      # allow a destination (port defaults to 443); live-reloads
-izba policy  block NAME HOST[:PORT]      # remove a destination (port defaults to 443); live-reloads
-izba policy  enable NAME                 # seed the allow-list from observed allowed traffic; live-reloads
-izba policy  reload NAME                 # re-read policy.yaml and apply to new connections (no restart)
+izba policy  show NAME                    # print the effective allow-list + enforce posture (on/off)
+izba policy  enforce NAME on|off          # turn the firewall on (default-deny) or off (log-only)
+izba policy  allow NAME HOST[:PORT]       # allow a destination (port defaults to 443); live-reloads
+izba policy  block NAME HOST[:PORT]       # remove a destination (port defaults to 443); live-reloads
+izba policy  git allow NAME TARGET [--write]  # allow git on a repo/host (clone/fetch; --write adds push)
+izba policy  git block NAME TARGET        # remove a git rule
+izba policy  enable NAME                  # seed the allow-list from observed allowed traffic; live-reloads
+izba policy  reload NAME                  # re-read policy.yaml and apply to new connections (no restart)
 ```
 
 Volume `SIZE` takes a `g` or `m` suffix (e.g. `10g`, `512m`). A named volume is

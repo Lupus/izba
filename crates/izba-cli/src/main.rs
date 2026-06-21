@@ -55,8 +55,11 @@ struct SandboxOpts {
     /// (survives rm); anonymous => ephemeral. Repeatable.
     #[arg(long = "volume", value_name = "[NAME:]GUEST_PATH:SIZE")]
     volumes: Vec<String>,
-    /// Egress policy YAML: a domain allow-list this sandbox may reach. Without
-    /// it the sandbox is unrestricted (no firewall).
+    /// Egress policy YAML: turns the firewall ON (default-deny) and sets the
+    /// allow-list this sandbox may reach (hosts/ports, plus optional `git:` and
+    /// per-host `access:` rules; `enforce: false` makes it log-only). Without
+    /// this flag the sandbox is unrestricted (firewall off); you can also turn
+    /// it on later with `izba policy enforce NAME on`.
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
 }

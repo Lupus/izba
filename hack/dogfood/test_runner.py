@@ -308,9 +308,30 @@ class HarnessImprovementTests(unittest.TestCase):
     def test_system_content_seeds_help_and_warns_against_inventing(self):
         from model import SYSTEM_PROMPT, _system_content
         self.assertEqual(_system_content(""), SYSTEM_PROMPT)
+        self.assertEqual(_system_content("", "", ""), SYSTEM_PROMPT)
         seeded = _system_content("$ izba --help\nCommands: create, run, exec")
         self.assertIn("create, run, exec", seeded)
         self.assertIn("do NOT invent", seeded)
+
+    def test_system_content_layers_readme_and_context_pack(self):
+        from model import _system_content
+        s = _system_content(
+            "$ izba --help\nCommands: create, run",
+            readme="# izba\nRun `izba policy enforce NAME on` to turn the firewall on.",
+            context_pack="The guest is ubuntu:24.04 with no curl preinstalled.",
+        )
+        self.assertIn("=== run notes (your environment) ===", s)
+        self.assertIn("ubuntu:24.04", s)
+        self.assertIn("=== README (product documentation) ===", s)
+        self.assertIn("policy enforce", s)
+        self.assertIn("=== izba help ===", s)
+        # run notes precede the README, which precedes the raw help.
+        self.assertLess(s.index("run notes"), s.index("README (product"))
+        self.assertLess(s.index("README (product"), s.index("izba help"))
+
+    def test_read_optional_missing_file_is_empty(self):
+        self.assertEqual(run_journeys._read_optional("/no/such/readme.md"), "")
+        self.assertEqual(run_journeys._read_optional(""), "")
 
     def test_main_isolates_data_dir_per_journey(self):
         with tempfile.TemporaryDirectory() as d:
