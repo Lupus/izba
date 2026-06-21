@@ -18,6 +18,19 @@ fn internal(msg: impl std::fmt::Display) -> TarError {
     (ErrorKind::Internal, msg.to_string())
 }
 
+// Mutation note (open-flag bit-ORs throughout this file): the `OFlag`
+// expressions below combine disjoint bits, so the `| -> ^` mutants on them are
+// EQUIVALENT (hence unkillable) and are excluded by name in
+// `.cargo/mutants.toml` (pinned + drift-checked by
+// `hack/mutants-check-excludes.py`):
+//   * `O_RDONLY | _`: `O_RDONLY` is 0, so `0 ^ x == 0 | x`.
+//   * `O_DIRECTORY | O_CLOEXEC`: disjoint bits, so `^ == |`.
+// The non-equivalent `| -> &` mutants — which DROP `O_DIRECTORY` — ARE killed
+// (`open_root_dir_rejects_non_directory`,
+// `unpack_one_rejects_entry_whose_parent_is_a_file`). The `flags ^ O_CLOEXEC`
+// mutant in `resolve_under_root` is NOT equivalent (a caller may already pass
+// O_CLOEXEC) and is killed by `resolve_under_root_keeps_cloexec_when_caller_sets_it`.
+//
 /// Open `root` itself as a directory fd, to serve as the `dirfd` anchor for
 /// every `openat2(RESOLVE_IN_ROOT)` below. Resolution can never climb above
 /// this fd.
@@ -171,6 +184,11 @@ pub fn extract<R: Read>(root: &Path, dest: &str, stream: &mut R) -> Result<(), T
         }
         DestKind::Missing => {
             // Parent must exist and be a directory.
+            // Mutation note: the `| -> &` mutant here (dropping `O_DIRECTORY`) is
+            // EQUIVALENT — reaching `Missing` means `classify` already resolved
+            // the full dest to `ENOENT`, which requires every prefix component
+            // (i.e. this parent) to be a traversable directory. `O_DIRECTORY` is
+            // therefore redundant at this site; excluded in `.cargo/mutants.toml`.
             let parent = parent_rel(&dest_rel);
             resolve_under_root(&root_dir, &parent, OFlag::O_RDONLY | OFlag::O_DIRECTORY)?;
             (parent, Some(base_name(&dest_rel)))
@@ -224,6 +242,11 @@ fn classify(root_dir: &OwnedFd, dest_rel: &Path) -> Result<DestKind, TarError> {
                 Err(other) => Err(other),
             }
         }
+        // Mutation note: forcing this guard to `true` is EQUIVALENT. The only
+        // error `O_DIRECTORY` adds over a plain open is `ENOTDIR` (target is not
+        // a directory); any OTHER `Internal` errno also fails the plain retry
+        // below, so it propagates identically whether the guard ran or not. No
+        // input distinguishes the two — excluded in `.cargo/mutants.toml`.
         Err((ErrorKind::Internal, msg)) if msg.contains("ENOTDIR") => {
             // O_DIRECTORY on an existing non-dir → ENOTDIR (mapped to Internal
             // by resolve_under_root). Confirm it resolves plainly.
@@ -895,6 +918,153 @@ mod tests {
         }
         assert!(names.contains(&"abs".to_string()), "{names:?}");
         assert!(names.contains(&"abs/data.txt".to_string()), "{names:?}");
+    }
+
+    // ── Mutation-gap kills (tests only; see docs/quality/mutation-gaps-runbook.md) ──
+
+    #[test]
+    fn open_root_dir_rejects_non_directory() {
+        // `open_root_dir` opens the root with `O_RDONLY | O_DIRECTORY | O_CLOEXEC`.
+        // Pointed at a regular file it MUST fail (ENOTDIR), never hand back a file
+        // fd — this pins the `O_DIRECTORY` bit at BOTH `|` positions: dropping it
+        // (`| -> &`) lets a non-directory root open successfully.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not_a_dir");
+        fs::write(&file, b"x").unwrap();
+        let (kind, msg) = open_root_dir(&file).expect_err("a non-directory root must fail");
+        assert_eq!(kind, ErrorKind::Internal, "{msg}");
+        assert!(msg.contains("opening workload root"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_under_root_keeps_cloexec_when_caller_sets_it() {
+        // `resolve_under_root` OR-s `O_CLOEXEC` into the caller's flags so every
+        // resolved fd is close-on-exec. Passing `O_CLOEXEC` in explicitly is what
+        // distinguishes `flags | O_CLOEXEC` (idempotent — the bit stays set) from
+        // `flags ^ O_CLOEXEC` (toggles it back OFF): only the real `|` keeps the
+        // resolved fd close-on-exec in this case.
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("f.txt"), b"x").unwrap();
+        let root_dir = open_root_dir(root).unwrap();
+        let fd = resolve_under_root(
+            &root_dir,
+            &root_relative("/f.txt"),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        )
+        .expect("in-root file resolves");
+        let raw_flags = fcntl(fd.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
+        assert!(
+            FdFlag::from_bits_retain(raw_flags).contains(FdFlag::FD_CLOEXEC),
+            "resolved fd must stay close-on-exec even when the caller passed O_CLOEXEC"
+        );
+    }
+
+    #[test]
+    fn resolve_error_message_includes_the_requested_path() {
+        // The `PathNotFound` message embeds `display_rel(rel)` (`/<rel>`). This
+        // pins `display_rel` against being replaced by an empty/constant string:
+        // a missing `/nope` must name `/nope`.
+        let dir = tempfile::tempdir().unwrap();
+        let root_dir = open_root_dir(dir.path()).unwrap();
+        let (kind, msg) = resolve_under_root(&root_dir, &root_relative("/nope"), OFlag::O_RDONLY)
+            .expect_err("missing path");
+        assert_eq!(kind, ErrorKind::PathNotFound);
+        assert!(
+            msg.contains("/nope"),
+            "message must name the path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unpack_one_rejects_entry_whose_parent_is_a_file() {
+        // An archive entry whose parent path resolves to a regular FILE must be
+        // rejected at PARENT RESOLUTION (`O_RDONLY | O_DIRECTORY`), never written
+        // through. Dropping `O_DIRECTORY` (`| -> &`) would open the file AS the
+        // parent and surface a later `unpack` error instead — so we pin the
+        // failure to the resolver, whose message names the resolve step.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut b = tar::Builder::new(Vec::new());
+        let mut dh = tar::Header::new_gnu();
+        dh.set_entry_type(tar::EntryType::Directory);
+        dh.set_size(0);
+        dh.set_mode(0o755);
+        dh.set_mtime(0);
+        dh.set_cksum();
+        b.append_data(&mut dh, "top/", &mut std::io::empty())
+            .unwrap();
+        let fdata = b"file";
+        let mut fh = tar::Header::new_gnu();
+        fh.set_entry_type(tar::EntryType::Regular);
+        fh.set_size(fdata.len() as u64);
+        fh.set_mode(0o644);
+        fh.set_mtime(0);
+        fh.set_cksum();
+        b.append_data(&mut fh, "top/f", &mut &fdata[..]).unwrap();
+        let cdata = b"child";
+        let mut ch = tar::Header::new_gnu();
+        ch.set_entry_type(tar::EntryType::Regular);
+        ch.set_size(cdata.len() as u64);
+        ch.set_mode(0o644);
+        ch.set_mtime(0);
+        ch.set_cksum();
+        // Parent `top/f` is a regular file, so `top/f/child` has a non-dir parent.
+        b.append_data(&mut ch, "top/f/child", &mut &cdata[..])
+            .unwrap();
+        let archive = b.into_inner().unwrap();
+
+        let mut cursor = std::io::Cursor::new(archive);
+        let (kind, msg) = extract(root, "/", &mut cursor)
+            .expect_err("an entry under a non-directory parent must fail");
+        assert_eq!(kind, ErrorKind::Internal, "{msg}");
+        assert!(
+            msg.contains("resolving"),
+            "failure must come from parent resolution (O_DIRECTORY), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rewrite_top_leaves_nonmatching_first_component() {
+        // `rewrite_top` rewrites the first component ONLY when it equals
+        // `src_top`; a non-matching first component is returned unchanged. Pins
+        // the `c == src_top` guard against being forced true (which would rewrite
+        // unrelated entries' top component).
+        let got = rewrite_top(Path::new("other/leaf"), "src", Some("new"));
+        assert_eq!(got, PathBuf::from("other/leaf"));
+        // And it DOES rewrite when the first component matches.
+        let got = rewrite_top(Path::new("src/leaf"), "src", Some("new"));
+        assert_eq!(got, PathBuf::from("new/leaf"));
+    }
+
+    #[test]
+    fn parent_rel_of_single_component_is_dot() {
+        // A single-component rel has an empty `Path::parent()`; `parent_rel` maps
+        // that to `.`. Pins the `!p.is_empty()` guard against being forced true
+        // (which would yield an empty path instead of `.`).
+        assert_eq!(parent_rel(Path::new("file")), PathBuf::from("."));
+        // A multi-component rel keeps its real parent.
+        assert_eq!(parent_rel(Path::new("a/b/c")), PathBuf::from("a/b"));
+    }
+
+    #[test]
+    fn truncated_or_internal_maps_only_unexpected_eof() {
+        // `UnexpectedEof` (missing tar EOF blocks) -> the "transfer truncated"
+        // message; every other error -> a plain internal error carrying the
+        // cause. Pins the `== UnexpectedEof` discriminator against inversion.
+        let (kind, msg) =
+            truncated_or_internal(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        assert_eq!(kind, ErrorKind::Internal);
+        assert_eq!(msg, "transfer truncated");
+        let (kind, msg) = truncated_or_internal(std::io::Error::other("boom"));
+        assert_eq!(kind, ErrorKind::Internal);
+        assert!(
+            msg.contains("boom"),
+            "non-EOF error must carry its cause: {msg}"
+        );
+        assert_ne!(msg, "transfer truncated");
     }
 
     // ── Property tests ──────────────────────────────────────────────────────
