@@ -6,6 +6,10 @@ No LLM, no network. Runs one ``izba`` command, captures the result, snapshots
 - ``implicit_oracle``  — scrape stdout/stderr for panic/assert/ERROR markers and
   decode the izba exit-code contract (127 -> CommandNotFound, 128+n -> Signal n).
 - ``latency_oracle``   — flag actions over a human-normal time budget.
+- ``functional_oracle`` — compare an action's exit against the step's expectation,
+  *understanding expected-failure steps*: a refusal-expecting step that exits
+  non-zero is the PASS (not a candidate), and one that exits 0 is a candidate (a
+  guard that should have fired silently did not).
 - ``reconcile_seq_oracle`` — *sequence* invariants the single-shot Rust
   reconciler cannot see: monotonic restart identity + legal status transitions.
 
@@ -190,6 +194,73 @@ def implicit_oracle(action: Action) -> List[Candidate]:
             trajectory_ref=dict(ref),
         ))
     return out
+
+
+# --- Functional oracle -------------------------------------------------------
+
+# Phrases in a step's `expect` that mean the COMMAND ITSELF should fail (be
+# refused/rejected), so a non-zero exit is the success case — not a divergence.
+# Kept deliberately narrow (no bare "error", which appears in success expects
+# like "succeeds with no error") so we don't misclassify an expect-success step.
+_EXPECT_FAILURE_RE = re.compile(
+    r"\brefus(?:e|es|ed|al)\b"
+    r"|\breject(?:s|ed)?\b"
+    r"|\bdenied\b|\bdeny\b"
+    r"|non-?zero exit"
+    r"|\bmust not\b|\bshould not\b"
+    r"|\bnot allowed\b|\bnot permitted\b"
+    r"|\billegal\b",
+    re.IGNORECASE,
+)
+
+
+def expects_failure(expect: str) -> bool:
+    """True if a step's expectation describes the command being refused/rejected,
+    so a non-zero exit is the intended outcome rather than a candidate finding."""
+    return bool(_EXPECT_FAILURE_RE.search(expect or ""))
+
+
+def functional_oracle(
+    command: str,
+    exit_code: int,
+    expect: str,
+    source: str = "journey step",
+    ref: Optional[Dict[str, Any]] = None,
+) -> List[Candidate]:
+    """Compare a command's exit against the step's expectation (two-sided).
+
+    - expect describes SUCCESS but the command exited non-zero -> candidate.
+    - expect describes a REFUSAL/REJECTION but the command exited 0 -> candidate
+      (a guard that should have fired silently did not — a real-bug class the
+      naive 'any non-zero exit' check could never see).
+    - expect describes a REFUSAL and the command exited non-zero -> PASS. This is
+      what kills the bulk of the false positives the old check produced on
+      grammar-rejection / in-use-guard journeys (whose whole point is a refusal).
+    """
+    if not expect:
+        return []
+    ref = dict(ref or {"journey_id": "", "action_index": -1})
+    if expects_failure(expect):
+        if exit_code == 0:
+            return [Candidate(
+                kind="functional",
+                detail=(f"command {command!r} unexpectedly succeeded (exit 0) "
+                        f"while the step expected a refusal: {expect!r}"),
+                violated_expectation=expect,
+                source=source,
+                trajectory_ref=ref,
+            )]
+        return []
+    if exit_code != 0:
+        return [Candidate(
+            kind="functional",
+            detail=(f"command {command!r} exited {exit_code} "
+                    f"while step expected: {expect!r}"),
+            violated_expectation=expect,
+            source=source,
+            trajectory_ref=ref,
+        )]
+    return []
 
 
 # --- Latency oracle ----------------------------------------------------------

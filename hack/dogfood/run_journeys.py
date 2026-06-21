@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model import FakeModel, OpenRouterModel  # noqa: E402
 from oracles import (  # noqa: E402
+    functional_oracle,
     implicit_oracle,
     latency_oracle,
     reconcile_seq_oracle,
@@ -79,29 +80,85 @@ def _argv_from_command(command: str) -> List[str]:
     return parts
 
 
+# A clap "Commands:" / "SUBCOMMANDS:" section header (nothing after the colon).
+_CMD_SECTION_RE = re.compile(r"^(commands|subcommands):\s*$", re.IGNORECASE)
+# An indented command entry: leading space then the command token.
+_CMD_ENTRY_RE = re.compile(r"^\s+([a-z][a-z0-9_-]*)\b")
+
+
+def _collect_cmd_name(line: str, names: List[str]) -> None:
+    """Append the command token on an indented clap entry line (skip ``help``/dups)."""
+    m = _CMD_ENTRY_RE.match(line)
+    if m and m.group(1) != "help" and m.group(1) not in names:
+        names.append(m.group(1))
+
+
+def _parse_subcommands(help_text: str) -> List[str]:
+    """Extract subcommand names from a clap ``Commands:`` block in ``--help`` text.
+
+    Returns names in declaration order, skipping the built-in ``help`` pseudo-
+    command and de-duplicating. Best-effort: unknown help layouts yield ``[]``.
+
+    The branches are mutually exclusive: a ``Commands:`` header opens the block,
+    any other non-indented line (``Options:``, ``Usage: ...``) closes it, and
+    indented lines while open are command entries (blank lines tolerated)."""
+    names: List[str] = []
+    in_cmds = False
+    for line in help_text.splitlines():
+        # Match the raw line (the regex is ^-anchored): a section header is a
+        # non-indented "Commands:"/"SUBCOMMANDS:" line, consistent with the
+        # non-indented invariant the other branches rely on.
+        if _CMD_SECTION_RE.match(line):
+            in_cmds = True
+        elif line and not line[0].isspace():
+            in_cmds = False
+        elif in_cmds:
+            _collect_cmd_name(line, names)
+    return names
+
+
+def _run_help_once(izba_bin: str, path_args: List[str], timeout_s: float,
+                   deadline: float) -> Optional[str]:
+    """``izba <path_args> --help`` -> stripped text, or None. Bounded by ``deadline``.
+
+    Report-only: any spawn/timeout error returns None rather than raising."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        p = subprocess.run([izba_bin, *path_args, "--help"], capture_output=True,
+                           text=True, timeout=min(timeout_s, remaining))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = ((p.stdout or "") + (p.stderr or "")).strip()
+    return text or None
+
+
 def gather_cli_help(izba_bin: str, timeout_s: float = 8.0,
                     total_timeout_s: float = 20.0) -> str:
-    """Best-effort `izba --help` (+ a few key subcommands) to seed the Actor so it
-    uses real commands instead of guessing (start/init/list/...). Report-only:
-    returns '' on any error. Bounded by an aggregate ``total_timeout_s`` so a
-    binary that hangs on every call can't impose a 7×timeout startup penalty."""
-    chunks: List[str] = []
-    targets = [["--help"], ["create", "--help"], ["run", "--help"],
-               ["exec", "--help"], ["stop", "--help"], ["rm", "--help"],
-               ["ls", "--help"]]
+    """Best-effort CLI help to seed the Actor so it uses real commands instead of
+    guessing (start/init/list/...).
+
+    Discovers subcommands from ``izba --help`` and recurses **one level** into
+    nested command namespaces (e.g. ``volume`` -> ``volume ls/attach/...``) so the
+    Actor sees real verbs and their signatures — the M3-volumes run missed
+    ``izba volume attach`` precisely because only a hardcoded top-level set was
+    seeded. Report-only: returns '' if top-level help is unavailable; bounded by
+    an aggregate ``total_timeout_s`` so a hanging binary can't stall startup."""
     deadline = time.monotonic() + total_timeout_s
-    for tgt in targets:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        try:
-            p = subprocess.run([izba_bin, *tgt], capture_output=True, text=True,
-                               timeout=min(timeout_s, remaining))
-            text = (p.stdout or "") + (p.stderr or "")
-        except (OSError, subprocess.SubprocessError):
+    top = _run_help_once(izba_bin, [], timeout_s, deadline)
+    if not top:
+        return ""
+    chunks: List[str] = [f"$ izba --help\n{top}"]
+    for cmd in _parse_subcommands(top):
+        sub = _run_help_once(izba_bin, [cmd], timeout_s, deadline)
+        if not sub:
             continue
-        if text.strip():
-            chunks.append(f"$ izba {' '.join(tgt)}\n{text.strip()}")
+        chunks.append(f"$ izba {cmd} --help\n{sub}")
+        for nested in _parse_subcommands(sub):
+            leaf = _run_help_once(izba_bin, [cmd, nested], timeout_s, deadline)
+            if leaf:
+                chunks.append(f"$ izba {cmd} {nested} --help\n{leaf}")
     return "\n\n".join(chunks)
 
 
@@ -138,23 +195,16 @@ def _collect_candidates(action, command, action_index, prev_reconcile,
     found = implicit_oracle(action) + latency_oracle(action, latency_budget_ms)
     if prev_reconcile is not None:
         found += reconcile_seq_oracle(prev_reconcile, action.reconcile)
+    # Functional oracle understands expected-failure steps (a refusal that
+    # exits non-zero is the PASS; a refusal that exits 0 is a candidate).
+    source = journey.get("source", {}).get("ref", "journey step")
+    found += functional_oracle(command, action.exit_code, step.get("expect", ""),
+                               source, ref)
     out = []
     for c in found:
         cd = c.to_dict()
         cd["trajectory_ref"] = ref
         out.append(cd)
-    # Functional oracle (cheap proxy): a non-zero exit on a step that expects
-    # success is a divergence from the expectation.
-    expect = step.get("expect", "")
-    if action.exit_code != 0 and expect:
-        out.append({
-            "kind": "functional",
-            "detail": (f"command {command!r} exited {action.exit_code} "
-                       f"while step expected: {expect!r}"),
-            "violated_expectation": expect,
-            "source": journey.get("source", {}).get("ref", "journey step"),
-            "trajectory_ref": ref,
-        })
     return out
 
 
