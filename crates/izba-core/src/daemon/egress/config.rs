@@ -906,4 +906,92 @@ mod tests {
             GitTarget::Host("github.com".into())
         );
     }
+
+    // ── mutation-gap closures ─────────────────────────────────────────────────
+
+    #[test]
+    fn default_access_is_omitted_from_serialized_yaml() {
+        // `skip_serializing_if = "is_default_access"` must drop the `access:` key
+        // for a default (read-write) entry. If `is_default_access` is forced to
+        // `false`, the redundant key leaks into every serialized file.
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "db.internal".into(),
+                ports: Some(vec![5432]),
+                access: Access::ReadWrite,
+            }],
+            git: vec![],
+        };
+        assert!(
+            !cfg.to_yaml().contains("access"),
+            "default read-write access must be omitted, got:\n{}",
+            cfg.to_yaml()
+        );
+        // A non-default access (read) must still serialize.
+        let cfg2 = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "db.internal".into(),
+                ports: Some(vec![5432]),
+                access: Access::Read,
+            }],
+            git: vec![],
+        };
+        assert!(
+            cfg2.to_yaml().contains("access"),
+            "a non-default access must be serialized"
+        );
+    }
+
+    #[test]
+    fn set_host_access_preserves_custom_ports() {
+        // Changing only the access verb must NOT clobber a host's custom
+        // (non-default) ports. The `ports == DEFAULT_PORTS -> None` normalization
+        // must match ONLY the default set: a guard forced to `true` (or `==`→`!=`)
+        // would null out [22] and silently widen the host to [80, 443].
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "ssh.internal".into(),
+                ports: Some(vec![22]),
+                access: Access::ReadWrite,
+            }],
+            git: vec![],
+        };
+        assert!(cfg.set_host_access("ssh.internal", Access::Read));
+        assert_eq!(
+            cfg.allow[0].ports(),
+            vec![22],
+            "custom ports must survive an access-only change"
+        );
+        assert_eq!(cfg.allow[0].access(), Access::Read);
+    }
+
+    #[test]
+    fn set_host_access_normalizes_default_ports_to_none() {
+        // A host carrying exactly the default web ports must normalize back to
+        // `ports: None` (the canonical default form) on an access change, so the
+        // file never pins [80, 443] explicitly. A guard forced to `false` would
+        // keep `Some([80, 443])`.
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "web.internal".into(),
+                ports: Some(vec![80, 443]),
+                access: Access::ReadWrite,
+            }],
+            git: vec![],
+        };
+        assert!(cfg.set_host_access("web.internal", Access::Read));
+        assert_eq!(
+            cfg.allow[0],
+            AllowEntry::Scoped {
+                host: "web.internal".into(),
+                ports: None,
+                access: Access::Read,
+            },
+            "default ports must normalize to None on an access change"
+        );
+    }
 }

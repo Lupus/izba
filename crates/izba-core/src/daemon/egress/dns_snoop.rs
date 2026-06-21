@@ -273,4 +273,117 @@ mod tests {
         );
         assert!(!allowlist_matches(&exact, "evil.anthropic.com"));
     }
+
+    // ---------- mutation-gap closures ----------
+
+    #[test]
+    fn extract_aaaa_record_yields_v6() {
+        use hickory_proto::op::{Message, Query};
+        use hickory_proto::rr::rdata::AAAA;
+        use hickory_proto::rr::{Name, Record, RecordType};
+        use std::net::Ipv6Addr;
+
+        // Build an AAAA response; the AAAA match arm must surface the V6 addr
+        // (deleting that arm would yield an empty result via the `_ => continue`).
+        let name = Name::from_str("ipv6.example.com.").unwrap();
+        let mut msg = Message::query();
+        msg.add_query(Query::query(name.clone(), RecordType::AAAA));
+        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        msg.add_answer(Record::from_rdata(name, 300, RData::AAAA(AAAA(v6))));
+        let bytes = msg.to_vec().unwrap();
+
+        assert_eq!(
+            extract_a_aaaa(&bytes),
+            vec![("ipv6.example.com".to_string(), IpAddr::V6(v6), 300)],
+            "AAAA answers must be extracted as V6 addrs"
+        );
+    }
+
+    #[test]
+    fn record_dedups_same_fqdn_refreshing_expiry() {
+        let store = SnoopStore::new();
+        let base = Instant::now();
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        // Record the same (fqdn, ip) twice; the second must refresh the existing
+        // entry's expiry, not push a duplicate (guards the `e.fqdn == *fqdn`
+        // dedup find against `==`→`!=`, which would never match and duplicate).
+        store.record_at("web", &[("api.anthropic.com".into(), ip, 60)], base);
+        store.record_at(
+            "web",
+            &[("api.anthropic.com".into(), ip, 60)],
+            base + Duration::from_secs(10),
+        );
+        assert_eq!(
+            store.fqdns_for_at("web", ip, base + Duration::from_secs(20)),
+            vec!["api.anthropic.com".to_string()],
+            "the same fqdn must be stored once, not duplicated"
+        );
+    }
+
+    #[test]
+    fn lookup_excludes_entry_at_exact_expiry() {
+        let store = SnoopStore::new();
+        let base = Instant::now();
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        // TTL 60s (the floor) → expiry is exactly base + 60s.
+        store.record_at("web", &[("api.anthropic.com".into(), ip, 60)], base);
+        // Strictly before expiry: present.
+        assert!(!store
+            .fqdns_for_at("web", ip, base + Duration::from_secs(59))
+            .is_empty());
+        // At the exact expiry instant: gone — the filter is `expiry > now`, so
+        // `>`→`>=` (which would keep it) must fail here.
+        assert!(
+            store
+                .fqdns_for_at("web", ip, base + Duration::from_secs(60))
+                .is_empty(),
+            "an entry must be expired at its exact expiry instant"
+        );
+    }
+
+    #[test]
+    fn sweep_at_keeps_live_and_drops_at_expiry() {
+        let store = SnoopStore::new();
+        let base = Instant::now();
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        store.record_at("web", &[("api.anthropic.com".into(), ip, 60)], base); // expiry base+60
+
+        // Sweeping BEFORE expiry must keep a still-live entry. This kills
+        // `>`→`==` in `retain(|e| e.expiry > now)`, which would retain only
+        // entries whose expiry equals `now` and thus drop this live one.
+        store.sweep_at(base + Duration::from_secs(30));
+        assert_eq!(
+            store.fqdns_for_at("web", ip, base + Duration::from_secs(30)),
+            vec!["api.anthropic.com".to_string()],
+            "a live entry must survive a sweep before its expiry"
+        );
+
+        // Sweeping AT the exact expiry must drop it. This kills `>`→`>=`, which
+        // would retain an entry whose expiry equals `now`.
+        store.sweep_at(base + Duration::from_secs(60));
+        assert!(
+            store.inner.lock().unwrap().is_empty(),
+            "an entry must be swept at its exact expiry instant"
+        );
+    }
+
+    #[test]
+    fn sweep_uses_the_real_clock() {
+        // The real-clock `sweep()` wrapper must actually evict expired entries
+        // (guards `sweep` against being replaced with `()`). Record ≥ the TTL
+        // floor in the past so the entry is already expired against `Instant::now()`.
+        let Some(past) = Instant::now().checked_sub(Duration::from_secs(61)) else {
+            // Monotonic clock younger than 61s (freshly booted): can't build a
+            // past instant — skip rather than flake.
+            return;
+        };
+        let store = SnoopStore::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        store.record_at("web", &[("api.anthropic.com".into(), ip, 60)], past);
+        store.sweep();
+        assert!(
+            store.inner.lock().unwrap().is_empty(),
+            "sweep() must drop entries already expired against the real clock"
+        );
+    }
 }
