@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
-# Build a static /sbin/sshd for the izba initramfs (musl, via Alpine).
-# Output: dist/sshd  (use: IZBA_SSHD=dist/sshd hack/build-initramfs.sh)
+# Build a static sshd (+ its re-exec helper) for the izba initramfs (musl, via
+# Alpine).  Outputs: dist/sshd, dist/sshd-session
+# (use: IZBA_SSHD=dist/sshd hack/build-initramfs.sh — it finds sshd-session
+# alongside dist/sshd automatically).
 #
-# The SSH access feature (Task 7) requires a static sshd binary so it can run
-# inside the minimal initramfs with no shared libraries.  sshd is started by
-# izba-init and listens on localhost:22 inside the guest; the host side reaches
-# it via the port-relay mechanism.
+# The SSH access feature requires a static sshd so it can run inside the minimal
+# initramfs with no shared libraries.  sshd is started by izba-init and listens
+# on localhost:22 inside the guest; the host side reaches it via the port-relay
+# mechanism.
+#
+# OpenSSH 9.8 split the monolithic sshd into a small network-facing listener
+# (`sshd`, which fixed CVE-2024-6387 "regreSSHion") that re-execs a per-session
+# worker `sshd-session`. The listener execs the worker by its compile-time
+# libexec path, so both binaries must be vendored. We build with --prefix=/usr
+# → the worker is expected at /usr/libexec/sshd-session, where
+# build-initramfs.sh installs it.
 #
 # Every input is sha256-pinned (same posture as build-nft.sh): the Alpine
 # builder image by digest, and the OpenSSH portable source tarball by hash —
@@ -62,7 +71,9 @@ docker run --rm \
   #
   # We pass -lresolv explicitly because the static OpenSSL pulls it in and
   # some musl toolchains need the hint to find the right archive.
+  #   --prefix=/usr   helper re-exec path becomes /usr/libexec/sshd-{session,auth}
   ./configure \
+      --prefix=/usr \
       --without-pam \
       --without-selinux \
       --with-ssl-engine=no \
@@ -73,14 +84,19 @@ docker run --rm \
       LDFLAGS="-static" \
       LIBS="-lresolv"
 
-  make -j"$(nproc)" sshd
-  strip sshd
-  cp sshd /out/sshd
+  make -j"$(nproc)" sshd sshd-session
+  for b in sshd sshd-session; do
+    strip "$b"
+    cp "$b" "/out/$b"
+  done
 '
 
-file "$OUT" | grep -q "statically linked" || {
-    echo "error: $OUT is not statically linked" >&2
-    file "$OUT" >&2
-    exit 1
-}
-echo "wrote $OUT ($(du -sh "$OUT" | cut -f1), static, sha256 $(sha256sum "$OUT" | cut -d' ' -f1))"
+for b in sshd sshd-session; do
+    f="dist/$b"
+    file "$f" | grep -q "statically linked" || {
+        echo "error: $f is not statically linked" >&2
+        file "$f" >&2
+        exit 1
+    }
+    echo "wrote $f ($(du -sh "$f" | cut -f1), static, sha256 $(sha256sum "$f" | cut -d' ' -f1))"
+done
