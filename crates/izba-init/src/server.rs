@@ -373,7 +373,12 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
-            let engine = Arc::new(ExecEngine::new(None));
+            // Direct-spawn engine: the server RPC-wiring tests exec real
+            // binaries (sh/sleep) and assert exec/kill/resize/stream framing.
+            // Production wraps execs in `crun exec`, which is absent on the test
+            // host; `new_direct` spawns the request argv directly so these tests
+            // exercise the server plumbing without a live crun + container.
+            let engine = Arc::new(ExecEngine::new_direct(None));
             let shutdown = Arc::new(AtomicBool::new(false));
 
             let (control_tx, rx) = mpsc::channel();

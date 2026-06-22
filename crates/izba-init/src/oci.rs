@@ -136,6 +136,55 @@ pub fn crun_run_argv(cgroup_manager: CgroupManager) -> Vec<String> {
     ]
 }
 
+/// Build the `crun exec` argument vector to enter container `CONTAINER_ID`.
+///
+/// crun exec runs `<user_argv>` inside the already-running container, joining
+/// its namespaces and (by default) its process spec. izba layers the per-exec
+/// `--cwd`, `--env K=V`, optional `--user uid:gid`, and `--tty` from the
+/// `ExecRequest`; the container's image env/PATH/USER apply for anything not
+/// overridden here.
+///
+/// Argument order: global options (`--cgroup-manager`) precede the `exec`
+/// subcommand, then exec-options precede the positional `CONTAINER_ID`, then
+/// the user's argv is the trailing positional list (mirroring `crun_run_argv`,
+/// where crun rejects options that follow the container id).
+///
+/// `cwd` is the working directory inside the container; `env` is the per-exec
+/// environment overlay; `user` is `Some("uid:gid")` to run as that uid/gid
+/// (skipped when `None`, so the container's configured user applies); `tty`
+/// requests a pseudo-terminal (the caller wires the pty as the child's stdio).
+pub fn crun_exec_argv(
+    cgroup_manager: CgroupManager,
+    tty: bool,
+    cwd: &str,
+    env: &[(String, String)],
+    user: Option<&str>,
+    user_argv: &[String],
+) -> Vec<String> {
+    let mut argv = vec![
+        CRUN_PATH.to_string(),
+        format!("--cgroup-manager={}", cgroup_manager.as_str()),
+        "exec".to_string(),
+    ];
+    if tty {
+        argv.push("--tty".to_string());
+    }
+    argv.push("--cwd".to_string());
+    argv.push(cwd.to_string());
+    for (k, v) in env {
+        argv.push("--env".to_string());
+        argv.push(format!("{k}={v}"));
+    }
+    if let Some(u) = user {
+        argv.push("--user".to_string());
+        argv.push(u.to_string());
+    }
+    // Positional container id, then the user's command + args.
+    argv.push(CONTAINER_ID.to_string());
+    argv.extend(user_argv.iter().cloned());
+    argv
+}
+
 /// Build the `crun state` argument vector for `container_id`.
 #[allow(dead_code)]
 pub fn crun_state_argv(container_id: &str) -> Vec<String> {
@@ -480,6 +529,135 @@ mod tests {
             !argv.iter().any(|a| a == "--no-pivot"),
             "--no-pivot must not appear in the production argv"
         );
+    }
+
+    // ── crun exec argv construction ──────────────────────────────────────────
+
+    #[test]
+    fn crun_exec_argv_pipe_minimal() {
+        // No tty, no env, no user override, single-word command.
+        let argv = crun_exec_argv(
+            CgroupManager::Cgroupfs,
+            false,
+            "/workspace",
+            &[],
+            None,
+            &["sh".to_string()],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                CRUN_PATH.to_string(),
+                "--cgroup-manager=cgroupfs".to_string(),
+                "exec".to_string(),
+                "--cwd".to_string(),
+                "/workspace".to_string(),
+                CONTAINER_ID.to_string(),
+                "sh".to_string(),
+            ]
+        );
+        // No --tty in the pipe path.
+        assert!(!argv.iter().any(|a| a == "--tty"));
+    }
+
+    #[test]
+    fn crun_exec_argv_tty_adds_flag_before_cwd() {
+        let argv = crun_exec_argv(
+            CgroupManager::Disabled,
+            true,
+            "/",
+            &[],
+            None,
+            &["bash".to_string()],
+        );
+        // --tty appears, and it precedes --cwd (exec-options before positionals).
+        let tty_pos = argv.iter().position(|a| a == "--tty").expect("--tty");
+        let cwd_pos = argv.iter().position(|a| a == "--cwd").expect("--cwd");
+        assert!(tty_pos < cwd_pos, "--tty must precede --cwd: {argv:?}");
+        assert_eq!(argv[1], "--cgroup-manager=disabled");
+    }
+
+    #[test]
+    fn crun_exec_argv_env_pairs_become_env_flags() {
+        let env = vec![
+            ("FOO".to_string(), "bar".to_string()),
+            ("EMPTY".to_string(), String::new()),
+        ];
+        let argv = crun_exec_argv(
+            CgroupManager::Cgroupfs,
+            false,
+            "/workspace",
+            &env,
+            None,
+            &["env".to_string()],
+        );
+        // Each pair becomes "--env" "K=V"; an empty value yields "K=".
+        let env_flags: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| *a == "--env" && argv.get(i + 1).is_some())
+            .map(|(i, _)| &argv[i + 1])
+            .collect();
+        assert_eq!(env_flags, vec!["FOO=bar", "EMPTY="]);
+    }
+
+    #[test]
+    fn crun_exec_argv_user_override() {
+        let argv = crun_exec_argv(
+            CgroupManager::Cgroupfs,
+            false,
+            "/",
+            &[],
+            Some("1000:1000"),
+            &["id".to_string()],
+        );
+        let user_pos = argv.iter().position(|a| a == "--user").expect("--user");
+        assert_eq!(argv[user_pos + 1], "1000:1000");
+        // --user precedes the container id positional.
+        let id_pos = argv
+            .iter()
+            .position(|a| a == CONTAINER_ID)
+            .expect("container id");
+        assert!(user_pos < id_pos, "--user must precede the id: {argv:?}");
+    }
+
+    #[test]
+    fn crun_exec_argv_user_argv_is_trailing_after_id() {
+        let argv = crun_exec_argv(
+            CgroupManager::Cgroupfs,
+            false,
+            "/",
+            &[],
+            None,
+            &["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+        );
+        let id_pos = argv
+            .iter()
+            .position(|a| a == CONTAINER_ID)
+            .expect("container id");
+        assert_eq!(&argv[id_pos + 1..], &["sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn crun_exec_argv_options_precede_container_id() {
+        // Every option flag must come before the positional container id, which
+        // must come before the user's argv. Mirrors crun's parser constraint.
+        let argv = crun_exec_argv(
+            CgroupManager::Cgroupfs,
+            true,
+            "/workspace",
+            &[("K".to_string(), "V".to_string())],
+            Some("0:0"),
+            &["cmd".to_string()],
+        );
+        let id_pos = argv
+            .iter()
+            .position(|a| a == CONTAINER_ID)
+            .expect("container id");
+        for opt in ["--tty", "--cwd", "--env", "--user"] {
+            let p = argv.iter().position(|a| a == opt).unwrap();
+            assert!(p < id_pos, "{opt} must precede container id: {argv:?}");
+        }
     }
 
     #[test]

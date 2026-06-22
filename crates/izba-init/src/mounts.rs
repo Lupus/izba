@@ -46,15 +46,15 @@ pub fn boot_mount_plan() -> Vec<MountOp> {
         MountOp::new("proc", "/proc", "proc", &["nosuid", "nodev", "noexec"], ""),
         MountOp::new("sysfs", "/sys", "sysfs", &["nosuid", "nodev", "noexec"], ""),
         MountOp::new("devtmpfs", "/dev", "devtmpfs", &["nosuid"], ""),
-        // devpts in init's OWN root, not just under /rootfs. The exec engine
-        // calls openpty() for tty jobs (exec.rs) from init's context, before
-        // the child chroots into /rootfs. openpty opens /dev/ptmx, and the
-        // kernel's ptmx_open → devpts_acquire → path_pts requires /dev/ptmx's
-        // sibling /dev/pts to be a devpts mount; without it openpty fails with
-        // ENODEV. The child inherits the already-opened slave fd (dup2'd by
-        // std before chroot), so it never reopens by path — only init needs a
-        // working /dev/ptmx here. /rootfs/dev/pts (rootfs_mount_plan) is still
-        // mounted separately for workloads that allocate their own ptys.
+        // devpts in init's OWN root. The exec engine calls openpty() for tty
+        // jobs (exec.rs) from init's context: it allocates the pty here, dup2's
+        // the slave onto the child's stdio, and hands it to `crun exec --tty`.
+        // openpty opens /dev/ptmx, and the kernel's ptmx_open → devpts_acquire →
+        // path_pts requires /dev/ptmx's sibling /dev/pts to be a devpts mount;
+        // without it openpty fails with ENODEV. The child (crun) inherits the
+        // already-opened slave fd, so it never reopens by path — only init needs
+        // a working /dev/ptmx here. (Stance B: no /rootfs/dev/pts pre-mount —
+        // crun sets up the container's own devpts from its OCI config.)
         MountOp::new(
             "devpts",
             "/dev/pts",
@@ -110,29 +110,17 @@ pub fn rootfs_mount_plan() -> Vec<MountOp> {
             "",
         )
         .optional(),
-        MountOp::new(
-            "proc",
-            "/rootfs/proc",
-            "proc",
-            &["nosuid", "nodev", "noexec"],
-            "",
-        ),
-        MountOp::new(
-            "sysfs",
-            "/rootfs/sys",
-            "sysfs",
-            &["nosuid", "nodev", "noexec"],
-            "",
-        ),
-        MountOp::new("devtmpfs", "/rootfs/dev", "devtmpfs", &["nosuid"], ""),
-        MountOp::new("tmpfs", "/rootfs/tmp", "tmpfs", &["nosuid", "nodev"], ""),
-        MountOp::new(
-            "devpts",
-            "/rootfs/dev/pts",
-            "devpts",
-            &["nosuid", "noexec"],
-            "gid=5,mode=620,ptmxmode=666",
-        ),
+        // NOTE (Stance B — crun owns the container's mounts): we deliberately do
+        // NOT pre-mount proc/sys/dev/tmp/devpts under /rootfs. crun sets up the
+        // container's OWN OCI default mounts there (a fresh proc for the
+        // container's pid-ns, plus sysfs/dev/devpts/mqueue/cgroup). Pre-mounting
+        // them here makes crun's setup fail — `mount sysfs to sys: EBUSY`,
+        // because sysfs cannot stack in the shared netns. The legacy chroot-exec
+        // engine needed these; exec now enters the container via `crun exec`
+        // (no chroot), so they are obsolete. The overlay (/rootfs) and the
+        // workspace/izba-trust/izba-oci virtiofs shares STAY (crun bind-mounts
+        // them in from the bundle config); init's own /proc,/sys,/dev,/tmp from
+        // boot_mount_plan() are untouched.
     ]
 }
 
@@ -320,8 +308,10 @@ mod tests {
     #[test]
     fn rootfs_plan_sequence() {
         let p = rootfs_mount_plan();
-        // 10 original ops + 1 OCI bundle share = 11
-        assert_eq!(p.len(), 11);
+        // Stance B: crun owns the container's proc/sys/dev/tmp/devpts, so the
+        // plan is only the overlay stack + the virtiofs shares: vda(lower),
+        // vdb(upper), overlay, workspace, izba-trust, izba-oci = 6 ops.
+        assert_eq!(p.len(), 6);
         assert_eq!(op(&p, 0), ("/dev/vda", "/lower", "erofs", vec!["ro"], ""));
         assert_eq!(op(&p, 1), ("/dev/vdb", "/upper", "ext4", vec![], ""));
         assert_eq!(
@@ -358,44 +348,33 @@ mod tests {
                 ""
             )
         );
-        assert_eq!(
-            op(&p, 6),
-            (
-                "proc",
-                "/rootfs/proc",
-                "proc",
-                vec!["nosuid", "nodev", "noexec"],
-                ""
-            )
-        );
-        assert_eq!(
-            op(&p, 7),
-            (
-                "sysfs",
-                "/rootfs/sys",
-                "sysfs",
-                vec!["nosuid", "nodev", "noexec"],
-                ""
-            )
-        );
-        assert_eq!(
-            op(&p, 8),
-            ("devtmpfs", "/rootfs/dev", "devtmpfs", vec!["nosuid"], "")
-        );
-        assert_eq!(
-            op(&p, 9),
-            ("tmpfs", "/rootfs/tmp", "tmpfs", vec!["nosuid", "nodev"], "")
-        );
-        assert_eq!(
-            op(&p, 10),
-            (
-                "devpts",
-                "/rootfs/dev/pts",
-                "devpts",
-                vec!["nosuid", "noexec"],
-                "gid=5,mode=620,ptmxmode=666"
-            )
-        );
+    }
+
+    #[test]
+    fn rootfs_plan_has_no_chroot_pseudofs_under_rootfs() {
+        // Stance B regression guard: crun mounts the container's proc/sys/dev/
+        // tmp/devpts itself. Pre-mounting any of them under /rootfs makes crun's
+        // setup fail (sysfs EBUSY in the shared netns), so the plan must contain
+        // none of them.
+        let p = rootfs_mount_plan();
+        for op in &p {
+            let t = op.target.to_str().unwrap();
+            assert!(
+                !matches!(
+                    t,
+                    "/rootfs/proc"
+                        | "/rootfs/sys"
+                        | "/rootfs/dev"
+                        | "/rootfs/tmp"
+                        | "/rootfs/dev/pts"
+                ),
+                "rootfs plan must not pre-mount {t} (crun owns it)"
+            );
+        }
+        // The fstypes present are only overlay + erofs/ext4 + virtiofs.
+        assert!(p
+            .iter()
+            .all(|o| matches!(o.fstype.as_str(), "overlay" | "erofs" | "ext4" | "virtiofs")));
     }
 
     #[test]
