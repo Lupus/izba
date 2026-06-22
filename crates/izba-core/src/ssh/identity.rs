@@ -16,11 +16,16 @@ fn ensure_keypair(dir: &Path, stem: &str) -> anyhow::Result<(PathBuf, PathBuf)> 
     let priv_path = dir.join(stem);
     let pub_path = dir.join(format!("{stem}.pub"));
     if !priv_path.exists() {
-        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
-            .context("generating ed25519 key")?;
-        let pem = key.to_openssh(LineEnding::LF).context("encoding private key")?;
+        let key =
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).context("generating ed25519 key")?;
+        let pem = key
+            .to_openssh(LineEnding::LF)
+            .context("encoding private key")?;
         write_private(&priv_path, pem.as_bytes())?;
-        let pub_openssh = key.public_key().to_openssh().context("encoding public key")?;
+        let pub_openssh = key
+            .public_key()
+            .to_openssh()
+            .context("encoding public key")?;
         std::fs::write(&pub_path, format!("{pub_openssh}\n"))
             .with_context(|| format!("writing {}", pub_path.display()))?;
     }
@@ -49,8 +54,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 pub fn ensure_identity(ssh_dir: &Path) -> anyhow::Result<SshIdentity> {
-    std::fs::create_dir_all(ssh_dir)
-        .with_context(|| format!("creating {}", ssh_dir.display()))?;
+    std::fs::create_dir_all(ssh_dir).with_context(|| format!("creating {}", ssh_dir.display()))?;
     let (user_private, user_public) = ensure_keypair(ssh_dir, USER_PRIV)?;
     let (host_private, host_public) = ensure_keypair(ssh_dir, HOST_PRIV)?;
     Ok(SshIdentity {
@@ -89,8 +93,12 @@ mod tests {
         let id2 = ensure_identity(tmp.path()).unwrap();
         let priv2 = std::fs::read(&id2.user_private).unwrap();
         assert_eq!(priv1, priv2, "keypair regenerated on second call");
-        assert!(host_public_openssh(tmp.path()).unwrap().starts_with("ssh-ed25519 "));
-        assert!(user_public_openssh(tmp.path()).unwrap().starts_with("ssh-ed25519 "));
+        assert!(host_public_openssh(tmp.path())
+            .unwrap()
+            .starts_with("ssh-ed25519 "));
+        assert!(user_public_openssh(tmp.path())
+            .unwrap()
+            .starts_with("ssh-ed25519 "));
     }
 
     #[cfg(unix)]

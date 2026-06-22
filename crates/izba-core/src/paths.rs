@@ -276,7 +276,10 @@ mod tests {
     fn ssh_dirs_resolve_under_root() {
         let p = Paths::with_root(PathBuf::from("/data"));
         assert_eq!(p.ssh_dir(), PathBuf::from("/data/ssh"));
-        assert_eq!(p.ssh_share_dir("foo"), PathBuf::from("/data/sandboxes/foo/ssh"));
+        assert_eq!(
+            p.ssh_share_dir("foo"),
+            PathBuf::from("/data/sandboxes/foo/ssh")
+        );
     }
 
     #[test]

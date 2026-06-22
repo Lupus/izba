@@ -1,7 +1,6 @@
 pub mod artifacts;
 pub mod build_info;
 pub mod ca;
-pub mod ssh;
 pub mod cp;
 pub mod daemon;
 mod discover;
@@ -13,6 +12,7 @@ pub mod portfwd;
 pub mod procmgr;
 pub mod reconcile;
 pub mod sandbox;
+pub mod ssh;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod testutil;
