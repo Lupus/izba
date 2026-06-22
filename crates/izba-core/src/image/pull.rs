@@ -30,6 +30,10 @@ pub struct ResolvedImage {
     manifest: OciImageManifest,
     /// Canonical image digest, e.g. `"sha256:..."`.
     pub digest: String,
+    /// The image's OCI runtime config blob (JSON), fetched alongside the
+    /// manifest. Holds `Entrypoint/Cmd/Env/WorkingDir/User`; persisted next to
+    /// the erofs rootfs and consumed by crun `config.json` generation.
+    pub config_json: String,
 }
 
 /// Fetch the manifest for `image_ref` (e.g. `"alpine:3.20"`,
@@ -50,8 +54,11 @@ pub fn resolve(image_ref: &str) -> Result<ResolvedImage> {
         platform_resolver: Some(Box::new(linux_amd64_resolver)),
         ..Default::default()
     });
-    let (manifest, digest) = rt
-        .block_on(client.pull_image_manifest(&reference, &RegistryAuth::Anonymous))
+    // pull_manifest_and_config resolves the same platform manifest digest as
+    // pull_image_manifest (both route through the linux/amd64 resolver), so the
+    // cache key is unchanged; it additionally returns the config blob.
+    let (manifest, digest, config_json) = rt
+        .block_on(client.pull_manifest_and_config(&reference, &RegistryAuth::Anonymous))
         .with_context(|| format!("failed to pull manifest for {image_ref}"))?;
     Ok(ResolvedImage {
         rt,
@@ -59,6 +66,7 @@ pub fn resolve(image_ref: &str) -> Result<ResolvedImage> {
         reference,
         manifest,
         digest,
+        config_json,
     })
 }
 

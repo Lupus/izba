@@ -2,6 +2,7 @@
 
 use crate::paths::Paths;
 use anyhow::{Context, Result};
+use oci_client::config::ConfigFile;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,47 @@ impl<'a> ImageStore<'a> {
     /// Path of the file recording which image ref produced this digest.
     pub fn ref_path(&self, digest: &str) -> PathBuf {
         self.paths.image_dir(digest).join("ref.txt")
+    }
+
+    /// Path of the cached OCI image runtime config (`config.json`) for
+    /// `digest`. Holds the registry's image config blob verbatim — the source
+    /// of `Entrypoint/Cmd/Env/WorkingDir/User` for crun `config.json` generation.
+    pub fn config_path(&self, digest: &str) -> PathBuf {
+        self.paths.image_dir(digest).join("config.json")
+    }
+
+    /// Load and parse the cached OCI runtime config for `digest`.
+    ///
+    /// Returns `Ok(None)` when no `config.json` is present — images cached by a
+    /// pre-crun izba did not persist the config blob, so callers self-heal that
+    /// case (re-persisting the config they fetched alongside the manifest).
+    pub fn load_config(&self, digest: &str) -> Result<Option<ConfigFile>> {
+        let path = self.config_path(digest);
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+        };
+        let config = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        Ok(Some(config))
+    }
+
+    /// Atomically write `json` as the cached `config.json` for an
+    /// already-published `digest`. Used to self-heal images cached by a
+    /// pre-crun izba: a temp file in the same dir is renamed into place, so a
+    /// concurrent reader never observes a torn config (and a re-run is a
+    /// harmless idempotent overwrite). The image dir must already exist.
+    pub fn persist_config(&self, digest: &str, json: &[u8]) -> Result<()> {
+        let dir = self.paths.image_dir(digest);
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".config-")
+            .tempfile_in(&dir)
+            .with_context(|| format!("failed to stage config in {}", dir.display()))?;
+        std::io::Write::write_all(&mut tmp, json).context("failed to write staged config")?;
+        tmp.persist(self.config_path(digest))
+            .context("failed to publish config.json")?;
+        Ok(())
     }
 
     /// An image is cached iff its `rootfs.erofs` exists.
@@ -99,6 +141,102 @@ mod tests {
             store.ref_path("sha256:abc"),
             PathBuf::from("/data/izba/images/sha256-abc/ref.txt")
         );
+        assert_eq!(
+            store.config_path("sha256:abc"),
+            PathBuf::from("/data/izba/images/sha256-abc/config.json")
+        );
+    }
+
+    /// A minimal-but-valid OCI image config JSON carrying the runtime fields
+    /// crun fidelity cares about (Entrypoint/Env/WorkingDir).
+    const CONFIG_JSON: &str = r#"{
+        "architecture": "amd64",
+        "os": "linux",
+        "rootfs": { "type": "layers", "diff_ids": [] },
+        "config": {
+            "Entrypoint": ["/bin/sh"],
+            "Cmd": ["-c", "echo hi"],
+            "Env": ["PATH=/usr/bin"],
+            "WorkingDir": "/work"
+        }
+    }"#;
+
+    #[test]
+    fn load_config_parses_stored_config() {
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                fs::write(staging.join("config.json"), CONFIG_JSON)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let cfg = store
+            .load_config(DIGEST)
+            .unwrap()
+            .expect("config.json should be present");
+        let inner = cfg.config.expect("config section present");
+        assert_eq!(inner.entrypoint, Some(vec!["/bin/sh".to_string()]));
+        assert_eq!(
+            inner.cmd,
+            Some(vec!["-c".to_string(), "echo hi".to_string()])
+        );
+        assert_eq!(inner.working_dir, Some("/work".to_string()));
+        assert_eq!(inner.env, Some(vec!["PATH=/usr/bin".to_string()]));
+    }
+
+    #[test]
+    fn load_config_is_none_for_pre_crun_cache() {
+        // An image cached by a pre-crun izba: rootfs.erofs exists, no config.json.
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.load_config(DIGEST).unwrap().is_none());
+    }
+
+    #[test]
+    fn persist_config_self_heals_pre_crun_cache() {
+        // A pre-crun cached image gains a config.json without a re-pull.
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.load_config(DIGEST).unwrap().is_none());
+
+        store
+            .persist_config(DIGEST, CONFIG_JSON.as_bytes())
+            .unwrap();
+
+        let cfg = store
+            .load_config(DIGEST)
+            .unwrap()
+            .expect("config persisted");
+        assert_eq!(cfg.config.unwrap().working_dir, Some("/work".to_string()));
+    }
+
+    #[test]
+    fn load_config_errors_on_corrupt_json() {
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                fs::write(staging.join("config.json"), b"{ not json")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.load_config(DIGEST).is_err());
     }
 
     #[test]

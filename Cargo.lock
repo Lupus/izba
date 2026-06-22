@@ -1394,6 +1394,7 @@ dependencies = [
  "izba-proto",
  "nix 0.29.0",
  "oci-client",
+ "oci-spec",
  "proptest",
  "rcgen",
  "regorus",
