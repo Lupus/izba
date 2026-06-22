@@ -112,9 +112,11 @@ nice-to-have profile drop-in, later).
     `izba-` prefix stripped by the subcommand), `IdentityFile`, `User root`,
     `UserKnownHostsFile` (izba-managed), `StrictHostKeyChecking accept-new`,
     `IdentitiesOnly yes`.
-  - cheap per-sandbox stubs: `Host izba-<name>` lines (no body) for each on-disk
-    sandbox, purely for `ssh izba-<TAB>` completion.
-- **Regeneration:** enumerate the authoritative on-disk sandbox list and
+  - cheap per-sandbox stubs: `Host izba-<name>` lines (no body) for each
+    **running** sandbox, purely for `ssh izba-<TAB>` completion. (Stubs track
+    the running set — `izba` can only SSH into a running sandbox, so a stub for
+    a stopped one would only fail at connect.)
+- **Regeneration:** enumerate the running sandbox set (daemon registry) and
   **atomically rewrite the whole managed file** (write temp + rename). No
   surgical edits. Pinned `known_hosts` written the same way.
 - Gated by `ssh.config_management`.
