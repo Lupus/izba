@@ -462,6 +462,44 @@ if ($lkSectionFails -gt 0) {
     [Console]::Error.WriteLine("  [11] lock-down section: $lkSectionFails check(s) failed")
 }
 
+# [12] ssh: `izba ssh` round-trip + chroot isolation (OpenSSH client on PATH).
+# Boots a dedicated sandbox so no [11] teardown ordering dependency.
+# The Windows GitHub runner ships OpenSSH client (ssh.exe) in PATH.
+$sshName = 'ssh-validate'
+$sshWs   = "$env:TEMP\izba-ssh-validate-ws"
+& $exe stop  $sshName 2>$null | Out-Null
+& $exe rm --force $sshName 2>$null | Out-Null
+if (Test-Path $sshWs) { Remove-Item -Recurse -Force $sshWs }
+New-Item -ItemType Directory -Path $sshWs | Out-Null
+
+$sshBootOk = $false
+foreach ($attempt in 1..3) {
+    & $exe run --image $image --name $sshName $sshWs -- /bin/true | Out-Null
+    if ($LASTEXITCODE -eq 0) { $sshBootOk = $true; break }
+    [Console]::Error.WriteLine("  ssh-validate boot attempt $attempt/3 timed out (nested-WHP flake); retrying from scratch")
+    & $exe stop $sshName 2>$null | Out-Null
+    & $exe rm --force $sshName 2>$null | Out-Null
+}
+Check 'ssh: sandbox boots (run exits 0)' $sshBootOk
+if (-not $sshBootOk) { Dump-BootLogs $sshName }
+
+if ($sshBootOk) {
+    # [12a] /bin/true via izba ssh exits 0.
+    & $exe ssh $sshName -- /bin/true | Out-Null
+    Check 'ssh /bin/true -> 0' ($LASTEXITCODE -eq 0)
+
+    # [12b] Round-trip: stdout from remote echo is delivered.
+    $sshOut = (& $exe ssh $sshName -- echo ssh-marker | Out-String)
+    Check 'ssh round-trips stdout' ("$sshOut".Trim() -eq 'ssh-marker')
+} else {
+    Check 'ssh /bin/true -> 0' $false
+    Check 'ssh round-trips stdout' $false
+}
+
+& $exe stop  $sshName 2>$null | Out-Null
+& $exe rm --force $sshName 2>$null | Out-Null
+if (Test-Path $sshWs) { Remove-Item -Recurse -Force $sshWs -ErrorAction SilentlyContinue }
+
 # Best-effort daemon cleanup so the validation run leaves no daemon behind.
 & $exe daemon stop 2>$null | Out-Null
 

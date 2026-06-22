@@ -263,6 +263,104 @@ fn daemon_full_lifecycle() {
     let _ = izba(&data, no_env, &["daemon", "stop"]);
 }
 
+/// SSH access against a real microVM: `izba ssh <name> -- <cmd>` round-trip +
+/// chroot-isolation proofs.
+///
+/// Gated behind `IZBA_INTEGRATION=1` (same as the other daemon e2e tests).
+/// The initramfs must be built WITH `IZBA_SSHD` embedded — CI does this via the
+/// `initramfs` job in `e2e.yml` which passes `IZBA_SSHD=dist/sshd`.
+///
+/// Assertions:
+/// 1. `/bin/true` exit-0 via `izba ssh`  — proxy channel is live.
+/// 2. Round-trip: `echo ssh-marker-42` stdout is recovered.
+/// 3. Chroot-isolation (positive): `cat /etc/alpine-release` works (we are
+///    inside the alpine image, chrooted to /rootfs).
+/// 4. Chroot-isolation (negative): `cat /run/izba/ssh/ssh_host_ed25519_key`
+///    fails — the host-key lives outside /rootfs and must not be visible to the
+///    session.
+#[test]
+fn ssh_access_e2e() {
+    if !want() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+
+    // [1] Boot a sandbox (the microVM persists after the workload exits).
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "run",
+            "--image",
+            IMAGE,
+            "--name",
+            "sshe2e",
+            &ws_s,
+            "--",
+            "/bin/true",
+        ],
+    );
+    assert_ok(&o, "run /bin/true (boot)");
+
+    // [2] Core: `izba ssh sshe2e -- /bin/true` exits 0.
+    let o = izba(&data, no_env, &["ssh", "sshe2e", "--", "/bin/true"]);
+    assert_ok(&o, "ssh /bin/true -> 0");
+
+    // [3] Round-trip: stdout from a remote command is delivered.
+    let o = izba(
+        &data,
+        no_env,
+        &["ssh", "sshe2e", "--", "echo", "ssh-marker-42"],
+    );
+    assert_ok(&o, "ssh echo exits 0");
+    assert!(
+        stdout_of(&o).contains("ssh-marker-42"),
+        "ssh stdout round-trip missing marker; got: {}",
+        stdout_of(&o)
+    );
+
+    // [4] Chroot-isolation (positive): inside the alpine image.
+    let o = izba(
+        &data,
+        no_env,
+        &["ssh", "sshe2e", "--", "cat", "/etc/alpine-release"],
+    );
+    assert_ok(&o, "ssh cat /etc/alpine-release (proves chroot to /rootfs)");
+    assert!(
+        !stdout_of(&o).is_empty(),
+        "alpine-release must be non-empty"
+    );
+
+    // [5] Chroot-isolation (negative): sshd host key is outside /rootfs.
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "ssh",
+            "sshe2e",
+            "--",
+            "cat",
+            "/run/izba/ssh/ssh_host_ed25519_key",
+        ],
+    );
+    assert!(
+        !o.status.success(),
+        "host key at /run/izba/ssh must be outside the chroot and inaccessible to the session"
+    );
+
+    // [6] Cleanup.
+    assert_ok(
+        &izba(&data, no_env, &["rm", "--force", "sshe2e"]),
+        "rm sshe2e",
+    );
+    let _ = izba(&data, no_env, &["daemon", "stop"]);
+}
+
 /// CLI-surface lifecycle: drives the thin verbs `daemon_full_lifecycle` does
 /// NOT reach end-to-end against a real daemon + microVM — `create` (vs `run`),
 /// `netlog`, `port ls`/`unpublish`, `stop`, and non-force `rm`. These verbs read
