@@ -348,9 +348,15 @@ fn ssh_access_e2e() {
             "/run/izba/ssh/ssh_host_ed25519_key",
         ],
     );
+    let err = String::from_utf8_lossy(&o.stderr);
     assert!(
         !o.status.success(),
-        "host key at /run/izba/ssh must be outside the chroot and inaccessible to the session"
+        "host key outside chroot must be unreadable"
+    );
+    assert!(
+        err.contains("No such file") || err.contains("can't open"),
+        "expected a not-found error proving the ssh session connected but the path is absent \
+        (chroot isolation), got stderr: {err}"
     );
 
     // [6] Cleanup.
