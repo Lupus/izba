@@ -119,12 +119,20 @@ pub fn detect_cgroup_manager() -> CgroupManager {
 pub fn crun_run_argv(cgroup_manager: CgroupManager) -> Vec<String> {
     vec![
         CRUN_PATH.to_string(),
+        // --log=FILE (a global option) is the reliable way to capture container
+        // setup errors under --detach: crun closes stdio across the detach
+        // double-fork, so a setup failure (pivot_root, exec, mount) would
+        // otherwise vanish. The launcher tails this file on failure.
+        "--log=/tmp/crun.log".to_string(),
         format!("--cgroup-manager={}", cgroup_manager.as_str()),
         "run".to_string(),
         "--detach".to_string(),
-        CONTAINER_ID.to_string(),
+        // run-options (--detach, -b) MUST precede the positional CONTAINER_ID;
+        // crun rejects options after the id ("`run` requires a maximum of 1
+        // arguments"). Verified on a real boot.
         "-b".to_string(),
         BUNDLE_MOUNT.to_string(),
+        CONTAINER_ID.to_string(),
     ]
 }
 
@@ -439,25 +447,28 @@ mod tests {
     fn crun_run_argv_cgroupfs_branch() {
         let argv = crun_run_argv(CgroupManager::Cgroupfs);
         assert_eq!(argv[0], CRUN_PATH);
-        assert_eq!(argv[1], "--cgroup-manager=cgroupfs");
-        assert_eq!(argv[2], "run");
-        assert_eq!(argv[3], "--detach");
-        assert_eq!(argv[4], CONTAINER_ID);
+        assert_eq!(argv[1], "--log=/tmp/crun.log");
+        assert_eq!(argv[2], "--cgroup-manager=cgroupfs");
+        assert_eq!(argv[3], "run");
+        assert_eq!(argv[4], "--detach");
+        // run-options before the positional id (crun rejects the reverse).
         assert_eq!(argv[5], "-b");
         assert_eq!(argv[6], BUNDLE_MOUNT);
-        assert_eq!(argv.len(), 7);
+        assert_eq!(argv[7], CONTAINER_ID);
+        assert_eq!(argv.len(), 8);
     }
 
     #[test]
     fn crun_run_argv_disabled_branch() {
         let argv = crun_run_argv(CgroupManager::Disabled);
-        assert_eq!(argv[1], "--cgroup-manager=disabled");
+        assert_eq!(argv[2], "--cgroup-manager=disabled");
         // Rest of argv is identical to cgroupfs branch.
-        assert_eq!(argv[2], "run");
-        assert_eq!(argv[3], "--detach");
-        assert_eq!(argv[4], CONTAINER_ID);
+        assert_eq!(argv[3], "run");
+        assert_eq!(argv[4], "--detach");
+        // run-options before the positional id (crun rejects the reverse).
         assert_eq!(argv[5], "-b");
         assert_eq!(argv[6], BUNDLE_MOUNT);
+        assert_eq!(argv[7], CONTAINER_ID);
     }
 
     #[test]
