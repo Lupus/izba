@@ -65,6 +65,21 @@ impl Registry {
             .count()
     }
 
+    /// Names of sandboxes whose liveness is NOT Stopped (Running or Degraded),
+    /// sorted alphabetically. Used to populate the managed SSH config.
+    pub fn running_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.liveness != Liveness::Stopped)
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     pub fn summaries(&self) -> Vec<SandboxSummary> {
         let mut out: Vec<SandboxSummary> = self
             .inner
@@ -141,6 +156,33 @@ mod tests {
 
         r.remove("db");
         assert_eq!(r.summaries().len(), 2);
+    }
+
+    #[test]
+    fn running_names_returns_non_stopped_sorted() {
+        let r = Registry::new();
+        assert!(r.running_names().is_empty());
+
+        r.set("web", "ubuntu:24.04", Liveness::Running);
+        r.set("db", "postgres:16", Liveness::Stopped);
+        r.set(
+            "api",
+            "alpine:3.20",
+            Liveness::Degraded("sidecar died".into()),
+        );
+        r.set("cache", "redis:7", Liveness::Stopped);
+
+        let names = r.running_names();
+        // Only Running + Degraded; Stopped excluded; sorted.
+        assert_eq!(names, vec!["api", "web"]);
+
+        // After stopping "web", only "api" remains.
+        r.set_liveness("web", Liveness::Stopped);
+        assert_eq!(r.running_names(), vec!["api"]);
+
+        // After removing "api", result is empty.
+        r.remove("api");
+        assert!(r.running_names().is_empty());
     }
 
     #[test]
