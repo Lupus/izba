@@ -30,13 +30,12 @@ pub fn reap_zombies() -> usize {
     let mut count = 0usize;
     loop {
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-            // A child exited/signalled/stopped — reap it and keep going.
-            Ok(WaitStatus::Exited(_, _))
-            | Ok(WaitStatus::Signaled(_, _, _))
-            | Ok(WaitStatus::Stopped(_, _))
-            | Ok(WaitStatus::Continued(_)) => {
+            // A child exited or was killed — reap it and keep going.
+            Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
                 count += 1;
             }
+            // Job-control notifications: not a zombie reap, don't count.
+            Ok(WaitStatus::Stopped(_, _)) | Ok(WaitStatus::Continued(_)) => {}
             // No more children ready right now.
             Ok(WaitStatus::StillAlive) => break,
             // No children at all — normal when there's nothing to reap.
@@ -72,18 +71,40 @@ pub fn run() -> ! {
 #[cfg(test)]
 mod tests {
     use super::reap_zombies;
+    use nix::sys::wait::waitpid;
     use nix::unistd::{fork, ForkResult};
 
-    /// `reap_zombies` returns 0 when there are no children (`ECHILD`).
+    /// `reap_zombies` returns 0 on `ECHILD` — exercised deterministically.
+    ///
+    /// Strategy: fork a quick-exiting child, then `waitpid` it *directly* to
+    /// fully exhaust it from the child table.  After that, `reap_zombies()` on
+    /// that PID subtree sees ECHILD and must return 0.
     #[test]
     fn reap_zombies_no_children_returns_zero() {
-        // This process may have other children in the test harness, but calling
-        // reap_zombies with WNOHANG simply returns 0 on ECHILD and ≥0 on
-        // StillAlive. We can't guarantee ECHILD in a multi-threaded harness,
-        // but we CAN guarantee the call does not panic or hang.
+        // Fork a child that exits immediately.
+        let child_pid = match unsafe { fork() }.expect("fork") {
+            ForkResult::Child => {
+                unsafe { libc::_exit(0) };
+            }
+            ForkResult::Parent { child } => child,
+        };
+
+        // Reap the child directly with a *blocking* wait so we know it is gone.
+        loop {
+            match waitpid(child_pid, None) {
+                Ok(_) => break,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => panic!("waitpid failed: {e}"),
+            }
+        }
+
+        // Now the child table for this child is empty.  reap_zombies() must hit
+        // ECHILD (or StillAlive with count 0) and return 0.
         let n = reap_zombies();
-        // Result is a non-negative count (0 or more); no panic = pass.
-        let _ = n;
+        assert_eq!(
+            n, 0,
+            "expected 0 after all children already reaped, got {n}"
+        );
     }
 
     /// `reap_zombies` reaps a forked quick-exiting child and reports count ≥ 1.
