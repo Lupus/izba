@@ -97,6 +97,17 @@ pub fn rootfs_mount_plan() -> Vec<MountOp> {
             "",
         )
         .optional(),
+        // The SSH host key + authorized_keys, delivered read-only for sshd setup.
+        // Optional: the share is only attached when SSH is configured; a missing
+        // tag fails-soft instead of aborting boot.
+        MountOp::new(
+            crate::ssh::SSH_TAG,
+            "/rootfs/izba-ssh",
+            "virtiofs",
+            &["ro"],
+            "",
+        )
+        .optional(),
         MountOp::new(
             "proc",
             "/rootfs/proc",
@@ -307,7 +318,7 @@ mod tests {
     #[test]
     fn rootfs_plan_sequence() {
         let p = rootfs_mount_plan();
-        assert_eq!(p.len(), 10);
+        assert_eq!(p.len(), 11);
         assert_eq!(op(&p, 0), ("/dev/vda", "/lower", "erofs", vec!["ro"], ""));
         assert_eq!(op(&p, 1), ("/dev/vdb", "/upper", "ext4", vec![], ""));
         assert_eq!(
@@ -336,6 +347,10 @@ mod tests {
         );
         assert_eq!(
             op(&p, 5),
+            ("izba-ssh", "/rootfs/izba-ssh", "virtiofs", vec!["ro"], "")
+        );
+        assert_eq!(
+            op(&p, 6),
             (
                 "proc",
                 "/rootfs/proc",
@@ -345,7 +360,7 @@ mod tests {
             )
         );
         assert_eq!(
-            op(&p, 6),
+            op(&p, 7),
             (
                 "sysfs",
                 "/rootfs/sys",
@@ -355,15 +370,15 @@ mod tests {
             )
         );
         assert_eq!(
-            op(&p, 7),
+            op(&p, 8),
             ("devtmpfs", "/rootfs/dev", "devtmpfs", vec!["nosuid"], "")
         );
         assert_eq!(
-            op(&p, 8),
+            op(&p, 9),
             ("tmpfs", "/rootfs/tmp", "tmpfs", vec!["nosuid", "nodev"], "")
         );
         assert_eq!(
-            op(&p, 9),
+            op(&p, 10),
             (
                 "devpts",
                 "/rootfs/dev/pts",
@@ -385,7 +400,25 @@ mod tests {
         assert!(trust.flags.iter().any(|f| f == "ro"));
         assert_eq!(trust.target, PathBuf::from("/rootfs/izba-trust"));
         // Only the trust share is optional; everything else is mandatory.
-        assert_eq!(p.iter().filter(|o| o.optional).count(), 1);
+        // Both izba-trust and izba-ssh are optional (conditionally attached by izbad).
+        assert_eq!(p.iter().filter(|o| o.optional).count(), 2);
+    }
+
+    /// The optional izba-ssh share must be present, read-only, and optional.
+    #[test]
+    fn ssh_share_is_optional_and_read_only() {
+        let p = rootfs_mount_plan();
+        let ssh = p
+            .iter()
+            .find(|o| o.source == crate::ssh::SSH_TAG)
+            .expect("izba-ssh share must be present in the rootfs plan");
+        assert!(ssh.optional, "izba-ssh share must fail-soft when absent");
+        assert!(
+            ssh.flags.iter().any(|f| f == "ro"),
+            "izba-ssh must be read-only"
+        );
+        assert_eq!(ssh.target, std::path::PathBuf::from("/rootfs/izba-ssh"));
+        assert_eq!(ssh.fstype, "virtiofs");
     }
 
     #[test]
