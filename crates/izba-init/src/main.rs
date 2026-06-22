@@ -116,6 +116,7 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     write_resolv_conf();
     write_trust_anchor();
+    ssh::launch();
 
     let engine = Arc::new(ExecEngine::new(Some("/rootfs".into())));
     let shutdown = Arc::new(AtomicBool::new(false));
