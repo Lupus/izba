@@ -30,7 +30,7 @@ pub fn build_ssh_args(paths: &Paths, name: &str, extra: &[String]) -> Vec<String
 
     let mut args = vec![
         "-o".to_string(),
-        format!("ProxyCommand={exe} __ssh-proxy {host_alias}"),
+        format!("ProxyCommand=\"{exe}\" __ssh-proxy {host_alias}"),
         "-o".to_string(),
         "IdentitiesOnly=yes".to_string(),
         "-o".to_string(),
@@ -80,6 +80,17 @@ mod tests {
         assert!(
             proxy_cmd.contains("__ssh-proxy izba-foo"),
             "ProxyCommand should call __ssh-proxy with izba-foo, got: {proxy_cmd}"
+        );
+
+        // The exe portion must be double-quoted so spaces in the path are safe
+        // when ssh passes ProxyCommand to /bin/sh -c.
+        assert!(
+            proxy_cmd.starts_with("ProxyCommand=\""),
+            "ProxyCommand exe must be double-quoted, got: {proxy_cmd}"
+        );
+        assert!(
+            proxy_cmd.contains("\" __ssh-proxy izba-foo"),
+            "ProxyCommand must have closing quote before __ssh-proxy, got: {proxy_cmd}"
         );
     }
 
