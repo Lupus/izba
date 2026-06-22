@@ -18,7 +18,7 @@ OpenVMM driver (M0 done).
 | [docs/superpowers/plans/2026-06-10-izba-v1.md](docs/superpowers/plans/2026-06-10-izba-v1.md) | The executed v1 implementation plan (historical; useful for "why is X built this way") |
 | [docs/design-lineage.md](docs/design-lineage.md) | **Design lineage & prior art** — how each izba subsystem maps to its public OSS building blocks (Cloud Hypervisor, OpenVMM, rust-vmm, virtiofs, containerd erofs, NVIDIA OpenShell). Read before architectural changes or external comparisons. |
 | [docs/security/README.md](docs/security/README.md) | **Security program** — threat model (guest-is-hostile microVM model), audit methodology (classical + LLM-driven SOTA + spec-first/TDD assurance), and the findings register. Read before any change that touches a trust boundary. |
-| [docs/egress-firewall-building-blocks.md](docs/egress-firewall-building-blocks.md) | OSS building-block survey + decisions for the **egress firewall** (M2 allow-list + M5 MITM/vault): regorus, DNS-snoop, NVIDIA OpenShell salvage map. Read before M2/M5 work. |
+| [docs/egress-firewall-building-blocks.md](docs/egress-firewall-building-blocks.md) | OSS building-block survey + decisions for the **egress firewall** (M2 allow-list + MITM, M5 credential vault): regorus, DNS-snoop, NVIDIA OpenShell salvage map. Read before M2/M5 work. |
 | [docs/testing.md](docs/testing.md) | KVM integration-suite runbook (WSL2 setup, deps, troubleshooting) |
 | [hack/README.md](hack/README.md) | Artifact tooling: kernel config/build, initramfs, binary fetching |
 
@@ -216,9 +216,10 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - Known v1 trade-offs are doc-commented at the site: PAX xattrs dropped in
   `image/flatten.rs`, exec-entry retention + orphan-zombie policy in
   `izba-init`, no mount namespace for workloads (chroot only).
-- Deferred scope (don't build casually — see spec §8/§9): egress MITM proxy +
-  credential injection (M5, branches off the `daemon/egress/router.rs` dispatch
-  point), erofs layer dedup, snapshot/resume, CI-published kernel artifacts.
+- Deferred scope (don't build casually — see spec §8/§9): credential
+  injection/vault (M5, branches off the `daemon/egress/router.rs` dispatch
+  point — the egress MITM proxy itself already shipped in M2), erofs layer
+  dedup, snapshot/resume, CI-published kernel artifacts.
 
 ## Agent autonomy & delivery workflow (repo owner authorization)
 
