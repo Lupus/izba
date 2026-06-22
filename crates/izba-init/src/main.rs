@@ -9,6 +9,7 @@ mod egress;
 mod exec;
 mod mounts;
 mod net;
+mod oci;
 mod pause;
 mod rwdisk;
 mod server;
@@ -143,6 +144,13 @@ fn run_pid1() -> anyhow::Result<()> {
         std::thread::spawn(move || server::serve_streams(streams, e));
     }
     bring_up_egress();
+
+    // Start the OCI workload container via crun.  Placement: after egress is
+    // up (the container shares init's netns and needs the egress stub active)
+    // and before the idle/serve loop so exec (a later task) can enter a live
+    // container.  Fail-honest: launch_container() logs errors but never
+    // panics or exits PID 1.
+    oci::launch_container();
 
     // Zombie policy (v1): every engine exec is reaped by its dedicated
     // waitpid thread. We deliberately do NOT waitpid(-1) here — that would

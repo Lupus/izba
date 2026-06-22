@@ -97,6 +97,19 @@ pub fn rootfs_mount_plan() -> Vec<MountOp> {
             "",
         )
         .optional(),
+        // OCI bundle share: the host delivers config.json (and the absolute
+        // root.path = /rootfs) over this read-only virtiofs tag.  Optional so
+        // a sandbox without a crun OCI config (pre-M2 launch or a bare shell)
+        // boots normally.  The target is under /rootfs because that is where
+        // crun is invoked with `-b /rootfs/izba-oci`.
+        MountOp::new(
+            crate::oci::BUNDLE_TAG,
+            crate::oci::BUNDLE_MOUNT,
+            "virtiofs",
+            &["ro"],
+            "",
+        )
+        .optional(),
         MountOp::new(
             "proc",
             "/rootfs/proc",
@@ -307,7 +320,8 @@ mod tests {
     #[test]
     fn rootfs_plan_sequence() {
         let p = rootfs_mount_plan();
-        assert_eq!(p.len(), 10);
+        // 10 original ops + 1 OCI bundle share = 11
+        assert_eq!(p.len(), 11);
         assert_eq!(op(&p, 0), ("/dev/vda", "/lower", "erofs", vec!["ro"], ""));
         assert_eq!(op(&p, 1), ("/dev/vdb", "/upper", "ext4", vec![], ""));
         assert_eq!(
@@ -337,6 +351,16 @@ mod tests {
         assert_eq!(
             op(&p, 5),
             (
+                izba_proto::OCI_TAG,
+                crate::oci::BUNDLE_MOUNT,
+                "virtiofs",
+                vec!["ro"],
+                ""
+            )
+        );
+        assert_eq!(
+            op(&p, 6),
+            (
                 "proc",
                 "/rootfs/proc",
                 "proc",
@@ -345,7 +369,7 @@ mod tests {
             )
         );
         assert_eq!(
-            op(&p, 6),
+            op(&p, 7),
             (
                 "sysfs",
                 "/rootfs/sys",
@@ -355,15 +379,15 @@ mod tests {
             )
         );
         assert_eq!(
-            op(&p, 7),
+            op(&p, 8),
             ("devtmpfs", "/rootfs/dev", "devtmpfs", vec!["nosuid"], "")
         );
         assert_eq!(
-            op(&p, 8),
+            op(&p, 9),
             ("tmpfs", "/rootfs/tmp", "tmpfs", vec!["nosuid", "nodev"], "")
         );
         assert_eq!(
-            op(&p, 9),
+            op(&p, 10),
             (
                 "devpts",
                 "/rootfs/dev/pts",
@@ -384,8 +408,29 @@ mod tests {
         assert!(trust.optional, "trust share must fail-soft when absent");
         assert!(trust.flags.iter().any(|f| f == "ro"));
         assert_eq!(trust.target, PathBuf::from("/rootfs/izba-trust"));
-        // Only the trust share is optional; everything else is mandatory.
-        assert_eq!(p.iter().filter(|o| o.optional).count(), 1);
+        // Both the trust share and the OCI bundle share are optional.
+        assert_eq!(p.iter().filter(|o| o.optional).count(), 2);
+    }
+
+    #[test]
+    fn oci_bundle_share_is_optional_and_read_only() {
+        use izba_proto::OCI_TAG;
+        let p = rootfs_mount_plan();
+        let oci = p
+            .iter()
+            .find(|o| o.source == OCI_TAG)
+            .expect("OCI bundle share present");
+        assert!(oci.optional, "OCI bundle share must fail-soft when absent");
+        assert!(
+            oci.flags.iter().any(|f| f == "ro"),
+            "OCI bundle share must be ro"
+        );
+        assert_eq!(
+            oci.target,
+            PathBuf::from(crate::oci::BUNDLE_MOUNT),
+            "OCI bundle share target must match BUNDLE_MOUNT"
+        );
+        assert_eq!(oci.fstype, "virtiofs");
     }
 
     #[test]
