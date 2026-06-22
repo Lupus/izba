@@ -199,7 +199,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             curl tar make gcc autoconf automake libtool-bin pkg-config patch \
-            unzip file
+            unzip file openssh-client
           mkdir -p "$HOME/.local/bin"
           IZBA_BIN_DIR="$HOME/.local/bin" hack/fetch-artifacts.sh || true
           hack/build-mkfs-erofs-windows.sh --linux-only
