@@ -30,7 +30,11 @@ pub fn build_ssh_args(paths: &Paths, name: &str, extra: &[String]) -> Vec<String
 
     let mut args = vec![
         "-o".to_string(),
-        format!("ProxyCommand=\"{exe}\" __ssh-proxy {host_alias}"),
+        // Use ssh's own `%h` token (the target host) rather than interpolating
+        // the alias into the string: ssh expands %h before handing ProxyCommand
+        // to /bin/sh, so the alias never passes through shell tokenization. This
+        // matches the managed-config form (ssh/config.rs render_managed).
+        format!("ProxyCommand=\"{exe}\" __ssh-proxy %h"),
         "-o".to_string(),
         "IdentitiesOnly=yes".to_string(),
         "-o".to_string(),
@@ -76,10 +80,12 @@ mod tests {
             .map(|w| w[1].clone())
             .expect("ProxyCommand not found");
 
-        // Must reference `__ssh-proxy izba-foo`.
+        // Must call `__ssh-proxy %h` — ssh expands %h (the target host) itself
+        // before invoking /bin/sh, so the alias never passes through shell
+        // tokenization. The target host (izba-foo) is the positional arg.
         assert!(
-            proxy_cmd.contains("__ssh-proxy izba-foo"),
-            "ProxyCommand should call __ssh-proxy with izba-foo, got: {proxy_cmd}"
+            proxy_cmd.contains("__ssh-proxy %h"),
+            "ProxyCommand should call __ssh-proxy with %h, got: {proxy_cmd}"
         );
 
         // The exe portion must be double-quoted so spaces in the path are safe
@@ -89,7 +95,7 @@ mod tests {
             "ProxyCommand exe must be double-quoted, got: {proxy_cmd}"
         );
         assert!(
-            proxy_cmd.contains("\" __ssh-proxy izba-foo"),
+            proxy_cmd.contains("\" __ssh-proxy %h"),
             "ProxyCommand must have closing quote before __ssh-proxy, got: {proxy_cmd}"
         );
     }
