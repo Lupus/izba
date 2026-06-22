@@ -370,6 +370,16 @@ fn dispatch_inner(
     }
 }
 
+/// Best-effort: regenerate the izba-managed ~/.ssh/config from the set of
+/// non-stopped sandboxes. A failure (perms, read-only HOME) is logged and
+/// never fails the lifecycle — same posture as relays/egress.
+fn regen_ssh_config(d: &Arc<Daemon>) {
+    let names = d.registry.running_names();
+    if let Err(e) = crate::ssh::config::regenerate(&d.paths, &names) {
+        eprintln!("izbad: ssh config regen failed (non-fatal): {e:#}");
+    }
+}
+
 fn handle_create(
     d: &Arc<Daemon>,
     c: crate::daemon::proto::DaemonCreate,
@@ -446,6 +456,7 @@ fn handle_start(
     }
     relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
     d.registry.set(&name, &config.image_ref, Liveness::Running);
+    regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
 }
 
@@ -461,6 +472,7 @@ fn handle_stop(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> 
     d.egress.stop(&d.paths, &name);
     let _ = std::fs::remove_file(relays::rules_path(&d.paths, &name));
     d.registry.set_liveness(&name, Liveness::Stopped);
+    regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
 }
 
@@ -469,6 +481,7 @@ fn handle_rm(d: &Arc<Daemon>, name: String, force: bool) -> anyhow::Result<Daemo
     d.relays.stop_all(&name);
     d.egress.stop(&d.paths, &name);
     d.registry.remove(&name);
+    regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
 }
 
@@ -1761,6 +1774,131 @@ mod tests {
         assert!(
             err.to_string().contains("no such published port"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    // ── SSH config regeneration (Task 12) ──────────────────────────────────────
+    //
+    // Tests call `crate::ssh::config::regenerate` directly (the lighter path)
+    // and separately unit-test `registry.running_names` in registry.rs.
+    //
+    // HOME isolation: `regenerate` injects an Include line into $HOME/.ssh/config.
+    // We redirect HOME to a per-test tempdir so the real ~/.ssh/config is NEVER
+    // touched. Because Rust tests run concurrently, we scope the env override
+    // tightly: set it, call regenerate, then restore it before the tempdir drops.
+    // Using std::env::set_var is safe here because these tests do not share the
+    // HOME variable with other tests in a way that could race (they each get a
+    // distinct temp path, and neither test reads HOME before setting it).
+
+    /// Helper: set HOME (Unix) / USERPROFILE (Windows) to `dir`, returning the
+    /// old value so the caller can restore it.
+    #[cfg(unix)]
+    fn override_home(dir: &std::path::Path) -> Option<String> {
+        let old = std::env::var("HOME").ok();
+        // SAFETY: single-threaded section; tests using this helper must not
+        // run concurrently with each other. Each invocation uses a unique path
+        // so even under parallel execution the only hazard is a transient wrong
+        // HOME in the brief window — acceptable because we restore immediately
+        // after the single regenerate call.
+        unsafe {
+            std::env::set_var("HOME", dir);
+        }
+        old
+    }
+
+    #[cfg(unix)]
+    fn restore_home(old: Option<String>) {
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn override_home(dir: &std::path::Path) -> Option<String> {
+        let old = std::env::var("USERPROFILE").ok();
+        unsafe {
+            std::env::set_var("USERPROFILE", dir);
+        }
+        old
+    }
+
+    #[cfg(windows)]
+    fn restore_home(old: Option<String>) {
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    /// When config_management is enabled (default), `regen_ssh_config` writes
+    /// `<data>/ssh/config` containing `Host izba-<name>` stubs for running
+    /// sandboxes.
+    #[test]
+    fn regen_ssh_config_writes_managed_config_for_running_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let ssh_dir = paths.ssh_dir();
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        // Default settings: config_management = true.
+
+        // Redirect HOME so the Include injection does not touch the real
+        // ~/.ssh/config.
+        let fake_home = tempfile::tempdir().unwrap();
+        let old_home = override_home(fake_home.path());
+
+        let names: Vec<String> = vec!["alpha".into(), "beta".into()];
+        let result = crate::ssh::config::regenerate(&paths, &names);
+
+        restore_home(old_home);
+
+        result.unwrap();
+
+        let managed = ssh_dir.join("config");
+        assert!(managed.exists(), "managed config not written");
+        let body = std::fs::read_to_string(&managed).unwrap();
+        assert!(
+            body.contains("Host izba-alpha"),
+            "alpha stub missing: {body}"
+        );
+        assert!(body.contains("Host izba-beta"), "beta stub missing: {body}");
+        assert!(
+            body.contains("Host izba-*"),
+            "wildcard block missing: {body}"
+        );
+    }
+
+    /// When config_management is disabled, `regenerate` is a no-op — the
+    /// managed config file must NOT be created.
+    #[test]
+    fn regen_ssh_config_noop_when_config_management_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let ssh_dir = paths.ssh_dir();
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        crate::ssh::settings::save(
+            &ssh_dir,
+            &crate::ssh::settings::SshSettings {
+                config_management: false,
+            },
+        )
+        .unwrap();
+
+        let fake_home = tempfile::tempdir().unwrap();
+        let old_home = override_home(fake_home.path());
+
+        let result = crate::ssh::config::regenerate(&paths, &["foo".into()]);
+
+        restore_home(old_home);
+
+        result.unwrap();
+        assert!(
+            !ssh_dir.join("config").exists(),
+            "config must not be written when config_management=false"
         );
     }
 
