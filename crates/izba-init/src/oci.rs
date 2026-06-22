@@ -128,7 +128,7 @@ pub fn crun_run_argv(cgroup_manager: CgroupManager) -> Vec<String> {
         // setup errors under --detach: crun closes stdio across the detach
         // double-fork, so a setup failure (pivot_root, exec, mount) would
         // otherwise vanish. The launcher tails this file on failure.
-        "--log=/tmp/crun.log".to_string(),
+        format!("--log={CRUN_LOG_PATH}"),
         format!("--cgroup-manager={}", cgroup_manager.as_str()),
         "run".to_string(),
         "--detach".to_string(),
@@ -512,7 +512,7 @@ mod tests {
     fn crun_run_argv_cgroupfs_branch() {
         let argv = crun_run_argv(CgroupManager::Cgroupfs);
         assert_eq!(argv[0], CRUN_PATH);
-        assert_eq!(argv[1], "--log=/tmp/crun.log");
+        assert_eq!(argv[1], format!("--log={CRUN_LOG_PATH}"));
         assert_eq!(argv[2], "--cgroup-manager=cgroupfs");
         assert_eq!(argv[3], "run");
         assert_eq!(argv[4], "--detach");

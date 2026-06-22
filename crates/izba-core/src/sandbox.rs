@@ -472,8 +472,18 @@ fn write_oci_bundle(
     oci_dir: &Path,
     name: &str,
     image_config: Option<&oci_client::config::Config>,
+    ca_present: bool,
 ) -> anyhow::Result<()> {
-    let trust = trust_env_strings();
+    // Gate the CA trust-env defaults on the bundle actually being present —
+    // same gate the guest applies in `build_env_overlay` (trust_bundle_present).
+    // Today the host always writes ca.pem so this is always-open, but encoding
+    // the gate keeps service-mode (a real entrypoint as PID 1, deferred) from
+    // inheriting SSL_CERT_FILE=… when no CA exists.
+    let trust = if ca_present {
+        trust_env_strings()
+    } else {
+        Vec::new()
+    };
     let pause_argv: Vec<String> = vec![PAUSE_GUEST_PATH.to_string(), "__pause".to_string()];
     let (uid, gid) = image_config
         .and_then(|c| c.user.as_deref())
@@ -590,8 +600,13 @@ pub fn start_with_timeouts(
     // image with root user and no default env.
     let image_cfg_file = ImageStore::new(paths).load_config(&config.image_digest)?;
     let image_config = image_cfg_file.as_ref().and_then(|f| f.config.as_ref());
-    write_oci_bundle(&oci_dir, name, image_config)
-        .with_context(|| format!("writing oci/config.json for sandbox '{name}'"))?;
+    write_oci_bundle(
+        &oci_dir,
+        name,
+        image_config,
+        trust_dir.join("ca.pem").exists(),
+    )
+    .with_context(|| format!("writing oci/config.json for sandbox '{name}'"))?;
 
     // The guest is a pure vsock island: no NIC, no DHCP. izba.egress=1 is
     // always on — guest egress rides the izbad-owned vsock 1027 plane.
