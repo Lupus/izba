@@ -43,7 +43,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .mode(0o600)
         .open(path)
         .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(bytes)?;
+    f.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
