@@ -24,6 +24,7 @@ thiserror.workspace = true
 flate2 = "1"
 tar = "0.4"
 tempfile = "3"
+ssh-key = { version = "0.6", features = ["ed25519", "std", "getrandom"] }
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "net", "io-util", "time"] }
 sha2 = "0.10"
