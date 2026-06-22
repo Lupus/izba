@@ -28,8 +28,8 @@ pub const RUN_DIR: &str = "/run/izba/ssh";
 ///
 /// If `<share_dir>/ssh_host_ed25519_key` is absent, returns `Ok(false)` (no SSH
 /// material — skip cleanly). Otherwise creates `run_dir` (mode 0700), copies
-/// the host key and authorized_keys into it (both mode 0600), creates the sshd
-/// privsep dir `/run/sshd` (mode 0755), and returns `Ok(true)`.
+/// the host key and authorized_keys into it (both mode 0600), and returns
+/// `Ok(true)`. All filesystem side-effects are confined to `run_dir`.
 pub fn materialize(share_dir: &Path, run_dir: &Path) -> std::io::Result<bool> {
     let host_key_src = share_dir.join("ssh_host_ed25519_key");
     if !host_key_src.exists() {
@@ -51,12 +51,6 @@ pub fn materialize(share_dir: &Path, run_dir: &Path) -> std::io::Result<bool> {
     std::fs::copy(&auth_keys_src, &auth_keys_dst)?;
     set_permissions(&auth_keys_dst, 0o600)?;
 
-    // Create the sshd privilege-separation directory (0755). Best-effort:
-    // in unit tests the path may be read-only; in the real guest it always
-    // succeeds.
-    let _ = std::fs::create_dir_all("/run/sshd")
-        .and_then(|()| set_permissions(Path::new("/run/sshd"), 0o755));
-
     Ok(true)
 }
 
@@ -73,6 +67,8 @@ pub fn sshd_argv() -> Vec<String> {
 /// Launch the vendored sshd if SSH material was delivered.
 ///
 /// Reads keys from `/rootfs/izba-ssh`, materializes them into `/run/izba/ssh`,
+/// creates the sshd privilege-separation directory `/run/sshd` (0755,
+/// best-effort — a missing privsep dir is non-fatal; sshd logs it),
 /// then spawns sshd as a fire-and-forget background thread. A dead sshd is
 /// non-fatal — errors are logged to the console but never panic or block boot.
 pub fn launch() {
@@ -91,6 +87,11 @@ pub fn launch() {
         // No SSH material delivered for this sandbox — skip silently.
         return;
     }
+
+    // Create the sshd privilege-separation directory (0755). Best-effort:
+    // a missing privsep dir is non-fatal; sshd logs it and may still start.
+    let _ = std::fs::create_dir_all("/run/sshd")
+        .and_then(|()| set_permissions(Path::new("/run/sshd"), 0o755));
 
     eprintln!("izba-init: starting sshd");
     std::thread::spawn(move || {
