@@ -86,6 +86,31 @@ Key properties:
   that loophole is now closed.) `access:` defaults to `read-write` for HTTP
   hosts; `git:` rules are vendor-neutral (keyed on the git wire protocol, not a
   hostname) and read-only unless `access: read-write`.
+
+  **HTTPS under enforce is intercepted (MITM) — the izba CA is auto-trusted.**
+  To apply the allow-list and the `access:`/`git:` rules to *encrypted* traffic,
+  an enforcing sandbox terminates TLS at `izbad`: it mints a per-host leaf
+  certificate for the connection's SNI/Host, signed by a stable **izba egress
+  CA**, applies the policy to the decrypted request, then re-originates TLS to
+  the real host. izba writes that CA into the guest (`/etc/izba/ca.pem`, plus a
+  combined system+izba bundle at `/etc/izba/ca-bundle.pem`) and, for every
+  `izba exec`, defaults the standard trust-env vars so common tools trust it
+  with no setup: `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`,
+  `GIT_SSL_CAINFO` (→ the bundle) and `NODE_EXTRA_CA_CERTS`, `DENO_CERT`
+  (→ `ca.pem`). So `curl`, `git`, Python `requests`, Node, and Deno verify
+  successfully out of the box; a tool that reads only the OS trust store should
+  be pointed at `/etc/izba/ca.pem` (e.g. copy it into
+  `/usr/local/share/ca-certificates/` and run `update-ca-certificates`). A
+  **bare** (non-enforcing) sandbox does NOT intercept TLS and ships no CA —
+  connections dial straight through.
+
+  **Working under enforce: allow-list what your tooling needs.** Default-deny
+  means a fresh enforcing sandbox can reach *nothing* — including your package
+  mirror — so installs and fetches fail until you grant the hosts. Add them
+  first (e.g. `izba policy allow NAME archive.ubuntu.com` for apt on Ubuntu,
+  plus whatever package index or registry you use), or pre-seed them in
+  `policy.yaml`. `izba netlog NAME` lists exactly which endpoints were denied,
+  so the log tells you what to allow next.
 - **OCI → erofs + overlay rootfs.** Images are pulled, flattened to a single
   erofs image (read-only), and combined with a sparse ext4 rw disk via
   overlayfs inside the guest. The erofs is content-addressed and shared across
