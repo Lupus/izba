@@ -1,0 +1,12 @@
+ListenAddress 127.0.0.1:22
+HostKey /run/izba/ssh/ssh_host_ed25519_key
+AuthorizedKeysFile /run/izba/ssh/authorized_keys
+PidFile /run/izba/ssh/sshd.pid
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+ChrootDirectory /rootfs
+Subsystem sftp internal-sftp
+PrintMotd no
+AcceptEnv LANG LC_*

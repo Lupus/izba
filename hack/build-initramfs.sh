@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the izba initramfs: static izba-init (+ optional static mke2fs/nft).
+# Build the izba initramfs: static izba-init (+ optional static mke2fs/nft/sshd).
 #
 # Usage:
 #   hack/build-initramfs.sh [OUTPUT]
@@ -12,6 +12,10 @@
 #   IZBA_NFT=/path/to/static/nft  (optional, see hack/build-nft.sh)
 #       If set, the binary is embedded in /sbin/nft for the egress stub's
 #       TCP REDIRECT ruleset (M1 izbad-owned egress).
+#   IZBA_SSHD=/path/to/static/sshd  (optional, see hack/build-sshd.sh)
+#       If set, the binary is embedded in /sbin/sshd so izba-init can launch
+#       it on boot (SSH access feature).  hack/sshd_config is always copied to
+#       /etc/ssh/sshd_config regardless of whether IZBA_SSHD is set.
 set -euo pipefail
 
 # Always run from repo root so cargo can find the workspace.
@@ -47,7 +51,8 @@ trap 'rm -rf "$WORK"' EXIT
 
 # Minimal directory skeleton that izba-init expects to find at boot.
 mkdir -p "$WORK/sbin" "$WORK/proc" "$WORK/sys" "$WORK/dev" \
-         "$WORK/tmp" "$WORK/lower" "$WORK/upper" "$WORK/rootfs"
+         "$WORK/tmp" "$WORK/lower" "$WORK/upper" "$WORK/rootfs" \
+         "$WORK/etc/ssh" "$WORK/run/sshd"
 
 # /init must be at the root and executable.
 cp "$INIT_BIN" "$WORK/init"
@@ -74,6 +79,21 @@ if [[ -n "${IZBA_NFT:-}" ]]; then
     cp "$IZBA_NFT" "$WORK/sbin/nft"
     chmod 755 "$WORK/sbin/nft"
     echo "  embedded nft from $IZBA_NFT"
+fi
+
+# Always embed the static sshd_config into /etc/ssh/sshd_config.
+cp "$(dirname "$0")/sshd_config" "$WORK/etc/ssh/sshd_config"
+chmod 644 "$WORK/etc/ssh/sshd_config"
+
+# Optional static sshd — required for the SSH access feature.
+if [[ -n "${IZBA_SSHD:-}" ]]; then
+    if [[ ! -f "$IZBA_SSHD" ]]; then
+        echo "error: IZBA_SSHD='$IZBA_SSHD' does not exist" >&2
+        exit 1
+    fi
+    cp "$IZBA_SSHD" "$WORK/sbin/sshd"
+    chmod 755 "$WORK/sbin/sshd"
+    echo "  embedded sshd from $IZBA_SSHD"
 fi
 
 # Pack the tree into a newc cpio archive and gzip it.
