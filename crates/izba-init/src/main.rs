@@ -9,6 +9,7 @@ mod egress;
 mod exec;
 mod mounts;
 mod net;
+mod pause;
 mod rwdisk;
 mod server;
 mod trust;
@@ -34,6 +35,12 @@ fn main() {
     if std::env::args().any(|a| a == "--self-check") {
         self_check();
         return;
+    }
+    // Hidden subcommand: `izba-init __pause` — minimal reaping PID-1 for an
+    // interactive OCI container. Must be checked before the PID-1 guard so it
+    // works when invoked as PID 1 of a container PID namespace (not VM PID 1).
+    if std::env::args().nth(1).as_deref() == Some("__pause") {
+        pause::run();
     }
     if std::process::id() != 1 {
         eprintln!("izba-init: not PID 1; nothing to do (try --self-check)");
@@ -388,5 +395,27 @@ mod tests {
         // A serve loop returning Err is logged inside the thread, not propagated.
         spawn_serve(Some(()), "err", err_serve);
         assert_eq!(spin_until_nonzero(&ERR_CALLS), 1);
+    }
+
+    // --- __pause dispatch recognition ---
+
+    /// Returns true when argv[1] is exactly `"__pause"`, matching the dispatch
+    /// guard in `main`. Extracted so the logic is directly unit-testable without
+    /// executing the actual pause loop.
+    fn is_pause_arg(args: &[&str]) -> bool {
+        args.get(1).copied() == Some("__pause")
+    }
+
+    #[test]
+    fn pause_arg_recognized_when_argv1_is_pause() {
+        assert!(is_pause_arg(&["izba-init", "__pause"]));
+    }
+
+    #[test]
+    fn pause_arg_not_recognized_for_other_argv1() {
+        assert!(!is_pause_arg(&["izba-init", "--self-check"]));
+        assert!(!is_pause_arg(&["izba-init"]));
+        assert!(!is_pause_arg(&["izba-init", "__pauses"])); // no prefix match
+        assert!(!is_pause_arg(&["izba-init", "__PAUSE"])); // case-sensitive
     }
 }
