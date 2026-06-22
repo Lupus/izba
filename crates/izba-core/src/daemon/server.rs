@@ -1779,65 +1779,13 @@ mod tests {
 
     // ── SSH config regeneration (Task 12) ──────────────────────────────────────
     //
-    // Tests call `crate::ssh::config::regenerate` directly (the lighter path)
-    // and separately unit-test `registry.running_names` in registry.rs.
-    //
-    // HOME isolation: `regenerate` injects an Include line into $HOME/.ssh/config.
-    // We redirect HOME to a per-test tempdir so the real ~/.ssh/config is NEVER
-    // touched. Because Rust tests run concurrently, we scope the env override
-    // tightly: set it, call regenerate, then restore it before the tempdir drops.
-    // Using std::env::set_var is safe here because these tests do not share the
-    // HOME variable with other tests in a way that could race (they each get a
-    // distinct temp path, and neither test reads HOME before setting it).
+    // Tests call `crate::ssh::config::regenerate_with` directly, injecting a
+    // hermetic env closure that maps HOME/USERPROFILE to a per-test tempdir.
+    // No global env mutation — safe under parallel test execution.
 
-    /// Helper: set HOME (Unix) / USERPROFILE (Windows) to `dir`, returning the
-    /// old value so the caller can restore it.
-    #[cfg(unix)]
-    fn override_home(dir: &std::path::Path) -> Option<String> {
-        let old = std::env::var("HOME").ok();
-        // SAFETY: single-threaded section; tests using this helper must not
-        // run concurrently with each other. Each invocation uses a unique path
-        // so even under parallel execution the only hazard is a transient wrong
-        // HOME in the brief window — acceptable because we restore immediately
-        // after the single regenerate call.
-        unsafe {
-            std::env::set_var("HOME", dir);
-        }
-        old
-    }
-
-    #[cfg(unix)]
-    fn restore_home(old: Option<String>) {
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    fn override_home(dir: &std::path::Path) -> Option<String> {
-        let old = std::env::var("USERPROFILE").ok();
-        unsafe {
-            std::env::set_var("USERPROFILE", dir);
-        }
-        old
-    }
-
-    #[cfg(windows)]
-    fn restore_home(old: Option<String>) {
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("USERPROFILE", v),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-        }
-    }
-
-    /// When config_management is enabled (default), `regen_ssh_config` writes
+    /// When config_management is enabled (default), `regenerate_with` writes
     /// `<data>/ssh/config` containing `Host izba-<name>` stubs for running
-    /// sandboxes.
+    /// sandboxes and injects an Include line into the fake home's .ssh/config.
     #[test]
     fn regen_ssh_config_writes_managed_config_for_running_names() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1846,17 +1794,18 @@ mod tests {
         std::fs::create_dir_all(&ssh_dir).unwrap();
         // Default settings: config_management = true.
 
-        // Redirect HOME so the Include injection does not touch the real
-        // ~/.ssh/config.
         let fake_home = tempfile::tempdir().unwrap();
-        let old_home = override_home(fake_home.path());
+        let fake_home_path = fake_home.path().to_owned();
+        let env = |k: &str| -> Option<String> {
+            if k == "HOME" || k == "USERPROFILE" {
+                Some(fake_home_path.to_string_lossy().into_owned())
+            } else {
+                std::env::var(k).ok()
+            }
+        };
 
         let names: Vec<String> = vec!["alpha".into(), "beta".into()];
-        let result = crate::ssh::config::regenerate(&paths, &names);
-
-        restore_home(old_home);
-
-        result.unwrap();
+        crate::ssh::config::regenerate_with(&paths, &names, &env).unwrap();
 
         let managed = ssh_dir.join("config");
         assert!(managed.exists(), "managed config not written");
@@ -1870,9 +1819,18 @@ mod tests {
             body.contains("Host izba-*"),
             "wildcard block missing: {body}"
         );
+
+        // The Include line must have landed in the fake home's .ssh/config.
+        let user_cfg = fake_home.path().join(".ssh").join("config");
+        assert!(user_cfg.exists(), "user config not created in fake home");
+        let user_body = std::fs::read_to_string(&user_cfg).unwrap();
+        assert!(
+            user_body.contains("Include"),
+            "Include not injected into user config: {user_body}"
+        );
     }
 
-    /// When config_management is disabled, `regenerate` is a no-op — the
+    /// When config_management is disabled, `regenerate_with` is a no-op — the
     /// managed config file must NOT be created.
     #[test]
     fn regen_ssh_config_noop_when_config_management_disabled() {
@@ -1889,13 +1847,16 @@ mod tests {
         .unwrap();
 
         let fake_home = tempfile::tempdir().unwrap();
-        let old_home = override_home(fake_home.path());
+        let fake_home_path = fake_home.path().to_owned();
+        let env = |k: &str| -> Option<String> {
+            if k == "HOME" || k == "USERPROFILE" {
+                Some(fake_home_path.to_string_lossy().into_owned())
+            } else {
+                std::env::var(k).ok()
+            }
+        };
 
-        let result = crate::ssh::config::regenerate(&paths, &["foo".into()]);
-
-        restore_home(old_home);
-
-        result.unwrap();
+        crate::ssh::config::regenerate_with(&paths, &["foo".into()], &env).unwrap();
         assert!(
             !ssh_dir.join("config").exists(),
             "config must not be written when config_management=false"

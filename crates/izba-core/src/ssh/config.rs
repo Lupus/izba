@@ -5,20 +5,22 @@ use crate::paths::Paths;
 use crate::ssh::{identity, settings};
 use identity::SshIdentity;
 
-/// Returns `~/.ssh/config` on Unix, `%USERPROFILE%\.ssh\config` on Windows.
-pub fn user_ssh_config_path() -> Option<PathBuf> {
+/// Returns `~/.ssh/config` on Unix, `%USERPROFILE%\.ssh\config` on Windows,
+/// reading the home directory from `env`.
+pub fn user_ssh_config_path_with(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        std::env::var("USERPROFILE")
-            .ok()
-            .map(|p| PathBuf::from(p).join(".ssh").join("config"))
+        env("USERPROFILE").map(|p| PathBuf::from(p).join(".ssh").join("config"))
     }
     #[cfg(not(windows))]
     {
-        std::env::var("HOME")
-            .ok()
-            .map(|p| PathBuf::from(p).join(".ssh").join("config"))
+        env("HOME").map(|p| PathBuf::from(p).join(".ssh").join("config"))
     }
+}
+
+/// Returns `~/.ssh/config` on Unix, `%USERPROFILE%\.ssh\config` on Windows.
+pub fn user_ssh_config_path() -> Option<PathBuf> {
+    user_ssh_config_path_with(&|k| std::env::var(k).ok())
 }
 
 /// Pure function — no disk I/O.
@@ -101,10 +103,15 @@ pub fn ensure_include_line(user_config: &Path, include_target: &Path) -> anyhow:
     atomic_write(user_config, new_content.as_bytes())
 }
 
-/// Regenerate the izba-managed SSH config and inject the Include line.
+/// Regenerate the izba-managed SSH config and inject the Include line,
+/// reading the home directory via `env` instead of the process environment.
 ///
 /// Early-returns `Ok(())` if `config_management` is disabled in settings.
-pub fn regenerate(paths: &Paths, sandbox_names: &[String]) -> anyhow::Result<()> {
+pub fn regenerate_with(
+    paths: &Paths,
+    sandbox_names: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<()> {
     let ssh_dir = paths.ssh_dir();
     if !settings::load(&ssh_dir).config_management {
         return Ok(());
@@ -116,7 +123,7 @@ pub fn regenerate(paths: &Paths, sandbox_names: &[String]) -> anyhow::Result<()>
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("izba"));
     let managed = render_managed(&exe, &id, &known_hosts, sandbox_names);
     atomic_write(&ssh_dir.join("config"), managed.as_bytes())?;
-    if let Some(user_cfg) = user_ssh_config_path() {
+    if let Some(user_cfg) = user_ssh_config_path_with(env) {
         if let Some(parent) = user_cfg.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -124,6 +131,13 @@ pub fn regenerate(paths: &Paths, sandbox_names: &[String]) -> anyhow::Result<()>
         ensure_include_line(&user_cfg, &ssh_dir.join("config"))?;
     }
     Ok(())
+}
+
+/// Regenerate the izba-managed SSH config and inject the Include line.
+///
+/// Early-returns `Ok(())` if `config_management` is disabled in settings.
+pub fn regenerate(paths: &Paths, sandbox_names: &[String]) -> anyhow::Result<()> {
+    regenerate_with(paths, sandbox_names, &|k| std::env::var(k).ok())
 }
 
 #[cfg(test)]
