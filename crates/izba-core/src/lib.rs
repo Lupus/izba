@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod build_info;
 pub mod ca;
+pub mod ssh;
 pub mod cp;
 pub mod daemon;
 mod discover;
