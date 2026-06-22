@@ -128,6 +128,7 @@ integration test suite.
 izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [--volume [NAME:]GUEST_PATH:SIZE]... [--policy PATH] [DIR]
 izba run    [--image IMG] [NAME_OR_DIR] [-- CMD...]
 izba exec   NAME [-it] [-- CMD...]
+izba ssh    NAME [-- CMD...]            # ssh into a running sandbox (root shell in the workspace)
 izba cp     HOST_PATH NAME:GUEST_PATH   # or NAME:GUEST_PATH HOST_PATH; recursive
 izba port   publish|unpublish|ls NAME [RULE]   # TCP, runtime or create-time -p
 izba volume prune [-f]                  # remove persistent volumes no sandbox uses
@@ -152,6 +153,32 @@ Volume `SIZE` takes a `g` or `m` suffix (e.g. `10g`, `512m`). A named volume is
 persistent (lives under `<data>/volumes`, survives `rm`, single-writer); an
 anonymous volume (no `NAME:`) is ephemeral. `izba volume rm`/`prune` ask for
 confirmation on a terminal and otherwise need `-f/--force`.
+
+## SSH access (VS Code Remote-SSH, tmux, scp)
+
+Every running sandbox is reachable over SSH with zero setup. izba keeps a small
+managed block in your `~/.ssh/config` (via a single `Include`), so as soon as a
+sandbox is up you can:
+
+```
+ssh izba-<name>          # root shell in the sandbox, landing in /workspace
+```
+
+This rides the same NIC-less vsock transport as `izba exec` — there is no open
+network port — through an izba-managed `ProxyCommand`. A vendored static OpenSSH
+`sshd` runs inside the guest, isolated from your project image; the session is
+chrooted into your image so you get its shell, tools, `$HOME`, and volumes.
+Authentication uses an izba-managed key, so there are no prompts.
+
+Because it's real SSH, the editor and CLI ecosystem just works:
+
+- **VS Code Remote-SSH** — open host `izba-<name>` and edit/build/debug inside the microVM.
+- `scp` / `sftp`, `rsync`, `tmux`, long-lived interactive sessions.
+
+`izba ssh <name>` does the same thing as a one-shot command (and works even if
+config management is disabled). To keep izba out of your `~/.ssh/config`
+entirely, set `config_management: false` in `<data>/ssh/settings.json` — `izba
+ssh <name>` still works directly.
 
 ## Project layout
 
