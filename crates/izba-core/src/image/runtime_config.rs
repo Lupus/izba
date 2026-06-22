@@ -126,6 +126,31 @@ pub fn parse_numeric_user(user: &str) -> Option<(u32, u32)> {
 /// also exec's default cwd today.
 pub const INTERACTIVE_CWD: &str = "/workspace";
 
+/// Render the 6 canonical CA-bundle env pairs as `"KEY=VALUE"` strings for
+/// the OCI spec's process environment.
+///
+/// Keep in sync with `izba-init trust.rs::trust_env_pairs()`:
+/// - `NODE_EXTRA_CA_CERTS`/`DENO_CERT` → `/etc/izba/ca.pem` (add to built-in roots)
+/// - `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`/`GIT_SSL_CAINFO`
+///   → `/etc/izba/ca-bundle.pem` (replace trust set, so must include system roots)
+///
+/// `izba-core` cannot depend on `izba-init`, so the pairs are duplicated here.
+pub fn trust_env_strings() -> Vec<String> {
+    const CA_PEM: &str = "/etc/izba/ca.pem";
+    const CA_BUNDLE: &str = "/etc/izba/ca-bundle.pem";
+    [
+        ("NODE_EXTRA_CA_CERTS", CA_PEM),
+        ("DENO_CERT", CA_PEM),
+        ("SSL_CERT_FILE", CA_BUNDLE),
+        ("REQUESTS_CA_BUNDLE", CA_BUNDLE),
+        ("CURL_CA_BUNDLE", CA_BUNDLE),
+        ("GIT_SSL_CAINFO", CA_BUNDLE),
+    ]
+    .iter()
+    .map(|(k, v)| format!("{k}={v}"))
+    .collect()
+}
+
 /// Which process runs as the container's PID 1 (decision **D4**).
 pub enum ContainerMode<'a> {
     /// Interactive dev sandbox (izba's default): a pause process holds the

@@ -125,6 +125,15 @@ pub const STREAM_PORT: u32 = 1026;
 /// vsock convention, shared by Cloud Hypervisor and OpenVMM).
 pub const EGRESS_PORT: u32 = 1027;
 
+/// Guest-side path of the vendored pause binary that izba-init bind-mounts
+/// into the container (shared host↔guest contract: izba-core builds the OCI
+/// `config.json` pause_argv from this; izba-init places the binary here).
+pub const PAUSE_GUEST_PATH: &str = "/.izba/pause";
+
+/// virtiofs tag of the per-sandbox OCI bundle share (`oci/config.json`).
+/// The host side writes it; the guest mounts it as the OCI bundle dir for crun.
+pub const OCI_TAG: &str = "izba-oci";
+
 #[cfg(test)]
 mod tests {
     use super::*;
