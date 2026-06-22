@@ -84,6 +84,12 @@ pub fn sshd_argv() -> Vec<String> {
 /// best-effort — a missing privsep dir is non-fatal; sshd logs it),
 /// then spawns sshd as a fire-and-forget background thread. A dead sshd is
 /// non-fatal — errors are logged to the console but never panic or block boot.
+// reason: guest-only glue — materializes keys, force-roots the runtime dirs, and
+// fire-and-forget spawns the real sshd process inside the microVM. Not unit
+// testable on the host (chown-to-root needs uid 0; the spawn needs the guest);
+// `materialize` + `sshd_argv` are unit-tested and the whole path is covered by
+// the KVM/WHP e2e.
+#[mutants::skip]
 pub fn launch() {
     let share_dir = Path::new("/rootfs/izba-ssh");
     let run_dir = Path::new(RUN_DIR);
@@ -152,6 +158,9 @@ fn set_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
 /// Best-effort: ensure `path` exists and is owned by root:root with `mode`.
 /// Used to normalize the init-root SSH runtime dirs against the initramfs'
 /// non-root packing uid + init's umask, which OpenSSH would otherwise reject.
+// reason: chown-to-root side-effect glue — exercising it needs uid 0 and a real
+// filesystem (the guest); covered by the KVM/WHP e2e, not host unit tests.
+#[mutants::skip]
 #[cfg(unix)]
 fn force_root_dir(path: &str, mode: u32) {
     let _ = std::fs::create_dir_all(path);

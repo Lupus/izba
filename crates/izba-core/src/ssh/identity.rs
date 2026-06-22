@@ -48,6 +48,11 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+// reason: trivial Windows file-write variant (no permission logic to assert);
+// the behaviorally-meaningful unix variant + its 0600 test carry the coverage,
+// and cargo-mutants cannot see the #[cfg] so this would otherwise spuriously
+// survive on the Linux leg.
+#[mutants::skip]
 #[cfg(windows)]
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     std::fs::write(path, bytes).with_context(|| format!("creating {}", path.display()))?;
