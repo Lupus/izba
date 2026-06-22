@@ -86,12 +86,14 @@ pub fn ensure_include_line(user_config: &Path, include_target: &Path) -> anyhow:
         String::new()
     };
 
-    // Idempotency: if the include path already appears anywhere in the file, skip.
-    if existing.contains(target_str.as_ref()) {
+    // Idempotency: match the exact directive line we write so that the path
+    // appearing in a comment or HostName does not suppress a real injection.
+    let include_line = format!("Include \"{target_str}\"");
+    if existing.lines().any(|l| l.trim() == include_line) {
         return Ok(());
     }
 
-    let new_content = format!("Include \"{target_str}\"\n\n{existing}");
+    let new_content = format!("{include_line}\n\n{existing}");
     if let Some(parent) = user_config.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -116,7 +118,8 @@ pub fn regenerate(paths: &Paths, sandbox_names: &[String]) -> anyhow::Result<()>
     atomic_write(&ssh_dir.join("config"), managed.as_bytes())?;
     if let Some(user_cfg) = user_ssh_config_path() {
         if let Some(parent) = user_cfg.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
         ensure_include_line(&user_cfg, &ssh_dir.join("config"))?;
     }
@@ -179,6 +182,36 @@ mod tests {
         assert_eq!(body.matches("Include").count(), 1);
         assert!(body.contains("Host myserver")); // preserved
         assert!(body.starts_with("Include ")); // at top
+    }
+
+    #[test]
+    fn include_not_suppressed_by_path_in_comment() {
+        // Regression: old guard used `contains(path)` which matched path inside a comment.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        // User config whose body contains the managed path in a comment only.
+        let inc = Path::new("/data/ssh/config");
+        let initial = format!(
+            "# backup of {}\nHost myserver\n    HostName example.com\n",
+            inc.display()
+        );
+        std::fs::write(&cfg, &initial).unwrap();
+        ensure_include_line(&cfg, inc).unwrap();
+        let body = std::fs::read_to_string(&cfg).unwrap();
+        // The real Include directive must be present exactly once.
+        let include_line = format!("Include \"{}\"", inc.display());
+        assert_eq!(
+            body.lines().filter(|l| l.trim() == include_line).count(),
+            1,
+            "expected exactly one Include directive line; got:\n{body}"
+        );
+        // The comment must still be there.
+        assert!(body.contains("# backup of"), "comment was lost");
+        // The Include must be at the very top.
+        assert!(
+            body.starts_with(&include_line),
+            "Include not at top of file"
+        );
     }
 
     #[test]
