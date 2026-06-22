@@ -12,6 +12,9 @@
 #   IZBA_NFT=/path/to/static/nft  (optional, see hack/build-nft.sh)
 #       If set, the binary is embedded in /sbin/nft for the egress stub's
 #       TCP REDIRECT ruleset (M1 izbad-owned egress).
+#   IZBA_CRUN=/path/to/static/crun  (optional, see hack/build-crun.sh)
+#       If set, the binary is embedded in /sbin/crun — the OCI runtime izba
+#       runs the user's workload container under inside the guest (Stance B).
 set -euo pipefail
 
 # Always run from repo root so cargo can find the workspace.
@@ -74,6 +77,17 @@ if [[ -n "${IZBA_NFT:-}" ]]; then
     cp "$IZBA_NFT" "$WORK/sbin/nft"
     chmod 755 "$WORK/sbin/nft"
     echo "  embedded nft from $IZBA_NFT"
+fi
+
+# Optional static crun — the OCI runtime for the in-guest workload container.
+if [[ -n "${IZBA_CRUN:-}" ]]; then
+    if [[ ! -f "$IZBA_CRUN" ]]; then
+        echo "error: IZBA_CRUN='$IZBA_CRUN' does not exist" >&2
+        exit 1
+    fi
+    cp "$IZBA_CRUN" "$WORK/sbin/crun"
+    chmod 755 "$WORK/sbin/crun"
+    echo "  embedded crun from $IZBA_CRUN"
 fi
 
 # Pack the tree into a newc cpio archive and gzip it.
