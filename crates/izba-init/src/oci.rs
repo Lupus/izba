@@ -53,12 +53,17 @@ pub const CONTAINER_ID: &str = "izba";
 /// Path to the vendored static crun binary.
 pub const CRUN_PATH: &str = "/sbin/crun";
 
-/// Guest path for crun's stdout+stderr log (writable tmpfs is always mounted).
+/// Guest path for crun's structured `--log` (crun's own trace).
 pub const CRUN_LOG_PATH: &str = "/tmp/crun.log";
+
+/// Guest path for crun's (and the container process's) stdout+stderr — kept
+/// SEPARATE from `--log` so crun's `--log` truncation can't clobber the
+/// container process's own output (e.g. a pause panic).
+pub const CRUN_OUT_PATH: &str = "/tmp/crun.out";
 
 /// Maximum number of bytes to tail from `CRUN_LOG_PATH` when reporting a
 /// failed container start.
-const LOG_TAIL_BYTES: usize = 2048;
+const LOG_TAIL_BYTES: usize = 4096;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Cgroup manager detection
@@ -127,6 +132,14 @@ pub fn crun_run_argv(cgroup_manager: CgroupManager) -> Vec<String> {
         format!("--cgroup-manager={}", cgroup_manager.as_str()),
         "run".to_string(),
         "--detach".to_string(),
+        // izba-init runs on the INITRAMFS root (it mounts the overlay at
+        // /rootfs but never switch_roots into it), and the kernel refuses to
+        // pivot_root out of an initramfs. So crun must use MS_MOVE+chroot, not
+        // pivot_root, to enter the container rootfs. Verified on a real boot:
+        // without this, crun fails after "Running container on PID" with the
+        // error invisible (it happens post-pivot inside the container ns). The
+        // VM remains the security boundary, so chroot-vs-pivot is acceptable.
+        "--no-pivot".to_string(),
         // run-options (--detach, -b) MUST precede the positional CONTAINER_ID;
         // crun rejects options after the id ("`run` requires a maximum of 1
         // arguments"). Verified on a real boot.
@@ -304,11 +317,11 @@ pub fn launch_container() {
         .create(true)
         .write(true)
         .truncate(true)
-        .open(CRUN_LOG_PATH)
+        .open(CRUN_OUT_PATH)
     {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("izba-init: [OCI] cannot open {CRUN_LOG_PATH}: {e}; crun output lost");
+            eprintln!("izba-init: [OCI] cannot open {CRUN_OUT_PATH}: {e}; crun output lost");
             // Fall back: we can still launch crun, its output goes nowhere.
             // Build a /dev/null fallback.
             match std::fs::OpenOptions::new().write(true).open("/dev/null") {
@@ -341,9 +354,12 @@ pub fn launch_container() {
         }
         Ok(code) => {
             let tail = read_log_tail(CRUN_LOG_PATH, LOG_TAIL_BYTES);
+            let out = read_log_tail(CRUN_OUT_PATH, LOG_TAIL_BYTES);
             eprintln!(
                 "izba-init: [OCI] *** CONTAINER START FAILED *** crun exited with code {code}"
             );
+            eprintln!("izba-init: [OCI] --- crun stdio tail ({CRUN_OUT_PATH}) ---");
+            eprintln!("{out}");
             eprintln!("izba-init: [OCI] --- crun log tail ({CRUN_LOG_PATH}) ---");
             eprintln!("{tail}");
             eprintln!("izba-init: [OCI] --- end crun log ---");
@@ -500,11 +516,12 @@ mod tests {
         assert_eq!(argv[2], "--cgroup-manager=cgroupfs");
         assert_eq!(argv[3], "run");
         assert_eq!(argv[4], "--detach");
+        assert_eq!(argv[5], "--no-pivot");
         // run-options before the positional id (crun rejects the reverse).
-        assert_eq!(argv[5], "-b");
-        assert_eq!(argv[6], BUNDLE_MOUNT);
-        assert_eq!(argv[7], CONTAINER_ID);
-        assert_eq!(argv.len(), 8);
+        assert_eq!(argv[6], "-b");
+        assert_eq!(argv[7], BUNDLE_MOUNT);
+        assert_eq!(argv[8], CONTAINER_ID);
+        assert_eq!(argv.len(), 9);
     }
 
     #[test]
@@ -514,20 +531,22 @@ mod tests {
         // Rest of argv is identical to cgroupfs branch.
         assert_eq!(argv[3], "run");
         assert_eq!(argv[4], "--detach");
+        assert_eq!(argv[5], "--no-pivot");
         // run-options before the positional id (crun rejects the reverse).
-        assert_eq!(argv[5], "-b");
-        assert_eq!(argv[6], BUNDLE_MOUNT);
-        assert_eq!(argv[7], CONTAINER_ID);
+        assert_eq!(argv[6], "-b");
+        assert_eq!(argv[7], BUNDLE_MOUNT);
+        assert_eq!(argv[8], CONTAINER_ID);
     }
 
     #[test]
-    fn crun_run_argv_no_no_pivot() {
-        // The production config uses the overlay root which supports pivot_root;
-        // --no-pivot must NOT be present.
+    fn crun_run_argv_has_no_pivot() {
+        // izba-init runs on the initramfs root, which cannot be pivot_root'd out
+        // of, so crun MUST use --no-pivot (MS_MOVE+chroot). Verified on a real
+        // boot: without it the container fails to start.
         let argv = crun_run_argv(CgroupManager::Cgroupfs);
         assert!(
-            !argv.iter().any(|a| a == "--no-pivot"),
-            "--no-pivot must not appear in the production argv"
+            argv.iter().any(|a| a == "--no-pivot"),
+            "--no-pivot is required (init runs on the initramfs root)"
         );
     }
 
