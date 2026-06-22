@@ -161,6 +161,14 @@ pub fn parse_crun_state_running(json: &str) -> bool {
 /// JSON parser.  Returns `None` when the key is absent or the value is not a
 /// simple quoted string.
 fn extract_status_field(json: &str) -> Option<&str> {
+    // Parser assumption: we return the value of the FIRST `"status"` occurrence
+    // in the JSON text.  This is correct for crun's OCI state JSON because no
+    // earlier field name or string value contains the literal substring
+    // `"status"` — the field always appears at the top level and is the only
+    // occurrence.  The extracted value is then compared exactly to `"running"`,
+    // so transitional/other states ("created", "stopped", "paused", "creating")
+    // all correctly map to not-running.
+    //
     // Look for `"status"` followed by optional whitespace, `:`, optional
     // whitespace, and a quoted string value.
     let key_pos = json.find("\"status\"")?;
@@ -297,6 +305,28 @@ pub fn launch_container() {
 /// # Safety
 /// The caller must ensure `log_fd` is a valid, open file descriptor.
 unsafe fn launch_crun_child(argv: &[String], log_fd: libc::c_int) -> std::io::Result<i32> {
+    // Build the CString argv and the pointer array BEFORE fork so the child
+    // never allocates or panics (inheriting the parent's malloc locks would be
+    // unsafe in a multi-threaded PID-1).  If any argument contains an interior
+    // NUL (impossible with our static argv, but handle it honestly), fail in
+    // the parent before forking.
+    let c_strings: Vec<std::ffi::CString> = argv
+        .iter()
+        .map(|s| {
+            std::ffi::CString::new(s.as_str()).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("argv contains interior NUL: {e}"),
+                )
+            })
+        })
+        .collect::<std::io::Result<_>>()?;
+    let mut c_ptrs: Vec<*const libc::c_char> = c_strings
+        .iter()
+        .map(|cs| cs.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+
     let pid = libc::fork();
     if pid < 0 {
         return Err(std::io::Error::last_os_error());
@@ -307,18 +337,8 @@ unsafe fn launch_crun_child(argv: &[String], log_fd: libc::c_int) -> std::io::Re
         libc::dup2(log_fd, libc::STDERR_FILENO);
         libc::close(log_fd);
 
-        // Build CString argv for execv.
-        let c_strings: Vec<_> = argv
-            .iter()
-            .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
-            .collect();
-        let c_ptrs: Vec<_> = c_strings
-            .iter()
-            .map(|cs| cs.as_ptr())
-            .chain(std::iter::once(std::ptr::null()))
-            .collect();
-
-        libc::execv(c_ptrs[0], c_ptrs.as_ptr());
+        // argv and pointer array are already built; no allocation here.
+        libc::execv(c_ptrs[0], c_ptrs.as_mut_ptr());
         // execv failed; write to the log (which is on fd 1/2 now) and exit.
         let msg = b"execv failed\n";
         libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
