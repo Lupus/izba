@@ -101,10 +101,23 @@ pub fn launch() {
         return;
     }
 
-    // Create the sshd privilege-separation directory (0755). Best-effort:
-    // a missing privsep dir is non-fatal; sshd logs it and may still start.
-    let _ = std::fs::create_dir_all("/run/sshd")
-        .and_then(|()| set_permissions(Path::new("/run/sshd"), 0o755));
+    // Normalize ownership/modes of the init-root SSH runtime directories.
+    //
+    // OpenSSH is strict about two things and rejects either with a fatal error
+    // (privsep dir) or an auth refusal (StrictModes walking the authorized_keys
+    // path): every directory must be owned by root and not group/world-writable.
+    // The initramfs cpio is packed as the (non-root) build user, so a shipped
+    // dir like /run carries a non-root owner; and dirs created at boot inherit
+    // init's umask for their mode. init is PID 1 (uid 0), so we force the whole
+    // chain to root:root with explicit modes. Best-effort — a failure here just
+    // means sshd will log its own refusal.
+    //   /run, /run/izba       0755 (path components, world-readable, not -writable)
+    //   /run/izba/ssh         0700 (host key + authorized_keys live here)
+    //   /run/sshd             0755 (sshd privilege-separation chroot dir)
+    force_root_dir("/run", 0o755);
+    force_root_dir("/run/izba", 0o755);
+    force_root_dir(RUN_DIR, 0o700);
+    force_root_dir("/run/sshd", 0o755);
 
     eprintln!("izba-init: starting sshd");
     std::thread::spawn(move || {
@@ -135,6 +148,24 @@ fn set_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
 fn set_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
+
+/// Best-effort: ensure `path` exists and is owned by root:root with `mode`.
+/// Used to normalize the init-root SSH runtime dirs against the initramfs'
+/// non-root packing uid + init's umask, which OpenSSH would otherwise reject.
+#[cfg(unix)]
+fn force_root_dir(path: &str, mode: u32) {
+    let _ = std::fs::create_dir_all(path);
+    let _ = nix::unistd::chown(
+        path,
+        Some(nix::unistd::Uid::from_raw(0)),
+        Some(nix::unistd::Gid::from_raw(0)),
+    );
+    let _ = set_permissions(Path::new(path), mode);
+}
+
+/// No-op on non-Unix targets (Windows cross-compile gate).
+#[cfg(not(unix))]
+fn force_root_dir(_path: &str, _mode: u32) {}
 
 #[cfg(test)]
 mod tests {

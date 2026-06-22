@@ -183,9 +183,14 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - **virtiofs tag** `workspace` (driver `FsShare` ↔ init mount plan) →
   `/workspace` inside the guest, which is also exec's default cwd.
 - **SSH access (`ssh izba-<name>`):** a vendored static OpenSSH `sshd`
-  (sha-pinned `hack/build-sshd.sh`, embedded via `IZBA_SSHD` into the initramfs
-  at `/sbin/sshd` + static `/etc/ssh/sshd_config`) is launched by `izba-init`
-  (`ssh.rs`) bound to `127.0.0.1:22`. Its host key + `authorized_keys` are
+  (sha-pinned `hack/build-sshd.sh`, OpenSSH 9.9p2) is launched by `izba-init`
+  (`ssh.rs`) bound to `127.0.0.1:22`. The initramfs ships, all izba-controlled:
+  `/sbin/sshd` + the 9.8-split re-exec worker `/usr/libexec/sshd-session`
+  (both `IZBA_SSHD`-embedded), the static `/etc/ssh/sshd_config`, and a minimal
+  `/etc/passwd`+`/etc/group` (sshd fatally needs the `sshd` privsep user + a
+  `root` login user). The initramfs cpio is packed `--owner=0:0` and init
+  force-roots `/run`,`/run/izba/ssh`,`/run/sshd` — sshd's StrictModes rejects a
+  non-root path up to `/`, and the build runs unprivileged. Its host key + `authorized_keys` are
   delivered host→guest through the **optional `izba-ssh` virtiofs share**
   (`<sandbox>/ssh/` ↔ `/rootfs/izba-ssh`, mirroring the `izba-trust` channel),
   then copied by init to **init-root `/run/izba/ssh/` (0600), OUTSIDE the

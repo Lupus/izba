@@ -89,7 +89,31 @@ fi
 cp "$SCRIPT_DIR/sshd_config" "$WORK/etc/ssh/sshd_config"
 chmod 644 "$WORK/etc/ssh/sshd_config"
 
+# Minimal user database for the vendored sshd. OpenSSH fatally exits at startup
+# if the privilege-separation user ("sshd") is absent, and it must getpwnam the
+# login user ("root") before chrooting the session into /rootfs. These live in
+# the izba-controlled initramfs root (NOT the OCI overlay), so they are present
+# regardless of the project image. root's shell/home (/bin/sh, /root) are
+# resolved here pre-chroot and exec'd relative to ChrootDirectory /rootfs, where
+# /bin/sh + /root exist in any normal image.
+cat > "$WORK/etc/passwd" <<'PASSWD'
+root:x:0:0:root:/root:/bin/sh
+sshd:x:74:74:Privilege-separated SSH:/run/sshd:/sbin/nologin
+PASSWD
+chmod 644 "$WORK/etc/passwd"
+cat > "$WORK/etc/group" <<'GROUP'
+root:x:0:
+sshd:x:74:
+GROUP
+chmod 644 "$WORK/etc/group"
+
 # Optional static sshd — required for the SSH access feature.
+#
+# OpenSSH 9.8+ splits sshd into the listener (`sshd`) and a per-session worker
+# (`sshd-session`); the listener re-execs the worker by its compile-time libexec
+# path (/usr/libexec/sshd-session, set via build-sshd.sh's --prefix=/usr). Both
+# must be embedded. build-sshd.sh emits them side by side, so we take
+# sshd-session from the same directory as IZBA_SSHD.
 if [[ -n "${IZBA_SSHD:-}" ]]; then
     if [[ ! -f "$IZBA_SSHD" ]]; then
         echo "error: IZBA_SSHD='$IZBA_SSHD' does not exist" >&2
@@ -98,6 +122,17 @@ if [[ -n "${IZBA_SSHD:-}" ]]; then
     cp "$IZBA_SSHD" "$WORK/sbin/sshd"
     chmod 755 "$WORK/sbin/sshd"
     echo "  embedded sshd from $IZBA_SSHD"
+
+    sshd_session="$(dirname "$IZBA_SSHD")/sshd-session"
+    if [[ ! -f "$sshd_session" ]]; then
+        echo "error: sshd-session not found next to IZBA_SSHD at '$sshd_session'" >&2
+        echo "       (build-sshd.sh emits sshd + sshd-session together)" >&2
+        exit 1
+    fi
+    mkdir -p "$WORK/usr/libexec"
+    cp "$sshd_session" "$WORK/usr/libexec/sshd-session"
+    chmod 755 "$WORK/usr/libexec/sshd-session"
+    echo "  embedded sshd-session from $sshd_session"
 fi
 
 # Pack the tree into a newc cpio archive and gzip it.
@@ -106,9 +141,16 @@ fi
 # leading './' is stripped from paths by cpio's own output, giving correct
 # /init, /sbin/mke2fs, etc. entries without a double-slash prefix.
 #
+# `--owner=0:0` forces every entry (including '/') to root:root. The build runs
+# as a non-root user, so without this the unpacked initramfs root and its dirs
+# are owned by the builder's uid — which the vendored sshd's StrictModes rejects
+# when it walks the authorized_keys path up to '/'. A root-owned initramfs is
+# also simply correct (init runs as root). Owner normalization keeps the archive
+# reproducible across build users too.
+#
 # Sorting the find output makes the archive reproducible.
 echo "Packing initramfs..."
-( cd "$WORK" && find . | LC_ALL=C sort | cpio -o -H newc --quiet | gzip -9 ) > "$OUTPUT"
+( cd "$WORK" && find . | LC_ALL=C sort | cpio -o -H newc --quiet --owner=0:0 | gzip -9 ) > "$OUTPUT"
 
 SIZE="$(du -sh "$OUTPUT" | cut -f1)"
 echo "wrote $OUTPUT  ($SIZE)"
