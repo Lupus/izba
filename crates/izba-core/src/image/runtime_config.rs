@@ -8,7 +8,48 @@
 
 use anyhow::{bail, Result};
 use oci_client::config::Config;
-use oci_spec::runtime::{LinuxNamespaceType, ProcessBuilder, RootBuilder, Spec, UserBuilder};
+use oci_spec::runtime::{
+    Capability, LinuxCapabilitiesBuilder, LinuxNamespaceType, ProcessBuilder, RootBuilder, Spec,
+    UserBuilder,
+};
+use std::collections::HashSet;
+
+/// The docker-default capability set for the container's root process.
+///
+/// `Spec::default()` ships only the OCI minimal example set (AuditWrite, Kill,
+/// NetBindService), which lacks `CAP_DAC_OVERRIDE` etc. — so container-root
+/// cannot even write the host-owned virtiofs `/workspace`. We instead grant the
+/// same set Docker grants by default: enough for a normal root workload (chown,
+/// dac-override, setuid/gid, mknod, …) while still dropping the dangerous caps
+/// (SYS_ADMIN, SYS_PTRACE, …). The in-guest container is HARDENING/least-
+/// privilege, not the security boundary (the VM is) — this matches that stance.
+fn docker_default_caps() -> Result<oci_spec::runtime::LinuxCapabilities> {
+    let set: HashSet<Capability> = [
+        Capability::AuditWrite,
+        Capability::Chown,
+        Capability::DacOverride,
+        Capability::Fowner,
+        Capability::Fsetid,
+        Capability::Kill,
+        Capability::Mknod,
+        Capability::NetBindService,
+        Capability::NetRaw,
+        Capability::Setfcap,
+        Capability::Setgid,
+        Capability::Setpcap,
+        Capability::Setuid,
+        Capability::SysChroot,
+    ]
+    .into_iter()
+    .collect();
+    Ok(LinuxCapabilitiesBuilder::default()
+        .bounding(set.clone())
+        .effective(set.clone())
+        .permitted(set)
+        .inheritable(HashSet::new())
+        .ambient(HashSet::new())
+        .build()?)
+}
 
 /// The container rootfs inside the guest — the overlay init mounts at `/rootfs`
 /// (erofs lower + ext4 upper). Workspace and user volumes are submounts under
@@ -236,6 +277,7 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
         .env(env)
         .cwd(cwd)
         .user(user)
+        .capabilities(docker_default_caps()?)
         .build()?;
     let root = RootBuilder::default()
         .path(CONTAINER_ROOTFS)
@@ -574,5 +616,27 @@ mod tests {
         let env = spec.process().as_ref().unwrap().env().clone().unwrap();
         assert!(env.contains(&"SSL_CERT_FILE=/etc/izba/ca.pem".to_string()));
         assert!(env.contains(&"PATH=/usr/bin".to_string()));
+    }
+
+    #[test]
+    fn spec_grants_docker_default_caps_incl_dac_override() {
+        // Without DAC_OVERRIDE the container root cannot write the host-owned
+        // virtiofs /workspace (verified on a real boot). The minimal OCI default
+        // set lacks it, so generate_spec must grant the docker-default set.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let spec = generate_spec(&base_params(&img)).unwrap();
+        let proc = spec.process().clone().unwrap();
+        let caps = proc.capabilities().clone().expect("capabilities set");
+        for set in [caps.bounding(), caps.effective(), caps.permitted()] {
+            let set = set.as_ref().expect("cap set present");
+            assert!(
+                set.contains(&Capability::DacOverride),
+                "DAC_OVERRIDE must be granted (workspace writes)"
+            );
+            assert!(set.contains(&Capability::Chown));
+            assert!(set.contains(&Capability::Setuid));
+            // dangerous caps stay dropped — the VM is the boundary.
+            assert!(!set.contains(&Capability::SysAdmin));
+        }
     }
 }
