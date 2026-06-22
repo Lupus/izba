@@ -207,6 +207,12 @@ enum Cmd {
         /// Sandbox name
         name: String,
     },
+    /// Internal: ssh ProxyCommand bridge (stdio <-> guest :22 over vsock).
+    #[command(hide = true, name = "__ssh-proxy")]
+    SshProxy {
+        /// SSH host alias (izba-<name> or just <name>)
+        host_alias: String,
+    },
     /// Remove orphaned izba lock-down accounts/firewall rules with no live
     /// sandbox (Windows). Pops a UAC prompt.
     WindowsCleanup,
@@ -275,6 +281,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             DaemonCmd::Status => commands::daemon::status(paths),
             DaemonCmd::Stop => commands::daemon::stop(paths),
         },
+        Cmd::SshProxy { host_alias } => commands::ssh_proxy::run(paths, &host_alias),
         Cmd::Reconcile { json } => commands::reconcile::run(paths, json),
         Cmd::Lockdown { name } => commands::lockdown::run(paths, &name),
         Cmd::Unlock { name } => commands::lockdown::unlock(paths, &name),
