@@ -45,8 +45,21 @@ pub fn materialize(share_dir: &Path, run_dir: &Path) -> std::io::Result<bool> {
     std::fs::copy(&host_key_src, &host_key_dst)?;
     set_permissions(&host_key_dst, 0o600)?;
 
-    // Copy authorized_keys with strict permissions (0600).
+    // Copy authorized_keys with strict permissions (0600). The host writes the
+    // host key and authorized_keys together (write_ssh_material), so a host key
+    // without authorized_keys means a partial/corrupt delivery — surface that
+    // explicitly rather than letting std::fs::copy emit a bare ENOENT that
+    // doesn't say which file is missing.
     let auth_keys_src = share_dir.join("authorized_keys");
+    if !auth_keys_src.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "authorized_keys missing from ssh share ({}); host key present but keys incomplete",
+                auth_keys_src.display()
+            ),
+        ));
+    }
     let auth_keys_dst = run_dir.join("authorized_keys");
     std::fs::copy(&auth_keys_src, &auth_keys_dst)?;
     set_permissions(&auth_keys_dst, 0o600)?;
