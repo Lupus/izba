@@ -18,8 +18,12 @@
 #       /etc/ssh/sshd_config regardless of whether IZBA_SSHD is set.
 set -euo pipefail
 
+# Capture the script directory before any cd so $0-relative paths stay valid
+# even when the script is invoked as e.g. "cd hack && ./build-initramfs.sh".
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 # Always run from repo root so cargo can find the workspace.
-cd "$(dirname "$0")/.."
+cd "$SCRIPT_DIR/.."
 
 # Source the repo-local cargo/rustup if present.
 # shellcheck disable=SC1091
@@ -82,7 +86,7 @@ if [[ -n "${IZBA_NFT:-}" ]]; then
 fi
 
 # Always embed the static sshd_config into /etc/ssh/sshd_config.
-cp "$(dirname "$0")/sshd_config" "$WORK/etc/ssh/sshd_config"
+cp "$SCRIPT_DIR/sshd_config" "$WORK/etc/ssh/sshd_config"
 chmod 644 "$WORK/etc/ssh/sshd_config"
 
 # Optional static sshd — required for the SSH access feature.
