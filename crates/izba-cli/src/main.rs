@@ -207,6 +207,14 @@ enum Cmd {
         /// Sandbox name
         name: String,
     },
+    /// SSH into a running sandbox (uses the system ssh client).
+    Ssh {
+        /// Sandbox name
+        name: String,
+        /// Command to run (and its arguments) inside the sandbox
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
     /// Internal: ssh ProxyCommand bridge (stdio <-> guest :22 over vsock).
     #[command(hide = true, name = "__ssh-proxy")]
     SshProxy {
@@ -281,6 +289,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             DaemonCmd::Status => commands::daemon::status(paths),
             DaemonCmd::Stop => commands::daemon::stop(paths),
         },
+        Cmd::Ssh { name, cmd } => commands::ssh::run(paths, &name, cmd),
         Cmd::SshProxy { host_alias } => commands::ssh_proxy::run(paths, &host_alias),
         Cmd::Reconcile { json } => commands::reconcile::run(paths, json),
         Cmd::Lockdown { name } => commands::lockdown::run(paths, &name),
