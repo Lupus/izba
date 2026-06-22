@@ -18,11 +18,6 @@ pub fn user_ssh_config_path_with(env: &dyn Fn(&str) -> Option<String>) -> Option
     }
 }
 
-/// Returns `~/.ssh/config` on Unix, `%USERPROFILE%\.ssh\config` on Windows.
-pub fn user_ssh_config_path() -> Option<PathBuf> {
-    user_ssh_config_path_with(&|k| std::env::var(k).ok())
-}
-
 /// Pure function — no disk I/O.
 ///
 /// Renders the full text of the izba-managed SSH config file:
@@ -136,6 +131,10 @@ pub fn regenerate_with(
 /// Regenerate the izba-managed SSH config and inject the Include line.
 ///
 /// Early-returns `Ok(())` if `config_management` is disabled in settings.
+// reason: thin wrapper that binds `regenerate_with` to the real process env;
+// the logic is unit-tested through `regenerate_with` with an injected env, and
+// calling this directly in a test would mutate the real ~/.ssh/config.
+#[mutants::skip]
 pub fn regenerate(paths: &Paths, sandbox_names: &[String]) -> anyhow::Result<()> {
     regenerate_with(paths, sandbox_names, &|k| std::env::var(k).ok())
 }

@@ -57,4 +57,13 @@ mod tests {
         std::fs::write(tmp.path().join("settings.json"), b"{ not json").unwrap();
         assert!(load(tmp.path()).config_management);
     }
+
+    #[test]
+    fn omitted_field_deserializes_to_default_true() {
+        // A valid settings file that simply omits `config_management` must
+        // deserialize with it ON (the serde `default = "default_true"` seam),
+        // not OFF — silently disabling SSH config management would be a footgun.
+        let s: SshSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.config_management);
+    }
 }

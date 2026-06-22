@@ -373,6 +373,10 @@ fn dispatch_inner(
 /// Best-effort: regenerate the izba-managed ~/.ssh/config from the set of
 /// non-stopped sandboxes. A failure (perms, read-only HOME) is logged and
 /// never fails the lifecycle — same posture as relays/egress.
+// reason: daemon-wired glue (registry.running_names → ssh::config::regenerate,
+// best-effort/log-only). running_names + the regeneration logic (regenerate_with)
+// are unit-tested; invoking this directly would write the real ~/.ssh.
+#[mutants::skip]
 fn regen_ssh_config(d: &Arc<Daemon>) {
     let names = d.registry.running_names();
     if let Err(e) = crate::ssh::config::regenerate(&d.paths, &names) {

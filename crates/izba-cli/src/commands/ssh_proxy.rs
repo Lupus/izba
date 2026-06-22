@@ -79,6 +79,11 @@ pub fn splice(
     let _ = bg.join();
 }
 
+// reason: opens a guest stream through a live izbad and splices process stdio;
+// not unit-testable on hosted runners. The two unit-testable pieces — the
+// stdio splice (`splice`) and the alias→name mapping (`sandbox_name_from_alias`)
+// — are covered by tests; the daemon stream path is exercised by KVM-gated e2e.
+#[mutants::skip]
 pub fn run(paths: &Paths, host_alias: &str) -> anyhow::Result<i32> {
     let name = sandbox_name_from_alias(host_alias);
     let mut conn = DaemonClient::open_guest_stream(paths, name)?;

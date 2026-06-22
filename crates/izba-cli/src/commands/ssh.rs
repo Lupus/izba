@@ -51,6 +51,10 @@ pub fn build_ssh_args(paths: &Paths, name: &str, extra: &[String]) -> Vec<String
     args
 }
 
+// reason: execs the system `ssh` client as a real subprocess and forwards its
+// exit code; not unit-testable. The argument construction is covered by the
+// build_ssh_args tests.
+#[mutants::skip]
 pub fn run(paths: &Paths, name: &str, extra: Vec<String>) -> anyhow::Result<i32> {
     izba_core::ssh::identity::ensure_identity(&paths.ssh_dir())?;
     let args = build_ssh_args(paths, name, &extra);

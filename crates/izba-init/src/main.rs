@@ -69,6 +69,10 @@ fn self_check() {
     println!("self-check OK");
 }
 
+// reason: PID 1 boot sequence — mounts, overlay, vsock servers, sshd/egress
+// launch. Runs only inside a real microVM; exercised by the KVM/WHP e2e, never
+// by host unit tests (main.rs is the crate's one non-host-testable file).
+#[mutants::skip]
 fn run_pid1() -> anyhow::Result<()> {
     // Pin the uptime origin (server::START is lazy) to boot time.
     let _ = *server::START;
