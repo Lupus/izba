@@ -97,6 +97,17 @@ pub fn rootfs_mount_plan() -> Vec<MountOp> {
             "",
         )
         .optional(),
+        // The SSH host key + authorized_keys, delivered read-only for sshd setup.
+        // Optional: the share is only attached when SSH is configured; a missing
+        // tag fails-soft instead of aborting boot.
+        MountOp::new(
+            crate::ssh::SSH_TAG,
+            "/rootfs/izba-ssh",
+            "virtiofs",
+            &["ro"],
+            "",
+        )
+        .optional(),
         // OCI bundle share: the host delivers config.json (and the absolute
         // root.path = /rootfs) over this read-only virtiofs tag.  Optional so
         // a sandbox without a crun OCI config (pre-M2 launch or a bare shell)
@@ -310,8 +321,8 @@ mod tests {
         let p = rootfs_mount_plan();
         // Stance B: crun owns the container's proc/sys/dev/tmp/devpts, so the
         // plan is only the overlay stack + the virtiofs shares: vda(lower),
-        // vdb(upper), overlay, workspace, izba-trust, izba-oci = 6 ops.
-        assert_eq!(p.len(), 6);
+        // vdb(upper), overlay, workspace, izba-trust, izba-ssh, izba-oci = 7 ops.
+        assert_eq!(p.len(), 7);
         assert_eq!(op(&p, 0), ("/dev/vda", "/lower", "erofs", vec!["ro"], ""));
         assert_eq!(op(&p, 1), ("/dev/vdb", "/upper", "ext4", vec![], ""));
         assert_eq!(
@@ -340,6 +351,10 @@ mod tests {
         );
         assert_eq!(
             op(&p, 5),
+            ("izba-ssh", "/rootfs/izba-ssh", "virtiofs", vec!["ro"], "")
+        );
+        assert_eq!(
+            op(&p, 6),
             (
                 izba_proto::OCI_TAG,
                 crate::oci::BUNDLE_MOUNT,
@@ -387,8 +402,8 @@ mod tests {
         assert!(trust.optional, "trust share must fail-soft when absent");
         assert!(trust.flags.iter().any(|f| f == "ro"));
         assert_eq!(trust.target, PathBuf::from("/rootfs/izba-trust"));
-        // Both the trust share and the OCI bundle share are optional.
-        assert_eq!(p.iter().filter(|o| o.optional).count(), 2);
+        // The trust, izba-ssh and OCI bundle shares are all optional.
+        assert_eq!(p.iter().filter(|o| o.optional).count(), 3);
     }
 
     #[test]
@@ -410,6 +425,23 @@ mod tests {
             "OCI bundle share target must match BUNDLE_MOUNT"
         );
         assert_eq!(oci.fstype, "virtiofs");
+    }
+
+    /// The optional izba-ssh share must be present, read-only, and optional.
+    #[test]
+    fn ssh_share_is_optional_and_read_only() {
+        let p = rootfs_mount_plan();
+        let ssh = p
+            .iter()
+            .find(|o| o.source == crate::ssh::SSH_TAG)
+            .expect("izba-ssh share must be present in the rootfs plan");
+        assert!(ssh.optional, "izba-ssh share must fail-soft when absent");
+        assert!(
+            ssh.flags.iter().any(|f| f == "ro"),
+            "izba-ssh must be read-only"
+        );
+        assert_eq!(ssh.target, std::path::PathBuf::from("/rootfs/izba-ssh"));
+        assert_eq!(ssh.fstype, "virtiofs");
     }
 
     #[test]

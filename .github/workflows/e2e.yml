@@ -72,9 +72,26 @@ jobs:
           path: dist/nft
           if-no-files-found: error
 
+  sshd:
+    name: static sshd (pinned OpenSSH 9.9p2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      # docker + file are preinstalled on ubuntu-latest; build-sshd.sh builds
+      # the static OpenSSH sshd in a digest-pinned Alpine container.
+      - run: hack/build-sshd.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sshd
+          path: |
+            dist/sshd
+            dist/sshd-session
+          if-no-files-found: error
+
   initramfs:
-    name: initramfs (izba-init + embedded mke2fs + nft)
-    needs: [mke2fs, nft]
+    name: initramfs (izba-init + embedded mke2fs + nft + sshd)
+    needs: [mke2fs, nft, sshd]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -93,7 +110,11 @@ jobs:
         with:
           name: nft
           path: dist/
-      - name: Build initramfs with embedded mke2fs + nft
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sshd
+          path: dist/
+      - name: Build initramfs with embedded mke2fs + nft + sshd
         run: |
           files=(dist/mke2fs-*-static-x86_64)
           if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
@@ -101,8 +122,10 @@ jobs:
             exit 1
           fi
           [ -f dist/nft ] || { echo "expected dist/nft from the nft job" >&2; exit 1; }
-          chmod 755 "${files[0]}" dist/nft
-          IZBA_MKE2FS="${files[0]}" IZBA_NFT=dist/nft hack/build-initramfs.sh
+          [ -f dist/sshd ] || { echo "expected dist/sshd from the sshd job" >&2; exit 1; }
+          [ -f dist/sshd-session ] || { echo "expected dist/sshd-session from the sshd job" >&2; exit 1; }
+          chmod 755 "${files[0]}" dist/nft dist/sshd dist/sshd-session
+          IZBA_MKE2FS="${files[0]}" IZBA_NFT=dist/nft IZBA_SSHD=dist/sshd hack/build-initramfs.sh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: initramfs
@@ -179,7 +202,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             curl tar make gcc autoconf automake libtool-bin pkg-config patch \
-            unzip file
+            unzip file openssh-client
           mkdir -p "$HOME/.local/bin"
           IZBA_BIN_DIR="$HOME/.local/bin" hack/fetch-artifacts.sh || true
           hack/build-mkfs-erofs-windows.sh --linux-only
@@ -191,6 +214,8 @@ jobs:
             command -v "$t" || { echo "missing $t" >&2; exit 1; }
           done
           mkfs.erofs --version
+      - name: Ensure ssh client present
+        run: command -v ssh >/dev/null || sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-client
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: vmlinux

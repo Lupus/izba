@@ -1,0 +1,18 @@
+# TCP forwarding is intentionally left at the OpenSSH default (enabled): VS Code
+# Remote-SSH port-forwarding requires it. The guest is NIC-less — forwards can
+# only reach guest loopback + the izbad policy-gated egress gateway, so this
+# does not widen the guest's reach.
+X11Forwarding no
+
+ListenAddress 127.0.0.1:22
+HostKey /run/izba/ssh/ssh_host_ed25519_key
+AuthorizedKeysFile /run/izba/ssh/authorized_keys
+PidFile /run/izba/ssh/sshd.pid
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+ChrootDirectory /rootfs
+Subsystem sftp internal-sftp
+PrintMotd no
+AcceptEnv LANG LC_*

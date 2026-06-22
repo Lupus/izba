@@ -24,6 +24,7 @@ thiserror.workspace = true
 flate2 = "1"
 tar = "0.4"
 tempfile = "3"
+ssh-key = { version = "0.6", features = ["ed25519", "std", "getrandom"] }
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
 # OCI runtime spec types/builders for crun config.json generation
 # (image/runtime_config.rs). Already in the tree via oci-client → no new
@@ -86,6 +87,8 @@ hyper-util = { version = "0.1", default-features = false, features = ["server-au
 http-body-util = "0.1"
 # Body/byte buffers shared between synthesized 403 responses and proxied bodies.
 bytes = "1"
+# Provides the no-op `#[mutants::skip]` attribute for the mutation gate.
+mutants = "0.0.4"
 
 [dev-dependencies]
 # in-memory duplex test driver for the MITM datapath needs a real runtime

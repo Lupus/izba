@@ -10,6 +10,8 @@ pub mod port;
 pub mod reconcile;
 pub mod rm;
 pub mod run;
+pub mod ssh;
+pub mod ssh_proxy;
 pub mod status;
 pub mod stop;
 pub mod version;

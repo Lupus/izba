@@ -528,6 +528,33 @@ fn write_oci_bundle(
     Ok(())
 }
 
+/// Writes the SSH host key and authorized_keys into the per-sandbox ssh share
+/// dir, creating it if needed. Returns the share dir path.
+/// Called next to the trust block in start_with_timeouts.
+pub fn write_ssh_material(paths: &Paths, name: &str) -> anyhow::Result<std::path::PathBuf> {
+    let ssh_share = paths.ssh_share_dir(name);
+    std::fs::create_dir_all(&ssh_share)
+        .with_context(|| format!("creating ssh share dir {}", ssh_share.display()))?;
+    let id =
+        crate::ssh::identity::ensure_identity(&paths.ssh_dir()).context("loading ssh identity")?;
+    std::fs::copy(&id.host_private, ssh_share.join("ssh_host_ed25519_key"))
+        .with_context(|| format!("copying host key into {}", ssh_share.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            ssh_share.join("ssh_host_ed25519_key"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .with_context(|| format!("setting 0600 on host key in {}", ssh_share.display()))?;
+    }
+    let authk = crate::ssh::identity::user_public_openssh(&paths.ssh_dir())
+        .context("reading user public key")?;
+    std::fs::write(ssh_share.join("authorized_keys"), format!("{}\n", authk))
+        .with_context(|| format!("writing authorized_keys into {}", ssh_share.display()))?;
+    Ok(ssh_share)
+}
+
 pub fn start(
     paths: &Paths,
     name: &str,
@@ -580,6 +607,10 @@ pub fn start_with_timeouts(
     let ca = crate::ca::load_or_create(&paths.ca_dir()).context("loading izba CA")?;
     std::fs::write(trust_dir.join("ca.pem"), ca.cert_pem())
         .with_context(|| format!("writing guest CA into {}", trust_dir.display()))?;
+
+    // Deliver the SSH host key + authorized_keys to the guest as the read-only
+    // izba-ssh virtiofs share. Mirrors the trust-CA channel.
+    let ssh_share = write_ssh_material(paths, name).context("preparing izba-ssh share")?;
 
     // Single-writer: a persistent volume may back at most one LIVE sandbox.
     for v in config.volumes.iter().filter(|v| v.is_persistent()) {
@@ -635,6 +666,10 @@ pub fn start_with_timeouts(
             FsShare {
                 tag: OCI_TAG.to_string(),
                 host_path: oci_dir.clone(),
+            },
+            FsShare {
+                tag: "izba-ssh".to_string(),
+                host_path: ssh_share.clone(),
             },
         ],
         console_log: console_log.clone(),
@@ -1602,7 +1637,7 @@ mod tests {
         assert_eq!(spec.disks[1].path, paths.sandbox_dir("web").join("rw.img"));
         assert!(!spec.disks[1].readonly);
 
-        assert_eq!(spec.shares.len(), 3);
+        assert_eq!(spec.shares.len(), 4); // workspace + izba-trust + izba-oci + izba-ssh
         assert_eq!(spec.shares[0].tag, "workspace");
         assert_eq!(spec.shares[0].host_path, ws);
         // The izba CA is baked into every guest via the read-only izba-trust
@@ -2406,6 +2441,77 @@ mod tests {
         o2.volumes = vec![crate::volume::parse_volume_flag("shared:/data:1g").unwrap()];
         let err = create(&paths, "sandbox-b", &o2).unwrap_err().to_string();
         assert!(err.contains("in use"), "expected 'in use', got: {err}");
+    }
+
+    /// write_ssh_material populates the per-sandbox ssh share dir with the
+    /// host private key and the user authorized_keys file; key is 0600 on Unix.
+    #[test]
+    fn write_ssh_material_creates_expected_files() {
+        let (_dir, paths) = test_paths();
+        std::fs::create_dir_all(paths.ssh_dir()).unwrap();
+
+        let share_dir = write_ssh_material(&paths, "web").unwrap();
+
+        let host_key = share_dir.join("ssh_host_ed25519_key");
+        let authk = share_dir.join("authorized_keys");
+        assert!(host_key.exists(), "host private key must be written");
+        assert!(authk.exists(), "authorized_keys must be written");
+
+        let authk_bytes = std::fs::read(&authk).unwrap();
+        let authk_str = std::str::from_utf8(&authk_bytes).unwrap();
+        assert!(
+            authk_str.starts_with("ssh-ed25519 "),
+            "authorized_keys must begin with ssh-ed25519"
+        );
+        assert!(
+            authk_bytes.last().copied() == Some(b'\n'),
+            "authorized_keys must end with newline"
+        );
+
+        let id = crate::ssh::identity::ensure_identity(&paths.ssh_dir()).unwrap();
+        let src = std::fs::read(&id.host_private).unwrap();
+        let dst = std::fs::read(&host_key).unwrap();
+        assert_eq!(src, dst, "host key content must match source");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&host_key).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "host private key must be 0600");
+        }
+    }
+
+    /// start delivers the izba-ssh share in the VmSpec shares vec.
+    #[test]
+    fn start_includes_ssh_share() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
+
+        let spec = driver
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spec captured");
+
+        assert_eq!(
+            spec.shares.len(),
+            4,
+            "workspace + izba-trust + izba-oci + izba-ssh"
+        );
+        let ssh_share = spec
+            .shares
+            .iter()
+            .find(|s| s.tag == "izba-ssh")
+            .expect("izba-ssh share must be present");
+        assert_eq!(ssh_share.host_path, paths.ssh_share_dir("web"));
+        assert!(ssh_share.host_path.join("ssh_host_ed25519_key").exists());
+        assert!(ssh_share.host_path.join("authorized_keys").exists());
     }
 
     /// Ephemeral volumes (no name) are not subject to the single-writer guard;

@@ -370,6 +370,20 @@ fn dispatch_inner(
     }
 }
 
+/// Best-effort: regenerate the izba-managed ~/.ssh/config from the set of
+/// non-stopped sandboxes. A failure (perms, read-only HOME) is logged and
+/// never fails the lifecycle — same posture as relays/egress.
+// reason: daemon-wired glue (registry.running_names → ssh::config::regenerate,
+// best-effort/log-only). running_names + the regeneration logic (regenerate_with)
+// are unit-tested; invoking this directly would write the real ~/.ssh.
+#[mutants::skip]
+fn regen_ssh_config(d: &Arc<Daemon>) {
+    let names = d.registry.running_names();
+    if let Err(e) = crate::ssh::config::regenerate(&d.paths, &names) {
+        eprintln!("izbad: ssh config regen failed (non-fatal): {e:#}");
+    }
+}
+
 fn handle_create(
     d: &Arc<Daemon>,
     c: crate::daemon::proto::DaemonCreate,
@@ -446,6 +460,7 @@ fn handle_start(
     }
     relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
     d.registry.set(&name, &config.image_ref, Liveness::Running);
+    regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
 }
 
@@ -461,6 +476,7 @@ fn handle_stop(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> 
     d.egress.stop(&d.paths, &name);
     let _ = std::fs::remove_file(relays::rules_path(&d.paths, &name));
     d.registry.set_liveness(&name, Liveness::Stopped);
+    regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
 }
 
@@ -469,6 +485,7 @@ fn handle_rm(d: &Arc<Daemon>, name: String, force: bool) -> anyhow::Result<Daemo
     d.relays.stop_all(&name);
     d.egress.stop(&d.paths, &name);
     d.registry.remove(&name);
+    regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
 }
 
@@ -1761,6 +1778,92 @@ mod tests {
         assert!(
             err.to_string().contains("no such published port"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    // ── SSH config regeneration (Task 12) ──────────────────────────────────────
+    //
+    // Tests call `crate::ssh::config::regenerate_with` directly, injecting a
+    // hermetic env closure that maps HOME/USERPROFILE to a per-test tempdir.
+    // No global env mutation — safe under parallel test execution.
+
+    /// When config_management is enabled (default), `regenerate_with` writes
+    /// `<data>/ssh/config` containing `Host izba-<name>` stubs for running
+    /// sandboxes and injects an Include line into the fake home's .ssh/config.
+    #[test]
+    fn regen_ssh_config_writes_managed_config_for_running_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let ssh_dir = paths.ssh_dir();
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        // Default settings: config_management = true.
+
+        let fake_home = tempfile::tempdir().unwrap();
+        let fake_home_path = fake_home.path().to_owned();
+        let env = |k: &str| -> Option<String> {
+            if k == "HOME" || k == "USERPROFILE" {
+                Some(fake_home_path.to_string_lossy().into_owned())
+            } else {
+                std::env::var(k).ok()
+            }
+        };
+
+        let names: Vec<String> = vec!["alpha".into(), "beta".into()];
+        crate::ssh::config::regenerate_with(&paths, &names, &env).unwrap();
+
+        let managed = ssh_dir.join("config");
+        assert!(managed.exists(), "managed config not written");
+        let body = std::fs::read_to_string(&managed).unwrap();
+        assert!(
+            body.contains("Host izba-alpha"),
+            "alpha stub missing: {body}"
+        );
+        assert!(body.contains("Host izba-beta"), "beta stub missing: {body}");
+        assert!(
+            body.contains("Host izba-*"),
+            "wildcard block missing: {body}"
+        );
+
+        // The Include line must have landed in the fake home's .ssh/config.
+        let user_cfg = fake_home.path().join(".ssh").join("config");
+        assert!(user_cfg.exists(), "user config not created in fake home");
+        let user_body = std::fs::read_to_string(&user_cfg).unwrap();
+        assert!(
+            user_body.contains("Include"),
+            "Include not injected into user config: {user_body}"
+        );
+    }
+
+    /// When config_management is disabled, `regenerate_with` is a no-op — the
+    /// managed config file must NOT be created.
+    #[test]
+    fn regen_ssh_config_noop_when_config_management_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let ssh_dir = paths.ssh_dir();
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        crate::ssh::settings::save(
+            &ssh_dir,
+            &crate::ssh::settings::SshSettings {
+                config_management: false,
+            },
+        )
+        .unwrap();
+
+        let fake_home = tempfile::tempdir().unwrap();
+        let fake_home_path = fake_home.path().to_owned();
+        let env = |k: &str| -> Option<String> {
+            if k == "HOME" || k == "USERPROFILE" {
+                Some(fake_home_path.to_string_lossy().into_owned())
+            } else {
+                std::env::var(k).ok()
+            }
+        };
+
+        crate::ssh::config::regenerate_with(&paths, &["foo".into()], &env).unwrap();
+        assert!(
+            !ssh_dir.join("config").exists(),
+            "config must not be written when config_management=false"
         );
     }
 

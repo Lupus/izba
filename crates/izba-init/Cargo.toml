@@ -31,6 +31,8 @@ nix = { version = "0.29", features = [
 libc = "0.2"
 vsock = "0.5"
 tar = "0.4"
+# Provides the no-op `#[mutants::skip]` attribute for the mutation gate.
+mutants = "0.0.4"
 
 [dev-dependencies]
 tempfile = "3"

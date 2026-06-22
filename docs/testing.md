@@ -269,6 +269,31 @@ Env knobs available for the daemon tests:
 The Windows PowerShell gate (`hack/spike/validate-izba-windows.ps1`) also
 validates daemon kill-adopt + stop-survival on Windows.
 
+### SSH exercise (`ssh_access_e2e`)
+
+The suite includes an `ssh_access_e2e` test that exercises `izba ssh` against a
+real running microVM. It asserts:
+
+1. `izba ssh sshe2e -- /bin/true` exits 0 — the proxy channel (izbad →
+   vsock-port-22 → guest sshd) is live.
+2. Round-trip: `echo ssh-marker-42` stdout is recovered — bytes flow both ways.
+3. Chroot-isolation (positive): `cat /etc/alpine-release` succeeds and is
+   non-empty — the session is chrooted to `/rootfs` (inside the alpine image).
+4. Chroot-isolation (negative): `cat /run/izba/ssh/ssh_host_ed25519_key` fails —
+   the sshd host key lives outside `/rootfs` and must not be visible to the
+   session.
+
+**Initramfs requirement:** the initramfs must be built with `IZBA_SSHD` pointing
+at a static `sshd` binary (built by `hack/build-sshd.sh`). The CI `initramfs`
+job in `e2e.yml` does this automatically. For local runs:
+
+```sh
+hack/build-sshd.sh                         # → dist/sshd  (needs Docker)
+IZBA_NFT=dist/nft IZBA_SSHD=dist/sshd \
+  IZBA_MKE2FS=/path/to/static/mke2fs \
+  hack/build-initramfs.sh
+```
+
 ## 5a. Code coverage
 
 `hack/coverage.sh` measures coverage for the Rust workspace with

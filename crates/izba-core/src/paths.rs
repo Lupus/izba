@@ -84,6 +84,17 @@ impl Paths {
     pub fn ca_dir(&self) -> PathBuf {
         self.root.join("ca")
     }
+
+    /// Global izba SSH material (keypair, host key, managed config, known_hosts).
+    pub fn ssh_dir(&self) -> PathBuf {
+        self.root.join("ssh")
+    }
+
+    /// Per-sandbox dir whose contents are delivered to the guest as the
+    /// `izba-ssh` virtiofs share (host key + authorized_keys).
+    pub fn ssh_share_dir(&self, name: &str) -> PathBuf {
+        self.sandbox_dir(name).join("ssh")
+    }
 }
 
 /// Create `path` (and any missing ancestors) and harden the izba-owned tree to
@@ -259,6 +270,16 @@ mod tests {
         assert_eq!(mode(&root.join("sandboxes").join("web")), 0o700, "sandbox");
         assert_eq!(mode(&root.join("sandboxes")), 0o700, "sandboxes");
         assert_eq!(mode(&root), 0o700, "data root");
+    }
+
+    #[test]
+    fn ssh_dirs_resolve_under_root() {
+        let p = Paths::with_root(PathBuf::from("/data"));
+        assert_eq!(p.ssh_dir(), PathBuf::from("/data/ssh"));
+        assert_eq!(
+            p.ssh_share_dir("foo"),
+            PathBuf::from("/data/sandboxes/foo/ssh")
+        );
     }
 
     #[test]

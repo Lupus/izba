@@ -36,6 +36,11 @@ blank `rw.img` on first boot when no host-side `mkfs.ext4` is available.
 binary in `/sbin/nft`.  This is required for the M1 izbad-egress TCP REDIRECT
 stub (see `build-nft.sh`).
 
+**Optional:** set `IZBA_SSHD=/path/to/static/sshd` to embed a static `sshd`
+binary in `/sbin/sshd`.  This enables the SSH access feature (izba-init
+launches sshd on boot).  `hack/sshd_config` is always copied to
+`/etc/ssh/sshd_config` regardless of whether `IZBA_SSHD` is set.
+
 Output defaults to `dist/initramfs.cpio.gz`.
 
 ### `build-nft.sh`
@@ -69,6 +74,23 @@ hack/build-crun.sh           # writes dist/crun (static, musl)
 
 Embed it via `IZBA_CRUN=dist/crun hack/build-initramfs.sh`.  Requires Docker.
 Pinned: crun 1.28, json-c 0.18 (both sha256-verified in-container).
+
+### `build-sshd.sh`
+
+Builds a static `sshd` (OpenSSH Portable **9.9p2**) for the initramfs, via a
+throwaway Alpine container (musl).  It fetches the sha256-pinned OpenSSH
+source tarball from cdn.openbsd.org, configures it without PAM/SELinux, links
+it fully static (`LDFLAGS=-static`), strips it, and writes it to `dist/sshd`.
+
+```sh
+hack/build-sshd.sh            # writes dist/sshd (~4.6 MB, statically linked)
+```
+
+Embed it via `IZBA_SSHD=dist/sshd hack/build-initramfs.sh`.  Requires Docker.
+The companion `hack/sshd_config` is always embedded at `/etc/ssh/sshd_config`
+regardless of whether `IZBA_SSHD` is set (the config is inert without the
+binary).  The binary is needed for the SSH access feature (izba-init launches
+`/sbin/sshd` at boot when the binary is present).
 
 ### `build-kernel.sh`
 
@@ -239,6 +261,7 @@ cargo build --release -p izba-cli
 | `IZBA_KERNEL_VERIFY_ONLY` | Set to `1` to hash-check the cached kernel tarball and exit without building (CI preflight mode). |
 | `IZBA_NFT` | Optional path to a static `nft` binary to embed in the initramfs at `/sbin/nft` (required for the M1 izbad-egress TCP REDIRECT stub; built by `build-nft.sh`). |
 | `IZBA_CRUN` | Optional path to a static `crun` binary to embed in the initramfs at `/sbin/crun` (the in-guest OCI workload runtime, Stance B; built by `build-crun.sh`). |
+| `IZBA_SSHD` | Optional path to a static `sshd` binary to embed in the initramfs at `/sbin/sshd` (required for the SSH access feature; built by `build-sshd.sh`). |
 | `VIRTIOFSD_VERSION` | virtiofsd release tag for `fetch-artifacts.sh`. Defaults to a pinned known-good version. |
 | `IZBA_MKFS_EROFS` | Absolute path to `mkfs.erofs` (or `mkfs.erofs.exe` on Windows). Overrides the bundled libexec copy and `$PATH`. |
 
