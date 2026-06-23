@@ -18,23 +18,37 @@ pub const SSH_SESSION_CWD: &str = "/workspace";
 /// container. `tty` is whether sshd gave this session a pseudo-terminal
 /// (interactive login); `command` is the remote command sshd passed via the
 /// restricted login shell's `-c` operand (`Some(cmd)` for `ssh host <cmd>` /
-/// scp-over-exec, `None` for an interactive login shell). Runs the container's
-/// `/bin/sh` either interactively or as `sh -c <cmd>`, in `SSH_SESSION_CWD`, as
-/// the container's configured user (no `--user`), with the container image env.
+/// scp-over-exec, `None` for an interactive login shell). `term` is the
+/// resolved `TERM` to forward into the container (`Some(value)` for a tty
+/// session, `None` otherwise); it is forwarded as `--env TERM=<value>` ONLY
+/// when `tty` is true AND `term` is `Some`, mirroring the `izba exec` server
+/// path which sets `TERM` for tty execs only. This is pure: the caller
+/// (`ssh_session`) resolves the actual value (the client's `TERM`, defaulting
+/// to `xterm-256color`) and the default; here we only forward what we are
+/// given. Runs the container's `/bin/sh` either interactively or as
+/// `sh -c <cmd>`, in `SSH_SESSION_CWD`, as the container's configured user
+/// (no `--user`), with the container image env plus the forwarded `TERM`.
 pub fn ssh_session_crun_argv(
     cgroup_manager: crate::oci::CgroupManager,
     tty: bool,
     command: Option<&str>,
+    term: Option<&str>,
 ) -> Vec<String> {
     let shell_argv = match command {
         Some(cmd) => vec!["/bin/sh".to_string(), "-c".to_string(), cmd.to_string()],
         None => vec!["/bin/sh".to_string()],
     };
+    // Forward TERM only for tty sessions (mirrors the exec server/CLI: pipe
+    // execs get no TERM). The caller supplies the resolved value + default.
+    let env: Vec<(String, String)> = match (tty, term) {
+        (true, Some(t)) => vec![("TERM".to_string(), t.to_string())],
+        _ => Vec::new(),
+    };
     crate::oci::crun_exec_argv(
         cgroup_manager,
         tty,
         SSH_SESSION_CWD,
-        &[],  // env: inherit the container image env
+        &env, // env: container image env + forwarded TERM (tty only)
         None, // user: the container's configured user (no --user)
         &shell_argv,
     )
@@ -54,7 +68,16 @@ pub fn ssh_session(command: Option<&str>) -> ! {
     use std::os::unix::process::CommandExt;
     let tty = nix::unistd::isatty(std::io::stdin().as_raw_fd()).unwrap_or(false);
     let cg = crate::oci::detect_cgroup_manager();
-    let argv = ssh_session_crun_argv(cg, tty, command);
+    // For an interactive (tty) login, sshd populated TERM in our environment;
+    // forward the client's real TERM into the container, defaulting to
+    // xterm-256color when unset (mirrors the `izba exec` CLI/server path).
+    // A non-tty session (`ssh host <cmd>`) gets no TERM.
+    let term: Option<String> = if tty {
+        Some(std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()))
+    } else {
+        None
+    };
+    let argv = ssh_session_crun_argv(cg, tty, command, term.as_deref());
     let e = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
     eprintln!("izba-init: ssh-session: {e}");
     std::process::exit(127);
@@ -267,11 +290,27 @@ mod tests {
 
     // ── ssh_session_crun_argv ────────────────────────────────────────────────
 
+    /// Find the value of the `--env` flag whose `K=V` value has key `key`,
+    /// e.g. `term_env_value(argv, "TERM")` returns `Some("xterm-256color")`
+    /// for an argv containing `["--env", "TERM=xterm-256color"]`. Returns
+    /// `None` when no `--env` pair has that key.
+    fn env_flag_value<'a>(argv: &'a [String], key: &str) -> Option<&'a str> {
+        let prefix = format!("{key}=");
+        argv.iter().enumerate().find_map(|(i, a)| {
+            if a == "--env" {
+                argv.get(i + 1)
+                    .and_then(|v| v.strip_prefix(prefix.as_str()))
+            } else {
+                None
+            }
+        })
+    }
+
     #[test]
     fn ssh_session_crun_argv_interactive_tty() {
         // tty=true, None (interactive login) → --tty present, ends with
         // ["izba", "/bin/sh"], cwd is SSH_SESSION_CWD.
-        let argv = ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, true, None);
+        let argv = ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, true, None, None);
         assert_eq!(
             argv.first().map(String::as_str),
             Some(crate::oci::CRUN_PATH)
@@ -301,7 +340,12 @@ mod tests {
     #[test]
     fn ssh_session_crun_argv_command_no_tty() {
         // tty=false, Some("ls -l") → NO --tty, ends with ["izba", "/bin/sh", "-c", "ls -l"]
-        let argv = ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, false, Some("ls -l"));
+        let argv = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            false,
+            Some("ls -l"),
+            None,
+        );
         assert_eq!(
             argv.first().map(String::as_str),
             Some(crate::oci::CRUN_PATH)
@@ -333,7 +377,7 @@ mod tests {
             crate::oci::CgroupManager::Cgroupfs,
             crate::oci::CgroupManager::Disabled,
         ] {
-            let argv = ssh_session_crun_argv(mgr, false, None);
+            let argv = ssh_session_crun_argv(mgr, false, None, None);
             assert_eq!(argv[0], crate::oci::CRUN_PATH);
             assert!(
                 argv[1].starts_with("--cgroup-manager="),
@@ -341,5 +385,82 @@ mod tests {
             );
             assert!(argv.iter().any(|a| a == "exec"));
         }
+    }
+
+    // ── TERM forwarding (mirrors the `izba exec` server/CLI tty contract) ─────
+
+    #[test]
+    fn ssh_session_crun_argv_tty_forwards_term() {
+        // tty=true + Some("xterm-256color") → argv carries --env TERM=xterm-256color
+        // (sits among the exec options, before the container id).
+        let argv = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            true,
+            None,
+            Some("xterm-256color"),
+        );
+        assert_eq!(
+            env_flag_value(&argv, "TERM"),
+            Some("xterm-256color"),
+            "tty session must forward TERM: {argv:?}"
+        );
+        // The --env TERM pair must precede the container id positional.
+        let env_pos = argv.iter().position(|a| a == "--env").expect("--env");
+        let id_pos = argv
+            .iter()
+            .position(|a| a == crate::oci::CONTAINER_ID)
+            .expect("container id");
+        assert!(
+            env_pos < id_pos,
+            "--env must precede the container id: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn ssh_session_crun_argv_tty_forwards_exact_term_value() {
+        // A different TERM is forwarded verbatim — proves it is not hardcoded.
+        let argv = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Cgroupfs,
+            true,
+            None,
+            Some("screen-256color"),
+        );
+        assert_eq!(env_flag_value(&argv, "TERM"), Some("screen-256color"));
+    }
+
+    #[test]
+    fn ssh_session_crun_argv_tty_none_term_omits_env() {
+        // tty=true but no resolved TERM → no --env TERM= fabricated here; the
+        // caller (`ssh_session`) is responsible for supplying the default.
+        let argv = ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, true, None, None);
+        assert_eq!(
+            env_flag_value(&argv, "TERM"),
+            None,
+            "no TERM env when term is None: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--env"),
+            "no --env at all when term is None: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn ssh_session_crun_argv_no_tty_never_forwards_term() {
+        // Non-tty session never gets TERM, even if a term value is passed.
+        let argv = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            false,
+            Some("ls"),
+            Some("xterm"),
+        );
+        assert_eq!(
+            env_flag_value(&argv, "TERM"),
+            None,
+            "non-tty must NOT forward TERM: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--env"),
+            "non-tty must have no --env: {argv:?}"
+        );
     }
 }
