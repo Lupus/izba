@@ -18,7 +18,7 @@ mod trust;
 
 use anyhow::Context;
 use exec::ExecEngine;
-use izba_proto::{ExitStatus, CONTROL_PORT, STREAM_PORT};
+use izba_proto::{CONTROL_PORT, STREAM_PORT};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -71,23 +71,48 @@ fn is_pause_invocation(first_arg: Option<&str>) -> bool {
 }
 
 /// Host-side smoke test used during image bring-up.
+///
+/// Validates the parts of init's logic that run on a bare host — cmdline
+/// parsing, `ExecEngine` construction, and the crun argv wiring. It deliberately
+/// does NOT perform a live exec: under Stance B `exec()` teleports into the
+/// running workload via `crun exec`, and crun (plus the `izba` container) exists
+/// only inside a booted guest. A build host has no `/sbin/crun` — the previous
+/// version spawned it and panicked here. Even where crun is present there is no
+/// running container to enter, so a real round-trip is impossible in this mode.
 fn self_check() {
     let parsed = cmdline::parse("izba.hostname=web quiet");
     assert_eq!(parsed.get("izba.hostname").map(String::as_str), Some("web"));
     assert_eq!(parsed.get("quiet").map(String::as_str), Some(""));
 
-    let engine = ExecEngine::new(None);
-    let req = izba_proto::ExecRequest {
-        argv: vec!["true".into()],
-        env: vec![],
-        cwd: "/".into(),
-        tty: false,
-        uid: nix::unistd::geteuid().as_raw(),
-        gid: nix::unistd::getegid().as_raw(),
-    };
-    let id = engine.exec(&req).expect("self-check: exec true");
-    let status = engine.wait(id).expect("self-check: wait");
-    assert_eq!(status, ExitStatus::Code(0), "self-check: true must exit 0");
+    // ExecEngine constructs without a live container (cgroup detection is
+    // best-effort), exercising the boot-time construction path.
+    let _engine = ExecEngine::new(None);
+
+    // The crun run/exec argv wiring is the Stance B substitute for the old
+    // direct spawn; validate both build the expected, well-formed argv.
+    let run = oci::crun_run_argv(oci::CgroupManager::Disabled);
+    assert_eq!(run.first().map(String::as_str), Some(oci::CRUN_PATH));
+    assert!(
+        run.iter().any(|a| a == "--no-pivot"),
+        "self-check: crun run argv must carry --no-pivot"
+    );
+    assert_eq!(run.last().map(String::as_str), Some(oci::CONTAINER_ID));
+
+    let exec = oci::crun_exec_argv(
+        oci::CgroupManager::Disabled,
+        false,
+        "/workspace",
+        &[],
+        None,
+        &["true".into()],
+    );
+    assert_eq!(exec.first().map(String::as_str), Some(oci::CRUN_PATH));
+    assert!(
+        exec.iter().any(|a| a == "exec"),
+        "self-check: crun exec argv must carry the exec subcommand"
+    );
+    assert_eq!(exec.last().map(String::as_str), Some("true"));
+
     println!("self-check OK");
 }
 
