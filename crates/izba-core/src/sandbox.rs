@@ -485,10 +485,12 @@ fn write_oci_bundle(
         Vec::new()
     };
     let pause_argv: Vec<String> = vec![PAUSE_GUEST_PATH.to_string(), "__pause".to_string()];
-    let (uid, gid) = image_config
-        .and_then(|c| c.user.as_deref())
-        .and_then(crate::image::runtime_config::parse_numeric_user)
-        .unwrap_or((0, 0));
+    let ((uid, gid), user_warn) = crate::image::runtime_config::resolve_process_user(
+        image_config.and_then(|c| c.user.as_deref()),
+    );
+    if let Some(w) = user_warn {
+        eprintln!("warning: sandbox '{name}': {w}");
+    }
     let params = SpecParams {
         mode: ContainerMode::Interactive {
             pause_argv: &pause_argv,
