@@ -7,13 +7,64 @@
 
 use std::path::Path;
 
+/// Working directory used when entering the container for an SSH session.
+///
+/// Matches the `izba exec` interactive default (`INTERACTIVE_CWD` in
+/// izba-core). izba-init cannot depend on izba-core, so the value is
+/// defined here; keep both in sync when changing.
+pub const SSH_SESSION_CWD: &str = "/workspace";
+
+/// Build the `crun exec` argv for an SSH session entering the `izba`
+/// container. `tty` is whether sshd gave this session a pseudo-terminal
+/// (interactive login); `original_command` is `$SSH_ORIGINAL_COMMAND`
+/// (`Some(cmd)` for `ssh host <cmd>` / scp-over-exec, `None` for an
+/// interactive login shell). Runs the container's `/bin/sh` either
+/// interactively or as `sh -c <cmd>`, in `SSH_SESSION_CWD`, as the
+/// container's configured user (no `--user`), with the container image env.
+pub fn ssh_session_crun_argv(
+    cgroup_manager: crate::oci::CgroupManager,
+    tty: bool,
+    original_command: Option<&str>,
+) -> Vec<String> {
+    let shell_argv = match original_command {
+        Some(cmd) => vec!["/bin/sh".to_string(), "-c".to_string(), cmd.to_string()],
+        None => vec!["/bin/sh".to_string()],
+    };
+    crate::oci::crun_exec_argv(
+        cgroup_manager,
+        tty,
+        SSH_SESSION_CWD,
+        &[],  // env: inherit the container image env
+        None, // user: the container's configured user (no --user)
+        &shell_argv,
+    )
+}
+
+/// `izba-init __ssh-session`: the sshd `ForceCommand`. Enters the running
+/// `izba` container via `crun exec`, replacing the old `ChrootDirectory`
+/// session so the SSH shell sees the container's /proc, /dev/pts, /tmp.
+/// Never returns on success (execs crun); on failure prints to stderr and
+/// exits 127.
+// reason: execs crun and never returns on success; covered by the KVM/WHP e2e,
+// not unit tests (no live container on the host).
+#[cfg(unix)]
+#[mutants::skip]
+pub fn ssh_session() -> ! {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let tty = nix::unistd::isatty(std::io::stdin().as_raw_fd()).unwrap_or(false);
+    let original = std::env::var("SSH_ORIGINAL_COMMAND")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let cg = crate::oci::detect_cgroup_manager();
+    let argv = ssh_session_crun_argv(cg, tty, original.as_deref());
+    let e = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
+    eprintln!("izba-init: __ssh-session: {e}");
+    std::process::exit(127);
+}
+
 /// virtiofs tag of the read-only SSH share izbad attaches per-sandbox.
 pub const SSH_TAG: &str = "izba-ssh";
-
-/// Post-chroot guest path of the SSH share.
-/// The rootfs plan mounts it at /rootfs/izba-ssh; inside the chroot it is /izba-ssh.
-#[allow(dead_code)]
-pub const SSH_MOUNT: &str = "/izba-ssh";
 
 /// Path to the vendored static sshd binary inside the initramfs.
 pub const SSHD_BIN: &str = "/sbin/sshd";
@@ -215,5 +266,83 @@ mod tests {
     #[test]
     fn sshd_argv_is_foreground_with_config() {
         assert_eq!(sshd_argv(), vec!["-D", "-e", "-f", "/etc/ssh/sshd_config"]);
+    }
+
+    // ── ssh_session_crun_argv ────────────────────────────────────────────────
+
+    #[test]
+    fn ssh_session_crun_argv_interactive_tty() {
+        // tty=true, None (interactive login) → --tty present, ends with
+        // ["izba", "/bin/sh"], cwd is SSH_SESSION_CWD.
+        let argv = ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, true, None);
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some(crate::oci::CRUN_PATH)
+        );
+        // must contain exec subcommand
+        assert!(
+            argv.iter().any(|a| a == "exec"),
+            "argv must contain 'exec': {argv:?}"
+        );
+        // --tty must be present for interactive sessions
+        assert!(
+            argv.iter().any(|a| a == "--tty"),
+            "--tty must be present for tty=true: {argv:?}"
+        );
+        // --cwd + /workspace pair
+        let cwd_pos = argv.iter().position(|a| a == "--cwd").expect("--cwd");
+        assert_eq!(argv[cwd_pos + 1], SSH_SESSION_CWD);
+        // container id followed by /bin/sh
+        let id_pos = argv
+            .iter()
+            .position(|a| a == crate::oci::CONTAINER_ID)
+            .expect("container id");
+        assert_eq!(argv[id_pos + 1], "/bin/sh");
+        assert_eq!(argv.len(), id_pos + 2, "interactive: only /bin/sh after id");
+    }
+
+    #[test]
+    fn ssh_session_crun_argv_command_no_tty() {
+        // tty=false, Some("ls -l") → NO --tty, ends with ["izba", "/bin/sh", "-c", "ls -l"]
+        let argv = ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, false, Some("ls -l"));
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some(crate::oci::CRUN_PATH)
+        );
+        assert!(
+            argv.iter().any(|a| a == "exec"),
+            "argv must contain 'exec': {argv:?}"
+        );
+        // no --tty for pipe sessions
+        assert!(
+            !argv.iter().any(|a| a == "--tty"),
+            "--tty must NOT be present for tty=false: {argv:?}"
+        );
+        // --cwd /workspace
+        let cwd_pos = argv.iter().position(|a| a == "--cwd").expect("--cwd");
+        assert_eq!(argv[cwd_pos + 1], SSH_SESSION_CWD);
+        // container id followed by /bin/sh -c ls -l
+        let id_pos = argv
+            .iter()
+            .position(|a| a == crate::oci::CONTAINER_ID)
+            .expect("container id");
+        assert_eq!(&argv[id_pos + 1..], &["/bin/sh", "-c", "ls -l"]);
+    }
+
+    #[test]
+    fn ssh_session_crun_argv_starts_with_cgroup_manager_flag() {
+        // Both cgroup manager variants produce a well-formed crun exec argv.
+        for mgr in [
+            crate::oci::CgroupManager::Cgroupfs,
+            crate::oci::CgroupManager::Disabled,
+        ] {
+            let argv = ssh_session_crun_argv(mgr, false, None);
+            assert_eq!(argv[0], crate::oci::CRUN_PATH);
+            assert!(
+                argv[1].starts_with("--cgroup-manager="),
+                "argv[1] must be --cgroup-manager=...: {argv:?}"
+            );
+            assert!(argv.iter().any(|a| a == "exec"));
+        }
     }
 }

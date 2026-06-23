@@ -12,7 +12,14 @@ PermitRootLogin prohibit-password
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
-ChrootDirectory /rootfs
+# Session entry: instead of ChrootDirectory, every SSH session (interactive
+# shell, remote command, scp/sftp) is routed through the `__ssh-session`
+# ForceCommand. It enters the running `izba` crun container via `crun exec`
+# (Stance B), sharing the container's mount/pid namespaces — so the shell sees
+# the container's /proc, /dev/pts, /tmp, etc., exactly like `izba exec`.
+ForceCommand /init __ssh-session
+# NOTE: ForceCommand overrides subsystem requests too, so sftp/scp also run
+# the crun-exec wrapper. Native in-container sftp-server support is a follow-up.
 Subsystem sftp internal-sftp
 PrintMotd no
 AcceptEnv LANG LC_*

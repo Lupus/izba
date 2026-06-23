@@ -50,6 +50,12 @@ fn main() {
     if is_pause_invocation(std::env::args().nth(1).as_deref()) {
         pause::run();
     }
+    // Hidden subcommand: `izba-init __ssh-session` — sshd ForceCommand that
+    // enters the running `izba` container via `crun exec`. Must be checked
+    // before the PID-1 guard because the ForceCommand process is not PID 1.
+    if is_ssh_session_invocation(std::env::args().nth(1).as_deref()) {
+        ssh::ssh_session();
+    }
     if std::process::id() != 1 {
         eprintln!("izba-init: not PID 1; nothing to do (try --self-check)");
         std::process::exit(1);
@@ -68,6 +74,14 @@ fn main() {
 /// (the live `main` path runs `pause::run()`, which never returns).
 fn is_pause_invocation(first_arg: Option<&str>) -> bool {
     first_arg == Some("__pause")
+}
+
+/// Whether argv[1] selects the hidden `__ssh-session` ForceCommand mode.
+///
+/// Extracted as a pure predicate so the dispatch condition is unit-testable
+/// (the live `main` path calls `ssh::ssh_session()`, which never returns).
+fn is_ssh_session_invocation(first_arg: Option<&str>) -> bool {
+    first_arg == Some("__ssh-session")
 }
 
 /// Host-side smoke test used during image bring-up.
@@ -391,7 +405,7 @@ fn power_off() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_pause_invocation, spawn_serve};
+    use super::{is_pause_invocation, is_ssh_session_invocation, spawn_serve};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -402,6 +416,16 @@ mod tests {
         assert!(!is_pause_invocation(Some("__pause__")));
         assert!(!is_pause_invocation(Some("")));
         assert!(!is_pause_invocation(None));
+    }
+
+    #[test]
+    fn ssh_session_invocation_only_for_exact_ssh_session_arg() {
+        assert!(is_ssh_session_invocation(Some("__ssh-session")));
+        assert!(!is_ssh_session_invocation(Some("__pause")));
+        assert!(!is_ssh_session_invocation(Some("__ssh-session-extra")));
+        assert!(!is_ssh_session_invocation(Some("ssh-session")));
+        assert!(!is_ssh_session_invocation(Some("")));
+        assert!(!is_ssh_session_invocation(None));
     }
 
     // `spawn_serve` is generic over the listener type, so these tests use `()` as
