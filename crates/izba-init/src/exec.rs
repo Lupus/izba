@@ -66,6 +66,12 @@ pub struct ExecEngine {
     /// cp tar arms' path resolution. Exec no longer chroots here — `crun exec`
     /// enters the container's namespaces instead (Stance B).
     root: Option<PathBuf>,
+    /// The cgroup manager crun should use, detected ONCE at construction.
+    /// Detection probes `/sys/fs/cgroup` (a mount + path check), so doing it per
+    /// exec would be wasteful and could race the boot-time cgroup setup; the
+    /// hierarchy does not change over a guest's lifetime. Mirrors the single
+    /// detection `launch_container()` does for `crun run`.
+    cgroup_manager: crate::oci::CgroupManager,
     /// Test-only: when set, `exec()` spawns the request's argv DIRECTLY instead
     /// of wrapping it in `crun exec`. Production always wraps in crun (this is
     /// `false`); the direct path lets the host unit tests exercise the control/
@@ -81,6 +87,7 @@ impl ExecEngine {
     pub fn new(root: Option<PathBuf>) -> Self {
         Self {
             root,
+            cgroup_manager: crate::oci::detect_cgroup_manager(),
             #[cfg(test)]
             direct: false,
             procs: Mutex::new(HashMap::new()),
@@ -162,7 +169,7 @@ impl ExecEngine {
         let user = crun_user_arg(req.uid, req.gid);
 
         let argv = crate::oci::crun_exec_argv(
-            crate::oci::detect_cgroup_manager(),
+            self.cgroup_manager,
             req.tty,
             &req.cwd,
             &env_overlay,

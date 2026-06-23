@@ -604,6 +604,22 @@ mod tests {
     }
 
     #[test]
+    fn trust_env_strings_are_the_canonical_six() {
+        // Must stay byte-for-byte in sync with izba-init trust.rs::trust_env_pairs.
+        assert_eq!(
+            trust_env_strings(),
+            vec![
+                "NODE_EXTRA_CA_CERTS=/etc/izba/ca.pem".to_string(),
+                "DENO_CERT=/etc/izba/ca.pem".to_string(),
+                "SSL_CERT_FILE=/etc/izba/ca-bundle.pem".to_string(),
+                "REQUESTS_CA_BUNDLE=/etc/izba/ca-bundle.pem".to_string(),
+                "CURL_CA_BUNDLE=/etc/izba/ca-bundle.pem".to_string(),
+                "GIT_SSL_CAINFO=/etc/izba/ca-bundle.pem".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn spec_trust_env_layered_when_present() {
         let img = image_config(serde_json::json!({
             "Cmd": ["/bin/sh"],

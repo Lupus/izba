@@ -19,6 +19,13 @@ use std::io::Read;
 ///
 /// The manifest is always fetched to resolve the digest; layer blobs are
 /// pulled, flattened and converted to erofs only on a cache miss.
+///
+/// `#[mutants::skip]`: every path here performs real registry I/O
+/// (`pull::resolve` fetches the manifest; `fetch_layers` downloads blobs), so
+/// it cannot run in the unit suite — it is covered by the integration tests.
+/// The testable pieces it orchestrates (`ImageStore::{load_config,
+/// persist_config,is_cached}`, `flatten_layers`) have their own unit tests.
+#[mutants::skip]
 pub fn ensure_image(paths: &Paths, image_ref: &str) -> Result<String> {
     let store = ImageStore::new(paths);
     let resolved = pull::resolve(image_ref)?;

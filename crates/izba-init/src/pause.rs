@@ -71,25 +71,67 @@ pub fn run() -> ! {
 #[cfg(test)]
 mod tests {
     use super::reap_zombies;
-    use nix::sys::wait::waitpid;
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     use nix::unistd::{fork, ForkResult};
 
-    /// `reap_zombies` returns 0 on `ECHILD` — exercised deterministically.
+    /// Exercises both `reap_zombies` outcomes — reaps a real child, and returns
+    /// 0 when nothing is left to reap.
     ///
-    /// Strategy: fork a quick-exiting child, then `waitpid` it *directly* to
-    /// fully exhaust it from the child table.  After that, `reap_zombies()` on
-    /// that PID subtree sees ECHILD and must return 0.
+    /// **Why one combined serial test, not two:** `reap_zombies` calls
+    /// `waitpid(-1, WNOHANG)`, which reaps *any* child of this process. If two
+    /// fork-based tests run concurrently on separate harness threads, one's
+    /// `reap_zombies(-1)` can swallow the other's child, making a later targeted
+    /// `waitpid(specific_pid)` fail with `ECHILD`. These are the only tests in
+    /// `izba-init` that fork lingering children, so folding them into a single
+    /// `#[test]` keeps the fork+wait sequence serial and race-free.
     #[test]
-    fn reap_zombies_no_children_returns_zero() {
-        // Fork a child that exits immediately.
+    fn reap_zombies_reaps_then_returns_zero() {
+        // ── Part 1: reaps a forked quick-exiting child via reap_zombies() ──
+        //
+        // Safety: this is a fork test. The child calls _exit immediately, so it
+        // does not interact with the Rust runtime or test harness.
+        let child_pid = match unsafe { fork() }.expect("fork") {
+            ForkResult::Child => {
+                // Exit immediately; the parent will reap us via reap_zombies().
+                unsafe { libc::_exit(0) };
+            }
+            ForkResult::Parent { child } => child,
+        };
+
+        // The child may not have exited yet — loop with a tiny sleep so the
+        // test stays fast on fast machines instead of using a fixed delay.
+        let count = loop {
+            let n = reap_zombies();
+            if n > 0 {
+                break n;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert!(count >= 1, "expected ≥1 reaped child, got {count}");
+
+        // The specific child must be gone: a targeted wait now returns ECHILD
+        // (already reaped) — or an already-reaped WaitStatus, also fine.
+        match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
+            Err(nix::errno::Errno::ECHILD) => {} // already reaped ✓
+            Ok(WaitStatus::StillAlive) => {
+                panic!("child pid {child_pid} still alive after reap_zombies");
+            }
+            other => {
+                let _ = other;
+            }
+        }
+
+        // ── Part 2: returns 0 when there is nothing left to reap ──
+        //
+        // Fork a second child and reap it *directly* with a blocking wait so we
+        // know it is fully gone from the child table. reap_zombies() must then
+        // hit ECHILD (or StillAlive with count 0) and return 0.
         let child_pid = match unsafe { fork() }.expect("fork") {
             ForkResult::Child => {
                 unsafe { libc::_exit(0) };
             }
             ForkResult::Parent { child } => child,
         };
-
-        // Reap the child directly with a *blocking* wait so we know it is gone.
         loop {
             match waitpid(child_pid, None) {
                 Ok(_) => break,
@@ -97,58 +139,10 @@ mod tests {
                 Err(e) => panic!("waitpid failed: {e}"),
             }
         }
-
-        // Now the child table for this child is empty.  reap_zombies() must hit
-        // ECHILD (or StillAlive with count 0) and return 0.
         let n = reap_zombies();
         assert_eq!(
             n, 0,
             "expected 0 after all children already reaped, got {n}"
         );
-    }
-
-    /// `reap_zombies` reaps a forked quick-exiting child and reports count ≥ 1.
-    /// Asserts that the specific child PID is no longer in the process table
-    /// (a second targeted wait returns ECHILD).
-    #[test]
-    fn reap_zombies_reaps_a_quick_exit_child() {
-        // Safety: this is a fork test. The child calls _exit immediately, so it
-        // does not interact with the Rust runtime or test harness.
-        let child_pid = match unsafe { fork() }.expect("fork") {
-            ForkResult::Child => {
-                // Exit immediately; the parent will wait for us.
-                unsafe { libc::_exit(0) };
-            }
-            ForkResult::Parent { child } => child,
-        };
-
-        // Give the kernel a moment to reap + mark the child as zombie.
-        // We loop with a small sleep instead of a fixed sleep so the test
-        // stays fast on fast machines.
-        let count = loop {
-            let n = reap_zombies();
-            if n > 0 {
-                break n;
-            }
-            // Tiny yield — the child may not have exited yet.
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        };
-
-        assert!(count >= 1, "expected ≥1 reaped child, got {count}");
-
-        // Verify the specific child is gone: a blocking wait for that exact PID
-        // should now return ECHILD (already reaped) or Err(ECHILD).
-        let second = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
-        // ECHILD means already reaped — exactly what we expect.
-        match second {
-            Err(nix::errno::Errno::ECHILD) => {} // already reaped ✓
-            Ok(nix::sys::wait::WaitStatus::StillAlive) => {
-                panic!("child pid {child_pid} still alive after reap_zombies");
-            }
-            other => {
-                // Any other result (already-reaped WaitStatus) is also fine.
-                let _ = other;
-            }
-        }
     }
 }

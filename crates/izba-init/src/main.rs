@@ -41,7 +41,7 @@ fn main() {
     // Hidden subcommand: `izba-init __pause` — minimal reaping PID-1 for an
     // interactive OCI container. Must be checked before the PID-1 guard so it
     // works when invoked as PID 1 of a container PID namespace (not VM PID 1).
-    if std::env::args().nth(1).as_deref() == Some("__pause") {
+    if is_pause_invocation(std::env::args().nth(1).as_deref()) {
         pause::run();
     }
     if std::process::id() != 1 {
@@ -54,6 +54,14 @@ fn main() {
         eprintln!("izba-init: fatal: {e:#}");
         power_off();
     }
+}
+
+/// Whether `first_arg` (argv[1]) selects the hidden `__pause` PID-1 mode.
+///
+/// Extracted as a pure predicate so the dispatch condition is unit-testable
+/// (the live `main` path runs `pause::run()`, which never returns).
+fn is_pause_invocation(first_arg: Option<&str>) -> bool {
+    first_arg == Some("__pause")
 }
 
 /// Host-side smoke test used during image bring-up.
@@ -352,9 +360,18 @@ fn power_off() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::spawn_serve;
+    use super::{is_pause_invocation, spawn_serve};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn pause_invocation_only_for_exact_pause_arg() {
+        assert!(is_pause_invocation(Some("__pause")));
+        assert!(!is_pause_invocation(Some("--self-check")));
+        assert!(!is_pause_invocation(Some("__pause__")));
+        assert!(!is_pause_invocation(Some("")));
+        assert!(!is_pause_invocation(None));
+    }
 
     // `spawn_serve` is generic over the listener type, so these tests use `()` as
     // a stand-in listener: no socket is bound (some sandboxes deny `bind`), yet
@@ -409,27 +426,5 @@ mod tests {
         // A serve loop returning Err is logged inside the thread, not propagated.
         spawn_serve(Some(()), "err", err_serve);
         assert_eq!(spin_until_nonzero(&ERR_CALLS), 1);
-    }
-
-    // --- __pause dispatch recognition ---
-
-    /// Returns true when argv[1] is exactly `"__pause"`, matching the dispatch
-    /// guard in `main`. Extracted so the logic is directly unit-testable without
-    /// executing the actual pause loop.
-    fn is_pause_arg(args: &[&str]) -> bool {
-        args.get(1).copied() == Some("__pause")
-    }
-
-    #[test]
-    fn pause_arg_recognized_when_argv1_is_pause() {
-        assert!(is_pause_arg(&["izba-init", "__pause"]));
-    }
-
-    #[test]
-    fn pause_arg_not_recognized_for_other_argv1() {
-        assert!(!is_pause_arg(&["izba-init", "--self-check"]));
-        assert!(!is_pause_arg(&["izba-init"]));
-        assert!(!is_pause_arg(&["izba-init", "__pauses"])); // no prefix match
-        assert!(!is_pause_arg(&["izba-init", "__PAUSE"])); // case-sensitive
     }
 }

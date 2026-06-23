@@ -240,6 +240,26 @@ mod tests {
     }
 
     #[test]
+    fn load_config_propagates_non_notfound_read_errors() {
+        // A read error that is NOT NotFound must surface as Err — only an
+        // absent config.json is the self-heal `Ok(None)` case. Make config.json
+        // a *directory* so `fs::read` fails with EISDIR (kind != NotFound).
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                Ok(())
+            })
+            .unwrap();
+        fs::create_dir(store.config_path(DIGEST)).unwrap();
+        assert!(
+            store.load_config(DIGEST).is_err(),
+            "a non-NotFound read error must propagate as Err, not Ok(None)"
+        );
+    }
+
+    #[test]
     fn atomic_publish() {
         let (_tmp, paths) = setup();
         let store = ImageStore::new(&paths);

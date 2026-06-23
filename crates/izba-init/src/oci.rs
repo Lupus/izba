@@ -457,6 +457,14 @@ fn read_log_tail(path: &str, max_bytes: usize) -> String {
 ///
 /// Used by the controller validation checkpoint and future exec integration
 /// (task 4: exec enters the container instead of bare chroot).
+///
+/// `#[mutants::skip]`: this shells out to a real `/sbin/crun state <id>` against
+/// a live container, which exists only inside a booted microVM. Unit tests run
+/// on a crun-less host where the `Command` always fails (→ `false`), so no unit
+/// test can distinguish the `true`/`false`/guard mutants here; the running-vs-
+/// not behavior is exercised by the real-VM checkpoint. The JSON parsing it
+/// delegates to (`parse_crun_state_running`) is unit-tested directly.
+#[mutants::skip]
 #[allow(dead_code)]
 pub fn container_running(id: &str) -> bool {
     let out = std::process::Command::new(CRUN_PATH)
@@ -770,5 +778,34 @@ mod tests {
     fn extract_status_field_absent() {
         assert_eq!(extract_status_field(r#"{"id":"x"}"#), None);
         assert_eq!(extract_status_field(""), None);
+    }
+
+    // ── read_log_tail internal ───────────────────────────────────────────────
+
+    #[test]
+    fn read_log_tail_returns_full_content_when_under_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, b"hello crun\n").unwrap();
+        assert_eq!(
+            read_log_tail(path.to_str().unwrap(), LOG_TAIL_BYTES),
+            "hello crun\n"
+        );
+    }
+
+    #[test]
+    fn read_log_tail_truncates_to_last_max_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        // 10 bytes of content, ask for only the last 4.
+        std::fs::write(&path, b"0123456789").unwrap();
+        assert_eq!(read_log_tail(path.to_str().unwrap(), 4), "6789");
+    }
+
+    #[test]
+    fn read_log_tail_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist");
+        assert_eq!(read_log_tail(path.to_str().unwrap(), LOG_TAIL_BYTES), "");
     }
 }
