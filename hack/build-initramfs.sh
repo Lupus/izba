@@ -105,13 +105,20 @@ chmod 644 "$WORK/etc/ssh/sshd_config"
 
 # Minimal user database for the vendored sshd. OpenSSH fatally exits at startup
 # if the privilege-separation user ("sshd") is absent, and it must getpwnam the
-# login user ("root") before chrooting the session into /rootfs. These live in
-# the izba-controlled initramfs root (NOT the OCI overlay), so they are present
-# regardless of the project image. root's shell/home (/bin/sh, /root) are
-# resolved here pre-chroot and exec'd relative to ChrootDirectory /rootfs, where
-# /bin/sh + /root exist in any normal image.
+# login user ("root"). These live in the izba-controlled initramfs root (NOT the
+# OCI overlay), so they are present regardless of the project image.
+#
+# root's login shell is `/init` (izba-init itself), NOT `/bin/sh`: under Stance B
+# the SSH session enters the crun container via `crun exec` (sshd_config's
+# `ForceCommand /init __ssh-session`) instead of a `ChrootDirectory /rootfs`
+# chroot. With the chroot gone, OpenSSH validates the login shell against THIS
+# (initramfs) root, which has no `/bin/sh` — and refuses login ("User root not
+# allowed because shell /bin/sh does not exist"). `/init` always exists here, so
+# it satisfies the shell-exists check; sshd then runs the forced command as
+# `/init -c "/init __ssh-session"`, which izba-init routes to its crun-exec SSH
+# entry. (The redundant home `/root` need not exist — OpenSSH only warns.)
 cat > "$WORK/etc/passwd" <<'PASSWD'
-root:x:0:0:root:/root:/bin/sh
+root:x:0:0:root:/root:/init
 sshd:x:74:74:Privilege-separated SSH:/run/sshd:/sbin/nologin
 PASSWD
 chmod 644 "$WORK/etc/passwd"

@@ -50,10 +50,15 @@ fn main() {
     if is_pause_invocation(std::env::args().nth(1).as_deref()) {
         pause::run();
     }
-    // Hidden subcommand: `izba-init __ssh-session` — sshd ForceCommand that
-    // enters the running `izba` container via `crun exec`. Must be checked
-    // before the PID-1 guard because the ForceCommand process is not PID 1.
-    if is_ssh_session_invocation(std::env::args().nth(1).as_deref()) {
+    // sshd runs root's login shell — set to `/init` in the initramfs passwd
+    // (see build-initramfs.sh) because OpenSSH refuses a login whose shell is
+    // absent from THIS root, and the initramfs has no /bin/sh now that the
+    // `ChrootDirectory /rootfs` session is gone. So the forced command arrives
+    // as `/init -c "/init __ssh-session"` (and a bare `/init __ssh-session`).
+    // Both route to the crun-exec SSH entry; check before the PID-1 guard
+    // because the session process is not PID 1.
+    let argv1 = std::env::args().nth(1);
+    if is_ssh_session_invocation(argv1.as_deref()) || is_login_shell_invocation(argv1.as_deref()) {
         ssh::ssh_session();
     }
     if std::process::id() != 1 {
@@ -82,6 +87,16 @@ fn is_pause_invocation(first_arg: Option<&str>) -> bool {
 /// (the live `main` path calls `ssh::ssh_session()`, which never returns).
 fn is_ssh_session_invocation(first_arg: Option<&str>) -> bool {
     first_arg == Some("__ssh-session")
+}
+
+/// Whether izba-init was invoked as root's login shell by sshd. Because root's
+/// shell is `/init` (initramfs passwd), sshd runs the forced command as
+/// `/init -c "<ForceCommand>"`; the `-c` is the unambiguous signal that this is
+/// an sshd session (izba-init is never otherwise exec'd with `-c`). The actual
+/// client command is read from `$SSH_ORIGINAL_COMMAND` by `ssh_session()`, so
+/// the `-c` operand itself is irrelevant here.
+fn is_login_shell_invocation(first_arg: Option<&str>) -> bool {
+    first_arg == Some("-c")
 }
 
 /// Host-side smoke test used during image bring-up.
@@ -412,7 +427,9 @@ fn power_off() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_pause_invocation, is_ssh_session_invocation, spawn_serve};
+    use super::{
+        is_login_shell_invocation, is_pause_invocation, is_ssh_session_invocation, spawn_serve,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -433,6 +450,17 @@ mod tests {
         assert!(!is_ssh_session_invocation(Some("ssh-session")));
         assert!(!is_ssh_session_invocation(Some("")));
         assert!(!is_ssh_session_invocation(None));
+    }
+
+    #[test]
+    fn login_shell_invocation_only_for_dash_c() {
+        // sshd runs root's `/init` shell as `/init -c "<forcecommand>"`.
+        assert!(is_login_shell_invocation(Some("-c")));
+        assert!(!is_login_shell_invocation(Some("__ssh-session")));
+        assert!(!is_login_shell_invocation(Some("-l")));
+        assert!(!is_login_shell_invocation(Some("--self-check")));
+        assert!(!is_login_shell_invocation(Some("")));
+        assert!(!is_login_shell_invocation(None));
     }
 
     // `spawn_serve` is generic over the listener type, so these tests use `()` as

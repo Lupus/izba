@@ -276,11 +276,11 @@ fn daemon_full_lifecycle() {
 /// Assertions:
 /// 1. `/bin/true` exit-0 via `izba ssh`  — proxy channel is live.
 /// 2. Round-trip: `echo ssh-marker-42` stdout is recovered.
-/// 3. Chroot-isolation (positive): `cat /etc/alpine-release` works (we are
-///    inside the alpine image, chrooted to /rootfs).
-/// 4. Chroot-isolation (negative): `cat /run/izba/ssh/ssh_host_ed25519_key`
-///    fails — the host-key lives outside /rootfs and must not be visible to the
-///    session.
+/// 3. Container isolation (positive): `cat /etc/alpine-release` works (the
+///    session entered the alpine crun container via `crun exec`).
+/// 4. Container isolation (negative): `cat /run/izba/ssh/ssh_host_ed25519_key`
+///    fails — the host key lives in init-root, outside the container's mount
+///    namespace, so it is invisible to the session.
 #[test]
 fn ssh_access_e2e() {
     if !want() {
@@ -327,19 +327,23 @@ fn ssh_access_e2e() {
         stdout_of(&o)
     );
 
-    // [4] Chroot-isolation (positive): inside the alpine image.
+    // [4] Container isolation (positive): inside the alpine image via crun exec.
     let o = izba(
         &data,
         no_env,
         &["ssh", "sshe2e", "--", "cat", "/etc/alpine-release"],
     );
-    assert_ok(&o, "ssh cat /etc/alpine-release (proves chroot to /rootfs)");
+    assert_ok(
+        &o,
+        "ssh cat /etc/alpine-release (proves the session entered the container)",
+    );
     assert!(
         !stdout_of(&o).is_empty(),
         "alpine-release must be non-empty"
     );
 
-    // [5] Chroot-isolation (negative): sshd host key is outside /rootfs.
+    // [5] Container isolation (negative): the sshd host key lives in init-root,
+    // outside the container's mount namespace.
     let o = izba(
         &data,
         no_env,
@@ -354,7 +358,7 @@ fn ssh_access_e2e() {
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(
         !o.status.success(),
-        "host key outside chroot must be unreadable"
+        "host key outside the container must be unreadable from the session"
     );
     assert!(
         err.contains("No such file") || err.contains("can't open"),
