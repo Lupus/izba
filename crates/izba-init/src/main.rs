@@ -93,6 +93,13 @@ fn is_ssh_session_invocation(first_arg: Option<&str>) -> bool {
 /// only inside a booted guest. A build host has no `/sbin/crun` — the previous
 /// version spawned it and panicked here. Even where crun is present there is no
 /// running container to enter, so a real round-trip is impossible in this mode.
+///
+/// `#[mutants::skip]`: a manual `--self-check` smoke entry whose only observable
+/// effect is internal assertions + a stdout line, so a unit test cannot tell the
+/// `replace with ()` mutant from real success. Every builder it exercises
+/// (`cmdline::parse`, `oci::crun_run_argv`, `oci::crun_exec_argv`) is unit-tested
+/// directly.
+#[mutants::skip]
 fn self_check() {
     let parsed = cmdline::parse("izba.hostname=web quiet");
     assert_eq!(parsed.get("izba.hostname").map(String::as_str), Some("web"));
