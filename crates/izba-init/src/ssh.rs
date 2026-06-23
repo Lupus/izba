@@ -25,14 +25,20 @@ pub const SSH_SESSION_CWD: &str = "/workspace";
 /// path which sets `TERM` for tty execs only. This is pure: the caller
 /// (`ssh_session`) resolves the actual value (the client's `TERM`, defaulting
 /// to `xterm-256color`) and the default; here we only forward what we are
-/// given. Runs the container's `/bin/sh` either interactively or as
-/// `sh -c <cmd>`, in `SSH_SESSION_CWD`, as the container's configured user
-/// (no `--user`), with the container image env plus the forwarded `TERM`.
+/// given. `trust_present` is whether the izba MITM CA bundle is present in the
+/// guest; when true, all six CA-bundle env vars from
+/// [`crate::trust::trust_env_pairs`] are forwarded (mirroring the `izba exec`
+/// server path), gated ONLY on bundle presence and NOT on tty — a non-tty
+/// `ssh host git ...` must still trust izbad's MITM leaf certs. Runs the
+/// container's `/bin/sh` either interactively or as `sh -c <cmd>`, in
+/// `SSH_SESSION_CWD`, as the container's configured user (no `--user`), with
+/// the container image env plus the forwarded `TERM` and CA-bundle vars.
 pub fn ssh_session_crun_argv(
     cgroup_manager: crate::oci::CgroupManager,
     tty: bool,
     command: Option<&str>,
     term: Option<&str>,
+    trust_present: bool,
 ) -> Vec<String> {
     let shell_argv = match command {
         Some(cmd) => vec!["/bin/sh".to_string(), "-c".to_string(), cmd.to_string()],
@@ -40,10 +46,21 @@ pub fn ssh_session_crun_argv(
     };
     // Forward TERM only for tty sessions (mirrors the exec server/CLI: pipe
     // execs get no TERM). The caller supplies the resolved value + default.
-    let env: Vec<(String, String)> = match (tty, term) {
+    let mut env: Vec<(String, String)> = match (tty, term) {
         (true, Some(t)) => vec![("TERM".to_string(), t.to_string())],
         _ => Vec::new(),
     };
+    // Forward the MITM CA-bundle env vars when the izba CA bundle is present in
+    // the guest, mirroring the `izba exec` server path (exec.rs
+    // build_env_overlay). Gated ONLY on bundle presence, NOT on tty: a non-tty
+    // `ssh host git ...` must also trust izbad's MITM leaf certs. The env VALUES
+    // are the container-internal paths from trust_env_pairs() (valid inside
+    // crun, which roots at /rootfs).
+    if trust_present {
+        for (k, v) in crate::trust::trust_env_pairs() {
+            env.push((k.to_string(), v.to_string()));
+        }
+    }
     crate::oci::crun_exec_argv(
         cgroup_manager,
         tty,
@@ -52,6 +69,24 @@ pub fn ssh_session_crun_argv(
         None, // user: the container's configured user (no --user)
         &shell_argv,
     )
+}
+
+/// Init-visible path of the izba MITM CA bundle: `/rootfs` joined with the
+/// container-internal bundle path ([`crate::trust::GUEST_CA_BUNDLE`]). The SSH
+/// login shell runs in PID 1's mount namespace (sshd is launched by init; no
+/// new mount ns), where the container overlay is mounted at `/rootfs` — so the
+/// bundle is visible here at `/rootfs/etc/izba/ca-bundle.pem`. Pure; mirrors
+/// the `oci.rs` overlay-root join pattern.
+fn ssh_trust_bundle_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/rootfs").join(crate::trust::GUEST_CA_BUNDLE.trim_start_matches('/'))
+}
+
+/// Whether the izba MITM CA bundle is present in the guest (init-visible path).
+// reason: filesystem existence check, exercised by the KVM/WHP e2e (no overlay
+// on the host); the pure path it checks (ssh_trust_bundle_path) is unit-tested.
+#[mutants::skip]
+fn ssh_trust_bundle_present() -> bool {
+    ssh_trust_bundle_path().is_file()
 }
 
 /// `izba-init` invoked as root's restricted login shell by sshd: enter the
@@ -77,7 +112,10 @@ pub fn ssh_session(command: Option<&str>) -> ! {
     } else {
         None
     };
-    let argv = ssh_session_crun_argv(cg, tty, command, term.as_deref());
+    // Forward the MITM CA-bundle env vars when the izba CA bundle is present in
+    // the guest (mirrors the `izba exec` server path); not gated on tty.
+    let trust_present = ssh_trust_bundle_present();
+    let argv = ssh_session_crun_argv(cg, tty, command, term.as_deref(), trust_present);
     let e = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
     eprintln!("izba-init: ssh-session: {e}");
     std::process::exit(127);
@@ -310,7 +348,8 @@ mod tests {
     fn ssh_session_crun_argv_interactive_tty() {
         // tty=true, None (interactive login) → --tty present, ends with
         // ["izba", "/bin/sh"], cwd is SSH_SESSION_CWD.
-        let argv = ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, true, None, None);
+        let argv =
+            ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, true, None, None, false);
         assert_eq!(
             argv.first().map(String::as_str),
             Some(crate::oci::CRUN_PATH)
@@ -345,6 +384,7 @@ mod tests {
             false,
             Some("ls -l"),
             None,
+            false,
         );
         assert_eq!(
             argv.first().map(String::as_str),
@@ -377,7 +417,7 @@ mod tests {
             crate::oci::CgroupManager::Cgroupfs,
             crate::oci::CgroupManager::Disabled,
         ] {
-            let argv = ssh_session_crun_argv(mgr, false, None, None);
+            let argv = ssh_session_crun_argv(mgr, false, None, None, false);
             assert_eq!(argv[0], crate::oci::CRUN_PATH);
             assert!(
                 argv[1].starts_with("--cgroup-manager="),
@@ -398,6 +438,7 @@ mod tests {
             true,
             None,
             Some("xterm-256color"),
+            false,
         );
         assert_eq!(
             env_flag_value(&argv, "TERM"),
@@ -424,6 +465,7 @@ mod tests {
             true,
             None,
             Some("screen-256color"),
+            false,
         );
         assert_eq!(env_flag_value(&argv, "TERM"), Some("screen-256color"));
     }
@@ -432,7 +474,8 @@ mod tests {
     fn ssh_session_crun_argv_tty_none_term_omits_env() {
         // tty=true but no resolved TERM → no --env TERM= fabricated here; the
         // caller (`ssh_session`) is responsible for supplying the default.
-        let argv = ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, true, None, None);
+        let argv =
+            ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, true, None, None, false);
         assert_eq!(
             env_flag_value(&argv, "TERM"),
             None,
@@ -452,6 +495,7 @@ mod tests {
             false,
             Some("ls"),
             Some("xterm"),
+            false,
         );
         assert_eq!(
             env_flag_value(&argv, "TERM"),
@@ -461,6 +505,96 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "--env"),
             "non-tty must have no --env: {argv:?}"
+        );
+    }
+
+    // ── MITM CA-bundle (trust) forwarding (mirrors `izba exec` build_env_overlay) ─
+
+    #[test]
+    fn ssh_session_crun_argv_trust_present_forwards_all_ca_env() {
+        // trust_present=true → all six CA-bundle env pairs from
+        // trust_env_pairs() are forwarded, with their container-internal paths.
+        let argv = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            true,
+            None,
+            Some("xterm-256color"),
+            true,
+        );
+        // The two key ones called out by the contract.
+        assert_eq!(
+            env_flag_value(&argv, "SSL_CERT_FILE"),
+            Some("/etc/izba/ca-bundle.pem"),
+            "SSL_CERT_FILE must point at the bundle: {argv:?}"
+        );
+        assert_eq!(
+            env_flag_value(&argv, "NODE_EXTRA_CA_CERTS"),
+            Some("/etc/izba/ca.pem"),
+            "NODE_EXTRA_CA_CERTS must point at the leaf CA pem: {argv:?}"
+        );
+        // All six, asserted against the canonical source of truth.
+        for (key, val) in crate::trust::trust_env_pairs() {
+            assert_eq!(
+                env_flag_value(&argv, key),
+                Some(val),
+                "trust env {key} must be forwarded as {val}: {argv:?}"
+            );
+        }
+        // TERM is still forwarded alongside the trust vars.
+        assert_eq!(env_flag_value(&argv, "TERM"), Some("xterm-256color"));
+    }
+
+    #[test]
+    fn ssh_session_crun_argv_trust_absent_forwards_no_ca_env() {
+        // trust_present=false → none of the six CA-bundle env vars are present.
+        let argv = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            true,
+            None,
+            Some("xterm-256color"),
+            false,
+        );
+        for (key, _) in crate::trust::trust_env_pairs() {
+            assert_eq!(
+                env_flag_value(&argv, key),
+                None,
+                "trust env {key} must be absent when trust_present=false: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_session_crun_argv_trust_forwarded_on_non_tty_command() {
+        // A non-tty `ssh host git fetch` (no TERM) must STILL get the trust vars:
+        // trust forwarding is gated on bundle presence, NOT on tty.
+        let argv = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            false,
+            Some("git fetch"),
+            None,
+            true,
+        );
+        // No TERM (non-tty), but all trust vars present.
+        assert_eq!(
+            env_flag_value(&argv, "TERM"),
+            None,
+            "non-tty must not forward TERM: {argv:?}"
+        );
+        for (key, val) in crate::trust::trust_env_pairs() {
+            assert_eq!(
+                env_flag_value(&argv, key),
+                Some(val),
+                "trust env {key} must be forwarded even on a non-tty command: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_trust_bundle_path_is_overlay_rooted_bundle() {
+        // The init-visible bundle path is /rootfs + the container-internal path.
+        assert_eq!(
+            ssh_trust_bundle_path(),
+            Path::new("/rootfs/etc/izba/ca-bundle.pem")
         );
     }
 }
