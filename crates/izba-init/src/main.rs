@@ -33,6 +33,12 @@ impl server::Listener for VsockPortListener {
     }
 }
 
+// `#[mutants::skip]`: PID-1 entry point — it branches on argv and the live
+// process id, then dispatches into `self_check`/`pause::run`/`run_pid1`/
+// `power_off`, none of which return in a unit test. The decision logic it
+// contains is extracted into testable helpers (`is_pause_invocation`,
+// `spawn_serve`), which are unit-tested directly.
+#[mutants::skip]
 fn main() {
     if std::env::args().any(|a| a == "--self-check") {
         self_check();

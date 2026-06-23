@@ -265,6 +265,13 @@ fn extract_status_field(json: &str) -> Option<&str> {
 /// (typically `/init` in the guest).
 ///
 /// Returns `Err` on any I/O failure.
+///
+/// `#[mutants::skip]`: copies `current_exe()` to the fixed guest path
+/// `pause_host_path()` (`/rootfs/.izba/pause`), so it only does meaningful work
+/// inside a booted guest with the overlay assembled; the unit suite has no
+/// `/rootfs`. The `Ok(())` mutant is indistinguishable from real success
+/// without that filesystem. Exercised by the real-VM checkpoint.
+#[mutants::skip]
 pub fn install_pause_binary() -> std::io::Result<()> {
     let src = std::env::current_exe()?;
     let dir = pause_host_dir();
@@ -297,6 +304,14 @@ pub fn install_pause_binary() -> std::io::Result<()> {
 ///
 /// **Does NOT exit or panic on failure** — a failed container start leaves
 /// the VM alive and diagnosable; the controlling process decides next steps.
+///
+/// `#[mutants::skip]`: orchestrates real side effects only available in a
+/// booted guest — installs the pause binary under `/rootfs`, detects the
+/// cgroup hierarchy, and forks `/sbin/crun run` — none reachable from the unit
+/// suite (no `/rootfs`, no crun). The `replace with ()` mutant cannot be
+/// distinguished without a live VM; covered by the real-VM checkpoint. Its
+/// pure helpers (`crun_run_argv`, `read_log_tail`) are unit-tested.
+#[mutants::skip]
 pub fn launch_container() {
     // Step 1: install pause binary.
     if let Err(e) = install_pause_binary() {
