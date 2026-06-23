@@ -195,10 +195,12 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   (`<sandbox>/ssh/` ↔ `/rootfs/izba-ssh`, mirroring the `izba-trust` channel),
   then copied by init to **init-root `/run/izba/ssh/` (0600), OUTSIDE the
   `/rootfs` overlay** — so izba's sshd material is fully isolated from the OCI
-  image. The SSH session enters the running `izba` crun container via
-  `crun exec` (the `/init __ssh-session` ForceCommand), sharing the container's
-  mount/pid namespaces exactly like `izba exec` — `ChrootDirectory /rootfs` is
-  gone; sftp-in-container is a follow-up.
+  image. root's login shell is `/init` (izba-init itself), which acts as a
+  restricted login shell — no `ForceCommand`, no `ChrootDirectory`. OpenSSH
+  invokes it as `-init` (dash-prefixed argv[0]) for an interactive login or as
+  `/init -c "<cmd>"` for a remote command; izba-init detects both forms and routes
+  either into `crun exec`, entering the running `izba` container exactly like
+  `izba exec`. sftp-in-container is a follow-up.
   The host reaches `:22` by **reusing `StreamOpen::TcpDial{port:22}`** through
   the daemon splice — **no new wire variant / no `DAEMON_PROTO_VERSION` bump**;
   the `izba __ssh-proxy <alias>` (hidden) is the `ProxyCommand` stdio bridge.

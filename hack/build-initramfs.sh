@@ -108,15 +108,16 @@ chmod 644 "$WORK/etc/ssh/sshd_config"
 # login user ("root"). These live in the izba-controlled initramfs root (NOT the
 # OCI overlay), so they are present regardless of the project image.
 #
-# root's login shell is `/init` (izba-init itself), NOT `/bin/sh`: under Stance B
-# the SSH session enters the crun container via `crun exec` (sshd_config's
-# `ForceCommand /init __ssh-session`) instead of a `ChrootDirectory /rootfs`
-# chroot. With the chroot gone, OpenSSH validates the login shell against THIS
-# (initramfs) root, which has no `/bin/sh` — and refuses login ("User root not
-# allowed because shell /bin/sh does not exist"). `/init` always exists here, so
-# it satisfies the shell-exists check; sshd then runs the forced command as
-# `/init -c "/init __ssh-session"`, which izba-init routes to its crun-exec SSH
-# entry. (The redundant home `/root` need not exist — OpenSSH only warns.)
+# root's login shell is `/init` (izba-init itself), NOT `/bin/sh`: OpenSSH
+# validates the login shell against THIS (initramfs) root, which has no `/bin/sh`
+# — and would refuse login ("User root not allowed because shell /bin/sh does not
+# exist"). `/init` always exists here, so it satisfies the shell-exists check.
+# izba-init acts as a restricted login shell: sshd execs it as `-init` (argv[0]
+# dash-prefixed, OpenSSH's login-shell convention) for an interactive session, or
+# as `/init -c "<cmd>"` for a remote command (`ssh host <cmd>`). izba-init detects
+# both forms and routes either into `crun exec`, entering the running container.
+# There is no ForceCommand and no ChrootDirectory in sshd_config.
+# (The redundant home `/root` need not exist — OpenSSH only warns.)
 cat > "$WORK/etc/passwd" <<'PASSWD'
 root:x:0:0:root:/root:/init
 sshd:x:74:74:Privilege-separated SSH:/run/sshd:/sbin/nologin

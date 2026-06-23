@@ -411,20 +411,22 @@ stdio-pass PTY option.
 The host bridge (`__ssh-proxy` → `TcpDial{22}` → daemon splice) and the
 **vendored-sshd-in-initramfs** model are unchanged. **Only the session entry
 changes:** `ChrootDirectory /rootfs` is deleted (it lands in bare rootfs,
-diverging from exec). Replace with a `ForceCommand` + Subsystem wrapper:
+diverging from exec).
 
-```
-# hack/sshd_config
-ForceCommand /sbin/izba-ssh-session
-Subsystem sftp /sbin/izba-ssh-session __sftp
-```
+**Honest restricted-login-shell design (implemented):** root's login shell in the
+initramfs `/etc/passwd` is `/init` (izba-init itself). OpenSSH invokes it per the
+login-shell protocol — no `ForceCommand`, no `$SSH_ORIGINAL_COMMAND`:
 
-`/sbin/izba-ssh-session` should be an **`izba-init __ssh-session` subcommand that
-calls the same `crun_exec::spawn`** code path as exec (literal shared
-implementation = strongest anti-divergence). Logic: empty `$SSH_ORIGINAL_COMMAND`
-+ tty → `crun exec --tty <cid> <login-shell> -l`; non-empty (scp/rsync/VS Code's
-`sh -c '…'`) → `crun exec [--tty?] <cid> sh -c "$SSH_ORIGINAL_COMMAND"`; `__sftp`
-→ `crun exec <cid> sftp-server`.
+- `ssh host` (interactive, gets a PTY): sshd execs `/init` as **`-init`**
+  (dash-prefixed argv[0], the POSIX login-shell convention), no further arguments.
+- `ssh host <cmd>` / scp / VS Code's bootstrap: sshd execs **`/init -c "<cmd>"`**
+  (`argv = ["/init", "-c", "<cmd>"]`, argv[0] NOT dash-prefixed).
+
+`izba-init::login_shell_command(&args)` extracts the command after `-c`; 
+`izba-init::is_interactive_login_shell(&args)` detects the dash-prefixed argv[0].
+Both call the shared `ssh::ssh_session(command: Option<&str>)` which builds a
+`crun exec` argv via `ssh_session_crun_argv` (same code path as `izba exec` — D5).
+`$SSH_ORIGINAL_COMMAND` is never read; no `__ssh-session` subcommand exists.
 
 - **sshd stays in initramfs (not in the container)** — the SSH design's security
   posture requires sshd's binary/keys/config to live in izba-controlled space,
@@ -624,14 +626,16 @@ the ingest/handoff.)
 - **Phase 5 — rewire exec to `crun exec` + interactive (pause-PID-1) mode +
   `--entrypoint`/`--service`** (the exit-code translation TDD; ttytest Tier1/2;
   egress+DNS+MITM from inside the container).
-- **Phase 6 — SSH teleport** — DONE. `izba-init __ssh-session` ForceCommand
-  rewires every SSH session (interactive shell + remote commands) through
-  `crun exec` into the running `izba` container, sharing its mount/pid
-  namespaces exactly like `izba exec`. `ChrootDirectory /rootfs` is deleted.
-  Remaining follow-up: native in-container sftp-server (sftp/scp currently
-  run `/bin/sh -c "$SSH_ORIGINAL_COMMAND"` via the wrapper, which works for
-  most tools but not sftp protocol over `Subsystem sftp`). VS Code Remote-SSH
-  and port-forward validation needs a real KVM/WHP e2e run.
+- **Phase 6 — SSH teleport** — DONE. `/init` acts as root's restricted login
+  shell (no `ForceCommand`, no `$SSH_ORIGINAL_COMMAND`): sshd execs it as
+  `-init` (interactive) or `/init -c "<cmd>"` (remote command); izba-init
+  detects both forms via `login_shell_command`/`is_interactive_login_shell` and
+  routes either through the shared `ssh::ssh_session(command)` → `crun exec`
+  path, entering the running `izba` container exactly like `izba exec`.
+  `ChrootDirectory /rootfs` is deleted. Remaining follow-up: native
+  in-container sftp-server (scp/rsync work via the `-c` form; sftp protocol
+  over `Subsystem sftp` is a follow-up). VS Code Remote-SSH and port-forward
+  validation needs a real KVM/WHP e2e run.
 - **Phase 7 — health/status honesty** (optional `container` field on
   `HealthInfo`, `#[serde(default)]`, proto bump if needed; `izba status` reports
   container-exited honestly; App gate).

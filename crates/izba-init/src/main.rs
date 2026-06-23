@@ -50,16 +50,17 @@ fn main() {
     if is_pause_invocation(std::env::args().nth(1).as_deref()) {
         pause::run();
     }
-    // sshd runs root's login shell — set to `/init` in the initramfs passwd
-    // (see build-initramfs.sh) because OpenSSH refuses a login whose shell is
-    // absent from THIS root, and the initramfs has no /bin/sh now that the
-    // `ChrootDirectory /rootfs` session is gone. So the forced command arrives
-    // as `/init -c "/init __ssh-session"` (and a bare `/init __ssh-session`).
-    // Both route to the crun-exec SSH entry; check before the PID-1 guard
-    // because the session process is not PID 1.
-    let argv1 = std::env::args().nth(1);
-    if is_ssh_session_invocation(argv1.as_deref()) || is_login_shell_invocation(argv1.as_deref()) {
-        ssh::ssh_session();
+    // sshd invokes root's login shell (`/init`) in two ways (OpenSSH contract):
+    //   interactive login  (`ssh host`):       argv[0] = "-init" (dash-prefixed), no `-c`
+    //   remote command     (`ssh host <cmd>`): argv = ["/init", "-c", "<cmd>"]
+    // Both routes enter the running `izba` crun container via `crun exec`.
+    // Check before the PID-1 guard because the session process is not PID 1.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(cmd) = login_shell_command(&args) {
+        ssh::ssh_session(Some(cmd));
+    }
+    if is_interactive_login_shell(&args) {
+        ssh::ssh_session(None);
     }
     if std::process::id() != 1 {
         eprintln!("izba-init: not PID 1; nothing to do (try --self-check)");
@@ -81,22 +82,19 @@ fn is_pause_invocation(first_arg: Option<&str>) -> bool {
     first_arg == Some("__pause")
 }
 
-/// Whether argv[1] selects the hidden `__ssh-session` ForceCommand mode.
-///
-/// Extracted as a pure predicate so the dispatch condition is unit-testable
-/// (the live `main` path calls `ssh::ssh_session()`, which never returns).
-fn is_ssh_session_invocation(first_arg: Option<&str>) -> bool {
-    first_arg == Some("__ssh-session")
+/// The remote command when sshd invoked izba-init as `init -c "<cmd>"`
+/// (`ssh host <cmd>`); `None` if there is no `-c`.
+fn login_shell_command(args: &[String]) -> Option<&str> {
+    // Look for "-c" and return the argument immediately following it.
+    args.windows(2)
+        .find(|w| w[0] == "-c")
+        .map(|w| w[1].as_str())
 }
 
-/// Whether izba-init was invoked as root's login shell by sshd. Because root's
-/// shell is `/init` (initramfs passwd), sshd runs the forced command as
-/// `/init -c "<ForceCommand>"`; the `-c` is the unambiguous signal that this is
-/// an sshd session (izba-init is never otherwise exec'd with `-c`). The actual
-/// client command is read from `$SSH_ORIGINAL_COMMAND` by `ssh_session()`, so
-/// the `-c` operand itself is irrelevant here.
-fn is_login_shell_invocation(first_arg: Option<&str>) -> bool {
-    first_arg == Some("-c")
+/// Whether sshd invoked izba-init as an INTERACTIVE login shell: argv[0] is
+/// dash-prefixed (OpenSSH's login-shell convention, e.g. "-init").
+fn is_interactive_login_shell(args: &[String]) -> bool {
+    args.first().map(|a| a.starts_with('-')).unwrap_or(false)
 }
 
 /// Host-side smoke test used during image bring-up.
@@ -428,10 +426,14 @@ fn power_off() -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_login_shell_invocation, is_pause_invocation, is_ssh_session_invocation, spawn_serve,
+        is_interactive_login_shell, is_pause_invocation, login_shell_command, spawn_serve,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn pause_invocation_only_for_exact_pause_arg() {
@@ -443,24 +445,33 @@ mod tests {
     }
 
     #[test]
-    fn ssh_session_invocation_only_for_exact_ssh_session_arg() {
-        assert!(is_ssh_session_invocation(Some("__ssh-session")));
-        assert!(!is_ssh_session_invocation(Some("__pause")));
-        assert!(!is_ssh_session_invocation(Some("__ssh-session-extra")));
-        assert!(!is_ssh_session_invocation(Some("ssh-session")));
-        assert!(!is_ssh_session_invocation(Some("")));
-        assert!(!is_ssh_session_invocation(None));
+    fn login_shell_command_extracts_c_operand() {
+        // sshd's remote-command form: argv = [<shell>, "-c", "<cmd>"]
+        assert_eq!(
+            login_shell_command(&args(&["init", "-c", "ls -l"])),
+            Some("ls -l")
+        );
+        // interactive login form: no "-c"
+        assert_eq!(login_shell_command(&args(&["-init"])), None);
+        // bare init invocation (PID-1)
+        assert_eq!(login_shell_command(&args(&["init"])), None);
+        // empty args
+        assert_eq!(login_shell_command(&[]), None);
+        // -c without a following arg (malformed) → None (windows(2) won't match last elem alone)
+        assert_eq!(login_shell_command(&args(&["init", "-c"])), None);
     }
 
     #[test]
-    fn login_shell_invocation_only_for_dash_c() {
-        // sshd runs root's `/init` shell as `/init -c "<forcecommand>"`.
-        assert!(is_login_shell_invocation(Some("-c")));
-        assert!(!is_login_shell_invocation(Some("__ssh-session")));
-        assert!(!is_login_shell_invocation(Some("-l")));
-        assert!(!is_login_shell_invocation(Some("--self-check")));
-        assert!(!is_login_shell_invocation(Some("")));
-        assert!(!is_login_shell_invocation(None));
+    fn is_interactive_login_shell_detects_dash_prefix() {
+        // OpenSSH login-shell convention: argv[0] starts with '-'
+        assert!(is_interactive_login_shell(&args(&["-init"])));
+        assert!(is_interactive_login_shell(&args(&["-/init"])));
+        // PID-1 form — not a login shell
+        assert!(!is_interactive_login_shell(&args(&["/init"])));
+        // remote command form — not a login shell (dash is not argv[0])
+        assert!(!is_interactive_login_shell(&args(&["init", "-c", "x"])));
+        // empty args
+        assert!(!is_interactive_login_shell(&[]));
     }
 
     // `spawn_serve` is generic over the listener type, so these tests use `()` as

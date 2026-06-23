@@ -16,17 +16,17 @@ pub const SSH_SESSION_CWD: &str = "/workspace";
 
 /// Build the `crun exec` argv for an SSH session entering the `izba`
 /// container. `tty` is whether sshd gave this session a pseudo-terminal
-/// (interactive login); `original_command` is `$SSH_ORIGINAL_COMMAND`
-/// (`Some(cmd)` for `ssh host <cmd>` / scp-over-exec, `None` for an
-/// interactive login shell). Runs the container's `/bin/sh` either
-/// interactively or as `sh -c <cmd>`, in `SSH_SESSION_CWD`, as the
-/// container's configured user (no `--user`), with the container image env.
+/// (interactive login); `command` is the remote command sshd passed via the
+/// restricted login shell's `-c` operand (`Some(cmd)` for `ssh host <cmd>` /
+/// scp-over-exec, `None` for an interactive login shell). Runs the container's
+/// `/bin/sh` either interactively or as `sh -c <cmd>`, in `SSH_SESSION_CWD`, as
+/// the container's configured user (no `--user`), with the container image env.
 pub fn ssh_session_crun_argv(
     cgroup_manager: crate::oci::CgroupManager,
     tty: bool,
-    original_command: Option<&str>,
+    command: Option<&str>,
 ) -> Vec<String> {
-    let shell_argv = match original_command {
+    let shell_argv = match command {
         Some(cmd) => vec!["/bin/sh".to_string(), "-c".to_string(), cmd.to_string()],
         None => vec!["/bin/sh".to_string()],
     };
@@ -40,26 +40,23 @@ pub fn ssh_session_crun_argv(
     )
 }
 
-/// `izba-init __ssh-session`: the sshd `ForceCommand`. Enters the running
-/// `izba` container via `crun exec`, replacing the old `ChrootDirectory`
-/// session so the SSH shell sees the container's /proc, /dev/pts, /tmp.
-/// Never returns on success (execs crun); on failure prints to stderr and
-/// exits 127.
+/// `izba-init` invoked as root's restricted login shell by sshd: enter the
+/// running `izba` container via `crun exec`. `command` is `Some(cmd)` for a
+/// remote command (`ssh host <cmd>` → sshd's `-c <cmd>`), `None` for an
+/// interactive login shell. Never returns on success; on failure prints to
+/// stderr and exits 127.
 // reason: execs crun and never returns on success; covered by the KVM/WHP e2e,
 // not unit tests (no live container on the host).
 #[cfg(unix)]
 #[mutants::skip]
-pub fn ssh_session() -> ! {
+pub fn ssh_session(command: Option<&str>) -> ! {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt;
     let tty = nix::unistd::isatty(std::io::stdin().as_raw_fd()).unwrap_or(false);
-    let original = std::env::var("SSH_ORIGINAL_COMMAND")
-        .ok()
-        .filter(|s| !s.is_empty());
     let cg = crate::oci::detect_cgroup_manager();
-    let argv = ssh_session_crun_argv(cg, tty, original.as_deref());
+    let argv = ssh_session_crun_argv(cg, tty, command);
     let e = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
-    eprintln!("izba-init: __ssh-session: {e}");
+    eprintln!("izba-init: ssh-session: {e}");
     std::process::exit(127);
 }
 
