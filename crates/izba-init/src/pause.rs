@@ -73,76 +73,104 @@ mod tests {
     use super::reap_zombies;
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     use nix::unistd::{fork, ForkResult};
+    use std::os::fd::AsRawFd;
 
-    /// Exercises both `reap_zombies` outcomes — reaps a real child, and returns
-    /// 0 when nothing is left to reap.
+    /// Single byte the isolated subprocess writes to the result pipe IFF every
+    /// `reap_zombies` check passed. Its ABSENCE is the failure signal.
+    const OK_SENTINEL: u8 = b'K';
+
+    /// Exercises both `reap_zombies` outcomes inside a FORKED SUBPROCESS, with
+    /// the verdict carried over a pipe rather than the subprocess exit code.
     ///
-    /// **Why one combined serial test, not two:** `reap_zombies` calls
-    /// `waitpid(-1, WNOHANG)`, which reaps *any* child of this process. If two
-    /// fork-based tests run concurrently on separate harness threads, one's
-    /// `reap_zombies(-1)` can swallow the other's child, making a later targeted
-    /// `waitpid(specific_pid)` fail with `ECHILD`. These are the only tests in
-    /// `izba-init` that fork lingering children, so folding them into a single
-    /// `#[test]` keeps the fork+wait sequence serial and race-free.
+    /// `reap_zombies` calls `waitpid(-1, WNOHANG)`, which reaps *any* child of
+    /// the calling process. Running it in the shared test-binary process would
+    /// (a) let it steal children spawned by other parallel tests — breaking
+    /// their own `wait()` with `ECHILD` — and (b) let those children inflate its
+    /// reap count. That cross-test race is real: it surfaced under the coverage
+    /// run's timing. Forking confines `waitpid(-1)` to children WE create here.
+    ///
+    /// **Verdict via a sentinel pipe, not the exit code.** A failed check — or a
+    /// usize-underflow panic from a mutated `count += 1` → `-= 1` inside the
+    /// forked child, whose unwinding through the test harness yields an
+    /// unreliable exit code — simply never writes `OK_SENTINEL`. The parent
+    /// treats a missing sentinel (EOF on the read end) as failure, so the result
+    /// is deterministic regardless of how the child ends. The subprocess uses
+    /// only async-signal-safe calls (fork / waitpid / nanosleep / write /
+    /// `_exit`, never `malloc`/`eprintln`) — mandatory after `fork()` in a
+    /// multi-threaded harness where another thread may hold the allocator lock.
     #[test]
     fn reap_zombies_reaps_then_returns_zero() {
-        // ── Part 1: reaps a forked quick-exiting child via reap_zombies() ──
-        //
-        // Safety: this is a fork test. The child calls _exit immediately, so it
-        // does not interact with the Rust runtime or test harness.
-        let child_pid = match unsafe { fork() }.expect("fork") {
+        let (read_end, write_end) = nix::unistd::pipe().expect("pipe");
+
+        let subproc = match unsafe { fork() }.expect("fork") {
             ForkResult::Child => {
-                // Exit immediately; the parent will reap us via reap_zombies().
+                // Child: keep only the write end; signal success via the pipe.
+                drop(read_end);
+                if run_isolated_reaper_checks() {
+                    let b = [OK_SENTINEL];
+                    // async-signal-safe write; ignore the (irrelevant) result.
+                    unsafe { libc::write(write_end.as_raw_fd(), b.as_ptr().cast(), 1) };
+                }
                 unsafe { libc::_exit(0) };
             }
             ForkResult::Parent { child } => child,
         };
 
-        // The child may not have exited yet — loop with a tiny sleep so the
-        // test stays fast on fast machines instead of using a fixed delay.
-        let count = loop {
-            let n = reap_zombies();
-            if n > 0 {
-                break n;
+        // Parent: drop the write end so the read sees EOF once the child is gone.
+        drop(write_end);
+        let mut buf = [0u8; 1];
+        let got = loop {
+            match nix::unistd::read(read_end.as_raw_fd(), &mut buf) {
+                Ok(n) => break n,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(_) => break 0,
+            }
+        };
+        // Reap the subprocess by its specific pid (never `-1`), so this test
+        // leaves no zombie and never disturbs another test's children.
+        let _ = waitpid(subproc, None);
+
+        assert!(
+            got == 1 && buf[0] == OK_SENTINEL,
+            "isolated reap_zombies checks failed: no success sentinel \
+             (read {got} byte(s)) — see the checks in run_isolated_reaper_checks"
+        );
+    }
+
+    /// Runs in the forked subprocess. Returns `true` iff every check passed.
+    ///
+    /// Async-signal-safe only (no allocation, no stdio locks): after `fork()` in
+    /// the multi-threaded harness, `malloc`/`eprintln` could deadlock on a lock
+    /// held by a now-absent thread.
+    fn run_isolated_reaper_checks() -> bool {
+        // Part 1: reap_zombies() reaps a forked quick-exiting child, and the
+        // specific child then becomes unwaitable (already reaped).
+        let child = match unsafe { fork() } {
+            Ok(ForkResult::Child) => unsafe { libc::_exit(0) },
+            Ok(ForkResult::Parent { child }) => child,
+            Err(_) => return false,
+        };
+        let mut count = 0;
+        for _ in 0..2000 {
+            count = reap_zombies();
+            if count > 0 {
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
-        };
-        assert!(count >= 1, "expected ≥1 reaped child, got {count}");
-
-        // The specific child must be gone: a targeted wait now returns ECHILD
-        // (already reaped) — or an already-reaped WaitStatus, also fine.
-        match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
-            Err(nix::errno::Errno::ECHILD) => {} // already reaped ✓
-            Ok(WaitStatus::StillAlive) => {
-                panic!("child pid {child_pid} still alive after reap_zombies");
-            }
-            other => {
-                let _ = other;
-            }
+        }
+        // Exactly one child was forked, so the reaping call must report exactly
+        // one — asserting `== 1` (not just `> 0`) pins the `count += 1`
+        // accumulator: a `*=` mutant leaves it 0 and a `-=` mutant wraps it.
+        if count != 1 {
+            return false;
+        }
+        if let Ok(WaitStatus::StillAlive) = waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            return false; // any already-reaped status (or ECHILD) is fine
         }
 
-        // ── Part 2: returns 0 when there is nothing left to reap ──
-        //
-        // Fork a second child and reap it *directly* with a blocking wait so we
-        // know it is fully gone from the child table. reap_zombies() must then
-        // hit ECHILD (or StillAlive with count 0) and return 0.
-        let child_pid = match unsafe { fork() }.expect("fork") {
-            ForkResult::Child => {
-                unsafe { libc::_exit(0) };
-            }
-            ForkResult::Parent { child } => child,
-        };
-        loop {
-            match waitpid(child_pid, None) {
-                Ok(_) => break,
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => panic!("waitpid failed: {e}"),
-            }
-        }
-        let n = reap_zombies();
-        assert_eq!(
-            n, 0,
-            "expected 0 after all children already reaped, got {n}"
-        );
+        // Part 2: with no children left, reap_zombies() must return 0 (the
+        // ECHILD/StillAlive path, no spin). Reliable HERE because this isolated
+        // subprocess has no other children — exactly what the outer fork buys.
+        reap_zombies() == 0
     }
 }
