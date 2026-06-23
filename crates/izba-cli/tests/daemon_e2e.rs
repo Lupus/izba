@@ -120,8 +120,11 @@ fn daemon_full_lifecycle() {
     // [2] Lifecycle through the daemon: exec exit codes + cp roundtrip.
     let o = izba(&data, no_env, &["exec", "e2e", "--", "/bin/false"]);
     assert_eq!(o.status.code(), Some(1), "exec false -> 1");
+    // Stance B: crun resolves the command inside the container; a missing
+    // executable surfaces as crun's stderr diagnostic + crun's exit code (1 on
+    // crun 1.28), passed straight through — not the pre-crun 127/CommandNotFound.
     let o = izba(&data, no_env, &["exec", "e2e", "--", "/no/such/cmd"]);
-    assert_eq!(o.status.code(), Some(127), "exec missing -> 127");
+    assert_eq!(o.status.code(), Some(1), "exec missing -> crun rc 1");
     std::fs::write(root.path().join("hello.txt"), b"roundtrip").unwrap();
     let src = root.path().join("hello.txt").to_string_lossy().into_owned();
     assert_ok(

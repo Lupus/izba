@@ -206,8 +206,8 @@ impl ExecEngine {
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 // The binary itself (crun in production) is missing — NOT the
-                // user's command, which is resolved inside the container and
-                // surfaces as crun rc 127.
+                // user's command, which is resolved inside the container by crun
+                // and surfaces as crun's stderr diagnostic + non-zero exit.
                 (
                     ErrorKind::Internal,
                     format!("exec binary {} not found: {e}", argv[0]),
@@ -245,7 +245,7 @@ impl ExecEngine {
     /// Test-only direct spawn: like `spawn_argv` but classifies a missing
     /// `argv[0]` as `CommandNotFound` (in the direct path the binary IS the
     /// user's workload). Production never takes this path — crun is always the
-    /// binary, and a missing user command surfaces as crun rc 127.
+    /// binary, and a missing user command surfaces as crun's stderr + exit code.
     #[cfg(test)]
     fn spawn_direct(&self, argv: &[String], tty: bool, user_argv0: &str) -> Result<u32, ExecError> {
         self.spawn_argv(argv, tty, user_argv0)
@@ -502,9 +502,10 @@ fn spawn_reaper(child: std::process::Child, pid: Pid, status: StatusCell) {
 ///
 /// **No double-add.** `crun exec` PROPAGATES the workload command's exit status
 /// as crun's OWN exit code: a normal exit `N` → crun exits `N`; a signal-killed
-/// command → crun exits `128+n`; a missing executable → crun exits `127`. So we
-/// pass crun's `Exited(code)` straight through as `Code(code)` — re-encoding a
-/// 128+n exit as `Signal(n)` here would double-apply the host CLI's `128+n`
+/// command → crun exits `128+n`; a missing executable → crun prints its
+/// `executable file ... not found` diagnostic and exits non-zero (rc 1 on crun
+/// 1.28). So we pass crun's `Exited(code)` straight through as `Code(code)` —
+/// re-encoding a 128+n exit as `Signal(n)` here would double-apply the host CLI's `128+n`
 /// mapping and produce the wrong number.
 ///
 /// `Signaled` only happens when the crun-exec PROCESS ITSELF is signaled (e.g.
@@ -589,7 +590,8 @@ mod tests {
         // spawn_argv's argv[0] is the binary to exec (crun in production). A
         // missing argv[0] is an Internal error (crun absent), NOT
         // CommandNotFound — the user's command is resolved *inside* the
-        // container by crun and surfaces as crun rc 127, not a spawn failure.
+        // container by crun and surfaces as crun's stderr + exit code, not a
+        // spawn failure.
         let e = engine();
         let (kind, msg) = spawn(&e, &["/nonexistent/zzz"], false).unwrap_err();
         assert_eq!(kind, ErrorKind::Internal, "{msg}");
@@ -895,7 +897,8 @@ mod tests {
             decode_wait_status(Ok(W::Exited(pid, 0))),
             ExitStatus::Code(0)
         );
-        // 127 = crun's "executable file not found" → CLI renders exit 127.
+        // An arbitrary non-zero workload exit passes straight through as
+        // Code(n) — crun propagates the workload's code verbatim.
         assert_eq!(
             decode_wait_status(Ok(W::Exited(pid, 127))),
             ExitStatus::Code(127)

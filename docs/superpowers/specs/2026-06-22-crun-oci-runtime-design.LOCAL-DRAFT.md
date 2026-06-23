@@ -385,15 +385,23 @@ stay). Internal edits: `ExecEngine::exec` calls the primitive; `child_pre_exec`
 loses `chroot`/`setuid` (crun does it), keeps `setsid`/`TIOCSCTTY` for the
 stdio-pass PTY option.
 
-**Exit-code translation is the subtle, highest-risk edit:**
-- **127 (CommandNotFound)** now originates from **crun's exit 127** (not an
-  execve ENOENT at spawn), since argv0 resolution happens inside crun → re-map
-  crun-exit-127 to `Response::Error{CommandNotFound}`.
-- **`Signal(n)` → 128+n:** crun exec exits with code `128+n` on child signal
-  death. The wire contract is `ExitStatus::Signal(n)` and the host *already*
-  computes `128+n`. So init must **decode crun's `128+n` exit back into
-  `ExitStatus::Signal(n)`** — otherwise the host double-adds. Dedicated TDD tests
-  up front (mirror the existing `command_not_found`/`kill_term` tests).
+**Exit-code translation (resolved — honest crun pass-through):**
+- The design originally assumed a missing command → **crun exit 127** → re-map
+  to `Response::Error{CommandNotFound}`. **Real crun 1.28 exits `1`** for a
+  missing executable (ambiguous with a legitimate `exit 1`), and prints
+  `executable file ... not found` to **stderr**. Reproducing the pre-crun
+  127/CommandNotFound would require fragile stderr-sniffing, so we **adopt the
+  honest container-runtime behavior** (decision, validated on real KVM): crun
+  resolves the command inside the container and izba **passes crun's exit code
+  straight through** (`Code(n)`), with crun's clear stderr diagnostic. `izba
+  exec /missing` therefore exits `1`, like `docker exec`. The `CommandNotFound`
+  frame stays in the wire protocol for genuine can't-reach-workload cases (and
+  the host RPC-wiring / scripted-guest tests still exercise its → 127 mapping).
+- **Signal death:** crun exec exits `128+n` when the workload is signal-killed.
+  Rather than decode `128+n` back to `Signal(n)`, init passes crun's `Code(128+n)`
+  straight through (the host CLI already renders `128+n`); re-encoding would
+  double-add. `Signal(n)` is reserved for when the crun-exec process ITSELF is
+  killed (e.g. our `kill`/`kill_all`). See `decode_wait_status`.
 - **PTY/resize:** keep the existing explicit `Resize` RPC → `TIOCSWINSZ` on init's
   PTY master (PTY-on-init-side, "option i"). Native `crun exec --tty
   --console-socket` (container-owned devpts) is a hardening follow-up.

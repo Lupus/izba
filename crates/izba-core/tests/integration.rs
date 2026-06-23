@@ -541,12 +541,22 @@ fn exit_codes() {
     let (status, _, _) = exec_collect(&tb.paths, "exit", &["false"], None).expect("exec false");
     assert_eq!(status, ExitStatus::Code(1));
 
-    let err = exec_collect(&tb.paths, "exit", &["/nonexistent"], None)
-        .expect_err("exec of /nonexistent must be rejected");
-    assert_eq!(
-        err.0,
-        ErrorKind::CommandNotFound,
-        "expected CommandNotFound, got {err:?}"
+    // Stance B: the workload runs inside the crun container, so command
+    // resolution happens in crun — a missing executable is no longer a
+    // spawn-time CommandNotFound frame. crun prints its own "executable file
+    // ... not found" diagnostic to stderr and exits non-zero (rc 1 on the
+    // pinned crun 1.28), which izba passes straight through (honest
+    // container-runtime behavior, like `docker exec`).
+    let (status, out, err) = exec_collect(&tb.paths, "exit", &["/nonexistent"], None)
+        .expect("exec of /nonexistent returns a status, not a transport error");
+    assert_eq!(status, ExitStatus::Code(1), "missing command -> crun rc 1");
+    assert!(
+        out.is_empty(),
+        "no stdout for a missing command, got {out:?}"
+    );
+    assert!(
+        err.contains("not found"),
+        "stderr should carry crun's not-found diagnostic, got {err:?}"
     );
 }
 
