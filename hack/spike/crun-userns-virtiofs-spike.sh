@@ -245,17 +245,18 @@ grep "SPIKE-RESULT:" "$CONSOLE" 2>/dev/null | sed 's/^/  /' || echo "  (none —
 echo ""
 echo "=== host-side round-trip ownership (spec test #3) ==="
 check_owner() {  # file label
-    local f="$WS/$1" label="$2"
+    local name="$1" label="$2"
+    local f="$WS/$name"
     if [[ ! -e "$f" ]]; then
         echo "  $label: MISSING ($f not created — that test did not reach the write)"
         return 1
     fi
     local own; own=$(stat -c '%u:%g' "$f")
     if [[ "$own" = "${HOST_UID}:${HOST_GID}" ]]; then
-        echo "  $label: PASS  $1 owned ${own} (== host ${HOST_UID}:${HOST_GID})"
+        echo "  $label: PASS  $name owned ${own} (== host ${HOST_UID}:${HOST_GID})"
         return 0
     fi
-    echo "  $label: FAIL  $1 owned ${own} (expected host ${HOST_UID}:${HOST_GID})"
+    echo "  $label: FAIL  $name owned ${own} (expected host ${HOST_UID}:${HOST_GID})"
     return 1
 }
 RT_A=0; RT_B=0
@@ -268,7 +269,7 @@ check_owner "created-by-B.txt" "optionB round-trip" || RT_B=1
 # target; its failure is reported loudly but, per spec, Option A alone is a
 # valid floor, so we surface B separately and only HARD-fail if A fails.
 # ---------------------------------------------------------------------------
-crun_pass() { grep -q "SPIKE-RESULT: $1 PASS" "$CONSOLE" 2>/dev/null; }
+crun_pass() { local opt="$1"; grep -q "SPIKE-RESULT: $opt PASS" "$CONSOLE" 2>/dev/null; }
 
 echo ""
 echo "=== verdict ==="

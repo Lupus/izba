@@ -47,10 +47,11 @@ build_rootfs() {  # $1 = dest dir
     done
     # world-readable/executable so a mapped (non-root) container uid can use it.
     chmod -R a+rX "$rfs"
+    return 0
 }
 
-log()    { echo "SPIKE: $*"; }
-result() { echo "SPIKE-RESULT: $*"; }   # "<test> PASS|FAIL <detail>"
+log()    { echo "SPIKE: $*"; return 0; }
+result() { echo "SPIKE-RESULT: $*"; return 0; }   # "<test> PASS|FAIL <detail>"
 
 # ---------------------------------------------------------------------------
 # 0. Pseudo-filesystems + cmdline parse
@@ -68,6 +69,7 @@ setup_mounts() {
     # sub-cgroup under it. If this fails we run crun with --cgroup-manager=disabled.
     mkdir -p /sys/fs/cgroup
     mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
+    return 0
 }
 
 parse_cmdline() {
@@ -77,8 +79,10 @@ parse_cmdline() {
             spike.hostuid=*) HOST_UID="${tok#spike.hostuid=}" ;;
             spike.hostgid=*) HOST_GID="${tok#spike.hostgid=}" ;;
             spike.atmpfs=*)  SPIKE_A_TMPFS="${tok#spike.atmpfs=}" ;;
+            *) : ;;  # ignore unrelated kernel cmdline tokens (console=, init=, etc.)
         esac
     done
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -131,6 +135,7 @@ probe_userns() {
     # A multi-row / identity map needs CAP_SETUID in the parent ns (root has it).
     # Probe writing setgroups + gid_map ordering the way the kernel requires.
     log "raw userns probe done"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -154,8 +159,10 @@ probe_userns() {
 # The probe reports the in-container ownership of the host-seeded file and creates
 # a fresh file for the host harness to round-trip-check after the VM exits.
 probe_cmd() {  # $1 = test label (A|B)
+    label="$1"
     printf '%s' \
-"set -e; cd /workspace; echo SPIKE: [$1] inside-owner-of-host-file \$(stat -c %u:%g hostfile 2>/dev/null || echo NONE); echo from-container-$1 > created-by-$1.txt; echo SPIKE: [$1] created created-by-$1.txt as \$(stat -c %u:%g created-by-$1.txt)"
+"set -e; cd /workspace; echo SPIKE: [$label] inside-owner-of-host-file \$(stat -c %u:%g hostfile 2>/dev/null || echo NONE); echo from-container-$label > created-by-$label.txt; echo SPIKE: [$label] created created-by-$label.txt as \$(stat -c %u:%g created-by-$label.txt)"
+    return 0
 }
 
 # Emit a COMPLETE OCI config.json by direct interpolation. No sed/awk templating
@@ -211,6 +218,7 @@ $ws_mount
   }
 }
 EOF
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -221,7 +229,7 @@ EOF
 #   files must appear as uid 0 inside, and a file the container creates must
 #   land on the host owned by HOST_UID. VMM-independent fallback.
 # ---------------------------------------------------------------------------
-write_config_optionA() {
+write_config_option_a() {
     mkdir -p "$BUNDLE_A"
     # Map a single-id row (container0 -> HOST_UID, the Option-A trick) plus a
     # small range so non-zero container ids stay valid. The guest runs as real
@@ -248,6 +256,7 @@ write_config_optionA() {
     build_rootfs "$rfs"
     chown -R "${HOST_UID}:${HOST_GID}" "$rfs"
     emit_config "$(probe_cmd A)" "$uidmap" "$gidmap" "$ws_mount" "$rfs" "$BUNDLE_A/config.json"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -259,7 +268,7 @@ write_config_optionA() {
 #   mount_setattr(MOUNT_ATTR_IDMAP). PASS = no EINVAL, file shows uid 0 inside,
 #   container-created file round-trips to host as HOST_UID.
 # ---------------------------------------------------------------------------
-write_config_optionB() {
+write_config_option_b() {
     mkdir -p "$BUNDLE_B"
     # Process userns is identity 0->0 over a range: the MOUNT carries the shift.
     # Identity, size 1: the container runs as real (guest-kernel) root; the
@@ -280,6 +289,7 @@ write_config_optionB() {
     rfs="$BUNDLE_B/rootfs"
     build_rootfs "$rfs"
     emit_config "$(probe_cmd B)" "$uidmap" "$gidmap" "$ws_mount" "$rfs" "$BUNDLE_B/config.json"
+    return 0
 }
 
 # Run crun for a bundle id; emit PASS/FAIL with the crun exit + a decoded hint.
@@ -313,6 +323,7 @@ run_crun() {
         esac
         result "$test FAIL crun-run rc=$rc$hint"
     fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -327,13 +338,13 @@ probe_userns
 
 if mount_workspace; then
     # Option A: VMM-independent fallback (test #6).
-    if write_config_optionA; then
+    if write_config_option_a; then
         run_crun optionA "$BUNDLE_A"
     else
         result "optionA FAIL could not write config.json"
     fi
     # Option B: SOTA idmapped mount (tests #1 + #3).
-    if write_config_optionB; then
+    if write_config_option_b; then
         run_crun optionB "$BUNDLE_B"
     else
         result "optionB FAIL could not write config.json"
