@@ -48,6 +48,9 @@ pub struct CreateOpts {
     pub rw_size_gb: u64,
     pub ports: Vec<crate::state::PortRule>,
     pub volumes: Vec<crate::volume::VolumeSpec>,
+    /// When true, this is a builder VM: a read-write `izba-buildout` virtiofs
+    /// share is attached at guest `/out` for build artefact output.
+    pub builder: bool,
 }
 
 /// Boot artifacts shared by all sandboxes (kernel + initramfs with izba-init).
@@ -191,8 +194,9 @@ fn build_vm_disks(
 }
 
 /// Kernel cmdline for a launch. `izba.volumes` carries the ordered guest
-/// mountpoints (vdc, vdd, …) only when volumes are present.
-fn build_cmdline(name: &str, volumes: &[crate::volume::VolumeSpec]) -> String {
+/// mountpoints (vdc, vdd, …) only when volumes are present. `izba.buildout=1`
+/// is appended for builder VMs so the guest mounts the `izba-buildout` share.
+fn build_cmdline(name: &str, volumes: &[crate::volume::VolumeSpec], builder: bool) -> String {
     let mut c = format!("console=ttyS0 izba.hostname={name} izba.egress=1");
     if !volumes.is_empty() {
         c.push_str(&format!(
@@ -200,7 +204,17 @@ fn build_cmdline(name: &str, volumes: &[crate::volume::VolumeSpec]) -> String {
             crate::volume::cmdline_value(volumes)
         ));
     }
+    if builder {
+        c.push_str(" izba.buildout=1");
+    }
     c
+}
+
+/// Returns the path the host should read after a builder VM finishes.
+/// The file is written by BuildKit at `/out/img.tar` inside the guest,
+/// which maps to this host path via the `izba-buildout` virtiofs share.
+pub fn buildout_path(paths: &Paths, name: &str) -> PathBuf {
+    paths.sandbox_dir(name).join("buildout").join("img.tar")
 }
 
 /// Resolve the per-sandbox account credentials to use when launching the VMM,
@@ -267,6 +281,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             workspace: opts.workspace.clone(),
             ports: opts.ports.clone(),
             volumes: volumes.clone(),
+            builder: opts.builder,
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 
@@ -702,10 +717,23 @@ pub fn start_with_timeouts(
     )
     .with_context(|| format!("writing oci/config.json for sandbox '{name}'"))?;
 
+    // For builder VMs: create the buildout host dir and add the rw share.
+    let mut extra_shares: Vec<FsShare> = Vec::new();
+    if config.builder {
+        let buildout_dir = paths.sandbox_dir(name).join("buildout");
+        std::fs::create_dir_all(&buildout_dir)
+            .with_context(|| format!("creating buildout dir {}", buildout_dir.display()))?;
+        extra_shares.push(FsShare {
+            tag: "izba-buildout".to_string(),
+            host_path: buildout_dir,
+        });
+    }
+
     // The guest is a pure vsock island: no NIC, no DHCP. izba.egress=1 is
     // always on — guest egress rides the izbad-owned vsock 1027 plane.
     // izba.volumes (when present) carries the ordered guest mountpoints.
-    let cmdline = build_cmdline(name, &config.volumes);
+    // izba.buildout=1 (when present) signals the guest to mount the buildout share.
+    let cmdline = build_cmdline(name, &config.volumes, config.builder);
     // Resolve per-sandbox account credentials when the sandbox is locked down
     // (Windows MVP-D).  On non-Windows and for unlocked sandboxes this is None
     // and the normal confined/unconfined path is used.
@@ -740,6 +768,10 @@ pub fn start_with_timeouts(
         allow_unconfined,
         lockdown,
     };
+    // Append optional per-mode shares (e.g. izba-buildout for builder VMs)
+    // after constructing the base spec so the base vec literal stays readable.
+    let mut spec = spec;
+    spec.shares.extend(extra_shares);
 
     let mut handle = driver.launch(&spec)?;
 
@@ -1608,8 +1640,8 @@ mod tests {
             size_bytes: 1 << 20,
             eph_id: None,
         }];
-        assert!(build_cmdline("web", &vols).contains("izba.volumes=/a"));
-        assert!(!build_cmdline("web", &[]).contains("izba.volumes"));
+        assert!(build_cmdline("web", &vols, false).contains("izba.volumes=/a"));
+        assert!(!build_cmdline("web", &[], false).contains("izba.volumes"));
     }
 
     fn opts(workspace: &Path) -> CreateOpts {
@@ -1622,6 +1654,7 @@ mod tests {
             rw_size_gb: 1,
             ports: Vec::new(),
             volumes: Vec::new(),
+            builder: false,
         }
     }
 
@@ -2627,5 +2660,118 @@ mod tests {
             crate::volume::parse_volume_flag("/scratch:1g").unwrap(),
         )
         .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // builder / buildout share tests
+    // -----------------------------------------------------------------------
+
+    /// A builder-mode sandbox must produce an `izba-buildout` share in the
+    /// VmSpec with the correct host_path (ending in `/buildout`).
+    #[test]
+    fn start_builder_includes_buildout_share() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let mut o = opts(&ws);
+        o.builder = true;
+        create(&paths, "builder", &o).unwrap();
+
+        let driver = MockDriver::new();
+        start(&paths, "builder", &driver, &arts(), false).unwrap();
+
+        let spec = driver
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spec captured");
+
+        let buildout = spec
+            .shares
+            .iter()
+            .find(|s| s.tag == "izba-buildout")
+            .expect("izba-buildout share must be present for a builder VM");
+        assert!(
+            buildout.host_path.ends_with("buildout"),
+            "buildout host_path must end with 'buildout', got: {}",
+            buildout.host_path.display()
+        );
+        assert!(
+            buildout.host_path.is_dir(),
+            "buildout dir must have been created on the host"
+        );
+    }
+
+    /// A normal (non-builder) sandbox must NOT have an `izba-buildout` share.
+    #[test]
+    fn start_non_builder_has_no_buildout_share() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
+
+        let spec = driver
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spec captured");
+        assert!(
+            spec.shares.iter().all(|s| s.tag != "izba-buildout"),
+            "normal sandbox must not have an izba-buildout share"
+        );
+    }
+
+    /// build_cmdline with builder=true must contain `izba.buildout=1`.
+    #[test]
+    fn build_cmdline_builder_flag_appended() {
+        let c = build_cmdline("mybox", &[], true);
+        assert!(
+            c.contains("izba.buildout=1"),
+            "builder cmdline must contain izba.buildout=1, got: {c}"
+        );
+    }
+
+    /// build_cmdline with builder=false must NOT contain `izba.buildout`.
+    #[test]
+    fn build_cmdline_no_builder_flag_absent() {
+        let c = build_cmdline("mybox", &[], false);
+        assert!(
+            !c.contains("izba.buildout"),
+            "non-builder cmdline must not contain izba.buildout, got: {c}"
+        );
+    }
+
+    /// `SandboxConfig` without a `builder` field in JSON deserializes to `builder == false`.
+    #[test]
+    fn sandbox_config_builder_defaults_to_false() {
+        let json = r#"{
+            "image_digest": "sha256:abc",
+            "image_ref": "ubuntu:22.04",
+            "cpus": 2,
+            "mem_mb": 1024,
+            "workspace": "/ws"
+        }"#;
+        let cfg: crate::state::SandboxConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            !cfg.builder,
+            "builder must default to false for back-compat"
+        );
+    }
+
+    /// `buildout_path` returns `<sandbox_dir>/buildout/img.tar`.
+    #[test]
+    fn buildout_path_ends_in_img_tar() {
+        let (_dir, paths) = test_paths();
+        let p = buildout_path(&paths, "builder");
+        assert!(
+            p.ends_with("buildout/img.tar"),
+            "buildout_path must end with buildout/img.tar, got: {}",
+            p.display()
+        );
     }
 }

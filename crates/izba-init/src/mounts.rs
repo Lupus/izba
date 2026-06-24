@@ -147,6 +147,17 @@ pub fn volume_device(index: usize) -> String {
     format!("/dev/vd{}", (b'c' + index as u8) as char)
 }
 
+/// The virtiofs tag for the builder output share.
+pub const BUILDOUT_TAG: &str = "izba-buildout";
+
+/// Mount op for the builder output share: the host `<sandbox>/buildout/` dir
+/// is presented read-WRITE at `/rootfs/out` so BuildKit can write `img.tar`.
+/// Only added to the mount plan when the kernel cmdline carries `izba.buildout=1`.
+pub fn buildout_mount_op() -> MountOp {
+    // No "ro" flag → writable by the guest (virtiofs passes writes through).
+    MountOp::new(BUILDOUT_TAG, "/rootfs/out", "virtiofs", &[], "")
+}
+
 /// Mount ops for user volumes, one per guest path in declaration order.
 /// Mounted under /rootfs AFTER the overlay + virtiofs shares. ext4, no
 /// special flags. Targets are created by [`apply`].
@@ -495,6 +506,24 @@ mod tests {
     fn volume_devices_match_plan() {
         assert_eq!(volume_device(0), "/dev/vdc");
         assert_eq!(volume_device(2), "/dev/vde");
+    }
+
+    /// Given `izba.buildout=1` in the cmdline, the buildout mount op must mount
+    /// `izba-buildout` at `/rootfs/out` as virtiofs with no `ro` flag.
+    #[test]
+    fn buildout_mount_op_is_rw_virtiofs_at_rootfs_out() {
+        let op = buildout_mount_op();
+        assert_eq!(op.source, BUILDOUT_TAG);
+        assert_eq!(op.target, std::path::PathBuf::from("/rootfs/out"));
+        assert_eq!(op.fstype, "virtiofs");
+        assert!(
+            !op.flags.iter().any(|f| f == "ro"),
+            "buildout share must be writable (no ro flag)"
+        );
+        assert!(
+            !op.optional,
+            "buildout share must be mandatory (not optional)"
+        );
     }
 
     #[test]

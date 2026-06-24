@@ -233,6 +233,7 @@ fn create_sandbox(env: &TestEnv, tb: &mut TestBox, name: &str, ws: &Path) {
             rw_size_gb: 2,
             ports: Vec::new(),
             volumes: Vec::new(),
+            builder: false,
         },
     )
     .expect("create");
@@ -260,6 +261,7 @@ fn create_sandbox_with_volumes(
             rw_size_gb: 2,
             ports: Vec::new(),
             volumes,
+            builder: false,
         },
     )
     .expect("create");
@@ -1748,6 +1750,7 @@ fn port_publish_create_time() {
                 guest_port: 8000,
             }],
             volumes: Vec::new(),
+            builder: false,
         },
     )
     .expect("create");

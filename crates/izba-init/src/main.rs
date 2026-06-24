@@ -194,6 +194,17 @@ fn run_pid1() -> anyhow::Result<()> {
         .unwrap_or_default();
     setup_user_volumes(&vols)?;
 
+    // Builder output share: when the host attached the `izba-buildout` virtiofs
+    // share (signalled by `izba.buildout=1` on the cmdline), mount it at
+    // /rootfs/out so BuildKit can write img.tar there.
+    if params
+        .get("izba.buildout")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        mounts::apply(&[mounts::buildout_mount_op()]).context("buildout mount")?;
+    }
+
     // Static guest networking: lo + dummy0 with the izba subnet. Log and
     // continue on error — exec/cp/vsock still work without IP networking.
     if let Err(e) = net::configure() {

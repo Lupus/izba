@@ -89,6 +89,7 @@ mod tests {
             rw_size_gb: 1,
             ports: Vec::new(),
             volumes: Vec::new(),
+            builder: false,
         };
         crate::sandbox::create(&paths, "up", &opts).unwrap();
         crate::sandbox::create(&paths, "down", &opts).unwrap();
