@@ -481,7 +481,7 @@ fn sftp(data: &Path, name: &str, batch: &Path) -> Output {
 /// Gated behind `IZBA_INTEGRATION=1` — self-skips otherwise.
 ///
 /// Note: this test requires host-side internet egress on the runner (builder
-/// image pull from ghcr.io/moby/buildkit, plus the in-VM `FROM alpine:3.20`
+/// image pull from docker.io/moby/buildkit, plus the in-VM `FROM alpine:3.20`
 /// pull through the enforcing build-network policy that allow-lists Docker Hub).
 /// GitHub Actions hosted runners have internet access; this test is always run
 /// in that environment.

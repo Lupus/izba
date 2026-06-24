@@ -550,7 +550,7 @@ if (Test-Path $unsWs) { Remove-Item -Recurse -Force $unsWs -ErrorAction Silently
 # [14] build-in-VM: Dockerfile -> OCI ingest -> tag -> run -> marker.
 #
 # Exercises the full `izba build` pipeline on WHP: lazy-pull of the BuildKit
-# builder image (ghcr.io/moby/buildkit), build inside a throwaway builder VM
+# builder image (docker.io/moby/buildkit), build inside a throwaway builder VM
 # (enforcing build-network policy, Docker Hub allow-list), OCI-archive ingest,
 # tag, then `izba run --image <tag> -- cat /izba-build-marker` to verify the
 # layer written by RUN is readable in the resulting sandbox.
