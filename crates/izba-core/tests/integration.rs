@@ -995,6 +995,59 @@ fn egress_dns_hardcoded_external_resolver() {
     mgr.stop(&tb.paths, "egress-dns-hard");
 }
 
+/// Completeness companion to `egress_dns_hardcoded_external_resolver`: DNS over
+/// *TCP* to a hardcoded external resolver is ALSO intercepted by the in-guest
+/// resolver, not raw-dialed to that IP. We target `192.0.2.1` (RFC 5737
+/// TEST-NET-1, guaranteed to host no real DNS server), so a non-empty answer
+/// can ONLY come from izba's resolver — the pre-`tcp dport 53 redirect` behaviour
+/// (general TCP REDIRECT → `TcpConnect` dial-out to 192.0.2.1:53) would connect
+/// nowhere and return nothing. busybox has no TCP-capable resolver, so we craft
+/// a minimal DNS/TCP query for `example.com` (2-byte length prefix + message,
+/// id 0xABCD) and send it with `nc`; the response echoes the question, whose
+/// `example` label is `65 78 61 6d 70 6c 65` in the hexdump. `sleep` keeps nc's
+/// stdin open long enough to read the reply before half-closing.
+#[test]
+fn egress_dns_tcp_hardcoded_external_resolver() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("egress-dns-tcp");
+    create_sandbox(&env, &mut tb, "egress-dns-tcp", &ws);
+
+    use izba_core::daemon::egress::EgressManager;
+    let mgr = EgressManager::new(
+        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
+        None,
+        izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
+    );
+    mgr.ensure_listening(&tb.paths, "egress-dns-tcp")
+        .expect("bind vsock_1027 listener");
+
+    if let Err(e) = start_sandbox(&env, &tb, "egress-dns-tcp") {
+        mgr.stop(&tb.paths, "egress-dns-tcp");
+        panic!(
+            "boot of 'egress-dns-tcp' failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, "egress-dns-tcp")
+        );
+    }
+
+    // DNS/TCP query for example.com A IN (id 0xABCD), 2-byte length-prefixed;
+    // octal escapes keep printf busybox-portable. The pipeline's exit status is
+    // `tr`'s (always 0), so `exec_ok` won't trip on nc's exit code.
+    let q = r"\000\035\253\315\001\000\000\001\000\000\000\000\000\000\007example\003com\000\000\001\000\001";
+    let cmd = format!(
+        "{{ printf '{q}'; sleep 2; }} | nc -w 5 192.0.2.1 53 | od -A n -t x1 | tr -d '\\n'"
+    );
+    let out = exec_ok(&tb.paths, "egress-dns-tcp", &["sh", "-lc", &cmd]);
+    assert!(
+        out.contains("65 78 61 6d 70 6c 65"),
+        "expected a DNS/TCP answer echoing example.com from the in-guest resolver \
+         (a raw dial to TEST-NET 192.0.2.1:53 would return nothing), got: {out:?}"
+    );
+
+    stop_sandbox(&tb, "egress-dns-tcp");
+    mgr.stop(&tb.paths, "egress-dns-tcp");
+}
+
 /// M1 phase B exit: guest TCP egress rides the stub. The guest wgets a
 /// host-served one-shot HTTP page addressed by a routable host IP; the nft
 /// REDIRECT intercepts, izbad dials back to the host listener.
