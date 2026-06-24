@@ -17,8 +17,10 @@
 #       runs the user's workload container under inside the guest (Stance B).
 #   IZBA_SSHD=/path/to/static/sshd  (optional, see hack/build-sshd.sh)
 #       If set, the binary is embedded in /sbin/sshd so izba-init can launch
-#       it on boot (SSH access feature).  hack/sshd_config is always copied to
-#       /etc/ssh/sshd_config regardless of whether IZBA_SSHD is set.
+#       it on boot (SSH access feature).  Its companions sshd-session and
+#       sftp-server (emitted next to IZBA_SSHD by build-sshd.sh) are embedded
+#       at /usr/libexec/sshd-session and /sbin/sftp-server.  hack/sshd_config
+#       is always copied to /etc/ssh/sshd_config regardless of IZBA_SSHD.
 set -euo pipefail
 
 # Capture the script directory before any cd so $0-relative paths stay valid
@@ -155,6 +157,21 @@ if [[ -n "${IZBA_SSHD:-}" ]]; then
     cp "$sshd_session" "$WORK/usr/libexec/sshd-session"
     chmod 755 "$WORK/usr/libexec/sshd-session"
     echo "  embedded sshd-session from $sshd_session"
+
+    # Native sftp-server for the SSH `Subsystem sftp` directive. izba-init copies
+    # it from /sbin/sftp-server into the workload container's overlay at boot
+    # (oci.rs install_sftp_server → SFTP_SERVER_INITRAMFS_PATH), so the sftp
+    # protocol runs inside the container. Emitted next to IZBA_SSHD by
+    # build-sshd.sh, like sshd-session.
+    sftp_server="$(dirname "$IZBA_SSHD")/sftp-server"
+    if [[ ! -f "$sftp_server" ]]; then
+        echo "error: sftp-server not found next to IZBA_SSHD at '$sftp_server'" >&2
+        echo "       (build-sshd.sh emits sshd + sshd-session + sftp-server together)" >&2
+        exit 1
+    fi
+    cp "$sftp_server" "$WORK/sbin/sftp-server"
+    chmod 755 "$WORK/sbin/sftp-server"
+    echo "  embedded sftp-server from $sftp_server"
 fi
 
 # Pack the tree into a newc cpio archive and gzip it.

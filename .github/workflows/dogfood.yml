@@ -108,6 +108,7 @@ jobs:
           path: |
             dist/sshd
             dist/sshd-session
+            dist/sftp-server
           if-no-files-found: error
 
   initramfs:
@@ -145,7 +146,8 @@ jobs:
           [ -f dist/nft ] || { echo "expected dist/nft from the nft job" >&2; exit 1; }
           [ -f dist/sshd ] || { echo "expected dist/sshd from the sshd job" >&2; exit 1; }
           [ -f dist/sshd-session ] || { echo "expected dist/sshd-session from the sshd job" >&2; exit 1; }
-          chmod 755 "${files[0]}" dist/nft dist/sshd dist/sshd-session
+          [ -f dist/sftp-server ] || { echo "expected dist/sftp-server from the sshd job" >&2; exit 1; }
+          chmod 755 "${files[0]}" dist/nft dist/sshd dist/sshd-session dist/sftp-server
           IZBA_MKE2FS="${files[0]}" IZBA_NFT=dist/nft IZBA_SSHD=dist/sshd hack/build-initramfs.sh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

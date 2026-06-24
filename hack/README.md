@@ -38,8 +38,12 @@ stub (see `build-nft.sh`).
 
 **Optional:** set `IZBA_SSHD=/path/to/static/sshd` to embed a static `sshd`
 binary in `/sbin/sshd`.  This enables the SSH access feature (izba-init
-launches sshd on boot).  `hack/sshd_config` is always copied to
-`/etc/ssh/sshd_config` regardless of whether `IZBA_SSHD` is set.
+launches sshd on boot).  The companion `sshd-session` (re-exec worker) and
+`sftp-server` (for the `Subsystem sftp` directive) must sit next to
+`IZBA_SSHD`; they are embedded at `/usr/libexec/sshd-session` and
+`/sbin/sftp-server` respectively (`build-sshd.sh` emits all three together).
+`hack/sshd_config` is always copied to `/etc/ssh/sshd_config` regardless of
+whether `IZBA_SSHD` is set.
 
 Output defaults to `dist/initramfs.cpio.gz`.
 
@@ -80,17 +84,23 @@ Pinned: crun 1.28, json-c 0.18 (both sha256-verified in-container).
 Builds a static `sshd` (OpenSSH Portable **9.9p2**) for the initramfs, via a
 throwaway Alpine container (musl).  It fetches the sha256-pinned OpenSSH
 source tarball from cdn.openbsd.org, configures it without PAM/SELinux, links
-it fully static (`LDFLAGS=-static`), strips it, and writes it to `dist/sshd`.
+it fully static (`LDFLAGS=-static`), strips it, and writes `dist/sshd`,
+`dist/sshd-session` (the 9.8 split re-exec worker), and `dist/sftp-server`
+(the native SFTP server for `Subsystem sftp`).
 
 ```sh
-hack/build-sshd.sh            # writes dist/sshd (~4.6 MB, statically linked)
+hack/build-sshd.sh            # writes dist/{sshd,sshd-session,sftp-server} (static)
 ```
 
-Embed it via `IZBA_SSHD=dist/sshd hack/build-initramfs.sh`.  Requires Docker.
+Embed them via `IZBA_SSHD=dist/sshd hack/build-initramfs.sh` (it picks up
+`sshd-session` and `sftp-server` from the same directory).  Requires Docker.
 The companion `hack/sshd_config` is always embedded at `/etc/ssh/sshd_config`
 regardless of whether `IZBA_SSHD` is set (the config is inert without the
 binary).  The binary is needed for the SSH access feature (izba-init launches
-`/sbin/sshd` at boot when the binary is present).
+`/sbin/sshd` at boot when the binary is present).  The sftp protocol runs the
+vendored `sftp-server` *inside* the workload container: izba-init copies it
+into the container overlay at boot and `sshd_config` points `Subsystem sftp`
+at that in-container path.
 
 ### `build-kernel.sh`
 

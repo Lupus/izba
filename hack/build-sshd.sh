@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Build a static sshd (+ its re-exec helper) for the izba initramfs (musl, via
-# Alpine).  Outputs: dist/sshd, dist/sshd-session
+# Build a static sshd (+ its re-exec helper + sftp-server) for the izba
+# initramfs (musl, via Alpine).  Outputs: dist/sshd, dist/sshd-session,
+# dist/sftp-server
 # (use: IZBA_SSHD=dist/sshd hack/build-initramfs.sh — it finds sshd-session
-# alongside dist/sshd automatically).
+# and sftp-server alongside dist/sshd automatically).
+#
+# sftp-server is the native OpenSSH SFTP server. izba bind/copies it into the
+# workload container and points `Subsystem sftp` at it (see hack/sshd_config),
+# so the sftp protocol runs inside the container rather than in sshd's own
+# (initramfs) namespace.
 #
 # The SSH access feature requires a static sshd so it can run inside the minimal
 # initramfs with no shared libraries.  sshd is started by izba-init and listens
@@ -84,14 +90,14 @@ docker run --rm \
       LDFLAGS="-static" \
       LIBS="-lresolv"
 
-  make -j"$(nproc)" sshd sshd-session
-  for b in sshd sshd-session; do
+  make -j"$(nproc)" sshd sshd-session sftp-server
+  for b in sshd sshd-session sftp-server; do
     strip "$b"
     cp "$b" "/out/$b"
   done
 '
 
-for b in sshd sshd-session; do
+for b in sshd sshd-session sftp-server; do
     f="dist/$b"
     file "$f" | grep -q "statically linked" || {
         echo "error: $f is not statically linked" >&2
