@@ -806,6 +806,7 @@ fn userns_numeric_user_owns_workspace() {
             rw_size_gb: 2,
             ports: Vec::new(),
             volumes: Vec::new(),
+            builder: false,
         },
     )
     .expect("create");
