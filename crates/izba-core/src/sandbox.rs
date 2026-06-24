@@ -489,10 +489,21 @@ fn workspace_owner(workspace: &Path) -> (u32, u32) {
         use std::os::unix::fs::MetadataExt;
         match std::fs::metadata(workspace) {
             Ok(m) => (m.uid(), m.gid()),
-            Err(_) => (
-                nix::unistd::Uid::effective().as_raw(),
-                nix::unistd::Gid::effective().as_raw(),
-            ),
+            Err(e) => {
+                // Fail-honest: the anchor falls back to the process owner (what
+                // virtiofsd runs as), but log it — a wrong anchor surfaces later
+                // as confusing in-container /workspace ownership.
+                eprintln!(
+                    "izba: [userns] warning: stat({}) failed ({e}); falling back to \
+                     euid/egid for the Option A workspace-owner anchor — in-container \
+                     /workspace ownership may be wrong",
+                    workspace.display()
+                );
+                (
+                    nix::unistd::Uid::effective().as_raw(),
+                    nix::unistd::Gid::effective().as_raw(),
+                )
+            }
         }
     }
     #[cfg(not(unix))]
