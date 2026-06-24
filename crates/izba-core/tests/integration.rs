@@ -944,6 +944,57 @@ fn egress_dns_via_izbad() {
     mgr.stop(&tb.paths, "egress-dns");
 }
 
+/// Transparent-reply fix (M4 prereq for docker/build-in-VM): a client that
+/// hardcodes an external UDP resolver (e.g. dockerd/buildkit falling back to
+/// 8.8.8.8:53 after stripping the loopback resolv.conf) resolves names. The
+/// nft `udp dport 53 redirect` pulls the query to the stub; the stub answers
+/// FROM the REDIRECT's original destination (IP_ORIGDSTADDR/IP_PKTINFO) so
+/// conntrack un-NATs the reply. Before the fix this path was dead (wildcard
+/// source mismatch). busybox `nslookup <name> <server>` queries ONLY the given
+/// server over UDP, so it exercises exactly the hardcoded-resolver path,
+/// bypassing the loopback resolv.conf the `egress_dns_via_izbad` test covers.
+#[test]
+fn egress_dns_hardcoded_external_resolver() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("egress-dns-hard");
+    create_sandbox(&env, &mut tb, "egress-dns-hard", &ws);
+
+    use izba_core::daemon::egress::EgressManager;
+    let mgr = EgressManager::new(
+        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
+        None,
+        izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
+    );
+    mgr.ensure_listening(&tb.paths, "egress-dns-hard")
+        .expect("bind vsock_1027 listener");
+
+    if let Err(e) = start_sandbox(&env, &tb, "egress-dns-hard") {
+        mgr.stop(&tb.paths, "egress-dns-hard");
+        panic!(
+            "boot of 'egress-dns-hard' failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, "egress-dns-hard")
+        );
+    }
+
+    // Query 8.8.8.8 explicitly: the datagram leaves for 8.8.8.8:53, nft
+    // REDIRECTs it to the guest stub, izbad resolves via the host upstream,
+    // and the transparent reply (sourced from the REDIRECT's 127.0.0.1 dst)
+    // is un-NAT'd by conntrack back to 8.8.8.8:53 so nslookup accepts it.
+    let out = exec_ok(
+        &tb.paths,
+        "egress-dns-hard",
+        &["sh", "-lc", "nslookup example.com 8.8.8.8"],
+    );
+    assert!(
+        out.contains("example.com") && out.to_lowercase().contains("address"),
+        "expected nslookup against hardcoded 8.8.8.8 to resolve example.com, got: {out:?}"
+    );
+
+    stop_sandbox(&tb, "egress-dns-hard");
+    mgr.stop(&tb.paths, "egress-dns-hard");
+}
+
 /// M1 phase B exit: guest TCP egress rides the stub. The guest wgets a
 /// host-served one-shot HTTP page addressed by a routable host IP; the nft
 /// REDIRECT intercepts, izbad dials back to the host listener.

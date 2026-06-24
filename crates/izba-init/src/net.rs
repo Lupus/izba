@@ -31,7 +31,19 @@ pub fn configure() -> io::Result<()> {
     set_addr("dummy0:1", RESOLVER_IP, NETMASK)?;
     if_up("dummy0:1")?;
     add_default_route(RESOLVER_IP)?;
+    enable_route_localnet()?;
     Ok(())
+}
+
+/// Permit 127/8 to appear as a route source/destination on real interfaces.
+/// The nft `udp dport 53 redirect` rule rewrites a hardcoded-resolver query's
+/// destination to 127.0.0.1; the DNS stub then replies FROM 127.0.0.1 to the
+/// guest IP so conntrack can reverse the DNAT (see `egress::NFT_RULESET`).
+/// Without `route_localnet` the kernel treats that 127.0.0.1 source as a
+/// martian and drops the reply. Harmless on this NIC-less island — there is no
+/// external interface for a 127/8 address to leak onto.
+fn enable_route_localnet() -> io::Result<()> {
+    std::fs::write("/proc/sys/net/ipv4/conf/all/route_localnet", "1\n")
 }
 
 fn ctl_socket() -> io::Result<std::os::fd::OwnedFd> {
