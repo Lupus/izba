@@ -155,6 +155,31 @@ struct RawConfig {
 }
 
 impl EgressPolicyConfig {
+    /// The dedicated build-network policy: enforcing, allow-listing the
+    /// Docker Hub hosts the BuildKit image pull + a Docker Hub `FROM` need,
+    /// plus caller-declared registries/mirrors (`extra_hosts`, from
+    /// `izba build --build-allow`). Everything else is denied. Distinct from
+    /// a sandbox run policy; never AllowAll.
+    pub fn build_network(extra_hosts: &[String]) -> Self {
+        const DOCKER_HUB_HOSTS: &[&str] = &[
+            "registry-1.docker.io",
+            "auth.docker.io",
+            "production.cloudflare.docker.com",
+        ];
+        let mut allow: Vec<AllowEntry> = DOCKER_HUB_HOSTS
+            .iter()
+            .map(|h| AllowEntry::Host((*h).to_string()))
+            .collect();
+        for h in extra_hosts {
+            allow.push(AllowEntry::Host(h.clone()));
+        }
+        Self {
+            enforce: true,
+            allow,
+            git: vec![],
+        }
+    }
+
     /// Parse the YAML policy file. An empty/comment-only file is a valid
     /// deny-all — a declared-but-allow-nothing sandbox. A present file without
     /// an explicit `enforce:` key defaults to `enforce: true` (authoring intent).
@@ -992,6 +1017,57 @@ mod tests {
                 access: Access::Read,
             },
             "default ports must normalize to None on an access change"
+        );
+    }
+
+    // ── Task 6: build_network policy tests ───────────────────────────────────
+
+    fn flow_with_host(sandbox: &str, host: &str, port: u16) -> FlowDesc {
+        let mut f = FlowDesc::l3(sandbox, host, port);
+        f.host = Some(host.into());
+        f
+    }
+
+    #[test]
+    fn build_policy_allows_dockerhub_denies_others() {
+        let p = EgressPolicyConfig::build_network(&[])
+            .into_policy("builder")
+            .unwrap();
+        assert!(p.enforces());
+        assert_eq!(
+            p.check(&flow_with_host("builder", "auth.docker.io", 443)),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check(&flow_with_host("builder", "registry-1.docker.io", 443)),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check(&flow_with_host(
+                "builder",
+                "production.cloudflare.docker.com",
+                443
+            )),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check(&flow_with_host("builder", "evil.example.com", 443)),
+            Verdict::Deny
+        );
+    }
+
+    #[test]
+    fn build_policy_extra_hosts_allowed() {
+        let p = EgressPolicyConfig::build_network(&["mirror.example.com".into()])
+            .into_policy("builder")
+            .unwrap();
+        assert_eq!(
+            p.check(&flow_with_host("builder", "mirror.example.com", 443)),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check(&flow_with_host("builder", "evil.example.com", 443)),
+            Verdict::Deny
         );
     }
 }
