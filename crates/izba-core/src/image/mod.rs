@@ -59,6 +59,9 @@ pub(crate) fn publish_image(
 /// persist_config,is_cached}`, `flatten_layers`) have their own unit tests.
 #[mutants::skip]
 pub fn ensure_image(paths: &Paths, image_ref: &str) -> Result<String> {
+    if let Some(p) = image_ref.strip_prefix("oci-archive:") {
+        return ingest_oci_archive(paths, std::path::Path::new(p));
+    }
     let store = ImageStore::new(paths);
     let resolved = pull::resolve(image_ref)?;
     let digest = resolved.digest.clone();
@@ -149,5 +152,32 @@ mod tests {
         // Second call with empty layers must succeed (cache hit — layers never read).
         let out = publish_image(&paths, &digest, "oci-archive:/x", b"{}", vec![]).unwrap();
         assert_eq!(out, digest);
+    }
+
+    /// `ensure_image("oci-archive:<path>")` must route to `ingest_oci_archive`
+    /// and return the same digest as a direct call.
+    #[test]
+    fn ensure_image_routes_oci_archive_prefix() {
+        if which::which("mkfs.erofs").is_err() {
+            eprintln!("SKIP: mkfs.erofs not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let archive =
+            crate::image::ingest::tests::build_oci_archive_fixture(tmp.path(), "/etc/x", b"hi");
+
+        // Direct ingest into one store.
+        let paths_direct = Paths::with_root(tmp.path().join("izba_direct"));
+        let digest_direct = ingest_oci_archive(&paths_direct, &archive).unwrap();
+
+        // ensure_image with the oci-archive: prefix into a fresh store.
+        let paths_via = Paths::with_root(tmp.path().join("izba_via"));
+        let image_ref = format!("oci-archive:{}", archive.display());
+        let digest_via = ensure_image(&paths_via, &image_ref).unwrap();
+
+        assert_eq!(
+            digest_direct, digest_via,
+            "ensure_image(oci-archive:...) must return the same digest as ingest_oci_archive"
+        );
     }
 }
