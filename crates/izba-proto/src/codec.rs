@@ -161,8 +161,8 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::messages::{
-        ErrorKind, ExecRequest, ExitStatus, HealthInfo, Request, Response, StreamAttach,
-        StreamKind, StreamOpen,
+        ContainerState, ErrorKind, ExecRequest, ExitStatus, HealthInfo, Request, Response,
+        StreamAttach, StreamKind, StreamOpen,
     };
 
     /// Build an arbitrary ExecRequest.
@@ -222,16 +222,32 @@ mod tests {
         ]
     }
 
+    /// Build an arbitrary in-guest container state (including `None`), so the
+    /// codec roundtrip fuzzes every `HealthInfo.container` value, not just None.
+    fn arb_container_state() -> impl Strategy<Value = Option<ContainerState>> {
+        prop_oneof![
+            Just(None),
+            Just(Some(ContainerState::Creating)),
+            Just(Some(ContainerState::Created)),
+            Just(Some(ContainerState::Running)),
+            Just(Some(ContainerState::Stopped)),
+            Just(Some(ContainerState::Paused)),
+            Just(Some(ContainerState::Unknown)),
+        ]
+    }
+
     /// Build an arbitrary Response covering all variants.
     fn arb_response() -> impl Strategy<Value = Response> {
         prop_oneof![
-            (any::<String>(), any::<u64>()).prop_map(|(version, uptime_ms)| {
-                Response::Health(HealthInfo {
-                    version,
-                    uptime_ms,
-                    container: None,
-                })
-            }),
+            (any::<String>(), any::<u64>(), arb_container_state()).prop_map(
+                |(version, uptime_ms, container)| {
+                    Response::Health(HealthInfo {
+                        version,
+                        uptime_ms,
+                        container,
+                    })
+                }
+            ),
             any::<u32>().prop_map(|exec_id| Response::ExecStarted { exec_id }),
             arb_exit_status().prop_map(|status| Response::Wait { status }),
             Just(Response::Ok),
