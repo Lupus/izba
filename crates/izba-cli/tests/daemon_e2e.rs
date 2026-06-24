@@ -408,7 +408,14 @@ fn ssh_sftp_e2e() {
         &data,
         no_env,
         &[
-            "run", "--image", IMAGE, "--name", "sftpe2e", &ws_s, "--", "/bin/true",
+            "run",
+            "--image",
+            IMAGE,
+            "--name",
+            "sftpe2e",
+            &ws_s,
+            "--",
+            "/bin/true",
         ],
     );
     assert_ok(&o, "run /bin/true (boot)");
