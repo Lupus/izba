@@ -217,6 +217,20 @@ impl DaemonClient {
         }
     }
 
+    /// Probe a sandbox's in-guest container state via the guest `Health` RPC.
+    ///
+    /// Returns `None` on any failure (the guest is unreachable / the sandbox is
+    /// stopped) or when the guest's `HealthInfo` carries no `container` field
+    /// (an older guest). Used by `izba daemon status` to render each running
+    /// sandbox's container state honestly — a per-sandbox probe driven by the
+    /// CLI, so a plain `Status` aggregate stays a cheap registry read.
+    pub fn container_state(&mut self, name: &str) -> Option<izba_proto::ContainerState> {
+        match self.guest_rpc(name, &Request::Health) {
+            Ok(Response::Health(h)) => h.container,
+            _ => None,
+        }
+    }
+
     /// Open a raw byte stream to `name`'s guest stream port through the
     /// daemon (fresh connection; consumed by the conversion). The caller
     /// sends the guest `StreamOpen` frame on the returned stream.
@@ -481,6 +495,48 @@ mod tests {
         let mut c = DaemonClient::handshake(conn, "v").unwrap();
         let resp = c.guest_rpc("web", &izba_proto::Request::Health).unwrap();
         assert!(matches!(resp, izba_proto::Response::Ok));
+    }
+
+    #[test]
+    fn container_state_extracts_from_health_reply() {
+        let conn = fake_daemon("v", |mut s| {
+            let req: DaemonRequest = read_frame(&mut s).unwrap();
+            assert!(matches!(req, DaemonRequest::GuestRpc { .. }));
+            write_frame(
+                &mut s,
+                &DaemonResponse::Guest {
+                    payload: izba_proto::Response::Health(izba_proto::HealthInfo {
+                        version: "v".into(),
+                        uptime_ms: 5,
+                        container: Some(izba_proto::ContainerState::Stopped),
+                    }),
+                },
+            )
+            .unwrap();
+        });
+        let mut c = DaemonClient::handshake(conn, "v").unwrap();
+        assert_eq!(
+            c.container_state("web"),
+            Some(izba_proto::ContainerState::Stopped)
+        );
+    }
+
+    #[test]
+    fn container_state_is_none_on_daemon_error() {
+        // A stopped/unreachable sandbox surfaces a daemon Error; the helper
+        // swallows it to None so `daemon status` renders "unknown", not a crash.
+        let conn = fake_daemon("v", |mut s| {
+            let _req: DaemonRequest = read_frame(&mut s).unwrap();
+            write_frame(
+                &mut s,
+                &DaemonResponse::Error {
+                    message: "sandbox 'web' is not running".into(),
+                },
+            )
+            .unwrap();
+        });
+        let mut c = DaemonClient::handshake(conn, "v").unwrap();
+        assert_eq!(c.container_state("web"), None);
     }
 
     #[test]

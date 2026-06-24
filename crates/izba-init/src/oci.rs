@@ -212,19 +212,19 @@ pub fn crun_state_argv(container_id: &str) -> Vec<String> {
 // crun state JSON parse
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Returns `true` when `crun state` output indicates the container is running.
+/// Parse the OCI `status` field out of `crun state` JSON into a
+/// [`izba_proto::ContainerState`].
 ///
-/// `crun state` emits OCI state JSON with a `"status"` field. The value is
-/// `"running"` when the container is live; `"stopped"`, `"created"`, or absent
-/// when it is not. An unparseable output is treated as not-running.
-pub fn parse_crun_state_running(json: &str) -> bool {
-    // We only need the "status" field, so a simple substring search is fine and
-    // avoids pulling in serde_json into the musl binary.
-    // OCI state spec: status ∈ { "creating", "created", "running", "stopped" }
-    // crun additionally emits "paused".
-    extract_status_field(json)
-        .map(|s| s == "running")
-        .unwrap_or(false)
+/// `crun state` emits OCI state JSON with a `"status"` field whose value is one
+/// of the OCI runtime states (`creating`/`created`/`running`/`stopped`, plus
+/// crun's `paused`). Returns `None` when no `"status"` field is present at all
+/// (the output is not OCI state JSON / is unparseable); a present-but-undefined
+/// status value maps to [`izba_proto::ContainerState::Unknown`].
+///
+/// We only need the `"status"` field, so a substring search is used rather than
+/// pulling serde_json into the musl binary.
+pub fn parse_container_state(json: &str) -> Option<izba_proto::ContainerState> {
+    extract_status_field(json).map(izba_proto::ContainerState::from_oci_status)
 }
 
 /// Extracts the value of the `"status"` key from a JSON object without a full
@@ -235,9 +235,10 @@ fn extract_status_field(json: &str) -> Option<&str> {
     // in the JSON text.  This is correct for crun's OCI state JSON because no
     // earlier field name or string value contains the literal substring
     // `"status"` — the field always appears at the top level and is the only
-    // occurrence.  The extracted value is then compared exactly to `"running"`,
-    // so transitional/other states ("created", "stopped", "paused", "creating")
-    // all correctly map to not-running.
+    // occurrence.  The extracted value is then mapped by
+    // `ContainerState::from_oci_status`, so every OCI state ("running",
+    // "created", "stopped", "paused", "creating") is reported faithfully and an
+    // unrecognized value becomes `Unknown`.
     //
     // Look for `"status"` followed by optional whitespace, `:`, optional
     // whitespace, and a quoted string value.
@@ -465,32 +466,44 @@ fn read_log_tail(path: &str, max_bytes: usize) -> String {
     String::from_utf8_lossy(&data[start..]).into_owned()
 }
 
-/// Check whether the container with `id` is currently running by invoking
-/// `crun state <id>` and parsing the OCI state JSON.
+/// Query the workload container's live state by invoking `crun state <id>` and
+/// parsing the OCI state JSON.
 ///
-/// Returns `false` if crun fails or the state is not "running".
-///
-/// Used by the controller validation checkpoint and future exec integration
-/// (task 4: exec enters the container instead of bare chroot).
+/// Returns [`izba_proto::ContainerState::Unknown`] when crun cannot be run,
+/// exits non-zero (e.g. the container was never created), or emits output
+/// without a parseable `status` field — it never reports a falsely-healthy
+/// state, so the host can surface an honest "container exited / unknown" rather
+/// than implying the sandbox is healthy.
 ///
 /// `#[mutants::skip]`: this shells out to a real `/sbin/crun state <id>` against
 /// a live container, which exists only inside a booted microVM. Unit tests run
-/// on a crun-less host where the `Command` always fails (→ `false`), so no unit
-/// test can distinguish the `true`/`false`/guard mutants here; the running-vs-
-/// not behavior is exercised by the real-VM checkpoint. The JSON parsing it
-/// delegates to (`parse_crun_state_running`) is unit-tested directly.
+/// on a crun-less host where the `Command` always fails (→ `Unknown`), so no
+/// unit test can distinguish the result mutants here; the running-vs-exited
+/// behavior is exercised by the real-VM checkpoint. The JSON parsing it
+/// delegates to (`parse_container_state`) is unit-tested directly.
 #[mutants::skip]
-#[allow(dead_code)]
-pub fn container_running(id: &str) -> bool {
+pub fn container_state(id: &str) -> izba_proto::ContainerState {
     let out = std::process::Command::new(CRUN_PATH)
         .args(["state", id])
         .output();
     match out {
-        Ok(o) if o.status.success() => {
-            parse_crun_state_running(&String::from_utf8_lossy(&o.stdout))
-        }
-        _ => false,
+        Ok(o) if o.status.success() => parse_container_state(&String::from_utf8_lossy(&o.stdout))
+            .unwrap_or(izba_proto::ContainerState::Unknown),
+        _ => izba_proto::ContainerState::Unknown,
     }
+}
+
+/// Check whether the container with `id` is currently running.
+///
+/// Thin honest wrapper over [`container_state`]; retained for the controller
+/// validation checkpoint and callers that only need the boolean.
+///
+/// `#[mutants::skip]`: delegates to the crun-shelling `container_state`, which
+/// is itself unreachable from the unit suite (see its note).
+#[mutants::skip]
+#[allow(dead_code)]
+pub fn container_running(id: &str) -> bool {
+    container_state(id).is_running()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -711,46 +724,63 @@ mod tests {
         assert_eq!(argv.len(), 3);
     }
 
-    // ── crun state JSON parse ────────────────────────────────────────────────
+    // ── crun state → ContainerState parse ────────────────────────────────────
 
     #[test]
-    fn parse_running_status_returns_true() {
+    fn parse_running_status_from_full_state_json() {
+        use izba_proto::ContainerState;
         let json = r#"{"ociVersion":"1.0.2","id":"izba","pid":42,"status":"running","bundle":"/rootfs/izba-oci","rootfs":"/rootfs","created":"2026-01-01T00:00:00.0Z","owner":""}"#;
-        assert!(parse_crun_state_running(json));
+        assert_eq!(parse_container_state(json), Some(ContainerState::Running));
+        assert!(parse_container_state(json).unwrap().is_running());
     }
 
     #[test]
-    fn parse_stopped_status_returns_false() {
+    fn parse_stopped_status_from_full_state_json() {
+        use izba_proto::ContainerState;
         let json = r#"{"ociVersion":"1.0.2","id":"izba","pid":0,"status":"stopped","bundle":"/rootfs/izba-oci","rootfs":"/rootfs","created":"2026-01-01T00:00:00.0Z","owner":""}"#;
-        assert!(!parse_crun_state_running(json));
-    }
-
-    #[test]
-    fn parse_created_status_returns_false() {
-        let json = r#"{"status":"created","id":"izba"}"#;
-        assert!(!parse_crun_state_running(json));
-    }
-
-    #[test]
-    fn parse_empty_string_returns_false() {
-        assert!(!parse_crun_state_running(""));
-    }
-
-    #[test]
-    fn parse_missing_status_field_returns_false() {
-        assert!(!parse_crun_state_running(r#"{"id":"izba"}"#));
-    }
-
-    #[test]
-    fn parse_paused_status_returns_false() {
-        let json = r#"{"status":"paused","id":"izba"}"#;
-        assert!(!parse_crun_state_running(json));
+        assert_eq!(parse_container_state(json), Some(ContainerState::Stopped));
+        assert!(!parse_container_state(json).unwrap().is_running());
     }
 
     #[test]
     fn parse_with_whitespace_around_colon() {
         let json = r#"{ "status" : "running" }"#;
-        assert!(parse_crun_state_running(json));
+        assert_eq!(
+            parse_container_state(json),
+            Some(izba_proto::ContainerState::Running)
+        );
+    }
+
+    #[test]
+    fn parse_container_state_maps_each_oci_status() {
+        use izba_proto::ContainerState;
+        for (status, want) in [
+            ("creating", ContainerState::Creating),
+            ("created", ContainerState::Created),
+            ("running", ContainerState::Running),
+            ("stopped", ContainerState::Stopped),
+            ("paused", ContainerState::Paused),
+        ] {
+            let json = format!(r#"{{"id":"izba","status":"{status}"}}"#);
+            assert_eq!(parse_container_state(&json), Some(want), "{status}");
+        }
+    }
+
+    #[test]
+    fn parse_container_state_unknown_status_value_is_unknown_not_none() {
+        // A present `status` we don't recognize is honestly Unknown — distinct
+        // from a missing status field (None), which means "not OCI state JSON".
+        let json = r#"{"id":"izba","status":"weird"}"#;
+        assert_eq!(
+            parse_container_state(json),
+            Some(izba_proto::ContainerState::Unknown)
+        );
+    }
+
+    #[test]
+    fn parse_container_state_missing_status_is_none() {
+        assert_eq!(parse_container_state(r#"{"id":"izba"}"#), None);
+        assert_eq!(parse_container_state(""), None);
     }
 
     // ── OCI mount op shape (mirrors mounts.rs test convention) ──────────────

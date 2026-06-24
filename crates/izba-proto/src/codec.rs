@@ -226,7 +226,11 @@ mod tests {
     fn arb_response() -> impl Strategy<Value = Response> {
         prop_oneof![
             (any::<String>(), any::<u64>()).prop_map(|(version, uptime_ms)| {
-                Response::Health(HealthInfo { version, uptime_ms })
+                Response::Health(HealthInfo {
+                    version,
+                    uptime_ms,
+                    container: None,
+                })
             }),
             any::<u32>().prop_map(|exec_id| Response::ExecStarted { exec_id }),
             arb_exit_status().prop_map(|status| Response::Wait { status }),

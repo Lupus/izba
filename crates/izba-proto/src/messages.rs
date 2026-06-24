@@ -22,10 +22,68 @@ pub enum Request {
     Shutdown,
 }
 
+/// State of the in-guest OCI workload container, as reported by `crun state`.
+///
+/// Carried as an optional field on [`HealthInfo`] so the host can report
+/// honestly when the workload has exited even though the VM — and thus the
+/// guest health RPC itself — is still alive. The variants mirror the OCI
+/// runtime status set (`creating`/`created`/`running`/`stopped`/`paused`);
+/// `Unknown` means crun could not be queried or its output was unparseable
+/// and is explicitly NOT a healthy claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerState {
+    Creating,
+    Created,
+    Running,
+    Stopped,
+    Paused,
+    Unknown,
+}
+
+impl ContainerState {
+    /// Map an OCI `state.status` value to a `ContainerState`. Any value the
+    /// OCI spec (and crun) does not define maps to [`ContainerState::Unknown`].
+    pub fn from_oci_status(status: &str) -> Self {
+        match status {
+            "creating" => ContainerState::Creating,
+            "created" => ContainerState::Created,
+            "running" => ContainerState::Running,
+            "stopped" => ContainerState::Stopped,
+            "paused" => ContainerState::Paused,
+            _ => ContainerState::Unknown,
+        }
+    }
+
+    /// Lowercase display token; round-trips with [`ContainerState::from_oci_status`]
+    /// for every variant except `Unknown` (which has no OCI status).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContainerState::Creating => "creating",
+            ContainerState::Created => "created",
+            ContainerState::Running => "running",
+            ContainerState::Stopped => "stopped",
+            ContainerState::Paused => "paused",
+            ContainerState::Unknown => "unknown",
+        }
+    }
+
+    /// Whether this state represents a live workload (`running`).
+    pub fn is_running(self) -> bool {
+        matches!(self, ContainerState::Running)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthInfo {
     pub version: String,
     pub uptime_ms: u64,
+    /// State of the in-guest OCI workload container, when the guest knows it.
+    /// `None` when the reporting guest predates container-state reporting;
+    /// `#[serde(default)]` keeps such older frames parseable, and the host
+    /// renders `None` as "unknown".
+    #[serde(default)]
+    pub container: Option<ContainerState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,11 +330,91 @@ mod tests {
     }
 
     #[test]
+    fn health_container_defaults_to_none_for_old_frames() {
+        // An old guest's Health frame had no `container` key; #[serde(default)]
+        // must let it deserialize (None), not error — the self-heal contract.
+        let json = r#"{"type":"health","version":"0.1.0","uptime_ms":7}"#;
+        let resp: Response = serde_json::from_str(json).unwrap();
+        match resp {
+            Response::Health(h) => {
+                assert_eq!(h.container, None);
+                assert_eq!(h.uptime_ms, 7);
+            }
+            other => panic!("expected health, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn container_state_serializes_snake_case() {
+        for (state, tag) in [
+            (ContainerState::Creating, "creating"),
+            (ContainerState::Created, "created"),
+            (ContainerState::Running, "running"),
+            (ContainerState::Stopped, "stopped"),
+            (ContainerState::Paused, "paused"),
+            (ContainerState::Unknown, "unknown"),
+        ] {
+            let s = serde_json::to_string(&state).unwrap();
+            assert_eq!(s, format!("\"{tag}\""));
+        }
+    }
+
+    #[test]
+    fn container_state_from_oci_status_maps_known_and_unknown() {
+        assert_eq!(
+            ContainerState::from_oci_status("running"),
+            ContainerState::Running
+        );
+        assert_eq!(
+            ContainerState::from_oci_status("stopped"),
+            ContainerState::Stopped
+        );
+        assert_eq!(
+            ContainerState::from_oci_status("created"),
+            ContainerState::Created
+        );
+        assert_eq!(
+            ContainerState::from_oci_status("paused"),
+            ContainerState::Paused
+        );
+        assert_eq!(
+            ContainerState::from_oci_status("creating"),
+            ContainerState::Creating
+        );
+        // Anything outside the OCI status set is honestly Unknown.
+        assert_eq!(ContainerState::from_oci_status(""), ContainerState::Unknown);
+        assert_eq!(
+            ContainerState::from_oci_status("garbage"),
+            ContainerState::Unknown
+        );
+    }
+
+    #[test]
+    fn container_state_is_running_only_for_running() {
+        assert!(ContainerState::Running.is_running());
+        for s in [
+            ContainerState::Creating,
+            ContainerState::Created,
+            ContainerState::Stopped,
+            ContainerState::Paused,
+            ContainerState::Unknown,
+        ] {
+            assert!(!s.is_running(), "{s:?} must not count as running");
+        }
+    }
+
+    #[test]
     fn response_roundtrip() {
         for resp in [
             Response::Health(HealthInfo {
                 version: "0.1.0".into(),
                 uptime_ms: 1234,
+                container: Some(ContainerState::Running),
+            }),
+            Response::Health(HealthInfo {
+                version: "0.1.0".into(),
+                uptime_ms: 1234,
+                container: None,
             }),
             Response::ExecStarted { exec_id: 42 },
             Response::Wait {

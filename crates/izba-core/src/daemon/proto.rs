@@ -172,6 +172,13 @@ pub struct SandboxDetail {
     /// parseable.
     #[serde(default)]
     pub confinement: Option<String>,
+    /// State of the in-guest OCI workload container, probed from the live guest
+    /// at inspect time. `None` when the sandbox is stopped, the guest could not
+    /// be reached, or the daemon predates container-state reporting — the CLI
+    /// renders `None` as "unknown". serde(default) keeps older frames parseable
+    /// so a stale daemon's reply self-heals into `None` rather than erroring.
+    #[serde(default)]
+    pub container: Option<izba_proto::ContainerState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +374,7 @@ mod tests {
                 ports: vec![],
                 volumes: vec![],
                 confinement: Some("confined: restricted(limited)+low-il+job".into()),
+                container: Some(izba_proto::ContainerState::Running),
             }),
             DaemonResponse::Ports { rules: vec![] },
             DaemonResponse::Pruned {
@@ -450,6 +458,48 @@ mod tests {
                 );
             }
             other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_inspect_without_container_defaults_none() {
+        // A pre-Phase-7 daemon's Inspect frame had no `container` key;
+        // serde(default) must read it as None (→ CLI "unknown") rather than
+        // failing to deserialize, so a stale daemon self-heals on the wire.
+        let json = r#"{"type":"inspect","name":"web","image_ref":"ubuntu:24.04","image_digest":"sha256:abc","cpus":2,"mem_mb":4096,"workspace":"/ws","status":"running","ports":[]}"#;
+        let back: DaemonResponse = serde_json::from_str(json).unwrap();
+        match back {
+            DaemonResponse::Inspect(det) => {
+                assert_eq!(det.container, None);
+                assert_eq!(det.volumes.len(), 0);
+                assert_eq!(det.confinement, None);
+            }
+            other => panic!("expected Inspect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_container_state_roundtrips() {
+        let resp = DaemonResponse::Inspect(SandboxDetail {
+            name: "web".into(),
+            image_ref: "ubuntu:24.04".into(),
+            image_digest: "sha256:abc".into(),
+            cpus: 1,
+            mem_mb: 512,
+            workspace: "/ws".into(),
+            status: "running".into(),
+            ports: vec![],
+            volumes: vec![],
+            confinement: None,
+            container: Some(izba_proto::ContainerState::Stopped),
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match back {
+            DaemonResponse::Inspect(det) => {
+                assert_eq!(det.container, Some(izba_proto::ContainerState::Stopped));
+            }
+            other => panic!("expected Inspect, got {other:?}"),
         }
     }
 

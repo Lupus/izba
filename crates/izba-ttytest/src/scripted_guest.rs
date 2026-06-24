@@ -293,6 +293,7 @@ fn handle_control_request(req: Request, shared: &Arc<Shared>) -> ControlOutcome 
         Request::Health => Response::Health(HealthInfo {
             version: "ttytest-guest".to_string(),
             uptime_ms: 0,
+            container: None,
         }),
         Request::Exec(_) => match shared.script.exec_outcome {
             ExecOutcome::Started => Response::ExecStarted { exec_id: 1 },
