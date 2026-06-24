@@ -11,7 +11,7 @@
 //! The launch function is intentionally thin: it is a thin wrapper around the
 //! testable pieces so the unit tests can cover every branch without a live crun.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -70,15 +70,6 @@ pub fn sftp_server_overlay_path() -> PathBuf {
             .strip_prefix('/')
             .unwrap_or(SFTP_SERVER_GUEST_PATH),
     )
-}
-
-/// Host path of the pause binary's parent directory.
-pub fn pause_host_dir() -> PathBuf {
-    // PAUSE_GUEST_PATH = "/.izba/pause" → parent ".izba" → host "/rootfs/.izba"
-    pause_host_path()
-        .parent()
-        .expect("PAUSE_GUEST_PATH must have a parent dir")
-        .to_path_buf()
 }
 
 /// Fixed container id. All crun state/exec calls use this name.
@@ -348,16 +339,27 @@ fn extract_status_field(json: &str) -> Option<&str> {
 #[mutants::skip]
 pub fn install_pause_binary() -> std::io::Result<()> {
     let src = std::env::current_exe()?;
-    let dir = pause_host_dir();
-    std::fs::create_dir_all(&dir)?;
-    let dst = pause_host_path();
-    std::fs::copy(&src, &dst)?;
+    copy_into_overlay(&src, &pause_host_path())
+}
+
+/// Copy an izba-controlled binary `src` into the container overlay at `dst`
+/// with mode 0755, creating `dst`'s parent directory first.
+///
+/// Shared by [`install_pause_binary`] and [`install_sftp_server`] so the
+/// create-parent + copy + chmod sequence (the part both need identically) lives
+/// in exactly one place. Unlike its callers — which target fixed `/rootfs`
+/// paths only meaningful in a booted guest — this operates purely on its
+/// arguments, so it is unit-tested with tempdirs (no `/rootfs` required).
+fn copy_into_overlay(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::copy(src, dst)?;
     // chmod 0755 so it is executable from inside the container.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&dst, perms)?;
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))?;
     }
     Ok(())
 }
@@ -385,23 +387,12 @@ pub fn install_pause_binary() -> std::io::Result<()> {
 /// exercised by the real-VM checkpoint.
 #[mutants::skip]
 pub fn install_sftp_server() -> std::io::Result<()> {
-    let src = std::path::Path::new(SFTP_SERVER_INITRAMFS_PATH);
+    let src = Path::new(SFTP_SERVER_INITRAMFS_PATH);
     if !src.exists() {
         // SSH/sftp not built into this initramfs — nothing to install.
         return Ok(());
     }
-    let dst = sftp_server_overlay_path();
-    if let Some(dir) = dst.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::copy(src, &dst)?;
-    // chmod 0755 so it is executable from inside the container.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
-    }
-    Ok(())
+    copy_into_overlay(src, &sftp_server_overlay_path())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -713,11 +704,6 @@ mod tests {
         assert_eq!(pause_host_path(), PathBuf::from("/rootfs/.izba/pause"));
     }
 
-    #[test]
-    fn pause_host_dir_is_parent_of_pause_host_path() {
-        assert_eq!(pause_host_dir(), PathBuf::from("/rootfs/.izba"));
-    }
-
     // ── sftp-server (in-container sftp subsystem) ────────────────────────────
 
     #[test]
@@ -734,6 +720,43 @@ mod tests {
             sftp_server_overlay_path(),
             PathBuf::from("/rootfs/.izba/sftp-server")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_into_overlay_copies_bytes_and_sets_0755() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src-bin");
+        std::fs::write(&src, b"BINARY-CONTENT").unwrap();
+        // dst parent does not exist yet — copy_into_overlay must create it.
+        let dst = tmp.path().join("nested/.izba/out-bin");
+        copy_into_overlay(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"BINARY-CONTENT");
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "overlay binary must be 0755 (executable inside the container)"
+        );
+    }
+
+    #[test]
+    fn copy_into_overlay_creates_missing_parent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("s");
+        std::fs::write(&src, b"x").unwrap();
+        let dst = tmp.path().join("a/b/c/d");
+        assert!(!dst.parent().unwrap().exists());
+        copy_into_overlay(&src, &dst).unwrap();
+        assert!(dst.exists());
+    }
+
+    #[test]
+    fn copy_into_overlay_missing_src_is_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("out");
+        assert!(copy_into_overlay(&tmp.path().join("does-not-exist"), &dst).is_err());
+        assert!(!dst.exists(), "no dst is written when the copy fails");
     }
 
     #[test]
