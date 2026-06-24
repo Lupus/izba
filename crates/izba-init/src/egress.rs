@@ -5,10 +5,20 @@
 //! tunnels all other guest TCP to izbad via `TcpConnect`.
 
 use izba_proto::{dns, write_frame, StreamOpen, EGRESS_PORT};
+use nix::sys::socket::{
+    recvmsg, sendmsg, setsockopt, sockopt, ControlMessage, ControlMessageOwned, MsgFlags,
+    SockaddrIn,
+};
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
+
+/// nix `Errno` → `std::io::Error` for the few socket syscalls that bypass the
+/// std wrappers (recvmsg/sendmsg/setsockopt for the transparent-reply cmsgs).
+fn nix_to_io(e: nix::errno::Errno) -> io::Error {
+    io::Error::from_raw_os_error(e as i32)
+}
 
 /// Dial the host (CID 2) egress port. Production dialer; tests substitute
 /// a socketpair half through the `forward_query` seam.
@@ -64,12 +74,89 @@ where
     }
 }
 
+/// Enable `IP_RECVORIGDSTADDR` so each received datagram carries its (post-NAT)
+/// destination address as an `IP_ORIGDSTADDR` control message. For a query the
+/// nft `udp dport 53 redirect to :53` rule pulled in, that address is the
+/// REDIRECT target (`127.0.0.1`); replying FROM it (see [`reply_dns`]) is what
+/// lets conntrack reverse the DNAT so a client that hardcoded an external
+/// resolver (e.g. `8.8.8.8:53`) accepts the answer. See [`NFT_RULESET`].
+fn set_recv_origdst(sock: &UdpSocket) -> io::Result<()> {
+    setsockopt(sock, sockopt::Ipv4OrigDstAddr, &true).map_err(nix_to_io)
+}
+
 /// Bind 0.0.0.0:53. Split out of `serve_dns_udp` so the bind can happen on
 /// the main thread BEFORE `apply_nft` (the redirect rule is meaningless, and
 /// worse, blackholes :53, if nothing is listening), giving a real
 /// happens-before between "listener exists" and "rule installed".
 pub fn bind_dns_udp() -> io::Result<UdpSocket> {
-    UdpSocket::bind(("0.0.0.0", 53))
+    let sock = UdpSocket::bind(("0.0.0.0", 53))?;
+    set_recv_origdst(&sock)?;
+    Ok(sock)
+}
+
+/// Receive one datagram together with the original destination address it was
+/// delivered to (`IP_ORIGDSTADDR`). Returns `(n, peer, orig_dst)`; `orig_dst`
+/// is `None` if the kernel attached no such control message (it should always
+/// be present once [`set_recv_origdst`] ran, but we degrade gracefully).
+fn recv_with_origdst(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SockaddrIn, Option<Ipv4Addr>)> {
+    let mut iov = [IoSliceMut::new(buf)];
+    // One IP_ORIGDSTADDR (a sockaddr_in) is all we ask for.
+    let mut cmsg_buf = nix::cmsg_space!(libc::sockaddr_in);
+    let msg = recvmsg::<SockaddrIn>(
+        sock.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_buf),
+        MsgFlags::empty(),
+    )
+    .map_err(nix_to_io)?;
+    let peer = msg
+        .address
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "recvmsg: no peer address"))?;
+    let mut orig = None;
+    for cmsg in msg.cmsgs().map_err(nix_to_io)? {
+        if let ControlMessageOwned::Ipv4OrigDstAddr(sin) = cmsg {
+            orig = Some(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
+        }
+    }
+    Ok((msg.bytes, peer, orig))
+}
+
+/// Send `resp` to `peer`. When `orig` is known, source the reply FROM that
+/// address via `IP_PKTINFO` (`ipi_spec_dst`) so conntrack reverses the
+/// REDIRECT's DNAT — the transparent-reply fix. Without `orig` we fall back to
+/// a plain send with the kernel's default source (correct for the loopback
+/// resolver path, which is never REDIRECTed).
+fn reply_dns(
+    sock: &UdpSocket,
+    resp: &[u8],
+    peer: &SockaddrIn,
+    orig: Option<Ipv4Addr>,
+) -> io::Result<usize> {
+    let fd = sock.as_raw_fd();
+    let iov = [IoSlice::new(resp)];
+    match orig {
+        Some(src) => {
+            let pktinfo = libc::in_pktinfo {
+                ipi_ifindex: 0,
+                ipi_spec_dst: libc::in_addr {
+                    s_addr: u32::from(src).to_be(),
+                },
+                ipi_addr: libc::in_addr { s_addr: 0 },
+            };
+            sendmsg(
+                fd,
+                &iov,
+                &[ControlMessage::Ipv4PacketInfo(&pktinfo)],
+                MsgFlags::empty(),
+                Some(peer),
+            )
+        }
+        None => sendmsg::<SockaddrIn>(fd, &iov, &[], MsgFlags::empty(), Some(peer)),
+    }
+    .map_err(nix_to_io)
 }
 
 /// Serve DNS forever (daemon thread) on an already-bound socket; one thread
@@ -78,7 +165,7 @@ pub fn bind_dns_udp() -> io::Result<UdpSocket> {
 pub fn serve_dns_udp(sock: UdpSocket) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     loop {
-        let (n, peer) = match sock.recv_from(&mut buf) {
+        let (n, peer, orig) = match recv_with_origdst(&sock, &mut buf) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("izba-init: dns stub recv: {e}");
@@ -89,7 +176,13 @@ pub fn serve_dns_udp(sock: UdpSocket) -> io::Result<()> {
         let sock2 = sock.try_clone()?;
         std::thread::spawn(move || {
             let resp = forward_query(dial_host, &query);
-            let _ = sock2.send_to(&resp, peer);
+            // Reply FROM the original destination so conntrack un-NATs a
+            // REDIRECTed hardcoded-resolver query (e.g. 8.8.8.8:53). The
+            // loopback resolver path is not REDIRECTed, but `orig` is still
+            // 127.0.0.1 there, so the same path serves both.
+            if let Err(e) = reply_dns(&sock2, &resp, &peer, orig) {
+                eprintln!("izba-init: dns stub reply: {e}");
+            }
         });
     }
 }
@@ -178,20 +271,20 @@ fn relay_tcp_query<S: Read + Write>(host: &mut S, query: &[u8]) -> io::Result<Ve
 pub const REDIRECT_PORT: u16 = 15001;
 
 /// The fixed transparent-redirect ruleset. Loopback destinations (`return`)
-/// are never redirected — that is the WORKING DNS path (resolv.conf points to
+/// are never redirected — that is the primary DNS path (resolv.conf points to
 /// 127.0.0.1; the UDP stub answers from 0.0.0.0:53 and the loopback reply
 /// matches; a client's TCP retry to 127.0.0.1:53 is likewise delivered
 /// straight to the TCP stub on 0.0.0.0:53, no redirect involved).
 /// All other TCP goes to the stub at :15001. `udp dport 53` pulls
-/// hardcoded-resolver queries to the stub too, but replies are currently
-/// DROPPED: the stub answers from an unconnected wildcard socket so the
-/// reply's source address doesn't match what the client sent to, conntrack's
-/// reverse-NAT tuple never matches, and the client never sees the answer
-/// (the textbook transparent-UDP-proxy reply problem). The udp:53 redirect
-/// rule stays as the hook for a future IP_ORIGDSTADDR transparent-reply fix;
-/// until then, apps that hardcode an external UDP resolver get no DNS (known
-/// M1 gap). The stub's own egress is AF_VSOCK — not IP — so no exclusion
-/// rule is needed and no redirect loop is possible. Non-DNS UDP is denied
+/// hardcoded-resolver queries (e.g. an app that bakes in `8.8.8.8:53`) to the
+/// stub too. The reply path now works: REDIRECT rewrites the destination to
+/// 127.0.0.1, the stub recovers that via `IP_ORIGDSTADDR` and answers FROM it
+/// with `IP_PKTINFO` (see [`serve_dns_udp`]/[`reply_dns`]), so conntrack's
+/// reverse-NAT tuple matches and un-NATs the source back to the address the
+/// client originally targeted. `route_localnet` (set in `net::configure`) lets
+/// that 127.0.0.1-sourced reply route to the guest IP without being treated as
+/// martian. The stub's own egress is AF_VSOCK — not IP — so no exclusion rule
+/// is needed and no redirect loop is possible. Non-DNS UDP is denied
 /// structurally (no route once the NIC goes away in phase C).
 pub const NFT_RULESET: &str = "\
 table ip izba {
@@ -509,6 +602,75 @@ mod tests {
         assert!(NFT_RULESET.contains("ip daddr 127.0.0.0/8 return"));
         assert!(NFT_RULESET.contains(&format!("redirect to :{REDIRECT_PORT}")));
         assert!(NFT_RULESET.contains("udp dport 53 redirect to :53"));
+    }
+
+    /// The transparent-reply plumbing end-to-end on plain loopback (no NAT, so
+    /// the original destination is just the listener's own 127.0.0.1): a query
+    /// arrives, `recv_with_origdst` recovers that destination from the
+    /// IP_ORIGDSTADDR cmsg, and `reply_dns` sources the answer FROM it via
+    /// IP_PKTINFO so the client receives it. This exercises the exact recvmsg/
+    /// sendmsg cmsg machinery the REDIRECT reply path relies on; the conntrack
+    /// un-NAT itself is covered by the KVM integration suite (which needs a
+    /// real REDIRECT rule unit tests cannot install). Runtime-skips where the
+    /// sandbox denies UDP bind.
+    #[test]
+    fn origdst_recv_and_pktinfo_reply_roundtrip() {
+        let server = match UdpSocket::bind(("127.0.0.1", 0)) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP origdst_recv_and_pktinfo_reply_roundtrip: bind denied: {e}");
+                return;
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        };
+        set_recv_origdst(&server).expect("enable IP_RECVORIGDSTADDR");
+        let saddr = server.local_addr().unwrap();
+
+        let client = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        client.send_to(b"query", saddr).unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, peer, orig) = recv_with_origdst(&server, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"query");
+        assert_eq!(
+            orig,
+            Some(Ipv4Addr::LOCALHOST),
+            "IP_ORIGDSTADDR must report the delivery address"
+        );
+
+        reply_dns(&server, b"answer", &peer, orig).unwrap();
+        let mut rbuf = [0u8; 64];
+        let (rn, from) = client.recv_from(&mut rbuf).unwrap();
+        assert_eq!(&rbuf[..rn], b"answer");
+        assert_eq!(
+            from.ip(),
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "reply must be sourced from the original destination"
+        );
+    }
+
+    /// `reply_dns` with no known original destination falls back to a plain
+    /// send (kernel-chosen source) and still delivers.
+    #[test]
+    fn reply_without_origdst_falls_back() {
+        let server = match UdpSocket::bind(("127.0.0.1", 0)) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP reply_without_origdst_falls_back: bind denied: {e}");
+                return;
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        };
+        set_recv_origdst(&server).expect("enable IP_RECVORIGDSTADDR");
+        let saddr = server.local_addr().unwrap();
+        let client = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        client.send_to(b"q", saddr).unwrap();
+        let mut buf = [0u8; 64];
+        let (_n, peer, _orig) = recv_with_origdst(&server, &mut buf).unwrap();
+        reply_dns(&server, b"a", &peer, None).unwrap();
+        let mut rbuf = [0u8; 64];
+        let (rn, _from) = client.recv_from(&mut rbuf).unwrap();
+        assert_eq!(&rbuf[..rn], b"a");
     }
 
     /// handle_redirected with an injected orig-dst and a socketpair "izbad":
