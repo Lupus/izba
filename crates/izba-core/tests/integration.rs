@@ -816,6 +816,33 @@ fn userns_numeric_user_owns_workspace() {
     }
 
     assert_userns_workspace_roundtrip(&tb.paths, "uns-user", &ws, "101");
+
+    // --- the sudo-enabling property of the transposition ---
+    // For a non-root USER, image-root-owned files (guest uid 0) map to
+    // container-root (uid 0) inside the userns. That is the exact kernel
+    // precondition for setuid-root binaries (sudo, su) owned by image-root to be
+    // honored: the file is owned by the namespace's root, so the setuid bit
+    // elevates to container-0. We assert the precondition directly (a root-owned
+    // image file reads as uid 0 inside) plus that USER 101 is GENUINELY
+    // unprivileged (cannot read a root-only file). A full in-container `sudo`
+    // round-trip needs an image fixture with sudo+NOPASSWD and a numeric USER —
+    // tracked as a follow-up.
+    let passwd_owner = exec_ok(&tb.paths, "uns-user", &["stat", "-c", "%u", "/etc/passwd"]);
+    assert_eq!(
+        passwd_owner.trim(),
+        "0",
+        "image-root files must map to container-root (uid 0) — the precondition \
+         for setuid sudo-to-root under a non-root USER"
+    );
+    let (shadow_status, _, _) = exec_collect(&tb.paths, "uns-user", &["cat", "/etc/shadow"], None)
+        .expect("exec cat shadow");
+    assert_ne!(
+        shadow_status,
+        ExitStatus::Code(0),
+        "USER 101 must NOT read root-only /etc/shadow (640 root:shadow) — proves it \
+         is genuinely unprivileged, not silently mapped to root"
+    );
+
     stop_sandbox(&tb, "uns-user");
 }
 

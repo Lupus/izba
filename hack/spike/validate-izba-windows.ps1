@@ -502,6 +502,51 @@ if ($sshBootOk) {
 & $exe rm --force $sshName 2>$null | Out-Null
 if (Test-Path $sshWs) { Remove-Item -Recurse -Force $sshWs -ErrorAction SilentlyContinue }
 
+# [13] Option A container userns uid-mapping on the OpenVMM/WHP leg.
+# A numeric-USER image (nginx-unprivileged, USER 101, digest-pinned). The user
+# namespace is a pure guest-side mechanism (crun creates it; the guest kernel
+# has CONFIG_USER_NS), so it is VMM-INDEPENDENT: the workload must run as the
+# image USER 101 on OpenVMM's bundled virtiofs exactly as it does on
+# virtiofsd/CH. That is the HARD check below. The /workspace OWNERSHIP
+# transposition additionally depends on what uid OpenVMM presents for the
+# host-owned share, which is not yet confirmed on WHP — so it is recorded as a
+# DIAGNOSTIC here, not yet a hard gate (tracked for follow-up).
+$unsImage = 'nginxinc/nginx-unprivileged@sha256:054e14f543eb688809d59ec2ad1644d1a61678e247c87a318ad605977eb37eaf'
+$unsName  = 'userns-validate'
+$unsWs    = "$env:TEMP\izba-userns-validate-ws"
+& $exe stop $unsName 2>$null | Out-Null
+& $exe rm --force $unsName 2>$null | Out-Null
+if (Test-Path $unsWs) { Remove-Item -Recurse -Force $unsWs -ErrorAction SilentlyContinue }
+New-Item -ItemType Directory -Path $unsWs | Out-Null
+
+$unsBootOk = $false
+foreach ($attempt in 1..3) {
+    & $exe run --image $unsImage --name $unsName $unsWs -- /bin/true | Out-Null
+    if ($LASTEXITCODE -eq 0) { $unsBootOk = $true; break }
+    [Console]::Error.WriteLine("  userns-validate boot attempt $attempt/3 timed out (nested-WHP flake); retrying from scratch")
+    & $exe stop $unsName 2>$null | Out-Null
+    & $exe rm --force $unsName 2>$null | Out-Null
+}
+Check 'userns: numeric-USER image boots (run exits 0)' $unsBootOk
+if (-not $unsBootOk) { Dump-BootLogs $unsName }
+
+if ($unsBootOk) {
+    # Hard check: default exec runs as the image USER 101 — the guest-side
+    # userns is applied on the OpenVMM path (VMM-independent property).
+    $unsUid = (& $exe exec $unsName -- /usr/bin/id -u | Out-String).Trim()
+    Check 'userns: default exec runs as image USER 101 (OpenVMM)' ($unsUid -eq '101')
+    # Diagnostic only: the in-container /workspace owner depends on what uid
+    # OpenVMM's virtiofs presents for the host share. Recorded, not gated.
+    $unsWsOwner = (& $exe exec $unsName -- /bin/stat -c '%u' /workspace | Out-String).Trim()
+    [Console]::Error.WriteLine("  [diag] userns: in-container /workspace owner uid = '$unsWsOwner' (expect 101 once OpenVMM virtiofs uid-presentation is confirmed)")
+} else {
+    Check 'userns: default exec runs as image USER 101 (OpenVMM)' $false
+}
+
+& $exe stop $unsName 2>$null | Out-Null
+& $exe rm --force $unsName 2>$null | Out-Null
+if (Test-Path $unsWs) { Remove-Item -Recurse -Force $unsWs -ErrorAction SilentlyContinue }
+
 # Best-effort daemon cleanup so the validation run leaves no daemon behind.
 & $exe daemon stop 2>$null | Out-Null
 
