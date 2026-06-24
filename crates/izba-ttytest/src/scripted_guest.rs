@@ -98,6 +98,7 @@ impl ScriptedGuest {
                 workspace: data_root.clone(),
                 ports: Vec::new(),
                 volumes: Vec::new(),
+                builder: false,
             },
         )
         .context("write config.json")?;
