@@ -267,11 +267,12 @@ fn daemon_full_lifecycle() {
 }
 
 /// SSH access against a real microVM: `izba ssh <name> -- <cmd>` round-trip +
-/// chroot-isolation proofs.
+/// chroot-isolation proofs + native in-container SFTP.
 ///
 /// Gated behind `IZBA_INTEGRATION=1` (same as the other daemon e2e tests).
 /// The initramfs must be built WITH `IZBA_SSHD` embedded — CI does this via the
-/// `initramfs` job in `e2e.yml` which passes `IZBA_SSHD=dist/sshd`.
+/// `initramfs` job in `e2e.yml` which passes `IZBA_SSHD=dist/sshd` (which also
+/// embeds the vendored static `sftp-server` used by step 6).
 ///
 /// Assertions:
 /// 1. `/bin/true` exit-0 via `izba ssh`  — proxy channel is live.
@@ -281,6 +282,10 @@ fn daemon_full_lifecycle() {
 /// 4. Container isolation (negative): `cat /run/izba/ssh/ssh_host_ed25519_key`
 ///    fails — the host key lives in init-root, outside the container's mount
 ///    namespace, so it is invisible to the session.
+/// 6. Native SFTP (`Subsystem sftp`): a `sftp` put/get byte round-trip through
+///    the in-container `sftp-server`, cross-checked against the host workspace
+///    share — exercised on this same (already-proven-alive) VM to avoid a
+///    separate, CI-flaky microVM boot.
 #[test]
 fn ssh_access_e2e() {
     if !want() {
@@ -366,70 +371,19 @@ fn ssh_access_e2e() {
         (chroot isolation), got stderr: {err}"
     );
 
-    // [6] Cleanup.
-    assert_ok(
-        &izba(&data, no_env, &["rm", "--force", "sshe2e"]),
-        "rm sshe2e",
-    );
-    let _ = izba(&data, no_env, &["daemon", "stop"]);
-}
-
-/// Native in-container SFTP against a real microVM: drives the system `sftp`
-/// client over the same `izba __ssh-proxy` ProxyCommand `izba ssh` uses, so the
-/// client requests the `Subsystem sftp` declared in `hack/sshd_config`. sshd
-/// runs that subsystem through root's login shell (`/init -c "<path>"`), which
-/// izba-init routes into `crun exec /bin/sh -c "<path>"`, executing the vendored
-/// `sftp-server` INSIDE the container (oci.rs `SFTP_SERVER_GUEST_PATH`).
-///
-/// Gated behind `IZBA_INTEGRATION=1`. The initramfs must be built WITH
-/// `IZBA_SSHD` so sshd + the vendored `sftp-server` are embedded (CI's
-/// `initramfs` job does this).
-///
-/// Assertions:
-/// 1. `put` a local file, then `get` it back — byte-for-byte round-trip proves
-///    the sftp protocol works through the in-container server.
-/// 2. The uploaded file lands in `/workspace`, which is the virtiofs share
-///    backed by the host `ws` dir — so it also appears host-side, proving the
-///    server operated on the container's filesystem (not sshd's initramfs).
-#[test]
-fn ssh_sftp_e2e() {
-    if !want() {
-        return;
-    }
-    let root = tempfile::tempdir().unwrap();
-    let data: PathBuf = root.path().join("izba");
-    let ws = root.path().join("ws");
-    std::fs::create_dir_all(&ws).unwrap();
-    let ws_s = ws.to_string_lossy().into_owned();
-    let no_env: &[(&str, &str)] = &[];
-
-    // [1] Boot a sandbox sharing `ws` at /workspace.
-    let o = izba(
-        &data,
-        no_env,
-        &[
-            "run",
-            "--image",
-            IMAGE,
-            "--name",
-            "sftpe2e",
-            &ws_s,
-            "--",
-            "/bin/true",
-        ],
-    );
-    assert_ok(&o, "run /bin/true (boot)");
-
-    // Warm the SSH identity + host-key trust exactly as `izba ssh` would (it
-    // calls ensure_identity); a no-op remote command both creates the keypair
-    // under <data>/ssh and accepts the host key into known_hosts.
-    assert_ok(
-        &izba(&data, no_env, &["ssh", "sftpe2e", "--", "/bin/true"]),
-        "warm ssh identity + known_hosts",
-    );
-
-    // [2] sftp round-trip via a batch file. cwd inside the session is
-    // /workspace (SSH_SESSION_CWD), so the relative remote paths land there.
+    // [6] Native in-container SFTP over the SAME sandbox (no extra VM boot — a
+    // separate microVM boot is the flakiest thing on constrained CI runners, so
+    // we exercise sftp on the VM the ssh checks above just proved alive). The
+    // system `sftp` client connects through the same `izba __ssh-proxy`
+    // ProxyCommand `izba ssh` uses, requesting the `Subsystem sftp` declared in
+    // `hack/sshd_config`. sshd runs that subsystem through root's login shell
+    // (`/init -c "<path>"`), which izba-init routes into
+    // `crun exec /bin/sh -c "<path>"` → the vendored `sftp-server` INSIDE the
+    // container (oci.rs `SFTP_SERVER_GUEST_PATH`). The ssh identity + host-key
+    // trust were already warmed by the `izba ssh` calls above.
+    //
+    // cwd inside the session is /workspace (SSH_SESSION_CWD), so the relative
+    // remote paths land in `ws` — which is the host side of that virtiofs share.
     let payload = b"sftp-roundtrip-payload-1337\n";
     let up = root.path().join("up.txt");
     std::fs::write(&up, payload).unwrap();
@@ -444,8 +398,7 @@ fn ssh_sftp_e2e() {
         ),
     )
     .unwrap();
-
-    let o = sftp(&data, "sftpe2e", &batch);
+    let o = sftp(&data, "sshe2e", &batch);
     assert!(
         o.status.success(),
         "sftp batch failed (exit {:?})\nstdout: {}\nstderr: {}",
@@ -453,16 +406,15 @@ fn ssh_sftp_e2e() {
         stdout_of(&o),
         String::from_utf8_lossy(&o.stderr)
     );
-
-    // [3] Downloaded bytes must equal what we uploaded (protocol round-trip).
+    // Downloaded bytes must equal what we uploaded (protocol round-trip through
+    // the in-container sftp-server).
     let got = std::fs::read(&down).expect("sftp get must have written down.txt");
     assert_eq!(
         got, payload,
         "sftp get round-trip mismatch: in-container sftp-server did not serve the file"
     );
-
-    // [4] The upload landed in /workspace, which is the host `ws` virtiofs
-    // share — confirms the server ran in the CONTAINER fs (not sshd's).
+    // The upload also appears in the host `ws` virtiofs share, confirming the
+    // server operated on the CONTAINER filesystem (not sshd's initramfs).
     let host_side = ws.join("sftp-uploaded.txt");
     assert_eq!(
         std::fs::read(&host_side).ok().as_deref(),
@@ -471,10 +423,10 @@ fn ssh_sftp_e2e() {
         host_side.display()
     );
 
-    // [5] Cleanup.
+    // [7] Cleanup.
     assert_ok(
-        &izba(&data, no_env, &["rm", "--force", "sftpe2e"]),
-        "rm sftpe2e",
+        &izba(&data, no_env, &["rm", "--force", "sshe2e"]),
+        "rm sshe2e",
     );
     let _ = izba(&data, no_env, &["daemon", "stop"]);
 }
