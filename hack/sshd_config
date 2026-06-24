@@ -19,9 +19,15 @@ PubkeyAuthentication yes
 #   interactive login  (`ssh host`):      argv[0] = "-init" (dash-prefixed)
 #   remote command     (`ssh host <cmd>`): /init -c "<cmd>"
 # izba-init detects both forms and routes them into crun exec.
-# sftp/scp: scp-over-ssh and VS Code Remote-SSH arrive as a remote command
-# ($SSH_ORIGINAL_COMMAND via the -c form) and work correctly; native in-container
-# sftp-server is a follow-up.
-Subsystem sftp internal-sftp
+# sftp/scp: scp-over-ssh and VS Code Remote-SSH arrive as a remote command (the
+# -c form) and work correctly. The sftp protocol runs a native in-container
+# sftp-server: sshd executes a Subsystem with an external command path through
+# the user's login shell, so this becomes `/init -c "<path>"` →
+# `crun exec /bin/sh -c "<path>"`, running the server INSIDE the container (the
+# right filesystem/uid). `internal-sftp` would instead run in sshd's own
+# (initramfs) namespace — the wrong environment. The path must match
+# izba-init's SFTP_SERVER_GUEST_PATH (oci.rs), where the vendored static
+# sftp-server is copied into the overlay at boot.
+Subsystem sftp /.izba/sftp-server
 PrintMotd no
 AcceptEnv LANG LC_*

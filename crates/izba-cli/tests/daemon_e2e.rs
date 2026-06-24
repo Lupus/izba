@@ -374,6 +374,136 @@ fn ssh_access_e2e() {
     let _ = izba(&data, no_env, &["daemon", "stop"]);
 }
 
+/// Native in-container SFTP against a real microVM: drives the system `sftp`
+/// client over the same `izba __ssh-proxy` ProxyCommand `izba ssh` uses, so the
+/// client requests the `Subsystem sftp` declared in `hack/sshd_config`. sshd
+/// runs that subsystem through root's login shell (`/init -c "<path>"`), which
+/// izba-init routes into `crun exec /bin/sh -c "<path>"`, executing the vendored
+/// `sftp-server` INSIDE the container (oci.rs `SFTP_SERVER_GUEST_PATH`).
+///
+/// Gated behind `IZBA_INTEGRATION=1`. The initramfs must be built WITH
+/// `IZBA_SSHD` so sshd + the vendored `sftp-server` are embedded (CI's
+/// `initramfs` job does this).
+///
+/// Assertions:
+/// 1. `put` a local file, then `get` it back — byte-for-byte round-trip proves
+///    the sftp protocol works through the in-container server.
+/// 2. The uploaded file lands in `/workspace`, which is the virtiofs share
+///    backed by the host `ws` dir — so it also appears host-side, proving the
+///    server operated on the container's filesystem (not sshd's initramfs).
+#[test]
+fn ssh_sftp_e2e() {
+    if !want() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+
+    // [1] Boot a sandbox sharing `ws` at /workspace.
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "run", "--image", IMAGE, "--name", "sftpe2e", &ws_s, "--", "/bin/true",
+        ],
+    );
+    assert_ok(&o, "run /bin/true (boot)");
+
+    // Warm the SSH identity + host-key trust exactly as `izba ssh` would (it
+    // calls ensure_identity); a no-op remote command both creates the keypair
+    // under <data>/ssh and accepts the host key into known_hosts.
+    assert_ok(
+        &izba(&data, no_env, &["ssh", "sftpe2e", "--", "/bin/true"]),
+        "warm ssh identity + known_hosts",
+    );
+
+    // [2] sftp round-trip via a batch file. cwd inside the session is
+    // /workspace (SSH_SESSION_CWD), so the relative remote paths land there.
+    let payload = b"sftp-roundtrip-payload-1337\n";
+    let up = root.path().join("up.txt");
+    std::fs::write(&up, payload).unwrap();
+    let down = root.path().join("down.txt");
+    let batch = root.path().join("batch.sftp");
+    std::fs::write(
+        &batch,
+        format!(
+            "put {} sftp-uploaded.txt\nget sftp-uploaded.txt {}\n",
+            up.display(),
+            down.display()
+        ),
+    )
+    .unwrap();
+
+    let o = sftp(&data, "sftpe2e", &batch);
+    assert!(
+        o.status.success(),
+        "sftp batch failed (exit {:?})\nstdout: {}\nstderr: {}",
+        o.status.code(),
+        stdout_of(&o),
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // [3] Downloaded bytes must equal what we uploaded (protocol round-trip).
+    let got = std::fs::read(&down).expect("sftp get must have written down.txt");
+    assert_eq!(
+        got, payload,
+        "sftp get round-trip mismatch: in-container sftp-server did not serve the file"
+    );
+
+    // [4] The upload landed in /workspace, which is the host `ws` virtiofs
+    // share — confirms the server ran in the CONTAINER fs (not sshd's).
+    let host_side = ws.join("sftp-uploaded.txt");
+    assert_eq!(
+        std::fs::read(&host_side).ok().as_deref(),
+        Some(payload.as_slice()),
+        "uploaded file must appear in the host workspace share at {}",
+        host_side.display()
+    );
+
+    // [5] Cleanup.
+    assert_ok(
+        &izba(&data, no_env, &["rm", "--force", "sftpe2e"]),
+        "rm sftpe2e",
+    );
+    let _ = izba(&data, no_env, &["daemon", "stop"]);
+}
+
+/// Run the system `sftp` client against `izba-<name>` over the `izba
+/// __ssh-proxy` ProxyCommand, executing the commands in `batch` (`sftp -b`).
+/// Mirrors `izba ssh`'s inline `-o` connection knobs (see
+/// `commands::ssh::build_ssh_args`) so it works without a managed ~/.ssh/config.
+fn sftp(data: &Path, name: &str, batch: &Path) -> Output {
+    let exe = env!("CARGO_BIN_EXE_izba");
+    let ssh_dir = data.join("ssh");
+    let identity = ssh_dir.join("id_ed25519");
+    let known_hosts = ssh_dir.join("known_hosts");
+    let args: Vec<String> = vec![
+        "-o".into(),
+        format!("ProxyCommand=\"{exe}\" __ssh-proxy %h"),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        format!("IdentityFile={}", identity.display()),
+        "-o".into(),
+        format!("UserKnownHostsFile={}", known_hosts.display()),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "User=root".into(),
+        "-b".into(),
+        batch.to_string_lossy().into_owned(),
+        format!("izba-{name}"),
+    ];
+    std::process::Command::new("sftp")
+        .args(&args)
+        .output()
+        .expect("run sftp client")
+}
+
 /// CLI-surface lifecycle: drives the thin verbs `daemon_full_lifecycle` does
 /// NOT reach end-to-end against a real daemon + microVM — `create` (vs `run`),
 /// `netlog`, `port ls`/`unpublish`, `stop`, and non-force `rm`. These verbs read

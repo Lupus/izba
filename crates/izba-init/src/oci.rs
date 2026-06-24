@@ -39,6 +39,39 @@ pub fn pause_host_path() -> PathBuf {
     PathBuf::from("/rootfs").join(guest.strip_prefix('/').unwrap_or(guest))
 }
 
+/// Container-internal path of the vendored static `sftp-server`, copied into
+/// the overlay alongside the pause binary so an SSH `sftp` subsystem session
+/// finds it inside the container.
+///
+/// The sftp subsystem is routed exactly like a remote command: sshd execs the
+/// login shell as `/init -c "<this path>"`, which izba-init turns into
+/// `crun exec /bin/sh -c "<this path>"` — so the path must be valid *inside the
+/// container* (the overlay root), not on the initramfs. Shares the `/.izba`
+/// namespace with [`izba_proto::PAUSE_GUEST_PATH`] to keep izba-internal files
+/// out of the image's own tree.
+///
+/// **Keep this in sync with `hack/sshd_config`'s `Subsystem sftp <path>`** — the
+/// `sshd_config_subsystem_matches_guest_path` unit test guards the coupling.
+pub const SFTP_SERVER_GUEST_PATH: &str = "/.izba/sftp-server";
+
+/// Initramfs path where `hack/build-initramfs.sh` embeds the static
+/// `sftp-server` (when `IZBA_SSHD` is set). [`install_sftp_server`] copies it
+/// from here into the overlay at boot.
+pub const SFTP_SERVER_INITRAMFS_PATH: &str = "/sbin/sftp-server";
+
+/// Init-visible path of the sftp-server once the overlay is assembled:
+/// `/rootfs` + [`SFTP_SERVER_GUEST_PATH`]. From init's perspective the overlay
+/// is mounted at `/rootfs`, so this is where the binary is written; inside the
+/// container (rooted at `/rootfs`) it appears at [`SFTP_SERVER_GUEST_PATH`].
+/// Pure; mirrors [`pause_host_path`].
+pub fn sftp_server_overlay_path() -> PathBuf {
+    PathBuf::from("/rootfs").join(
+        SFTP_SERVER_GUEST_PATH
+            .strip_prefix('/')
+            .unwrap_or(SFTP_SERVER_GUEST_PATH),
+    )
+}
+
 /// Host path of the pause binary's parent directory.
 pub fn pause_host_dir() -> PathBuf {
     // PAUSE_GUEST_PATH = "/.izba/pause" → parent ".izba" → host "/rootfs/.izba"
@@ -329,6 +362,48 @@ pub fn install_pause_binary() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Copy the vendored static `sftp-server` from the initramfs into the container
+/// overlay so an SSH `sftp` subsystem session can find it inside the container.
+///
+/// The sftp subsystem is delivered as `/init -c "<SFTP_SERVER_GUEST_PATH>"` →
+/// `crun exec /bin/sh -c "<SFTP_SERVER_GUEST_PATH>"`, so the server must be a
+/// real file inside the container's filesystem. We copy the static binary
+/// embedded at [`SFTP_SERVER_INITRAMFS_PATH`] into the overlay at
+/// [`sftp_server_overlay_path`] (`/rootfs/.izba/sftp-server`), mirroring
+/// [`install_pause_binary`]. The overlay upper is writable, so the copy
+/// persists across the container lifetime.
+///
+/// **No-op (returns `Ok`) when the initramfs `sftp-server` is absent** — an
+/// initramfs built without `IZBA_SSHD` ships no sshd and no sftp-server; basic
+/// `ssh`/`exec` still works, only the sftp protocol is unavailable. This keeps
+/// the call unconditional and harmless at the launch site.
+///
+/// `#[mutants::skip]`: copies a fixed initramfs path to the fixed overlay path,
+/// so it only does meaningful work inside a booted guest with the overlay
+/// assembled; the unit suite has no `/rootfs` and no `/sbin/sftp-server`. The
+/// pure path helper ([`sftp_server_overlay_path`]) is unit-tested; the copy is
+/// exercised by the real-VM checkpoint.
+#[mutants::skip]
+pub fn install_sftp_server() -> std::io::Result<()> {
+    let src = std::path::Path::new(SFTP_SERVER_INITRAMFS_PATH);
+    if !src.exists() {
+        // SSH/sftp not built into this initramfs — nothing to install.
+        return Ok(());
+    }
+    let dst = sftp_server_overlay_path();
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::copy(src, &dst)?;
+    // chmod 0755 so it is executable from inside the container.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Container launch
 // ──────────────────────────────────────────────────────────────────────────────
@@ -372,6 +447,13 @@ pub fn launch_container() {
              container requires a user namespace (Option A uid mapping) and will fail to start \
              — NOT downgrading to an unmapped container"
         );
+    }
+
+    // Step 1b: install the in-container sftp-server (for SSH `Subsystem sftp`).
+    // No-op when the initramfs ships no sftp-server (SSH not built in); a
+    // failure here only disables sftp, so it is non-fatal — log and continue.
+    if let Err(e) = install_sftp_server() {
+        eprintln!("izba-init: [OCI] installing sftp-server: {e} (sftp unavailable)");
     }
 
     // Step 2: cgroup manager.
@@ -634,6 +716,57 @@ mod tests {
     #[test]
     fn pause_host_dir_is_parent_of_pause_host_path() {
         assert_eq!(pause_host_dir(), PathBuf::from("/rootfs/.izba"));
+    }
+
+    // ── sftp-server (in-container sftp subsystem) ────────────────────────────
+
+    #[test]
+    fn sftp_server_overlay_path_is_rootfs_plus_guest_path() {
+        // Init-visible path = /rootfs + the container-internal guest path.
+        let expected = PathBuf::from("/rootfs").join(
+            SFTP_SERVER_GUEST_PATH
+                .strip_prefix('/')
+                .unwrap_or(SFTP_SERVER_GUEST_PATH),
+        );
+        assert_eq!(sftp_server_overlay_path(), expected);
+        // Spot-check the literal: it sits alongside pause under /.izba.
+        assert_eq!(
+            sftp_server_overlay_path(),
+            PathBuf::from("/rootfs/.izba/sftp-server")
+        );
+    }
+
+    #[test]
+    fn sftp_server_guest_path_is_under_izba_namespace() {
+        // Shares the /.izba namespace with the pause binary (both copied into
+        // the overlay), keeping izba-internal files out of the image's tree.
+        assert_eq!(SFTP_SERVER_GUEST_PATH, "/.izba/sftp-server");
+        assert!(SFTP_SERVER_GUEST_PATH.starts_with("/.izba/"));
+    }
+
+    /// Guard against drift between the guest path const and hack/sshd_config's
+    /// `Subsystem sftp <path>` directive (the literal must equal
+    /// SFTP_SERVER_GUEST_PATH or sshd would exec a non-existent server). Reads
+    /// the in-repo config relative to CARGO_MANIFEST_DIR; skips cleanly if the
+    /// file is not where it is in the source tree (e.g. a packaged build).
+    #[test]
+    fn sshd_config_subsystem_matches_guest_path() {
+        let cfg_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hack/sshd_config");
+        let Ok(cfg) = std::fs::read_to_string(&cfg_path) else {
+            return; // not in the source tree; nothing to assert
+        };
+        let subsystem_line = cfg
+            .lines()
+            .find(|l| l.trim_start().starts_with("Subsystem sftp"))
+            .expect("hack/sshd_config must declare a `Subsystem sftp` directive");
+        assert!(
+            subsystem_line
+                .split_whitespace()
+                .any(|tok| tok == SFTP_SERVER_GUEST_PATH),
+            "sshd_config Subsystem line {subsystem_line:?} must reference \
+             SFTP_SERVER_GUEST_PATH ({SFTP_SERVER_GUEST_PATH})"
+        );
     }
 
     // ── crun run argv construction ───────────────────────────────────────────
