@@ -66,6 +66,38 @@ pub const CRUN_OUT_PATH: &str = "/tmp/crun.out";
 const LOG_TAIL_BYTES: usize = 4096;
 
 // ──────────────────────────────────────────────────────────────────────────────
+// User-namespace floor (Option A)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Path the kernel exposes for the per-userns nesting/count limit.
+const MAX_USER_NS_PATH: &str = "/proc/sys/user/max_user_namespaces";
+
+/// Parse `/proc/sys/user/max_user_namespaces` content into its numeric value.
+///
+/// The file holds a single decimal integer (possibly trailing newline). `0`
+/// means user namespaces are administratively disabled; a positive value means
+/// the container's `user` namespace (Option A's mapping mechanism) can be
+/// created. Unparseable/empty content yields `None` (treated as "unknown").
+pub fn parse_max_user_namespaces(content: &str) -> Option<u64> {
+    content.trim().parse::<u64>().ok()
+}
+
+/// Whether the guest kernel permits creating user namespaces — the **only**
+/// floor Option A needs (it is VMM-independent: no idmapped mount, no virtiofsd
+/// translate). Reads [`MAX_USER_NS_PATH`]; a missing file (kernel without
+/// `CONFIG_USER_NS`) or a `0` value means the floor is NOT met.
+///
+/// `#[mutants::skip]`: reads a real `/proc` path that only exists in a booted
+/// guest; the unit suite covers the parse via [`parse_max_user_namespaces`].
+#[mutants::skip]
+pub fn userns_floor_met() -> bool {
+    match std::fs::read_to_string(MAX_USER_NS_PATH) {
+        Ok(s) => parse_max_user_namespaces(&s).is_some_and(|n| n > 0),
+        Err(_) => false,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Cgroup manager detection
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -318,6 +350,20 @@ pub fn launch_container() {
     if let Err(e) = install_pause_binary() {
         eprintln!("izba-init: [OCI] installing pause binary: {e}");
         // Continue: the container start will fail and that gives better info.
+    }
+
+    // Step 1.5: user-namespace floor (Option A). The OCI config.json ALWAYS
+    // carries the container `user` namespace + uid/gid transposition — there is
+    // no silent no-userns fallback. If the kernel can't create user namespaces
+    // the crun launch below fails closed; warn loudly first so the serial log
+    // names the real cause instead of a cryptic crun map-write error.
+    if !userns_floor_met() {
+        eprintln!(
+            "izba-init: [OCI] *** USER-NAMESPACE FLOOR NOT MET *** the guest kernel reports \
+             user namespaces unavailable ({MAX_USER_NS_PATH} missing or 0); the workload \
+             container requires a user namespace (Option A uid mapping) and will fail to start \
+             — NOT downgrading to an unmapped container"
+        );
     }
 
     // Step 2: cgroup manager.
@@ -797,6 +843,28 @@ mod tests {
         // Bundle mount must be under /rootfs so the bundle is accessible to init.
         let mount_path = std::path::Path::new(BUNDLE_MOUNT);
         assert!(mount_path.starts_with("/rootfs"));
+    }
+
+    // ── user-namespace floor parse ───────────────────────────────────────────
+
+    #[test]
+    fn parse_max_user_namespaces_positive() {
+        assert_eq!(parse_max_user_namespaces("15000\n"), Some(15000));
+        assert_eq!(parse_max_user_namespaces("1"), Some(1));
+        assert_eq!(parse_max_user_namespaces("  42  \n"), Some(42));
+    }
+
+    #[test]
+    fn parse_max_user_namespaces_zero_means_disabled() {
+        // 0 is parseable but the floor check treats it as not-met.
+        assert_eq!(parse_max_user_namespaces("0\n"), Some(0));
+    }
+
+    #[test]
+    fn parse_max_user_namespaces_unparseable_is_none() {
+        assert_eq!(parse_max_user_namespaces(""), None);
+        assert_eq!(parse_max_user_namespaces("garbage"), None);
+        assert_eq!(parse_max_user_namespaces("-1"), None);
     }
 
     #[test]

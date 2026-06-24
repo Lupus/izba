@@ -9,8 +9,8 @@
 use anyhow::{bail, Result};
 use oci_client::config::Config;
 use oci_spec::runtime::{
-    Capability, LinuxCapabilitiesBuilder, LinuxNamespaceType, ProcessBuilder, RootBuilder, Spec,
-    UserBuilder,
+    Capability, LinuxCapabilitiesBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
+    ProcessBuilder, RootBuilder, Spec, UserBuilder,
 };
 use std::collections::HashSet;
 
@@ -197,6 +197,110 @@ pub fn resolve_process_user(declared: Option<&str>) -> ((u32, u32), Option<Strin
 /// also exec's default cwd today.
 pub const INTERACTIVE_CWD: &str = "/workspace";
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Option A — container user-namespace uid/gid mapping (spike recommendation #1)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Exclusive upper bound of the mapped id range. The kernel treats
+/// `(uid_t)-1` == 4294967295 as the "invalid"/overflow id, so a full identity
+/// map is conventionally `0 0 4294967295` — covering ids `0..=4294967294`. Our
+/// transposition keeps that coverage so any id an image uses (root, the USER,
+/// service accounts, `nobody`) stays mapped and never appears as overflow.
+pub const USERNS_RANGE_END: u32 = u32::MAX; // 4294967295, exclusive
+
+/// Build the container's user-namespace id map for **Option A** (single-uid
+/// arithmetic, VMM-independent — the spike's recommended primary strategy).
+///
+/// izba's virtiofsd runs **unprivileged** (as the host user) and applies **no**
+/// uid translation, so the guest sees workspace files owned by the host uid
+/// that owns them, and every container write squashes back to that host uid on
+/// disk regardless of the in-guest uid. The container user namespace therefore
+/// exists to make ownership *correct and writable inside the guest*, not to pick
+/// the on-disk owner (that is always the host user).
+///
+/// The map is the **identity** over the full id range **except it transposes**
+/// the workload id (`workload_id`, the image `USER`'s uid/gid — 0 when the image
+/// declares no USER) with the workspace-owner id (`owner_id`, the host uid/gid
+/// that owns the virtiofs `workspace`). This single swap delivers the whole UX:
+///
+/// - Workspace files (seen in-guest as `owner_id`) map to container `workload_id`
+///   → the image's USER **owns** `/workspace` and can write it, whatever the host
+///   uid happens to be.
+/// - Image-root files (host id 0) keep mapping to container 0 whenever the
+///   workload is non-root (`workload_id != 0`), so **setuid binaries like `sudo`
+///   still work** and passwordless-sudo-to-root is seamless.
+/// - When the workload *is* root (`workload_id == 0`, izba's default interactive
+///   sandbox), container-root maps to the workspace owner so root owns
+///   `/workspace`; image-root files then read as a non-root id, but the binaries
+///   are world-rx and the workload is already root, so nothing breaks.
+/// - When `workload_id == owner_id` (e.g. host uid 1000 running an image whose
+///   USER is uid 1000) the map degenerates to pure identity.
+///
+/// The returned extents are a bijection over `0..USERNS_RANGE_END` with no
+/// overlapping host ranges (the kernel rejects overlaps), using at most five
+/// extents (well under the kernel's 340-extent limit). The guest init is real
+/// root in the initial (full-range) user namespace, so crun can write any of
+/// these extents directly.
+pub fn transpose_identity_map(
+    workload_id: u32,
+    owner_id: u32,
+) -> Vec<oci_spec::runtime::LinuxIdMapping> {
+    use oci_spec::runtime::LinuxIdMappingBuilder;
+    // Build one extent; `size == 0` extents are skipped (an empty span).
+    let extent = |container: u32, host: u32, size: u32| {
+        LinuxIdMappingBuilder::default()
+            .container_id(container)
+            .host_id(host)
+            .size(size)
+            .build()
+            .expect("LinuxIdMapping build is infallible for u32 fields")
+    };
+
+    // workload == owner ⇒ the swap is a no-op ⇒ a single full-range identity map.
+    if workload_id == owner_id {
+        return vec![extent(0, 0, USERNS_RANGE_END)];
+    }
+
+    let (lo, hi) = (workload_id.min(owner_id), workload_id.max(owner_id));
+    let mut maps = Vec::with_capacity(5);
+    // [0, lo): identity.
+    if lo > 0 {
+        maps.push(extent(0, 0, lo));
+    }
+    // lo -> hi  (the transposition's first half).
+    maps.push(extent(lo, hi, 1));
+    // (lo, hi): identity.
+    if hi - lo > 1 {
+        maps.push(extent(lo + 1, lo + 1, hi - lo - 1));
+    }
+    // hi -> lo  (the transposition's second half; consumes host id `lo` once).
+    maps.push(extent(hi, lo, 1));
+    // (hi, USERNS_RANGE_END): identity (skip when hi is the last mapped id).
+    if hi < USERNS_RANGE_END - 1 {
+        maps.push(extent(hi + 1, hi + 1, USERNS_RANGE_END - (hi + 1)));
+    }
+    maps
+}
+
+/// Compute the container user-namespace `(uidMappings, gidMappings)` for
+/// Option A from the workspace-owner ids and the workload (image `USER`) ids.
+/// Thin wrapper over [`transpose_identity_map`] applied to uid and gid.
+///
+/// `owner` is `(host_uid, host_gid)` owning the virtiofs `workspace`; `workload`
+/// is the resolved image-`USER` `(uid, gid)` (see [`resolve_process_user`]).
+pub fn compute_userns_mappings(
+    owner: (u32, u32),
+    workload: (u32, u32),
+) -> (
+    Vec<oci_spec::runtime::LinuxIdMapping>,
+    Vec<oci_spec::runtime::LinuxIdMapping>,
+) {
+    (
+        transpose_identity_map(workload.0, owner.0),
+        transpose_identity_map(workload.1, owner.1),
+    )
+}
+
 /// Render the 6 canonical CA-bundle env pairs as `"KEY=VALUE"` strings for
 /// the OCI spec's process environment.
 ///
@@ -257,6 +361,12 @@ pub struct SpecParams<'a> {
     pub cwd_override: Option<&'a str>,
     /// Already-resolved process user `(uid, gid)` (see [`parse_numeric_user`]).
     pub user: (u32, u32),
+    /// The host `(uid, gid)` that owns the virtiofs `workspace` share — the
+    /// anchor of the Option A user-namespace transposition (see
+    /// [`compute_userns_mappings`]). Workspace files are seen in-guest as this
+    /// owner; the container userns maps it to the workload's [`SpecParams::user`]
+    /// so the image USER owns `/workspace`.
+    pub host_owner: (u32, u32),
     /// Guest hostname (the sandbox name).
     pub hostname: &'a str,
     /// Allocate a terminal for the container process (interactive shells).
@@ -323,11 +433,29 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
 
     // D1: the container shares izba-init's network namespace — drop `network`
     // from the namespace set so crun does not unshare a fresh (routeless) one.
+    //
+    // Option A: add a `user` namespace and the uid/gid transposition so the
+    // image USER owns the host-owned virtiofs `/workspace` (and image-root files
+    // keep mapping to container-root, so setuid `sudo` works). VMM-independent —
+    // the same guest-userns mechanism normalizes ownership on both the
+    // virtiofsd (Linux) and OpenVMM (Windows) backends, which both present host
+    // uids untranslated.
     if let Some(linux) = spec.linux_mut().as_mut() {
         if let Some(mut nss) = linux.namespaces().clone() {
             nss.retain(|n| n.typ() != LinuxNamespaceType::Network);
+            // Idempotent: only add the user namespace if the default set lacks it.
+            if !nss.iter().any(|n| n.typ() == LinuxNamespaceType::User) {
+                nss.push(
+                    LinuxNamespaceBuilder::default()
+                        .typ(LinuxNamespaceType::User)
+                        .build()?,
+                );
+            }
             linux.set_namespaces(Some(nss));
         }
+        let (uid_maps, gid_maps) = compute_userns_mappings(params.host_owner, params.user);
+        linux.set_uid_mappings(Some(uid_maps));
+        linux.set_gid_mappings(Some(gid_maps));
     }
     Ok(spec)
 }
@@ -492,6 +620,126 @@ mod tests {
         assert_eq!(parse_numeric_user("1000:wheel"), None);
     }
 
+    // ---- Option A userns transposition map ----
+
+    /// Resolve a container id to its host id through a set of extents, using u64
+    /// arithmetic so a full-range extent can't overflow. `None` ⇒ unmapped.
+    fn map_c2h(maps: &[oci_spec::runtime::LinuxIdMapping], cid: u32) -> Option<u32> {
+        for m in maps {
+            let lo = m.container_id() as u64;
+            let hi = lo + m.size() as u64;
+            if (cid as u64) >= lo && (cid as u64) < hi {
+                return Some((m.host_id() as u64 + (cid as u64 - lo)) as u32);
+            }
+        }
+        None
+    }
+
+    /// Assert the extents are a clean bijection over `0..USERNS_RANGE_END`: no
+    /// two extents share a host id, and every container id maps to a distinct
+    /// host id (spot-checked at the boundaries plus a sample).
+    fn assert_no_host_overlap(maps: &[oci_spec::runtime::LinuxIdMapping]) {
+        let mut ranges: Vec<(u64, u64)> = maps
+            .iter()
+            .map(|m| (m.host_id() as u64, m.host_id() as u64 + m.size() as u64))
+            .collect();
+        ranges.sort();
+        for w in ranges.windows(2) {
+            assert!(w[0].1 <= w[1].0, "host ranges overlap: {ranges:?}");
+        }
+    }
+
+    #[test]
+    fn userns_identity_when_workload_equals_owner() {
+        // host uid 1000 running an image whose USER is 1000 → pure identity.
+        let m = transpose_identity_map(1000, 1000);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].container_id(), 0);
+        assert_eq!(m[0].host_id(), 0);
+        assert_eq!(m[0].size(), USERNS_RANGE_END);
+        assert_eq!(map_c2h(&m, 0), Some(0));
+        assert_eq!(map_c2h(&m, 1000), Some(1000));
+        assert_eq!(map_c2h(&m, 65534), Some(65534));
+    }
+
+    #[test]
+    fn userns_root_workload_swaps_zero_and_owner() {
+        // Default interactive sandbox: workload is root (0), workspace owner 1000.
+        let m = transpose_identity_map(0, 1000);
+        // container-root owns the workspace (maps to host 1000).
+        assert_eq!(map_c2h(&m, 0), Some(1000));
+        // the workspace-owner id is consumed exactly once (by container 1000).
+        assert_eq!(map_c2h(&m, 1000), Some(0));
+        // everything else is identity.
+        assert_eq!(map_c2h(&m, 1), Some(1));
+        assert_eq!(map_c2h(&m, 999), Some(999));
+        assert_eq!(map_c2h(&m, 1001), Some(1001));
+        assert_eq!(map_c2h(&m, 65534), Some(65534));
+        assert_no_host_overlap(&m);
+    }
+
+    #[test]
+    fn userns_named_user_keeps_root_for_sudo() {
+        // Image USER=node(1000), host owner uid 1001 (host uid != image uid).
+        let m = transpose_identity_map(1000, 1001);
+        // the USER owns the workspace.
+        assert_eq!(map_c2h(&m, 1000), Some(1001));
+        // CRITICAL: container-root still maps to host-root → setuid sudo works.
+        assert_eq!(map_c2h(&m, 0), Some(0));
+        // the owner id is consumed exactly once (by container 1001).
+        assert_eq!(map_c2h(&m, 1001), Some(1000));
+        assert_eq!(map_c2h(&m, 65534), Some(65534));
+        assert_no_host_overlap(&m);
+    }
+
+    #[test]
+    fn userns_multi_uid_nobody_image() {
+        // Real multi-uid image whose USER resolves to a high id (nobody=65534),
+        // host workspace owner 1000.
+        let m = transpose_identity_map(65534, 1000);
+        assert_eq!(map_c2h(&m, 65534), Some(1000)); // nobody owns the workspace
+        assert_eq!(map_c2h(&m, 0), Some(0)); // root preserved (sudo)
+        assert_eq!(map_c2h(&m, 1000), Some(65534)); // owner id consumed once
+        assert_eq!(map_c2h(&m, 33), Some(33)); // www-data etc. identity
+        assert_no_host_overlap(&m);
+    }
+
+    #[test]
+    fn userns_covers_full_range_no_overflow_id() {
+        // Highest mapped id is RANGE_END-1; the (uid_t)-1 overflow id is excluded.
+        let m = transpose_identity_map(1000, 2000);
+        assert_eq!(
+            map_c2h(&m, USERNS_RANGE_END - 1),
+            Some(USERNS_RANGE_END - 1)
+        );
+        // total coverage equals the full range (sum of sizes).
+        let total: u64 = m.iter().map(|e| e.size() as u64).sum();
+        assert_eq!(total, USERNS_RANGE_END as u64);
+        // at most five extents.
+        assert!(m.len() <= 5, "too many extents: {}", m.len());
+    }
+
+    #[test]
+    fn userns_owner_is_root_degenerate() {
+        // Pathological: virtiofsd somehow runs as root (owner 0) and workload 0.
+        // workload==owner==0 → identity (no swap needed; root already owns it).
+        let m = transpose_identity_map(0, 0);
+        assert_eq!(m.len(), 1);
+        assert_eq!(map_c2h(&m, 0), Some(0));
+    }
+
+    #[test]
+    fn compute_userns_mappings_maps_uid_and_gid_independently() {
+        // owner (1000,1000), workload USER (0,0) → both transpose 0<->1000.
+        let (uid_maps, gid_maps) = compute_userns_mappings((1000, 1000), (0, 0));
+        assert_eq!(map_c2h(&uid_maps, 0), Some(1000));
+        assert_eq!(map_c2h(&gid_maps, 0), Some(1000));
+        // owner (1000, 50) workload (1000, 50) → identity both.
+        let (uid_maps, gid_maps) = compute_userns_mappings((1000, 50), (1000, 50));
+        assert_eq!(uid_maps.len(), 1);
+        assert_eq!(gid_maps.len(), 1);
+    }
+
     // ---- resolve_process_user (config.json USER → (uid,gid) + loud warning) ----
 
     #[test]
@@ -552,6 +800,7 @@ mod tests {
             trust_env: &[],
             cwd_override: None,
             user: (0, 0),
+            host_owner: (1000, 1000),
             hostname: "web",
             terminal: false,
         }
@@ -616,6 +865,60 @@ mod tests {
         assert!(types.contains(&LinuxNamespaceType::Mount));
         assert!(types.contains(&LinuxNamespaceType::Ipc));
         assert!(types.contains(&LinuxNamespaceType::Uts));
+    }
+
+    #[test]
+    fn spec_adds_user_namespace_with_transposed_mappings() {
+        // Option A: generate_spec must add a User namespace and the uid/gid
+        // transposition mapping (workload USER <-> workspace owner).
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut p = base_params(&img);
+        p.user = (0, 0); // root workload
+        p.host_owner = (1000, 1000); // host owns the workspace
+        let spec = generate_spec(&p).unwrap();
+        let linux = spec.linux().as_ref().unwrap();
+
+        // A User namespace is present.
+        let nss = linux.namespaces().clone().unwrap();
+        assert!(
+            nss.iter().any(|n| n.typ() == LinuxNamespaceType::User),
+            "User namespace must be added (Option A)"
+        );
+
+        // uid/gid mappings are the transposition (container-0 -> host-1000).
+        let uid_maps = linux.uid_mappings().clone().expect("uid mappings set");
+        let gid_maps = linux.gid_mappings().clone().expect("gid mappings set");
+        assert_eq!(map_c2h(&uid_maps, 0), Some(1000));
+        assert_eq!(map_c2h(&gid_maps, 0), Some(1000));
+        assert_eq!(map_c2h(&uid_maps, 1000), Some(0));
+    }
+
+    #[test]
+    fn spec_userns_named_user_preserves_root_mapping() {
+        // Image USER=1000 with host owner 1001: the USER owns the workspace and
+        // container-root stays host-root (sudo works).
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"], "User": "1000" }));
+        let mut p = base_params(&img);
+        p.user = (1000, 1000);
+        p.host_owner = (1001, 1001);
+        let spec = generate_spec(&p).unwrap();
+        let linux = spec.linux().as_ref().unwrap();
+        let uid_maps = linux.uid_mappings().clone().expect("uid mappings set");
+        assert_eq!(map_c2h(&uid_maps, 1000), Some(1001)); // USER -> owner
+        assert_eq!(map_c2h(&uid_maps, 0), Some(0)); // root preserved
+    }
+
+    #[test]
+    fn spec_userns_mappings_serialize_to_json() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut p = base_params(&img);
+        p.host_owner = (1000, 1000);
+        let spec = generate_spec(&p).unwrap();
+        let json = serde_json::to_string(&spec).unwrap();
+        // OCI serializes these as camelCase keys.
+        assert!(json.contains("uidMappings"), "uidMappings in JSON: {json}");
+        assert!(json.contains("gidMappings"), "gidMappings in JSON");
+        assert!(json.contains("\"user\""), "user namespace type in JSON");
     }
 
     #[test]

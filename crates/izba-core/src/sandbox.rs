@@ -461,6 +461,39 @@ fn liveness_of(paths: &Paths, name: &str, connector: Connector) -> anyhow::Resul
     Ok(assess(state.as_ref(), &probes))
 }
 
+/// Resolve the host `(uid, gid)` that owns the virtiofs `workspace` share — the
+/// anchor for the Option A container user-namespace transposition.
+///
+/// On Unix this is the owner of the `workspace` directory exactly as the guest's
+/// (unprivileged, untranslated) virtiofsd will present it. If the stat fails
+/// (e.g. the path was just removed) we fall back to the running process's
+/// effective uid/gid, which is also what virtiofsd runs as.
+///
+/// On non-Unix hosts (Windows/OpenVMM) there is no POSIX owner to read; the
+/// OpenVMM bundled virtiofs presents files under a fixed identity, so we anchor
+/// at `(0, 0)`. For izba's default root workload that yields an identity map
+/// (correct); the non-root-USER case on the OpenVMM backend is pending the
+/// WHP-leg validation (see the crun-userns spike findings) — the guest-userns
+/// mechanism itself is identical on both backends.
+fn workspace_owner(workspace: &Path) -> (u32, u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(workspace) {
+            Ok(m) => (m.uid(), m.gid()),
+            Err(_) => (
+                nix::unistd::Uid::effective().as_raw(),
+                nix::unistd::Gid::effective().as_raw(),
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = workspace;
+        (0, 0)
+    }
+}
+
 /// Write `oci/config.json` into `oci_dir` for the interactive (pause) mode.
 ///
 /// Generates an OCI runtime spec via [`crate::image::runtime_config::generate_spec`]
@@ -473,6 +506,7 @@ fn write_oci_bundle(
     name: &str,
     image_config: Option<&oci_client::config::Config>,
     ca_present: bool,
+    workspace: &Path,
 ) -> anyhow::Result<()> {
     // Gate the CA trust-env defaults on the bundle actually being present —
     // same gate the guest applies in `build_env_overlay` (trust_bundle_present).
@@ -491,6 +525,12 @@ fn write_oci_bundle(
     if let Some(w) = user_warn {
         eprintln!("warning: sandbox '{name}': {w}");
     }
+    // Option A anchor: the host (uid, gid) that owns the virtiofs `workspace`,
+    // as the guest will see it. izba's virtiofsd runs UNPRIVILEGED and applies
+    // no uid translation, so the guest sees the share's real host owner; the
+    // container user namespace transposes it to the workload USER so the image
+    // USER owns `/workspace`. See `compute_userns_mappings`.
+    let host_owner = workspace_owner(workspace);
     let params = SpecParams {
         mode: ContainerMode::Interactive {
             pause_argv: &pause_argv,
@@ -502,6 +542,7 @@ fn write_oci_bundle(
         trust_env: &trust,
         cwd_override: Some(INTERACTIVE_CWD),
         user: (uid, gid),
+        host_owner,
         hostname: name,
         terminal: false,
     };
@@ -638,6 +679,7 @@ pub fn start_with_timeouts(
         name,
         image_config,
         trust_dir.join("ca.pem").exists(),
+        &config.workspace,
     )
     .with_context(|| format!("writing oci/config.json for sandbox '{name}'"))?;
 
@@ -1372,6 +1414,33 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+
+    // -----------------------------------------------------------------------
+    // workspace_owner (Option A userns anchor)
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_owner_reads_dir_owner() {
+        // A freshly created dir is owned by the running process's euid/egid,
+        // which is exactly what an unprivileged virtiofsd would present.
+        let dir = tempfile::tempdir().unwrap();
+        let (uid, gid) = workspace_owner(dir.path());
+        let euid = nix::unistd::Uid::effective().as_raw();
+        let egid = nix::unistd::Gid::effective().as_raw();
+        assert_eq!((uid, gid), (euid, egid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_owner_missing_path_falls_back_to_euid() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let (uid, gid) = workspace_owner(&missing);
+        let euid = nix::unistd::Uid::effective().as_raw();
+        let egid = nix::unistd::Gid::effective().as_raw();
+        assert_eq!((uid, gid), (euid, egid));
+    }
 
     // -----------------------------------------------------------------------
     // compute_launch_lockdown (non-Windows: always None)
