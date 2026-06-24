@@ -3,11 +3,13 @@
 
 pub mod erofs;
 pub mod flatten;
+pub mod ingest;
 pub mod pull;
 pub mod runtime_config;
 pub mod store;
 
 pub use flatten::flatten_layers;
+pub use ingest::ingest_oci_archive;
 pub use store::ImageStore;
 
 use crate::paths::Paths;
