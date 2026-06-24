@@ -43,6 +43,17 @@ pub struct BuildOpts {
 const BUILDCACHE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 pub fn run(paths: &Paths, opts: &BuildOpts) -> anyhow::Result<i32> {
+    // `izba build` only needs the exit status; all orchestration lives in
+    // `build_image`. A successful build maps to exit 0.
+    build_image(paths, opts)?;
+    Ok(0)
+}
+
+/// Build an OCI image inside a throwaway builder VM and return its canonical
+/// digest. Drives the full pipeline: validate → Create → arm build-network
+/// policy → Start → run BuildKit → ingest → tag → teardown. Used directly by
+/// `izba run --build` (to chain build→run) and via `run` by `izba build`.
+pub fn build_image(paths: &Paths, opts: &BuildOpts) -> anyhow::Result<String> {
     // Fail fast on a bad tag BEFORE any daemon work or VM boot.
     if let Some(tag) = &opts.tag {
         image::tags::validate_tag(tag).context("invalid -t tag")?;
@@ -71,101 +82,15 @@ pub fn run(paths: &Paths, opts: &BuildOpts) -> anyhow::Result<i32> {
     result
 }
 
-/// Build an OCI image and return its canonical digest.
-///
-/// Identical to `run` but returns the built image digest instead of an exit
-/// code — used by `izba run --build` to chain build→run without the caller
-/// having to parse stdout.  Prints the same "Built <digest>" line as `run`.
-pub fn build_image(paths: &Paths, opts: &BuildOpts) -> anyhow::Result<String> {
-    if let Some(tag) = &opts.tag {
-        image::tags::validate_tag(tag).context("invalid -t tag")?;
-    }
-
-    let context = opts
-        .context
-        .canonicalize()
-        .with_context(|| format!("resolving build context {}", opts.context.display()))?;
-    let filename = dockerfile_rel(&context, &opts.dockerfile)?;
-
-    let name = generate_builder_name()?;
-    let mut client = DaemonClient::connect(paths)?;
-
-    let req = DaemonRequest::Create(builder_create_request(name.clone(), opts, context.clone()));
-    match client.request(&req, &mut |m| eprintln!("{m}"))? {
-        DaemonResponse::Created { .. } => {}
-        DaemonResponse::Error { message } => bail!(message),
-        other => bail!("unexpected daemon reply: {other:?}"),
-    }
-
-    // From here on the sandbox exists — tear it down no matter what.
-    let result = run_build_return_digest(paths, &mut client, &name, opts, &filename);
-    teardown(&mut client, &name);
-    result
-}
-
-/// Like `run_build` but returns the built digest instead of an exit code.
-/// Used by `build_image` so `izba run --build` can feed the digest straight
-/// into the run phase without parsing stdout.
-fn run_build_return_digest(
-    paths: &Paths,
-    client: &mut DaemonClient,
-    name: &str,
-    opts: &BuildOpts,
-    filename: &str,
-) -> anyhow::Result<String> {
-    let policy = EgressPolicyConfig::build_network(&opts.build_allow);
-    super::persist_policy_config(paths, name, &policy)?;
-
-    match client.request(
-        &DaemonRequest::Start {
-            name: name.to_string(),
-            allow_unconfined: false,
-        },
-        &mut |m| eprintln!("{m}"),
-    )? {
-        DaemonResponse::Ok => {}
-        DaemonResponse::Error { message } if message.contains("already running") => {}
-        DaemonResponse::Error { message } => bail!(message),
-        other => bail!("unexpected daemon reply: {other:?}"),
-    }
-
-    let script = build_script(filename);
-    let code = super::exec::run(
-        paths,
-        name,
-        false,
-        false,
-        vec!["/bin/sh".to_string(), "-c".to_string(), script],
-    )?;
-    if code != 0 {
-        bail!(
-            "build failed (buildctl exited {code}); inspect the builder console at {}",
-            paths.sandbox_dir(name).join("logs/console.log").display()
-        );
-    }
-
-    let archive = sandbox::buildout_path(paths, name);
-    let digest = image::ingest_oci_archive(paths, &archive)
-        .with_context(|| format!("ingesting build output {}", archive.display()))?;
-
-    if let Some(tag) = &opts.tag {
-        image::tags::set_tag(paths, tag, &digest)?;
-        println!("Built {digest}\nTagged {tag} -> {digest}");
-    } else {
-        println!("Built {digest}");
-    }
-    Ok(digest)
-}
-
 /// The build proper, AFTER Create and BEFORE teardown. Persists the policy,
-/// starts the VM, runs the build, ingests + tags on success.
+/// starts the VM, runs the build, ingests + tags on success, returns the digest.
 fn run_build(
     paths: &Paths,
     client: &mut DaemonClient,
     name: &str,
     opts: &BuildOpts,
     filename: &str,
-) -> anyhow::Result<i32> {
+) -> anyhow::Result<String> {
     // 2. Arm the enforcing build-network policy BEFORE Start. The daemon reads
     // policy.yaml fresh when it binds the egress listener at Start
     // (egress::Manager::ensure_listening → resolve_policy), so writing it here
@@ -216,7 +141,7 @@ fn run_build(
     } else {
         println!("Built {digest}");
     }
-    Ok(0)
+    Ok(digest)
 }
 
 /// Always-runs teardown: remove the throwaway sandbox (force, since it is
