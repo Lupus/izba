@@ -23,6 +23,10 @@ const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
 /// Bring up lo + dummy0 and install the default route. Errors are
 /// reported per step so a console log names the exact failure.
+// reason: ioctl-based network bring-up (SIOCSIFADDR/SIOCADDRT/...) plus the
+// route_localnet sysctl; needs a real guest netns, so it is exercised only by
+// the KVM integration suite (egress_dns_* / net boot), never host unit tests.
+#[mutants::skip]
 pub fn configure() -> io::Result<()> {
     if_up("lo")?;
     set_addr("dummy0", GUEST_IP, NETMASK)?;
@@ -42,6 +46,10 @@ pub fn configure() -> io::Result<()> {
 /// Without `route_localnet` the kernel treats that 127.0.0.1 source as a
 /// martian and drops the reply. Harmless on this NIC-less island — there is no
 /// external interface for a 127/8 address to leak onto.
+// reason: writes a real /proc/sys sysctl; covered by the KVM egress_dns_*
+// integration tests (the hardcoded-resolver reply path depends on it), not host
+// unit tests.
+#[mutants::skip]
 fn enable_route_localnet() -> io::Result<()> {
     std::fs::write("/proc/sys/net/ipv4/conf/all/route_localnet", "1\n")
 }
