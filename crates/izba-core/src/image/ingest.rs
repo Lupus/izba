@@ -282,7 +282,7 @@ fn verify_sha256(data: &[u8], digest: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::image::ImageStore;
     use crate::paths::Paths;
