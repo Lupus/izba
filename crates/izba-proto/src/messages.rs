@@ -390,6 +390,26 @@ mod tests {
     }
 
     #[test]
+    fn container_state_as_str_matches_oci_tokens() {
+        assert_eq!(ContainerState::Creating.as_str(), "creating");
+        assert_eq!(ContainerState::Created.as_str(), "created");
+        assert_eq!(ContainerState::Running.as_str(), "running");
+        assert_eq!(ContainerState::Stopped.as_str(), "stopped");
+        assert_eq!(ContainerState::Paused.as_str(), "paused");
+        assert_eq!(ContainerState::Unknown.as_str(), "unknown");
+        // `as_str` round-trips through `from_oci_status` for the OCI states.
+        for state in [
+            ContainerState::Creating,
+            ContainerState::Created,
+            ContainerState::Running,
+            ContainerState::Stopped,
+            ContainerState::Paused,
+        ] {
+            assert_eq!(ContainerState::from_oci_status(state.as_str()), state);
+        }
+    }
+
+    #[test]
     fn container_state_is_running_only_for_running() {
         assert!(ContainerState::Running.is_running());
         for s in [

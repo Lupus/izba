@@ -12,6 +12,14 @@ pub fn run_foreground(paths: &Paths) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+// reason: daemon-wired glue — connects to a live izbad and prints a status
+// table; the whole module is intentionally untestable without a running daemon
+// (exercised by the KVM-gated `daemon_e2e`, which cargo-mutants cannot run on
+// hosted runners). The one mutation-worthy bit, the CONTAINER column token, is
+// `ContainerState::as_str`, unit-tested in izba-proto. The `status == "stopped"`
+// guard is a probe-skipping optimization (a stopped VM can't hold a live
+// container; `container_state` would return None anyway).
+#[mutants::skip]
 pub fn status(paths: &Paths) -> anyhow::Result<i32> {
     let Some(mut client) = DaemonClient::connect_existing(paths)? else {
         println!("daemon: not running");
