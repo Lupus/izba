@@ -896,6 +896,38 @@ fn guest_networking() {
     mgr.stop(&tb.paths, "net");
 }
 
+/// Boot `name` with a stand-in izbad egress listener (the daemonless suite
+/// plays izbad). The listener must exist on `run/vsock.sock_1027` BEFORE the
+/// guest boots and dials it. Panics with the console tail on boot failure;
+/// returns the manager so the caller stops it at the end. Shared by the
+/// `egress_dns_*` tests so their setup isn't copy-pasted (CPD gate).
+fn start_with_egress(
+    env: &TestEnv,
+    tb: &mut TestBox,
+    name: &str,
+    ws: &Path,
+) -> izba_core::daemon::egress::EgressManager {
+    use izba_core::daemon::egress::{
+        audit::AuditSink, sys_resolver::SystemResolver, EgressManager,
+    };
+    create_sandbox(env, tb, name, ws);
+    let mgr = EgressManager::new(
+        SystemResolver::new().expect("system resolver"),
+        None,
+        AuditSink::new(tb.paths.clone()),
+    );
+    mgr.ensure_listening(&tb.paths, name)
+        .expect("bind vsock_1027 listener");
+    if let Err(e) = start_sandbox(env, tb, name) {
+        mgr.stop(&tb.paths, name);
+        panic!(
+            "boot of '{name}' failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, name)
+        );
+    }
+    mgr
+}
+
 /// M1 phase A exit: an egress=izbad sandbox resolves DNS through izbad.
 /// This is ALSO the runtime validation of guest-initiated hybrid vsock
 /// (guest dials CID 2:1027 -> CH bridges to run/vsock.sock_1027).
@@ -904,26 +936,7 @@ fn egress_dns_via_izbad() {
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("egress-dns");
-    create_sandbox(&env, &mut tb, "egress-dns", &ws);
-
-    // Daemonless suite: stand in for izbad's listener ourselves. The listener
-    // must exist on run/vsock.sock_1027 BEFORE the guest boots and dials it.
-    use izba_core::daemon::egress::EgressManager;
-    let mgr = EgressManager::new(
-        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
-        None,
-        izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
-    );
-    mgr.ensure_listening(&tb.paths, "egress-dns")
-        .expect("bind vsock_1027 listener");
-
-    if let Err(e) = start_sandbox(&env, &tb, "egress-dns") {
-        mgr.stop(&tb.paths, "egress-dns");
-        panic!(
-            "boot of 'egress-dns' failed: {e:#}\nconsole tail:\n{}",
-            console_tail(&tb.paths, "egress-dns")
-        );
-    }
+    let mgr = start_with_egress(&env, &mut tb, "egress-dns", &ws);
 
     // getent uses the guest resolv.conf (nameserver 127.0.0.1 -> the izba-init
     // DNS stub on 0.0.0.0:53 -> vsock Dns stream -> izbad SystemResolver ->
@@ -958,24 +971,7 @@ fn egress_dns_hardcoded_external_resolver() {
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("egress-dns-hard");
-    create_sandbox(&env, &mut tb, "egress-dns-hard", &ws);
-
-    use izba_core::daemon::egress::EgressManager;
-    let mgr = EgressManager::new(
-        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
-        None,
-        izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
-    );
-    mgr.ensure_listening(&tb.paths, "egress-dns-hard")
-        .expect("bind vsock_1027 listener");
-
-    if let Err(e) = start_sandbox(&env, &tb, "egress-dns-hard") {
-        mgr.stop(&tb.paths, "egress-dns-hard");
-        panic!(
-            "boot of 'egress-dns-hard' failed: {e:#}\nconsole tail:\n{}",
-            console_tail(&tb.paths, "egress-dns-hard")
-        );
-    }
+    let mgr = start_with_egress(&env, &mut tb, "egress-dns-hard", &ws);
 
     // Query 8.8.8.8 explicitly: the datagram leaves for 8.8.8.8:53, nft
     // REDIRECTs it to the guest stub, izbad resolves via the host upstream,
@@ -1011,24 +1007,7 @@ fn egress_dns_tcp_hardcoded_external_resolver() {
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("egress-dns-tcp");
-    create_sandbox(&env, &mut tb, "egress-dns-tcp", &ws);
-
-    use izba_core::daemon::egress::EgressManager;
-    let mgr = EgressManager::new(
-        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
-        None,
-        izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
-    );
-    mgr.ensure_listening(&tb.paths, "egress-dns-tcp")
-        .expect("bind vsock_1027 listener");
-
-    if let Err(e) = start_sandbox(&env, &tb, "egress-dns-tcp") {
-        mgr.stop(&tb.paths, "egress-dns-tcp");
-        panic!(
-            "boot of 'egress-dns-tcp' failed: {e:#}\nconsole tail:\n{}",
-            console_tail(&tb.paths, "egress-dns-tcp")
-        );
-    }
+    let mgr = start_with_egress(&env, &mut tb, "egress-dns-tcp", &ws);
 
     // DNS/TCP query for example.com A IN (id 0xABCD), 2-byte length-prefixed;
     // octal escapes keep printf busybox-portable. The pipeline's exit status is

@@ -162,7 +162,25 @@ fn reply_dns(
 /// Serve DNS forever (daemon thread) on an already-bound socket; one thread
 /// per query so a slow upstream cannot head-of-line-block other resolutions.
 /// M1: unbounded thread-per-query (and one izbad conn each) — the host-side bound is M2 scope.
+// reason: 1-line delegation wiring the real `dial_host` (CID 2 vsock) into the
+// tested serve loop; the loop logic lives in `serve_dns_udp_with`, which is
+// unit-tested with a fake izbad over a socketpair.
+#[mutants::skip]
 pub fn serve_dns_udp(sock: UdpSocket) -> io::Result<()> {
+    serve_dns_udp_with(sock, dial_host)
+}
+
+/// The serve loop, generic over the izbad dialer so it can be unit-tested with a
+/// socketpair fake (production passes [`dial_host`]). Each datagram is recv'd
+/// with its original destination, forwarded over a fresh `Dns` stream, and the
+/// answer is sent back FROM that destination so conntrack un-NATs a REDIRECTed
+/// hardcoded-resolver query (e.g. 8.8.8.8:53). The loopback resolver path is not
+/// REDIRECTed, but `orig` is still 127.0.0.1 there, so the same path serves both.
+fn serve_dns_udp_with<S, D>(sock: UdpSocket, dial: D) -> io::Result<()>
+where
+    S: Read + Write + Send + 'static,
+    D: Fn() -> io::Result<S> + Clone + Send + 'static,
+{
     let mut buf = [0u8; 4096];
     loop {
         let (n, peer, orig) = match recv_with_origdst(&sock, &mut buf) {
@@ -174,12 +192,9 @@ pub fn serve_dns_udp(sock: UdpSocket) -> io::Result<()> {
         };
         let query = buf[..n].to_vec();
         let sock2 = sock.try_clone()?;
+        let dial = dial.clone();
         std::thread::spawn(move || {
-            let resp = forward_query(dial_host, &query);
-            // Reply FROM the original destination so conntrack un-NATs a
-            // REDIRECTed hardcoded-resolver query (e.g. 8.8.8.8:53). The
-            // loopback resolver path is not REDIRECTed, but `orig` is still
-            // 127.0.0.1 there, so the same path serves both.
+            let resp = forward_query(dial, &query);
             if let Err(e) = reply_dns(&sock2, &resp, &peer, orig) {
                 eprintln!("izba-init: dns stub reply: {e}");
             }
@@ -612,6 +627,64 @@ mod tests {
         assert_eq!(resp[3] & 0x0f, 0x02, "SERVFAIL");
         h.join().unwrap();
         izbad.join().unwrap();
+    }
+
+    #[test]
+    fn nix_to_io_maps_errno() {
+        let e = nix_to_io(nix::errno::Errno::EINVAL);
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    /// The serve loop end-to-end with a fake izbad over a socketpair (driving the
+    /// injected-dialer seam, so it is deterministic — no real vsock): a datagram
+    /// in → forwarded over a `Dns` stream → the fake's `re:<query>` answer is
+    /// sent back to the client. Proves recv→forward→reply wiring runs (and kills
+    /// the `-> Ok(())` mutant). Runtime-skips where the sandbox denies UDP bind.
+    #[test]
+    fn serve_dns_udp_loop_forwards_and_replies() {
+        let server = match UdpSocket::bind(("127.0.0.1", 0)) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP serve_dns_udp_loop_forwards_and_replies: bind denied: {e}");
+                return;
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        };
+        set_recv_origdst(&server).expect("enable IP_RECVORIGDSTADDR");
+        let saddr = server.local_addr().unwrap();
+
+        // Fresh fake izbad per dial: expect the `Dns` open frame, echo `re:<q>`.
+        let dial = || -> io::Result<UnixStream> {
+            let (mine, theirs) = UnixStream::pair().unwrap();
+            std::thread::spawn(move || {
+                let mut s = theirs;
+                if read_frame::<_, StreamOpen>(&mut s).is_err() {
+                    return;
+                }
+                while let Ok(Some(q)) = dns::read_dns_msg(&mut s) {
+                    let mut r = b"re:".to_vec();
+                    r.extend_from_slice(&q);
+                    if dns::write_dns_msg(&mut s, &r).is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok(mine)
+        };
+        std::thread::spawn(move || {
+            let _ = serve_dns_udp_with(server, dial);
+        });
+
+        let client = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        client.send_to(b"hello", saddr).unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _from) = client
+            .recv_from(&mut buf)
+            .expect("serve_dns_udp must reply (loop ran)");
+        assert_eq!(&buf[..n], b"re:hello");
     }
 
     #[test]
