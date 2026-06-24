@@ -30,7 +30,7 @@ fn short_version() -> &'static str {
 }
 
 /// Options shared by `create` and `run`.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct SandboxOpts {
     /// Container image to boot
     #[arg(long, default_value = "ubuntu:24.04")]
@@ -121,6 +121,16 @@ enum Cmd {
         /// if confinement fails on your host)
         #[arg(long)]
         allow_unconfined: bool,
+        /// Build a Dockerfile (or directory) first, then run the resulting
+        /// image. PATH may be a Dockerfile (context = its parent dir) or a
+        /// directory (context = the directory itself). Mutually exclusive
+        /// with --image.
+        #[arg(long = "build", value_name = "PATH", conflicts_with = "image")]
+        build: Option<PathBuf>,
+        /// Extra host the build network may reach (registry/mirror; repeatable).
+        /// Only meaningful with --build.
+        #[arg(long = "build-allow", value_name = "HOST")]
+        build_allow: Vec<String>,
         /// Command to run (default: /bin/sh -l)
         #[arg(last = true)]
         cmd: Vec<String>,
@@ -275,8 +285,18 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             opts,
             name_or_dir,
             allow_unconfined,
+            build,
+            build_allow,
             cmd,
-        } => commands::run::run(paths, &opts, &name_or_dir, allow_unconfined, cmd),
+        } => commands::run::run(
+            paths,
+            &opts,
+            &name_or_dir,
+            allow_unconfined,
+            build,
+            build_allow,
+            cmd,
+        ),
         Cmd::Build {
             file,
             tag,
