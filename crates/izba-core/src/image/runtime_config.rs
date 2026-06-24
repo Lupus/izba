@@ -51,6 +51,74 @@ fn docker_default_caps() -> Result<oci_spec::runtime::LinuxCapabilities> {
         .build()?)
 }
 
+/// The FULL capability set, for **privileged builder VMs only** (see
+/// [`SpecParams::privileged`]).
+///
+/// Rootful BuildKit's overlayfs snapshotter performs bind/overlay `mount(2)`s
+/// inside the container, which require `CAP_SYS_ADMIN` (and friends) — exactly
+/// what [`docker_default_caps`] drops. Granting every capability (effective /
+/// bounding / permitted / inheritable / ambient) is the in-VM equivalent of
+/// `docker run --privileged`. This is acceptable ONLY because the throwaway
+/// builder microVM is itself the security boundary (gated egress + host-side
+/// VMM jail); normal sandboxes never use this.
+fn all_caps() -> Result<oci_spec::runtime::LinuxCapabilities> {
+    // `oci_spec::runtime::Capability` does not derive `EnumIter`, so the full
+    // set is enumerated explicitly (kept exhaustive — a new variant should be
+    // added here too; the unit test asserts SysAdmin presence as the canary).
+    let set: HashSet<Capability> = [
+        Capability::AuditControl,
+        Capability::AuditRead,
+        Capability::AuditWrite,
+        Capability::BlockSuspend,
+        Capability::Bpf,
+        Capability::CheckpointRestore,
+        Capability::Chown,
+        Capability::DacOverride,
+        Capability::DacReadSearch,
+        Capability::Fowner,
+        Capability::Fsetid,
+        Capability::IpcLock,
+        Capability::IpcOwner,
+        Capability::Kill,
+        Capability::Lease,
+        Capability::LinuxImmutable,
+        Capability::MacAdmin,
+        Capability::MacOverride,
+        Capability::Mknod,
+        Capability::NetAdmin,
+        Capability::NetBindService,
+        Capability::NetBroadcast,
+        Capability::NetRaw,
+        Capability::Perfmon,
+        Capability::Setgid,
+        Capability::Setfcap,
+        Capability::Setpcap,
+        Capability::Setuid,
+        Capability::SysAdmin,
+        Capability::SysBoot,
+        Capability::SysChroot,
+        Capability::SysModule,
+        Capability::SysNice,
+        Capability::SysPacct,
+        Capability::SysPtrace,
+        Capability::SysRawio,
+        Capability::SysResource,
+        Capability::SysTime,
+        Capability::SysTtyConfig,
+        Capability::Syslog,
+        Capability::WakeAlarm,
+    ]
+    .into_iter()
+    .collect();
+    Ok(LinuxCapabilitiesBuilder::default()
+        .bounding(set.clone())
+        .effective(set.clone())
+        .permitted(set.clone())
+        .inheritable(set.clone())
+        .ambient(set)
+        .build()?)
+}
+
 /// The container rootfs inside the guest — the overlay init mounts at `/rootfs`
 /// (erofs lower + ext4 upper). Workspace and user volumes are submounts under
 /// it, so they ride along in the container's rootfs subtree.
@@ -371,6 +439,14 @@ pub struct SpecParams<'a> {
     pub hostname: &'a str,
     /// Allocate a terminal for the container process (interactive shells).
     pub terminal: bool,
+    /// Builder/privileged mode — full capabilities and NO user namespace, for
+    /// rootful buildkit-in-VM. The VM is the boundary. When true, the container
+    /// gets every capability ([`all_caps`], incl. `CAP_SYS_ADMIN` for buildkit's
+    /// overlayfs bind/overlay mounts) and the Option-A user namespace + uid/gid
+    /// mappings are skipped so container-root == guest-root (real root, which
+    /// rootful buildkit requires). The network namespace is still dropped (D1).
+    /// Normal (non-builder) sandboxes leave this `false` and are UNCHANGED.
+    pub privileged: bool,
 }
 
 /// Generate the OCI runtime [`Spec`] for the guest's single workload container.
@@ -411,13 +487,21 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
         .uid(params.user.0)
         .gid(params.user.1)
         .build()?;
+    // Privileged builder VMs get the full capability set (rootful buildkit needs
+    // CAP_SYS_ADMIN for its overlayfs bind/overlay mounts); normal sandboxes get
+    // the least-privilege docker-default set.
+    let caps = if params.privileged {
+        all_caps()?
+    } else {
+        docker_default_caps()?
+    };
     let process = ProcessBuilder::default()
         .terminal(params.terminal)
         .args(args)
         .env(env)
         .cwd(cwd)
         .user(user)
-        .capabilities(docker_default_caps()?)
+        .capabilities(caps)
         .build()?;
     let root = RootBuilder::default()
         .path(CONTAINER_ROOTFS)
@@ -440,11 +524,17 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     // the same guest-userns mechanism normalizes ownership on both the
     // virtiofsd (Linux) and OpenVMM (Windows) backends, which both present host
     // uids untranslated.
+    //
+    // Privileged builder VMs (`params.privileged`) SKIP the user namespace and
+    // its uid/gid mappings entirely: rootful buildkit requires real container-
+    // root == guest-root (no userns), and the throwaway builder VM is itself the
+    // boundary. The network namespace is still dropped (D1 applies to builders
+    // too — they share init's netns for gated egress).
     if let Some(linux) = spec.linux_mut().as_mut() {
         if let Some(mut nss) = linux.namespaces().clone() {
             nss.retain(|n| n.typ() != LinuxNamespaceType::Network);
-            // Idempotent: only add the user namespace if the default set lacks it.
-            if !nss.iter().any(|n| n.typ() == LinuxNamespaceType::User) {
+            if !params.privileged && !nss.iter().any(|n| n.typ() == LinuxNamespaceType::User) {
+                // Idempotent: only add the user namespace if the default set lacks it.
                 nss.push(
                     LinuxNamespaceBuilder::default()
                         .typ(LinuxNamespaceType::User)
@@ -453,9 +543,11 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
             }
             linux.set_namespaces(Some(nss));
         }
-        let (uid_maps, gid_maps) = compute_userns_mappings(params.host_owner, params.user);
-        linux.set_uid_mappings(Some(uid_maps));
-        linux.set_gid_mappings(Some(gid_maps));
+        if !params.privileged {
+            let (uid_maps, gid_maps) = compute_userns_mappings(params.host_owner, params.user);
+            linux.set_uid_mappings(Some(uid_maps));
+            linux.set_gid_mappings(Some(gid_maps));
+        }
     }
 
     // Present `/sys` as a recursive bind of the host `/sys`, not a fresh `sysfs`
@@ -879,6 +971,7 @@ mod tests {
             host_owner: (1000, 1000),
             hostname: "web",
             terminal: false,
+            privileged: false,
         }
     }
 
@@ -1149,5 +1242,94 @@ mod tests {
             // dangerous caps stay dropped — the VM is the boundary.
             assert!(!set.contains(&Capability::SysAdmin));
         }
+    }
+
+    // ---- privileged builder spec ----
+
+    #[test]
+    fn spec_privileged_grants_full_caps_including_sysadmin() {
+        // Builder VMs run the in-guest container privileged: rootful buildkit's
+        // overlayfs snapshotter needs CAP_SYS_ADMIN for its bind/overlay mounts.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut p = base_params(&img);
+        p.privileged = true;
+        let spec = generate_spec(&p).unwrap();
+        let proc = spec.process().clone().unwrap();
+        let caps = proc.capabilities().clone().expect("capabilities set");
+        // The full set: effective/bounding/permitted/inheritable/ambient all
+        // contain SysAdmin (and equal the docker-default plus the dropped ones).
+        for set in [
+            caps.bounding(),
+            caps.effective(),
+            caps.permitted(),
+            caps.inheritable(),
+            caps.ambient(),
+        ] {
+            let set = set.as_ref().expect("cap set present");
+            assert!(
+                set.contains(&Capability::SysAdmin),
+                "privileged spec must grant CAP_SYS_ADMIN"
+            );
+            // sanity: also still has the everyday ones.
+            assert!(set.contains(&Capability::DacOverride));
+            assert!(set.contains(&Capability::SysPtrace));
+        }
+    }
+
+    #[test]
+    fn spec_privileged_omits_user_namespace_and_mappings() {
+        // Privileged = real container-root == guest-root: NO user namespace and
+        // NO uid/gid mappings (rootful buildkit requires real root, not a userns).
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut p = base_params(&img);
+        p.privileged = true;
+        let spec = generate_spec(&p).unwrap();
+        let linux = spec.linux().as_ref().unwrap();
+        let nss = linux.namespaces().clone().unwrap();
+        let types: Vec<LinuxNamespaceType> = nss.iter().map(|n| n.typ()).collect();
+        assert!(
+            !types.contains(&LinuxNamespaceType::User),
+            "privileged spec must NOT add a User namespace"
+        );
+        // D1 still applies: the builder shares init's netns.
+        assert!(
+            !types.contains(&LinuxNamespaceType::Network),
+            "network namespace must still be dropped for builders (D1)"
+        );
+        assert!(
+            linux.uid_mappings().is_none(),
+            "privileged spec must not set uid mappings"
+        );
+        assert!(
+            linux.gid_mappings().is_none(),
+            "privileged spec must not set gid mappings"
+        );
+    }
+
+    #[test]
+    fn spec_non_privileged_unchanged_caps_and_userns() {
+        // Belt-and-braces: privileged:false (the default) is byte-identical to
+        // the established behavior — docker-default caps (no SysAdmin) and a User
+        // namespace with mappings.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let p = base_params(&img); // privileged: false
+        let spec = generate_spec(&p).unwrap();
+        let proc = spec.process().clone().unwrap();
+        let caps = proc.capabilities().clone().unwrap();
+        let eff = caps.effective().as_ref().unwrap();
+        assert!(!eff.contains(&Capability::SysAdmin));
+        assert!(eff.contains(&Capability::DacOverride));
+        let linux = spec.linux().as_ref().unwrap();
+        let types: Vec<LinuxNamespaceType> = linux
+            .namespaces()
+            .clone()
+            .unwrap()
+            .iter()
+            .map(|n| n.typ())
+            .collect();
+        assert!(types.contains(&LinuxNamespaceType::User));
+        assert!(!types.contains(&LinuxNamespaceType::Network));
+        assert!(linux.uid_mappings().is_some());
+        assert!(linux.gid_mappings().is_some());
     }
 }

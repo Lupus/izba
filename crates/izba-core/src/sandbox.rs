@@ -541,6 +541,7 @@ fn write_oci_bundle(
     image_config: Option<&oci_client::config::Config>,
     ca_present: bool,
     workspace: &Path,
+    privileged: bool,
 ) -> anyhow::Result<()> {
     // Gate the CA trust-env defaults on the bundle actually being present —
     // same gate the guest applies in `build_env_overlay` (trust_bundle_present).
@@ -579,6 +580,10 @@ fn write_oci_bundle(
         host_owner,
         hostname: name,
         terminal: false,
+        // Builder VMs run the in-guest container privileged (full caps, no
+        // userns) so rootful buildkit's overlayfs mounts work; the VM is the
+        // boundary. Normal sandboxes stay least-privilege.
+        privileged,
     };
     let spec =
         crate::image::runtime_config::generate_spec(&params).context("generating OCI spec")?;
@@ -714,6 +719,7 @@ pub fn start_with_timeouts(
         image_config,
         trust_dir.join("ca.pem").exists(),
         &config.workspace,
+        config.builder,
     )
     .with_context(|| format!("writing oci/config.json for sandbox '{name}'"))?;
 
@@ -1866,6 +1872,94 @@ mod tests {
             !types.contains(&LinuxNamespaceType::Network),
             "network namespace must be absent (D1)"
         );
+    }
+
+    /// A builder sandbox's written OCI config.json must be a PRIVILEGED spec:
+    /// CAP_SYS_ADMIN present and NO user namespace (rootful buildkit). A normal
+    /// sandbox must NOT be privileged.
+    #[test]
+    fn start_builder_writes_privileged_oci_config() {
+        use izba_proto::OCI_TAG;
+        use oci_spec::runtime::{Capability, LinuxNamespaceType, Spec};
+
+        fn read_spec(paths: &Paths, name: &str, builder: bool) -> Spec {
+            let ws = paths.root().join(format!("ws-{name}"));
+            fs::create_dir_all(&ws).unwrap();
+            let mut o = opts(&ws);
+            o.builder = builder;
+            create(paths, name, &o).unwrap();
+            let driver = MockDriver::new();
+            start(paths, name, &driver, &arts(), false).unwrap();
+            let spec_captured = driver.captured.lock().unwrap().take().expect("spec");
+            let oci_share = spec_captured
+                .shares
+                .iter()
+                .find(|s| s.tag == OCI_TAG)
+                .expect("izba-oci share present");
+            let json =
+                fs::read_to_string(oci_share.host_path.join("config.json")).expect("config.json");
+            serde_json::from_str(&json).expect("valid OCI Spec")
+        }
+
+        let (dir, paths) = test_paths();
+        let _ = dir;
+
+        // Builder sandbox → privileged.
+        let bspec = read_spec(&paths, "builder", true);
+        let bproc = bspec.process().as_ref().unwrap();
+        let bcaps = bproc.capabilities().clone().unwrap();
+        assert!(
+            bcaps
+                .effective()
+                .as_ref()
+                .unwrap()
+                .contains(&Capability::SysAdmin),
+            "builder config must grant CAP_SYS_ADMIN"
+        );
+        let blinux = bspec.linux().as_ref().unwrap();
+        let btypes: Vec<LinuxNamespaceType> = blinux
+            .namespaces()
+            .clone()
+            .unwrap()
+            .iter()
+            .map(|n| n.typ())
+            .collect();
+        assert!(
+            !btypes.contains(&LinuxNamespaceType::User),
+            "builder config must NOT have a User namespace"
+        );
+        assert!(blinux.uid_mappings().is_none());
+
+        // Non-builder sandbox → unprivileged (unchanged).
+        let nspec = read_spec(&paths, "web", false);
+        let ncaps = nspec
+            .process()
+            .as_ref()
+            .unwrap()
+            .capabilities()
+            .clone()
+            .unwrap();
+        assert!(
+            !ncaps
+                .effective()
+                .as_ref()
+                .unwrap()
+                .contains(&Capability::SysAdmin),
+            "normal config must NOT grant CAP_SYS_ADMIN"
+        );
+        let nlinux = nspec.linux().as_ref().unwrap();
+        let ntypes: Vec<LinuxNamespaceType> = nlinux
+            .namespaces()
+            .clone()
+            .unwrap()
+            .iter()
+            .map(|n| n.typ())
+            .collect();
+        assert!(
+            ntypes.contains(&LinuxNamespaceType::User),
+            "normal config must keep the User namespace"
+        );
+        assert!(nlinux.uid_mappings().is_some());
     }
 
     #[test]
