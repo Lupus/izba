@@ -34,6 +34,7 @@ fn render(paths: &Paths, det: &SandboxDetail) -> String {
          mem:         {} MiB\n\
          workspace:   {}\n\
          status:      {}\n\
+         container:   {}\n\
          confinement: {}\n\
          lock-down:   {}\n",
         det.name,
@@ -43,9 +44,26 @@ fn render(paths: &Paths, det: &SandboxDetail) -> String {
         det.mem_mb,
         det.workspace,
         det.status,
+        container_label(det.container),
         confinement,
         lockdown,
     )
+}
+
+/// Human-readable label for the in-guest container state. `None` (stopped
+/// sandbox, unreachable guest, or pre-Phase-7 daemon) and `Unknown` both render
+/// as "unknown" — never a healthy claim. The honest exited/created cases carry
+/// a parenthetical so `status` doesn't imply the workload is up when it isn't.
+fn container_label(state: Option<izba_proto::ContainerState>) -> String {
+    use izba_proto::ContainerState;
+    match state {
+        None | Some(ContainerState::Unknown) => "unknown".to_string(),
+        Some(ContainerState::Running) => "running".to_string(),
+        Some(ContainerState::Stopped) => "stopped (workload exited)".to_string(),
+        Some(ContainerState::Created) => "created (not started)".to_string(),
+        Some(ContainerState::Paused) => "paused".to_string(),
+        Some(ContainerState::Creating) => "creating".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -59,6 +77,13 @@ mod tests {
     }
 
     fn detail(confinement: Option<&str>) -> SandboxDetail {
+        detail_with_container(confinement, None)
+    }
+
+    fn detail_with_container(
+        confinement: Option<&str>,
+        container: Option<izba_proto::ContainerState>,
+    ) -> SandboxDetail {
         SandboxDetail {
             name: "web".into(),
             image_ref: "ubuntu:24.04".into(),
@@ -70,6 +95,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             confinement: confinement.map(String::from),
+            container,
         }
     }
 
@@ -108,6 +134,61 @@ mod tests {
         let paths = test_paths(&tmp);
         let out = render(&paths, &detail(None));
         assert!(out.contains("confinement: unknown"), "{out}");
+    }
+
+    #[test]
+    fn renders_container_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let out = render(
+            &paths,
+            &detail_with_container(None, Some(izba_proto::ContainerState::Running)),
+        );
+        assert!(out.contains("container:   running"), "{out}");
+    }
+
+    #[test]
+    fn renders_container_exited_honestly() {
+        // The headline honesty case: the VM (status) is up but the workload
+        // container has exited — `status` must not imply the workload is alive.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let out = render(
+            &paths,
+            &detail_with_container(None, Some(izba_proto::ContainerState::Stopped)),
+        );
+        assert!(
+            out.contains("container:   stopped (workload exited)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn renders_container_unknown_when_absent() {
+        // A stopped sandbox / unreachable guest / pre-Phase-7 daemon → None →
+        // "unknown", never a healthy claim.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let out = render(&paths, &detail_with_container(None, None));
+        assert!(out.contains("container:   unknown"), "{out}");
+    }
+
+    #[test]
+    fn container_label_maps_all_states() {
+        use izba_proto::ContainerState;
+        assert_eq!(container_label(None), "unknown");
+        assert_eq!(container_label(Some(ContainerState::Unknown)), "unknown");
+        assert_eq!(container_label(Some(ContainerState::Running)), "running");
+        assert_eq!(
+            container_label(Some(ContainerState::Stopped)),
+            "stopped (workload exited)"
+        );
+        assert_eq!(
+            container_label(Some(ContainerState::Created)),
+            "created (not started)"
+        );
+        assert_eq!(container_label(Some(ContainerState::Paused)), "paused");
+        assert_eq!(container_label(Some(ContainerState::Creating)), "creating");
     }
 
     #[test]

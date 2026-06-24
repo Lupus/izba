@@ -504,6 +504,16 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
     )?
     .and_then(|s| s.confinement)
     .map(|c| c.summary());
+    // Honesty: the VM (liveness) being up does not mean the workload container
+    // inside it is. Probe the guest's container state best-effort; any failure
+    // (unreachable/wedged guest, or a guest that doesn't report it) maps to
+    // `None` → the CLI renders "unknown". A stopped VM can't hold a live
+    // container, so skip the dial (it would only fail) and report `None`.
+    let container = if status == "stopped" {
+        None
+    } else {
+        probe_container_state(d, &name)
+    };
     Ok(DaemonResponse::Inspect(SandboxDetail {
         name,
         image_ref: config.image_ref,
@@ -515,7 +525,23 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
         ports: config.ports,
         volumes: config.volumes,
         confinement,
+        container,
     }))
+}
+
+/// Best-effort probe of a sandbox's in-guest container state via the guest
+/// `Health` RPC. Returns `None` on any failure — a stopped sandbox (the
+/// control dial fails), an unreachable/wedged guest, or a guest old enough that
+/// its `HealthInfo` carries no `container` field — so inspect degrades to
+/// "unknown" instead of erroring. Mirrors `handle_guest_rpc`'s single
+/// request/response exchange, but swallows errors rather than surfacing them.
+fn probe_container_state(d: &Arc<Daemon>, name: &str) -> Option<izba_proto::ContainerState> {
+    let mut conn = sandbox::control(&d.paths, name, d.connector()).ok()?;
+    write_frame(&mut conn, &izba_proto::Request::Health).ok()?;
+    match read_frame::<_, Response>(&mut conn).ok()? {
+        Response::Health(h) => h.container,
+        _ => None,
+    }
 }
 
 fn handle_guest_rpc(
@@ -999,6 +1025,9 @@ mod tests {
                 assert_eq!(det.status, "stopped");
                 // No state.json (never started) ⇒ confinement unknown.
                 assert_eq!(det.confinement, None);
+                // A stopped VM can't hold a live container; the daemon skips the
+                // probe and reports None → CLI "unknown" (never falsely healthy).
+                assert_eq!(det.container, None);
             }
             other => panic!("inspect: {other:?}"),
         }
@@ -1236,6 +1265,33 @@ mod tests {
                 payload: Response::Health(h),
             } => assert_eq!(h.version, "test"),
             other => panic!("guest rpc: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_folds_running_container_state_from_guest() {
+        // A running sandbox: the daemon probes the guest Health RPC and folds
+        // the reported container state onto the inspect detail. The fake guest
+        // reports a live container, so this proves the probe→fold path end to
+        // end (not just the serde default).
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        // Two things make a sandbox "live" here: the cached registry liveness
+        // (drives the inspect `status` string) and an on-disk live pid (the
+        // gate `sandbox::control` checks before dialing the guest). Set both so
+        // the probe actually reaches the fake guest.
+        d.registry.set_liveness("web", Liveness::Running);
+        write_state(&d.paths, "web", live_identity());
+        match rpc(&mut c, &DaemonRequest::Inspect { name: "web".into() }) {
+            DaemonResponse::Inspect(det) => {
+                assert_eq!(det.status, "running");
+                assert_eq!(det.container, Some(izba_proto::ContainerState::Running));
+            }
+            other => panic!("inspect: {other:?}"),
         }
     }
 

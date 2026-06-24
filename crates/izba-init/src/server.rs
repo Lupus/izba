@@ -88,6 +88,13 @@ fn dispatch_control_request(engine: &ExecEngine, req: Request) -> Response {
         Request::Health => Response::Health(HealthInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_ms: START.elapsed().as_millis() as u64,
+            // Report the workload container's live state so the host can be
+            // honest when the container has exited even though this guest RPC
+            // (and the VM) is still up. `crun state` is queried fresh on each
+            // health check; an unreachable/unparseable crun yields `Unknown`,
+            // never a falsely-healthy answer. On a crun-less unit host this is
+            // `Unknown`; the real value is exercised by the VM checkpoint.
+            container: Some(crate::oci::container_state(crate::oci::CONTAINER_ID)),
         }),
         Request::Exec(er) => match engine.exec(&er) {
             Ok(exec_id) => Response::ExecStarted { exec_id },
@@ -420,6 +427,10 @@ mod tests {
         match rpc(&mut c, &Request::Health) {
             Response::Health(info) => {
                 assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+                // The handler always reports a container state. On this
+                // crun-less unit host the query fails, which is honestly
+                // `Unknown` — never `None` (absent) and never a healthy claim.
+                assert_eq!(info.container, Some(izba_proto::ContainerState::Unknown));
             }
             other => panic!("unexpected: {other:?}"),
         }

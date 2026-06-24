@@ -177,6 +177,7 @@ impl VmHandle for MockHandle {
                     Request::Health => Response::Health(HealthInfo {
                         version: "test".into(),
                         uptime_ms: 1,
+                        container: None,
                     }),
                     _ => Response::Ok,
                 };
@@ -229,6 +230,9 @@ pub(crate) fn fake_connector(
                     Request::Health => Response::Health(HealthInfo {
                         version: "test".into(),
                         uptime_ms: 1,
+                        // A reachable fake guest reports a live container, so
+                        // tests can assert the host folds the probed state.
+                        container: Some(izba_proto::ContainerState::Running),
                     }),
                     Request::Shutdown => {
                         if let Some(id) = &kill_on_shutdown {

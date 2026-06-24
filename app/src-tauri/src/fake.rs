@@ -300,6 +300,7 @@ impl DaemonApi for FakeDaemon {
             ports: self.ports.clone(),
             volumes: self.detail_volumes.clone(),
             confinement: None,
+            container: None,
         })
     }
 

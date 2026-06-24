@@ -32,9 +32,25 @@ pub fn status(paths: &Paths) -> anyhow::Result<i32> {
                 println!("⚠ daemon and CLI builds differ (run `izba version` for detail)");
             }
             println!("socket: {}", s.socket);
-            println!("{:<24} {:<32} STATUS", "NAME", "IMAGE");
+            println!("{:<24} {:<32} {:<16} CONTAINER", "NAME", "IMAGE", "STATUS");
             for sb in &s.sandboxes {
-                println!("{:<24} {:<32} {}", sb.name, sb.image_ref, sb.status);
+                // A stopped VM can't have a live container; skip the probe (it
+                // would only fail → "unknown") so a plain `daemon status` stays
+                // a cheap registry read for stopped sandboxes. For running ones,
+                // probe the guest so we report the workload honestly even when
+                // the VM is up but the container has exited.
+                let container = if sb.status == "stopped" {
+                    None
+                } else {
+                    client.container_state(&sb.name)
+                };
+                println!(
+                    "{:<24} {:<32} {:<16} {}",
+                    sb.name,
+                    sb.image_ref,
+                    sb.status,
+                    container.map(|c| c.as_str()).unwrap_or("unknown"),
+                );
             }
             Ok(0)
         }
