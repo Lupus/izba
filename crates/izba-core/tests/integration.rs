@@ -698,57 +698,47 @@ fn workspace_roundtrip() {
 ///
 /// `#[cfg(unix)]`: asserts on POSIX file ownership (`MetadataExt::uid`), which
 /// only exists on unix; the KVM suite runs on Linux only anyway.
+/// Shared assertions for the Option A userns round-trip tests:
+/// 1. the workload runs as `expect_uid` (the image USER);
+/// 2. the host-seeded `/workspace/seed.txt` appears owned by `expect_uid`
+///    inside the guest (transposition: host owner -> the workload USER);
+/// 3. a file the workload writes to `/workspace` lands on the host owned by the
+///    workspace directory's owner (virtiofsd squashes to the host user,
+///    whatever the in-guest uid).
 #[cfg(unix)]
-#[test]
-fn userns_root_owns_workspace_roundtrip() {
-    let Some(env) = want() else { return };
-    let mut tb = TestBox::new();
-    let ws = tb.workspace("userns");
-    fs::write(ws.join("seed.txt"), "from-host").unwrap();
-    boot(&env, &mut tb, "userns", &ws);
+fn assert_userns_workspace_roundtrip(paths: &Paths, name: &str, ws: &Path, expect_uid: &str) {
+    use std::os::unix::fs::MetadataExt;
 
-    // The interactive workload runs as the image USER; alpine's is root.
-    let uid = exec_ok(&tb.paths, "userns", &["id", "-u"]);
+    let uid = exec_ok(paths, name, &["id", "-u"]);
     assert_eq!(
         uid.trim(),
-        "0",
-        "alpine workload must run as container-root"
+        expect_uid,
+        "workload must run as the image USER {expect_uid}"
     );
 
-    // Transposition: the host-owned workspace appears owned by container-root.
-    let owner = exec_ok(
-        &tb.paths,
-        "userns",
-        &["stat", "-c", "%u", "/workspace/seed.txt"],
-    );
+    let owner = exec_ok(paths, name, &["stat", "-c", "%u", "/workspace/seed.txt"]);
     assert_eq!(
         owner.trim(),
-        "0",
-        "host-owned /workspace must appear owned by container-root (uid 0) under the userns map"
-    );
-    // And it is writable by container-root without a permission error.
-    exec_ok(
-        &tb.paths,
-        "userns",
-        &["sh", "-c", "echo appended >> /workspace/seed.txt"],
+        expect_uid,
+        "the image USER {expect_uid} must own the host workspace under the userns map"
     );
 
-    // guest -> host: the container-created file lands owned by the workspace
-    // owner (the host user running the test), regardless of the in-guest uid.
-    use std::os::unix::fs::MetadataExt;
-    let want_uid = fs::metadata(&ws).unwrap().uid();
+    // guest -> host: the workload-created file lands owned by the workspace
+    // owner regardless of the in-guest uid.
+    let want_uid = fs::metadata(ws).unwrap().uid();
     exec_ok(
-        &tb.paths,
-        "userns",
+        paths,
+        name,
         &["sh", "-c", "echo from-guest > /workspace/out.txt"],
     );
     let out = ws.join("out.txt");
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        if let Ok(meta) = fs::metadata(&out) {
-            if meta.uid() == want_uid {
-                break;
-            }
+        if fs::metadata(&out)
+            .map(|m| m.uid())
+            .is_ok_and(|u| u == want_uid)
+        {
+            break;
         }
         assert!(
             Instant::now() < deadline,
@@ -759,16 +749,29 @@ fn userns_root_owns_workspace_roundtrip() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn userns_root_owns_workspace_roundtrip() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("userns");
+    fs::write(ws.join("seed.txt"), "from-host").unwrap();
+    boot(&env, &mut tb, "userns", &ws);
+
+    // alpine's USER is root; the transposition swaps host-euid <-> container-0,
+    // so container-root owns the host-owned /workspace and the write round-trips.
+    assert_userns_workspace_roundtrip(&tb.paths, "userns", &ws, "0");
+    stop_sandbox(&tb, "userns");
+}
+
 /// Option A with a REAL multi-uid image whose `USER` is numeric and non-root.
 ///
 /// Uses `nginxinc/nginx-unprivileged` (pinned by digest) — `USER 101`, alpine
 /// base (busybox `id`/`stat`/`sh`). This is the case the spike called out
 /// (recommendation #4: "real multi-uid images use a uid range — does Option A
 /// run them?"). The transposition swaps container-101 with the host workspace
-/// owner, so:
-/// - default exec runs as the image USER (uid 101), no `--user` override;
-/// - that USER OWNS the host-owned `/workspace` (host owner -> container-101);
-/// - a file the USER writes round-trips to the host workspace owner.
+/// owner, so default exec runs as USER 101, that USER owns `/workspace`, and its
+/// writes round-trip to the host owner.
 ///
 /// Pulled directly into the test's own store (not the shared alpine cache) so
 /// the image's real `config.json` (carrying `USER 101`) drives the mapping.
@@ -781,7 +784,6 @@ fn userns_numeric_user_owns_workspace() {
     // Pinned digest of nginxinc/nginx-unprivileged:alpine (USER 101). Pinning by
     // digest keeps the test reproducible even if the floating tag is re-pushed.
     const IMAGE: &str = "nginxinc/nginx-unprivileged@sha256:054e14f543eb688809d59ec2ad1644d1a61678e247c87a318ad605977eb37eaf";
-    const EXPECT_UID: &str = "101";
 
     let mut tb = TestBox::new();
     let ws = tb.workspace("uns-user");
@@ -813,50 +815,7 @@ fn userns_numeric_user_owns_workspace() {
         );
     }
 
-    // Default exec runs as the image USER (config.json process.user = 101).
-    let uid = exec_ok(&tb.paths, "uns-user", &["id", "-u"]);
-    assert_eq!(
-        uid.trim(),
-        EXPECT_UID,
-        "default exec must run as the image's numeric USER 101"
-    );
-
-    // Transposition: the host-owned workspace appears owned by the USER (101),
-    // and the USER can write it.
-    let owner = exec_ok(
-        &tb.paths,
-        "uns-user",
-        &["stat", "-c", "%u", "/workspace/seed.txt"],
-    );
-    assert_eq!(
-        owner.trim(),
-        EXPECT_UID,
-        "the image USER (101) must own the host workspace under the userns map"
-    );
-
-    // The USER's write round-trips to the host workspace owner.
-    use std::os::unix::fs::MetadataExt;
-    let want_uid = fs::metadata(&ws).unwrap().uid();
-    exec_ok(
-        &tb.paths,
-        "uns-user",
-        &["sh", "-c", "echo from-101 > /workspace/u.txt"],
-    );
-    let out = ws.join("u.txt");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if let Ok(meta) = fs::metadata(&out) {
-            if meta.uid() == want_uid {
-                break;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "host never saw u.txt owned by workspace owner {want_uid} (got {:?})",
-            fs::metadata(&out).map(|m| m.uid())
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    assert_userns_workspace_roundtrip(&tb.paths, "uns-user", &ws, "101");
     stop_sandbox(&tb, "uns-user");
 }
 

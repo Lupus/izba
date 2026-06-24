@@ -475,6 +475,14 @@ fn liveness_of(paths: &Paths, name: &str, connector: Connector) -> anyhow::Resul
 /// (correct); the non-root-USER case on the OpenVMM backend is pending the
 /// WHP-leg validation (see the crun-userns spike findings) — the guest-userns
 /// mechanism itself is identical on both backends.
+///
+/// `#[mutants::skip]`: returns a real file's `(uid, gid)`. A unit test can only
+/// observe the test process's own euid/egid (a freshly-created dir is owned by
+/// it), and forging a file whose uid != gid needs root — so the uid↔gid-swap
+/// and Ok-vs-Err-arm mutants are indistinguishable from correct behavior
+/// without privilege. Covered by the real-VM userns round-trip tests, which
+/// assert the workspace owner appears as the workload USER inside the guest.
+#[mutants::skip]
 fn workspace_owner(workspace: &Path) -> (u32, u32) {
     #[cfg(unix)]
     {

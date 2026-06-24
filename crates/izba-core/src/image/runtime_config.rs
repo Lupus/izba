@@ -637,8 +637,19 @@ mod tests {
 
     /// Assert the extents are a clean bijection over `0..USERNS_RANGE_END`: no
     /// two extents share a host id, and every container id maps to a distinct
-    /// host id (spot-checked at the boundaries plus a sample).
+    /// host id (spot-checked at the boundaries plus a sample). Also asserts NO
+    /// zero-size extents (a relaxed `>`→`>=` guard would emit empty extents,
+    /// which the kernel/crun may reject — and which would otherwise be invisible
+    /// to the value assertions, since `map_c2h` skips them).
     fn assert_no_host_overlap(maps: &[oci_spec::runtime::LinuxIdMapping]) {
+        for m in maps {
+            assert!(
+                m.size() > 0,
+                "zero-size extent (container_id={}, host_id={})",
+                m.container_id(),
+                m.host_id()
+            );
+        }
         let mut ranges: Vec<(u64, u64)> = maps
             .iter()
             .map(|m| (m.host_id() as u64, m.host_id() as u64 + m.size() as u64))
@@ -730,14 +741,38 @@ mod tests {
 
     #[test]
     fn compute_userns_mappings_maps_uid_and_gid_independently() {
-        // owner (1000,1000), workload USER (0,0) → both transpose 0<->1000.
-        let (uid_maps, gid_maps) = compute_userns_mappings((1000, 1000), (0, 0));
-        assert_eq!(map_c2h(&uid_maps, 0), Some(1000));
-        assert_eq!(map_c2h(&gid_maps, 0), Some(1000));
-        // owner (1000, 50) workload (1000, 50) → identity both.
+        // Asymmetric across all four ids so a swapped uid/gid field OR a swapped
+        // owner/workload arg would change an assertion (the transposition itself
+        // is symmetric in its two args, so the distinguishing power comes from
+        // uid != gid AND owner != workload with distinct values).
+        let (uid_maps, gid_maps) = compute_userns_mappings((1000, 2000), (10, 20));
+        // uid map transposes workload-uid 10 <-> owner-uid 1000.
+        assert_eq!(map_c2h(&uid_maps, 10), Some(1000));
+        assert_eq!(map_c2h(&uid_maps, 1000), Some(10));
+        assert_eq!(map_c2h(&uid_maps, 20), Some(20)); // gid value is identity in the uid map
+                                                      // gid map transposes workload-gid 20 <-> owner-gid 2000.
+        assert_eq!(map_c2h(&gid_maps, 20), Some(2000));
+        assert_eq!(map_c2h(&gid_maps, 2000), Some(20));
+        assert_eq!(map_c2h(&gid_maps, 10), Some(10)); // uid value is identity in the gid map
+
+        // owner == workload → identity both.
         let (uid_maps, gid_maps) = compute_userns_mappings((1000, 50), (1000, 50));
         assert_eq!(uid_maps.len(), 1);
         assert_eq!(gid_maps.len(), 1);
+    }
+
+    #[test]
+    fn userns_top_boundary_no_trailing_zero_extent() {
+        // workload at the very top mapped id (RANGE_END-1): the trailing
+        // identity extent must be omitted (a relaxed `<`→`<=` guard would emit a
+        // zero-size extent at the top). assert_no_host_overlap rejects that.
+        let m = transpose_identity_map(USERNS_RANGE_END - 1, 1000);
+        assert_eq!(map_c2h(&m, USERNS_RANGE_END - 1), Some(1000));
+        assert_eq!(map_c2h(&m, 1000), Some(USERNS_RANGE_END - 1));
+        assert_eq!(map_c2h(&m, 0), Some(0));
+        assert_no_host_overlap(&m);
+        let total: u64 = m.iter().map(|e| e.size() as u64).sum();
+        assert_eq!(total, USERNS_RANGE_END as u64);
     }
 
     // ---- resolve_process_user (config.json USER → (uid,gid) + loud warning) ----
