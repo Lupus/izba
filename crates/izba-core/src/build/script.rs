@@ -19,7 +19,16 @@ pub fn build_script(filename: &str) -> String {
         "set -e\n\
          buildkitd --oci-worker-snapshotter=overlayfs --root /var/lib/buildkit >/var/log/buildkitd.log 2>&1 &\n\
          for i in $(seq 1 60); do buildctl debug workers >/dev/null 2>&1 && break; sleep 1; done\n\
-         buildctl build --frontend dockerfile.v0 --local context=/workspace --local dockerfile=/workspace --opt filename={filename} --output type=oci,dest=/out/img.tar\n"
+         set +e\n\
+         buildctl build --frontend dockerfile.v0 --local context=/workspace --local dockerfile=/workspace --opt filename={filename} --output type=oci,dest=/out/img.tar\n\
+         rc=$?\n\
+         if [ \"$rc\" -ne 0 ]; then\n\
+           echo \"=== izba build diagnostics (buildctl rc=$rc) ===\" >&2\n\
+           echo \"--- /etc/resolv.conf ---\" >&2; cat /etc/resolv.conf >&2 2>&1\n\
+           echo \"--- nslookup registry-1.docker.io @127.0.0.1 ---\" >&2; nslookup registry-1.docker.io 127.0.0.1 >&2 2>&1\n\
+           echo \"--- buildkitd.log (tail) ---\" >&2; tail -n 50 /var/log/buildkitd.log >&2 2>&1\n\
+         fi\n\
+         exit $rc\n"
     )
 }
 
