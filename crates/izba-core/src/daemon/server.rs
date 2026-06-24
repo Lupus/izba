@@ -416,9 +416,10 @@ fn handle_create(
             rw_size_gb: c.rw_size_gb,
             ports: c.ports.clone(),
             volumes: c.volumes.clone(),
-            // Builder flag is not yet surfaced in the daemon wire protocol;
-            // it defaults to false for normal sandboxes created via the daemon.
-            builder: false,
+            // `izba build` sets this to provision the throwaway build host
+            // with the `izba-buildout` rw share at `/out`; normal create/run
+            // leave it false.
+            builder: c.builder,
         },
     )?;
     d.registry.set(&c.name, &c.image_ref, Liveness::Stopped);
@@ -988,6 +989,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             allow_unconfined: false,
+            builder: false,
         })
     }
 

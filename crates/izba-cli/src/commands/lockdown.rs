@@ -164,6 +164,7 @@ mod tests {
                 workspace: std::path::PathBuf::from("/workspace"),
                 ports: vec![],
                 volumes: vec![],
+                builder: false,
             },
         )
         .unwrap();
@@ -198,6 +199,7 @@ mod tests {
                 workspace: std::path::PathBuf::from("/workspace"),
                 ports: vec![],
                 volumes: vec![],
+                builder: false,
             },
         )
         .unwrap();

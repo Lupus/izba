@@ -125,6 +125,27 @@ enum Cmd {
         #[arg(last = true)]
         cmd: Vec<String>,
     },
+    /// Build an OCI image from a Dockerfile in a throwaway builder VM
+    Build {
+        /// Path to the Dockerfile (default: <CONTEXT>/Dockerfile)
+        #[arg(short = 'f', long = "file", value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Tag to apply to the built image
+        #[arg(short = 't', long = "tag", value_name = "TAG")]
+        tag: Option<String>,
+        /// Extra host the build network may reach (registry/mirror; repeatable)
+        #[arg(long = "build-allow", value_name = "HOST")]
+        build_allow: Vec<String>,
+        /// Number of virtual CPUs for the builder VM
+        #[arg(long, default_value_t = 2)]
+        cpus: u32,
+        /// Memory in MiB for the builder VM
+        #[arg(long, default_value_t = 4096)]
+        mem: u32,
+        /// Build context directory
+        #[arg(default_value = ".")]
+        context: PathBuf,
+    },
     /// Run a command in a running sandbox
     Exec {
         /// Sandbox name
@@ -256,6 +277,27 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             allow_unconfined,
             cmd,
         } => commands::run::run(paths, &opts, &name_or_dir, allow_unconfined, cmd),
+        Cmd::Build {
+            file,
+            tag,
+            build_allow,
+            cpus,
+            mem,
+            context,
+        } => {
+            let dockerfile = file.unwrap_or_else(|| context.join("Dockerfile"));
+            commands::build::run(
+                paths,
+                &commands::build::BuildOpts {
+                    dockerfile,
+                    tag,
+                    context,
+                    build_allow,
+                    cpus,
+                    mem,
+                },
+            )
+        }
         Cmd::Exec {
             name,
             interactive,

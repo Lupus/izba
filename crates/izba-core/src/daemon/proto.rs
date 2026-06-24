@@ -61,6 +61,12 @@ pub struct DaemonCreate {
     /// serde so an older client's frame (no field) still deserializes confined.
     #[serde(default)]
     pub allow_unconfined: bool,
+    /// Provision this sandbox as a throwaway in-VM build host: adds the
+    /// `izba-buildout` rw share at guest `/out`. Set by `izba build`; never by
+    /// `create`/`run`. Additive + serde-default → no `DAEMON_PROTO_VERSION`
+    /// bump (a pre-feature client's frame deserializes to `false`).
+    #[serde(default)]
+    pub builder: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +278,7 @@ mod tests {
                     eph_id: None,
                 }],
                 allow_unconfined: false,
+                builder: true,
             }),
             DaemonRequest::VolumePrune,
             DaemonRequest::Start {
@@ -335,6 +342,29 @@ mod tests {
             let back: DaemonRequest = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
             assert_eq!(format!("{req:?}"), format!("{back:?}"));
         }
+    }
+
+    /// A `create` frame from a pre-`builder` client (the field absent) must
+    /// deserialize to `builder: false` — additive, no proto bump.
+    #[test]
+    fn create_without_builder_defaults_false() {
+        let json = serde_json::json!({
+            "type": "create",
+            "name": "web",
+            "image_ref": "ubuntu:24.04",
+            "cpus": 2,
+            "mem_mb": 4096,
+            "workspace": "/ws",
+            "rw_size_gb": 8,
+            "ports": [],
+        });
+        let req: DaemonRequest = serde_json::from_value(json).unwrap();
+        let DaemonRequest::Create(c) = req else {
+            panic!("expected Create");
+        };
+        assert!(!c.builder, "absent builder field defaults to false");
+        assert!(!c.allow_unconfined);
+        assert!(c.volumes.is_empty());
     }
 
     #[test]

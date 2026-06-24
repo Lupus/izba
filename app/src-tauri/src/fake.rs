@@ -383,6 +383,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             allow_unconfined: false,
+            builder: false,
         }
     }
 
