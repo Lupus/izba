@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod build;
 pub mod build_info;
 pub mod ca;
 pub mod cp;
