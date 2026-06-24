@@ -7,10 +7,12 @@ pub mod ingest;
 pub mod pull;
 pub mod runtime_config;
 pub mod store;
+pub mod tags;
 
 pub use flatten::flatten_layers;
 pub use ingest::ingest_oci_archive;
 pub use store::ImageStore;
+pub use tags::{resolve_tag, set_tag, validate_tag};
 
 use crate::paths::Paths;
 use anyhow::{Context, Result};
@@ -61,6 +63,14 @@ pub(crate) fn publish_image(
 pub fn ensure_image(paths: &Paths, image_ref: &str) -> Result<String> {
     if let Some(p) = image_ref.strip_prefix("oci-archive:") {
         return ingest_oci_archive(paths, std::path::Path::new(p));
+    }
+    // Local tag dispatch: a local tag shadows a registry ref only when the
+    // tag resolves AND the digest is cached (prevents a stale evicted tag from
+    // silently winning over a fresh registry pull).
+    if let Some(digest) = tags::resolve_tag(paths, image_ref)? {
+        if ImageStore::new(paths).is_cached(&digest) {
+            return Ok(digest);
+        }
     }
     let store = ImageStore::new(paths);
     let resolved = pull::resolve(image_ref)?;
@@ -152,6 +162,59 @@ mod tests {
         // Second call with empty layers must succeed (cache hit — layers never read).
         let out = publish_image(&paths, &digest, "oci-archive:/x", b"{}", vec![]).unwrap();
         assert_eq!(out, digest);
+    }
+
+    // ── ensure_image tag dispatch ─────────────────────────────────────────────
+
+    /// Seed a fake cached entry (just the rootfs.erofs sentinel file) for
+    /// `digest` without running mkfs.erofs.
+    fn seed_cached_entry(paths: &Paths, digest: &str) {
+        let dir = paths.image_dir(digest);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("rootfs.erofs"), b"fake erofs").unwrap();
+    }
+
+    /// When a local tag resolves AND the digest is cached, `ensure_image`
+    /// must return that digest without touching the registry.
+    #[test]
+    fn ensure_image_returns_tagged_digest_when_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let digest = "sha256:".to_string() + &"c".repeat(64);
+
+        // Seed: tag + cached store entry.
+        set_tag(&paths, "myimg", &digest).unwrap();
+        seed_cached_entry(&paths, &digest);
+
+        let got = ensure_image(&paths, "myimg").unwrap();
+        assert_eq!(got, digest);
+    }
+
+    /// When a local tag exists but its digest is NOT cached, `ensure_image`
+    /// must fall through to the registry path.  We assert fall-through by
+    /// passing an invalid (non-resolvable) tag string that would only fail via
+    /// registry resolution (not via local tag lookup).
+    ///
+    /// Strategy: register a tag pointing at an uncached digest, then call
+    /// `ensure_image` with the tag name.  The local tag IS found, but
+    /// `is_cached` returns false, so the code falls through to `pull::resolve`.
+    /// The registry attempt will fail (no network / invalid ref) — we just
+    /// check it does NOT return the tagged digest directly.
+    #[test]
+    fn ensure_image_falls_through_when_tag_not_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let digest = "sha256:".to_string() + &"d".repeat(64);
+
+        // Tag exists but digest is NOT seeded into the store.
+        set_tag(&paths, "notcached", &digest).unwrap();
+
+        // Must NOT return the tagged digest; must attempt registry (and fail).
+        let result = ensure_image(&paths, "notcached");
+        assert!(
+            result.is_err(),
+            "expected registry error on fall-through, got: {result:?}"
+        );
     }
 
     /// `ensure_image("oci-archive:<path>")` must route to `ingest_oci_archive`
