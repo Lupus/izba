@@ -32,6 +32,11 @@ pub struct SandboxConfig {
     /// configs written before this feature still deserialize.
     #[serde(default)]
     pub volumes: Vec<crate::volume::VolumeSpec>,
+    /// When true, a read-write `izba-buildout` virtiofs share is mounted at
+    /// guest `/out` for builder VMs. Defaults to false so configs written
+    /// before this field was added still deserialize correctly (back-compat).
+    #[serde(default)]
+    pub builder: bool,
 }
 
 /// A single host→guest TCP publish rule. Its identity (uniqueness key) is
@@ -107,6 +112,7 @@ mod tests {
             workspace: PathBuf::from("/workspace"),
             ports: Vec::new(),
             volumes: Vec::new(),
+            builder: false,
         }
     }
 

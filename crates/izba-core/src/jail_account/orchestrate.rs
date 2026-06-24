@@ -501,6 +501,7 @@ mod tests {
             workspace: PathBuf::from("/workspace"),
             ports: Vec::new(),
             volumes,
+            builder: false,
         };
         core_save_json(&sandbox_dir.join(CONFIG_FILE), &cfg).unwrap();
     }
@@ -516,6 +517,7 @@ mod tests {
             workspace: PathBuf::from("/workspace"),
             ports: Vec::new(),
             volumes: Vec::new(),
+            builder: false,
         }
     }
 
@@ -587,6 +589,7 @@ mod tests {
             workspace: PathBuf::from("/my/workspace"),
             ports: Vec::new(),
             volumes: Vec::new(),
+            builder: false,
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
         assert!(grants.contains(&PathBuf::from("/my/workspace")));
@@ -610,6 +613,7 @@ mod tests {
                 size_bytes: 1 << 30,
                 eph_id: None,
             }],
+            builder: false,
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
         assert!(grants.contains(&paths.volume_image("cache")));
@@ -632,6 +636,7 @@ mod tests {
                 size_bytes: 1 << 20,
                 eph_id: None,
             }],
+            builder: false,
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
         // Anonymous volumes live under sandbox_dir so only the sandbox_dir

@@ -416,6 +416,9 @@ fn handle_create(
             rw_size_gb: c.rw_size_gb,
             ports: c.ports.clone(),
             volumes: c.volumes.clone(),
+            // Builder flag is not yet surfaced in the daemon wire protocol;
+            // it defaults to false for normal sandboxes created via the daemon.
+            builder: false,
         },
     )?;
     d.registry.set(&c.name, &c.image_ref, Liveness::Stopped);
@@ -1434,6 +1437,7 @@ mod tests {
                 rw_size_gb: 1,
                 ports: Vec::new(),
                 volumes,
+                builder: false,
             },
         )
         .unwrap();
@@ -1527,6 +1531,7 @@ mod tests {
                     size_bytes: 1 << 20,
                     eph_id: None,
                 }],
+                builder: false,
             },
         )
         .unwrap();
@@ -1682,6 +1687,7 @@ mod tests {
             workspace: dir.join("ws"),
             ports: Vec::new(),
             volumes: Vec::new(),
+            builder: false,
         };
         crate::state::save_json(&dir.join(CONFIG_FILE), &cfg).unwrap();
     }
@@ -1939,6 +1945,7 @@ mod tests {
                 rw_size_gb: 1,
                 ports: Vec::new(),
                 volumes: Vec::new(),
+                builder: false,
             },
         )
         .unwrap();
