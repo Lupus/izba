@@ -12,6 +12,9 @@
 #   IZBA_NFT=/path/to/static/nft  (optional, see hack/build-nft.sh)
 #       If set, the binary is embedded in /sbin/nft for the egress stub's
 #       TCP REDIRECT ruleset (M1 izbad-owned egress).
+#   IZBA_CRUN=/path/to/static/crun  (optional, see hack/build-crun.sh)
+#       If set, the binary is embedded in /sbin/crun — the OCI runtime izba
+#       runs the user's workload container under inside the guest (Stance B).
 #   IZBA_SSHD=/path/to/static/sshd  (optional, see hack/build-sshd.sh)
 #       If set, the binary is embedded in /sbin/sshd so izba-init can launch
 #       it on boot (SSH access feature).  hack/sshd_config is always copied to
@@ -85,19 +88,38 @@ if [[ -n "${IZBA_NFT:-}" ]]; then
     echo "  embedded nft from $IZBA_NFT"
 fi
 
+# Optional static crun — the OCI runtime for the in-guest workload container.
+if [[ -n "${IZBA_CRUN:-}" ]]; then
+    if [[ ! -f "$IZBA_CRUN" ]]; then
+        echo "error: IZBA_CRUN='$IZBA_CRUN' does not exist" >&2
+        exit 1
+    fi
+    cp "$IZBA_CRUN" "$WORK/sbin/crun"
+    chmod 755 "$WORK/sbin/crun"
+    echo "  embedded crun from $IZBA_CRUN"
+fi
+
 # Always embed the static sshd_config into /etc/ssh/sshd_config.
 cp "$SCRIPT_DIR/sshd_config" "$WORK/etc/ssh/sshd_config"
 chmod 644 "$WORK/etc/ssh/sshd_config"
 
 # Minimal user database for the vendored sshd. OpenSSH fatally exits at startup
 # if the privilege-separation user ("sshd") is absent, and it must getpwnam the
-# login user ("root") before chrooting the session into /rootfs. These live in
-# the izba-controlled initramfs root (NOT the OCI overlay), so they are present
-# regardless of the project image. root's shell/home (/bin/sh, /root) are
-# resolved here pre-chroot and exec'd relative to ChrootDirectory /rootfs, where
-# /bin/sh + /root exist in any normal image.
+# login user ("root"). These live in the izba-controlled initramfs root (NOT the
+# OCI overlay), so they are present regardless of the project image.
+#
+# root's login shell is `/init` (izba-init itself), NOT `/bin/sh`: OpenSSH
+# validates the login shell against THIS (initramfs) root, which has no `/bin/sh`
+# — and would refuse login ("User root not allowed because shell /bin/sh does not
+# exist"). `/init` always exists here, so it satisfies the shell-exists check.
+# izba-init acts as a restricted login shell: sshd execs it as `-init` (argv[0]
+# dash-prefixed, OpenSSH's login-shell convention) for an interactive session, or
+# as `/init -c "<cmd>"` for a remote command (`ssh host <cmd>`). izba-init detects
+# both forms and routes either into `crun exec`, entering the running container.
+# There is no ForceCommand and no ChrootDirectory in sshd_config.
+# (The redundant home `/root` need not exist — OpenSSH only warns.)
 cat > "$WORK/etc/passwd" <<'PASSWD'
-root:x:0:0:root:/root:/bin/sh
+root:x:0:0:root:/root:/init
 sshd:x:74:74:Privilege-separated SSH:/run/sshd:/sbin/nologin
 PASSWD
 chmod 644 "$WORK/etc/passwd"

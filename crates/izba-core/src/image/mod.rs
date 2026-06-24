@@ -4,6 +4,7 @@
 pub mod erofs;
 pub mod flatten;
 pub mod pull;
+pub mod runtime_config;
 pub mod store;
 
 pub use flatten::flatten_layers;
@@ -18,13 +19,27 @@ use std::io::Read;
 ///
 /// The manifest is always fetched to resolve the digest; layer blobs are
 /// pulled, flattened and converted to erofs only on a cache miss.
+///
+/// `#[mutants::skip]`: every path here performs real registry I/O
+/// (`pull::resolve` fetches the manifest; `fetch_layers` downloads blobs), so
+/// it cannot run in the unit suite — it is covered by the integration tests.
+/// The testable pieces it orchestrates (`ImageStore::{load_config,
+/// persist_config,is_cached}`, `flatten_layers`) have their own unit tests.
+#[mutants::skip]
 pub fn ensure_image(paths: &Paths, image_ref: &str) -> Result<String> {
     let store = ImageStore::new(paths);
     let resolved = pull::resolve(image_ref)?;
     let digest = resolved.digest.clone();
     if store.is_cached(&digest) {
+        // Self-heal: images cached by a pre-crun izba have no config.json.
+        // resolve() already fetched the config alongside the manifest, so
+        // persist it now if missing — cheap, no extra round trip.
+        if store.load_config(&digest)?.is_none() {
+            store.persist_config(&digest, resolved.config_json.as_bytes())?;
+        }
         return Ok(digest);
     }
+    let config_json = resolved.config_json.clone();
     let layers = resolved.fetch_layers()?;
     store.publish(&digest, |staging| {
         let merged_tar = staging.join("merged.tar");
@@ -39,6 +54,7 @@ pub fn ensure_image(paths: &Paths, image_ref: &str) -> Result<String> {
         erofs::build_erofs(&merged_tar, &staging.join("rootfs.erofs"))?;
         fs::remove_file(&merged_tar)?;
         fs::write(staging.join("ref.txt"), image_ref)?;
+        fs::write(staging.join("config.json"), &config_json)?;
         Ok(())
     })?;
     Ok(digest)

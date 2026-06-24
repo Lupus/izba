@@ -195,7 +195,12 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   (`<sandbox>/ssh/` ↔ `/rootfs/izba-ssh`, mirroring the `izba-trust` channel),
   then copied by init to **init-root `/run/izba/ssh/` (0600), OUTSIDE the
   `/rootfs` overlay** — so izba's sshd material is fully isolated from the OCI
-  image. The session runs `ChrootDirectory /rootfs` (exec-parity environment).
+  image. root's login shell is `/init` (izba-init itself), which acts as a
+  restricted login shell — no `ForceCommand`, no `ChrootDirectory`. OpenSSH
+  invokes it as `-init` (dash-prefixed argv[0]) for an interactive login or as
+  `/init -c "<cmd>"` for a remote command; izba-init detects both forms and routes
+  either into `crun exec`, entering the running `izba` container exactly like
+  `izba exec`. sftp-in-container is a follow-up.
   The host reaches `:22` by **reusing `StreamOpen::TcpDial{port:22}`** through
   the daemon splice — **no new wire variant / no `DAEMON_PROTO_VERSION` bump**;
   the `izba __ssh-proxy <alias>` (hidden) is the `ProxyCommand` stdio bridge.
@@ -205,8 +210,15 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   start/stop/rm** (best-effort, never fails the lifecycle); gated by
   `<data>/ssh/settings.json` `config_management` (default on). Keys are an
   izba-managed ed25519 user keypair + a shared host key under `<data>/ssh/`.
-- **Exit-code mapping:** guest `CommandNotFound` → CLI exit 127;
-  `Signal(n)` → 128+n. The guest serial console is ALWAYS captured to
+- **Exit-code mapping:** the workload runs inside the crun container, so crun
+  PROPAGATES its exit status and izba passes it straight through (no re-encode):
+  normal exit `N` → `N`; a signal-killed command → `128+n`. A **missing command**
+  is resolved by crun inside the container (Stance B), so it is NOT a spawn-time
+  `CommandNotFound` frame — crun prints `executable file ... not found` to stderr
+  and exits non-zero (rc 1 on crun 1.28), passed through like `docker exec`
+  (honest container-runtime behavior, NOT the pre-crun 127). The `CommandNotFound`
+  frame (→ CLI exit 127) remains in the wire protocol for when the guest can't
+  reach the workload at all. The guest serial console is ALWAYS captured to
   `logs/console.log` — boot failures print its tail.
 
 ## Conventions & state

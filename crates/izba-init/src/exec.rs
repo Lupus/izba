@@ -11,12 +11,11 @@ use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEFAULT_TERM: &str = "xterm-256color";
 
 type ExecError = (ErrorKind, String);
@@ -62,8 +61,24 @@ struct ExecProc {
 /// can introduce an explicit `Release` RPC to let the host signal that it will
 /// never call `Wait` again, at which point the entry can be removed safely.
 pub struct ExecEngine {
-    /// Chroot for workloads: `Some("/rootfs")` in the guest, `None` in tests.
+    /// The overlay root: `Some("/rootfs")` in the guest, `None` in tests. Used
+    /// to (a) validate an exec's cwd against `<root>/<cwd>` and (b) confine the
+    /// cp tar arms' path resolution. Exec no longer chroots here — `crun exec`
+    /// enters the container's namespaces instead (Stance B).
     root: Option<PathBuf>,
+    /// The cgroup manager crun should use, detected ONCE at construction.
+    /// Detection probes `/sys/fs/cgroup` (a mount + path check), so doing it per
+    /// exec would be wasteful and could race the boot-time cgroup setup; the
+    /// hierarchy does not change over a guest's lifetime. Mirrors the single
+    /// detection `launch_container()` does for `crun run`.
+    cgroup_manager: crate::oci::CgroupManager,
+    /// Test-only: when set, `exec()` spawns the request's argv DIRECTLY instead
+    /// of wrapping it in `crun exec`. Production always wraps in crun (this is
+    /// `false`); the direct path lets the host unit tests exercise the control/
+    /// stream RPC wiring and the lifecycle machinery without a live crun + a
+    /// running container. See `spawn_direct`.
+    #[cfg(test)]
+    direct: bool,
     procs: Mutex<HashMap<u32, ExecProc>>,
     next_id: AtomicU32,
 }
@@ -72,13 +87,27 @@ impl ExecEngine {
     pub fn new(root: Option<PathBuf>) -> Self {
         Self {
             root,
+            cgroup_manager: crate::oci::detect_cgroup_manager(),
+            #[cfg(test)]
+            direct: false,
             procs: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
         }
     }
 
-    /// The workload chroot root, if any (`Some("/rootfs")` in the guest,
-    /// `None` in tests). Used by the cp tar arms to confine path resolution.
+    /// Test-only constructor whose `exec()` spawns the request argv directly
+    /// (no crun wrapping). Used by the server RPC-wiring tests, which need a
+    /// real spawnable workload but run on a host without crun or a container.
+    #[cfg(test)]
+    pub fn new_direct(root: Option<PathBuf>) -> Self {
+        Self {
+            direct: true,
+            ..Self::new(root)
+        }
+    }
+
+    /// The overlay root, if any (`Some("/rootfs")` in the guest, `None` in
+    /// tests). Used by the cp tar arms to confine path resolution.
     pub fn root(&self) -> Option<&std::path::Path> {
         self.root.as_deref()
     }
@@ -100,19 +129,13 @@ impl ExecEngine {
         let argv0 = req
             .argv
             .first()
-            .ok_or((ErrorKind::BadRequest, "empty argv".to_string()))?;
-
-        let mut cmd = Command::new(argv0);
-        cmd.args(&req.argv[1..]);
-        cmd.env_clear();
-        cmd.envs(req.env.iter().map(|(k, v)| (k, v)));
-        self.configure_env_defaults(&mut cmd, req);
-
-        let (pty_master, mut streams) = self.configure_stdio(&mut cmd, req.tty)?;
+            .ok_or((ErrorKind::BadRequest, "empty argv".to_string()))?
+            .clone();
 
         // Pre-validate the working directory so a nonexistent cwd surfaces as
-        // BadRequest rather than being misclassified as CommandNotFound (both
-        // produce ENOENT from the child-side chdir in pre_exec).
+        // BadRequest rather than being misclassified later. The container roots
+        // at the overlay (`<root>` = `/rootfs` in the guest), so the cwd inside
+        // the container resolves to `<root>/<cwd>` from init's view.
         let host_cwd = match &self.root {
             Some(r) => r.join(req.cwd.trim_start_matches('/')),
             None => PathBuf::from(&req.cwd),
@@ -124,26 +147,77 @@ impl ExecEngine {
             ));
         }
 
-        let root = self.root.clone();
-        let cwd = req.cwd.clone();
-        let tty = req.tty;
-        let uid = req.uid;
-        let gid = req.gid;
+        // Test-only: spawn the request argv directly (no crun) so the server
+        // RPC-wiring/lifecycle tests run on a crun-less host. A missing argv0 is
+        // classified CommandNotFound here (the direct binary IS the workload),
+        // mirroring the pre-Stance-B contract those tests pin.
+        #[cfg(test)]
+        if self.direct {
+            return self.spawn_direct(&req.argv, req.tty, &argv0);
+        }
+
+        // Build the per-exec environment overlay: the caller's env plus izba's
+        // trust-env defaults (only when the CA bundle is present and the key was
+        // not already supplied). crun applies the container's image env as the
+        // base; these `--env K=V` pairs layer on top. izba-init's OWN process
+        // env is NOT propagated (crun sets the container env from its config).
+        let env_overlay = self.build_env_overlay(req);
+
+        // crun enters the container and applies the user via `--user`; only pass
+        // it when the request asks for a specific uid/gid (uid==gid==0 means run
+        // as the container's configured user, so we omit --user there).
+        let user = crun_user_arg(req.uid, req.gid);
+
+        let argv = crate::oci::crun_exec_argv(
+            self.cgroup_manager,
+            req.tty,
+            &req.cwd,
+            &env_overlay,
+            user.as_deref(),
+            &req.argv,
+        );
+
+        self.spawn_argv(&argv, req.tty, &argv0)
+    }
+
+    /// Spawn `argv` (argv[0] is the binary to exec), wire its stdio per `tty`,
+    /// attach the reaper, and register the resulting [`ExecProc`]. This holds
+    /// the lifecycle machinery shared by every exec; `exec()` is the thin layer
+    /// that turns an [`ExecRequest`] into a `crun exec` argv first.
+    ///
+    /// `user_argv0` is only used for diagnostics (the user's command name) so a
+    /// spawn failure reports something meaningful.
+    fn spawn_argv(&self, argv: &[String], tty: bool, user_argv0: &str) -> Result<u32, ExecError> {
+        // argv[0] is the binary to exec (CRUN_PATH in production); the rest are
+        // its args. The container's command is carried as crun-exec's trailing
+        // positionals (already folded into `argv` by the caller).
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+
+        let (pty_master, mut streams) = self.configure_stdio(&mut cmd, tty)?;
+
         // SAFETY: pre_exec runs in the forked child before exec; only
-        // async-signal-safe calls (setsid/ioctl/chroot/chdir/setgid/setuid).
+        // async-signal-safe calls (setsid/ioctl). No chroot/setuid here — crun
+        // joins the container's namespaces and applies the user itself.
         unsafe {
-            cmd.pre_exec(move || child_pre_exec(tty, root.as_deref(), &cwd, uid, gid));
+            cmd.pre_exec(move || child_pre_exec(tty));
         }
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                (ErrorKind::CommandNotFound, format!("{argv0}: {e}"))
+                // The binary itself (crun in production) is missing — NOT the
+                // user's command, which is resolved inside the container by crun
+                // and surfaces as crun's stderr diagnostic + non-zero exit.
+                (
+                    ErrorKind::Internal,
+                    format!("exec binary {} not found: {e}", argv[0]),
+                )
             } else {
-                internal(format!("spawn {argv0}: {e}"))
+                internal(format!("spawn {} for {user_argv0}: {e}", argv[0]))
             }
         })?;
 
-        if !req.tty {
+        if !tty {
             streams.stdin = Some(OwnedFd::from(child.stdin.take().expect("piped stdin")));
             streams.stdout = Some(OwnedFd::from(child.stdout.take().expect("piped stdout")));
             streams.stderr = Some(OwnedFd::from(child.stderr.take().expect("piped stderr")));
@@ -160,7 +234,7 @@ impl ExecEngine {
             ExecProc {
                 pid,
                 status,
-                tty_mode: req.tty,
+                tty_mode: tty,
                 streams,
                 pty_master,
             },
@@ -168,28 +242,50 @@ impl ExecEngine {
         Ok(id)
     }
 
-    /// Apply izba's default env (PATH/TERM and the MITM CA-bundle vars) unless
-    /// the caller already set each key. Mirrors the "default unless overridden"
-    /// pattern across all defaults.
-    fn configure_env_defaults(&self, cmd: &mut Command, req: &ExecRequest) {
-        let has = |key: &str| req.env.iter().any(|(k, _)| k == key);
-        if !has("PATH") {
-            cmd.env("PATH", DEFAULT_PATH);
+    /// Test-only direct spawn: like `spawn_argv` but classifies a missing
+    /// `argv[0]` as `CommandNotFound` (in the direct path the binary IS the
+    /// user's workload). Production never takes this path — crun is always the
+    /// binary, and a missing user command surfaces as crun's stderr + exit code.
+    #[cfg(test)]
+    fn spawn_direct(&self, argv: &[String], tty: bool, user_argv0: &str) -> Result<u32, ExecError> {
+        self.spawn_argv(argv, tty, user_argv0)
+            .map_err(|(kind, msg)| {
+                if kind == ErrorKind::Internal && msg.contains("not found") {
+                    (ErrorKind::CommandNotFound, msg)
+                } else {
+                    (kind, msg)
+                }
+            })
+    }
+
+    /// Build the per-exec `--env` overlay passed to `crun exec`.
+    ///
+    /// Starts from the caller's `req.env`, then appends izba's defaults for any
+    /// key the caller did not set:
+    /// - `TERM` (tty execs only) — the container image rarely sets it;
+    /// - the MITM CA-bundle vars, but ONLY when the combined bundle exists in
+    ///   the guest (`write_trust_anchor` wrote it), so non-MITM sandboxes don't
+    ///   point tools at a missing file. The values are guest paths valid inside
+    ///   the container (it shares the overlay rootfs).
+    ///
+    /// `PATH` is intentionally NOT defaulted here: crun applies the container
+    /// image's `PATH` (the right value for the image), and overriding it with
+    /// izba's generic default would mask the image's bin dirs. A caller may
+    /// still pass `PATH` explicitly to override.
+    fn build_env_overlay(&self, req: &ExecRequest) -> Vec<(String, String)> {
+        let mut env = req.env.clone();
+        let has = |env: &[(String, String)], key: &str| env.iter().any(|(k, _)| k == key);
+        if req.tty && !has(&env, "TERM") {
+            env.push(("TERM".to_string(), DEFAULT_TERM.to_string()));
         }
-        if req.tty && !has("TERM") {
-            cmd.env("TERM", DEFAULT_TERM);
-        }
-        // CA-bundle env defaults for the izba MITM trust anchor. Only advertise
-        // them when the combined bundle actually exists in the guest
-        // (write_trust_anchor wrote it), so non-MITM sandboxes don't point
-        // tools at a missing file. The values are post-chroot guest paths.
         if self.trust_bundle_present() {
             for (k, v) in crate::trust::trust_env_pairs() {
-                if !has(k) {
-                    cmd.env(k, v);
+                if !has(&env, k) {
+                    env.push((k.to_string(), v.to_string()));
                 }
             }
         }
+        env
     }
 
     /// Wire up the child's stdio. Tty mode allocates a pre-sized pty and returns
@@ -345,6 +441,14 @@ fn not_found(id: u32) -> ExecError {
     (ErrorKind::ExecNotFound, format!("no exec with id {id}"))
 }
 
+/// The `--user uid:gid` argument for `crun exec`, or `None` when the request
+/// wants the container's configured user (uid==gid==0). Passing `--user 0:0`
+/// would force root even if the image declares a non-root USER, so we omit it
+/// in the default case and only set it for an explicit non-zero id.
+fn crun_user_arg(uid: u32, gid: u32) -> Option<String> {
+    (uid != 0 || gid != 0).then(|| format!("{uid}:{gid}"))
+}
+
 fn set_cloexec(fd: &OwnedFd) -> std::io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, FdFlag};
     let flags = fcntl(fd.as_raw_fd(), FcntlArg::F_GETFD)?;
@@ -356,16 +460,16 @@ fn set_cloexec(fd: &OwnedFd) -> std::io::Result<()> {
 
 /// Child-side setup run in the forked process before exec.
 ///
+/// In Stance B the child execs `crun exec`, which itself joins the container's
+/// namespaces, chdirs to `--cwd`, and applies the user (`--user`). So this
+/// pre_exec does NOT chroot or drop privileges any more — it only establishes
+/// the session (so `killpg` reaches the whole crun-exec job) and, for tty
+/// execs, adopts the pre-allocated pty slave as the controlling terminal.
+///
 /// # Safety
 /// Runs in the forked child before exec; only async-signal-safe calls
-/// (setsid/ioctl/chroot/chdir/setgid/setuid).
-fn child_pre_exec(
-    tty: bool,
-    root: Option<&Path>,
-    cwd: &str,
-    uid: u32,
-    gid: u32,
-) -> std::io::Result<()> {
+/// (setsid/ioctl).
+fn child_pre_exec(tty: bool) -> std::io::Result<()> {
     // Own session per exec → killpg targets the whole job.
     if unsafe { libc::setsid() } < 0 {
         return Err(std::io::Error::last_os_error());
@@ -377,24 +481,6 @@ fn child_pre_exec(
             return Err(std::io::Error::last_os_error());
         }
     }
-    if let Some(root) = root {
-        nix::unistd::chroot(root).map_err(std::io::Error::from)?;
-    }
-    nix::unistd::chdir(Path::new(cwd)).map_err(std::io::Error::from)?;
-    // Drop privileges last (gid before uid, or setgid fails).
-    // Skip no-op changes so unprivileged test runs work.
-    //
-    // Clear supplementary groups to exactly {gid} before setgid.
-    // setgroups may fail with EPERM in unprivileged test runs;
-    // ignore that — root inside a guest will succeed, and tests
-    // run as the invoking user (which has no extra groups to drop).
-    let _ = nix::unistd::setgroups(&[nix::unistd::Gid::from_raw(gid)]);
-    if gid != nix::unistd::getegid().as_raw() {
-        nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)).map_err(std::io::Error::from)?;
-    }
-    if uid != nix::unistd::geteuid().as_raw() {
-        nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)).map_err(std::io::Error::from)?;
-    }
     Ok(())
 }
 
@@ -405,17 +491,34 @@ fn spawn_reaper(child: std::process::Child, pid: Pid, status: StatusCell) {
         // `child` is moved in (but never `wait()`ed) so its Drop
         // runs here, not in exec(); only this waitpid reaps.
         let _keep = child;
-        let st = match waitpid(pid, None) {
-            Ok(WaitStatus::Exited(_, code)) => ExitStatus::Code(code),
-            Ok(WaitStatus::Signaled(_, sig, _)) => ExitStatus::Signal(sig as i32),
-            // Anything else (or waitpid error) is reported as a
-            // wedge-proof synthetic failure rather than wedging wait().
-            _ => ExitStatus::Code(-1),
-        };
+        let st = decode_wait_status(waitpid(pid, None));
         let (lock, cvar) = &*status;
         *lock.lock().unwrap() = Some(st);
         cvar.notify_all();
     });
+}
+
+/// Decode the reaped `crun exec` process status into an `ExitStatus`.
+///
+/// **No double-add.** `crun exec` PROPAGATES the workload command's exit status
+/// as crun's OWN exit code: a normal exit `N` → crun exits `N`; a signal-killed
+/// command → crun exits `128+n`; a missing executable → crun prints its
+/// `executable file ... not found` diagnostic and exits non-zero (rc 1 on crun
+/// 1.28). So we pass crun's `Exited(code)` straight through as `Code(code)` —
+/// re-encoding a 128+n exit as `Signal(n)` here would double-apply the host CLI's `128+n`
+/// mapping and produce the wrong number.
+///
+/// `Signaled` only happens when the crun-exec PROCESS ITSELF is signaled (e.g.
+/// via our `kill`/`kill_all`), and maps to `Signal(n)` — the host CLI then
+/// renders `128+n`, the right contract for "the exec was killed".
+fn decode_wait_status(res: nix::Result<WaitStatus>) -> ExitStatus {
+    match res {
+        Ok(WaitStatus::Exited(_, code)) => ExitStatus::Code(code),
+        Ok(WaitStatus::Signaled(_, sig, _)) => ExitStatus::Signal(sig as i32),
+        // Anything else (or waitpid error) is reported as a
+        // wedge-proof synthetic failure rather than wedging wait().
+        _ => ExitStatus::Code(-1),
+    }
 }
 
 #[cfg(test)]
@@ -439,25 +542,59 @@ mod tests {
         ExecEngine::new(None)
     }
 
+    /// Resolve a real binary in the test host for the lifecycle tests.
+    ///
+    /// In Stance B `exec()` always shells out to `crun`, which is NOT present in
+    /// the unit-test host (and there is no live container), so the lifecycle
+    /// machinery (spawn/reaper/wait/kill/streams/resize) is exercised by calling
+    /// the private `spawn_argv()` directly with an ordinary binary. That tests
+    /// the same code path crun would drive at runtime, minus the crun process.
+    fn bin(name: &str) -> String {
+        for prefix in ["/bin/", "/usr/bin/"] {
+            let p = format!("{prefix}{name}");
+            if std::path::Path::new(&p).exists() {
+                return p;
+            }
+        }
+        panic!("test host is missing /bin/{name} (or /usr/bin/{name})");
+    }
+
+    /// Spawn an ordinary binary through the engine's lifecycle machinery,
+    /// bypassing crun-argv construction. `argv[0]` must be an absolute binary
+    /// path (use [`bin`]).
+    fn spawn(e: &ExecEngine, argv: &[&str], tty: bool) -> Result<u32, ExecError> {
+        let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        e.spawn_argv(&owned, tty, &owned[0])
+    }
+
+    // ── Lifecycle machinery (spawn_argv → reaper/wait/kill/streams/resize) ────
+    // These drive a real binary directly because the production `exec()` now
+    // shells out to crun, which is absent in the unit-test host.
+
     #[test]
     fn exit_code_zero() {
         let e = engine();
-        let id = e.exec(&req(&["true"])).unwrap();
+        let id = spawn(&e, &[&bin("true")], false).unwrap();
         assert_eq!(e.wait(id).unwrap(), ExitStatus::Code(0));
     }
 
     #[test]
     fn exit_code_one() {
         let e = engine();
-        let id = e.exec(&req(&["false"])).unwrap();
+        let id = spawn(&e, &[&bin("false")], false).unwrap();
         assert_eq!(e.wait(id).unwrap(), ExitStatus::Code(1));
     }
 
     #[test]
-    fn command_not_found() {
+    fn missing_binary_is_internal_error() {
+        // spawn_argv's argv[0] is the binary to exec (crun in production). A
+        // missing argv[0] is an Internal error (crun absent), NOT
+        // CommandNotFound — the user's command is resolved *inside* the
+        // container by crun and surfaces as crun's stderr + exit code, not a
+        // spawn failure.
         let e = engine();
-        let (kind, msg) = e.exec(&req(&["/nonexistent/zzz"])).unwrap_err();
-        assert_eq!(kind, ErrorKind::CommandNotFound, "{msg}");
+        let (kind, msg) = spawn(&e, &["/nonexistent/zzz"], false).unwrap_err();
+        assert_eq!(kind, ErrorKind::Internal, "{msg}");
     }
 
     #[test]
@@ -470,7 +607,7 @@ mod tests {
     #[test]
     fn stdout_pipe() {
         let e = engine();
-        let id = e.exec(&req(&["sh", "-c", "echo out"])).unwrap();
+        let id = spawn(&e, &[&bin("sh"), "-c", "echo out"], false).unwrap();
         let mut out = String::new();
         File::from(e.take_stream(id, StreamKind::Stdout).unwrap())
             .read_to_string(&mut out)
@@ -482,7 +619,7 @@ mod tests {
     #[test]
     fn stdin_roundtrip() {
         let e = engine();
-        let id = e.exec(&req(&["cat"])).unwrap();
+        let id = spawn(&e, &[&bin("cat")], false).unwrap();
         {
             let mut stdin = File::from(e.take_stream(id, StreamKind::Stdin).unwrap());
             stdin.write_all(b"hi").unwrap();
@@ -499,15 +636,17 @@ mod tests {
     #[test]
     fn kill_term() {
         let e = engine();
-        let id = e.exec(&req(&["sleep", "30"])).unwrap();
+        let id = spawn(&e, &[&bin("sleep"), "30"], false).unwrap();
         e.kill(id, 15).unwrap();
+        // The spawned process ITSELF is signaled → Signal(15). (At runtime this
+        // is the crun-exec process; see decode_wait_status.)
         assert_eq!(e.wait(id).unwrap(), ExitStatus::Signal(15));
     }
 
     #[test]
     fn double_wait_same() {
         let e = engine();
-        let id = e.exec(&req(&["false"])).unwrap();
+        let id = spawn(&e, &[&bin("false")], false).unwrap();
         let first = e.wait(id).unwrap();
         let second = e.wait(id).unwrap();
         assert_eq!(first, second);
@@ -528,7 +667,7 @@ mod tests {
     #[test]
     fn stream_takeable_once() {
         let e = engine();
-        let id = e.exec(&req(&["true"])).unwrap();
+        let id = spawn(&e, &[&bin("true")], false).unwrap();
         e.take_stream(id, StreamKind::Stdout).unwrap();
         let (kind, _) = e.take_stream(id, StreamKind::Stdout).unwrap_err();
         assert_eq!(kind, ErrorKind::BadRequest);
@@ -541,7 +680,7 @@ mod tests {
     #[test]
     fn resize_without_tty_is_bad_request() {
         let e = engine();
-        let id = e.exec(&req(&["true"])).unwrap();
+        let id = spawn(&e, &[&bin("true")], false).unwrap();
         let (kind, _) = e.resize(id, 80, 24).unwrap_err();
         assert_eq!(kind, ErrorKind::BadRequest);
         e.wait(id).unwrap();
@@ -550,15 +689,13 @@ mod tests {
     #[test]
     fn tty_size() {
         let e = engine();
-        let mut r = req(&["sh", "-c", "stty size"]);
-        r.tty = true;
-        let id = match e.exec(&r) {
+        let id = match spawn(&e, &[&bin("sh"), "-c", "stty size"], true) {
             Ok(id) => id,
             Err((_, msg)) if msg.contains("openpty denied") => {
                 eprintln!("SKIP: sandbox denies pty allocation: {msg}");
                 return;
             }
-            Err((k, m)) => panic!("exec failed: {k:?} {m}"),
+            Err((k, m)) => panic!("spawn failed: {k:?} {m}"),
         };
         // openpty pre-sizes to 24x80; this exercises TIOCSWINSZ with the
         // same geometry so there is no race with stty.
@@ -592,7 +729,7 @@ mod tests {
     #[test]
     fn kill_after_exit_is_ok() {
         let e = engine();
-        let id = e.exec(&req(&["true"])).unwrap();
+        let id = spawn(&e, &[&bin("true")], false).unwrap();
         e.wait(id).unwrap();
         // Process has been reaped; kill should return Ok without signaling.
         e.kill(id, 15).unwrap();
@@ -601,7 +738,7 @@ mod tests {
     #[test]
     fn kill_with_invalid_signal_is_bad_request() {
         let e = engine();
-        let id = e.exec(&req(&["sleep", "30"])).unwrap();
+        let id = spawn(&e, &[&bin("sleep"), "30"], false).unwrap();
         // 9999 is not a valid signal number → BadRequest before any signal.
         let (kind, _) = e.kill(id, 9999).unwrap_err();
         assert_eq!(kind, ErrorKind::BadRequest);
@@ -613,8 +750,8 @@ mod tests {
     #[test]
     fn kill_all_sigkills_unreaped() {
         let e = engine();
-        let running = e.exec(&req(&["sleep", "30"])).unwrap();
-        let done = e.exec(&req(&["true"])).unwrap();
+        let running = spawn(&e, &[&bin("sleep"), "30"], false).unwrap();
+        let done = spawn(&e, &[&bin("true")], false).unwrap();
         // Reap the short-lived one so kill_all must skip it (status present)
         // and only signal the still-running job.
         assert_eq!(e.wait(done).unwrap(), ExitStatus::Code(0));
@@ -622,19 +759,76 @@ mod tests {
         assert_eq!(e.wait(running).unwrap(), ExitStatus::Signal(libc::SIGKILL));
     }
 
+    // ── exec() → crun-argv contract (the part exec() now owns) ────────────────
+
     #[test]
-    fn env_is_cleared_and_path_defaulted() {
+    fn exec_cwd_is_validated_against_root() {
+        // exec() pre-validates the cwd against <root>/<cwd> BEFORE shelling out
+        // to crun, so a nonexistent cwd is a clean BadRequest. With root=None a
+        // real, existing absolute cwd passes that gate; the subsequent crun
+        // spawn fails (no crun on the host) with an Internal error — proving the
+        // cwd gate ran and passed.
         let e = engine();
-        let mut r = req(&["sh", "-c", "echo \"P=$PATH M=${IZBA_MARKER:-unset}\""]);
-        r.env = vec![("IZBA_OTHER".into(), "x".into())];
-        std::env::set_var("IZBA_MARKER", "leaked");
-        let id = e.exec(&r).unwrap();
-        let mut out = String::new();
-        File::from(e.take_stream(id, StreamKind::Stdout).unwrap())
-            .read_to_string(&mut out)
-            .unwrap();
-        assert_eq!(out, format!("P={DEFAULT_PATH} M=unset\n"));
-        e.wait(id).unwrap();
+        let mut r = req(&[&bin("true")]);
+        r.cwd = "/".into();
+        // /  exists → cwd gate passes → crun spawn fails Internal (crun absent).
+        let err = e.exec(&r);
+        match err {
+            Err((ErrorKind::Internal, _)) => {} // crun absent — expected here.
+            Err((ErrorKind::BadRequest, m)) => panic!("cwd / wrongly rejected: {m}"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_env_overlay_defaults_term_only_for_tty() {
+        let e = engine(); // root=None → no trust bundle.
+        let mut r = req(&["x"]);
+        r.tty = false;
+        assert!(
+            !e.build_env_overlay(&r).iter().any(|(k, _)| k == "TERM"),
+            "pipe exec must not inject TERM"
+        );
+        r.tty = true;
+        let env = e.build_env_overlay(&r);
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "TERM")
+                .map(|(_, v)| v.as_str()),
+            Some(DEFAULT_TERM),
+            "tty exec defaults TERM"
+        );
+    }
+
+    #[test]
+    fn build_env_overlay_preserves_caller_env_and_term_override() {
+        let e = engine();
+        let mut r = req(&["x"]);
+        r.tty = true;
+        r.env = vec![
+            ("FOO".into(), "bar".into()),
+            ("TERM".into(), "vt100".into()),
+        ];
+        let env = e.build_env_overlay(&r);
+        // Caller env is preserved verbatim.
+        assert!(env.contains(&("FOO".to_string(), "bar".to_string())));
+        // Caller-supplied TERM wins (no duplicate default appended).
+        assert_eq!(env.iter().filter(|(k, _)| k == "TERM").count(), 1);
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "TERM")
+                .map(|(_, v)| v.as_str()),
+            Some("vt100")
+        );
+    }
+
+    #[test]
+    fn build_env_overlay_no_path_default() {
+        // PATH is left to the container image; izba must NOT inject a default
+        // (that would mask the image's bin dirs).
+        let e = engine();
+        let r = req(&["x"]);
+        assert!(!e.build_env_overlay(&r).iter().any(|(k, _)| k == "PATH"));
     }
 
     #[test]
@@ -651,22 +845,135 @@ mod tests {
     }
 
     #[test]
-    fn trust_env_defaulting_skips_caller_supplied_keys() {
-        // Mirrors exec()'s injection loop: a caller override for one trust key
-        // must win, while the rest still default. (The gate + env_clear path is
-        // exercised by exit/PATH tests; this pins the override semantics.)
-        let caller: Vec<(String, String)> =
-            vec![("CURL_CA_BUNDLE".into(), "/custom/ca.pem".into())];
-        let mut injected = Vec::new();
-        for (k, v) in crate::trust::trust_env_pairs() {
-            if !caller.iter().any(|(ck, _)| ck == k) {
-                injected.push((k, v));
-            }
-        }
-        assert!(
-            !injected.iter().any(|(k, _)| *k == "CURL_CA_BUNDLE"),
-            "caller-supplied CURL_CA_BUNDLE must not be overwritten"
+    fn build_env_overlay_injects_trust_vars_when_bundle_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = ExecEngine::new(Some(dir.path().to_path_buf()));
+        let bundle = dir.path().join("etc/izba/ca-bundle.pem");
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        std::fs::write(&bundle, "CA\n").unwrap();
+
+        // Caller supplies one of the trust keys; it must win, the rest default.
+        let mut r = req(&["x"]);
+        r.env = vec![("CURL_CA_BUNDLE".into(), "/custom/ca.pem".into())];
+        let env = e.build_env_overlay(&r);
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "CURL_CA_BUNDLE")
+                .map(|(_, v)| v.as_str()),
+            Some("/custom/ca.pem"),
+            "caller CURL_CA_BUNDLE must not be overwritten"
         );
-        assert_eq!(injected.len(), 5, "the other five trust vars still default");
+        // All six trust keys present (the supplied one + five defaulted).
+        for (k, _) in crate::trust::trust_env_pairs() {
+            assert!(
+                env.iter().any(|(ek, _)| ek == k),
+                "trust var {k} must be present"
+            );
+        }
+    }
+
+    #[test]
+    fn build_env_overlay_suppresses_trust_vars_without_bundle() {
+        // root=None → no bundle → no trust vars injected.
+        let e = engine();
+        let r = req(&["x"]);
+        let env = e.build_env_overlay(&r);
+        for (k, _) in crate::trust::trust_env_pairs() {
+            assert!(
+                !env.iter().any(|(ek, _)| ek == k),
+                "trust var {k} must NOT be injected when no bundle"
+            );
+        }
+    }
+
+    // ── exit-status decode table (crun rc → ExitStatus; NO double-add) ────────
+
+    #[test]
+    fn decode_wait_status_table() {
+        use nix::sys::wait::WaitStatus as W;
+        let pid = Pid::from_raw(1);
+        // crun exec propagates the command's rc verbatim → straight passthrough.
+        assert_eq!(
+            decode_wait_status(Ok(W::Exited(pid, 0))),
+            ExitStatus::Code(0)
+        );
+        // An arbitrary non-zero workload exit passes straight through as
+        // Code(n) — crun propagates the workload's code verbatim.
+        assert_eq!(
+            decode_wait_status(Ok(W::Exited(pid, 127))),
+            ExitStatus::Code(127)
+        );
+        // 137 = a signal-killed command (crun already encoded 128+9). We MUST
+        // pass it through as Code(137), NOT re-encode as Signal(9), or the host
+        // CLI's 128+n mapping would double-add to 265.
+        assert_eq!(
+            decode_wait_status(Ok(W::Exited(pid, 137))),
+            ExitStatus::Code(137)
+        );
+        // crun-exec PROCESS itself signaled (our kill/kill_all) → Signal.
+        assert_eq!(
+            decode_wait_status(Ok(W::Signaled(pid, Signal::SIGKILL, false))),
+            ExitStatus::Signal(libc::SIGKILL)
+        );
+        // waitpid error / unexpected status → wedge-proof synthetic failure.
+        assert_eq!(
+            decode_wait_status(Err(nix::errno::Errno::ECHILD)),
+            ExitStatus::Code(-1)
+        );
+    }
+
+    // ── exec() end-to-end crun argv (overlay + user + crun_exec_argv) ─────────
+
+    #[test]
+    fn exec_builds_crun_exec_argv_with_user_and_env() {
+        // Verify the argv exec() hands to spawn_argv by reconstructing it from
+        // the same pure pieces. This pins exec()'s composition: user mapping,
+        // env overlay, and crun_exec_argv ordering.
+        let e = engine();
+        let mut r = req(&["sh", "-c", "echo hi"]);
+        r.tty = false;
+        r.cwd = "/workspace".into();
+        r.uid = 1000;
+        r.gid = 1000;
+        r.env = vec![("FOO".into(), "bar".into())];
+
+        let overlay = e.build_env_overlay(&r);
+        let user = crun_user_arg(r.uid, r.gid);
+        assert_eq!(user.as_deref(), Some("1000:1000"));
+        let argv = crate::oci::crun_exec_argv(
+            crate::oci::CgroupManager::Disabled,
+            r.tty,
+            &r.cwd,
+            &overlay,
+            user.as_deref(),
+            &r.argv,
+        );
+        // crun binary, exec subcommand, cwd, env, user, id, then user argv.
+        assert_eq!(argv[0], crate::oci::CRUN_PATH);
+        assert!(argv.iter().any(|a| a == "exec"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--cwd" && w[1] == "/workspace"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--env" && w[1] == "FOO=bar"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--user" && w[1] == "1000:1000"));
+        let id_pos = argv
+            .iter()
+            .position(|a| a == crate::oci::CONTAINER_ID)
+            .unwrap();
+        assert_eq!(&argv[id_pos + 1..], &["sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn crun_user_arg_table() {
+        // uid==gid==0 → None (container's configured USER applies).
+        assert_eq!(crun_user_arg(0, 0), None);
+        // any non-zero id → "uid:gid".
+        assert_eq!(crun_user_arg(1000, 1000).as_deref(), Some("1000:1000"));
+        assert_eq!(crun_user_arg(0, 1000).as_deref(), Some("0:1000"));
+        assert_eq!(crun_user_arg(1000, 0).as_deref(), Some("1000:0"));
     }
 }

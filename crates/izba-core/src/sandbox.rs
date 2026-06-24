@@ -9,8 +9,12 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use izba_proto::{read_frame, write_frame, Request, Response, CONTROL_PORT, STREAM_PORT};
+use izba_proto::{
+    read_frame, write_frame, Request, Response, CONTROL_PORT, OCI_TAG, PAUSE_GUEST_PATH,
+    STREAM_PORT,
+};
 
+use crate::image::runtime_config::{trust_env_strings, ContainerMode, SpecParams, INTERACTIVE_CWD};
 use crate::image::store::ImageStore;
 #[cfg(windows)]
 use crate::jail_account::orchestrate;
@@ -457,6 +461,75 @@ fn liveness_of(paths: &Paths, name: &str, connector: Connector) -> anyhow::Resul
     Ok(assess(state.as_ref(), &probes))
 }
 
+/// Write `oci/config.json` into `oci_dir` for the interactive (pause) mode.
+///
+/// Generates an OCI runtime spec via [`crate::image::runtime_config::generate_spec`]
+/// in Interactive mode, then atomically writes it as `config.json` (tempfile +
+/// rename) so a concurrent reader never sees a torn file. Mode 0644.
+///
+/// `oci_dir` is `<sandbox_dir>/oci/` and must already exist before this call.
+fn write_oci_bundle(
+    oci_dir: &Path,
+    name: &str,
+    image_config: Option<&oci_client::config::Config>,
+    ca_present: bool,
+) -> anyhow::Result<()> {
+    // Gate the CA trust-env defaults on the bundle actually being present —
+    // same gate the guest applies in `build_env_overlay` (trust_bundle_present).
+    // Today the host always writes ca.pem so this is always-open, but encoding
+    // the gate keeps service-mode (a real entrypoint as PID 1, deferred) from
+    // inheriting SSL_CERT_FILE=… when no CA exists.
+    let trust = if ca_present {
+        trust_env_strings()
+    } else {
+        Vec::new()
+    };
+    let pause_argv: Vec<String> = vec![PAUSE_GUEST_PATH.to_string(), "__pause".to_string()];
+    let ((uid, gid), user_warn) = crate::image::runtime_config::resolve_process_user(
+        image_config.and_then(|c| c.user.as_deref()),
+    );
+    if let Some(w) = user_warn {
+        eprintln!("warning: sandbox '{name}': {w}");
+    }
+    let params = SpecParams {
+        mode: ContainerMode::Interactive {
+            pause_argv: &pause_argv,
+        },
+        image: image_config,
+        entrypoint_override: None,
+        cmd_override: None,
+        env_overrides: &[],
+        trust_env: &trust,
+        cwd_override: Some(INTERACTIVE_CWD),
+        user: (uid, gid),
+        hostname: name,
+        terminal: false,
+    };
+    let spec =
+        crate::image::runtime_config::generate_spec(&params).context("generating OCI spec")?;
+    let json = serde_json::to_vec_pretty(&spec).context("serializing OCI spec")?;
+
+    // Atomic write: tempfile in the same dir, then rename into place.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".config-")
+        .tempfile_in(oci_dir)
+        .context("creating tempfile for oci/config.json")?;
+    use std::io::Write as _;
+    tmp.write_all(&json)
+        .context("writing oci/config.json content")?;
+    // Set mode 0644 before persisting.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))
+            .context("setting oci/config.json permissions")?;
+    }
+    tmp.persist(oci_dir.join("config.json"))
+        .context("persisting oci/config.json")?;
+    Ok(())
+}
+
 /// Writes the SSH host key and authorized_keys into the per-sandbox ssh share
 /// dir, creating it if needed. Returns the share dir path.
 /// Called next to the trust block in start_with_timeouts.
@@ -549,6 +622,25 @@ pub fn start_with_timeouts(
         }
     }
 
+    // Write the per-sandbox OCI bundle (`oci/config.json`) and expose it to
+    // the guest as the `izba-oci` virtiofs share. The guest's crun reads this
+    // config to start the workload container (Pillar A2).
+    let oci_dir = paths.sandbox_dir(name).join("oci");
+    std::fs::create_dir_all(&oci_dir)
+        .with_context(|| format!("creating oci dir {}", oci_dir.display()))?;
+    // Load the image config (Entrypoint/Cmd/Env/WorkingDir/User). None is fine
+    // for images cached by a pre-crun izba — generate_spec treats it as a bare
+    // image with root user and no default env.
+    let image_cfg_file = ImageStore::new(paths).load_config(&config.image_digest)?;
+    let image_config = image_cfg_file.as_ref().and_then(|f| f.config.as_ref());
+    write_oci_bundle(
+        &oci_dir,
+        name,
+        image_config,
+        trust_dir.join("ca.pem").exists(),
+    )
+    .with_context(|| format!("writing oci/config.json for sandbox '{name}'"))?;
+
     // The guest is a pure vsock island: no NIC, no DHCP. izba.egress=1 is
     // always on — guest egress rides the izbad-owned vsock 1027 plane.
     // izba.volumes (when present) carries the ordered guest mountpoints.
@@ -572,6 +664,10 @@ pub fn start_with_timeouts(
             FsShare {
                 tag: "izba-trust".to_string(),
                 host_path: trust_dir.clone(),
+            },
+            FsShare {
+                tag: OCI_TAG.to_string(),
+                host_path: oci_dir.clone(),
             },
             FsShare {
                 tag: "izba-ssh".to_string(),
@@ -1543,7 +1639,7 @@ mod tests {
         assert_eq!(spec.disks[1].path, paths.sandbox_dir("web").join("rw.img"));
         assert!(!spec.disks[1].readonly);
 
-        assert_eq!(spec.shares.len(), 3);
+        assert_eq!(spec.shares.len(), 4); // workspace + izba-trust + izba-oci + izba-ssh
         assert_eq!(spec.shares[0].tag, "workspace");
         assert_eq!(spec.shares[0].host_path, ws);
         // The izba CA is baked into every guest via the read-only izba-trust
@@ -1561,6 +1657,20 @@ mod tests {
                 .exists(),
             "guest CA cert written for the izba-trust share"
         );
+        // The OCI bundle is delivered to the guest as the izba-oci share.
+        assert_eq!(spec.shares[2].tag, izba_proto::OCI_TAG);
+        assert_eq!(
+            spec.shares[2].host_path,
+            paths.sandbox_dir("web").join("oci")
+        );
+        assert!(
+            paths
+                .sandbox_dir("web")
+                .join("oci")
+                .join("config.json")
+                .exists(),
+            "oci/config.json written for the izba-oci share"
+        );
 
         assert_eq!(spec.console_log, paths.logs_dir("web").join("console.log"));
         assert_eq!(spec.run_dir, paths.run_dir("web"));
@@ -1570,6 +1680,71 @@ mod tests {
             .expect("state.json written");
         assert_eq!(state.vmm_pid, live_identity());
         assert!(state.sidecar_pids.is_empty());
+    }
+
+    #[test]
+    fn start_writes_parseable_interactive_oci_config() {
+        use crate::image::runtime_config::INTERACTIVE_CWD;
+        use izba_proto::{OCI_TAG, PAUSE_GUEST_PATH};
+        use oci_spec::runtime::{LinuxNamespaceType, Spec};
+
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
+
+        let spec_captured = driver
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spec captured");
+        // The izba-oci share host_path holds config.json.
+        let oci_share = spec_captured
+            .shares
+            .iter()
+            .find(|s| s.tag == OCI_TAG)
+            .expect("izba-oci share present");
+        let config_path = oci_share.host_path.join("config.json");
+        let json = fs::read_to_string(&config_path).expect("oci/config.json readable");
+
+        // Must parse as a valid OCI runtime Spec.
+        let spec: Spec = serde_json::from_str(&json).expect("config.json is a valid OCI Spec");
+
+        // Root path must be /rootfs (CONTAINER_ROOTFS).
+        let root = spec.root().as_ref().expect("root present");
+        assert_eq!(
+            root.path().to_string_lossy(),
+            crate::image::runtime_config::CONTAINER_ROOTFS
+        );
+
+        // Process args must be the pause argv.
+        let proc = spec.process().as_ref().expect("process present");
+        let args = proc.args().clone().expect("args present");
+        assert_eq!(
+            args,
+            vec![PAUSE_GUEST_PATH.to_string(), "__pause".to_string()]
+        );
+
+        // cwd must be INTERACTIVE_CWD (/workspace).
+        assert_eq!(proc.cwd().to_string_lossy(), INTERACTIVE_CWD);
+
+        // D1: no network namespace — the container shares izba-init's netns.
+        let nss = spec
+            .linux()
+            .as_ref()
+            .expect("linux section")
+            .namespaces()
+            .clone()
+            .expect("namespaces");
+        let types: Vec<LinuxNamespaceType> = nss.iter().map(|n| n.typ()).collect();
+        assert!(
+            !types.contains(&LinuxNamespaceType::Network),
+            "network namespace must be absent (D1)"
+        );
     }
 
     #[test]
@@ -2326,7 +2501,11 @@ mod tests {
             .take()
             .expect("spec captured");
 
-        assert_eq!(spec.shares.len(), 3, "workspace + izba-trust + izba-ssh");
+        assert_eq!(
+            spec.shares.len(),
+            4,
+            "workspace + izba-trust + izba-oci + izba-ssh"
+        );
         let ssh_share = spec
             .shares
             .iter()

@@ -64,8 +64,10 @@ Check 'ls shows sandbox running' ($ls -match 'valid8' -and $ls -match 'running')
 Check 'exec true -> 0' ($LASTEXITCODE -eq 0)
 & $exe exec valid8 -- /bin/false | Out-Null
 Check 'exec false -> 1' ($LASTEXITCODE -eq 1)
+# Stance B: crun resolves the command inside the container; a missing
+# executable surfaces as crun's stderr + crun's exit code (1), passed through.
 & $exe exec valid8 -- /no/such/cmd 2>$null | Out-Null
-Check 'CommandNotFound -> 127' ($LASTEXITCODE -eq 127)
+Check 'missing command -> crun rc 1' ($LASTEXITCODE -eq 1)
 
 # [4] exec: stdin plumbing (-i)
 $out = 'ping' | & $exe exec -i valid8 -- /bin/cat

@@ -9,6 +9,8 @@ mod egress;
 mod exec;
 mod mounts;
 mod net;
+mod oci;
+mod pause;
 mod rwdisk;
 mod server;
 mod ssh;
@@ -16,7 +18,7 @@ mod trust;
 
 use anyhow::Context;
 use exec::ExecEngine;
-use izba_proto::{ExitStatus, CONTROL_PORT, STREAM_PORT};
+use izba_proto::{CONTROL_PORT, STREAM_PORT};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,10 +33,34 @@ impl server::Listener for VsockPortListener {
     }
 }
 
+// `#[mutants::skip]`: PID-1 entry point — it branches on argv and the live
+// process id, then dispatches into `self_check`/`pause::run`/`run_pid1`/
+// `power_off`, none of which return in a unit test. The decision logic it
+// contains is extracted into testable helpers (`is_pause_invocation`,
+// `spawn_serve`), which are unit-tested directly.
+#[mutants::skip]
 fn main() {
     if std::env::args().any(|a| a == "--self-check") {
         self_check();
         return;
+    }
+    // Hidden subcommand: `izba-init __pause` — minimal reaping PID-1 for an
+    // interactive OCI container. Must be checked before the PID-1 guard so it
+    // works when invoked as PID 1 of a container PID namespace (not VM PID 1).
+    if is_pause_invocation(std::env::args().nth(1).as_deref()) {
+        pause::run();
+    }
+    // sshd invokes root's login shell (`/init`) in two ways (OpenSSH contract):
+    //   interactive login  (`ssh host`):       argv[0] = "-init" (dash-prefixed), no `-c`
+    //   remote command     (`ssh host <cmd>`): argv = ["/init", "-c", "<cmd>"]
+    // Both routes enter the running `izba` crun container via `crun exec`.
+    // Check before the PID-1 guard because the session process is not PID 1.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(cmd) = login_shell_command(&args) {
+        ssh::ssh_session(Some(cmd));
+    }
+    if is_interactive_login_shell(&args) {
+        ssh::ssh_session(None);
     }
     if std::process::id() != 1 {
         eprintln!("izba-init: not PID 1; nothing to do (try --self-check)");
@@ -48,24 +74,79 @@ fn main() {
     }
 }
 
+/// Whether `first_arg` (argv[1]) selects the hidden `__pause` PID-1 mode.
+///
+/// Extracted as a pure predicate so the dispatch condition is unit-testable
+/// (the live `main` path runs `pause::run()`, which never returns).
+fn is_pause_invocation(first_arg: Option<&str>) -> bool {
+    first_arg == Some("__pause")
+}
+
+/// The remote command when sshd invoked izba-init as `init -c "<cmd>"`
+/// (`ssh host <cmd>`); `None` if there is no `-c`.
+fn login_shell_command(args: &[String]) -> Option<&str> {
+    // Look for "-c" and return the argument immediately following it.
+    args.windows(2)
+        .find(|w| w[0] == "-c")
+        .map(|w| w[1].as_str())
+}
+
+/// Whether sshd invoked izba-init as an INTERACTIVE login shell: argv[0] is
+/// dash-prefixed (OpenSSH's login-shell convention, e.g. "-init").
+fn is_interactive_login_shell(args: &[String]) -> bool {
+    args.first().map(|a| a.starts_with('-')).unwrap_or(false)
+}
+
 /// Host-side smoke test used during image bring-up.
+///
+/// Validates the parts of init's logic that run on a bare host — cmdline
+/// parsing, `ExecEngine` construction, and the crun argv wiring. It deliberately
+/// does NOT perform a live exec: under Stance B `exec()` teleports into the
+/// running workload via `crun exec`, and crun (plus the `izba` container) exists
+/// only inside a booted guest. A build host has no `/sbin/crun` — the previous
+/// version spawned it and panicked here. Even where crun is present there is no
+/// running container to enter, so a real round-trip is impossible in this mode.
+///
+/// `#[mutants::skip]`: a manual `--self-check` smoke entry whose only observable
+/// effect is internal assertions + a stdout line, so a unit test cannot tell the
+/// `replace with ()` mutant from real success. Every builder it exercises
+/// (`cmdline::parse`, `oci::crun_run_argv`, `oci::crun_exec_argv`) is unit-tested
+/// directly.
+#[mutants::skip]
 fn self_check() {
     let parsed = cmdline::parse("izba.hostname=web quiet");
     assert_eq!(parsed.get("izba.hostname").map(String::as_str), Some("web"));
     assert_eq!(parsed.get("quiet").map(String::as_str), Some(""));
 
-    let engine = ExecEngine::new(None);
-    let req = izba_proto::ExecRequest {
-        argv: vec!["true".into()],
-        env: vec![],
-        cwd: "/".into(),
-        tty: false,
-        uid: nix::unistd::geteuid().as_raw(),
-        gid: nix::unistd::getegid().as_raw(),
-    };
-    let id = engine.exec(&req).expect("self-check: exec true");
-    let status = engine.wait(id).expect("self-check: wait");
-    assert_eq!(status, ExitStatus::Code(0), "self-check: true must exit 0");
+    // ExecEngine constructs without a live container (cgroup detection is
+    // best-effort), exercising the boot-time construction path.
+    let _engine = ExecEngine::new(None);
+
+    // The crun run/exec argv wiring is the Stance B substitute for the old
+    // direct spawn; validate both build the expected, well-formed argv.
+    let run = oci::crun_run_argv(oci::CgroupManager::Disabled);
+    assert_eq!(run.first().map(String::as_str), Some(oci::CRUN_PATH));
+    assert!(
+        run.iter().any(|a| a == "--no-pivot"),
+        "self-check: crun run argv must carry --no-pivot"
+    );
+    assert_eq!(run.last().map(String::as_str), Some(oci::CONTAINER_ID));
+
+    let exec = oci::crun_exec_argv(
+        oci::CgroupManager::Disabled,
+        false,
+        "/workspace",
+        &[],
+        None,
+        &["true".into()],
+    );
+    assert_eq!(exec.first().map(String::as_str), Some(oci::CRUN_PATH));
+    assert!(
+        exec.iter().any(|a| a == "exec"),
+        "self-check: crun exec argv must carry the exec subcommand"
+    );
+    assert_eq!(exec.last().map(String::as_str), Some("true"));
+
     println!("self-check OK");
 }
 
@@ -142,6 +223,13 @@ fn run_pid1() -> anyhow::Result<()> {
         std::thread::spawn(move || server::serve_streams(streams, e));
     }
     bring_up_egress();
+
+    // Start the OCI workload container via crun.  Placement: after egress is
+    // up (the container shares init's netns and needs the egress stub active)
+    // and before the idle/serve loop so exec (a later task) can enter a live
+    // container.  Fail-honest: launch_container() logs errors but never
+    // panics or exits PID 1.
+    oci::launch_container();
 
     // Zombie policy (v1): every engine exec is reaped by its dedicated
     // waitpid thread. We deliberately do NOT waitpid(-1) here — that would
@@ -337,9 +425,54 @@ fn power_off() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::spawn_serve;
+    use super::{
+        is_interactive_login_shell, is_pause_invocation, login_shell_command, spawn_serve,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pause_invocation_only_for_exact_pause_arg() {
+        assert!(is_pause_invocation(Some("__pause")));
+        assert!(!is_pause_invocation(Some("--self-check")));
+        assert!(!is_pause_invocation(Some("__pause__")));
+        assert!(!is_pause_invocation(Some("")));
+        assert!(!is_pause_invocation(None));
+    }
+
+    #[test]
+    fn login_shell_command_extracts_c_operand() {
+        // sshd's remote-command form: argv = [<shell>, "-c", "<cmd>"]
+        assert_eq!(
+            login_shell_command(&args(&["init", "-c", "ls -l"])),
+            Some("ls -l")
+        );
+        // interactive login form: no "-c"
+        assert_eq!(login_shell_command(&args(&["-init"])), None);
+        // bare init invocation (PID-1)
+        assert_eq!(login_shell_command(&args(&["init"])), None);
+        // empty args
+        assert_eq!(login_shell_command(&[]), None);
+        // -c without a following arg (malformed) → None (windows(2) won't match last elem alone)
+        assert_eq!(login_shell_command(&args(&["init", "-c"])), None);
+    }
+
+    #[test]
+    fn is_interactive_login_shell_detects_dash_prefix() {
+        // OpenSSH login-shell convention: argv[0] starts with '-'
+        assert!(is_interactive_login_shell(&args(&["-init"])));
+        assert!(is_interactive_login_shell(&args(&["-/init"])));
+        // PID-1 form — not a login shell
+        assert!(!is_interactive_login_shell(&args(&["/init"])));
+        // remote command form — not a login shell (dash is not argv[0])
+        assert!(!is_interactive_login_shell(&args(&["init", "-c", "x"])));
+        // empty args
+        assert!(!is_interactive_login_shell(&[]));
+    }
 
     // `spawn_serve` is generic over the listener type, so these tests use `()` as
     // a stand-in listener: no socket is bound (some sandboxes deny `bind`), yet

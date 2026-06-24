@@ -12,7 +12,16 @@ PermitRootLogin prohibit-password
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
-ChrootDirectory /rootfs
+# Session entry: root's login shell is `/init` (izba-init itself), which acts as
+# a restricted login shell that enters the running `izba` crun container via
+# `crun exec` (Stance B), sharing the container's mount/pid namespaces. There is
+# no ForceCommand and no ChrootDirectory. OpenSSH invokes /init as:
+#   interactive login  (`ssh host`):      argv[0] = "-init" (dash-prefixed)
+#   remote command     (`ssh host <cmd>`): /init -c "<cmd>"
+# izba-init detects both forms and routes them into crun exec.
+# sftp/scp: scp-over-ssh and VS Code Remote-SSH arrive as a remote command
+# ($SSH_ORIGINAL_COMMAND via the -c form) and work correctly; native in-container
+# sftp-server is a follow-up.
 Subsystem sftp internal-sftp
 PrintMotd no
 AcceptEnv LANG LC_*

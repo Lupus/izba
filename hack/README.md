@@ -58,6 +58,23 @@ hack/build-nft.sh            # writes dist/nft (~1.1 MB, statically linked)
 
 Embed it via `IZBA_NFT=dist/nft hack/build-initramfs.sh`.  Requires Docker.
 
+### `build-crun.sh`
+
+Builds a static `crun` (the OCI runtime) for the initramfs, via a throwaway
+Alpine container (musl) — the same sha-pinned posture as `build-nft.sh`. crun
+is the runtime izba runs the user's workload container under inside the guest
+(Stance B). Because Alpine ships no `json-c-static`, it also builds a static
+`json-c` (crun's JSON dep) from the official release tarball, then links crun
+fully static (`-all-static`).
+
+```sh
+hack/build-crun.sh           # writes dist/crun (static, musl)
+./dist/crun --version        # smoke-test (note: a static binary needs no libs)
+```
+
+Embed it via `IZBA_CRUN=dist/crun hack/build-initramfs.sh`.  Requires Docker.
+Pinned: crun 1.28, json-c 0.18 (both sha256-verified in-container).
+
 ### `build-sshd.sh`
 
 Builds a static `sshd` (OpenSSH Portable **9.9p2**) for the initramfs, via a
@@ -243,6 +260,7 @@ cargo build --release -p izba-cli
 | `IZBA_KERNEL_SHA256` | sha256 of the kernel source tarball when building an unlisted version; required when the version has no entry in `build-kernel.sh`'s `KNOWN_SHA256` table. |
 | `IZBA_KERNEL_VERIFY_ONLY` | Set to `1` to hash-check the cached kernel tarball and exit without building (CI preflight mode). |
 | `IZBA_NFT` | Optional path to a static `nft` binary to embed in the initramfs at `/sbin/nft` (required for the M1 izbad-egress TCP REDIRECT stub; built by `build-nft.sh`). |
+| `IZBA_CRUN` | Optional path to a static `crun` binary to embed in the initramfs at `/sbin/crun` (the in-guest OCI workload runtime, Stance B; built by `build-crun.sh`). |
 | `IZBA_SSHD` | Optional path to a static `sshd` binary to embed in the initramfs at `/sbin/sshd` (required for the SSH access feature; built by `build-sshd.sh`). |
 | `VIRTIOFSD_VERSION` | virtiofsd release tag for `fetch-artifacts.sh`. Defaults to a pinned known-good version. |
 | `IZBA_MKFS_EROFS` | Absolute path to `mkfs.erofs` (or `mkfs.erofs.exe` on Windows). Overrides the bundled libexec copy and `$PATH`. |
