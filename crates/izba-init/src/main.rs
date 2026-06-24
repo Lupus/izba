@@ -214,6 +214,25 @@ fn run_pid1() -> anyhow::Result<()> {
         vsock::VsockListener::bind_with_cid_port(libc::VMADDR_CID_ANY, STREAM_PORT)
             .context("binding vsock stream port")?,
     );
+    bring_up_egress();
+
+    // Start the OCI workload container via crun BEFORE the vsock control/stream
+    // servers begin answering.  Placement rationale:
+    //   * after egress is up — the container shares init's netns and needs the
+    //     egress stub active;
+    //   * before serving control/streams — `launch_container()` blocks until the
+    //     container actually reaches `running` (crun --detach returns once the
+    //     monitor is forked, BEFORE the detached child finishes creating the
+    //     `user` namespace + writing its uid/gid map and exec'ing PID 1).  The
+    //     host marks a sandbox healthy via a `Health` RPC answered by
+    //     `serve_control`; gating that behind the container being up means a
+    //     freshly-booted sandbox never reports ready while exec/ssh would still
+    //     race the container into existence ("container does not exist").
+    // The listeners are already bound above, so connections that arrive during
+    // this window queue in the kernel backlog rather than being refused.
+    // Fail-honest: launch_container() logs errors but never panics or exits PID 1.
+    oci::launch_container();
+
     {
         let (e, s) = (Arc::clone(&engine), Arc::clone(&shutdown));
         std::thread::spawn(move || server::serve_control(control, e, s));
@@ -222,14 +241,6 @@ fn run_pid1() -> anyhow::Result<()> {
         let e = Arc::clone(&engine);
         std::thread::spawn(move || server::serve_streams(streams, e));
     }
-    bring_up_egress();
-
-    // Start the OCI workload container via crun.  Placement: after egress is
-    // up (the container shares init's netns and needs the egress stub active)
-    // and before the idle/serve loop so exec (a later task) can enter a live
-    // container.  Fail-honest: launch_container() logs errors but never
-    // panics or exits PID 1.
-    oci::launch_container();
 
     // Zombie policy (v1): every engine exec is reaped by its dedicated
     // waitpid thread. We deliberately do NOT waitpid(-1) here — that would

@@ -12,6 +12,7 @@
 //! testable pieces so the unit tests can cover every branch without a live crun.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Constants re-exported from izba-proto; derived paths are computed here once
@@ -64,6 +65,13 @@ pub const CRUN_OUT_PATH: &str = "/tmp/crun.out";
 /// Maximum number of bytes to tail from `CRUN_LOG_PATH` when reporting a
 /// failed container start.
 const LOG_TAIL_BYTES: usize = 4096;
+
+/// Upper bound on how long [`launch_container`] waits for the detached crun
+/// container to reach `running` before giving up (fail-honest, not fatal).
+const CONTAINER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll interval while waiting for the container to reach `running`.
+const CONTAINER_READY_POLL: Duration = Duration::from_millis(20);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // User-namespace floor (Option A)
@@ -412,7 +420,20 @@ pub fn launch_container() {
 
     match status {
         Ok(0) => {
-            eprintln!("izba-init: [OCI] container started OK");
+            // `crun run --detach` returns once the monitor is forked, BEFORE the
+            // detached child has finished creating the container (clone of the
+            // namespaces — including the `user` namespace + uid/gid map write —
+            // then exec of PID 1). Until that completes, `/run/crun/izba/status`
+            // is absent and a racing `crun exec` fails "container does not
+            // exist". So block here until `crun state` reports `running`, so the
+            // sandbox is only reported healthy once exec/ssh can actually enter
+            // the container. Bounded; a timeout is logged but not fatal (the
+            // sandbox stays alive + diagnosable, consistent with fail-honest).
+            let waited = wait_container_running(CONTAINER_ID, CONTAINER_READY_TIMEOUT);
+            eprintln!(
+                "izba-init: [OCI] container started OK (running after {:?})",
+                waited
+            );
         }
         Ok(code) => {
             let tail = read_log_tail(CRUN_LOG_PATH, LOG_TAIL_BYTES);
@@ -431,6 +452,33 @@ pub fn launch_container() {
             eprintln!("izba-init: [OCI] *** CONTAINER START ERROR ***: {e}");
             eprintln!("izba-init: [OCI] sandbox is alive but workload container is NOT running");
         }
+    }
+}
+
+/// Block until `crun state <id>` reports `running`, or `timeout` elapses.
+/// Returns the elapsed wait. A timeout is logged loudly but is NOT fatal — the
+/// sandbox stays alive and diagnosable (fail-honest), and exec/ssh will then
+/// surface crun's own "container not running" error rather than racing it.
+///
+/// `#[mutants::skip]`: spins on `container_running`, which shells out to a live
+/// `/sbin/crun state` only present in a booted guest; the unit suite has no
+/// crun, so the loop/timeout branches can't be distinguished without a VM.
+/// Exercised by the real-VM checkpoint.
+#[mutants::skip]
+fn wait_container_running(id: &str, timeout: Duration) -> Duration {
+    let start = Instant::now();
+    loop {
+        if container_running(id) {
+            return start.elapsed();
+        }
+        if start.elapsed() >= timeout {
+            eprintln!(
+                "izba-init: [OCI] *** container '{id}' did not reach 'running' within {timeout:?} \
+                 *** exec/ssh into this sandbox will fail until it does"
+            );
+            return start.elapsed();
+        }
+        std::thread::sleep(CONTAINER_READY_POLL);
     }
 }
 
