@@ -547,6 +547,88 @@ if ($unsBootOk) {
 & $exe rm --force $unsName 2>$null | Out-Null
 if (Test-Path $unsWs) { Remove-Item -Recurse -Force $unsWs -ErrorAction SilentlyContinue }
 
+# [14] build-in-VM: Dockerfile -> OCI ingest -> tag -> run -> marker.
+#
+# Exercises the full `izba build` pipeline on WHP: lazy-pull of the BuildKit
+# builder image (ghcr.io/moby/buildkit), build inside a throwaway builder VM
+# (enforcing build-network policy, Docker Hub allow-list), OCI-archive ingest,
+# tag, then `izba run --image <tag> -- cat /izba-build-marker` to verify the
+# layer written by RUN is readable in the resulting sandbox.
+#
+# The Windows host drives a Linux microVM (same as all other izba builds), so
+# the Dockerfile build path is identical to the KVM leg. Requires host internet
+# egress for both the builder-image pull (host-side) and the in-VM FROM pull
+# (governed by the build-network policy that allow-lists Docker Hub).
+# GitHub Actions hosted runners have internet access.
+$buildName  = 'izba-e2e-built'
+$buildWs    = "$env:TEMP\izba-build-e2e-ws"
+$buildFails0 = $fails
+
+# Locate the fixture Dockerfile: resolve relative to this script's directory.
+$scriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$fixtureDir  = Join-Path $scriptDir '..\..\crates\izba-cli\tests\fixtures\build'
+$fixtureDir  = [System.IO.Path]::GetFullPath($fixtureDir)
+if (-not (Test-Path (Join-Path $fixtureDir 'Dockerfile'))) {
+    Check 'build-in-VM: fixture Dockerfile exists' $false
+    [Console]::Error.WriteLine("  Dockerfile not found at: $fixtureDir\Dockerfile")
+} else {
+    Check 'build-in-VM: fixture Dockerfile exists' $true
+
+    # Pre-cleanup: remove any leftover workspace from a previous aborted run.
+    if (Test-Path $buildWs) { Remove-Item -Recurse -Force $buildWs -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $buildWs | Out-Null
+
+    # Step 1: izba build -t izba-e2e-built <fixture>.
+    # The builder VM is ephemeral (torn down by `izba build` internally) and the
+    # builder image is pulled lazily on first use (may take a few minutes in CI).
+    $buildOut = (& $exe build -t $buildName $fixtureDir 2>&1 | Out-String)
+    $buildRc  = $LASTEXITCODE
+    $buildOk  = ($buildRc -eq 0)
+    Check 'build-in-VM: izba build exits 0' $buildOk
+    if (-not $buildOk) {
+        [Console]::Error.WriteLine("  izba build rc=$buildRc")
+        ($buildOut -split "`n") | Select-Object -Last 20 | ForEach-Object { [Console]::Error.WriteLine("  $_") }
+        # Try to dump the most-recently-created builder sandbox console.log.
+        $sbDir = "$env:LOCALAPPDATA\izba\sandboxes"
+        if (Test-Path $sbDir) {
+            $latest = Get-ChildItem $sbDir -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 3
+            foreach ($d in $latest) {
+                $cl = Join-Path $d.FullName 'logs\console.log'
+                if (Test-Path $cl) {
+                    [Console]::Error.WriteLine("  --- $($d.Name) console.log tail ---")
+                    Get-Content $cl -Tail 40 -ErrorAction SilentlyContinue |
+                        ForEach-Object { [Console]::Error.WriteLine("  $_") }
+                }
+            }
+        }
+    }
+
+    if ($buildOk) {
+        # Step 2: run the built image and assert the marker written by RUN is readable.
+        $markerOut = (& $exe run --image $buildName --name 'e2e-built-run' $buildWs -- cat /izba-build-marker 2>&1 | Out-String)
+        $markerRc  = $LASTEXITCODE
+        $markerOk  = ($markerRc -eq 0 -and "$markerOut".Trim() -eq 'izba-build-ok')
+        Check 'build-in-VM: run reads marker from built image' $markerOk
+        if (-not $markerOk) {
+            [Console]::Error.WriteLine("  izba run rc=$markerRc out='$($markerOut.Trim())'")
+            Dump-BootLogs 'e2e-built-run'
+        }
+        & $exe stop 'e2e-built-run' 2>$null | Out-Null
+        & $exe rm --force 'e2e-built-run' 2>$null | Out-Null
+    } else {
+        # Skip the run check: report it failed so the section total is honest.
+        Check 'build-in-VM: run reads marker from built image' $false
+        [Console]::Error.WriteLine("  (skipped: build step failed)")
+    }
+
+    if (Test-Path $buildWs) { Remove-Item -Recurse -Force $buildWs -ErrorAction SilentlyContinue }
+}
+
+$buildSectionFails = $fails - $buildFails0
+if ($buildSectionFails -gt 0) {
+    [Console]::Error.WriteLine("  [14] build-in-VM section: $buildSectionFails check(s) failed")
+}
+
 # Best-effort daemon cleanup so the validation run leaves no daemon behind.
 & $exe daemon stop 2>$null | Out-Null
 

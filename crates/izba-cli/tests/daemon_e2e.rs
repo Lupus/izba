@@ -470,6 +470,109 @@ fn sftp(data: &Path, name: &str, batch: &Path) -> Output {
         .expect("run sftp client")
 }
 
+/// Build a Dockerfile inside a throwaway builder VM, ingest the result, tag it,
+/// then run the built image and assert the marker file written by the `RUN` layer
+/// is readable inside a fresh workload sandbox.
+///
+/// Exercises the full Track E / `izba build` pipeline end-to-end:
+///   lazy-pull of the BuildKit builder image → build in VM → OCI-archive ingest
+///   → tag → `izba run --image <tag>` → verify marker.
+///
+/// Gated behind `IZBA_INTEGRATION=1` — self-skips otherwise.
+///
+/// Note: this test requires host-side internet egress on the runner (builder
+/// image pull from ghcr.io/moby/buildkit, plus the in-VM `FROM alpine:3.20`
+/// pull through the enforcing build-network policy that allow-lists Docker Hub).
+/// GitHub Actions hosted runners have internet access; this test is always run
+/// in that environment.
+#[test]
+fn build_in_vm_dockerfile_to_running_sandbox() {
+    if !want() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let no_env: &[(&str, &str)] = &[];
+
+    // Resolve the fixture directory relative to this crate's manifest.
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/build");
+    let fixture_s = fixture_dir.to_string_lossy().into_owned();
+
+    // [1] Build the Dockerfile inside a throwaway builder VM.
+    //     On failure, dump the builder sandbox's console.log to aid diagnosis
+    //     (the builder name is ephemeral, so we look for the most-recent one).
+    let o = izba(
+        &data,
+        no_env,
+        &["build", "-t", "izba-e2e-built", &fixture_s],
+    );
+    if !o.status.success() {
+        // Best-effort: find the builder sandbox log dir (name is time-based).
+        let sandboxes_dir = data.join("sandboxes");
+        if let Ok(rd) = std::fs::read_dir(&sandboxes_dir) {
+            for entry in rd.flatten() {
+                let console = entry.path().join("logs/console.log");
+                if console.exists() {
+                    eprintln!(
+                        "--- builder console.log ({}) ---",
+                        entry.file_name().to_string_lossy()
+                    );
+                    if let Ok(txt) = std::fs::read_to_string(&console) {
+                        for line in txt
+                            .lines()
+                            .rev()
+                            .take(60)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                        {
+                            eprintln!("{line}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_ok(&o, "izba build -t izba-e2e-built");
+
+    // [2] Run the built image and confirm the marker the RUN layer wrote is
+    //     visible inside the container.
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "run",
+            "--image",
+            "izba-e2e-built",
+            "--name",
+            "e2e-built-run",
+            &ws_s,
+            "--",
+            "cat",
+            "/izba-build-marker",
+        ],
+    );
+    assert_ok(
+        &o,
+        "izba run --image izba-e2e-built -- cat /izba-build-marker",
+    );
+    let marker = stdout_of(&o);
+    assert!(
+        marker.contains("izba-build-ok"),
+        "marker file content from built image must contain 'izba-build-ok'; got: {marker:?}"
+    );
+
+    // [3] Cleanup.
+    let _ = izba(&data, no_env, &["rm", "--force", "e2e-built-run"]);
+    // Note: the tag + image store live inside the tempdir and are cleaned up
+    // automatically when `root` is dropped; no explicit `izba image rm` is
+    // needed (and there is no such subcommand in the CLI surface).
+    let _ = izba(&data, no_env, &["daemon", "stop"]);
+}
+
 /// CLI-surface lifecycle: drives the thin verbs `daemon_full_lifecycle` does
 /// NOT reach end-to-end against a real daemon + microVM — `create` (vs `run`),
 /// `netlog`, `port ls`/`unpublish`, `stop`, and non-force `rm`. These verbs read
