@@ -190,14 +190,22 @@ pub fn serve_dns_udp(sock: UdpSocket) -> io::Result<()> {
 /// Bind 0.0.0.0:53 for DNS-over-TCP. Split out like [`bind_dns_udp`] so the
 /// bind happens on the main thread BEFORE [`apply_nft`].
 ///
-/// No nft rule is needed to reach this listener: the resolver in resolv.conf is
-/// `127.0.0.1`, and the nat-output `ip daddr 127.0.0.0/8 return` rule means a
-/// client's TCP retry to `127.0.0.1:53` is never redirected — it is delivered
-/// straight to this loopback listener. (Contrast the UDP path, which needs
-/// `udp dport 53 redirect to :53` only to pull hardcoded-resolver datagrams.)
-/// This is the path a resolver takes after izbad answers a UDP query with TC=1
-/// (an answer over the 512-byte non-EDNS limit): without it, large or
-/// split-horizon record sets are unresolvable in the guest.
+/// Two client paths reach this listener:
+///   1. the resolv.conf resolver (`127.0.0.1:53`): the nat-output
+///      `ip daddr 127.0.0.0/8 return` rule means a TCP retry to `127.0.0.1:53`
+///      is never redirected — it is delivered straight here. This is the path a
+///      resolver takes after izbad answers a UDP query with TC=1 (an answer
+///      over the 512-byte non-EDNS limit); without it, large or split-horizon
+///      record sets are unresolvable in the guest.
+///   2. a hardcoded external resolver over TCP (e.g. `dig +tcp @1.1.1.1`): the
+///      `tcp dport 53 redirect to :53` rule REDIRECTs it here just like the UDP
+///      `udp dport 53 redirect to :53` rule, so any in-guest DNS — UDP or TCP,
+///      loopback or hardcoded — funnels through izbad's resolver.
+///
+/// Unlike the UDP stub, no source-address fixup is needed: each connection is an
+/// accepted (connected) socket whose local address is the REDIRECT target, so
+/// conntrack reverse-NATs replies automatically (the same reason the `:15001`
+/// TCP relay works). See [`NFT_RULESET`].
 pub fn bind_dns_tcp() -> io::Result<TcpListener> {
     TcpListener::bind(("0.0.0.0", 53))
 }
@@ -275,24 +283,35 @@ pub const REDIRECT_PORT: u16 = 15001;
 /// 127.0.0.1; the UDP stub answers from 0.0.0.0:53 and the loopback reply
 /// matches; a client's TCP retry to 127.0.0.1:53 is likewise delivered
 /// straight to the TCP stub on 0.0.0.0:53, no redirect involved).
-/// All other TCP goes to the stub at :15001. `udp dport 53` pulls
-/// hardcoded-resolver queries (e.g. an app that bakes in `8.8.8.8:53`) to the
-/// stub too. The reply path now works: REDIRECT rewrites the destination to
-/// 127.0.0.1, the stub recovers that via `IP_ORIGDSTADDR` and answers FROM it
-/// with `IP_PKTINFO` (see [`serve_dns_udp`]/[`reply_dns`]), so conntrack's
-/// reverse-NAT tuple matches and un-NATs the source back to the address the
-/// client originally targeted. `route_localnet` (set in `net::configure`) lets
-/// that 127.0.0.1-sourced reply route to the guest IP without being treated as
-/// martian. The stub's own egress is AF_VSOCK — not IP — so no exclusion rule
-/// is needed and no redirect loop is possible. Non-DNS UDP is denied
-/// structurally (no route once the NIC goes away in phase C).
+///
+/// Both `dport 53` rules pull hardcoded-resolver queries (e.g. an app that
+/// bakes in `8.8.8.8:53`/`1.1.1.1:53`) to the in-guest DNS stub so ALL DNS —
+/// UDP or TCP, loopback or hardcoded — funnels through izbad's resolver:
+///   - `udp dport 53 redirect to :53` → the UDP stub. Its reply path works
+///     because the stub recovers the REDIRECT's destination via
+///     `IP_ORIGDSTADDR` and answers FROM it with `IP_PKTINFO` (see
+///     [`serve_dns_udp`]/[`reply_dns`]); conntrack then un-NATs the source back
+///     to the address the client targeted. `route_localnet` (set in
+///     `net::configure`) lets that 127.0.0.1-sourced reply route to the guest
+///     IP without being treated as martian.
+///   - `tcp dport 53 redirect to :53` → the DNS-over-TCP stub. No source fixup
+///     is needed (accepted connected socket ⇒ conntrack auto-un-NATs replies).
+///
+/// All non-DNS TCP (`tcp dport != 53`) goes to the relay stub at :15001. The
+/// `!= 53` carve-out (rather than `meta l4proto tcp`) makes the rules
+/// non-overlapping, so a `tcp:53` packet is REDIRECTed only to the DNS stub
+/// regardless of whether nft treats `redirect` as terminal. The stub's own
+/// egress is AF_VSOCK — not IP — so no exclusion rule is needed and no redirect
+/// loop is possible. Non-DNS UDP is denied structurally (no route once the NIC
+/// goes away in phase C).
 pub const NFT_RULESET: &str = "\
 table ip izba {
   chain output {
     type nat hook output priority -100; policy accept;
     ip daddr 127.0.0.0/8 return
-    meta l4proto tcp redirect to :15001
+    tcp dport 53 redirect to :53
     udp dport 53 redirect to :53
+    tcp dport != 53 redirect to :15001
   }
 }
 ";
@@ -600,8 +619,19 @@ mod tests {
         // The contract bits the redirect depends on; the full file is integration-tested.
         assert!(NFT_RULESET.contains("type nat hook output priority -100"));
         assert!(NFT_RULESET.contains("ip daddr 127.0.0.0/8 return"));
-        assert!(NFT_RULESET.contains(&format!("redirect to :{REDIRECT_PORT}")));
         assert!(NFT_RULESET.contains("udp dport 53 redirect to :53"));
+        assert!(NFT_RULESET.contains("tcp dport 53 redirect to :53"));
+        // The general TCP relay carve-out must EXCLUDE dport 53 so a tcp:53
+        // packet only ever hits the DNS rule (terminality-independent), and it
+        // must still target the relay port.
+        assert!(NFT_RULESET.contains(&format!("tcp dport != 53 redirect to :{REDIRECT_PORT}")));
+        // Ordering: both DNS rules must precede the general TCP relay.
+        let dns_tcp = NFT_RULESET.find("tcp dport 53 redirect").unwrap();
+        let relay = NFT_RULESET.find("tcp dport != 53 redirect").unwrap();
+        assert!(
+            dns_tcp < relay,
+            "tcp:53 DNS rule must precede the relay rule"
+        );
     }
 
     /// The transparent-reply plumbing end-to-end on plain loopback (no NAT, so
