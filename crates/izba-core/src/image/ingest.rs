@@ -495,4 +495,510 @@ pub(crate) mod tests {
             "error message should indicate integrity failure; got: {msg}"
         );
     }
+
+    // ── Helper: build an archive with a custom index.json body ───────────────
+
+    /// Write a tar archive that contains exactly `files`: a slice of (path, bytes).
+    fn build_raw_tar(tmp_dir: &Path, name: &str, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let archive_path = tmp_dir.join(name);
+        let f = std::fs::File::create(&archive_path).unwrap();
+        let mut b = tar::Builder::new(f);
+        for (entry_path, data) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            b.append_data(&mut h, entry_path, *data).unwrap();
+        }
+        b.finish().unwrap();
+        archive_path
+    }
+
+    // ── Error-path tests ─────────────────────────────────────────────────────
+
+    /// Lines 92-94: find_file_in_tar returns Ok(None) for missing index.json.
+    #[test]
+    fn ingest_errors_when_index_json_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        // Archive with no index.json at all.
+        let archive = build_raw_tar(tmp.path(), "no_index.tar", &[("oci-layout", b"{}")]);
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(result.is_err(), "must error when index.json is absent");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("index.json"),
+            "error should mention index.json; got: {msg}"
+        );
+    }
+
+    /// Line 113: zero image manifests in index.json.
+    #[test]
+    fn ingest_errors_on_zero_image_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        // index.json with a manifest-list entry (not an image manifest).
+        let index = br#"{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:aaaa","size":4}]}"#;
+        let archive = build_raw_tar(tmp.path(), "zero_manifests.tar", &[("index.json", index)]);
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(result.is_err(), "must error on zero image manifests");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("no") || msg.contains("manifest"),
+            "error should mention manifests; got: {msg}"
+        );
+    }
+
+    /// Lines 135-138: multiple image manifests but none is linux/amd64.
+    #[test]
+    fn ingest_errors_on_multiple_manifests_no_amd64() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let index = br#"{
+          "schemaVersion": 2,
+          "manifests": [
+            {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaa","size":4,"platform":{"os":"linux","architecture":"arm64"}},
+            {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbb","size":4,"platform":{"os":"linux","architecture":"s390x"}}
+          ]
+        }"#;
+        let archive = build_raw_tar(tmp.path(), "multi_no_amd64.tar", &[("index.json", index)]);
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(
+            result.is_err(),
+            "must error when no linux/amd64 manifest present"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("linux/amd64") || msg.contains("unambiguous"),
+            "error should mention linux/amd64 or ambiguity; got: {msg}"
+        );
+    }
+
+    /// Lines 140-143: multiple linux/amd64 manifests (ambiguous).
+    #[test]
+    fn ingest_errors_on_multiple_amd64_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let index = br#"{
+          "schemaVersion": 2,
+          "manifests": [
+            {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaa","size":4,"platform":{"os":"linux","architecture":"amd64"}},
+            {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbb","size":4,"platform":{"os":"linux","architecture":"amd64"}}
+          ]
+        }"#;
+        let archive = build_raw_tar(tmp.path(), "multi_amd64.tar", &[("index.json", index)]);
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(
+            result.is_err(),
+            "must error when multiple linux/amd64 manifests"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("multiple") || msg.contains("linux/amd64"),
+            "error should mention multiple amd64 manifests; got: {msg}"
+        );
+    }
+
+    /// Lines 113-114 (single manifest path) + lines 173-175: manifest blob
+    /// referenced from index.json but absent from blobs/.
+    #[test]
+    fn ingest_errors_when_manifest_blob_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        // A syntactically valid index.json pointing to a non-existent blob.
+        let index = br#"{
+          "schemaVersion": 2,
+          "manifests": [
+            {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef","size":99,"platform":{"os":"linux","architecture":"amd64"}}
+          ]
+        }"#;
+        let archive = build_raw_tar(
+            tmp.path(),
+            "missing_manifest_blob.tar",
+            &[("index.json", index)],
+        );
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(result.is_err(), "must error when manifest blob is missing");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("blob") || msg.contains("not found") || msg.contains("manifest"),
+            "error should mention missing blob; got: {msg}"
+        );
+    }
+
+    /// Lines 177 / 279-283: manifest blob present but sha256 mismatches.
+    #[test]
+    fn ingest_errors_on_manifest_blob_digest_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+
+        // Craft a manifest blob whose content does NOT match the digest we
+        // put in index.json.
+        let bogus_manifest = b"{}";
+        let correct_hex = hex::encode(Sha256::digest(bogus_manifest));
+        // Use a wrong digest in the index (flip first nibble).
+        let wrong_hex = format!("ff{}", &correct_hex[2..]);
+        let index = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:{wrong_hex}","size":2,"platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#
+        );
+        let blob_path = format!("blobs/sha256/{wrong_hex}");
+        let archive = build_raw_tar(
+            tmp.path(),
+            "manifest_digest_mismatch.tar",
+            &[
+                ("index.json", index.as_bytes()),
+                (&blob_path, bogus_manifest),
+            ],
+        );
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(
+            result.is_err(),
+            "must error on manifest blob digest mismatch"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("digest mismatch") || msg.contains("sha256"),
+            "error should indicate digest mismatch; got: {msg}"
+        );
+    }
+
+    /// Lines 51-52: config blob missing from archive.
+    #[test]
+    fn ingest_errors_when_config_blob_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+
+        // Build a real manifest that points to a config blob we won't include.
+        let config_bytes = make_config_json();
+        let config_digest = format!("sha256:{}", hex::encode(Sha256::digest(&config_bytes)));
+        let layer_bytes = make_gzip_layer("/a", b"a");
+        let layer_digest = format!("sha256:{}", hex::encode(Sha256::digest(&layer_bytes)));
+
+        let manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{layer_digest}","size":{}}}]}}"#,
+            config_bytes.len(),
+            layer_bytes.len()
+        );
+        let manifest_bytes = manifest_json.as_bytes();
+        let manifest_digest = format!("sha256:{}", hex::encode(Sha256::digest(manifest_bytes)));
+        let manifest_hex = manifest_digest.strip_prefix("sha256:").unwrap();
+
+        let index = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest_digest}","size":{},"platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#,
+            manifest_bytes.len()
+        );
+
+        let manifest_blob_path = format!("blobs/sha256/{manifest_hex}");
+        // Deliberately omit the config blob.
+        let archive = build_raw_tar(
+            tmp.path(),
+            "missing_config.tar",
+            &[
+                ("index.json", index.as_bytes()),
+                (&manifest_blob_path, manifest_bytes),
+            ],
+        );
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(result.is_err(), "must error when config blob is missing");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("config") || msg.contains("blob") || msg.contains("not found"),
+            "error should mention missing config; got: {msg}"
+        );
+    }
+
+    /// Lines 177: config blob present but digest mismatches.
+    #[test]
+    fn ingest_errors_on_config_blob_digest_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+
+        let config_bytes = make_config_json();
+        let correct_hex = hex::encode(Sha256::digest(&config_bytes));
+        // Write the correct blob under a wrong digest reference.
+        let wrong_hex = format!("ff{}", &correct_hex[2..]);
+        let config_digest_wrong = format!("sha256:{wrong_hex}");
+
+        let layer_bytes = make_gzip_layer("/a", b"a");
+        let layer_digest = format!("sha256:{}", hex::encode(Sha256::digest(&layer_bytes)));
+
+        let manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest_wrong}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{layer_digest}","size":{}}}]}}"#,
+            config_bytes.len(),
+            layer_bytes.len()
+        );
+        let manifest_bytes = manifest_json.as_bytes();
+        let manifest_digest = format!("sha256:{}", hex::encode(Sha256::digest(manifest_bytes)));
+        let manifest_hex = manifest_digest.strip_prefix("sha256:").unwrap();
+
+        let index = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest_digest}","size":{},"platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#,
+            manifest_bytes.len()
+        );
+
+        let manifest_blob_path = format!("blobs/sha256/{manifest_hex}");
+        let config_blob_path = format!("blobs/sha256/{wrong_hex}");
+        let archive = build_raw_tar(
+            tmp.path(),
+            "config_digest_mismatch.tar",
+            &[
+                ("index.json", index.as_bytes()),
+                (&manifest_blob_path, manifest_bytes),
+                (&config_blob_path, &config_bytes),
+            ],
+        );
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(result.is_err(), "must error on config blob digest mismatch");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("digest mismatch") || msg.contains("sha256"),
+            "error should indicate digest mismatch; got: {msg}"
+        );
+    }
+
+    /// Lines 66-71: unsupported layer media type.
+    #[test]
+    fn ingest_errors_on_unsupported_layer_media_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+
+        let config_bytes = make_config_json();
+        let config_digest = format!("sha256:{}", hex::encode(Sha256::digest(&config_bytes)));
+
+        let layer_bytes = b"fake layer data";
+        let layer_digest = format!("sha256:{}", hex::encode(Sha256::digest(layer_bytes)));
+
+        // Use a mediaType that is not tar+gzip or tar.
+        let manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+zstd","digest":"{layer_digest}","size":{}}}]}}"#,
+            config_bytes.len(),
+            layer_bytes.len()
+        );
+        let manifest_bytes = manifest_json.as_bytes();
+        let manifest_digest = format!("sha256:{}", hex::encode(Sha256::digest(manifest_bytes)));
+        let manifest_hex = manifest_digest.strip_prefix("sha256:").unwrap();
+        let config_hex = config_digest.strip_prefix("sha256:").unwrap();
+
+        let index = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest_digest}","size":{},"platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#,
+            manifest_bytes.len()
+        );
+
+        let archive = build_raw_tar(
+            tmp.path(),
+            "unsupported_media.tar",
+            &[
+                ("index.json", index.as_bytes()),
+                (&format!("blobs/sha256/{manifest_hex}"), manifest_bytes),
+                (&format!("blobs/sha256/{config_hex}"), &config_bytes),
+            ],
+        );
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(
+            result.is_err(),
+            "must error on unsupported layer media type"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("unsupported") || msg.contains("media type") || msg.contains("zstd"),
+            "error should mention unsupported media type; got: {msg}"
+        );
+    }
+
+    /// Lines 221-222: layer blob referenced but absent from blobs/.
+    #[test]
+    fn ingest_errors_when_layer_blob_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+
+        let config_bytes = make_config_json();
+        let config_digest = format!("sha256:{}", hex::encode(Sha256::digest(&config_bytes)));
+        let config_hex = config_digest.strip_prefix("sha256:").unwrap();
+
+        // Point to a layer blob we will NOT include.
+        let layer_digest =
+            "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{layer_digest}","size":99}}]}}"#,
+            config_bytes.len()
+        );
+        let manifest_bytes = manifest_json.as_bytes();
+        let manifest_digest = format!("sha256:{}", hex::encode(Sha256::digest(manifest_bytes)));
+        let manifest_hex = manifest_digest.strip_prefix("sha256:").unwrap();
+
+        let index = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest_digest}","size":{},"platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#,
+            manifest_bytes.len()
+        );
+
+        let archive = build_raw_tar(
+            tmp.path(),
+            "missing_layer_blob.tar",
+            &[
+                ("index.json", index.as_bytes()),
+                (&format!("blobs/sha256/{manifest_hex}"), manifest_bytes),
+                (&format!("blobs/sha256/{config_hex}"), &config_bytes),
+            ],
+        );
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(result.is_err(), "must error when layer blob is missing");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("blob") || msg.contains("not found"),
+            "error should mention missing blob; got: {msg}"
+        );
+    }
+
+    /// Lines 268-269: matches_blob_path handles dot-slash prefix correctly.
+    #[test]
+    fn matches_blob_path_handles_dot_slash_prefix() {
+        assert!(matches_blob_path("./index.json", "index.json"));
+        assert!(matches_blob_path("index.json", "index.json"));
+        assert!(matches_blob_path("./blobs/sha256/abc", "blobs/sha256/abc"));
+        assert!(!matches_blob_path("blobs/sha256/abc", "blobs/sha256/xyz"));
+    }
+
+    /// Lines 164-166 (blob_path_from_digest): non-sha256 digest algorithm.
+    #[test]
+    fn ingest_errors_on_unsupported_digest_algorithm() {
+        // The only way to trigger blob_path_from_digest with a bad algorithm
+        // is via verify_sha256 or read_verified_blob called with a non-sha256 digest.
+        // We test the internal helper directly since it is private-but-pub-in-tests.
+        let result = blob_path_from_digest("sha512:abcd");
+        assert!(result.is_err(), "should error on non-sha256 digest");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("sha256") || msg.contains("unsupported"),
+            "error should mention sha256; got: {msg}"
+        );
+    }
+
+    /// Line 148-151 (read_manifest): manifest entry missing 'digest' field.
+    #[test]
+    fn ingest_errors_when_manifest_entry_missing_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        // An image manifest entry with no 'digest' key.
+        let index = br#"{
+          "schemaVersion": 2,
+          "manifests": [
+            {"mediaType":"application/vnd.oci.image.manifest.v1+json","size":4,"platform":{"os":"linux","architecture":"amd64"}}
+          ]
+        }"#;
+        let archive = build_raw_tar(
+            tmp.path(),
+            "manifest_no_digest.tar",
+            &[("index.json", index)],
+        );
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(
+            result.is_err(),
+            "must error when manifest entry lacks digest"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("digest") || msg.contains("manifest"),
+            "error should mention missing digest; got: {msg}"
+        );
+    }
+
+    /// Lines 35-48: manifest missing 'config' or 'layers' fields.
+    #[test]
+    fn ingest_errors_on_manifest_missing_config_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+
+        // Build an archive with a manifest that has no 'config' field.
+        let manifest_json = br#"{"schemaVersion":2,"layers":[]}"#;
+        let manifest_digest = format!("sha256:{}", hex::encode(Sha256::digest(manifest_json)));
+        let manifest_hex = manifest_digest.strip_prefix("sha256:").unwrap();
+
+        let index = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest_digest}","size":{},"platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#,
+            manifest_json.len()
+        );
+
+        let archive = build_raw_tar(
+            tmp.path(),
+            "manifest_no_config.tar",
+            &[
+                ("index.json", index.as_bytes()),
+                (&format!("blobs/sha256/{manifest_hex}"), manifest_json),
+            ],
+        );
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(result.is_err(), "must error when manifest lacks 'config'");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("config") || msg.contains("manifest"),
+            "error should mention config field; got: {msg}"
+        );
+    }
+
+    /// Single-manifest path with an explicit linux/amd64 platform: verify the
+    /// multi-manifest amd64-selection success path (lines 117-134) is exercised.
+    #[test]
+    fn ingest_selects_amd64_from_multi_manifest_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+
+        // Build a real manifest+blobs, then wrap in a multi-manifest index where
+        // only the amd64 entry points to real content; the arm64 entry is a stub
+        // with a fake digest (we never try to read it since amd64 wins).
+        let layer_bytes = make_gzip_layer("/f", b"data");
+        let layer_digest = format!("sha256:{}", hex::encode(Sha256::digest(&layer_bytes)));
+        let layer_hex = layer_digest.strip_prefix("sha256:").unwrap();
+
+        let config_bytes = make_config_json();
+        let config_digest = format!("sha256:{}", hex::encode(Sha256::digest(&config_bytes)));
+        let config_hex = config_digest.strip_prefix("sha256:").unwrap();
+
+        let manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{layer_digest}","size":{}}}]}}"#,
+            config_bytes.len(),
+            layer_bytes.len()
+        );
+        let manifest_bytes = manifest_json.as_bytes();
+        let manifest_digest = format!("sha256:{}", hex::encode(Sha256::digest(manifest_bytes)));
+        let manifest_hex = manifest_digest.strip_prefix("sha256:").unwrap();
+
+        // The arm64 stub — digest is fake; it must never be fetched.
+        let arm64_digest =
+            "sha256:a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
+
+        let index = format!(
+            r#"{{
+  "schemaVersion": 2,
+  "manifests": [
+    {{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest_digest}","size":{},"platform":{{"os":"linux","architecture":"amd64"}}}},
+    {{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{arm64_digest}","size":4,"platform":{{"os":"linux","architecture":"arm64"}}}}
+  ]
+}}"#,
+            manifest_bytes.len()
+        );
+
+        let archive = build_raw_tar(
+            tmp.path(),
+            "multi_amd64_select.tar",
+            &[
+                ("index.json", index.as_bytes()),
+                (&format!("blobs/sha256/{manifest_hex}"), manifest_bytes),
+                (&format!("blobs/sha256/{config_hex}"), &config_bytes),
+                (&format!("blobs/sha256/{layer_hex}"), &layer_bytes),
+            ],
+        );
+
+        // This test exercises the amd64-selection branch but reaches
+        // publish_image which needs mkfs.erofs. Skip if unavailable.
+        if which::which("mkfs.erofs").is_err() {
+            eprintln!("SKIP: mkfs.erofs not installed");
+            return;
+        }
+        let result = ingest_oci_archive(&paths, &archive);
+        assert!(
+            result.is_ok(),
+            "multi-manifest amd64 selection should succeed; err={result:?}"
+        );
+    }
 }
