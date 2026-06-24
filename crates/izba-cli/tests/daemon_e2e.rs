@@ -435,6 +435,12 @@ fn ssh_access_e2e() {
 /// __ssh-proxy` ProxyCommand, executing the commands in `batch` (`sftp -b`).
 /// Mirrors `izba ssh`'s inline `-o` connection knobs (see
 /// `commands::ssh::build_ssh_args`) so it works without a managed ~/.ssh/config.
+///
+/// CRITICAL: `IZBA_DATA_DIR` must be set on the `sftp` process so the
+/// `izba __ssh-proxy` child it spawns (via ProxyCommand) inherits it and talks
+/// to *this test's* daemon/sandbox — without it the proxy falls back to the
+/// default data dir, finds no such sandbox, and fails with "sandbox … is not
+/// running". `izba ssh` works because the `izba()` helper sets it on the parent.
 fn sftp(data: &Path, name: &str, batch: &Path) -> Output {
     let exe = env!("CARGO_BIN_EXE_izba");
     let ssh_dir = data.join("ssh");
@@ -458,6 +464,7 @@ fn sftp(data: &Path, name: &str, batch: &Path) -> Output {
         format!("izba-{name}"),
     ];
     std::process::Command::new("sftp")
+        .env("IZBA_DATA_DIR", data)
         .args(&args)
         .output()
         .expect("run sftp client")
