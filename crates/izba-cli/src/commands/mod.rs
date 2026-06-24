@@ -146,6 +146,8 @@ pub(crate) fn persist_policy_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izba_core::daemon::egress::config::EgressPolicyConfig;
+    use izba_core::paths::Paths;
 
     fn opts() -> SandboxOpts {
         SandboxOpts {
@@ -158,6 +160,49 @@ mod tests {
             policy: None,
             volumes: vec![],
         }
+    }
+
+    /// Verify persist_policy_config writes a policy.yaml that round-trips.
+    #[test]
+    fn persist_policy_config_writes_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let name = "mybuild";
+
+        // The sandbox dir must exist before persist_policy_config can write into it.
+        let sandbox_dir = paths.sandbox_dir(name);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+
+        let config = EgressPolicyConfig::build_network(&[]);
+        persist_policy_config(&paths, name, &config).unwrap();
+
+        // File must exist at the canonical policy path.
+        let policy_path = EgressPolicyConfig::path_in(&sandbox_dir);
+        assert!(
+            policy_path.exists(),
+            "policy.yaml should be written at {policy_path:?}"
+        );
+
+        // Must round-trip: load back and compare.
+        let raw = std::fs::read_to_string(&policy_path).unwrap();
+        let loaded = EgressPolicyConfig::from_yaml(&raw).unwrap();
+        assert_eq!(loaded.enforce, config.enforce, "enforce must round-trip");
+        assert_eq!(
+            loaded.allow.len(),
+            config.allow.len(),
+            "allow list length must round-trip"
+        );
+
+        // Must contain the Docker Hub hosts.
+        let hosts: Vec<&str> = loaded.allow.iter().map(|e| e.host()).collect();
+        assert!(
+            hosts.contains(&"registry-1.docker.io"),
+            "registry-1.docker.io must be in allow list"
+        );
+        assert!(
+            hosts.contains(&"auth.docker.io"),
+            "auth.docker.io must be in allow list"
+        );
     }
 
     #[test]
