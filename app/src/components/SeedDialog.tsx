@@ -4,6 +4,16 @@ import { api } from "../lib/ipc";
 import { git_repo_from_row, git_op_from_path, git_access_for } from "../lib/git";
 import { allowKeys } from "../lib/policy";
 import { AccessPicker } from "./AccessPicker";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 
 interface Props {
   name: string;
@@ -161,24 +171,27 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
   }
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/30" role="dialog" aria-modal="true">
-      <div className="w-[36rem] max-w-[95vw] rounded-xl bg-surface p-5 shadow-xl">
-        <h2 className="mb-1 text-lg font-semibold">Review observed traffic</h2>
-        <p className="mb-3 text-sm text-ink-2">
-          Select endpoints to add to your allow-list. Already-covered entries are excluded.
-        </p>
+    <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Review observed traffic</DialogTitle>
+          <DialogDescription>
+            Select endpoints to add to your allow-list. Already-covered entries are excluded.
+          </DialogDescription>
+        </DialogHeader>
 
         {candidates.length === 0 ? (
-          <p className="text-sm text-ink-3">No new endpoints to add — policy already covers all observed traffic.</p>
+          <p className="text-sm text-muted-foreground-2">No new endpoints to add — policy already covers all observed traffic.</p>
         ) : (
-          <div className="mb-3 flex flex-col gap-1.5 max-h-64 overflow-y-auto">
+          <div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto">
             {candidates.map((c) => (
               <label
                 key={c.key}
-                className={`flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-sm ${
-                  c.disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer hover:bg-hover"
+                className={`flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm ${
+                  c.disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer hover:bg-muted"
                 }`}
               >
+                {/* eslint-disable-next-line izba/no-raw-control -- no Checkbox primitive available */}
                 <input
                   type="checkbox"
                   checked={!c.disabled && (checked.get(c.key) ?? false)}
@@ -187,7 +200,7 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
                   className="shrink-0"
                 />
                 <span className="flex-1 font-mono">{c.label}</span>
-                <span className="text-xs text-ink-3">{c.countLabel}</span>
+                <span className="text-xs text-muted-foreground-2">{c.countLabel}</span>
                 {!c.disabled && (
                   <AccessPicker
                     value={access.get(c.key) ?? c.defaultAccess}
@@ -195,35 +208,33 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
                   />
                 )}
                 {c.disabled && (
-                  <span className="text-xs text-warn">raw IP — not selectable</span>
+                  <span className="text-xs text-destructive">raw IP — not selectable</span>
                 )}
               </label>
             ))}
           </div>
         )}
 
-        {/* Enforce-after checkbox — prominent when firewall is off */}
+        {/* Enforce-after switch — prominent when firewall is off */}
         {!enforcing ? (
-          <div className="mb-4 rounded-lg border border-amber-400 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          <div className="rounded-lg border border-amber-400 bg-amber-50 px-3 py-2 text-sm text-amber-900">
             <p className="mb-1 font-semibold">⚠ firewall is currently OFF</p>
             <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
+              <Switch
                 checked={enforceAfter}
-                onChange={(e) => setEnforceAfter(e.target.checked)}
+                onCheckedChange={setEnforceAfter}
                 aria-label="Enforce firewall after adding"
               />
               Enforce firewall after adding
             </label>
           </div>
         ) : (
-          <div className="mb-4">
-            <label className="flex items-center gap-2 text-sm text-ink-3 cursor-not-allowed">
-              <input
-                type="checkbox"
+          <div>
+            <label className="flex items-center gap-2 text-sm text-muted-foreground cursor-not-allowed">
+              <Switch
                 checked={enforceAfter}
                 disabled
-                onChange={(e) => setEnforceAfter(e.target.checked)}
+                onCheckedChange={setEnforceAfter}
                 aria-label="Enforce firewall after adding"
               />
               Enforce firewall after adding
@@ -232,29 +243,24 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
         )}
 
         {applyError && (
-          <div role="alert" className="text-sm text-warn">
+          <div role="alert" className="text-sm text-destructive">
             Failed to apply: {applyError}
           </div>
         )}
 
-        <div className="flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-lg px-3 py-1.5 text-ink-2 hover:bg-hover"
-          >
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>
             Cancel
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="default"
             disabled={submitting || selectedCount === 0}
             onClick={() => void handleAdd()}
-            className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white disabled:opacity-50"
           >
             {selectedCount > 0 ? `Add ${selectedCount} selected to allow-list` : "Add selected to allow-list"}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
