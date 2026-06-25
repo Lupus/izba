@@ -36,11 +36,11 @@ export function LogsView({ name }: { name: string }) {
 
   return (
     <div className="flex h-full flex-col">
-      {error && <div className="mb-2 text-sm text-warn">{error}</div>}
+      {error && <div className="mb-2 text-sm text-destructive">{error}</div>}
       <pre
         ref={preRef}
         data-testid="log-output"
-        className="flex-1 overflow-auto whitespace-pre-wrap rounded-lg bg-hover p-3 font-mono text-xs text-ink"
+        className="flex-1 overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-3 font-mono text-xs text-foreground"
       >
         {text || "No console output yet."}
       </pre>
