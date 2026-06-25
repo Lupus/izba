@@ -179,6 +179,15 @@ violated invariant is a failing test, not a judgment call.
 8. **All untrusted parsers are bounded** (frame size, file count, recursion,
    total bytes). Today: partial (16 MiB frame cap exists but is per-frame, not
    per-peer; no image size caps) (F-12, F-17).
+9. **Authoritative control-plane/state input is never read from a guest-writable
+   path while a sandbox is live.** In-repo config (policy, future `izba.yaml`
+   manifest, vault material) is host-pinned at apply time and re-activation after
+   any change is an explicit host-side act; the guest can never edit what the host
+   then trusts. Today: **holds for the live egress policy** (enforced from the
+   host state-dir copy, never re-read in-guest) but the workspace-resident-source
+   ergonomics invite a re-persist footgun, and the guest-flag-only RO on the
+   trust/ssh/oci shares lets a hostile kernel write back into host state
+   (F-30, F-31).
 
 ## 8. Out of scope / accepted risks (record explicitly)
 
