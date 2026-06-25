@@ -13,6 +13,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Switch } from "@/components/ui/switch";
 
 interface Props {
@@ -191,13 +192,11 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
                   c.disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer hover:bg-muted"
                 }`}
               >
-                {/* eslint-disable-next-line izba/no-raw-control -- no Checkbox primitive available */}
-                <input
-                  type="checkbox"
+                <Checkbox
                   checked={!c.disabled && (checked.get(c.key) ?? false)}
                   disabled={c.disabled}
-                  onChange={() => toggleChecked(c.key)}
-                  className="shrink-0"
+                  onCheckedChange={() => toggleChecked(c.key)}
+                  aria-label={c.label}
                 />
                 <span className="flex-1 font-mono">{c.label}</span>
                 <span className="text-xs text-muted-foreground-2">{c.countLabel}</span>
