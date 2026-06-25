@@ -29,6 +29,10 @@ import {
 } from "@/components/ui/dialog";
 import { AddRowButton, RemoveRowButton } from "@/components/ui/row-editor";
 
+// NewSandbox has no seeded volumes, so the seeded-names set is always empty —
+// hoisted to a module constant to avoid re-allocating an empty Set per render.
+const NO_SEEDED: ReadonlySet<string> = new Set();
+
 interface Props {
   onClose: () => void;
   onCreated: (name: string) => void;
@@ -92,10 +96,9 @@ export function NewSandbox({ onClose, onCreated }: Props) {
     setVolumeRowsState((rows) => rows.map((r, j) => (j === i ? row : r)));
 
   // Free volumes for each row: exclude referenced + names used in other rows as
-  // existing_persistent. NewSandbox has no seeded volumes, so seededNames is empty.
-  const noSeeded = new Set<string>();
+  // existing_persistent. NewSandbox has no seeded volumes (NO_SEEDED, module const).
   function freeVolumesFor(rowIdx: number): VolumeInfo[] {
-    return computeFreeVolumes(allVolumes, noSeeded, usedExistingNames(volumeRows, rowIdx));
+    return computeFreeVolumes(allVolumes, NO_SEEDED, usedExistingNames(volumeRows, rowIdx));
   }
 
   async function submit() {
