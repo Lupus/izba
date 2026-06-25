@@ -1,3 +1,6 @@
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter, DialogClose } from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+
 interface Props {
   title: string;
   message: string;
@@ -9,34 +12,21 @@ interface Props {
 
 export function ConfirmDialog({ title, message, confirmLabel, danger, onConfirm, onCancel }: Props) {
   return (
-    <div
-      className="fixed inset-0 z-50 grid place-items-center bg-black/30"
-      role="dialog"
-      aria-modal="true"
-      aria-label={title}
-    >
-      <div className="w-[26rem] max-w-[90vw] rounded-xl bg-surface p-5 shadow-xl">
-        <h2 className="text-lg font-semibold">{title}</h2>
-        <p className="mt-2 text-ink-2 text-sm">{message}</p>
-        <div className="mt-5 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="rounded-lg px-3 py-1.5 text-ink-2 hover:bg-hover"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={onConfirm}
-            className={`rounded-lg px-3 py-1.5 font-semibold text-white shadow-sm ${
-              danger ? "bg-warn" : "bg-accent"
-            }`}
-          >
+    <Dialog open onOpenChange={(o) => { if (!o) onCancel(); }}>
+      <DialogContent aria-label={title}>
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{message}</DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button variant="ghost">Cancel</Button>
+          </DialogClose>
+          <Button variant={danger ? "destructive" : "default"} onClick={onConfirm}>
             {confirmLabel}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
