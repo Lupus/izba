@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState } from "react";
+import { X } from "lucide-react";
 import type { Access, AllowEntry, GitRule } from "../lib/types";
 import { api } from "../lib/ipc";
 import { WEB_DEFAULT_PORTS } from "../lib/ports";
 import { AccessPicker } from "./AccessPicker";
 import { Section } from "./Section";
 import { EnforceToggle } from "./EnforceToggle";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { RowCard, RowList, AddRowButton, RemoveRowButton } from "@/components/ui/row-editor";
 
 interface Row {
   host: string;
@@ -75,22 +80,21 @@ function PortEditor({
     <div className="flex flex-1 flex-col gap-1">
       <div className="flex flex-wrap items-center gap-1">
         {ports.map((p) => (
-          <span
-            key={p}
-            className="inline-flex items-center gap-1 rounded bg-hover px-2 py-0.5 text-xs font-mono"
-          >
+          <Badge key={p} variant="secondary" className="gap-1">
             {p}
-            <button
+            <Button
               type="button"
+              variant="ghost"
+              size="icon"
               aria-label={`Remove port ${p}`}
               onClick={() => onRemove(p)}
-              className="text-ink-3 hover:text-warn"
+              className="h-3.5 w-3.5 p-0 text-muted-foreground-2 hover:text-destructive"
             >
-              ✕
-            </button>
-          </span>
+              <X className="h-3 w-3" />
+            </Button>
+          </Badge>
         ))}
-        <input
+        <Input
           value={draft}
           onChange={(e) => {
             setDraft(e.target.value);
@@ -105,17 +109,18 @@ function PortEditor({
           placeholder="add port"
           aria-label="add port"
           inputMode="numeric"
-          className="w-20 rounded border border-line px-2 py-1 text-xs"
+          className="w-20 py-1 text-xs"
         />
-        <button
+        <Button
           type="button"
+          variant="secondary"
+          size="sm"
           onClick={commit}
-          className="rounded border border-line px-2 py-1 text-xs text-ink-2 hover:bg-hover"
         >
           Add
-        </button>
+        </Button>
       </div>
-      {err && <span className="text-xs text-warn">{err}</span>}
+      {err && <span className="text-xs text-destructive">{err}</span>}
     </div>
   );
 }
@@ -245,126 +250,102 @@ export function PolicyEditor({ name }: { name: string }) {
       <div className="flex shrink-0 items-center gap-3 pb-3">
         <EnforceToggle enforcing={enforcing} onToggle={() => void toggleEnforce()} />
       </div>
-      {error && <div className="shrink-0 pb-3 text-sm text-warn">{error}</div>}
+      {error && <div className="shrink-0 pb-3 text-sm text-destructive">{error}</div>}
 
       {/* Scrollable sections area — flexes to fill available height */}
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="flex flex-col gap-3 pb-3">
           <Section title="Hosts">
-            <p className="mb-2 text-sm text-ink-2">
+            <p className="mb-2 text-sm text-muted-foreground">
               Hosts this sandbox may reach. Add a port to a host, or remove one with its ✕.
             </p>
-            <div className="flex flex-col gap-2">
+            <RowList>
               {hosts.map((r, i) => (
-                <div key={i} className="flex flex-col gap-2 rounded-lg border border-line p-3">
-                  <div className="flex items-center gap-2">
-                    <label className="w-12 shrink-0 text-xs font-semibold text-ink-2">Host</label>
-                    <input
+                <RowCard key={i} className="flex-col items-start p-3">
+                  <div className="flex w-full items-center gap-2">
+                    <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Host</label>
+                    <Input
                       value={r.host}
                       onChange={(e) => setHost(i, e.target.value)}
                       placeholder="api.example.com"
-                      className="flex-1 rounded border border-line px-2 py-1 text-sm font-mono"
+                      className="flex-1 font-mono text-sm"
                     />
-                    <button
-                      type="button"
+                    <RemoveRowButton
                       aria-label={`Remove host ${r.host}`}
                       onClick={() => removeRow(i)}
-                      className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
-                    >
-                      Remove
-                    </button>
+                    />
                   </div>
-                  <div className="flex items-center gap-2">
-                    <label className="w-12 shrink-0 text-xs font-semibold text-ink-2">Ports</label>
+                  <div className="flex w-full items-center gap-2">
+                    <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Ports</label>
                     <PortEditor
                       ports={r.ports}
                       onAdd={(p) => addPort(i, p)}
                       onRemove={(p) => removePort(i, p)}
                     />
                   </div>
-                  <div className="flex items-center gap-2">
-                    <label className="w-12 shrink-0 text-xs font-semibold text-ink-2">Access</label>
+                  <div className="flex w-full items-center gap-2">
+                    <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Access</label>
                     <AccessPicker
                       value={r.access}
                       onChange={(v) => setHostAccess(i, v)}
                     />
                   </div>
-                </div>
+                </RowCard>
               ))}
               {hosts.length === 0 && (
-                <div className="text-sm text-ink-3">No hosts allowed yet — add one below.</div>
+                <div className="text-sm text-muted-foreground-2">No hosts allowed yet — add one below.</div>
               )}
-            </div>
+            </RowList>
             <div className="mt-2 flex items-center gap-2">
-              <button
-                type="button"
-                onClick={addRow}
-                className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover"
-              >
-                Add host
-              </button>
+              <AddRowButton onClick={addRow}>Add host</AddRowButton>
             </div>
           </Section>
 
           <Section title="Git repos">
-            <p className="mb-2 text-sm text-ink-2">
+            <p className="mb-2 text-sm text-muted-foreground">
               Git repositories this sandbox may clone or push to. Specify as{" "}
               <span className="font-mono">host/owner/repo</span> or <span className="font-mono">host</span>.
             </p>
-            <div className="flex flex-col gap-2">
+            <RowList>
               {gitRows.map((gr, i) => (
-                <div
-                  key={i}
-                  className="flex items-center gap-2 rounded-lg border border-line p-2"
-                >
-                  <input
+                <RowCard key={i}>
+                  <Input
                     value={gr.target}
                     onChange={(e) => setGitTarget(i, e.target.value)}
                     placeholder="github.com/owner/repo"
-                    className="flex-1 rounded border border-line px-2 py-1 text-sm font-mono"
+                    className="flex-1 font-mono text-sm"
                   />
                   <AccessPicker
                     value={gr.access}
                     onChange={(v) => setGitAccess(i, v)}
                   />
-                  <button
-                    type="button"
+                  <RemoveRowButton
                     aria-label={`Remove git row ${i}`}
                     onClick={() => removeGitRow(i)}
-                    className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
-                  >
-                    Remove
-                  </button>
-                </div>
+                  />
+                </RowCard>
               ))}
               {gitRows.length === 0 && (
-                <div className="text-sm text-ink-3">No git repos allowed yet — add one below.</div>
+                <div className="text-sm text-muted-foreground-2">No git repos allowed yet — add one below.</div>
               )}
-            </div>
+            </RowList>
             <div className="mt-2 flex items-center gap-2">
-              <button
-                type="button"
-                onClick={addGitRow}
-                className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover"
-              >
-                Add repo
-              </button>
+              <AddRowButton onClick={addGitRow}>Add repo</AddRowButton>
             </div>
           </Section>
         </div>
       </div>
 
       {/* Save footer — always visible, never scrolls away */}
-      <div className="flex shrink-0 items-center gap-2 border-t border-line pt-3">
-        <button
+      <div className="flex shrink-0 items-center gap-2 border-t border-border pt-3">
+        <Button
           type="button"
           onClick={() => void save()}
-          className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white"
         >
           Save
-        </button>
-        {dirty && <span className="self-center text-sm text-ink-2">● unsaved changes</span>}
-        {saved && !dirty && <span className="self-center text-sm text-ink-2">saved · reloaded</span>}
+        </Button>
+        {dirty && <span className="self-center text-sm text-muted-foreground">● unsaved changes</span>}
+        {saved && !dirty && <span className="self-center text-sm text-muted-foreground">saved · reloaded</span>}
       </div>
     </div>
   );
