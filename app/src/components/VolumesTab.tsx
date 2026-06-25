@@ -15,6 +15,9 @@ import {
   volPickError,
 } from "../lib/volumevalidate";
 import { VolumeRowEditor } from "./VolumeRowEditor";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { AddRowButton } from "@/components/ui/row-editor";
 
 interface Props {
   sandbox: SandboxView;
@@ -170,41 +173,43 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
 
   return (
     <div className="flex flex-col gap-4">
-      {error && <div className="text-sm text-warn">{error}</div>}
+      {error && <div className="text-sm text-destructive">{error}</div>}
 
       {/* Dirty banner */}
       {dirty && (
-        <div className="flex items-center gap-3 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 text-sm">
+        <div className="flex items-center gap-3 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
           <span className="flex-1">
             Unsaved changes.{" "}
-            <span className="text-ink-3">
+            <span className="text-muted-foreground-2">
               Changes are saved to the sandbox config and applied on next restart.
             </span>
           </span>
-          <button
+          <Button
             type="button"
+            variant="default"
+            size="sm"
             disabled={saving || volumesInvalid}
             onClick={() => void save()}
-            className="rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-50"
           >
             Save changes
-          </button>
+          </Button>
           {running && (
-            <button
+            <Button
               type="button"
+              variant="secondary"
+              size="sm"
               disabled={saving || volumesInvalid}
               onClick={() => void restartNow()}
-              className="rounded-lg border border-line px-3 py-1.5 text-sm hover:bg-hover disabled:opacity-50"
             >
               Save &amp; restart now
-            </button>
+            </Button>
           )}
         </div>
       )}
 
       {/* Seeded rows (from inspect) */}
       {seeded.length === 0 && volumeRows.length === 0 && (
-        <div className="text-sm text-ink-3">No volumes attached.</div>
+        <div className="text-sm text-muted-foreground-2">No volumes attached.</div>
       )}
 
       {seeded.map((s, i) => {
@@ -214,16 +219,13 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
             key={`seeded-${i}`}
             className={
               "flex flex-col gap-1 rounded-lg border p-3 " +
-              (s.removed ? "border-warn/30 bg-warn/5 opacity-60" : "border-line")
+              (s.removed ? "border-destructive/30 bg-destructive/5 opacity-60" : "border-border")
             }
           >
             <div className="flex items-center gap-2">
               <span className="flex-1 font-mono text-sm">{s.spec.guest_path}</span>
-              <span
-                className={
-                  "rounded px-1.5 py-0.5 text-xs font-semibold " +
-                  (isPersistent ? "bg-accent/10 text-accent" : "bg-hover text-ink-2")
-                }
+              <Badge
+                variant={isPersistent ? "default" : "secondary"}
                 title={
                   isPersistent
                     ? "Persistent volumes are single-writer — only one sandbox may attach this volume at a time."
@@ -231,32 +233,34 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
                 }
               >
                 {isPersistent ? "persistent" : "ephemeral"}
-              </span>
+              </Badge>
               {isPersistent && s.spec.name && (
-                <span className="font-mono text-xs text-ink-2">{s.spec.name}</span>
+                <span className="font-mono text-xs text-muted-foreground">{s.spec.name}</span>
               )}
-              <span className="text-xs text-ink-3">{fmtBytes(s.spec.size_bytes)}</span>
+              <span className="text-xs text-muted-foreground-2">{fmtBytes(s.spec.size_bytes)}</span>
               {!s.removed ? (
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="sm"
                   aria-label={
                     isPersistent
                       ? `Detach ${s.spec.guest_path}`
                       : `Remove ${s.spec.guest_path}`
                   }
                   onClick={() => removeSeeded(i)}
-                  className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
                 >
                   {isPersistent ? "Detach" : "Remove"}
-                </button>
+                </Button>
               ) : (
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="sm"
                   onClick={() => restoreSeeded(i)}
-                  className="rounded border border-line px-2 py-1 text-xs text-ink-2 hover:bg-hover"
                 >
                   Undo
-                </button>
+                </Button>
               )}
             </div>
           </div>
@@ -287,22 +291,16 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
               onChange={(r) => setVolumeRow(i, r)}
               onRemove={() => removeVolume(i)}
             />
-            {nameErr && <span className="text-xs text-warn">{nameErr}</span>}
-            {pathErr && <span className="text-xs text-warn">{pathErr}</span>}
-            {sizeErr && <span className="text-xs text-warn">{sizeErr}</span>}
-            {pickErr && <span className="text-xs text-warn">{pickErr}</span>}
+            {nameErr && <span className="text-xs text-destructive">{nameErr}</span>}
+            {pathErr && <span className="text-xs text-destructive">{pathErr}</span>}
+            {sizeErr && <span className="text-xs text-destructive">{sizeErr}</span>}
+            {pickErr && <span className="text-xs text-destructive">{pickErr}</span>}
           </div>
         );
       })}
 
       {/* Add volume button */}
-      <button
-        type="button"
-        onClick={addVolume}
-        className="justify-self-start rounded-lg border border-line px-2 py-1 text-xs text-ink-2 hover:bg-hover"
-      >
-        + Add volume
-      </button>
+      <AddRowButton onClick={addVolume}>+ Add volume</AddRowButton>
     </div>
   );
 }
