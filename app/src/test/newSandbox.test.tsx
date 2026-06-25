@@ -312,9 +312,9 @@ describe("NewSandbox", () => {
   it("backdrop click calls onClose", () => {
     const onClose = vi.fn();
     render(<NewSandbox onClose={onClose} onCreated={() => {}} />);
-    // The backdrop is now a native <button> with aria-label "Close dialog"
-    const backdrop = screen.getByRole("button", { name: /close dialog/i });
-    fireEvent.click(backdrop);
+    // The Dialog primitive renders a built-in close button (sr-only "Close")
+    const closeBtn = screen.getByRole("button", { name: /^close$/i });
+    fireEvent.click(closeBtn);
     expect(onClose).toHaveBeenCalled();
   });
 

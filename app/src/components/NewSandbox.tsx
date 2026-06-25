@@ -17,6 +17,17 @@ import {
   volPickError,
 } from "../lib/volumevalidate";
 import { VolumeRowEditor } from "./VolumeRowEditor";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import { AddRowButton, RemoveRowButton } from "@/components/ui/row-editor";
 
 interface Props {
   onClose: () => void;
@@ -58,15 +69,6 @@ export function NewSandbox({ onClose, onCreated }: Props) {
       }
     })();
   }, []);
-
-  // Escape key and backdrop close
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
-  }, [onClose]);
 
   async function pickDir() {
     const picked = await open({ directory: true, multiple: false });
@@ -149,96 +151,102 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const portGrid = "grid grid-cols-[minmax(0,1fr)_5rem_0.75rem_5rem_2rem] items-center gap-1.5";
 
   return (
-    <div
-      className="fixed inset-0 z-50 grid place-items-center bg-black/30"
-      role="dialog"
-      aria-modal="true"
-      aria-label="New sandbox"
+    <Dialog
+      open={true}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
     >
-      {/* Full-screen backdrop button: click outside the panel closes. Native button = keyboard+screenreader accessible. */}
-      <button
-        type="button"
-        aria-label="Close dialog"
-        onClick={onClose}
-        className="absolute inset-0 cursor-default"
-        tabIndex={-1}
-      />
-      <div
-        className="relative w-[32rem] max-w-[92vw] rounded-xl bg-surface p-5 shadow-xl max-h-[90vh] overflow-y-auto"
-      >
-        <h2 className="text-lg font-semibold">New sandbox</h2>
-        <div className="mt-4 grid gap-3 text-sm">
-          <label className="grid gap-1">
-            <span className="text-ink-2">Name</span>
-            <input
+      <DialogContent className="max-w-lg overflow-y-auto max-h-screen sm:max-h-screen">
+        <DialogHeader>
+          <DialogTitle>New sandbox</DialogTitle>
+        </DialogHeader>
+
+        <div className="grid gap-3 text-sm">
+          <div className="grid gap-1">
+            <Label htmlFor="ns-name" className="text-muted-foreground">
+              Name
+            </Label>
+            <Input
+              id="ns-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              className="w-full min-w-0 rounded-lg border border-line px-2 py-1.5"
             />
-          </label>
+          </div>
           <div className="grid gap-1">
-            <span className="text-ink-2">Workspace</span>
+            <Label htmlFor="ns-workspace" className="text-muted-foreground">
+              Workspace
+            </Label>
             <div className="flex gap-2">
-              <input
+              <Input
+                id="ns-workspace"
                 aria-label="Workspace"
                 value={workspace}
                 onChange={(e) => setWorkspace(e.target.value)}
-                className="flex-1 rounded-lg border border-line px-2 py-1.5"
+                className="flex-1"
               />
-              <button
+              <Button
                 type="button"
+                variant="secondary"
                 onClick={() => void pickDir()}
-                className="rounded-lg border border-line px-3 hover:bg-hover"
               >
                 Browse…
-              </button>
+              </Button>
             </div>
           </div>
-          <label className="grid gap-1">
-            <span className="text-ink-2">Image</span>
-            <input
+          <div className="grid gap-1">
+            <Label htmlFor="ns-image" className="text-muted-foreground">
+              Image
+            </Label>
+            <Input
+              id="ns-image"
               value={image}
               onChange={(e) => setImage(e.target.value)}
-              className="w-full min-w-0 rounded-lg border border-line px-2 py-1.5"
             />
-          </label>
+          </div>
           <div className="grid grid-cols-3 gap-3">
-            <label className="grid gap-1">
-              <span className="text-ink-2">vCPUs</span>
-              <input
+            <div className="grid gap-1">
+              <Label htmlFor="ns-cpus" className="text-muted-foreground">
+                vCPUs
+              </Label>
+              <Input
+                id="ns-cpus"
                 type="number"
                 min={1}
                 value={cpus}
                 onChange={(e) => setCpus(+e.target.value)}
-                className="w-full min-w-0 rounded-lg border border-line px-2 py-1.5"
               />
-            </label>
-            <label className="grid gap-1">
-              <span className="text-ink-2">Memory (MiB)</span>
-              <input
+            </div>
+            <div className="grid gap-1">
+              <Label htmlFor="ns-mem" className="text-muted-foreground">
+                Memory (MiB)
+              </Label>
+              <Input
+                id="ns-mem"
                 type="number"
                 min={256}
                 value={memMb}
                 onChange={(e) => setMemMb(+e.target.value)}
-                className="w-full min-w-0 rounded-lg border border-line px-2 py-1.5"
               />
-            </label>
-            <label className="grid gap-1">
-              <span className="text-ink-2">Disk (GiB)</span>
-              <input
+            </div>
+            <div className="grid gap-1">
+              <Label htmlFor="ns-disk" className="text-muted-foreground">
+                Disk (GiB)
+              </Label>
+              <Input
+                id="ns-disk"
                 type="number"
                 min={1}
                 value={rwSizeGb}
                 onChange={(e) => setRwSizeGb(+e.target.value)}
-                className="w-full min-w-0 rounded-lg border border-line px-2 py-1.5"
               />
-            </label>
+            </div>
           </div>
           <div className="grid gap-1">
-            <span className="text-ink-2">Ports</span>
+            <span className="text-muted-foreground">Ports</span>
             <div className="grid gap-1.5">
               {ports.length > 0 && (
-                <div className={portGrid + " text-xs text-ink-3"}>
+                <div className={portGrid + " text-xs text-muted-foreground-2"}>
                   <span>Bind address</span>
                   <span>Host port</span>
                   <span />
@@ -250,18 +258,17 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                 const invalid = !isBlankRow(r) && !isValidRow(r);
                 // Shared cell style; flag the specific field that is wrong.
                 const cell = (bad: boolean) =>
-                  "w-full min-w-0 rounded-lg border px-2 py-1.5 text-xs " +
-                  (bad ? "border-warn" : "border-line");
+                  bad ? "border-destructive" : "";
                 return (
                   <div key={i} className={portGrid}>
-                    <input
+                    <Input
                       aria-label={`Port ${i + 1} bind`}
                       placeholder="127.0.0.1"
                       value={r.bind}
                       onChange={(e) => setPort(i, { bind: e.target.value })}
                       className={cell(invalid && !isValidBind(r.bind))}
                     />
-                    <input
+                    <Input
                       aria-label={`Port ${i + 1} host`}
                       placeholder="host"
                       inputMode="numeric"
@@ -269,8 +276,8 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                       onChange={(e) => setPort(i, { host: e.target.value })}
                       className={cell(invalid && !isValidPort(r.host))}
                     />
-                    <span className="text-center text-ink-3">:</span>
-                    <input
+                    <span className="text-center text-muted-foreground-2">:</span>
+                    <Input
                       aria-label={`Port ${i + 1} guest`}
                       placeholder="guest"
                       inputMode="numeric"
@@ -278,36 +285,26 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                       onChange={(e) => setPort(i, { guest: e.target.value })}
                       className={cell(invalid && !isValidPort(r.guest))}
                     />
-                    <button
-                      type="button"
+                    <RemoveRowButton
                       aria-label={`Remove port ${i + 1}`}
                       onClick={() => removePort(i)}
-                      className="w-full rounded-lg border border-line py-1.5 text-ink-2 hover:bg-hover"
-                    >
-                      ×
-                    </button>
+                    />
                   </div>
                 );
               })}
-              <button
-                type="button"
-                onClick={addPort}
-                className="justify-self-start rounded-lg border border-line px-2 py-1 text-xs text-ink-2 hover:bg-hover"
-              >
-                + Add port
-              </button>
-              <span className="text-xs text-ink-3">
+              <AddRowButton onClick={addPort}>+ Add port</AddRowButton>
+              <span className="text-xs text-muted-foreground-2">
                 Bind address defaults to 127.0.0.1 when left empty.
               </span>
               {portsInvalid && (
-                <span className="text-xs text-warn">
+                <span className="text-xs text-destructive">
                   Each port needs a host and guest in 1–65535, and a valid IPv4 bind (or empty).
                 </span>
               )}
             </div>
           </div>
           <div className="grid gap-1">
-            <span className="text-ink-2">Volumes</span>
+            <span className="text-muted-foreground">Volumes</span>
             <div className="grid gap-1.5">
               {volumeRows.map((row, i) => {
                 const nameErr =
@@ -334,51 +331,40 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                       onChange={(r) => setVolumeRow(i, r)}
                       onRemove={() => removeVolume(i)}
                     />
-                    {nameErr && <span className="text-xs text-warn">{nameErr}</span>}
-                    {pathErr && <span className="text-xs text-warn">{pathErr}</span>}
-                    {sizeErr && <span className="text-xs text-warn">{sizeErr}</span>}
-                    {pickErr && <span className="text-xs text-warn">{pickErr}</span>}
+                    {nameErr && <span className="text-xs text-destructive">{nameErr}</span>}
+                    {pathErr && <span className="text-xs text-destructive">{pathErr}</span>}
+                    {sizeErr && <span className="text-xs text-destructive">{sizeErr}</span>}
+                    {pickErr && <span className="text-xs text-destructive">{pickErr}</span>}
                   </div>
                 );
               })}
-              <button
-                type="button"
-                onClick={addVolume}
-                className="justify-self-start rounded-lg border border-line px-2 py-1 text-xs text-ink-2 hover:bg-hover"
-              >
-                + Add volume
-              </button>
+              <AddRowButton onClick={addVolume}>+ Add volume</AddRowButton>
             </div>
           </div>
         </div>
 
         {progress.length > 0 && (
-          <div className="mt-3 max-h-24 overflow-auto rounded-lg bg-rail p-2 font-mono text-xs text-ink-2">
+          <div className="mt-3 max-h-24 overflow-auto rounded-lg bg-sidebar p-2 font-mono text-xs text-muted-foreground">
             {progress.map((m, i) => (
               <div key={i}>{m}</div>
             ))}
           </div>
         )}
-        {error && <div className="mt-3 text-warn text-sm">{error}</div>}
+        {error && <div className="mt-3 text-sm text-destructive">{error}</div>}
 
-        <div className="mt-5 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-lg px-3 py-1.5 text-ink-2 hover:bg-hover"
-          >
+        <DialogFooter className="gap-2">
+          <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
             disabled={!canCreate}
             onClick={() => void submit()}
-            className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white shadow-sm disabled:opacity-50"
           >
             {busy ? "Creating…" : "Create"}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
