@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import type { VolumeInfo } from "../lib/types";
 import { api } from "../lib/ipc";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent } from "@/components/ui/card";
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -46,9 +49,8 @@ export function StorageView() {
       setConfirm(null);
       await load();
     } else {
-      let result: { removed: string[]; reclaimed_bytes: number } | null = null;
       try {
-        result = await api.volumePrune();
+        const result = await api.volumePrune();
         setPruneResult(result);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -66,80 +68,79 @@ export function StorageView() {
     <div className="flex h-full flex-col gap-4 p-6 overflow-auto">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold">Named Volumes</h2>
-        <button
-          type="button"
+        <Button
+          variant="secondary"
+          size="sm"
           onClick={() => setConfirm({ kind: "prune" })}
-          className="rounded-lg border border-line px-3 py-1.5 text-sm hover:bg-hover"
         >
           Prune unused
-        </button>
+        </Button>
       </div>
 
-      {error && <div className="text-sm text-warn">{error}</div>}
+      {error && <div className="text-sm text-destructive">{error}</div>}
 
       {pruneResult && (
-        <div className="rounded-lg border border-line bg-surface p-3 text-sm">
-          Pruned {pruneResult.removed.length} volume(s) — reclaimed{" "}
-          <strong>{formatBytes(pruneResult.reclaimed_bytes)}</strong>
-        </div>
+        <Card>
+          <CardContent className="p-3 text-sm">
+            Pruned {pruneResult.removed.length} volume(s) — reclaimed{" "}
+            <strong>{formatBytes(pruneResult.reclaimed_bytes)}</strong>
+          </CardContent>
+        </Card>
       )}
 
-      <p className="text-sm text-ink-3">
+      <p className="text-sm text-muted-foreground-2">
         Persistent volumes are created when you attach a new persistent volume from a sandbox&apos;s{" "}
-        <span className="font-medium text-ink-2">Volumes</span> tab.
+        <span className="font-medium text-muted-foreground">Volumes</span> tab.
       </p>
 
       {volumes.length === 0 ? (
-        <div className="text-sm text-ink-3">No named volumes.</div>
+        <div className="text-sm text-muted-foreground-2">No named volumes.</div>
       ) : (
-        <table className="w-full text-sm border-collapse">
-          <thead>
-            <tr className="border-b border-line text-left text-xs uppercase tracking-wide text-ink-3">
-              <th className="pb-2 pr-4 font-semibold">Name</th>
-              <th className="pb-2 pr-4 font-semibold">Size</th>
-              <th className="pb-2 pr-4 font-semibold">In use by</th>
-              <th className="pb-2 font-semibold"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {volumes.map((v) => {
-              const inUse = v.referenced_by.length > 0;
-              return (
-                <tr key={v.name} className="border-b border-line/50 hover:bg-hover/30">
-                  <td className="py-2 pr-4 font-mono">{v.name}</td>
-                  <td className="py-2 pr-4">{formatBytes(v.size_bytes)}</td>
-                  <td className="py-2 pr-4">
-                    <div className="flex flex-wrap gap-1">
-                      {v.referenced_by.map((ref) => (
-                        <span
-                          key={ref}
-                          className="inline-flex items-center rounded bg-hover px-2 py-0.5 text-xs font-mono"
-                        >
-                          {ref}
-                        </span>
-                      ))}
-                    </div>
-                  </td>
-                  <td className="py-2">
-                    <button
-                      type="button"
-                      disabled={inUse}
-                      title={inUse ? `in use by ${v.referenced_by.join(", ")}` : undefined}
-                      onClick={() => setConfirm({ kind: "delete", name: v.name })}
-                      className={`rounded border px-2 py-1 text-xs ${
-                        inUse
-                          ? "border-line text-ink-3 cursor-not-allowed opacity-50"
-                          : "border-warn/40 text-warn hover:bg-warn/5"
-                      }`}
-                    >
-                      Delete
-                    </button>
-                  </td>
+        <Card>
+          <CardContent className="p-0">
+            <table className="w-full text-sm border-collapse">
+              <thead>
+                <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-muted-foreground-2">
+                  <th className="pb-2 pr-4 pt-3 pl-4 font-semibold">Name</th>
+                  <th className="pb-2 pr-4 pt-3 font-semibold">Size</th>
+                  <th className="pb-2 pr-4 pt-3 font-semibold">In use by</th>
+                  <th className="pb-2 pt-3 pr-4 font-semibold"></th>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              </thead>
+              <tbody>
+                {volumes.map((v) => {
+                  const inUse = v.referenced_by.length > 0;
+                  return (
+                    <tr key={v.name} className="border-b border-border/50 hover:bg-muted/30">
+                      <td className="py-2 pr-4 pl-4 font-mono">{v.name}</td>
+                      <td className="py-2 pr-4">{formatBytes(v.size_bytes)}</td>
+                      <td className="py-2 pr-4">
+                        <div className="flex flex-wrap gap-1">
+                          {v.referenced_by.map((ref) => (
+                            <Badge key={ref} variant="secondary" className="font-mono">
+                              {ref}
+                            </Badge>
+                          ))}
+                        </div>
+                      </td>
+                      <td className="py-2 pr-4">
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          disabled={inUse}
+                          title={inUse ? `in use by ${v.referenced_by.join(", ")}` : undefined}
+                          onClick={() => setConfirm({ kind: "delete", name: v.name })}
+                        >
+                          Delete
+                        </Button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </CardContent>
+        </Card>
       )}
 
       {confirm?.kind === "delete" && (
