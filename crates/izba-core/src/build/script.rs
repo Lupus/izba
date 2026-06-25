@@ -13,14 +13,19 @@
 /// - `buildkitd` uses the overlayfs snapshotter rooted at `/var/lib/buildkit`
 ///   (the persistent `izba-buildcache` volume — incremental cache across builds).
 /// - The worker-ready poll bounds boot to ~60s before buildctl runs.
+/// - A DNS-readiness poll then waits for the in-guest izbad resolver to answer:
+///   immediately after boot the resolver can SERVFAIL its first query ("server
+///   misbehaving") before it warms up, and BuildKit issues the base-image
+///   manifest `HEAD` at once without retrying DNS — so prime it first.
 /// - Output is `type=oci,dest=/out/img.tar` for host ingest.
 pub fn build_script(filename: &str) -> String {
     format!(
         "set -e\n\
          buildkitd --oci-worker-snapshotter=overlayfs --root /var/lib/buildkit >/var/log/buildkitd.log 2>&1 &\n\
          for i in $(seq 1 60); do buildctl debug workers >/dev/null 2>&1 && break; sleep 1; done\n\
+         for i in $(seq 1 30); do nslookup registry-1.docker.io 127.0.0.1 >/dev/null 2>&1 && break; sleep 1; done\n\
          set +e\n\
-         buildctl build --frontend dockerfile.v0 --local context=/workspace --local dockerfile=/workspace --opt filename={filename} --output type=oci,dest=/out/img.tar\n\
+         buildctl build --progress=plain --frontend dockerfile.v0 --local context=/workspace --local dockerfile=/workspace --opt filename={filename} --output type=oci,dest=/out/img.tar\n\
          rc=$?\n\
          if [ \"$rc\" -ne 0 ]; then\n\
            echo \"=== izba build diagnostics (buildctl rc=$rc) ===\" >&2\n\
@@ -56,6 +61,19 @@ mod tests {
             s.contains("--local dockerfile=/workspace"),
             "dockerfile share: {s}"
         );
+    }
+
+    #[test]
+    fn build_script_waits_for_dns_readiness_before_buildctl() {
+        // The resolver can SERVFAIL its first post-boot query; gate buildctl on
+        // a successful resolution so BuildKit's eager manifest HEAD doesn't race
+        // the cold-start warm-up. The DNS poll must precede the `buildctl build`.
+        let s = build_script("Dockerfile");
+        let dns = s
+            .find("nslookup registry-1.docker.io 127.0.0.1")
+            .expect("DNS-readiness poll present");
+        let build = s.find("buildctl build").expect("buildctl build present");
+        assert!(dns < build, "DNS poll must run before buildctl build: {s}");
     }
 
     #[test]
