@@ -566,6 +566,37 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     // podman); `/sys/fs/cgroup` stays a separate mount that crun layers on top.
     rebind_sys_mount(&mut spec);
 
+    // Privileged builders: mount `/sys/fs/cgroup` read-WRITE. The OCI default
+    // mounts cgroupfs read-only, but rootful BuildKit's OCI worker runs each
+    // `RUN` step via a nested runc that must create its own cgroup subtree
+    // (`mkdir /sys/fs/cgroup/<id>`) — read-only cgroupfs fails it with
+    // "unable to apply cgroup configuration: ... read-only file system". The
+    // throwaway builder VM is the trust boundary, so a writable cgroupfs is
+    // acceptable. Normal sandboxes keep the read-only default.
+    if params.privileged {
+        if let Some(mounts) = spec.mounts_mut().as_mut() {
+            for m in mounts.iter_mut() {
+                if m.destination().to_string_lossy() == "/sys/fs/cgroup" {
+                    let opts: Vec<String> = m
+                        .options()
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|o| if o == "ro" { "rw".to_string() } else { o })
+                        .collect();
+                    let opts = if opts.iter().any(|o| o == "rw") {
+                        opts
+                    } else {
+                        let mut o = opts;
+                        o.push("rw".to_string());
+                        o
+                    };
+                    m.set_options(Some(opts));
+                }
+            }
+        }
+    }
+
     Ok(spec)
 }
 
@@ -1303,6 +1334,52 @@ mod tests {
         assert!(
             linux.gid_mappings().is_none(),
             "privileged spec must not set gid mappings"
+        );
+    }
+
+    /// Helper: the options of the `/sys/fs/cgroup` mount in a generated spec.
+    fn cgroup_mount_opts(spec: &Spec) -> Vec<String> {
+        spec.mounts()
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|m| m.destination().to_string_lossy() == "/sys/fs/cgroup")
+            .and_then(|m| m.options().clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn spec_privileged_mounts_cgroup_writable() {
+        // Rootful BuildKit's OCI worker runs each `RUN` step via a nested runc,
+        // which must create its own cgroup subtree (`mkdir /sys/fs/cgroup/...`).
+        // The OCI default mounts cgroupfs read-only, so the nested runc fails
+        // with "read-only file system". Privileged builders mount it rw.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut p = base_params(&img);
+        p.privileged = true;
+        let spec = generate_spec(&p).unwrap();
+        let opts = cgroup_mount_opts(&spec);
+        assert!(
+            opts.iter().any(|o| o == "rw"),
+            "privileged builder must mount /sys/fs/cgroup rw; got {opts:?}"
+        );
+        assert!(
+            !opts.iter().any(|o| o == "ro"),
+            "privileged builder cgroup mount must not be read-only; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn spec_non_privileged_keeps_cgroup_readonly() {
+        // Regression guard: normal sandboxes keep the OCI-default read-only
+        // cgroup mount — only the throwaway builder VM gets the writable one.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let p = base_params(&img); // privileged: false
+        let spec = generate_spec(&p).unwrap();
+        let opts = cgroup_mount_opts(&spec);
+        assert!(
+            opts.iter().any(|o| o == "ro"),
+            "non-privileged cgroup mount must stay read-only; got {opts:?}"
         );
     }
 
