@@ -9,6 +9,10 @@ describe("cn", () => {
     expect(cn("px-2", "px-4")).toBe("px-4");
   });
   it("drops falsy values", () => {
-    expect(cn("a", false && "b", undefined, "c")).toBe("a c");
+    // `off` is boolean-typed (not a literal) so the falsy operand isn't a
+    // constant binary expression — keeps the intent (cn drops falsy values)
+    // without tripping no-constant-binary-expression.
+    const off: boolean = false;
+    expect(cn("a", off && "b", undefined, "c")).toBe("a c");
   });
 });
