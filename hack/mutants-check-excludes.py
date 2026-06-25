@@ -106,6 +106,19 @@ EXPECTED = {
             ): 1,
         },
     },
+    # run.rs reconcile_existing `if !ignored.is_empty()`: `delete !` only flips
+    # whether a stderr warning prints (no return/state change) — unobservable by a
+    # unit test. Named exclusion keeps the policy-persist mutants under test.
+    r"run\.rs:\d+:\d+: delete ! in reconcile_existing": {
+        "reason": "reconcile_existing ignored-opts warning guard: `delete !` only "
+        "toggles a stderr warning, no return/state change — not unit-killable.",
+        "matches": {
+            (
+                "crates/izba-cli/src/commands/run.rs",
+                "delete ! in reconcile_existing",
+            ): 1,
+        },
+    },
 }
 
 

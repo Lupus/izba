@@ -150,6 +150,22 @@ mod tests {
         assert!(validate_tag(&long).is_err());
     }
 
+    /// Mutant 57:18 (`> 128` → `>= 128`): the length boundary. Exactly 128 chars
+    /// is the longest VALID tag; 129 chars is the first rejected length.
+    #[test]
+    fn validate_tag_length_boundary_128_ok_129_err() {
+        let at_limit = "a".repeat(128);
+        assert!(
+            validate_tag(&at_limit).is_ok(),
+            "128-char tag must be accepted (boundary)"
+        );
+        let over_limit = "a".repeat(129);
+        assert!(
+            validate_tag(&over_limit).is_err(),
+            "129-char tag must be rejected"
+        );
+    }
+
     #[test]
     fn validate_tag_rejects_uppercase() {
         assert!(validate_tag("MyImg").is_err());
@@ -203,6 +219,21 @@ mod tests {
             Some(DIGEST.to_string())
         );
         assert_eq!(resolve_tag(&paths, "imgtwo").unwrap(), Some(d2.to_string()));
+    }
+
+    /// Mutant 23:19 (`e.kind() == NotFound` → `true`): a read error that is NOT
+    /// NotFound (here, a DIRECTORY at the tags.json path → IsADirectory/other)
+    /// must propagate as Err, never be swallowed into an empty map.
+    #[test]
+    fn load_tags_non_notfound_read_error_propagates() {
+        let (_tmp, paths) = setup();
+        let path = tags_path(&paths);
+        fs::create_dir_all(&path).unwrap(); // tags.json is now a directory.
+        let result = load_tags(&paths);
+        assert!(
+            result.is_err(),
+            "a non-NotFound read error must propagate, not yield an empty map"
+        );
     }
 
     #[test]

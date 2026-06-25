@@ -62,6 +62,12 @@ exclude_re = [
     # `O_DIRECTORY` adds is ENOTDIR; any other Internal errno also fails the
     # plain retry, so it propagates identically with or without the guard.
     "tarfs\\.rs:\\d+:\\d+: replace match guard msg.contains\\(\"ENOTDIR\"\\) with true in classify",
+    # run.rs reconcile_existing `if !ignored.is_empty()`: the `delete !` mutant only
+    # flips whether a stderr "ignored opts" warning prints (no return/state change),
+    # so no unit test can observe it. Named exclusion keeps the function's
+    # policy-persist mutants under test (covered by the reconcile_* tests), unlike a
+    # function-wide `#[mutants::skip]`.
+    "run\\.rs:\\d+:\\d+: delete ! in reconcile_existing",
 ]
 
 # Give the suite headroom: some host tests spawn processes / do timed I/O.

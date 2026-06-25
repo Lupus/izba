@@ -936,6 +936,223 @@ pub(crate) mod tests {
         );
     }
 
+    // ── read_manifest: direct unit tests of the manifest-selection logic ─────
+
+    /// A descriptor that points at a blob present in the archive, with a digest
+    /// that actually matches the blob content. Returns (index_entry_json,
+    /// (blob_path, blob_bytes), digest).
+    fn manifest_descriptor_with_blob(
+        body: &[u8],
+        platform: Option<(&str, &str)>,
+    ) -> (String, (String, Vec<u8>), String) {
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(body)));
+        let hex_only = digest.strip_prefix("sha256:").unwrap().to_string();
+        let blob_path = format!("blobs/sha256/{hex_only}");
+        let platform_json = match platform {
+            Some((os, arch)) => {
+                format!(r#","platform":{{"os":"{os}","architecture":"{arch}"}}"#)
+            }
+            None => String::new(),
+        };
+        let entry = format!(
+            r#"{{"mediaType":"{MEDIA_TYPE_IMAGE_MANIFEST}","digest":"{digest}","size":{}{platform_json}}}"#,
+            body.len()
+        );
+        (entry, (blob_path, body.to_vec()), digest)
+    }
+
+    /// Mutants 113-114, 148-152: a single image manifest entry → read_manifest
+    /// returns that manifest's (digest, bytes). Kills the `1 =>` arm deletion.
+    #[test]
+    fn read_manifest_single_entry_returns_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = br#"{"single":true}"#;
+        let (entry, (blob_path, blob), digest) = manifest_descriptor_with_blob(body, None);
+        let index = format!(r#"{{"schemaVersion":2,"manifests":[{entry}]}}"#);
+        let archive = build_raw_tar(
+            tmp.path(),
+            "single_manifest.tar",
+            &[("index.json", index.as_bytes()), (&blob_path, &blob)],
+        );
+        let (got_digest, got_bytes) = read_manifest(&archive).unwrap();
+        assert_eq!(
+            got_digest, digest,
+            "must return the single manifest's digest"
+        );
+        assert_eq!(got_bytes, body, "must return the single manifest's bytes");
+    }
+
+    /// Mutant 113 (`0 =>` arm): ZERO image manifest entries → Err via the
+    /// dedicated `0 =>` bail. Deleting that arm makes 0 fall through to the `_`
+    /// (multi) branch, which bails with the "none match linux/amd64" wording
+    /// instead — so we assert the SPECIFIC zero-entries message ("contains no"),
+    /// which the fall-through path never produces.
+    #[test]
+    fn read_manifest_zero_entries_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A non-image-manifest entry: filtered out, leaving zero image manifests.
+        let index = br#"{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:aa","size":2}]}"#;
+        let archive = build_raw_tar(tmp.path(), "zero.tar", &[("index.json", index)]);
+        let err = read_manifest(&archive).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("contains no") && msg.contains("manifest entries"),
+            "must be the zero-entries error, not the amd64 fall-through; got: {msg}"
+        );
+        assert!(
+            !msg.contains("linux/amd64"),
+            "the zero-entries path must NOT mention linux/amd64; got: {msg}"
+        );
+    }
+
+    /// Mutants 129 (os==/arch== and the `&&`) + 134: MULTIPLE entries, exactly
+    /// one linux/amd64 → read_manifest selects the linux/amd64 descriptor.
+    /// Distinguished by a unique digest so a wrong-selection mutant is caught.
+    #[test]
+    fn read_manifest_selects_the_one_linux_amd64() {
+        let tmp = tempfile::tempdir().unwrap();
+        // amd64 entry — the one that MUST be picked. Its body is unique.
+        let amd64_body = br#"{"pick":"amd64"}"#;
+        let (amd64_entry, (amd64_path, amd64_blob), amd64_digest) =
+            manifest_descriptor_with_blob(amd64_body, Some(("linux", "amd64")));
+        // A linux/arm64 decoy with the SAME os but different arch (kills arch==).
+        let arm_body = br#"{"pick":"arm64"}"#;
+        let (arm_entry, (arm_path, arm_blob), arm_digest) =
+            manifest_descriptor_with_blob(arm_body, Some(("linux", "arm64")));
+        // A windows/amd64 decoy with the SAME arch but different os (kills os==).
+        let win_body = br#"{"pick":"windows"}"#;
+        let (win_entry, (win_path, win_blob), win_digest) =
+            manifest_descriptor_with_blob(win_body, Some(("windows", "amd64")));
+
+        let index =
+            format!(r#"{{"schemaVersion":2,"manifests":[{arm_entry},{win_entry},{amd64_entry}]}}"#);
+        let archive = build_raw_tar(
+            tmp.path(),
+            "multi_pick_amd64.tar",
+            &[
+                ("index.json", index.as_bytes()),
+                (&amd64_path, &amd64_blob),
+                (&arm_path, &arm_blob),
+                (&win_path, &win_blob),
+            ],
+        );
+        let (got_digest, got_bytes) = read_manifest(&archive).unwrap();
+        assert_eq!(
+            got_digest, amd64_digest,
+            "must select the linux/amd64 descriptor, not arm64 ({arm_digest}) or windows ({win_digest})"
+        );
+        assert_eq!(
+            got_bytes, amd64_body,
+            "must return the amd64 manifest bytes"
+        );
+    }
+
+    /// Mutant 135 (inner `0 =>` arm): MULTIPLE entries with ZERO linux/amd64 →
+    /// Err via the dedicated inner `0 =>` bail ("none match linux/amd64").
+    /// Deleting that arm makes 0 fall through to the inner `_` ("multiple
+    /// linux/amd64") branch — a different message — so we assert the SPECIFIC
+    /// none-match wording and that it does NOT claim "multiple".
+    #[test]
+    fn read_manifest_multiple_no_amd64_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (arm_entry, ..) =
+            manifest_descriptor_with_blob(br#"{"a":1}"#, Some(("linux", "arm64")));
+        let (s390_entry, ..) =
+            manifest_descriptor_with_blob(br#"{"a":2}"#, Some(("linux", "s390x")));
+        let index = format!(r#"{{"schemaVersion":2,"manifests":[{arm_entry},{s390_entry}]}}"#);
+        let archive = build_raw_tar(
+            tmp.path(),
+            "multi_no_amd64_direct.tar",
+            &[("index.json", index.as_bytes())],
+        );
+        let err = read_manifest(&archive).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("none match linux/amd64"),
+            "must be the none-match error, not the multiple-amd64 fall-through; got: {msg}"
+        );
+        assert!(
+            !msg.contains("multiple"),
+            "the zero-amd64 path must NOT claim multiple; got: {msg}"
+        );
+    }
+
+    /// Mutants 140-143: MULTIPLE linux/amd64 entries → Err (ambiguous).
+    #[test]
+    fn read_manifest_multiple_amd64_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (e1, ..) = manifest_descriptor_with_blob(br#"{"a":1}"#, Some(("linux", "amd64")));
+        let (e2, ..) = manifest_descriptor_with_blob(br#"{"a":2}"#, Some(("linux", "amd64")));
+        let index = format!(r#"{{"schemaVersion":2,"manifests":[{e1},{e2}]}}"#);
+        let archive = build_raw_tar(
+            tmp.path(),
+            "multi_amd64_direct.tar",
+            &[("index.json", index.as_bytes())],
+        );
+        let err = read_manifest(&archive).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("multiple") || msg.contains("linux/amd64"),
+            "{msg}"
+        );
+    }
+
+    // ── read_verified_blob_to_tempfile: direct unit tests ────────────────────
+
+    /// Mutants 209/221/229 (success path): a blob LARGER than the 64 KiB read
+    /// buffer, with the CORRECT sha256, streams into a rewound temp file whose
+    /// content matches exactly. The multi-chunk size makes the `n == 0` loop
+    /// break (209) load-bearing — a wrong break would truncate/corrupt the hash.
+    #[test]
+    fn read_verified_blob_to_tempfile_ok_multichunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 200 KiB of non-repeating-ish data → spans 4 read iterations.
+        let mut body = Vec::with_capacity(200 * 1024);
+        for i in 0..(200u32 * 1024) {
+            body.push((i % 251) as u8);
+        }
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
+        let hex_only = digest.strip_prefix("sha256:").unwrap();
+        let blob_path = format!("blobs/sha256/{hex_only}");
+        let archive = build_raw_tar(tmp.path(), "blob_ok_multichunk.tar", &[(&blob_path, &body)]);
+        let mut reader = read_verified_blob_to_tempfile(&archive, &digest).unwrap();
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body, "temp file must contain the full verified blob");
+    }
+
+    /// Mutant 229: blob present but its content does NOT match the requested
+    /// digest → Err "mismatch".
+    #[test]
+    fn read_verified_blob_to_tempfile_wrong_digest_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"the real blob content";
+        let correct = hex::encode(Sha256::digest(body));
+        // Reference a wrong digest (flip first nibble) but store the body at the
+        // wrong digest's blob path so the blob IS found and only the hash fails.
+        let wrong_hex = format!("ff{}", &correct[2..]);
+        let wrong_digest = format!("sha256:{wrong_hex}");
+        let blob_path = format!("blobs/sha256/{wrong_hex}");
+        let archive = build_raw_tar(tmp.path(), "blob_wrong_digest.tar", &[(&blob_path, body)]);
+        let err = read_verified_blob_to_tempfile(&archive, &wrong_digest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mismatch") || msg.contains("sha256"), "{msg}");
+    }
+
+    /// Mutant 221: blob NOT present in the archive → Err "not found" (the
+    /// `if !found` guard). Kills the `!` deletion (which would proceed to hash
+    /// an empty temp file and wrongly succeed/fail differently).
+    #[test]
+    fn read_verified_blob_to_tempfile_missing_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Archive has SOME unrelated file but not the requested blob.
+        let archive = build_raw_tar(tmp.path(), "blob_missing.tar", &[("oci-layout", b"{}")]);
+        let digest = "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let err = read_verified_blob_to_tempfile(&archive, digest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not found"), "{msg}");
+    }
+
     /// Single-manifest path with an explicit linux/amd64 platform: verify the
     /// multi-manifest amd64-selection success path (lines 117-134) is exercised.
     #[test]
