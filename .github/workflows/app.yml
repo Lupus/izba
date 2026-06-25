@@ -51,6 +51,9 @@ jobs:
       - name: npm ci
         working-directory: app
         run: npm ci
+      - name: frontend lint (consistency gate)
+        working-directory: app
+        run: npm run lint
       - name: frontend build (tsc typecheck + vite)
         working-directory: app
         run: npm run build
