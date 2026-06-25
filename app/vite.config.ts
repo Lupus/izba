@@ -19,7 +19,7 @@ export default defineConfig({
     // Scope vitest to src/ unit+component tests. The Playwright e2e suite under
     // e2e/ (*.spec.ts) imports @playwright/test and must NOT be collected here;
     // Playwright runs it via its own testDir.
-    include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    include: ["src/**/*.{test,spec}.{ts,tsx,js}"],
     coverage: {
       provider: "v8",
       // lcov for SonarCloud ingestion; text for a local at-a-glance summary.
