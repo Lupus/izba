@@ -61,7 +61,7 @@ jobs:
       # project) requires a real Chromium to run the Radix overlay smoke tests.
       - name: install Playwright Chromium (for Vitest Browser Mode)
         working-directory: app
-        run: npx playwright install --with-deps chromium
+        run: npm run e2e:install:chromium:deps
       - name: frontend tests
         working-directory: app
         run: npm run test

@@ -144,8 +144,9 @@ jobs:
           npm ci --ignore-scripts
           # test:coverage runs both Vitest projects (jsdom unit + chromium
           # browser-mode for Radix overlay tests) and merges into one lcov;
-          # --ignore-scripts skips Playwright's browser download, so fetch it.
-          npx playwright install --with-deps chromium
+          # --ignore-scripts skips Playwright's browser download, so fetch it
+          # via the lock-pinned local binary (npm script, not npx).
+          npm run e2e:install:chromium:deps
           npm run test:coverage
       # Guard on the file existing rather than on the same-repo PR condition:
       # if the vitest step above failed (npm/network hiccup) the lcov is absent,

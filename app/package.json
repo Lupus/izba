@@ -14,6 +14,7 @@
     "e2e:ui": "playwright test --ui",
     "e2e:install": "playwright install --with-deps chromium webkit",
     "e2e:install:chromium": "playwright install chromium",
+    "e2e:install:chromium:deps": "playwright install --with-deps chromium",
     "tauri": "tauri",
     "lint": "eslint . --max-warnings 0"
   },
