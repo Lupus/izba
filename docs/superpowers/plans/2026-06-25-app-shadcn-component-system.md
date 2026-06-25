@@ -1437,3 +1437,42 @@ git add -A app && git commit -m "chore(app): final consistency fixups; full App 
 - **Behavior-assertion safety** is encoded in the recipe and called out per risky file (dialogs, EnforceToggle, the two class-assertion tests `policyEditor`/`shellPanel`).
 - **CI-red-until-Phase-3** is flagged at Task 11 so the executor doesn't misdiagnose it.
 - **No arbitrary values** constraint is repeated at the gate.
+
+---
+
+## Addendum (2026-06-25) — Task 29: Vitest 4 + Browser Mode for Radix overlay tests
+
+**Why:** Radix overlay components (Select especially) are unreliable under jsdom — opening the Select dropdown depends on pointer-capture/`scrollIntoView`/`ResizeObserver`/pointer events jsdom lacks, and the canonical shim set is fragile for Select (Radix's `pointer-events:none`-on-`<body>` still breaks `userEvent` option clicks). Research (2026-06-25) found the consensus fix is **Vitest Browser Mode** (stable in Vitest 4.0, Oct 2025), run via the **Playwright provider we already have installed**. Tiered split: jsdom for the bulk; a real-Chromium `*.browser.test.tsx` project for Radix overlay interactions. This task must land **before** redoing Task 15 (the existing-volume Radix `Select`).
+
+**Decision impact:** `select` stays banned by `izba/no-raw-control` (no native-select carve-out). The Task 5 Radix `Select` primitive is kept and used. Task 15 is redone after this task with the Select-interaction assertions in a `*.browser.test.tsx`.
+
+### Task 29: Upgrade Vitest 2→4 and add Browser Mode (Playwright provider)
+
+**Files:**
+- Modify: `app/package.json` (bump `vitest` + `@vitest/coverage-v8` to `^4`; add browser-mode + react-adapter packages), `app/package-lock.json`
+- Modify: `app/vite.config.ts` (or add `app/vitest.config.ts` / `app/vitest.workspace.ts`) — two projects: `unit` (jsdom) + `browser` (chromium headless)
+- Create: a smoke browser test `app/src/test/browser/select-smoke.browser.test.tsx`
+- Modify: `.github/workflows/app.yml` (ensure chromium is installed before the test step that runs browser tests)
+- Keep green: all existing `src/test/**/*.test.{ts,tsx}` under the `unit` project.
+
+**Constraints / acceptance:**
+- `vitest` and `@vitest/coverage-v8` must be the SAME major (`^4`). Verify exact Browser Mode package names by INSPECTING the installed packages (vitest.dev is not reachable in-sandbox; registry.npmjs.org is). As of v4 the provider is a separate package (e.g. `@vitest/browser` + a playwright provider) and React rendering uses `vitest-browser-react`. Use whatever the installed v4 packages actually expose; adapt config to match.
+- **Two projects** (Vitest `projects`/workspace):
+  - `unit`: `environment: "jsdom"`, `setupFiles: ["./src/test/setup.ts"]`, include `src/**/*.test.{ts,tsx}`, **exclude** `src/**/*.browser.test.tsx`. (Existing 27 tests run here, unchanged, on v4.)
+  - `browser`: Vitest Browser Mode, provider `playwright`, `instances: [{ browser: "chromium" }]`, `headless: true`, include `src/**/*.browser.test.tsx`, render via `vitest-browser-react`.
+- `npm run test` runs BOTH projects and emits a MERGED lcov to `coverage/lcov.info` (Sonar ingests this — confirm the file exists and contains entries; coverage from browser tests must merge in). If merging both in one `npm run test` is problematic, it is acceptable to keep `npm run test` = unit and add `npm run test:browser`, BUT then both must run in CI and BOTH coverage outputs must reach Sonar — prefer the single merged run.
+- The smoke browser test must **prove Radix Select works in the browser env**: render the `Select` primitive (`@/components/ui/select`) with 2–3 items, `await userEvent`/`vitest-browser` interaction to OPEN the trigger and CLICK an option, assert the selected value updates. This is the capability gate — if this passes in browser mode, Task 15's select test will work.
+- CI (`.github/workflows/app.yml`, `app-linux` job): chromium must be present before the step that runs browser tests. Add `npx playwright install --with-deps chromium` (or reuse the existing `e2e:install:chromium` script) BEFORE the `frontend tests` step (browser mode runs as part of `npm run test`). Keep `headless: true` (gate on CI). Mirror in the windows job if it runs `npm run test` (it does — ensure chromium installs there too, or scope browser project to run only where chromium is available; prefer installing chromium in both).
+- ESLint: `*.browser.test.tsx` matches the existing `**/*.test.tsx` exemption for `izba/no-raw-control` (ends in `.test.tsx`) — verify it's exempt; `no-arbitrary-value` still applies (fine, tests use no arbitrary classes).
+- No `git add -A`.
+
+**Steps (TDD-style where possible):**
+- [ ] Bump `vitest`+`@vitest/coverage-v8` to `^4`, install browser-mode + `vitest-browser-react` (+ provider). Run existing suite under the new `unit` project: `cd app && npm run test` → all existing tests pass on v4 (fix any v4 breaking-change fallout — e.g. config shape, `workspace`→`projects` rename).
+- [ ] Write the failing smoke browser test `src/test/browser/select-smoke.browser.test.tsx` (Select open+pick). Run the browser project; confirm it FAILS first if the component path is wrong, then PASSES once config is right.
+- [ ] Wire the two-project config + merged coverage; confirm `coverage/lcov.info` is produced with both projects' data.
+- [ ] Add the chromium-install CI step(s) before `frontend tests`.
+- [ ] Commit `test(app): add Vitest 4 Browser Mode (Playwright provider) for Radix overlay tests` staging only the touched files.
+- [ ] Report: vitest/coverage versions; both projects' results; the smoke test (Select open+pick) result in real chromium; confirmation `coverage/lcov.info` merges both; CI step added; any v4 breaking-change fixes.
+
+### Task 15 (REDO, after Task 29)
+Migrate `VolumeRowEditor` fully: volume-type → `SegmentedControl` (jsdom test, `role="radio"`, update `volumesTab` queries `button`→`radio`); existing-volume `<select>` → Radix `Select` primitive. Move the **Select open+pick interaction** assertions (currently in `volumesTab.test.tsx` + `newSandbox.test.tsx` as `fireEvent.change`) into `*.browser.test.tsx` companions, preserving the downstream state/behavior assertions. Zero eslint-disable in `VolumeRowEditor.tsx`. SelectTrigger keeps accessible name "existing volume".
