@@ -19,6 +19,11 @@
 ///   manifest `HEAD` at once without retrying DNS — so prime it first.
 /// - Output is `type=oci,dest=/out/img.tar` for host ingest.
 pub fn build_script(filename: &str) -> String {
+    // `filename` is user-controlled (`izba build -f <path>`) and is interpolated
+    // into a `/bin/sh -c` command, so it MUST be shell-quoted: an unquoted path
+    // with a space (`sub dir/Dockerfile`) would word-split buildctl's args, and a
+    // shell metacharacter could otherwise inject into the builder shell.
+    let filename = sh_single_quote(filename);
     format!(
         "set -e\n\
          buildkitd --oci-worker-snapshotter=overlayfs --root /var/lib/buildkit >/var/log/buildkitd.log 2>&1 &\n\
@@ -37,6 +42,13 @@ pub fn build_script(filename: &str) -> String {
     )
 }
 
+/// POSIX single-quote a string for safe interpolation into a `/bin/sh` command:
+/// wrap in `'…'` and rewrite each embedded `'` as `'\''` (close-quote, an
+/// escaped literal quote, reopen-quote). The result is a single shell word.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,7 +64,10 @@ mod tests {
             s.contains("type=oci,dest=/out/img.tar"),
             "oci output to /out/img.tar: {s}"
         );
-        assert!(s.contains("--opt filename=Dockerfile"), "filename opt: {s}");
+        assert!(
+            s.contains("--opt filename='Dockerfile'"),
+            "filename opt (shell-quoted): {s}"
+        );
         assert!(
             s.contains("--local context=/workspace"),
             "context share: {s}"
@@ -80,13 +95,30 @@ mod tests {
     fn build_script_custom_filename() {
         let s = build_script("Dockerfile.dev");
         assert!(
-            s.contains("--opt filename=Dockerfile.dev"),
+            s.contains("--opt filename='Dockerfile.dev'"),
             "custom filename injected: {s}"
         );
         // The default name must not leak in when a custom one is requested.
         assert!(
-            !s.contains("filename=Dockerfile "),
+            !s.contains("filename='Dockerfile' "),
             "no stray default filename: {s}"
+        );
+    }
+
+    #[test]
+    fn build_script_shell_quotes_filename() {
+        // A path with a space must stay a SINGLE buildctl arg (no word-split),
+        // and an embedded single quote must be escaped, not break out of the
+        // quoting. `izba build -f` passes this through verbatim.
+        let s = build_script("sub dir/Docker'file");
+        assert!(
+            s.contains("--opt filename='sub dir/Docker'\\''file'"),
+            "filename must be POSIX single-quoted with escaped inner quote: {s}"
+        );
+        // The raw, unquoted form must NOT appear (that would word-split).
+        assert!(
+            !s.contains("filename=sub dir"),
+            "unquoted filename must not leak: {s}"
         );
     }
 }
