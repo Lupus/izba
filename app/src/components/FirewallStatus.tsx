@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { PolicyView } from "../lib/types";
 import { api } from "../lib/ipc";
+import { Badge } from "@/components/ui/badge";
 
 /** A compact badge for the Overview tab: is this sandbox bare (all egress
  *  allowed) or enforcing a firewall, and how many allow rules does it have. */
@@ -26,19 +27,17 @@ export function FirewallStatus({ name }: { name: string }) {
 
   if (!policy.enforcing) {
     return (
-      <div className="inline-flex w-fit items-center gap-2 rounded-lg border border-line bg-hover px-3 py-1.5 text-sm text-ink-2">
-        <span>Firewall off · bare sandbox (all egress allowed)</span>
-      </div>
+      <Badge variant="secondary" className="gap-2 rounded-lg px-3 py-1.5 text-sm font-normal">
+        Firewall off · bare sandbox (all egress allowed)
+      </Badge>
     );
   }
 
   const n = policy.allow.length;
   return (
-    <div className="inline-flex w-fit items-center gap-2 rounded-lg border border-ok/30 bg-ok/5 px-3 py-1.5 text-sm text-ok">
+    <Badge variant="success" className="gap-2 rounded-lg px-3 py-1.5 text-sm font-normal">
       <span aria-hidden>🛡</span>
-      <span>
-        Firewall enforcing · {n} allow rule{n === 1 ? "" : "s"}
-      </span>
-    </div>
+      Firewall enforcing · {n} allow rule{n === 1 ? "" : "s"}
+    </Badge>
   );
 }
