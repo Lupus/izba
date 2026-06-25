@@ -1,25 +1,21 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
+import { playwright } from "@vitest/browser-playwright";
 import { fileURLToPath, URL } from "node:url";
+
+const alias = { "@": fileURLToPath(new URL("./src", import.meta.url)) };
 
 export default defineConfig({
   plugins: [react()],
-  resolve: {
-    alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
-  },
+  resolve: { alias },
   // Expose Tauri's build-time env vars (TAURI_ENV_*) to the toolchain.
   envPrefix: ["VITE_", "TAURI_ENV_"],
   clearScreen: false,
   server: { port: 1420, strictPort: true },
   build: { target: "es2021", outDir: "dist" },
   test: {
-    environment: "jsdom",
     globals: true,
-    setupFiles: ["./src/test/setup.ts"],
-    // Scope vitest to src/ unit+component tests. The Playwright e2e suite under
-    // e2e/ (*.spec.ts) imports @playwright/test and must NOT be collected here;
-    // Playwright runs it via its own testDir.
-    include: ["src/**/*.{test,spec}.{ts,tsx,js}"],
+    // Merged coverage across both projects (Sonar reads coverage/lcov.info).
     coverage: {
       provider: "v8",
       // lcov for SonarCloud ingestion; text for a local at-a-glance summary.
@@ -31,10 +27,46 @@ export default defineConfig({
       exclude: [
         "src/**/*.d.ts",
         "src/**/*.test.{ts,tsx}",
+        "src/**/*.browser.test.tsx",
         "src/test/**",
         "src/main.tsx",
         "src/lib/types.ts",
       ],
     },
+    // Two Vitest projects:
+    //   unit   — jsdom, existing *.test.{ts,tsx} suite (excludes *.browser.test.tsx)
+    //   browser — real Chromium via Playwright for Radix overlay interaction tests
+    projects: [
+      {
+        plugins: [react()],
+        resolve: { alias },
+        test: {
+          name: "unit",
+          environment: "jsdom",
+          globals: true,
+          setupFiles: ["./src/test/setup.ts"],
+          // Collect src/**/*.test.{ts,tsx} but NOT *.browser.test.tsx (those
+          // use pointer-capture / ResizeObserver APIs jsdom can't reliably fake).
+          include: ["src/**/*.test.{ts,tsx}"],
+          exclude: ["src/**/*.browser.test.tsx"],
+        },
+      },
+      {
+        plugins: [react()],
+        resolve: { alias },
+        test: {
+          name: "browser",
+          globals: true,
+          // Vitest 4 Browser Mode — Playwright provider, real Chromium.
+          browser: {
+            enabled: true,
+            provider: playwright(),
+            instances: [{ browser: "chromium" }],
+            headless: true,
+          },
+          include: ["src/**/*.browser.test.tsx"],
+        },
+      },
+    ],
   },
 });
