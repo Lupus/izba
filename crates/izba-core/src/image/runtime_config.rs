@@ -577,20 +577,17 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
         if let Some(mounts) = spec.mounts_mut().as_mut() {
             for m in mounts.iter_mut() {
                 if m.destination().to_string_lossy() == "/sys/fs/cgroup" {
-                    let opts: Vec<String> = m
+                    // Drop any `ro`, then guarantee `rw` is present.
+                    let mut opts: Vec<String> = m
                         .options()
                         .clone()
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|o| if o == "ro" { "rw".to_string() } else { o })
+                        .filter(|o| o != "ro")
                         .collect();
-                    let opts = if opts.iter().any(|o| o == "rw") {
-                        opts
-                    } else {
-                        let mut o = opts;
-                        o.push("rw".to_string());
-                        o
-                    };
+                    if !opts.iter().any(|o| o == "rw") {
+                        opts.push("rw".to_string());
+                    }
                     m.set_options(Some(opts));
                 }
             }
