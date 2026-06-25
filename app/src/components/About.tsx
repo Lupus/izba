@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/ipc";
 import type { BuildInfo, VersionView } from "../lib/types";
-import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 /** Short `0.1.0 (9f0d480)` summary for a build. */
 function short(b: BuildInfo): string {
@@ -37,28 +37,11 @@ export function About({ onClose }: { onClose: () => void }) {
   }, []);
 
   return (
-    <div
-      className="fixed inset-0 z-50 grid place-items-center bg-black/30"
-      role="dialog"
-      aria-modal="true"
-      aria-label="About izba"
-      onClick={onClose}
-    >
-      <div
-        className="w-80 rounded-lg border border-border bg-card p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="font-semibold">About izba</h2>
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="Close"
-            onClick={onClose}
-          >
-            ✕
-          </Button>
-        </div>
+    <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
+      <DialogContent className="max-w-sm">
+        <DialogHeader>
+          <DialogTitle>About izba</DialogTitle>
+        </DialogHeader>
 
         {error ? (
           <p className="text-sm text-destructive">{error}</p>
@@ -76,7 +59,7 @@ export function About({ onClose }: { onClose: () => void }) {
             )}
           </>
         )}
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
