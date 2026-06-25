@@ -12,9 +12,9 @@ const term = vi.hoisted(() => ({
   rows: 24,
 }));
 
-vi.mock("@xterm/xterm", () => ({ Terminal: vi.fn(() => term) }));
+vi.mock("@xterm/xterm", () => ({ Terminal: vi.fn(function () { return term; }) }));
 vi.mock("@xterm/xterm/css/xterm.css", () => ({}));
-vi.mock("@xterm/addon-fit", () => ({ FitAddon: vi.fn(() => ({ fit: vi.fn() })) }));
+vi.mock("@xterm/addon-fit", () => ({ FitAddon: vi.fn(function () { return { fit: vi.fn() }; }) }));
 
 vi.mock("../lib/ipc", () => ({
   api: {
