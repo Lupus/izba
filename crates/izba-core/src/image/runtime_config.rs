@@ -457,7 +457,48 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
         linux.set_uid_mappings(Some(uid_maps));
         linux.set_gid_mappings(Some(gid_maps));
     }
+
+    // Present `/sys` as a recursive bind of the host `/sys`, not a fresh `sysfs`
+    // mount. The container runs in the Option-A user namespace (above) while
+    // still SHARING izba-init's network namespace (D1, `network` dropped). The
+    // Linux kernel refuses to mount a NEW `sysfs` instance from a user namespace
+    // that does not OWN the network namespace that sysfs would expose, so crun's
+    // default `type:sysfs` `/sys` mount fails with `mount sysfs: Operation not
+    // permitted`. crun ships a sysfs->/sys bind fallback, but it is conditional
+    // (read-only mount, in-userns probe) and VMM-dependent — it rescues the
+    // CH/virtiofsd guest yet NOT the OpenVMM/WHP guest, where every container
+    // then fails to start. Authoring the bind ourselves makes container start
+    // deterministic on every backend: a recursive bind of an already-visible
+    // mount needs no netns ownership. This is the canonical rootless /
+    // `--net=host`+userns layout (cf. oci-spec `get_rootless_mounts`, runc,
+    // podman); `/sys/fs/cgroup` stays a separate mount that crun layers on top.
+    rebind_sys_mount(&mut spec);
+
     Ok(spec)
+}
+
+/// Rewrite the spec's `/sys` mount from a fresh `sysfs` mount into a recursive
+/// read-only bind of the host `/sys` (see the call site in [`generate_spec`]
+/// for why). Idempotent and a no-op if there is no `/sys` mount.
+fn rebind_sys_mount(spec: &mut Spec) {
+    let Some(mounts) = spec.mounts_mut().as_mut() else {
+        return;
+    };
+    let Some(sys) = mounts
+        .iter_mut()
+        .find(|m| m.destination().to_string_lossy() == "/sys")
+    else {
+        return;
+    };
+    // A bind mount: `type:none`, `source:/sys`, with `rbind` added to the
+    // existing hardening options (nosuid/noexec/nodev/ro carry over).
+    sys.set_typ(Some("none".to_string()));
+    sys.set_source(Some(std::path::PathBuf::from("/sys")));
+    let mut opts = sys.options().clone().unwrap_or_default();
+    if !opts.iter().any(|o| o == "rbind") {
+        opts.push("rbind".to_string());
+    }
+    sys.set_options(Some(opts));
 }
 
 #[cfg(test)]
@@ -954,6 +995,48 @@ mod tests {
         assert!(json.contains("uidMappings"), "uidMappings in JSON: {json}");
         assert!(json.contains("gidMappings"), "gidMappings in JSON");
         assert!(json.contains("\"user\""), "user namespace type in JSON");
+    }
+
+    #[test]
+    fn spec_sys_mount_is_a_recursive_bind_not_fresh_sysfs() {
+        // Option A adds a user namespace while the container still SHARES
+        // izba-init's (host) network namespace (D1). The kernel forbids mounting
+        // a fresh `sysfs` instance from a user namespace that does not own the
+        // network namespace it would expose, so a `type:sysfs` `/sys` mount fails
+        // `mount sysfs: EPERM` under crun (seen on the OpenVMM/WHP backend). The
+        // spec must instead present `/sys` as a recursive bind of the already-
+        // mounted host `/sys` — the canonical rootless / `--net=host`+userns
+        // layout. A bind clone of a visible mount needs no netns ownership, so it
+        // is deterministic on every VMM.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let p = base_params(&img);
+        let spec = generate_spec(&p).unwrap();
+        let mounts = spec.mounts().clone().expect("mounts set");
+        let sys = mounts
+            .iter()
+            .find(|m| m.destination().to_string_lossy() == "/sys")
+            .expect("/sys mount present");
+
+        // NOT a fresh sysfs — a bind of the host /sys.
+        assert_ne!(
+            sys.typ().as_deref(),
+            Some("sysfs"),
+            "/sys must not be a fresh sysfs mount under a userns sharing the host netns"
+        );
+        assert_eq!(
+            sys.source()
+                .as_ref()
+                .map(|s| s.to_string_lossy().into_owned()),
+            Some("/sys".to_string()),
+            "/sys bind source must be the host /sys"
+        );
+        let opts = sys.options().clone().unwrap_or_default();
+        assert!(
+            opts.iter().any(|o| o == "rbind"),
+            "/sys mount must be a recursive bind (rbind): {opts:?}"
+        );
+        // The hardening options carry over (read-only, no suid/dev/exec).
+        assert!(opts.iter().any(|o| o == "ro"), "/sys must stay read-only");
     }
 
     #[test]
