@@ -6,6 +6,17 @@ import {
   isValidVolPath,
   isValidVolSize,
 } from "../lib/volumevalidate";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { RemoveRowButton } from "@/components/ui/row-editor";
+import { SegmentedControl } from "@/components/ui/segmented-control";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 interface Props {
   row: VolumeRow;
@@ -24,16 +35,15 @@ function fmtBytes(n: number): string {
   return `${n} B`;
 }
 
-const KINDS: { kind: VolumeKind; label: string }[] = [
-  { kind: "ephemeral", label: "Ephemeral" },
-  { kind: "new_persistent", label: "New persistent" },
-  { kind: "existing_persistent", label: "Existing persistent" },
+const KIND_OPTIONS = [
+  { value: "ephemeral" as const, label: "Ephemeral" },
+  { value: "new_persistent" as const, label: "New persistent" },
+  { value: "existing_persistent" as const, label: "Existing persistent" },
 ];
 
 /** One editable new-volume row with a 3-way type selector. */
 export function VolumeRowEditor({ row, freeVolumes, onChange, onRemove, index }: Props) {
   const n = index + 1;
-  const inputCls = "rounded border border-line px-2 py-1 text-sm font-mono";
 
   const setKind = (kind: VolumeKind) => onChange({ ...row, kind });
   const set = (patch: Partial<VolumeRow>) => onChange({ ...row, ...patch });
@@ -50,54 +60,39 @@ export function VolumeRowEditor({ row, freeVolumes, onChange, onRemove, index }:
   const selectedVol = freeVolumes.find((v) => v.name === row.selectedVolName);
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-line p-3">
+    <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
       {/* Segmented type selector */}
-      <div className="flex w-fit overflow-hidden rounded-lg border border-line text-xs">
-        {KINDS.map(({ kind, label }) => {
-          const active = row.kind === kind;
-          return (
-            <button
-              key={kind}
-              type="button"
-              aria-pressed={active}
-              onClick={() => setKind(kind)}
-              className={
-                "px-3 py-1.5 " +
-                (active ? "bg-accent text-white" : "text-ink-2 hover:bg-hover")
-              }
-            >
-              {label}
-            </button>
-          );
-        })}
-      </div>
+      <SegmentedControl
+        value={row.kind}
+        onChange={setKind}
+        options={KIND_OPTIONS}
+        aria-label="Volume type"
+      />
 
       {/* Existing-persistent: dropdown of free named volumes */}
       {isExisting && (
         <div className="flex items-center gap-2">
-          <label
-            className="w-24 shrink-0 text-xs font-semibold text-ink-2"
-            htmlFor={`vol-existing-${index}`}
-          >
+          <Label className="w-24 shrink-0 text-xs font-semibold text-muted-foreground">
             Volume
-          </label>
+          </Label>
           {freeVolumes.length === 0 ? (
-            <span className="flex-1 text-xs text-ink-3">No free volumes available</span>
+            <span className="flex-1 text-xs text-muted-foreground-2">No free volumes available</span>
           ) : (
-            <select
-              id={`vol-existing-${index}`}
-              aria-label="Existing volume"
+            <Select
               value={row.selectedVolName}
-              onChange={(e) => set({ selectedVolName: e.target.value })}
-              className={inputCls + " flex-1"}
+              onValueChange={(v) => set({ selectedVolName: v })}
             >
-              <option value="">Select a volume…</option>
-              {freeVolumes.map((v) => (
-                <option key={v.name} value={v.name}>
-                  {v.name} ({fmtBytes(v.size_bytes)})
-                </option>
-              ))}
-            </select>
+              <SelectTrigger className="flex-1" aria-label="existing volume">
+                <SelectValue placeholder="Select a volume…" />
+              </SelectTrigger>
+              <SelectContent>
+                {freeVolumes.map((v) => (
+                  <SelectItem key={v.name} value={v.name}>
+                    {v.name} ({fmtBytes(v.size_bytes)})
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           )}
         </div>
       )}
@@ -105,78 +100,74 @@ export function VolumeRowEditor({ row, freeVolumes, onChange, onRemove, index }:
       {/* New-persistent: free-input name */}
       {showName && (
         <div className="flex items-center gap-2">
-          <label
-            className="w-24 shrink-0 text-xs font-semibold text-ink-2"
+          <Label
             htmlFor={`vol-name-${index}`}
+            className="w-24 shrink-0 text-xs font-semibold text-muted-foreground"
           >
             Volume name
-          </label>
-          <input
+          </Label>
+          <Input
             id={`vol-name-${index}`}
             aria-label={`Volume ${n} name`}
             value={row.name}
             onChange={(e) => set({ name: e.target.value })}
             placeholder="cache"
-            className={inputCls + " flex-1 " + (nameBad ? "border-warn" : "")}
+            className={nameBad ? "border-destructive" : ""}
           />
         </div>
       )}
 
       {/* Guest path (all kinds) */}
       <div className="flex items-center gap-2">
-        <label
-          className="w-24 shrink-0 text-xs font-semibold text-ink-2"
+        <Label
           htmlFor={`vol-path-${index}`}
+          className="w-24 shrink-0 text-xs font-semibold text-muted-foreground"
         >
           Guest path
-        </label>
-        <input
+        </Label>
+        <Input
           id={`vol-path-${index}`}
           aria-label={`Volume ${n} path`}
           value={row.path}
           onChange={(e) => set({ path: e.target.value })}
           placeholder="/data"
-          className={inputCls + " flex-1 " + (pathBad ? "border-warn" : "")}
+          className={pathBad ? "border-destructive" : ""}
         />
       </div>
 
       {/* Size: editable for ephemeral/new, read-only display for existing */}
       <div className="flex items-center gap-2">
         {isExisting ? (
-          <span className="w-24 shrink-0 text-xs font-semibold text-ink-2">Size</span>
+          <span className="w-24 shrink-0 text-xs font-semibold text-muted-foreground">Size</span>
         ) : (
-          <label
-            className="w-24 shrink-0 text-xs font-semibold text-ink-2"
+          <Label
             htmlFor={`vol-size-${index}`}
+            className="w-24 shrink-0 text-xs font-semibold text-muted-foreground"
           >
             Size
-          </label>
+          </Label>
         )}
         {isExisting ? (
-          <span className="flex-1 font-mono text-sm text-ink-2">
+          <span className="flex-1 font-mono text-sm text-muted-foreground">
             {selectedVol ? fmtBytes(selectedVol.size_bytes) : "—"}
           </span>
         ) : (
-          <input
+          <Input
             id={`vol-size-${index}`}
             aria-label={`Volume ${n} size`}
             value={row.size}
             onChange={(e) => set({ size: e.target.value })}
             placeholder="1g"
-            className={inputCls + " w-24 " + (sizeBad ? "border-warn" : "")}
+            className={`w-24 ${sizeBad ? "border-destructive" : ""}`}
           />
         )}
       </div>
 
       <div className="flex justify-end">
-        <button
-          type="button"
+        <RemoveRowButton
           aria-label={`Remove volume ${n}`}
           onClick={onRemove}
-          className="rounded border border-warn/40 px-2 py-1 text-xs text-warn hover:bg-warn/5"
-        >
-          ×
-        </button>
+        />
       </div>
     </div>
   );
