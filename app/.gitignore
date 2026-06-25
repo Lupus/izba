@@ -5,3 +5,5 @@ src-tauri/target/
 gen/
 playwright-report/
 test-results/
+.vitest-attachments/
+src/test/browser/__screenshots__/

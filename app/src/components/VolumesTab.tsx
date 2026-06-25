@@ -5,8 +5,10 @@ import {
   type VolumeRow,
   defaultVolumeRow,
   buildVolSpec,
+  freeVolumes as computeFreeVolumes,
   isBlankVolRow,
   isValidVolRow,
+  usedExistingNames,
   volNameError,
   volPathError,
   volSizeError,
@@ -95,15 +97,7 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
   );
 
   function freeVolumesFor(rowIdx: number): VolumeInfo[] {
-    const usedNames = new Set(
-      volumeRows
-        .filter((r, i) => i !== rowIdx && r.kind === "existing_persistent")
-        .map((r) => r.selectedVolName)
-        .filter(Boolean),
-    );
-    return allVolumes.filter(
-      (v) => v.referenced_by.length === 0 && !seededNames.has(v.name) && !usedNames.has(v.name),
-    );
+    return computeFreeVolumes(allVolumes, seededNames, usedExistingNames(volumeRows, rowIdx));
   }
 
   const addVolume = () => setVolumeRows((rows) => [...rows, defaultVolumeRow()]);

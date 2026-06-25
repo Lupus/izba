@@ -84,6 +84,41 @@ export function volPickError(kind: VolumeKind, selectedVolName: string): string 
   return null;
 }
 
+/**
+ * Compute the volumes available to attach as an existing_persistent volume for a
+ * given inline row, given the full known volume set and the set of names already
+ * spoken for. A volume is free when:
+ *   - it is not referenced by any sandbox (`referenced_by` is empty),
+ *   - its name is not in `seededNames` (already attached to THIS sandbox), and
+ *   - its name is not in `usedNames` (picked by another inline existing row).
+ *
+ * Pure so the filtering contract is directly unit-testable (the Radix Select's
+ * options live in a closed portal and aren't queryable in jsdom).
+ */
+export function freeVolumes(
+  allVolumes: VolumeInfo[],
+  seededNames: ReadonlySet<string>,
+  usedNames: ReadonlySet<string>,
+): VolumeInfo[] {
+  return allVolumes.filter(
+    (v) =>
+      v.referenced_by.length === 0 && !seededNames.has(v.name) && !usedNames.has(v.name),
+  );
+}
+
+/**
+ * The set of existing_persistent volume names picked by inline rows OTHER than
+ * `rowIdx` — i.e. names that should be excluded from `rowIdx`'s picker.
+ */
+export function usedExistingNames(rows: VolumeRow[], rowIdx: number): Set<string> {
+  return new Set(
+    rows
+      .filter((r, i) => i !== rowIdx && r.kind === "existing_persistent")
+      .map((r) => r.selectedVolName)
+      .filter(Boolean),
+  );
+}
+
 /** Build the spec string to pass to volumeAttach / CreateOpts.volumes. */
 export function buildVolSpec(r: VolumeRow, freeVolumes: VolumeInfo[]): string {
   const path = r.path.trim();

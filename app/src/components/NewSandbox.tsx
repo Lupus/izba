@@ -7,8 +7,10 @@ import {
   type VolumeRow,
   defaultVolumeRow,
   buildVolSpec,
+  freeVolumes as computeFreeVolumes,
   isBlankVolRow,
   isValidVolRow,
+  usedExistingNames,
   volNameError,
   volPathError,
   volSizeError,
@@ -87,15 +89,11 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   const setVolumeRow = (i: number, row: VolumeRow) =>
     setVolumeRowsState((rows) => rows.map((r, j) => (j === i ? row : r)));
 
-  // Free volumes for each row: exclude referenced + names used in other rows as existing_persistent.
+  // Free volumes for each row: exclude referenced + names used in other rows as
+  // existing_persistent. NewSandbox has no seeded volumes, so seededNames is empty.
+  const noSeeded = new Set<string>();
   function freeVolumesFor(rowIdx: number): VolumeInfo[] {
-    const usedNames = new Set(
-      volumeRows
-        .filter((r, i) => i !== rowIdx && r.kind === "existing_persistent")
-        .map((r) => r.selectedVolName)
-        .filter(Boolean),
-    );
-    return allVolumes.filter((v) => v.referenced_by.length === 0 && !usedNames.has(v.name));
+    return computeFreeVolumes(allVolumes, noSeeded, usedExistingNames(volumeRows, rowIdx));
   }
 
   async function submit() {

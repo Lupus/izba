@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
-import type { SandboxView, SandboxDetail } from "../lib/types";
+import type { SandboxView, SandboxDetail, VolumeInfo } from "../lib/types";
+import { freeVolumes, usedExistingNames } from "../lib/volumevalidate";
 
 // ── hoisted mocks ─────────────────────────────────────────────────────────────
 
@@ -510,6 +511,13 @@ describe("VolumesTab — 3-way volume type selector", () => {
     // Note: open+pick is exercised in the browser test (volumeRowEditor.browser.test.tsx)
   });
 
+  // The existing-volume options live in a closed Radix portal that jsdom doesn't
+  // mount, so the dropdown CONTENTS can't be asserted in jsdom (the open+pick path
+  // is covered in volumeRowEditor.browser.test.tsx). What VolumesTab is responsible
+  // for is the FILTERING that produces each row's `freeVolumes` prop. That filter is
+  // the pure `freeVolumes(allVolumes, seededNames, usedNames)` the component calls
+  // (see VolumesTab.freeVolumesFor); these tests assert that contract on the exact
+  // scenarios the integration cases used, so they FAIL if the filter regresses.
   it("existing persistent dropdown excludes in-use volumes (referenced_by non-empty)", async () => {
     volumeList.mockResolvedValue([
       { name: "archive", size_bytes: 1073741824, actual_bytes: 0, referenced_by: [] },
@@ -520,14 +528,14 @@ describe("VolumesTab — 3-way volume type selector", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /existing/i }));
-
     await waitFor(() => expect(volumeList).toHaveBeenCalled());
-    // Radix Select trigger present; options are rendered in the portal (not accessible in jsdom).
-    // Verify filtering by asserting the component received only the free volumes:
-    // "archive" (free) → trigger present; "inuse" is excluded by caller filtering logic.
     expect(screen.getByRole("combobox", { name: /existing volume/i })).toBeInTheDocument();
-    // "inuse" text must not appear in the visible DOM (it's not an option in the trigger or content)
-    expect(screen.queryByText(/inuse/i)).not.toBeInTheDocument();
+
+    // Filtering contract: a referenced volume is excluded, a free one is kept.
+    const allVolumes: VolumeInfo[] = await volumeList.mock.results[0].value;
+    const free = freeVolumes(allVolumes, new Set(), usedExistingNames([], 0)).map((v) => v.name);
+    expect(free).toContain("archive");
+    expect(free).not.toContain("inuse");
   });
 
   it("existing persistent dropdown excludes volumes already seeded on this sandbox", async () => {
@@ -543,14 +551,15 @@ describe("VolumesTab — 3-way volume type selector", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /existing/i }));
-
     await waitFor(() => expect(volumeList).toHaveBeenCalled());
-    // Radix Select trigger present; "cache" is excluded by caller filtering.
     expect(screen.getByRole("combobox", { name: /existing volume/i })).toBeInTheDocument();
-    // "cache" should not appear in the select content (it's seeded); "archive" is the only free vol.
-    // The trigger placeholder text is visible but "cache" as a selectable option should not exist in DOM.
-    // We validate by asserting the freeVolumes prop only contains "archive":
-    // (the VolumesTab filtering logic is what's under test here — presence of combobox confirms rendering)
+
+    // Filtering contract: a volume already seeded on this sandbox ("cache") is excluded.
+    const allVolumes: VolumeInfo[] = await volumeList.mock.results[0].value;
+    const seededNames = new Set(["cache"]);
+    const free = freeVolumes(allVolumes, seededNames, new Set()).map((v) => v.name);
+    expect(free).toContain("archive");
+    expect(free).not.toContain("cache");
   });
 
   it("existing persistent dropdown excludes volumes already in another inline row", async () => {
@@ -561,18 +570,23 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    // Add first row: existing — trigger is present
+    // Two existing-persistent rows, the first having picked "vol1".
     fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /existing/i }));
     await waitFor(() => expect(volumeList).toHaveBeenCalled());
-    // Radix Select: open+pick is in the browser test; here we verify trigger presence and path fill
-    expect(screen.getByRole("combobox", { name: /existing volume/i })).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/v1" } });
-
-    // Add second row — second trigger present; filtering logic is validated by browser test
     fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
     fireEvent.click(screen.getAllByRole("radio", { name: /existing/i })[1]);
     expect(screen.getAllByRole("combobox", { name: /existing volume/i })).toHaveLength(2);
+
+    // Filtering contract: vol1 (picked by row 0) is excluded from row 1's free list.
+    const allVolumes: VolumeInfo[] = await volumeList.mock.results[0].value;
+    const rows = [
+      { kind: "existing_persistent" as const, name: "", path: "", size: "", selectedVolName: "vol1" },
+      { kind: "existing_persistent" as const, name: "", path: "", size: "", selectedVolName: "" },
+    ];
+    const freeForRow1 = freeVolumes(allVolumes, new Set(), usedExistingNames(rows, 1)).map((v) => v.name);
+    expect(freeForRow1).toContain("vol2");
+    expect(freeForRow1).not.toContain("vol1");
   });
 });
 

@@ -1,5 +1,27 @@
 import { describe, it, expect } from "vitest";
-import { isValidVolSize, volSizeError } from "../lib/volumevalidate";
+import type { VolumeInfo } from "../lib/types";
+import type { VolumeRow } from "../lib/volumevalidate";
+import {
+  freeVolumes,
+  isValidVolSize,
+  usedExistingNames,
+  volSizeError,
+} from "../lib/volumevalidate";
+
+const vol = (name: string, referenced_by: string[] = []): VolumeInfo => ({
+  name,
+  size_bytes: 1073741824,
+  actual_bytes: 0,
+  referenced_by,
+});
+
+const existingRow = (selectedVolName: string): VolumeRow => ({
+  kind: "existing_persistent",
+  name: "",
+  path: "",
+  size: "",
+  selectedVolName,
+});
 
 describe("isValidVolSize", () => {
   it("accepts valid sizes with lowercase suffixes", () => {
@@ -55,5 +77,56 @@ describe("volSizeError", () => {
 
   it("returns null for existing_persistent (no size needed)", () => {
     expect(volSizeError("existing_persistent", "0g")).toBeNull();
+  });
+});
+
+describe("freeVolumes (existing-volume filtering)", () => {
+  const empty = new Set<string>();
+
+  it("excludes volumes referenced by any sandbox (referenced_by non-empty)", () => {
+    const all = [vol("archive"), vol("inuse", ["other-sbx"])];
+    const result = freeVolumes(all, empty, empty).map((v) => v.name);
+    expect(result).toEqual(["archive"]);
+    expect(result).not.toContain("inuse");
+  });
+
+  it("excludes volumes already seeded on this sandbox", () => {
+    const all = [vol("cache"), vol("archive")];
+    const seeded = new Set(["cache"]);
+    const result = freeVolumes(all, seeded, empty).map((v) => v.name);
+    expect(result).toEqual(["archive"]);
+    expect(result).not.toContain("cache");
+  });
+
+  it("excludes volumes already picked by another inline row (usedNames)", () => {
+    const all = [vol("vol1"), vol("vol2")];
+    const used = new Set(["vol1"]);
+    const result = freeVolumes(all, empty, used).map((v) => v.name);
+    expect(result).toEqual(["vol2"]);
+    expect(result).not.toContain("vol1");
+  });
+
+  it("applies all three exclusions together", () => {
+    const all = [vol("free"), vol("ref", ["s"]), vol("seeded"), vol("used")];
+    const result = freeVolumes(all, new Set(["seeded"]), new Set(["used"])).map((v) => v.name);
+    expect(result).toEqual(["free"]);
+  });
+});
+
+describe("usedExistingNames", () => {
+  it("collects existing_persistent picks from OTHER rows, excluding the current row", () => {
+    const rows = [existingRow("vol1"), existingRow("vol2")];
+    // For row 1, vol1 (row 0's pick) is used; vol2 (its own pick) is not.
+    expect(usedExistingNames(rows, 1)).toEqual(new Set(["vol1"]));
+    expect(usedExistingNames(rows, 0)).toEqual(new Set(["vol2"]));
+  });
+
+  it("ignores rows that are not existing_persistent and blank picks", () => {
+    const rows: VolumeRow[] = [
+      { kind: "ephemeral", name: "", path: "/x", size: "1g", selectedVolName: "" },
+      existingRow(""), // started but nothing picked yet
+      existingRow("picked"),
+    ];
+    expect(usedExistingNames(rows, 0)).toEqual(new Set(["picked"]));
   });
 });
