@@ -5,6 +5,7 @@ import { git_repo_from_row, git_op_from_path, git_access_for } from "../lib/git"
 import { allowKeys } from "../lib/policy";
 import { SeedDialog } from "./SeedDialog";
 import { EnforceToggle } from "./EnforceToggle";
+import { Button } from "@/components/ui/button";
 
 /** Human-readable "time since" for the Last-activity column. `now` is injected
  *  so the formatting is pure and unit-testable. */
@@ -121,10 +122,10 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
 
   return (
     <div className="flex h-full flex-col">
-      {error && <div className="mb-2 text-sm text-warn">{error}</div>}
+      {error && <div className="mb-2 text-sm text-destructive">{error}</div>}
 
       {/* Banner: always visible — honest about firewall state */}
-      <div className="mb-3 flex items-center justify-between rounded-lg border border-line bg-hover px-3 py-2 text-sm">
+      <div className="mb-3 flex items-center justify-between rounded-lg border border-border bg-muted px-3 py-2 text-sm">
         <div>
           {enforcing ? (
             <span>🛡 Firewall ON · {allowRuleCount} allow rule(s)</span>
@@ -132,7 +133,7 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
             <span>
               <span>🛡 Firewall OFF · all egress currently allowed</span>
               <br />
-              <span className="text-ink-3">
+              <span className="text-muted-foreground-2">
                 {rows.length} endpoint(s) observed · {blockedCount} were blocked while enforcing
               </span>
             </span>
@@ -146,14 +147,12 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
             onToggle={() => void toggleEnforce()}
           />
           {/* Review observed traffic button (always available) */}
-          <button
-            type="button"
+          <Button
             disabled={pending !== null}
             onClick={() => setShowSeed(true)}
-            className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white disabled:opacity-50"
           >
             Review observed traffic
-          </button>
+          </Button>
         </div>
       </div>
 
@@ -163,7 +162,7 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
           onMouseEnter={() => setHover(true)}
           onMouseLeave={() => setHover(false)}
         >
-          <thead className="text-ink-2">
+          <thead className="text-muted-foreground">
             <tr>
               <th className="py-1">Endpoint</th>
               <th>Port</th>
@@ -193,7 +192,7 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
                 : null;
 
               return (
-                <tr key={key} className="border-t border-line">
+                <tr key={key} className="border-t border-border">
                   <td className="py-1">
                     {isGit ? (
                       <span>{`git → ${gitRepo}`}</span>
@@ -203,17 +202,17 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
                   </td>
                   <td>{r.port}</td>
                   <td>{r.tier}</td>
-                  <td className={r.verdict === "deny" ? "text-warn" : "text-ok"}>
+                  <td className={r.verdict === "deny" ? "text-destructive" : "text-success"}>
                     {r.allow_count}✓ {r.deny_count}✕
                   </td>
-                  <td className="text-ink-3" title={new Date(r.last_seen_ms).toLocaleString()}>
+                  <td className="text-muted-foreground-2" title={new Date(r.last_seen_ms).toLocaleString()}>
                     {relTime(r.last_seen_ms, now)}
                   </td>
                   {enforcing && (
                     <td className={
                       isGit
-                        ? (gitAccess !== null ? "text-ok" : "text-ink-3")
-                        : permitted ? "text-ok" : "text-ink-3"
+                        ? (gitAccess !== null ? "text-success" : "text-muted-foreground-2")
+                        : permitted ? "text-success" : "text-muted-foreground-2"
                     }>
                       {isGit
                         ? (gitAccess !== null ? gitAccess : "blocked")
@@ -227,92 +226,85 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
                         gitAccess !== null ? (
                           // Rule exists: show highlighted active access + Block
                           <span className="flex gap-1">
-                            <button
-                              type="button"
+                            <Button
                               aria-label="Allow read"
                               disabled={busy}
+                              size="sm"
+                              variant={gitAccess === "read" ? "default" : "secondary"}
                               onClick={() =>
                                 void act(key, () => api.policyGitAllow(name, gitRepo, false))
                               }
-                              className={`rounded border px-2 py-0.5 disabled:opacity-40 ${
-                                gitAccess === "read"
-                                  ? "border-accent bg-accent/10 text-accent font-semibold"
-                                  : "border-line hover:bg-hover"
-                              }`}
                             >
                               {busy ? "…" : "Allow read"}
-                            </button>
-                            <button
-                              type="button"
+                            </Button>
+                            <Button
                               aria-label="Allow write"
                               disabled={busy}
+                              size="sm"
+                              variant={gitAccess === "read-write" ? "default" : "secondary"}
                               onClick={() =>
                                 void act(key, () => api.policyGitAllow(name, gitRepo, true))
                               }
-                              className={`rounded border px-2 py-0.5 disabled:opacity-40 ${
-                                gitAccess === "read-write"
-                                  ? "border-accent bg-accent/10 text-accent font-semibold"
-                                  : "border-line hover:bg-hover"
-                              }`}
                             >
                               {busy ? "…" : "Allow write"}
-                            </button>
-                            <button
-                              type="button"
+                            </Button>
+                            <Button
                               aria-label="Block"
                               disabled={busy}
+                              size="sm"
+                              variant="destructive"
                               onClick={() =>
                                 void act(key, () => api.policyGitBlock(name, gitRepo))
                               }
-                              className="rounded border border-warn/40 px-2 py-0.5 text-warn hover:bg-warn/5 disabled:opacity-40"
                             >
                               {busy ? "…" : "Block"}
-                            </button>
+                            </Button>
                           </span>
                         ) : (
                           // No rule yet: call-to-action Allow read / Allow write
                           <span className="flex gap-1">
-                            <button
-                              type="button"
+                            <Button
                               aria-label="Allow read"
                               disabled={busy}
+                              size="sm"
+                              variant="secondary"
                               onClick={() =>
                                 void act(key, () => api.policyGitAllow(name, gitRepo, false))
                               }
-                              className="rounded border border-line px-2 py-0.5 hover:bg-hover disabled:opacity-40"
                             >
                               {busy ? "…" : "Allow read"}
-                            </button>
-                            <button
-                              type="button"
+                            </Button>
+                            <Button
                               aria-label="Allow write"
                               disabled={busy}
+                              size="sm"
+                              variant="secondary"
                               onClick={() =>
                                 void act(key, () => api.policyGitAllow(name, gitRepo, true))
                               }
-                              className="rounded border border-line px-2 py-0.5 hover:bg-hover disabled:opacity-40"
                             >
                               {busy ? "…" : "Allow write"}
-                            </button>
+                            </Button>
                           </span>
                         )
                       ) : permitted ? (
-                        <button
-                          type="button"
+                        <Button
                           aria-label={`Block ${target}`}
                           disabled={busy}
+                          size="sm"
+                          variant="destructive"
                           onClick={() =>
                             r.host && void act(key, () => api.policyBlock(name, r.host!, r.port))
                           }
-                          className="rounded border border-warn/40 px-2 py-0.5 text-warn hover:bg-warn/5 disabled:opacity-40"
                         >
                           {busy ? "…" : "Block"}
-                        </button>
+                        </Button>
                       ) : (
-                        <button
-                          type="button"
+                        <Button
                           aria-label={`Allow ${target}`}
                           disabled={rawIp || busy}
+                          size="sm"
+                          variant="secondary"
                           title={
                             rawIp
                               ? "no resolved name; allowing a bare IP would defeat the SSRF / DNS-rebind guard"
@@ -321,10 +313,9 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
                           onClick={() =>
                             r.host && void act(key, () => api.policyAllow(name, r.host!, r.port))
                           }
-                          className="rounded border border-line px-2 py-0.5 hover:bg-hover disabled:opacity-40"
                         >
                           {busy ? "…" : "Allow"}
-                        </button>
+                        </Button>
                       )}
                     </td>
                   )}
@@ -333,11 +324,11 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
             })}
           </tbody>
         </table>
-        {rows.length === 0 && <div className="mt-3 text-ink-3">No egress recorded yet.</div>}
+        {rows.length === 0 && <div className="mt-3 text-muted-foreground-2">No egress recorded yet.</div>}
       </div>
       {/* Fixed-height status line, always present so toggling its text never
           reflows the table (it sits below the scroll area, not above it). */}
-      <div className="mt-2 h-5 shrink-0 text-xs text-ink-3" aria-live="polite">
+      <div className="mt-2 h-5 shrink-0 text-xs text-muted-foreground-2" aria-live="polite">
         {hovering ? "Auto-refresh paused while hovering." : ""}
       </div>
 
