@@ -1,8 +1,12 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { fileURLToPath, URL } from "node:url";
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
+  },
   // Expose Tauri's build-time env vars (TAURI_ENV_*) to the toolchain.
   envPrefix: ["VITE_", "TAURI_ENV_"],
   clearScreen: false,
