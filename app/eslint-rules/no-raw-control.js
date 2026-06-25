@@ -1,4 +1,4 @@
-const BANNED = new Set(["button", "input", "select"]);
+const BANNED = new Set(["button", "input", "select", "textarea"]);
 
 /** @type {import("eslint").Rule.RuleModule} */
 export default {
