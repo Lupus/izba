@@ -30,8 +30,10 @@ export default tseslint.config(
       "react-hooks/exhaustive-deps": "warn",
       "tailwindcss/no-arbitrary-value": "error",
       "tailwindcss/no-custom-classname": "off",
-      // "off": crashes under ESLint 10 + eslint-plugin-tailwindcss v3.x
-      // (context.getSourceCode removed); re-enable when plugin gains v10 support.
+      // "off" deliberately: the consistency gate is no-arbitrary-value +
+      // izba/no-raw-control. classnames-order is cosmetic and would flag the
+      // existing (un-reordered) class strings across migrated components under
+      // --max-warnings 0; out of scope for this migration.
       "tailwindcss/classnames-order": "off",
     },
   },
