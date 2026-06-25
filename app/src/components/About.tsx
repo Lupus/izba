@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/ipc";
 import type { BuildInfo, VersionView } from "../lib/types";
+import { Button } from "@/components/ui/button";
 
 /** Short `0.1.0 (9f0d480)` summary for a build. */
 function short(b: BuildInfo): string {
@@ -10,9 +11,9 @@ function short(b: BuildInfo): string {
 
 function Row({ label, build }: { label: string; build: BuildInfo | null }) {
   return (
-    <div className="flex justify-between gap-6 py-1 text-[13px]">
-      <span className="text-ink-2">{label}</span>
-      <span className="font-mono text-ink-1" title={build ? build.git_describe : undefined}>
+    <div className="flex justify-between gap-6 py-1 text-sm">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="font-mono text-foreground" title={build ? build.git_describe : undefined}>
         {build ? short(build) : "not running"}
       </span>
     </div>
@@ -44,31 +45,32 @@ export function About({ onClose }: { onClose: () => void }) {
       onClick={onClose}
     >
       <div
-        className="w-[360px] rounded-lg border border-line bg-surface p-5 shadow-xl"
+        className="w-80 rounded-lg border border-border bg-card p-5 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center justify-between">
           <h2 className="font-semibold">About izba</h2>
-          <button
-            className="text-ink-2 hover:text-ink-1"
+          <Button
+            variant="ghost"
+            size="icon"
             aria-label="Close"
             onClick={onClose}
           >
             ✕
-          </button>
+          </Button>
         </div>
 
         {error ? (
-          <p className="text-[13px] text-warn">{error}</p>
+          <p className="text-sm text-destructive">{error}</p>
         ) : !version ? (
-          <p className="text-[13px] text-ink-2">Loading…</p>
+          <p className="text-sm text-muted-foreground">Loading…</p>
         ) : (
           <>
             <Row label="App" build={version.app} />
             <Row label="Core" build={version.core} />
             <Row label="Daemon" build={version.daemon} />
             {version.mismatch && (
-              <p className="mt-3 rounded-md bg-warn/10 px-2 py-1.5 text-[12px] text-warn">
+              <p className="mt-3 rounded-md bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
                 ⚠ app and daemon builds differ
               </p>
             )}
