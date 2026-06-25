@@ -3,6 +3,10 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "../lib/ipc";
 import type { SandboxView, PortRule } from "../lib/types";
 import { isValidPort, isValidBind } from "../lib/portvalidate";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { AddRowButton, RemoveRowButton } from "@/components/ui/row-editor";
 
 interface Props {
   sandbox: SandboxView;
@@ -91,21 +95,18 @@ export function PortsTab({ sandbox }: Props) {
     ...persistedOnly.map((r) => ({ rule: r, isPersisted: true, isLive: false })),
   ];
 
-  const inputCls =
-    "min-w-0 rounded-lg border border-line px-2 py-1.5 text-sm disabled:opacity-50";
-
   return (
     <div className="flex flex-col gap-4">
-      {error && <div className="text-sm text-warn">{error}</div>}
+      {error && <div className="text-sm text-destructive">{error}</div>}
 
       {rows.length === 0 && !error && (
-        <div className="text-sm text-ink-3">No port forwards active.</div>
+        <div className="text-sm text-muted-foreground-2">No port forwards active.</div>
       )}
 
       {rows.length > 0 && (
         <table className="w-full text-sm">
           <thead>
-            <tr className="text-left text-xs text-ink-3">
+            <tr className="text-left text-xs text-muted-foreground-2">
               <th className="pb-1 font-normal">Forward</th>
               <th className="pb-1 font-normal" />
               <th className="pb-1 font-normal" />
@@ -113,47 +114,45 @@ export function PortsTab({ sandbox }: Props) {
           </thead>
           <tbody>
             {rows.map(({ rule: r, isPersisted, isLive }) => (
-              <tr key={persistedKey(r)} className="border-t border-line">
+              <tr key={persistedKey(r)} className="border-t border-border">
                 <td className="py-2 font-mono">
                   {r.bind}:{r.host_port} → {r.guest_port}
                   {!isPersisted && (
-                    <span className="ml-2 rounded bg-warn/10 px-1.5 py-0.5 text-xs text-warn">
+                    <Badge variant="warning" className="ml-2">
                       active until restart
-                    </span>
+                    </Badge>
                   )}
                 </td>
                 <td className="py-2 pl-2">
                   <div className="flex gap-1.5">
                     {isLive && (
-                      <button
+                      <Button
                         type="button"
+                        variant="secondary"
+                        size="sm"
                         aria-label={`Open port ${r.host_port} in browser`}
                         onClick={() => void openUrl(`http://127.0.0.1:${r.host_port}`)}
-                        className="rounded-lg border border-line px-2 py-1 text-xs hover:bg-hover"
                       >
                         Open in browser
-                      </button>
+                      </Button>
                     )}
                     {!isPersisted && (
-                      <button
+                      <Button
                         type="button"
+                        variant="secondary"
+                        size="sm"
                         onClick={() => void makePersistent(r)}
-                        className="rounded-lg border border-line px-2 py-1 text-xs hover:bg-hover"
                       >
                         Make persistent
-                      </button>
+                      </Button>
                     )}
                   </div>
                 </td>
                 <td className="py-2 pl-2 text-right">
-                  <button
-                    type="button"
+                  <RemoveRowButton
                     aria-label={`Remove port ${r.host_port}`}
                     onClick={() => void remove(r)}
-                    className="rounded-lg border border-line px-2 py-1 text-xs text-ink-2 hover:bg-hover"
-                  >
-                    ×
-                  </button>
+                  />
                 </td>
               </tr>
             ))}
@@ -162,45 +161,40 @@ export function PortsTab({ sandbox }: Props) {
       )}
 
       <div className="mt-2 grid gap-2">
-        <span className="text-xs font-medium text-ink-2">Add forward</span>
+        <span className="text-xs font-medium text-muted-foreground">Add forward</span>
         <div className="flex flex-wrap items-center gap-2">
-          <input
+          <Input
             aria-label="Bind address"
             placeholder="127.0.0.1"
             value={newBind}
             disabled={!running}
             onChange={(e) => setNewBind(e.target.value)}
-            className={inputCls + " w-32"}
+            className="w-32"
           />
-          <input
+          <Input
             aria-label="Host port"
             placeholder="host"
             inputMode="numeric"
             value={newHost}
             disabled={!running}
             onChange={(e) => setNewHost(e.target.value)}
-            className={inputCls + " w-20"}
+            className="w-20"
           />
-          <span className="text-ink-3">:</span>
-          <input
+          <span className="text-muted-foreground-2">:</span>
+          <Input
             aria-label="Guest port"
             placeholder="guest"
             inputMode="numeric"
             value={newGuest}
             disabled={!running}
             onChange={(e) => setNewGuest(e.target.value)}
-            className={inputCls + " w-20"}
+            className="w-20"
           />
-          <button
-            type="button"
-            disabled={!running}
-            onClick={() => void addForward()}
-            className="rounded-lg border border-line px-3 py-1.5 text-sm hover:bg-hover disabled:opacity-50"
-          >
+          <AddRowButton disabled={!running} onClick={() => void addForward()}>
             Add forward
-          </button>
+          </AddRowButton>
         </div>
-        {formError && <span className="text-xs text-warn">{formError}</span>}
+        {formError && <span className="text-xs text-destructive">{formError}</span>}
       </div>
     </div>
   );
