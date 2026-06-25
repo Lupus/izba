@@ -10,6 +10,7 @@ import { ShellPanel } from "./ShellPanel";
 import { PortsTab } from "./PortsTab";
 import { VolumesTab } from "./VolumesTab";
 import { Spinner } from "./Spinner";
+import { Button } from "@/components/ui/button";
 import { api } from "../lib/ipc";
 
 interface Props {
@@ -44,7 +45,7 @@ export function Detail({ sandbox, onChanged }: Props) {
   }, [sandbox?.name]);
 
   if (!sandbox) {
-    return <div className="grid flex-1 place-items-center text-ink-3">Select a sandbox</div>;
+    return <div className="grid flex-1 place-items-center text-muted-foreground-2">Select a sandbox</div>;
   }
 
   const running = sandbox.state.kind !== "stopped";
@@ -88,30 +89,31 @@ export function Detail({ sandbox, onChanged }: Props) {
       <div className="flex items-center gap-3 text-lg font-semibold">
         <StatusDot state={sandbox.state} /> {name}
       </div>
-      <div className="mt-1 text-ink-2">{sandbox.image}</div>
+      <div className="mt-1 text-muted-foreground">{sandbox.image}</div>
       {sandbox.state.kind === "degraded" && (
-        <div className="mt-3 rounded-lg border border-warn/30 bg-warn/5 px-3 py-2 text-sm text-warn">
+        <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           {sandbox.state.reason}
         </div>
       )}
 
-      <div role="tablist" className="mt-4 flex gap-1 border-b border-line">
+      <div role="tablist" className="mt-4 flex gap-1 border-b border-border">
         {tabs.map((t) => (
-          <button
+          <Button
             key={t.id}
             type="button"
+            variant="ghost"
             role="tab"
             aria-selected={tab === t.id}
             onClick={() => setTab(t.id)}
             className={
-              "px-3 py-2 text-sm -mb-px border-b-2 " +
+              "px-3 py-2 text-sm -mb-px rounded-none border-b-2 h-auto " +
               (tab === t.id
-                ? "border-accent font-semibold text-ink-1"
-                : "border-transparent text-ink-2 hover:text-ink-1")
+                ? "border-primary font-semibold text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground hover:bg-transparent")
             }
           >
             {t.label}
-          </button>
+          </Button>
         ))}
       </div>
 
@@ -121,42 +123,42 @@ export function Detail({ sandbox, onChanged }: Props) {
             <FirewallStatus name={name} />
             <div className="flex flex-wrap gap-2">
               {running ? (
-                <button
+                <Button
                   type="button"
+                  variant="secondary"
                   disabled={busy}
                   onClick={() => setPending({ kind: "stop", name })}
-                  className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover disabled:opacity-50"
                 >
                   {label("stop", "Stop")}
-                </button>
+                </Button>
               ) : (
-                <button
+                <Button
                   type="button"
+                  variant="default"
                   disabled={busy}
                   onClick={() => void act("start", () => api.start(name))}
-                  className="rounded-lg bg-accent px-3 py-1.5 font-semibold text-white shadow-sm disabled:opacity-50"
                 >
                   {label("start", "Start")}
-                </button>
+                </Button>
               )}
-              <button
+              <Button
                 type="button"
+                variant="secondary"
                 disabled={busy}
                 onClick={() => void act("restart", () => api.restart(name))}
-                className="rounded-lg border border-line px-3 py-1.5 hover:bg-hover disabled:opacity-50"
               >
                 {label("restart", "Restart")}
-              </button>
-              <button
+              </Button>
+              <Button
                 type="button"
+                variant="destructive"
                 disabled={busy}
                 onClick={() => setPending({ kind: "remove", name })}
-                className="rounded-lg border border-warn/40 px-3 py-1.5 text-warn hover:bg-warn/5 disabled:opacity-50"
               >
                 {label("remove", "Remove")}
-              </button>
+              </Button>
             </div>
-            {error && <div className="mt-3 text-sm text-warn">{error}</div>}
+            {error && <div className="mt-3 text-sm text-destructive">{error}</div>}
           </div>
         )}
 
@@ -174,7 +176,7 @@ export function Detail({ sandbox, onChanged }: Props) {
           (running ? (
             <ShellPanel sandbox={name} />
           ) : (
-            <div className="text-ink-3">Start the sandbox to open a shell.</div>
+            <div className="text-muted-foreground-2">Start the sandbox to open a shell.</div>
           ))}
       </div>
 
