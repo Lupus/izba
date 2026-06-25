@@ -7,6 +7,7 @@ use izba_core::sandbox;
 use izba_core::state::CONFIG_FILE;
 use std::path::{Path, PathBuf};
 
+#[mutants::skip] // reason: live daemon+VM, e2e-only
 pub fn run(
     paths: &Paths,
     opts: &SandboxOpts,
@@ -37,6 +38,7 @@ pub fn run(
 /// The built digest is registered as a hidden local tag
 /// `izba-run-build-<base36-timestamp>` so the daemon's `ensure_image` short-
 /// circuits the tag-is-cached branch and never touches the registry.
+#[mutants::skip] // reason: live daemon+VM, e2e-only
 pub(crate) fn build_then_image_ref(
     paths: &Paths,
     build_path: &Path,
@@ -91,6 +93,7 @@ pub(crate) fn resolve_build_context(build_path: &Path) -> (PathBuf, PathBuf) {
     }
 }
 
+#[mutants::skip] // reason: connects to a live daemon, starts the VM + execs; e2e-only (daemon_e2e)
 fn run_inner(
     paths: &Paths,
     opts: &SandboxOpts,
@@ -134,6 +137,7 @@ fn run_inner(
 /// directory (created if missing), with the sandbox created on first use.
 /// Reading config.json for name resolution is the one read-only local
 /// operation kept CLI-side; everything mutating goes through the daemon.
+#[mutants::skip] // reason: drives a live daemon (Create/persist over the socket); e2e-only
 fn resolve_or_create(
     client: &mut DaemonClient,
     paths: &Paths,
@@ -188,6 +192,11 @@ fn reconcile_existing(paths: &Paths, name: &str, opts: &SandboxOpts) -> anyhow::
         eprintln!("updated egress policy for '{name}' (takes effect on (re)start)");
     }
     let ignored = ignored_create_opts(opts);
+    // Mutation note: the `delete !` mutant on this guard only flips whether the
+    // stderr "ignored opts" warning prints — no return/state change, so it is
+    // unkillable by a unit test. It is excluded by name in `.cargo/mutants.toml`
+    // (pinned in `hack/mutants-check-excludes.py`); the function's policy-persist
+    // mutants stay under test (covered by the `reconcile_*` tests).
     if !ignored.is_empty() {
         eprintln!(
             "warning: '{name}' is an existing sandbox — stored config wins; {} ignored \

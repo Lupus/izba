@@ -23,6 +23,7 @@ use std::io::Read;
 /// erofs, and publish under `digest` along with `config_json` + `image_ref`.
 /// Returns the canonical digest (echoes `digest`). Idempotent: if the store
 /// already has `digest` cached, it is a no-op returning `digest`.
+#[mutants::skip] // reason: flatten→erofs→publish; needs mkfs.erofs tooling, exercised by e2e
 pub(crate) fn publish_image(
     paths: &Paths,
     digest: &str,

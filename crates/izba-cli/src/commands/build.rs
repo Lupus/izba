@@ -42,6 +42,7 @@ pub struct BuildOpts {
 /// 16 GiB for the persistent BuildKit cache volume.
 const BUILDCACHE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+#[mutants::skip] // reason: orchestrates a live daemon + builder microVM; e2e-only (daemon_e2e)
 pub fn run(paths: &Paths, opts: &BuildOpts) -> anyhow::Result<i32> {
     // `izba build` only needs the exit status; all orchestration lives in
     // `build_image`. A successful build maps to exit 0.
@@ -53,6 +54,7 @@ pub fn run(paths: &Paths, opts: &BuildOpts) -> anyhow::Result<i32> {
 /// digest. Drives the full pipeline: validate → Create → arm build-network
 /// policy → Start → run BuildKit → ingest → tag → teardown. Used directly by
 /// `izba run --build` (to chain build→run) and via `run` by `izba build`.
+#[mutants::skip] // reason: connects to a live daemon + boots a builder microVM; e2e-only (daemon_e2e)
 pub fn build_image(paths: &Paths, opts: &BuildOpts) -> anyhow::Result<String> {
     // Fail fast on a bad tag BEFORE any daemon work or VM boot.
     if let Some(tag) = &opts.tag {
@@ -84,6 +86,7 @@ pub fn build_image(paths: &Paths, opts: &BuildOpts) -> anyhow::Result<String> {
 
 /// The build proper, AFTER Create and BEFORE teardown. Persists the policy,
 /// starts the VM, runs the build, ingests + tags on success, returns the digest.
+#[mutants::skip] // reason: drives a live daemon (Start/exec) + builder microVM + ingest; e2e-only
 fn run_build(
     paths: &Paths,
     client: &mut DaemonClient,
@@ -147,6 +150,7 @@ fn run_build(
 /// Always-runs teardown: remove the throwaway sandbox (force, since it is
 /// running). Best-effort — a failure here is reported but never masks the
 /// build result. The persistent `izba-buildcache` volume survives by design.
+#[mutants::skip] // reason: best-effort daemon Rm of a live builder sandbox; e2e-only
 fn teardown(client: &mut DaemonClient, name: &str) {
     match client.request(
         &DaemonRequest::Rm {
@@ -249,6 +253,13 @@ mod tests {
             cpus: 2,
             mem: 4096,
         }
+    }
+
+    /// Mutants on line 43 (the three `*` in `16 * 1024 * 1024 * 1024`): pin the
+    /// constant to exactly 16 GiB so any arithmetic-operator mutation is caught.
+    #[test]
+    fn buildcache_bytes_is_16_gib() {
+        assert_eq!(BUILDCACHE_BYTES, 17_179_869_184);
     }
 
     #[test]
