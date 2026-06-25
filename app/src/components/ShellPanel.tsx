@@ -1,6 +1,7 @@
 import { useSyncExternalStore, useState, useEffect, useRef } from "react";
 import { shellStore } from "../lib/shellStore";
 import { api } from "../lib/ipc";
+import { Button } from "@/components/ui/button";
 
 export function ShellPanel({ sandbox }: { sandbox: string }) {
   useSyncExternalStore(shellStore.subscribe, shellStore.snapshot);
@@ -46,43 +47,51 @@ export function ShellPanel({ sandbox }: { sandbox: string }) {
 
   return (
     <div className="flex h-full flex-col">
-      <div role="tablist" className="flex items-center gap-1 border-b border-line pb-1">
+      <div role="tablist" className="flex items-center gap-1 border-b border-border pb-1">
         {all.map((s) => (
           <div
             key={s.id}
             className={
               "flex items-center gap-1 rounded-t px-2 py-1 text-xs " +
-              (active && active.id === s.id ? "bg-hover font-semibold" : "text-ink-2")
+              (active && active.id === s.id ? "bg-muted font-semibold" : "text-muted-foreground")
             }
           >
-            <button type="button" role="tab" onClick={() => selectShell(s.id)}>
+            <Button
+              variant="ghost"
+              size="sm"
+              role="tab"
+              className="h-auto p-0 text-xs font-normal hover:bg-transparent"
+              onClick={() => selectShell(s.id)}
+            >
               {s.label}
               {s.exited ? " (exited)" : ""}
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
               aria-label={`Close ${s.label}`}
+              className="h-4 w-4 text-muted-foreground-2 hover:bg-transparent hover:text-destructive"
               onClick={() => void shellStore.close(s.id)}
-              className="text-ink-3 hover:text-warn"
             >
               ×
-            </button>
+            </Button>
           </div>
         ))}
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="sm"
           aria-label="New shell"
+          className="text-muted-foreground hover:bg-muted"
           onClick={() => void openShell()}
-          className="rounded px-2 py-1 text-xs text-ink-2 hover:bg-hover"
         >
           +
-        </button>
+        </Button>
       </div>
       <div className="min-h-0 flex-1">
         {active ? (
           <ShellViewer key={active.id} sandbox={sandbox} sessionKey={active.id} />
         ) : (
-          <div className="flex h-full items-center justify-center text-sm text-ink-3">
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground-2">
             No shells. Click + to open one.
           </div>
         )}
