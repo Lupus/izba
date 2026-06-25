@@ -18,6 +18,7 @@ describe("no-raw-control", () => {
         { code: "const x = <button>no</button>;", errors: [{ messageId: "rawControl" }] },
         { code: "const x = <input />;", errors: [{ messageId: "rawControl" }] },
         { code: "const x = <select />;", errors: [{ messageId: "rawControl" }] },
+        { code: "const x = <textarea />;", errors: [{ messageId: "rawControl" }] },
       ],
     });
   });

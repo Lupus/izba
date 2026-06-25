@@ -216,7 +216,7 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
 
         {/* Enforce-after switch — prominent when firewall is off */}
         {!enforcing ? (
-          <div className="rounded-lg border border-amber-400 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             <p className="mb-1 font-semibold">⚠ firewall is currently OFF</p>
             <label className="flex items-center gap-2 cursor-pointer">
               <Switch

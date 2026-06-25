@@ -82,6 +82,7 @@ function PortEditor({
         {ports.map((p) => (
           <Badge key={p} variant="secondary" className="gap-1">
             {p}
+            {/* Intentional in-chip remove button — distinct from row-level RemoveRowButton idiom */}
             <Button
               type="button"
               variant="ghost"
