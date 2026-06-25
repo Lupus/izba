@@ -161,9 +161,18 @@ impl EgressPolicyConfig {
     /// `izba build --build-allow`). Everything else is denied. Distinct from
     /// a sandbox run policy; never AllowAll.
     pub fn build_network(extra_hosts: &[String]) -> Self {
+        // `registry-1.docker.io` serves manifests + issues the blob redirect;
+        // `auth.docker.io` mints the pull bearer token. A blob `GET` 307-redirects
+        // to Docker Hub's blob-storage CDN — today an AWS CloudFront distribution
+        // (`production.cloudfront.docker.com`, presigned S3 URL), historically the
+        // Cloudflare host. We allow-list BOTH: an unlisted redirect target is
+        // denied by the MITM (its own 403), which manifests deep in BuildKit as a
+        // misleading "403 Forbidden" on the *registry* blob URL. (cloudfront vs
+        // cloudflare is a real, easy-to-miss distinction — keep both.)
         const DOCKER_HUB_HOSTS: &[&str] = &[
             "registry-1.docker.io",
             "auth.docker.io",
+            "production.cloudfront.docker.com",
             "production.cloudflare.docker.com",
         ];
         let mut allow: Vec<AllowEntry> = DOCKER_HUB_HOSTS
@@ -1040,6 +1049,17 @@ mod tests {
         );
         assert_eq!(
             p.check(&flow_with_host("builder", "registry-1.docker.io", 443)),
+            Verdict::Allow
+        );
+        // Blob CDN — the real Docker Hub blob redirect target (CloudFront)
+        // plus the historical Cloudflare host. A missing CDN host is the exact
+        // bug that 403'd the in-VM `alpine` blob pull.
+        assert_eq!(
+            p.check(&flow_with_host(
+                "builder",
+                "production.cloudfront.docker.com",
+                443
+            )),
             Verdict::Allow
         );
         assert_eq!(
