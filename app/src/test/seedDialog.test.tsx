@@ -56,7 +56,7 @@ describe("SeedDialog", () => {
     render(<SeedDialog name="web" rows={[sum({host:"pypi.org",port:443,last_method:"GET",last_path:"/"})]}
       enforcing={false} policy={{enforcing:false,allow:[],git:[]}} onClose={()=>{}} onApplied={()=>{}} />);
     expect(screen.getByText(/firewall is currently OFF/i)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("checkbox", { name: /Enforce firewall after adding/i }));
+    fireEvent.click(screen.getByRole("switch", { name: /Enforce firewall after adding/i }));
     fireEvent.click(screen.getByRole("button", { name: /Add .* selected/ }));
     await waitFor(() => expect(add).toHaveBeenCalledWith("web", expect.anything(), true));
   });
