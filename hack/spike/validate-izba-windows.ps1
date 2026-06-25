@@ -607,7 +607,11 @@ if (-not (Test-Path (Join-Path $fixtureDir 'Dockerfile'))) {
         # Step 2: run the built image and assert the marker written by RUN is readable.
         $markerOut = (& $exe run --image $buildName --name 'e2e-built-run' $buildWs -- cat /izba-build-marker 2>&1 | Out-String)
         $markerRc  = $LASTEXITCODE
-        $markerOk  = ($markerRc -eq 0 -and "$markerOut".Trim() -eq 'izba-build-ok')
+        # `2>&1` folds izba's stderr progress ("resolving…", "starting…") into
+        # the capture, so assert the marker is PRESENT (mirroring the KVM
+        # daemon_e2e `.contains()` check) rather than exact-equality — the
+        # marker string never appears in those progress lines.
+        $markerOk  = ($markerRc -eq 0 -and "$markerOut" -match 'izba-build-ok')
         Check 'build-in-VM: run reads marker from built image' $markerOk
         if (-not $markerOk) {
             [Console]::Error.WriteLine("  izba run rc=$markerRc out='$($markerOut.Trim())'")
