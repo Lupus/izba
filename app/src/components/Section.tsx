@@ -1,20 +1,23 @@
 import { useState, type ReactNode } from "react";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 
 export function Section({ title, defaultOpen = true, children }: Readonly<{
   title: string; defaultOpen?: boolean; children: ReactNode;
 }>) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <section className="rounded-lg border border-line">
-      <button
+    <Card>
+      <Button
         type="button"
+        variant="ghost"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm font-semibold"
+        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm font-semibold justify-start"
       >
-        <span className="text-ink-3">{open ? "▾" : "▸"}</span>
+        <span className="text-muted-foreground-2">{open ? "▾" : "▸"}</span>
         {title}
-      </button>
-      {open && <div className="border-t border-line p-3">{children}</div>}
-    </section>
+      </Button>
+      {open && <div className="border-t border-border p-3">{children}</div>}
+    </Card>
   );
 }

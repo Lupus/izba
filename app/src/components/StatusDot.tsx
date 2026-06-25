@@ -1,9 +1,9 @@
 import type { SbxState } from "../lib/types";
 
 const COLOR: Record<SbxState["kind"], string> = {
-  running: "bg-ok",
-  degraded: "bg-warn",
-  stopped: "bg-off",
+  running: "bg-success",
+  degraded: "bg-destructive",
+  stopped: "bg-muted-foreground-2",
 };
 
 export function StatusDot({ state }: { state: SbxState }) {
