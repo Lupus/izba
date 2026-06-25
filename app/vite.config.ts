@@ -54,6 +54,15 @@ export default defineConfig({
       {
         plugins: [react()],
         resolve: { alias },
+        // Pre-bundle Tauri deps the browser-mode IPC-spec tests import via the
+        // mocked components, so Vitest doesn't reload mid-run (avoids flakiness).
+        optimizeDeps: {
+          include: [
+            "@tauri-apps/plugin-dialog",
+            "@tauri-apps/api/core",
+            "@tauri-apps/api/event",
+          ],
+        },
         test: {
           name: "browser",
           globals: true,
