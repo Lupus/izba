@@ -100,6 +100,13 @@ pub fn set_tag(paths: &Paths, tag: &str, digest: &str) -> Result<()> {
 ///
 /// Used by `izba run --build` to prune stale one-shot `izba-run-build-<ts>`
 /// tags from prior invocations (see [`RUN_BUILD_TAG_PREFIX`]).
+///
+/// NOT safe against a *concurrent* `izba run --build` sharing the same `<data>`
+/// dir: a parallel invocation's top-of-build prune may sweep this run's
+/// freshly-registered hidden tag before the daemon's `ensure_image` resolves it
+/// at Create, making that run miss the cache. Concurrent one-shot builds against
+/// the same data dir are unsupported (and the load→modify→save here is itself
+/// not atomic against concurrent writers).
 pub fn prune_tags_with_prefix(paths: &Paths, prefix: &str) -> Result<usize> {
     let mut map = load_tags(paths)?;
     let before = map.len();

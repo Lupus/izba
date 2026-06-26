@@ -132,8 +132,10 @@ mod tests {
         // buildkitd.log tail so console.log shows why the daemon never came up.
         let s = build_script("Dockerfile");
         let poll_end = s.find("seq 1 60").expect("buildkitd poll present") + "seq 1 60".len();
-        let buildctl_start = s.find("buildctl build").expect("buildctl build present");
-        let between = &s[poll_end..buildctl_start];
+        // Bound at the START of the DNS poll so this slice covers ONLY the
+        // buildkitd guard — not the DNS guard, which has its own exit 1 / message.
+        let region_end = s.find("seq 1 30").expect("DNS poll present");
+        let between = &s[poll_end..region_end];
         assert!(
             between.contains("exit 1"),
             "exit 1 must appear between buildkitd poll and buildctl build: {s}"
