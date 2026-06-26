@@ -28,7 +28,9 @@ pub fn build_script(filename: &str) -> String {
         "set -e\n\
          buildkitd --oci-worker-snapshotter=overlayfs --root /var/lib/buildkit >/var/log/buildkitd.log 2>&1 &\n\
          for i in $(seq 1 60); do buildctl debug workers >/dev/null 2>&1 && break; sleep 1; done\n\
+         buildctl debug workers >/dev/null 2>&1 || {{ echo \"timed out waiting for buildkitd (60s)\" >&2; tail -n 50 /var/log/buildkitd.log >&2 2>&1; exit 1; }}\n\
          for i in $(seq 1 30); do nslookup registry-1.docker.io 127.0.0.1 >/dev/null 2>&1 && break; sleep 1; done\n\
+         nslookup registry-1.docker.io 127.0.0.1 >/dev/null 2>&1 || {{ echo \"timed out waiting for DNS (30s)\" >&2; cat /etc/resolv.conf >&2 2>&1; nslookup registry-1.docker.io 127.0.0.1 >&2 2>&1; exit 1; }}\n\
          set +e\n\
          buildctl build --progress=plain --frontend dockerfile.v0 --local context=/workspace --local dockerfile=/workspace --opt filename={filename} --output type=oci,dest=/out/img.tar\n\
          rc=$?\n\
@@ -119,6 +121,53 @@ mod tests {
         assert!(
             !s.contains("filename=sub dir"),
             "unquoted filename must not leak: {s}"
+        );
+    }
+
+    #[test]
+    fn build_script_exits_on_buildkitd_poll_timeout() {
+        // After the buildkitd poll loop the script must explicitly exit 1 with
+        // a clear message (not silently fall through to a confusing
+        // connection-refused from `buildctl`).  It must also dump the
+        // buildkitd.log tail so console.log shows why the daemon never came up.
+        let s = build_script("Dockerfile");
+        let poll_end = s.find("seq 1 60").expect("buildkitd poll present") + "seq 1 60".len();
+        let buildctl_start = s.find("buildctl build").expect("buildctl build present");
+        let between = &s[poll_end..buildctl_start];
+        assert!(
+            between.contains("exit 1"),
+            "exit 1 must appear between buildkitd poll and buildctl build: {s}"
+        );
+        assert!(
+            between.contains("timed out") || between.contains("timeout"),
+            "timeout message must appear between buildkitd poll and buildctl build: {s}"
+        );
+        assert!(
+            between.contains("buildkitd.log"),
+            "buildkitd.log tail must be dumped on buildkitd poll timeout: {s}"
+        );
+    }
+
+    #[test]
+    fn build_script_exits_on_dns_poll_timeout() {
+        // After the DNS poll loop the script must explicitly exit 1 with a
+        // clear message.  It must also dump resolv.conf so console.log shows
+        // the resolver configuration at the time of the failure.
+        let s = build_script("Dockerfile");
+        let poll_end = s.find("seq 1 30").expect("DNS poll present") + "seq 1 30".len();
+        let buildctl_start = s.find("buildctl build").expect("buildctl build present");
+        let between = &s[poll_end..buildctl_start];
+        assert!(
+            between.contains("exit 1"),
+            "exit 1 must appear between DNS poll and buildctl build: {s}"
+        );
+        assert!(
+            between.contains("timed out") || between.contains("timeout"),
+            "timeout message must appear between DNS poll and buildctl build: {s}"
+        );
+        assert!(
+            between.contains("resolv.conf"),
+            "resolv.conf must be dumped on DNS poll timeout: {s}"
         );
     }
 }
