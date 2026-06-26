@@ -42,13 +42,22 @@ composite.
    button. Consistent by construction; one place to evolve.
 4. **Row density is driven by content type, applied consistently across tabs**
    (not chosen per-tab):
-   - **`inline` (borderless):** compact single-line rows. → Ports forwards,
-     New-sandbox ports.
+   - **`inline` (borderless):** compact single-line rows. → New-sandbox ports.
    - **`card` (bordered `RowCard`):** multi-control *form* rows. → Volumes +
      New-sandbox volumes (type-segmented + path + name), Policy host rows
      (host + access picker), Policy git/repo rows (kept carded so PolicyEditor's
      two lists stay uniform).
    - Rule: *compact one-line → borderless; multi-control form → carded.*
+
+> **PortsTab scope correction (2026-06-26):** PortsTab (running-sandbox detail)
+> is NOT a declarative editable-row list — it is a read-only table of LIVE +
+> persisted forwards (each with Open / Make-persistent / Remove actions) plus a
+> separate "Add forward" create-form whose inputs **apply immediately** to the
+> daemon. So it does **not** use `EditableList` (which is click-to-append for
+> declarative specs). PortsTab keeps its live-list + create-form model but
+> adopts the **same unified add button** (decision 5) and a tidied create-form
+> layout. `EditableList` is used only by the declarative surfaces: VolumesTab,
+> PolicyEditor (hosts + git), NewSandbox (ports + volumes).
 5. **One add affordance everywhere**, independent of density:
    - **Solid, surface-independent background** (no transparent `secondary`) —
      identical over any surface.
@@ -108,10 +117,12 @@ owns them).
 Each tab replaces its hand-rolled list + add/remove wiring with `EditableList`,
 passing the row fields via `renderRow` and the right `density`:
 
-- **PortsTab** (`density="inline"`): the committed-forwards list + the inline
-  "Add forward" template both collapse into one `EditableList`; clicking Add
-  appends a blank forward row (bind/host/guest inputs inline). Remove via
-  EditableList.
+- **PortsTab** (NOT EditableList — keeps live model): the live/persisted
+  forwards table is unchanged. The "Add forward" create-form keeps its
+  bind/host/guest inputs but adopts the unified `AddRowButton` (solid bg, input
+  height, `Plus` icon) and a tidied layout — the add button moves **below** the
+  inputs, left-aligned (not inline-right), so its height no longer clashes with
+  the inputs. No interaction-model change (forwards still apply immediately).
 - **VolumesTab** (`density="card"`): `VolumeRowEditor` becomes fields-only
   (no own remove); EditableList wraps it.
 - **PolicyEditor** (`density="card"`, both the hosts list and the git/repos
