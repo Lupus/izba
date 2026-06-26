@@ -36,7 +36,7 @@ pub fn run(
 /// - PATH is a file (Dockerfile) → context = PATH's parent directory
 ///
 /// The built digest is registered as a hidden local tag
-/// `izba-run-build-<base36-timestamp>` so the daemon's `ensure_image` short-
+/// `izba-run-build-<decimal-millis>` so the daemon's `ensure_image` short-
 /// circuits the tag-is-cached branch and never touches the registry.
 #[mutants::skip] // reason: live daemon+VM, e2e-only
 pub(crate) fn build_then_image_ref(
