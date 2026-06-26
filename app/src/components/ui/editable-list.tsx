@@ -1,6 +1,5 @@
 import * as React from "react";
 import { RowList, RowCard, AddRowButton, RemoveRowButton } from "@/components/ui/row-editor";
-import { cn } from "@/lib/utils";
 
 export interface EditableListProps<T> {
   items: T[];
@@ -42,7 +41,9 @@ export function EditableList<T>({
                 </div>
               </RowCard>
             ) : (
-              <div key={i} className={cn("flex flex-wrap items-center gap-2")}>
+              // key=index is safe here: rows are fully controlled by the parent's
+              // items state (no uncontrolled per-row state lives in the wrapper).
+              <div key={i} className="flex flex-wrap items-center gap-2">
                 {renderRow(item, i)}
                 <RemoveRowButton aria-label={label(item, i)} onClick={() => onRemove(i)} />
               </div>
