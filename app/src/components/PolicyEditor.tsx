@@ -9,7 +9,7 @@ import { EnforceToggle } from "./EnforceToggle";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { RowCard, RowList, AddRowButton, RemoveRowButton } from "@/components/ui/row-editor";
+import { EditableList } from "@/components/ui/editable-list";
 
 interface Row {
   host: string;
@@ -260,9 +260,11 @@ export function PolicyEditor({ name }: { name: string }) {
             <p className="mb-2 text-sm text-muted-foreground">
               Hosts this sandbox may reach. Add a port to a host, or remove one with its ✕.
             </p>
-            <RowList>
-              {hosts.map((r, i) => (
-                <RowCard key={i} className="flex-col items-start p-3">
+            <EditableList
+              density="card"
+              items={hosts}
+              renderRow={(r, i) => (
+                <>
                   <div className="flex w-full items-center gap-2">
                     <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Host</label>
                     <Input
@@ -270,10 +272,6 @@ export function PolicyEditor({ name }: { name: string }) {
                       onChange={(e) => setHost(i, e.target.value)}
                       placeholder="api.example.com"
                       className="flex-1 font-mono text-sm"
-                    />
-                    <RemoveRowButton
-                      aria-label={`Remove host ${r.host}`}
-                      onClick={() => removeRow(i)}
                     />
                   </div>
                   <div className="flex w-full items-center gap-2">
@@ -291,15 +289,14 @@ export function PolicyEditor({ name }: { name: string }) {
                       onChange={(v) => setHostAccess(i, v)}
                     />
                   </div>
-                </RowCard>
-              ))}
-              {hosts.length === 0 && (
-                <div className="text-sm text-muted-foreground-2">No hosts allowed yet — add one below.</div>
+                </>
               )}
-            </RowList>
-            <div className="mt-2 flex items-center gap-2">
-              <AddRowButton onClick={addRow}>Add host</AddRowButton>
-            </div>
+              onAdd={addRow}
+              onRemove={(i) => removeRow(i)}
+              addLabel="Add host"
+              emptyHint="No allowed hosts — add one to permit egress."
+              rowAriaLabel={(_,i) => `Remove host ${i + 1}`}
+            />
           </Section>
 
           <Section title="Git repos">
@@ -307,9 +304,11 @@ export function PolicyEditor({ name }: { name: string }) {
               Git repositories this sandbox may clone or push to. Specify as{" "}
               <span className="font-mono">host/owner/repo</span> or <span className="font-mono">host</span>.
             </p>
-            <RowList>
-              {gitRows.map((gr, i) => (
-                <RowCard key={i}>
+            <EditableList
+              density="card"
+              items={gitRows}
+              renderRow={(gr, i) => (
+                <div className="flex w-full items-center gap-2">
                   <Input
                     value={gr.target}
                     onChange={(e) => setGitTarget(i, e.target.value)}
@@ -320,19 +319,14 @@ export function PolicyEditor({ name }: { name: string }) {
                     value={gr.access}
                     onChange={(v) => setGitAccess(i, v)}
                   />
-                  <RemoveRowButton
-                    aria-label={`Remove git row ${i}`}
-                    onClick={() => removeGitRow(i)}
-                  />
-                </RowCard>
-              ))}
-              {gitRows.length === 0 && (
-                <div className="text-sm text-muted-foreground-2">No git repos allowed yet — add one below.</div>
+                </div>
               )}
-            </RowList>
-            <div className="mt-2 flex items-center gap-2">
-              <AddRowButton onClick={addGitRow}>Add repo</AddRowButton>
-            </div>
+              onAdd={addGitRow}
+              onRemove={(i) => removeGitRow(i)}
+              addLabel="Add repo"
+              emptyHint="No git rules — add one to allow a repo."
+              rowAriaLabel={(_,i) => `Remove repo ${i + 1}`}
+            />
           </Section>
         </div>
       </div>
