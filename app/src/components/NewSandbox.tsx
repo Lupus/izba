@@ -27,7 +27,6 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
-import { AddRowButton, RemoveRowButton } from "@/components/ui/row-editor";
 import { EditableList } from "@/components/ui/editable-list";
 
 // NewSandbox has no seeded volumes, so the seeded-names set is always empty —
@@ -132,7 +131,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
   }
 
   // A row the user added but left entirely blank is ignored (so a stray
-  // "+ Add port" click can't block submit). Any row they started filling must
+  // "Add port" click can't block submit). Any row they started filling must
   // carry numeric host AND guest ports in 1–65535, plus a valid IPv4 bind (or
   // empty → the daemon defaults it to 127.0.0.1). The bind contract mirrors
   // izba_core::portfwd::parse_rule, which parses bind as an Ipv4Addr.
@@ -149,10 +148,6 @@ export function NewSandbox({ onClose, onCreated }: Props) {
     !busy &&
     !portsInvalid &&
     !volumesInvalid;
-
-  // Shared column template so the Bind/Host/Guest headers line up with the
-  // inputs below: [bind grows] [host 5rem] [colon] [guest 5rem] [remove 2rem].
-  const portGrid = "grid grid-cols-[minmax(0,1fr)_5rem_0.75rem_5rem_2rem] items-center gap-1.5";
 
   return (
     <Dialog
@@ -248,29 +243,27 @@ export function NewSandbox({ onClose, onCreated }: Props) {
           </div>
           <div className="grid gap-1">
             <span className="text-muted-foreground">Ports</span>
-            <div className="grid gap-1.5">
-              {ports.length > 0 && (
-                <div className={portGrid + " text-xs text-muted-foreground-2"}>
-                  <span>Bind address</span>
-                  <span>Host port</span>
-                  <span />
-                  <span>Guest port</span>
-                  <span />
-                </div>
-              )}
-              {ports.map((r, i) => {
+            {ports.length > 0 && (
+              <div className="flex gap-2 text-xs text-muted-foreground-2">
+                <span className="flex-1">Bind address</span>
+                <span className="w-20">Host port</span>
+                <span className="w-3" />
+                <span className="w-20">Guest port</span>
+              </div>
+            )}
+            <EditableList
+              density="inline"
+              items={ports}
+              renderRow={(r, i) => {
                 const invalid = !isBlankRow(r) && !isValidRow(r);
-                // Shared cell style; flag the specific field that is wrong.
-                const cell = (bad: boolean) =>
-                  bad ? "border-destructive" : "";
                 return (
-                  <div key={i} className={portGrid}>
+                  <>
                     <Input
                       aria-label={`Port ${i + 1} bind`}
                       placeholder="127.0.0.1"
                       value={r.bind}
                       onChange={(e) => setPort(i, { bind: e.target.value })}
-                      className={cell(invalid && !isValidBind(r.bind))}
+                      className={`flex-1${invalid && !isValidBind(r.bind) ? " border-destructive" : ""}`}
                     />
                     <Input
                       aria-label={`Port ${i + 1} host`}
@@ -278,7 +271,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                       inputMode="numeric"
                       value={r.host}
                       onChange={(e) => setPort(i, { host: e.target.value })}
-                      className={cell(invalid && !isValidPort(r.host))}
+                      className={`w-20${invalid && !isValidPort(r.host) ? " border-destructive" : ""}`}
                     />
                     <span className="text-center text-muted-foreground-2">:</span>
                     <Input
@@ -287,25 +280,25 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                       inputMode="numeric"
                       value={r.guest}
                       onChange={(e) => setPort(i, { guest: e.target.value })}
-                      className={cell(invalid && !isValidPort(r.guest))}
+                      className={`w-20${invalid && !isValidPort(r.guest) ? " border-destructive" : ""}`}
                     />
-                    <RemoveRowButton
-                      aria-label={`Remove port ${i + 1}`}
-                      onClick={() => removePort(i)}
-                    />
-                  </div>
+                  </>
                 );
-              })}
-              <AddRowButton onClick={addPort}>+ Add port</AddRowButton>
-              <span className="text-xs text-muted-foreground-2">
-                Bind address defaults to 127.0.0.1 when left empty.
+              }}
+              onAdd={addPort}
+              onRemove={removePort}
+              addLabel="Add port"
+              emptyHint="No published ports — add one to forward a port."
+              rowAriaLabel={(_, i) => `Remove port ${i + 1}`}
+            />
+            <span className="text-xs text-muted-foreground-2">
+              Bind address defaults to 127.0.0.1 when left empty.
+            </span>
+            {portsInvalid && (
+              <span className="text-xs text-destructive">
+                Each port needs a host and guest in 1–65535, and a valid IPv4 bind (or empty).
               </span>
-              {portsInvalid && (
-                <span className="text-xs text-destructive">
-                  Each port needs a host and guest in 1–65535, and a valid IPv4 bind (or empty).
-                </span>
-              )}
-            </div>
+            )}
           </div>
           <div className="grid gap-1">
             <span className="text-muted-foreground">Volumes</span>
