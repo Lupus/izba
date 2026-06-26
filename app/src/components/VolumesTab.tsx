@@ -17,7 +17,7 @@ import {
 import { VolumeRowEditor } from "./VolumeRowEditor";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { AddRowButton } from "@/components/ui/row-editor";
+import { EditableList } from "@/components/ui/editable-list";
 
 interface Props {
   sandbox: SandboxView;
@@ -208,9 +208,6 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       )}
 
       {/* Seeded rows (from inspect) */}
-      {seeded.length === 0 && volumeRows.length === 0 && (
-        <div className="text-sm text-muted-foreground-2">No volumes attached.</div>
-      )}
 
       {seeded.map((s, i) => {
         const isPersistent = s.spec.name !== null;
@@ -268,39 +265,44 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       })}
 
       {/* Inline new-volume rows */}
-      {volumeRows.map((row, i) => {
-        const nameErr =
-          row.kind === "new_persistent" && row.name.trim() !== ""
-            ? volNameError(row.kind, row.name.trim())
-            : null;
-        const pathErr = row.path.trim() !== "" ? volPathError(row.path.trim()) : null;
-        const sizeErr =
-          (row.kind === "ephemeral" || row.kind === "new_persistent") && row.size.trim() !== ""
-            ? volSizeError(row.kind, row.size.trim())
-            : null;
-        const pickErr =
-          row.kind === "existing_persistent" && row.path.trim() !== ""
-            ? volPickError(row.kind, row.selectedVolName)
-            : null;
-        return (
-          <div key={i} className="flex flex-col gap-1">
-            <VolumeRowEditor
-              row={row}
-              index={i}
-              freeVolumes={freeVolumesFor(i)}
-              onChange={(r) => setVolumeRow(i, r)}
-              onRemove={() => removeVolume(i)}
-            />
-            {nameErr && <span className="text-xs text-destructive">{nameErr}</span>}
-            {pathErr && <span className="text-xs text-destructive">{pathErr}</span>}
-            {sizeErr && <span className="text-xs text-destructive">{sizeErr}</span>}
-            {pickErr && <span className="text-xs text-destructive">{pickErr}</span>}
-          </div>
-        );
-      })}
-
-      {/* Add volume button */}
-      <AddRowButton onClick={addVolume}>+ Add volume</AddRowButton>
+      <EditableList
+        density="card"
+        items={volumeRows}
+        renderRow={(row, i) => {
+          const nameErr =
+            row.kind === "new_persistent" && row.name.trim() !== ""
+              ? volNameError(row.kind, row.name.trim())
+              : null;
+          const pathErr = row.path.trim() !== "" ? volPathError(row.path.trim()) : null;
+          const sizeErr =
+            (row.kind === "ephemeral" || row.kind === "new_persistent") && row.size.trim() !== ""
+              ? volSizeError(row.kind, row.size.trim())
+              : null;
+          const pickErr =
+            row.kind === "existing_persistent" && row.path.trim() !== ""
+              ? volPickError(row.kind, row.selectedVolName)
+              : null;
+          return (
+            <>
+              <VolumeRowEditor
+                row={row}
+                index={i}
+                freeVolumes={freeVolumesFor(i)}
+                onChange={(r) => setVolumeRow(i, r)}
+              />
+              {nameErr && <span className="text-xs text-destructive">{nameErr}</span>}
+              {pathErr && <span className="text-xs text-destructive">{pathErr}</span>}
+              {sizeErr && <span className="text-xs text-destructive">{sizeErr}</span>}
+              {pickErr && <span className="text-xs text-destructive">{pickErr}</span>}
+            </>
+          );
+        }}
+        onAdd={addVolume}
+        onRemove={removeVolume}
+        addLabel="+ Add volume"
+        emptyHint="No volumes — add one to mount it."
+        rowAriaLabel={(_, i) => `Remove volume ${i + 1}`}
+      />
     </div>
   );
 }

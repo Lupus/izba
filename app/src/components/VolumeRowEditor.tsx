@@ -8,7 +8,6 @@ import {
 } from "../lib/volumevalidate";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { RemoveRowButton } from "@/components/ui/row-editor";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import {
   Select,
@@ -23,7 +22,6 @@ interface Props {
   /** Already filtered to free, attachable volumes (caller does the filtering). */
   freeVolumes: VolumeInfo[];
   onChange: (row: VolumeRow) => void;
-  onRemove: () => void;
   /** Zero-based; used for aria-labels like "Volume 1 name". */
   index: number;
 }
@@ -42,7 +40,7 @@ const KIND_OPTIONS = [
 ];
 
 /** One editable new-volume row with a 3-way type selector. */
-export function VolumeRowEditor({ row, freeVolumes, onChange, onRemove, index }: Props) {
+export function VolumeRowEditor({ row, freeVolumes, onChange, index }: Props) {
   const n = index + 1;
 
   const setKind = (kind: VolumeKind) => onChange({ ...row, kind });
@@ -60,7 +58,7 @@ export function VolumeRowEditor({ row, freeVolumes, onChange, onRemove, index }:
   const selectedVol = freeVolumes.find((v) => v.name === row.selectedVolName);
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
+    <div className="flex flex-col gap-2">
       {/* Segmented type selector */}
       <SegmentedControl
         value={row.kind}
@@ -163,12 +161,6 @@ export function VolumeRowEditor({ row, freeVolumes, onChange, onRemove, index }:
         )}
       </div>
 
-      <div className="flex justify-end">
-        <RemoveRowButton
-          aria-label={`Remove volume ${n}`}
-          onClick={onRemove}
-        />
-      </div>
     </div>
   );
 }
