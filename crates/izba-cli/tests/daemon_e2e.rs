@@ -499,15 +499,17 @@ fn build_in_vm_dockerfile_to_running_sandbox() {
     let fixture_s = fixture_dir.to_string_lossy().into_owned();
 
     // [1] Build the Dockerfile inside a throwaway builder VM.
-    //     On failure, dump the builder sandbox's console.log to aid diagnosis
-    //     (the builder name is ephemeral, so we look for the most-recent one).
+    //     On failure, dump all sandbox console.logs to aid diagnosis.
+    //     Note: buildkitd.log lives inside the VM and is NOT readable from the
+    //     host; it surfaces here because the build script tails it to stderr on
+    //     buildctl failure, and stderr is captured into console.log.
     let o = izba(
         &data,
         no_env,
         &["build", "-t", "izba-e2e-built", &fixture_s],
     );
     if !o.status.success() {
-        // Best-effort: find the builder sandbox log dir (name is time-based).
+        // Best-effort: dump all sandbox console.logs (builder name is time-based).
         let sandboxes_dir = data.join("sandboxes");
         if let Ok(rd) = std::fs::read_dir(&sandboxes_dir) {
             for entry in rd.flatten() {
