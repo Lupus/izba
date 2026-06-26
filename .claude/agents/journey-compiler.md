@@ -48,7 +48,9 @@ checkout):
 
 1. **`journeys.json`** — conforms to `hack/dogfood/schema/journeys.schema.json`.
    `{ "feature": "...", "journeys": [ { journey_id, rationale, source{kind,ref},
-   steps:[{intent, expect}] } ] }`. You MUST validate it (see Validation).
+   tier?, establishes?, requires?, gating?, steps:[{intent, expect}] } ] }`. You
+   MUST validate it (see Validation). Compile for COMPLETENESS first, then tag
+   every journey for progressive exploration (Mandate 6).
 2. **`context-pack.md`** — the fair-test surface: README excerpts + the gathered
    recursive `--help` + any user-facing doc sections. ONLY user-visible material.
    This documents exactly what the swarm is allowed to know, so the test is
@@ -110,6 +112,37 @@ the required ordering isn't explained — record it in `discoverability-flags.md
 as a predicted UX finding. (Example shape: "`--volume SIZE` requires a `g`/`m`
 suffix but `--help` shows only `SIZE` with no example → a user will guess `:1`
 and fail.") These are first-class findings, not footnotes.
+
+## Mandate 6 — Tier & capability tagging (for progressive exploration)
+
+The run is progressive: the cheapest, shallowest journeys run first so obvious
+gaps (e.g. a missing README explanation that would block dozens of deeper
+journeys) surface in the first small iteration — not after a 50-journey swarm.
+Compile for completeness FIRST (don't drop journeys), then tag each for ordering:
+
+- **`tier`** — `smoke` | `core` | `deep`:
+  - `smoke` — a handful of shallow happy-path journeys AND the **capability
+    probes** that deeper journeys depend on. Ask: "what must a user be able to
+    discover/do before any deep test is even meaningful?" (e.g. turn the feature
+    on; reach an allowed endpoint / install tooling under the new mode; find the
+    trust/CA story). These are the obvious-gap detectors — keep them few and cheap.
+  - `core` — the main feature coverage (the bulk of allow/deny/state/lifecycle).
+  - `deep` — adversarial, edge, multi-step, cross-entity, and anything that
+    presupposes the smoke capabilities already work.
+- **`establishes`** — on a smoke/core journey, the kebab-case capability tokens it
+  proves usable when it genuinely succeeds (e.g. `install-tooling-under-enforce`,
+  `tls-verifies-under-enforce`). Share one vocabulary across the feature.
+- **`requires`** — on a deeper journey, the capability tokens it needs first. If
+  that capability turns out to be a confirmed unfixable blocker, the orchestrator
+  defers this journey (and logs it) instead of burning budget on a guaranteed
+  fail.
+- **`gating: true`** — on the *few* smoke journeys that are true prerequisites:
+  advancing past their tier requires them to genuinely succeed (or their blocker
+  to be fixed in-place). Use sparingly.
+
+Tag honestly from the spec — a capability the swarm can only learn from
+privileged sources is exactly the kind of smoke-tier discoverability gate worth
+flagging. Tagging is ordering metadata; it never leaks into `intent`/`expect`.
 
 ## Validation (mandatory before you finish)
 

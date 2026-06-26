@@ -20,6 +20,12 @@ You have **privileged** access (spec, PR, review) — the swarm did not. Judge t
 swarm's behavior against what a *user* could know (the context pack) and what the
 spec *promises*. Quote anchors and trajectory lines. **Never invent evidence.**
 
+You may be invoked **per tier** in a progressive run (just one tier's bundles at a
+time) or over a whole run. When given the `sequence-plan.json`, judge the tier's
+**gating** journeys especially carefully — the orchestrator uses your capability
+verdict (below) to decide whether to advance, fix-and-retry, or defer dependent
+deep journeys.
+
 ## Inputs you will be given
 
 - The **trajectory bundles** (`traj-*.json`) for every shard: each journey's
@@ -29,6 +35,8 @@ spec *promises*. Quote anchors and trajectory lines. **Never invent evidence.**
 - The **anchors**: spec (primary), PR body, code review.
 - The compiler's **coverage-map** and **discoverability-flags** (predicted UX gaps).
 - The **context-pack** (exactly what the swarm was allowed to know).
+- Optionally the **`sequence-plan.json`** (tiers, gating journeys, capability
+  graph) when triaging a progressive run — drives your capability verdict.
 
 Use `scripts/collect-trajectories.py <artifacts-dir>` to flatten the bundles into
 negative candidates, the positive-journey list, and a signal/noise summary.
@@ -111,6 +119,22 @@ journey).
    journeys to tighten (from inconclusive verdicts), caps that tripped early,
    context-pack gaps, and which candidates were pure cheap-model weakness (noise
    to suppress next run).
+5. **Capability verdict** (for the progressive gate) — for each capability named
+   in the tier's `establishes`/`requires`: `established` (a genuinely-achieved
+   journey proves it — cite it), `blocked` (no journey could reach it; say why),
+   or `not-exercised`. List which **gating** journeys genuinely passed. This is
+   the orchestrator's advance/fix/defer signal — be unambiguous.
+6. **Fix routing** — for every confirmed finding (item 1), tag it:
+   - **auto-fixable** — the fix is purely documentation, `--help`/clap text,
+     human-facing message *wording*, or the dogfood harness itself; it changes
+     what the product *says*, not what it *does*. → the `dogfood-gap-fixer` can
+     apply it in-place this loop. Name the file(s) you believe need editing.
+   - **escalate** — fixing it requires changing behavior, the datapath, policy/
+     enforcement semantics, a trust boundary/security posture, or a public
+     contract (flag/command/RPC/schema), or it needs a design decision. → a
+     blocker for the human; do NOT mark auto-fixable to be helpful. When unsure,
+     tag **escalate**. (Canonical escalate: a too-loose length/validation check
+     that needs tightening — that is behavior, not text.)
 
 ## Rules
 
