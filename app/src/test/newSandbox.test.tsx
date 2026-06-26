@@ -118,17 +118,17 @@ describe("NewSandbox", () => {
 
   // ── Volume section — inline-rows flow ─────────────────────────────────────────
 
-  it("'+ Add volume' appends a row", () => {
+  it("'Add volume' appends a row", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     // No VolumeRowEditor before clicking
     expect(screen.queryByLabelText(/volume 1 path/i)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     expect(screen.getByLabelText(/volume 1 path/i)).toBeInTheDocument();
   });
 
   it("'×' removes the inline row", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     expect(screen.getByLabelText(/volume 1 path/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /remove volume 1/i }));
     expect(screen.queryByLabelText(/volume 1 path/i)).not.toBeInTheDocument();
@@ -138,8 +138,8 @@ describe("NewSandbox", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    // Click + Add volume then fill inline
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    // Click Add volume then fill inline
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
@@ -154,14 +154,14 @@ describe("NewSandbox", () => {
 
   it("live error: typing invalid path shows error immediately (no click needed)", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "data" } });
     expect(screen.getByText(/guest path must be absolute/i)).toBeInTheDocument();
   });
 
   it("live error: non-blank invalid size shows error immediately", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1x" } });
     expect(screen.getByText(/size must be a positive number followed by g or m/i)).toBeInTheDocument();
@@ -171,7 +171,7 @@ describe("NewSandbox", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "data" } });
@@ -186,7 +186,7 @@ describe("NewSandbox", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
@@ -201,7 +201,7 @@ describe("NewSandbox", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     // Ephemeral is the default type
     fireEvent.click(screen.getByRole("radio", { name: /ephemeral/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/scratch" } });
@@ -222,7 +222,7 @@ describe("NewSandbox", () => {
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     // Switch to existing persistent type
     fireEvent.click(screen.getByRole("radio", { name: /existing/i }));
 
@@ -237,7 +237,7 @@ describe("NewSandbox", () => {
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
     // Add a blank row — should NOT block Create
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     expect(screen.getByRole("button", { name: /create/i })).not.toBeDisabled();
   });
 
@@ -245,7 +245,7 @@ describe("NewSandbox", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     // Type an invalid (non-slash-prefixed) path
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "x" } });
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
@@ -256,7 +256,7 @@ describe("NewSandbox", () => {
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
     // Add row but leave blank
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("button", { name: /create/i }));
     await waitFor(() =>
       expect(create).toHaveBeenCalledWith(expect.objectContaining({ volumes: [] })),
@@ -267,7 +267,7 @@ describe("NewSandbox", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
     fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
     // Remove it with ×
@@ -287,7 +287,7 @@ describe("NewSandbox", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
 
     // Add first row, switch to existing persistent, fill path
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /existing/i }));
     await waitFor(() => expect(volumeList).toHaveBeenCalled());
     // Radix Select: open+pick via browser test; here verify the trigger is present
@@ -295,7 +295,7 @@ describe("NewSandbox", () => {
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/arch" } });
 
     // Add a second row — both triggers present; filtering validated by browser test
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getAllByRole("radio", { name: /existing/i })[1]);
     expect(screen.getAllByRole("combobox", { name: /existing volume/i })).toHaveLength(2);
   });

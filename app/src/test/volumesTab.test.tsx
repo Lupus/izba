@@ -86,8 +86,8 @@ describe("VolumesTab — dirty banner", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    // Click + Add volume, then fill inline fields
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    // Click Add volume, then fill inline fields
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
@@ -105,7 +105,7 @@ describe("VolumesTab — dirty banner", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     // Add a valid inline row
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
     await screen.findByText(/applied on next restart/i);
@@ -120,7 +120,7 @@ describe("VolumesTab — dirty banner", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     // Add row but leave all fields blank
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     expect(screen.queryByText(/applied on next restart/i)).not.toBeInTheDocument();
   });
 });
@@ -130,7 +130,7 @@ describe("VolumesTab — inline row validation (live errors)", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "nopath" } });
 
     expect(screen.getByText(/guest path must be absolute/i)).toBeInTheDocument();
@@ -151,7 +151,7 @@ describe("VolumesTab — inline row validation (live errors)", () => {
     expect(screen.getByText(/applied on next restart/i)).toBeInTheDocument();
 
     // Now add an invalid inline row
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "x" } });
 
     // Save button should be disabled because volumesInvalid
@@ -163,7 +163,7 @@ describe("VolumesTab — inline row validation (live errors)", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     // Add row but don't type anything
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     expect(screen.queryByText(/must be a number/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/must be absolute/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/name must match/i)).not.toBeInTheDocument();
@@ -173,7 +173,7 @@ describe("VolumesTab — inline row validation (live errors)", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
@@ -184,7 +184,7 @@ describe("VolumesTab — inline row validation (live errors)", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /new persistent/i }));
     // Type an invalid name (uppercase not allowed)
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "Bad-Name" } });
@@ -196,7 +196,7 @@ describe("VolumesTab — inline row validation (live errors)", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /existing/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/arch" } });
 
@@ -209,8 +209,8 @@ describe("VolumesTab — Save: attach a new volume", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    // Click + Add volume, switch to new persistent, fill fields
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    // Click Add volume, switch to new persistent, fill fields
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /new persistent/i }));
 
     const nameInput = screen.getByLabelText(/volume 1 name/i);
@@ -303,7 +303,7 @@ describe("VolumesTab — Restart now", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     // Add a valid inline row to make dirty
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
@@ -315,7 +315,7 @@ describe("VolumesTab — Restart now", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     // Add a valid inline row to make dirty
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
@@ -329,7 +329,7 @@ describe("VolumesTab — Restart now", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     // Add a valid inline row
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1g" } });
 
@@ -350,7 +350,7 @@ describe("VolumesTab — Restart now", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     // Add a new valid inline row
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
@@ -370,7 +370,7 @@ describe("VolumesTab — Restart now", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     // Add a valid inline row
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "2g" } });
 
@@ -398,7 +398,7 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
 
     // Add a new valid inline row
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
@@ -421,7 +421,7 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
 
     // Add a new valid inline row
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
@@ -443,7 +443,7 @@ describe("VolumesTab — save re-syncs on partial failure", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
 
     // Add a new valid inline row
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /new persistent/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 name/i), { target: { value: "cache" } });
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/cache" } });
@@ -463,7 +463,7 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     // Choose Ephemeral (should be default, or click the radio)
     const ephBtn = screen.getByRole("radio", { name: /ephemeral/i });
     fireEvent.click(ephBtn);
@@ -481,7 +481,7 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     const newPersBtn = screen.getByRole("radio", { name: /new persistent/i });
     fireEvent.click(newPersBtn);
 
@@ -502,7 +502,7 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /existing/i }));
 
     await waitFor(() => expect(volumeList).toHaveBeenCalled());
@@ -526,7 +526,7 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /existing/i }));
     await waitFor(() => expect(volumeList).toHaveBeenCalled());
     expect(screen.getByRole("combobox", { name: /existing volume/i })).toBeInTheDocument();
@@ -549,7 +549,7 @@ describe("VolumesTab — 3-way volume type selector", () => {
     render(<VolumesTab sandbox={running} onChanged={noop} />);
     await screen.findByText(/\/data/);
 
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /existing/i }));
     await waitFor(() => expect(volumeList).toHaveBeenCalled());
     expect(screen.getByRole("combobox", { name: /existing volume/i })).toBeInTheDocument();
@@ -571,10 +571,10 @@ describe("VolumesTab — 3-way volume type selector", () => {
     await waitFor(() => expect(inspect).toHaveBeenCalled());
 
     // Two existing-persistent rows, the first having picked "vol1".
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getByRole("radio", { name: /existing/i }));
     await waitFor(() => expect(volumeList).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole("button", { name: /\+ add volume/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.click(screen.getAllByRole("radio", { name: /existing/i })[1]);
     expect(screen.getAllByRole("combobox", { name: /existing volume/i })).toHaveLength(2);
 
