@@ -10,7 +10,10 @@
 #           [7] daemon lifecycle (status/kill-adopt/stop-survival),
 #           [8] stop/restart/rm, [9] M3 persistent volume + prune (vdc parity),
 #           [10] VMM confinement (differential PoC + live status),
-#           [11] lock-down: per-sandbox account + read-deny + net-block.
+#           [11] lock-down: per-sandbox account + read-deny + net-block,
+#           [12] ssh round-trip + chroot isolation,
+#           [13] container userns uid-mapping (OpenVMM/WHP leg),
+#           [14] build-in-VM: Dockerfile -> OCI ingest -> tag -> run -> marker.
 $ErrorActionPreference = 'Continue'
 $exe   = if ($env:IZBA_EXE)   { $env:IZBA_EXE }   else { 'C:\izba\bin\izba.exe' }
 $image = if ($env:IZBA_IMAGE) { $env:IZBA_IMAGE } else { 'alpine:3.20' }
