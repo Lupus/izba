@@ -17,7 +17,14 @@ JOURNEYS="${2:?usage: dispatch-swarm.sh <feature> <journeys.json> [shards] [max_
 SHARDS="${3:-3}"
 MAX_USD="${4:-3}"
 MODEL="${5:-}"
-BRANCH="dogfood-run/${FEATURE}"
+# DOGFOOD_BRANCH lets a progressive run tag the dispatch branch per tier
+# (e.g. dogfood-run/<feature>-smoke) so concurrent tiers don't clobber.
+BRANCH="${DOGFOOD_BRANCH:-dogfood-run/${FEATURE}}"
+# DOGFOOD_BASE is the ref the dispatch branch is cut from. Default origin/main.
+# In a progressive/self-improving loop set it to the CI fixes-branch tip (e.g.
+# the local HEAD that carries the in-place doc/help fixes) so the swarm reads
+# the LATEST improvements and does not re-stumble on already-fixed gaps.
+BASE="${DOGFOOD_BASE:-origin/main}"
 SCHEMA="hack/dogfood/schema/journeys.schema.json"
 OUTDIR="${DOGFOOD_OUT:-dogfood-artifacts}"
 
@@ -35,10 +42,11 @@ assert len(ids) == len(set(ids)), "duplicate journey_id"
 print(f"SCHEMA OK: {len(ids)} journeys for {data['feature']!r}")
 PY
 
-echo "== pushing dispatch branch $BRANCH off origin/main (no PR) =="
-git fetch origin main
+echo "== pushing dispatch branch $BRANCH off $BASE (no PR) =="
+# Only fetch when basing on a remote ref; a local fixes-branch tip is used as-is.
+case "$BASE" in origin/*) git fetch origin "${BASE#origin/}" ;; esac
 TMP_WT="$(mktemp -d)"; trap 'git worktree remove --force "$TMP_WT" 2>/dev/null || true' EXIT
-git worktree add -q -B "$BRANCH" "$TMP_WT" origin/main
+git worktree add -q -B "$BRANCH" "$TMP_WT" "$BASE"
 cp "$JOURNEYS" "$TMP_WT/journeys.json"
 git -C "$TMP_WT" add journeys.json
 git -C "$TMP_WT" commit -q -m "dogfood: journeys for ${FEATURE} (dispatch-only; not for merge)"

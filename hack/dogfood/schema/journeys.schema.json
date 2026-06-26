@@ -31,6 +31,25 @@
           "description": "Why this journey exists: the spec promise / expectation it probes."
         },
         "source": { "$ref": "#/definitions/source" },
+        "tier": {
+          "type": "string",
+          "enum": ["smoke", "core", "deep"],
+          "description": "Progressive-exploration depth (Phase 2 sequencing). 'smoke' = shallow happy-path + capability probes run first and cheap; 'core' = main feature coverage; 'deep' = adversarial / edge / multi-step. Deeper tiers are dispatched only after the prior tier's gating journeys established the prerequisite capabilities (post in-place fix). Optional; absent ⇒ treated as 'core'."
+        },
+        "establishes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Capability ids this journey proves usable when it genuinely succeeds (e.g. 'install-tooling-under-enforce', 'tls-verifies-under-enforce'). Smoke journeys establish the prerequisites deeper journeys depend on. Optional; kebab-case capability tokens shared across journeys of one feature."
+        },
+        "requires": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Capability ids that must be established (by an earlier-tier journey, possibly after an in-place fix) before this journey is worth running. If a required capability is a confirmed unfixable blocker, the sequencer/orchestrator defers this journey and records why (never silently). Optional."
+        },
+        "gating": {
+          "type": "boolean",
+          "description": "When true, this journey is a gate for its tier: advancing to the next tier requires it to genuinely succeed (or its blocker to be fixed in-place). Use sparingly — only for the capability prerequisites deeper tiers truly depend on. Optional; default false."
+        },
         "steps": {
           "type": "array",
           "items": { "$ref": "#/definitions/step" }
@@ -44,8 +63,8 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["spec", "pr", "greptile", "help"],
-          "description": "Where the expectation was traced from."
+          "enum": ["spec", "pr", "greptile", "help", "readme"],
+          "description": "Where the expectation was traced from (spec | pr | greptile review | --help topic | README)."
         },
         "ref": {
           "type": "string",
