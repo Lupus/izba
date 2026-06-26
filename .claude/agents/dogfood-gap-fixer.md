@@ -84,7 +84,9 @@ line — produce an **ESCALATE** verdict (below) and change nothing.
      tests if present (`cd hack/dogfood && python3 -m unittest test_oracles test_runner`).
 5. Commit atomically (you run sequentially with other fixers on a shared tree):
    conventional message, scope the change, tag it `(dogfood Fn)` with the finding
-   id, and end the body with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+   id, and end the body with the model-agnostic trailer
+   `Co-Authored-By: Claude Opus <noreply@anthropic.com>` (this agent is
+   `model: opus`, an alias — don't pin a version that will drift on upgrade).
    Stage only the files you changed (`git add <paths>` — never `git add -A`).
    Do NOT push (the orchestrator pushes/dispatches).
 
