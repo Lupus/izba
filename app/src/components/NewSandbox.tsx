@@ -28,6 +28,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { AddRowButton, RemoveRowButton } from "@/components/ui/row-editor";
+import { EditableList } from "@/components/ui/editable-list";
 
 // NewSandbox has no seeded volumes, so the seeded-names set is always empty —
 // hoisted to a module constant to avoid re-allocating an empty Set per render.
@@ -308,8 +309,10 @@ export function NewSandbox({ onClose, onCreated }: Props) {
           </div>
           <div className="grid gap-1">
             <span className="text-muted-foreground">Volumes</span>
-            <div className="grid gap-1.5">
-              {volumeRows.map((row, i) => {
+            <EditableList
+              density="card"
+              items={volumeRows}
+              renderRow={(row, i) => {
                 const nameErr =
                   row.kind === "new_persistent" && row.name.trim() !== ""
                     ? volNameError(row.kind, row.name.trim())
@@ -326,23 +329,26 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                     ? volPickError(row.kind, row.selectedVolName)
                     : null;
                 return (
-                  <div key={i} className="grid gap-1">
+                  <>
                     <VolumeRowEditor
                       row={row}
                       index={i}
                       freeVolumes={freeVolumesFor(i)}
                       onChange={(r) => setVolumeRow(i, r)}
-                      onRemove={() => removeVolume(i)}
                     />
                     {nameErr && <span className="text-xs text-destructive">{nameErr}</span>}
                     {pathErr && <span className="text-xs text-destructive">{pathErr}</span>}
                     {sizeErr && <span className="text-xs text-destructive">{sizeErr}</span>}
                     {pickErr && <span className="text-xs text-destructive">{pickErr}</span>}
-                  </div>
+                  </>
                 );
-              })}
-              <AddRowButton onClick={addVolume}>+ Add volume</AddRowButton>
-            </div>
+              }}
+              onAdd={addVolume}
+              onRemove={removeVolume}
+              addLabel="+ Add volume"
+              emptyHint="No volumes — add one to mount it."
+              rowAriaLabel={(_, i) => `Remove volume ${i + 1}`}
+            />
           </div>
         </div>
 

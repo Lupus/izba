@@ -38,12 +38,10 @@ function EditorWrapper({
   initialRow,
   freeVolumes,
   onChange,
-  onRemove,
 }: {
   initialRow: VolumeRow;
   freeVolumes: VolumeInfo[];
   onChange: (row: VolumeRow) => void;
-  onRemove: () => void;
 }) {
   const [row, setRow] = useState(initialRow);
   return (
@@ -54,7 +52,6 @@ function EditorWrapper({
         setRow(r);
         onChange(r);
       }}
-      onRemove={onRemove}
       index={0}
     />
   );
@@ -69,7 +66,6 @@ test("VolumeRowEditor: SegmentedControl switches volume type", async () => {
       initialRow={makeRow()}
       freeVolumes={FREE_VOLUMES}
       onChange={onChange}
-      onRemove={() => {}}
     />,
   );
 
@@ -92,7 +88,6 @@ test("VolumeRowEditor: Radix Select opens and picks an existing volume", async (
       initialRow={makeRow({ kind: "existing_persistent" })}
       freeVolumes={FREE_VOLUMES}
       onChange={onChange}
-      onRemove={() => {}}
     />,
   );
 
@@ -123,7 +118,6 @@ test("VolumeRowEditor: switching to existing_persistent shows the Select trigger
       initialRow={makeRow()}
       freeVolumes={FREE_VOLUMES}
       onChange={onChange}
-      onRemove={() => {}}
     />,
   );
 
