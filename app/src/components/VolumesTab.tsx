@@ -299,7 +299,7 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
         }}
         onAdd={addVolume}
         onRemove={removeVolume}
-        addLabel="+ Add volume"
+        addLabel="Add volume"
         emptyHint="No volumes — add one to mount it."
         rowAriaLabel={(_, i) => `Remove volume ${i + 1}`}
       />

@@ -66,7 +66,7 @@ test("VolumesTab: existing-persistent pick → Save → volumeAttach with compos
   const screen = await render(<VolumesTab sandbox={running} onChanged={() => {}} />);
 
   // Add an inline row and switch it to existing-persistent.
-  await screen.getByRole("button", { name: /\+ add volume/i }).click();
+  await screen.getByRole("button", { name: /add volume/i }).click();
   await screen.getByRole("radio", { name: /existing/i }).click();
 
   // Open the Radix Select and pick "archive".
@@ -93,7 +93,7 @@ test("NewSandbox: existing-persistent pick → Create → create() with composit
   await screen.getByLabelText(/name/i).fill("web");
   await screen.getByLabelText(/workspace/i).fill("/ws");
 
-  await screen.getByRole("button", { name: /\+ add volume/i }).click();
+  await screen.getByRole("button", { name: /add volume/i }).click();
   await screen.getByRole("radio", { name: /existing/i }).click();
 
   const trigger = screen.getByRole("combobox", { name: /existing volume/i });
