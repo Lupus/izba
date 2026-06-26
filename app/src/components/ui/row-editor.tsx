@@ -1,5 +1,5 @@
 import * as React from "react";
-import { X } from "lucide-react";
+import { Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -25,7 +25,17 @@ export function AddRowButton({
   disabled?: boolean;
 }) {
   return (
-    <Button type="button" variant="secondary" size="sm" onClick={onClick} disabled={disabled} className="justify-self-start self-start">
+    <Button
+      type="button"
+      variant="outline"
+      onClick={onClick}
+      disabled={disabled}
+      // Solid, surface-independent background so it looks identical over a
+      // card (white) or a plain section (gray) — fixes the transparent-secondary
+      // white-vs-gray drift. Default size = Input height (py-1.5).
+      className="self-start gap-1.5 bg-card hover:bg-muted"
+    >
+      <Plus className="h-4 w-4" />
       {children}
     </Button>
   );

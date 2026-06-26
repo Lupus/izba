@@ -9,6 +9,15 @@ describe("RowEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add volume" }));
     expect(onClick).toHaveBeenCalledOnce();
   });
+  it("AddRowButton renders a leading Plus icon and a solid (non-transparent) surface", () => {
+    const { container } = render(<AddRowButton onClick={() => {}}>Add volume</AddRowButton>);
+    const btn = screen.getByRole("button", { name: "Add volume" });
+    // solid, surface-independent background (not bg-transparent)
+    expect(btn.className).toContain("bg-card");
+    expect(btn.className).not.toContain("bg-transparent");
+    // leading icon present (lucide renders an <svg>)
+    expect(container.querySelector("svg")).toBeInTheDocument();
+  });
   it("RemoveRowButton is destructive-styled and labelled", () => {
     const onClick = vi.fn();
     render(<RemoveRowButton aria-label="remove" onClick={onClick} />);
