@@ -249,6 +249,8 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                 <span className="w-20">Host port</span>
                 <span className="w-3" />
                 <span className="w-20">Guest port</span>
+                {/* spacer for the remove-button column EditableList appends */}
+                <span className="w-8" />
               </div>
             )}
             <EditableList
@@ -273,7 +275,7 @@ export function NewSandbox({ onClose, onCreated }: Props) {
                       onChange={(e) => setPort(i, { host: e.target.value })}
                       className={`w-20${invalid && !isValidPort(r.host) ? " border-destructive" : ""}`}
                     />
-                    <span className="text-center text-muted-foreground-2">:</span>
+                    <span className="w-3 text-center text-muted-foreground-2">:</span>
                     <Input
                       aria-label={`Port ${i + 1} guest`}
                       placeholder="guest"
