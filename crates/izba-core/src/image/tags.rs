@@ -45,6 +45,11 @@ fn save_tags(paths: &Paths, map: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
+/// Prefix used by `izba run --build` for hidden one-shot local image tags.
+/// These tags are pruned by [`prune_tags_with_prefix`] at the start of every
+/// `run --build` invocation so the store does not grow unbounded.
+pub const RUN_BUILD_TAG_PREFIX: &str = "izba-run-build-";
+
 /// Validate a user-supplied tag name.
 ///
 /// Accepted grammar: `[a-z0-9][a-z0-9._-]*`, max 128 characters.
@@ -64,7 +69,7 @@ pub fn validate_tag(tag: &str) -> Result<()> {
         bail!("tag must not contain '/' (would collide with registry refs)");
     }
     let first = tag.chars().next().unwrap();
-    if !first.is_ascii_alphanumeric() {
+    if !matches!(first, 'a'..='z' | '0'..='9') {
         bail!("tag must start with [a-z0-9], got '{first}'");
     }
     for ch in tag.chars() {
@@ -85,6 +90,25 @@ pub fn set_tag(paths: &Paths, tag: &str, digest: &str) -> Result<()> {
     let mut map = load_tags(paths)?;
     map.insert(tag.to_string(), digest.to_string());
     save_tags(paths, &map)
+}
+
+/// Remove every tag whose name starts with `prefix` from the local tag store.
+///
+/// Loads the store, drops all matching entries, and atomically saves the result
+/// (only writes when at least one entry was removed — a no-op on an absent or
+/// already-clean store). Returns the number of entries removed.
+///
+/// Used by `izba run --build` to prune stale one-shot `izba-run-build-<ts>`
+/// tags from prior invocations (see [`RUN_BUILD_TAG_PREFIX`]).
+pub fn prune_tags_with_prefix(paths: &Paths, prefix: &str) -> Result<usize> {
+    let mut map = load_tags(paths)?;
+    let before = map.len();
+    map.retain(|k, _| !k.starts_with(prefix));
+    let removed = before - map.len();
+    if removed > 0 {
+        save_tags(paths, &map)?;
+    }
+    Ok(removed)
 }
 
 /// Look up `tag` in the local tag store.
@@ -171,6 +195,19 @@ mod tests {
         assert!(validate_tag("MyImg").is_err());
     }
 
+    /// 1b: a leading uppercase char must be caught by the first-char check, not
+    /// only by the per-char loop.  The error message must name the first-char
+    /// constraint ("tag must start with [a-z0-9]"), not the per-char constraint.
+    #[test]
+    fn validate_tag_rejects_leading_uppercase() {
+        let err = validate_tag("Abc").expect_err("'Abc' should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tag must start with [a-z0-9]"),
+            "expected first-char error for 'Abc', got: {msg}"
+        );
+    }
+
     // ── resolve_tag (missing file) ────────────────────────────────────────────
 
     #[test]
@@ -242,5 +279,65 @@ mod tests {
         assert!(set_tag(&paths, "a:b", DIGEST).is_err());
         // Nothing written.
         assert!(resolve_tag(&paths, "a:b").unwrap().is_none());
+    }
+
+    // ── prune_tags_with_prefix ────────────────────────────────────────────────
+
+    /// Pruning an absent store is a no-op: returns 0 and does not error.
+    #[test]
+    fn prune_tags_empty_store_is_noop() {
+        let (_tmp, paths) = setup();
+        let removed = prune_tags_with_prefix(&paths, "izba-run-build-").unwrap();
+        assert_eq!(removed, 0, "no entries to prune");
+        // tags.json must still be absent (no spurious write).
+        assert!(
+            !tags_path(&paths).exists(),
+            "no file should have been created"
+        );
+    }
+
+    /// Pruning removes only keys with the given prefix, leaves others intact,
+    /// returns the correct count, and the persisted file reflects the removal.
+    #[test]
+    fn prune_tags_removes_matching_leaves_others() {
+        let (_tmp, paths) = setup();
+        let d2 = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let d3 = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        // Two hidden run-build tags + one user tag.
+        set_tag(&paths, "izba-run-build-111", DIGEST).unwrap();
+        set_tag(&paths, "izba-run-build-222", d2).unwrap();
+        set_tag(&paths, "myapp", d3).unwrap();
+
+        let removed = prune_tags_with_prefix(&paths, "izba-run-build-").unwrap();
+        assert_eq!(removed, 2, "both run-build tags should be pruned");
+
+        // Hidden tags gone, user tag survives.
+        assert!(resolve_tag(&paths, "izba-run-build-111").unwrap().is_none());
+        assert!(resolve_tag(&paths, "izba-run-build-222").unwrap().is_none());
+        assert_eq!(
+            resolve_tag(&paths, "myapp").unwrap(),
+            Some(d3.to_string()),
+            "unrelated tag must survive pruning"
+        );
+
+        // Persisted file must reflect the removal.
+        let on_disk = load_tags(&paths).unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert!(on_disk.contains_key("myapp"));
+    }
+
+    /// Pruning with a prefix that matches nothing is a no-op (returns 0).
+    #[test]
+    fn prune_tags_no_match_returns_zero() {
+        let (_tmp, paths) = setup();
+        set_tag(&paths, "myapp", DIGEST).unwrap();
+        let removed = prune_tags_with_prefix(&paths, "izba-run-build-").unwrap();
+        assert_eq!(removed, 0);
+        // "myapp" still present.
+        assert_eq!(
+            resolve_tag(&paths, "myapp").unwrap(),
+            Some(DIGEST.to_string())
+        );
     }
 }

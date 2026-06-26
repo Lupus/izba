@@ -45,8 +45,13 @@ pub(crate) fn build_then_image_ref(
     build_allow: &[String],
 ) -> anyhow::Result<String> {
     use super::build::{build_image, BuildOpts};
-    use izba_core::image::tags::set_tag;
+    use izba_core::image::tags::{prune_tags_with_prefix, set_tag, RUN_BUILD_TAG_PREFIX};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Sweep stale one-shot tags from prior `run --build` invocations so
+    // tags.json does not grow unbounded.  This runs BEFORE registering this
+    // run's tag so the current tag is never caught by the prune.
+    prune_tags_with_prefix(paths, RUN_BUILD_TAG_PREFIX)?;
 
     let (context, dockerfile) = resolve_build_context(build_path);
 
