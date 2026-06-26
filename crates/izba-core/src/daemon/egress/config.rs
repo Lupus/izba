@@ -156,10 +156,11 @@ struct RawConfig {
 
 impl EgressPolicyConfig {
     /// The dedicated build-network policy: enforcing, allow-listing the
-    /// Docker Hub hosts the BuildKit image pull + a Docker Hub `FROM` need,
-    /// plus caller-declared registries/mirrors (`extra_hosts`, from
+    /// Docker Hub hosts the **in-guest `FROM` base-image pull** needs, plus
+    /// caller-declared registries/mirrors (`extra_hosts`, from
     /// `izba build --build-allow`). Everything else is denied. Distinct from
-    /// a sandbox run policy; never AllowAll.
+    /// a sandbox run policy; never AllowAll. The BuildKit builder image itself
+    /// (moby/buildkit) is pulled host-side and is NOT gated by this policy.
     pub fn build_network(extra_hosts: &[String]) -> Self {
         // `registry-1.docker.io` serves manifests + issues the blob redirect;
         // `auth.docker.io` mints the pull bearer token. A blob `GET` 307-redirects

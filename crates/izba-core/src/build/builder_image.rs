@@ -32,9 +32,12 @@ pub const BUILDER_IMAGE_REF: &str =
 /// Ensure the BuildKit builder image is in the local store, lazy-pulling on
 /// first use. Returns its store (config) digest.
 ///
-/// The live pull needs egress + DNS and runs under the build-network policy
-/// when invoked from the build flow. Unit tests must not call this function
-/// directly; the e2e suite exercises the full pull path.
+/// The live pull is host-side: it calls `image::ensure_image` directly over
+/// the host's normal network, BEFORE the sandbox's egress policy is armed.
+/// It is NOT gated by the build-network egress policy; that policy gates only
+/// the in-guest `FROM` base-image pull done by BuildKit inside the VM.
+/// Unit tests must not call this function directly; the e2e suite exercises
+/// the full pull path.
 ///
 /// `#[mutants::skip]`: every non-cached path here performs real registry I/O —
 /// it delegates entirely to `image::ensure_image` which is itself
