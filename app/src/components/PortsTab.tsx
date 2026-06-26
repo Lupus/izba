@@ -190,10 +190,10 @@ export function PortsTab({ sandbox }: Props) {
             onChange={(e) => setNewGuest(e.target.value)}
             className="w-20"
           />
-          <AddRowButton disabled={!running} onClick={() => void addForward()}>
-            Add forward
-          </AddRowButton>
         </div>
+        <AddRowButton disabled={!running} onClick={() => void addForward()}>
+          Add forward
+        </AddRowButton>
         {formError && <span className="text-xs text-destructive">{formError}</span>}
       </div>
     </div>
