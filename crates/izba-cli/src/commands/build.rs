@@ -224,12 +224,15 @@ fn to_base36(mut n: u128) -> String {
 /// `--opt filename=` BuildKit expects against the `dockerfile=/workspace` share.
 /// The Dockerfile must live inside the context dir.
 fn dockerfile_rel(context: &Path, dockerfile: &Path) -> anyhow::Result<String> {
-    // Canonicalize the Dockerfile if it exists so the strip_prefix works even
-    // when paths mix `.`/symlinks; otherwise fall back to the raw path (lets a
-    // clearer "not found" surface from BuildKit rather than a host stat error).
+    // Canonicalize the Dockerfile so the strip_prefix works even when paths mix
+    // `.`/symlinks. A missing Dockerfile must surface as a clear "not found" here
+    // (fail fast, before any VM boot) — NOT as a spurious "not inside the build
+    // context": a non-existent path can't be canonicalized, and the raw
+    // (possibly relative) fallback would never strip_prefix against the absolute
+    // context, mislabelling every missing file as outside the context (#113).
     let df = dockerfile
         .canonicalize()
-        .unwrap_or_else(|_| dockerfile.to_path_buf());
+        .map_err(|e| anyhow::anyhow!("Dockerfile {} not found: {}", dockerfile.display(), e))?;
     let rel = df.strip_prefix(context).map_err(|_| {
         anyhow::anyhow!(
             "Dockerfile {} is not inside the build context {}",
@@ -325,11 +328,39 @@ mod tests {
         let ctx = dir.path().join("ctx");
         std::fs::create_dir_all(&ctx).unwrap();
         let ctx = ctx.canonicalize().unwrap();
-        let err = dockerfile_rel(&ctx, Path::new("/etc/hostname")).unwrap_err();
+        // A Dockerfile that EXISTS but lives OUTSIDE the context (a sibling of
+        // `ctx`). It must canonicalize successfully — otherwise we'd be testing
+        // the "not found" path — and then fail strip_prefix. (Using an absolute
+        // OS path like `/etc/hostname` is not portable: it is absent on Windows,
+        // so it would hit the missing-Dockerfile branch instead.)
+        let outside = dir.path().join("Dockerfile");
+        std::fs::write(&outside, "FROM scratch\n").unwrap();
+        let err = dockerfile_rel(&ctx, &outside).unwrap_err();
         assert!(
             err.to_string().contains("not inside the build context"),
             "{err}"
         );
+    }
+
+    /// Regression for #113: a MISSING Dockerfile must surface as a clear
+    /// "not found", NOT as a spurious "not inside the build context". This
+    /// reproduces the CLI shape where the context is canonicalized to an
+    /// absolute path while the default dockerfile is the raw (relative) path —
+    /// `canonicalize()` then fails and the raw relative path can't be
+    /// strip_prefix'd against the absolute context.
+    #[test]
+    fn dockerfile_rel_missing_dockerfile_reports_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = dir.path().canonicalize().unwrap();
+        // Relative, non-existent — mirrors `izba build <subdir>` with no Dockerfile.
+        let missing = Path::new("subdir/Dockerfile");
+        let err = dockerfile_rel(&ctx, missing).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("not inside the build context"),
+            "a missing Dockerfile must not be reported as outside the context: {msg}"
+        );
+        assert!(msg.contains("not found"), "should report not found: {msg}");
     }
 
     #[test]
