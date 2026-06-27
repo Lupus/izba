@@ -110,7 +110,8 @@ fn run_inner(
     cmd: Vec<String>,
 ) -> anyhow::Result<i32> {
     let mut client = DaemonClient::connect(paths)?;
-    let name = resolve_or_create(&mut client, paths, opts, name_or_dir, allow_unconfined)?;
+    let (name, was_created) =
+        resolve_or_create(&mut client, paths, opts, name_or_dir, allow_unconfined)?;
     if allow_unconfined {
         // Loud, BEFORE start: the user is waiving the host-side jail, so a VM
         // escape would run with their full user privileges.
@@ -140,15 +141,28 @@ fn run_inner(
     let tty = terminal::stdin_is_tty();
     let result = super::exec::run(paths, &name, true, tty, cmd);
     if rm {
-        // Best-effort throwaway teardown. Runs whether the command exited
-        // cleanly, non-zero, or the exec itself errored — so `--rm` never
-        // leaks the VM — and never masks the command's outcome: `rm::run`'s
-        // own status is dropped and `result` (the command's exit code, or its
-        // error) is returned. Reuses the `rm --force` path (stops if running,
-        // releases any Windows lock-down account, removes ephemeral resources;
-        // named volumes survive by contract).
-        if let Err(e) = super::rm::run(paths, &name, true) {
-            eprintln!("warning: --rm cleanup of '{name}' failed: {e:#}");
+        if was_created {
+            // Best-effort throwaway teardown. Runs whether the command exited
+            // cleanly, non-zero, or the exec itself errored — so `--rm` never
+            // leaks the VM — and never masks the command's outcome: `rm::run`'s
+            // own status is dropped and `result` (the command's exit code, or
+            // its error) is returned. Reuses the `rm --force` path (stops if
+            // running, releases any Windows lock-down account, removes ephemeral
+            // resources; named volumes survive by contract).
+            if let Err(e) = super::rm::run(paths, &name, true) {
+                eprintln!("warning: --rm cleanup of '{name}' failed: {e:#}");
+            }
+        } else {
+            // `run` can ATTACH to a pre-existing sandbox (resolved by name or by
+            // a cwd whose sandbox already exists). Unlike `docker run` — which
+            // always creates — that makes `--rm` asymmetrically destructive: it
+            // would delete a sandbox (and its rw-layer data) the user already
+            // had. `--rm` only reaps what THIS invocation freshly created; for
+            // a pre-existing sandbox we leave it untouched and say so.
+            eprintln!(
+                "note: --rm had no effect — '{name}' existed before this run, so it was \
+                 left in place (remove it explicitly with `izba rm {name}`)"
+            );
         }
     }
     result
@@ -158,6 +172,11 @@ fn run_inner(
 /// directory (created if missing), with the sandbox created on first use.
 /// Reading config.json for name resolution is the one read-only local
 /// operation kept CLI-side; everything mutating goes through the daemon.
+///
+/// Returns `(name, was_created)`. `was_created` is true ONLY when this call
+/// freshly minted the sandbox (neither Case A nor Case B matched) — it gates
+/// `run --rm`'s teardown so attaching to a pre-existing sandbox is never
+/// destructive.
 #[mutants::skip] // reason: drives a live daemon (Create/persist over the socket); e2e-only
 fn resolve_or_create(
     client: &mut DaemonClient,
@@ -165,20 +184,20 @@ fn resolve_or_create(
     opts: &SandboxOpts,
     name_or_dir: &str,
     allow_unconfined: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, bool)> {
     // Case A: an existing sandbox addressed directly by name.
     if sandbox::validate_name(name_or_dir).is_ok()
         && paths.sandbox_dir(name_or_dir).join(CONFIG_FILE).is_file()
     {
         reconcile_existing(paths, name_or_dir, opts)?;
-        return Ok(name_or_dir.to_string());
+        return Ok((name_or_dir.to_string(), false));
     }
     let workspace = super::ensure_workspace(Path::new(name_or_dir))?;
     let name = super::name_for(opts, &workspace)?;
     // Case B: addressed by directory, but the sandbox already exists.
     if paths.sandbox_dir(&name).join(CONFIG_FILE).is_file() {
         reconcile_existing(paths, &name, opts)?;
-        return Ok(name);
+        return Ok((name, false));
     }
     let ports = super::parse_publish(&opts.publish)?;
     let volumes = super::parse_volumes(&opts.volumes)?;
@@ -199,7 +218,7 @@ fn resolve_or_create(
         other => bail!("unexpected daemon reply: {other:?}"),
     }
     super::persist_policy(paths, &name, opts.policy.as_deref())?;
-    Ok(name)
+    Ok((name, true))
 }
 
 /// Reconcile run-time opts against an ALREADY-existing sandbox. The stored
