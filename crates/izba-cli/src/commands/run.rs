@@ -8,10 +8,12 @@ use izba_core::state::CONFIG_FILE;
 use std::path::{Path, PathBuf};
 
 #[mutants::skip] // reason: live daemon+VM, e2e-only
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     paths: &Paths,
     opts: &SandboxOpts,
     name_or_dir: &str,
+    rm: bool,
     allow_unconfined: bool,
     build: Option<PathBuf>,
     build_allow: Vec<String>,
@@ -23,9 +25,9 @@ pub fn run(
         // Construct a modified SandboxOpts with the built image.
         let mut run_opts = opts.clone();
         run_opts.image = image_ref;
-        return run_inner(paths, &run_opts, name_or_dir, allow_unconfined, cmd);
+        return run_inner(paths, &run_opts, name_or_dir, rm, allow_unconfined, cmd);
     }
-    run_inner(paths, opts, name_or_dir, allow_unconfined, cmd)
+    run_inner(paths, opts, name_or_dir, rm, allow_unconfined, cmd)
 }
 
 /// Resolve `--build PATH` into a local image ref that `ensure_image` can
@@ -103,6 +105,7 @@ fn run_inner(
     paths: &Paths,
     opts: &SandboxOpts,
     name_or_dir: &str,
+    rm: bool,
     allow_unconfined: bool,
     cmd: Vec<String>,
 ) -> anyhow::Result<i32> {
@@ -135,7 +138,20 @@ fn run_inner(
         cmd
     };
     let tty = terminal::stdin_is_tty();
-    super::exec::run(paths, &name, true, tty, cmd)
+    let result = super::exec::run(paths, &name, true, tty, cmd);
+    if rm {
+        // Best-effort throwaway teardown. Runs whether the command exited
+        // cleanly, non-zero, or the exec itself errored — so `--rm` never
+        // leaks the VM — and never masks the command's outcome: `rm::run`'s
+        // own status is dropped and `result` (the command's exit code, or its
+        // error) is returned. Reuses the `rm --force` path (stops if running,
+        // releases any Windows lock-down account, removes ephemeral resources;
+        // named volumes survive by contract).
+        if let Err(e) = super::rm::run(paths, &name, true) {
+            eprintln!("warning: --rm cleanup of '{name}' failed: {e:#}");
+        }
+    }
+    result
 }
 
 /// NAME_OR_DIR: an existing sandbox name wins; anything else is a workspace

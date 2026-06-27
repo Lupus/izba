@@ -151,13 +151,14 @@ integration test suite.
 
 ```
 izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [--volume [NAME:]GUEST_PATH:SIZE]... [--policy PATH] [DIR]
-izba run    [--image IMG] [NAME_OR_DIR] [-- CMD...]
+izba run    [--image IMG] [--rm] [NAME_OR_DIR] [-- CMD...]   # create+start+exec; persists unless --rm
 izba exec   NAME [-it] [-- CMD...]
 izba ssh    NAME [-- CMD...]            # ssh into a running sandbox (root shell in the workspace)
 izba cp     HOST_PATH NAME:GUEST_PATH   # or NAME:GUEST_PATH HOST_PATH; recursive
 izba port   publish|unpublish|ls NAME [RULE]   # TCP, runtime or create-time -p
 izba volume prune [-f]                  # remove persistent volumes no sandbox uses
 izba ls
+izba start  NAME                        # boot a stopped sandbox (no exec; symmetric with stop)
 izba stop   NAME
 izba rm     [--force] NAME
 izba daemon run                         # run the daemon in the foreground (auto-started on demand otherwise)
@@ -179,6 +180,14 @@ persistent (lives under `<data>/volumes`, survives `rm`, single-writer); an
 anonymous volume (no `NAME:`) is ephemeral. `izba volume rm`/`prune` ask for
 confirmation on a terminal and otherwise need `-f/--force`.
 
+**Lifecycle.** `izba run` does create + start + exec in one step (docker-parity)
+and the sandbox **persists** after the command exits — stop it with `izba stop`,
+restart it with `izba start` (or `izba run NAME` to start and exec again), and
+delete it with `izba rm`. For a throwaway run, `izba run --rm -- <cmd>` removes
+the sandbox (and its ephemeral resources; named volumes survive) once the
+command exits, propagating its exit code. When `NAME_OR_DIR` is omitted the
+sandbox is named after the current directory's basename.
+
 ## SSH access (VS Code Remote-SSH, tmux, scp)
 
 Every running sandbox is reachable over SSH with zero setup. izba keeps a small
@@ -195,12 +204,21 @@ network port — through an izba-managed `ProxyCommand`. A vendored static OpenS
 chrooted into your image so you get its shell, tools, `$HOME`, and volumes.
 Authentication uses an izba-managed key, so there are no prompts.
 
-Because it's real SSH, the editor and CLI ecosystem just works:
+Because it's real SSH, the editor and CLI ecosystem just works against the
+`izba-<name>` alias — including file transfer, which needs no extra setup (a
+native `sftp-server` runs inside the guest):
 
-- **VS Code Remote-SSH** — open host `izba-<name>` and edit/build/debug inside the microVM.
-- `scp` / `sftp`, `rsync`, `tmux`, long-lived interactive sessions.
+```
+scp ./local.txt izba-<name>:/workspace/      # copy a file in
+scp izba-<name>:/workspace/out.txt ./        # …and back out
+sftp izba-<name>                             # interactive sftp on the workspace
+rsync -a ./src/ izba-<name>:/workspace/src/  # mirror a tree
+code --remote ssh-remote+izba-<name> /workspace   # VS Code Remote-SSH
+```
 
-`izba ssh <name>` does the same thing as a one-shot command (and works even if
+`scp`/`sftp`/`rsync` and VS Code Remote-SSH all rely on the managed
+`izba-<name>` alias in `~/.ssh/config`, so they need config management **on**
+(the default). `izba ssh <name>` does the same thing as a one-shot command (and works even if
 config management is disabled). To keep izba out of your `~/.ssh/config`
 entirely, set `config_management: false` in `<data>/ssh/settings.json` — `izba
 ssh <name>` still works directly.
