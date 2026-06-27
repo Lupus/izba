@@ -17,6 +17,10 @@ describe("RowEditor", () => {
     expect(btn.className).not.toContain("bg-transparent");
     // leading icon present (lucide renders an <svg>)
     expect(container.querySelector("svg")).toBeInTheDocument();
+    // never stretches full-width: self-start (flex parent) + justify-self-start
+    // (grid parent, e.g. PortsTab's create-form) so it stays content-width.
+    expect(btn.className).toContain("self-start");
+    expect(btn.className).toContain("justify-self-start");
   });
   it("RemoveRowButton is destructive-styled and labelled", () => {
     const onClick = vi.fn();
