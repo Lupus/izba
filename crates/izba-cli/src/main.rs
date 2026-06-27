@@ -127,8 +127,10 @@ enum Cmd {
         #[arg(default_value = ".")]
         name_or_dir: String,
         /// Remove the sandbox (and its ephemeral resources) once the command
-        /// exits — for throwaway `izba run --rm -- <cmd>`. Named/persistent
-        /// volumes survive; the command's exit code is still propagated.
+        /// exits — for throwaway `izba run --rm -- <cmd>`. Only reaps a sandbox
+        /// THIS run freshly created; attaching to a pre-existing sandbox leaves
+        /// it untouched. Named/persistent volumes survive; the command's exit
+        /// code is still propagated.
         #[arg(long = "rm")]
         rm: bool,
         /// Start the VMM WITHOUT host-side confinement (NOT recommended; only

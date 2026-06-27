@@ -712,5 +712,31 @@ fn cli_surface_lifecycle() {
         stdout_of(&izba(&data, no_env, &["ls"]))
     );
 
+    // [9] `run --rm` against a PRE-EXISTING sandbox must NOT destroy it: `run`
+    // can attach to an existing sandbox by name, so `--rm` only reaps what this
+    // invocation freshly created. Create `keep`, then `run --rm keep` — it must
+    // survive (otherwise `--rm` would silently delete user data).
+    let ws3 = root.path().join("ws-keep");
+    std::fs::create_dir_all(&ws3).unwrap();
+    let ws3_s = ws3.to_string_lossy().into_owned();
+    assert_ok(
+        &izba(
+            &data,
+            no_env,
+            &["create", "--image", IMAGE, "--name", "keep", &ws3_s],
+        ),
+        "create keep",
+    );
+    assert_ok(
+        &izba(&data, no_env, &["run", "--rm", "keep", "--", "/bin/true"]),
+        "run --rm against existing",
+    );
+    assert!(
+        stdout_of(&izba(&data, no_env, &["ls"])).contains("keep"),
+        "run --rm must NOT remove a pre-existing sandbox: {}",
+        stdout_of(&izba(&data, no_env, &["ls"]))
+    );
+    assert_ok(&izba(&data, no_env, &["rm", "--force", "keep"]), "rm keep");
+
     let _ = izba(&data, no_env, &["daemon", "stop"]);
 }

@@ -185,8 +185,10 @@ and the sandbox **persists** after the command exits — stop it with `izba stop
 restart it with `izba start` (or `izba run NAME` to start and exec again), and
 delete it with `izba rm`. For a throwaway run, `izba run --rm -- <cmd>` removes
 the sandbox (and its ephemeral resources; named volumes survive) once the
-command exits, propagating its exit code. When `NAME_OR_DIR` is omitted the
-sandbox is named after the current directory's basename.
+command exits, propagating its exit code — but only when that run *created* the
+sandbox; `--rm` against a pre-existing sandbox leaves it in place. When
+`NAME_OR_DIR` is omitted the sandbox is named after the current directory's
+basename.
 
 ## SSH access (VS Code Remote-SSH, tmux, scp)
 
