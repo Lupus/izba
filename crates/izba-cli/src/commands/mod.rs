@@ -13,6 +13,7 @@ pub mod rm;
 pub mod run;
 pub mod ssh;
 pub mod ssh_proxy;
+pub mod start;
 pub mod status;
 pub mod stop;
 pub mod version;

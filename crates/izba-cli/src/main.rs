@@ -111,12 +111,26 @@ enum Cmd {
         dir: PathBuf,
     },
     /// Create (if needed), start (if needed) and exec into a sandbox
+    ///
+    /// By default the sandbox PERSISTS after the command exits (docker-parity:
+    /// run = create + start + exec) — tear it down with `izba stop`/`izba rm`,
+    /// or pass `--rm` to remove it automatically when the command exits.
+    ///
+    /// When NAME_OR_DIR is omitted it defaults to the current directory and the
+    /// sandbox name is derived from that directory's basename (sanitized) — so
+    /// running inside a `foo/` directory creates/starts a sandbox named `foo`.
+    /// To start an existing/stopped sandbox without exec'ing, use `izba start`.
     Run {
         #[command(flatten)]
         opts: SandboxOpts,
         /// Existing sandbox name, or a workspace directory
         #[arg(default_value = ".")]
         name_or_dir: String,
+        /// Remove the sandbox (and its ephemeral resources) once the command
+        /// exits — for throwaway `izba run --rm -- <cmd>`. Named/persistent
+        /// volumes survive; the command's exit code is still propagated.
+        #[arg(long = "rm")]
+        rm: bool,
         /// Start the VMM WITHOUT host-side confinement (NOT recommended; only
         /// if confinement fails on your host)
         #[arg(long)]
@@ -184,6 +198,20 @@ enum Cmd {
         /// Sandbox name
         name: String,
     },
+    /// Start a stopped sandbox's VM (symmetric with `stop`; does not exec)
+    ///
+    /// Boots an existing, stopped sandbox without attaching — then reach it with
+    /// `izba exec`, `izba ssh`, or published ports. (`izba run NAME` also starts
+    /// it but additionally execs a shell/command into it.) Already-running is a
+    /// no-op success.
+    Start {
+        /// Sandbox name
+        name: String,
+        /// Start the VMM WITHOUT host-side confinement (NOT recommended; only
+        /// if confinement fails on your host)
+        #[arg(long)]
+        allow_unconfined: bool,
+    },
     /// Stop a running sandbox
     Stop {
         /// Sandbox name
@@ -239,6 +267,18 @@ enum Cmd {
         name: String,
     },
     /// SSH into a running sandbox (uses the system ssh client).
+    ///
+    /// While a sandbox runs, izba writes a `Host izba-<name>` block into your
+    /// `~/.ssh/config` (a single managed Include), so the whole OpenSSH
+    /// ecosystem works against the `izba-<name>` alias with no setup — not just
+    /// `ssh izba-<name>` but also file transfer: `scp FILE izba-<name>:PATH`
+    /// (and back), `sftp izba-<name>` (a native sftp-server runs in the guest),
+    /// `rsync … izba-<name>:…`, and VS Code Remote-SSH all ride the same path.
+    ///
+    /// `izba ssh <name>` is the config-independent fallback (it passes every
+    /// knob inline) — but scp/sftp/rsync need the managed `izba-<name>` alias,
+    /// which requires config management ON (the default; toggle in
+    /// <data>/ssh/settings.json).
     Ssh {
         /// Sandbox name
         name: String,
@@ -284,6 +324,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         Cmd::Run {
             opts,
             name_or_dir,
+            rm,
             allow_unconfined,
             build,
             build_allow,
@@ -292,6 +333,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             paths,
             &opts,
             &name_or_dir,
+            rm,
             allow_unconfined,
             build,
             build_allow,
@@ -327,6 +369,10 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         Cmd::Cp { src, dst } => commands::cp::run(paths, &src, &dst),
         Cmd::Ls => commands::ls::run(paths),
         Cmd::Status { name } => commands::status::run(paths, &name),
+        Cmd::Start {
+            name,
+            allow_unconfined,
+        } => commands::start::run(paths, &name, allow_unconfined),
         Cmd::Stop { name } => commands::stop::run(paths, &name),
         Cmd::Rm { name, force } => commands::rm::run(paths, &name, force),
         Cmd::Netlog {
@@ -440,6 +486,48 @@ mod tests {
             panic!("expected run");
         };
         assert!(!allow_unconfined);
+    }
+
+    #[test]
+    fn parse_run_rm_flag() {
+        let cli = Cli::try_parse_from(["izba", "run", "--rm", ".", "--", "uname", "-s"]).unwrap();
+        let Cmd::Run { rm, cmd, .. } = cli.cmd else {
+            panic!("expected run");
+        };
+        assert!(rm, "--rm must parse to true");
+        assert_eq!(cmd, vec!["uname".to_string(), "-s".to_string()]);
+        // Persist-after-run is the default: no --rm => false.
+        let bare = Cli::try_parse_from(["izba", "run", "."]).unwrap();
+        let Cmd::Run { rm, .. } = bare.cmd else {
+            panic!("expected run");
+        };
+        assert!(!rm, "default must persist (rm = false)");
+    }
+
+    #[test]
+    fn parse_start() {
+        let cli = Cli::try_parse_from(["izba", "start", "web"]).unwrap();
+        let Cmd::Start {
+            name,
+            allow_unconfined,
+        } = cli.cmd
+        else {
+            panic!("expected start");
+        };
+        assert_eq!(name, "web");
+        assert!(!allow_unconfined, "default must be confined");
+    }
+
+    #[test]
+    fn parse_start_allow_unconfined() {
+        let cli = Cli::try_parse_from(["izba", "start", "--allow-unconfined", "web"]).unwrap();
+        let Cmd::Start {
+            allow_unconfined, ..
+        } = cli.cmd
+        else {
+            panic!("expected start");
+        };
+        assert!(allow_unconfined);
     }
 
     #[test]

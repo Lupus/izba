@@ -661,11 +661,55 @@ fn cli_surface_lifecycle() {
         "stopped after stop"
     );
 
+    // [6b] `start` re-boots the stopped sandbox WITHOUT exec'ing (symmetric with
+    // `stop`); `ls` reflects running again. Then stop once more so the rm step
+    // below operates on a stopped sandbox.
+    assert_ok(&izba(&data, no_env, &["start", "cli"]), "start");
+    assert!(
+        stdout_of(&izba(&data, no_env, &["ls"])).contains("running"),
+        "running after start"
+    );
+    assert_ok(&izba(&data, no_env, &["stop", "cli"]), "stop after start");
+
+    // [6c] `start` on a sandbox that does not exist is an honest error.
+    let o = izba(&data, no_env, &["start", "no-such-sandbox"]);
+    assert!(!o.status.success(), "start on missing sandbox must error");
+
     // [7] non-force `rm` on a stopped sandbox removes it; `ls` no longer lists it.
     assert_ok(&izba(&data, no_env, &["rm", "cli"]), "rm (non-force)");
     assert!(
         !stdout_of(&izba(&data, no_env, &["ls"])).contains("cli"),
         "removed sandbox is gone"
+    );
+
+    // [8] `run --rm`: a throwaway run creates + starts + execs, then tears the
+    // sandbox down on exit — it must NOT linger in `ls`. Uses its own workspace
+    // so it does not collide with the (now-removed) `cli` sandbox's relabel.
+    let ws2 = root.path().join("ws-rm");
+    std::fs::create_dir_all(&ws2).unwrap();
+    let ws2_s = ws2.to_string_lossy().into_owned();
+    assert_ok(
+        &izba(
+            &data,
+            no_env,
+            &[
+                "run",
+                "--rm",
+                "--image",
+                IMAGE,
+                "--name",
+                "rmtest",
+                &ws2_s,
+                "--",
+                "/bin/true",
+            ],
+        ),
+        "run --rm throwaway",
+    );
+    assert!(
+        !stdout_of(&izba(&data, no_env, &["ls"])).contains("rmtest"),
+        "run --rm removed the sandbox: {}",
+        stdout_of(&izba(&data, no_env, &["ls"]))
     );
 
     let _ = izba(&data, no_env, &["daemon", "stop"]);
