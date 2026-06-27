@@ -756,10 +756,11 @@ fn cli_surface_lifecycle() {
         "run -d prints the sandbox name: {}",
         stdout_of(&o)
     );
+    let ls_out = stdout_of(&izba(&data, no_env, &["ls"]));
     assert!(
-        stdout_of(&izba(&data, no_env, &["ls"])).contains("running"),
+        ls_out.contains("detached") && ls_out.contains("running"),
         "run -d leaves the sandbox running: {}",
-        stdout_of(&izba(&data, no_env, &["ls"]))
+        ls_out
     );
     // [10b] `run -d` with a trailing command is contradictory and rejected
     // (before any VM work) — the sandbox is still up from the call above.
