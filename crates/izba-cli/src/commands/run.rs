@@ -14,20 +14,47 @@ pub fn run(
     opts: &SandboxOpts,
     name_or_dir: &str,
     rm: bool,
+    detach: bool,
     allow_unconfined: bool,
     build: Option<PathBuf>,
     build_allow: Vec<String>,
     cmd: Vec<String>,
 ) -> anyhow::Result<i32> {
+    // `--detach` starts the sandbox without exec'ing, so a trailing command has
+    // nowhere to run — reject it up front (before building anything).
+    check_detach_no_cmd(detach, &cmd)?;
     // When --build is given: build the image first, then run it.
     if let Some(build_path) = build {
         let image_ref = build_then_image_ref(paths, &build_path, &build_allow)?;
         // Construct a modified SandboxOpts with the built image.
         let mut run_opts = opts.clone();
         run_opts.image = image_ref;
-        return run_inner(paths, &run_opts, name_or_dir, rm, allow_unconfined, cmd);
+        return run_inner(
+            paths,
+            &run_opts,
+            name_or_dir,
+            rm,
+            detach,
+            allow_unconfined,
+            cmd,
+        );
     }
-    run_inner(paths, opts, name_or_dir, rm, allow_unconfined, cmd)
+    run_inner(paths, opts, name_or_dir, rm, detach, allow_unconfined, cmd)
+}
+
+/// `izba run -d` boots the sandbox and returns without exec'ing, so a trailing
+/// `-- CMD` is contradictory. Reject it with a pointer at the verbs that DO run
+/// a command, rather than silently dropping the user's command.
+fn check_detach_no_cmd(detach: bool, cmd: &[String]) -> anyhow::Result<()> {
+    if detach && !cmd.is_empty() {
+        bail!(
+            "--detach starts the sandbox without running a command, so the trailing `-- {}` \
+             has nowhere to run. Drop --detach to run it in the foreground, or start detached \
+             and reach the sandbox afterward with `izba exec`/`izba ssh`.",
+            cmd.join(" ")
+        );
+    }
+    Ok(())
 }
 
 /// Resolve `--build PATH` into a local image ref that `ensure_image` can
@@ -106,6 +133,7 @@ fn run_inner(
     opts: &SandboxOpts,
     name_or_dir: &str,
     rm: bool,
+    detach: bool,
     allow_unconfined: bool,
     cmd: Vec<String>,
 ) -> anyhow::Result<i32> {
@@ -132,6 +160,14 @@ fn run_inner(
         DaemonResponse::Error { message } if message.contains("already running") => {}
         DaemonResponse::Error { message } => bail!(message),
         other => bail!("unexpected daemon reply: {other:?}"),
+    }
+    if detach {
+        // Detached bring-up: the sandbox is now running. Print its name on
+        // stdout (script-friendly, mirrors `create`) and return WITHOUT
+        // exec'ing — `--rm` cannot ride along (clap `conflicts_with`), so there
+        // is nothing to reap. Reach it via `izba exec`/`izba ssh`/ports.
+        println!("{name}");
+        return Ok(0);
     }
     let cmd = if cmd.is_empty() {
         vec!["/bin/sh".to_string(), "-l".to_string()]
@@ -397,6 +433,32 @@ mod tests {
     #[test]
     fn ignored_create_opts_empty_for_defaults() {
         assert!(ignored_create_opts(&opts()).is_empty());
+    }
+
+    // ── --detach vs a trailing command ───────────────────────────────────────
+
+    /// `izba run -d -- <cmd>` is contradictory: detach runs no command. The
+    /// error names the dropped command and points at the verbs that do run one.
+    #[test]
+    fn detach_with_cmd_is_rejected() {
+        let err = check_detach_no_cmd(true, &["sleep".into(), "infinity".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--detach"), "{err}");
+        assert!(err.contains("sleep infinity"), "echoes the cmd: {err}");
+        assert!(err.contains("izba exec"), "points at exec/ssh: {err}");
+    }
+
+    /// `izba run -d` with no trailing command is the happy path.
+    #[test]
+    fn detach_without_cmd_is_ok() {
+        assert!(check_detach_no_cmd(true, &[]).is_ok());
+    }
+
+    /// A foreground `run -- <cmd>` (no detach) is unaffected by the guard.
+    #[test]
+    fn foreground_with_cmd_is_ok() {
+        assert!(check_detach_no_cmd(false, &["uname".into(), "-s".into()]).is_ok());
     }
 
     /// The reported bug: edit the policy, re-run with `--policy` against an
