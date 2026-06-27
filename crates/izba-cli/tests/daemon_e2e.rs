@@ -738,5 +738,40 @@ fn cli_surface_lifecycle() {
     );
     assert_ok(&izba(&data, no_env, &["rm", "--force", "keep"]), "rm keep");
 
+    // [10] `run -d`/`--detach`: create + start in one step and return
+    // immediately, leaving the sandbox RUNNING (no exec). This is the
+    // docker-parity bring-up path (#109). It must print the name and the
+    // sandbox must show as running in `ls` without any foreground shell.
+    let ws4 = root.path().join("ws-detach");
+    std::fs::create_dir_all(&ws4).unwrap();
+    let ws4_s = ws4.to_string_lossy().into_owned();
+    let o = izba(
+        &data,
+        no_env,
+        &["run", "-d", "--image", IMAGE, "--name", "detached", &ws4_s],
+    );
+    assert_ok(&o, "run -d");
+    assert!(
+        stdout_of(&o).contains("detached"),
+        "run -d prints the sandbox name: {}",
+        stdout_of(&o)
+    );
+    assert!(
+        stdout_of(&izba(&data, no_env, &["ls"])).contains("running"),
+        "run -d leaves the sandbox running: {}",
+        stdout_of(&izba(&data, no_env, &["ls"]))
+    );
+    // [10b] `run -d` with a trailing command is contradictory and rejected
+    // (before any VM work) — the sandbox is still up from the call above.
+    let o = izba(&data, no_env, &["run", "-d", "detached", "--", "/bin/true"]);
+    assert!(
+        !o.status.success(),
+        "run -d -- CMD must be rejected (detach runs no command)"
+    );
+    assert_ok(
+        &izba(&data, no_env, &["rm", "--force", "detached"]),
+        "rm detached",
+    );
+
     let _ = izba(&data, no_env, &["daemon", "stop"]);
 }

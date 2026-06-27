@@ -119,7 +119,8 @@ enum Cmd {
     /// When NAME_OR_DIR is omitted it defaults to the current directory and the
     /// sandbox name is derived from that directory's basename (sanitized) — so
     /// running inside a `foo/` directory creates/starts a sandbox named `foo`.
-    /// To start an existing/stopped sandbox without exec'ing, use `izba start`.
+    /// To start an existing/stopped sandbox without exec'ing, use `izba start`;
+    /// to create + start in one step and leave it running, use `izba run -d`.
     Run {
         #[command(flatten)]
         opts: SandboxOpts,
@@ -133,6 +134,14 @@ enum Cmd {
         /// code is still propagated.
         #[arg(long = "rm")]
         rm: bool,
+        /// Detached: create (if needed) + start the sandbox and return
+        /// immediately, leaving it RUNNING — do NOT exec a shell/command into
+        /// it. The docker-parity `run -d`. Reach the running sandbox afterward
+        /// with `izba exec`, `izba ssh`, or published ports. Conflicts with
+        /// `--rm` (nothing to reap) and with a trailing `-- CMD` (a detached
+        /// start runs no command).
+        #[arg(short = 'd', long = "detach", conflicts_with = "rm")]
+        detach: bool,
         /// Start the VMM WITHOUT host-side confinement (NOT recommended; only
         /// if confinement fails on your host)
         #[arg(long)]
@@ -327,6 +336,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             opts,
             name_or_dir,
             rm,
+            detach,
             allow_unconfined,
             build,
             build_allow,
@@ -336,6 +346,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             &opts,
             &name_or_dir,
             rm,
+            detach,
             allow_unconfined,
             build,
             build_allow,
@@ -507,6 +518,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_run_detach_flag() {
+        // Both spellings parse to detach = true.
+        for argv in [["izba", "run", "-d", "."], ["izba", "run", "--detach", "."]] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Cmd::Run { detach, .. } = cli.cmd else {
+                panic!("expected run");
+            };
+            assert!(detach, "{argv:?} must parse --detach to true");
+        }
+        // Foreground is the default: no flag => false.
+        let bare = Cli::try_parse_from(["izba", "run", "."]).unwrap();
+        let Cmd::Run { detach, .. } = bare.cmd else {
+            panic!("expected run");
+        };
+        assert!(!detach, "default must be foreground (detach = false)");
+    }
+
+    #[test]
+    fn parse_run_detach_conflicts_with_rm() {
+        // `--rm` reaps on command exit; `--detach` runs no command — mutually
+        // exclusive, rejected by clap before we ever reach the daemon.
+        assert!(Cli::try_parse_from(["izba", "run", "--rm", "--detach", "."]).is_err());
+        assert!(Cli::try_parse_from(["izba", "run", "-d", "--rm", "."]).is_err());
+    }
+
+    #[test]
     fn parse_start() {
         let cli = Cli::try_parse_from(["izba", "start", "web"]).unwrap();
         let Cmd::Start {
@@ -559,6 +596,7 @@ mod tests {
         let Cmd::Run {
             name_or_dir,
             rm,
+            detach,
             allow_unconfined,
             build,
             build_allow,
@@ -570,6 +608,7 @@ mod tests {
         };
         assert_eq!(name_or_dir, ".");
         assert!(!rm, "persist-after-run is the default");
+        assert!(!detach, "foreground exec is the default");
         assert!(!allow_unconfined);
         assert!(build.is_none());
         assert!(build_allow.is_empty());

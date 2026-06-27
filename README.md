@@ -151,7 +151,7 @@ integration test suite.
 
 ```
 izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [--volume [NAME:]GUEST_PATH:SIZE]... [--policy PATH] [DIR]
-izba run    [--image IMG] [--rm] [NAME_OR_DIR] [-- CMD...]   # create+start+exec; persists unless --rm
+izba run    [--image IMG] [--rm|-d] [NAME_OR_DIR] [-- CMD...]   # create+start+exec; --rm reaps on exit, -d/--detach leaves it running
 izba exec   NAME [-it] [-- CMD...]
 izba ssh    NAME [-- CMD...]            # ssh into a running sandbox (root shell in the workspace)
 izba cp     HOST_PATH NAME:GUEST_PATH   # or NAME:GUEST_PATH HOST_PATH; recursive
@@ -190,11 +190,32 @@ sandbox; `--rm` against a pre-existing sandbox leaves it in place. When
 `NAME_OR_DIR` is omitted the sandbox is named after the current directory's
 basename.
 
+To **start a sandbox and leave it running in the background** — without
+attaching a foreground shell — use the detached run (docker's `run -d`), then
+reach it over `exec`/`ssh`/ports:
+
+```sh
+izba run -d ./myproj      # create + start, return immediately (prints the name)
+izba ssh myproj           # …now SSH in (see below)
+izba exec -it myproj      # …or open an interactive shell
+```
+
+The two-step form does the same thing: `izba create ./myproj` then `izba start
+myproj`. (Don't reach for `izba run -- sleep infinity` to keep a sandbox alive —
+a foreground `run` blocks until the command exits; `-d` is the right tool.)
+
 ## SSH access (VS Code Remote-SSH, tmux, scp)
 
-Every running sandbox is reachable over SSH with zero setup. izba keeps a small
-managed block in your `~/.ssh/config` (via a single `Include`), so as soon as a
-sandbox is up you can:
+Every running sandbox is reachable over SSH with zero setup. First get a sandbox
+running in the background (see **Lifecycle** above) — the one-step way is the
+detached run:
+
+```sh
+izba run -d ./myproj     # create + start, return immediately (sandbox stays up)
+```
+
+izba keeps a small managed block in your `~/.ssh/config` (via a single
+`Include`), so as soon as a sandbox is up you can:
 
 ```
 ssh izba-<name>          # root shell in the sandbox, landing in /workspace
