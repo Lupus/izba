@@ -544,6 +544,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_run_detach_full_surface() {
+        // `-d` composes with `--name`, an explicit NAME_OR_DIR, and rides
+        // alongside `--allow-unconfined` — none of these flip detach off, and
+        // detach does not imply `--rm`.
+        let cli = Cli::try_parse_from([
+            "izba",
+            "run",
+            "-d",
+            "--name",
+            "bg",
+            "--allow-unconfined",
+            "./proj",
+        ])
+        .unwrap();
+        let Cmd::Run {
+            opts,
+            name_or_dir,
+            rm,
+            detach,
+            allow_unconfined,
+            cmd,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert!(detach, "detached");
+        assert!(!rm, "detach does not imply --rm");
+        assert!(allow_unconfined, "rides alongside --allow-unconfined");
+        assert_eq!(opts.name.as_deref(), Some("bg"));
+        assert_eq!(name_or_dir, "./proj");
+        assert!(cmd.is_empty(), "a detached run carries no trailing command");
+    }
+
+    #[test]
+    fn parse_run_detach_long_form_with_directory() {
+        // The `--detach` spelling against a bare directory (the issue's
+        // `izba run -d myproj` bring-up path).
+        let cli = Cli::try_parse_from(["izba", "run", "--detach", "myproj"]).unwrap();
+        let Cmd::Run {
+            name_or_dir,
+            detach,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert!(detach);
+        assert_eq!(name_or_dir, "myproj");
+    }
+
+    #[test]
     fn parse_start() {
         let cli = Cli::try_parse_from(["izba", "start", "web"]).unwrap();
         let Cmd::Start {
