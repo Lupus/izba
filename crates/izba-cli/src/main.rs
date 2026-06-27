@@ -531,6 +531,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_start_requires_a_name() {
+        // `start` takes a mandatory NAME positional (unlike `run`, which
+        // defaults to the cwd) — a bare `izba start` must be a parse error.
+        assert!(Cli::try_parse_from(["izba", "start"]).is_err());
+    }
+
+    #[test]
+    fn parse_run_rm_with_name() {
+        // `--rm` composes with an explicit `--name`: the throwaway is the named
+        // sandbox, not a cwd-derived one.
+        let cli = Cli::try_parse_from(["izba", "run", "--rm", "--name", "throwaway", "."]).unwrap();
+        let Cmd::Run { opts, rm, .. } = cli.cmd else {
+            panic!("expected run");
+        };
+        assert!(rm);
+        assert_eq!(opts.name.as_deref(), Some("throwaway"));
+    }
+
+    #[test]
+    fn parse_run_rm_with_build() {
+        // `--rm` composes with `--build`: build the image, run it, then tear the
+        // throwaway sandbox down on exit.
+        let cli =
+            Cli::try_parse_from(["izba", "run", "--rm", "--build", "./Dockerfile", "."]).unwrap();
+        let Cmd::Run { rm, build, .. } = cli.cmd else {
+            panic!("expected run");
+        };
+        assert!(rm);
+        assert_eq!(build.as_deref(), Some(std::path::Path::new("./Dockerfile")));
+    }
+
+    #[test]
+    fn parse_run_rm_and_allow_unconfined() {
+        // Both opt-ins can ride together on one throwaway run.
+        let cli = Cli::try_parse_from(["izba", "run", "--rm", "--allow-unconfined", "."]).unwrap();
+        let Cmd::Run {
+            rm,
+            allow_unconfined,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert!(rm && allow_unconfined);
+    }
+
+    #[test]
     fn parse_exec_flags() {
         let cli = Cli::try_parse_from(["izba", "exec", "web", "-it", "--", "bash"]).unwrap();
         let Cmd::Exec {
