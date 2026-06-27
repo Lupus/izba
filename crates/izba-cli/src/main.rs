@@ -550,6 +550,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_run_persist_defaults_when_no_rm() {
+        // The whole `run` surface at its defaults: a bare `run` persists
+        // (rm = false), is confined, has no build, and reaches no trailing cmd.
+        let cli = Cli::try_parse_from(["izba", "run"]).unwrap();
+        let Cmd::Run {
+            name_or_dir,
+            rm,
+            allow_unconfined,
+            build,
+            build_allow,
+            cmd,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(name_or_dir, ".");
+        assert!(!rm, "persist-after-run is the default");
+        assert!(!allow_unconfined);
+        assert!(build.is_none());
+        assert!(build_allow.is_empty());
+        assert!(cmd.is_empty());
+    }
+
+    #[test]
     fn parse_run_rm_with_build() {
         // `--rm` composes with `--build`: build the image, run it, then tear the
         // throwaway sandbox down on exit.
