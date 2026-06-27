@@ -300,7 +300,13 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
         onAdd={addVolume}
         onRemove={removeVolume}
         addLabel="Add volume"
-        emptyHint="No volumes — add one to mount it."
+        emptyHint={
+          // The attached volumes are listed above; only claim "no volumes" when
+          // there are none attached either, so the hint never contradicts them.
+          seeded.some((s) => !s.removed)
+            ? "Add a volume to mount another path."
+            : "No volumes — add one to mount it."
+        }
         rowAriaLabel={(_, i) => `Remove volume ${i + 1}`}
       />
     </div>

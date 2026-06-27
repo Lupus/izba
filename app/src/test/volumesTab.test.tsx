@@ -79,6 +79,20 @@ describe("VolumesTab — seeding from inspect", () => {
     await screen.findByText("ephemeral");
     expect(screen.getByText(/\/scratch/)).toBeInTheDocument();
   });
+
+  it("empty new-row hint does not claim 'No volumes' when a volume is attached", async () => {
+    inspect.mockResolvedValue(
+      makeDetail({
+        volumes: [{ name: "scratch2", guest_path: "/scratch2", size_bytes: 1073741824 }],
+      }),
+    );
+    render(<VolumesTab sandbox={running} onChanged={noop} />);
+    await screen.findByText(/\/scratch2/);
+    // The attached volume is listed above; the empty new-row hint must not
+    // contradict it by saying "No volumes".
+    expect(screen.queryByText(/no volumes/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/add a volume to mount another path/i)).toBeInTheDocument();
+  });
 });
 
 describe("VolumesTab — dirty banner", () => {
