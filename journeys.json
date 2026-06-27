@@ -1,0 +1,53 @@
+{
+  "feature": "SSH + SFTP transfer + exit-code propagation (loop 4, contamination-hardened)",
+  "journeys": [
+    {
+      "journey_id": "scp-file-in-outside-workspace",
+      "tier": "deep",
+      "rationale": "Mechanically-verifiable inbound transfer. scp into the SHARED /workspace can false-green because that path is mirrored host<->guest by the live directory share — a copy there proves nothing. Copying to the sandbox's own home directory (NOT the shared workspace) means the bytes can only appear inside the guest if scp genuinely carried them over the SSH transport (modern OpenSSH scp rides the in-guest sftp-server). README documents the scp-to-alias form.",
+      "source": { "kind": "readme", "ref": "README.md 'SSH access' transfer block (`scp ./local.txt izba-<name>:...`) + `izba ssh --help`" },
+      "steps": [
+        { "intent": "get a sandbox up and running and confirm it stays running, without tying up your terminal in the foreground", "expect": "a sandbox is created and listed as running" },
+        { "intent": "create a host file with unique, recognizable contents", "expect": "the host file exists with the chosen contents" },
+        { "intent": "copy that host file INTO the sandbox's home directory (the root user's home, not the shared project workspace) using the documented scp-to-alias form", "expect": "the copy completes with no host-key warning and no key/password prompt" },
+        { "intent": "from inside the sandbox, read back the file at that home-directory path and compare it", "expect": "the file exists at the home-directory path inside the sandbox and its contents exactly match the host original — confirming a real transfer, not a shared-folder artifact" }
+      ]
+    },
+    {
+      "journey_id": "scp-file-out-outside-workspace",
+      "tier": "deep",
+      "rationale": "Mechanically-verifiable outbound transfer (reverse direction), also outside the shared workspace. A file the sandbox writes under /tmp inside the guest is not visible on the host through any share, so it can only reach the host if scp-from-alias genuinely pulls it over the SSH transport.",
+      "source": { "kind": "readme", "ref": "README.md 'SSH access' transfer block (`scp izba-<name>:... ./`)" },
+      "steps": [
+        { "intent": "get a sandbox up and running and confirm it stays running, without tying up your terminal in the foreground", "expect": "a sandbox is created and listed as running" },
+        { "intent": "have the sandbox write a file with unique, recognizable contents to a temporary location inside the guest (its /tmp directory, not the shared project workspace)", "expect": "the file exists at that temporary in-guest path with the chosen contents" },
+        { "intent": "copy that file from the sandbox's /tmp path back to the host using the documented scp-from-alias form", "expect": "the copy completes cleanly and a host-side copy of the file now exists" },
+        { "intent": "compare the host-side copy against what the sandbox wrote", "expect": "the round-tripped file's contents exactly match the in-guest original — confirming a real transfer off the guest" }
+      ]
+    },
+    {
+      "journey_id": "sftp-interactive-roundtrip-outside-workspace",
+      "tier": "deep",
+      "rationale": "Re-observe whether a user can drive sftp from the documented surface ALONE. The README shows only the interactive `sftp izba-<name>` form; if that cannot be used non-interactively in practice, that is a legitimate discoverability finding (no non-interactive sftp form is documented), surfaced as an honest failure — NOT rescued by leaking batch syntax. Targets the sandbox home, not the shared workspace, so any success is a real transfer.",
+      "source": { "kind": "pr", "ref": "PR #91 (native in-container sftp-server) + README.md 'SSH access' (`sftp izba-<name>`)" },
+      "steps": [
+        { "intent": "get a sandbox up and running and confirm it stays running, without tying up your terminal in the foreground", "expect": "a sandbox is created and listed as running" },
+        { "intent": "create a host file with unique, recognizable contents to move with sftp", "expect": "the host file exists with the chosen contents" },
+        { "intent": "using sftp against the sandbox, upload that file into the sandbox's home directory and then download it back to the host under a different name", "expect": "the sftp transfer completes without prompts and both the upload and download report success" },
+        { "intent": "confirm the uploaded file is present in the sandbox home directory and the downloaded copy matches the original", "expect": "the file appears in the sandbox home directory and the downloaded bytes exactly match the uploaded original (a clean put/get round-trip)" }
+      ]
+    },
+    {
+      "journey_id": "ssh-exit-code-single-token-failing-command",
+      "tier": "deep",
+      "rationale": "Genuine exit-status propagation, fixing the prior refuted artifact: `sh -c 'exit N'` is flattened to 0 by OpenSSH, so it never tested propagation. A SINGLE-TOKEN failing remote command (`false`, or `cat` of a nonexistent file) exercises the real path — the workload's non-zero exit is propagated straight through and must surface as a non-zero host-side CLI exit, while a trivially-succeeding command exits zero.",
+      "source": { "kind": "spec", "ref": "CLAUDE.md 'Exit-code mapping' (crun propagates exit N; izba passes it straight through) + PR #87 ssh remote-command exit handling" },
+      "steps": [
+        { "intent": "get a sandbox up and running and confirm it stays running, without tying up your terminal in the foreground", "expect": "a sandbox is created and listed as running" },
+        { "intent": "run a single trivially-succeeding command in the sandbox over izba's SSH entry point", "expect": "the CLI reports success (zero exit) for that run" },
+        { "intent": "run a single command over SSH that always fails (the standard always-false command), with no shell wrapper around it", "expect": "the host-side CLI exit is non-zero — the remote failure is propagated, not flattened to success, and does not hang" },
+        { "intent": "run a single command over SSH that fails because it targets a path that does not exist in the sandbox", "expect": "the host-side CLI exit is again non-zero, reflecting the remote command's failure" }
+      ]
+    }
+  ]
+}
