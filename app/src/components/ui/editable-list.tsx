@@ -34,11 +34,11 @@ export function EditableList<T>({
         <RowList>
           {items.map((item, i) =>
             density === "card" ? (
-              <RowCard key={i} className="flex-col items-stretch p-3">
-                <div className="flex flex-col gap-2">{renderRow(item, i)}</div>
-                <div className="flex justify-end">
-                  <RemoveRowButton aria-label={label(item, i)} onClick={() => onRemove(i)} />
-                </div>
+              // Fields fill a flex-1 column; the remove button sits in its own
+              // column pinned to the card's top-right corner (items-start).
+              <RowCard key={i} className="items-start p-3">
+                <div className="flex min-w-0 flex-1 flex-col gap-2">{renderRow(item, i)}</div>
+                <RemoveRowButton aria-label={label(item, i)} onClick={() => onRemove(i)} />
               </RowCard>
             ) : (
               // key=index is safe here: rows are fully controlled by the parent's
