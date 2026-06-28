@@ -2,6 +2,7 @@ pub mod build;
 pub mod cp;
 pub mod create;
 pub mod daemon;
+pub mod diff;
 pub mod exec;
 pub mod lockdown;
 pub mod ls;
@@ -22,8 +23,54 @@ pub mod volume;
 use crate::name;
 use crate::SandboxOpts;
 use anyhow::Context;
+use izba_core::manifest::{Manifest, Normalized};
 use izba_core::state::PortRule;
 use std::path::{Path, PathBuf};
+
+/// Load `izba.yml` from a workspace dir, returning (manifest, raw_yaml,
+/// dockerfile_contents). `dockerfile` is `Some` only for a `build:` spec.
+pub(crate) fn load_repo_manifest(dir: &Path) -> anyhow::Result<(Manifest, String, Option<String>)> {
+    let path = dir.join("izba.yml");
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let m = Manifest::load_str(&raw)?;
+    let dockerfile = match &m.spec.build {
+        Some(b) => {
+            let ctx = dir.join(b.context.as_deref().unwrap_or("."));
+            let df = ctx.join(b.dockerfile.as_deref().unwrap_or("Dockerfile"));
+            Some(
+                std::fs::read_to_string(&df)
+                    .with_context(|| format!("reading {}", df.display()))?,
+            )
+        }
+        None => None,
+    };
+    Ok((m, raw, dockerfile))
+}
+
+/// Derive the default sandbox name from a workspace directory: the sanitized
+/// basename (mirrors `name_for` but without `SandboxOpts`).
+pub(crate) fn workspace_default_name(dir: &Path) -> anyhow::Result<String> {
+    let base = dir
+        .file_name()
+        .with_context(|| format!("{} has no basename; pass --name", dir.display()))?;
+    name::sanitize(&base.to_string_lossy())
+}
+
+/// Read the managed truth (config.json + policy.yaml) for `name` into a
+/// `Normalized`, directly from disk (works on a stopped sandbox).
+pub(crate) fn managed_normalized(
+    paths: &izba_core::paths::Paths,
+    name: &str,
+) -> anyhow::Result<Normalized> {
+    use izba_core::daemon::egress::config::EgressPolicyConfig;
+    use izba_core::state::{load_json, SandboxConfig, CONFIG_FILE};
+    let dir = paths.sandbox_dir(name);
+    let cfg: SandboxConfig =
+        load_json(&dir.join(CONFIG_FILE))?.with_context(|| format!("no such sandbox: {name}"))?;
+    let egress = EgressPolicyConfig::load(&dir)?.unwrap_or_default();
+    Ok(Normalized::from_managed(name, &cfg, &egress))
+}
 
 /// Map a daemon reply that should be `Ok` into `Result<()>`.
 pub(crate) fn expect_ok(resp: izba_core::daemon::proto::DaemonResponse) -> anyhow::Result<()> {
