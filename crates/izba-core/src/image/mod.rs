@@ -36,10 +36,13 @@ fn extract_user_dbs(merged_tar: &std::path::Path) -> Result<(Option<Vec<u8>>, Op
             continue;
         }
         let path = entry.path().context("entry path")?;
+        // Strip a leading `/` BEFORE any `./` so all of `etc/passwd`,
+        // `./etc/passwd`, `/etc/passwd`, and `/./etc/passwd` normalise to the
+        // same key (the reverse order would leave `/./…` as `./…`, unmatched).
         let norm = path
             .to_string_lossy()
-            .trim_start_matches("./")
             .trim_start_matches('/')
+            .trim_start_matches("./")
             .to_string();
         let slot = match norm.as_str() {
             "etc/passwd" => &mut passwd,
@@ -284,11 +287,18 @@ mod tests {
                 b.append(&h, std::io::Cursor::new(data)).unwrap();
             };
             add_raw(&mut b, "etc/passwd", b"root:x:0:0::/root:/bin/sh\n");
-            // a later, absolute-prefixed entry for the same logical path wins
+            // an absolute-prefixed entry for the same logical path
             add_raw(
                 &mut b,
                 "/etc/passwd",
                 b"node:x:1000:1000::/home/node:/bin/sh\n",
+            );
+            // a later `/./`-prefixed entry must normalise to `etc/passwd` AND win
+            // (last-wins) — exercises stripping `/` before `./`.
+            add_raw(
+                &mut b,
+                "/./etc/passwd",
+                b"appuser:x:4242:4242::/home/appuser:/bin/sh\n",
             );
             // dot-slash prefix (canonical OCI/docker layer format) must also match
             add_raw(&mut b, "./etc/group", b"node:x:1000:\n");
@@ -297,8 +307,8 @@ mod tests {
         let (passwd, group) = extract_user_dbs(&tar_path).unwrap();
         let passwd = String::from_utf8(passwd.expect("passwd present")).unwrap();
         assert!(
-            passwd.contains("node:x:1000"),
-            "last-wins entry must win: {passwd}"
+            passwd.contains("appuser:x:4242"),
+            "the `/./`-prefixed last-wins entry must normalise and win: {passwd}"
         );
         let group = String::from_utf8(group.expect("./etc/group must be extracted")).unwrap();
         assert!(
