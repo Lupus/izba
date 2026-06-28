@@ -51,7 +51,8 @@ pub(crate) fn load_repo_manifest(dir: &Path) -> anyhow::Result<(Manifest, String
 /// Derive the default sandbox name from a workspace directory: the sanitized
 /// basename (mirrors `name_for` but without `SandboxOpts`).
 pub(crate) fn workspace_default_name(dir: &Path) -> anyhow::Result<String> {
-    let base = dir
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let base = canonical
         .file_name()
         .with_context(|| format!("{} has no basename; pass --name", dir.display()))?;
     name::sanitize(&base.to_string_lossy())
@@ -208,6 +209,24 @@ mod tests {
             policy: None,
             volumes: vec![],
         }
+    }
+
+    /// A workspace dir with a real basename yields the sanitized basename.
+    #[test]
+    fn workspace_default_name_uses_sanitized_basename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("My_Proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        assert_eq!(workspace_default_name(&ws).unwrap(), "my_proj");
+    }
+
+    /// `Path::new(".")` must resolve to the current directory's basename rather
+    /// than erroring out (the real `izba diff` default-arg path).
+    #[test]
+    fn workspace_default_name_resolves_dot_to_cwd_basename() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected = name::sanitize(&cwd.file_name().unwrap().to_string_lossy()).unwrap();
+        assert_eq!(workspace_default_name(Path::new(".")).unwrap(), expected);
     }
 
     /// Verify persist_policy_config writes a policy.yaml that round-trips.
