@@ -245,6 +245,7 @@ spec:
             volumes: vec![],
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         let eg = EgressPolicyConfig {
             enforce: true,
@@ -279,6 +280,7 @@ spec:
             volumes: vec![],
             builder: false,
             build: Some(build_spec.clone()),
+            rw_size_gb: 8,
         };
         let n = Normalized::from_managed("myapp", &cfg, &EgressPolicyConfig::default());
         assert_eq!(n.image, ImageSource::Build(build_spec));
@@ -296,6 +298,7 @@ spec:
             volumes: vec![],
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         let n = Normalized::from_managed("myapp", &cfg, &EgressPolicyConfig::default());
         assert_eq!(n.image, ImageSource::Ref("ubuntu:24.04".into()));
@@ -321,6 +324,7 @@ spec:
             volumes: vec![],
             builder: false,
             build: Some(build_spec.clone()),
+            rw_size_gb: 8,
         };
         let n = Normalized::from_managed("myapp", &cfg, &EgressPolicyConfig::default());
         let m = n.to_manifest();

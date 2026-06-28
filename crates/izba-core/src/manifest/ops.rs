@@ -120,13 +120,30 @@ pub fn managed_normalized(paths: &Paths, name: &str) -> Result<Normalized> {
         load_json(&dir.join(CONFIG_FILE))?.with_context(|| format!("no such sandbox: {name}"))?;
     let egress = EgressPolicyConfig::load(&dir)?.unwrap_or_default();
     let mut n = Normalized::from_managed(name, &cfg, &egress);
-    // SandboxConfig does not persist the rw scratch size (it is only used at
-    // create time). Recover it from the actual rw.img length so that
-    // `izba export` emits a valid `rootDisk.size` that round-trips through
-    // Manifest::load_str without a "no unit suffix" parse error.
-    let rw = dir.join("rw.img");
-    if let Ok(meta) = std::fs::metadata(&rw) {
-        n.rw_size_gb = meta.len() >> 30;
+    // Recover the scratch rw disk size so `izba export` emits a valid
+    // `rootDisk.size` (not "0", which has no unit suffix and fails to parse).
+    //
+    // Priority order:
+    //   1. cfg.rw_size_gb > 0  — persisted at create time (new sandboxes).
+    //   2. rw.img file length >> 30  — back-compat for pre-existing sandboxes.
+    //   3. If the file-length is also sub-GiB/zero (test images), round it up
+    //      to 1 GiB so we never emit "0Gi" or the bare "0" that parse_gib
+    //      rejects.  A 1 GiB rootDisk entry for a sub-GiB test image is
+    //      conservative (never under-allocates on re-import).
+    if cfg.rw_size_gb > 0 {
+        n.rw_size_gb = cfg.rw_size_gb;
+    } else {
+        let rw = dir.join("rw.img");
+        if let Ok(meta) = std::fs::metadata(&rw) {
+            let from_file = meta.len() >> 30;
+            n.rw_size_gb = if from_file > 0 {
+                from_file
+            } else {
+                // Sub-GiB image (unusual but valid in tests / legacy setups):
+                // round up to 1 GiB so to_manifest() never emits "0".
+                1
+            };
+        }
     }
     Ok(n)
 }
@@ -237,6 +254,7 @@ mod tests {
             volumes: vec![],
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         std::fs::write(
             sandbox_dir.join(crate::state::CONFIG_FILE),
@@ -267,6 +285,7 @@ mod tests {
         let sandbox_dir = paths.sandbox_dir(name);
         std::fs::create_dir_all(&sandbox_dir).unwrap();
 
+        // cfg.rw_size_gb == 0 simulates a legacy sandbox (no persisted size).
         let cfg = SandboxConfig {
             image_digest: "sha256:abc".into(),
             image_ref: "ubuntu:24.04".into(),
@@ -277,6 +296,7 @@ mod tests {
             volumes: vec![],
             builder: false,
             build: None,
+            rw_size_gb: 0, // legacy: unknown, must recover from rw.img
         };
         std::fs::write(
             sandbox_dir.join(crate::state::CONFIG_FILE),
@@ -290,7 +310,10 @@ mod tests {
         f.set_len(8u64 << 30).unwrap();
 
         let n = managed_normalized(&paths, name).unwrap();
-        assert_eq!(n.rw_size_gb, 8, "rw_size_gb must be recovered from rw.img");
+        assert_eq!(
+            n.rw_size_gb, 8,
+            "rw_size_gb must be recovered from rw.img when cfg.rw_size_gb == 0"
+        );
 
         // to_manifest() must produce a rootDisk.size that parses without error.
         let m = n.to_manifest();
@@ -299,6 +322,51 @@ mod tests {
         let gib = quantity::parse_gib(&m2.spec.root_disk.size)
             .expect("rootDisk.size must have a valid unit suffix");
         assert_eq!(gib, 8, "rootDisk.size must round-trip to 8 GiB");
+    }
+
+    /// Fix 2 (primary): cfg.rw_size_gb > 0 must be used directly (no file read).
+    #[test]
+    fn managed_normalized_uses_persisted_rw_size_gb() {
+        use crate::manifest::quantity;
+        use crate::manifest::schema::Manifest;
+        use crate::state::SandboxConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let name = "persisted";
+        let sandbox_dir = paths.sandbox_dir(name);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+
+        let cfg = SandboxConfig {
+            image_digest: "sha256:abc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem_mb: 2048,
+            workspace: "/workspace".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+            rw_size_gb: 16, // persisted at create time
+        };
+        std::fs::write(
+            sandbox_dir.join(crate::state::CONFIG_FILE),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+        // No rw.img at all — must NOT fall back to file-length recovery.
+
+        let n = managed_normalized(&paths, name).unwrap();
+        assert_eq!(
+            n.rw_size_gb, 16,
+            "rw_size_gb must come from cfg when cfg.rw_size_gb > 0"
+        );
+        let m = n.to_manifest();
+        let yaml = m.to_yaml();
+        let m2 = Manifest::load_str(&yaml).expect("exported manifest must parse");
+        let gib = quantity::parse_gib(&m2.spec.root_disk.size)
+            .expect("rootDisk.size must have a valid unit suffix");
+        assert_eq!(gib, 16, "rootDisk.size must round-trip to 16 GiB");
     }
 
     // -- Security fix 1: validate_name at every sandbox-path chokepoint --

@@ -283,6 +283,10 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             volumes: volumes.clone(),
             builder: opts.builder,
             build: None,
+            // Persist the requested scratch size so `izba export` can emit a
+            // valid `rootDisk.size` without reading the physical rw.img length
+            // (which truncates to 0 for sub-GiB images).
+            rw_size_gb: opts.rw_size_gb,
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 
@@ -1738,6 +1742,10 @@ mod tests {
         assert_eq!(config.cpus, o.cpus);
         assert_eq!(config.mem_mb, o.mem_mb);
         assert_eq!(config.workspace, o.workspace);
+        assert_eq!(
+            config.rw_size_gb, o.rw_size_gb,
+            "rw_size_gb must be persisted in config.json"
+        );
 
         let rw = sdir.join("rw.img");
         assert!(rw.is_file());

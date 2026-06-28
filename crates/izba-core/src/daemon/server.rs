@@ -1691,6 +1691,7 @@ mod tests {
             volumes: Vec::new(),
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         crate::state::save_json(&dir.join(CONFIG_FILE), &cfg).unwrap();
     }

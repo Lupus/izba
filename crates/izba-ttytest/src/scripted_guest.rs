@@ -100,6 +100,7 @@ impl ScriptedGuest {
                 volumes: Vec::new(),
                 builder: false,
                 build: None,
+                rw_size_gb: 0,
             },
         )
         .context("write config.json")?;

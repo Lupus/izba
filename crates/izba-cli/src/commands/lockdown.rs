@@ -166,6 +166,7 @@ mod tests {
                 volumes: vec![],
                 builder: false,
                 build: None,
+                rw_size_gb: 8,
             },
         )
         .unwrap();
@@ -202,6 +203,7 @@ mod tests {
                 volumes: vec![],
                 builder: false,
                 build: None,
+                rw_size_gb: 8,
             },
         )
         .unwrap();
