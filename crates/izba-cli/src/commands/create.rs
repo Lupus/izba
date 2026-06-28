@@ -89,4 +89,30 @@ mod tests {
         );
         assert_eq!(opts.image, super::super::DEFAULT_IMAGE);
     }
+
+    /// A `build:`-only manifest cannot be honored by create/run (no image ref),
+    /// so `opts.image` stays at the default — but the manifest is still parsed
+    /// and returned (so the base gets seeded). The user is warned on stderr.
+    #[test]
+    fn build_manifest_leaves_image_default_but_returns_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("izba.yml"),
+            "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nmetadata: { name: built }\nspec:\n  build: { context: . }\n  resources: { cpus: 4, memory: 2Gi }\n  rootDisk: { size: 4Gi }\n",
+        ).unwrap();
+        // load_repo_manifest reads the referenced Dockerfile for a `build:` spec.
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let mut opts = sample_opts_with_defaults();
+        let m = super::super::merge_manifest_into_opts(&mut opts, dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            opts.image,
+            super::super::DEFAULT_IMAGE,
+            "build: recipe cannot fill image; default stays"
+        );
+        // Other fields are still filled from the manifest.
+        assert_eq!(opts.cpus, 4, "cpus still filled from manifest");
+        assert_eq!(m.metadata.name.as_deref(), Some("built"));
+    }
 }
