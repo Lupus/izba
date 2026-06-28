@@ -11,8 +11,8 @@ use base64::Engine as _;
 use daemon::{DaemonApi, RealDaemon, ShellSession};
 use tauri::{Emitter, State};
 use views::{
-    CreateOpts, DaemonStatusView, PortRuleView, SandboxDetailView, SandboxView, SeedEntry,
-    VersionView, VolumeInfoView,
+    CreateOpts, DaemonStatusView, DiffView, PortRuleView, SandboxDetailView, SandboxView,
+    SeedEntry, VersionView, VolumeInfoView,
 };
 
 /// A live interactive shell, wrapped so the `shells` map lock is only held for
@@ -314,6 +314,20 @@ async fn volume_detach(
     .await
 }
 
+#[tauri::command]
+async fn manifest_diff(workspace: String, name: String) -> Result<DiffView, String> {
+    tauri::async_runtime::spawn_blocking(move || commands::manifest_diff_core(&workspace, &name))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn manifest_export(workspace: String, name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || commands::manifest_export_core(&workspace, &name))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
 #[derive(Clone, serde::Serialize)]
 struct ShellOutput {
     id: String,
@@ -456,7 +470,9 @@ pub fn run() {
             shell_open,
             shell_write,
             shell_resize,
-            shell_close
+            shell_close,
+            manifest_diff,
+            manifest_export
         ])
         .run(tauri::generate_context!())
         .expect("error while running izba app");
