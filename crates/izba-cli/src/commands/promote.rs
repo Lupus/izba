@@ -303,7 +303,6 @@ fn send_ok(client: &mut DaemonClient, req: &DaemonRequest) -> Result<()> {
 mod tests {
     use super::*;
     use izba_core::manifest::schema::{BuildSpec, Resources};
-    use std::path::PathBuf;
 
     #[test]
     fn gate_requires_a_token() {
@@ -321,6 +320,12 @@ mod tests {
     fn gate_passes_on_match() {
         assert_eq!(gate(Some("tok"), "tok", false), GateOutcome::Ok);
         assert_eq!(gate(Some("tok"), "tok", true), GateOutcome::Ok);
+    }
+
+    fn make_workspace() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        tmp
     }
 
     fn build_spec_with_memory(memory: &str) -> BuildSpec {
@@ -349,16 +354,20 @@ mod tests {
     #[test]
     fn build_opts_from_valid_binary_si_memory() {
         // "4Gi" is valid binary SI — should parse to 4096 MiB.
+        let tmp = make_workspace();
         let spec = build_spec_with_memory("4Gi");
-        let opts = build_opts_from(&PathBuf::from("/tmp"), &spec).unwrap();
+        let opts = build_opts_from(tmp.path(), &spec).unwrap();
         assert_eq!(opts.mem, 4096);
     }
 
     #[test]
     fn build_opts_from_invalid_decimal_si_memory_returns_err() {
         // "4GB" uses decimal SI which parse_mib does not accept — must propagate Err.
+        // Provide a real workspace so ensure_within canonicalize succeeds and we
+        // reach the memory-parse stage (portable: no hardcoded Unix /tmp).
+        let tmp = make_workspace();
         let spec = build_spec_with_memory("4GB");
-        match build_opts_from(&PathBuf::from("/tmp"), &spec) {
+        match build_opts_from(tmp.path(), &spec) {
             Ok(_) => panic!("expected Err for invalid memory \"4GB\""),
             Err(e) => assert!(
                 e.to_string().contains("build.resources.memory"),
@@ -370,8 +379,9 @@ mod tests {
     #[test]
     fn build_opts_from_no_resources_defaults_to_4096() {
         // When resources is None the default mem should be 4096 (not an error).
+        let tmp = make_workspace();
         let spec = build_spec_no_resources();
-        let opts = build_opts_from(&PathBuf::from("/tmp"), &spec).unwrap();
+        let opts = build_opts_from(tmp.path(), &spec).unwrap();
         assert_eq!(opts.mem, 4096);
         assert_eq!(opts.cpus, 2);
     }
