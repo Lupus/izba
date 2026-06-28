@@ -80,9 +80,13 @@ impl<'a> ImageStore<'a> {
     /// when absent — images cached before passwd capture, or images shipping no
     /// such file. A non-`NotFound` read error propagates as `Err`.
     pub fn load_user_dbs(&self, digest: &str) -> Result<(Option<String>, Option<String>)> {
+        // `fs::read` + lossy decode, NOT `read_to_string`: a real `/etc/passwd`
+        // GECOS field may hold non-UTF-8 (latin-1) bytes, which `read_to_string`
+        // rejects with `InvalidData` — that would fail the whole sandbox launch.
+        // The parser only reads the ASCII name/uid/gid columns, so lossy is safe.
         let read_opt = |path: PathBuf| -> Result<Option<String>> {
-            match fs::read_to_string(&path) {
-                Ok(s) => Ok(Some(s)),
+            match fs::read(&path) {
+                Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
             }
@@ -453,6 +457,37 @@ mod tests {
         assert!(
             store.load_user_dbs(DIGEST).is_err(),
             "a non-NotFound read error must propagate as Err, not Ok(None)"
+        );
+    }
+
+    #[test]
+    fn load_user_dbs_decodes_non_utf8_lossily() {
+        // A real /etc/passwd GECOS field can hold latin-1 bytes (e.g. 0xE9 = é).
+        // load_user_dbs must NOT reject that as InvalidData — it decodes lossily
+        // (the parser only needs the ASCII name/uid/gid columns).
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                Ok(())
+            })
+            .unwrap();
+        // `Andr\xE9` in the GECOS field is invalid UTF-8.
+        store
+            .persist_user_dbs(
+                DIGEST,
+                Some(b"node:x:1000:1000:Andr\xE9:/home/node:/bin/sh\n"),
+                None,
+            )
+            .unwrap();
+        let (passwd, _) = store
+            .load_user_dbs(DIGEST)
+            .expect("non-utf8 passwd must not Err");
+        let passwd = passwd.expect("passwd present");
+        assert!(
+            passwd.contains("node:x:1000:1000"),
+            "ASCII columns survive: {passwd}"
         );
     }
 
