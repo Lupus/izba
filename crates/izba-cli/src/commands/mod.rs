@@ -202,6 +202,21 @@ pub(crate) fn merge_manifest_into_opts(
             .map(|p| format!("{}:{}:{}", p.bind, p.host_port, p.guest_port))
             .collect();
     }
+    // Volumes: only adopt from manifest when the user passed none.
+    if opts.volumes.is_empty() {
+        opts.volumes = n
+            .volumes
+            .iter()
+            .map(|v| {
+                let path = v.guest_path.to_string_lossy();
+                let size_gb = v.size_bytes >> 30;
+                match &v.name {
+                    Some(name) => format!("{name}:{path}:{size_gb}g"),
+                    None => format!("{path}:{size_gb}g"),
+                }
+            })
+            .collect();
+    }
     Ok(Some(m))
 }
 
@@ -349,5 +364,86 @@ mod tests {
         let unconfined =
             build_create_request("web".into(), &o, PathBuf::from("/ws"), vec![], vec![], true);
         assert!(unconfined.allow_unconfined);
+    }
+
+    /// Fix 4: manifest volumes are adopted into opts when the user passed none.
+    #[test]
+    fn merge_manifest_adopts_volumes_when_none_passed() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Write an izba.yml with a named and an anonymous volume.
+        std::fs::write(
+            tmp.path().join("izba.yml"),
+            concat!(
+                "apiVersion: izba.dev/v1alpha1\n",
+                "kind: Sandbox\n",
+                "spec:\n",
+                "  image: ubuntu:24.04\n",
+                "  resources: { cpus: 1, memory: 1Gi }\n",
+                "  rootDisk: { size: 1Gi }\n",
+                "  volumes:\n",
+                "    - { name: data, mountPath: /data, size: 8Gi }\n",
+                "    - { mountPath: /cache, size: 2Gi }\n",
+            ),
+        )
+        .unwrap();
+
+        // opts() has no volumes (the clap default).
+        let mut o = opts();
+        let ws_dir = tmp.path().join("myproject");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        // Rename the izba.yml to myproject/izba.yml for the lookup.
+        let izba_yml = tmp.path().join("izba.yml");
+        std::fs::copy(&izba_yml, ws_dir.join("izba.yml")).unwrap();
+
+        merge_manifest_into_opts(&mut o, &ws_dir).unwrap();
+
+        // Both volumes must be adopted as flag strings.
+        assert_eq!(o.volumes.len(), 2, "two volumes should be adopted");
+        // Named volume: data:/data:8g
+        assert!(
+            o.volumes.iter().any(|v| v == "data:/data:8g"),
+            "named volume flag must be data:/data:8g; got {:?}",
+            o.volumes
+        );
+        // Anonymous volume: /cache:2g
+        assert!(
+            o.volumes.iter().any(|v| v == "/cache:2g"),
+            "anonymous volume flag must be /cache:2g; got {:?}",
+            o.volumes
+        );
+    }
+
+    /// Fix 4: an explicit --volume flag must NOT be overridden by the manifest.
+    #[test]
+    fn merge_manifest_does_not_override_explicit_volumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_dir = tmp.path().join("myproject");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        std::fs::write(
+            ws_dir.join("izba.yml"),
+            concat!(
+                "apiVersion: izba.dev/v1alpha1\n",
+                "kind: Sandbox\n",
+                "spec:\n",
+                "  image: ubuntu:24.04\n",
+                "  resources: { cpus: 1, memory: 1Gi }\n",
+                "  rootDisk: { size: 1Gi }\n",
+                "  volumes:\n",
+                "    - { name: data, mountPath: /data, size: 8Gi }\n",
+            ),
+        )
+        .unwrap();
+
+        // User passed an explicit volume.
+        let mut o = opts();
+        o.volumes = vec!["/tmp/work:4g".into()];
+
+        merge_manifest_into_opts(&mut o, &ws_dir).unwrap();
+
+        // The explicit flag must win; manifest volume must not be added.
+        assert_eq!(o.volumes, vec!["/tmp/work:4g".to_string()]);
     }
 }

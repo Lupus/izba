@@ -83,7 +83,9 @@ pub fn run(
     // one — which can be UNBOOTABLE due to missing libs / wrong ABI.
     if p.image_changed && !restart {
         bail!(
-            "image change requires --restart (the rw scratch overlay must be reset              on the new base; pass --restart, optionally with --reset-scratch=false              to keep the old overlay at your own risk)"
+            "image change requires --restart (the rw scratch overlay must be reset \
+             on the new base; pass --restart, optionally with --reset-scratch=false \
+             to keep the old overlay at your own risk)"
         );
     }
 
@@ -227,7 +229,8 @@ pub fn run(
                 },
             ) {
                 bail!(
-                    "failed to start sandbox after promote (config already committed);                      run `izba start {name}` to retry: {err}"
+                    "failed to start sandbox after promote (config already committed); \
+                     run `izba start {name}` to retry: {err}"
                 );
             }
             println!("restarted to apply: {}", p.restart_fields.join(", "));
