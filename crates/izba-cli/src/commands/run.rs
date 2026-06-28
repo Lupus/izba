@@ -229,20 +229,23 @@ fn resolve_or_create(
         return Ok((name_or_dir.to_string(), false));
     }
     let workspace = super::ensure_workspace(Path::new(name_or_dir))?;
-    let name = super::name_for(opts, &workspace)?;
+    // Honor izba.yml: overlay manifest defaults, explicit CLI flags always win.
+    let mut merged = opts.clone();
+    let manifest_for_base = super::merge_manifest_into_opts(&mut merged, &workspace)?;
+    let name = super::name_for(&merged, &workspace)?;
     // Case B: addressed by directory, but the sandbox already exists.
     if paths.sandbox_dir(&name).join(CONFIG_FILE).is_file() {
         reconcile_existing(paths, &name, opts)?;
         return Ok((name, false));
     }
-    let ports = super::parse_publish(&opts.publish)?;
-    let volumes = super::parse_volumes(&opts.volumes)?;
+    let ports = super::parse_publish(&merged.publish)?;
+    let volumes = super::parse_volumes(&merged.volumes)?;
     // Carry the run's confinement intent into create: `run --allow-unconfined`
     // on a workspace that can't be relabelled must still create (the VMM will run
     // unconfined and never relabel it), so skip the create-time preflight.
     let req = DaemonRequest::Create(super::build_create_request(
         name.clone(),
-        opts,
+        &merged,
         workspace,
         ports,
         volumes,
@@ -253,7 +256,18 @@ fn resolve_or_create(
         DaemonResponse::Error { message } => bail!(message),
         other => bail!("unexpected daemon reply: {other:?}"),
     }
-    super::persist_policy(paths, &name, opts.policy.as_deref())?;
+    super::persist_policy(paths, &name, merged.policy.as_deref())?;
+    // Seed the manifest base so `izba diff` reads in-sync right after create.
+    if let Some(ref m) = manifest_for_base {
+        if merged.policy.is_none() {
+            if let Some(ref eg) = m.spec.egress {
+                super::persist_policy_config(paths, &name, eg)?;
+            }
+        }
+        use izba_core::manifest::store;
+        store::write_base(&paths.sandbox_dir(&name), m)?;
+        store::clear_review(&paths.sandbox_dir(&name))?;
+    }
     Ok((name, true))
 }
 
@@ -289,16 +303,16 @@ fn reconcile_existing(paths: &Paths, name: &str, opts: &SandboxOpts) -> anyhow::
 /// addresses the sandbox.
 fn ignored_create_opts(opts: &SandboxOpts) -> Vec<&'static str> {
     let mut ignored = Vec::new();
-    if opts.image != "ubuntu:24.04" {
+    if opts.image != super::DEFAULT_IMAGE {
         ignored.push("--image");
     }
-    if opts.cpus != 2 {
+    if opts.cpus != super::DEFAULT_CPUS {
         ignored.push("--cpus");
     }
-    if opts.mem != 4096 {
+    if opts.mem != super::DEFAULT_MEM_MB {
         ignored.push("--mem");
     }
-    if opts.rw_size_gb != 8 {
+    if opts.rw_size_gb != super::DEFAULT_RW_GB {
         ignored.push("--rw-size-gb");
     }
     if !opts.publish.is_empty() {
