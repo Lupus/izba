@@ -5,3 +5,4 @@ pub mod diff;
 pub mod normalize;
 pub mod quantity;
 pub mod schema;
+pub mod store;
