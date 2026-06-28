@@ -104,4 +104,16 @@ mod tests {
         assert!(parse_bytes("").is_err());
         assert!(parse_bytes("-1Gi").is_err());
     }
+
+    /// Fix 6: Ti (tebibyte) must parse and format round-trip correctly.
+    #[test]
+    fn parses_ti_round_trips() {
+        let bytes = parse_bytes("1Ti").unwrap();
+        assert_eq!(bytes, 1u64 << 40, "1Ti must equal 2^40 bytes");
+        assert_eq!(
+            format(bytes),
+            "1Ti",
+            "format(1Ti bytes) must round-trip to 1Ti"
+        );
+    }
 }
