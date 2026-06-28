@@ -41,35 +41,43 @@ fn image_str(i: &ImageSource) -> String {
     }
 }
 
-/// Build a host -> (sorted ports, access) view of an allow-list for comparison.
-fn allow_index(eg: &EgressPolicyConfig) -> BTreeMap<String, (Vec<u16>, Access)> {
-    eg.allow
-        .iter()
-        .map(|e| {
-            let mut ports = e.ports();
-            ports.sort_unstable();
-            (e.host().to_string(), (ports, e.access()))
-        })
-        .collect()
+/// Build a (host, port) -> max-access view of an allow-list for comparison.
+///
+/// Expanding to per-port rows prevents the old host-keyed last-wins collapse:
+/// two entries for the same host with different verbs (e.g. one port read-only,
+/// another read-write) are now distinct cells, so a verb widening on one of them
+/// is correctly flagged as a firewall loosening even when the other tightens.
+fn allow_index(eg: &EgressPolicyConfig) -> BTreeMap<(String, u16), Access> {
+    let mut m: BTreeMap<(String, u16), Access> = BTreeMap::new();
+    for e in &eg.allow {
+        let host = e.host().to_string();
+        let acc = e.access();
+        for p in e.ports() {
+            // Take max-access across duplicate (host, port) pairs so the "from"
+            // side is never understated and the "to" side is not over-flagged.
+            let entry = m.entry((host.clone(), p)).or_insert(acc);
+            if acc == Access::ReadWrite {
+                *entry = Access::ReadWrite;
+            }
+        }
+    }
+    m
 }
 
 /// True if turning `from` egress into `to` egress LOOSENS the firewall:
-/// disabling enforce, adding a host, adding ports to a host, widening access
-/// (read -> read-write), or adding/loosening a git rule.
+/// disabling enforce, adding a (host, port) pair, widening access
+/// (read -> read-write) on any (host, port), or adding/loosening a git rule.
 fn egress_weakens(from: &EgressPolicyConfig, to: &EgressPolicyConfig) -> bool {
     if from.enforce && !to.enforce {
         return true;
     }
     let (fi, ti) = (allow_index(from), allow_index(to));
-    for (host, (to_ports, to_access)) in &ti {
-        match fi.get(host) {
-            None => return true, // new host allowed
-            Some((from_ports, from_access)) => {
-                if to_ports.iter().any(|p| !from_ports.contains(p)) {
-                    return true; // new port on an existing host
-                }
+    for ((host, port), to_access) in &ti {
+        match fi.get(&(host.clone(), *port)) {
+            None => return true, // new (host, port) allowed
+            Some(from_access) => {
                 if *from_access == Access::Read && *to_access == Access::ReadWrite {
-                    return true; // widened verb
+                    return true; // widened verb on this (host, port)
                 }
             }
         }
@@ -288,5 +296,65 @@ mod tests {
         assert_eq!(classify(&b, &repo, &b), DriftState::RepoAhead);
         assert_eq!(classify(&b, &b, &managed), DriftState::ManagedAhead);
         assert_eq!(classify(&b, &repo, &managed), DriftState::Diverged);
+    }
+
+    /// Fix 1: duplicate allow-list entries for the same host must not collapse
+    /// last-wins. A verb widening on any (host, port) cell must be flagged.
+    #[test]
+    fn duplicate_host_verb_widening_weakens_egress() {
+        let mut from = base();
+        from.egress.allow = vec![
+            AllowEntry::Scoped {
+                host: "h".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            },
+            AllowEntry::Scoped {
+                host: "h".into(),
+                ports: Some(vec![80]),
+                access: Access::Read,
+            },
+        ];
+        let mut to = from.clone();
+        // Widen the second entry (port 80) from Read to ReadWrite.
+        if let AllowEntry::Scoped { access, .. } = &mut to.egress.allow[1] {
+            *access = Access::ReadWrite;
+        }
+        let d = diff(&from, &to);
+        assert!(!d.is_empty(), "a change must be detected");
+        assert!(
+            d[0].weakens_egress,
+            "verb widening on a duplicate-host entry must flag weakens_egress"
+        );
+    }
+
+    /// Fix 1 (negative): a pure tightening on duplicate-host entries must NOT
+    /// flag weakening.
+    #[test]
+    fn duplicate_host_pure_tightening_does_not_weaken() {
+        let mut from = base();
+        from.egress.allow = vec![
+            AllowEntry::Scoped {
+                host: "h".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            },
+            AllowEntry::Scoped {
+                host: "h".into(),
+                ports: Some(vec![80]),
+                access: Access::ReadWrite,
+            },
+        ];
+        let mut to = from.clone();
+        // Tighten the second entry (port 80) from ReadWrite to Read.
+        if let AllowEntry::Scoped { access, .. } = &mut to.egress.allow[1] {
+            *access = Access::Read;
+        }
+        let d = diff(&from, &to);
+        assert!(!d.is_empty(), "a change must be detected");
+        assert!(
+            !d[0].weakens_egress,
+            "pure tightening on a duplicate-host entry must NOT flag weakens_egress"
+        );
     }
 }
