@@ -4,6 +4,7 @@
 //! name-sanitisation however they like (e.g. the CLI uses `name::sanitize`;
 //! the Tauri app can do the same without pulling in CLI crates).
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -34,23 +35,49 @@ pub fn ensure_within(base: &Path, candidate: &Path) -> Result<PathBuf> {
             Ok(resolved)
         }
         Err(_) => {
-            // Path does not yet exist. Walk components: reject `..` outright
-            // (we cannot know where a symlink would resolve to), strip `.`.
-            let mut parts: Vec<Component<'_>> = Vec::new();
+            // Path does not yet exist. Reject any `..` component up front —
+            // we cannot follow symlinks that don't exist, so `..` is
+            // conservative-rejected (the `ensure_within_rejects_dotdot_nonexistent`
+            // test depends on this).
             for c in candidate.components() {
-                match c {
-                    Component::ParentDir => {
-                        bail!("build context/dockerfile escapes the workspace");
-                    }
-                    Component::CurDir => {} // strip `.`
-                    other => parts.push(other),
+                if c == Component::ParentDir {
+                    bail!("build context/dockerfile escapes the workspace");
                 }
             }
-            let lexical: PathBuf = parts.into_iter().collect();
-            if !lexical.starts_with(&canon_base) {
+
+            // Resolve the longest existing ancestor via canonicalize so BOTH
+            // sides of the comparison are canonical. On Windows, canonicalize
+            // returns a verbatim path (`\\?\C:\...`); without this the plain
+            // `C:\...` path from `candidate` would fail `starts_with` against
+            // the verbatim `canon_base`.
+            let mut ancestor = candidate.to_path_buf();
+            let mut tail: Vec<OsString> = Vec::new();
+            let canon_ancestor = loop {
+                if let Ok(p) = ancestor.canonicalize() {
+                    break p;
+                }
+                match ancestor.file_name() {
+                    Some(n) => tail.push(n.to_os_string()),
+                    None => bail!("build context/dockerfile escapes the workspace"),
+                }
+                if !ancestor.pop() {
+                    bail!("build context/dockerfile escapes the workspace");
+                }
+            };
+
+            if !canon_ancestor.starts_with(&canon_base) {
                 bail!("build context/dockerfile escapes the workspace");
             }
-            Ok(lexical)
+
+            // Re-append the non-existent tail (collected in reverse order).
+            let mut resolved = canon_ancestor;
+            for component in tail.into_iter().rev() {
+                resolved.push(component);
+            }
+            if !resolved.starts_with(&canon_base) {
+                bail!("build context/dockerfile escapes the workspace");
+            }
+            Ok(resolved)
         }
     }
 }
@@ -413,5 +440,23 @@ mod tests {
         let candidate = tmp.path().join("subdir/Dockerfile");
         let result = ensure_within(tmp.path(), &candidate).unwrap();
         assert!(result.starts_with(tmp.path().canonicalize().unwrap()));
+    }
+
+    /// ensure_within: a deeply nested non-existent path (a/b/c.txt where `a`
+    /// also doesn't exist) is accepted and the returned path starts_with the
+    /// canonicalized base. This exercises the ancestor-walk on Windows where
+    /// canonicalize() returns a verbatim `\\?\`-prefixed path and a plain
+    /// `C:\...` candidate would otherwise fail `starts_with`.
+    #[test]
+    fn ensure_within_accepts_nonexistent_nested_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Neither `a` nor `a/b` exist; only tmp.path() itself exists.
+        let candidate = tmp.path().join("a").join("b").join("c.txt");
+        let result = ensure_within(tmp.path(), &candidate).unwrap();
+        let canon_base = tmp.path().canonicalize().unwrap();
+        assert!(
+            result.starts_with(&canon_base),
+            "resolved path {result:?} must start with canon base {canon_base:?}"
+        );
     }
 }
