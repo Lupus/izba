@@ -1506,9 +1506,18 @@ mod tests {
              # a comment\n\
              \n\
              node:x:1000:1000:Node:/home/node:/bin/sh\n\
-             short:x:1\n",
+             short:x:1\n\
+             #commented:x:999:999::/c:/bin/sh\n",
         );
+        // The trailing line is a comment that is ALSO a structurally-valid passwd
+        // row: it must be dropped by the leading-`#` skip, NOT parsed (this makes
+        // the `is_empty() || starts_with('#')` guard load-bearing — without the
+        // `#` arm it would yield a bogus "#commented" uid-999 entry).
         assert_eq!(p.len(), 2);
+        assert!(
+            p.iter().all(|e| e.uid != 999),
+            "a #-commented row must never be parsed as an entry: {p:?}"
+        );
         assert_eq!(p[0].name, "root");
         assert_eq!(
             (p[1].name.as_str(), p[1].uid, p[1].gid),
@@ -1518,8 +1527,15 @@ mod tests {
 
     #[test]
     fn parse_group_basic_and_skips_junk() {
-        let g = parse_group("root:x:0:\nwheel:x:10:node\n#c\n\nbad:x\n");
+        // `#fake:x:777:` is a comment that is also a structurally-valid group row;
+        // it must be skipped (not parsed as gid 777), keeping the `#` skip arm
+        // load-bearing.
+        let g = parse_group("root:x:0:\nwheel:x:10:node\n#c\n\nbad:x\n#fake:x:777:\n");
         assert_eq!(g.len(), 2);
+        assert!(
+            g.iter().all(|e| e.gid != 777),
+            "a #-commented row must never be parsed as a group: {g:?}"
+        );
         assert_eq!((g[1].name.as_str(), g[1].gid), ("wheel", 10));
     }
 

@@ -436,6 +436,27 @@ mod tests {
     }
 
     #[test]
+    fn load_user_dbs_propagates_non_notfound_read_errors() {
+        // Only an ABSENT passwd/group is the `Ok(None)` self-heal case; any other
+        // read error must surface as `Err`. Make `passwd` a *directory* so
+        // `fs::read_to_string` fails with EISDIR (kind != NotFound) — this keeps
+        // the `e.kind() == NotFound` match guard load-bearing.
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                Ok(())
+            })
+            .unwrap();
+        fs::create_dir(store.passwd_path(DIGEST)).unwrap();
+        assert!(
+            store.load_user_dbs(DIGEST).is_err(),
+            "a non-NotFound read error must propagate as Err, not Ok(None)"
+        );
+    }
+
+    #[test]
     fn publish_tolerates_existing_target() {
         // Models only the losing side of a publish race: the pre-existing dir
         // here holds a marker file, not a real rootfs.erofs, so this verifies
