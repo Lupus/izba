@@ -4,15 +4,63 @@
 //! name-sanitisation however they like (e.g. the CLI uses `name::sanitize`;
 //! the Tauri app can do the same without pulling in CLI crates).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::manifest::{diff, store, DriftState, Manifest, Normalized};
 use crate::paths::Paths;
 
+/// Verify that `candidate` resides inside `base`, defending against path
+/// traversal via agent-controlled values (context, dockerfile fields in
+/// izba.yml).
+///
+/// - If `candidate` exists on disk, uses `canonicalize` (resolves symlinks).
+/// - If it does not exist, rejects any path with `..` components (conservative:
+///   we cannot follow symlinks that do not exist yet) and performs a lexical
+///   `starts_with` check against the canonicalized base.
+///
+/// Error messages do NOT include the escaped absolute path to avoid leaking it.
+pub fn ensure_within(base: &Path, candidate: &Path) -> Result<PathBuf> {
+    let canon_base = base
+        .canonicalize()
+        .with_context(|| format!("resolving workspace {}", base.display()))?;
+
+    match candidate.canonicalize() {
+        Ok(resolved) => {
+            if !resolved.starts_with(&canon_base) {
+                bail!("build context/dockerfile escapes the workspace");
+            }
+            Ok(resolved)
+        }
+        Err(_) => {
+            // Path does not yet exist. Walk components: reject `..` outright
+            // (we cannot know where a symlink would resolve to), strip `.`.
+            let mut parts: Vec<Component<'_>> = Vec::new();
+            for c in candidate.components() {
+                match c {
+                    Component::ParentDir => {
+                        bail!("build context/dockerfile escapes the workspace");
+                    }
+                    Component::CurDir => {} // strip `.`
+                    other => parts.push(other),
+                }
+            }
+            let lexical: PathBuf = parts.into_iter().collect();
+            if !lexical.starts_with(&canon_base) {
+                bail!("build context/dockerfile escapes the workspace");
+            }
+            Ok(lexical)
+        }
+    }
+}
+
 /// Load `izba.yml` from a workspace dir, returning `(manifest, raw_yaml,
 /// dockerfile_contents)`. `dockerfile` is `Some` only for a `build:` spec.
+///
+/// The `context` and `dockerfile` fields are agent-controlled; both are
+/// verified to reside within `dir` via [`ensure_within`] before any filesystem
+/// read.
 pub fn load_repo_manifest(dir: &Path) -> Result<(Manifest, String, Option<String>)> {
     let path = dir.join("izba.yml");
     let raw =
@@ -20,8 +68,10 @@ pub fn load_repo_manifest(dir: &Path) -> Result<(Manifest, String, Option<String
     let m = Manifest::load_str(&raw)?;
     let dockerfile = match &m.spec.build {
         Some(b) => {
-            let ctx = dir.join(b.context.as_deref().unwrap_or("."));
-            let df = ctx.join(b.dockerfile.as_deref().unwrap_or("Dockerfile"));
+            let ctx_raw = dir.join(b.context.as_deref().unwrap_or("."));
+            let ctx = ensure_within(dir, &ctx_raw)?;
+            let df_raw = ctx.join(b.dockerfile.as_deref().unwrap_or("Dockerfile"));
+            let df = ensure_within(&ctx, &df_raw)?;
             Some(
                 std::fs::read_to_string(&df)
                     .with_context(|| format!("reading {}", df.display()))?,
@@ -35,6 +85,7 @@ pub fn load_repo_manifest(dir: &Path) -> Result<(Manifest, String, Option<String
 /// Read the managed truth (config.json + policy.yaml) for `name` into a
 /// `Normalized`, directly from disk (works on a stopped sandbox).
 pub fn managed_normalized(paths: &Paths, name: &str) -> Result<Normalized> {
+    crate::sandbox::validate_name(name)?;
     use crate::daemon::egress::config::EgressPolicyConfig;
     use crate::state::{load_json, SandboxConfig, CONFIG_FILE};
     let dir = paths.sandbox_dir(name);
@@ -62,6 +113,7 @@ pub fn compute_diff(
     dir: &Path,
     name: &str,
 ) -> Result<(DriftState, Vec<diff::FieldDelta>, String)> {
+    crate::sandbox::validate_name(name)?;
     let (m, raw, dockerfile) = load_repo_manifest(dir)?;
     let repo = Normalized::from_manifest(&m, name)?;
     let managed = managed_normalized(paths, name)?;
@@ -80,6 +132,7 @@ pub fn compute_diff(
 /// base, and clear the review token. Returns the path written.
 /// Inverse of promote; no review gate (the caller is the human operator).
 pub fn export(paths: &Paths, dir: &Path, name: &str) -> Result<PathBuf> {
+    crate::sandbox::validate_name(name)?;
     let managed = managed_normalized(paths, name)?;
     let manifest = managed.to_manifest();
     let path = dir.join("izba.yml");
@@ -219,5 +272,146 @@ mod tests {
         let gib = quantity::parse_gib(&m2.spec.root_disk.size)
             .expect("rootDisk.size must have a valid unit suffix");
         assert_eq!(gib, 8, "rootDisk.size must round-trip to 8 GiB");
+    }
+
+    // -- Security fix 1: validate_name at every sandbox-path chokepoint --
+
+    /// managed_normalized must reject a traversal name before touching the fs.
+    #[test]
+    fn managed_normalized_rejects_traversal_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let err = managed_normalized(&paths, "../../etc").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid sandbox name"),
+            "expected name-validation error, got: {err}"
+        );
+    }
+
+    /// compute_diff must reject a traversal name before touching the fs.
+    #[test]
+    fn compute_diff_rejects_traversal_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        std::fs::write(tmp.path().join("izba.yml"), MINIMAL_MANIFEST).unwrap();
+        let err = compute_diff(&paths, tmp.path(), "../../etc").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid sandbox name"),
+            "expected name-validation error, got: {err}"
+        );
+    }
+
+    /// export must reject a traversal name before touching the fs.
+    #[test]
+    fn export_rejects_traversal_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let err = export(&paths, tmp.path(), "../../etc").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid sandbox name"),
+            "expected name-validation error, got: {err}"
+        );
+    }
+
+    // -- Security fix 2: ensure_within bounds build paths to workspace --
+
+    /// A build: manifest with normal paths (context=., dockerfile=Dockerfile).
+    const BUILD_MANIFEST: &str = concat!(
+        "apiVersion: izba.dev/v1alpha1\n",
+        "kind: Sandbox\n",
+        "spec:\n",
+        "  build:\n",
+        "    context: '.'\n",
+        "    dockerfile: 'Dockerfile'\n",
+        "  resources: { cpus: 1, memory: 1Gi }\n",
+        "  rootDisk: { size: 1Gi }\n",
+    );
+
+    /// load_repo_manifest with a traversal context dir must return Err.
+    #[test]
+    fn load_repo_manifest_rejects_traversal_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = concat!(
+            "apiVersion: izba.dev/v1alpha1\n",
+            "kind: Sandbox\n",
+            "spec:\n",
+            "  build:\n",
+            "    context: '../..'\n",
+            "    dockerfile: 'x'\n",
+            "  resources: { cpus: 1, memory: 1Gi }\n",
+            "  rootDisk: { size: 1Gi }\n",
+        );
+        std::fs::write(tmp.path().join("izba.yml"), manifest).unwrap();
+        let err = load_repo_manifest(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the workspace"),
+            "expected traversal error, got: {err}"
+        );
+    }
+
+    /// load_repo_manifest with a traversal dockerfile path must return Err.
+    #[test]
+    fn load_repo_manifest_rejects_traversal_dockerfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = concat!(
+            "apiVersion: izba.dev/v1alpha1\n",
+            "kind: Sandbox\n",
+            "spec:\n",
+            "  build:\n",
+            "    context: '.'\n",
+            "    dockerfile: '../../../etc/shadow'\n",
+            "  resources: { cpus: 1, memory: 1Gi }\n",
+            "  rootDisk: { size: 1Gi }\n",
+        );
+        std::fs::write(tmp.path().join("izba.yml"), manifest).unwrap();
+        let err = load_repo_manifest(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the workspace"),
+            "expected traversal error, got: {err}"
+        );
+    }
+
+    /// load_repo_manifest with normal build spec must succeed.
+    #[test]
+    fn load_repo_manifest_allows_normal_build_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("izba.yml"), BUILD_MANIFEST).unwrap();
+        std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let (m, _, dockerfile) = load_repo_manifest(tmp.path()).unwrap();
+        assert!(m.spec.build.is_some(), "build spec present");
+        assert!(dockerfile.is_some(), "dockerfile contents present");
+    }
+
+    /// ensure_within: an existing path outside base is rejected.
+    #[test]
+    fn ensure_within_rejects_existing_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let candidate = std::env::temp_dir();
+        let err = ensure_within(tmp.path(), &candidate).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the workspace"),
+            "got: {err}"
+        );
+    }
+
+    /// ensure_within: a non-existent path with `..` is rejected.
+    #[test]
+    fn ensure_within_rejects_dotdot_nonexistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let candidate = tmp.path().join("../evil_nonexistent_xyzzy");
+        let err = ensure_within(tmp.path(), &candidate).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the workspace"),
+            "got: {err}"
+        );
+    }
+
+    /// ensure_within: a non-existent child path (no `..`) is accepted.
+    #[test]
+    fn ensure_within_accepts_nonexistent_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let candidate = tmp.path().join("subdir/Dockerfile");
+        let result = ensure_within(tmp.path(), &candidate).unwrap();
+        assert!(result.starts_with(tmp.path().canonicalize().unwrap()));
     }
 }
