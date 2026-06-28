@@ -233,7 +233,9 @@ fn resolve_or_create(
     let mut merged = opts.clone();
     let manifest_for_base = super::merge_manifest_into_opts(&mut merged, &workspace)?;
     let name = super::name_for(&merged, &workspace)?;
-    // Case B: addressed by directory, but the sandbox already exists.
+    // Case B: addressed by directory, but the sandbox already exists. Here the
+    // merge above only served to resolve the manifest-derived name; base seeding
+    // is for fresh creates only, so dropping `manifest_for_base` is intentional.
     if paths.sandbox_dir(&name).join(CONFIG_FILE).is_file() {
         reconcile_existing(paths, &name, opts)?;
         return Ok((name, false));

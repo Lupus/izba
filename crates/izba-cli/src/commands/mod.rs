@@ -184,9 +184,21 @@ pub(crate) fn merge_manifest_into_opts(
         String::new() // manifest name takes precedence; fallback never used
     };
     let n = Normalized::from_manifest(&m, &default_name)?;
+    // Known limitation: a user explicitly passing a value equal to the clap
+    // default is indistinguishable from not passing it at all — we compare
+    // against the default constant rather than consulting clap's value source.
+    // This is intentional simplicity (the manifest only fills genuine gaps).
     if opts.image == DEFAULT_IMAGE {
-        if let izba_core::manifest::ImageSource::Ref(r) = &n.image {
-            opts.image = r.clone();
+        match &n.image {
+            izba_core::manifest::ImageSource::Ref(r) => opts.image = r.clone(),
+            izba_core::manifest::ImageSource::Build(_) => {
+                eprintln!(
+                    "warning: izba.yml declares a `build:` recipe, but build-on-create \
+                     is not yet supported by `izba create`/`izba run`. Booting the default \
+                     image ({DEFAULT_IMAGE}). To build the declared image, run \
+                     `izba run --build .` (or `izba build` then reference the tag).",
+                );
+            }
         }
     }
     if opts.cpus == DEFAULT_CPUS {
