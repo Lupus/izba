@@ -61,6 +61,23 @@ pub fn plan(current: &Normalized, target: &Normalized) -> ApplyPlan {
     p
 }
 
+/// Write ONLY `policy.yaml` (the egress allow-list) into the sandbox dir.
+///
+/// Split out so `promote` can land the durable policy BEFORE the live
+/// `ReloadPolicy` RPC (which re-reads policy.yaml from disk), while deferring
+/// the config.json commit until after all live effects succeed. `write_managed`
+/// reuses this so config.json + policy.yaml stay consistent.
+pub fn write_policy(
+    dir: &std::path::Path,
+    egress: &crate::daemon::egress::config::EgressPolicyConfig,
+) -> Result<()> {
+    std::fs::write(
+        crate::daemon::egress::config::EgressPolicyConfig::path_in(dir),
+        egress.to_yaml(),
+    )
+    .with_context(|| format!("writing policy.yaml in {}", dir.display()))
+}
+
 /// Write the managed truth: config.json (cpus/mem/image/ports/volumes from
 /// `target`, with `image_digest` resolved by the caller) and policy.yaml from
 /// `target.egress`. Preserves `workspace` and `builder` from the existing config.
@@ -84,11 +101,7 @@ pub fn write_managed(
     crate::volume::assign_eph_ids(&mut volumes);
     cfg.volumes = volumes;
     save_json(&dir.join(CONFIG_FILE), &cfg)?;
-    std::fs::write(
-        crate::daemon::egress::config::EgressPolicyConfig::path_in(&dir),
-        target.egress.to_yaml(),
-    )
-    .with_context(|| format!("writing policy.yaml for {name:?}"))?;
+    write_policy(&dir, &target.egress)?;
     Ok(())
 }
 
@@ -156,6 +169,22 @@ mod tests {
         let p = plan(&n(2), &to);
         assert!(p.policy_changed);
         assert!(p.image_changed);
+    }
+
+    #[test]
+    fn write_policy_writes_round_trippable_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let egress = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Host("github.com".into())],
+            git: vec![],
+        };
+
+        write_policy(dir.path(), &egress).unwrap();
+
+        let back = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
+        assert!(back.enforce);
+        assert!(back.allow.iter().any(|e| e.host() == "github.com"));
     }
 
     #[test]

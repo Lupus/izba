@@ -95,12 +95,16 @@ pub fn run(
         );
     }
 
-    // Write managed truth (config.json + policy.yaml).
-    apply::write_managed(paths, &name, &repo, &digest)?;
-
-    // Enact live effects via the daemon.
+    // Atomicity: enact the live daemon effects FIRST, and only commit the
+    // durable config.json AFTER they succeed. If a live RPC fails partway,
+    // config.json stays at the OLD state so a retry recomputes the correct
+    // deltas (rather than computing an empty diff against a half-applied truth).
     let mut client = DaemonClient::connect(paths)?;
+    // policy.yaml is the one durable file that must land BEFORE its live RPC:
+    // `ReloadPolicy` re-reads policy.yaml from disk. Writing it first is safe to
+    // retry (idempotent) and `write_managed` rewrites it identically below.
     if p.policy_changed {
+        apply::write_policy(&dir_managed, &repo.egress)?;
         send_ok(
             &mut client,
             &DaemonRequest::ReloadPolicy { name: name.clone() },
@@ -144,6 +148,11 @@ pub fn run(
             },
         )?;
     }
+
+    // Live effects succeeded — NOW commit the durable managed truth (config.json
+    // + policy.yaml). `Stop`→`Start` below reads config.json from disk, so this
+    // must precede the restart branch.
+    apply::write_managed(paths, &name, &repo, &digest)?;
 
     // Restart-class fields (cpus, memory, image): apply now or note for later.
     if !p.restart_fields.is_empty() {
