@@ -1,0 +1,4 @@
+//! Project manifest (`izba.yml`): schema, canonical form, structural diff, and
+//! the host-only review/base store backing `izba diff`/`promote`/`export`.
+
+pub mod quantity;
