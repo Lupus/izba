@@ -165,6 +165,7 @@ mod tests {
                 ports: vec![],
                 volumes: vec![],
                 builder: false,
+                build: None,
             },
         )
         .unwrap();
@@ -200,6 +201,7 @@ mod tests {
                 ports: vec![],
                 volumes: vec![],
                 builder: false,
+                build: None,
             },
         )
         .unwrap();

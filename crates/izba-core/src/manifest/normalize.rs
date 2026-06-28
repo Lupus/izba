@@ -104,9 +104,13 @@ impl Normalized {
         }
         let ports = cfg.ports.clone();
         let mut egress = egress.clone();
+        let image = match &cfg.build {
+            Some(b) => ImageSource::Build(b.clone()),
+            None => ImageSource::Ref(cfg.image_ref.clone()),
+        };
         let mut n = Normalized {
             name: name.to_string(),
-            image: ImageSource::Ref(cfg.image_ref.clone()),
+            image,
             cpus: cfg.cpus,
             mem_mb: cfg.mem_mb,
             // SandboxConfig does not record rw scratch size post-create (it sizes
@@ -240,6 +244,7 @@ spec:
             ports: vec![],
             volumes: vec![],
             builder: false,
+            build: None,
         };
         let eg = EgressPolicyConfig {
             enforce: true,
@@ -252,6 +257,76 @@ spec:
         assert_eq!(n.mem_mb, 2048);
         assert_eq!(n.image, ImageSource::Ref("ubuntu:24.04".into()));
         assert!(n.egress.enforce);
+    }
+
+    #[test]
+    fn from_managed_with_build_yields_build_image_source() {
+        use crate::manifest::schema::BuildSpec;
+        let build_spec = BuildSpec {
+            context: Some(".".into()),
+            dockerfile: Some("Dockerfile".into()),
+            tag: Some("myapp:latest".into()),
+            allow: vec![],
+            resources: None,
+        };
+        let cfg = crate::state::SandboxConfig {
+            image_digest: "sha256:built".into(),
+            image_ref: "myapp:latest".into(),
+            cpus: 2,
+            mem_mb: 1024,
+            workspace: "/w".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: Some(build_spec.clone()),
+        };
+        let n = Normalized::from_managed("myapp", &cfg, &EgressPolicyConfig::default());
+        assert_eq!(n.image, ImageSource::Build(build_spec));
+    }
+
+    #[test]
+    fn from_managed_with_no_build_yields_ref_image_source() {
+        let cfg = crate::state::SandboxConfig {
+            image_digest: "sha256:abc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem_mb: 1024,
+            workspace: "/w".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+        };
+        let n = Normalized::from_managed("myapp", &cfg, &EgressPolicyConfig::default());
+        assert_eq!(n.image, ImageSource::Ref("ubuntu:24.04".into()));
+    }
+
+    #[test]
+    fn to_manifest_with_build_source_emits_build_block_not_image() {
+        use crate::manifest::schema::BuildSpec;
+        let build_spec = BuildSpec {
+            context: Some(".".into()),
+            dockerfile: Some("Dockerfile".into()),
+            tag: Some("myapp:latest".into()),
+            allow: vec![],
+            resources: None,
+        };
+        let cfg = crate::state::SandboxConfig {
+            image_digest: "sha256:built".into(),
+            image_ref: "myapp:latest".into(),
+            cpus: 2,
+            mem_mb: 1024,
+            workspace: "/w".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: Some(build_spec.clone()),
+        };
+        let n = Normalized::from_managed("myapp", &cfg, &EgressPolicyConfig::default());
+        let m = n.to_manifest();
+        assert!(m.spec.build.is_some(), "build block must be present");
+        assert!(m.spec.image.is_none(), "image field must be absent");
+        assert_eq!(m.spec.build.unwrap(), build_spec);
     }
 
     #[test]

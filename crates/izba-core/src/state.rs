@@ -37,6 +37,11 @@ pub struct SandboxConfig {
     /// before this field was added still deserialize correctly (back-compat).
     #[serde(default)]
     pub builder: bool,
+    /// Build recipe this sandbox's image was produced from, when it came from a
+    /// `build:` manifest (vs a plain image ref). `serde(default)` keeps configs
+    /// written before this field deserializing (disk-state back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<crate::manifest::schema::BuildSpec>,
 }
 
 /// A single host→guest TCP publish rule. Its identity (uniqueness key) is
@@ -113,6 +118,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            build: None,
         }
     }
 
@@ -305,6 +311,24 @@ mod tests {
         save_json(&path, &records).unwrap();
         let loaded: Vec<PortRecord> = load_json(&path).unwrap().unwrap();
         assert_eq!(loaded, records);
+    }
+
+    #[test]
+    fn sandbox_config_build_defaults_none_when_absent() {
+        // A config.json written before the `build` field was added must still
+        // load correctly; `serde(default)` makes it deserialize as `None`.
+        let legacy = r#"{
+            "image_digest": "sha256:abc",
+            "image_ref": "ubuntu:24.04",
+            "cpus": 2,
+            "mem_mb": 512,
+            "workspace": "/workspace"
+        }"#;
+        let cfg: SandboxConfig = serde_json::from_str(legacy).unwrap();
+        assert!(
+            cfg.build.is_none(),
+            "missing build field must default to None"
+        );
     }
 
     #[test]

@@ -282,6 +282,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             ports: opts.ports.clone(),
             volumes: volumes.clone(),
             builder: opts.builder,
+            build: None,
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 
