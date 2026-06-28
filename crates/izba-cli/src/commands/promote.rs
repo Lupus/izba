@@ -51,6 +51,7 @@ pub fn run(
     let default_name = super::workspace_default_name(dir)?;
     let repo = Normalized::from_manifest(&m, &default_name)?;
     let name = name_override.unwrap_or(&repo.name).to_string();
+    izba_core::sandbox::validate_name(&name)?;
     let dir_managed = paths.sandbox_dir(&name);
 
     // Review gate: the token binds the human review to the exact manifest+Dockerfile bytes.
@@ -248,13 +249,6 @@ pub fn run(
                 "pending restart to apply: {} (run `izba promote --restart` or restart manually)",
                 p.restart_fields.join(", ")
             );
-            if p.image_changed {
-                println!(
-                    "note: image change is pending the next restart; scratch reset \
-                     (--reset-scratch) will only happen when restarted via \
-                     `izba promote --restart` (cannot reset a running VM's disk)"
-                );
-            }
         }
     }
 
@@ -303,6 +297,16 @@ fn send_ok(client: &mut DaemonClient, req: &DaemonRequest) -> Result<()> {
 mod tests {
     use super::*;
     use izba_core::manifest::schema::{BuildSpec, Resources};
+
+    /// validate_name is the first check in promote::run (hoisted before any path
+    /// construction). This sentinel asserts it rejects traversal names.
+    #[test]
+    fn validate_name_rejects_traversal() {
+        assert!(
+            izba_core::sandbox::validate_name("../../etc").is_err(),
+            "traversal name must be rejected by validate_name"
+        );
+    }
 
     #[test]
     fn gate_requires_a_token() {
