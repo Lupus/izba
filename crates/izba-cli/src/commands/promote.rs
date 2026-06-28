@@ -269,8 +269,10 @@ fn build_opts_from(
     dir: &Path,
     b: &izba_core::manifest::schema::BuildSpec,
 ) -> Result<crate::commands::build::BuildOpts> {
-    let context = dir.join(b.context.as_deref().unwrap_or("."));
-    let dockerfile = context.join(b.dockerfile.as_deref().unwrap_or("Dockerfile"));
+    let context_raw = dir.join(b.context.as_deref().unwrap_or("."));
+    let context = izba_core::manifest::ops::ensure_within(dir, &context_raw)?;
+    let dockerfile_raw = context.join(b.dockerfile.as_deref().unwrap_or("Dockerfile"));
+    let dockerfile = izba_core::manifest::ops::ensure_within(&context, &dockerfile_raw)?;
     let (cpus, mem) = match &b.resources {
         Some(r) => {
             let mem = izba_core::manifest::quantity::parse_mib(&r.memory)
