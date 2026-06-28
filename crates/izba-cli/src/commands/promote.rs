@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use izba_core::daemon::proto::{DaemonRequest, DaemonResponse};
 use izba_core::daemon::DaemonClient;
 use izba_core::manifest::normalize::ImageSource;
@@ -106,7 +106,7 @@ pub fn run(
     let digest = match &repo.image {
         ImageSource::Ref(r) => izba_core::image::ensure_image(paths, r)?,
         ImageSource::Build(b) => {
-            let opts = build_opts_from(dir, b);
+            let opts = build_opts_from(dir, b)?;
             crate::commands::build::build_image(paths, &opts)?
         }
     };
@@ -189,7 +189,12 @@ pub fn run(
             )?;
         }
     } else {
-        eprintln!("sandbox not running — changes apply on next start");
+        // Live RPCs are skipped when the sandbox is not running. Only warn
+        // "changes apply on next start" when --restart won't Start it anyway.
+        let will_start = restart && !p.restart_fields.is_empty();
+        if !will_start {
+            eprintln!("sandbox not running — changes apply on next start");
+        }
     }
 
     // Commit the durable managed truth (config.json + policy.yaml)
@@ -213,7 +218,11 @@ pub fn run(
                 .map(|c| !c.is_confined())
                 .unwrap_or(false);
 
-            send_ok(&mut client, &DaemonRequest::Stop { name: name.clone() })?;
+            // Only Stop when the sandbox is actually running; sending Stop to a
+            // non-running sandbox may error from the daemon and is unnecessary.
+            if is_running {
+                send_ok(&mut client, &DaemonRequest::Stop { name: name.clone() })?;
+            }
             // Reset the rw scratch overlay to a blank state on the new base
             // before starting, so the image change boots cleanly.
             if p.image_changed && reset_scratch {
@@ -259,21 +268,25 @@ pub fn run(
 fn build_opts_from(
     dir: &Path,
     b: &izba_core::manifest::schema::BuildSpec,
-) -> crate::commands::build::BuildOpts {
+) -> Result<crate::commands::build::BuildOpts> {
     let context = dir.join(b.context.as_deref().unwrap_or("."));
     let dockerfile = context.join(b.dockerfile.as_deref().unwrap_or("Dockerfile"));
-    crate::commands::build::BuildOpts {
+    let (cpus, mem) = match &b.resources {
+        Some(r) => {
+            let mem = izba_core::manifest::quantity::parse_mib(&r.memory)
+                .context("build.resources.memory")?;
+            (r.cpus, mem)
+        }
+        None => (2, 4096),
+    };
+    Ok(crate::commands::build::BuildOpts {
         dockerfile,
         tag: b.tag.clone(),
         context,
         build_allow: b.allow.clone(),
-        cpus: b.resources.as_ref().map(|r| r.cpus).unwrap_or(2),
-        mem: b
-            .resources
-            .as_ref()
-            .and_then(|r| izba_core::manifest::quantity::parse_mib(&r.memory).ok())
-            .unwrap_or(4096),
-    }
+        cpus,
+        mem,
+    })
 }
 
 fn send_ok(client: &mut DaemonClient, req: &DaemonRequest) -> Result<()> {
@@ -287,6 +300,8 @@ fn send_ok(client: &mut DaemonClient, req: &DaemonRequest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izba_core::manifest::schema::{BuildSpec, Resources};
+    use std::path::PathBuf;
 
     #[test]
     fn gate_requires_a_token() {
@@ -304,5 +319,58 @@ mod tests {
     fn gate_passes_on_match() {
         assert_eq!(gate(Some("tok"), "tok", false), GateOutcome::Ok);
         assert_eq!(gate(Some("tok"), "tok", true), GateOutcome::Ok);
+    }
+
+    fn build_spec_with_memory(memory: &str) -> BuildSpec {
+        BuildSpec {
+            context: None,
+            dockerfile: None,
+            tag: None,
+            allow: vec![],
+            resources: Some(Resources {
+                cpus: 2,
+                memory: memory.to_string(),
+            }),
+        }
+    }
+
+    fn build_spec_no_resources() -> BuildSpec {
+        BuildSpec {
+            context: None,
+            dockerfile: None,
+            tag: None,
+            allow: vec![],
+            resources: None,
+        }
+    }
+
+    #[test]
+    fn build_opts_from_valid_binary_si_memory() {
+        // "4Gi" is valid binary SI — should parse to 4096 MiB.
+        let spec = build_spec_with_memory("4Gi");
+        let opts = build_opts_from(&PathBuf::from("/tmp"), &spec).unwrap();
+        assert_eq!(opts.mem, 4096);
+    }
+
+    #[test]
+    fn build_opts_from_invalid_decimal_si_memory_returns_err() {
+        // "4GB" uses decimal SI which parse_mib does not accept — must propagate Err.
+        let spec = build_spec_with_memory("4GB");
+        match build_opts_from(&PathBuf::from("/tmp"), &spec) {
+            Ok(_) => panic!("expected Err for invalid memory \"4GB\""),
+            Err(e) => assert!(
+                e.to_string().contains("build.resources.memory"),
+                "error context should mention build.resources.memory, got: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn build_opts_from_no_resources_defaults_to_4096() {
+        // When resources is None the default mem should be 4096 (not an error).
+        let spec = build_spec_no_resources();
+        let opts = build_opts_from(&PathBuf::from("/tmp"), &spec).unwrap();
+        assert_eq!(opts.mem, 4096);
+        assert_eq!(opts.cpus, 2);
     }
 }
