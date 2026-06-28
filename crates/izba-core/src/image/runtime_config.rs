@@ -231,6 +231,121 @@ pub fn parse_numeric_user(user: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// One `/etc/passwd` row reduced to the fields izba's USER resolution needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswdEntry {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// One `/etc/group` row reduced to `(name, gid)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupEntry {
+    pub name: String,
+    pub gid: u32,
+}
+
+/// Parse `/etc/passwd` content into entries. Standard 7-field colon format;
+/// blank lines, `#` comments, and rows whose name/uid/gid don't parse are
+/// skipped (a malformed image passwd never aborts a launch).
+pub fn parse_passwd(content: &str) -> Vec<PasswdEntry> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let mut f = line.split(':');
+            let name = f.next()?;
+            let _passwd = f.next()?;
+            let uid = f.next()?.parse().ok()?;
+            let gid = f.next()?.parse().ok()?;
+            if name.is_empty() {
+                return None;
+            }
+            Some(PasswdEntry {
+                name: name.to_string(),
+                uid,
+                gid,
+            })
+        })
+        .collect()
+}
+
+/// Parse `/etc/group` content into `(name, gid)` entries (4-field colon
+/// format; same skip rules as [`parse_passwd`]).
+pub fn parse_group(content: &str) -> Vec<GroupEntry> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let mut f = line.split(':');
+            let name = f.next()?;
+            let _passwd = f.next()?;
+            let gid = f.next()?.parse().ok()?;
+            if name.is_empty() {
+                return None;
+            }
+            Some(GroupEntry {
+                name: name.to_string(),
+                gid,
+            })
+        })
+        .collect()
+}
+
+/// The image's user databases (`/etc/passwd` + `/etc/group`), used to resolve a
+/// symbolic `USER` host-side exactly as docker/containerd do (against the image
+/// rootfs at create time). An empty db (legacy cache / image without passwd)
+/// resolves no names, so symbolic users fall back to the loud root path.
+#[derive(Debug, Clone, Default)]
+pub struct UserDb {
+    pub passwd: Vec<PasswdEntry>,
+    pub group: Vec<GroupEntry>,
+}
+
+impl UserDb {
+    /// Build from raw file contents (each `None` when the image lacked it).
+    pub fn from_files(passwd: Option<&str>, group: Option<&str>) -> Self {
+        UserDb {
+            passwd: passwd.map(parse_passwd).unwrap_or_default(),
+            group: group.map(parse_group).unwrap_or_default(),
+        }
+    }
+
+    /// Resolve a docker `user[:group]` spec to `(uid, gid)`, or `None` when any
+    /// component is a name absent from the db. Pure-numeric components never
+    /// consult the db (docker's numeric default gid is 0), matching
+    /// [`parse_numeric_user`].
+    pub fn resolve(&self, spec: &str) -> Option<(u32, u32)> {
+        let (user_part, group_part) = match spec.split_once(':') {
+            Some((u, g)) => (u, Some(g)),
+            None => (spec, None),
+        };
+        // uid + the user's primary gid (used when no explicit group is given).
+        let (uid, primary_gid) = match user_part.parse::<u32>() {
+            Ok(uid) => (uid, 0), // numeric: docker default gid 0, no passwd lookup
+            Err(_) => {
+                let e = self.passwd.iter().find(|e| e.name == user_part)?;
+                (e.uid, e.gid)
+            }
+        };
+        let gid = match group_part {
+            None => primary_gid,
+            Some(g) => match g.parse::<u32>() {
+                Ok(gid) => gid,
+                Err(_) => self.group.iter().find(|e| e.name == g)?.gid,
+            },
+        };
+        Some((uid, gid))
+    }
+}
+
 /// Resolve an image's declared `USER` to a numeric `(uid, gid)` for config.json,
 /// plus an optional loud warning.
 ///
@@ -1405,5 +1520,64 @@ mod tests {
         assert!(!types.contains(&LinuxNamespaceType::Network));
         assert!(linux.uid_mappings().is_some());
         assert!(linux.gid_mappings().is_some());
+    }
+
+    // ---- passwd/group parsing + UserDb::resolve ----
+
+    #[test]
+    fn parse_passwd_basic_and_skips_junk() {
+        let p = parse_passwd(
+            "root:x:0:0:root:/root:/bin/sh\n\
+             # a comment\n\
+             \n\
+             node:x:1000:1000:Node:/home/node:/bin/sh\n\
+             short:x:1\n",
+        );
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].name, "root");
+        assert_eq!(
+            (p[1].name.as_str(), p[1].uid, p[1].gid),
+            ("node", 1000, 1000)
+        );
+    }
+
+    #[test]
+    fn parse_group_basic_and_skips_junk() {
+        let g = parse_group("root:x:0:\nwheel:x:10:node\n#c\n\nbad:x\n");
+        assert_eq!(g.len(), 2);
+        assert_eq!((g[1].name.as_str(), g[1].gid), ("wheel", 10));
+    }
+
+    #[test]
+    fn userdb_resolves_name_to_uid_and_primary_gid() {
+        let db = UserDb::from_files(Some("node:x:1000:1000::/:/bin/sh\n"), None);
+        assert_eq!(db.resolve("node"), Some((1000, 1000)));
+    }
+
+    #[test]
+    fn userdb_resolves_name_colon_group_name() {
+        let db = UserDb::from_files(Some("node:x:1000:1000::/:/bin/sh\n"), Some("wheel:x:10:\n"));
+        assert_eq!(db.resolve("node:wheel"), Some((1000, 10)));
+    }
+
+    #[test]
+    fn userdb_numeric_uid_does_not_consult_passwd() {
+        // Pure-numeric spec keeps docker's default gid 0 even if passwd has 1000.
+        let db = UserDb::from_files(Some("node:x:1000:1000::/:/bin/sh\n"), None);
+        assert_eq!(db.resolve("1000"), Some((1000, 0)));
+        assert_eq!(db.resolve("1000:1001"), Some((1000, 1001)));
+    }
+
+    #[test]
+    fn userdb_unknown_name_or_group_is_none() {
+        let db = UserDb::from_files(Some("node:x:1000:1000::/:/bin/sh\n"), Some("wheel:x:10:\n"));
+        assert_eq!(db.resolve("ghost"), None);
+        assert_eq!(db.resolve("node:ghostgroup"), None);
+    }
+
+    #[test]
+    fn userdb_name_colon_numeric_gid() {
+        let db = UserDb::from_files(Some("node:x:1000:1000::/:/bin/sh\n"), None);
+        assert_eq!(db.resolve("node:42"), Some((1000, 42)));
     }
 }
