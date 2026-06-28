@@ -19,6 +19,40 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io::Read;
 
+/// Pull the raw bytes of `etc/passwd` and `etc/group` out of a flattened image
+/// tar. Matches the canonical paths regardless of a leading `/` or `./`;
+/// last entry wins (the flattened tar is lowest-layer-first, so a higher layer's
+/// passwd appears later and overrides). Only regular-file entries are read.
+#[allow(clippy::type_complexity)]
+fn extract_user_dbs(merged_tar: &std::path::Path) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    let f = fs::File::open(merged_tar)
+        .with_context(|| format!("failed to open {}", merged_tar.display()))?;
+    let mut ar = tar::Archive::new(f);
+    let mut passwd = None;
+    let mut group = None;
+    for entry in ar.entries().context("reading merged tar")? {
+        let mut entry = entry.context("reading merged tar entry")?;
+        if entry.header().entry_type() != tar::EntryType::Regular {
+            continue;
+        }
+        let path = entry.path().context("entry path")?;
+        let norm = path
+            .to_string_lossy()
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_string();
+        let slot = match norm.as_str() {
+            "etc/passwd" => &mut passwd,
+            "etc/group" => &mut group,
+            _ => continue,
+        };
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut buf).context("reading user db entry")?;
+        *slot = Some(buf); // last-wins
+    }
+    Ok((passwd, group))
+}
+
 /// Shared tail: flatten the ordered layer readers into one tar, build the
 /// erofs, and publish under `digest` along with `config_json` + `image_ref`.
 /// Returns the canonical digest (echoes `digest`). Idempotent: if the store
@@ -42,6 +76,15 @@ pub(crate) fn publish_image(
         flatten_layers(layers, std::io::BufWriter::new(out))
             .with_context(|| format!("failed to flatten layers of {image_ref}"))?;
         erofs::build_erofs(&merged_tar, &staging.join("rootfs.erofs"))?;
+        // Capture the image's user databases for host-side symbolic-USER
+        // resolution (issue #96) before the merged tar is discarded.
+        let (passwd, group) = extract_user_dbs(&merged_tar)?;
+        if let Some(p) = &passwd {
+            fs::write(staging.join("passwd"), p)?;
+        }
+        if let Some(g) = &group {
+            fs::write(staging.join("group"), g)?;
+        }
         fs::remove_file(&merged_tar)?;
         fs::write(staging.join("ref.txt"), image_ref)?;
         fs::write(staging.join("config.json"), config_json)?;
@@ -216,6 +259,46 @@ mod tests {
             result.is_err(),
             "expected registry error on fall-through, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn extract_user_dbs_reads_passwd_handles_paths_and_last_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tar_path = tmp.path().join("merged.tar");
+        {
+            let f = fs::File::create(&tar_path).unwrap();
+            let mut b = tar::Builder::new(f);
+            // `Builder::append_data` rejects absolute paths (tar crate policy),
+            // so we set the path bytes directly in the GNU header and use
+            // `append` to write raw header bytes without re-validation.
+            let add_raw = |b: &mut tar::Builder<fs::File>, path: &str, data: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_entry_type(tar::EntryType::Regular);
+                h.set_mode(0o644);
+                let name_bytes = path.as_bytes();
+                let gnu = h.as_gnu_mut().unwrap();
+                let len = gnu.name.len().min(name_bytes.len());
+                gnu.name[..len].copy_from_slice(&name_bytes[..len]);
+                h.set_cksum();
+                b.append(&h, std::io::Cursor::new(data)).unwrap();
+            };
+            add_raw(&mut b, "etc/passwd", b"root:x:0:0::/root:/bin/sh\n");
+            // a later, absolute-prefixed entry for the same logical path wins
+            add_raw(
+                &mut b,
+                "/etc/passwd",
+                b"node:x:1000:1000::/home/node:/bin/sh\n",
+            );
+            b.finish().unwrap();
+        }
+        let (passwd, group) = extract_user_dbs(&tar_path).unwrap();
+        let passwd = String::from_utf8(passwd.expect("passwd present")).unwrap();
+        assert!(
+            passwd.contains("node:x:1000"),
+            "last-wins entry must win: {passwd}"
+        );
+        assert!(group.is_none(), "no /etc/group entry -> None");
     }
 
     /// `ensure_image("oci-archive:<path>")` must route to `ingest_oci_archive`
