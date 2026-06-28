@@ -39,23 +39,9 @@ pub(crate) const DEFAULT_RW_GB: u64 = 8;
 
 /// Load `izba.yml` from a workspace dir, returning (manifest, raw_yaml,
 /// dockerfile_contents). `dockerfile` is `Some` only for a `build:` spec.
+/// Delegates to [`izba_core::manifest::ops::load_repo_manifest`].
 pub(crate) fn load_repo_manifest(dir: &Path) -> anyhow::Result<(Manifest, String, Option<String>)> {
-    let path = dir.join("izba.yml");
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let m = Manifest::load_str(&raw)?;
-    let dockerfile = match &m.spec.build {
-        Some(b) => {
-            let ctx = dir.join(b.context.as_deref().unwrap_or("."));
-            let df = ctx.join(b.dockerfile.as_deref().unwrap_or("Dockerfile"));
-            Some(
-                std::fs::read_to_string(&df)
-                    .with_context(|| format!("reading {}", df.display()))?,
-            )
-        }
-        None => None,
-    };
-    Ok((m, raw, dockerfile))
+    izba_core::manifest::ops::load_repo_manifest(dir)
 }
 
 /// Derive the default sandbox name from a workspace directory: the sanitized
@@ -70,17 +56,12 @@ pub(crate) fn workspace_default_name(dir: &Path) -> anyhow::Result<String> {
 
 /// Read the managed truth (config.json + policy.yaml) for `name` into a
 /// `Normalized`, directly from disk (works on a stopped sandbox).
+/// Delegates to [`izba_core::manifest::ops::managed_normalized`].
 pub(crate) fn managed_normalized(
     paths: &izba_core::paths::Paths,
     name: &str,
 ) -> anyhow::Result<Normalized> {
-    use izba_core::daemon::egress::config::EgressPolicyConfig;
-    use izba_core::state::{load_json, SandboxConfig, CONFIG_FILE};
-    let dir = paths.sandbox_dir(name);
-    let cfg: SandboxConfig =
-        load_json(&dir.join(CONFIG_FILE))?.with_context(|| format!("no such sandbox: {name}"))?;
-    let egress = EgressPolicyConfig::load(&dir)?.unwrap_or_default();
-    Ok(Normalized::from_managed(name, &cfg, &egress))
+    izba_core::manifest::ops::managed_normalized(paths, name)
 }
 
 /// Map a daemon reply that should be `Ok` into `Result<()>`.
