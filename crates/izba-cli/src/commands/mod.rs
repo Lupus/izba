@@ -4,6 +4,7 @@ pub mod create;
 pub mod daemon;
 pub mod diff;
 pub mod exec;
+pub mod export;
 pub mod lockdown;
 pub mod ls;
 pub mod netlog;

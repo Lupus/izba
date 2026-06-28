@@ -312,6 +312,15 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Write the managed sandbox truth back into izba.yml
+    Export {
+        /// Workspace directory to write izba.yml into
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// Sandbox name (default: from existing izba.yml or the dir basename)
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Apply izba.yml to the managed sandbox (requires a prior `izba diff`)
     Promote {
         /// Workspace directory containing izba.yml
@@ -439,6 +448,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             DaemonCmd::Stop => commands::daemon::stop(paths),
         },
         Cmd::Diff { dir, name } => commands::diff::run(paths, &dir, name.as_deref()),
+        Cmd::Export { dir, name } => commands::export::run(paths, &dir, name.as_deref()),
         Cmd::Promote {
             dir,
             name,
