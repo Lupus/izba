@@ -1442,18 +1442,34 @@ pub fn remove_volume(paths: &Paths, name: &str) -> anyhow::Result<u64> {
 /// — the size is not persisted in config), then recreates the file blank at
 /// that same length and reformats it via the same sparse-create + best-effort-
 /// mkfs path used at `create` time.
+///
+/// The operation is atomic: writes to `rw.img.tmp` in the same directory,
+/// then renames over `rw.img`. If any step before the rename fails the
+/// original `rw.img` is left untouched and the temp file is cleaned up.
 pub fn reset_rw_scratch(paths: &Paths, name: &str) -> anyhow::Result<()> {
     let rw = paths.sandbox_dir(name).join("rw.img");
+    let tmp = paths.sandbox_dir(name).join("rw.img.tmp");
     let size = fs::metadata(&rw)
         .with_context(|| format!("reading size of {}", rw.display()))?
         .len();
-    let f = File::create(&rw).with_context(|| format!("recreating {}", rw.display()))?;
-    mark_sparse(&f);
-    f.set_len(size)
-        .with_context(|| format!("sizing {}", rw.display()))?;
-    drop(f);
-    best_effort_mkfs(&rw);
-    Ok(())
+
+    // Helper: remove tmp on failure so we never leave debris.
+    let result = (|| -> anyhow::Result<()> {
+        let f = File::create(&tmp).with_context(|| format!("creating tmp {}", tmp.display()))?;
+        mark_sparse(&f);
+        f.set_len(size)
+            .with_context(|| format!("sizing {}", tmp.display()))?;
+        drop(f);
+        best_effort_mkfs(&tmp);
+        fs::rename(&tmp, &rw)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), rw.display()))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp); // best-effort cleanup; ignore errors
+    }
+    result
 }
 
 /// If a *live* sandbox other than `exclude` references persistent volume
@@ -3008,6 +3024,21 @@ mod tests {
             buf,
             [0xAB, 0xCD, 0xEF],
             "rw.img first bytes must not be the old data after reset"
+        );
+
+        // No temp debris: rw.img.tmp must not exist after a successful reset.
+        let tmp = paths.sandbox_dir("web").join("rw.img.tmp");
+        assert!(
+            !tmp.exists(),
+            "rw.img.tmp must not exist after a successful reset"
+        );
+
+        // rw.img must remain at the original size after the reset (confirms
+        // the atomic path: tmp was renamed over rw, not truncated in place).
+        let after_size = fs::metadata(&rw).unwrap().len();
+        assert_eq!(
+            after_size, original_size,
+            "rw.img size must be unchanged after successful reset"
         );
     }
 }
