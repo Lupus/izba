@@ -1,7 +1,9 @@
+use std::path::Path;
+
 use crate::daemon::DaemonApi;
 use crate::views::{
-    app_build_info, CreateOpts, DaemonStatusView, PolicyView, PortRuleView, SandboxDetailView,
-    SandboxView, SeedEntry, VersionView, VolumeInfoView,
+    app_build_info, CreateOpts, DaemonStatusView, DiffView, PolicyView, PortRuleView,
+    SandboxDetailView, SandboxView, SeedEntry, VersionView, VolumeInfoView,
 };
 use izba_core::daemon::egress::audit::EndpointSummary;
 use izba_core::daemon::egress::config::{AllowEntry, GitRule};
@@ -220,6 +222,26 @@ pub fn volume_remove_core(d: &mut dyn DaemonApi, name: &str) -> Result<(), Strin
 /// Core of `volume_prune`: prune unreferenced persistent volumes.
 pub fn volume_prune_core(d: &mut dyn DaemonApi) -> Result<izba_core::volume::Pruned, String> {
     d.volume_prune().map_err(|e| e.to_string())
+}
+
+/// Core of `manifest_diff`: compute the structural diff between `workspace/izba.yml`
+/// and the managed truth for sandbox `name`. Does NOT write the review token —
+/// the app diff is a read-only preview; promote is a deferred follow-up.
+pub fn manifest_diff_core(workspace: &str, name: &str) -> Result<DiffView, String> {
+    let paths = izba_core::paths::Paths::from_env_or_default(None);
+    let (state, deltas, _token) =
+        izba_core::manifest::ops::compute_diff(&paths, Path::new(workspace), name)
+            .map_err(|e| e.to_string())?;
+    Ok(DiffView::new(state, &deltas))
+}
+
+/// Core of `manifest_export`: write the managed truth back into `workspace/izba.yml`
+/// and return the path written as a string.
+pub fn manifest_export_core(workspace: &str, name: &str) -> Result<String, String> {
+    let paths = izba_core::paths::Paths::from_env_or_default(None);
+    izba_core::manifest::ops::export(&paths, Path::new(workspace), name)
+        .map(|p| p.display().to_string())
+        .map_err(|e| e.to_string())
 }
 
 /// Core of `volume_attach`: attach a volume spec (parsed from `spec_str`) to sandbox `name`.

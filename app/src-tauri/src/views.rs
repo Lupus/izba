@@ -242,6 +242,59 @@ impl From<VolumeInfo> for VolumeInfoView {
     }
 }
 
+/// A single field-level change between the repo manifest and the managed truth.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeltaView {
+    pub field: String,
+    pub from: String,
+    pub to: String,
+    /// "live" | "restart" | "image"
+    pub class: String,
+    pub weakens_egress: bool,
+}
+
+/// Manifest diff result returned to the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffView {
+    /// "in_sync" | "repo_ahead" | "managed_ahead" | "diverged"
+    pub state: String,
+    pub deltas: Vec<DeltaView>,
+}
+
+impl DiffView {
+    pub fn new(
+        state: izba_core::manifest::DriftState,
+        deltas: &[izba_core::manifest::diff::FieldDelta],
+    ) -> Self {
+        use izba_core::manifest::diff::FieldClass;
+        use izba_core::manifest::DriftState;
+        let state_str = match state {
+            DriftState::InSync => "in_sync",
+            DriftState::RepoAhead => "repo_ahead",
+            DriftState::ManagedAhead => "managed_ahead",
+            DriftState::Diverged => "diverged",
+        };
+        let delta_views = deltas
+            .iter()
+            .map(|d| DeltaView {
+                field: d.field.clone(),
+                from: d.from.clone(),
+                to: d.to.clone(),
+                class: match d.class {
+                    FieldClass::Live => "live".to_string(),
+                    FieldClass::Restart => "restart".to_string(),
+                    FieldClass::Image => "image".to_string(),
+                },
+                weakens_egress: d.weakens_egress,
+            })
+            .collect();
+        DiffView {
+            state: state_str.to_string(),
+            deltas: delta_views,
+        }
+    }
+}
+
 /// Full sandbox detail for the UI (ports + volumes included).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SandboxDetailView {
@@ -267,6 +320,64 @@ impl From<SandboxDetail> for SandboxDetailView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_view_maps_state_and_deltas() {
+        use izba_core::manifest::diff::{FieldClass, FieldDelta};
+        use izba_core::manifest::DriftState;
+
+        // InSync + empty deltas
+        let v = DiffView::new(DriftState::InSync, &[]);
+        assert_eq!(v.state, "in_sync");
+        assert!(v.deltas.is_empty());
+
+        // RepoAhead
+        assert_eq!(
+            DiffView::new(DriftState::RepoAhead, &[]).state,
+            "repo_ahead"
+        );
+        // ManagedAhead
+        assert_eq!(
+            DiffView::new(DriftState::ManagedAhead, &[]).state,
+            "managed_ahead"
+        );
+        // Diverged
+        assert_eq!(DiffView::new(DriftState::Diverged, &[]).state, "diverged");
+
+        // Delta class mapping + weakens_egress forwarding
+        let deltas = vec![
+            FieldDelta {
+                field: "cpus".into(),
+                from: "2".into(),
+                to: "4".into(),
+                class: FieldClass::Restart,
+                weakens_egress: false,
+            },
+            FieldDelta {
+                field: "image".into(),
+                from: "ubuntu:22.04".into(),
+                to: "ubuntu:24.04".into(),
+                class: FieldClass::Image,
+                weakens_egress: false,
+            },
+            FieldDelta {
+                field: "egress".into(),
+                from: "".into(),
+                to: "allow: [evil.com]".into(),
+                class: FieldClass::Live,
+                weakens_egress: true,
+            },
+        ];
+        let v = DiffView::new(DriftState::RepoAhead, &deltas);
+        assert_eq!(v.state, "repo_ahead");
+        assert_eq!(v.deltas.len(), 3);
+        assert_eq!(v.deltas[0].field, "cpus");
+        assert_eq!(v.deltas[0].class, "restart");
+        assert!(!v.deltas[0].weakens_egress);
+        assert_eq!(v.deltas[1].class, "image");
+        assert_eq!(v.deltas[2].class, "live");
+        assert!(v.deltas[2].weakens_egress);
+    }
 
     #[test]
     fn parses_running_and_stopped() {
