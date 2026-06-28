@@ -209,10 +209,14 @@ pub(crate) fn merge_manifest_into_opts(
             .iter()
             .map(|v| {
                 let path = v.guest_path.to_string_lossy();
-                let size_gb = v.size_bytes >> 30;
+                let size = if v.size_bytes % (1 << 30) == 0 {
+                    format!("{}g", v.size_bytes >> 30)
+                } else {
+                    format!("{}m", v.size_bytes >> 20)
+                };
                 match &v.name {
-                    Some(name) => format!("{name}:{path}:{size_gb}g"),
-                    None => format!("{path}:{size_gb}g"),
+                    Some(name) => format!("{name}:{path}:{size}"),
+                    None => format!("{path}:{size}"),
                 }
             })
             .collect();
@@ -445,5 +449,72 @@ mod tests {
 
         // The explicit flag must win; manifest volume must not be added.
         assert_eq!(o.volumes, vec!["/tmp/work:4g".to_string()]);
+    }
+
+    /// Sub-GiB manifest volumes (e.g. 512Mi) must be expressed in MiB (`512m`)
+    /// rather than GiB (`0g`) so that `parse_volume_flag` accepts them.
+    #[test]
+    fn merge_manifest_adopts_sub_gib_volumes_as_mib() {
+        use izba_core::volume::parse_volume_flag;
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_dir = tmp.path().join("myproject");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        std::fs::write(
+            ws_dir.join("izba.yml"),
+            concat!(
+                "apiVersion: izba.dev/v1alpha1\n",
+                "kind: Sandbox\n",
+                "spec:\n",
+                "  image: ubuntu:24.04\n",
+                "  resources: { cpus: 1, memory: 1Gi }\n",
+                "  rootDisk: { size: 1Gi }\n",
+                "  volumes:\n",
+                "    - { name: cache, mountPath: /cache, size: 512Mi }\n",
+                "    - { mountPath: /data, size: 8Gi }\n",
+            ),
+        )
+        .unwrap();
+
+        let mut o = opts();
+        merge_manifest_into_opts(&mut o, &ws_dir).unwrap();
+
+        assert_eq!(o.volumes.len(), 2, "two volumes should be adopted");
+
+        // Named 512Mi volume must be expressed as 512m (not 0g).
+        let named = o
+            .volumes
+            .iter()
+            .find(|v| v.starts_with("cache:"))
+            .expect("named volume flag not found");
+        assert_eq!(
+            named, "cache:/cache:512m",
+            "512Mi named volume must format as 512m; got {named:?}"
+        );
+        let named_spec = parse_volume_flag(named)
+            .expect("named volume flag must be parseable by parse_volume_flag");
+        assert_eq!(
+            named_spec.size_bytes,
+            512 << 20,
+            "parsed size_bytes must be 512Mi"
+        );
+
+        // Anonymous 8Gi volume must stay as 8g.
+        let anon = o
+            .volumes
+            .iter()
+            .find(|v| v.starts_with("/data"))
+            .expect("anonymous volume flag not found");
+        assert_eq!(
+            anon, "/data:8g",
+            "8Gi anonymous volume must format as 8g; got {anon:?}"
+        );
+        let anon_spec = parse_volume_flag(anon)
+            .expect("anonymous volume flag must be parseable by parse_volume_flag");
+        assert_eq!(
+            anon_spec.size_bytes,
+            8 << 30,
+            "parsed size_bytes must be 8Gi"
+        );
     }
 }
