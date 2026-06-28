@@ -575,6 +575,149 @@ fn build_in_vm_dockerfile_to_running_sandbox() {
     let _ = izba(&data, no_env, &["daemon", "stop"]);
 }
 
+/// Manifest live-apply path: create → `izba diff` → `izba promote` against a
+/// RUNNING sandbox proves egress policy and port relays change without restart.
+///
+/// Steps:
+/// 1. Boot a sandbox with an initial enforcing policy (example.com only).
+/// 2. Start a guest TCP nc server on port 8000 for the relay assertion.
+/// 3. Write `izba.yml` adding a second egress host + a published port.
+/// 4. `izba diff` — assert deltas contain the new host and the port change.
+/// 5. `izba promote` (no `--restart`) — live-apply the egress+port deltas.
+/// 6. Assert `izba policy show` reflects the new host.
+/// 7. Assert `izba port ls` shows the new relay rule.
+/// 8. Assert `http_get` through the promoted port relay returns the expected body.
+#[test]
+fn manifest_diff_promote_live_path() {
+    if !want() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+    let name = "manifest";
+
+    // [1] Write the initial policy (enforcing, one host) and boot the sandbox.
+    let policy_path = root.path().join("initial-policy.yaml");
+    std::fs::write(&policy_path, b"enforce: true\nallow:\n  - example.com\n").unwrap();
+    let policy_s = policy_path.to_string_lossy().into_owned();
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "run", "-d", "--image", IMAGE, "--name", name, "--policy", &policy_s, &ws_s,
+        ],
+    );
+    assert_ok(&o, "run -d (boot detached with policy)");
+    assert!(
+        stdout_of(&o).contains(name),
+        "run -d prints sandbox name: {}",
+        stdout_of(&o)
+    );
+
+    // [2] Start a guest TCP server so the promoted port relay can be tested.
+    std::fs::write(
+        ws.join("serve.sh"),
+        b"printf 'HTTP/1.0 200 OK\\r\\n\\r\\npromote-port-body'\n",
+    )
+    .unwrap();
+    assert_ok(
+        &izba(
+            &data,
+            no_env,
+            &[
+                "exec",
+                name,
+                "--",
+                "sh",
+                "-c",
+                "setsid sh -c 'while true; do nc -l -p 8000 -e sh /workspace/serve.sh; done' \
+               >/dev/null 2>&1 & sleep 1",
+            ],
+        ),
+        "start guest nc server on :8000",
+    );
+
+    // [3] Write izba.yml: same image/cpus/memory (no restart-class delta),
+    //     + add api.anthropic.com to the egress allow-list, + a published port.
+    //     rootDisk is ignored in the managed↔repo diff (rw_size_gb = 0 on
+    //     managed side; diff.rs never compares it), but must parse validly.
+    std::fs::write(
+        ws.join("izba.yml"),
+        concat!(
+            "apiVersion: izba.dev/v1alpha1\n",
+            "kind: Sandbox\n",
+            "metadata:\n",
+            "  name: manifest\n",
+            "spec:\n",
+            "  image: alpine:3.20\n",
+            "  resources:\n",
+            "    cpus: 2\n",
+            "    memory: 4Gi\n",
+            "  rootDisk:\n",
+            "    size: 8Gi\n",
+            "  egress:\n",
+            "    enforce: true\n",
+            "    allow:\n",
+            "      - example.com\n",
+            "      - api.anthropic.com\n",
+            "  ports:\n",
+            "    - guest: 8000\n",
+            "      host: 18131\n",
+        ),
+    )
+    .unwrap();
+
+    // [4] `izba diff <ws>` — must exit 0 and show the two live deltas.
+    let o = izba(&data, no_env, &["diff", &ws_s]);
+    assert_ok(&o, "izba diff");
+    let diff_out = stdout_of(&o);
+    assert!(
+        diff_out.contains("api.anthropic.com"),
+        "diff must list the new egress host; got:\n{diff_out}"
+    );
+    assert!(
+        diff_out.contains("ports"),
+        "diff must list the port change; got:\n{diff_out}"
+    );
+
+    // [5] `izba promote <ws>` (no --restart — only live-class deltas).
+    let o = izba(&data, no_env, &["promote", &ws_s]);
+    assert_ok(&o, "izba promote");
+
+    // [6] Verify the live egress policy was reloaded: new host must appear.
+    let o = izba(&data, no_env, &["policy", "show", name]);
+    assert_ok(&o, "izba policy show");
+    let policy_out = stdout_of(&o);
+    assert!(
+        policy_out.contains("api.anthropic.com"),
+        "promoted policy must list api.anthropic.com; got:\n{policy_out}"
+    );
+
+    // [7] Verify the port relay was published.
+    let o = izba(&data, no_env, &["port", "ls", name]);
+    assert_ok(&o, "izba port ls");
+    let pls = stdout_of(&o);
+    assert!(
+        pls.contains("18131") && pls.contains("8000"),
+        "promoted port relay must appear in port ls; got:\n{pls}"
+    );
+
+    // [8] Verify the relay is actually live by making an HTTP request through it.
+    let body = http_get(18131).expect("GET through promoted port relay");
+    assert!(
+        body.contains("promote-port-body"),
+        "port relay must deliver guest response; got: {body}"
+    );
+
+    // Cleanup.
+    let _ = izba(&data, no_env, &["rm", "--force", name]);
+    let _ = izba(&data, no_env, &["daemon", "stop"]);
+}
+
 /// CLI-surface lifecycle: drives the thin verbs `daemon_full_lifecycle` does
 /// NOT reach end-to-end against a real daemon + microVM — `create` (vs `run`),
 /// `netlog`, `port ls`/`unpublish`, `stop`, and non-force `rm`. These verbs read
