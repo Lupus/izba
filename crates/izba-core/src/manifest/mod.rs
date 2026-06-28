@@ -2,3 +2,4 @@
 //! the host-only review/base store backing `izba diff`/`promote`/`export`.
 
 pub mod quantity;
+pub mod schema;
