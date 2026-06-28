@@ -5,31 +5,26 @@ use std::path::Path;
 
 use anyhow::Result;
 use izba_core::manifest::diff::{FieldClass, FieldDelta};
-use izba_core::manifest::{self, store, DriftState, Normalized};
+use izba_core::manifest::{store, DriftState};
 use izba_core::paths::Paths;
 
 pub fn run(paths: &Paths, dir: &Path, name_override: Option<&str>) -> Result<i32> {
-    let (m, raw, dockerfile) = super::load_repo_manifest(dir)?;
+    // Resolve the sandbox name. Name resolution is CLI-side: workspace_default_name
+    // depends on name::sanitize which lives in the CLI crate and cannot move to
+    // core without creating a circular dependency.
+    let (m, _, _) = super::load_repo_manifest(dir)?;
     let default_name = super::workspace_default_name(dir)?;
-    let repo = Normalized::from_manifest(&m, &default_name)?;
-    let name = name_override.unwrap_or(&repo.name).to_string();
+    let name = match name_override {
+        Some(n) => n.to_string(),
+        None => m.metadata.name.unwrap_or(default_name),
+    };
 
-    let managed = super::managed_normalized(paths, &name)?;
-    let base = store::read_base(&paths.sandbox_dir(&name))?
-        .map(|bm| Normalized::from_manifest(&bm, &default_name))
-        .transpose()?
-        .unwrap_or_else(|| managed.clone());
-
-    let state = manifest::classify(&base, &repo, &managed);
-    // The deltas the human is asked to review are repo-relative-to-managed.
-    let deltas = manifest::diff_normalized(&managed, &repo);
+    // Delegate the pure filesystem logic to ops (shared with the desktop app).
+    let (state, deltas, token) = izba_core::manifest::ops::compute_diff(paths, dir, &name)?;
     println!("{}", render_deltas(state, &deltas));
 
     // Record the review token over exactly what we showed.
-    store::write_review(
-        &paths.sandbox_dir(&name),
-        &store::review_token(&raw, dockerfile.as_deref()),
-    )?;
+    store::write_review(&paths.sandbox_dir(&name), &token)?;
     Ok(0)
 }
 
