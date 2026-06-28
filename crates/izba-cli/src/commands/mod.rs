@@ -9,6 +9,7 @@ pub mod ls;
 pub mod netlog;
 pub mod policy;
 pub mod port;
+pub mod promote;
 pub mod reconcile;
 pub mod rm;
 pub mod run;

@@ -312,6 +312,25 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Apply izba.yml to the managed sandbox (requires a prior `izba diff`)
+    Promote {
+        /// Workspace directory containing izba.yml
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// Sandbox name (default: from manifest metadata.name or the dir basename)
+        #[arg(long)]
+        name: Option<String>,
+        /// Promote even if the manifest was never reviewed / changed since review
+        #[arg(long)]
+        force: bool,
+        /// Stop+start the sandbox now to apply restart-class fields (cpus/mem/image)
+        #[arg(long)]
+        restart: bool,
+        /// On an image change, reset the rw scratch overlay onto the new base
+        /// (default true). `--reset-scratch=false` keeps it (expert-only, loud).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        reset_scratch: bool,
+    },
     /// Remove orphaned izba lock-down accounts/firewall rules with no live
     /// sandbox (Windows). Pops a UAC prompt.
     WindowsCleanup,
@@ -420,6 +439,13 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             DaemonCmd::Stop => commands::daemon::stop(paths),
         },
         Cmd::Diff { dir, name } => commands::diff::run(paths, &dir, name.as_deref()),
+        Cmd::Promote {
+            dir,
+            name,
+            force,
+            restart,
+            reset_scratch,
+        } => commands::promote::run(paths, &dir, name.as_deref(), force, restart, reset_scratch),
         Cmd::Ssh { name, cmd } => commands::ssh::run(paths, &name, cmd),
         Cmd::SshProxy { host_alias } => commands::ssh_proxy::run(paths, &host_alias),
         Cmd::Reconcile { json } => commands::reconcile::run(paths, json),

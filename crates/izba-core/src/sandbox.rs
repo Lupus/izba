@@ -1432,6 +1432,29 @@ pub fn remove_volume(paths: &Paths, name: &str) -> anyhow::Result<u64> {
     Ok(bytes)
 }
 
+/// Recreate the rw scratch overlay blank, at its current apparent size.
+///
+/// Used by `izba promote --reset-scratch` on an image change so the overlay
+/// starts clean on the new base. The VM MUST be stopped before calling this.
+///
+/// Reads `<sandbox>/rw.img`'s current length (the original `rw_size_gb*GiB`
+/// — the size is not persisted in config), then recreates the file blank at
+/// that same length and reformats it via the same sparse-create + best-effort-
+/// mkfs path used at `create` time.
+pub fn reset_rw_scratch(paths: &Paths, name: &str) -> anyhow::Result<()> {
+    let rw = paths.sandbox_dir(name).join("rw.img");
+    let size = fs::metadata(&rw)
+        .with_context(|| format!("reading size of {}", rw.display()))?
+        .len();
+    let f = File::create(&rw).with_context(|| format!("recreating {}", rw.display()))?;
+    mark_sparse(&f);
+    f.set_len(size)
+        .with_context(|| format!("sizing {}", rw.display()))?;
+    drop(f);
+    best_effort_mkfs(&rw);
+    Ok(())
+}
+
 /// If a *live* sandbox other than `exclude` references persistent volume
 /// `vol_name`, return that sandbox's name. Enforces single-writer at start.
 fn persistent_volume_holder(
@@ -2933,6 +2956,57 @@ mod tests {
             p.ends_with("buildout/img.tar"),
             "buildout_path must end with buildout/img.tar, got: {}",
             p.display()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // reset_rw_scratch
+    // -----------------------------------------------------------------------
+
+    /// `reset_rw_scratch` recreates rw.img blank at the same size: the file
+    /// still exists at the original length and previous content is cleared.
+    #[test]
+    fn reset_rw_scratch_blanks_file_at_same_size() {
+        let (_dir, paths) = test_paths();
+        let ws = paths.root().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        // Create the sandbox so the sandbox dir and rw.img exist.
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let rw = paths.sandbox_dir("web").join("rw.img");
+        let original_size = fs::metadata(&rw).unwrap().len();
+        assert!(original_size > 0, "rw.img must be sized after create");
+
+        // Write a distinguishable byte pattern into the file.
+        {
+            use std::io::Write as _;
+            let mut f = fs::OpenOptions::new().write(true).open(&rw).unwrap();
+            f.write_all(&[0xAB, 0xCD, 0xEF]).unwrap();
+        }
+
+        // Reset: must succeed.
+        reset_rw_scratch(&paths, "web").unwrap();
+
+        // File must still exist at the same apparent size.
+        assert!(rw.is_file(), "rw.img must still exist after reset");
+        let new_size = fs::metadata(&rw).unwrap().len();
+        assert_eq!(
+            new_size, original_size,
+            "rw.img must be the same size after reset"
+        );
+
+        // The old data must not survive: first few bytes should be zero (sparse
+        // or freshly formatted), not the 0xAB 0xCD 0xEF we wrote.
+        let mut buf = [0u8; 3];
+        {
+            use std::io::Read as _;
+            let mut f = fs::File::open(&rw).unwrap();
+            f.read_exact(&mut buf).unwrap();
+        }
+        assert_ne!(
+            buf,
+            [0xAB, 0xCD, 0xEF],
+            "rw.img first bytes must not be the old data after reset"
         );
     }
 }
