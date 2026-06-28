@@ -66,6 +66,62 @@ impl<'a> ImageStore<'a> {
         Ok(())
     }
 
+    /// Path of the image's captured `/etc/passwd` (absent for legacy caches).
+    pub fn passwd_path(&self, digest: &str) -> PathBuf {
+        self.paths.image_dir(digest).join("passwd")
+    }
+
+    /// Path of the image's captured `/etc/group` (absent for legacy caches).
+    pub fn group_path(&self, digest: &str) -> PathBuf {
+        self.paths.image_dir(digest).join("group")
+    }
+
+    /// Load the captured `(passwd, group)` contents for `digest`. Each is `None`
+    /// when absent — images cached before passwd capture, or images shipping no
+    /// such file. A non-`NotFound` read error propagates as `Err`.
+    pub fn load_user_dbs(&self, digest: &str) -> Result<(Option<String>, Option<String>)> {
+        let read_opt = |path: PathBuf| -> Result<Option<String>> {
+            match fs::read_to_string(&path) {
+                Ok(s) => Ok(Some(s)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+            }
+        };
+        Ok((
+            read_opt(self.passwd_path(digest))?,
+            read_opt(self.group_path(digest))?,
+        ))
+    }
+
+    /// Atomically persist the captured `passwd`/`group` for an already-published
+    /// `digest`. A `None` component writes no file. Temp-file + rename per file,
+    /// mirroring [`persist_config`]. The image dir must already exist.
+    pub fn persist_user_dbs(
+        &self,
+        digest: &str,
+        passwd: Option<&[u8]>,
+        group: Option<&[u8]>,
+    ) -> Result<()> {
+        let dir = self.paths.image_dir(digest);
+        let write_atomic = |bytes: &[u8], dst: PathBuf| -> Result<()> {
+            let mut tmp = tempfile::Builder::new()
+                .prefix(".userdb-")
+                .tempfile_in(&dir)
+                .with_context(|| format!("failed to stage user db in {}", dir.display()))?;
+            std::io::Write::write_all(&mut tmp, bytes).context("failed to write staged user db")?;
+            tmp.persist(&dst)
+                .with_context(|| format!("failed to publish {}", dst.display()))?;
+            Ok(())
+        };
+        if let Some(p) = passwd {
+            write_atomic(p, self.passwd_path(digest))?;
+        }
+        if let Some(g) = group {
+            write_atomic(g, self.group_path(digest))?;
+        }
+        Ok(())
+    }
+
     /// An image is cached iff its `rootfs.erofs` exists.
     pub fn is_cached(&self, digest: &str) -> bool {
         self.rootfs_path(digest).is_file()
@@ -310,6 +366,73 @@ mod tests {
             .unwrap();
         assert!(!called, "build closure ran despite cache hit");
         assert_eq!(fs::read(store.rootfs_path(DIGEST)).unwrap(), b"v1");
+    }
+
+    #[test]
+    fn user_db_paths() {
+        let paths = Paths::with_root("/data/izba".into());
+        let store = ImageStore::new(&paths);
+        assert_eq!(
+            store.passwd_path("sha256:abc"),
+            PathBuf::from("/data/izba/images/sha256-abc/passwd")
+        );
+        assert_eq!(
+            store.group_path("sha256:abc"),
+            PathBuf::from("/data/izba/images/sha256-abc/group")
+        );
+    }
+
+    #[test]
+    fn user_dbs_round_trip() {
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .persist_user_dbs(
+                DIGEST,
+                Some(b"node:x:1000:1000::/:/bin/sh\n"),
+                Some(b"wheel:x:10:\n"),
+            )
+            .unwrap();
+        let (passwd, group) = store.load_user_dbs(DIGEST).unwrap();
+        assert!(passwd.unwrap().contains("node"));
+        assert_eq!(group.unwrap(), "wheel:x:10:\n");
+    }
+
+    #[test]
+    fn user_dbs_absent_is_none() {
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.load_user_dbs(DIGEST).unwrap(), (None, None));
+    }
+
+    #[test]
+    fn persist_user_dbs_skips_none_components() {
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .persist_user_dbs(DIGEST, Some(b"x:x:1:1::/:/x\n"), None)
+            .unwrap();
+        let (passwd, group) = store.load_user_dbs(DIGEST).unwrap();
+        assert!(passwd.is_some());
+        assert!(group.is_none(), "no group file written when group is None");
     }
 
     #[test]
