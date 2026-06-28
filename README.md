@@ -173,6 +173,10 @@ izba policy  git allow NAME TARGET [--write]  # allow git on a repo/host (clone/
 izba policy  git block NAME TARGET        # remove a git rule
 izba policy  enable NAME                  # seed the allow-list from observed allowed traffic; live-reloads
 izba policy  reload NAME                  # re-read policy.yaml and apply to new connections (no restart)
+izba diff    [DIR] [--name NAME]          # show drift between izba.yml and managed truth
+izba promote [DIR] [--name NAME] [--force] [--restart] [--reset-scratch=BOOL]
+                                          # apply manifest → managed truth (human-gated)
+izba export  [DIR] [--name NAME]          # write managed truth → izba.yml
 ```
 
 Volume `SIZE` takes a `g` or `m` suffix (e.g. `10g`, `512m`). A named volume is
@@ -203,6 +207,93 @@ izba exec -it myproj      # …or open an interactive shell
 The two-step form does the same thing: `izba create ./myproj` then `izba start
 myproj`. (Don't reach for `izba run -- sleep infinity` to keep a sandbox alive —
 a foreground `run` blocks until the command exits; `-d` is the right tool.)
+
+## Project manifest (`izba.yml`)
+
+An `izba.yml` at your project root declares a sandbox's desired configuration —
+image or build recipe, resources, volumes, ports, and egress policy — in a
+version-controllable file. `izba create` and `izba run` honor it automatically:
+running bare `izba run .` picks it up with no flags.
+
+```yaml
+apiVersion: izba.dev/v1alpha1
+kind: Sandbox
+metadata:
+  name: myapp                 # optional; defaults to workspace basename
+spec:
+  image: ubuntu:24.04         # an OCI ref
+  # build:                    # OR a build recipe (requires build-in-VM)
+  #   context: .
+  #   dockerfile: Dockerfile
+  resources:
+    cpus: 2
+    memory: 4Gi               # k8s quantity string (Mi/Gi)
+  rootDisk:
+    size: 8Gi                 # writable overlay (scratch) over the RO image
+  volumes:
+    - name: data              # named → persistent (survives rm); omit name → ephemeral
+      mountPath: /data
+      size: 8Gi
+  ports:
+    - guest: 80
+      host: 8080
+      bind: 127.0.0.1         # optional; defaults to 127.0.0.1
+  egress:
+    enforce: true
+    allow:
+      - host: github.com      # bare host → ports 80 and 443
+      - host: api.example.com
+        ports: [443]
+        access: read          # read | read-write
+    git:
+      - repo: github.com/me/*
+        access: read-write
+```
+
+**Trust model.** `izba.yml` lives in the project workspace, mounted at
+`/workspace` inside the guest, so the in-guest agent can edit it. It is
+therefore an **untrusted proposal**, not authority. The **managed truth** lives
+host-only at `~/.local/share/izba/sandboxes/<name>/` (`config.json` +
+`policy.yaml`) — outside the overlay, unreachable by the guest — and is the
+only record that matters for a running sandbox. `izba promote` is the
+**human-gated bridge**: you review the diff, approve it, and only then does
+the manifest's intent become authoritative.
+
+**The review loop: `izba diff` → `izba promote` → `izba export`**
+
+```sh
+izba diff    myapp    # show structural drift between izba.yml and managed truth
+izba promote myapp    # apply the reviewed changes to the managed truth
+izba export  myapp    # write managed truth → izba.yml ("save the truth back to the repo")
+```
+
+`izba diff` categorizes each changed field by blast radius:
+
+- **Live** — `egress`, `ports`, `volumes`: applied immediately, no interruption.
+- **Restart** — `resources`, `image`/`build`: written to managed truth, take
+  effect on next start. `izba status` shows a `pending restart: cpus 2→4`
+  delta. Use `izba promote --restart` to stop and restart now.
+- **Image change** — when `image` or `build` changes, `promote` also governs
+  the overlay scratch disk via `--reset-scratch` (default **true**):
+  - `--reset-scratch=true` *(default)*: a fresh overlay on the new image base —
+    correct semantics; discards un-volumed writes to the root filesystem.
+  - `--reset-scratch=false`: keep the existing overlay (expert-only, loud
+    warning; old overlay layers may be ABI-incompatible with the new base).
+
+Any change that **weakens** the egress jail — adding `allow` entries, flipping
+`enforce: true → false`, widening `access:` scope — is marked `⚠ weakens egress`
+in `diff` and `promote` output. You cannot miss a loosened firewall.
+
+**Review gate.** `izba diff` writes a host-only review token (`manifest.review`)
+that covers the exact `izba.yml` (and any referenced `Dockerfile`) it just
+showed. `izba promote` requires that token to match the current file — a TOCTOU
+guard: if the manifest changes after `diff` but before `promote`, the promote
+fails with "manifest changed since review — re-run `izba diff`". Use `--force`
+to bypass (with a loud warning naming exactly what is being promoted unreviewed).
+The token is host-only, so the in-guest agent cannot fabricate a reviewed state.
+
+No secrets cross into the repo: `export` renders only declarative config; CA
+keys, SSH host keys, and other host-only material are never written to `izba.yml`.
 
 ## SSH access (VS Code Remote-SSH, tmux, scp)
 
