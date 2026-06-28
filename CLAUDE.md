@@ -210,6 +210,19 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   start/stop/rm** (best-effort, never fails the lifecycle); gated by
   `<data>/ssh/settings.json` `config_management` (default on). Keys are an
   izba-managed ed25519 user keypair + a shared host key under `<data>/ssh/`.
+- **`izba.yml` manifest trust boundary:** `izba.yml` (repo root, mounted at
+  guest `/workspace`) is agent-writable and therefore treated as an **untrusted
+  proposal**; the managed truth (`config.json` + `policy.yaml` under
+  `~/.local/share/izba/sandboxes/<name>/`) is host-only authority — never
+  inside the overlay, never readable from the guest. `izba promote` is the
+  human-gated bridge (review token in `manifest.review`, last-reconciled base
+  in `manifest.base.yaml`, both host-only). diff/promote/export are host-side
+  computations over existing daemon RPCs (`ReloadPolicy`, `PortPublish/
+  Unpublish`, `VolumeAttach/Detach`, `Stop`, `Start`, `Inspect`) — **no
+  `DAEMON_PROTO_VERSION` bump**. Security-weakening deltas are flagged `⚠
+  weakens egress` and the review gate is a TOCTOU guard (token covers the exact
+  `izba.yml` + any referenced `Dockerfile` shown at `diff` time). No secrets
+  are ever rendered into `izba.yml`.
 - **Exit-code mapping:** the workload runs inside the crun container, so crun
   PROPAGATES its exit status and izba passes it straight through (no re-encode):
   normal exit `N` → `N`; a signal-killed command → `128+n`. A **missing command**
