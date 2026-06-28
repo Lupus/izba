@@ -42,6 +42,14 @@ pub struct SandboxConfig {
     /// written before this field deserializing (disk-state back-compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<crate::manifest::schema::BuildSpec>,
+    /// Scratch rw disk size requested at create time, in whole GiB.  Persisted
+    /// here so `izba export` can emit a valid `rootDisk.size` without reading
+    /// the physical `rw.img` file length (which truncates to 0 for sub-GiB
+    /// images).  `serde(default)` keeps old `config.json` files (without this
+    /// field) deserializing — 0 means "unknown; fall back to file-length
+    /// recovery for backwards compatibility".
+    #[serde(default)]
+    pub rw_size_gb: u64,
 }
 
 /// A single host→guest TCP publish rule. Its identity (uniqueness key) is
@@ -119,6 +127,7 @@ mod tests {
             volumes: Vec::new(),
             builder: false,
             build: None,
+            rw_size_gb: 8,
         }
     }
 
@@ -348,5 +357,38 @@ mod tests {
             "expected exactly one file, found: {entries:?}"
         );
         assert_eq!(entries[0], CONFIG_FILE);
+    }
+
+    /// Back-compat: a config.json written before `rw_size_gb` was added must
+    /// still deserialize — the missing field must default to 0 ("unknown").
+    #[test]
+    fn sandbox_config_rw_size_gb_defaults_zero_when_absent() {
+        let legacy = r#"{
+            "image_digest": "sha256:abc",
+            "image_ref": "ubuntu:24.04",
+            "cpus": 2,
+            "mem_mb": 512,
+            "workspace": "/workspace"
+        }"#;
+        let cfg: SandboxConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            cfg.rw_size_gb, 0,
+            "missing rw_size_gb must default to 0 (unknown)"
+        );
+    }
+
+    /// New configs with `rw_size_gb` set must round-trip faithfully.
+    #[test]
+    fn sandbox_config_rw_size_gb_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let mut cfg = sample_config();
+        cfg.rw_size_gb = 16;
+        save_json(&path, &cfg).unwrap();
+        let loaded: SandboxConfig = load_json(&path).unwrap().unwrap();
+        assert_eq!(
+            loaded.rw_size_gb, 16,
+            "rw_size_gb must round-trip via save/load"
+        );
     }
 }

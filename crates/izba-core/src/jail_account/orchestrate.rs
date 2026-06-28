@@ -503,6 +503,7 @@ mod tests {
             volumes,
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         core_save_json(&sandbox_dir.join(CONFIG_FILE), &cfg).unwrap();
     }
@@ -520,6 +521,7 @@ mod tests {
             volumes: Vec::new(),
             builder: false,
             build: None,
+            rw_size_gb: 8,
         }
     }
 
@@ -593,6 +595,7 @@ mod tests {
             volumes: Vec::new(),
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
         assert!(grants.contains(&PathBuf::from("/my/workspace")));
@@ -618,6 +621,7 @@ mod tests {
             }],
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
         assert!(grants.contains(&paths.volume_image("cache")));
@@ -642,6 +646,7 @@ mod tests {
             }],
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
         // Anonymous volumes live under sandbox_dir so only the sandbox_dir

@@ -203,7 +203,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::paths::Paths::with_root(dir.path().to_path_buf());
         std::fs::create_dir_all(paths.sandbox_dir("x")).unwrap();
-        // Seed an existing config (write_managed preserves workspace + builder).
+        // Seed an existing config (write_managed preserves workspace + builder + rw_size_gb).
         let seed = SandboxConfig {
             image_digest: "sha256:old".into(),
             image_ref: "ubuntu:24.04".into(),
@@ -214,6 +214,7 @@ mod tests {
             volumes: vec![],
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         crate::state::save_json(&paths.sandbox_dir("x").join(CONFIG_FILE), &seed).unwrap();
 
@@ -254,6 +255,7 @@ mod tests {
             volumes: vec![],
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         crate::state::save_json(&paths.sandbox_dir("y").join(CONFIG_FILE), &seed).unwrap();
 
@@ -299,6 +301,7 @@ mod tests {
             volumes: vec![],
             builder: false,
             build: None,
+            rw_size_gb: 8,
         };
         crate::state::save_json(&paths.sandbox_dir("z").join(CONFIG_FILE), &seed).unwrap();
 
@@ -324,11 +327,41 @@ mod tests {
             .unwrap_or_default();
         let managed = Normalized::from_managed("z", &cfg, &egress);
         let deltas = diff::diff(&managed, &repo);
-        // rw_size_gb is always 0 in managed; filter it out as diff() does for Image/Restart fields
-        let meaningful: Vec<_> = deltas.iter().filter(|d| d.field != "rw_size_gb").collect();
         assert!(
-            meaningful.is_empty(),
-            "no drift expected after promote round-trip, got: {meaningful:?}"
+            deltas.is_empty(),
+            "no drift expected after promote round-trip, got: {deltas:?}"
+        );
+    }
+
+    /// write_managed must NOT clobber rw_size_gb: it's immutable post-create.
+    #[test]
+    fn write_managed_preserves_rw_size_gb() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().to_path_buf());
+        std::fs::create_dir_all(paths.sandbox_dir("rw")).unwrap();
+        let seed = SandboxConfig {
+            image_digest: "sha256:old".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: "/ws".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+            rw_size_gb: 12, // persisted at create time
+        };
+        crate::state::save_json(&paths.sandbox_dir("rw").join(CONFIG_FILE), &seed).unwrap();
+
+        // write_managed updates cpus but must not touch rw_size_gb.
+        write_managed(&paths, "rw", &n(8), "sha256:new").unwrap();
+
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir("rw").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.rw_size_gb, 12,
+            "write_managed must preserve the existing rw_size_gb (immutable post-create)"
         );
     }
 }

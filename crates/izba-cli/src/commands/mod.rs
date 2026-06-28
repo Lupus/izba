@@ -29,6 +29,15 @@ use izba_core::manifest::{Manifest, Normalized};
 use izba_core::state::PortRule;
 use std::path::{Path, PathBuf};
 
+/// Read and parse `izba.yml` from `dir` WITHOUT reading the Dockerfile.  Used
+/// for name-resolution / opts-merge paths where only the YAML is needed.
+fn load_manifest_yaml(dir: &Path) -> anyhow::Result<Manifest> {
+    let path = dir.join("izba.yml");
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    Manifest::load_str(&raw).with_context(|| format!("parsing {}", path.display()))
+}
+
 /// Clap default values — the single source of truth.  Both the `SandboxOpts`
 /// `default_value_t` attributes in `main.rs` and the `merge_manifest_into_opts`
 /// "was this field left at its default?" checks must reference these consts.
@@ -155,7 +164,13 @@ pub(crate) fn merge_manifest_into_opts(
     if !dir.join("izba.yml").exists() {
         return Ok(None);
     }
-    let (m, _, _) = load_repo_manifest(dir)?;
+    // Read only the YAML — deliberately do NOT call load_repo_manifest here.
+    // load_repo_manifest reads the Dockerfile for `build:` specs, but name
+    // resolution only needs the parsed YAML.  On a HEALTHY existing build-spec
+    // sandbox with a deleted/cleaned Dockerfile `izba run .` would otherwise
+    // fail with "reading Dockerfile: No such file" even though reconcile_existing
+    // should kick in and short-circuit before any build attempt.
+    let m = load_manifest_yaml(dir)?;
     // Only compute the dir-basename fallback when the manifest does not supply
     // a name; this avoids failing on a tmpdir whose basename cannot be a valid
     // sandbox name (e.g. `.tmpXXXXX` used in tests).
@@ -516,5 +531,43 @@ mod tests {
             8 << 30,
             "parsed size_bytes must be 8Gi"
         );
+    }
+
+    /// Fix 1 (CLI): merge_manifest_into_opts with a `build:` spec must succeed
+    /// even when the referenced Dockerfile does NOT exist on disk.  Name
+    /// resolution / opts-merge only needs the YAML; the Dockerfile is only
+    /// needed by `diff`/`promote` for the review token.
+    #[test]
+    fn merge_manifest_build_spec_succeeds_without_dockerfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_dir = tmp.path().join("myproject");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        // izba.yml has a build: spec, but we deliberately do NOT create the Dockerfile.
+        std::fs::write(
+            ws_dir.join("izba.yml"),
+            concat!(
+                "apiVersion: izba.dev/v1alpha1\n",
+                "kind: Sandbox\n",
+                "metadata: { name: myproject }\n",
+                "spec:\n",
+                "  build:\n",
+                "    context: '.'\n",
+                "    dockerfile: 'Dockerfile'\n",
+                "  resources: { cpus: 2, memory: 4Gi }\n",
+                "  rootDisk: { size: 8Gi }\n",
+            ),
+        )
+        .unwrap();
+
+        let mut o = opts();
+        // Must NOT error even though Dockerfile is absent.
+        let result = merge_manifest_into_opts(&mut o, &ws_dir);
+        assert!(
+            result.is_ok(),
+            "merge_manifest_into_opts must succeed without Dockerfile: {result:?}"
+        );
+        // Name should be resolved from the manifest metadata.
+        assert_eq!(o.name.as_deref(), Some("myproject"));
     }
 }
