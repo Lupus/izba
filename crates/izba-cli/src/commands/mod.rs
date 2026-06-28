@@ -29,6 +29,14 @@ use izba_core::manifest::{Manifest, Normalized};
 use izba_core::state::PortRule;
 use std::path::{Path, PathBuf};
 
+/// Clap default values — the single source of truth.  Both the `SandboxOpts`
+/// `default_value_t` attributes in `main.rs` and the `merge_manifest_into_opts`
+/// "was this field left at its default?" checks must reference these consts.
+pub(crate) const DEFAULT_IMAGE: &str = "ubuntu:24.04";
+pub(crate) const DEFAULT_CPUS: u32 = 2;
+pub(crate) const DEFAULT_MEM_MB: u32 = 4096;
+pub(crate) const DEFAULT_RW_GB: u64 = 8;
+
 /// Load `izba.yml` from a workspace dir, returning (manifest, raw_yaml,
 /// dockerfile_contents). `dockerfile` is `Some` only for a `build:` spec.
 pub(crate) fn load_repo_manifest(dir: &Path) -> anyhow::Result<(Manifest, String, Option<String>)> {
@@ -153,6 +161,55 @@ pub(crate) fn build_create_request(
         // `create`/`run` never provision a build host; only `izba build` does.
         builder: false,
     }
+}
+
+/// Overlay an `izba.yml` (if present) onto `opts`: for each field the user left
+/// at its clap default, take the manifest's value. Explicit flags always win.
+/// Returns the parsed manifest so the caller can seed the manifest base after a
+/// successful create.
+pub(crate) fn merge_manifest_into_opts(
+    opts: &mut crate::SandboxOpts,
+    dir: &Path,
+) -> anyhow::Result<Option<Manifest>> {
+    if !dir.join("izba.yml").exists() {
+        return Ok(None);
+    }
+    let (m, _, _) = load_repo_manifest(dir)?;
+    // Only compute the dir-basename fallback when the manifest does not supply
+    // a name; this avoids failing on a tmpdir whose basename cannot be a valid
+    // sandbox name (e.g. `.tmpXXXXX` used in tests).
+    let default_name = if m.metadata.name.is_none() {
+        workspace_default_name(dir)?
+    } else {
+        String::new() // manifest name takes precedence; fallback never used
+    };
+    let n = Normalized::from_manifest(&m, &default_name)?;
+    if opts.image == DEFAULT_IMAGE {
+        if let izba_core::manifest::ImageSource::Ref(r) = &n.image {
+            opts.image = r.clone();
+        }
+    }
+    if opts.cpus == DEFAULT_CPUS {
+        opts.cpus = n.cpus;
+    }
+    if opts.mem == DEFAULT_MEM_MB {
+        opts.mem = n.mem_mb;
+    }
+    if opts.rw_size_gb == DEFAULT_RW_GB && n.rw_size_gb != 0 {
+        opts.rw_size_gb = n.rw_size_gb;
+    }
+    if opts.name.is_none() {
+        opts.name = Some(n.name.clone());
+    }
+    // Ports: only adopt from manifest when the user passed none.
+    if opts.publish.is_empty() {
+        opts.publish = n
+            .ports
+            .iter()
+            .map(|p| format!("{}:{}:{}", p.bind, p.host_port, p.guest_port))
+            .collect();
+    }
+    Ok(Some(m))
 }
 
 /// Validate a `--policy` file and persist it into the sandbox directory as

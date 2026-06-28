@@ -33,16 +33,16 @@ fn short_version() -> &'static str {
 #[derive(Debug, Clone, Args)]
 struct SandboxOpts {
     /// Container image to boot
-    #[arg(long, default_value = "ubuntu:24.04")]
+    #[arg(long, default_value_t = commands::DEFAULT_IMAGE.to_string())]
     image: String,
     /// Number of virtual CPUs
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = commands::DEFAULT_CPUS)]
     cpus: u32,
     /// Memory in MiB
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = commands::DEFAULT_MEM_MB)]
     mem: u32,
     /// Size of the writable scratch disk in GiB
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = commands::DEFAULT_RW_GB)]
     rw_size_gb: u64,
     /// Sandbox name (default: derived from the workspace directory name)
     #[arg(long)]
