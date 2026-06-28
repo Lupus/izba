@@ -41,7 +41,16 @@ pub fn managed_normalized(paths: &Paths, name: &str) -> Result<Normalized> {
     let cfg: SandboxConfig =
         load_json(&dir.join(CONFIG_FILE))?.with_context(|| format!("no such sandbox: {name}"))?;
     let egress = EgressPolicyConfig::load(&dir)?.unwrap_or_default();
-    Ok(Normalized::from_managed(name, &cfg, &egress))
+    let mut n = Normalized::from_managed(name, &cfg, &egress);
+    // SandboxConfig does not persist the rw scratch size (it is only used at
+    // create time). Recover it from the actual rw.img length so that
+    // `izba export` emits a valid `rootDisk.size` that round-trips through
+    // Manifest::load_str without a "no unit suffix" parse error.
+    let rw = dir.join("rw.img");
+    if let Ok(meta) = std::fs::metadata(&rw) {
+        n.rw_size_gb = meta.len() >> 30;
+    }
+    Ok(n)
 }
 
 /// Compute the structural diff between `izba.yml` in `dir` and the managed
@@ -162,5 +171,51 @@ mod tests {
             crate::manifest::normalize::ImageSource::Ref(r) => assert_eq!(r, "ubuntu:22.04"),
             _ => panic!("expected Ref image source"),
         }
+    }
+
+    /// Fix 1: rw.img length is recovered as rw_size_gb so `izba export`
+    /// emits a parseable `rootDisk.size` (not `"0"` which has no unit suffix).
+    #[test]
+    fn managed_normalized_recovers_rw_size_from_rw_img() {
+        use crate::manifest::{quantity, schema::Manifest};
+        use crate::state::SandboxConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let name = "scratchbox";
+        let sandbox_dir = paths.sandbox_dir(name);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+
+        let cfg = SandboxConfig {
+            image_digest: "sha256:abc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem_mb: 2048,
+            workspace: "/workspace".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+        };
+        std::fs::write(
+            sandbox_dir.join(crate::state::CONFIG_FILE),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        // Seed rw.img at exactly 8 GiB (sparse).
+        let rw_path = sandbox_dir.join("rw.img");
+        let f = std::fs::File::create(&rw_path).unwrap();
+        f.set_len(8u64 << 30).unwrap();
+
+        let n = managed_normalized(&paths, name).unwrap();
+        assert_eq!(n.rw_size_gb, 8, "rw_size_gb must be recovered from rw.img");
+
+        // to_manifest() must produce a rootDisk.size that parses without error.
+        let m = n.to_manifest();
+        let yaml = m.to_yaml();
+        let m2 = Manifest::load_str(&yaml).expect("exported manifest must parse without error");
+        let gib = quantity::parse_gib(&m2.spec.root_disk.size)
+            .expect("rootDisk.size must have a valid unit suffix");
+        assert_eq!(gib, 8, "rootDisk.size must round-trip to 8 GiB");
     }
 }
