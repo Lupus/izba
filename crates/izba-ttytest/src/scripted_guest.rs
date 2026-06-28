@@ -99,6 +99,7 @@ impl ScriptedGuest {
                 ports: Vec::new(),
                 volumes: Vec::new(),
                 builder: false,
+                build: None,
             },
         )
         .context("write config.json")?;

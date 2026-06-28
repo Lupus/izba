@@ -1690,6 +1690,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            build: None,
         };
         crate::state::save_json(&dir.join(CONFIG_FILE), &cfg).unwrap();
     }

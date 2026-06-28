@@ -156,6 +156,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            build: None,
         };
         std::fs::write(
             sandbox_dir.join(crate::state::CONFIG_FILE),
@@ -195,6 +196,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            build: None,
         };
         std::fs::write(
             sandbox_dir.join(crate::state::CONFIG_FILE),

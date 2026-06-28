@@ -93,8 +93,19 @@ pub fn write_managed(
     cfg.cpus = target.cpus;
     cfg.mem_mb = target.mem_mb;
     cfg.image_digest = image_digest.to_string();
-    if let crate::manifest::normalize::ImageSource::Ref(r) = &target.image {
-        cfg.image_ref = r.clone();
+    match &target.image {
+        crate::manifest::normalize::ImageSource::Ref(r) => {
+            cfg.image_ref = r.clone();
+            cfg.build = None;
+        }
+        crate::manifest::normalize::ImageSource::Build(b) => {
+            cfg.build = Some(b.clone());
+            // Store the tag as image_ref for display/legacy purposes;
+            // from_managed uses cfg.build for authoritative reconstruction.
+            if let Some(tag) = &b.tag {
+                cfg.image_ref = tag.clone();
+            }
+        }
     }
     cfg.ports = target.ports.clone();
     let mut volumes = target.volumes.clone();
@@ -202,6 +213,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            build: None,
         };
         crate::state::save_json(&paths.sandbox_dir("x").join(CONFIG_FILE), &seed).unwrap();
 
@@ -223,5 +235,100 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(eg.allow.iter().any(|e| e.host() == "github.com"));
+    }
+
+    #[test]
+    fn write_managed_with_build_target_persists_build_provenance() {
+        use crate::manifest::normalize::ImageSource;
+        use crate::manifest::schema::BuildSpec;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().to_path_buf());
+        std::fs::create_dir_all(paths.sandbox_dir("y")).unwrap();
+        let seed = SandboxConfig {
+            image_digest: "sha256:old".into(),
+            image_ref: "myapp:latest".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: "/ws".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+        };
+        crate::state::save_json(&paths.sandbox_dir("y").join(CONFIG_FILE), &seed).unwrap();
+
+        let build_spec = BuildSpec {
+            context: Some(".".into()),
+            dockerfile: Some("Dockerfile".into()),
+            tag: Some("myapp:latest".into()),
+            allow: vec![],
+            resources: None,
+        };
+        let mut target = n(2);
+        target.image = ImageSource::Build(build_spec.clone());
+        write_managed(&paths, "y", &target, "sha256:built").unwrap();
+
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir("y").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(
+            cfg.build.is_some(),
+            "build provenance must be persisted in config.json"
+        );
+        assert_eq!(cfg.build.unwrap(), build_spec);
+    }
+
+    #[test]
+    fn build_manifest_diff_is_empty_after_promote_round_trip() {
+        // Regression test: after promote writes config.json for a build-spec
+        // sandbox, from_managed must reconstruct Build so diff(managed, repo)
+        // is empty (no perpetual drift).
+        use crate::manifest::diff;
+        use crate::manifest::normalize::{ImageSource, Normalized};
+        use crate::manifest::schema::BuildSpec;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().to_path_buf());
+        std::fs::create_dir_all(paths.sandbox_dir("z")).unwrap();
+        let seed = SandboxConfig {
+            image_digest: "sha256:old".into(),
+            image_ref: "myapp:latest".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: "/ws".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+        };
+        crate::state::save_json(&paths.sandbox_dir("z").join(CONFIG_FILE), &seed).unwrap();
+
+        let build_spec = BuildSpec {
+            context: Some(".".into()),
+            dockerfile: Some("Dockerfile".into()),
+            tag: Some("myapp:latest".into()),
+            allow: vec![],
+            resources: None,
+        };
+        let mut repo = n(2);
+        repo.name = "z".into();
+        repo.image = ImageSource::Build(build_spec.clone());
+        // Simulate promote: write managed with the build target.
+        write_managed(&paths, "z", &repo, "sha256:built").unwrap();
+
+        // Simulate diff: load managed and compare to repo.
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir("z").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        let egress = EgressPolicyConfig::load(&paths.sandbox_dir("z"))
+            .unwrap()
+            .unwrap_or_default();
+        let managed = Normalized::from_managed("z", &cfg, &egress);
+        let deltas = diff::diff(&managed, &repo);
+        // rw_size_gb is always 0 in managed; filter it out as diff() does for Image/Restart fields
+        let meaningful: Vec<_> = deltas.iter().filter(|d| d.field != "rw_size_gb").collect();
+        assert!(
+            meaningful.is_empty(),
+            "no drift expected after promote round-trip, got: {meaningful:?}"
+        );
     }
 }
