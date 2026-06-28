@@ -349,26 +349,22 @@ impl UserDb {
 /// Resolve an image's declared `USER` to a numeric `(uid, gid)` for config.json,
 /// plus an optional loud warning.
 ///
-/// crun's `config.json` `process.user` is numeric-only per the OCI runtime spec,
-/// so a symbolic username cannot be passed through and resolving it would require
-/// reading the image's `/etc/passwd` out of the overlay (not available here);
-/// proper symbolic→numeric resolution is a deferred follow-up. Until then a
-/// non-empty symbolic/unparseable USER falls back to root `(0, 0)` — but **loudly**
-/// (izba never silently downgrades security), via the returned `Some(msg)`.
-///
-/// - `None` (no declared USER) / `Some("")` (explicit root) → `((0, 0), None)`.
-/// - numeric (`"1000"`, `"1000:1001"`) → resolved pair, `None` warning.
-/// - symbolic / partly-symbolic (`"node"`, `"1000:wheel"`) → `((0, 0), Some(msg))`,
-///   `msg` naming the offending USER string.
-pub fn resolve_process_user(declared: Option<&str>) -> ((u32, u32), Option<String>) {
+/// - `None` / `Some("")` -> `((0,0), None)` (silent root).
+/// - fully numeric (`"1000"`, `"1000:1001"`) -> resolved pair, no warning.
+/// - symbolic (`"node"`, `"1000:wheel"`) resolved against `db` (the image's
+///   `/etc/passwd`+`/etc/group`) -> resolved pair, no warning.
+/// - symbolic but unresolvable (name absent from the image's passwd/group, or a
+///   legacy cache with no captured db) -> `((0,0), Some(msg))` naming the USER.
+///   izba never silently downgrades security, so the fallback is loud.
+pub fn resolve_process_user(declared: Option<&str>, db: &UserDb) -> ((u32, u32), Option<String>) {
     match declared {
         None | Some("") => ((0, 0), None),
-        Some(u) => match parse_numeric_user(u) {
+        Some(u) => match db.resolve(u) {
             Some(ids) => (ids, None),
             None => (
                 (0, 0),
                 Some(format!(
-                    "image USER '{u}' is not numeric; izba cannot resolve symbolic users yet \
+                    "image USER '{u}' could not be resolved against the image's /etc/passwd \
                      — running the workload as root (uid 0)"
                 )),
             ),
@@ -1051,48 +1047,64 @@ mod tests {
         assert_eq!(total, USERNS_RANGE_END as u64);
     }
 
-    // ---- resolve_process_user (config.json USER → (uid,gid) + loud warning) ----
+    // ---- resolve_process_user (config.json USER -> (uid,gid) + loud warning) ----
+
+    fn db_with_node() -> UserDb {
+        UserDb::from_files(
+            Some("root:x:0:0::/root:/bin/sh\nnode:x:1000:1000::/home/node:/bin/sh\n"),
+            Some("node:x:1000:\nwheel:x:10:\n"),
+        )
+    }
 
     #[test]
     fn resolve_process_user_none_is_silent_root() {
-        assert_eq!(resolve_process_user(None), ((0, 0), None));
+        assert_eq!(
+            resolve_process_user(None, &UserDb::default()),
+            ((0, 0), None)
+        );
     }
 
     #[test]
     fn resolve_process_user_empty_is_silent_root() {
-        assert_eq!(resolve_process_user(Some("")), ((0, 0), None));
-    }
-
-    #[test]
-    fn resolve_process_user_numeric_uid_only_silent() {
-        assert_eq!(resolve_process_user(Some("1000")), ((1000, 0), None));
-    }
-
-    #[test]
-    fn resolve_process_user_numeric_uid_gid_silent() {
         assert_eq!(
-            resolve_process_user(Some("1000:1001")),
+            resolve_process_user(Some(""), &UserDb::default()),
+            ((0, 0), None)
+        );
+    }
+
+    #[test]
+    fn resolve_process_user_numeric_is_silent() {
+        assert_eq!(
+            resolve_process_user(Some("1000"), &UserDb::default()),
+            ((1000, 0), None)
+        );
+        assert_eq!(
+            resolve_process_user(Some("1000:1001"), &UserDb::default()),
             ((1000, 1001), None)
         );
     }
 
     #[test]
-    fn resolve_process_user_symbolic_name_is_loud_root() {
-        let ((uid, gid), warn) = resolve_process_user(Some("node"));
-        assert_eq!((uid, gid), (0, 0));
-        let msg = warn.expect("symbolic USER must produce a warning");
-        assert!(msg.contains("node"), "warning must name the user: {msg}");
+    fn resolve_process_user_symbolic_resolves_from_db() {
+        assert_eq!(
+            resolve_process_user(Some("node"), &db_with_node()),
+            ((1000, 1000), None)
+        );
     }
 
     #[test]
-    fn resolve_process_user_partly_symbolic_is_loud_root() {
-        let ((uid, gid), warn) = resolve_process_user(Some("1000:wheel"));
-        assert_eq!((uid, gid), (0, 0));
-        let msg = warn.expect("partly-symbolic USER must produce a warning");
-        assert!(
-            msg.contains("1000:wheel"),
-            "warning must name the user: {msg}"
+    fn resolve_process_user_partly_symbolic_resolves_group() {
+        assert_eq!(
+            resolve_process_user(Some("1000:wheel"), &db_with_node()),
+            ((1000, 10), None)
         );
+    }
+
+    #[test]
+    fn resolve_process_user_unresolvable_is_loud_root() {
+        let ((uid, gid), warn) = resolve_process_user(Some("ghost"), &db_with_node());
+        assert_eq!((uid, gid), (0, 0));
+        assert!(warn.expect("must warn").contains("ghost"));
     }
 
     // ---- full spec assembly ----
