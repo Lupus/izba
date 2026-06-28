@@ -556,6 +556,7 @@ fn write_oci_bundle(
     let pause_argv: Vec<String> = vec![PAUSE_GUEST_PATH.to_string(), "__pause".to_string()];
     let ((uid, gid), user_warn) = crate::image::runtime_config::resolve_process_user(
         image_config.and_then(|c| c.user.as_deref()),
+        &crate::image::runtime_config::UserDb::default(), // TODO Task 5: replace with captured image db
     );
     if let Some(w) = user_warn {
         eprintln!("warning: sandbox '{name}': {w}");
