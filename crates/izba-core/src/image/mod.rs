@@ -290,6 +290,8 @@ mod tests {
                 "/etc/passwd",
                 b"node:x:1000:1000::/home/node:/bin/sh\n",
             );
+            // dot-slash prefix (canonical OCI/docker layer format) must also match
+            add_raw(&mut b, "./etc/group", b"node:x:1000:\n");
             b.finish().unwrap();
         }
         let (passwd, group) = extract_user_dbs(&tar_path).unwrap();
@@ -298,7 +300,11 @@ mod tests {
             passwd.contains("node:x:1000"),
             "last-wins entry must win: {passwd}"
         );
-        assert!(group.is_none(), "no /etc/group entry -> None");
+        let group = String::from_utf8(group.expect("./etc/group must be extracted")).unwrap();
+        assert!(
+            group.contains("node:x:1000"),
+            "./etc/group dot-prefix entry must be found: {group}"
+        );
     }
 
     /// `ensure_image("oci-archive:<path>")` must route to `ingest_oci_archive`

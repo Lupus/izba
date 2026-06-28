@@ -713,9 +713,10 @@ pub fn start_with_timeouts(
     // Load the image config (Entrypoint/Cmd/Env/WorkingDir/User). None is fine
     // for images cached by a pre-crun izba — generate_spec treats it as a bare
     // image with root user and no default env.
-    let image_cfg_file = ImageStore::new(paths).load_config(&config.image_digest)?;
+    let store = ImageStore::new(paths);
+    let image_cfg_file = store.load_config(&config.image_digest)?;
     let image_config = image_cfg_file.as_ref().and_then(|f| f.config.as_ref());
-    let (passwd, group) = ImageStore::new(paths).load_user_dbs(&config.image_digest)?;
+    let (passwd, group) = store.load_user_dbs(&config.image_digest)?;
     let user_db =
         crate::image::runtime_config::UserDb::from_files(passwd.as_deref(), group.as_deref());
     write_oci_bundle(
@@ -2020,6 +2021,11 @@ mod tests {
             proc.user().uid(),
             1000,
             "symbolic USER 'node' must resolve to uid 1000 via the captured passwd"
+        );
+        assert_eq!(
+            proc.user().gid(),
+            1000,
+            "resolved primary gid must flow through"
         );
     }
 

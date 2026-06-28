@@ -214,23 +214,6 @@ pub fn resolve_cwd(image_working_dir: Option<&str>, cwd_override: Option<&str>) 
         .to_string()
 }
 
-/// Parse a numeric OCI/docker `User` spec into `(uid, gid)`.
-///
-/// `"1000:1000"` → `(1000, 1000)`; `"1000"` → `(1000, 0)` (docker's gid default
-/// for a numeric uid without a passwd lookup); `""` → `(0, 0)`. Returns `None`
-/// when either component is a non-numeric *name* — that requires resolving
-/// against the container's `/etc/passwd`, which is deferred to the guest side
-/// (Phase 4), not guessed host-side.
-pub fn parse_numeric_user(user: &str) -> Option<(u32, u32)> {
-    if user.is_empty() {
-        return Some((0, 0));
-    }
-    match user.split_once(':') {
-        Some((u, g)) => Some((u.parse().ok()?, g.parse().ok()?)),
-        None => Some((user.parse().ok()?, 0)),
-    }
-}
-
 /// One `/etc/passwd` row reduced to the fields izba's USER resolution needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswdEntry {
@@ -319,9 +302,13 @@ impl UserDb {
     }
 
     /// Resolve a docker `user[:group]` spec to `(uid, gid)`, or `None` when any
-    /// component is a name absent from the db. Pure-numeric components never
-    /// consult the db (docker's numeric default gid is 0), matching
-    /// [`parse_numeric_user`].
+    /// component is a name absent from the db.
+    ///
+    /// **Intentional divergence:** a pure-numeric `uid` (e.g. `"1000"`) does NOT
+    /// consult passwd and defaults gid to 0 — docker-faithful for the numeric form
+    /// and matches izba's prior behaviour. A symbolic name (e.g. `"node"`) adopts
+    /// the passwd entry's primary gid. So `USER 1000` → `(1000, 0)` while
+    /// `USER node` (node=1000:1000 in passwd) → `(1000, 1000)` — on the record.
     pub fn resolve(&self, spec: &str) -> Option<(u32, u32)> {
         let (user_part, group_part) = match spec.split_once(':') {
             Some((u, g)) => (u, Some(g)),
@@ -538,7 +525,7 @@ pub struct SpecParams<'a> {
     pub trust_env: &'a [String],
     /// Working-dir override; else image WD (Service) / [`INTERACTIVE_CWD`].
     pub cwd_override: Option<&'a str>,
-    /// Already-resolved process user `(uid, gid)` (see [`parse_numeric_user`]).
+    /// Already-resolved process user `(uid, gid)` (see [`UserDb::resolve`]).
     pub user: (u32, u32),
     /// The host `(uid, gid)` that owns the virtiofs `workspace` share — the
     /// anchor of the Option A user-namespace transposition (see
@@ -866,30 +853,6 @@ mod tests {
     fn cwd_defaults_to_root() {
         assert_eq!(resolve_cwd(None, None), "/");
         assert_eq!(resolve_cwd(Some(""), None), "/");
-    }
-
-    // ---- numeric user ----
-
-    #[test]
-    fn user_uid_and_gid() {
-        assert_eq!(parse_numeric_user("1000:1001"), Some((1000, 1001)));
-    }
-
-    #[test]
-    fn user_uid_only_defaults_gid_zero() {
-        assert_eq!(parse_numeric_user("1000"), Some((1000, 0)));
-    }
-
-    #[test]
-    fn user_empty_is_root() {
-        assert_eq!(parse_numeric_user(""), Some((0, 0)));
-    }
-
-    #[test]
-    fn user_name_needs_passwd_resolution() {
-        assert_eq!(parse_numeric_user("node"), None);
-        assert_eq!(parse_numeric_user("node:1000"), None);
-        assert_eq!(parse_numeric_user("1000:wheel"), None);
     }
 
     // ---- Option A userns transposition map ----
