@@ -539,6 +539,7 @@ fn write_oci_bundle(
     oci_dir: &Path,
     name: &str,
     image_config: Option<&oci_client::config::Config>,
+    user_db: &crate::image::runtime_config::UserDb,
     ca_present: bool,
     workspace: &Path,
     privileged: bool,
@@ -556,7 +557,7 @@ fn write_oci_bundle(
     let pause_argv: Vec<String> = vec![PAUSE_GUEST_PATH.to_string(), "__pause".to_string()];
     let ((uid, gid), user_warn) = crate::image::runtime_config::resolve_process_user(
         image_config.and_then(|c| c.user.as_deref()),
-        &crate::image::runtime_config::UserDb::default(), // TODO Task 5: replace with captured image db
+        user_db,
     );
     if let Some(w) = user_warn {
         eprintln!("warning: sandbox '{name}': {w}");
@@ -714,10 +715,14 @@ pub fn start_with_timeouts(
     // image with root user and no default env.
     let image_cfg_file = ImageStore::new(paths).load_config(&config.image_digest)?;
     let image_config = image_cfg_file.as_ref().and_then(|f| f.config.as_ref());
+    let (passwd, group) = ImageStore::new(paths).load_user_dbs(&config.image_digest)?;
+    let user_db =
+        crate::image::runtime_config::UserDb::from_files(passwd.as_deref(), group.as_deref());
     write_oci_bundle(
         &oci_dir,
         name,
         image_config,
+        &user_db,
         trust_dir.join("ca.pem").exists(),
         &config.workspace,
         config.builder,
@@ -1961,6 +1966,61 @@ mod tests {
             "normal config must keep the User namespace"
         );
         assert!(nlinux.uid_mappings().is_some());
+    }
+
+    /// Symbolic Docker USER (`"node"`) stored in the image config is resolved to
+    /// uid=1000 via the captured `/etc/passwd` at start time. Proves the full
+    /// host-side UserDb plumbing introduced in Task 5.
+    #[test]
+    fn start_oci_bundle_resolves_symbolic_user_from_db() {
+        use izba_proto::OCI_TAG;
+        use oci_spec::runtime::Spec;
+
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        // Populate the image store with a config that declares User "node"
+        // and a passwd file that maps "node" → uid 1000.
+        let img_dir = paths.image_dir("sha256:abc");
+        fs::create_dir_all(&img_dir).unwrap();
+        let cfg_json = br#"{
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": { "type": "layers", "diff_ids": [] },
+            "config": { "User": "node" }
+        }"#;
+        ImageStore::new(&paths)
+            .persist_config("sha256:abc", cfg_json)
+            .unwrap();
+        ImageStore::new(&paths)
+            .persist_user_dbs("sha256:abc", Some(b"node:x:1000:1000::/:/bin/sh\n"), None)
+            .unwrap();
+
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
+
+        let spec_captured = driver
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spec captured");
+        let oci_share = spec_captured
+            .shares
+            .iter()
+            .find(|s| s.tag == OCI_TAG)
+            .expect("izba-oci share present");
+        let json =
+            fs::read_to_string(oci_share.host_path.join("config.json")).expect("config.json");
+        let spec: Spec = serde_json::from_str(&json).expect("valid OCI Spec");
+        let proc = spec.process().as_ref().expect("process present");
+        assert_eq!(
+            proc.user().uid(),
+            1000,
+            "symbolic USER 'node' must resolve to uid 1000 via the captured passwd"
+        );
     }
 
     #[test]
