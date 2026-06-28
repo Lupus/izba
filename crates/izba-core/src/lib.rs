@@ -8,6 +8,7 @@ mod discover;
 pub mod image;
 pub mod jail_account;
 pub mod liveness;
+pub mod manifest;
 pub mod paths;
 pub mod portfwd;
 pub mod procmgr;
