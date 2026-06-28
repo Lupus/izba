@@ -849,6 +849,79 @@ fn userns_numeric_user_owns_workspace() {
     stop_sandbox(&tb, "uns-user");
 }
 
+/// Symbolic image `USER` (`nobody`) is resolved host-side to its numeric uid
+/// (65534 on alpine) and baked into the OCI `process.user`.  Distinct from the
+/// numeric-`USER` test: the image config carries a *name*, not a number.  The
+/// host reads the captured `/etc/passwd` (`nobody:x:65534:65534:…`) produced by
+/// Task 4's flatten step and maps "nobody" → 65534, then transposes the userns
+/// workspace accordingly.
+///
+/// Fixture: `alpine:3.20` (the suite's `DEFAULT_IMAGE`) pulled into a private
+/// per-test store so the shared cache is unaffected.  After the pull the test
+/// patches the image's `config.json` in-place — setting `["config"]["User"] =
+/// "nobody"` — before handing the digest to `sandbox::create`.
+///
+/// `#[cfg(unix)]`: asserts on POSIX file ownership; KVM suite is Linux-only.
+#[cfg(unix)]
+#[test]
+fn userns_resolves_symbolic_image_user() {
+    use izba_core::image::ImageStore;
+
+    let Some(env) = want() else { return };
+
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("uns-sym");
+    fs::write(ws.join("seed.txt"), "from-host").unwrap();
+
+    // Pull alpine into this test's own private store so we can patch its
+    // config.json without poisoning the shared image cache used by other tests.
+    let digest =
+        ensure_image(&tb.paths, DEFAULT_IMAGE).expect("pull alpine for symbolic-user test");
+
+    // Patch config.json: set ["config"]["User"] = "nobody".
+    // Alpine ships `nobody:x:65534:65534:…` in /etc/passwd; the flatten step
+    // captures that file, so the host-side resolver maps "nobody" → 65534.
+    let cfg_path = ImageStore::new(&tb.paths).config_path(&digest);
+    let raw = fs::read_to_string(&cfg_path).expect("config.json must be present after pull");
+    let mut cfg_value: serde_json::Value =
+        serde_json::from_str(&raw).expect("config.json must be valid JSON");
+    cfg_value["config"]["User"] = serde_json::Value::String("nobody".to_string());
+    let patched = serde_json::to_vec(&cfg_value).expect("re-serialise patched config");
+    ImageStore::new(&tb.paths)
+        .persist_config(&digest, &patched)
+        .expect("atomically write patched config.json");
+
+    // Create and start the sandbox with the patched image config.
+    sandbox::create(
+        &tb.paths,
+        "uns-sym",
+        &CreateOpts {
+            image_digest: digest,
+            image_ref: DEFAULT_IMAGE.to_string(),
+            cpus: 1,
+            mem_mb: 1024,
+            workspace: ws.clone(),
+            rw_size_gb: 2,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            builder: false,
+        },
+    )
+    .expect("create");
+    tb.names.push("uns-sym".to_string());
+    if let Err(e) = start_sandbox(&env, &tb, "uns-sym") {
+        panic!(
+            "boot failed: {e:#}\nconsole tail:\n{}",
+            boot_diag(&tb.paths, "uns-sym")
+        );
+    }
+
+    // Symbolic USER "nobody" must resolve to uid 65534 (alpine's nobody uid).
+    assert_userns_workspace_roundtrip(&tb.paths, "uns-sym", &ws, "65534");
+
+    stop_sandbox(&tb, "uns-sym");
+}
+
 #[test]
 fn rw_persistence_across_restart() {
     let Some(env) = want() else { return };
