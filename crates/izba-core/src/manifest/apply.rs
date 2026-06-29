@@ -182,6 +182,46 @@ mod tests {
         assert!(p.image_changed);
     }
 
+    /// An image change must also be recorded as a restart-class field, since the
+    /// VM must restart to boot the new base (exercises the `== Image` arm in the
+    /// restart_fields classification loop).
+    #[test]
+    fn plan_records_image_as_a_restart_field() {
+        let mut to = n(2);
+        to.image = ImageSource::Ref("ubuntu:22.04".into());
+        let p = plan(&n(2), &to);
+        assert!(
+            p.restart_fields.iter().any(|f| f == "image"),
+            "image change must appear in restart_fields; got {:?}",
+            p.restart_fields
+        );
+    }
+
+    /// A volume present in `current` but absent from `target` must be reported in
+    /// `volumes_removed` (exercises the `!target.volumes.contains` filter).
+    #[test]
+    fn plan_reports_removed_volume() {
+        let vol = VolumeSpec {
+            name: Some("d".into()),
+            guest_path: "/d".into(),
+            size_bytes: 1 << 30,
+            eph_id: None,
+        };
+        let mut from = n(2);
+        from.volumes = vec![vol.clone()];
+        let to = n(2); // no volumes
+        let p = plan(&from, &to);
+        assert_eq!(
+            p.volumes_removed,
+            vec![std::path::PathBuf::from("/d")],
+            "a volume dropped from target must be in volumes_removed"
+        );
+        assert!(
+            p.volumes_added.is_empty(),
+            "nothing should be added in a pure-removal plan"
+        );
+    }
+
     #[test]
     fn write_policy_writes_round_trippable_policy() {
         let dir = tempfile::tempdir().unwrap();

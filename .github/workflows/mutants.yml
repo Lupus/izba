@@ -66,11 +66,20 @@ jobs:
           path: gate-out/mutants.out
           if-no-files-found: error
 
+  # Windows builds each mutant ~4x slower than Linux, so a large PR's changed-line
+  # set can blow a single 60-min job. Shard it: cargo-mutants assigns mutant i to
+  # shard i%4 (after the stable --no-shuffle order), spreading the slow izba-core
+  # rebuilds round-robin across all four. The aggregator merges every shard with
+  # the caught-nowhere rule, so the partition is invisible to the verdict.
   gate-windows:
-    name: gate run (windows)
+    name: gate run (windows shard ${{ matrix.shard }}/4)
     if: github.event_name == 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]   # 0-INDEXED (see .cargo/mutants.toml notes)
     defaults:
       run:
         shell: bash
@@ -87,11 +96,11 @@ jobs:
           tool: cargo-mutants
       - name: Fetch base ref
         run: git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
-      - name: Run changed-line mutants (windows)
-        run: hack/mutants-gate-run.sh "origin/${{ github.base_ref }}" gate-out
+      - name: Run changed-line mutants (windows shard ${{ matrix.shard }}/4)
+        run: hack/mutants-gate-run.sh "origin/${{ github.base_ref }}" gate-out "${{ matrix.shard }}/4"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gate-windows
+          name: gate-windows-${{ matrix.shard }}
           path: gate-out/mutants.out
           if-no-files-found: error
 
@@ -116,16 +125,18 @@ jobs:
         with:
           name: gate-linux
           path: g-linux
+      # Windows is sharded (gate-windows-0..3); each artifact lands in its own
+      # g-windows/<artifact-name>/ subdir, and each is a mutants.out dir.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: gate-windows
+          pattern: gate-windows-*
           path: g-windows
       - name: Reconcile survivors across platforms (caught-nowhere)
         run: |
           echo "## Mutation gate (incremental, Linux + Windows)" >> "$GITHUB_STEP_SUMMARY"
           echo >> "$GITHUB_STEP_SUMMARY"
           set +e
-          python3 hack/mutants-report.py --mode gate g-linux g-windows >> "$GITHUB_STEP_SUMMARY"
+          python3 hack/mutants-report.py --mode gate g-linux g-windows/gate-windows-* >> "$GITHUB_STEP_SUMMARY"
           rc=$?
           set -e
           if [[ $rc -ne 0 ]]; then

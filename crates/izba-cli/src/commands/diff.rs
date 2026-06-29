@@ -8,6 +8,7 @@ use izba_core::manifest::diff::{FieldClass, FieldDelta};
 use izba_core::manifest::{store, DriftState};
 use izba_core::paths::Paths;
 
+#[mutants::skip] // reason: reads managed truth from disk + writes the review token for a managed sandbox; orchestration exercised by daemon_e2e (manifest_diff_promote_live_path). The pure pieces (ops::compute_diff, render_deltas) are unit-tested separately.
 pub fn run(paths: &Paths, dir: &Path, name_override: Option<&str>) -> Result<i32> {
     // Resolve the sandbox name. Name resolution is CLI-side: workspace_default_name
     // depends on name::sanitize which lives in the CLI crate and cannot move to

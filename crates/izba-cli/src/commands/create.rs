@@ -5,6 +5,7 @@ use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
 use std::path::Path;
 
+#[mutants::skip] // reason: connects to a live daemon (Create over the socket); e2e-only (daemon_e2e). The testable pieces (merge_manifest_into_opts, build_create_request) are unit-tested separately.
 pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32> {
     let workspace = super::ensure_workspace(dir)?;
     // Honor izba.yml: overlay manifest defaults, explicit CLI flags always win.

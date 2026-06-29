@@ -178,7 +178,8 @@ def main(argv=None):
     mutants = merge(dirs)
 
     if args.mode == "gate":
-        # Gate runs over a single dir; a tested-count header is noise here.
+        # Gate reconciles the Linux dir + the Windows shards (caught-nowhere); a
+        # tested-count header is noise here.
         sys.stdout.write(render_markdown(mutants))
         return 1 if mutants else 0
 
