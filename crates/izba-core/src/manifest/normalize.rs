@@ -211,6 +211,66 @@ spec:
     }
 
     #[test]
+    fn from_manifest_with_build_spec_yields_build_image_source() {
+        // A `build:`-only manifest must normalize to ImageSource::Build (exercises
+        // the (None, Some(build)) match arm in from_manifest).
+        let y = concat!(
+            "apiVersion: izba.dev/v1alpha1\n",
+            "kind: Sandbox\n",
+            "metadata: { name: built }\n",
+            "spec:\n",
+            "  build:\n",
+            "    context: '.'\n",
+            "    dockerfile: 'Dockerfile'\n",
+            "  resources: { cpus: 2, memory: 4Gi }\n",
+            "  rootDisk: { size: 8Gi }\n",
+        );
+        let n = Normalized::from_manifest(&Manifest::load_str(y).unwrap(), "fallback").unwrap();
+        match &n.image {
+            ImageSource::Build(b) => {
+                assert_eq!(b.context.as_deref(), Some("."));
+                assert_eq!(b.dockerfile.as_deref(), Some("Dockerfile"));
+            }
+            other => panic!("expected ImageSource::Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_manifest_rejects_both_image_and_build() {
+        // Setting BOTH image and build must error (the `_ => bail!` arm).
+        // `Manifest::load_str` rejects this earlier, so construct the spec
+        // directly to exercise from_manifest's own guard.
+        use crate::manifest::schema::{BuildSpec, Resources, RootDisk, SandboxSpec};
+        let m = Manifest {
+            api_version: schema::API_VERSION.to_string(),
+            kind: schema::KIND_SANDBOX.to_string(),
+            metadata: Metadata::default(),
+            spec: SandboxSpec {
+                image: Some("ubuntu:24.04".into()),
+                build: Some(BuildSpec {
+                    context: Some(".".into()),
+                    dockerfile: None,
+                    tag: None,
+                    allow: vec![],
+                    resources: None,
+                }),
+                resources: Resources {
+                    cpus: 1,
+                    memory: "1Gi".into(),
+                },
+                root_disk: RootDisk { size: "1Gi".into() },
+                volumes: vec![],
+                ports: vec![],
+                egress: None,
+            },
+        };
+        assert!(
+            Normalized::from_manifest(&m, "f").is_err(),
+            "manifest setting both image and build must be rejected"
+        );
+    }
+
+    #[test]
     fn from_manifest_uses_default_name_when_absent() {
         let y = SAMPLE.replace("metadata: { name: myapp }", "metadata: {}");
         let n = Normalized::from_manifest(&Manifest::load_str(&y).unwrap(), "fallback").unwrap();

@@ -11,14 +11,25 @@
 # Exit 0 on a successful run (with or without survivors) or no mutable changes;
 # exit 1 only on a genuine baseline/build failure.
 #
-# Usage: hack/mutants-gate-run.sh <base_ref> <out_dir>
+# An optional <shard> ("k/n") partitions the changed-line mutant set across n
+# parallel jobs (cargo-mutants assigns mutant i to shard i%n after the stable
+# --no-shuffle ordering, so contiguous slow crates spread round-robin across all
+# shards). The aggregator merges every shard's mutants.out with the caught-nowhere
+# rule, so the partition is transparent. Omit it to run the whole set in one job.
+#
+# Usage: hack/mutants-gate-run.sh <base_ref> <out_dir> [<shard k/n>]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck source=/dev/null
 [[ -f .cargo-env ]] && source .cargo-env
 
-BASE_REF="${1:?usage: mutants-gate-run.sh <base_ref> <out_dir>}"
-OUT_DIR="${2:?usage: mutants-gate-run.sh <base_ref> <out_dir>}"
+BASE_REF="${1:?usage: mutants-gate-run.sh <base_ref> <out_dir> [<shard k/n>]}"
+OUT_DIR="${2:?usage: mutants-gate-run.sh <base_ref> <out_dir> [<shard k/n>]}"
+SHARD="${3:-}"
+SHARD_ARGS=()
+if [[ -n "$SHARD" ]]; then
+  SHARD_ARGS=(--shard "$SHARD")
+fi
 mkdir -p "$OUT_DIR"
 
 # Always leave a mutants.out the aggregator can read, even when nothing ran.
@@ -45,7 +56,7 @@ if [[ ! -s "$OUT_DIR/pr.diff" ]]; then
 fi
 
 set +e
-cargo mutants --no-shuffle --in-diff "$OUT_DIR/pr.diff" -o "$OUT_DIR/run" 2> "$OUT_DIR/stderr"
+cargo mutants --no-shuffle "${SHARD_ARGS[@]}" --in-diff "$OUT_DIR/pr.diff" -o "$OUT_DIR/run" 2> "$OUT_DIR/stderr"
 CM_RC=$?
 set -e
 

@@ -221,6 +221,38 @@ mod tests {
         assert_eq!(d[0].class, FieldClass::Image);
     }
 
+    /// image_str must render the actual ref/build strings into `from`/`to`
+    /// (not an empty/constant string).
+    #[test]
+    fn image_delta_renders_actual_image_strings() {
+        let mut to = base();
+        to.image = ImageSource::Ref("ubuntu:22.04".into());
+        let d = diff(&base(), &to);
+        assert_eq!(d[0].from, "ubuntu:24.04", "from must be the base image ref");
+        assert_eq!(d[0].to, "ubuntu:22.04", "to must be the target image ref");
+    }
+
+    /// A Ref -> Build image change renders the build dockerfile in `to`.
+    #[test]
+    fn image_delta_renders_build_source() {
+        use crate::manifest::schema::BuildSpec;
+        let mut to = base();
+        to.image = ImageSource::Build(BuildSpec {
+            context: Some(".".into()),
+            dockerfile: Some("Dockerfile.prod".into()),
+            tag: None,
+            allow: vec![],
+            resources: None,
+        });
+        let d = diff(&base(), &to);
+        assert_eq!(d[0].from, "ubuntu:24.04");
+        assert!(
+            d[0].to.contains("Dockerfile.prod"),
+            "build image must render its dockerfile name; got {:?}",
+            d[0].to
+        );
+    }
+
     #[test]
     fn port_change_is_live_class() {
         let mut to = base();
@@ -325,6 +357,52 @@ mod tests {
         assert!(
             d[0].weakens_egress,
             "verb widening on a duplicate-host entry must flag weakens_egress"
+        );
+    }
+
+    /// Adding a NEW git rule that did not exist before LOOSENS the firewall
+    /// (exercises the `None => return true` arm of the git loop).
+    #[test]
+    fn adding_a_git_rule_weakens_egress() {
+        use crate::daemon::egress::config::{GitRule, GitTarget};
+        let from = base();
+        let mut to = base();
+        to.egress.git = vec![GitRule {
+            target: GitTarget::Host("github.com".into()),
+            access: Access::Read,
+        }];
+        let d = diff(&from, &to);
+        assert_eq!(d[0].field, "egress");
+        assert!(
+            d[0].weakens_egress,
+            "adding a git rule that did not exist must flag weakening"
+        );
+    }
+
+    /// Widening a git rule's access read -> read-write LOOSENS; the reverse, or
+    /// an identical rule, does NOT (exercises the git match guard).
+    #[test]
+    fn git_rule_verb_widening_weakens_but_tightening_and_identity_do_not() {
+        use crate::daemon::egress::config::{GitRule, GitTarget};
+        let mut from = base();
+        from.egress.git = vec![GitRule {
+            target: GitTarget::Repo("github.com/o/a".into()),
+            access: Access::Read,
+        }];
+        let mut to = from.clone();
+        to.egress.git[0].access = Access::ReadWrite;
+        assert!(
+            diff(&from, &to)[0].weakens_egress,
+            "git read -> read-write must flag weakening"
+        );
+        assert!(
+            !diff(&to, &from)[0].weakens_egress,
+            "git read-write -> read must NOT flag weakening"
+        );
+        // Identical git rule on both sides: no egress delta at all.
+        assert!(
+            diff(&from, &from.clone()).is_empty(),
+            "identical egress must produce no delta"
         );
     }
 

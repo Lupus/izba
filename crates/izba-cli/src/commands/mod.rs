@@ -434,6 +434,71 @@ mod tests {
         );
     }
 
+    /// memory + rootDisk are adopted from the manifest when opts are at their
+    /// clap defaults (pins the `mem == DEFAULT` / `rw == DEFAULT && n.rw != 0`
+    /// adoption guards).
+    #[test]
+    fn merge_manifest_adopts_mem_and_rw_when_at_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_dir = tmp.path().join("proj");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(
+            ws_dir.join("izba.yml"),
+            concat!(
+                "apiVersion: izba.dev/v1alpha1\n",
+                "kind: Sandbox\n",
+                "metadata: { name: proj }\n",
+                "spec:\n",
+                "  image: ubuntu:24.04\n",
+                "  resources: { cpus: 1, memory: 2Gi }\n",
+                "  rootDisk: { size: 16Gi }\n",
+            ),
+        )
+        .unwrap();
+        // opts() carries the clap defaults: mem == DEFAULT_MEM_MB, rw == DEFAULT_RW_GB.
+        let mut o = opts();
+        merge_manifest_into_opts(&mut o, &ws_dir).unwrap();
+        assert_eq!(
+            o.mem, 2048,
+            "manifest memory (2Gi) adopted when opts at default"
+        );
+        assert_eq!(
+            o.rw_size_gb, 16,
+            "manifest rootDisk (16Gi) adopted when opts at default"
+        );
+    }
+
+    /// Explicit --mem / --rw-size-gb (non-default) must NOT be overridden by the
+    /// manifest (pins the `&&` and `==` halves of the adoption guards).
+    #[test]
+    fn merge_manifest_does_not_override_explicit_mem_and_rw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_dir = tmp.path().join("proj");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(
+            ws_dir.join("izba.yml"),
+            concat!(
+                "apiVersion: izba.dev/v1alpha1\n",
+                "kind: Sandbox\n",
+                "metadata: { name: proj }\n",
+                "spec:\n",
+                "  image: ubuntu:24.04\n",
+                "  resources: { cpus: 1, memory: 2Gi }\n",
+                "  rootDisk: { size: 16Gi }\n",
+            ),
+        )
+        .unwrap();
+        let mut o = opts();
+        o.mem = 9000; // explicit, != DEFAULT_MEM_MB
+        o.rw_size_gb = 20; // explicit, != DEFAULT_RW_GB
+        merge_manifest_into_opts(&mut o, &ws_dir).unwrap();
+        assert_eq!(o.mem, 9000, "explicit --mem must win over manifest");
+        assert_eq!(
+            o.rw_size_gb, 20,
+            "explicit --rw-size-gb must win over manifest"
+        );
+    }
+
     /// Fix 4: an explicit --volume flag must NOT be overridden by the manifest.
     #[test]
     fn merge_manifest_does_not_override_explicit_volumes() {

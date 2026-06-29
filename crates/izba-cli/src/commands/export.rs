@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 use izba_core::paths::Paths;
 
+#[mutants::skip] // reason: reads managed truth from disk + writes izba.yml for a managed sandbox; orchestration exercised by daemon_e2e. The pure logic (ops::export, managed_normalized, to_manifest) is unit-tested separately.
 pub fn run(paths: &Paths, dir: &Path, name_override: Option<&str>) -> Result<i32> {
     let default_name = super::workspace_default_name(dir)?;
     // Prefer an explicit name; else the existing manifest's name; else the dir.

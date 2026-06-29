@@ -39,6 +39,7 @@ pub(crate) fn gate(review: Option<&str>, current_token: &str, force: bool) -> Ga
     }
 }
 
+#[mutants::skip] // reason: drives a live daemon (ReloadPolicy/Port*/Volume*/Stop/Start/Inspect over the socket) + image build/pull; e2e-only (daemon_e2e manifest_diff_promote_live_path). The decision logic it composes (gate, apply::plan, diff_normalized, build_opts_from) is unit-tested separately.
 pub fn run(
     paths: &Paths,
     dir: &Path,
@@ -285,6 +286,7 @@ fn build_opts_from(
     })
 }
 
+#[mutants::skip] // reason: thin wrapper over a live daemon RPC (DaemonClient::request); e2e-only.
 fn send_ok(client: &mut DaemonClient, req: &DaemonRequest) -> Result<()> {
     match client.request(req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Ok => Ok(()),
