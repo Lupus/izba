@@ -242,9 +242,24 @@ can actually reach, not on journeys blocked by a known gap.
   justification (see `CONTRIBUTING.md`). Keep the *testable* decision logic
   (pure helpers) covered and mutation-gated.
 
-## Extending to the UI
+## The GUI modality (Tauri app)
 
-The same shape applies to the Tauri app: the swarm drives the UI (e.g. via the
-Playwright MCP), the oracle is the same reconcile snapshot plus DOM/console
-assertions, and a cross-platform differential oracle (Linux vs Windows) catches
-platform-specific breakage. Increment after the CLI/daemon loop is stable.
+The same shape covers the desktop app — only Phase-2's act/observe layer swaps
+(see `docs/superpowers/specs/2026-06-30-gui-dogfooding-design.md`).
+
+- **Driver:** the cheap Actor drives the real React frontend in headless
+  Chromium via `agent-browser` (Apache-2.0, pinned `v0.31.1`) called as a
+  `--json` subprocess — observations are its accessibility set-of-marks
+  (`[@e2] button "Create"`), actions are `{click|fill|press|select|read}`.
+- **Real backend:** an in-page `real-bridge.js` forwards `invoke()` over a
+  WebSocket to a headless `izba-app` sidecar (`bin/headless`, `app_lib::dispatch`)
+  that reuses the app's real command/view/daemon layer against real microVMs.
+- **Oracles:** daemon state-evidence + reconcile (reused), plus GUI oracles —
+  `ui_daemon_diff` (UI disagrees with daemon truth), `console`, `silent_failure`,
+  `dom_expect`. The UI-vs-daemon differential is the headline: it catches a UI
+  that lies about state.
+- **Run it:** `run_gui_journeys.py` selects `modality:"gui"` journeys; the
+  `dogfood-gui` job in `dogfood.yml` fans it across KVM shards. Manual smoke:
+  `hack/dogfood/gui/smoke.sh`.
+- A cross-engine smoke (real WebKitGTK window via tauri-driver) is the deferred
+  fidelity bump for the macro-glue/render gap.
