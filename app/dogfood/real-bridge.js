@@ -41,6 +41,7 @@
   if (typeof module !== "undefined" && module) {
     module.exports = { __dfHandleMessage: __dfHandleMessage };
     if (typeof window === "undefined") return; // unit-test load: stop here
+    if (typeof WebSocket === "undefined") return; // no real WS — skip browser install
   }
 
   // ---- browser install ----
@@ -102,7 +103,8 @@
     win.__TAURI_EVENT_PLUGIN_INTERNALS__ || {});
   eventInternals.unregisterListener = function (event, id) {
     var set = state.listeners.get(event);
-    if (set) set.delete(id);
+    if (set) set.forEach(function (h) { if (h.__id === id) set.delete(h); });
+    Reflect.deleteProperty(win, "_" + id);
   };
 
   internals.invoke = function (cmd, args) {
