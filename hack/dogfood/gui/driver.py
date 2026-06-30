@@ -34,6 +34,10 @@ class ActResult:
 # `- button "Create sandbox" [ref=e2]` (aria-snapshot text form). The name is
 # the first quoted run; trailing `[level=1]` etc. are ignored.
 _ARIA_RE = re.compile(r'^\s*-\s+(?P<role>[a-zA-Z]+)\s+"(?P<name>(?:[^"\\]|\\.)*)"\s+\[ref=(?P<ref>e\d+)\]')
+# `[@e2] button "Create sandbox"` — render_marks output format; parse_snapshot
+# must handle its own output so FakeDriver snapshots and test assertions are
+# consistent (round-trip: render_marks(parse_snapshot(render_marks(marks)))==...).
+_RENDER_RE = re.compile(r'^\[(?P<ref>@e\d+)\]\s+(?P<role>[a-zA-Z]+)\s+"(?P<name>(?:[^"\\]|\\.)*)"')
 
 
 def _norm_ref(ref: str) -> str:
@@ -77,6 +81,12 @@ def parse_snapshot(raw: str) -> List[Mark]:
         m = _ARIA_RE.match(line)
         if m:
             marks.append(Mark(ref=_norm_ref(m.group("ref")), role=m.group("role"),
+                              name=m.group("name")))
+            continue
+        m = _RENDER_RE.match(line)
+        if m:
+            # ref already carries '@' in the render_marks format
+            marks.append(Mark(ref=m.group("ref"), role=m.group("role"),
                               name=m.group("name")))
     return marks
 
