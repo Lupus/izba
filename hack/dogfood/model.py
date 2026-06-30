@@ -22,7 +22,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -151,7 +151,9 @@ class OpenRouterModel:
     def __init__(self, api_key: str, model_id: str,
                  url: str = OPENROUTER_URL, timeout_s: float = 60.0,
                  cli_help: str = "", readme: str = "", context_pack: str = "",
-                 max_retries: int = 2, retry_backoff_s: float = 2.0):
+                 max_retries: int = 2, retry_backoff_s: float = 2.0,
+                 system_override: Optional[str] = None,
+                 user_message_fn=None, reply_parser=None):
         self.api_key = api_key
         self.model_id = model_id
         self.url = url
@@ -161,9 +163,12 @@ class OpenRouterModel:
         self.context_pack = context_pack
         self._max_retries = max_retries
         self._retry_backoff_s = retry_backoff_s
-        # Compute the system prompt once: it is identical across every turn, so
-        # there is no reason to re-concatenate the README on each API call.
-        self._system = _system_content(cli_help, readme, context_pack)
+        # CLI default: assemble from --help/README/context. GUI passes a
+        # precomputed system_override + its own message/parse fns.
+        self._system = system_override if system_override is not None \
+            else _system_content(cli_help, readme, context_pack)
+        self._user_message_fn = user_message_fn or _build_user_message
+        self._reply_parser = reply_parser or _parse_reply
         self.last_cost_usd = 0.0
 
     def next_command(self, journey, step, observations) -> Dict[str, Any]:
@@ -173,7 +178,7 @@ class OpenRouterModel:
             "messages": [
                 {"role": "system", "content": self._system},
                 {"role": "user",
-                 "content": _build_user_message(journey, step, observations)},
+                 "content": self._user_message_fn(journey, step, observations)},
             ],
             "temperature": 0,
         }
@@ -209,7 +214,7 @@ class OpenRouterModel:
             content = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
             return {"done": True}
-        return _parse_reply(content or "")
+        return self._reply_parser(content or "")
 
     @staticmethod
     def _estimate_cost(body: Dict[str, Any]) -> float:
