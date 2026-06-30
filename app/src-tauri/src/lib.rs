@@ -428,6 +428,81 @@ async fn shell_close(state: State<'_, AppState>, id: String) -> Result<(), Strin
     Ok(())
 }
 
+/// Headless invoke dispatcher: the same command→core-fn mapping the
+/// `#[tauri::command]` shims use, but transport-agnostic. Used by the dogfood
+/// bridge sidecar (`bin/headless`) to drive the real command/view/daemon layer
+/// from a browser without the Tauri runtime. `emit` carries Tauri events
+/// (e.g. `create-progress`) back to the caller.
+///
+/// Shell commands are intentionally unsupported here (deferred — see the GUI
+/// dogfooding spec §10); they return an explicit error rather than a stub.
+pub fn dispatch(
+    state: &AppState,
+    cmd: &str,
+    args: serde_json::Value,
+    emit: &mut dyn FnMut(&str, serde_json::Value),
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+
+    fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("missing string arg '{key}'"))
+    }
+    fn to_json<T: serde::Serialize>(v: T) -> Result<serde_json::Value, String> {
+        serde_json::to_value(v).map_err(|e| format!("serialize error: {e}"))
+    }
+
+    let mut d = state
+        .daemon
+        .lock()
+        .map_err(|e| format!("state poisoned: {e}"))?;
+    let d = d.as_mut();
+    match cmd {
+        "list" => to_json(commands::list_core(d)?),
+        "daemon_status" => to_json(commands::status_core(d)?),
+        "version_info" => to_json(commands::version_core(d)?),
+        "read_logs" => to_json(commands::read_logs_core(d, &arg_str(&args, "name")?)?),
+        "start" => to_json(commands::start_core(d, &arg_str(&args, "name")?)?),
+        "stop" => to_json(commands::stop_core(d, &arg_str(&args, "name")?)?),
+        "restart" => to_json(commands::restart_core(d, &arg_str(&args, "name")?)?),
+        "remove" => {
+            let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+            to_json(commands::remove_core(d, &arg_str(&args, "name")?, force)?)
+        }
+        "inspect" => to_json(commands::inspect_core(d, &arg_str(&args, "name")?)?),
+        "policy_show" => to_json(commands::policy_show_core(d, &arg_str(&args, "name")?)?),
+        "policy_set_enforce" => {
+            let on = args.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            to_json(commands::policy_set_enforce_core(
+                d,
+                &arg_str(&args, "name")?,
+                on,
+            )?)
+        }
+        "create" => {
+            let opts: views::CreateOpts = serde_json::from_value(
+                args.get("opts").cloned().unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|e| format!("bad create opts: {e}"))?;
+            let name = commands::create_core(d, opts, &mut |m| {
+                emit("create-progress", json!(m));
+            })?;
+            to_json(name)
+        }
+        "shell_open" | "shell_write" | "shell_resize" | "shell_close" => {
+            Err("shell not supported in dogfood headless (deferred)".to_string())
+        }
+        other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// Constructor the dogfood bridge bin uses to build a real daemon connection.
+pub fn new_real_daemon() -> Box<dyn DaemonApi> {
+    Box::new(RealDaemon::new())
+}
+
 pub fn run() {
     let state = AppState {
         daemon: Mutex::new(Box::new(RealDaemon::new())),
@@ -476,4 +551,47 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running izba app");
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use crate::fake::FakeDaemon;
+    use std::sync::{Arc, Mutex};
+
+    fn state_with(d: FakeDaemon) -> AppState {
+        AppState {
+            daemon: Mutex::new(Box::new(d)),
+            make_daemon: Arc::new(|| Box::new(FakeDaemon::default())),
+            shells: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn dispatch_list_returns_sandbox_json() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(&st, "list", serde_json::json!({}), &mut emit).unwrap();
+        assert!(out.is_array());
+    }
+
+    #[test]
+    fn dispatch_unknown_cmd_errors() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        assert!(dispatch(&st, "no_such_cmd", serde_json::json!({}), &mut emit).is_err());
+    }
+
+    #[test]
+    fn dispatch_shell_open_is_deferred_error() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let e = dispatch(
+            &st,
+            "shell_open",
+            serde_json::json!({"name": "a", "id": "s1"}),
+            &mut emit,
+        );
+        assert!(e.is_err());
+    }
 }
