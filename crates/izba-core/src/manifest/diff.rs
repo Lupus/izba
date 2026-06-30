@@ -406,6 +406,33 @@ mod tests {
         );
     }
 
+    /// An unchanged Read git rule must not be flagged as weakening even when
+    /// some OTHER egress field changes in a tightening direction. This isolates
+    /// the `&&` in the git guard: `from==Read` is true but `to==ReadWrite` is
+    /// false, so a `||` would wrongly fire on the unchanged rule.
+    #[test]
+    fn unchanged_read_git_rule_with_other_tightening_does_not_weaken() {
+        use crate::daemon::egress::config::{GitRule, GitTarget};
+        let mut from = base();
+        from.egress.allow = vec![AllowEntry::Host("removed.example".into())];
+        from.egress.git = vec![GitRule {
+            target: GitTarget::Repo("github.com/o/a".into()),
+            access: Access::Read,
+        }];
+        let mut to = base();
+        to.egress.allow = vec![]; // host removed -> tightening
+        to.egress.git = vec![GitRule {
+            target: GitTarget::Repo("github.com/o/a".into()),
+            access: Access::Read, // unchanged
+        }];
+        let d = diff(&from, &to);
+        assert_eq!(d[0].field, "egress");
+        assert!(
+            !d[0].weakens_egress,
+            "removing a host with an unchanged Read git rule is a pure tightening"
+        );
+    }
+
     /// Fix 1 (negative): a pure tightening on duplicate-host entries must NOT
     /// flag weakening.
     #[test]
