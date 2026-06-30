@@ -41,4 +41,24 @@ describe("real-bridge protocol", () => {
     handle(state, JSON.stringify({ type: "event", event: "create-progress", payload: "pulling" }));
     expect(got).toEqual({ event: "create-progress", payload: "pulling" });
   });
+
+  it("rejects a pending invoke on an error reply and logs it", async () => {
+    const handle = loadHelper();
+    let rejectFn!: (e: Error) => void;
+    const rejectionPromise = new Promise<void>((_resolve, reject) => {
+      rejectFn = reject;
+    });
+    const state = {
+      pending: new Map([[2, { resolve: () => {}, reject: rejectFn }]]),
+      listeners: new Map(),
+      invokeLog: [] as any[],
+      lastCmd: new Map([[2, "sandbox-create"]]),
+    };
+    handle(state, JSON.stringify({ id: 2, ok: false, error: "boom" }));
+    // synchronous checks: state cleaned up, log written
+    expect(state.invokeLog).toEqual([{ cmd: "sandbox-create", ok: false, error: "boom" }]);
+    expect(state.pending.size).toBe(0);
+    // the promise stored in pending should have been rejected
+    await expect(rejectionPromise).rejects.toThrow("boom");
+  });
 });
