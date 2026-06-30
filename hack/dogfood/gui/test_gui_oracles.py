@@ -43,3 +43,11 @@ def test_ui_daemon_diff_flags_sandbox_missing_from_ui():
 def test_ui_daemon_diff_quiet_when_ui_shows_sandbox():
     ev = {"sandboxes": ["web"]}
     assert ui_daemon_diff_oracle('[@e1] row "web running"', ev, REF) == []
+
+
+def test_ui_daemon_diff_word_boundary_run_not_suppressed_by_running():
+    """Sandbox named 'run' must still be flagged when the UI only shows 'running'
+    (substring match would silently pass it; word-boundary must reject it)."""
+    ev = {"sandboxes": ["run"]}
+    cs = ui_daemon_diff_oracle('[@e1] status "running"', ev, REF)
+    assert len(cs) == 1 and cs[0].kind == "ui_daemon_diff"

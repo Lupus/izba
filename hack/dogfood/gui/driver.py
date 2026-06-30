@@ -12,7 +12,7 @@ import json
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 
@@ -130,6 +130,7 @@ class FakeDriver:
         self._errors = list(errors or [])
         self._invoke_log = list(invoke_log or [])
         self.actions: List[List[str]] = []
+        self.shots: List[str] = []
         self.opened: Optional[str] = None
         self.closed = False
 
@@ -151,7 +152,7 @@ class FakeDriver:
         return list(self._invoke_log)
 
     def screenshot(self, path: str) -> None:
-        pass
+        self.shots.append(path)
 
     def close(self) -> None:
         self.closed = True
