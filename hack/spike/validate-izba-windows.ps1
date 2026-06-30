@@ -45,6 +45,45 @@ function Dump-BootLogs($name) {
     }
 }
 
+# Boot a sandbox with up to $Attempts retries, HONESTLY distinguishing the two
+# failure modes so a deterministic product bug is never mislabeled an infra
+# flake in the CI log:
+#   * zero-byte console.log  -> genuine nested-WHP boot stall (the documented
+#     hosted-Windows nested-virt flake: the VM emits no serial output and never
+#     reaches health; a from-scratch re-run reliably absorbs it).
+#   * non-empty console.log  -> the guest BOOTED and a real product error
+#     followed (e.g. `*** CONTAINER START FAILED *** crun ...`). Retrying cannot
+#     fix a deterministic bug, but we still retry for safety and dump the guest
+#     error so the reader sees it is NOT an infra flake.
+# `-Restart` reboots an EXISTING sandbox (stop-only between attempts, never rm)
+# so a provisioned config survives — e.g. the post-lockdown account binding.
+# Returns $true if any attempt booted. Mirrors `Check`'s diagnostics; never
+# decides pass/fail itself.
+function Invoke-BootWithRetry {
+    param(
+        [string]   $Name,
+        [string[]] $RunArgs,
+        [int]      $Attempts = 3,
+        [switch]   $Restart
+    )
+    $console = "$env:LOCALAPPDATA\izba\sandboxes\$Name\logs\console.log"
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        & $exe stop $Name 2>$null | Out-Null
+        if (-not $Restart) { & $exe rm --force $Name 2>$null | Out-Null }
+        & $exe run --name $Name @RunArgs | Out-Null
+        if ($LASTEXITCODE -eq 0) { return $true }
+        $ci = Get-Item $console -ErrorAction SilentlyContinue
+        if ($null -eq $ci -or $ci.Length -eq 0) {
+            [Console]::Error.WriteLine("  $Name boot attempt $attempt/$Attempts -- zero guest console output (genuine nested-WHP boot stall); retrying from scratch")
+        } else {
+            [Console]::Error.WriteLine("  $Name boot attempt $attempt/$Attempts FAILED with a NON-empty console.log -- this is a PRODUCT error, NOT a nested-WHP infra flake (retrying for determinism):")
+            Get-Content $console -Tail 12 -ErrorAction SilentlyContinue |
+                ForEach-Object { [Console]::Error.WriteLine("    $_") }
+        }
+    }
+    return $false
+}
+
 # Fresh workspace + no leftover sandbox from a previous run
 & $exe stop valid8 2>$null | Out-Null
 & $exe rm --force valid8 2>$null | Out-Null
@@ -95,15 +134,9 @@ $egFailsBefore = $fails
 # from-scratch retry (the programmatic equivalent of that re-run) absorbs the
 # flake without masking a real regression — a genuine boot break fails all
 # attempts. KVM never exhibits this; it is specific to nested virt on hosted
-# Windows runners. See e2e.yml / izba CI flake notes.
-$bootOk = $false
-foreach ($attempt in 1..3) {
-    & $exe stop egress-a 2>$null | Out-Null
-    & $exe rm --force egress-a 2>$null | Out-Null
-    & $exe run --image $image --name egress-a $ws -- /bin/true | Out-Null
-    if ($LASTEXITCODE -eq 0) { $bootOk = $true; break }
-    [Console]::Error.WriteLine("  egress-a boot attempt $attempt/3 timed out (nested-WHP flake); retrying from scratch")
-}
+# Windows runners. See e2e.yml / izba CI flake notes. Invoke-BootWithRetry
+# reports zero-console stalls vs product errors honestly (no blanket "flake").
+$bootOk = Invoke-BootWithRetry 'egress-a' @('--image', $image, $ws, '--', '/bin/true')
 Check 'izbad-egress sandbox boots (run exits 0)' $bootOk
 if (-not $bootOk) { Dump-BootLogs 'egress-a' }
 $egOut = (& $exe exec egress-a -- /bin/sh -lc 'getent hosts example.com' 2>&1 | Out-String)
@@ -269,9 +302,12 @@ if (-not $env:IZBA_CONFINE_PROBE) {
 
 # (10b) Live product status: a real confined VMM must be honestly reported. The
 # earlier checks rm'd valid8, so boot a fresh one and assert `izba status` shows
-# a `confinement:` line that says `confined` and NOT `UNCONFINED`.
-& $exe run --image $image --name valid8 $ws -- /bin/true | Out-Null
-Check 'confinement status sandbox boots (run exits 0)' ($LASTEXITCODE -eq 0)
+# a `confinement:` line that says `confined` and NOT `UNCONFINED`. Retry-guarded
+# against the nested-WHP boot stall like egress-a (this is another from-scratch
+# microVM boot on the same hosted-Windows runner).
+$confBootOk = Invoke-BootWithRetry 'valid8' @('--image', $image, $ws, '--', '/bin/true')
+Check 'confinement status sandbox boots (run exits 0)' $confBootOk
+if (-not $confBootOk) { Dump-BootLogs 'valid8' }
 $stConf = & $exe status valid8 | Out-String
 $confOk = ($stConf -match 'confinement:' -and $stConf -match 'confined' -and -not ($stConf -match 'UNCONFINED'))
 Check 'izba status reports the VMM as confined' $confOk
@@ -309,8 +345,8 @@ powershell.exe -NoProfile -NonInteractive -Command `
     "Get-NetFirewallRule -DisplayName '$lkRule' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue; Get-NetFirewallRule -DisplayName '$lkRule-in' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue" 2>$null | Out-Null
 
 # Step 1: create the sandbox so lockdown has a config.json to find.
-& $exe run --image $image --name $lkName $lkWs -- /bin/true | Out-Null
-$lkBootOk = ($LASTEXITCODE -eq 0)
+# Retry-guarded against the nested-WHP boot stall (fresh from-scratch boot).
+$lkBootOk = Invoke-BootWithRetry $lkName @('--image', $image, $lkWs, '--', '/bin/true')
 Check 'lock-down: initial sandbox boot (run exits 0)' $lkBootOk
 if (-not $lkBootOk) { Dump-BootLogs $lkName }
 & $exe stop $lkName 2>$null | Out-Null
@@ -346,13 +382,9 @@ if ($null -eq $lkDone) {
 Remove-Job $lkJob -ErrorAction SilentlyContinue
 
 # Step 3: restart the sandbox so the VMM relaunches as the per-sandbox account.
-$lkStartOk = $false
-foreach ($attempt in 1..3) {
-    & $exe run --name $lkName $lkWs -- /bin/true | Out-Null
-    if ($LASTEXITCODE -eq 0) { $lkStartOk = $true; break }
-    [Console]::Error.WriteLine("  lk-validate restart attempt $attempt/3 timed out (nested-WHP flake); retrying")
-    & $exe stop $lkName 2>$null | Out-Null
-}
+# -Restart: stop-only between attempts (never rm) so the lockdown-provisioned
+# account binding / config survives the retry.
+$lkStartOk = Invoke-BootWithRetry $lkName @($lkWs, '--', '/bin/true') -Restart
 Check 'lock-down: sandbox boots after lockdown (run exits 0)' $lkStartOk
 if (-not $lkStartOk) { Dump-BootLogs $lkName }
 
@@ -477,14 +509,7 @@ $sshWs   = "$env:TEMP\izba-ssh-validate-ws"
 if (Test-Path $sshWs) { Remove-Item -Recurse -Force $sshWs }
 New-Item -ItemType Directory -Path $sshWs | Out-Null
 
-$sshBootOk = $false
-foreach ($attempt in 1..3) {
-    & $exe run --image $image --name $sshName $sshWs -- /bin/true | Out-Null
-    if ($LASTEXITCODE -eq 0) { $sshBootOk = $true; break }
-    [Console]::Error.WriteLine("  ssh-validate boot attempt $attempt/3 timed out (nested-WHP flake); retrying from scratch")
-    & $exe stop $sshName 2>$null | Out-Null
-    & $exe rm --force $sshName 2>$null | Out-Null
-}
+$sshBootOk = Invoke-BootWithRetry $sshName @('--image', $image, $sshWs, '--', '/bin/true')
 Check 'ssh: sandbox boots (run exits 0)' $sshBootOk
 if (-not $sshBootOk) { Dump-BootLogs $sshName }
 
@@ -522,14 +547,7 @@ $unsWs    = "$env:TEMP\izba-userns-validate-ws"
 if (Test-Path $unsWs) { Remove-Item -Recurse -Force $unsWs -ErrorAction SilentlyContinue }
 New-Item -ItemType Directory -Path $unsWs | Out-Null
 
-$unsBootOk = $false
-foreach ($attempt in 1..3) {
-    & $exe run --image $unsImage --name $unsName $unsWs -- /bin/true | Out-Null
-    if ($LASTEXITCODE -eq 0) { $unsBootOk = $true; break }
-    [Console]::Error.WriteLine("  userns-validate boot attempt $attempt/3 timed out (nested-WHP flake); retrying from scratch")
-    & $exe stop $unsName 2>$null | Out-Null
-    & $exe rm --force $unsName 2>$null | Out-Null
-}
+$unsBootOk = Invoke-BootWithRetry $unsName @('--image', $unsImage, $unsWs, '--', '/bin/true')
 Check 'userns: numeric-USER image boots (run exits 0)' $unsBootOk
 if (-not $unsBootOk) { Dump-BootLogs $unsName }
 
