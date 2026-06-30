@@ -78,7 +78,7 @@ def ui_daemon_diff_oracle(marks_text: str, state_evidence: Dict[str, Any],
     hay = (marks_text or "").lower()
     out: List[Candidate] = []
     for name in (state_evidence or {}).get("sandboxes", []) or []:
-        if str(name).lower() not in hay:
+        if not re.search(r'\b' + re.escape(str(name).lower()) + r'\b', hay):
             out.append(Candidate(
                 kind="ui_daemon_diff",
                 detail=f"daemon reports sandbox {name!r} but it is absent from the UI",

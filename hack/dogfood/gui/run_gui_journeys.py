@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model import FakeModel  # noqa: E402
 from oracles import (  # noqa: E402
-    capture_state_evidence, latency_oracle, reconcile_seq_oracle,
+    Action as _A, capture_state_evidence, latency_oracle, reconcile_seq_oracle,
 )
 from run_journeys import select_shard, _journey_data_dir, BudgetExceeded  # noqa: E402
 from gui.driver import (  # noqa: E402
@@ -148,7 +148,6 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                                             marks_text, reconcile, console_errors))
                 obs.append({"action": command, "marks": marks_text})
                 # Per-action oracles.
-                from oracles import Action as _A
                 act_obj = _A(intent=step.get("intent", ""), command=command,
                              exit_code=int(res.exit_code), stdout_tail=marks_text,
                              stderr_tail="", latency_ms=int(res.latency_ms),
@@ -185,8 +184,9 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
         shot = os.path.join(artifact_dir, f"{journey_id}.png")
         try:
             driver.screenshot(shot)
-            for c in end_found:
-                c.trajectory_ref = dict(final_ref)
+            if actions:
+                actions[-1]["screenshot_ref"] = os.path.join(
+                    os.path.basename(artifact_dir), f"{journey_id}.png")
         except Exception:
             shot = ""
     for c in end_found:
