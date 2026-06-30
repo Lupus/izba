@@ -47,18 +47,22 @@ function Dump-BootLogs($name) {
 
 # Boot a sandbox with up to $Attempts retries, HONESTLY distinguishing the two
 # failure modes so a deterministic product bug is never mislabeled an infra
-# flake in the CI log:
-#   * zero-byte console.log  -> genuine nested-WHP boot stall (the documented
-#     hosted-Windows nested-virt flake: the VM emits no serial output and never
-#     reaches health; a from-scratch re-run reliably absorbs it).
-#   * non-empty console.log  -> the guest BOOTED and a real product error
+# flake in the CI log. Classification is on the GROWTH of console.log across the
+# attempt (NOT its absolute size), so it is immune to stale serial output left
+# by a prior boot — in `-Restart` mode the sandbox dir is not removed between
+# attempts, and OpenVMM's `--com1 file=` is not guaranteed to truncate:
+#   * no new serial output  -> genuine nested-WHP boot stall (the documented
+#     hosted-Windows nested-virt flake: the VM emits nothing and never reaches
+#     health — often the WHP partition never starts; a re-run absorbs it).
+#   * new serial output      -> the guest BOOTED and a real product error
 #     followed (e.g. `*** CONTAINER START FAILED *** crun ...`). Retrying cannot
 #     fix a deterministic bug, but we still retry for safety and dump the guest
 #     error so the reader sees it is NOT an infra flake.
 # `-Restart` reboots an EXISTING sandbox (stop-only between attempts, never rm)
 # so a provisioned config survives — e.g. the post-lockdown account binding.
-# Returns $true if any attempt booted. Mirrors `Check`'s diagnostics; never
-# decides pass/fail itself.
+# The per-attempt message names the final attempt explicitly (no misleading
+# "retrying" on the last line). Returns $true if any attempt booted. Mirrors
+# `Check`'s diagnostics; never decides pass/fail itself.
 function Invoke-BootWithRetry {
     param(
         [string]   $Name,
@@ -70,13 +74,21 @@ function Invoke-BootWithRetry {
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         & $exe stop $Name 2>$null | Out-Null
         if (-not $Restart) { & $exe rm --force $Name 2>$null | Out-Null }
+        # Pre-attempt console size: a genuine stall produces NO NEW serial bytes,
+        # so we classify on growth rather than emptiness (stale-content immune).
+        $preItem = Get-Item $console -ErrorAction SilentlyContinue
+        $preLen  = if ($null -eq $preItem) { 0 } else { $preItem.Length }
         & $exe run --name $Name @RunArgs | Out-Null
         if ($LASTEXITCODE -eq 0) { return $true }
-        $ci = Get-Item $console -ErrorAction SilentlyContinue
-        if ($null -eq $ci -or $ci.Length -eq 0) {
-            [Console]::Error.WriteLine("  $Name boot attempt $attempt/$Attempts -- zero guest console output (genuine nested-WHP boot stall); retrying from scratch")
+        $postItem = Get-Item $console -ErrorAction SilentlyContinue
+        $postLen  = if ($null -eq $postItem) { 0 } else { $postItem.Length }
+        $retry = ($attempt -lt $Attempts)
+        if ($postLen -le $preLen) {
+            $tail = if ($retry) { '; retrying' } else { '; no attempts left' }
+            [Console]::Error.WriteLine("  $Name boot attempt $attempt/$Attempts -- no new guest console output (genuine nested-WHP boot stall)$tail")
         } else {
-            [Console]::Error.WriteLine("  $Name boot attempt $attempt/$Attempts FAILED with a NON-empty console.log -- this is a PRODUCT error, NOT a nested-WHP infra flake (retrying for determinism):")
+            $tail = if ($retry) { '; retrying for determinism:' } else { '; no attempts left:' }
+            [Console]::Error.WriteLine("  $Name boot attempt $attempt/$Attempts FAILED with new console.log output -- this is a PRODUCT error, NOT a nested-WHP infra flake$tail")
             Get-Content $console -Tail 12 -ErrorAction SilentlyContinue |
                 ForEach-Object { [Console]::Error.WriteLine("    $_") }
         }
