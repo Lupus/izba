@@ -34,11 +34,20 @@ jobs:
         run: python3 hack/mutants-check-excludes.test.py
 
   # ---------- incremental PR gate (both platforms + aggregator) ----------
+  # Linux is ~4x faster per mutant than Windows, but a large PR's changed-line
+  # set still pushed the single unsharded job to the 45-min cap. Shard it 2x the
+  # same way as Windows: cargo-mutants assigns mutant i to shard i%2 (after the
+  # stable --no-shuffle order). The aggregator merges every shard with the
+  # caught-nowhere rule, so the partition is invisible to the verdict.
   gate-linux:
-    name: gate run (linux)
+    name: gate run (linux shard ${{ matrix.shard }}/2)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]   # 0-INDEXED (see .cargo/mutants.toml notes)
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
         with:
@@ -53,16 +62,18 @@ jobs:
       # Fail fast if any `exclude_re` in .cargo/mutants.toml has drifted (gone
       # stale or over-broad) vs its pin in hack/mutants-check-excludes.py. The
       # full, cfg-blind `--list` here sees mutants from every platform's code, so
-      # one Linux run covers the cross-platform inventory.
+      # one Linux run covers the cross-platform inventory. Run it only on shard 0
+      # to avoid redundant work across the matrix.
       - name: Check exclude_re pins (no stale/over-broad)
+        if: matrix.shard == 0
         run: python3 hack/mutants-check-excludes.py
       - name: Fetch base ref
         run: git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
-      - name: Run changed-line mutants (linux)
-        run: hack/mutants-gate-run.sh "origin/${{ github.base_ref }}" gate-out
+      - name: Run changed-line mutants (linux shard ${{ matrix.shard }}/2)
+        run: hack/mutants-gate-run.sh "origin/${{ github.base_ref }}" gate-out "${{ matrix.shard }}/2"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gate-linux
+          name: gate-linux-${{ matrix.shard }}
           path: gate-out/mutants.out
           if-no-files-found: error
 
@@ -121,12 +132,13 @@ jobs:
             exit 1
           fi
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      # Both platforms are sharded (gate-linux-0..1, gate-windows-0..3); each
+      # artifact lands in its own g-<plat>/<artifact-name>/ subdir, and each is a
+      # mutants.out dir.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: gate-linux
+          pattern: gate-linux-*
           path: g-linux
-      # Windows is sharded (gate-windows-0..3); each artifact lands in its own
-      # g-windows/<artifact-name>/ subdir, and each is a mutants.out dir.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: gate-windows-*
@@ -136,7 +148,7 @@ jobs:
           echo "## Mutation gate (incremental, Linux + Windows)" >> "$GITHUB_STEP_SUMMARY"
           echo >> "$GITHUB_STEP_SUMMARY"
           set +e
-          python3 hack/mutants-report.py --mode gate g-linux g-windows/gate-windows-* >> "$GITHUB_STEP_SUMMARY"
+          python3 hack/mutants-report.py --mode gate g-linux/gate-linux-* g-windows/gate-windows-* >> "$GITHUB_STEP_SUMMARY"
           rc=$?
           set -e
           if [[ $rc -ne 0 ]]; then
