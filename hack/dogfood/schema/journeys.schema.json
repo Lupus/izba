@@ -31,6 +31,11 @@
           "description": "Why this journey exists: the spec promise / expectation it probes."
         },
         "source": { "$ref": "#/definitions/source" },
+        "modality": {
+          "type": "string",
+          "enum": ["cli", "gui"],
+          "description": "Action surface this journey runs against. 'cli' (default) = izba shell commands via run_journeys.py; 'gui' = the Tauri app driven through a browser via run_gui_journeys.py. Absent ⇒ treated as 'cli'."
+        },
         "tier": {
           "type": "string",
           "enum": ["smoke", "core", "deep"],
