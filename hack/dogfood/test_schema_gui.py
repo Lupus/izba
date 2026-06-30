@@ -36,3 +36,13 @@ def test_action_allows_optional_gui_fields():
         assert k in props, k
     # GUI fields are optional — required list is unchanged (CLI fields only).
     assert "snapshot" not in schema["definitions"]["action"]["required"]
+
+
+def test_gui_skeleton_journeys_are_gui_and_anchored():
+    with open(os.path.join(HERE, "fixtures", "journeys.gui-skeleton.json")) as f:
+        doc = json.load(f)
+    assert len(doc["journeys"]) == 5
+    for j in doc["journeys"]:
+        assert j["modality"] == "gui"
+        assert j["source"]["ref"]
+        assert j["steps"] and all(s["intent"] and s["expect"] for s in j["steps"])

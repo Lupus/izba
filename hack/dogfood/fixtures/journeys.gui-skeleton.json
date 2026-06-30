@@ -1,0 +1,57 @@
+{
+  "feature": "izba desktop app (GUI dogfood walking skeleton)",
+  "journeys": [
+    {
+      "journey_id": "gui-create-sandbox",
+      "modality": "gui",
+      "rationale": "A user can create a sandbox from the app and see it appear.",
+      "source": { "kind": "spec", "ref": "2026-06-30-gui-dogfooding-design.md §9.1" },
+      "steps": [
+        { "intent": "create a new sandbox named web using the default image",
+          "expect": "a sandbox named web appears in the sandbox list" }
+      ]
+    },
+    {
+      "journey_id": "gui-start-sandbox",
+      "modality": "gui",
+      "rationale": "A user can start a created sandbox and the app shows it running.",
+      "source": { "kind": "spec", "ref": "2026-06-30-gui-dogfooding-design.md §9.2" },
+      "steps": [
+        { "intent": "create a sandbox named web", "expect": "web appears in the list" },
+        { "intent": "start the sandbox named web", "expect": "web is shown as running" }
+      ]
+    },
+    {
+      "journey_id": "gui-open-shell",
+      "modality": "gui",
+      "rationale": "A user can open a shell into a running sandbox.",
+      "source": { "kind": "spec", "ref": "2026-06-30-gui-dogfooding-design.md §9.3" },
+      "steps": [
+        { "intent": "create and start a sandbox named web", "expect": "web is running" },
+        { "intent": "open a shell or terminal for web", "expect": "a terminal/shell view for web is shown" }
+      ]
+    },
+    {
+      "journey_id": "gui-enforce-policy",
+      "modality": "gui",
+      "rationale": "A user can turn on firewall enforcement for a sandbox.",
+      "source": { "kind": "spec", "ref": "2026-06-30-gui-dogfooding-design.md §9.4" },
+      "steps": [
+        { "intent": "create a sandbox named web", "expect": "web appears in the list" },
+        { "intent": "open web's firewall/policy settings and turn enforcement on",
+          "expect": "the firewall for web shows as enforcing" }
+      ]
+    },
+    {
+      "journey_id": "gui-remove-sandbox",
+      "modality": "gui",
+      "rationale": "A user can remove a sandbox and it disappears from the app.",
+      "source": { "kind": "spec", "ref": "2026-06-30-gui-dogfooding-design.md §9.5" },
+      "steps": [
+        { "intent": "create a sandbox named web", "expect": "web appears in the list" },
+        { "intent": "remove the sandbox named web, confirming if asked",
+          "expect": "web no longer appears in the sandbox list" }
+      ]
+    }
+  ]
+}
