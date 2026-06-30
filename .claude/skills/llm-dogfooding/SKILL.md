@@ -128,6 +128,7 @@ the test's main signal.
 | Journey / trajectory file contracts | `hack/dogfood/schema/*.schema.json` (journey has `tier`/`establishes`/`requires`/`gating`) |
 | Phase-3 runner internals & oracle harness | `hack/dogfood/` (`run_journeys.py`, `oracles.py`, `local-harness.md`) |
 | Why & deeper method (tiers, gate, auto-fix boundary, CI hygiene, report) | [references/methodology.md](references/methodology.md) |
+| Drive the GUI swarm (Tauri app) | `hack/dogfood/gui/run_gui_journeys.py` (agent-browser + `bin/headless` bridge); `modality:"gui"` journeys |
 
 ## Common mistakes
 
