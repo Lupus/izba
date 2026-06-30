@@ -68,7 +68,10 @@
             "violations": { "type": "array", "items": { "type": "object" } },
             "sandboxes": { "type": "array", "items": { "type": "object" } }
           }
-        }
+        },
+        "snapshot": { "type": "string", "description": "GUI only: the rendered accessibility set-of-marks the Actor saw after this action (role + name + @ref lines), trimmed. Empty for CLI actions." },
+        "console_errors": { "type": "array", "items": { "type": "string" }, "description": "GUI only: uncaught JS errors / unhandled rejections collected by the in-page bridge during this action." },
+        "screenshot_ref": { "type": "string", "description": "GUI only: artifact-relative path of an annotated screenshot captured on failure (for the Phase-3 skeptic). Absent on success." }
       }
     },
     "candidate": {
@@ -78,8 +81,8 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["functional", "latency", "implicit", "reconcile_seq"],
-          "description": "Which oracle produced the candidate."
+          "enum": ["functional", "latency", "implicit", "reconcile_seq", "console", "ui_daemon_diff", "silent_failure", "dom_expect"],
+          "description": "Which oracle produced the candidate. CLI oracles: functional/latency/implicit/reconcile_seq. GUI oracles: console (uncaught JS error / rejection), ui_daemon_diff (UI state disagrees with daemon truth), silent_failure (invoke rejected with no visible error surface), dom_expect (user-observable expectation absent from the snapshot)."
         },
         "detail": { "type": "string", "description": "What was observed." },
         "violated_expectation": { "type": "string", "description": "The expectation the observation contradicts." },
