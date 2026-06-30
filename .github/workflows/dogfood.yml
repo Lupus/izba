@@ -323,3 +323,109 @@ jobs:
           path: |
             ${{ runner.temp }}/izba-dogfood-${{ matrix.shard }}/sandboxes/*/logs/*
           if-no-files-found: ignore
+
+  dogfood-gui:
+    name: dogfood GUI journeys (KVM shard ${{ matrix.shard }})
+    needs: [kernel, initramfs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
+    env:
+      IZBA_KERNEL: ${{ github.workspace }}/dist/vmlinux
+      IZBA_INITRAMFS: ${{ github.workspace }}/dist/initramfs.cpio.gz
+      IZBA_TEST_CACHE: /home/runner/.cache/izba-itest
+      IZBA_BOOT_TIMEOUT_SECS: '120'
+    steps:
+      - name: Guard — matrix is fixed at 3 shards
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          if [ "$SHARDS" != "3" ]; then
+            echo "::error::dogfood.yml matrix is fixed at 3 shards but shards=$SHARDS"; exit 1
+          fi
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Make /dev/kvm accessible
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          [ -r /dev/kvm ] && [ -w /dev/kvm ]
+      - name: Allow unprivileged user namespaces (virtiofsd --sandbox namespace)
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Restore runtime tools
+        id: tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.local/bin/cloud-hypervisor
+            ~/.local/bin/virtiofsd
+            ~/.local/bin/mkfs.erofs
+          key: e2e-tools-${{ hashFiles('hack/fetch-artifacts.sh', 'hack/build-mkfs-erofs-windows.sh') }}
+      - name: Build runtime tools (cache miss)
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl tar make gcc autoconf automake libtool-bin pkg-config patch unzip file
+          mkdir -p "$HOME/.local/bin"
+          IZBA_BIN_DIR="$HOME/.local/bin" hack/fetch-artifacts.sh || true
+          hack/build-mkfs-erofs-windows.sh --linux-only
+          install -m755 "$HOME/.cache/izba/erofs-utils/build-linux/mkfs/mkfs.erofs" "$HOME/.local/bin/mkfs.erofs"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: vmlinux, path: dist/ }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: initramfs, path: dist/ }
+      - name: Restore OCI test-image cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with: { path: /home/runner/.cache/izba-itest, key: izba-itest-alpine-3.20 }
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with: { prefix-key: dogfood-gui-linux }
+      - name: Build izba binary + headless bridge sidecar
+        run: |
+          cargo build --locked --release -p izba-cli
+          (cd app/src-tauri && cargo build --release --bin headless)
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: '20' }
+      - name: Build dogfood frontend
+        run: cd app && npm ci && npm run build:dogfood
+      - name: Install agent-browser (pinned) + browser
+        run: |
+          npm i -g agent-browser@0.31.1
+          agent-browser install --with-deps
+      - name: Run GUI dogfood journeys (report-only)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+          MODEL: ${{ inputs.model }}
+          MAX_USD: ${{ inputs.max_usd }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          python3 hack/dogfood/gui/run_gui_journeys.py \
+            --journeys journeys.json \
+            --shard "$SHARD" --shards "$SHARDS" \
+            --izba-bin "$PWD/target/release/izba" \
+            --sidecar-bin "$PWD/app/src-tauri/target/release/headless" \
+            --frontend-dir "$PWD/app/dist" \
+            --data-dir "/tmp/izd-gui-$SHARD" \
+            --out "gui-traj-$SHARD.json" \
+            --artifact-dir "gui-shots-$SHARD" \
+            --model "$MODEL" --max-usd "$MAX_USD" \
+            --readme README.md --app-guide dogfood-app-guide.md \
+            --action-timeout-s 30 --step-cap 20
+      - name: Upload GUI trajectory bundle
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gui-traj-${{ matrix.shard }}
+          path: |
+            gui-traj-${{ matrix.shard }}.json
+            gui-shots-${{ matrix.shard }}/**
+          if-no-files-found: warn
