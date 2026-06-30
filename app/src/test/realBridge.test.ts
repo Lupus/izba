@@ -5,22 +5,36 @@ import { resolve } from "node:path";
 // Load the bridge source and eval its exported pure helper in jsdom.
 const SRC = readFileSync(resolve(__dirname, "../../dogfood/real-bridge.js"), "utf8");
 
-function loadHelper() {
-  const mod: any = {};
-  // The file ends with: if (typeof module!=='undefined') module.exports={__dfHandleMessage};
-  // eslint-disable-next-line no-new-func
+// Minimal types that mirror real-bridge.js's internal state shape.
+type EventPayload = { event: string; payload: unknown };
+type InvokeLogEntry = { cmd: string; ok: boolean; error: string };
+type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
+type BridgeState = {
+  pending: Map<number, Pending>;
+  listeners: Map<string, Set<(p: EventPayload) => void>>;
+  invokeLog: InvokeLogEntry[];
+  lastCmd: Map<number, string>;
+};
+type HandleFn = (state: BridgeState, raw: string) => void;
+
+function loadHelper(): HandleFn {
+  const mod: { exports?: { __dfHandleMessage: HandleFn } } = {};
+  // new Function is the correct tool here: we're loading a plain-JS file
+  // (dogfood/real-bridge.js) in a Node/jsdom environment to unit-test its
+  // exported pure helper without a bundler. no-new-func is not in the
+  // recommended ruleset so no disable directive is needed.
   new Function("module", "window", SRC)(mod, { addEventListener() {}, location: { search: "" } });
-  return mod.exports.__dfHandleMessage;
+  return mod.exports!.__dfHandleMessage;
 }
 
 describe("real-bridge protocol", () => {
   it("resolves a pending invoke on an ok reply and logs it", () => {
     const handle = loadHelper();
-    let resolved: any = null;
-    const state = {
-      pending: new Map([[1, { resolve: (v: any) => (resolved = v), reject: () => {} }]]),
+    let resolved: unknown = null;
+    const state: BridgeState = {
+      pending: new Map([[1, { resolve: (v: unknown) => { resolved = v; }, reject: () => {} }]]),
       listeners: new Map(),
-      invokeLog: [] as any[],
+      invokeLog: [],
       lastCmd: new Map([[1, "list"]]),
     };
     handle(state, JSON.stringify({ id: 1, ok: true, result: [{ name: "web" }] }));
@@ -31,10 +45,10 @@ describe("real-bridge protocol", () => {
 
   it("fires event listeners on an event frame", () => {
     const handle = loadHelper();
-    let got: any = null;
-    const state = {
+    let got: unknown = null;
+    const state: BridgeState = {
       pending: new Map(),
-      listeners: new Map([["create-progress", new Set([(p: any) => (got = p)])]]),
+      listeners: new Map([["create-progress", new Set([(p: EventPayload) => { got = p; }])]]),
       invokeLog: [],
       lastCmd: new Map(),
     };
@@ -48,10 +62,10 @@ describe("real-bridge protocol", () => {
     const rejectionPromise = new Promise<void>((_resolve, reject) => {
       rejectFn = reject;
     });
-    const state = {
+    const state: BridgeState = {
       pending: new Map([[2, { resolve: () => {}, reject: rejectFn }]]),
       listeners: new Map(),
-      invokeLog: [] as any[],
+      invokeLog: [],
       lastCmd: new Map([[2, "sandbox-create"]]),
     };
     handle(state, JSON.stringify({ id: 2, ok: false, error: "boom" }));

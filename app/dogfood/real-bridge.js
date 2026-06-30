@@ -11,7 +11,7 @@
     var msg;
     try {
       msg = JSON.parse(raw);
-    } catch (e) {
+    } catch {
       return;
     }
     if (msg && msg.type === "event") {

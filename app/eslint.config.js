@@ -42,4 +42,15 @@ export default tseslint.config(
     ignores: ["src/components/ui/**", "**/*.test.tsx"],
     rules: { "izba/no-raw-control": "error" },
   },
+  // dogfood/ build scripts: Node ESM (.mjs) needs Node globals; the browser
+  // IIFE + CommonJS dual-mode bridge (.js) needs browser + CommonJS globals.
+  // Both are intentionally linted (not ignored) — just with the right env.
+  {
+    files: ["dogfood/*.mjs"],
+    languageOptions: { globals: { ...globals.node } },
+  },
+  {
+    files: ["dogfood/*.js"],
+    languageOptions: { globals: { ...globals.browser, ...globals.commonjs } },
+  },
 );
