@@ -16,7 +16,8 @@
     "e2e:install:chromium": "playwright install chromium",
     "e2e:install:chromium:deps": "playwright install --with-deps chromium",
     "tauri": "tauri",
-    "lint": "eslint . --max-warnings 0"
+    "lint": "eslint . --max-warnings 0",
+    "build:dogfood": "vite build && node dogfood/inject.mjs dist"
   },
   "dependencies": {
     "@radix-ui/react-checkbox": "^1.3.5",
