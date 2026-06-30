@@ -136,6 +136,25 @@ journey).
      tag **escalate**. (Canonical escalate: a too-loose length/validation check
      that needs tightening — that is behavior, not text.)
 
+## GUI trajectories
+
+GUI journeys (`modality:"gui"`) carry, per action, the accessibility `snapshot`
+the Actor saw, `console_errors`, and on failure a `screenshot_ref` (annotated
+with the same `@e` refs). Candidate kinds extend to `console`, `ui_daemon_diff`,
+`silent_failure`, `dom_expect`. Apply the same bidirectional skepticism:
+
+- **Refute reds:** a `dom_expect` miss may be Actor fumbling (gave up early,
+  never reached the screen) rather than a product gap — check the snapshots.
+  A `console` error in third-party noise is not a product bug; one from the app's
+  own code is. `silent_failure` is real only if the invoke truly rejected AND no
+  error surface appears in the *final* snapshot.
+- **Audit greens:** a journey that "succeeded" must have reached its `expect`
+  through the UI. The **`ui_daemon_diff` = empty** check is your strongest ally:
+  the daemon state-evidence is ground truth; if the UI claimed success but
+  `state_evidence.sandboxes` disagrees, the green is a lie.
+- A control the Actor could not find (it stalled, no matching ref) is a
+  discoverability/a11y finding, not Actor weakness — confirm via the snapshots.
+
 ## Rules
 
 - Quote, don't paraphrase, the anchor or trajectory line for every verdict.

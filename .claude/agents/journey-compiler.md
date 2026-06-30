@@ -144,6 +144,22 @@ Tag honestly from the spec — a capability the swarm can only learn from
 privileged sources is exactly the kind of smoke-tier discoverability gate worth
 flagging. Tagging is ordering metadata; it never leaks into `intent`/`expect`.
 
+## Mandate 7 — GUI journeys (modality)
+
+When the feature has a desktop-app (Tauri) surface, also emit `modality: "gui"`
+journeys (CLI journeys stay `modality:"cli"` / absent). For GUI journeys:
+
+- `intent` is a UI goal in **user** language ("create a sandbox named web and
+  open a shell in it") — never a component name, selector, or invoke command.
+- `expect` is **DOM-observable**: text or a control a user would see ("web is
+  shown as running"), never an exit code or internal state.
+- Launder the same way: nothing about `src/components`, `data-testid`s, the IPC
+  command names, or the spec leaks into intent/expect or the context pack.
+- The fair-test context pack for GUI runs is the app's user-facing guide
+  (`dogfood-app-guide.md`) + README — the docs a user reads, not the source.
+- A control the journey needs that has no accessible name is a *predicted
+  discoverability finding* (Mandate 5), not a reason to name an internal handle.
+
 ## Validation (mandatory before you finish)
 
 Validate `journeys.json` against the schema, e.g.:
