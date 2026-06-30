@@ -27,6 +27,12 @@ base64 = "0.22"
 izba-core = { path = "../../crates/izba-core" }
 # Wire types for the interactive shell stream (Exec/Attach/Resize frames).
 izba-proto = { path = "../../crates/izba-proto" }
+# Dogfood bridge sidecar transport (sync WebSocket; test/dogfood only).
+tungstenite = "0.24"
+
+[[bin]]
+name = "headless"
+path = "src/bin/headless.rs"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
