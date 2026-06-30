@@ -105,6 +105,49 @@ mod tests {
         assert_eq!(back.spec.resources.cpus, 1);
     }
 
+    /// read_base must SWALLOW only NotFound (returning Ok(None)) and PROPAGATE
+    /// any other I/O error. A directory at the base path makes read_to_string
+    /// fail with a non-NotFound error. Pins the `e.kind() == NotFound` guard.
+    #[test]
+    fn read_base_propagates_non_notfound_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(MANIFEST_BASE_FILE)).unwrap();
+        assert!(
+            read_base(dir.path()).is_err(),
+            "a non-NotFound read error must propagate, not become Ok(None)"
+        );
+    }
+
+    /// Same NotFound-only guard for read_review.
+    #[test]
+    fn read_review_propagates_non_notfound_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(MANIFEST_REVIEW_FILE)).unwrap();
+        assert!(
+            read_review(dir.path()).is_err(),
+            "a non-NotFound read error must propagate, not become Ok(None)"
+        );
+    }
+
+    /// clear_review is idempotent on a missing token (NotFound -> Ok) but must
+    /// PROPAGATE a non-NotFound removal error. Pins both halves of the guard
+    /// (`e.kind() == NotFound`).
+    #[test]
+    fn clear_review_idempotent_but_propagates_non_notfound_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent token: NotFound -> Ok(()).
+        assert!(
+            clear_review(dir.path()).is_ok(),
+            "clearing an absent review token must be Ok (idempotent)"
+        );
+        // A directory at the review path makes remove_file fail non-NotFound.
+        std::fs::create_dir(dir.path().join(MANIFEST_REVIEW_FILE)).unwrap();
+        assert!(
+            clear_review(dir.path()).is_err(),
+            "a non-NotFound removal error must propagate"
+        );
+    }
+
     #[test]
     fn review_round_trips_and_clears() {
         let dir = tempfile::tempdir().unwrap();

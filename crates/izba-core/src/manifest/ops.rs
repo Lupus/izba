@@ -369,6 +369,48 @@ mod tests {
         assert_eq!(gib, 16, "rootDisk.size must round-trip to 16 GiB");
     }
 
+    /// A sub-GiB rw.img (file length >> 30 == 0) must round UP to 1 GiB, never
+    /// 0 (which `to_manifest` would emit as the unparseable bare "0"). Pins the
+    /// `from_file > 0` guard (a `>= 0` would pass the 0 through).
+    #[test]
+    fn managed_normalized_rounds_sub_gib_rw_img_up_to_one() {
+        use crate::state::SandboxConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let name = "subgib";
+        let sandbox_dir = paths.sandbox_dir(name);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+
+        let cfg = SandboxConfig {
+            image_digest: "sha256:abc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem_mb: 2048,
+            workspace: "/workspace".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+            rw_size_gb: 0, // legacy: unknown, recover from rw.img
+        };
+        std::fs::write(
+            sandbox_dir.join(crate::state::CONFIG_FILE),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        // rw.img smaller than 1 GiB -> (len >> 30) == 0.
+        let f = std::fs::File::create(sandbox_dir.join("rw.img")).unwrap();
+        f.set_len(512u64 << 20).unwrap(); // 512 MiB
+
+        let n = managed_normalized(&paths, name).unwrap();
+        assert_eq!(
+            n.rw_size_gb, 1,
+            "a sub-GiB rw.img must round up to 1 GiB, never 0"
+        );
+    }
+
     // -- Security fix 1: validate_name at every sandbox-path chokepoint --
 
     /// managed_normalized must reject a traversal name before touching the fs.
