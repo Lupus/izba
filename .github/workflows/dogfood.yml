@@ -18,7 +18,11 @@ on:
   workflow_dispatch:
     inputs:
       shards:
-        description: 'Number of journey shards (must match the matrix below)'
+        description: 'Number of CLI journey shards (must match the dogfood matrix below)'
+        required: false
+        default: '3'
+      gui_shards:
+        description: 'Number of GUI journey shards (independent of `shards`; must match the dogfood-gui matrix, fixed at 3)'
         required: false
         default: '3'
       model:
@@ -339,12 +343,12 @@ jobs:
       IZBA_TEST_CACHE: /home/runner/.cache/izba-itest
       IZBA_BOOT_TIMEOUT_SECS: '120'
     steps:
-      - name: Guard — matrix is fixed at 3 shards
+      - name: Guard — GUI matrix is fixed at 3 shards
         env:
-          SHARDS: ${{ inputs.shards }}
+          GUI_SHARDS: ${{ inputs.gui_shards }}
         run: |
-          if [ "$SHARDS" != "3" ]; then
-            echo "::error::dogfood.yml matrix is fixed at 3 shards but shards=$SHARDS"; exit 1
+          if [ "$GUI_SHARDS" != "3" ]; then
+            echo "::error::dogfood-gui matrix is fixed at 3 shards but gui_shards=$GUI_SHARDS — journeys for shard>=3 would be silently skipped. Use gui_shards=3 or extend the matrix."; exit 1
           fi
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - name: Make /dev/kvm accessible
@@ -414,14 +418,14 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ inputs.shards }}
+          GUI_SHARDS: ${{ inputs.gui_shards }}
           MODEL: ${{ inputs.model }}
           MAX_USD: ${{ inputs.max_usd }}
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           python3 hack/dogfood/gui/run_gui_journeys.py \
             --journeys journeys.json \
-            --shard "$SHARD" --shards "$SHARDS" \
+            --shard "$SHARD" --shards "$GUI_SHARDS" \
             --izba-bin "$PWD/target/release/izba" \
             --sidecar-bin "$PWD/app/src-tauri/target/release/headless" \
             --frontend-dir "$PWD/app/dist" \

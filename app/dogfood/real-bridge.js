@@ -82,6 +82,14 @@
       });
     };
     ws.onclose = function () {
+      // Reject every in-flight invoke so callers don't hang forever, and drop
+      // any un-sent frames, before reconnecting.
+      state.pending.forEach(function (p) {
+        p.reject(new Error("dogfood bridge disconnected"));
+      });
+      state.pending.clear();
+      state.lastCmd.clear();
+      queue.length = 0;
       setTimeout(connect, 300);
     };
   }

@@ -16,7 +16,7 @@ export function injectBridge(html) {
 }
 
 // CLI: `node dogfood/inject.mjs <dist-dir>`
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
   const rawArg = process.argv[2] || "dist";
   const dist = resolve(rawArg);
   // Validate: must be within the working directory (reject path traversal / escaping cwd)

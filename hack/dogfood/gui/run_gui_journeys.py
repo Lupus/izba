@@ -130,9 +130,12 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     try:
         for step in steps:
             seen: set = set()
-            obs: List[Dict[str, Any]] = []
-            # Seed the Actor with the current screen.
+            # Seed the Actor with the current screen so its FIRST decision sees
+            # the accessibility marks (real refs to act on) rather than an empty
+            # observation — otherwise it guesses a ref and burns a turn.
             marks_text = render_marks(driver.snapshot())
+            obs: List[Dict[str, Any]] = [{"action": "(opened screen)",
+                                          "marks": marks_text}]
             while True:
                 if len(actions) >= step_cap:
                     log(f"{journey_id}: step-cap reached"); raise StopIteration
