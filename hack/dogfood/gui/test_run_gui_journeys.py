@@ -85,3 +85,29 @@ def test_run_gui_journey_screenshot_ref_recorded_on_last_action(monkeypatch, tmp
     assert res["actions"]
     expected_ref = os.path.join(os.path.basename(artifact_dir), "ui_daemon_diff_sc.png")
     assert res["actions"][-1].get("screenshot_ref") == expected_ref
+
+
+def test_settle_for_sandbox_returns_when_sandbox_appears(monkeypatch):
+    import gui.run_gui_journeys as rgj
+    calls = {"n": 0}
+
+    def fake_recon(*a, **k):
+        calls["n"] += 1
+        return {"violations": [],
+                "sandboxes": ([{"name": "web"}] if calls["n"] >= 2 else [])}
+
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", fake_recon)
+    monkeypatch.setattr(rgj.time, "sleep", lambda s: None)  # no real waiting
+    rgj._settle_for_sandbox("izba", "/tmp/x", timeout_s=10,
+                            action_timeout_s=5, poll_s=0.01)
+    assert calls["n"] >= 2  # polled until the sandbox registered
+
+
+def test_settle_for_sandbox_times_out_without_sandbox(monkeypatch):
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "_reconcile_snapshot",
+                        lambda *a, **k: {"violations": [], "sandboxes": []})
+    monkeypatch.setattr(rgj.time, "sleep", lambda s: None)
+    # Report-only: returns promptly on timeout, no raise, no sandbox found.
+    rgj._settle_for_sandbox("izba", "/tmp/x", timeout_s=0.02,
+                            action_timeout_s=5, poll_s=0.01)

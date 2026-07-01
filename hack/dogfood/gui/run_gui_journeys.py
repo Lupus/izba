@@ -68,6 +68,21 @@ def _reconcile_snapshot(izba_bin: str, data_dir: str, timeout_s: float,
     return snap
 
 
+def _settle_for_sandbox(izba_bin: str, data_dir: str, timeout_s: float,
+                        action_timeout_s: float, poll_s: float = 3.0) -> None:
+    """Bounded wait for an async create/VM-boot to register a sandbox before the
+    final state snapshot. Polls `izba __reconcile` and returns as soon as any
+    sandbox appears, or when ``timeout_s`` elapses. Report-only: never raises.
+    A ``timeout_s`` of 0 returns immediately (no settle)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        snap = _reconcile_snapshot(izba_bin, data_dir,
+                                   min(action_timeout_s, max(poll_s, 1.0)))
+        if snap.get("sandboxes"):
+            return
+        time.sleep(poll_s)
+
+
 def _action_dict(intent: str, command: str, res, marks_text: str,
                  reconcile: Dict[str, Any], console_errors: List[str],
                  screenshot_ref: str = "") -> Dict[str, Any]:
@@ -96,8 +111,15 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                     data_dir: str, max_turns: int, step_cap: int,
                     action_timeout_s: float, latency_budget_ms: int,
                     budget: Dict[str, float], max_usd: float,
-                    artifact_dir: str = "") -> Dict[str, Any]:
-    """Run one GUI journey under all caps. Returns a journey_result dict."""
+                    artifact_dir: str = "",
+                    create_settle_s: float = 0.0) -> Dict[str, Any]:
+    """Run one GUI journey under all caps. Returns a journey_result dict.
+
+    ``create_settle_s`` bounds an end-of-journey wait for an in-flight async
+    create/VM-boot to register a sandbox in the daemon before the final
+    state-evidence snapshot (the GUI ``create`` invoke resolves asynchronously,
+    so a journey can otherwise end before its sandbox appears). 0 disables it
+    (used by the unit tests, which mock the reconcile)."""
     journey_id = journey.get("journey_id", "")
     actions: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
@@ -165,6 +187,10 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     except BudgetExceeded:
         raise
 
+    # Give an in-flight async create/VM-boot time to register a sandbox before
+    # grading the outcome (the GUI create invoke resolves asynchronously).
+    if create_settle_s > 0:
+        _settle_for_sandbox(izba_bin, data_dir, create_settle_s, action_timeout_s)
     # End-of-journey oracles: daemon truth + UI-vs-daemon + dom-expect + silent-fail.
     try:
         state_evidence = capture_state_evidence(izba_bin, data_dir, action_timeout_s,
@@ -271,6 +297,9 @@ def parse_args(argv):
     p.add_argument("--step-cap", type=int, default=20)
     p.add_argument("--action-timeout-s", type=float, default=30.0)
     p.add_argument("--latency-budget-ms", type=int, default=DEFAULT_LATENCY_BUDGET_MS)
+    p.add_argument("--create-settle-s", type=float, default=90.0,
+                   help="bounded end-of-journey wait for an async create/boot to "
+                        "register a sandbox before grading (0 disables)")
     p.add_argument("--readme", default="README.md")
     p.add_argument("--app-guide", default="dogfood-app-guide.md")
     p.add_argument("--fake-model", default=None)
@@ -315,7 +344,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     max_turns=args.max_turns, step_cap=args.step_cap,
                     action_timeout_s=args.action_timeout_s,
                     latency_budget_ms=args.latency_budget_ms,
-                    budget=budget, max_usd=args.max_usd, artifact_dir=args.artifact_dir)
+                    budget=budget, max_usd=args.max_usd, artifact_dir=args.artifact_dir,
+                    create_settle_s=args.create_settle_s)
                 driver.close()
                 results.append(res)
             except BudgetExceeded:
