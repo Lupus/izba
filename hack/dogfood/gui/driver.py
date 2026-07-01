@@ -43,6 +43,34 @@ _ARIA_RE = re.compile(r'^\s*-\s+(?P<role>[a-zA-Z]+)\s+"(?P<name>(?:[^"\\]|\\.)*)
 _RENDER_RE = re.compile(r'^\[(?P<ref>@e\d+)\]\s+(?P<role>[a-zA-Z]+)\s+"(?P<name>(?:[^"\\]|\\.)*)"')
 
 
+# Valid agent-browser subcommands accepted by AgentBrowserDriver._run.
+_ALLOWED_SUBCMDS: frozenset = frozenset(
+    {"open", "snapshot", "click", "fill", "press", "select",
+     "eval", "screenshot", "close", "wait", "get"}
+)
+# Subcommands whose first positional arg is a UI element ref (@eN / eN).
+_REF_SUBCMDS: frozenset = frozenset({"click", "fill", "select"})
+# Element ref pattern: optional @ prefix, then 'e', then one or more digits.
+_REF_RE = re.compile(r'^@?e\d+$')
+
+
+def _validate_args(args: List[str]) -> Optional[str]:
+    """Return an error string if *args* looks unsafe, else ``None``.
+
+    Checks that the subcommand is in the allowlist and, for ref-taking
+    commands (click / fill / select), that the element ref arg matches the
+    expected ``@eN`` shape.  Other positional args (URLs, key names, text,
+    JS expressions) are left unchecked as they are operator-controlled."""
+    if not args:
+        return "empty args list"
+    subcmd = args[0]
+    if subcmd not in _ALLOWED_SUBCMDS:
+        return f"unknown subcommand: {subcmd!r}"
+    if subcmd in _REF_SUBCMDS and len(args) > 1 and not _REF_RE.match(args[1]):
+        return f"subcommand {subcmd!r}: invalid element ref {args[1]!r}"
+    return None
+
+
 def _norm_ref(ref: str) -> str:
     return ref if ref.startswith("@") else "@" + ref
 
@@ -217,6 +245,12 @@ class AgentBrowserDriver:
         self.timeout_s = timeout_s
 
     def _run(self, args: List[str]) -> ActResult:
+        err_msg = _validate_args(args)
+        if err_msg:
+            import logging
+            logging.warning("[driver] rejected unsafe args: %s", err_msg)
+            return ActResult(exit_code=1, stdout="",
+                             stderr=f"validation error: {err_msg}", latency_ms=0)
         t0 = time.monotonic()
         try:
             p = subprocess.run([self.bin, *args, "--json"], capture_output=True,
