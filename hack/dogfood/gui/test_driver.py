@@ -40,3 +40,41 @@ def test_action_to_argv_read_and_done_are_none():
     assert action_to_argv({"read": True}) is None
     assert action_to_argv({"done": True}) is None
     assert action_to_argv({"bogus": 1}) is None
+
+
+# The exact `agent-browser snapshot -i --json` payload captured from
+# agent-browser v0.31.1 in CI (against example.com). The marks come from the
+# `data.refs` dict; `data.snapshot` is the aria-text fallback.
+_REAL_AB_JSON = (
+    '{"success":true,"data":{"lifecycle":{"reused":true},'
+    '"origin":"https://example.com/",'
+    '"refs":{"e1":{"name":"Example Domain","role":"heading"},'
+    '"e2":{"name":"Learn more","role":"link"}},'
+    '"snapshot":"- heading \\"Example Domain\\" [level=1, ref=e1]\\n'
+    '- link \\"Learn more\\" [ref=e2]"}}'
+)
+
+
+def test_parse_snapshot_real_agent_browser_json():
+    marks = parse_snapshot(_REAL_AB_JSON)
+    assert marks == [
+        Mark(ref="@e1", role="heading", name="Example Domain"),
+        Mark(ref="@e2", role="link", name="Learn more"),
+    ]
+
+
+def test_parse_snapshot_real_aria_text_with_leading_attrs():
+    # ref is NOT first in the bracket (`[level=1, ref=e1]`) — must still parse.
+    raw = ('- heading "Example Domain" [level=1, ref=e1]\n'
+           '- link "Learn more" [ref=e2]')
+    assert parse_snapshot(raw) == [
+        Mark(ref="@e1", role="heading", name="Example Domain"),
+        Mark(ref="@e2", role="link", name="Learn more"),
+    ]
+
+
+def test_parse_snapshot_json_snapshot_string_fallback():
+    # A JSON object whose only usable field is the aria-text `snapshot` string
+    # (no `refs`/`elements`) still yields marks via the text fallback.
+    doc = '{"success":true,"data":{"snapshot":"- button \\"Go\\" [ref=e5]"}}'
+    assert parse_snapshot(doc) == [Mark(ref="@e5", role="button", name="Go")]
