@@ -4,7 +4,7 @@
 # (real microVMs) + agent-browser on PATH. NOT a CI gate — a dev sanity check.
 set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
-cd "$ROOT/app" && npm ci && npm run build:dogfood
+cd "$ROOT/app" && npm ci --ignore-scripts && npm run build:dogfood
 cd "$ROOT/app/src-tauri" && cargo build --release --bin headless
 DIST="$ROOT/app/dist"
 SIDE="$ROOT/app/src-tauri/target/release/headless"

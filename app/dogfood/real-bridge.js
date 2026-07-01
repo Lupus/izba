@@ -67,7 +67,9 @@
 
   function wsPort() {
     var m = /[?&]ws=(\d+)/.exec(win.location.search || "");
-    return m ? m[1] : "17890";
+    if (!m) return "17890";
+    var p = parseInt(m[1], 10);
+    return (p >= 1024 && p <= 65535) ? String(p) : "17890";
   }
   function connect() {
     ws = new WebSocket("ws://127.0.0.1:" + wsPort());

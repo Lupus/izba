@@ -1,6 +1,6 @@
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gui.driver import parse_snapshot, render_marks, action_to_argv, Mark
+from gui.driver import parse_snapshot, render_marks, action_to_argv, Mark, _validate_args
 
 
 def test_parse_snapshot_text_form():
@@ -78,3 +78,33 @@ def test_parse_snapshot_json_snapshot_string_fallback():
     # (no `refs`/`elements`) still yields marks via the text fallback.
     doc = '{"success":true,"data":{"snapshot":"- button \\"Go\\" [ref=e5]"}}'
     assert parse_snapshot(doc) == [Mark(ref="@e5", role="button", name="Go")]
+
+
+# --- _validate_args ---
+
+def test_validate_args_rejects_bogus_subcommand():
+    assert _validate_args(["rm", "-rf", "/"]) is not None
+    assert _validate_args(["bogus_cmd"]) is not None
+    assert _validate_args([]) is not None
+
+
+def test_validate_args_accepts_known_subcommands():
+    for subcmd in ("open", "snapshot", "click", "fill", "press",
+                   "select", "eval", "screenshot", "close", "wait", "get"):
+        # Basic call with no extra args must pass the subcommand check
+        assert _validate_args([subcmd]) is None
+
+
+def test_validate_args_ref_subcmds_reject_bad_ref():
+    # click / fill / select with an invalid ref must be rejected
+    assert _validate_args(["click", "not-a-ref"]) is not None
+    assert _validate_args(["fill", "evil;cmd"]) is not None
+    assert _validate_args(["select", "../../etc"]) is not None
+
+
+def test_validate_args_ref_subcmds_accept_good_ref():
+    # Both '@eN' and bare 'eN' forms are valid
+    assert _validate_args(["click", "@e1"]) is None
+    assert _validate_args(["click", "e42"]) is None
+    assert _validate_args(["fill", "@e3", "some text"]) is None
+    assert _validate_args(["select", "@e9", "alpine"]) is None
