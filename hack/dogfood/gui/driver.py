@@ -33,7 +33,10 @@ class ActResult:
 
 # `- button "Create sandbox" [ref=e2]` (aria-snapshot text form). The name is
 # the first quoted run; trailing `[level=1]` etc. are ignored.
-_ARIA_RE = re.compile(r'^\s*-\s+(?P<role>[a-zA-Z]+)\s+"(?P<name>(?:[^"\\]|\\.)*)"\s+\[ref=(?P<ref>e\d+)\]')
+# agent-browser aria-snapshot line: `- role "name" [<attrs>, ref=eN]`. The ref
+# is NOT necessarily first in the bracket (e.g. `[level=1, ref=e1]`), so match
+# `ref=eN` anywhere inside the trailing `[...]`.
+_ARIA_RE = re.compile(r'^\s*-\s+(?P<role>[a-zA-Z]+)\s+"(?P<name>(?:[^"\\]|\\.)*)"\s+\[[^\]]*\bref=(?P<ref>e\d+)\b')
 # `[@e2] button "Create sandbox"` — render_marks output format; parse_snapshot
 # must handle its own output so FakeDriver snapshots and test assertions are
 # consistent (round-trip: render_marks(parse_snapshot(render_marks(marks)))==...).
@@ -44,51 +47,92 @@ def _norm_ref(ref: str) -> str:
     return ref if ref.startswith("@") else "@" + ref
 
 
-def parse_snapshot(raw: str) -> List[Mark]:
-    """Parse an agent-browser snapshot (JSON or aria-text) into Marks.
-
-    Best-effort: unparseable input yields []. JSON form expects
-    {"elements":[{"ref","role","name"}, ...]} (refs may already carry '@')."""
-    raw = (raw or "").strip()
-    if not raw:
-        return []
-    # JSON form first (snapshot --json).
-    if raw[0] in "{[":
-        try:
-            doc = json.loads(raw)
-        except ValueError:
-            doc = None
-        if isinstance(doc, dict):
-            els = doc.get("elements") or doc.get("snapshot") or []
-        elif isinstance(doc, list):
-            els = doc
-        else:
-            els = []
-        out: List[Mark] = []
-        for e in els:
-            if not isinstance(e, dict):
-                continue
-            ref = e.get("ref")
-            if not ref:
-                continue
-            out.append(Mark(ref=_norm_ref(str(ref)), role=str(e.get("role", "")),
-                            name=str(e.get("name", ""))))
-        if out:
-            return out
-        # fall through to text parsing if JSON had no usable elements
+def _marks_from_text(text: str) -> List[Mark]:
+    """Parse aria-snapshot text (`- role "name" [..., ref=eN]`) OR render_marks
+    output (`[@eN] role "name"`) into Marks. Unmatched lines are skipped."""
     marks: List[Mark] = []
-    for line in raw.splitlines():
+    for line in (text or "").splitlines():
         m = _ARIA_RE.match(line)
         if m:
             marks.append(Mark(ref=_norm_ref(m.group("ref")), role=m.group("role"),
                               name=m.group("name")))
             continue
         m = _RENDER_RE.match(line)
-        if m:
-            # ref already carries '@' in the render_marks format
+        if m:  # ref already carries '@' in the render_marks format
             marks.append(Mark(ref=m.group("ref"), role=m.group("role"),
                               name=m.group("name")))
     return marks
+
+
+def _marks_from_json(doc: Any) -> List[Mark]:
+    """Build Marks from agent-browser's ``snapshot --json`` object.
+
+    Real shape (agent-browser v0.31.x)::
+
+        {"success": true, "data": {"refs": {"e1": {"name","role"}, ...},
+                                   "snapshot": "- role \\"name\\" [ref=e1]\\n..."}}
+
+    The ``data.refs`` dict (ref id -> {name, role}) is the primary source. Also
+    tolerates a flat ``{"elements": [{"ref","role","name"}, ...]}`` list and a
+    top-level ``refs`` dict (no ``data`` envelope)."""
+    if isinstance(doc, list):
+        items: Any = doc
+    elif isinstance(doc, dict):
+        data = doc.get("data") if isinstance(doc.get("data"), dict) else doc
+        refs = data.get("refs")
+        if isinstance(refs, dict):
+            out: List[Mark] = []
+            for ref, v in refs.items():
+                if isinstance(v, dict):
+                    out.append(Mark(ref=_norm_ref(str(ref)),
+                                    role=str(v.get("role", "")),
+                                    name=str(v.get("name", ""))))
+            return out
+        items = data.get("elements") or []
+    else:
+        items = []
+    out2: List[Mark] = []
+    for e in items:
+        if isinstance(e, dict) and e.get("ref"):
+            out2.append(Mark(ref=_norm_ref(str(e["ref"])), role=str(e.get("role", "")),
+                             name=str(e.get("name", ""))))
+    return out2
+
+
+def _json_snapshot_text(doc: Any) -> str:
+    """The aria-text ``snapshot`` string agent-browser embeds in its JSON, if any."""
+    if isinstance(doc, dict):
+        data = doc.get("data") if isinstance(doc.get("data"), dict) else doc
+        s = data.get("snapshot")
+        if isinstance(s, str):
+            return s
+    return ""
+
+
+def parse_snapshot(raw: str) -> List[Mark]:
+    """Parse an agent-browser snapshot into Marks. Best-effort: [] on garbage.
+
+    Handles agent-browser's ``snapshot --json`` object (``data.refs`` dict +
+    ``data.snapshot`` aria string), the plain aria-text form
+    (``- role "name" [..., ref=eN]``), and render_marks' own
+    ``[@eN] role "name"`` output (so FakeDriver snapshots round-trip)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    if raw[0] in "{[":
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            doc = None
+        marks = _marks_from_json(doc)
+        if marks:
+            return marks
+        aria = _json_snapshot_text(doc)
+        if aria:
+            return _marks_from_text(aria)
+        # Not usable JSON — e.g. a render_marks line `[@e1] role "name"` which
+        # starts with '[' but is not JSON. Fall through to text parsing.
+    return _marks_from_text(raw)
 
 
 def render_marks(marks: List[Mark], cap_chars: int = 4000) -> str:
