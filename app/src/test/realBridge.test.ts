@@ -1,9 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import bridgeSrc from "../../dogfood/real-bridge.js?raw";
 
 // Load the bridge source and eval its exported pure helper in jsdom.
-const SRC = readFileSync(resolve(__dirname, "../../dogfood/real-bridge.js"), "utf8");
+const SRC = bridgeSrc;
 
 // Minimal types that mirror real-bridge.js's internal state shape.
 type EventPayload = { event: string; payload: unknown };
