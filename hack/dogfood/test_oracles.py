@@ -316,6 +316,27 @@ class RunActionTests(unittest.TestCase):
                            timeout_s=10, cwd_file=cwd_file)
             self.assertEqual(a.exit_code, 3)  # the command's own rc, not the writeback's
 
+    def test_run_action_cwd_file_tolerates_background_and_comment(self):
+        # greptile P1: the cwd-persistence wrapper terminates the brace group with
+        # a NEWLINE, not `;`. A trailing `&` (background/keep-alive) or a trailing
+        # `# comment` must run as product behavior, NOT become a bash syntax error.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub(d, "echo ok; exit 0\n")
+            cwd_file = os.path.join(d, ".cwd")
+            os.mkdir(os.path.join(d, "sub"))
+            # Trailing background job: `{ true & ; }` would be a syntax error.
+            a = run_action("true &", izba_bin=stub, workdir=d, data_dir=d,
+                           timeout_s=10, cwd_file=cwd_file)
+            self.assertEqual(a.exit_code, 0, a.stderr_tail)
+            self.assertNotIn("syntax error", a.stderr_tail)
+            # Trailing comment must not swallow the closing brace; cwd still persists.
+            b = run_action("cd sub  # jump into sub", izba_bin=stub, workdir=d,
+                           data_dir=d, timeout_s=10, cwd_file=cwd_file)
+            self.assertEqual(b.exit_code, 0, b.stderr_tail)
+            c = run_action("pwd", izba_bin=stub, workdir=d, data_dir=d,
+                           timeout_s=10, cwd_file=cwd_file)
+            self.assertTrue(c.stdout_tail.strip().endswith("/sub"), c.stdout_tail)
+
     def test_run_action_cwd_file_none_does_not_persist(self):
         # Default (cwd_file=None): each action starts fresh in workdir, so a `cd`
         # in one call does NOT leak into the next — unchanged legacy behavior.

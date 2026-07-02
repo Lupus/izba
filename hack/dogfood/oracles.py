@@ -142,10 +142,14 @@ def run_action(
         # persist $PWD for the next action. `cd workdir` stays as the subprocess
         # base so a failed START `cd` still lands somewhere sane. shlex.quote all
         # three interpolated paths so odd chars can't break out of the wrapper.
+        # The brace group is terminated by a NEWLINE, not a `;`: a `;` right after
+        # the command turns a valid trailing `&` (background job) into `&;` — a
+        # bash syntax error — and lets a trailing `# comment` swallow the closing
+        # `}`. A newline terminates the command cleanly in both cases.
         start_dir = _read_cwd_file(cwd_file) or workdir
         to_run = (
             f"cd {shlex.quote(start_dir)} 2>/dev/null || cd {shlex.quote(workdir)}; "
-            f"{{ {command}; }}; __rc=$?; "
+            f"{{ {command}\n}}; __rc=$?; "
             f"printf '%s' \"$PWD\" > {shlex.quote(cwd_file)}; exit $__rc"
         )
 
