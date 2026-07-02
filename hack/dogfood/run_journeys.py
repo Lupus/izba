@@ -179,20 +179,63 @@ class BudgetExceeded(Exception):
 
 def _collect_candidates(action, command, action_index, prev_reconcile,
                         latency_budget_ms, journey, step, journey_id):
-    """All oracles for one action -> a list of candidate dicts (with refs)."""
+    """Per-ACTION oracles -> a list of candidate dicts (with refs).
+
+    ``implicit`` (crash markers / exit-code contract), ``latency``, and
+    ``reconcile_seq`` fire on EVERY action — a panic or a signal-death anywhere in
+    the journey is a finding regardless of which step it happened in. The
+    ``functional`` oracle is deliberately NOT here: it is graded once per step, on
+    that step's FINAL action, by ``_grade_step_functional`` — so an intermediate
+    recovery action inside an otherwise-passing step no longer emits a spurious
+    functional candidate (the #111 setup-noise false-negative)."""
     ref = {"journey_id": journey_id, "action_index": action_index}
     found = implicit_oracle(action) + latency_oracle(action, latency_budget_ms)
     if prev_reconcile is not None:
         found += reconcile_seq_oracle(prev_reconcile, action.reconcile)
-    # Functional oracle understands expected-failure steps (a refusal that
-    # exits non-zero is the PASS; a refusal that exits 0 is a candidate).
-    source = journey.get("source", {}).get("ref", "journey step")
-    found += functional_oracle(command, action.exit_code, step.get("expect", ""),
-                               source, ref)
     out = []
     for c in found:
         cd = c.to_dict()
         cd["trajectory_ref"] = ref
+        out.append(cd)
+    return out
+
+
+def _decisive_step_indices(steps: List[Dict[str, Any]]) -> set:
+    """The indices of a journey's DECISIVE steps.
+
+    Decisive = every step marked ``core: true``; or, if none is marked, just the
+    LAST step (the "grade the decisive (last/core) step" rule). An empty step list
+    yields an empty set."""
+    core = {i for i, s in enumerate(steps) if s.get("core")}
+    if core:
+        return core
+    return {len(steps) - 1} if steps else set()
+
+
+def _grade_step_functional(step, produced, journey, journey_id, decisive,
+                           action_index) -> List[Dict[str, Any]]:
+    """Grade the functional assertion ONCE, on a step's FINAL action.
+
+    ``produced`` is the list of action dicts this step appended (``actions[start:]``);
+    ``action_index`` is the absolute index of its LAST element. Grading only the
+    action the step actually ended on means intermediate recovery actions don't
+    flip the journey. Each emitted functional candidate is tagged ``decisive`` (a
+    plain dict key, NOT a Candidate field) so the collector knows whether it may
+    flip the journey negative (decisive) or is merely soft (non-decisive)."""
+    if not produced:
+        return []
+    last = produced[-1]
+    ref = {"journey_id": journey_id, "action_index": action_index}
+    source = journey.get("source", {}).get("ref", "journey step")
+    found = functional_oracle(
+        last.get("command", ""), last.get("exit_code", 0),
+        step.get("expect", ""), source, ref,
+        expect_exit=step.get("expect_exit"))
+    out = []
+    for c in found:
+        cd = c.to_dict()
+        cd["trajectory_ref"] = ref
+        cd["decisive"] = bool(decisive)
         out.append(cd)
     return out
 
@@ -216,49 +259,115 @@ def _next_command(model, journey, step, actions, budget, journey_id):
 def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
               action_timeout_s,
               latency_budget_ms, budget, max_usd, max_turns, step_cap,
-              journey_id, actions, candidates, ctx) -> bool:
+              journey_id, actions, candidates, ctx, decisive, cwd_file) -> bool:
     """Run one step's Actor loop. Mutates ``actions``/``candidates``/``ctx``.
     Returns True if a journey-level cap (step-cap/max-turns) tripped (caller
     should stop the whole journey). Raises BudgetExceeded on the $ cap.
 
     Loop-dedup (``seen``) is scoped PER STEP so a later step can legitimately
-    re-issue a common verify command (e.g. ``izba ls``)."""
+    re-issue a common verify command (e.g. ``izba ls``).
+
+    The functional assertion is graded ONCE at step end, on the step's final
+    action (``actions[start:][-1]``): we snapshot ``start`` before the loop and
+    grade what the step produced, tagging the candidate ``decisive`` per this
+    step's role. Grading in a ``finally`` guarantees it also runs when a cap trips
+    or a report-only error ends the step early."""
     seen: set = set()
-    while True:
-        if len(actions) >= step_cap:
-            log(f"{journey_id}: step-cap {step_cap} reached; stopping journey")
-            return True
-        if ctx["turns"] >= max_turns:
-            log(f"{journey_id}: max-turns {max_turns} reached; stopping journey")
-            return True
-        if budget["usd"] >= max_usd:
-            log(f"{journey_id}: budget ${budget['usd']:.4f} >= ${max_usd}; aborting")
-            raise BudgetExceeded()
+    start = len(actions)  # index of this step's first action; actions[start:] = its own
+    try:
+        while True:
+            if len(actions) >= step_cap:
+                log(f"{journey_id}: step-cap {step_cap} reached; stopping journey")
+                return True
+            if ctx["turns"] >= max_turns:
+                log(f"{journey_id}: max-turns {max_turns} reached; stopping journey")
+                return True
+            if budget["usd"] >= max_usd:
+                log(f"{journey_id}: budget ${budget['usd']:.4f} >= ${max_usd}; aborting")
+                raise BudgetExceeded()
 
-        ctx["turns"] += 1
-        command = _next_command(model, journey, step, actions, budget, journey_id)
-        if command is None:
-            return False
-        h = _cmd_hash(journey_id, command)
-        if h in seen:
-            log(f"{journey_id}: loop-dedup hit on {command!r}; ending step")
-            return False
-        seen.add(h)
+            ctx["turns"] += 1
+            command = _next_command(model, journey, step, actions, budget, journey_id)
+            if command is None:
+                return False
+            h = _cmd_hash(journey_id, command)
+            if h in seen:
+                log(f"{journey_id}: loop-dedup hit on {command!r}; ending step")
+                return False
+            seen.add(h)
 
-        try:  # report-only; run_action never raises in practice
-            action = run_action(command, izba_bin=izba_bin, workdir=workdir,
-                                data_dir=data_dir, timeout_s=action_timeout_s,
-                                intent=step.get("intent", ""))
-        except Exception as e:  # defensive: should not happen
-            log(f"{journey_id}: run_action error: {e!r}; skipping")
-            return False
+            try:  # report-only; run_action never raises in practice
+                action = run_action(command, izba_bin=izba_bin, workdir=workdir,
+                                    data_dir=data_dir, timeout_s=action_timeout_s,
+                                    intent=step.get("intent", ""), cwd_file=cwd_file)
+            except Exception as e:  # defensive: should not happen
+                log(f"{journey_id}: run_action error: {e!r}; skipping")
+                return False
 
-        action_index = len(actions)
-        actions.append(action.to_dict())
-        candidates.extend(_collect_candidates(
-            action, command, action_index, ctx["prev_reconcile"],
-            latency_budget_ms, journey, step, journey_id))
-        ctx["prev_reconcile"] = action.reconcile
+            action_index = len(actions)
+            actions.append(action.to_dict())
+            candidates.extend(_collect_candidates(
+                action, command, action_index, ctx["prev_reconcile"],
+                latency_budget_ms, journey, step, journey_id))
+            ctx["prev_reconcile"] = action.reconcile
+    finally:
+        # Grade the step's final action once, on EVERY exit path (done, dedup,
+        # cap, run_action error) — except a BudgetExceeded unwind, which is
+        # aborting the whole run mid-step, so a functional verdict on a
+        # half-finished step would be misleading. sys.exc_info() tells us whether
+        # we are leaving the block via that in-flight exception.
+        if not isinstance(sys.exc_info()[1], BudgetExceeded):
+            produced = actions[start:]
+            candidates.extend(_grade_step_functional(
+                step, produced, journey, journey_id, decisive,
+                len(actions) - 1))
+
+
+def _write_seed_files(workdir: str, seed_files: Optional[Dict[str, Any]]) -> None:
+    """Materialize a journey's ``seed_files`` (relpath -> content) into ``workdir``.
+
+    A precondition-seeding primitive (Part E): each entry is written under
+    ``workdir``, creating parent dirs. Traversal-guarded exactly like
+    ``_journey_data_dir`` reasons about ``base`` — an agent-authored path must not
+    escape the project dir:
+
+    - reject a non-str / empty key, or a non-str content;
+    - reject an absolute path or one whose ``normpath`` starts with ``..``
+      (the cheap syntactic guard);
+    - reject anything that, resolved, does not stay under ``workdir`` (the
+      authoritative ``realpath``-prefix guard — catches symlink/edge escapes the
+      syntactic check misses).
+
+    Report-only: a rejected or failed entry is logged and skipped; this never
+    raises (a seeding hiccup must not abort a journey — the journey just starts
+    without that fixture, which the oracles will then observe honestly)."""
+    if not isinstance(seed_files, dict):
+        return
+    # realpath the base once so the prefix comparison is against the resolved dir.
+    base_real = os.path.realpath(workdir)
+    for relpath, content in seed_files.items():
+        if not isinstance(relpath, str) or not relpath.strip():
+            log(f"seed_files: skipping non-str/empty key {relpath!r}")
+            continue
+        if not isinstance(content, str):
+            log(f"seed_files: skipping {relpath!r}: content is not a string")
+            continue
+        norm = os.path.normpath(relpath)
+        if os.path.isabs(norm) or norm == ".." or norm.startswith(".." + os.sep):
+            log(f"seed_files: rejecting traversal/absolute path {relpath!r}")
+            continue
+        dest = os.path.join(workdir, norm)
+        # Authoritative escape check: the resolved parent must stay under base.
+        parent_real = os.path.realpath(os.path.dirname(dest))
+        if parent_real != base_real and not parent_real.startswith(base_real + os.sep):
+            log(f"seed_files: rejecting escaping path {relpath!r}")
+            continue
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:  # report-only: a bad write must not kill the journey
+            log(f"seed_files: failed to write {relpath!r}: {e!r}")
 
 
 def run_journey(
@@ -284,14 +393,24 @@ def run_journey(
     # izba's internal sandbox state. izba run/cp share this as /workspace.
     workdir = os.path.join(data_dir, "proj")
     os.makedirs(workdir, exist_ok=True)
+    # Materialize precondition files (Part E) into the workdir BEFORE any step, so
+    # a deep journey can start at the feature's real surface (e.g. a valid izba.yml
+    # already present) instead of burning its steps authoring the prerequisite.
+    _write_seed_files(workdir, journey.get("seed_files"))
+    # One cwd file per journey so cwd persists across actions like a real shell
+    # (Part D). NOT pre-created: run_action treats its absence as "start in
+    # workdir", so the first action naturally begins there.
+    cwd_file = os.path.join(data_dir, ".cwd")
     steps = journey.get("steps", []) or [{"intent": journey.get("rationale", ""),
                                           "expect": ""}]
-    for step in steps:
+    decisive_idx = _decisive_step_indices(steps)
+    for i, step in enumerate(steps):
         stop = _run_step(
             model, journey, step, izba_bin, data_dir, workdir,
             action_timeout_s=action_timeout_s, latency_budget_ms=latency_budget_ms,
             budget=budget, max_usd=max_usd, max_turns=max_turns, step_cap=step_cap,
-            journey_id=journey_id, actions=actions, candidates=candidates, ctx=ctx)
+            journey_id=journey_id, actions=actions, candidates=candidates, ctx=ctx,
+            decisive=(i in decisive_idx), cwd_file=cwd_file)
         if stop:
             break
     # State-based oracle: snapshot izba's OWN audit/policy/lifecycle state so the

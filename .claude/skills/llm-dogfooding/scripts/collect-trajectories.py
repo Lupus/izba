@@ -37,8 +37,36 @@ def load_bundles(artifacts_dir: str) -> list[dict]:
     return out
 
 
+def _is_flipping(cand: dict) -> bool:
+    """Does this candidate flip its journey NEGATIVE?
+
+    Framed as the SOFT allow-list, so everything else fails LOUD (an unknown or
+    future candidate kind flips rather than being silently dropped from the tally
+    — the collector must never quietly lose a real finding). Exactly two classes
+    are soft:
+
+    - a ``latency`` candidate — an over-budget action is a UX finding, never the
+      pass/fail of the user's goal;
+    - a NON-decisive ``functional`` candidate — setup/recovery noise, i.e. a
+      non-zero exit in a step that is not the journey's core / fallback-last step.
+
+    Everything else flips: ``implicit`` (crash/panic/exit-contract) and
+    ``reconcile_seq`` (lifecycle invariant) — a crash anywhere is always real; a
+    ``decisive`` ``functional`` — the assertion that governs the user's goal; and
+    any GUI kind (``console``/``ui_daemon_diff``/``silent_failure``/``dom_expect``)
+    should this collector ever ingest GUI bundles. This is the #111 fix: setup
+    noise no longer masks a satisfied core assertion, WITHOUT downgrading anything
+    we don't explicitly recognize as soft."""
+    kind = cand.get("kind", "?")
+    if kind == "latency":
+        return False
+    if kind == "functional":
+        return bool(cand.get("decisive"))
+    return True
+
+
 def collect(artifacts_dir: str) -> dict:
-    negatives, positives = [], []
+    negatives, soft, positives = [], [], []
     by_kind = collections.Counter()
     n_journeys = 0
     for path, bundle in load_bundles(artifacts_dir):
@@ -49,10 +77,19 @@ def collect(artifacts_dir: str) -> dict:
             acts = r.get("actions", []) or []
             cands = r.get("candidates", []) or []
             ref = {"shard": shard, "journey_id": jid, "bundle": path}
+            n_flipping = 0
             for c in cands:
-                by_kind[c.get("kind", "?")] += 1
-                negatives.append({**ref, **{k: c.get(k) for k in
-                                  ("kind", "detail", "violated_expectation", "source")}})
+                by_kind[c.get("kind", "?")] += 1  # by_kind counts ALL candidates
+                row = {**ref, **{k: c.get(k) for k in
+                       ("kind", "detail", "violated_expectation", "source")}}
+                if _is_flipping(c):
+                    n_flipping += 1
+                    negatives.append(row)
+                else:
+                    # Carry `decisive` so the skeptic can see it was a graded-but-
+                    # non-decisive functional finding (vs a latency one).
+                    row["decisive"] = c.get("decisive")
+                    soft.append(row)
             # Final exit + a compact trajectory the skeptic can scan.
             traj = [{"i": i, "cmd": a.get("command"), "exit": a.get("exit_code"),
                      "out": (a.get("stdout_tail") or "")[-160:],
@@ -61,8 +98,12 @@ def collect(artifacts_dir: str) -> dict:
             entry = {**ref, "n_actions": len(acts),
                      "exits": [a.get("exit_code") for a in acts],
                      "trajectory": traj}
-            if cands:
-                entry["n_candidates"] = len(cands)
+            # A journey is POSITIVE iff it has zero FLIPPING candidates. Soft
+            # candidates (non-decisive functional / latency) don't disqualify it,
+            # but they are still emitted for the skeptic to audit.
+            if n_flipping:
+                entry["n_candidates"] = n_flipping
+                entry["n_soft"] = len(cands) - n_flipping
             else:
                 positives.append(entry)
     return {
@@ -70,8 +111,11 @@ def collect(artifacts_dir: str) -> dict:
         "totals": {"journeys": n_journeys,
                    "candidates": sum(by_kind.values()),
                    "by_kind": dict(by_kind),
+                   "flipping_candidates": len(negatives),
+                   "soft_candidates": len(soft),
                    "positive_journeys": len(positives)},
         "negatives": negatives,
+        "soft": soft,
         "positives": positives,
     }
 
@@ -89,9 +133,16 @@ def main(argv=None) -> int:
 
     t = data["totals"]
     print(f"== {t['journeys']} journeys | {t['candidates']} candidates "
-          f"({t['by_kind']}) | {t['positive_journeys']} positive (audit for cheating) ==\n")
-    print("NEGATIVE candidates (refute each — real | intended | self-inflicted | discoverability):")
+          f"({t['by_kind']}) | {t['flipping_candidates']} flipping / "
+          f"{t['soft_candidates']} soft | {t['positive_journeys']} positive "
+          f"(audit for cheating) ==\n")
+    print("FLIPPING candidates (journey-negative — refute each: "
+          "real | intended | self-inflicted | discoverability):")
     for c in data["negatives"]:
+        print(f"  [{c['kind']}] {c['journey_id']}: {(c.get('detail') or '')[:150]}")
+    print("\nSOFT candidates (do NOT flip the journey — non-decisive functional / "
+          "latency; still audit as UX signal):")
+    for c in data["soft"]:
         print(f"  [{c['kind']}] {c['journey_id']}: {(c.get('detail') or '')[:150]}")
     print("\nPOSITIVE journeys (audit — genuinely-achieved | cheated/unverified | inconclusive):")
     for p in data["positives"]:
