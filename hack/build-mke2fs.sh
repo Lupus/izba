@@ -15,7 +15,16 @@ REPO_ROOT="$(pwd)"
 VERSION=1.47.2
 # sha256 from https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.2/sha256sums.asc
 SHA256=08242e64ca0e8194d9c1caad49762b19209a06318199b63ce74ae4ef2d74e63c
-URL="https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${VERSION}/e2fsprogs-${VERSION}.tar.xz"
+# Mirror list, tried in order until one succeeds. kernel.org's `people/tytso`
+# area is NOT part of the standard kernel.org mirror network AND kernel.org's CDN
+# has 404'd this file during outages, which would (and did) break both this build
+# and e2e on any cache miss. sources.buildroot.net keeps the byte-identical
+# upstream release tarball (sha256 verified below — that check is what makes
+# pulling from a secondary mirror safe: a wrong/tampered file simply fails it).
+URLS=(
+    "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${VERSION}/e2fsprogs-${VERSION}.tar.xz"
+    "https://sources.buildroot.net/e2fsprogs/e2fsprogs-${VERSION}.tar.xz"
+)
 
 OUTPUT="${1:-dist/mke2fs-${VERSION}-static-x86_64}"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/izba/e2fsprogs"
@@ -46,7 +55,21 @@ fi
 # ---------------------------------------------------------------------------
 mkdir -p "$CACHE"
 if [[ ! -f "$TARBALL" ]]; then
-    curl -fsSL -o "$TARBALL.part" "$URL" || { rm -f "$TARBALL.part"; exit 1; }
+    fetched=0
+    for url in "${URLS[@]}"; do
+        echo "fetching e2fsprogs-${VERSION}.tar.xz from $url" >&2
+        if curl -fsSL --retry 2 --retry-delay 1 --max-time 180 \
+                -o "$TARBALL.part" "$url"; then
+            fetched=1
+            break
+        fi
+        rm -f "$TARBALL.part"
+        echo "  ...mirror failed, trying next" >&2
+    done
+    if [[ "$fetched" -ne 1 ]]; then
+        echo "error: all mirrors failed for e2fsprogs-${VERSION}.tar.xz" >&2
+        exit 1
+    fi
     mv "$TARBALL.part" "$TARBALL"
 fi
 if ! echo "$SHA256  $TARBALL" | sha256sum -c - >/dev/null; then
