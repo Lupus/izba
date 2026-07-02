@@ -1,0 +1,57 @@
+{
+  "feature": "izba.yml diff/promote — deep seeded example",
+  "journeys": [
+    {
+      "journey_id": "promote-first-manifest-applies",
+      "rationale": "A first-time promote of a reviewed manifest reconciles the live sandbox to it — the happy path through the human-gated bridge.",
+      "source": { "kind": "spec", "ref": "2026-06-28-izba-manifest-diff-promote-design §8 promote semantics" },
+      "tier": "deep",
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nmetadata:\n  name: gate-demo\nspec:\n  image: ubuntu:24.04\n  resources: {cpus: 2, memory: 2Gi}\n  rootDisk: {size: 8Gi}\n  egress:\n    enforce: true\n    allow:\n      - host: github.com\n"
+      },
+      "steps": [
+        {
+          "intent": "create a sandbox from the manifest in the current directory",
+          "expect": "the sandbox is created and running",
+          "core": false
+        },
+        {
+          "intent": "review the pending changes between the manifest and the live sandbox",
+          "expect": "a structured diff and a review token are shown"
+        },
+        {
+          "intent": "apply the reviewed manifest to the sandbox",
+          "expect": "the changes are promoted and the sandbox reflects the manifest",
+          "core": true
+        }
+      ]
+    },
+    {
+      "journey_id": "review-gate-refuses-stale-token",
+      "rationale": "Editing izba.yml after reviewing it invalidates the review token; promote must refuse (the TOCTOU guard the review gate exists to enforce).",
+      "source": { "kind": "spec", "ref": "2026-06-28-izba-manifest-diff-promote-design §7 review gate" },
+      "tier": "deep",
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nmetadata:\n  name: gate-demo\nspec:\n  image: ubuntu:24.04\n  resources: {cpus: 2, memory: 2Gi}\n  rootDisk: {size: 8Gi}\n  egress:\n    enforce: true\n    allow:\n      - host: github.com\n"
+      },
+      "steps": [
+        {
+          "intent": "create a sandbox from the manifest",
+          "expect": "the sandbox is running",
+          "core": false
+        },
+        {
+          "intent": "review the diff to obtain a review token for the current manifest",
+          "expect": "a review token is shown for the current izba.yml",
+          "core": false
+        },
+        {
+          "intent": "edit izba.yml to broaden the egress allow-list, then try to promote relying on the earlier review",
+          "expect": "promote refuses because the manifest changed since it was reviewed",
+          "core": true,
+          "expect_exit": "nonzero"
+        }
+      ]
+    }
+  ]
+}

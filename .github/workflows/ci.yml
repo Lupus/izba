@@ -103,3 +103,24 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87 # v2
         with:
           command: check advisories bans licenses sources
+
+  dogfood-harness:
+    # The LLM-dogfooding harness (hack/dogfood/**) is pure-stdlib Python with its
+    # own unit tests, but nothing gated them before — dogfood.yml only RUNS the
+    # harness, never its tests, so a harness regression could land green. This
+    # job is that missing gate. venv-isolated so `pip` works on the PEP-668
+    # externally-managed system Python of ubuntu-latest without --break-system.
+    name: dogfood harness tests (python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Run dogfood harness tests
+        run: |
+          python3 -m venv /tmp/dfvenv
+          # jsonschema is what dispatch-swarm.sh uses to validate a journeys.json;
+          # installing it here lets the fixture-validation test actually run.
+          /tmp/dfvenv/bin/pip install --quiet pytest jsonschema
+          # Covers the unittest.TestCase suites (CLI runner + oracles) AND the
+          # pytest-style GUI + schema tests in one pass.
+          /tmp/dfvenv/bin/pytest hack/dogfood -q

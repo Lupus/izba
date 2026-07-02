@@ -129,6 +129,55 @@ class FunctionalOracleTests(unittest.TestCase):
         self.assertEqual(c[0].source, "spec §1")
 
 
+class ExpectExitOracleTests(unittest.TestCase):
+    def test_expect_exit_nonzero_pass(self):
+        # A declared expected-failure that actually failed -> PASS (no candidate).
+        self.assertEqual(
+            functional_oracle("izba ssh x -- false", 1, "", expect_exit="nonzero"),
+            [],
+        )
+
+    def test_expect_exit_nonzero_fail(self):
+        # Declared expected-failure that SUCCEEDED (exit 0) -> candidate.
+        c = functional_oracle("izba ssh x -- false", 0, "", expect_exit="nonzero")
+        self.assertTrue(any(x.kind == "functional" for x in c))
+        self.assertIn("unexpectedly succeeded", c[0].detail)
+
+    def test_expect_exit_specific_int_pass(self):
+        self.assertEqual(
+            functional_oracle("cmd", 1, "", expect_exit=1), [])
+
+    def test_expect_exit_specific_int_fail(self):
+        c = functional_oracle("cmd", 2, "", expect_exit=1)
+        self.assertTrue(any(x.kind == "functional" for x in c))
+        self.assertIn("exited 2", c[0].detail)
+
+    def test_expect_exit_none_falls_back_to_keyword_path(self):
+        # expect_exit absent -> the existing English-keyword `expect` path governs.
+        self.assertTrue(functional_oracle(
+            "izba create x", 1, "create succeeds", expect_exit=None))
+        self.assertEqual(functional_oracle(
+            "izba create x", 0, "create succeeds", expect_exit=None), [])
+        # A True bool must NOT be read as exit code 1 -> still falls back.
+        self.assertTrue(functional_oracle(
+            "izba create x", 1, "create succeeds", expect_exit=True))
+
+
+class ExitCodeMappingTests(unittest.TestCase):
+    def test_exit_255_is_transport_failure_not_signal_127(self):
+        c = implicit_oracle(act(exit_code=255, command="ssh izba-box -- false"))
+        self.assertTrue(c)
+        detail = " ".join(x.detail for x in c)
+        self.assertNotIn("Signal(127)", detail)
+        self.assertTrue("transport" in detail or "connection" in detail, detail)
+        # ssh/scp family is named.
+        self.assertIn("ssh", detail)
+
+    def test_exit_139_still_maps_to_signal_11(self):
+        c = implicit_oracle(act(exit_code=139))  # 128 + 11 (SIGSEGV)
+        self.assertTrue(any("Signal(11)" in x.detail for x in c))
+
+
 class ReconcileSeqOracleTests(unittest.TestCase):
     def snap(self, **kw):
         base = dict(name="box", status_daemon="running", status_disk="running",
@@ -243,6 +292,40 @@ class RunActionTests(unittest.TestCase):
             self.assertEqual(ev["sandboxes"], ["sb1"])
             self.assertIn("enforce: on", ev["per_sandbox"]["sb1"]["policy_show"]["stdout"])
             self.assertIn("ALLOW", ev["per_sandbox"]["sb1"]["netlog"]["stdout"])
+
+    def test_run_action_cwd_file_persists_across_two_calls(self):
+        # With a cwd_file, `cd sub` in one action must persist so a command in the
+        # next action runs inside sub — a real shell session, not fresh each time.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub(d, "echo ok; exit 0\n")
+            cwd_file = os.path.join(d, ".cwd")
+            os.mkdir(os.path.join(d, "sub"))
+            a1 = run_action("cd sub", izba_bin=stub, workdir=d, data_dir=d,
+                            timeout_s=10, cwd_file=cwd_file)
+            self.assertEqual(a1.exit_code, 0)
+            a2 = run_action("pwd", izba_bin=stub, workdir=d, data_dir=d,
+                            timeout_s=10, cwd_file=cwd_file)
+            self.assertTrue(a2.stdout_tail.strip().endswith("/sub"),
+                            a2.stdout_tail)
+
+    def test_run_action_cwd_file_preserves_command_exit_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub(d, "echo ok; exit 0\n")
+            cwd_file = os.path.join(d, ".cwd")
+            a = run_action("exit 3", izba_bin=stub, workdir=d, data_dir=d,
+                           timeout_s=10, cwd_file=cwd_file)
+            self.assertEqual(a.exit_code, 3)  # the command's own rc, not the writeback's
+
+    def test_run_action_cwd_file_none_does_not_persist(self):
+        # Default (cwd_file=None): each action starts fresh in workdir, so a `cd`
+        # in one call does NOT leak into the next — unchanged legacy behavior.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub(d, "echo ok; exit 0\n")
+            os.mkdir(os.path.join(d, "sub"))
+            run_action("cd sub", izba_bin=stub, workdir=d, data_dir=d, timeout_s=10)
+            a2 = run_action("pwd", izba_bin=stub, workdir=d, data_dir=d, timeout_s=10)
+            self.assertFalse(a2.stdout_tail.strip().endswith("/sub"), a2.stdout_tail)
+            self.assertFalse(os.path.exists(os.path.join(d, ".cwd")))
 
     def test_action_round_trips_to_dict(self):
         a = act()

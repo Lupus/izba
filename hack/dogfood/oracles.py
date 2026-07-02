@@ -20,7 +20,9 @@ Everything here is pure/stdlib so it is unit-testable anywhere (see
 
 from __future__ import annotations
 
+import os
 import re
+import shlex
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -86,6 +88,20 @@ def _shell_env(izba_bin: str, data_dir: str,
     return run_env
 
 
+def _read_cwd_file(cwd_file: str) -> str:
+    """Return the saved cwd from ``cwd_file`` (stripped), or '' if absent/empty.
+
+    Report-only: any read error just yields '' so the caller falls back to
+    ``workdir`` — a missing cwd file is the normal first-action state, never an
+    error.
+    """
+    try:
+        with open(cwd_file, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def run_action(
     command: str,
     *,
@@ -95,6 +111,7 @@ def run_action(
     timeout_s: float,
     intent: str = "",
     env: Optional[Dict[str, str]] = None,
+    cwd_file: Optional[str] = None,
 ) -> Action:
     """Run ONE Actor command as a real shell line, then snapshot reconcile.
 
@@ -104,15 +121,38 @@ def run_action(
     This is the faithful "real user with a shell" model: the Actor can write
     files and compose pipelines, not just call one binary.
 
+    ``cwd_file`` — when given, cwd PERSISTS across actions like a real shell: the
+    command starts from the dir saved in ``cwd_file`` (falling back to ``workdir``
+    when the file is absent/empty), and the resulting ``$PWD`` is written back for
+    the next action. So ``mkdir X && cd X`` in one action and a command inside
+    ``X`` in the next now behave as one shell session. When ``cwd_file`` is
+    ``None`` (the default, and every existing caller/test) behavior is unchanged:
+    each action starts fresh in ``workdir``. The command's own exit code is always
+    preserved (``__rc``); the cwd write-back is best-effort.
+
     Report-only: a timeout or any OS error is captured into the Action (exit_code
     set to a non-zero sentinel); this never raises.
     """
     run_env = _shell_env(izba_bin, data_dir, env)
 
+    to_run = command
+    if cwd_file is not None:
+        # Start from the saved cwd (or workdir if unseeded/empty), run the Actor's
+        # command in a brace group so ITS exit code is what we preserve, then
+        # persist $PWD for the next action. `cd workdir` stays as the subprocess
+        # base so a failed START `cd` still lands somewhere sane. shlex.quote all
+        # three interpolated paths so odd chars can't break out of the wrapper.
+        start_dir = _read_cwd_file(cwd_file) or workdir
+        to_run = (
+            f"cd {shlex.quote(start_dir)} 2>/dev/null || cd {shlex.quote(workdir)}; "
+            f"{{ {command}; }}; __rc=$?; "
+            f"printf '%s' \"$PWD\" > {shlex.quote(cwd_file)}; exit $__rc"
+        )
+
     start = time.monotonic()
     try:
         proc = subprocess.run(
-            ["bash", "-c", command],
+            ["bash", "-c", to_run],
             cwd=workdir,
             capture_output=True,
             text=True,
@@ -249,6 +289,24 @@ def implicit_oracle(action: Action) -> List[Candidate]:
             source="contract: exec exit-code mapping",
             trajectory_ref=dict(ref),
         ))
+    elif code == 255:
+        # 255 = 128+127 can NEVER be a real signal (max signal is ~64), so the
+        # generic 128+n arm below would mislabel it Signal(127). It is the
+        # conventional ssh/scp/sftp exit for a transport/connection failure
+        # (auth/handshake/network), so classify it as that instead — and name
+        # the tool when the command is one of that family.
+        tool = ""
+        first = (action.command or "").strip().split()
+        if first and os.path.basename(first[0]) in ("ssh", "scp", "sftp"):
+            tool = f" ({os.path.basename(first[0])})"
+        out.append(Candidate(
+            kind="implicit",
+            detail=(f"exit 255 (SSH/scp transport or connection failure) from "
+                    f"{action.command!r}{tool}"),
+            violated_expectation="ssh/scp transport should connect (exit != 255)",
+            source="contract: ssh/scp transport exit convention",
+            trajectory_ref=dict(ref),
+        ))
     elif code > 128:
         out.append(Candidate(
             kind="implicit",
@@ -299,6 +357,8 @@ def functional_oracle(
     expect: str,
     source: str = "journey step",
     ref: Optional[Dict[str, Any]] = None,
+    *,
+    expect_exit: Any = None,
 ) -> List[Candidate]:
     """Compare a command's exit against the step's expectation (two-sided).
 
@@ -310,15 +370,53 @@ def functional_oracle(
       what kills the bulk of the false positives the old check produced on
       grammar-rejection / in-use-guard journeys (whose whole point is a refusal).
 
+    When ``expect_exit`` is supplied and valid it DRIVES the verdict, superseding
+    the English-keyword ``expect`` heuristic entirely (the declarative escape
+    hatch #111 asked for — a step can now assert an expected failure instead of
+    hoping the phrasing trips ``_EXPECT_FAILURE_RE``):
+
+    - ``"nonzero"`` -> candidate iff the command exited 0 (an expected refusal
+      that silently succeeded).
+    - integer ``N`` -> candidate iff the command exited != N (the assertion is a
+      specific code, e.g. `izba ssh NAME -- false` must exit 1).
+
+    An absent/invalid ``expect_exit`` falls back to the ``expect`` path unchanged.
+
     This is a deliberately WEAK proposer, not an outcome verdict: an exit code is
     a poor oracle for "did the user's goal happen" (a command can exit 0 without
     achieving it, or non-zero via a valid alternative path). Egress/UX outcomes
     are judged from product state + the rubric judge; this only catches the gross
     "expected success, hard error" / "expected refusal, silent success" cases.
     """
+    ref = dict(ref or {"journey_id": "", "action_index": -1})
+    # Declarative assertion takes precedence over the fragile keyword heuristic.
+    # `bool` is a subclass of `int`, so exclude it explicitly — `expect_exit:
+    # true` is not a meaningful exit code and must not be read as `1`.
+    if expect_exit == "nonzero":
+        if exit_code == 0:
+            return [Candidate(
+                kind="functional",
+                detail=(f"command {command!r} unexpectedly succeeded (exit 0) "
+                        f"while the step declared expect_exit=nonzero"),
+                violated_expectation=expect or "expect_exit: nonzero",
+                source=source,
+                trajectory_ref=ref,
+            )]
+        return []
+    if isinstance(expect_exit, int) and not isinstance(expect_exit, bool):
+        if exit_code != expect_exit:
+            return [Candidate(
+                kind="functional",
+                detail=(f"command {command!r} exited {exit_code} "
+                        f"while the step declared expect_exit={expect_exit}"),
+                violated_expectation=expect or f"expect_exit: {expect_exit}",
+                source=source,
+                trajectory_ref=ref,
+            )]
+        return []
+    # No (valid) declarative assertion -> the legacy English-keyword path.
     if not expect:
         return []
-    ref = dict(ref or {"journey_id": "", "action_index": -1})
     if expects_failure(expect):
         if exit_code == 0:
             return [Candidate(

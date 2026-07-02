@@ -85,6 +85,7 @@
           "description": "Which oracle produced the candidate. CLI oracles: functional/latency/implicit/reconcile_seq. GUI oracles: console (uncaught JS error / rejection), ui_daemon_diff (UI state disagrees with daemon truth), silent_failure (invoke rejected with no visible error surface), dom_expect (user-observable expectation absent from the snapshot)."
         },
         "detail": { "type": "string", "description": "What was observed." },
+        "decisive": { "type": "boolean", "description": "Functional oracle only: true iff this candidate came from a journey's decisive (core, or fallback last) step. The collector flips a journey negative on a decisive functional candidate; a non-decisive one is soft (surfaced but does not bury the journey). Absent on non-functional candidates." },
         "violated_expectation": { "type": "string", "description": "The expectation the observation contradicts." },
         "source": { "type": "string", "description": "Where that expectation is traced from (spec/pr/help/contract)." },
         "trajectory_ref": {

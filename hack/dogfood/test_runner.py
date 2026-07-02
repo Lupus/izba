@@ -4,6 +4,7 @@ Everything here runs with a FakeModel and a stub ``izba`` binary, so it needs
 neither an API key nor KVM.
 """
 
+import importlib.util
 import json
 import os
 import sys
@@ -14,6 +15,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import run_journeys  # noqa: E402
 from model import FakeModel  # noqa: E402
+
+
+def _load_collector():
+    """Import the (dash-named, out-of-tree) collect-trajectories.py script so the
+    end-to-end tally can be asserted against the REAL collector, not a re-impl.
+
+    Path is resolved from this file (cwd-independent). Returns None if the script
+    is absent (odd checkout) so the dependent test self-skips instead of erroring."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(repo_root, ".claude", "skills", "llm-dogfooding",
+                        "scripts", "collect-trajectories.py")
+    if not os.path.isfile(path):
+        return None
+    spec = importlib.util.spec_from_file_location("collect_trajectories", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _write_stub_izba(d):
@@ -356,6 +374,154 @@ class HarnessImprovementTests(unittest.TestCase):
             ])
             self.assertTrue(os.path.isdir(run_journeys._journey_data_dir(data_dir, "j-one")))
             self.assertTrue(os.path.isdir(run_journeys._journey_data_dir(data_dir, "j-two")))
+
+
+class SeedFilesTests(unittest.TestCase):
+    def test_write_seed_files_writes_nested_and_rejects_traversal(self):
+        with tempfile.TemporaryDirectory() as d:
+            wd = os.path.join(d, "proj")
+            os.makedirs(wd)
+            run_journeys._write_seed_files(wd, {
+                "izba.yml": "version: 1\n",
+                "sub/dir/f.txt": "hi",
+                "../escape.txt": "bad",        # rejected (traversal)
+                "/abs.txt": "bad",             # rejected (absolute)
+                "": "bad",                     # rejected (empty key)
+            })
+            # Valid entries materialized, including a nested path.
+            with open(os.path.join(wd, "izba.yml")) as _f:
+                self.assertEqual(_f.read(), "version: 1\n")
+            self.assertTrue(os.path.isfile(os.path.join(wd, "sub", "dir", "f.txt")))
+            # Traversal / absolute rejected: nothing escaped the workdir.
+            self.assertFalse(os.path.exists(os.path.join(d, "escape.txt")))
+            self.assertFalse(os.path.exists("/abs.txt"))
+
+    def test_write_seed_files_report_only_on_non_dict(self):
+        # None / non-dict is a no-op, never raises (report-only).
+        with tempfile.TemporaryDirectory() as d:
+            run_journeys._write_seed_files(d, None)
+            run_journeys._write_seed_files(d, "not-a-dict")
+
+
+def _write_decisive_stub_izba(d):
+    """Like _write_stub_izba but used for the decisive-grading integration test.
+
+    Reuses the exact same contract: `__reconcile` -> empty snapshot,
+    `bogus-subcommand` -> exit 2 (the setup step's non-zero exit), any other
+    subcommand -> exit 0 (the core step's success). cd/file ops need no stubbing —
+    run_action runs a real shell, so only `izba` itself is intercepted here."""
+    return _write_stub_izba(d)
+
+
+class DecisiveGradingTests(unittest.TestCase):
+    def test_setup_noise_is_not_decisive_and_core_step_governs(self):
+        # Replays the #111 masking scenario: a non-core SETUP step that exits
+        # non-zero (would have buried the journey under the old harness) followed
+        # by a core:true step that succeeds. The setup step's functional candidate
+        # must be tagged decisive:false, and there must be NO decisive functional
+        # candidate — so the collector will tally the journey positive.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_decisive_stub_izba(d)
+            jf = _journeys_file(d, [{
+                "journey_id": "review-gate",
+                "rationale": "r",
+                "source": {"kind": "spec", "ref": "review-gate §"},
+                # A seeded valid-looking manifest: the journey starts at the gate.
+                "seed_files": {"izba.yml": "version: 1\nservices: {}\n"},
+                "steps": [
+                    {"intent": "prepare", "expect": "the setup succeeds",
+                     "core": False},
+                    {"intent": "assert the gate", "expect": "the listing succeeds",
+                     "core": True},
+                ],
+            }])
+            out = os.path.join(d, "traj.json")
+            # step 0: failing setup action, then done; step 1: succeeding action, done.
+            script = [
+                {"command": "izba bogus-subcommand"}, {"done": True},
+                {"command": "izba ls"}, {"done": True},
+            ]
+            rc = run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps(script),
+                "--step-cap", "25", "--action-timeout-s", "10",
+                "--max-turns", "10", "--max-usd", "5",
+            ])
+            self.assertEqual(rc, 0)
+            with open(out) as _f:
+                bundle = json.load(_f)
+            res = bundle["results"][0]
+            funcs = [c for c in res["candidates"] if c["kind"] == "functional"]
+            # Exactly the setup-step functional candidate, tagged non-decisive.
+            self.assertTrue(funcs, "expected a setup-step functional candidate")
+            self.assertTrue(any(c.get("decisive") is False for c in funcs), funcs)
+            # No decisive functional candidate => nothing flips the journey.
+            self.assertFalse(any(c.get("decisive") for c in funcs), funcs)
+            # The seed file was materialized into the journey's workdir.
+            jdir = run_journeys._journey_data_dir(d, "review-gate")
+            self.assertTrue(os.path.isfile(os.path.join(jdir, "proj", "izba.yml")))
+
+    # A realistic minimal izba.yml (the #122 required fields) — seeded so a deep
+    # review-gate journey starts AT the gate instead of dying on manifest
+    # authoring. The stub izba doesn't parse it; this documents the real shape.
+    SEEDED_MANIFEST = (
+        "apiVersion: izba.dev/v1alpha1\n"
+        "kind: Sandbox\n"
+        "metadata:\n  name: gate-demo\n"
+        "spec:\n"
+        "  image: ubuntu:24.04\n"
+        "  resources: {cpus: 2, memory: 2Gi}\n"
+        "  rootDisk: {size: 8Gi}\n"
+        "  egress: {enforce: true, allow: [{host: github.com}]}\n"
+    )
+
+    def test_collector_tallies_masking_journey_positive(self):
+        # THE #111 acceptance proof, end-to-end: the masking scenario run through
+        # main() AND the real collector comes out POSITIVE — the non-zero setup
+        # exit no longer buries a satisfied core assertion — with the setup
+        # candidate demoted to SOFT (not a flipping negative). Old harness: 0
+        # positive. New harness: 1 positive.
+        collector = _load_collector()
+        if collector is None:
+            self.skipTest("collect-trajectories.py not found in this checkout")
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            arts = os.path.join(d, "arts")
+            os.makedirs(arts)
+            jf = _journeys_file(d, [{
+                "journey_id": "review-gate",
+                "rationale": "the review-gate refuses a stale token",
+                "source": {"kind": "spec", "ref": "review-gate §7"},
+                "seed_files": {"izba.yml": self.SEEDED_MANIFEST},
+                "steps": [
+                    {"intent": "prepare the sandbox", "expect": "setup succeeds",
+                     "core": False},
+                    {"intent": "assert the gate holds", "expect": "listing succeeds",
+                     "core": True},
+                ],
+            }])
+            # The collector globs traj-*.json (dash) — name the bundle so it matches.
+            out = os.path.join(arts, "traj-0.json")
+            script = [
+                {"command": "izba bogus-subcommand"}, {"done": True},  # setup fails
+                {"command": "izba ls"}, {"done": True},                # core succeeds
+            ]
+            rc = run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps(script),
+                "--step-cap", "25", "--action-timeout-s", "10",
+                "--max-turns", "10", "--max-usd", "5",
+            ])
+            self.assertEqual(rc, 0)
+            data = collector.collect(arts)
+            self.assertEqual(data["totals"]["positive_journeys"], 1, data["totals"])
+            self.assertEqual(data["negatives"], [], data["negatives"])
+            # The setup-step non-zero exit survives as a SOFT functional candidate.
+            self.assertTrue(
+                any(s.get("kind") == "functional" for s in data["soft"]),
+                data["soft"])
 
 
 if __name__ == "__main__":
