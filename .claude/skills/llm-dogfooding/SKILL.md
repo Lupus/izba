@@ -128,7 +128,7 @@ the test's main signal.
 
 | Need | Use |
 |---|---|
-| Build the fair-test context pack | `scripts/gather-context-pack.sh <bin> <repo-root>` |
+| Build the fair-test context pack | `scripts/gather-context-pack.sh <bin> <repo-root>` (build the binary first: `cargo build -p izba-cli`) |
 | Sequence the complete set into tiers + gate plan | `scripts/sequence-journeys.py <journeys.json> [--out DIR]` |
 | Dispatch a tier off the fixes tip | `DOGFOOD_BASE=HEAD scripts/dispatch-swarm.sh <feature> tier-<t>.json <shards> <max_usd>` |
 | Flatten bundles for the skeptic | `scripts/collect-trajectories.py <artifacts-dir>` |
