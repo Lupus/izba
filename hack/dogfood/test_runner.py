@@ -668,6 +668,32 @@ class UnreachedDecisiveTests(unittest.TestCase):
             data = collector.collect(os.path.dirname(out))
             self.assertEqual(data["totals"]["positive_journeys"], 0)
 
+    def test_entered_decisive_step_with_zero_actions_flags_unreached(self):
+        # The decisive step IS entered (step 1 finishes cleanly, no cap trips),
+        # but the Actor immediately replies done without running a single
+        # command — the step produced zero actions, so its assertion was never
+        # exercised. Must flag exactly like the never-entered case.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            jf = _journeys_file(d, [self._journey()])
+            out = os.path.join(d, "traj.json")
+            script = [{"command": "izba ls"}, {"done": True},  # step 0 does work then finishes
+                      {"done": True}]  # step 1 (core) entered, zero actions
+            run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps(script),
+                "--step-cap", "25", "--action-timeout-s", "10",
+                "--max-turns", "10", "--max-usd", "5",
+            ])
+            with open(out) as f:
+                res = json.load(f)["results"][0]
+            unreached = [c for c in res["candidates"]
+                         if c["kind"] == "unreached_decisive"]
+            self.assertEqual(len(unreached), 1, res["candidates"])
+            self.assertIn("decisive step 1", unreached[0]["detail"])
+            self.assertIn("the real assertion", unreached[0]["detail"])
+
     def test_reached_decisive_step_emits_nothing(self):
         with tempfile.TemporaryDirectory() as d:
             stub = _write_stub_izba(d)
