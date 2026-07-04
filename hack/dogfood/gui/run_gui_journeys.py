@@ -107,6 +107,18 @@ def _cmd_hash(journey_id: str, command: str) -> str:
     return hashlib.sha256(f"{journey_id}\0{command}".encode("utf-8")).hexdigest()
 
 
+def _infra_candidate(journey_id: str, detail: str) -> Dict[str, Any]:
+    """Flipping infra candidate — same shape as the CLI runner's (a broken
+    model/driver plumbing means the journey verified nothing)."""
+    return {
+        "kind": "infra",
+        "detail": detail,
+        "violated_expectation": "model/API must produce a next command",
+        "source": "harness: model transport",
+        "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
+    }
+
+
 def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                     data_dir: str, max_turns: int, step_cap: int,
                     action_timeout_s: float, latency_budget_ms: int,
@@ -124,6 +136,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     actions: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
     turns = 0
+    console_seen = 0
     prev_reconcile: Optional[Dict[str, Any]] = None
     steps = journey.get("steps", []) or [{"intent": journey.get("rationale", ""),
                                           "expect": ""}]
@@ -147,8 +160,16 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 try:
                     reply = model.next_command(journey, step, obs)
                     budget["usd"] += float(getattr(model, "last_cost_usd", 0.0) or 0.0)
-                except Exception as e:  # report-only
-                    log(f"{journey_id}: model error: {e!r}"); break
+                except Exception as e:  # report-only, but never silently green
+                    log(f"{journey_id}: model error: {e!r}")
+                    candidates.append(_infra_candidate(journey_id,
+                                                       f"model raised: {e!r}"))
+                    break
+                if isinstance(reply, dict) and reply.get("error"):
+                    log(f"{journey_id}: model infra error: {reply['error']}")
+                    candidates.append(_infra_candidate(journey_id,
+                                                       str(reply["error"])))
+                    break
                 if not isinstance(reply, dict) or reply.get("done"):
                     break
                 if reply.get("read"):
@@ -166,7 +187,9 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 res = driver.act(argv)
                 marks_text = render_marks(driver.snapshot())
                 reconcile = _reconcile_snapshot(izba_bin, data_dir, action_timeout_s)
-                console_errors = driver.read_console_errors()
+                all_console = driver.read_console_errors()
+                console_errors = all_console[console_seen:]
+                console_seen = len(all_console)
                 action_index = len(actions)
                 ref = {"journey_id": journey_id, "action_index": action_index}
                 actions.append(_action_dict(step.get("intent", ""), command, res,
@@ -222,7 +245,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
         cd = c.to_dict(); cd["trajectory_ref"] = dict(final_ref)
         candidates.append(cd)
     return {"journey_id": journey_id, "actions": actions, "candidates": candidates,
-            "state_evidence": state_evidence}
+            "state_evidence": state_evidence, "invoke_log": invoke_log}
 
 
 # ---------- CI orchestration (static server + sidecar lifecycle) ----------

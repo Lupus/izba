@@ -111,3 +111,80 @@ def test_settle_for_sandbox_times_out_without_sandbox(monkeypatch):
     # Report-only: returns promptly on timeout, no raise, no sandbox found.
     rgj._settle_for_sandbox("izba", "/tmp/x", timeout_s=0.02,
                             action_timeout_s=5, poll_s=0.01)
+
+
+def test_invoke_log_persisted_in_result(monkeypatch):
+    # FakeDriver's read_invoke_log returns a canned list; the journey result
+    # must carry it verbatim under "invoke_log" (the evidence behind
+    # silent_failure verdicts, for the skeptic to audit later).
+    model = FakeModel([{"done": True}])
+    invoke_log = [{"cmd": "create", "ok": True},
+                  {"cmd": "list", "ok": False, "error": "boom"}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"',
+                                   '[@e1] heading "Sandboxes"'],
+                        invoke_log=invoke_log)
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j3", "modality": "gui",
+               "steps": [{"intent": "look at the list", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert res["invoke_log"] == invoke_log
+
+
+def test_console_errors_are_per_action_deltas(monkeypatch):
+    # FakeDriver.read_console_errors returns a GROWING cumulative list: ["e1"]
+    # after action 1, ["e1", "e2"] after action 2. Each action must record
+    # only the errors NEW since the previous action, and the console oracle
+    # must fire once per distinct error (2 candidates total, not 3).
+    model = FakeModel([{"click": "@e1"}, {"click": "@e2"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "Create"',
+                                   '[@e1] button "Create"',
+                                   '[@e1] button "Create"',
+                                   '[@e1] button "Create"'])
+    cumulative = [["e1"], ["e1", "e2"]]
+    calls = {"n": 0}
+
+    def fake_read_console_errors():
+        v = cumulative[calls["n"]]
+        calls["n"] += 1
+        return v
+
+    driver.read_console_errors = fake_read_console_errors
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j4", "modality": "gui",
+               "steps": [{"intent": "click things", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert res["actions"][0]["console_errors"] == ["e1"]
+    assert res["actions"][1]["console_errors"] == ["e2"]
+    console_candidates = [c for c in res["candidates"] if c["kind"] == "console"]
+    assert len(console_candidates) == 2
+
+
+def test_model_error_reply_emits_infra_candidate(monkeypatch):
+    # FakeModel scripted with an {"error": ...} reply: the journey's
+    # candidates must include kind == "infra" and the journey must have no
+    # actions (the step loop breaks before any driver action runs).
+    model = FakeModel([{"error": "transport down"}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"',
+                                   '[@e1] heading "Sandboxes"'])
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j5", "modality": "gui",
+               "steps": [{"intent": "do something", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert res["actions"] == []
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "infra" in kinds
