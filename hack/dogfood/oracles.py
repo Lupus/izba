@@ -24,6 +24,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,9 @@ from typing import Any, Dict, List, Optional
 # Keep tails small enough to upload cheaply but large enough to carry a panic
 # backtrace head: last 4 KB of each stream.
 TAIL_BYTES = 4096
+# Same idea for the guest serial console: enough to carry a panic/backtrace
+# head, small enough to upload cheaply.
+CONSOLE_TAIL_BYTES = 8192
 
 
 @dataclass
@@ -253,11 +257,23 @@ def capture_state_evidence(
              if s.get("name")]
     per_sandbox: Dict[str, Any] = {}
     for name in names:
+        console_tail = ""
+        try:
+            console_path = os.path.join(data_dir, "sandboxes", name,
+                                        "logs", "console.log")
+            with open(console_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - CONSOLE_TAIL_BYTES))
+                console_tail = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            pass  # absent console.log is the normal never-booted state
         per_sandbox[name] = {
             "policy_show": _izba_capture(izba_bin, ["policy", "show", name],
                                          timeout_s, run_env),
             "netlog": _izba_capture(izba_bin, ["netlog", name, "--summary"],
                                     timeout_s, run_env),
+            "console_tail": console_tail,
         }
     return {"sandboxes": names, "reconcile": reconcile, "per_sandbox": per_sandbox}
 
@@ -326,6 +342,45 @@ def implicit_oracle(action: Action) -> List[Candidate]:
             trajectory_ref=dict(ref),
         ))
     return out
+
+
+def guest_console_oracle(state_evidence: Dict[str, Any],
+                         ref: Dict[str, Any]) -> List[Candidate]:
+    """Scan each sandbox's guest serial-console tail for crash markers.
+
+    The guest console is the documented always-captured boot truth
+    (logs/console.log), yet no oracle read it — a guest-side panic that never
+    surfaced in CLI stderr was invisible. Same marker regex as the implicit
+    oracle; one candidate per affected sandbox."""
+    out: List[Candidate] = []
+    for name, ev in (state_evidence.get("per_sandbox") or {}).items():
+        tail = ev.get("console_tail") or ""
+        m = _IMPLICIT_RE.search(tail)
+        if m:
+            out.append(Candidate(
+                kind="guest_console",
+                detail=(f"crash marker {m.group(0)!r} in guest console of "
+                        f"sandbox {name!r}"),
+                violated_expectation="guest must not panic/abort (console.log)",
+                source="contract: clean guest boot/run, no panics",
+                trajectory_ref=dict(ref),
+            ))
+    return out
+
+
+def teardown_journey(izba_bin: str, data_dir: str, timeout_s: float,
+                     names: List[str]) -> None:
+    """Best-effort per-journey cleanup: remove this journey's sandboxes and stop
+    its (data-dir-scoped) daemon so leftover VMs don't skew later journeys'
+    latency/boot behavior on the shard. Hygiene, not an oracle: failures are
+    logged to stderr and swallowed — teardown must never fail a journey."""
+    run_env = _shell_env(izba_bin, data_dir)
+    for argv in [["rm", n, "--force"] for n in names] + [["daemon", "stop"]]:
+        try:
+            subprocess.run([izba_bin, *argv], capture_output=True, text=True,
+                           timeout=timeout_s, env=run_env)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"[dogfood] teardown {argv}: {e!r}", file=sys.stderr)
 
 
 # --- Functional oracle -------------------------------------------------------
