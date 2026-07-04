@@ -244,7 +244,7 @@ def capture_state_evidence(
     env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Snapshot the product's OWN authoritative state after a journey, for the
-    rubric judge to grade outcomes against (the τ-bench "end-state" oracle).
+    Phase-3 trajectory-skeptic to grade outcomes against (the τ-bench "end-state" oracle).
 
     For an egress-firewall run the ground truth is izba's own observability — NOT
     a guest command's exit code. Per sandbox the journey created we capture
@@ -397,7 +397,7 @@ def teardown_journey(izba_bin: str, data_dir: str, timeout_s: float,
 # false positives and false negatives (see references/methodology.md, "state vs
 # exit-code oracles"). Egress outcomes are judged from the product's own audit
 # state (`izba netlog` / `policy show`) captured as state evidence, then graded by
-# the rubric judge — not here.
+# the Phase-3 skeptic — not here.
 _EXPECT_FAILURE_RE = re.compile(
     r"\brefus(?:e|es|ed|al)\b"
     r"|\breject(?:s|ed)?\b"
@@ -450,7 +450,7 @@ def functional_oracle(
     This is a deliberately WEAK proposer, not an outcome verdict: an exit code is
     a poor oracle for "did the user's goal happen" (a command can exit 0 without
     achieving it, or non-zero via a valid alternative path). Egress/UX outcomes
-    are judged from product state + the rubric judge; this only catches the gross
+    are judged from product state by the Phase-3 skeptic; this only catches the gross
     "expected success, hard error" / "expected refusal, silent success" cases.
     """
     ref = dict(ref or {"journey_id": "", "action_index": -1})
