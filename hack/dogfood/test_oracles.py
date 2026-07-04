@@ -375,5 +375,76 @@ class ReconcileVisibilityTests(unittest.TestCase):
         self.assertEqual(oracles.reconcile_seq_oracle(cur, prev), [])
 
 
+class GuestConsoleTests(unittest.TestCase):
+    def _stub(self, d, names=("web",)):
+        import json as _json
+        stub = os.path.join(d, "izba")
+        sandboxes = _json.dumps([{"name": n} for n in names])
+        with open(stub, "w") as f:
+            f.write(
+                "#!/bin/sh\n"
+                'if [ "$1" = "__reconcile" ]; then\n'
+                f"  echo '{{\"violations\":[],\"sandboxes\":{sandboxes}}}'\n"
+                "  exit 0\nfi\n"
+                "echo ok\nexit 0\n")
+        os.chmod(stub, 0o755)
+        return stub
+
+    def test_console_tail_captured_and_panic_flagged(self):
+        import oracles
+        with tempfile.TemporaryDirectory() as d:
+            stub = self._stub(d)
+            logdir = os.path.join(d, "sandboxes", "web", "logs")
+            os.makedirs(logdir)
+            with open(os.path.join(logdir, "console.log"), "w") as f:
+                f.write("boot ok\nthread 'main' panicked at init.rs:42\n")
+            ev = oracles.capture_state_evidence(stub, d, 5)
+            self.assertIn("panicked", ev["per_sandbox"]["web"]["console_tail"])
+            cands = oracles.guest_console_oracle(
+                ev, {"journey_id": "j", "action_index": -1})
+            self.assertEqual(len(cands), 1)
+            self.assertEqual(cands[0].kind, "guest_console")
+
+    def test_clean_console_emits_nothing(self):
+        import oracles
+        with tempfile.TemporaryDirectory() as d:
+            stub = self._stub(d)
+            logdir = os.path.join(d, "sandboxes", "web", "logs")
+            os.makedirs(logdir)
+            with open(os.path.join(logdir, "console.log"), "w") as f:
+                f.write("boot ok\ninit: reached target\n")
+            ev = oracles.capture_state_evidence(stub, d, 5)
+            self.assertEqual(oracles.guest_console_oracle(
+                ev, {"journey_id": "j", "action_index": -1}), [])
+
+    def test_missing_console_is_empty_not_error(self):
+        import oracles
+        with tempfile.TemporaryDirectory() as d:
+            stub = self._stub(d)
+            ev = oracles.capture_state_evidence(stub, d, 5)
+            self.assertEqual(ev["per_sandbox"]["web"]["console_tail"], "")
+
+
+class TeardownTests(unittest.TestCase):
+    def test_teardown_invokes_rm_force_and_daemon_stop(self):
+        import oracles
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "calls.log")
+            stub = os.path.join(d, "izba")
+            with open(stub, "w") as f:
+                f.write(f'#!/bin/sh\necho "$@" >> {calls}\nexit 0\n')
+            os.chmod(stub, 0o755)
+            oracles.teardown_journey(stub, d, 5, ["web", "db"])
+            with open(calls) as f:
+                lines = f.read().splitlines()
+            self.assertIn("rm web --force", lines)
+            self.assertIn("rm db --force", lines)
+            self.assertIn("daemon stop", lines)
+
+    def test_teardown_never_raises(self):
+        import oracles
+        oracles.teardown_journey("/nonexistent/izba", "/tmp", 1, ["x"])
+
+
 if __name__ == "__main__":
     unittest.main()

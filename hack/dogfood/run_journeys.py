@@ -44,10 +44,12 @@ from oracles import (  # noqa: E402
     Candidate,
     capture_state_evidence,
     functional_oracle,
+    guest_console_oracle,
     implicit_oracle,
     latency_oracle,
     reconcile_seq_oracle,
     run_action,
+    teardown_journey,
 )
 
 # Default per-action human-normal latency budget. Sandbox lifecycle ops (boot,
@@ -507,6 +509,17 @@ def run_journey(
     except Exception as e:  # report-only: never let evidence capture fail a run
         log(f"{journey_id}: state-evidence capture error: {e!r}")
         state_evidence = {"sandboxes": [], "reconcile": {}, "per_sandbox": {}}
+    for cd in guest_console_oracle(
+            state_evidence, {"journey_id": journey_id, "action_index": -1}):
+        d = cd.to_dict()
+        candidates.append(d)
+    # Hygiene: tear down this journey's sandboxes + daemon so shard N+5's
+    # latency isn't skewed by N's leftover VMs. Best-effort by contract.
+    try:
+        teardown_journey(izba_bin, data_dir, action_timeout_s,
+                         state_evidence.get("sandboxes") or [])
+    except Exception as e:  # defensive: teardown_journey shouldn't raise
+        log(f"{journey_id}: teardown error: {e!r}")
     return {"journey_id": journey_id, "actions": actions, "candidates": candidates,
             "state_evidence": state_evidence}
 
