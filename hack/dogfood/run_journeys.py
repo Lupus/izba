@@ -7,11 +7,14 @@ concrete ``izba`` command; the harness runs it (``oracles.run_action``), snapsho
 the reconciler, applies the deterministic oracles, and asks the model for the
 next command — until the step is done or a cap trips.
 
-**Report-only.** Any infra/subprocess error is logged and the loop continues; the
-runner never raises out of the loop and always writes a trajectory bundle that
-matches ``schema/trajectory.schema.json``. Exit code is 0 regardless of findings;
-only a totally unrecoverable startup error (bad args / unreadable journeys file)
-exits non-zero.
+**Report-only, with one honesty backstop.** Any infra/subprocess error is logged
+and the loop continues; the runner never raises out of the loop and always
+writes a trajectory bundle that matches ``schema/trajectory.schema.json``. Exit
+code is 0 regardless of findings, non-zero for a totally unrecoverable startup
+error (bad args / unreadable journeys file), and **3** when more than
+``CATASTROPHIC_DEGRADED_FRACTION`` (50%) of attempted journeys were
+infra-degraded (zero actions, or a model/API failure) — a dead API key or a
+broken transport must not silently produce an all-green run.
 
 **Hard caps (all mandatory):**
 - ``--max-turns``      — model calls per journey.
@@ -50,6 +53,26 @@ from oracles import (  # noqa: E402
 # image pull) are slow, so this is generous; the per-action hard timeout is the
 # real backstop. Tunable via --latency-budget-ms.
 DEFAULT_LATENCY_BUDGET_MS = 30_000
+
+# Catastrophic-infra threshold: if MORE than this fraction of attempted
+# journeys are degraded (zero actions, or >=1 `infra` candidate), the run
+# was not a measurement — exit 3 so the CI job fails per the "only infra
+# failures fail a job" contract. At or below the threshold stays report-only
+# (a transient model blip must not kill a 40-minute shard).
+CATASTROPHIC_DEGRADED_FRACTION = 0.5
+EXIT_CATASTROPHIC_INFRA = 3
+
+
+def _infra_candidate(journey_id: str, detail: str) -> Dict[str, Any]:
+    """A flipping `infra` candidate: the harness/model plumbing failed, so the
+    journey verified nothing (and must not tally positive)."""
+    return {
+        "kind": "infra",
+        "detail": detail,
+        "violated_expectation": "model/API must produce a next command",
+        "source": "harness: model transport",
+        "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
+    }
 
 
 def log(msg: str) -> None:
@@ -240,13 +263,22 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
     return out
 
 
-def _next_command(model, journey, step, actions, budget, journey_id):
-    """One model turn -> a command string, or None to end the step."""
+def _next_command(model, journey, step, actions, budget, journey_id, candidates):
+    """One model turn -> a command string, or None to end the step.
+
+    A model-layer failure ({"error": ...} reply, or an exception) is an INFRA
+    finding, not a completion: it appends a flipping `infra` candidate so the
+    journey cannot tally positive on the back of a broken model."""
     try:
         reply = model.next_command(journey, step, actions)
         budget["usd"] += float(getattr(model, "last_cost_usd", 0.0) or 0.0)
-    except Exception as e:  # report-only: model failure ends the step
+    except Exception as e:  # report-only, but never silently green
         log(f"{journey_id}: model error: {e!r}; ending step")
+        candidates.append(_infra_candidate(journey_id, f"model raised: {e!r}"))
+        return None
+    if isinstance(reply, dict) and reply.get("error"):
+        log(f"{journey_id}: model infra error: {reply['error']}; ending step")
+        candidates.append(_infra_candidate(journey_id, str(reply["error"])))
         return None
     if not isinstance(reply, dict) or reply.get("done"):
         return None
@@ -287,7 +319,8 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
                 raise BudgetExceeded()
 
             ctx["turns"] += 1
-            command = _next_command(model, journey, step, actions, budget, journey_id)
+            command = _next_command(model, journey, step, actions, budget, journey_id,
+                                    candidates)
             if command is None:
                 return False
             h = _cmd_hash(journey_id, command)
@@ -464,8 +497,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--izba-bin", required=True, help="path to the izba binary")
     p.add_argument("--data-dir", required=True, help="IZBA_DATA_DIR for this shard")
     p.add_argument("--out", required=True, help="trajectory bundle output path")
-    p.add_argument("--model", default="deepseek/deepseek-chat",
-                   help="OpenRouter model id (ignored with --fake-model)")
+    p.add_argument("--model", default="google/gemini-2.5-flash",
+                   help="OpenRouter model id (ignored with --fake-model); cheap "
+                        "but tool-capable by default — deepseek-chat was too weak "
+                        "to drive the shell-agent loop reliably")
     p.add_argument("--max-turns", type=int, default=12,
                    help="model calls per journey")
     p.add_argument("--max-usd", type=float, default=2.0,
@@ -541,11 +576,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             log(f"journey {jid!r} crashed: {e!r}; continuing")
             results.append({"journey_id": jid, "actions": [], "candidates": []})
 
+    degraded = sum(
+        1 for r in results
+        if not r.get("actions")
+        or any(c.get("kind") == "infra" for c in r.get("candidates", []))
+    )
+    catastrophic = bool(results) and degraded / len(results) > CATASTROPHIC_DEGRADED_FRACTION
+
     bundle = {"shard": args.shard, "feature": feature, "results": results}
     with open(args.out, "w") as f:
         json.dump(bundle, f, indent=2)
-    log(f"wrote {args.out}: {len(results)} journeys, "
+    log(f"wrote {args.out}: {len(results)} journeys ({degraded} degraded), "
         f"est. cost ${budget['usd']:.4f}")
+    if catastrophic:
+        log(f"CATASTROPHIC: {degraded}/{len(results)} journeys degraded "
+            f"(> {CATASTROPHIC_DEGRADED_FRACTION:.0%}) — the run measured "
+            f"nothing; failing the job (exit {EXIT_CATASTROPHIC_INFRA})")
+        return EXIT_CATASTROPHIC_INFRA
     return 0
 
 

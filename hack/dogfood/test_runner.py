@@ -248,7 +248,8 @@ class HarnessImprovementTests(unittest.TestCase):
             rc = run_journeys.main([
                 "--journeys", jpath, "--shard", "0", "--shards", "1",
                 "--izba-bin", izba, "--data-dir", os.path.join(d, "data"),
-                "--out", out, "--fake-model", json.dumps([{"done": True}]),
+                "--out", out, "--fake-model",
+                json.dumps([{"command": "izba ls"}, {"done": True}]),
             ])
             self.assertEqual(rc, 0)
             self.assertTrue(os.path.isfile(out))  # report-only: bundle written
@@ -522,6 +523,77 @@ class DecisiveGradingTests(unittest.TestCase):
             self.assertTrue(
                 any(s.get("kind") == "functional" for s in data["soft"]),
                 data["soft"])
+
+
+class InfraCandidateTests(unittest.TestCase):
+    def _run(self, d, fake_script, n_journeys=1):
+        stub = _write_stub_izba(d)
+        journeys = [{
+            "journey_id": f"j{i}", "rationale": "r",
+            "source": {"kind": "spec", "ref": "x"},
+            "steps": [{"intent": "do", "expect": "works"}],
+        } for i in range(n_journeys)]
+        jf = _journeys_file(d, journeys)
+        out = os.path.join(d, "traj.json")
+        rc = run_journeys.main([
+            "--journeys", jf, "--shard", "0", "--shards", "1",
+            "--izba-bin", stub, "--data-dir", d, "--out", out,
+            "--fake-model", json.dumps(fake_script),
+            "--step-cap", "25", "--action-timeout-s", "10",
+            "--max-turns", "10", "--max-usd", "5",
+        ])
+        with open(out) as f:
+            return rc, json.load(f)
+
+    def test_model_error_reply_emits_flipping_infra_candidate(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, bundle = self._run(d, [{"error": "openrouter request failed"}])
+            cands = bundle["results"][0]["candidates"]
+            infra = [c for c in cands if c["kind"] == "infra"]
+            self.assertTrue(infra, cands)
+            self.assertIn("openrouter request failed", infra[0]["detail"])
+            # single journey, degraded -> catastrophic exit
+            self.assertEqual(rc, 3)
+
+    def test_infra_journey_not_positive_in_collector(self):
+        collector = _load_collector()
+        if collector is None:
+            self.skipTest("collector script not present")
+        with tempfile.TemporaryDirectory() as d:
+            _, bundle = self._run(d, [{"error": "dead key"}])
+            bdir = os.path.join(d, "bundles")
+            os.makedirs(bdir)
+            with open(os.path.join(bdir, "traj-0.json"), "w") as f:
+                json.dump(bundle, f)
+            data = collector.collect(bdir)
+            self.assertEqual(data["totals"]["positive_journeys"], 0)
+
+    def test_catastrophic_exit_only_above_half(self):
+        # 1 of 3 journeys degraded (error on first journey's first turn; the
+        # FakeModel script then supplies clean done-runs for the other two).
+        with tempfile.TemporaryDirectory() as d:
+            script = [{"error": "blip"},               # j0: degraded
+                      {"command": "izba ls"}, {"done": True},   # j1: fine
+                      {"command": "izba ls"}, {"done": True}]   # j2: fine
+            rc, bundle = self._run(d, script, n_journeys=3)
+            self.assertEqual(rc, 0)  # 1/3 <= 0.5 -> report-only
+
+    def test_model_exception_emits_infra_candidate(self):
+        class ExplodingModel:
+            last_cost_usd = 0.0
+            def next_command(self, *a):
+                raise RuntimeError("kaboom")
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            journey = {"journey_id": "boom", "rationale": "r",
+                       "source": {"kind": "spec", "ref": "x"},
+                       "steps": [{"intent": "do", "expect": "works"}]}
+            budget = {"usd": 0.0}
+            res = run_journeys.run_journey(
+                ExplodingModel(), journey, stub, d,
+                max_turns=5, step_cap=5, action_timeout_s=5,
+                latency_budget_ms=1000, budget=budget, max_usd=5)
+            self.assertTrue(any(c["kind"] == "infra" for c in res["candidates"]))
 
 
 if __name__ == "__main__":
