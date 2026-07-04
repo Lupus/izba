@@ -58,7 +58,11 @@ git -C "$TMP_WT" commit -q -m "dogfood: journeys for ${FEATURE} (dispatch-only; 
 git -C "$TMP_WT" push -f origin "HEAD:refs/heads/${BRANCH}"
 
 echo "== dispatching dogfood.yml (shards=$SHARDS max_usd=$MAX_USD) =="
-echo "budget: \$${MAX_USD}/shard (worst case \$$((MAX_USD * (SHARDS + 3))) if GUI runs)"
+# awk, not $(( )): max_usd is legitimately fractional (run_journeys --max-usd
+# is a float) and bash integer arithmetic would abort the dispatch under
+# set -e ("invalid arithmetic operator" on e.g. 2.5) AFTER the branch push.
+WORST_CASE="$(awk -v u="$MAX_USD" -v s="$SHARDS" 'BEGIN{printf "%.2f", u*(s+3)}')"
+echo "budget: \$${MAX_USD}/shard (worst case \$${WORST_CASE} if GUI runs)"
 DISPATCH_ARGS=(--ref "$BRANCH" -f "shards=$SHARDS" -f "max_usd=$MAX_USD")
 [ -n "$MODEL" ] && DISPATCH_ARGS+=(-f "model=$MODEL")
 gh workflow run dogfood.yml "${DISPATCH_ARGS[@]}"
