@@ -614,5 +614,80 @@ class InfraCandidateTests(unittest.TestCase):
             self.assertTrue(any(c["kind"] == "infra" for c in res["candidates"]))
 
 
+class UnreachedDecisiveTests(unittest.TestCase):
+    def _journey(self):
+        return {
+            "journey_id": "deep", "rationale": "r",
+            "source": {"kind": "spec", "ref": "spec §9"},
+            "steps": [
+                {"intent": "setup", "expect": "ok"},
+                {"intent": "the real assertion", "expect": "guard refuses",
+                 "core": True},
+            ],
+        }
+
+    def test_budget_burned_in_setup_flags_unreached_core(self):
+        # Model does setup actions then goes silent (done) without ever
+        # reaching step 2 — max-turns trips inside step 1.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            jf = _journeys_file(d, [self._journey()])
+            out = os.path.join(d, "traj.json")
+            script = [{"command": f"izba ls-{i}"} for i in range(10)]
+            run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps(script),
+                "--step-cap", "25", "--action-timeout-s", "10",
+                "--max-turns", "3", "--max-usd", "5",
+            ])
+            with open(out) as f:
+                res = json.load(f)["results"][0]
+            unreached = [c for c in res["candidates"]
+                         if c["kind"] == "unreached_decisive"]
+            self.assertEqual(len(unreached), 1, res["candidates"])
+            self.assertIn("the real assertion", unreached[0]["detail"])
+
+    def test_unreached_journey_not_positive_in_collector(self):
+        collector = _load_collector()
+        if collector is None:
+            self.skipTest("collector script not present")
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            jf = _journeys_file(d, [self._journey()])
+            out = os.path.join(d, "bundles", "traj-0.json")
+            os.makedirs(os.path.dirname(out))
+            run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps(
+                    [{"command": "izba setup-thing"}] * 5),
+                "--step-cap", "25", "--action-timeout-s", "10",
+                "--max-turns", "2", "--max-usd", "5",
+            ])
+            data = collector.collect(os.path.dirname(out))
+            self.assertEqual(data["totals"]["positive_journeys"], 0)
+
+    def test_reached_decisive_step_emits_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            jf = _journeys_file(d, [self._journey()])
+            out = os.path.join(d, "traj.json")
+            script = [{"command": "izba ls"}, {"done": True},        # step 1
+                      {"command": "izba bogus-subcommand"}, {"done": True}]  # step 2 (nonzero = refusal ok)
+            run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps(script),
+                "--step-cap", "25", "--action-timeout-s", "10",
+                "--max-turns", "10", "--max-usd", "5",
+            ])
+            with open(out) as f:
+                res = json.load(f)["results"][0]
+            self.assertFalse([c for c in res["candidates"]
+                              if c["kind"] == "unreached_decisive"],
+                             res["candidates"])
+
+
 if __name__ == "__main__":
     unittest.main()
