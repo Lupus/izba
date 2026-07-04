@@ -171,7 +171,10 @@ class RunnerTests(unittest.TestCase):
 
     def test_infra_error_does_not_raise(self):
         # Point at a non-existent izba binary; the run must still complete and
-        # write a bundle (report-only).
+        # write a bundle (report-only) instead of raising. A binary that
+        # doesn't exist means EVERY reconcile snapshot errors, so this is now
+        # honestly surfaced as a catastrophic infra failure (exit 3) rather
+        # than a silent rc=0 that hid a dead reconciler.
         with tempfile.TemporaryDirectory() as d:
             jf = _journeys_file(d, [{
                 "journey_id": "infra",
@@ -188,8 +191,13 @@ class RunnerTests(unittest.TestCase):
                 "--step-cap", "25", "--action-timeout-s", "5",
                 "--max-turns", "5", "--max-usd", "5",
             ])
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, run_journeys.EXIT_CATASTROPHIC_INFRA)
             self.assertTrue(os.path.exists(out))
+            with open(out) as f:
+                res = json.load(f)["results"][0]
+            infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+            self.assertTrue(any("reconciler unusable" in c["detail"] for c in infra),
+                            res["candidates"])
 
 
 class FakeModelTests(unittest.TestCase):
@@ -713,6 +721,65 @@ class UnreachedDecisiveTests(unittest.TestCase):
             self.assertFalse([c for c in res["candidates"]
                               if c["kind"] == "unreached_decisive"],
                              res["candidates"])
+
+
+class ReconcileViolationTests(unittest.TestCase):
+    def _stub_with_violations(self, d):
+        stub = os.path.join(d, "izba")
+        with open(stub, "w") as f:
+            f.write(
+                "#!/bin/sh\n"
+                'if [ "$1" = "__reconcile" ]; then\n'
+                '  echo \'{"violations":[{"kind":"orphan-relay","name":"web"}],"sandboxes":[]}\'\n'
+                "  exit 0\nfi\n"
+                "echo ok\nexit 0\n")
+        os.chmod(stub, 0o755)
+        return stub
+
+    def test_nonempty_violations_emit_flipping_candidate(self):
+        with tempfile.TemporaryDirectory() as d:
+            stub = self._stub_with_violations(d)
+            jf = _journeys_file(d, [{
+                "journey_id": "viol", "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"},
+                "steps": [{"intent": "do", "expect": "ok"}]}])
+            out = os.path.join(d, "traj.json")
+            run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps([{"command": "izba ls"}, {"done": True}]),
+                "--step-cap", "25", "--action-timeout-s", "10",
+                "--max-turns", "10", "--max-usd", "5"])
+            with open(out) as f:
+                res = json.load(f)["results"][0]
+            rv = [c for c in res["candidates"] if c["kind"] == "reconcile_violation"]
+            self.assertTrue(rv, res["candidates"])
+            self.assertIn("orphan-relay", rv[0]["detail"])
+
+    def test_all_snapshots_failed_emits_infra(self):
+        with tempfile.TemporaryDirectory() as d:
+            stub = os.path.join(d, "izba")
+            with open(stub, "w") as f:
+                f.write("#!/bin/sh\n"
+                        'if [ "$1" = "__reconcile" ]; then exit 7; fi\n'
+                        "echo ok\nexit 0\n")
+            os.chmod(stub, 0o755)
+            jf = _journeys_file(d, [{
+                "journey_id": "deadrec", "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"},
+                "steps": [{"intent": "do", "expect": "ok"}]}])
+            out = os.path.join(d, "traj.json")
+            run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps([{"command": "izba ls"}, {"done": True}]),
+                "--step-cap", "25", "--action-timeout-s", "10",
+                "--max-turns", "10", "--max-usd", "5"])
+            with open(out) as f:
+                res = json.load(f)["results"][0]
+            infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+            self.assertTrue(any("reconciler unusable" in c["detail"] for c in infra),
+                            res["candidates"])
 
 
 if __name__ == "__main__":

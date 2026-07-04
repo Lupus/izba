@@ -41,6 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model import FakeModel, OpenRouterModel  # noqa: E402
 from oracles import (  # noqa: E402
+    Candidate,
     capture_state_evidence,
     functional_oracle,
     implicit_oracle,
@@ -215,6 +216,19 @@ def _collect_candidates(action, command, action_index, prev_reconcile,
     found = implicit_oracle(action) + latency_oracle(action, latency_budget_ms)
     if prev_reconcile is not None:
         found += reconcile_seq_oracle(prev_reconcile, action.reconcile)
+    violations = (action.reconcile or {}).get("violations") or []
+    if violations:
+        import json as _json
+        found = list(found)
+        preview = _json.dumps(violations[:3])[:400]
+        found.append(Candidate(
+            kind="reconcile_violation",
+            detail=(f"izba __reconcile reported {len(violations)} violation(s) "
+                    f"after {command!r}: {preview}"),
+            violated_expectation="reconciler must report no violations "
+                                 "(declared state == reality)",
+            source="contract: disk-state invariant (__reconcile)",
+        ))
     out = []
     for c in found:
         cd = c.to_dict()
@@ -466,6 +480,10 @@ def run_journey(
                 "source": source,
                 "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
             })
+    # A journey whose EVERY snapshot errored had no reconcile oracle at all.
+    if actions and all((a.get("reconcile") or {}).get("error") for a in actions):
+        candidates.append(_infra_candidate(
+            journey_id, "reconciler unusable: every snapshot errored"))
     # State-based oracle: snapshot izba's OWN audit/policy/lifecycle state so the
     # rubric judge grades the outcome from ground truth, not guest exit codes.
     try:

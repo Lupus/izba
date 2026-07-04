@@ -355,5 +355,25 @@ class RunActionTests(unittest.TestCase):
         self.assertIn("reconcile", d)
 
 
+class ReconcileVisibilityTests(unittest.TestCase):
+    def test_snapshot_failure_has_error_key(self):
+        import oracles
+        # A binary that is not there -> OSError path.
+        snap = oracles._snapshot_reconcile(
+            "/nonexistent/izba", "/tmp", 5,
+            oracles._shell_env("/nonexistent/izba", "/tmp"))
+        self.assertIn("error", snap)
+        self.assertEqual(snap["violations"], [])
+
+    def test_seq_oracle_skips_error_snapshots(self):
+        import oracles
+        prev = {"error": "boom", "violations": [], "sandboxes": []}
+        cur = {"violations": [], "sandboxes": [
+            {"name": "s", "status_disk": "running",
+             "vmm": {"pid": 1, "starttime": 2}}]}
+        self.assertEqual(oracles.reconcile_seq_oracle(prev, cur), [])
+        self.assertEqual(oracles.reconcile_seq_oracle(cur, prev), [])
+
+
 if __name__ == "__main__":
     unittest.main()
