@@ -5,24 +5,38 @@ name: Dogfood
 # (intent extraction → journeys.json) and Phase 3 (skeptic + synthesis) run
 # locally in Claude Code (see hack/dogfood/README.md + the dogfood skill).
 #
-# Trigger ONLY via workflow_dispatch off a `dogfood-run/<feature>` branch that
-# carries a committed `journeys.json` at the repo root. NEVER open a PR for that
-# branch — ci.yml/app.yml/coverage.yml have `branches-ignore: ['dogfood-run/**']`
-# guards so an accidental PR fires no gates, but the discipline is: dispatch only.
+# Trigger via workflow_dispatch off a `dogfood-run/<feature>` branch that
+# carries a committed journeys file (path given by `journeys_path`, default
+# `journeys.json`) at the repo root. NEVER open a PR for that branch —
+# ci.yml/app.yml/coverage.yml have `branches-ignore: ['dogfood-run/**']`
+# guards so an accidental PR fires no gates, but the discipline is: dispatch
+# only. Also runs on a weekly Monday 06:00 UTC cron on `main`, driving the
+# committed smoke corpus (`hack/dogfood/journeys/smoke-core-cli.json`) as a
+# report-only novice-smoke probe.
 #
 # Report-only: a run that finds bugs still exits 0. Only infra failures (build,
 # boot, artifact fetch) fail a job — the runner itself always exits 0 and writes
 # a trajectory bundle, so we never grep its output to fail the job.
+#
+# The `setup` job derives the shard matrices from the `shards`/`gui_shards`
+# inputs AND the journey set itself, so shard counts are a real knob (not a
+# hardcoded 3) and the GUI job is skipped entirely when the journey set has no
+# modality:"gui" entries. `max_usd` is a PER-SHARD budget cap (see the setup
+# job's outputs + the per-job env below).
 
 on:
   workflow_dispatch:
     inputs:
+      journeys_path:
+        description: 'Path (in the dispatched ref) of the journeys file to run'
+        required: false
+        default: 'journeys.json'
       shards:
-        description: 'Number of CLI journey shards (must match the dogfood matrix below)'
+        description: 'Number of CLI journey shards'
         required: false
         default: '3'
       gui_shards:
-        description: 'Number of GUI journey shards (independent of `shards`; must match the dogfood-gui matrix, fixed at 3)'
+        description: 'Number of GUI journey shards (GUI jobs are skipped when the journey set has no modality:"gui" entries)'
         required: false
         default: '3'
       model:
@@ -30,9 +44,13 @@ on:
         required: false
         default: 'google/gemini-2.5-flash'
       max_usd:
-        description: 'Cumulative estimated USD budget for the whole run'
+        description: 'PER-SHARD estimated USD cap (worst-case total = max_usd × (cli shards + gui shards))'
         required: false
         default: '2'
+  schedule:
+    # Weekly novice smoke probe on main: the committed smoke corpus, report-only
+    # (owner decision 2026-07-04: manual/weekly only — no push trigger).
+    - cron: '0 6 * * 1'
 
 concurrency:
   group: dogfood-${{ github.ref }}
@@ -42,6 +60,54 @@ permissions:
   contents: read
 
 jobs:
+  # Derive the shard matrices from the inputs + the journey set, so the shard
+  # count is a real knob (the old hardcoded 3-shard matrices killed dispatches
+  # with any other value) and the GUI jobs are skipped entirely when the set
+  # has no modality:"gui" journeys (3 wasted Tauri builds otherwise).
+  setup:
+    name: plan shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      journeys_path: ${{ steps.plan.outputs.journeys_path }}
+      cli_shards: ${{ steps.plan.outputs.cli_shards }}
+      gui_shards: ${{ steps.plan.outputs.gui_shards }}
+      cli_matrix: ${{ steps.plan.outputs.cli_matrix }}
+      gui_matrix: ${{ steps.plan.outputs.gui_matrix }}
+      has_gui: ${{ steps.plan.outputs.has_gui }}
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - id: plan
+        env:
+          # schedule fires with empty inputs -> smoke-corpus defaults.
+          JOURNEYS_PATH: ${{ github.event_name == 'schedule' && 'hack/dogfood/journeys/smoke-core-cli.json' || inputs.journeys_path || 'journeys.json' }}
+          SHARDS: ${{ inputs.shards || '3' }}
+          GUI_SHARDS: ${{ inputs.gui_shards || '3' }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          jp = os.environ["JOURNEYS_PATH"]
+          shards = max(1, int(os.environ["SHARDS"]))
+          gui_shards = max(1, int(os.environ["GUI_SHARDS"]))
+          with open(jp) as f:
+              doc = json.load(f)
+          journeys = doc.get("journeys", []) or []
+          n_gui = sum(1 for j in journeys if j.get("modality") == "gui")
+          n_cli = len(journeys) - n_gui
+          shards = min(shards, n_cli) or 1
+          gui_shards = min(gui_shards, n_gui) or 1
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a") as f:
+              f.write(f"journeys_path={jp}\n")
+              f.write(f"cli_shards={shards}\n")
+              f.write(f"gui_shards={gui_shards}\n")
+              f.write(f"cli_matrix={json.dumps(list(range(shards)))}\n")
+              f.write(f"gui_matrix={json.dumps(list(range(gui_shards)))}\n")
+              f.write(f"has_gui={'true' if n_gui else 'false'}\n")
+          print(f"{jp}: {n_cli} cli journeys -> {shards} shards; "
+                f"{n_gui} gui journeys -> {gui_shards} shards")
+          EOF
+
   # Build the microVM artifacts the KVM jobs boot real sandboxes with. Mirrors
   # e2e.yml's kernel/mke2fs/nft/initramfs jobs (same pinned versions + caches).
   kernel:
@@ -181,20 +247,18 @@ jobs:
           path: dist/initramfs.cpio.gz
           if-no-files-found: error
 
-  # The fan-out. A fixed 3-way matrix for the PoC. NOTE: this matrix MUST match
-  # the `shards` input (default "3"); changing the input without changing this
-  # list (or vice versa) would mis-shard the journeys. Kept literal for the PoC
-  # because GitHub Actions cannot derive a matrix from a dispatch input without a
-  # generator job — revisit if the shard count becomes dynamic.
+  # The fan-out. The matrix is derived by `setup` from the `shards` input AND
+  # the journey set (never wider than the number of CLI journeys), so the
+  # count is a real knob instead of a hardcoded literal.
   dogfood:
     name: dogfood journeys (KVM shard ${{ matrix.shard }})
-    needs: [kernel, initramfs]
+    needs: [setup, kernel, initramfs]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        shard: ${{ fromJson(needs.setup.outputs.cli_matrix) }}
     env:
       # Real-VM env, mirroring e2e.yml's linux-kvm leg so `izba create/run` boots
       # actual microVMs.
@@ -203,17 +267,6 @@ jobs:
       IZBA_TEST_CACHE: /home/runner/.cache/izba-itest
       IZBA_BOOT_TIMEOUT_SECS: '120'
     steps:
-      # The matrix is hardcoded to 3 shards (GitHub can't derive a matrix from a
-      # dispatch input). Fail loudly if `shards` != 3 so journeys for shard>=3
-      # aren't silently dropped — extend the matrix here if you raise `shards`.
-      - name: Guard — matrix is fixed at 3 shards
-        env:
-          SHARDS: ${{ inputs.shards }}
-        run: |
-          if [ "$SHARDS" != "3" ]; then
-            echo "::error::dogfood.yml matrix is fixed at 3 shards but shards=$SHARDS — journeys for shard>=3 would be silently skipped. Use shards=3 or extend the matrix."
-            exit 1
-          fi
       # Check out the DISPATCHED ref so journeys.json committed on the
       # dogfood-run/<feature> branch is present at the repo root.
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
@@ -288,9 +341,10 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ inputs.shards }}
-          MODEL: ${{ inputs.model }}
-          MAX_USD: ${{ inputs.max_usd }}
+          SHARDS: ${{ needs.setup.outputs.cli_shards }}
+          JOURNEYS_PATH: ${{ needs.setup.outputs.journeys_path }}
+          MODEL: ${{ inputs.model || 'google/gemini-2.5-flash' }}
+          MAX_USD: ${{ inputs.max_usd || '2' }}
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           # Short data-dir base: the sandbox runtime socket lives under
@@ -300,7 +354,7 @@ jobs:
           # product README + the run-specific context pack (its environment).
           # Both live at the repo root on the dispatched branch.
           python3 hack/dogfood/run_journeys.py \
-            --journeys journeys.json \
+            --journeys "$JOURNEYS_PATH" \
             --shard "$SHARD" \
             --shards "$SHARDS" \
             --izba-bin "$PWD/target/release/izba" \
@@ -319,37 +373,36 @@ jobs:
           name: traj-${{ matrix.shard }}
           path: traj-${{ matrix.shard }}.json
           if-no-files-found: warn
+      - name: Job summary
+        if: always()
+        run: python3 hack/dogfood/summarize_bundle.py "traj-$SHARD.json" >> "$GITHUB_STEP_SUMMARY" || true
+        env:
+          SHARD: ${{ matrix.shard }}
       - name: Upload sandbox logs on failure
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dogfood-${{ matrix.shard }}-failure-logs
           path: |
-            ${{ runner.temp }}/izba-dogfood-${{ matrix.shard }}/sandboxes/*/logs/*
+            /tmp/izd-${{ matrix.shard }}/*/sandboxes/*/logs/*
           if-no-files-found: ignore
 
   dogfood-gui:
     name: dogfood GUI journeys (KVM shard ${{ matrix.shard }})
-    needs: [kernel, initramfs]
+    needs: [setup, kernel, initramfs]
+    if: needs.setup.outputs.has_gui == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 70
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        shard: ${{ fromJson(needs.setup.outputs.gui_matrix) }}
     env:
       IZBA_KERNEL: ${{ github.workspace }}/dist/vmlinux
       IZBA_INITRAMFS: ${{ github.workspace }}/dist/initramfs.cpio.gz
       IZBA_TEST_CACHE: /home/runner/.cache/izba-itest
       IZBA_BOOT_TIMEOUT_SECS: '120'
     steps:
-      - name: Guard — GUI matrix is fixed at 3 shards
-        env:
-          GUI_SHARDS: ${{ inputs.gui_shards }}
-        run: |
-          if [ "$GUI_SHARDS" != "3" ]; then
-            echo "::error::dogfood-gui matrix is fixed at 3 shards but gui_shards=$GUI_SHARDS — journeys for shard>=3 would be silently skipped. Use gui_shards=3 or extend the matrix."; exit 1
-          fi
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - name: Make /dev/kvm accessible
         run: |
@@ -418,13 +471,14 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           SHARD: ${{ matrix.shard }}
-          GUI_SHARDS: ${{ inputs.gui_shards }}
-          MODEL: ${{ inputs.model }}
-          MAX_USD: ${{ inputs.max_usd }}
+          GUI_SHARDS: ${{ needs.setup.outputs.gui_shards }}
+          JOURNEYS_PATH: ${{ needs.setup.outputs.journeys_path }}
+          MODEL: ${{ inputs.model || 'google/gemini-2.5-flash' }}
+          MAX_USD: ${{ inputs.max_usd || '2' }}
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           python3 hack/dogfood/gui/run_gui_journeys.py \
-            --journeys journeys.json \
+            --journeys "$JOURNEYS_PATH" \
             --shard "$SHARD" --shards "$GUI_SHARDS" \
             --izba-bin "$PWD/target/release/izba" \
             --sidecar-bin "$PWD/app/src-tauri/target/release/headless" \
@@ -444,3 +498,16 @@ jobs:
             gui-traj-${{ matrix.shard }}.json
             gui-shots-${{ matrix.shard }}/**
           if-no-files-found: warn
+      - name: Job summary
+        if: always()
+        run: python3 hack/dogfood/summarize_bundle.py "gui-traj-$SHARD.json" >> "$GITHUB_STEP_SUMMARY" || true
+        env:
+          SHARD: ${{ matrix.shard }}
+      - name: Upload sandbox logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dogfood-gui-${{ matrix.shard }}-failure-logs
+          path: |
+            /tmp/izd-gui-${{ matrix.shard }}/*/sandboxes/*/logs/*
+          if-no-files-found: ignore

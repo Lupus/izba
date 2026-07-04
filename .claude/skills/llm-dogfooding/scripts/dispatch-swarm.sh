@@ -7,6 +7,11 @@
 # Usage: dispatch-swarm.sh <feature> <journeys.json> [shards] [max_usd] [model]
 #   defaults: shards=3  max_usd=3  model=(workflow default, cheap)
 #
+#   max_usd is a PER-SHARD budget cap (dogfood.yml's setup job derives the CLI
+#   and GUI shard counts from `shards`/`gui_shards` + the journey set itself;
+#   the GUI job auto-skips when the journey set has no modality:"gui" entries,
+#   so the worst case below is shards + 3 gui shards, not shards alone).
+#
 # Requires network + gh auth → run UNSANDBOXED. Never opens a PR (the ci/app/
 # coverage workflows ignore dogfood-run/**; dogfood.yml is workflow_dispatch only).
 # Report-only: a run that finds bugs still succeeds; only infra failures fail.
@@ -53,6 +58,7 @@ git -C "$TMP_WT" commit -q -m "dogfood: journeys for ${FEATURE} (dispatch-only; 
 git -C "$TMP_WT" push -f origin "HEAD:refs/heads/${BRANCH}"
 
 echo "== dispatching dogfood.yml (shards=$SHARDS max_usd=$MAX_USD) =="
+echo "budget: \$${MAX_USD}/shard (worst case \$$((MAX_USD * (SHARDS + 3))) if GUI runs)"
 DISPATCH_ARGS=(--ref "$BRANCH" -f "shards=$SHARDS" -f "max_usd=$MAX_USD")
 [ -n "$MODEL" ] && DISPATCH_ARGS+=(-f "model=$MODEL")
 gh workflow run dogfood.yml "${DISPATCH_ARGS[@]}"
