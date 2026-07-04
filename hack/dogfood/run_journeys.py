@@ -502,8 +502,8 @@ def run_journey(
     if actions and all((a.get("reconcile") or {}).get("error") for a in actions):
         candidates.append(_infra_candidate(
             journey_id, "reconciler unusable: every snapshot errored"))
-    # State-based oracle: snapshot izba's OWN audit/policy/lifecycle state so the
-    # rubric judge grades the outcome from ground truth, not guest exit codes.
+    # State-based oracle: snapshot izba's OWN audit/policy/lifecycle state
+    # so the Phase-3 skeptic grades the outcome from ground truth, not guest exit codes.
     try:
         state_evidence = capture_state_evidence(izba_bin, data_dir, action_timeout_s)
     except Exception as e:  # report-only: never let evidence capture fail a run
@@ -655,6 +655,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         json.dump(bundle, f, indent=2)
     log(f"wrote {args.out}: {len(results)} journeys ({degraded} degraded), "
         f"est. cost ${budget['usd']:.4f}")
+
+    try:
+        import jsonschema  # optional: report-only validation
+        schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "schema", "trajectory.schema.json")
+        with open(schema_path) as f:
+            jsonschema.validate(bundle, json.load(f))
+    except ImportError:
+        pass
+    except Exception as e:
+        log(f"WARNING: bundle does not validate against trajectory.schema.json: {e}")
+
     if catastrophic:
         log(f"CATASTROPHIC: {degraded}/{len(results)} journeys degraded "
             f"(> {CATASTROPHIC_DEGRADED_FRACTION:.0%}) — the run measured "

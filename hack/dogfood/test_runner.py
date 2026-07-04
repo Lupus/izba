@@ -858,5 +858,40 @@ class ExpectCmdReTests(unittest.TestCase):
                               if c["kind"] == "functional"], [])
 
 
+class BundleSchemaTests(unittest.TestCase):
+    def test_full_run_bundle_validates(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema not installed")
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            jf = _journeys_file(d, [{
+                "journey_id": "ok", "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"},
+                "steps": [{"intent": "list", "expect": "works", "core": True,
+                           "expect_cmd_re": "ls"}]},
+                {"journey_id": "err", "rationale": "r",
+                 "source": {"kind": "spec", "ref": "x"},
+                 "steps": [{"intent": "boom", "expect": "works"}]}])
+            out = os.path.join(d, "traj.json")
+            run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps([
+                    {"command": "izba ls"}, {"done": True},   # journey ok
+                    {"error": "transport down"}]),            # journey err
+                "--step-cap", "25", "--action-timeout-s", "10",
+                "--max-turns", "10", "--max-usd", "5"])
+            schema_path = os.path.join(os.path.dirname(
+                os.path.abspath(run_journeys.__file__)),
+                "schema", "trajectory.schema.json")
+            with open(schema_path) as f:
+                schema = json.load(f)
+            with open(out) as f:
+                bundle = json.load(f)
+            jsonschema.validate(bundle, schema)  # raises on mismatch
+
+
 if __name__ == "__main__":
     unittest.main()

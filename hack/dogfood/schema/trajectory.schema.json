@@ -37,16 +37,17 @@
         },
         "state_evidence": {
           "type": "object",
-          "description": "The product's OWN authoritative end-state after the journey — the state-based oracle the rubric judge grades outcomes against (NOT guest exit codes). Per sandbox the journey created: `izba policy show` (allow-list + enforce posture) and `izba netlog --summary` (what the firewall actually allowed/denied), plus the final reconcile snapshot.",
+          "description": "The product's OWN authoritative end-state after the journey — the state-based oracle the Phase-3 trajectory-skeptic grades outcomes against (NOT guest exit codes). Per sandbox the journey created: `izba policy show` (allow-list + enforce posture) and `izba netlog --summary` (what the firewall actually allowed/denied), plus the final reconcile snapshot.",
           "properties": {
             "sandboxes": { "type": "array", "items": { "type": "string" } },
             "reconcile": { "type": "object" },
             "per_sandbox": {
               "type": "object",
-              "description": "Keyed by sandbox name; each has policy_show + netlog capture results (argv/exit_code/stdout/stderr)."
+              "description": "Keyed by sandbox name; each has policy_show + netlog capture results (argv/exit_code/stdout/stderr). per_sandbox entries also carry console_tail (last 8 KiB of the guest serial console)."
             }
           }
-        }
+        },
+        "invoke_log": { "type": "array", "items": { "type": "object" }, "description": "GUI only: the in-page bridge's invoke log (command, ok/error, duration) captured at journey end — the evidence behind silent_failure verdicts." }
       }
     },
     "action": {
@@ -66,7 +67,8 @@
           "required": ["violations"],
           "properties": {
             "violations": { "type": "array", "items": { "type": "object" } },
-            "sandboxes": { "type": "array", "items": { "type": "object" } }
+            "sandboxes": { "type": "array", "items": { "type": "object" } },
+            "error": { "type": "string", "description": "Present iff the __reconcile snapshot itself failed (spawn/timeout/parse) — the snapshot carries no state and the seq oracle skipped it." }
           }
         },
         "snapshot": { "type": "string", "description": "GUI only: the rendered accessibility set-of-marks the Actor saw after this action (role + name + @ref lines), trimmed. Empty for CLI actions." },
@@ -81,11 +83,12 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["functional", "latency", "implicit", "reconcile_seq", "console", "ui_daemon_diff", "silent_failure", "dom_expect"],
-          "description": "Which oracle produced the candidate. CLI oracles: functional/latency/implicit/reconcile_seq. GUI oracles: console (uncaught JS error / rejection), ui_daemon_diff (UI state disagrees with daemon truth), silent_failure (invoke rejected with no visible error surface), dom_expect (user-observable expectation absent from the snapshot)."
+          "enum": ["functional", "latency", "implicit", "reconcile_seq", "infra", "unreached_decisive", "reconcile_violation", "guest_console", "console", "ui_daemon_diff", "silent_failure", "dom_expect"],
+          "description": "Which oracle produced the candidate. CLI oracles: functional/latency/implicit/reconcile_seq/infra/unreached_decisive/reconcile_violation/guest_console. GUI oracles: console (uncaught JS error / rejection), ui_daemon_diff (UI state disagrees with daemon truth), silent_failure (invoke rejected with no visible error surface), dom_expect (user-observable expectation absent from the snapshot). infra = harness/model transport failure (journey verified nothing). unreached_decisive = a decisive step produced no actions (#126). reconcile_violation = `izba __reconcile` reported violations. guest_console = crash marker in a guest's console.log."
         },
         "detail": { "type": "string", "description": "What was observed." },
         "decisive": { "type": "boolean", "description": "Functional oracle only: true iff this candidate came from a journey's decisive (core, or fallback last) step. The collector flips a journey negative on a decisive functional candidate; a non-decisive one is soft (surfaced but does not bury the journey). Absent on non-functional candidates." },
+        "graded_cmd": { "type": "string", "description": "Functional oracle only: the exact command whose exit code was graded (the expect_cmd_re-selected action, or the step's final action)." },
         "violated_expectation": { "type": "string", "description": "The expectation the observation contradicts." },
         "source": { "type": "string", "description": "Where that expectation is traced from (spec/pr/help/contract)." },
         "trajectory_ref": {
