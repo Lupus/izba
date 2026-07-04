@@ -105,6 +105,10 @@
             { "type": "string", "enum": ["nonzero"] }
           ],
           "description": "Declarative exit-code assertion that supersedes the fragile 'expect' keyword heuristic when present: an integer N grades the step's final action as PASS iff it exited exactly N; the string 'nonzero' grades PASS iff it exited non-zero (the way to assert an expected refusal, e.g. `izba ssh NAME -- false`). When absent, the 'expect' English-keyword path is the fallback (backward compatible). Optional."
+        },
+        "expect_cmd_re": {
+          "type": "string",
+          "description": "Optional regex anchoring WHICH of the step's actions the functional/expect_exit verdict is graded against: the LAST action whose command matches. Without it the step's final action is graded — which false-fires when the Actor runs a trailing verify (e.g. `izba ls`) after the intent-bearing command. Compiler rule: set it on refusal/expect_exit steps to the distinctive token of the command under test (e.g. 'promote'); never anchor to an exact full command line (that would leak a prescription to the swarm's benefit — the regex lives here, invisible to the Actor)."
         }
       }
     }
