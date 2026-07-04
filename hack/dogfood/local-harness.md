@@ -135,6 +135,32 @@ gh run download <run-id> --dir ./dogfood-artifacts
 - [ ] Never push to `main`; never open a PR for a `dogfood-run/*` branch.
 - [ ] After the run, the branch can be deleted — it carries no reviewable work.
 
+### 1.4 Run outcomes — the honest exit codes
+
+The run is **report-only**: findings never fail a shard. `run_journeys.py` exits
+distinguish "ran" from "couldn't measure", so a CI shard fails loudly only when
+the run was not a measurement:
+
+| exit | meaning |
+|---|---|
+| `0` | ran to completion — findings are report-only, a green shard is not "no bugs" |
+| `2` | usage / startup error (bad args, missing model config) |
+| `3` | **catastrophic infra** — more than half the journeys degraded (zero actions or an `infra` candidate). Check `OPENROUTER_API_KEY` first; a dead key degrades every journey. |
+
+Exit 3 is the instrument-honesty backstop: below the threshold a transient model
+blip stays report-only (it must not kill a 40-minute shard); above it, the run
+verified nothing and must not read as a green void.
+
+### 1.5 The standing smoke corpus (weekly cron)
+
+Most journey sets are throwaway (recompiled per feature). The **one** committed
+exception is `hack/dogfood/journeys/smoke-core-cli.json` — a novice smoke set, one
+journey per top-level workflow, whose only oracle is goal achievement. It rides a
+weekly Monday cron in `dogfood.yml` (report-only), and any manual dispatch can
+point at a committed journeys file via the `journeys_path` input (default: the
+smoke corpus). Everything deeper stays fresh; see
+[`docs/dogfooding-value.md`](../../docs/dogfooding-value.md) §5–6.
+
 ---
 
 ## Phase 3 — skeptic + synthesis
@@ -152,7 +178,10 @@ expect ~20-50% precision *before* it; its whole job is to refute the rest.
       `results[].actions[]` (the trajectory: command, exit_code, stdout/stderr
       tails, latency_ms, reconcile snapshot).
 - [ ] Flatten all candidates across all shards into one working list, each tagged
-      with its originating `journey_id`, shard, and `trajectory_ref`.
+      with its originating `journey_id`, shard, and `trajectory_ref`. (The CI job
+      already renders a per-bundle tally into the run summary via
+      `summarize_bundle.py <traj.json> [...]` — read it for a quick
+      journeys/positive/flip/infra/unreached overview before you dig in.)
 
 ### 3.2 Run the adversarial skeptic on each candidate
 
@@ -172,37 +201,13 @@ one of:
 Bias toward dropping: only keep a candidate you can tie to a concrete,
 anchor-traceable expectation.
 
-#### Reusable skeptic prompt template
+#### Run the skeptic agent, not an inline prompt
 
-> You are an adversarial reviewer. Your job is to **refute** the following
-> candidate finding from an izba dogfooding run, not to confirm it.
->
-> **Candidate**
-> - kind: `{kind}` (functional | latency | implicit | reconcile_seq)
-> - detail: `{detail}`
-> - violated_expectation: `{violated_expectation}`
-> - claimed source: `{source}`
-> - trajectory (ordered actions, outputs, exit codes, latencies, reconcile
->   snapshots): `{trajectory}`
->
-> **Anchors** (ground truth — cite these, do not invent)
-> - spec section(s): `{spec_excerpt}`
-> - PR description: `{pr_excerpt}`
-> - Greptile review: `{greptile_excerpt}`
-> - relevant `--help`: `{help_excerpt}`
->
-> Decide **exactly one** verdict and justify it by quoting an anchor or a
-> trajectory line:
-> 1. **intended** — an anchor documents/specifies this behavior. Quote it. → drop.
-> 2. **self-inflicted** — a trajectory line shows the agent's own command caused
->    the failure (e.g. an infinite/blocking command inside `izba exec` that
->    tripped the latency oracle; a malformed argument the agent supplied). Quote
->    the offending action. → drop.
-> 3. **real** — the observed behavior contradicts a specific expectation AND no
->    anchor permits it AND no trajectory line shows self-infliction. Quote the
->    violated expectation, its source, and the contradicting observation. → keep.
->
-> Output: `verdict`, the quoted evidence, and a one-line justification.
+Dispatch the `trajectory-skeptic` agent (`.claude/agents/trajectory-skeptic.md`) —
+it emits `report.md` + `skeptic-verdict.json` (schema:
+`hack/dogfood/schema/skeptic-verdict.schema.json`). The old inline template
+predates the discoverability class, the Direction-B green audit, and the JSON
+contract.
 
 ### 3.3 Synthesize survivors into `report.md`
 
@@ -224,3 +229,20 @@ anchor-traceable expectation.
 - [ ] Output is `report.md`. Findings are **candidates for the owner**, not
       verified bugs — minimization is out of scope here (the owner does that
       locally). Report-only; never a merge gate.
+
+### 3.4 Append the run to the signal/noise ledger
+
+- [ ] Record the run's tallies so signal-quality drift is tracked across runs
+      instead of from memory:
+
+  ```bash
+  scripts/append-ledger.py \
+    --collected collected.json \
+    --verdict   skeptic-verdict.json \
+    --feature   <feature> --tier <smoke|core|deep>
+  ```
+
+  `--collected` is the `collect-trajectories.py --json` output (per-bucket journey
+  tallies); `--verdict` is the skeptic's `skeptic-verdict.json` (its kept/refuted
+  counts). One JSON line is appended to `hack/dogfood/ledger.jsonl` (report-only;
+  never mutates existing lines).

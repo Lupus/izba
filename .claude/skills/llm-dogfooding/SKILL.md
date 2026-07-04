@@ -93,6 +93,14 @@ digraph dogfood {
 - **Phase 4 — Land.** Ensure the **SonarQube** gate is green, run **`/greploop`**
   to clear Greptile on the fixes PR, then emit ONE comprehensive report:
   discovered / fixed-in-place / blockers / depth-reached-per-tier / signal-noise.
+  Two more steps close the loop honestly:
+  - **Graduation.** For each confirmed **behavioral** finding, land a distilled
+    deterministic e2e test alongside the fix (the trajectory is the repro) —
+    behaviors get pinned in the e2e layer, never by freezing journeys; UX findings
+    land as docs/help fixes or issues.
+  - **Ledger.** Append the run's tallies:
+    `scripts/append-ledger.py --collected collected.json --verdict skeptic-verdict.json --feature <f> --tier <t>`
+    (ledger: `hack/dogfood/ledger.jsonl`).
 
 Keep only the distilled outputs (tier plan, per-tier verdict, the final report) in
 the orchestrator's context — bundles and reasoning live in the subagents.
@@ -125,8 +133,12 @@ the test's main signal.
 | Dispatch a tier off the fixes tip | `DOGFOOD_BASE=HEAD scripts/dispatch-swarm.sh <feature> tier-<t>.json <shards> <max_usd>` |
 | Flatten bundles for the skeptic | `scripts/collect-trajectories.py <artifacts-dir>` |
 | Fix a well-scoped gap in-place | dispatch the `dogfood-gap-fixer` subagent (one finding) |
+| Append the run's signal/noise tallies | `scripts/append-ledger.py --collected collected.json --verdict skeptic-verdict.json --feature <f> --tier <t>` (ledger: `hack/dogfood/ledger.jsonl`) |
 | Journey / trajectory file contracts | `hack/dogfood/schema/*.schema.json` (journey has `tier`/`establishes`/`requires`/`gating`) |
 | Phase-3 runner internals & oracle harness | `hack/dogfood/` (`run_journeys.py`, `oracles.py`, `local-harness.md`) |
+| Render a one-bundle CI job summary | `hack/dogfood/summarize_bundle.py <traj.json> [...]` |
+| Standing novice smoke corpus (weekly cron + `journeys_path` input) | `hack/dogfood/journeys/smoke-core-cli.json` |
+| Why dogfooding exists & where it sits vs e2e (the value model) | [`docs/dogfooding-value.md`](../../../docs/dogfooding-value.md) |
 | Why & deeper method (tiers, gate, auto-fix boundary, CI hygiene, report) | [references/methodology.md](references/methodology.md) |
 | Drive the GUI swarm (Tauri app) | `hack/dogfood/gui/run_gui_journeys.py` (agent-browser + `bin/headless` bridge); `modality:"gui"` journeys |
 
@@ -154,6 +166,13 @@ the test's main signal.
 - **Auto-fixing across the boundary** — never let the gap-fixer touch behavior,
   the datapath, policy semantics, a trust boundary, or a public contract. Those
   are blockers to escalate, not edits to make. When unsure, escalate.
+- **Turning journeys into regression tests** — deep journeys are disposable by
+  design (see docs/dogfooding-value.md); recompile against today's surface
+  instead of re-running stale sets. The only standing corpus is the novice smoke
+  probe.
+- **Subtracting journeys because e2e covers the behavior** — e2e coverage never
+  subtracts journeys; the swarm failing an e2e-proven scenario IS the
+  discoverability signal.
 
 See [references/methodology.md](references/methodology.md) for the oracle catalog,
 the candidate/cheating taxonomies, the progressive-loop gate + auto-fix boundary,

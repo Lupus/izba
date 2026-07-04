@@ -48,6 +48,29 @@ exit code. Treat these as **independent ground truth** — they are not the
 swarm's narration. When the swarm *claims* something ("created the sandbox"),
 check it against the snapshot and exit codes, not its prose.
 
+Two newer evidence fields sharpen this: a **functional** candidate carries
+`graded_cmd` — the exact command whose exit code was scored (the
+`expect_cmd_re`-selected action, not necessarily the step's last line), so you
+can see *what* was judged. GUI bundles carry `invoke_log` (the in-page bridge's
+command/ok/duration log at journey end) — the ground truth behind a
+`silent_failure` verdict.
+
+### Harness-verified kinds are facts, not refutable claims
+
+Four candidate kinds are produced by the harness/reconciler, not by grading the
+swarm's narration — the observation is already verified, so **do not try to
+"refute the oracle."** Triage each by what it means, not whether it happened:
+
+| kind | what it is | triage as |
+|---|---|---|
+| `infra` | model/API/transport failure — the journey verified nothing | **infra** (class `harness`): drop as a non-finding; if pervasive it's why depth is missing, note it — never a product bug |
+| `unreached_decisive` | a decisive step the actor never reached (budget exhausted, izba#126) | **inconclusive**: a coverage/depth gap, not a product bug — the promise was never exercised |
+| `reconcile_violation` | `izba __reconcile` reported `violations` (declared-vs-real state disagrees) | **product finding**: real state inconsistency; the violation objects are the evidence |
+| `guest_console` | a crash marker in a sandbox's guest `console.log` | **product finding**: a guest-side panic/crash |
+
+You still adjudicate *severity and dedup*; you do not re-litigate whether the
+harness saw what it saw.
+
 ## Direction A — refute NEGATIVE candidates (oracle-flagged / failed steps)
 
 For each candidate, try to disprove it's a real bug. Classify as exactly one:
@@ -104,7 +127,19 @@ Verdict per positive journey: **genuinely-achieved** (quote the trajectory lines
 too weak to verify its promise → a **coverage finding**: recommend a tighter
 journey).
 
-## Output — a triaged report (write `report.md` and summarize)
+## Output — a triaged report + machine-readable verdict
+
+Emit **two** artifacts. Write the human `report.md` (below) AND, alongside it,
+`skeptic-verdict.json` conforming to
+`hack/dogfood/schema/skeptic-verdict.schema.json`. The orchestrator consumes the
+JSON — `findings[].fix_routing` routes fixes, `capabilities` gates the next tier,
+`counts` feeds `append-ledger.py` — with **no prose parsing**; the human reads the
+markdown. Keep the two in sync: every confirmed finding in the report has a
+`findings[]` object (`id`/`class`/`fix_routing`/`summary`/`journey_ids`/`anchor`),
+and the `counts` (kept/refuted, and cheated/inconclusive from Direction B) match
+your triage.
+
+The `report.md`:
 
 1. **Confirmed product findings** — real bugs + UX/discoverability findings. Each
    with: one-line description, severity hint, the anchor it violates, and a

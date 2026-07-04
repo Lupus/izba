@@ -78,12 +78,24 @@ Keep each journey **small, orthogonal, and independent** — independence is wha
 makes the swarm shardable and the results attributable. A journey is a goal, not
 a script: the swarm chooses the concrete commands.
 
+**e2e coverage never subtracts journeys.** Do not skip a journey because an e2e
+test proves the behavior wired — the swarm failing an e2e-proven scenario is
+exactly the discoverability differential this method measures.
+
 ## Mandate 2 — Anchor every expectation
 
 Every `expect` must be traceable to an anchor. Set `source.kind` to
 `spec | pr | greptile | help` and `source.ref` to the exact section / PR / review
 / help topic. **If you cannot cite a source for an outcome, do not assert it.**
 The skeptic will use these citations as ground truth; an uncited expect is slop.
+
+On a **refusal** or `expect_exit` step, add `expect_cmd_re`: a regex anchoring the
+distinctive token of the command under test (e.g. `"promote"`), so the functional
+oracle grades the action that actually carries the intent instead of a trailing
+verify command the Actor happened to run last (e.g. `izba ls`). Anchor to the
+distinctive *token*, **never** a full command line — `expect_cmd_re` lives in
+`journeys.json`, which the swarm never sees; a full invocation there would leak a
+prescription and defeat the fair test.
 
 ## Mandate 3 — Launder (no leaks to the swarm)
 
