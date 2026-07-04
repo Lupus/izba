@@ -88,7 +88,7 @@ shape:
 }
 ```
 
-- `source.kind` is one of `spec | pr | greptile | help`; `source.ref` points at
+- `source.kind` is one of `spec | pr | greptile | help | readme`; `source.ref` points at
   the exact section / PR / review the expectation comes from.
 - Every `expect` must be traceable to an anchor. If you cannot cite a source for
   an outcome, do not assert it.
@@ -171,7 +171,8 @@ expect ~20-50% precision *before* it; its whole job is to refute the rest.
 
 ### 3.1 Load the bundles
 
-- [ ] Read every per-shard bundle (`dogfood-artifacts/**/traj-*.json`),
+- [ ] Read every per-shard bundle (`dogfood-artifacts/**/*traj-*.json` — the
+      CLI shards' `traj-*.json` and the GUI shards' `gui-traj-*.json`),
       conforming to
       [`schema/trajectory.schema.json`](schema/trajectory.schema.json). Each
       bundle has `results[].candidates[]` (candidate findings) and

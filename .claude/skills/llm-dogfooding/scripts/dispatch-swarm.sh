@@ -82,7 +82,7 @@ gh run watch "$RID" --exit-status || echo "(run reported non-success — inspect
 
 echo "== downloading trajectory bundles to $OUTDIR =="
 rm -rf "$OUTDIR"; gh run download "$RID" --dir "$OUTDIR"
-echo "bundles:"; find "$OUTDIR" -name 'traj-*.json' | sort
+echo "bundles:"; find "$OUTDIR" -name '*traj-*.json' | sort
 echo
 echo "next: scripts/collect-trajectories.py $OUTDIR  → then dispatch the trajectory-skeptic subagent."
 echo "cleanup when done: git push origin --delete $BRANCH"

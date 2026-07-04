@@ -205,7 +205,8 @@ class OpenRouterModel:
         )
         # Cheap OpenRouter tiers are flaky (transient 429/5xx/timeouts). Retry a
         # few times with linear backoff before giving up — a single blip should
-        # not silently end an otherwise-good journey. Report-only on exhaustion.
+        # not silently end an otherwise-good journey. Exhaustion returns
+        # {"error": ...} which the runner records as a flipping infra candidate.
         body = None
         last_err = ""
         for attempt in range(self._max_retries + 1):

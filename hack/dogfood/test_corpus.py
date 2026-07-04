@@ -3,6 +3,7 @@ goal-achievement oracles only, no gui journeys (the weekly cron runs the CLI
 smoke), every journey shallow (<= 4 steps)."""
 import json
 import os
+import re
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,3 +30,20 @@ class SmokeCorpusTests(unittest.TestCase):
         for j in doc["journeys"]:
             self.assertNotEqual(j.get("modality"), "gui", j["journey_id"])
             self.assertLessEqual(len(j["steps"]), 4, j["journey_id"])
+
+    def test_nonzero_expects_declare_expect_exit(self):
+        """A step whose `expect` prose asserts a non-zero exit as the CORRECT
+        outcome must also declare `expect_exit` — prose alone does not
+        reliably trip the functional oracle's expected-failure regex (see
+        oracles._EXPECT_FAILURE_RE), so an under-specified step silently
+        stops being graded as a refusal and flips false-negative forever on
+        the weekly cron (no skeptic there to catch it)."""
+        doc = self._load()
+        for j in doc["journeys"]:
+            for step in j["steps"]:
+                if re.search(r"non-?zero", step["expect"], re.I):
+                    self.assertIn(
+                        "expect_exit", step,
+                        f"{j['journey_id']!r} step {step['intent']!r} asserts "
+                        "a non-zero exit in prose but has no expect_exit",
+                    )
