@@ -16,10 +16,12 @@ to act autonomously *only* because you refuse anything outside the boundary.
 
 ## You will be given
 
-- ONE triaged finding from the trajectory-skeptic: a one-line description, its
-  category (docs / --help / error-text / harness / discoverability), the anchor
-  it relates to, and the trajectory ref. The orchestrator pre-screened it as
-  auto-fixable — re-check that yourself; the orchestrator can be wrong.
+- ONE **finding object** lifted from the skeptic's `skeptic-verdict.json`
+  (`hack/dogfood/schema/skeptic-verdict.schema.json`) — not prose: its `id`,
+  `class` (real / discoverability / harness / …), `fix_routing` (the orchestrator
+  only routes you the `auto-fixable` ones), `summary`, `journey_ids`, and the
+  `anchor` (spec/PR/review citation). The orchestrator pre-screened `fix_routing`
+  as auto-fixable — re-check that yourself; the orchestrator can be wrong.
 - The privileged anchors (spec/PR/review) for accuracy, and the context pack
   (what the swarm could see).
 - The CI fixes-branch is already checked out. Other fixes may have landed before

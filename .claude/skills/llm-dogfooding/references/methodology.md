@@ -4,6 +4,9 @@ Depth behind [SKILL.md](../SKILL.md). Read when designing journeys, tuning the
 oracle, or interpreting a run. Grounded in real izba runs (the harness lives in
 `hack/dogfood/`; the original design is
 `docs/superpowers/specs/2026-06-20-llm-dogfooding-agent-design.md`).
+For *why* this method exists and where it sits relative to the e2e suite — the
+placement model this method serves — see
+[`docs/dogfooding-value.md`](../../../../docs/dogfooding-value.md).
 
 ## Why this exists
 
@@ -56,6 +59,31 @@ swarm's candidates and are the anti-slop spine (see `hack/dogfood/oracles.py`):
   expected-success + non-zero = candidate; **expected-failure + exit 0 = candidate**
   (a guard that should have fired silently didn't); expected-failure + non-zero =
   pass (this two-sidedness removes the bulk of rejection-journey false-positives).
+  Which action gets graded is intent-directed: a step may carry `expect_cmd_re`,
+  a regex anchoring the distinctive token of the command under test, and the
+  functional oracle grades the *last* action whose command matches it (falling
+  back to the step's final action). Every functional candidate records the
+  `graded_cmd` it actually judged, so the skeptic sees *what* was scored rather
+  than assuming it was the step's last line.
+
+The instrument-honesty kinds (a green must mean reached-and-corroborated, not a
+silent void — see [`docs/dogfooding-value.md`](../../../../docs/dogfooding-value.md) §7):
+
+- **`infra`** — a model/API/transport failure (dead key, malformed model output):
+  the journey verified nothing, so it emits a *flipping* candidate carrying the
+  reason instead of tallying a phantom positive. This is a harness-verified fact,
+  not a product claim. When more than half a run's journeys are degraded the
+  runner exits **3** (catastrophic infra) so the CI shard fails loudly instead of
+  reporting a green void.
+- **`unreached_decisive`** — a decisive (core) step the actor never reached (budget
+  exhausted before it) flips the journey as *unreached* rather than letting the
+  absence of a candidate read as *passed* (izba#126).
+- **`reconcile_violation`** — the `violations` array from `izba __reconcile` (once
+  captured and read by nobody) now flips the journey and carries the violation
+  objects verbatim; a *failed* reconcile snapshot is recorded as an error, not
+  masqueraded as clean.
+- **`guest_console`** — each sandbox's guest `console.log` is tailed and scanned
+  for crash markers, giving guest-side panics an oracle they never had.
 
 Sequence invariants the single-shot reconciler can't see (idempotency, monotonic
 restart identity, legal transitions) are the harness's job, computed by diffing
@@ -109,6 +137,13 @@ assertions). A real izba sequence ran 18 → 13 → 6 candidates across three ru
 harness and product fixes landed — the drop wasn't fewer bugs hidden, it was less
 noise and journeys finally reaching the assertions that surfaced a genuine
 durability edge. Don't declare done on a single run; iterate until it stabilizes.
+
+That trend is no longer tracked from memory: each run appends one line to the
+signal/noise ledger (`hack/dogfood/ledger.jsonl`) via
+`scripts/append-ledger.py --collected collected.json --verdict skeptic-verdict.json --feature <f> --tier <t>` —
+the per-bucket journey tallies plus the skeptic's kept/refuted counts, so drift
+in signal quality is visible across runs instead of recalled as an "18 → 13 → 6"
+anecdote.
 
 ## Progressive, gated, self-improving loop
 
