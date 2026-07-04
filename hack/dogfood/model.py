@@ -10,7 +10,10 @@ Two implementations of one tiny protocol:
   exercisable with no API key and no network.
 
 Reply contract (both): a dict ``{"command": "<shell command>"}`` to run the next
-action, or ``{"done": true}`` to finish the current step/journey. Each call also
+action, ``{"done": true}`` to finish the current step/journey, or
+``{"error": "<reason>"}`` when the model/API call itself failed (dead key,
+retry exhaustion, unparseable reply) — this is NOT a completion signal;
+``{"done": true}`` now ONLY means the model chose to finish. Each call also
 records ``last_cost_usd`` (an *approximate* USD estimate from the API ``usage``
 field; 0.0 for the fake).
 """
@@ -92,21 +95,27 @@ _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _parse_reply(content: str) -> Dict[str, Any]:
-    """Extract the {"command": ...} | {"done": true} object from model content."""
+    """Extract the {"command": ...} | {"done": true} object from model content.
+
+    A reply we cannot parse is an INFRA ERROR, not a completion: returning
+    {"done": true} here made a broken model indistinguishable from a finished
+    step (the silent-green path). The runner turns {"error": ...} into a
+    flipping `infra` candidate."""
     content = content.strip()
     try:
         obj = json.loads(content)
     except ValueError:
         m = _JSON_OBJ_RE.search(content)
         if not m:
-            return {"done": True}
+            return {"error": f"unparseable model reply: {content[:120]!r}"}
         try:
             obj = json.loads(m.group(0))
         except ValueError:
-            return {"done": True}
-    if isinstance(obj, dict) and (obj.get("done") or isinstance(obj.get("command"), str)):
+            return {"error": f"unparseable model reply: {content[:120]!r}"}
+    if isinstance(obj, dict) and (obj.get("done") or obj.get("read")
+                                  or isinstance(obj.get("command"), str)):
         return obj
-    return {"done": True}
+    return {"error": f"model reply has wrong shape: {content[:120]!r}"}
 
 
 def _build_user_message(journey: Dict[str, Any], step: Dict[str, Any],
@@ -146,7 +155,8 @@ class FakeModel:
 
 
 class OpenRouterModel:
-    """Calls OpenRouter chat-completions. Report-only: on error returns done."""
+    """Calls OpenRouter chat-completions. On failure returns {"error": ...},
+    never a fake {"done": true} — see the module docstring's reply contract."""
 
     def __init__(self, api_key: str, model_id: str,
                  url: str = OPENROUTER_URL, timeout_s: float = 60.0,
@@ -197,23 +207,26 @@ class OpenRouterModel:
         # few times with linear backoff before giving up — a single blip should
         # not silently end an otherwise-good journey. Report-only on exhaustion.
         body = None
+        last_err = ""
         for attempt in range(self._max_retries + 1):
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
                 break
-            except (urllib.error.URLError, ValueError, OSError):
+            except (urllib.error.URLError, ValueError, OSError) as e:
+                last_err = str(e)
                 if attempt >= self._max_retries:
-                    return {"done": True}
+                    return {"error": (f"openrouter request failed after "
+                                      f"{attempt + 1} attempts: {last_err}")}
                 time.sleep(self._retry_backoff_s * (attempt + 1))
         if body is None:
-            return {"done": True}
+            return {"error": f"openrouter request failed: {last_err or 'no body'}"}
 
         self.last_cost_usd = self._estimate_cost(body)
         try:
             content = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
-            return {"done": True}
+            return {"error": "openrouter reply missing choices[0].message.content"}
         return self._reply_parser(content or "")
 
     @staticmethod
