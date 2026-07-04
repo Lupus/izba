@@ -25,7 +25,7 @@ class SmokeCorpusTests(unittest.TestCase):
 
     def test_novice_shape(self):
         doc = self._load()
-        self.assertGreaterEqual(len(doc["journeys"]), 7)
+        self.assertGreaterEqual(len(doc["journeys"]), 9)
         for j in doc["journeys"]:
             self.assertNotEqual(j.get("modality"), "gui", j["journey_id"])
             self.assertLessEqual(len(j["steps"]), 4, j["journey_id"])
