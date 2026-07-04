@@ -3,13 +3,13 @@
   "journeys": [
     {
       "journey_id": "lifecycle-happy-path",
-      "rationale": "README/--help promise the core lifecycle: create a sandbox, list it, exec a command in it, stop it, remove it. The whole loop should work and leave consistent state at every step.",
+      "rationale": "README/--help promise the core lifecycle: create a sandbox, list it, exec a command in it, remove it. The whole loop should work and leave consistent state at every step.",
       "source": { "kind": "readme", "ref": "README.md (command surface) + `izba --help`" },
       "steps": [
         { "intent": "create a sandbox from a small image (e.g. alpine:3.20) with a given name", "expect": "create succeeds with a non-error exit; the daemon/state reflect a new sandbox" },
         { "intent": "list sandboxes", "expect": "the newly created sandbox appears in `izba ls`" },
         { "intent": "exec a trivial command that prints a known string in the sandbox (e.g. echo hello-izba)", "expect": "exit 0 and the known string appears in stdout" },
-        { "intent": "stop and remove the sandbox (e.g. `izba rm --force`)", "expect": "rm succeeds and the sandbox no longer appears in `izba ls`; reconciler reports no orphaned resources" }
+        { "intent": "remove the sandbox even though it is still running", "expect": "the sandbox is gone from the list" }
       ]
     },
     {
@@ -44,6 +44,20 @@
       "steps": [
         { "intent": "list sandboxes before creating anything", "expect": "an empty list (or a clear 'no sandboxes' message), exit 0" },
         { "intent": "run the consistency reconciler", "expect": "zero violations" }
+      ]
+    },
+    {
+      "journey_id": "stop-and-restart",
+      "rationale": "Stopping and restarting a sandbox without recreating it is a top-level workflow; a novice should manage it from documented verbs without losing the sandbox's identity.",
+      "source": { "kind": "help", "ref": "`izba stop`/`izba start` semantics" },
+      "tier": "smoke",
+      "steps": [
+        { "intent": "start a sandbox and confirm it is running",
+          "expect": "sandbox shows as running" },
+        { "intent": "stop it and confirm it is no longer running",
+          "expect": "sandbox shows as stopped" },
+        { "intent": "get the same sandbox running again without recreating it or losing its identity",
+          "expect": "the same sandbox shows as running again", "core": true }
       ]
     },
     {
