@@ -782,5 +782,61 @@ class ReconcileViolationTests(unittest.TestCase):
                             res["candidates"])
 
 
+class ExpectCmdReTests(unittest.TestCase):
+    def _run(self, d, step, script):
+        stub = _write_stub_izba(d)
+        jf = _journeys_file(d, [{
+            "journey_id": "anchor", "rationale": "r",
+            "source": {"kind": "spec", "ref": "x"},
+            "steps": [step]}])
+        out = os.path.join(d, "traj.json")
+        run_journeys.main([
+            "--journeys", jf, "--shard", "0", "--shards", "1",
+            "--izba-bin", stub, "--data-dir", d, "--out", out,
+            "--fake-model", json.dumps(script),
+            "--step-cap", "25", "--action-timeout-s", "10",
+            "--max-turns", "10", "--max-usd", "5"])
+        with open(out) as f:
+            return json.load(f)["results"][0]
+
+    def test_grades_matching_action_not_trailing_verify(self):
+        # The refusal (bogus-subcommand, exit 2) is followed by a passing
+        # `izba ls` verify. expect_exit=nonzero must be graded against the
+        # promote-like command, so NO candidate fires.
+        step = {"intent": "try the guarded op", "expect": "must be refused",
+                "expect_exit": "nonzero", "core": True,
+                "expect_cmd_re": r"bogus-subcommand"}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [
+                {"command": "izba bogus-subcommand"},
+                {"command": "izba ls"},
+                {"done": True}])
+            func = [c for c in res["candidates"] if c["kind"] == "functional"]
+            self.assertEqual(func, [], func)
+
+    def test_without_anchor_trailing_verify_false_fires(self):
+        # Same trajectory WITHOUT expect_cmd_re: the final action (ls, exit 0)
+        # is graded against nonzero -> false candidate. Locks in the motivation.
+        step = {"intent": "try the guarded op", "expect": "must be refused",
+                "expect_exit": "nonzero", "core": True}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [
+                {"command": "izba bogus-subcommand"},
+                {"command": "izba ls"},
+                {"done": True}])
+            func = [c for c in res["candidates"] if c["kind"] == "functional"]
+            self.assertEqual(len(func), 1)
+            self.assertEqual(func[0].get("graded_cmd"), "izba ls")
+
+    def test_bad_regex_falls_back_to_last_action(self):
+        step = {"intent": "x", "expect": "works", "core": True,
+                "expect_cmd_re": "["}  # invalid regex
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [{"command": "izba ls"}, {"done": True}])
+            # ls exits 0 and expect describes success -> no candidate; and no crash.
+            self.assertEqual([c for c in res["candidates"]
+                              if c["kind"] == "functional"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

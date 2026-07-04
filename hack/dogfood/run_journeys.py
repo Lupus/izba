@@ -251,21 +251,34 @@ def _decisive_step_indices(steps: List[Dict[str, Any]]) -> set:
 
 def _grade_step_functional(step, produced, journey, journey_id, decisive,
                            action_index) -> List[Dict[str, Any]]:
-    """Grade the functional assertion ONCE, on a step's FINAL action.
+    """Grade the functional assertion ONCE per step, on its intent-bearing action.
 
-    ``produced`` is the list of action dicts this step appended (``actions[start:]``);
-    ``action_index`` is the absolute index of its LAST element. Grading only the
-    action the step actually ended on means intermediate recovery actions don't
-    flip the journey. Each emitted functional candidate is tagged ``decisive`` (a
-    plain dict key, NOT a Candidate field) so the collector knows whether it may
-    flip the journey negative (decisive) or is merely soft (non-decisive)."""
+    Default target is the step's FINAL action. When the step declares
+    ``expect_cmd_re`` (a regex), the target is the LAST action whose command
+    matches — so a trailing verify (`izba ls`) after a correct refusal no
+    longer false-fires, and a refusal followed by unrelated commands is still
+    the thing graded. Invalid regexes log + fall back to the final action.
+    Every candidate records ``graded_cmd`` so the skeptic sees WHAT was graded."""
     if not produced:
         return []
-    last = produced[-1]
-    ref = {"journey_id": journey_id, "action_index": action_index}
+    target = produced[-1]
+    target_index = action_index
+    pattern = step.get("expect_cmd_re")
+    if isinstance(pattern, str) and pattern:
+        try:
+            rx = re.compile(pattern)
+            for off, a in enumerate(reversed(produced)):
+                if rx.search(a.get("command", "")):
+                    target = a
+                    target_index = action_index - off
+                    break
+        except re.error as e:
+            log(f"{journey_id}: invalid expect_cmd_re {pattern!r}: {e}; "
+                f"grading the final action")
+    ref = {"journey_id": journey_id, "action_index": target_index}
     source = journey.get("source", {}).get("ref", "journey step")
     found = functional_oracle(
-        last.get("command", ""), last.get("exit_code", 0),
+        target.get("command", ""), target.get("exit_code", 0),
         step.get("expect", ""), source, ref,
         expect_exit=step.get("expect_exit"))
     out = []
@@ -273,6 +286,7 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
         cd = c.to_dict()
         cd["trajectory_ref"] = ref
         cd["decisive"] = bool(decisive)
+        cd["graded_cmd"] = target.get("command", "")
         out.append(cd)
     return out
 
