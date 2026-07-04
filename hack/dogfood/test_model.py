@@ -16,10 +16,7 @@ import model  # noqa: E402
 from model import OpenRouterModel, _parse_reply  # noqa: E402
 
 
-def _ok_response(content, usage=None):
-    body = {"choices": [{"message": {"content": content}}]}
-    if usage is not None:
-        body["usage"] = usage
+def _raw_response(body):
     raw = json.dumps(body).encode("utf-8")
 
     class _Resp(io.BytesIO):
@@ -30,6 +27,13 @@ def _ok_response(content, usage=None):
             return False
 
     return _Resp(raw)
+
+
+def _ok_response(content, usage=None):
+    body = {"choices": [{"message": {"content": content}}]}
+    if usage is not None:
+        body["usage"] = usage
+    return _raw_response(body)
 
 
 JOURNEY = {"journey_id": "j"}
@@ -91,13 +95,24 @@ class NextCommandTests(unittest.TestCase):
         self.assertNotIn("done", out)
         self.assertIn("connection refused", out["error"])
 
-    def test_missing_content_is_error(self):
+    def test_null_content_is_error(self):
+        # choices[0].message.content = None survives the subscript chain and
+        # flows through `content or ""` into _parse_reply("") -> error. This
+        # covers the null-content path, NOT the missing-key except branch.
         with mock.patch.object(model.urllib.request, "urlopen",
-                               return_value=_ok_response(None)) as m:
-            # body with no usable content: choices[0].message.content = None
+                               return_value=_ok_response(None)):
             out = self._model().next_command(JOURNEY, STEP, [])
-        # None content parses as empty -> _parse_reply("") -> error
         self.assertIn("error", out)
+
+    def test_missing_content_is_error(self):
+        # choices is empty -> IndexError in the subscript chain -> the
+        # except (KeyError, IndexError, TypeError) branch.
+        with mock.patch.object(model.urllib.request, "urlopen",
+                               return_value=_raw_response({"choices": []})):
+            out = self._model().next_command(JOURNEY, STEP, [])
+        self.assertIn("error", out)
+        self.assertNotIn("done", out)
+        self.assertIn("missing choices[0].message.content", out["error"])
 
     def test_cost_prefers_usage_cost(self):
         resp = _ok_response('{"done": true}', usage={"cost": 0.0123,
