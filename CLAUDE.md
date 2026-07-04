@@ -19,6 +19,7 @@ OpenVMM driver (M0 done).
 | [docs/design-lineage.md](docs/design-lineage.md) | **Design lineage & prior art** — how each izba subsystem maps to its public OSS building blocks (Cloud Hypervisor, OpenVMM, rust-vmm, virtiofs, containerd erofs, NVIDIA OpenShell). Read before architectural changes or external comparisons. |
 | [docs/security/README.md](docs/security/README.md) | **Security program** — threat model (guest-is-hostile microVM model), audit methodology (classical + LLM-driven SOTA + spec-first/TDD assurance), and the findings register. Read before any change that touches a trust boundary. |
 | [docs/egress-firewall-building-blocks.md](docs/egress-firewall-building-blocks.md) | OSS building-block survey + decisions for the **egress firewall** (M2 allow-list + MITM, M5 credential vault): regorus, DNS-snoop, NVIDIA OpenShell salvage map. Read before M2/M5 work. |
+| [docs/dogfooding-value.md](docs/dogfooding-value.md) | **LLM-dogfooding value model** — what the swarm harness measures vs e2e tests, the fair-test boundary, graduation/freshness principles, and the instrument-honesty guarantees. Read before changing `hack/dogfood/` or the `llm-dogfooding` skill. |
 | [docs/testing.md](docs/testing.md) | KVM integration-suite runbook (WSL2 setup, deps, troubleshooting) |
 | [hack/README.md](hack/README.md) | Artifact tooling: kernel config/build, initramfs, binary fetching |
 
