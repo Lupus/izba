@@ -85,7 +85,7 @@ exactly the discoverability differential this method measures.
 ## Mandate 2 — Anchor every expectation
 
 Every `expect` must be traceable to an anchor. Set `source.kind` to
-`spec | pr | greptile | help` and `source.ref` to the exact section / PR / review
+`spec | pr | greptile | help | readme` and `source.ref` to the exact section / PR / review
 / help topic. **If you cannot cite a source for an outcome, do not assert it.**
 The skeptic will use these citations as ground truth; an uncited expect is slop.
 

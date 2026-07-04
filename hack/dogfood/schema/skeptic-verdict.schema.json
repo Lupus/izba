@@ -48,7 +48,7 @@
       "required": ["kept", "refuted"],
       "properties": {
         "kept": { "type": "integer", "description": "Candidates confirmed real (incl. discoverability)." },
-        "refuted": { "type": "integer", "description": "Candidates dropped as intended/self-inflicted." },
+        "refuted": { "type": "integer", "description": "Candidates dropped as non-product-findings: intended / self-inflicted / harness (incl. infra candidates — facts about the harness run, not the product)." },
         "cheated": { "type": "integer", "description": "Positive journeys found cheated/unverified." },
         "inconclusive": { "type": "integer" }
       }

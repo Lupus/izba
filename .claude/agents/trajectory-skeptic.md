@@ -158,7 +158,10 @@ The `report.md`:
    in the tier's `establishes`/`requires`: `established` (a genuinely-achieved
    journey proves it — cite it), `blocked` (no journey could reach it; say why),
    or `not-exercised`. List which **gating** journeys genuinely passed. This is
-   the orchestrator's advance/fix/defer signal — be unambiguous.
+   the orchestrator's advance/fix/defer signal — be unambiguous. For a
+   non-progressive run (e.g. the smoke corpus) with no `sequence-plan.json` and
+   no `establishes`/`requires` tags, state "capability verdict: not applicable
+   (non-progressive run)" and leave the verdict JSON's `capabilities` empty.
 6. **Fix routing** — for every confirmed finding (item 1), tag it:
    - **auto-fixable** — the fix is purely documentation, `--help`/clap text,
      human-facing message *wording*, or the dogfood harness itself; it changes
