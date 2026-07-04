@@ -578,6 +578,24 @@ class InfraCandidateTests(unittest.TestCase):
             rc, bundle = self._run(d, script, n_journeys=3)
             self.assertEqual(rc, 0)  # 1/3 <= 0.5 -> report-only
 
+    def test_exactly_half_degraded_is_not_catastrophic(self):
+        # Pin the boundary: exactly 2 of 4 journeys degraded is 0.5, and 0.5 is
+        # NOT > CATASTROPHIC_DEGRADED_FRACTION (0.5) -> report-only rc 0. Kills
+        # a `>` -> `>=` mutation in the catastrophic check. Each {"error"} reply
+        # ends that journey's only step, so the two error replies degrade j0
+        # and j1; the clean command/done pairs serve j2 and j3.
+        with tempfile.TemporaryDirectory() as d:
+            script = [{"error": "blip"},                       # j0: degraded
+                      {"error": "blip2"},                      # j1: degraded
+                      {"command": "izba ls"}, {"done": True},  # j2: fine
+                      {"command": "izba ls"}, {"done": True}]  # j3: fine
+            rc, bundle = self._run(d, script, n_journeys=4)
+            degraded = [r["journey_id"] for r in bundle["results"]
+                        if not r["actions"]
+                        or any(c["kind"] == "infra" for c in r["candidates"])]
+            self.assertEqual(degraded, ["j0", "j1"])  # exactly half
+            self.assertEqual(rc, 0)  # 2/4 == 0.5 is NOT > 0.5 -> report-only
+
     def test_model_exception_emits_infra_candidate(self):
         class ExplodingModel:
             last_cost_usd = 0.0
