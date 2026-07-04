@@ -828,6 +828,26 @@ class ExpectCmdReTests(unittest.TestCase):
             self.assertEqual(len(func), 1)
             self.assertEqual(func[0].get("graded_cmd"), "izba ls")
 
+    def test_mid_step_match_pins_action_index(self):
+        # The anchored action is NOT the step's last: two distinct verifies
+        # follow it (varied because loop-dedup is per (journey_id, command)).
+        # expect_exit=0 against the anchored bogus-subcommand (exit 2) fires
+        # exactly one candidate, whose graded_cmd AND trajectory_ref must
+        # point at action 0 — not the trailing verifies.
+        step = {"intent": "run the op then verify", "expect": "op succeeds",
+                "expect_exit": 0, "core": True,
+                "expect_cmd_re": r"bogus-subcommand"}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [
+                {"command": "izba bogus-subcommand"},
+                {"command": "izba ls"},
+                {"command": "izba ls --json"},
+                {"done": True}])
+            func = [c for c in res["candidates"] if c["kind"] == "functional"]
+            self.assertEqual(len(func), 1, func)
+            self.assertEqual(func[0].get("graded_cmd"), "izba bogus-subcommand")
+            self.assertEqual(func[0]["trajectory_ref"]["action_index"], 0)
+
     def test_bad_regex_falls_back_to_last_action(self):
         step = {"intent": "x", "expect": "works", "core": True,
                 "expect_cmd_re": "["}  # invalid regex

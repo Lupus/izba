@@ -209,7 +209,8 @@ def _collect_candidates(action, command, action_index, prev_reconcile,
     ``reconcile_seq`` fire on EVERY action — a panic or a signal-death anywhere in
     the journey is a finding regardless of which step it happened in. The
     ``functional`` oracle is deliberately NOT here: it is graded once per step, on
-    that step's FINAL action, by ``_grade_step_functional`` — so an intermediate
+    the step's intent-bearing action (``expect_cmd_re``-selected, falling back to
+    the final action), by ``_grade_step_functional`` — so an intermediate
     recovery action inside an otherwise-passing step no longer emits a spurious
     functional candidate (the #111 setup-noise false-negative)."""
     ref = {"journey_id": journey_id, "action_index": action_index}
@@ -327,8 +328,9 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
     Loop-dedup (``seen``) is scoped PER STEP so a later step can legitimately
     re-issue a common verify command (e.g. ``izba ls``).
 
-    The functional assertion is graded ONCE at step end, on the step's final
-    action (``actions[start:][-1]``): we snapshot ``start`` before the loop and
+    The functional assertion is graded ONCE at step end, on the step's
+    intent-bearing action (``expect_cmd_re``-selected, falling back to the final
+    action ``actions[start:][-1]``): we snapshot ``start`` before the loop and
     grade what the step produced, tagging the candidate ``decisive`` per this
     step's role. Grading in a ``finally`` guarantees it also runs when a cap trips
     or a report-only error ends the step early."""
