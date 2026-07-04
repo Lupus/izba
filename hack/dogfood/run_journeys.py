@@ -437,15 +437,35 @@ def run_journey(
     steps = journey.get("steps", []) or [{"intent": journey.get("rationale", ""),
                                           "expect": ""}]
     decisive_idx = _decisive_step_indices(steps)
+    step_actions: Dict[int, int] = {}  # step index -> actions it produced
     for i, step in enumerate(steps):
+        before = len(actions)
         stop = _run_step(
             model, journey, step, izba_bin, data_dir, workdir,
             action_timeout_s=action_timeout_s, latency_budget_ms=latency_budget_ms,
             budget=budget, max_usd=max_usd, max_turns=max_turns, step_cap=step_cap,
             journey_id=journey_id, actions=actions, candidates=candidates, ctx=ctx,
             decisive=(i in decisive_idx), cwd_file=cwd_file)
+        step_actions[i] = len(actions) - before
         if stop:
             break
+    # #126: a decisive step the Actor never reached (or reached with zero
+    # actions) verified NOTHING — emit a flipping candidate so the journey
+    # can't tally positive on budget exhaustion before its core assertion.
+    source = journey.get("source", {}).get("ref", "journey step")
+    for i in sorted(decisive_idx):
+        if step_actions.get(i, 0) == 0:
+            s = steps[i]
+            candidates.append({
+                "kind": "unreached_decisive",
+                "detail": (f"decisive step {i} ({s.get('intent', '')[:80]!r}) "
+                           f"produced no actions — its assertion was never "
+                           f"exercised"),
+                "violated_expectation": s.get("expect", "")
+                                        or "decisive step must be exercised",
+                "source": source,
+                "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
+            })
     # State-based oracle: snapshot izba's OWN audit/policy/lifecycle state so the
     # rubric judge grades the outcome from ground truth, not guest exit codes.
     try:
