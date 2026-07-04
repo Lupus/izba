@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/Lupus/izba/hack/dogfood/schema/skeptic-verdict.schema.json",
+  "title": "izba dogfood skeptic verdict (Phase 3 machine-readable output)",
+  "description": "Emitted by the trajectory-skeptic agent ALONGSIDE its human report.md. The orchestrator routes fixes from `findings[].fix_routing`, gates tiers on `capabilities`, and append-ledger.py reads `counts` — no prose parsing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["feature", "findings", "counts"],
+  "properties": {
+    "feature": { "type": "string" },
+    "tier": { "type": "string", "enum": ["smoke", "core", "deep"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "class", "summary", "journey_ids"],
+        "properties": {
+          "id": { "type": "string", "description": "Stable kebab-case finding id (e.g. 'volume-size-suffix-undocumented')." },
+          "class": {
+            "type": "string",
+            "enum": ["real", "intended", "self-inflicted", "discoverability", "cheating", "unverified", "inconclusive", "harness"],
+            "description": "Direction-A candidate classes (real/intended/self-inflicted/discoverability), Direction-B green-audit classes (cheating/unverified/inconclusive), or 'harness' (the finding is about the dogfood harness itself)."
+          },
+          "severity": { "type": "string", "enum": ["P1", "P2", "P3"] },
+          "fix_routing": {
+            "type": "string",
+            "enum": ["auto-fixable", "escalate", "none"],
+            "description": "auto-fixable = within the in-place fix boundary (docs/help/error wording/harness); escalate = behavior/security/contract, record as blocker; none = dropped/informational."
+          },
+          "summary": { "type": "string" },
+          "journey_ids": { "type": "array", "items": { "type": "string" } },
+          "anchor": { "type": "string", "description": "Spec/PR/review citation grounding the verdict." }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "established": { "type": "array", "items": { "type": "string" } },
+        "blocked": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kept", "refuted"],
+      "properties": {
+        "kept": { "type": "integer", "description": "Candidates confirmed real (incl. discoverability)." },
+        "refuted": { "type": "integer", "description": "Candidates dropped as intended/self-inflicted." },
+        "cheated": { "type": "integer", "description": "Positive journeys found cheated/unverified." },
+        "inconclusive": { "type": "integer" }
+      }
+    }
+  }
+}
