@@ -58,6 +58,7 @@ class Candidate:
     """A possible-bug finding emitted by an oracle. Matches trajectory.schema.json."""
 
     kind: str  # functional | latency | implicit | reconcile_seq
+              # | reconcile_violation | guest_console (and runner-emitted: infra | unreached_decisive)
     detail: str
     violated_expectation: str = ""
     source: str = ""
