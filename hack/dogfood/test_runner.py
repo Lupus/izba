@@ -893,5 +893,51 @@ class BundleSchemaTests(unittest.TestCase):
             jsonschema.validate(bundle, schema)  # raises on mismatch
 
 
+class CollectorBucketsTests(unittest.TestCase):
+    def _mk_bundle(self, d, fname, results):
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, fname), "w") as f:
+            json.dump({"shard": 0, "feature": "t", "results": results}, f)
+
+    def test_gui_bundles_are_collected_with_modality(self):
+        collector = _load_collector()
+        if collector is None:
+            self.skipTest("collector script not present")
+        with tempfile.TemporaryDirectory() as d:
+            self._mk_bundle(d, "traj-0.json", [
+                {"journey_id": "cli-j", "actions": [], "candidates": []}])
+            self._mk_bundle(d, "gui-traj-0.json", [
+                {"journey_id": "gui-j", "actions": [], "candidates": []}])
+            data = collector.collect(d)
+            self.assertEqual(data["totals"]["journeys"], 2)
+            mods = {p["journey_id"]: p["modality"] for p in data["positives"]}
+            # NOTE: zero-action journeys stop being positive once Task 3's
+            # unreached candidates are in real bundles; these synthetic results
+            # have no candidates, so they still land in positives here.
+            self.assertEqual(mods, {"cli-j": "cli", "gui-j": "gui"})
+
+    def test_infra_and_unreached_buckets(self):
+        collector = _load_collector()
+        if collector is None:
+            self.skipTest("collector script not present")
+        with tempfile.TemporaryDirectory() as d:
+            self._mk_bundle(d, "traj-0.json", [
+                {"journey_id": "dead", "actions": [], "candidates": [
+                    {"kind": "infra", "detail": "x", "violated_expectation": "",
+                     "source": "", "trajectory_ref": {"journey_id": "dead",
+                                                      "action_index": -1}}]},
+                {"journey_id": "shallow", "actions": [], "candidates": [
+                    {"kind": "unreached_decisive", "detail": "y",
+                     "violated_expectation": "", "source": "",
+                     "trajectory_ref": {"journey_id": "shallow",
+                                        "action_index": -1}}]}])
+            data = collector.collect(d)
+            self.assertEqual(data["totals"]["positive_journeys"], 0)
+            self.assertEqual(data["totals"]["infra_journeys"], 1)
+            self.assertEqual(data["totals"]["unreached_journeys"], 1)
+            self.assertEqual([u["journey_id"] for u in data["unreached"]],
+                             ["shallow"])
+
+
 if __name__ == "__main__":
     unittest.main()

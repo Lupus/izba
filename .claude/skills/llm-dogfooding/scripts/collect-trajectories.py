@@ -24,10 +24,10 @@ import sys
 
 
 def load_bundles(artifacts_dir: str) -> list[dict]:
-    paths = sorted(glob.glob(os.path.join(artifacts_dir, "**", "traj-*.json"),
+    paths = sorted(glob.glob(os.path.join(artifacts_dir, "**", "*traj-*.json"),
                              recursive=True))
     if not paths:
-        sys.exit(f"no traj-*.json under {artifacts_dir!r}")
+        sys.exit(f"no *traj-*.json under {artifacts_dir!r}")
     out = []
     for p in paths:
         try:
@@ -56,7 +56,11 @@ def _is_flipping(cand: dict) -> bool:
     any GUI kind (``console``/``ui_daemon_diff``/``silent_failure``/``dom_expect``)
     should this collector ever ingest GUI bundles. This is the #111 fix: setup
     noise no longer masks a satisfied core assertion, WITHOUT downgrading anything
-    we don't explicitly recognize as soft."""
+    we don't explicitly recognize as soft.
+
+    ``infra`` and ``unreached_decisive`` flip by design — an infra-degraded or
+    never-reached journey must not tally positive (spec 2026-07-04);
+    ``reconcile_violation`` and ``guest_console`` flip as product findings."""
     kind = cand.get("kind", "?")
     if kind == "latency":
         return False
@@ -66,22 +70,32 @@ def _is_flipping(cand: dict) -> bool:
 
 
 def collect(artifacts_dir: str) -> dict:
-    negatives, soft, positives = [], [], []
+    negatives, soft, positives, unreached = [], [], [], []
     by_kind = collections.Counter()
     n_journeys = 0
+    infra_journeys = 0
     for path, bundle in load_bundles(artifacts_dir):
         shard = bundle.get("shard")
+        modality = "gui" if os.path.basename(path).startswith("gui-") else "cli"
         for r in bundle.get("results", []):
             n_journeys += 1
             jid = r.get("journey_id")
             acts = r.get("actions", []) or []
             cands = r.get("candidates", []) or []
-            ref = {"shard": shard, "journey_id": jid, "bundle": path}
+            ref = {"shard": shard, "journey_id": jid, "bundle": path,
+                   "modality": modality}
+            kinds = {c.get("kind") for c in cands}
+            if "infra" in kinds:
+                infra_journeys += 1
+            if "unreached_decisive" in kinds:
+                unreached.append(dict(ref))
             n_flipping = 0
             for c in cands:
                 by_kind[c.get("kind", "?")] += 1  # by_kind counts ALL candidates
                 row = {**ref, **{k: c.get(k) for k in
                        ("kind", "detail", "violated_expectation", "source")}}
+                if c.get("graded_cmd") is not None:
+                    row["graded_cmd"] = c.get("graded_cmd")
                 if _is_flipping(c):
                     n_flipping += 1
                     negatives.append(row)
@@ -113,10 +127,13 @@ def collect(artifacts_dir: str) -> dict:
                    "by_kind": dict(by_kind),
                    "flipping_candidates": len(negatives),
                    "soft_candidates": len(soft),
-                   "positive_journeys": len(positives)},
+                   "positive_journeys": len(positives),
+                   "infra_journeys": infra_journeys,
+                   "unreached_journeys": len(unreached)},
         "negatives": negatives,
         "soft": soft,
         "positives": positives,
+        "unreached": unreached,
     }
 
 
@@ -135,7 +152,8 @@ def main(argv=None) -> int:
     print(f"== {t['journeys']} journeys | {t['candidates']} candidates "
           f"({t['by_kind']}) | {t['flipping_candidates']} flipping / "
           f"{t['soft_candidates']} soft | {t['positive_journeys']} positive "
-          f"(audit for cheating) ==\n")
+          f"(audit for cheating) | {t['infra_journeys']} infra / "
+          f"{t['unreached_journeys']} unreached-decisive ==\n")
     print("FLIPPING candidates (journey-negative — refute each: "
           "real | intended | self-inflicted | discoverability):")
     for c in data["negatives"]:
@@ -147,6 +165,11 @@ def main(argv=None) -> int:
     print("\nPOSITIVE journeys (audit — genuinely-achieved | cheated/unverified | inconclusive):")
     for p in data["positives"]:
         print(f"  {p['journey_id']}: {p['n_actions']} actions, exits={p['exits']}")
+    if data["unreached"]:
+        print("\nUNREACHED-DECISIVE journeys (inconclusive — the core assertion "
+              "was never exercised; tighten the journey or fix the blocking gap):")
+        for u in data["unreached"]:
+            print(f"  [{u['modality']}] {u['journey_id']}")
     if args.json_out:
         print(f"\nfull set → {args.json_out} (feed to the trajectory-skeptic subagent)")
     return 0
