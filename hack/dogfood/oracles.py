@@ -193,9 +193,14 @@ def run_action(
 def _snapshot_reconcile(
     izba_bin: str, data_dir: str, timeout_s: float, env: Dict[str, str]
 ) -> Dict[str, Any]:
-    """Best-effort ``izba __reconcile --json``. Report-only: errors -> empty snapshot."""
+    """Best-effort ``izba __reconcile --json``.
+
+    Report-only, but honest: a FAILED snapshot returns an ``error`` key so a
+    broken reconciler is distinguishable from a clean one (previously both
+    yielded the same empty shape, hiding a dead oracle)."""
     import json
 
+    err = "unknown"
     try:
         proc = subprocess.run(
             [izba_bin, "__reconcile", "--json"],
@@ -206,9 +211,10 @@ def _snapshot_reconcile(
         )
         if proc.returncode == 0 and proc.stdout.strip():
             return json.loads(proc.stdout)
-    except (subprocess.TimeoutExpired, OSError, ValueError):
-        pass
-    return {"violations": [], "sandboxes": []}
+        err = f"exit {proc.returncode}: {(proc.stderr or '')[-200:]}"
+    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
+        err = repr(e)
+    return {"error": err, "violations": [], "sandboxes": []}
 
 
 def _izba_capture(izba_bin: str, argv: List[str],
@@ -487,6 +493,11 @@ def reconcile_seq_oracle(
       reset its vmm identity; we approximate "fresh create" as an unchanged
       identity being illegal here).
     """
+    # An errored snapshot carries no state; comparing against it would fabricate
+    # transitions. Skip (the runner separately flags an all-errored journey).
+    if (prev_snapshot or {}).get("error") or (cur_snapshot or {}).get("error"):
+        return []
+
     out: List[Candidate] = []
     prev = _by_name(prev_snapshot)
     cur = _by_name(cur_snapshot)
