@@ -971,6 +971,28 @@ class CollectorBucketsTests(unittest.TestCase):
             self.assertEqual([u["journey_id"] for u in data["unreached"]],
                              ["shallow"])
 
+    def test_by_kind_split_by_modality(self):
+        collector = _load_collector()
+        if collector is None:
+            self.skipTest("collector script not present")
+        with tempfile.TemporaryDirectory() as d:
+            self._mk_bundle(d, "traj-0.json", [
+                {"journey_id": "cli-dead", "actions": [], "candidates": [
+                    {"kind": "infra", "detail": "x", "violated_expectation": "",
+                     "source": "", "trajectory_ref": {"journey_id": "cli-dead",
+                                                      "action_index": -1}}]}])
+            self._mk_bundle(d, "gui-traj-0.json", [
+                {"journey_id": "gui-err", "actions": [], "candidates": [
+                    {"kind": "console", "detail": "boom",
+                     "violated_expectation": "", "source": "",
+                     "trajectory_ref": {"journey_id": "gui-err",
+                                        "action_index": 0}}]}])
+            data = collector.collect(d)
+            self.assertEqual(data["totals"]["by_kind"],
+                             {"infra": 1, "console": 1})
+            self.assertEqual(data["totals"]["by_kind_by_modality"],
+                             {"cli": {"infra": 1}, "gui": {"console": 1}})
+
 
 if __name__ == "__main__":
     unittest.main()

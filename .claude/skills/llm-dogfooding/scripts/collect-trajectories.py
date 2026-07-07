@@ -72,6 +72,7 @@ def _is_flipping(cand: dict) -> bool:
 def collect(artifacts_dir: str) -> dict:
     negatives, soft, positives, unreached = [], [], [], []
     by_kind = collections.Counter()
+    by_kind_by_modality: dict = {}
     n_journeys = 0
     infra_journeys = 0
     for path, bundle in load_bundles(artifacts_dir):
@@ -92,6 +93,8 @@ def collect(artifacts_dir: str) -> dict:
             n_flipping = 0
             for c in cands:
                 by_kind[c.get("kind", "?")] += 1  # by_kind counts ALL candidates
+                by_kind_by_modality.setdefault(
+                    modality, collections.Counter())[c.get("kind", "?")] += 1
                 row = {**ref, **{k: c.get(k) for k in
                        ("kind", "detail", "violated_expectation", "source")}}
                 if c.get("graded_cmd") is not None:
@@ -125,6 +128,8 @@ def collect(artifacts_dir: str) -> dict:
         "totals": {"journeys": n_journeys,
                    "candidates": sum(by_kind.values()),
                    "by_kind": dict(by_kind),
+                   "by_kind_by_modality": {
+                       m: dict(cnt) for m, cnt in by_kind_by_modality.items()},
                    "flipping_candidates": len(negatives),
                    "soft_candidates": len(soft),
                    "positive_journeys": len(positives),
@@ -154,6 +159,9 @@ def main(argv=None) -> int:
           f"{t['soft_candidates']} soft | {t['positive_journeys']} positive "
           f"(audit for cheating) | {t['infra_journeys']} infra / "
           f"{t['unreached_journeys']} unreached-decisive ==\n")
+    if len(t.get("by_kind_by_modality", {})) > 1:
+        for m, kinds in sorted(t["by_kind_by_modality"].items()):
+            print(f"   {m}: {kinds}")
     print("FLIPPING candidates (journey-negative — refute each: "
           "real | intended | self-inflicted | discoverability):")
     for c in data["negatives"]:
