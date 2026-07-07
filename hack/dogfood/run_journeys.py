@@ -90,6 +90,13 @@ def select_shard(journeys: List[Dict[str, Any]], shard: int,
     return [j for i, j in enumerate(journeys) if i % shards == shard]
 
 
+def select_cli_journeys(journeys: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """CLI-modality journeys only — the mirror of the GUI runner's
+    select_gui_journeys. A CLI shard must never run a modality:"gui" journey
+    as if it were CLI (the model would type shell commands at a GUI intent)."""
+    return [j for j in journeys if j.get("modality") != "gui"]
+
+
 def _cmd_hash(journey_id: str, command: str) -> str:
     return hashlib.sha256(f"{journey_id}\0{command}".encode("utf-8")).hexdigest()
 
@@ -611,8 +618,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         doc = json.load(f)
     feature = doc.get("feature", "")
     all_journeys = doc.get("journeys", []) or []
-    mine = select_shard(all_journeys, args.shard, args.shards)
-    log(f"shard {args.shard}/{args.shards}: {len(mine)} of {len(all_journeys)} journeys")
+    cli_journeys = select_cli_journeys(all_journeys)
+    mine = select_shard(cli_journeys, args.shard, args.shards)
+    log(f"shard {args.shard}/{args.shards}: {len(mine)} of {len(cli_journeys)} "
+        f"cli journeys ({len(all_journeys) - len(cli_journeys)} gui excluded)")
 
     os.makedirs(args.data_dir, exist_ok=True)
     model = build_model(args)
