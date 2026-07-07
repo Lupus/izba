@@ -237,3 +237,25 @@ def test_sidecar_startup_failure_records_infra_candidate(monkeypatch, tmp_path):
     kinds = {c["kind"] for c in res["candidates"]}
     assert "infra" in kinds
     assert "sidecar did not come up" in res["candidates"][0]["detail"]
+
+
+def test_reconcile_violations_flip_gui_journey(monkeypatch):
+    # Parity with the CLI runner: a non-empty violations array in an action's
+    # reconcile snapshot must emit a flipping reconcile_violation candidate.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "Create"'] * 4)
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(
+        rgj, "_reconcile_snapshot",
+        lambda *a, **k: {"violations": [{"kind": "orphan-relay", "name": "web"}],
+                         "sandboxes": []})
+    journey = {"journey_id": "jv", "modality": "gui",
+               "steps": [{"intent": "click", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    rv = [c for c in res["candidates"] if c["kind"] == "reconcile_violation"]
+    assert len(rv) == 1
+    assert "orphan-relay" in rv[0]["detail"]
