@@ -108,3 +108,50 @@ def test_validate_args_ref_subcmds_accept_good_ref():
     assert _validate_args(["click", "e42"]) is None
     assert _validate_args(["fill", "@e3", "some text"]) is None
     assert _validate_args(["select", "@e9", "alpine"]) is None
+
+
+# --- _eval_json ---
+
+def _stub_driver(stdout):
+    """AgentBrowserDriver whose _run returns canned stdout (no subprocess)."""
+    from gui.driver import ActResult, AgentBrowserDriver
+    d = AgentBrowserDriver("agent-browser", http_port=0, ws_port=0)
+    d._run = lambda args: ActResult(exit_code=0, stdout=stdout, stderr="",
+                                    latency_ms=0)
+    return d
+
+
+def test_eval_json_unwraps_real_agent_browser_envelope_string_result():
+    # Real `agent-browser eval --json` output: the value sits under
+    # data.result as a JSON string (probed on 0.25.4; same envelope family as
+    # snapshot's data.refs on 0.31.1). The old code returned the whole
+    # envelope dict, so read_invoke_log() was [] on every real run.
+    out = ('{"success":true,"data":{"origin":"http://127.0.0.1:1",'
+           '"result":"[{\\"cmd\\":\\"list_sandboxes\\",\\"ok\\":true,'
+           '\\"error\\":\\"\\"}]"},"error":null}')
+    d = _stub_driver(out)
+    assert d.read_invoke_log() == [
+        {"cmd": "list_sandboxes", "ok": True, "error": ""}]
+
+
+def test_eval_json_unwraps_real_agent_browser_envelope_raw_result():
+    out = ('{"success":true,"data":{"origin":"http://127.0.0.1:1",'
+           '"result":[{"cmd":"a","ok":true}]},"error":null}')
+    d = _stub_driver(out)
+    assert d._eval_json("whatever") == [{"cmd": "a", "ok": True}]
+
+
+def test_eval_json_still_handles_legacy_top_level_result():
+    d = _stub_driver('{"result": "[1, 2]"}')
+    assert d._eval_json("whatever") == [1, 2]
+
+
+def test_eval_json_bare_value_and_garbage():
+    assert _stub_driver('["x"]')._eval_json("e") == ["x"]
+    assert _stub_driver("not json")._eval_json("e") is None
+
+
+def test_read_console_errors_through_real_envelope():
+    out = ('{"success":true,"data":{"origin":"o",'
+           '"result":"[\\"boom\\"]"},"error":null}')
+    assert _stub_driver(out).read_console_errors() == ["boom"]
