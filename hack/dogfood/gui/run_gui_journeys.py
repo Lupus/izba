@@ -216,6 +216,23 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 for c in found:
                     cd = c.to_dict(); cd["trajectory_ref"] = ref
                     candidates.append(cd)
+                # Reconcile violations flip the journey (parity with the CLI
+                # runner's _collect_candidates): declared state != reality is
+                # a product finding regardless of which surface drove it.
+                violations = (reconcile or {}).get("violations") or []
+                if violations:
+                    preview = json.dumps(violations[:3])[:400]
+                    candidates.append({
+                        "kind": "reconcile_violation",
+                        "detail": (f"izba __reconcile reported "
+                                   f"{len(violations)} violation(s) after "
+                                   f"{command!r}: {preview}"),
+                        "violated_expectation": "reconciler must report no "
+                                                "violations (declared state == "
+                                                "reality)",
+                        "source": "contract: disk-state invariant (__reconcile)",
+                        "trajectory_ref": dict(ref),
+                    })
                 prev_reconcile = reconcile
     except StopIteration:
         pass
