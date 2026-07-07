@@ -30,7 +30,7 @@ from oracles import (  # noqa: E402
     Action as _A, capture_state_evidence, latency_oracle, reconcile_seq_oracle,
 )
 from run_journeys import (  # noqa: E402
-    select_shard, _journey_data_dir, BudgetExceeded,
+    select_shard, _journey_data_dir, BudgetExceeded, count_degraded,
     CATASTROPHIC_DEGRADED_FRACTION, EXIT_CATASTROPHIC_INFRA,
 )
 from gui.driver import (  # noqa: E402
@@ -429,16 +429,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     with open(args.out, "w") as f:
         json.dump(bundle, f, indent=2)
     # Same catastrophic-infra backstop as the CLI runner: when more than half
-    # the attempted journeys are degraded (zero actions, or >=1 infra
-    # candidate), the run measured nothing and must not read as a green void.
-    # Zero attempted journeys is NOT catastrophic (an all-CLI corpus sharded
-    # to a GUI runner measures nothing by design). The bundle is written
-    # first so a catastrophic run's trajectories stay inspectable.
-    degraded = sum(
-        1 for r in results
-        if not r.get("actions")
-        or any(c.get("kind") == "infra" for c in r.get("candidates", []))
-    )
+    # the attempted journeys are degraded, the run measured nothing and must
+    # not read as a green void. Zero attempted journeys is NOT catastrophic
+    # (an all-CLI corpus sharded to a GUI runner measures nothing by design).
+    # The bundle is written first so a catastrophic run's trajectories stay
+    # inspectable.
+    degraded = count_degraded(results)
     catastrophic = (bool(results)
                     and degraded / len(results) > CATASTROPHIC_DEGRADED_FRACTION)
     log(f"wrote {args.out}: {len(results)} journeys ({degraded} degraded), "
