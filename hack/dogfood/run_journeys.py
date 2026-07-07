@@ -641,7 +641,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             break
         except Exception as e:  # report-only: never let one journey kill the run
             log(f"journey {jid!r} crashed: {e!r}; continuing")
-            results.append({"journey_id": jid, "actions": [], "candidates": []})
+            # Carry a flipping infra candidate so the crashed journey can't
+            # read as positive in the collector/summary (the degraded tally
+            # already counts it for the exit-3 decision; this keeps the
+            # per-journey verdicts honest too — parity with the GUI runner).
+            results.append({"journey_id": jid, "actions": [],
+                            "candidates": [_infra_candidate(
+                                jid, f"journey crashed: {e!r}")]})
 
     degraded = sum(
         1 for r in results
