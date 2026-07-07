@@ -272,13 +272,20 @@ class AgentBrowserDriver:
 
     def _eval_json(self, expr: str) -> Any:
         out = self._run(["eval", expr]).stdout.strip()
-        # agent-browser --json wraps results; tolerate either a bare JSON value
-        # or {"result": <value-or-json-string>}.
+        # agent-browser --json wraps eval results in
+        # {"success":..,"data":{"origin":..,"result":<value-or-json-string>}};
+        # tolerate the legacy top-level {"result": ...} and a bare JSON value.
         try:
             doc = json.loads(out)
         except ValueError:
             return None
-        val = doc.get("result", doc) if isinstance(doc, dict) else doc
+        val = doc
+        if isinstance(doc, dict):
+            data = doc.get("data")
+            if isinstance(data, dict) and "result" in data:
+                val = data["result"]
+            else:
+                val = doc.get("result", doc)
         if isinstance(val, str):
             try:
                 return json.loads(val)
