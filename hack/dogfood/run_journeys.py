@@ -66,6 +66,15 @@ CATASTROPHIC_DEGRADED_FRACTION = 0.5
 EXIT_CATASTROPHIC_INFRA = 3
 
 
+def count_degraded(results: List[Dict[str, Any]]) -> int:
+    """Journeys that measured nothing: zero actions, or >=1 infra candidate."""
+    return sum(
+        1 for r in results
+        if not r.get("actions")
+        or any(c.get("kind") == "infra" for c in r.get("candidates", []))
+    )
+
+
 def _infra_candidate(journey_id: str, detail: str) -> Dict[str, Any]:
     """A flipping `infra` candidate: the harness/model plumbing failed, so the
     journey verified nothing (and must not tally positive)."""
@@ -658,11 +667,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             "candidates": [_infra_candidate(
                                 jid, f"journey crashed: {e!r}")]})
 
-    degraded = sum(
-        1 for r in results
-        if not r.get("actions")
-        or any(c.get("kind") == "infra" for c in r.get("candidates", []))
-    )
+    degraded = count_degraded(results)
     catastrophic = bool(results) and degraded / len(results) > CATASTROPHIC_DEGRADED_FRACTION
 
     bundle = {"shard": args.shard, "feature": feature, "results": results}

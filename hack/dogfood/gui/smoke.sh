@@ -24,10 +24,10 @@ python3 "$ROOT/hack/dogfood/gui/run_gui_journeys.py" \
   --data-dir "$DATA" \
   --out /tmp/gui-traj.json \
   --fake-model '[{"read":true},{"done":true}]' || rc=$?
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+if [[ "$rc" -ne 0 && "$rc" -ne 3 ]]; then
   exit "$rc"
 fi
-if [ "$rc" -eq 3 ]; then
+if [[ "$rc" -eq 3 ]]; then
   echo "note: runner exited 3 (catastrophic-infra backstop) — expected here, the thin fake-model script starves journeys 2-5 of actions"
 fi
 echo "wrote /tmp/gui-traj.json"
