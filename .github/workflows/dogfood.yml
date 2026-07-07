@@ -15,8 +15,10 @@ name: Dogfood
 # report-only novice-smoke probe.
 #
 # Report-only: a run that finds bugs still exits 0. Only infra failures (build,
-# boot, artifact fetch) fail a job — the runner itself always exits 0 and writes
-# a trajectory bundle, so we never grep its output to fail the job.
+# boot, artifact fetch) fail a job — the runner exits 0, or 3 when the run
+# measured nothing (catastrophic infra: >50% of attempted journeys degraded),
+# and always writes a trajectory bundle either way, so we never grep its
+# output to fail the job.
 #
 # The `setup` job derives the shard matrices from the `shards`/`gui_shards`
 # inputs AND the journey set itself, so shard counts are a real knob (not a
