@@ -159,8 +159,8 @@ The guarantees that make a green trustworthy are named, so future changes can be
 checked against them. **`infra` candidates + exit 3:** any model/API failure
 becomes a flipping `infra` candidate carrying the reason instead of a silent
 `{"done": true}`, and when more than half a run's journeys are degraded the
-runner exits with a distinct code (`3`) so the CI shard fails loudly rather than
-reporting a green void. **`unreached_decisive`:** a decisive (core) step the
+runner — CLI and GUI alike — exits with a distinct code (`3`) so the CI shard
+fails loudly rather than reporting a green void. **`unreached_decisive`:** a decisive (core) step the
 actor never reached emits a flipping candidate instead of a phantom positive
 (izba#126), so budget exhausted before the core step tallies as *unreached*, not
 *passed*. **`reconcile_violation`:** the `violations` array from

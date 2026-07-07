@@ -230,13 +230,85 @@ def test_sidecar_startup_failure_records_infra_candidate(monkeypatch, tmp_path):
         "--izba-bin", "izba", "--sidecar-bin", "/nonexistent/sidecar",
         "--frontend-dir", str(tmp_path), "--data-dir", str(tmp_path / "d"),
         "--out", str(out), "--fake-model", "[]"])
-    assert rc == 0  # report-only
+    # 1/1 journeys degraded -> catastrophic backstop, same contract as the CLI
+    # runner: a dead sidecar on every journey is a run that measured nothing.
+    assert rc == rgj.EXIT_CATASTROPHIC_INFRA
     bundle = __import__("json").loads(out.read_text())
     res = bundle["results"][0]
     assert res["actions"] == []
     kinds = {c["kind"] for c in res["candidates"]}
     assert "infra" in kinds
     assert "sidecar did not come up" in res["candidates"][0]["detail"]
+
+
+def test_gui_exactly_half_degraded_is_not_catastrophic(monkeypatch, tmp_path):
+    # Pin the boundary: 1 of 2 degraded is 0.5, NOT > 0.5 -> rc 0. Kills a
+    # `>` -> `>=` mutation, mirrors the CLI runner's boundary test.
+    import gui.run_gui_journeys as rgj
+
+    class _DummyProc:
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    canned = {
+        "healthy": {"journey_id": "healthy",
+                    "actions": [{"command": "click @e1", "exit_code": 0}],
+                    "candidates": []},
+        "degraded": {"journey_id": "degraded", "actions": [],
+                     "candidates": [rgj._infra_candidate("degraded",
+                                                         "model error")]},
+    }
+    monkeypatch.setattr(rgj, "_spawn_sidecar", lambda *a, **k: _DummyProc())
+    monkeypatch.setattr(rgj, "_wait_port", lambda *a, **k: True)
+    monkeypatch.setattr(rgj, "AgentBrowserDriver",
+                        lambda *a, **k: FakeDriver(snapshots=[]))
+    monkeypatch.setattr(
+        rgj, "run_gui_journey",
+        lambda model, driver, journey, **k: canned[journey["journey_id"]])
+    journeys = {"feature": "f", "journeys": [
+        {"journey_id": jid, "modality": "gui", "rationale": "r",
+         "source": {"kind": "spec", "ref": "x"},
+         "steps": [{"intent": "do", "expect": ""}]}
+        for jid in ("healthy", "degraded")]}
+    jf = tmp_path / "journeys.json"
+    jf.write_text(__import__("json").dumps(journeys))
+    out = tmp_path / "gui-traj-0.json"
+    rc = rgj.main([
+        "--journeys", str(jf), "--shard", "0", "--shards", "1",
+        "--izba-bin", "izba", "--sidecar-bin", "/nonexistent/sidecar",
+        "--frontend-dir", str(tmp_path), "--data-dir", str(tmp_path / "d"),
+        "--out", str(out), "--fake-model", "[]"])
+    assert rc == 0
+    bundle = __import__("json").loads(out.read_text())
+    assert {r["journey_id"] for r in bundle["results"]} == {"healthy", "degraded"}
+
+
+def test_gui_zero_attempted_journeys_is_not_catastrophic(tmp_path):
+    # An all-CLI corpus sharded to the GUI runner measures nothing BY DESIGN:
+    # empty `results` must not trip the backstop.
+    import gui.run_gui_journeys as rgj
+
+    journeys = {"feature": "f", "journeys": [
+        {"journey_id": "cli-only", "rationale": "r",
+         "source": {"kind": "spec", "ref": "x"},
+         "steps": [{"intent": "do", "expect": ""}]}]}
+    jf = tmp_path / "journeys.json"
+    jf.write_text(__import__("json").dumps(journeys))
+    out = tmp_path / "gui-traj-0.json"
+    rc = rgj.main([
+        "--journeys", str(jf), "--shard", "0", "--shards", "1",
+        "--izba-bin", "izba", "--sidecar-bin", "/nonexistent/sidecar",
+        "--frontend-dir", str(tmp_path), "--data-dir", str(tmp_path / "d"),
+        "--out", str(out), "--fake-model", "[]"])
+    assert rc == 0
+    bundle = __import__("json").loads(out.read_text())
+    assert bundle["results"] == []
 
 
 def test_reconcile_violations_flip_gui_journey(monkeypatch):

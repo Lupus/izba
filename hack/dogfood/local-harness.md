@@ -137,7 +137,8 @@ gh run download <run-id> --dir ./dogfood-artifacts
 
 ### 1.4 Run outcomes — the honest exit codes
 
-The run is **report-only**: findings never fail a shard. `run_journeys.py` exits
+The run is **report-only**: findings never fail a shard. Both runners
+(`run_journeys.py` and `gui/run_gui_journeys.py`) use the same exit codes to
 distinguish "ran" from "couldn't measure", so a CI shard fails loudly only when
 the run was not a measurement:
 
