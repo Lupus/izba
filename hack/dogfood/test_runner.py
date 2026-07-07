@@ -941,3 +941,44 @@ class CollectorBucketsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrashedJourneyHonestyTests(unittest.TestCase):
+    def test_crashed_journey_carries_infra_candidate(self):
+        # A journey that crashes at the run_journey level must not read as
+        # positive: the outer handler records a flipping infra candidate
+        # (parity with the GUI runner's crash path).
+        class ExplodingOnJourneyModel:
+            last_cost_usd = 0.0
+            def next_command(self, *a):
+                raise KeyboardInterrupt  # not caught by inner report-only guards
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            jf = _journeys_file(d, [{
+                "journey_id": "boom", "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"},
+                "steps": [{"intent": "do", "expect": "ok"}]}])
+            out = os.path.join(d, "traj.json")
+            import run_journeys as rj
+            # Route build_model to the exploding model via --fake-model then
+            # monkeypatch FakeModel's next_command to raise BaseException-free:
+            # simplest robust route — patch run_journey itself to raise.
+            orig = rj.run_journey
+            def boom(*a, **k):
+                raise RuntimeError("kaboom-at-journey-level")
+            rj.run_journey = boom
+            try:
+                rc = rj.main([
+                    "--journeys", jf, "--shard", "0", "--shards", "1",
+                    "--izba-bin", stub, "--data-dir", d, "--out", out,
+                    "--fake-model", json.dumps([{"done": True}]),
+                    "--step-cap", "5", "--action-timeout-s", "5",
+                    "--max-turns", "5", "--max-usd", "5"])
+            finally:
+                rj.run_journey = orig
+            self.assertEqual(rc, 3)  # 1/1 degraded -> catastrophic
+            with open(out) as f:
+                res = json.load(f)["results"][0]
+            infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+            self.assertTrue(any("journey crashed" in c["detail"] for c in infra),
+                            res["candidates"])
