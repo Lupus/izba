@@ -242,6 +242,11 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     except BudgetExceeded:
         raise
 
+    # A journey whose EVERY snapshot errored had no reconcile oracle at all.
+    if actions and all((a.get("reconcile") or {}).get("error") for a in actions):
+        candidates.append(_infra_candidate(
+            journey_id, "reconciler unusable: every snapshot errored"))
+
     # Give an in-flight async create/VM-boot time to register a sandbox before
     # grading the outcome (the GUI create invoke resolves asynchronously).
     if create_settle_s > 0:

@@ -316,3 +316,26 @@ def test_reconcile_violations_flip_gui_journey(monkeypatch):
     rv = [c for c in res["candidates"] if c["kind"] == "reconcile_violation"]
     assert len(rv) == 1
     assert "orphan-relay" in rv[0]["detail"]
+
+
+def test_unusable_reconciler_flags_gui_journey_as_infra(monkeypatch):
+    # Parity with the CLI runner (run_journeys.py ~517-520): a journey whose
+    # EVERY snapshot errored had no reconcile oracle at all and must be
+    # flagged infra-degraded, not silently graded as if nothing were wrong.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "Create"'] * 4)
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(
+        rgj, "_reconcile_snapshot",
+        lambda *a, **k: {"error": "boom", "violations": [], "sandboxes": []})
+    journey = {"journey_id": "jr", "modality": "gui",
+               "steps": [{"intent": "click", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert res["actions"]
+    infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+    assert len(infra) >= 1
+    assert any("reconciler unusable" in c["detail"] for c in infra)
