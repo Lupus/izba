@@ -66,6 +66,39 @@ class ShardSelectionTests(unittest.TestCase):
         sel = run_journeys.select_shard(js, shard=1, shards=2)
         self.assertEqual([j["journey_id"] for j in sel], ["j1", "j3"])
 
+    def test_select_cli_journeys_excludes_gui(self):
+        js = [{"journey_id": "c1"},
+              {"journey_id": "g1", "modality": "gui"},
+              {"journey_id": "c2", "modality": "cli"}]
+        self.assertEqual(
+            [j["journey_id"] for j in run_journeys.select_cli_journeys(js)],
+            ["c1", "c2"])
+
+    def test_main_excludes_gui_journeys_from_cli_shards(self):
+        # A CLI shard must never run a modality:"gui" journey as CLI — in the
+        # gui-skeleton dispatch the model typed shell commands at GUI intents.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            jf = _journeys_file(d, [
+                {"journey_id": "cli-j", "rationale": "r",
+                 "source": {"kind": "spec", "ref": "x"},
+                 "steps": [{"intent": "do", "expect": "works"}]},
+                {"journey_id": "gui-j", "modality": "gui", "rationale": "r",
+                 "source": {"kind": "spec", "ref": "x"},
+                 "steps": [{"intent": "click it", "expect": "works"}]},
+            ])
+            out = os.path.join(d, "traj.json")
+            script = [{"command": "izba ls"}, {"done": True}]
+            rc = run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps(script)])
+            self.assertEqual(rc, 0)
+            with open(out) as f:
+                bundle = json.load(f)
+            self.assertEqual([r["journey_id"] for r in bundle["results"]],
+                             ["cli-j"])
+
 
 class RunnerTests(unittest.TestCase):
     def test_failing_command_produces_candidate(self):
