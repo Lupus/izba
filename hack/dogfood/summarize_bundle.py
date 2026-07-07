@@ -37,7 +37,6 @@ def summarize(paths: list[str]) -> str:
             cands = r.get("candidates", []) or []
             kinds = [c.get("kind") for c in cands]
             n_flip = sum(1 for c in cands if _flips(c))
-            tot["flip"] += n_flip
             tot["soft"] += len(cands) - n_flip
             verdict = "✅ positive"
             if "infra" in kinds:
@@ -47,6 +46,11 @@ def summarize(paths: list[str]) -> str:
                 tot["unreached"] += 1
                 verdict = "❓ unreached"
             elif n_flip:
+                # Count flipping candidates in the header ONLY for journeys
+                # whose verdict is ❌ flipped — an infra/unreached journey's
+                # candidates would otherwise inflate the flipping column and
+                # contradict the per-row verdicts below.
+                tot["flip"] += n_flip
                 verdict = "❌ flipped"
             else:
                 tot["pos"] += 1

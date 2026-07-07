@@ -188,3 +188,52 @@ def test_model_error_reply_emits_infra_candidate(monkeypatch):
     assert res["actions"] == []
     kinds = {c["kind"] for c in res["candidates"]}
     assert "infra" in kinds
+
+
+def test_reconcile_snapshot_failure_carries_error_key():
+    # A dead izba binary must not masquerade as a clean {"violations": []}
+    # snapshot (mirrors oracles._snapshot_reconcile's honest error shape).
+    import gui.run_gui_journeys as rgj
+    snap = rgj._reconcile_snapshot("/nonexistent/izba", "/tmp/x", 1)
+    assert "error" in snap
+    assert snap["violations"] == []
+    assert snap["sandboxes"] == []
+
+
+def test_sidecar_startup_failure_records_infra_candidate(monkeypatch, tmp_path):
+    # A sidecar that never comes up means the journey measured NOTHING: the
+    # bundle must carry a flipping infra candidate, not a silently-empty
+    # (positive-looking) result.
+    import gui.run_gui_journeys as rgj
+
+    class _DummyProc:
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(rgj, "_spawn_sidecar", lambda *a, **k: _DummyProc())
+    monkeypatch.setattr(rgj, "_wait_port", lambda *a, **k: False)
+    journeys = {"feature": "f", "journeys": [
+        {"journey_id": "dead-sidecar", "modality": "gui", "rationale": "r",
+         "source": {"kind": "spec", "ref": "x"},
+         "steps": [{"intent": "do", "expect": ""}]}]}
+    jf = tmp_path / "journeys.json"
+    jf.write_text(__import__("json").dumps(journeys))
+    out = tmp_path / "gui-traj-0.json"
+    rc = rgj.main([
+        "--journeys", str(jf), "--shard", "0", "--shards", "1",
+        "--izba-bin", "izba", "--sidecar-bin", "/nonexistent/sidecar",
+        "--frontend-dir", str(tmp_path), "--data-dir", str(tmp_path / "d"),
+        "--out", str(out), "--fake-model", "[]"])
+    assert rc == 0  # report-only
+    bundle = __import__("json").loads(out.read_text())
+    res = bundle["results"][0]
+    assert res["actions"] == []
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "infra" in kinds
+    assert "sidecar did not come up" in res["candidates"][0]["detail"]

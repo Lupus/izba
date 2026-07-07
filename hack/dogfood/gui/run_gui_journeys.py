@@ -52,20 +52,29 @@ def select_gui_journeys(journeys: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _reconcile_snapshot(izba_bin: str, data_dir: str, timeout_s: float,
                         env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """`izba __reconcile --json` against the shared data dir → snapshot dict
-    (always has a 'violations' key). Report-only: errors yield an empty snap."""
+    (always has a 'violations' key).
+
+    Report-only, but honest (mirrors oracles._snapshot_reconcile): a FAILED
+    snapshot carries an ``error`` key so a broken reconciler is distinguishable
+    from a clean one — a dead izba binary must not masquerade as
+    ``{"violations": []}``."""
     run_env = dict(os.environ)
     if env:
         run_env.update(env)
     run_env["IZBA_DATA_DIR"] = data_dir
+    err = "unknown"
     try:
         p = subprocess.run([izba_bin, "__reconcile", "--json"], capture_output=True,
                            text=True, timeout=timeout_s, env=run_env)
-        snap = json.loads(p.stdout or "{}")
-    except (OSError, subprocess.SubprocessError, ValueError):
-        snap = {}
-    if "violations" not in snap:
-        snap["violations"] = []
-    return snap
+        if p.returncode == 0 and (p.stdout or "").strip():
+            snap = json.loads(p.stdout)
+            if "violations" not in snap:
+                snap["violations"] = []
+            return snap
+        err = f"exit {p.returncode}: {(p.stderr or '')[-200:]}"
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        err = repr(e)
+    return {"error": err, "violations": [], "sandboxes": []}
 
 
 def _settle_for_sandbox(izba_bin: str, data_dir: str, timeout_s: float,
@@ -358,8 +367,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             sidecar = _spawn_sidecar(args.sidecar_bin, jdir, ws_port)
             try:
                 if not _wait_port(ws_port):
+                    # A dead sidecar means the journey measured NOTHING — record
+                    # a flipping infra candidate so the bundle can't read as a
+                    # silently-empty positive (mirrors the CLI runner's honesty).
                     log(f"{jid}: sidecar did not come up on :{ws_port}; skipping")
-                    results.append({"journey_id": jid, "actions": [], "candidates": []})
+                    results.append({"journey_id": jid, "actions": [],
+                                    "candidates": [_infra_candidate(
+                                        jid, f"sidecar did not come up on "
+                                             f":{ws_port}")]})
                     continue
                 driver = AgentBrowserDriver(args.agent_browser_bin,
                                             http_port=http_port, ws_port=ws_port,
@@ -376,9 +391,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 results.append(res)
             except BudgetExceeded:
                 log("budget exhausted; stopping"); break
-            except Exception as e:  # report-only
+            except Exception as e:  # report-only, but never silently green
                 log(f"journey {jid!r} crashed: {e!r}")
-                results.append({"journey_id": jid, "actions": [], "candidates": []})
+                results.append({"journey_id": jid, "actions": [],
+                                "candidates": [_infra_candidate(
+                                    jid, f"journey crashed: {e!r}")]})
             finally:
                 sidecar.terminate()
                 try:
