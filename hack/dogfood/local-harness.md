@@ -94,6 +94,10 @@ shape:
   an outcome, do not assert it.
 - Keep journeys small and orthogonal; favor breadth (the boring permutations the
   owner skips) over depth.
+- Mark the journey's decisive assertion(s) `"core": true` and give it an
+  `expect_cmd_re`: besides pinning which action gets graded, it lets the runner
+  credit the assertion if the swarm satisfies it under an earlier step instead
+  of flagging `unreached_decisive`.
 - [ ] Validate the file against the schema before pushing (any JSON-schema
       checker, e.g. `python3 -c "import json,jsonschema,sys; jsonschema.validate(json.load(open('journeys.json')), json.load(open('hack/dogfood/schema/journeys.schema.json')))"`).
 

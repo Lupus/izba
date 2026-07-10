@@ -95,7 +95,9 @@ oracle grades the action that actually carries the intent instead of a trailing
 verify command the Actor happened to run last (e.g. `izba ls`). Anchor to the
 distinctive *token*, **never** a full command line — `expect_cmd_re` lives in
 `journeys.json`, which the swarm never sees; a full invocation there would leak a
-prescription and defeat the fair test.
+prescription and defeat the fair test. Every **decisive** (`core: true`) step
+should carry an `expect_cmd_re` too: it lets the runner credit the assertion when
+satisfied under an earlier step instead of flagging `unreached_decisive`.
 
 ## Mandate 3 — Launder (no leaks to the swarm)
 
