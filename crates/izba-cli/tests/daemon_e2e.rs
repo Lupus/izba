@@ -810,6 +810,47 @@ fn manifest_diff_promote_live_path() {
         "offline promote must print the next-start note; stdout:\n{out}\nstderr:\n{err}"
     );
 
+    // [11] A divergent agent-writable metadata.name must NOT redirect the
+    // promote target: `izba diff NAME` writes the review token under NAME's
+    // sandbox dir, and `izba promote NAME` must read it from the same place
+    // (pre-fix it consulted metadata.name and bailed "no reviewed diff").
+    std::fs::write(
+        ws.join("izba.yml"),
+        concat!(
+            "apiVersion: izba.dev/v1alpha1\n",
+            "kind: Sandbox\n",
+            "metadata:\n",
+            "  name: manifest-alias\n",
+            "spec:\n",
+            "  image: alpine:3.20\n",
+            "  resources:\n",
+            "    cpus: 2\n",
+            "    memory: 4Gi\n",
+            "  rootDisk:\n",
+            "    size: 8Gi\n",
+            "  egress:\n",
+            "    enforce: true\n",
+            "    allow:\n",
+            "      - example.com\n",
+        ),
+    )
+    .unwrap();
+    assert_ok(
+        &izba(&data, no_env, &["diff", name]),
+        "diff by name with divergent metadata.name",
+    );
+    let o = izba(&data, no_env, &["promote", name]);
+    assert_ok(&o, "promote by name must target the resolved sandbox");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !err.contains("no reviewed diff"),
+        "promote must read the review token from the RESOLVED sandbox: {err}"
+    );
+    assert!(
+        !data.join("sandboxes").join("manifest-alias").exists(),
+        "metadata.name must not create/redirect to a different sandbox dir"
+    );
+
     // Cleanup.
     let _ = izba(&data, no_env, &["rm", "--force", name]);
     let _ = izba(&data, no_env, &["daemon", "stop"]);

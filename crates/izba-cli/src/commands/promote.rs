@@ -57,7 +57,10 @@ pub fn run(
     let dir = dir.as_path();
     let (m, raw, dockerfile) = super::load_repo_manifest(dir)?;
     let repo = Normalized::from_manifest(&m, &r.name)?;
-    let name = name_override.unwrap_or(&repo.name).to_string();
+    // #123: the RESOLVED reference pins the target sandbox — never the
+    // agent-writable metadata.name. A divergent metadata.name must not
+    // redirect which managed truth is mutated (diff/export use the same rule).
+    let name = name_override.unwrap_or(&r.name).to_string();
     izba_core::sandbox::validate_name(&name)?;
     let dir_managed = paths.sandbox_dir(&name);
 
