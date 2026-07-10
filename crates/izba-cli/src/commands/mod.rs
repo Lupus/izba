@@ -14,6 +14,11 @@ pub mod promote;
 pub mod reconcile;
 pub mod rm;
 pub mod run;
+// Consumed by Tasks 6-7 (diff/promote/export/status/stop/rm/start); until then
+// nothing but this module's own tests calls it, so `-D warnings` would flag
+// the whole surface as dead code.
+#[allow(dead_code)]
+pub mod sandbox_ref;
 pub mod ssh;
 pub mod ssh_proxy;
 pub mod start;
@@ -31,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 /// Read and parse `izba.yml` from `dir` WITHOUT reading the Dockerfile.  Used
 /// for name-resolution / opts-merge paths where only the YAML is needed.
-fn load_manifest_yaml(dir: &Path) -> anyhow::Result<Manifest> {
+pub(crate) fn load_manifest_yaml(dir: &Path) -> anyhow::Result<Manifest> {
     let path = dir.join("izba.yml");
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
