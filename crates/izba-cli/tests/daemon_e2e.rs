@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, Instant};
 
+use izba_core::state::{load_json, RunState, STATE_FILE};
+
 const IMAGE: &str = "alpine:3.20";
 
 fn want() -> bool {
@@ -711,6 +713,101 @@ fn manifest_diff_promote_live_path() {
     assert!(
         body.contains("promote-port-body"),
         "port relay must deliver guest response; got: {body}"
+    );
+
+    // [9] Graduation (dogfood 2026-07-09): an egress-ONLY promote must
+    // hot-reload the policy WITHOUT restarting the VM — vmm pid constant.
+    let state_path = data.join("sandboxes").join(name).join(STATE_FILE);
+    let st: RunState = load_json(&state_path)
+        .expect("read state.json")
+        .expect("state.json present while running");
+    let pid_before = st.vmm_pid.clone();
+    std::fs::write(
+        ws.join("izba.yml"),
+        concat!(
+            "apiVersion: izba.dev/v1alpha1\n",
+            "kind: Sandbox\n",
+            "metadata:\n",
+            "  name: manifest\n",
+            "spec:\n",
+            "  image: alpine:3.20\n",
+            "  resources:\n",
+            "    cpus: 2\n",
+            "    memory: 4Gi\n",
+            "  rootDisk:\n",
+            "    size: 8Gi\n",
+            "  egress:\n",
+            "    enforce: true\n",
+            "    allow:\n",
+            "      - example.com\n",
+            "      - api.anthropic.com\n",
+            "      - crates.io\n",
+            "  ports:\n",
+            "    - guest: 8000\n",
+            "      host: 18131\n",
+        ),
+    )
+    .unwrap();
+    // #123: use the BARE NAME form — exercises the sandbox_ref Name-form
+    // resolver end-to-end (name -> config.json's recorded workspace).
+    assert_ok(
+        &izba(&data, no_env, &["diff", name]),
+        "diff (egress-only, by name)",
+    );
+    assert_ok(
+        &izba(&data, no_env, &["promote", name]),
+        "promote (egress-only, by name)",
+    );
+    let st: RunState = load_json(&state_path)
+        .expect("read state.json after promote")
+        .expect("state.json still present");
+    assert_eq!(
+        st.vmm_pid, pid_before,
+        "egress-only promote must hot-reload, not restart the VM"
+    );
+    let o = izba(&data, no_env, &["policy", "show", name]);
+    assert_ok(&o, "policy show after hot-reload");
+    assert!(
+        stdout_of(&o).contains("crates.io"),
+        "hot-reloaded policy must list crates.io; got:\n{}",
+        stdout_of(&o)
+    );
+
+    // [10] Promote against a STOPPED sandbox skips live RPCs with the honest
+    // "changes apply on next start" note (promote.rs:198) and exits 0.
+    assert_ok(
+        &izba(&data, no_env, &["stop", name]),
+        "stop before offline promote",
+    );
+    std::fs::write(
+        ws.join("izba.yml"),
+        concat!(
+            "apiVersion: izba.dev/v1alpha1\n",
+            "kind: Sandbox\n",
+            "metadata:\n",
+            "  name: manifest\n",
+            "spec:\n",
+            "  image: alpine:3.20\n",
+            "  resources:\n",
+            "    cpus: 2\n",
+            "    memory: 4Gi\n",
+            "  rootDisk:\n",
+            "    size: 8Gi\n",
+            "  egress:\n",
+            "    enforce: true\n",
+            "    allow:\n",
+            "      - example.com\n",
+        ),
+    )
+    .unwrap();
+    assert_ok(&izba(&data, no_env, &["diff", &ws_s]), "diff (stopped)");
+    let o = izba(&data, no_env, &["promote", &ws_s]);
+    assert_ok(&o, "promote against a stopped sandbox");
+    let err = String::from_utf8_lossy(&o.stderr);
+    let out = stdout_of(&o);
+    assert!(
+        err.contains("changes apply on next start") || out.contains("changes apply on next start"),
+        "offline promote must print the next-start note; stdout:\n{out}\nstderr:\n{err}"
     );
 
     // Cleanup.
