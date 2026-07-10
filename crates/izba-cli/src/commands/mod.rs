@@ -41,10 +41,12 @@ fn load_manifest_yaml(dir: &Path) -> anyhow::Result<Manifest> {
 /// Clap default values — the single source of truth.  Both the `SandboxOpts`
 /// `default_value_t` attributes in `main.rs` and the `merge_manifest_into_opts`
 /// "was this field left at its default?" checks must reference these consts.
+/// The resource trio re-exports the manifest schema defaults so an izba.yml
+/// omitting `resources`/`rootDisk` boots identically to a bare `izba run`.
 pub(crate) const DEFAULT_IMAGE: &str = "ubuntu:24.04";
-pub(crate) const DEFAULT_CPUS: u32 = 2;
-pub(crate) const DEFAULT_MEM_MB: u32 = 4096;
-pub(crate) const DEFAULT_RW_GB: u64 = 8;
+pub(crate) const DEFAULT_CPUS: u32 = izba_core::manifest::schema::DEFAULT_CPUS;
+pub(crate) const DEFAULT_MEM_MB: u32 = izba_core::manifest::schema::DEFAULT_MEM_MB;
+pub(crate) const DEFAULT_RW_GB: u64 = izba_core::manifest::schema::DEFAULT_RW_GB;
 
 /// Load `izba.yml` from a workspace dir, returning (manifest, raw_yaml,
 /// dockerfile_contents). `dockerfile` is `Some` only for a `build:` spec.
