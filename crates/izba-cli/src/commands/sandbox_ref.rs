@@ -101,7 +101,9 @@ pub(crate) fn resolve(paths: &Paths, arg: Option<&str>) -> anyhow::Result<Sandbo
     }
     bail!(
         "no sandbox named '{arg}' and no ./{arg}/izba.yml — pass an existing \
-         sandbox name or a workspace directory (e.g. './{arg}')"
+         sandbox name or a workspace directory (e.g. './{arg}'); to create a \
+         sandbox, use `izba create` (or `izba run` to create + start + exec \
+         in one step)"
     )
 }
 
@@ -197,6 +199,10 @@ mod tests {
         assert!(
             err.contains("./ghost"),
             "hint must show the dir form: {err}"
+        );
+        assert!(
+            err.contains("izba create"),
+            "must hint the create verbs: {err}"
         );
     }
 

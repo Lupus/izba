@@ -15,6 +15,12 @@ use izba_core::state::CONFIG_FILE;
 /// `start` (unlike `run`) does NOT create: a missing sandbox is a user error,
 /// so we resolve it CLI-side and point at the verbs that *do* create, rather
 /// than surfacing the daemon's lower-level "no config.json" message.
+///
+/// Since #123, bare-word CLI invocations are pre-screened by
+/// `sandbox_ref::resolve` (which errors first with its own create hint);
+/// this check remains load-bearing for workspace-form/omitted-arg
+/// invocations, where the resolver derives a name without checking
+/// existence.
 fn ensure_exists(paths: &Paths, name: &str) -> anyhow::Result<()> {
     sandbox::validate_name(name)?;
     if paths.sandbox_dir(name).join(CONFIG_FILE).is_file() {
