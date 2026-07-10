@@ -219,6 +219,19 @@ class BudgetExceeded(Exception):
     """Raised internally to unwind to the writer when --max-usd is hit."""
 
 
+def _flipping_violations(violations: List[Any]) -> List[Any]:
+    """Drop the product's self-labeled `informational:` reconcile items (e.g. an
+    unreferenced named volume after rm — intended behavior, reconcile.rs prefixes
+    the detail). Informational items stay visible in state_evidence; only the
+    rest may flip a journey (H2)."""
+    out = []
+    for v in violations:
+        detail = v.get("detail", "") if isinstance(v, dict) else str(v)
+        if not str(detail).startswith("informational:"):
+            out.append(v)
+    return out
+
+
 def _collect_candidates(action, command, action_index, prev_reconcile,
                         latency_budget_ms, journey, step, journey_id):
     """Per-ACTION oracles -> a list of candidate dicts (with refs).
@@ -235,7 +248,8 @@ def _collect_candidates(action, command, action_index, prev_reconcile,
     found = implicit_oracle(action) + latency_oracle(action, latency_budget_ms)
     if prev_reconcile is not None:
         found += reconcile_seq_oracle(prev_reconcile, action.reconcile)
-    violations = (action.reconcile or {}).get("violations") or []
+    violations = _flipping_violations(
+        (action.reconcile or {}).get("violations") or [])
     if violations:
         import json as _json
         found = list(found)

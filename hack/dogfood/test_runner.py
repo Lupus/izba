@@ -815,6 +815,37 @@ class ReconcileViolationTests(unittest.TestCase):
                             res["candidates"])
 
 
+class InformationalReconcileTest(unittest.TestCase):
+    def _action(self, violations):
+        from oracles import Action
+        return Action(intent="", command="izba rm x", exit_code=0,
+                      stdout_tail="", stderr_tail="", latency_ms=1,
+                      reconcile={"violations": violations, "sandboxes": []})
+
+    def test_informational_only_violations_do_not_flip(self):
+        import run_journeys as rj
+        a = self._action([{"kind": "orphan_volume",
+                           "detail": "informational: named volume 'x' is "
+                                     "unreferenced (persistent volumes survive rm)"}])
+        cands = rj._collect_candidates(a, "izba rm x", 0, None, 30000, {}, {}, "j1")
+        self.assertFalse(
+            [c for c in cands if c["kind"] == "reconcile_violation"],
+            f"informational items must not flip: {cands}")
+
+    def test_mixed_violations_flip_and_count_only_real_ones(self):
+        import run_journeys as rj
+        a = self._action([
+            {"kind": "orphan_volume", "detail": "informational: named volume 'x'"},
+            {"kind": "list_mismatch", "detail": "daemon lists a ghost sandbox"},
+        ])
+        cands = [c for c in rj._collect_candidates(
+            a, "izba ls", 0, None, 30000, {}, {}, "j1")
+            if c["kind"] == "reconcile_violation"]
+        self.assertEqual(len(cands), 1)
+        self.assertIn("1 violation(s)", cands[0]["detail"])
+        self.assertNotIn("informational", cands[0]["detail"])
+
+
 class ExpectCmdReTests(unittest.TestCase):
     def _run(self, d, step, script):
         stub = _write_stub_izba(d)
