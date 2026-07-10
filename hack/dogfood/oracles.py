@@ -107,6 +107,32 @@ def _read_cwd_file(cwd_file: str) -> str:
         return ""
 
 
+def _console_tails(data_dir: str, limit_per_sandbox: int = 2048) -> str:
+    """Guest console.log tails for every sandbox under ``data_dir`` — evidence
+    appended to a TIMED-OUT action's stderr so a stalled `izba start` is
+    diagnosable post-hoc (H6: two 120s stalls in the 2026-07-09 run were
+    environmental but undiagnosable). Capped per sandbox so the 4 KiB
+    stderr_tail keeps the timeout marker. Report-only: '' on any error."""
+    import glob
+    chunks: List[str] = []
+    try:
+        for path in sorted(glob.glob(os.path.join(
+                data_dir, "sandboxes", "*", "logs", "console.log"))):
+            name = os.path.basename(os.path.dirname(os.path.dirname(path)))
+            try:
+                with open(path, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - limit_per_sandbox))
+                    tail = f.read().decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            chunks.append(f"\n[harness] console.log tail ({name}):\n{tail}")
+    except Exception:
+        return ""
+    return "".join(chunks)
+
+
 def run_action(
     command: str,
     *,
@@ -175,7 +201,8 @@ def run_action(
         exit_code = 124  # GNU timeout convention; non-zero so oracles flag it
         stdout = (e.stdout or "") if isinstance(e.stdout, str) else ""
         stderr = ((e.stderr or "") if isinstance(e.stderr, str) else "") + \
-            f"\n[harness] action timed out after {timeout_s}s"
+            f"\n[harness] action timed out after {timeout_s}s" + \
+            _console_tails(data_dir)
     except OSError as e:
         exit_code = 125
         stdout = ""
