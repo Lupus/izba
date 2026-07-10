@@ -181,7 +181,8 @@ izba export  [NAME_OR_DIR] [--name NAME]  # write managed truth → izba.yml
 
 ### Referring to sandboxes
 
-Every lifecycle and manifest command takes `NAME_OR_DIR`: a **path-looking
+`status`, `start`, `stop`, `rm`, `diff`, `export`, and `promote` all take
+`NAME_OR_DIR`: a **path-looking
 argument** (`.`, `./proj`, `/abs/path`) always means a workspace directory; a
 **bare word** means a sandbox name first (falling back to `./word` if that
 directory holds an `izba.yml`); **no argument** means the sandbox of the

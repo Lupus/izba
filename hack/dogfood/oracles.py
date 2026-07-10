@@ -111,8 +111,11 @@ def _console_tails(data_dir: str, limit_per_sandbox: int = 2048) -> str:
     """Guest console.log tails for every sandbox under ``data_dir`` — evidence
     appended to a TIMED-OUT action's stderr so a stalled `izba start` is
     diagnosable post-hoc (H6: two 120s stalls in the 2026-07-09 run were
-    environmental but undiagnosable). Capped per sandbox so the 4 KiB
-    stderr_tail keeps the timeout marker. Report-only: '' on any error."""
+    environmental but undiagnosable). Capped per sandbox, and placed BEFORE
+    the ``[harness] action timed out`` marker in the assembled stderr, so the
+    4 KiB ``stderr_tail`` truncation (which keeps the LAST bytes) can never
+    cut the marker away even with multiple sandboxes. Report-only: '' on any
+    error."""
     import glob
     chunks: List[str] = []
     try:
@@ -201,8 +204,8 @@ def run_action(
         exit_code = 124  # GNU timeout convention; non-zero so oracles flag it
         stdout = (e.stdout or "") if isinstance(e.stdout, str) else ""
         stderr = ((e.stderr or "") if isinstance(e.stderr, str) else "") + \
-            f"\n[harness] action timed out after {timeout_s}s" + \
-            _console_tails(data_dir)
+            _console_tails(data_dir) + \
+            f"\n[harness] action timed out after {timeout_s}s"
     except OSError as e:
         exit_code = 125
         stdout = ""
