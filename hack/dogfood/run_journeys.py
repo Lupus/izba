@@ -324,22 +324,23 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
     return out
 
 
-def _next_command(model, journey, step, actions, budget, journey_id, candidates):
+def _next_command(model, journey, step, actions, budget, journey_id, starved):
     """One model turn -> a command string, or None to end the step.
 
     A model-layer failure ({"error": ...} reply, or an exception) is an INFRA
-    finding, not a completion: it appends a flipping `infra` candidate so the
-    journey cannot tally positive on the back of a broken model."""
+    finding, not a completion — but per-turn candidates drowned the bundle
+    (H7), so failures are TALLIED into ``starved`` and the journey emits ONE
+    coalesced `infra` candidate at the end (run_journey)."""
     try:
         reply = model.next_command(journey, step, actions)
         budget["usd"] += float(getattr(model, "last_cost_usd", 0.0) or 0.0)
     except Exception as e:  # report-only, but never silently green
         log(f"{journey_id}: model error: {e!r}; ending step")
-        candidates.append(_infra_candidate(journey_id, f"model raised: {e!r}"))
+        starved.append(f"model raised: {e!r}")
         return None
     if isinstance(reply, dict) and reply.get("error"):
         log(f"{journey_id}: model infra error: {reply['error']}; ending step")
-        candidates.append(_infra_candidate(journey_id, str(reply["error"])))
+        starved.append(str(reply["error"]))
         return None
     if not isinstance(reply, dict) or reply.get("done"):
         return None
@@ -382,7 +383,7 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
 
             ctx["turns"] += 1
             command = _next_command(model, journey, step, actions, budget, journey_id,
-                                    candidates)
+                                    ctx["starved"])
             if command is None:
                 return False
             h = _cmd_hash(journey_id, command)
@@ -482,7 +483,7 @@ def run_journey(
     journey_id = journey.get("journey_id", "")
     actions: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
-    ctx: Dict[str, Any] = {"turns": 0, "prev_reconcile": None}
+    ctx: Dict[str, Any] = {"turns": 0, "prev_reconcile": None, "starved": []}
     # The Actor's shell cwd — a real project dir, kept OUT of the izba data dir
     # so the user's files (e.g. a policy.yaml they write) don't mingle with
     # izba's internal sandbox state. izba run/cp share this as /workspace.
@@ -511,6 +512,13 @@ def run_journey(
         step_actions[i] = len(actions) - before
         if stop:
             break
+    # H7: coalesce model-starvation failures into ONE flipping infra candidate
+    # (count_degraded semantics unchanged — any infra candidate degrades).
+    if ctx["starved"]:
+        candidates.append(_infra_candidate(
+            journey_id,
+            f"model starved: {len(ctx['starved'])} failed turn(s); "
+            f"first: {ctx['starved'][0]}"))
     # #126: a decisive step the Actor never reached (or reached with zero
     # actions) verified NOTHING — emit a flipping candidate so the journey
     # can't tally positive on budget exhaustion before its core assertion.
