@@ -67,9 +67,14 @@ fn allow_index(eg: &EgressPolicyConfig) -> BTreeMap<(String, u16), Access> {
 /// True if turning `from` egress into `to` egress LOOSENS the firewall:
 /// disabling enforce, adding a (host, port) pair, widening access
 /// (read -> read-write) on any (host, port), or adding/loosening a git rule.
+/// An unenforced `from` allowed everything, so nothing weakens from it (#124).
 fn egress_weakens(from: &EgressPolicyConfig, to: &EgressPolicyConfig) -> bool {
     if from.enforce && !to.enforce {
         return true;
+    }
+    if !from.enforce {
+        // `from` allowed everything (unenforced); no `to` can be weaker (#124).
+        return false;
     }
     let (fi, ti) = (allow_index(from), allow_index(to));
     for ((host, port), to_access) in &ti {
@@ -460,6 +465,38 @@ mod tests {
         assert!(
             !d[0].weakens_egress,
             "pure tightening on a duplicate-host entry must NOT flag weakens_egress"
+        );
+    }
+
+    /// #124 repro (dogfood 2026-07-02/09): turning enforcement ON — even while
+    /// adding allow entries — is a net TIGHTENING (the unenforced `from` allowed
+    /// everything), and must NOT flag `⚠ weakens egress`.
+    #[test]
+    fn enabling_enforce_with_allow_entries_does_not_weaken() {
+        let mut from = base();
+        from.egress.enforce = false;
+        let mut to = base();
+        to.egress.enforce = true;
+        to.egress.allow = vec![AllowEntry::Host("github.com".into())];
+        let d = diff(&from, &to);
+        assert_eq!(d[0].field, "egress");
+        assert!(
+            !d[0].weakens_egress,
+            "enforce off->on is a tightening even with new allow entries"
+        );
+    }
+
+    /// While unenforced on BOTH sides, allow/git entries are inert — adding one
+    /// changes nothing effective and must not flag weakening.
+    #[test]
+    fn unenforced_to_unenforced_allow_changes_do_not_weaken() {
+        let mut from = base();
+        from.egress.enforce = false;
+        let mut to = from.clone();
+        to.egress.allow = vec![AllowEntry::Host("example.com".into())];
+        assert!(
+            !diff(&from, &to)[0].weakens_egress,
+            "allow entries are inert while unenforced"
         );
     }
 }
