@@ -1025,6 +1025,30 @@ class CollectorBucketsTests(unittest.TestCase):
                              {"cli": {"infra": 1}, "gui": {"console": 1}})
 
 
+class StarvationTallyTest(unittest.TestCase):
+    def test_repeated_model_failures_yield_one_infra_candidate(self):
+        # Two steps; the model errors on BOTH turns -> previously 2 per-reply
+        # infra candidates, now ONE tally candidate for the journey.
+        model = FakeModel([{"error": "unparseable model reply: 'x'"},
+                           {"error": "unparseable model reply: 'y'"}])
+        journey = {"journey_id": "starved-j",
+                   "steps": [{"intent": "a", "expect": ""},
+                             {"intent": "b", "expect": ""}]}
+        with tempfile.TemporaryDirectory() as td:
+            res = run_journeys.run_journey(
+                model, journey, izba_bin="/bin/false", data_dir=td,
+                max_turns=8, step_cap=8, action_timeout_s=5,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
+        infra = [c for c in res["candidates"] if c.get("kind") == "infra"]
+        self.assertEqual(
+            len(infra), 1,
+            f"starvation must coalesce to ONE infra candidate: {infra}")
+        self.assertIn("2 failed turn(s)", infra[0]["detail"])
+        self.assertIn("unparseable", infra[0]["detail"])
+        # Degradation semantics unchanged: the journey still counts degraded.
+        self.assertEqual(run_journeys.count_degraded([res]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 
