@@ -116,35 +116,26 @@ pub fn reconcile(
         });
     }
 
-    use crate::state::{PortRecord, SandboxConfig, CONFIG_FILE, PORTS_FILE};
+    use crate::state::{SandboxConfig, CONFIG_FILE};
     use std::collections::HashSet;
 
-    // Orphan relays: relay liveness must track sandbox liveness.
+    // Orphan LEGACY relays (NEW-1): ports.json is read via the daemon's
+    // schema-tolerant loader — the daemon has written `Vec<PortRule>` since the
+    // thread-relay model landed, and the old strict `Vec<PortRecord>` read here
+    // errored on every current-format file (false-empty snapshot). Thread
+    // relays persist no pid, so relay liveness is not observable from disk;
+    // the only remaining relay check is a LEGACY pre-daemon relay process that
+    // survived its migration.
     for name in &disk {
-        let ports: Option<Vec<PortRecord>> = load_json(&paths.sandbox_dir(name).join(PORTS_FILE))?;
-        let Some(ports) = ports else { continue };
-        let sandbox_alive = sandboxes
-            .iter()
-            .any(|s| &s.name == name && s.status_disk != "stopped");
-        for rec in ports {
-            let relay_alive = probes.pid_alive(&rec.relay);
-            if sandbox_alive && !relay_alive {
+        let (_rules, legacy_pids) = crate::daemon::relays::load_rules_migrating(paths, name)?;
+        for pid in legacy_pids {
+            if probes.pid_alive(&pid) {
                 violations.push(Violation {
                     kind: ViolationKind::OrphanRelay,
                     sandbox: Some(name.clone()),
                     detail: format!(
-                        "relay for host_port {} dead while sandbox is alive",
-                        rec.rule.host_port
-                    ),
-                });
-            }
-            if !sandbox_alive && relay_alive {
-                violations.push(Violation {
-                    kind: ViolationKind::OrphanRelay,
-                    sandbox: Some(name.clone()),
-                    detail: format!(
-                        "relay for host_port {} alive while sandbox is stopped",
-                        rec.rule.host_port
+                        "legacy relay process (pid {}) still alive; relays are daemon threads now",
+                        pid.pid
                     ),
                 });
             }
@@ -286,8 +277,84 @@ mod tests {
         );
     }
 
+    /// NEW-1 (dogfood 2026-07-09): the daemon writes ports.json as the CURRENT
+    /// schema (`Vec<PortRule>`, daemon/relays.rs save_rules). Reconcile used to
+    /// read the legacy `Vec<PortRecord>` and errored "missing field `rule`" on
+    /// every current-format file, returning a false-empty snapshot.
     #[test]
-    fn relay_dead_while_sandbox_running_is_orphan_relay() {
+    fn current_schema_ports_json_reconciles_cleanly() {
+        use crate::state::{save_json, PortRule, PORTS_FILE};
+        use std::net::Ipv4Addr;
+
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("box")).unwrap();
+        let vmm = live_identity();
+        write_state(&paths, "box", vmm.clone());
+        let rules = vec![PortRule {
+            bind: Ipv4Addr::LOCALHOST,
+            host_port: 8080,
+            guest_port: 80,
+        }];
+        save_json(&paths.sandbox_dir("box").join(PORTS_FILE), &rules).unwrap();
+        let view = vec![summary("box", "running")];
+        let probes = FakeProbes {
+            alive: vec![vmm],
+            control: true,
+        };
+        let report = reconcile(&paths, Some(&view), &probes)
+            .expect("current-schema ports.json must not break reconcile");
+        assert!(
+            report.violations.is_empty(),
+            "clean current-schema state must have no violations: {:?}",
+            report.violations
+        );
+        assert_eq!(report.sandboxes.len(), 1, "snapshot must not be empty");
+    }
+
+    /// A legacy-schema ports.json whose relay process is STILL ALIVE is an
+    /// anomaly (relays are daemon threads now) — flagged as OrphanRelay.
+    #[test]
+    fn alive_legacy_relay_pid_is_orphan_relay() {
+        use crate::state::{save_json, PortRecord, PortRule, PORTS_FILE};
+        use std::net::Ipv4Addr;
+
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("box")).unwrap();
+        let vmm = live_identity();
+        write_state(&paths, "box", vmm.clone());
+        let relay = PidIdentity {
+            pid: vmm.pid + 1,
+            starttime: 42,
+        };
+        let rec = PortRecord {
+            rule: PortRule {
+                bind: Ipv4Addr::LOCALHOST,
+                host_port: 8080,
+                guest_port: 80,
+            },
+            relay: relay.clone(),
+        };
+        save_json(&paths.sandbox_dir("box").join(PORTS_FILE), &vec![rec]).unwrap();
+        let view = vec![summary("box", "running")];
+        let probes = FakeProbes {
+            alive: vec![vmm, relay],
+            control: true,
+        };
+        let report = reconcile(&paths, Some(&view), &probes).unwrap();
+        let v = report
+            .violations
+            .iter()
+            .find(|v| v.kind == ViolationKind::OrphanRelay)
+            .expect("alive legacy relay must be flagged");
+        assert!(v.detail.contains("legacy relay"), "got: {}", v.detail);
+    }
+
+    /// A DEAD legacy relay pid is the normal migrated state — no violation.
+    /// (Replaces the deleted relay_dead_while_sandbox_running_is_orphan_relay:
+    /// thread relays persist no pid, so "relay dead while sandbox alive" is
+    /// no longer observable from disk.)
+    #[test]
+    fn dead_legacy_relay_pid_is_not_flagged() {
         use crate::state::{save_json, PortRecord, PortRule, PORTS_FILE};
         use std::net::Ipv4Addr;
 
@@ -310,10 +377,14 @@ mod tests {
             control: true,
         };
         let report = reconcile(&paths, Some(&view), &probes).unwrap();
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.kind == ViolationKind::OrphanRelay && v.sandbox.as_deref() == Some("box")));
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.kind == ViolationKind::OrphanRelay),
+            "dead legacy relay is the normal migrated state: {:?}",
+            report.violations
+        );
     }
 
     #[test]
