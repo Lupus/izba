@@ -1,30 +1,25 @@
 //! `izba export` — write the managed truth back into izba.yml (the human then
 //! commits the git diff). Inverse of promote; no review gate (the human runs it).
 
-use std::path::Path;
-
-use anyhow::Result;
+use anyhow::{Context, Result};
 use izba_core::paths::Paths;
 
-#[mutants::skip] // reason: reads managed truth from disk + writes izba.yml for a managed sandbox; orchestration exercised by daemon_e2e. The pure logic (ops::export, managed_normalized, to_manifest) is unit-tested separately.
-pub fn run(paths: &Paths, dir: &Path, name_override: Option<&str>) -> Result<i32> {
-    let default_name = super::workspace_default_name(dir)?;
-    // Prefer an explicit name; else the existing manifest's name; else the dir.
-    // Only fall back to the default when izba.yml does NOT exist — if it exists
-    // but is malformed, propagate the parse error rather than silently
-    // exporting under the wrong name.
+#[mutants::skip] // reason: reads managed truth from disk + writes izba.yml for a managed sandbox; orchestration exercised by daemon_e2e. The pure logic (sandbox_ref::resolve, ops::export, managed_normalized, to_manifest) is unit-tested separately.
+pub fn run(paths: &Paths, target: Option<&str>, name_override: Option<&str>) -> Result<i32> {
+    // #123: NAME-or-DIR positional. For the workspace form the name comes from
+    // an existing izba.yml metadata.name (malformed YAML propagates — never
+    // silently exporting under the wrong name) or the dir basename; for the
+    // name form the workspace comes from config.json.
+    let r = super::sandbox_ref::resolve(paths, target)?;
+    let dir = r
+        .workspace
+        .clone()
+        .with_context(|| format!("sandbox '{}' has no recorded workspace directory", r.name))?;
     let name = match name_override {
         Some(n) => n.to_string(),
-        None => {
-            if dir.join("izba.yml").exists() {
-                let (m, _, _) = super::load_repo_manifest(dir)?; // propagate parse errors
-                m.metadata.name.unwrap_or(default_name)
-            } else {
-                default_name
-            }
-        }
+        None => r.name,
     };
-    let path = izba_core::manifest::ops::export(paths, dir, &name)?;
+    let path = izba_core::manifest::ops::export(paths, &dir, &name)?;
     println!("exported managed truth -> {}", path.display());
     Ok(0)
 }

@@ -305,28 +305,31 @@ enum Cmd {
     },
     /// Show drift between izba.yml and the managed sandbox truth
     Diff {
-        /// Workspace directory containing izba.yml
-        #[arg(default_value = ".")]
-        dir: PathBuf,
-        /// Sandbox name (default: from manifest metadata.name or the dir basename)
+        /// Sandbox name, or workspace directory containing izba.yml
+        /// (default: the current directory)
+        #[arg(value_name = "NAME_OR_DIR")]
+        target: Option<String>,
+        /// Sandbox name override (default: from manifest metadata.name or the dir basename)
         #[arg(long)]
         name: Option<String>,
     },
     /// Write the managed sandbox truth back into izba.yml
     Export {
-        /// Workspace directory to write izba.yml into
-        #[arg(default_value = ".")]
-        dir: PathBuf,
-        /// Sandbox name (default: from existing izba.yml or the dir basename)
+        /// Sandbox name, or workspace directory to write izba.yml into
+        /// (default: the current directory)
+        #[arg(value_name = "NAME_OR_DIR")]
+        target: Option<String>,
+        /// Sandbox name override (default: from existing izba.yml or the dir basename)
         #[arg(long)]
         name: Option<String>,
     },
     /// Apply izba.yml to the managed sandbox (requires a prior `izba diff`)
     Promote {
-        /// Workspace directory containing izba.yml
-        #[arg(default_value = ".")]
-        dir: PathBuf,
-        /// Sandbox name (default: from manifest metadata.name or the dir basename)
+        /// Sandbox name, or workspace directory containing izba.yml
+        /// (default: the current directory)
+        #[arg(value_name = "NAME_OR_DIR")]
+        target: Option<String>,
+        /// Sandbox name override (default: from manifest metadata.name or the dir basename)
         #[arg(long)]
         name: Option<String>,
         /// Promote even if the manifest was never reviewed / changed since review
@@ -447,15 +450,26 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             DaemonCmd::Status => commands::daemon::status(paths),
             DaemonCmd::Stop => commands::daemon::stop(paths),
         },
-        Cmd::Diff { dir, name } => commands::diff::run(paths, &dir, name.as_deref()),
-        Cmd::Export { dir, name } => commands::export::run(paths, &dir, name.as_deref()),
+        Cmd::Diff { target, name } => {
+            commands::diff::run(paths, target.as_deref(), name.as_deref())
+        }
+        Cmd::Export { target, name } => {
+            commands::export::run(paths, target.as_deref(), name.as_deref())
+        }
         Cmd::Promote {
-            dir,
+            target,
             name,
             force,
             restart,
             reset_scratch,
-        } => commands::promote::run(paths, &dir, name.as_deref(), force, restart, reset_scratch),
+        } => commands::promote::run(
+            paths,
+            target.as_deref(),
+            name.as_deref(),
+            force,
+            restart,
+            reset_scratch,
+        ),
         Cmd::Ssh { name, cmd } => commands::ssh::run(paths, &name, cmd),
         Cmd::SshProxy { host_alias } => commands::ssh_proxy::run(paths, &host_alias),
         Cmd::Reconcile { json } => commands::reconcile::run(paths, json),
