@@ -13,6 +13,16 @@ use crate::daemon::egress::config::EgressPolicyConfig;
 pub const API_VERSION: &str = "izba.dev/v1alpha1";
 pub const KIND_SANDBOX: &str = "Sandbox";
 
+/// Product-wide sandbox resource defaults — the single source of truth shared
+/// by the manifest schema defaults (below) and the CLI's clap defaults
+/// (`izba-cli commands::DEFAULT_*`). A manifest that omits `resources`/
+/// `rootDisk` boots identically to a bare `izba run` (#122).
+pub const DEFAULT_CPUS: u32 = 2;
+pub const DEFAULT_MEM_MB: u32 = 4096;
+pub const DEFAULT_MEMORY: &str = "4Gi";
+pub const DEFAULT_RW_GB: u64 = 8;
+pub const DEFAULT_ROOT_DISK_SIZE: &str = "8Gi";
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -40,8 +50,9 @@ pub struct SandboxSpec {
     pub image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildSpec>,
+    #[serde(default)]
     pub resources: Resources,
-    #[serde(rename = "rootDisk")]
+    #[serde(default, rename = "rootDisk")]
     pub root_disk: RootDisk,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeMount>,
@@ -58,10 +69,27 @@ pub struct Resources {
     pub memory: String,
 }
 
+impl Default for Resources {
+    fn default() -> Self {
+        Resources {
+            cpus: DEFAULT_CPUS,
+            memory: DEFAULT_MEMORY.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootDisk {
     pub size: String,
+}
+
+impl Default for RootDisk {
+    fn default() -> Self {
+        RootDisk {
+            size: DEFAULT_ROOT_DISK_SIZE.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -242,5 +270,28 @@ spec:
         let back = Manifest::load_str(&m.to_yaml()).unwrap();
         assert_eq!(back.spec.resources.memory, "4Gi");
         assert_eq!(back.metadata.name, m.metadata.name);
+    }
+
+    /// #122: a minimal manifest (image only) must parse, inheriting the same
+    /// defaults a bare `izba run` uses — 2 cpus / 4Gi memory / 8Gi rootDisk.
+    #[test]
+    fn minimal_manifest_defaults_resources_and_root_disk() {
+        let y = "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: ubuntu:24.04\n";
+        let m = Manifest::load_str(y).expect("image-only manifest must be valid");
+        assert_eq!(m.spec.resources.cpus, DEFAULT_CPUS);
+        assert_eq!(m.spec.resources.memory, DEFAULT_MEMORY);
+        assert_eq!(m.spec.root_disk.size, DEFAULT_ROOT_DISK_SIZE);
+    }
+
+    /// The string defaults and the numeric defaults must agree — the numeric
+    /// pair is what the CLI's clap defaults reuse (single source of truth).
+    #[test]
+    fn default_strings_match_numeric_defaults() {
+        use crate::manifest::quantity;
+        assert_eq!(quantity::parse_mib(DEFAULT_MEMORY).unwrap(), DEFAULT_MEM_MB);
+        assert_eq!(
+            quantity::parse_gib(DEFAULT_ROOT_DISK_SIZE).unwrap(),
+            DEFAULT_RW_GB
+        );
     }
 }

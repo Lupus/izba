@@ -250,6 +250,10 @@ spec:
         access: read-write
 ```
 
+`spec.resources` and `spec.rootDisk` are optional — when omitted they default
+to **2 cpus / 4Gi memory / 8Gi root disk**, the same defaults as a bare
+`izba run`, so a minimal manifest is just `apiVersion` + `kind` + `spec.image`.
+
 **Trust model.** `izba.yml` lives in the project workspace, mounted at
 `/workspace` inside the guest, so the in-guest agent can edit it. It is
 therefore an **untrusted proposal**, not authority. The **managed truth** lives
