@@ -799,6 +799,51 @@ class UnreachedDecisiveTests(unittest.TestCase):
                              res["candidates"])
 
 
+class DecisiveByObservedCommandTest(unittest.TestCase):
+    def test_decisive_satisfied_under_earlier_step_is_not_unreached(self):
+        import run_journeys as rj
+        from model import FakeModel
+        # Step 0's model turn runs the DECISIVE command (izba diff) and then the
+        # model goes done for the rest; step 1 (core) produces no actions.
+        model = FakeModel([
+            {"command": "true"},   # any benign shell action for step 0
+            {"done": True},        # step 0 ends
+            {"done": True},        # step 1 produces nothing
+        ])
+        journey = {"journey_id": "early-decisive",
+                   "steps": [
+                       {"intent": "explore", "expect": ""},
+                       {"intent": "verify drift shows", "expect": "",
+                        "core": True, "expect_exit": 0,
+                        "expect_cmd_re": r"\btrue\b"}]}
+        with tempfile.TemporaryDirectory() as td:
+            res = rj.run_journey(
+                model, journey, izba_bin="/bin/false", data_dir=td,
+                max_turns=8, step_cap=8, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
+        kinds = [c.get("kind") for c in res["candidates"]]
+        self.assertNotIn(
+            "unreached_decisive", kinds,
+            f"decisive assertion was exercised under step 0: {res['candidates']}")
+
+    def test_decisive_without_match_still_flags_unreached(self):
+        import run_journeys as rj
+        from model import FakeModel
+        model = FakeModel([{"command": "true"}, {"done": True}, {"done": True}])
+        journey = {"journey_id": "never-reached",
+                   "steps": [
+                       {"intent": "explore", "expect": ""},
+                       {"intent": "verify", "expect": "", "core": True,
+                        "expect_cmd_re": r"izba promote"}]}
+        with tempfile.TemporaryDirectory() as td:
+            res = rj.run_journey(
+                model, journey, izba_bin="/bin/false", data_dir=td,
+                max_turns=8, step_cap=8, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
+        kinds = [c.get("kind") for c in res["candidates"]]
+        self.assertIn("unreached_decisive", kinds)
+
+
 class ReconcileViolationTests(unittest.TestCase):
     def _stub_with_violations(self, d):
         stub = os.path.join(d, "izba")

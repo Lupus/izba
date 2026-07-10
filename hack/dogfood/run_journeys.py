@@ -482,6 +482,42 @@ def _write_seed_files(workdir: str, seed_files: Optional[Dict[str, Any]]) -> Non
             log(f"seed_files: failed to write {relpath!r}: {e!r}")
 
 
+def _grade_decisive_from_observed(step, actions, journey, journey_id):
+    """H3: a decisive step whose own pointer produced no actions may still have
+    been exercised — the swarm often satisfies the assertion under an EARLIER
+    step. When the step declares ``expect_cmd_re``, scan ALL journey actions for
+    the LAST match and grade THAT action functionally. Returns None when the
+    step has no usable ``expect_cmd_re`` or nothing matched (caller then flags
+    ``unreached_decisive``); an empty list means exercised-and-passed."""
+    pattern = step.get("expect_cmd_re")
+    if not (isinstance(pattern, str) and pattern):
+        return None
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        log(f"{journey_id}: invalid expect_cmd_re {pattern!r}: {e}")
+        return None
+    for idx in range(len(actions) - 1, -1, -1):
+        a = actions[idx]
+        if not rx.search(a.get("command", "")):
+            continue
+        ref = {"journey_id": journey_id, "action_index": idx}
+        source = journey.get("source", {}).get("ref", "journey step")
+        found = functional_oracle(
+            a.get("command", ""), a.get("exit_code", 0),
+            step.get("expect", ""), source, ref,
+            expect_exit=step.get("expect_exit"))
+        out = []
+        for c in found:
+            cd = c.to_dict()
+            cd["trajectory_ref"] = ref
+            cd["decisive"] = True
+            cd["graded_cmd"] = a.get("command", "")
+            out.append(cd)
+        return out
+    return None
+
+
 def run_journey(
     model,
     journey: Dict[str, Any],
@@ -542,6 +578,10 @@ def run_journey(
     for i in sorted(decisive_idx):
         if step_actions.get(i, 0) == 0:
             s = steps[i]
+            graded = _grade_decisive_from_observed(s, actions, journey, journey_id)
+            if graded is not None:
+                candidates.extend(graded)
+                continue
             candidates.append({
                 "kind": "unreached_decisive",
                 "detail": (f"decisive step {i} ({s.get('intent', '')[:80]!r}) "
