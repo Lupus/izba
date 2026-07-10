@@ -425,6 +425,32 @@ class GuestConsoleTests(unittest.TestCase):
             self.assertEqual(ev["per_sandbox"]["web"]["console_tail"], "")
 
 
+class TimeoutConsoleEvidenceTest(unittest.TestCase):
+    def test_timeout_appends_console_tails(self):
+        import oracles
+        with tempfile.TemporaryDirectory() as td:
+            logdir = os.path.join(td, "sandboxes", "webbox", "logs")
+            os.makedirs(logdir)
+            with open(os.path.join(logdir, "console.log"), "w") as f:
+                f.write("guest kernel: mounting /dev/vda\nBOOT STALLED HERE\n")
+            a = oracles.run_action(
+                "sleep 5", izba_bin="/bin/false", workdir=td,
+                data_dir=td, timeout_s=0.2)
+        self.assertEqual(a.exit_code, 124)
+        self.assertIn("timed out", a.stderr_tail)
+        self.assertIn("console.log tail (webbox)", a.stderr_tail)
+        self.assertIn("BOOT STALLED HERE", a.stderr_tail)
+
+    def test_timeout_without_console_logs_is_clean(self):
+        import oracles
+        with tempfile.TemporaryDirectory() as td:
+            a = oracles.run_action(
+                "sleep 5", izba_bin="/bin/false", workdir=td,
+                data_dir=td, timeout_s=0.2)
+        self.assertEqual(a.exit_code, 124)
+        self.assertNotIn("console.log tail", a.stderr_tail)
+
+
 class TeardownTests(unittest.TestCase):
     def test_teardown_invokes_rm_force_and_daemon_stop(self):
         import oracles
