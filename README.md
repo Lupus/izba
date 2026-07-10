@@ -158,9 +158,9 @@ izba cp     HOST_PATH NAME:GUEST_PATH   # or NAME:GUEST_PATH HOST_PATH; recursiv
 izba port   publish|unpublish|ls NAME [RULE]   # TCP, runtime or create-time -p
 izba volume prune [-f]                  # remove persistent volumes no sandbox uses
 izba ls
-izba start  NAME                        # boot a stopped sandbox (no exec; symmetric with stop)
-izba stop   NAME
-izba rm     [--force] NAME
+izba start  [NAME_OR_DIR]               # boot a stopped sandbox (no exec; symmetric with stop)
+izba stop   [NAME_OR_DIR]
+izba rm     [--force] [NAME_OR_DIR]
 izba daemon run                         # run the daemon in the foreground (auto-started on demand otherwise)
 izba daemon status                      # daemon health + supervised sandboxes
 izba daemon stop                        # stop the daemon; sandboxes keep running, published ports pause
@@ -173,11 +173,22 @@ izba policy  git allow NAME TARGET [--write]  # allow git on a repo/host (clone/
 izba policy  git block NAME TARGET        # remove a git rule
 izba policy  enable NAME                  # seed the allow-list from observed allowed traffic; live-reloads
 izba policy  reload NAME                  # re-read policy.yaml and apply to new connections (no restart)
-izba diff    [DIR] [--name NAME]          # show drift between izba.yml and managed truth
-izba promote [DIR] [--name NAME] [--force] [--restart] [--reset-scratch=BOOL]
+izba diff    [NAME_OR_DIR] [--name NAME]  # show drift between izba.yml and managed truth
+izba promote [NAME_OR_DIR] [--name NAME] [--force] [--restart] [--reset-scratch=BOOL]
                                           # apply manifest → managed truth (human-gated)
-izba export  [DIR] [--name NAME]          # write managed truth → izba.yml
+izba export  [NAME_OR_DIR] [--name NAME]  # write managed truth → izba.yml
 ```
+
+### Referring to sandboxes
+
+Every lifecycle and manifest command takes `NAME_OR_DIR`: a **path-looking
+argument** (`.`, `./proj`, `/abs/path`) always means a workspace directory; a
+**bare word** means a sandbox name first (falling back to `./word` if that
+directory holds an `izba.yml`); **no argument** means the sandbox of the
+current directory — so `izba status`, `izba stop`, `izba diff` all "just work"
+from a project root, git-style. If a bare word matches both a sandbox and a
+directory that resolves to a *different* sandbox, izba refuses and asks for
+the explicit `./word` or the exact name.
 
 Volume `SIZE` takes a `g` or `m` suffix (e.g. `10g`, `512m`). A named volume is
 persistent (lives under `<data>/volumes`, survives `rm`, single-writer); an

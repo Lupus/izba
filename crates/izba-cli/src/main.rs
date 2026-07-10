@@ -206,8 +206,10 @@ enum Cmd {
     Ls,
     /// Show detailed status for one sandbox (incl. host-side VMM confinement)
     Status {
-        /// Sandbox name
-        name: String,
+        /// Sandbox name or workspace directory (default: the current
+        /// directory's sandbox)
+        #[arg(value_name = "NAME_OR_DIR")]
+        target: Option<String>,
     },
     /// Start a stopped sandbox's VM (symmetric with `stop`; does not exec)
     ///
@@ -216,8 +218,10 @@ enum Cmd {
     /// it but additionally execs a shell/command into it.) Already-running is a
     /// no-op success.
     Start {
-        /// Sandbox name
-        name: String,
+        /// Sandbox name or workspace directory (default: the current
+        /// directory's sandbox)
+        #[arg(value_name = "NAME_OR_DIR")]
+        target: Option<String>,
         /// Start the VMM WITHOUT host-side confinement (NOT recommended; only
         /// if confinement fails on your host)
         #[arg(long)]
@@ -225,13 +229,17 @@ enum Cmd {
     },
     /// Stop a running sandbox
     Stop {
-        /// Sandbox name
-        name: String,
+        /// Sandbox name or workspace directory (default: the current
+        /// directory's sandbox)
+        #[arg(value_name = "NAME_OR_DIR")]
+        target: Option<String>,
     },
     /// Remove a sandbox
     Rm {
-        /// Sandbox name
-        name: String,
+        /// Sandbox name or workspace directory (default: the current
+        /// directory's sandbox)
+        #[arg(value_name = "NAME_OR_DIR")]
+        target: Option<String>,
         /// Stop and remove even if running
         #[arg(long)]
         force: bool,
@@ -421,13 +429,25 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         } => commands::exec::run(paths, &name, interactive, tty, cmd),
         Cmd::Cp { src, dst } => commands::cp::run(paths, &src, &dst),
         Cmd::Ls => commands::ls::run(paths),
-        Cmd::Status { name } => commands::status::run(paths, &name),
+        Cmd::Status { target } => {
+            let name = commands::sandbox_ref::resolve(paths, target.as_deref())?.name;
+            commands::status::run(paths, &name)
+        }
         Cmd::Start {
-            name,
+            target,
             allow_unconfined,
-        } => commands::start::run(paths, &name, allow_unconfined),
-        Cmd::Stop { name } => commands::stop::run(paths, &name),
-        Cmd::Rm { name, force } => commands::rm::run(paths, &name, force),
+        } => {
+            let name = commands::sandbox_ref::resolve(paths, target.as_deref())?.name;
+            commands::start::run(paths, &name, allow_unconfined)
+        }
+        Cmd::Stop { target } => {
+            let name = commands::sandbox_ref::resolve(paths, target.as_deref())?.name;
+            commands::stop::run(paths, &name)
+        }
+        Cmd::Rm { target, force } => {
+            let name = commands::sandbox_ref::resolve(paths, target.as_deref())?.name;
+            commands::rm::run(paths, &name, force)
+        }
         Cmd::Netlog {
             name,
             summary,
@@ -659,13 +679,13 @@ mod tests {
     fn parse_start() {
         let cli = Cli::try_parse_from(["izba", "start", "web"]).unwrap();
         let Cmd::Start {
-            name,
+            target,
             allow_unconfined,
         } = cli.cmd
         else {
             panic!("expected start");
         };
-        assert_eq!(name, "web");
+        assert_eq!(target.as_deref(), Some("web"));
         assert!(!allow_unconfined, "default must be confined");
     }
 
@@ -682,10 +702,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_start_requires_a_name() {
-        // `start` takes a mandatory NAME positional (unlike `run`, which
-        // defaults to the cwd) — a bare `izba start` must be a parse error.
-        assert!(Cli::try_parse_from(["izba", "start"]).is_err());
+    fn parse_start_target_optional() {
+        // Unlike the old mandatory NAME, `start` now defaults to the current
+        // directory's sandbox (same NAME_OR_DIR resolver as diff/promote/export).
+        let cli = Cli::try_parse_from(["izba", "start"]).unwrap();
+        let Cmd::Start { target, .. } = cli.cmd else {
+            panic!("expected start");
+        };
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn parse_status_stop_rm_start_optional_target() {
+        // Bare word stays a name; omitted means "the current workspace".
+        let c = Cli::try_parse_from(["izba", "stop", "myapp"]).unwrap();
+        match c.cmd {
+            Cmd::Stop { target } => assert_eq!(target.as_deref(), Some("myapp")),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        let c = Cli::try_parse_from(["izba", "status"]).unwrap();
+        match c.cmd {
+            Cmd::Status { target } => assert!(target.is_none()),
+            other => panic!("expected Status, got {other:?}"),
+        }
+        let c = Cli::try_parse_from(["izba", "rm", "--force", "./proj"]).unwrap();
+        match c.cmd {
+            Cmd::Rm { target, force } => {
+                assert_eq!(target.as_deref(), Some("./proj"));
+                assert!(force);
+            }
+            other => panic!("expected Rm, got {other:?}"),
+        }
     }
 
     #[test]
