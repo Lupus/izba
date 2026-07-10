@@ -206,6 +206,19 @@ mod tests {
         );
     }
 
+    /// Pins every arm of the syntactic split (kills the `||`→`&&` mutants):
+    /// `.`/`..`/separators are path syntax; a bare word never is.
+    #[test]
+    fn path_syntax_arms_are_each_sufficient() {
+        assert!(is_path_syntax("."));
+        assert!(is_path_syntax(".."));
+        assert!(is_path_syntax("a/b"));
+        assert!(is_path_syntax("./x"));
+        assert!(is_path_syntax("a\\b"));
+        assert!(!is_path_syntax("myapp"));
+        assert!(!is_path_syntax("my.app"));
+    }
+
     #[test]
     fn ambiguous_bare_word_is_a_hard_error() {
         let _g = super::super::CWD_LOCK.lock().unwrap();
