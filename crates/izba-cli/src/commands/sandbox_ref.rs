@@ -108,9 +108,6 @@ pub(crate) fn resolve(paths: &Paths, arg: Option<&str>) -> anyhow::Result<Sandbo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     const MANIFEST: &str = concat!(
         "apiVersion: izba.dev/v1alpha1\n",
@@ -159,7 +156,7 @@ mod tests {
 
     #[test]
     fn omitted_arg_means_current_workspace() {
-        let _g = CWD_LOCK.lock().unwrap();
+        let _g = super::super::CWD_LOCK.lock().unwrap();
         let (_tmp, paths, _ws) = fixture("other");
         let r = resolve(&paths, None).unwrap();
         // cwd's basename, sanitized — matches workspace_default_name(".").
@@ -170,7 +167,7 @@ mod tests {
 
     #[test]
     fn bare_word_falls_back_to_local_dir_with_manifest() {
-        let _g = CWD_LOCK.lock().unwrap();
+        let _g = super::super::CWD_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_root(tmp.path().join("izba"));
         // Run from tmp as cwd is not possible in a unit test; use a relative
@@ -205,7 +202,7 @@ mod tests {
 
     #[test]
     fn ambiguous_bare_word_is_a_hard_error() {
-        let _g = CWD_LOCK.lock().unwrap();
+        let _g = super::super::CWD_LOCK.lock().unwrap();
         let (tmp, paths, _ws) = fixture("proj");
         // ./proj/izba.yml resolves to a DIFFERENT sandbox name ("fromyaml").
         let proj = tmp.path().join("proj");
@@ -222,7 +219,7 @@ mod tests {
 
     #[test]
     fn agreeing_bare_word_resolves_as_the_sandbox() {
-        let _g = CWD_LOCK.lock().unwrap();
+        let _g = super::super::CWD_LOCK.lock().unwrap();
         // Sandbox "proj" exists AND ./proj/izba.yml names the SAME sandbox — fine.
         let (tmp, paths, ws) = fixture("proj");
         let proj = tmp.path().join("proj");

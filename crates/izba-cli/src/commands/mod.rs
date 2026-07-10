@@ -34,6 +34,12 @@ use izba_core::manifest::{Manifest, Normalized};
 use izba_core::state::PortRule;
 use std::path::{Path, PathBuf};
 
+/// Serializes tests that read or change the process-global cwd
+/// (std::env::set_current_dir / current_dir): cargo runs unit tests
+/// concurrently in one process, so any cwd-dependent test must hold this.
+#[cfg(test)]
+pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Read and parse `izba.yml` from `dir` WITHOUT reading the Dockerfile.  Used
 /// for name-resolution / opts-merge paths where only the YAML is needed.
 pub(crate) fn load_manifest_yaml(dir: &Path) -> anyhow::Result<Manifest> {
@@ -317,6 +323,7 @@ mod tests {
     /// than erroring out (the real `izba diff` default-arg path).
     #[test]
     fn workspace_default_name_resolves_dot_to_cwd_basename() {
+        let _g = CWD_LOCK.lock().unwrap();
         let cwd = std::env::current_dir().unwrap();
         let expected = name::sanitize(&cwd.file_name().unwrap().to_string_lossy()).unwrap();
         assert_eq!(workspace_default_name(Path::new(".")).unwrap(), expected);
