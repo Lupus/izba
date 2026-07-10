@@ -1,27 +1,27 @@
 //! `izba diff` — structural drift between `izba.yml` and the managed truth,
 //! recording a review token so `promote` knows what the human saw.
 
-use std::path::Path;
-
-use anyhow::Result;
+use anyhow::{Context, Result};
 use izba_core::manifest::diff::{FieldClass, FieldDelta};
 use izba_core::manifest::{store, DriftState};
 use izba_core::paths::Paths;
 
-#[mutants::skip] // reason: reads managed truth from disk + writes the review token for a managed sandbox; orchestration exercised by daemon_e2e (manifest_diff_promote_live_path). The pure pieces (ops::compute_diff, render_deltas) are unit-tested separately.
-pub fn run(paths: &Paths, dir: &Path, name_override: Option<&str>) -> Result<i32> {
-    // Resolve the sandbox name. Name resolution is CLI-side: workspace_default_name
-    // depends on name::sanitize which lives in the CLI crate and cannot move to
-    // core without creating a circular dependency.
-    let (m, _, _) = super::load_repo_manifest(dir)?;
-    let default_name = super::workspace_default_name(dir)?;
+#[mutants::skip] // reason: reads managed truth from disk + writes the review token for a managed sandbox; orchestration exercised by daemon_e2e (manifest_diff_promote_live_path). The pure pieces (sandbox_ref::resolve, ops::compute_diff, render_deltas) are unit-tested separately.
+pub fn run(paths: &Paths, target: Option<&str>, name_override: Option<&str>) -> Result<i32> {
+    // #123: NAME-or-DIR positional through the shared resolver. A bare sandbox
+    // name resolves to the workspace recorded in its config.json.
+    let r = super::sandbox_ref::resolve(paths, target)?;
+    let dir = r
+        .workspace
+        .clone()
+        .with_context(|| format!("sandbox '{}' has no recorded workspace directory", r.name))?;
     let name = match name_override {
         Some(n) => n.to_string(),
-        None => m.metadata.name.unwrap_or(default_name),
+        None => r.name,
     };
 
     // Delegate the pure filesystem logic to ops (shared with the desktop app).
-    let (state, deltas, token) = izba_core::manifest::ops::compute_diff(paths, dir, &name)?;
+    let (state, deltas, token) = izba_core::manifest::ops::compute_diff(paths, &dir, &name)?;
     println!("{}", render_deltas(state, &deltas));
 
     // Record the review token over exactly what we showed.

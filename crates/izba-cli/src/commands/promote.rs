@@ -39,18 +39,24 @@ pub(crate) fn gate(review: Option<&str>, current_token: &str, force: bool) -> Ga
     }
 }
 
-#[mutants::skip] // reason: drives a live daemon (ReloadPolicy/Port*/Volume*/Stop/Start/Inspect over the socket) + image build/pull; e2e-only (daemon_e2e manifest_diff_promote_live_path). The decision logic it composes (gate, apply::plan, diff_normalized, build_opts_from) is unit-tested separately.
+#[mutants::skip] // reason: drives a live daemon (ReloadPolicy/Port*/Volume*/Stop/Start/Inspect over the socket) + image build/pull; e2e-only (daemon_e2e manifest_diff_promote_live_path). The decision logic it composes (sandbox_ref::resolve, gate, apply::plan, diff_normalized, build_opts_from) is unit-tested separately.
 pub fn run(
     paths: &Paths,
-    dir: &Path,
+    target: Option<&str>,
     name_override: Option<&str>,
     force: bool,
     restart: bool,
     reset_scratch: bool,
 ) -> Result<i32> {
+    // #123: NAME-or-DIR positional through the shared resolver.
+    let r = super::sandbox_ref::resolve(paths, target)?;
+    let dir = r
+        .workspace
+        .clone()
+        .with_context(|| format!("sandbox '{}' has no recorded workspace directory", r.name))?;
+    let dir = dir.as_path();
     let (m, raw, dockerfile) = super::load_repo_manifest(dir)?;
-    let default_name = super::workspace_default_name(dir)?;
-    let repo = Normalized::from_manifest(&m, &default_name)?;
+    let repo = Normalized::from_manifest(&m, &r.name)?;
     let name = name_override.unwrap_or(&repo.name).to_string();
     izba_core::sandbox::validate_name(&name)?;
     let dir_managed = paths.sandbox_dir(&name);
