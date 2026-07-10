@@ -5,6 +5,10 @@ name = "izba-app"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+# The `headless` dogfood-bridge [[bin]] below makes this a multi-bin package;
+# `tauri build` (devbuild/release installers) needs the main binary named
+# explicitly or it aborts with "failed to find main binary".
+default-run = "izba-app"
 
 [lib]
 name = "app_lib"
