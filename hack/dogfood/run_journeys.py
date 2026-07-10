@@ -116,6 +116,12 @@ _CMD_SECTION_RE = re.compile(r"^(commands|subcommands):\s*$", re.IGNORECASE)
 # An indented command entry: leading space then the command token.
 _CMD_ENTRY_RE = re.compile(r"^\s+([a-z][a-z0-9_-]*)\b")
 
+# H1: the default functional-grading target is the step's last PRODUCT
+# invocation — a shell line that runs the izba binary (word-boundary; possibly
+# after env assignments / `cd x && ` / pipes). "izba.yml" does NOT match (the
+# dot fails the trailing \s|$), so file-writing heredocs stay plumbing.
+_PRODUCT_CMD_RE = re.compile(r"(?:^|[\s;|&(])izba(?:\s|$)")
+
 
 def _collect_cmd_name(line: str, names: List[str]) -> None:
     """Append the command token on an indented clap entry line (skip ``help``/dups)."""
@@ -240,10 +246,10 @@ def _collect_candidates(action, command, action_index, prev_reconcile,
     ``reconcile_seq`` fire on EVERY action — a panic or a signal-death anywhere in
     the journey is a finding regardless of which step it happened in. The
     ``functional`` oracle is deliberately NOT here: it is graded once per step, on
-    the step's intent-bearing action (``expect_cmd_re``-selected, falling back to
-    the final action), by ``_grade_step_functional`` — so an intermediate
-    recovery action inside an otherwise-passing step no longer emits a spurious
-    functional candidate (the #111 setup-noise false-negative)."""
+    the step's intent-bearing action (``expect_cmd_re``-selected, else the last
+    izba-invoking action, else the final action), by ``_grade_step_functional`` —
+    so an intermediate recovery action inside an otherwise-passing step no longer
+    emits a spurious functional candidate (the #111 setup-noise false-negative)."""
     ref = {"journey_id": journey_id, "action_index": action_index}
     found = implicit_oracle(action) + latency_oracle(action, latency_budget_ms)
     if prev_reconcile is not None:
@@ -286,12 +292,13 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
                            action_index) -> List[Dict[str, Any]]:
     """Grade the functional assertion ONCE per step, on its intent-bearing action.
 
-    Default target is the step's FINAL action. When the step declares
-    ``expect_cmd_re`` (a regex), the target is the LAST action whose command
-    matches — so a trailing verify (`izba ls`) after a correct refusal no
-    longer false-fires, and a refusal followed by unrelated commands is still
-    the thing graded. Invalid regexes log + fall back to the final action.
-    Every candidate records ``graded_cmd`` so the skeptic sees WHAT was graded."""
+    Default target is the step's last action that INVOKES the izba binary
+    (falling back to the final action when none does); ``expect_cmd_re`` overrides.
+    When the step declares ``expect_cmd_re`` (a regex), the target is the LAST
+    action whose command matches — so a trailing verify (`izba ls`) after a correct
+    refusal no longer false-fires. Invalid regexes log + fall back to the final
+    action. Every candidate records ``graded_cmd`` so the skeptic sees WHAT was
+    graded."""
     if not produced:
         return []
     target = produced[-1]
@@ -308,6 +315,15 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
         except re.error as e:
             log(f"{journey_id}: invalid expect_cmd_re {pattern!r}: {e}; "
                 f"grading the final action")
+    else:
+        # H1: without expect_cmd_re, prefer the last action that invokes the
+        # product over trailing shell plumbing (seed-write heredocs, `ls`
+        # peeks). Nothing izba-shaped -> the final action, as before.
+        for off, a in enumerate(reversed(produced)):
+            if _PRODUCT_CMD_RE.search(a.get("command", "")):
+                target = a
+                target_index = action_index - off
+                break
     ref = {"journey_id": journey_id, "action_index": target_index}
     source = journey.get("source", {}).get("ref", "journey step")
     found = functional_oracle(

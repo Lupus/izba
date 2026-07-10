@@ -445,6 +445,49 @@ class SeedFilesTests(unittest.TestCase):
             run_journeys._write_seed_files(d, "not-a-dict")
 
 
+class ProductCommandGradingTest(unittest.TestCase):
+    def _produced(self):
+        # The izba command failed as expected (exit 2), then the model wrote a
+        # file with a heredoc as the step's FINAL action (exit 0).
+        return [
+            {"command": "izba promote .", "exit_code": 2},
+            {"command": "cat > izba.yml <<EOF\nfoo\nEOF", "exit_code": 0},
+        ]
+
+    def test_grades_last_izba_action_not_trailing_heredoc(self):
+        import run_journeys as rj
+        step = {"intent": "promote must refuse", "expect": "",
+                "expect_exit": "nonzero"}
+        cands = rj._grade_step_functional(
+            step, self._produced(), {}, "j1", True, action_index=1)
+        self.assertFalse(
+            cands, f"the izba action (exit 2) satisfies expect_exit=nonzero, "
+                   f"but the heredoc was graded: {cands}")
+
+    def test_falls_back_to_final_action_without_any_izba_command(self):
+        import run_journeys as rj
+        produced = [{"command": "ls -la", "exit_code": 0},
+                    {"command": "cat notes.txt", "exit_code": 1}]
+        step = {"intent": "x", "expect": "the listing succeeds"}
+        cands = rj._grade_step_functional(step, produced, {}, "j1", False,
+                                          action_index=1)
+        self.assertTrue(cands, "final action (exit 1) vs success expectation "
+                               "must still produce a candidate")
+        self.assertEqual(cands[0]["graded_cmd"], "cat notes.txt")
+
+    def test_expect_cmd_re_still_wins_over_izba_heuristic(self):
+        import run_journeys as rj
+        produced = [{"command": "izba diff .", "exit_code": 0},
+                    {"command": "izba promote .", "exit_code": 2},
+                    {"command": "echo done", "exit_code": 0}]
+        step = {"intent": "x", "expect": "", "expect_exit": 0,
+                "expect_cmd_re": r"izba diff"}
+        cands = rj._grade_step_functional(step, produced, {}, "j1", True,
+                                          action_index=2)
+        self.assertFalse(cands, f"expect_cmd_re selects `izba diff` (exit 0), "
+                                f"which matches expect_exit=0: {cands}")
+
+
 def _write_decisive_stub_izba(d):
     """Like _write_stub_izba but used for the decisive-grading integration test.
 
