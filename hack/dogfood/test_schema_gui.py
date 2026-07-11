@@ -225,11 +225,19 @@ def test_manifest_gui_corpus_validates_against_schema():
 
 
 def test_manifest_gui_corpus_core_counts():
-    # Every journey marks at most one decisive (core) step; a journey with
-    # NO core step (manifest-missing-manifest-guidance) is intentional — its
-    # manifest_diff call never carries a digest, so a core step there would
-    # falsely flip `unreached_decisive` (see the journey's own rationale).
+    # Every journey marks at most one decisive (core) step. The corpus was
+    # extended from 4 to the full 10-journey acceptance set (final-polish
+    # Fix 3, sourced from the run-4 confirming swarm's journeys-run4.json);
+    # 7 of the 10 declare a core step. The 3 without one are intentional:
+    # - manifest-missing-manifest-guidance: its manifest_diff call never
+    #   carries a digest (a rejected invoke), so a core step there would
+    #   falsely flip `unreached_decisive` (see the journey's own rationale).
+    # - manifest-stale-token-refusal / newsandbox-create-disabled-hints: no
+    #   manifest_diff surface to ground-truth at all; a lazy actor bail on
+    #   either is now caught instead by the H2 all-ambient-invoke_log check
+    #   in run_gui_journeys.py (_has_product_invoke), not the core-step path.
     doc = _load_manifest_gui_corpus()
+    assert len(doc["journeys"]) == 10
     for j in doc["journeys"]:
         n_core = sum(1 for s in j["steps"] if s.get("core"))
         assert n_core <= 1, j["journey_id"]
@@ -238,7 +246,15 @@ def test_manifest_gui_corpus_core_counts():
                 if any(s.get("core") for s in j["steps"])}
     assert with_core == {"manifest-open-tab-in-sync",
                          "manifest-seeded-drift-promote",
-                         "manifest-managed-ahead-export"}
+                         "manifest-managed-ahead-export",
+                         "manifest-weakens-egress-ack",
+                         "manifest-promote-live-running-no-restart",
+                         "manifest-promote-stopped-next-start",
+                         "manifest-diverged-rendering"}
+    without_core = {j["journey_id"] for j in doc["journeys"]} - with_core
+    assert without_core == {"manifest-missing-manifest-guidance",
+                            "manifest-stale-token-refusal",
+                            "newsandbox-create-disabled-hints"}
 
 
 def test_manifest_gui_managed_ahead_export_core_is_the_export_step():
