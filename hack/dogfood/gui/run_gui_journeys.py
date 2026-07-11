@@ -30,7 +30,7 @@ from oracles import (  # noqa: E402
     Action as _A, capture_state_evidence, latency_oracle, reconcile_seq_oracle,
 )
 from run_journeys import (  # noqa: E402
-    select_shard, _journey_data_dir, BudgetExceeded, count_degraded,
+    select_shard, _journey_data_dir, _write_seeds, BudgetExceeded, count_degraded,
     CATASTROPHIC_DEGRADED_FRACTION, EXIT_CATASTROPHIC_INFRA,
 )
 from gui.driver import (  # noqa: E402
@@ -131,29 +131,79 @@ def _infra_candidate(journey_id: str, detail: str) -> Dict[str, Any]:
     }
 
 
+def _substitute_workspace(text: Any, workspace: str) -> Any:
+    """Replace the literal ``{workspace}`` token with the journey's absolute
+    workspace path. Only that one token is templated — no other substitution.
+    Non-str input (or a falsy ``workspace``) passes through unchanged."""
+    if not isinstance(text, str) or not workspace:
+        return text
+    return text.replace("{workspace}", workspace)
+
+
+def _substitute_steps_workspace(steps: List[Dict[str, Any]],
+                                workspace: str) -> List[Dict[str, Any]]:
+    """Shallow-copy each step, substituting ``{workspace}`` in ``intent`` and
+    ``expect`` only (``seed_files`` and everything else pass through
+    untouched). Done ONCE up front so both the Actor loop (which reads
+    ``step['intent']`` every turn) and the end-of-journey dom_expect grading
+    (which reads ``steps[-1]['expect']``) see the same substituted text —
+    the substitution must land before ``expectation_keywords`` tokenizes it."""
+    if not workspace:
+        return steps
+    out = []
+    for step in steps:
+        s = dict(step)
+        if "intent" in s:
+            s["intent"] = _substitute_workspace(s.get("intent"), workspace)
+        if "expect" in s:
+            s["expect"] = _substitute_workspace(s.get("expect"), workspace)
+        out.append(s)
+    return out
+
+
 def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                     data_dir: str, max_turns: int, step_cap: int,
                     action_timeout_s: float, latency_budget_ms: int,
                     budget: Dict[str, float], max_usd: float,
                     artifact_dir: str = "",
-                    create_settle_s: float = 0.0) -> Dict[str, Any]:
+                    create_settle_s: float = 0.0,
+                    workspace: str = "") -> Dict[str, Any]:
     """Run one GUI journey under all caps. Returns a journey_result dict.
 
     ``create_settle_s`` bounds an end-of-journey wait for an in-flight async
     create/VM-boot to register a sandbox in the daemon before the final
     state-evidence snapshot (the GUI ``create`` invoke resolves asynchronously,
     so a journey can otherwise end before its sandbox appears). 0 disables it
-    (used by the unit tests, which mock the reconcile)."""
+    (used by the unit tests, which mock the reconcile).
+
+    ``workspace`` (Task 10) is a per-journey directory the GUI swarm can type
+    a real path into (e.g. the NewSandbox form) and that mid-journey
+    ``seed_files`` drift lands in — the GUI counterpart of the CLI runner's
+    ``workdir``. Journey-level ``seed_files`` are written there before step 0;
+    step-level ``seed_files`` immediately before that step's first action
+    (same timing semantics as ``run_journeys._run_step``). The literal token
+    ``{workspace}`` in a step's ``intent``/``expect`` is replaced with this
+    absolute path before the Actor or the dom_expect oracle ever see it."""
     journey_id = journey.get("journey_id", "")
     actions: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
     turns = 0
     console_seen = 0
     prev_reconcile: Optional[Dict[str, Any]] = None
+    ws_abs = os.path.abspath(workspace) if workspace else ""
+    if ws_abs:
+        os.makedirs(ws_abs, exist_ok=True)
     steps = journey.get("steps", []) or [{"intent": journey.get("rationale", ""),
                                           "expect": ""}]
+    steps = _substitute_steps_workspace(steps, ws_abs)
+    # Journey-level seed_files (precondition), written before step 0.
+    _write_seeds(ws_abs, journey.get("seed_files"))
     try:
         for step in steps:
+            # Step-level seed_files (mid-journey drift) land immediately
+            # before this step's first action — never inside its while loop,
+            # so they're written exactly once per step regardless of turns.
+            _write_seeds(ws_abs, step.get("seed_files"))
             seen: set = set()
             # Seed the Actor with the current screen so its FIRST decision sees
             # the accessibility marks (real refs to act on) rather than an empty
@@ -279,7 +329,8 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
         cd = c.to_dict(); cd["trajectory_ref"] = dict(final_ref)
         candidates.append(cd)
     return {"journey_id": journey_id, "actions": actions, "candidates": candidates,
-            "state_evidence": state_evidence, "invoke_log": invoke_log}
+            "state_evidence": state_evidence, "invoke_log": invoke_log,
+            "workspace": str(ws_abs)}
 
 
 # ---------- CI orchestration (static server + sidecar lifecycle) ----------
@@ -388,6 +439,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             jid = journey.get("journey_id") or ""
             jdir = _journey_data_dir(args.data_dir, jid)
             os.makedirs(jdir, exist_ok=True)
+            # Per-journey workspace (Task 10): created before the sidecar
+            # spawns so it's ready the instant the Actor's first turn starts.
+            workspace = os.path.join(jdir, "workspace")
+            os.makedirs(workspace, exist_ok=True)
             ws_port = _free_port()
             sidecar = _spawn_sidecar(args.sidecar_bin, jdir, ws_port)
             try:
@@ -411,7 +466,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     action_timeout_s=args.action_timeout_s,
                     latency_budget_ms=args.latency_budget_ms,
                     budget=budget, max_usd=args.max_usd, artifact_dir=args.artifact_dir,
-                    create_settle_s=args.create_settle_s)
+                    create_settle_s=args.create_settle_s, workspace=workspace)
                 driver.close()
                 results.append(res)
             except BudgetExceeded:
