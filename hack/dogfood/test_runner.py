@@ -825,6 +825,11 @@ class DecisiveByObservedCommandTest(unittest.TestCase):
         self.assertNotIn(
             "unreached_decisive", kinds,
             f"decisive assertion was exercised under step 0: {res['candidates']}")
+        # The credit itself must be recorded in the bundle so the Phase-3
+        # skeptic can audit it (Greptile P2: a silent pass left no artifact).
+        self.assertEqual(
+            res["decisive_credits"],
+            [{"step_index": 1, "action_index": 0, "graded_cmd": "true"}])
 
     def test_decisive_without_match_still_flags_unreached(self):
         import run_journeys as rj
@@ -842,6 +847,8 @@ class DecisiveByObservedCommandTest(unittest.TestCase):
                 latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
         kinds = [c.get("kind") for c in res["candidates"]]
         self.assertIn("unreached_decisive", kinds)
+        # No credit was made (nothing matched) — the audit trail stays empty.
+        self.assertEqual(res["decisive_credits"], [])
 
     def test_degenerate_expect_cmd_re_does_not_credit_unreached_decisive(self):
         # A decisive step declaring `expect_cmd_re: ".*"` matches EVERY action
