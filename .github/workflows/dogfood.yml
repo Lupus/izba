@@ -283,8 +283,18 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm || true
-          ls -l /dev/kvm
-          [ -r /dev/kvm ] && [ -w /dev/kvm ]
+          # /dev/kvm can take a few seconds to show up (or land with lagging
+          # perms) on hosted runners; poll instead of failing on the first
+          # check. If it never appears the runner genuinely lacks nested
+          # virt and failing is correct.
+          for i in $(seq 1 15); do
+            [ -r /dev/kvm ] && [ -w /dev/kvm ] && exit 0
+            sleep 2
+            sudo udevadm trigger --name-match=kvm || true
+          done
+          ls -l /dev/kvm || true
+          sudo dmesg | grep -i kvm | tail -5 || true
+          exit 1
       # virtiofsd --sandbox namespace mounts inside an unprivileged user
       # namespace, which the default Ubuntu 24.04 AppArmor restriction blocks.
       # Same relaxation as e2e.yml's linux-kvm gate. Guarded: the knob only
@@ -417,7 +427,18 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm || true
-          [ -r /dev/kvm ] && [ -w /dev/kvm ]
+          # /dev/kvm can take a few seconds to show up (or land with lagging
+          # perms) on hosted runners; poll instead of failing on the first
+          # check. If it never appears the runner genuinely lacks nested
+          # virt and failing is correct.
+          for i in $(seq 1 15); do
+            [ -r /dev/kvm ] && [ -w /dev/kvm ] && exit 0
+            sleep 2
+            sudo udevadm trigger --name-match=kvm || true
+          done
+          ls -l /dev/kvm || true
+          sudo dmesg | grep -i kvm | tail -5 || true
+          exit 1
       - name: Allow unprivileged user namespaces (virtiofsd --sandbox namespace)
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
