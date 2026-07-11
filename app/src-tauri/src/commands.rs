@@ -377,6 +377,10 @@ pub fn manifest_export_core(name: &str) -> Result<String, String> {
 /// (`izba-cli::commands::build::build_image`); the app surfaces a clear error
 /// instead of attempting it.
 pub fn manifest_promote_core(name: &str, restart: bool) -> Result<PromoteView, String> {
+    // CLI parity: `promote::run` trusts its caller to have validated the name
+    // (the CLI does this in `commands::promote::run`); `Paths::sandbox_dir`
+    // is a bare join, so validate before any path is derived from `name`.
+    izba_core::sandbox::validate_name(name).map_err(|e| e.to_string())?;
     let paths = app_paths();
     let ws = workspace_for(&paths, name)?;
     let opts = izba_core::manifest::promote::PromoteOpts {
@@ -983,6 +987,16 @@ mod tests {
         let _guard = HomeGuard::new();
         let err = manifest_promote_core("ghost", false).unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
+    }
+
+    /// CLI parity (final-review Minor): promote validates the name BEFORE any
+    /// path is derived from it — a traversal-shaped name must be rejected by
+    /// `validate_name`, never reach `Paths::sandbox_dir`'s bare join.
+    #[test]
+    fn manifest_promote_core_rejects_traversal_name() {
+        let _guard = HomeGuard::new();
+        let err = manifest_promote_core("../escape", false).unwrap_err();
+        assert!(err.contains("invalid sandbox name"), "got: {err}");
     }
 
     /// `app_paths()` must honor `IZBA_DATA_DIR` exactly like the CLI does —
