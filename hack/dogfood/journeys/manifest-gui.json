@@ -107,6 +107,183 @@
           "core": true
         }
       ]
+    },
+    {
+      "journey_id": "manifest-weakens-egress-ack",
+      "modality": "gui",
+      "tier": "core",
+      "rationale": "A promote that loosens the egress firewall must not sail through silently: izba.yml flips egress enforcement from on to off (a weakening the diff engine flags weakens_egress), the delta table must carry the red '⚠ weakens egress' marker, and the Promote confirm dialog must gate the Promote button behind an explicit acknowledgment checkbox before it will apply. egress is a live-class field, so no image-restart checkbox is in play — only the weakens-ack gate. core marks the repo_ahead diff view that renders the weakens marker; the ack+promote is dom_expect-graded and leaves the tab in-sync (post-journey ground truth), so the truth oracle's last digest matches.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.2 (weakens-egress acknowledgment) + §6; ManifestTab.tsx WEAKENS_ACK_LABEL + '⚠ weakens egress'; crates/izba-core/src/manifest/diff.rs egress_weakens; dogfood-app-guide.md 'weakens egress'"
+      },
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - example.com\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'manifest-weakens-demo' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "a sandbox named manifest-weakens-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the manifest-weakens-demo sandbox's detail view, click its Manifest tab, and click Refresh to review izba.yml's pending changes",
+          "expect": "the Manifest tab shows 'izba.yml has changes not yet applied. Review below, then Promote.' and the changed egress row carries a red '⚠ weakens egress' marker",
+          "core": true,
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: false\n    allow:\n      - example.com\n"
+          }
+        },
+        {
+          "intent": "click 'Promote…', try to confirm, notice the Promote button is not armed until you tick 'I understand this weakens the egress firewall', then tick it and confirm",
+          "expect": "the confirm dialog requires ticking 'I understand this weakens the egress firewall' before Promote is enabled, and after confirming it reports 'Promoted 1 change(s).'"
+        }
+      ]
+    },
+    {
+      "journey_id": "manifest-promote-live-running-no-restart",
+      "modality": "gui",
+      "tier": "core",
+      "rationale": "A live-class change (adding a published port) promoted onto a RUNNING sandbox must apply immediately with NO next-start caveat — distinguishing it from restart/image-class promotes. Run-3 revision: the GUI creates the sandbox STOPPED, so the journey now explicitly STARTS the sandbox and confirms it is running BEFORE seeding the drift and promoting — otherwise the 'live on a running sandbox' promise is never actually exercised (the run-2 miss). The port delta must be tagged 'live' and the promote outcome must apply immediately with no restart/stopped note. core marks the repo_ahead diff view; the promote is dom_expect-graded and refetches to in-sync.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.1 delta class chip + §6 promote happy path (live-class field, no restart); ManifestTab.tsx CLASS_TOOLTIP.live + showRestartNote/showRestartCheckbox; crates/izba-core/src/manifest/diff.rs ports->FieldClass::Live; dogfood-app-guide.md 'Start' / 'Manifest (izba.yml)'"
+      },
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'manifest-live-demo' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "a sandbox named manifest-live-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the manifest-live-demo sandbox's detail view and, on its Overview, click Start to boot the sandbox; wait until its status shows running",
+          "expect": "the manifest-live-demo sandbox is running"
+        },
+        {
+          "intent": "click the Manifest tab and click Refresh to review the pending izba.yml change",
+          "expect": "the Manifest tab shows 'izba.yml has changes not yet applied. Review below, then Promote.' and the changed ports row is tagged 'live'",
+          "core": true,
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  ports:\n    - guest: 8080\n      host: 8080\n"
+          }
+        },
+        {
+          "intent": "click 'Promote…' and confirm the change in the dialog",
+          "expect": "the dialog reports 'Promoted 1 change(s).' applied immediately, with no 'apply on next start' or 'Sandbox is stopped' caveat, and the banner returns to 'In sync — izba.yml and managed settings match.'"
+        }
+      ]
+    },
+    {
+      "journey_id": "manifest-promote-stopped-next-start",
+      "modality": "gui",
+      "tier": "core",
+      "rationale": "Promoting a change to a STOPPED sandbox must tell the user it takes effect on the next start rather than pretending it applied live. Run-3 revision: the GUI already creates the sandbox STOPPED, so the earlier explicit Stop step is dropped (a stopped sandbox shows a Start control, not Stop — the old step was unreachable). A resources (cpus) change is restart-class but NOT image-class, so no promote-gate checkbox blocks it; the outcome must carry the 'Sandbox is stopped — changes apply on next start' note. core marks the repo_ahead diff view; the promote is dom_expect-graded and refetches to in-sync.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.2 confirm dialog restart implications + §6 promote on stopped sandbox; ManifestTab.tsx 'Sandbox is stopped — changes apply on next start.' + RESTART_NOTE; crates/izba-core/src/manifest/diff.rs cpus->FieldClass::Restart"
+      },
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'manifest-stopped-demo' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "a sandbox named manifest-stopped-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the manifest-stopped-demo sandbox's detail view, click the Manifest tab, and click Refresh to review the pending izba.yml change",
+          "expect": "the Manifest tab shows 'izba.yml has changes not yet applied. Review below, then Promote.' with a row changing cpus from 2 to 4",
+          "core": true,
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  resources:\n    cpus: 4\n"
+          }
+        },
+        {
+          "intent": "click 'Promote…' and confirm the change in the dialog",
+          "expect": "the dialog reports 'Promoted 1 change(s).' and notes 'Sandbox is stopped — changes apply on next start.'"
+        }
+      ]
+    },
+    {
+      "journey_id": "manifest-diverged-rendering",
+      "modality": "gui",
+      "tier": "core",
+      "rationale": "When BOTH sides change — the user edits managed truth via the Policy tab AND izba.yml is edited independently — the tab must render the diverged banner that explains Promote applies izba.yml while Export overwrites it, rather than mislabeling one side. Cheaply reachable by combining a policy-edit (managed drift) with a seeded izba.yml image change (repo drift). core marks the diverged diff view; the journey ends there so post-journey ground truth stays diverged and matches the last UI digest.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.1 diverged state + §6 drift rendering per state; ManifestTab.tsx BANNER_TEXT.diverged; dogfood-app-guide.md 'Diverged'"
+      },
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'manifest-diverged-demo' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "a sandbox named manifest-diverged-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the manifest-diverged-demo sandbox's detail view, click its Policy tab, click 'Add host', type 'example.com' into the new row's Host field, then click Save",
+          "expect": "the Policy tab shows 'saved · reloaded'"
+        },
+        {
+          "intent": "click the Manifest tab and click Refresh to compare izba.yml with the live settings",
+          "expect": "the Manifest tab shows 'Both izba.yml and managed settings changed. Promote applies izba.yml; Export overwrites it.'",
+          "core": true,
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.21\n"
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "manifest-stale-token-refusal",
+      "modality": "gui",
+      "tier": "deep",
+      "rationale": "The review-token TOCTOU guard: after the user reviews a diff, if izba.yml changes again before they Promote (without re-reviewing), Promote must refuse and tell them to Refresh and review again — no silent apply of unreviewed bytes. Run-3 revision: the two seeded edits are now ports (live-class) changes, NOT image changes — an image delta would trip the new client-side image-restart gate (`requiresRestartForImage` disables Promote until the stopped-image checkbox is ticked), which would prevent the click from ever reaching the backend token check. A ports change is live-class, so Promote is directly clickable and the backend stale-token refusal is what surfaces. NOT marked core: the decisive assertion is a refusal error surfaced in the promote dialog (dom_expect), not a fresh manifest_diff digest; both seeded edits are single ports-live deltas so any digest comparison still agrees (repo_ahead / 1 delta / no weakens).",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.2 review-token parity / stale-token refusal + §6; ManifestTab.tsx STALE_TOKEN_ERROR + mapPromoteError; dogfood-app-guide.md 'Refresh re-reads both sides'"
+      },
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'manifest-stale-demo' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "a sandbox named manifest-stale-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the manifest-stale-demo sandbox's detail view, click its Manifest tab, and click Refresh to review the pending izba.yml change",
+          "expect": "the Manifest tab shows 'izba.yml has changes not yet applied. Review below, then Promote.' with a published-port change (host 8080)",
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  ports:\n    - guest: 8080\n      host: 8080\n"
+          }
+        },
+        {
+          "intent": "without clicking Refresh again, click 'Promote…' and confirm Promote in the dialog (izba.yml has since changed on disk once more)",
+          "expect": "Promote is refused with the message 'izba.yml changed since you viewed this diff. Refresh and review again.'",
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  ports:\n    - guest: 9090\n      host: 9090\n"
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "newsandbox-create-disabled-hints",
+      "modality": "gui",
+      "tier": "core",
+      "rationale": "The P1 from the first GUI run: a disabled Create button with no explanation. With required fields empty the dialog must name exactly what's missing beneath the button instead of leaving Create inertly greyed out. No sandbox is created and no manifest_diff runs, so this is core-less and dom_expect-graded on the inline hint copy.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.4 NewSandbox feedback fix + §6 NewSandbox validation feedback; NewSandbox.tsx createBlockers ('Name is required.' / 'Workspace folder is required.'); dogfood-app-guide.md 'If Create stays disabled, look just below the button'"
+      },
+      "steps": [
+        {
+          "intent": "open the New sandbox dialog, clear the Name field, and leave the Workspace folder empty, then look at the Create button",
+          "expect": "Create is disabled and inline hints beneath it read 'Name is required.' and 'Workspace folder is required.', naming exactly what must be filled in"
+        }
+      ]
     }
   ]
 }
