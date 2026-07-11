@@ -2,7 +2,7 @@
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gui.driver import FakeDriver
-from gui.run_gui_journeys import run_gui_journey, select_gui_journeys
+from gui.run_gui_journeys import parse_args, run_gui_journey, select_gui_journeys
 from model import FakeModel
 
 
@@ -45,6 +45,19 @@ def test_select_gui_journeys_filters_modality():
     js = [{"journey_id": "a", "modality": "gui"}, {"journey_id": "b"},
           {"journey_id": "c", "modality": "cli"}]
     assert [j["journey_id"] for j in select_gui_journeys(js)] == ["a"]
+
+
+def test_max_turns_default_is_20():
+    # H2 (run-3 skeptic): 14 starved multi-phase manifest journeys before
+    # their decisive step (manifest-diverged-rendering never reached the
+    # Manifest tab). dogfood.yml's GUI job passes no `--max-turns`, so this
+    # default IS the effective CI value — pin it so a future edit can't
+    # silently regress it back down.
+    args = parse_args([
+        "--journeys", "j.json", "--izba-bin", "izba",
+        "--sidecar-bin", "sidecar", "--frontend-dir", "dist",
+        "--data-dir", "/tmp/d", "--out", "out.json"])
+    assert args.max_turns == 20
 
 
 def test_run_gui_journey_happy_path_records_actions_and_state(monkeypatch):
