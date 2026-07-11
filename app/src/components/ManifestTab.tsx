@@ -83,6 +83,22 @@ function mapPromoteError(message: string): string {
   return message;
 }
 
+const SCRATCH_KEPT_WARNING =
+  "Note: the scratch disk was kept. If the sandbox misbehaves on the new image, recreate it or reset from the CLI.";
+
+/** Same belt-and-braces substring mapping as `mapPromoteError`, but for
+ *  `promoteOutcome.warnings` on the SUCCESS path. The app's promote bridge
+ *  (`manifest_promote_core` in `app/src-tauri/src/commands.rs`) hardcodes
+ *  `reset_scratch: false`, so the core's expert `--reset-scratch=false`
+ *  warning (promote.rs's `emit_warn` when `image_changed && !reset_scratch`)
+ *  fires on essentially every image-class promote from the GUI — raw
+ *  CLI-speak naming a flag with no GUI equivalent. Anything else (e.g. "port
+ *  8080 already published") passes through unchanged. */
+function mapPromoteWarning(message: string): string {
+  if (message.includes("--reset-scratch")) return SCRATCH_KEPT_WARNING;
+  return message;
+}
+
 /** Drift view over `izba.yml` vs. the host-managed truth: a banner keyed on
  *  `DriftState`, a per-field delta table, Export, and a Promote confirm
  *  dialog (weakens-egress acknowledgment, optional restart, outcome/error
@@ -312,7 +328,7 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
               {promoteOutcome.needs_restart && <div>Some changes apply on the next restart.</div>}
               {promoteOutcome.warnings.map((w) => (
                 <div key={w} className="text-destructive">
-                  {w}
+                  {mapPromoteWarning(w)}
                 </div>
               ))}
             </div>
