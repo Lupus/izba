@@ -166,6 +166,60 @@ def test_invoke_log_persisted_in_result(monkeypatch):
     assert res["invoke_log"] == invoke_log
 
 
+def test_daemon_spawn_failures_fold_to_one_infra_and_suppress_silent_failure(monkeypatch):
+    # A daemon that can't spawn rejects every invoke identically: this must
+    # not tally as one silent_failure candidate per rejected invoke (noise
+    # that masks the real root cause) — it folds into a single flipping infra
+    # candidate, and the matching invoke-log entries are excluded from the
+    # silent_failure oracle.
+    model = FakeModel([{"done": True}])
+    spawn_err = ('spawning ["izba", "daemon", "run"]: '
+                 'No such file or directory (os error 2)')
+    invoke_log = [{"cmd": "list", "ok": False, "error": spawn_err},
+                  {"cmd": "create", "ok": False, "error": spawn_err}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"',
+                                   '[@e1] heading "Sandboxes"'],
+                        invoke_log=invoke_log)
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j-spawn-fail", "modality": "gui",
+               "steps": [{"intent": "look at the list", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+    assert len(infra) == 1
+    assert "daemon failed to spawn" in infra[0]["detail"]
+    assert "spawning [" in infra[0]["detail"]
+    assert [c for c in res["candidates"] if c["kind"] == "silent_failure"] == []
+    # The raw invoke_log is still persisted verbatim for the skeptic.
+    assert res["invoke_log"] == invoke_log
+
+
+def test_non_spawn_rejection_still_flags_silent_failure(monkeypatch):
+    # Regression: only 'spawning [...]' rejections are folded — every other
+    # rejected invoke keeps the normal per-entry silent_failure treatment.
+    model = FakeModel([{"done": True}])
+    invoke_log = [{"cmd": "create", "ok": False, "error": "boom"}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"',
+                                   '[@e1] heading "Sandboxes"'],
+                        invoke_log=invoke_log)
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j-other-fail", "modality": "gui",
+               "steps": [{"intent": "look at the list", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    silent = [c for c in res["candidates"] if c["kind"] == "silent_failure"]
+    assert len(silent) == 1
+    assert [c for c in res["candidates"] if c["kind"] == "infra"] == []
+
+
 def test_console_errors_are_per_action_deltas(monkeypatch):
     # FakeDriver.read_console_errors returns a GROWING cumulative list: ["e1"]
     # after action 1, ["e1", "e2"] after action 2. Each action must record
@@ -229,6 +283,42 @@ def test_reconcile_snapshot_failure_carries_error_key():
     assert "error" in snap
     assert snap["violations"] == []
     assert snap["sandboxes"] == []
+
+
+def test_spawn_sidecar_prepends_izba_dir_to_path(monkeypatch, tmp_path):
+    # The sidecar's DaemonClient::connect_spawning_izba resolves 'izba' via
+    # PATH when there's no sibling next to its own current_exe (true for a
+    # CI-built sidecar). _spawn_sidecar must therefore prepend the izba
+    # binary's directory to the child's PATH so every daemon-touching invoke
+    # doesn't fail with 'spawning ["izba", ...]'.
+    import gui.run_gui_journeys as rgj
+
+    izba_dir = str(tmp_path / "targetdir")
+    os.makedirs(izba_dir, exist_ok=True)
+    izba_bin = os.path.join(izba_dir, "izba")
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, argv, env=None, **kw):
+            captured["argv"] = argv
+            captured["env"] = env
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(rgj.subprocess, "Popen", _FakePopen)
+    rgj._spawn_sidecar("/some/sidecar-bin", izba_bin, str(tmp_path / "d"), 12345)
+    assert captured["argv"] == ["/some/sidecar-bin"]
+    path_entries = captured["env"]["PATH"].split(os.pathsep)
+    assert path_entries[0] == izba_dir
+    assert captured["env"]["IZBA_DATA_DIR"] == str(tmp_path / "d")
+    assert captured["env"]["IZBA_DOGFOOD_WS_PORT"] == "12345"
 
 
 def test_sidecar_startup_failure_records_infra_candidate(monkeypatch, tmp_path):
