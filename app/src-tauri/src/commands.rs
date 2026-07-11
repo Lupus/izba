@@ -255,6 +255,15 @@ fn workspace_for(paths: &Paths, name: &str) -> Result<PathBuf, String> {
     Ok(cfg.workspace)
 }
 
+/// The exact error string `manifest_diff_core` returns when the sandbox's
+/// workspace has no `izba.yml` at all. ManifestTab.tsx keys its "No izba.yml
+/// found" guidance panel on this substring — a CORRUPT-but-present izba.yml
+/// must NOT match it (that's a parse error from `compute_diff`, which also
+/// happens to mention "izba.yml" in its message, e.g. `Manifest::load_str`'s
+/// `.context("parsing izba.yml")`; it has to flow through as a raw, honest
+/// error instead of being mislabeled "file doesn't exist").
+pub const NO_MANIFEST_ERROR: &str = "no izba.yml found in workspace";
+
 /// Core of `manifest_diff`: compute the structural diff between the sandbox's
 /// recorded workspace `izba.yml` and the managed truth for sandbox `name`.
 /// WRITES the review token — rendering the diff to the user IS the review
@@ -262,6 +271,9 @@ fn workspace_for(paths: &Paths, name: &str) -> Result<PathBuf, String> {
 pub fn manifest_diff_core(name: &str) -> Result<DiffView, String> {
     let paths = app_paths();
     let ws = workspace_for(&paths, name)?;
+    if !ws.join("izba.yml").exists() {
+        return Err(NO_MANIFEST_ERROR.to_string());
+    }
     let (state, deltas, token) =
         izba_core::manifest::ops::compute_diff(&paths, &ws, name).map_err(|e| e.to_string())?;
     store::write_review(&paths.sandbox_dir(name), &token).map_err(|e| e.to_string())?;
@@ -610,11 +622,25 @@ mod tests {
     /// `<data>/sandboxes/<name>/` recording that workspace — the on-disk
     /// shape `workspace_for` reads. Returns `(Paths, workspace dir)`.
     fn setup_sandbox(guard: &HomeGuard, name: &str) -> (Paths, PathBuf) {
+        setup_sandbox_with_manifest(guard, name, Some(MINIMAL_MANIFEST))
+    }
+
+    /// Same as `setup_sandbox`, but `manifest` controls what (if anything) is
+    /// written to the workspace's `izba.yml`: `Some(content)` writes it
+    /// verbatim (letting a test seed a corrupt document), `None` leaves the
+    /// workspace without an `izba.yml` at all (the genuinely-missing case).
+    fn setup_sandbox_with_manifest(
+        guard: &HomeGuard,
+        name: &str,
+        manifest: Option<&str>,
+    ) -> (Paths, PathBuf) {
         let paths = Paths::from_env_or_default(None);
 
         let ws = guard.home.join("ws").join(name);
         std::fs::create_dir_all(&ws).unwrap();
-        std::fs::write(ws.join("izba.yml"), MINIMAL_MANIFEST).unwrap();
+        if let Some(content) = manifest {
+            std::fs::write(ws.join("izba.yml"), content).unwrap();
+        }
 
         let sandbox_dir = paths.sandbox_dir(name);
         std::fs::create_dir_all(&sandbox_dir).unwrap();
@@ -659,6 +685,34 @@ mod tests {
         let _guard = HomeGuard::new();
         let err = manifest_diff_core("ghost").unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
+    }
+
+    /// A workspace with no `izba.yml` at all must fail with the exact stable
+    /// sentinel `NO_MANIFEST_ERROR` — ManifestTab.tsx keys its "No izba.yml
+    /// found" guidance panel on this string.
+    #[test]
+    fn manifest_diff_core_no_manifest_file_err() {
+        let guard = HomeGuard::new();
+        let name = "web";
+        setup_sandbox_with_manifest(&guard, name, None);
+
+        let err = manifest_diff_core(name).unwrap_err();
+        assert_eq!(err, NO_MANIFEST_ERROR);
+    }
+
+    /// A CORRUPT (present but unparseable) `izba.yml` must NOT be classified
+    /// as "missing" — its error must flow through as the raw parse failure,
+    /// not the `NO_MANIFEST_ERROR` sentinel, so the frontend renders it
+    /// honestly instead of telling the user the file doesn't exist.
+    #[test]
+    fn manifest_diff_core_parse_error_is_not_missing_manifest() {
+        let guard = HomeGuard::new();
+        let name = "web";
+        setup_sandbox_with_manifest(&guard, name, Some("not: [valid, izba.yml"));
+
+        let err = manifest_diff_core(name).unwrap_err();
+        assert_ne!(err, NO_MANIFEST_ERROR, "got: {err}");
+        assert!(err.contains("parsing izba.yml"), "got: {err}");
     }
 
     #[test]
