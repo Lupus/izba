@@ -239,6 +239,46 @@ describe("ManifestTab promote dialog", () => {
     await waitFor(() => expect(api.manifestDiff).toHaveBeenCalledTimes(2));
   });
 
+  it("maps the core's --reset-scratch expert warning to friendly copy, leaving other warnings passed through", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "image", from: "alpine:3.20", to: "alpine:3.21", class: "image", weakens_egress: false }],
+    });
+    (api.manifestPromote as Mock).mockResolvedValue(
+      promoteView({
+        applied: [{ field: "image", from: "alpine:3.20", to: "alpine:3.21", class: "image", weakens_egress: false }],
+        restarted: true,
+        warnings: [
+          "WARNING: --reset-scratch=false keeps the rw overlay built on the PREVIOUS image. " +
+            "Packages installed (e.g. apt-get) against the old base may have missing libs / " +
+            "wrong ABI on the new image and can render the guest UNBOOTABLE. Proceed only if " +
+            "you understand overlay semantics.",
+          "port 8080 already published",
+        ],
+      }),
+    );
+    render(<ManifestTab name="web" running={false} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "Start the sandbox to apply the image change (the scratch disk is kept, not reset)",
+      }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /^promote$/i }));
+
+    expect(
+      await within(dialog).findByText(
+        "Note: the scratch disk was kept. If the sandbox misbehaves on the new image, recreate it or reset from the CLI.",
+      ),
+    ).toBeInTheDocument();
+    expect(within(dialog).queryByText(/--reset-scratch/)).not.toBeInTheDocument();
+    // Unmapped warnings still pass through verbatim.
+    expect(within(dialog).getByText("port 8080 already published")).toBeInTheDocument();
+  });
+
   it("shows a restart checkbox for a restart-class delta while running and promotes with restart=true", async () => {
     (api.manifestDiff as Mock).mockResolvedValue({
       state: "repo_ahead",
