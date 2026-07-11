@@ -315,18 +315,22 @@ async fn volume_detach(
 }
 
 #[tauri::command]
-async fn manifest_diff(_workspace: String, name: String) -> Result<DiffView, String> {
-    // Task 2 made the core name-only (config.json is the workspace source of
-    // truth, never a frontend-supplied path); `_workspace` stays on the wire
-    // until Task 3 updates the frontend invocation.
+async fn manifest_diff(name: String) -> Result<DiffView, String> {
     tauri::async_runtime::spawn_blocking(move || commands::manifest_diff_core(&name))
         .await
         .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-async fn manifest_export(_workspace: String, name: String) -> Result<String, String> {
+async fn manifest_export(name: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || commands::manifest_export_core(&name))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn manifest_promote(name: String, restart: bool) -> Result<views::PromoteView, String> {
+    tauri::async_runtime::spawn_blocking(move || commands::manifest_promote_core(&name, restart))
         .await
         .map_err(|e| format!("task join error: {e}"))?
 }
@@ -497,6 +501,18 @@ pub fn dispatch(
         "shell_open" | "shell_write" | "shell_resize" | "shell_close" => {
             Err("shell not supported in dogfood headless (deferred)".to_string())
         }
+        "manifest_diff" => to_json(commands::manifest_diff_core(&arg_str(&args, "name")?)?),
+        "manifest_export" => to_json(commands::manifest_export_core(&arg_str(&args, "name")?)?),
+        "manifest_promote" => {
+            let restart = args
+                .get("restart")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            to_json(commands::manifest_promote_core(
+                &arg_str(&args, "name")?,
+                restart,
+            )?)
+        }
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -550,7 +566,8 @@ pub fn run() {
             shell_resize,
             shell_close,
             manifest_diff,
-            manifest_export
+            manifest_export,
+            manifest_promote
         ])
         .run(tauri::generate_context!())
         .expect("error while running izba app");
@@ -596,5 +613,47 @@ mod dispatch_tests {
             &mut emit,
         );
         assert!(e.is_err());
+    }
+
+    #[test]
+    fn dispatch_manifest_diff_unknown_sandbox() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let err = dispatch(
+            &st,
+            "manifest_diff",
+            serde_json::json!({"name": "ghost"}),
+            &mut emit,
+        )
+        .unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_manifest_export_unknown_sandbox() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let err = dispatch(
+            &st,
+            "manifest_export",
+            serde_json::json!({"name": "ghost"}),
+            &mut emit,
+        )
+        .unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_manifest_promote_unknown_sandbox() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let err = dispatch(
+            &st,
+            "manifest_promote",
+            serde_json::json!({"name": "ghost", "restart": false}),
+            &mut emit,
+        )
+        .unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
     }
 }

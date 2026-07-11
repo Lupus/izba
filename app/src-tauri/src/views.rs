@@ -306,9 +306,6 @@ impl DiffView {
 /// Result of a `manifest_promote` run, mapped for the frontend. Mirrors
 /// `DiffView`'s state/class vocabulary (via the shared helpers above) so the
 /// promote confirmation view and the diff preview read consistently.
-// See the matching #[allow(dead_code)] on `commands::manifest_promote_core`:
-// unreached until Task 3 wires the `manifest_promote` shim in the same PR.
-#[allow(dead_code)]
 #[derive(Serialize, Debug)]
 pub struct PromoteView {
     /// "in_sync" | "repo_ahead" | "managed_ahead" | "diverged" — the 3-way
