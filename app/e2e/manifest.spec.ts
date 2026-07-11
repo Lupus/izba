@@ -50,7 +50,18 @@ test.describe("manifest tab", () => {
       page.getByText("Live settings have drifted from izba.yml. Export to capture them."),
     ).toBeVisible();
 
+    // Real Export writes izba.yml to match managed truth, so the next
+    // manifest_diff reads in_sync; mirror that in the mock so this test
+    // exercises the post-export refetch, not a stale managed_ahead re-render.
+    await page.evaluate(setMockManifest, { diff: { state: "in_sync", deltas: [] } });
     await page.getByRole("button", { name: "Export to izba.yml" }).click();
+
+    // The export confirmation must survive the refetch it triggers, and the
+    // banner must flip to in_sync — not stay on the stale managed_ahead
+    // reading (the bug this journey guards against).
     await expect(page.getByText("Exported to /ws/izba.yml")).toBeVisible();
+    await expect(
+      page.getByText("In sync — izba.yml and managed settings match."),
+    ).toBeVisible();
   });
 });

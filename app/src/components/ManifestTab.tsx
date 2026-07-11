@@ -76,17 +76,26 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
   const [promoteError, setPromoteError] = useState<string | null>(null);
   const [promoteOutcome, setPromoteOutcome] = useState<PromoteView | null>(null);
 
-  const load = useCallback(() => {
-    setError(null);
-    setExportedPath(null);
-    api
-      .manifestDiff(name)
-      .then((d) => setDiff(d))
-      .catch((e: unknown) => {
-        setDiff(null);
-        setError(e instanceof Error ? e.message : String(e));
-      });
-  }, [name]);
+  // `keepExportBanner` lets `doExport` below re-fetch the diff after a
+  // successful export WITHOUT wiping the "Exported to ..." confirmation it
+  // just set — mirroring how `confirmPromote`'s refetch never touches
+  // `promoteOutcome`. Every other caller (mount/name-change below, the
+  // Refresh button) omits it and gets the pre-fix behavior: a fresh
+  // `manifestDiff` clears any stale export confirmation.
+  const load = useCallback(
+    (keepExportBanner = false) => {
+      setError(null);
+      if (!keepExportBanner) setExportedPath(null);
+      api
+        .manifestDiff(name)
+        .then((d) => setDiff(d))
+        .catch((e: unknown) => {
+          setDiff(null);
+          setError(e instanceof Error ? e.message : String(e));
+        });
+    },
+    [name],
+  );
 
   useEffect(() => {
     load();
@@ -98,6 +107,15 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
     try {
       const path = await api.manifestExport(name);
       setExportedPath(path);
+      // Re-fetch the diff so the banner/digest reflect the just-exported,
+      // now-in-sync state — without this, the banner stayed on its
+      // pre-export reading (e.g. "Live settings have drifted...") even
+      // though the file on disk now matches, and the dogfood truth oracle's
+      // last-seen digest (managed_ahead) permanently mismatched the
+      // post-export ground truth (in_sync). Mirrors `confirmPromote`, which
+      // already refetches after a successful promote. `keepExportBanner`
+      // keeps the "Exported to ..." line alive across that refetch.
+      load(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

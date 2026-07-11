@@ -74,7 +74,7 @@ describe("ManifestTab", () => {
     expect(exportBtn).toHaveAttribute("title", "Nothing to export — no managed-side drift.");
   });
 
-  it("enables Export on managed_ahead and reports the exported path after a click", async () => {
+  it("enables Export on managed_ahead, reports the exported path, and refetches the diff so the banner is no longer stale", async () => {
     (api.manifestDiff as Mock).mockResolvedValue({ state: "managed_ahead", deltas: [] });
     (api.manifestExport as Mock).mockResolvedValue("/ws/izba.yml");
     render(<ManifestTab name="web" running={true} />);
@@ -83,10 +83,23 @@ describe("ManifestTab", () => {
     expect(exportBtn).not.toBeDisabled();
     // Promote stays disabled — managed_ahead has nothing repo-side to promote.
     expect(screen.getByRole("button", { name: /^promote…$/i })).toBeDisabled();
+    expect(api.manifestDiff).toHaveBeenCalledTimes(1);
 
+    // The diff flips to in_sync once the export lands — mirrors the real
+    // backend, where manifest_export writes izba.yml to match managed truth.
+    (api.manifestDiff as Mock).mockResolvedValue({ state: "in_sync", deltas: [] });
     fireEvent.click(exportBtn);
     await waitFor(() => expect(api.manifestExport).toHaveBeenCalledWith("web"));
+
+    // The export confirmation must survive the post-export refetch...
     expect(await screen.findByText("Exported to /ws/izba.yml")).toBeInTheDocument();
+    // ...and manifestDiff must have been re-called (not left showing the
+    // stale managed_ahead banner/digest) so the in_sync banner now shows too.
+    await waitFor(() => expect(api.manifestDiff).toHaveBeenCalledTimes(2));
+    expect(
+      await screen.findByText("In sync — izba.yml and managed settings match."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Exported to /ws/izba.yml")).toBeInTheDocument();
   });
 
   it("enables both Promote and Export on diverged", async () => {
