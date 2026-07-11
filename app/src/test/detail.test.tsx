@@ -21,6 +21,9 @@ vi.mock("../components/FirewallStatus", () => ({
 vi.mock("../components/ShellPanel", () => ({
   ShellPanel: ({ sandbox }: { sandbox: string }) => <div>shell-for-{sandbox}</div>,
 }));
+vi.mock("../components/ManifestTab", () => ({
+  ManifestTab: ({ name }: { name: string }) => <div>manifest-for-{name}</div>,
+}));
 
 const noop = () => {};
 
@@ -115,6 +118,13 @@ describe("Detail tabs", () => {
     render(<Detail sandbox={sbx} onChanged={noop} />);
     fireEvent.click(screen.getByRole("tab", { name: /logs/i }));
     expect(screen.getByText("logs-for-web")).toBeInTheDocument();
+  });
+
+  it("has a Manifest tab that switches to the ManifestTab", () => {
+    const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
+    render(<Detail sandbox={sbx} onChanged={noop} />);
+    fireEvent.click(screen.getByRole("tab", { name: /^manifest$/i }));
+    expect(screen.getByText("manifest-for-web")).toBeInTheDocument();
   });
 
   it("shows the shell for a running sandbox and a hint when stopped", () => {
