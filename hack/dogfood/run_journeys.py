@@ -122,6 +122,14 @@ _CMD_ENTRY_RE = re.compile(r"^\s+([a-z][a-z0-9_-]*)\b")
 # dot fails the trailing \s|$), so file-writing heredocs stay plumbing.
 _PRODUCT_CMD_RE = re.compile(r"(?:^|[\s;|&(])izba(?:\s|$)")
 
+# Crediting an UNREACHED decisive step (H3) demands a stricter bar than
+# per-step grading: the matched action must be an actual product invocation —
+# `izba` in COMMAND POSITION (start of a shell segment: begin / && / || / ; /
+# | / subshell, optionally after env assignments) — so a broad-but-valid
+# expect_cmd_re can never credit prose like `echo izba` or a filename match.
+_CREDIT_CMD_RE = re.compile(
+    r"(?:^|&&|\|\||;|\||\()\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*izba\s")
+
 
 def _collect_cmd_name(line: str, names: List[str]) -> None:
     """Append the command token on an indented clap entry line (skip ``help``/dups)."""
@@ -497,7 +505,10 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id):
     patterns here, every credit is recorded verbatim by the caller into the
     journey's ``decisive_credits``: a decisive step credited from another
     step's action is a CLAIM the Phase-3 skeptic must be able to see and
-    audit, including when the grade was a silent pass."""
+    audit, including when the grade was a silent pass. Crediting DOES require
+    the match to be an izba invocation in command position (``_CREDIT_CMD_RE``)
+    — pattern breadth alone can no longer credit shell plumbing like
+    ``echo izba`` or a filename mention."""
     pattern = step.get("expect_cmd_re")
     if not (isinstance(pattern, str) and pattern):
         return None
@@ -513,6 +524,8 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id):
     for idx in range(len(actions) - 1, -1, -1):
         a = actions[idx]
         if not rx.search(a.get("command", "")):
+            continue
+        if not _CREDIT_CMD_RE.search(a.get("command", "")):
             continue
         ref = {"journey_id": journey_id, "action_index": idx}
         source = journey.get("source", {}).get("ref", "journey step")

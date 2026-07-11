@@ -803,22 +803,24 @@ class DecisiveByObservedCommandTest(unittest.TestCase):
     def test_decisive_satisfied_under_earlier_step_is_not_unreached(self):
         import run_journeys as rj
         from model import FakeModel
-        # Step 0's model turn runs the DECISIVE command (izba diff) and then the
-        # model goes done for the rest; step 1 (core) produces no actions.
+        # Step 0's model turn runs the DECISIVE command (a real izba-shaped
+        # invocation, via the stub izba on PATH) and then the model goes done
+        # for the rest; step 1 (core) produces no actions.
         model = FakeModel([
-            {"command": "true"},   # any benign shell action for step 0
-            {"done": True},        # step 0 ends
-            {"done": True},        # step 1 produces nothing
+            {"command": "izba ls"},  # a real product invocation for step 0
+            {"done": True},          # step 0 ends
+            {"done": True},          # step 1 produces nothing
         ])
         journey = {"journey_id": "early-decisive",
                    "steps": [
                        {"intent": "explore", "expect": ""},
                        {"intent": "verify drift shows", "expect": "",
                         "core": True, "expect_exit": 0,
-                        "expect_cmd_re": r"\btrue\b"}]}
+                        "expect_cmd_re": r"izba ls"}]}
         with tempfile.TemporaryDirectory() as td:
+            stub = _write_decisive_stub_izba(td)
             res = rj.run_journey(
-                model, journey, izba_bin="/bin/false", data_dir=td,
+                model, journey, izba_bin=stub, data_dir=td,
                 max_turns=8, step_cap=8, action_timeout_s=10,
                 latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
         kinds = [c.get("kind") for c in res["candidates"]]
@@ -829,7 +831,37 @@ class DecisiveByObservedCommandTest(unittest.TestCase):
         # skeptic can audit it (Greptile P2: a silent pass left no artifact).
         self.assertEqual(
             res["decisive_credits"],
-            [{"step_index": 1, "action_index": 0, "graded_cmd": "true"}])
+            [{"step_index": 1, "action_index": 0, "graded_cmd": "izba ls"}])
+
+    def test_non_product_command_does_not_credit_unreached_decisive(self):
+        # Greptile P1: a broad-but-valid expect_cmd_re (e.g. bare `izba`) must
+        # NOT be satisfied by a non-product command like `echo izba diff
+        # looks-good` from an earlier step — only an actual izba invocation in
+        # command position can credit an unreached decisive step.
+        import run_journeys as rj
+        from model import FakeModel
+        model = FakeModel([
+            {"command": "echo izba diff looks-good"},  # prose, not a product call
+            {"done": True},   # step 0 ends
+            {"done": True},   # step 1 (core) produces nothing
+        ])
+        journey = {"journey_id": "echo-not-credited",
+                   "steps": [
+                       {"intent": "explore", "expect": ""},
+                       {"intent": "verify drift shows", "expect": "",
+                        "core": True, "expect_exit": 0,
+                        "expect_cmd_re": r"izba"}]}
+        with tempfile.TemporaryDirectory() as td:
+            res = rj.run_journey(
+                model, journey, izba_bin="/bin/false", data_dir=td,
+                max_turns=8, step_cap=8, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
+        kinds = [c.get("kind") for c in res["candidates"]]
+        self.assertIn(
+            "unreached_decisive", kinds,
+            f"echo izba ... must not credit the decisive step: {res['candidates']}")
+        self.assertEqual(res["decisive_credits"], [],
+                          "no izba invocation was observed; nothing should be credited")
 
     def test_decisive_without_match_still_flags_unreached(self):
         import run_journeys as rj
@@ -872,6 +904,33 @@ class DecisiveByObservedCommandTest(unittest.TestCase):
         self.assertIn(
             "unreached_decisive", kinds,
             f"degenerate expect_cmd_re must not be credited: {res['candidates']}")
+
+
+class CreditCmdRegexTest(unittest.TestCase):
+    """Direct unit coverage of `_CREDIT_CMD_RE` (Greptile P1): it must accept
+    `izba` in COMMAND POSITION (start of a shell segment, optionally after env
+    assignments) and reject `izba` appearing merely as an argument/word/filename."""
+
+    def test_matches_izba_in_command_position(self):
+        import run_journeys as rj
+        for cmd in [
+            "izba diff .",
+            "cd x && izba diff",
+            "FOO=1 izba run",
+            "izba ls | grep x",
+            "(izba status)",
+        ]:
+            self.assertTrue(rj._CREDIT_CMD_RE.search(cmd), cmd)
+
+    def test_rejects_izba_as_mere_argument_or_filename(self):
+        import run_journeys as rj
+        for cmd in [
+            "echo izba",
+            "cat izba.yml",
+            "grep izba log.txt",
+            "./izba run",
+        ]:
+            self.assertFalse(rj._CREDIT_CMD_RE.search(cmd), cmd)
 
 
 class ReconcileViolationTests(unittest.TestCase):
