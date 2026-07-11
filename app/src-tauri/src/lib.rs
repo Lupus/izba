@@ -479,6 +479,7 @@ pub fn dispatch(
             to_json(commands::remove_core(d, &arg_str(&args, "name")?, force)?)
         }
         "inspect" => to_json(commands::inspect_core(d, &arg_str(&args, "name")?)?),
+        "volume_list" => to_json(commands::volume_list_core(d)?),
         "policy_show" => to_json(commands::policy_show_core(d, &arg_str(&args, "name")?)?),
         "policy_set_enforce" => {
             let on = args.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -593,6 +594,19 @@ mod dispatch_tests {
         let mut emit = |_: &str, _: serde_json::Value| {};
         let out = dispatch(&st, "list", serde_json::json!({}), &mut emit).unwrap();
         assert!(out.is_array());
+    }
+
+    #[test]
+    fn dispatch_volume_list_returns_volume_json() {
+        // Regression: wandering Actors open the Storage view, whose
+        // volume_list invoke previously had no dispatch arm and fell through
+        // to "unknown command" — a false silent-failure finding against the
+        // product, not a real bug.
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(&st, "volume_list", serde_json::json!({}), &mut emit).unwrap();
+        assert!(out.is_array());
+        assert_eq!(out.as_array().unwrap().len(), 1);
     }
 
     #[test]
