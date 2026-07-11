@@ -489,6 +489,23 @@ pub fn dispatch(
                 on,
             )?)
         }
+        "policy_set_full" => {
+            let allow: Vec<izba_core::daemon::egress::config::AllowEntry> = serde_json::from_value(
+                args.get("allow")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|e| format!("bad allow: {e}"))?;
+            let git: Vec<izba_core::daemon::egress::config::GitRule> =
+                serde_json::from_value(args.get("git").cloned().unwrap_or(serde_json::Value::Null))
+                    .map_err(|e| format!("bad git: {e}"))?;
+            to_json(commands::policy_set_full_core(
+                d,
+                &arg_str(&args, "name")?,
+                allow,
+                git,
+            )?)
+        }
         "create" => {
             let opts: views::CreateOpts = serde_json::from_value(
                 args.get("opts").cloned().unwrap_or(serde_json::Value::Null),
@@ -627,6 +644,38 @@ mod dispatch_tests {
             &mut emit,
         );
         assert!(e.is_err());
+    }
+
+    #[test]
+    fn dispatch_policy_set_full_updates_policy() {
+        // Regression: PolicyEditor's Save button invokes `policy_set_full`,
+        // but the headless bridge had no matching dispatch arm — it fell
+        // through to "unknown command", silently breaking Save in the
+        // dogfood harness (and any journey depending on it).
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(
+            &st,
+            "policy_set_full",
+            serde_json::json!({
+                "name": "web",
+                "allow": [{"host": "api.example.com", "ports": [443], "access": "read-write"}],
+                "git": [{"host": "github.com", "access": "read"}],
+            }),
+            &mut emit,
+        )
+        .unwrap();
+        assert!(out.is_null());
+
+        let shown = dispatch(
+            &st,
+            "policy_show",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(shown["allow"][0]["host"], "api.example.com");
+        assert_eq!(shown["git"][0]["host"], "github.com");
     }
 
     #[test]
