@@ -567,7 +567,15 @@ def parse_args(argv):
     p.add_argument("--out", required=True)
     p.add_argument("--artifact-dir", default="")
     p.add_argument("--model", default="google/gemini-2.5-flash")
-    p.add_argument("--max-turns", type=int, default=14)
+    # H2 (run-3 skeptic): 14 starved multi-phase manifest journeys before
+    # their decisive step — `manifest-diverged-rendering` burned its whole
+    # budget on the Policy-tab save and never reached the Manifest tab click.
+    # No CI-arg override exists (dogfood.yml's GUI job does not pass
+    # `--max-turns`), so this default IS the effective value in CI; bumped to
+    # 20 to give a multi-phase journey (create + one tab's edit/save + the
+    # Manifest tab's own read/act turns) enough headroom to reach its core
+    # step. No per-journey override exists in the journeys schema either.
+    p.add_argument("--max-turns", type=int, default=20)
     p.add_argument("--max-usd", type=float, default=2.0)
     p.add_argument("--step-cap", type=int, default=20)
     p.add_argument("--action-timeout-s", type=float, default=30.0)
