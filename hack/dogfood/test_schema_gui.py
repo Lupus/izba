@@ -34,10 +34,11 @@ def test_candidate_kind_includes_gui_oracles():
 def test_action_allows_optional_gui_fields():
     schema = _load("trajectory.schema.json")
     props = schema["definitions"]["action"]["properties"]
-    for k in ("snapshot", "console_errors", "screenshot_ref"):
+    for k in ("snapshot", "console_errors", "screenshot_ref", "page_text"):
         assert k in props, k
     # GUI fields are optional — required list is unchanged (CLI fields only).
     assert "snapshot" not in schema["definitions"]["action"]["required"]
+    assert "page_text" not in schema["definitions"]["action"]["required"]
 
 
 def test_journey_result_allows_workspace():

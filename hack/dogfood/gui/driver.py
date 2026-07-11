@@ -192,15 +192,30 @@ def action_to_argv(reply: Dict[str, Any]) -> Optional[List[str]]:
     return None
 
 
+_PAGE_TEXT_TRUNCATION_SUFFIX = "...[truncated]"
+
+
+def _cap_page_text(text: str, cap_chars: int) -> str:
+    """Cap ``text`` at ``cap_chars``, appending a truncation note (Fix 2 —
+    ``document.body.innerText`` on a busy screen can be arbitrarily long, and
+    the cap must be visibly marked so a downstream oracle/report never reads
+    a silently-cut string as the whole page)."""
+    if len(text) <= cap_chars:
+        return text
+    return text[:cap_chars] + _PAGE_TEXT_TRUNCATION_SUFFIX
+
+
 class FakeDriver:
     """Offline driver for tests: pops scripted snapshots; records actions."""
 
     def __init__(self, snapshots: Optional[List[str]] = None,
                  errors: Optional[List[str]] = None,
-                 invoke_log: Optional[List[Dict[str, Any]]] = None):
+                 invoke_log: Optional[List[Dict[str, Any]]] = None,
+                 page_texts: Optional[List[str]] = None):
         self._snaps = list(snapshots or [])
         self._errors = list(errors or [])
         self._invoke_log = list(invoke_log or [])
+        self._page_texts = list(page_texts or [])
         self.actions: List[List[str]] = []
         self.shots: List[str] = []
         self.opened: Optional[str] = None
@@ -222,6 +237,10 @@ class FakeDriver:
 
     def read_invoke_log(self) -> List[Dict[str, Any]]:
         return list(self._invoke_log)
+
+    def read_page_text(self, cap_chars: int = 4000) -> str:
+        text = self._page_texts.pop(0) if self._page_texts else ""
+        return _cap_page_text(text, cap_chars)
 
     def screenshot(self, path: str) -> None:
         self.shots.append(path)
@@ -300,6 +319,18 @@ class AgentBrowserDriver:
     def read_invoke_log(self) -> List[Dict[str, Any]]:
         v = self._eval_json("JSON.stringify(window.__DF_INVOKE_LOG__||[])")
         return [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
+
+    def read_page_text(self, cap_chars: int = 4000) -> str:
+        """`document.body.innerText` (Fix 2): the raw rendered text of the
+        page, alongside the accessibility marks. `JSON.stringify`-wrapped so
+        it round-trips through the same envelope-then-json.loads path as
+        `read_invoke_log`/`read_console_errors` (see `_eval_json` — its
+        `result` is itself a JSON-encoded string of the JS value, so a bare
+        string comes back needing one more `json.loads`, which `_eval_json`
+        already does)."""
+        v = self._eval_json("JSON.stringify(document.body.innerText||'')")
+        text = v if isinstance(v, str) else ""
+        return _cap_page_text(text, cap_chars)
 
     def screenshot(self, path: str) -> None:
         self._run(["screenshot", path, "--annotate"])

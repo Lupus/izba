@@ -98,8 +98,14 @@ def _settle_for_sandbox(izba_bin: str, data_dir: str, timeout_s: float,
 
 def _action_dict(intent: str, command: str, res, marks_text: str,
                  reconcile: Dict[str, Any], console_errors: List[str],
-                 screenshot_ref: str = "") -> Dict[str, Any]:
-    """Map a GUI action into the trajectory Action shape (+ optional GUI fields)."""
+                 screenshot_ref: str = "", page_text: str = "") -> Dict[str, Any]:
+    """Map a GUI action into the trajectory Action shape (+ optional GUI fields).
+
+    ``page_text`` (Fix 2, run-2 skeptic) is `document.body.innerText` captured
+    right alongside ``marks_text`` — the accessibility set-of-marks misses
+    plain `<div>` text (no role/name), which is exactly how promote/create
+    error and outcome copy renders (see `driver.read_page_text`,
+    `gui_oracles.silent_failure_oracle`/`dom_expect_oracle`)."""
     d = {
         "intent": intent,
         "command": command,
@@ -109,6 +115,7 @@ def _action_dict(intent: str, command: str, res, marks_text: str,
         "latency_ms": int(getattr(res, "latency_ms", 0)),
         "reconcile": reconcile,
         "snapshot": marks_text[-4000:],
+        "page_text": page_text,
         "console_errors": list(console_errors or []),
     }
     if screenshot_ref:
@@ -203,6 +210,12 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     turns = 0
     console_seen = 0
     prev_reconcile: Optional[Dict[str, Any]] = None
+    # Fix 1 (run-2 skeptic): every marks snapshot taken this journey, in
+    # chronological order — fed to ui_daemon_diff_oracle so it can grade
+    # against the last one that isn't a portal-obscured modal, instead of
+    # false-positiving whenever the journey happened to end with a dialog
+    # open (see gui_oracles.ui_daemon_diff_oracle's docstring).
+    marks_history: List[str] = []
     ws_abs = os.path.abspath(workspace) if workspace else ""
     if ws_abs:
         os.makedirs(ws_abs, exist_ok=True)
@@ -222,6 +235,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
             # the accessibility marks (real refs to act on) rather than an empty
             # observation — otherwise it guesses a ref and burns a turn.
             marks_text = render_marks(driver.snapshot())
+            marks_history.append(marks_text)
             obs: List[Dict[str, Any]] = [{"action": "(opened screen)",
                                           "marks": marks_text}]
             while True:
@@ -249,6 +263,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                     break
                 if reply.get("read"):
                     marks_text = render_marks(driver.snapshot())
+                    marks_history.append(marks_text)
                     obs.append({"action": "read", "marks": marks_text})
                     continue
                 argv = action_to_argv(reply)
@@ -261,6 +276,8 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 seen.add(h)
                 res = driver.act(argv)
                 marks_text = render_marks(driver.snapshot())
+                marks_history.append(marks_text)
+                page_text = driver.read_page_text()
                 reconcile = _reconcile_snapshot(izba_bin, data_dir, action_timeout_s)
                 all_console = driver.read_console_errors()
                 console_errors = all_console[console_seen:]
@@ -268,7 +285,8 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 action_index = len(actions)
                 ref = {"journey_id": journey_id, "action_index": action_index}
                 actions.append(_action_dict(step.get("intent", ""), command, res,
-                                            marks_text, reconcile, console_errors))
+                                            marks_text, reconcile, console_errors,
+                                            page_text=page_text))
                 obs.append({"action": command, "marks": marks_text})
                 # Per-action oracles.
                 act_obj = _A(intent=step.get("intent", ""), command=command,
@@ -322,6 +340,8 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
         log(f"{journey_id}: state-evidence error: {e!r}")
         state_evidence = {"sandboxes": [], "reconcile": {}, "per_sandbox": {}}
     final_marks = render_marks(driver.snapshot())
+    marks_history.append(final_marks)
+    final_page_text = driver.read_page_text()
     final_ref = {"journey_id": journey_id, "action_index": -1}
     invoke_log = driver.read_invoke_log()
     last_expect = (steps[-1].get("expect", "") if steps else "")
@@ -338,9 +358,19 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
             f"first: {spawn_failed[0].get('error')!r}"))
     silent_failure_log = [e for e in (invoke_log or [])
                           if not _is_daemon_spawn_failure(e)]
-    end_found = (ui_daemon_diff_oracle(final_marks, state_evidence, final_ref)
-                 + dom_expect_oracle(last_expect, final_marks, final_ref)
-                 + silent_failure_oracle(silent_failure_log, final_marks, final_ref))
+    # Fix 2 (run-2 skeptic): silent_failure has no timestamp/index
+    # correlation between a specific invoke-log rejection and a specific
+    # action, so it checks the union of every action's page_text across the
+    # whole journey (plus the final one) — the widest reasonable "at-or-after
+    # the rejection" approximation (see gui_oracles.silent_failure_oracle's
+    # docstring for the false-negative/false-positive tradeoff rationale).
+    all_page_text = "\n".join(
+        [a.get("page_text", "") for a in actions] + [final_page_text])
+    end_found = (ui_daemon_diff_oracle(marks_history, state_evidence, final_ref)
+                 + dom_expect_oracle(last_expect, final_marks, final_ref,
+                                    page_text=final_page_text)
+                 + silent_failure_oracle(silent_failure_log, final_marks, final_ref,
+                                         page_text=all_page_text))
 
     # Decisive wiring (Task 11 + Critical-finding fix): manifest_truth is the
     # GUI runner's only `functional`-candidate-producing oracle, so it
