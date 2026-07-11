@@ -55,13 +55,6 @@ pub(crate) const DEFAULT_CPUS: u32 = izba_core::manifest::schema::DEFAULT_CPUS;
 pub(crate) const DEFAULT_MEM_MB: u32 = izba_core::manifest::schema::DEFAULT_MEM_MB;
 pub(crate) const DEFAULT_RW_GB: u64 = izba_core::manifest::schema::DEFAULT_RW_GB;
 
-/// Load `izba.yml` from a workspace dir, returning (manifest, raw_yaml,
-/// dockerfile_contents). `dockerfile` is `Some` only for a `build:` spec.
-/// Delegates to [`izba_core::manifest::ops::load_repo_manifest`].
-pub(crate) fn load_repo_manifest(dir: &Path) -> anyhow::Result<(Manifest, String, Option<String>)> {
-    izba_core::manifest::ops::load_repo_manifest(dir)
-}
-
 /// Derive the default sandbox name from a workspace directory: the sanitized
 /// basename (mirrors `name_for` but without `SandboxOpts`).
 pub(crate) fn workspace_default_name(dir: &Path) -> anyhow::Result<String> {
@@ -70,16 +63,6 @@ pub(crate) fn workspace_default_name(dir: &Path) -> anyhow::Result<String> {
         .file_name()
         .with_context(|| format!("{} has no basename; pass --name", dir.display()))?;
     name::sanitize(&base.to_string_lossy())
-}
-
-/// Read the managed truth (config.json + policy.yaml) for `name` into a
-/// `Normalized`, directly from disk (works on a stopped sandbox).
-/// Delegates to [`izba_core::manifest::ops::managed_normalized`].
-pub(crate) fn managed_normalized(
-    paths: &izba_core::paths::Paths,
-    name: &str,
-) -> anyhow::Result<Normalized> {
-    izba_core::manifest::ops::managed_normalized(paths, name)
 }
 
 /// Map a daemon reply that should be `Ok` into `Result<()>`.

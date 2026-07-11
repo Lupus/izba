@@ -5,6 +5,7 @@ pub mod apply;
 pub mod diff;
 pub mod normalize;
 pub mod ops;
+pub mod promote;
 pub mod quantity;
 pub mod schema;
 pub mod store;
