@@ -317,19 +317,30 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                  + dom_expect_oracle(last_expect, final_marks, final_ref)
                  + silent_failure_oracle(invoke_log, final_marks, final_ref))
 
-    # Decisive wiring (Task 11): manifest_truth is the GUI runner's only
-    # `functional`-candidate-producing oracle, so it doubles as the decisive
-    # (core: true, else last-step) grading mechanism — mirroring the CLI
-    # runner's contract (run_journeys._decisive_step_indices, imported
-    # unchanged: pure over `steps`, nothing CLI-shaped to fake). Gated on
-    # whether the journey ever invoked manifest_diff at all, so a GUI journey
-    # unrelated to the Manifest tab (the vast majority today) is completely
-    # unaffected — its fallback-to-last-step decisive index never gets
-    # graded, exactly like before this task. Side-effect constraint: the
-    # oracle shells out to `izba diff`, which WRITES the review token, so it
-    # is called exactly ONCE here, post-journey (see its docstring).
+    # Decisive wiring (Task 11 + Critical-finding fix): manifest_truth is the
+    # GUI runner's only `functional`-candidate-producing oracle, so it
+    # doubles as the decisive (core: true, else last-step) grading mechanism
+    # — mirroring the CLI runner's contract (run_journeys._decisive_step_
+    # indices, imported unchanged: pure over `steps`, nothing CLI-shaped to
+    # fake). A journey WITHOUT any core: true step keeps the original Task-11
+    # behavior exactly: decisive wiring only activates when the journey
+    # happened to invoke manifest_diff — its fallback-to-last-step decisive
+    # index never gets graded otherwise. A journey that explicitly DECLARES a
+    # core: true step, though, is asserting "this step's assertion must be
+    # verified" — so those journeys must never grade silently positive when
+    # the decisive assertion was never actually checked. Three unverifiable
+    # paths, mirroring the CLI runner's #126/PR#129 unreached_decisive fix
+    # (run_journeys.py ~618-640) so the collector/skeptic see ONE convention
+    # across CLI and GUI bundles: (a) manifest_diff never invoked at all ⇒
+    # flip via the exact `unreached_decisive` kind/shape; (b) ground truth
+    # couldn't be computed (`no_target`/`unparseable`) ⇒ flip via `infra`
+    # (harness degradation — couldn't verify — not a product bug). Side-
+    # effect constraint: the oracle shells out to `izba diff`, which WRITES
+    # the review token, so it is called exactly ONCE here, post-journey (see
+    # its docstring).
     decisive_credits: List[Dict[str, Any]] = []
     mt_found: List[Any] = []
+    has_core_step = any(isinstance(s, dict) and s.get("core") for s in steps)
     manifest_diff_seen = any(
         isinstance(e, dict) and e.get("cmd") == "manifest_diff"
         and isinstance(e.get("digest"), dict) for e in invoke_log)
@@ -341,13 +352,15 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
             "timeout_s": action_timeout_s, "ref": dict(final_ref)}
         mt_found = manifest_truth_oracle(mt_ctx)
         decisive_idx = _decisive_step_indices(steps)
+        mt_result = mt_ctx.get("manifest_truth_result")
         # An empty mt_found is ambiguous by itself (it means EITHER "verified
         # equal" OR "couldn't check" — a subprocess failure/timeout/unparseable
         # `izba diff` output must never be read as a confirmed pass). Only
         # ctx["manifest_truth_result"] == "matched" is an honest positive;
-        # "unparseable"/"no_target" leave the decisive step ungraded (no
-        # credit fabricated) rather than lying about what was verified.
-        if decisive_idx and mt_ctx.get("manifest_truth_result") == "matched":
+        # "unparseable"/"no_target" leave the decisive step ungraded when
+        # there is no explicit core step (unchanged Task-11 behavior) —
+        # otherwise they degrade the journey below.
+        if decisive_idx and mt_result == "matched":
             # Ground truth matched what the UI showed: the decisive
             # assertion passed. Recorded as an audit-trail credit (schema
             # parity with the CLI runner's decisive_credits) even though
@@ -359,6 +372,34 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 "action_index": final_ref["action_index"],
                 "graded_cmd": "manifest_truth: izba diff ground truth (matched)",
             })
+        elif has_core_step and mt_result in ("no_target", "unparseable"):
+            # The harness attempted to verify the declared decisive
+            # assertion but couldn't: report-only degradation, not a product
+            # finding — same `infra` shape/contract as every other infra
+            # candidate this runner emits (must not tally positive).
+            candidates.append(_infra_candidate(
+                journey_id,
+                f"manifest_truth: ground truth could not be verified "
+                f"({mt_result}) for a core decisive step"))
+    elif has_core_step and steps:
+        # The journey declares a core: true step but the Actor never even
+        # opened the Manifest tab (no manifest_diff invoke at all): the
+        # decisive assertion was never exercised. Mirrors the CLI runner's
+        # unreached_decisive shape exactly (run_journeys.py ~631-640).
+        decisive_idx = _decisive_step_indices(steps)
+        step_idx = min(decisive_idx) if decisive_idx else 0
+        s = steps[step_idx] if step_idx < len(steps) else {}
+        source = journey.get("source", {}).get("ref", "journey step")
+        candidates.append({
+            "kind": "unreached_decisive",
+            "detail": (f"decisive step {step_idx} "
+                       f"({s.get('intent', '')[:80]!r}) never invoked "
+                       f"manifest_diff — its assertion was never exercised"),
+            "violated_expectation": s.get("expect", "")
+                                    or "decisive step must be exercised",
+            "source": source,
+            "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
+        })
     # Capture an annotated screenshot only if the journey produced any candidate.
     if (candidates or end_found or mt_found) and artifact_dir:
         shot = os.path.join(artifact_dir, f"{journey_id}.png")

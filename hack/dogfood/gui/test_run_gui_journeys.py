@@ -441,12 +441,14 @@ def test_run_gui_journey_substitutes_workspace_token_in_intent(tmp_path, monkeyp
     assert res["workspace"] == os.path.abspath(str(workspace))
 
 
-def test_run_gui_journey_no_manifest_invoke_no_decisive_wiring(monkeypatch):
-    """Task 11 regression guard: a GUI journey that never touches the
-    Manifest tab (the vast majority) must be completely unaffected by
-    decisive wiring — manifest_truth_oracle is never even called, and
-    decisive_credits stays empty, even though this step declares core: true
-    (the fallback-to-last-step decisive index always exists)."""
+def test_run_gui_journey_core_step_no_manifest_invoke_flips_unreached_decisive(monkeypatch):
+    """Critical-finding fix: a journey that DECLARES a core: true step but
+    never even invoked manifest_diff verified NOTHING — it must not tally
+    positive. manifest_truth_oracle is still never called (there is no
+    digest to compare), but the journey must carry an `unreached_decisive`
+    candidate mirroring the CLI runner's exact kind/shape convention
+    (run_journeys.py's #126/PR#129 fix) so the collector flips it and the
+    skeptic sees why."""
     import gui.run_gui_journeys as rgj
     model = FakeModel([{"done": True}])
     driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"',
@@ -462,9 +464,43 @@ def test_run_gui_journey_no_manifest_invoke_no_decisive_wiring(monkeypatch):
                           data_dir="/tmp/x", max_turns=8, step_cap=10,
                           action_timeout_s=5, latency_budget_ms=30000,
                           budget={"usd": 0.0}, max_usd=2.0)
+    assert called == []  # nothing to check ⇒ never shells out / calls the oracle
+    assert res["decisive_credits"] == []  # never a fabricated pass
+    assert not [c for c in res["candidates"] if c["kind"] == "functional"]
+    unreached = [c for c in res["candidates"] if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1
+    assert unreached[0]["trajectory_ref"] == {"journey_id": "j-no-manifest",
+                                              "action_index": -1}
+    assert "manifest_diff" in unreached[0]["detail"]
+
+
+def test_run_gui_journey_non_core_no_manifest_invoke_unaffected(monkeypatch):
+    """Regression: a journey WITHOUT any core: true step (fallback-to-last-
+    step decisive index) that never touches the Manifest tab keeps the
+    original Task-11 behavior exactly — no unreached_decisive, no infra, no
+    decisive_credits. Only journeys that explicitly declare a decisive step
+    opt into the new unverifiable-decisive flip."""
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"',
+                                   '[@e1] heading "Sandboxes"'])
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    called = []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle",
+                        lambda ctx, **k: called.append(1) or [])
+    journey = {"journey_id": "j-non-core-no-manifest", "modality": "gui",
+               "steps": [{"intent": "look around", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
     assert called == []
     assert res["decisive_credits"] == []
-    assert not [c for c in res["candidates"] if c["kind"] == "functional"]
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "unreached_decisive" not in kinds
+    assert "infra" not in kinds
+    assert "functional" not in kinds
 
 
 def test_run_gui_journey_decisive_manifest_mismatch_flips_negative(monkeypatch):
@@ -544,7 +580,13 @@ def test_run_gui_journey_manifest_truth_unparseable_records_no_false_credit(monk
     EITHER a verified match OR that ground truth couldn't be checked at all
     (izba diff subprocess failure/timeout/unparseable output). The runner
     must only credit a decisive pass when the oracle's side channel says
-    'matched' — never fabricate a credit off a bare empty return."""
+    'matched' — never fabricate a credit off a bare empty return.
+
+    Critical-finding fix: a core: true step whose ground truth was
+    unparseable must not grade silently positive either — it degrades the
+    journey via a flipping `infra` candidate (harness couldn't verify, not a
+    product bug), same shape as every other infra candidate this runner
+    emits."""
     import gui.run_gui_journeys as rgj
     model = FakeModel([{"done": True}])
     invoke_log = [{"cmd": "manifest_diff", "ok": True,
@@ -568,6 +610,74 @@ def test_run_gui_journey_manifest_truth_unparseable_records_no_false_credit(monk
                           budget={"usd": 0.0}, max_usd=2.0)
     assert not [c for c in res["candidates"] if c["kind"] == "functional"]
     assert res["decisive_credits"] == []  # not a fabricated pass
+    infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+    assert len(infra) == 1
+    assert "unparseable" in infra[0]["detail"]
+
+
+def test_run_gui_journey_core_step_no_target_emits_infra_candidate(monkeypatch):
+    """Same class as the unparseable case above: a core: true step whose
+    ground truth couldn't even be targeted (missing sandbox/workspace, e.g.
+    the async create never registered) must degrade via `infra`, not pass
+    silently."""
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"done": True}])
+    invoke_log = [{"cmd": "manifest_diff", "ok": True,
+                  "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"',
+                                   '[@e1] heading "Manifest"'],
+                        invoke_log=invoke_log)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+
+    def fake_mt_no_target(ctx, **k):
+        ctx["manifest_truth_result"] = "no_target"  # e.g. no sandbox registered
+        return []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle", fake_mt_no_target)
+    journey = {"journey_id": "j-mt-no-target", "modality": "gui",
+               "steps": [{"intent": "view manifest diff", "expect": "state shown",
+                          "core": True}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert not [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert res["decisive_credits"] == []
+    infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+    assert len(infra) == 1
+    assert "no_target" in infra[0]["detail"]
+
+
+def test_run_gui_journey_non_core_unparseable_truth_unaffected(monkeypatch):
+    """Regression: a non-core (fallback-to-last-step) journey whose ground
+    truth is unparseable keeps the original Task-11 behavior exactly — no
+    infra candidate, no fabricated credit. Only journeys that explicitly
+    declare a core: true step opt into the new unverifiable-decisive flip."""
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"done": True}])
+    invoke_log = [{"cmd": "manifest_diff", "ok": True,
+                  "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"',
+                                   '[@e1] heading "Manifest"'],
+                        invoke_log=invoke_log)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+
+    def fake_mt_unparseable(ctx, **k):
+        ctx["manifest_truth_result"] = "unparseable"
+        return []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle", fake_mt_unparseable)
+    journey = {"journey_id": "j-non-core-unparseable", "modality": "gui",
+               "steps": [{"intent": "view manifest diff", "expect": "state shown"}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert res["decisive_credits"] == []
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "infra" not in kinds
+    assert "unreached_decisive" not in kinds
+    assert "functional" not in kinds
 
 
 def test_run_gui_journey_manifest_truth_ctx_carries_sandbox_from_state_evidence(monkeypatch):
