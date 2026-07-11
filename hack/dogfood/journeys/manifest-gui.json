@@ -1,0 +1,80 @@
+{
+  "feature": "izba desktop app — Manifest tab (izba.yml diff/promote/export)",
+  "journeys": [
+    {
+      "journey_id": "manifest-open-tab-in-sync",
+      "modality": "gui",
+      "tier": "smoke",
+      "rationale": "A user who already has a valid izba.yml in their workspace and creates the sandbox from it should see the Manifest tab confirm there is nothing to reconcile. This is the tab's simplest, most common state and the swarm's cheapest way to exercise the manifest_truth oracle's happy path.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.1 Manifest tab; ManifestTab.tsx BANNER_TEXT.in_sync"
+      },
+      "seed_files": {
+        "izba.yml": "spec:\n  image: alpine:3.20\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'manifest-sync-demo' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "a sandbox named manifest-sync-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the manifest-sync-demo sandbox's detail view, click its Manifest tab, and click Refresh",
+          "expect": "the Manifest tab shows 'In sync — izba.yml and managed settings match.'",
+          "core": true
+        }
+      ]
+    },
+    {
+      "journey_id": "manifest-seeded-drift-promote",
+      "modality": "gui",
+      "tier": "smoke",
+      "rationale": "The headline manifest workflow: someone edits izba.yml (here simulating that edit as a precondition of the step, since the GUI Actor has no file-editing surface of its own), the app must show the drift, and Promote must apply it. This is the harness's ground-truth-verified decisive assertion — manifest_diff's reported state must match `izba diff`'s.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.2 Promote in the app; ManifestTab.tsx BANNER_TEXT.repo_ahead + Promote dialog"
+      },
+      "seed_files": {
+        "izba.yml": "spec:\n  image: alpine:3.20\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'manifest-drift-demo' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "a sandbox named manifest-drift-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the manifest-drift-demo sandbox's detail view, click its Manifest tab, and click Refresh to see whether izba.yml has any changes not yet applied",
+          "expect": "the Manifest tab shows 'izba.yml has changes not yet applied. Review below, then Promote.' with a table row showing the image changing from alpine:3.20 to alpine:3.21",
+          "core": true,
+          "seed_files": {
+            "izba.yml": "spec:\n  image: alpine:3.21\n"
+          }
+        },
+        {
+          "intent": "click 'Promote…' on the Manifest tab, then confirm by clicking 'Promote' in the dialog that appears",
+          "expect": "the dialog reports 'Promoted 1 change(s).' and, after closing it and refreshing, the Manifest tab shows 'In sync — izba.yml and managed settings match.'"
+        }
+      ]
+    },
+    {
+      "journey_id": "manifest-missing-manifest-guidance",
+      "modality": "gui",
+      "tier": "smoke",
+      "rationale": "A workspace with no izba.yml at all is the common first-time state (nothing was ever exported); the tab must guide the user to create one rather than show a bare error or an empty table. NOT marked core: real-bridge.js records a manifest_diff invoke-log digest only on a successful (ok) response (app/dogfood/real-bridge.js __dfHandleMessage), and ManifestTab's missing-manifest path is api.manifestDiff() REJECTING (its .catch sets `error`, never `diff` — see ManifestTab.tsx `missingManifest = error !== null && error.includes(\"izba.yml\")`). So this step's manifest_diff call never carries a `digest`, manifest_truth_oracle's `manifest_diff_seen` check stays false, and a `core: true` here would flip run_gui_journeys.py's `unreached_decisive` path even though the Actor did exactly what the step asked — a false product-negative, not a real one. The dom_expect oracle (which does not require a digest) still verifies this step from the rendered banner text.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.1 Manifest tab; ManifestTab.tsx MISSING_MANIFEST_HEADING/MISSING_MANIFEST_BODY"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field and 'manifest-missing-demo' into the Name field (leave Image at its default), then click Create to create a new sandbox from this empty workspace",
+          "expect": "a sandbox named manifest-missing-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the manifest-missing-demo sandbox's detail view and click its Manifest tab",
+          "expect": "the Manifest tab shows \"No izba.yml found in this sandbox's workspace.\" along with guidance to run 'izba export' or use Export to create one"
+        }
+      ]
+    }
+  ]
+}

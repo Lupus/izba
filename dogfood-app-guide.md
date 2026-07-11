@@ -15,7 +15,9 @@ every few seconds so you see live state without reloading.
 
 Click **Create sandbox** (top-right of the list). Enter a name and optionally
 choose an OCI image. Confirm to launch the sandbox; it moves from "stopped" to
-"running" once the microVM boots.
+"running" once the microVM boots. If **Create** stays disabled, look just
+below the button — it names exactly what's missing (for example, a name or a
+workspace folder).
 
 ## Starting and stopping
 
@@ -45,6 +47,46 @@ Each sandbox enforces an egress policy. In the detail panel, click **Firewall**
 to view or edit the active policy YAML. Rules control which hostnames and ports
 outbound traffic is allowed to reach. Changes take effect immediately; the app
 saves the policy file without restarting the sandbox.
+
+## Manifest (izba.yml)
+
+If the sandbox's workspace has an `izba.yml`, the detail panel's **Manifest**
+tab (right after **Firewall**) shows how that file compares to the sandbox's
+actual, running settings. A banner at the top gives you the state at a
+glance:
+
+- **In sync** — izba.yml and the live sandbox match; nothing to do.
+- **izba.yml has changes not yet applied** — you (or someone) edited
+  izba.yml; review the changes below, then **Promote**.
+- **Live settings have drifted from izba.yml** — something changed the
+  sandbox another way (for example, toggling the firewall on the
+  **Firewall** tab) without updating the file; **Export** to capture it.
+- **Diverged** — both sides changed. Promoting applies izba.yml's version;
+  Exporting overwrites izba.yml with the live version instead.
+
+When there's a difference, a table below the banner lists each changed
+field with its old and new value, plus a small tag showing when the change
+takes effect: **live** (immediately), **restart** (on the sandbox's next
+start), or **image** (next start, with a new image). A change that would
+loosen the egress firewall is flagged with a red **⚠ weakens egress** marker.
+
+- **Promote…** opens a confirmation dialog listing exactly what will
+  change, then applies izba.yml's pending changes to the sandbox. If any
+  change weakens the firewall, you must check "I understand this weakens the
+  egress firewall" before you can confirm. If the sandbox is running and a
+  change needs a restart, you can optionally check "Restart now to apply
+  restart-class changes" to apply it right away instead of waiting for the
+  next start. The button is disabled when there's nothing to promote.
+- **Export to izba.yml** writes the sandbox's current live settings back
+  into izba.yml, so a change made another way ends up captured in the file.
+  It's disabled when there's no live-side drift to capture.
+- **Refresh** re-reads both sides and updates the banner and table — use it
+  after editing izba.yml by hand, or after making a change elsewhere in the
+  app.
+
+If the workspace has no izba.yml yet, the tab tells you so and points you at
+`izba export <name>` (or the **Export** button here, once you've made some
+changes) to create one from the sandbox's current settings.
 
 ## Removing a sandbox
 
