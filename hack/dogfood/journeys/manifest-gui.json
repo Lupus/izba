@@ -11,7 +11,7 @@
         "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.1 Manifest tab; ManifestTab.tsx BANNER_TEXT.in_sync"
       },
       "seed_files": {
-        "izba.yml": "spec:\n  image: alpine:3.20\n"
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n"
       },
       "steps": [
         {
@@ -35,7 +35,7 @@
         "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.2 Promote in the app; ManifestTab.tsx BANNER_TEXT.repo_ahead + Promote dialog"
       },
       "seed_files": {
-        "izba.yml": "spec:\n  image: alpine:3.20\n"
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n"
       },
       "steps": [
         {
@@ -47,7 +47,7 @@
           "expect": "the Manifest tab shows 'izba.yml has changes not yet applied. Review below, then Promote.' with a table row showing the image changing from alpine:3.20 to alpine:3.21",
           "core": true,
           "seed_files": {
-            "izba.yml": "spec:\n  image: alpine:3.21\n"
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.21\n"
           }
         },
         {
@@ -60,10 +60,10 @@
       "journey_id": "manifest-missing-manifest-guidance",
       "modality": "gui",
       "tier": "smoke",
-      "rationale": "A workspace with no izba.yml at all is the common first-time state (nothing was ever exported); the tab must guide the user to create one rather than show a bare error or an empty table. NOT marked core: real-bridge.js records a manifest_diff invoke-log digest only on a successful (ok) response (app/dogfood/real-bridge.js __dfHandleMessage), and ManifestTab's missing-manifest path is api.manifestDiff() REJECTING (its .catch sets `error`, never `diff` — see ManifestTab.tsx `missingManifest = error !== null && error.includes(\"izba.yml\")`). So this step's manifest_diff call never carries a `digest`, manifest_truth_oracle's `manifest_diff_seen` check stays false, and a `core: true` here would flip run_gui_journeys.py's `unreached_decisive` path even though the Actor did exactly what the step asked — a false product-negative, not a real one. The dom_expect oracle (which does not require a digest) still verifies this step from the rendered banner text.",
+      "rationale": "A workspace with no izba.yml at all is the common first-time state (nothing was ever exported); the tab must guide the user to create one rather than show a bare error or an empty table. NOT marked core: real-bridge.js records a manifest_diff invoke-log digest only on a successful (ok) response (app/dogfood/real-bridge.js __dfHandleMessage), and ManifestTab's missing-manifest path is api.manifestDiff() REJECTING (its .catch sets `error`, never `diff`). commands.rs's `manifest_diff_core` checks `workspace.join(\"izba.yml\").exists()` BEFORE calling `compute_diff` and, when it's genuinely absent, returns the exact string `no izba.yml found in workspace` — a stable sentinel distinct from a parse failure (`compute_diff` -> `Manifest::load_str` -> `.context(\"parsing izba.yml\")`), which also mentions izba.yml but is a different, honest-to-render error. ManifestTab keys its guidance panel on that sentinel (`missingManifest = error !== null && error.includes(\"no izba.yml found\")`), so a corrupt izba.yml now falls through to the raw error area instead of being mislabeled as absent. So this step's manifest_diff call never carries a `digest`, manifest_truth_oracle's `manifest_diff_seen` check stays false, and a `core: true` here would flip run_gui_journeys.py's `unreached_decisive` path even though the Actor did exactly what the step asked — a false product-negative, not a real one. The dom_expect oracle (which does not require a digest) still verifies this step from the rendered banner text.",
       "source": {
         "kind": "spec",
-        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.1 Manifest tab; ManifestTab.tsx MISSING_MANIFEST_HEADING/MISSING_MANIFEST_BODY"
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.1 Manifest tab; ManifestTab.tsx MISSING_MANIFEST_HEADING/MISSING_MANIFEST_BODY; app/src-tauri/src/commands.rs manifest_diff_core"
       },
       "steps": [
         {
@@ -73,6 +73,38 @@
         {
           "intent": "open the manifest-missing-demo sandbox's detail view and click its Manifest tab",
           "expect": "the Manifest tab shows \"No izba.yml found in this sandbox's workspace.\" along with guidance to run 'izba export' or use Export to create one"
+        }
+      ]
+    },
+    {
+      "journey_id": "manifest-managed-ahead-export",
+      "modality": "gui",
+      "tier": "smoke",
+      "rationale": "The other half of the reconciliation story (complementing manifest-seeded-drift-promote's repo_ahead/Promote path): a user changes a sandbox's *live* settings through the app itself — here, editing the egress policy on the Policy tab (PolicyEditor.tsx) and clicking its Save button, which calls `policy_set_full` and mutates the managed truth (policy.yaml) without touching izba.yml — then opens the Manifest tab and must see the managed_ahead banner ('Live settings have drifted from izba.yml. Export to capture them.'), and Export must write that drift back into the file. `core: true` sits ONLY on the Manifest-tab step (the one that calls manifest_diff): that is the step whose banner assertion `run_gui_journeys.py`'s manifest_truth oracle can ground-truth against `izba diff`. The preceding Policy-tab save and the trailing Export click are NOT marked core — neither invokes manifest_diff, so marking them core would either do nothing (Export) or wrongly gate decisiveness on a step the oracle cannot verify (Policy save); the Export step's own outcome is instead checked by the ordinary end-of-journey dom_expect oracle against its 'Exported to' text.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.1 Manifest tab; ManifestTab.tsx BANNER_TEXT.managed_ahead; PolicyEditor.tsx save(); dogfood-app-guide.md Firewall / egress policy + Manifest (izba.yml)"
+      },
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'manifest-export-demo' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "a sandbox named manifest-export-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the manifest-export-demo sandbox's detail view, click its Policy tab, click 'Add host', type 'example.com' into the new row's Host field, then click Save",
+          "expect": "the Policy tab shows 'saved · reloaded'"
+        },
+        {
+          "intent": "click the Manifest tab, then click Refresh to see whether the live settings have drifted from izba.yml",
+          "expect": "the Manifest tab shows 'Live settings have drifted from izba.yml. Export to capture them.'",
+          "core": true
+        },
+        {
+          "intent": "click 'Export to izba.yml' on the Manifest tab",
+          "expect": "the Manifest tab shows 'Exported to {workspace}/izba.yml', confirming the live policy change was captured back into the file"
         }
       ]
     }
