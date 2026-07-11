@@ -102,8 +102,8 @@ describe("ManifestTab", () => {
     expect(screen.getByRole("button", { name: /^export to izba\.yml$/i })).not.toBeDisabled();
   });
 
-  it("shows missing-manifest guidance when the error mentions izba.yml", async () => {
-    (api.manifestDiff as Mock).mockRejectedValue(new Error("reading /ws/izba.yml: No such file"));
+  it("shows missing-manifest guidance when the error is the backend's not-found sentinel", async () => {
+    (api.manifestDiff as Mock).mockRejectedValue(new Error("no izba.yml found in workspace"));
     render(<ManifestTab name="web" running={true} />);
 
     expect(
@@ -121,6 +121,24 @@ describe("ManifestTab", () => {
     render(<ManifestTab name="web" running={true} />);
 
     expect(await screen.findByText("daemon unreachable")).toBeInTheDocument();
+    expect(
+      screen.queryByText("No izba.yml found in this sandbox's workspace."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows a parse-error message mentioning izba.yml in the raw error area, not the missing-manifest guidance", async () => {
+    // A corrupt izba.yml surfaces as "parsing izba.yml: ..." from
+    // Manifest::load_str — it mentions "izba.yml" but is NOT the backend's
+    // stable "no izba.yml found in workspace" not-found sentinel, so it must
+    // render honestly instead of being mislabeled as a missing file.
+    (api.manifestDiff as Mock).mockRejectedValue(
+      new Error("parsing izba.yml: invalid type: string, expected struct SandboxSpec"),
+    );
+    render(<ManifestTab name="web" running={true} />);
+
+    expect(
+      await screen.findByText("parsing izba.yml: invalid type: string, expected struct SandboxSpec"),
+    ).toBeInTheDocument();
     expect(
       screen.queryByText("No izba.yml found in this sandbox's workspace."),
     ).not.toBeInTheDocument();

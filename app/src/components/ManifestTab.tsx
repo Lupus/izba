@@ -105,7 +105,12 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
     }
   }
 
-  const missingManifest = error !== null && error.includes("izba.yml");
+  // Keyed on the backend's exact "not found" sentinel (manifest_diff_core in
+  // commands.rs), NOT on the mere presence of "izba.yml" in the message — a
+  // CORRUPT izba.yml also produces an error mentioning "izba.yml" (a parse
+  // failure), and that must render honestly in the raw error area below
+  // instead of being told the file doesn't exist.
+  const missingManifest = error !== null && error.includes("no izba.yml found");
   const canPromote = diff !== null && (diff.state === "repo_ahead" || diff.state === "diverged");
   const canExport = diff !== null && (diff.state === "managed_ahead" || diff.state === "diverged");
 
