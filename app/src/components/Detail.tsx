@@ -9,6 +9,7 @@ import { FirewallStatus } from "./FirewallStatus";
 import { ShellPanel } from "./ShellPanel";
 import { PortsTab } from "./PortsTab";
 import { VolumesTab } from "./VolumesTab";
+import { ManifestTab } from "./ManifestTab";
 import { Spinner } from "./Spinner";
 import { Button } from "@/components/ui/button";
 import { api } from "../lib/ipc";
@@ -19,7 +20,7 @@ interface Props {
 }
 
 type Pending = { kind: "stop" | "remove"; name: string } | null;
-type Tab = "overview" | "ports" | "volumes" | "logs" | "netlog" | "policy" | "shell";
+type Tab = "overview" | "ports" | "volumes" | "logs" | "netlog" | "policy" | "manifest" | "shell";
 type Action = "start" | "stop" | "restart" | "remove";
 
 // Present-progressive label shown beside the spinner while an action runs.
@@ -81,6 +82,7 @@ export function Detail({ sandbox, onChanged }: Props) {
     { id: "logs", label: "Logs" },
     { id: "netlog", label: "Netlog" },
     { id: "policy", label: "Policy" },
+    { id: "manifest", label: "Manifest" },
     { id: "shell", label: "Shell" },
   ];
 
@@ -171,6 +173,8 @@ export function Detail({ sandbox, onChanged }: Props) {
         {tab === "netlog" && <NetlogView name={name} />}
 
         {tab === "policy" && <PolicyEditor name={name} />}
+
+        {tab === "manifest" && <ManifestTab name={name} running={running} />}
 
         {tab === "shell" &&
           (running ? (
