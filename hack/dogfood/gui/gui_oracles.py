@@ -30,6 +30,20 @@ _ERROR_COPY_MAP: List[tuple] = [
      "Review the diff first — open this tab's latest state, then Promote."),
     ("requires --restart",
      "This image change needs the checkbox above ticked before Promote can continue."),
+    # Run-4 skeptic H1: `manifest_diff_core` (app/src-tauri/src/commands.rs
+    # NO_MANIFEST_ERROR) rejects with the raw sentinel "no izba.yml found in
+    # workspace" when a workspace has no izba.yml at all. ManifestTab.tsx
+    # keys its friendly guidance panel on that same substring
+    # (`error.includes("no izba.yml found")`) but RENDERS a differently-
+    # worded heading (MISSING_MANIFEST_HEADING) — "in this sandbox's
+    # workspace" vs the raw "in workspace" — so neither the raw-text nor the
+    # marks/page_text substring check in `silent_failure_oracle` matched it:
+    # the guidance panel rendered correctly, but the oracle mis-fired a
+    # false-positive `silent_failure` because it never learned this token's
+    # mapped copy. Token is the shared substring of both the raw sentinel and
+    # the rendered heading.
+    ("no izba.yml found",
+     "No izba.yml found in this sandbox's workspace."),
 ]
 
 

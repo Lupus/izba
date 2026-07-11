@@ -55,6 +55,28 @@ def test_silent_failure_oracle_quiet_when_error_surfaced_only_in_page_text():
                                  REF, page_text=page_text) == []
 
 
+def test_silent_failure_oracle_quiet_on_missing_manifest_guidance_copy():
+    # Run-4 skeptic H1: manifest_diff_core rejects with the raw sentinel "no
+    # izba.yml found in workspace" (commands.rs NO_MANIFEST_ERROR).
+    # ManifestTab.tsx keys its guidance panel on that same substring but
+    # RENDERS a differently-worded heading ("in this sandbox's workspace",
+    # not "in workspace") — before the H1 fix, neither the raw-text nor the
+    # marks/page_text checks matched, so a genuinely-rendered guidance panel
+    # false-fired silent_failure. This is the exact evidence shape from run 4's
+    # manifest-missing-manifest-guidance trajectory.
+    log = [{"cmd": "manifest_diff", "ok": False,
+           "error": "no izba.yml found in workspace"}]
+    page_text = (
+        "Manifest\nRefresh\nExport to izba.yml\nPromote…\n"
+        "No izba.yml found in this sandbox's workspace.\n"
+        "Create an izba.yml in the workspace to manage this sandbox "
+        "declaratively — the manifest describes image, resources, ports, "
+        "and the egress policy. Run 'izba export <name>' or use Export "
+        "here once one exists.")
+    assert silent_failure_oracle(log, '[@e1] heading "Manifest"', REF,
+                                 page_text=page_text) == []
+
+
 def test_silent_failure_oracle_flags_when_neither_surface_shows_it():
     log = [{"cmd": "manifest_promote", "ok": False, "error": "boom"}]
     cs = silent_failure_oracle(log, '[@e1] heading "Sandboxes"', REF,
