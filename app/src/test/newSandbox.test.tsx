@@ -79,6 +79,7 @@ describe("NewSandbox", () => {
     fireEvent.change(screen.getByLabelText(/port 1 host/i), { target: { value: "sdfsdf" } });
     fireEvent.change(screen.getByLabelText(/port 1 guest/i), { target: { value: "80" } });
     expect(screen.getByText(/65535/)).toBeInTheDocument();
+    expect(screen.getByText("Fix the invalid port row above.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
   });
 
@@ -105,6 +106,33 @@ describe("NewSandbox", () => {
   it("disables Create when name is empty", () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
+  });
+
+  it("explains why Create is disabled with a hint list for missing required fields", () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    expect(screen.getByText("Name is required.")).toBeInTheDocument();
+    expect(screen.getByText("Workspace folder is required.")).toBeInTheDocument();
+    const btn = screen.getByRole("button", { name: /create/i });
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute("aria-describedby", "ns-create-hints");
+  });
+
+  it("drops the missing-name hint once a name is entered, keeps the workspace one", () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    expect(screen.queryByText("Name is required.")).not.toBeInTheDocument();
+    expect(screen.getByText("Workspace folder is required.")).toBeInTheDocument();
+  });
+
+  it("has no disabled-reason hints once the required fields are filled in", () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    expect(screen.queryByText("Name is required.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Workspace folder is required.")).not.toBeInTheDocument();
+    const btn = screen.getByRole("button", { name: /create/i });
+    expect(btn).not.toBeDisabled();
+    expect(btn).not.toHaveAttribute("aria-describedby");
   });
 
   it("surfaces a create error", async () => {
@@ -180,6 +208,7 @@ describe("NewSandbox", () => {
     expect(screen.getByText(/guest path must be absolute/i)).toBeInTheDocument();
     // Create button IS disabled because the row is non-blank and invalid
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
+    expect(screen.getByText("Fix the invalid volume row above.")).toBeInTheDocument();
   });
 
   it("shows error on Add when volume size is invalid and blocks Create", () => {
