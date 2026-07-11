@@ -315,15 +315,18 @@ async fn volume_detach(
 }
 
 #[tauri::command]
-async fn manifest_diff(workspace: String, name: String) -> Result<DiffView, String> {
-    tauri::async_runtime::spawn_blocking(move || commands::manifest_diff_core(&workspace, &name))
+async fn manifest_diff(_workspace: String, name: String) -> Result<DiffView, String> {
+    // Task 2 made the core name-only (config.json is the workspace source of
+    // truth, never a frontend-supplied path); `_workspace` stays on the wire
+    // until Task 3 updates the frontend invocation.
+    tauri::async_runtime::spawn_blocking(move || commands::manifest_diff_core(&name))
         .await
         .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-async fn manifest_export(workspace: String, name: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || commands::manifest_export_core(&workspace, &name))
+async fn manifest_export(_workspace: String, name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || commands::manifest_export_core(&name))
         .await
         .map_err(|e| format!("task join error: {e}"))?
 }
