@@ -127,6 +127,39 @@ def _cmd_hash(journey_id: str, command: str) -> str:
     return hashlib.sha256(f"{journey_id}\0{command}".encode("utf-8")).hexdigest()
 
 
+# The app's ambient background polling commands (app/src/lib/ipc.ts's
+# `list`/`daemonStatus`/`versionInfo`, driven by usePolling on a fixed
+# interval regardless of what the Actor does) — every GUI journey's
+# invoke_log carries a growing stream of these even if the Actor does
+# nothing at all. They are therefore not evidence the journey exercised
+# anything; see `_has_product_invoke`.
+_AMBIENT_POLL_CMDS = frozenset({"list", "daemon_status", "version_info"})
+
+
+def _has_product_invoke(invoke_log: List[Dict[str, Any]]) -> bool:
+    """True if ``invoke_log`` contains at least one invoke beyond the app's
+    ambient polling (``_AMBIENT_POLL_CMDS``) — i.e. the Actor engaged the
+    app's real command surface at least once, even a read-only one (e.g.
+    ``volume_list``).
+
+    Run-4 skeptic H2: `manifest-stale-token-refusal` (no ``core: true``
+    step) clicked ONE ref and stopped; its invoke_log was 90 entries of
+    alternating ``list``/``daemon_status`` polling and NOTHING else — no
+    `create`, no `manifest_diff`. The journey's whole point (a TOCTOU
+    stale-review-token refusal) was never exercised, yet it graded positive:
+    the runner's decisive-wiring above only flips a journey that DECLARES a
+    `core: true` step, and this journey deliberately doesn't have one (its
+    only assertion is the promote-refusal copy, which the harness cannot
+    assert as a hard precondition — see the journey's `rationale`). A lazy
+    1-action bail with an entirely-ambient invoke_log must not be
+    indistinguishable from a journey that legitimately only reads state
+    (`newsandbox-create-disabled-hints` also has no core step, but its
+    invoke_log carries a real `volume_list` call — this function correctly
+    returns True for it, so it is NOT flipped by the check below)."""
+    return any(isinstance(e, dict) and e.get("cmd") not in _AMBIENT_POLL_CMDS
+               for e in invoke_log or [])
+
+
 def _is_daemon_spawn_failure(entry: Any) -> bool:
     """True for an invoke-log rejection whose error is a `DaemonClient` spawn
     failure — the ``spawning [...]`` anyhow context string
@@ -462,6 +495,36 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                        f"manifest_diff — its assertion was never exercised"),
             "violated_expectation": s.get("expect", "")
                                     or "decisive step must be exercised",
+            "source": source,
+            "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
+        })
+    elif not has_core_step and steps and not _has_product_invoke(invoke_log):
+        # H2 (run-4 skeptic): a NON-core journey (no declared `core: true`
+        # step, so the branches above never engage) whose Actor bailed
+        # before invoking anything beyond the app's ambient background
+        # polling verified NOTHING — same failure mode as the declared-core
+        # case above (a decisive-in-spirit assertion never exercised), just
+        # without a `core: true` step to detect it via manifest_diff. Reuses
+        # the exact `unreached_decisive` kind so the collector's
+        # `_is_flipping` (every kind other than `latency`/non-decisive
+        # `functional` flips) and `summarize_bundle.py`'s "❓ unreached"
+        # grouping treat it identically to the declared-core-step-unreached
+        # case: same meaning ("this journey verified nothing"), different
+        # cause (no core step to miss in the first place). A journey that
+        # legitimately only reads state (e.g.
+        # `newsandbox-create-disabled-hints`) is unaffected: its invoke_log
+        # carries a real non-ambient call (`volume_list`), so
+        # `_has_product_invoke` is True and this branch never fires.
+        source = journey.get("source", {}).get("ref", "journey step")
+        candidates.append({
+            "kind": "unreached_decisive",
+            "detail": (f"invoke_log has no invoke beyond ambient polling "
+                       f"({sorted(_AMBIENT_POLL_CMDS)!r}) — the Actor "
+                       f"bailed before exercising anything this journey "
+                       f"was meant to verify"),
+            "violated_expectation": last_expect
+                                    or "the journey must exercise at least "
+                                       "one real product action",
             "source": source,
             "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
         })

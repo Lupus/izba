@@ -579,14 +579,20 @@ def test_run_gui_journey_core_step_no_manifest_invoke_flips_unreached_decisive(m
 
 def test_run_gui_journey_non_core_no_manifest_invoke_unaffected(monkeypatch):
     """Regression: a journey WITHOUT any core: true step (fallback-to-last-
-    step decisive index) that never touches the Manifest tab keeps the
-    original Task-11 behavior exactly — no unreached_decisive, no infra, no
-    decisive_credits. Only journeys that explicitly declare a decisive step
-    opt into the new unverifiable-decisive flip."""
+    step decisive index) that never touches the Manifest tab, but DOES
+    exercise a real (non-ambient) invoke, keeps the original Task-11
+    behavior exactly — no unreached_decisive, no infra, no decisive_credits.
+    Updated for H2 (run-4 skeptic): this scenario is deliberately
+    distinguished from a true lazy bail (see
+    test_run_gui_journey_non_core_lazy_bail_flips_unreached_decisive) by
+    giving the Actor one real click + a real `volume_list` invoke — a
+    zero-invoke variant of this same journey is exactly what H2 now flips,
+    so it would be dishonest to keep asserting non-flipping over an
+    all-ambient invoke_log."""
     import gui.run_gui_journeys as rgj
-    model = FakeModel([{"done": True}])
-    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"',
-                                   '[@e1] heading "Sandboxes"'])
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"'] * 3,
+                        invoke_log=[{"cmd": "volume_list", "ok": True, "error": ""}])
     monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
     monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
     called = []
@@ -781,6 +787,107 @@ def test_run_gui_journey_non_core_unparseable_truth_unaffected(monkeypatch):
     assert "infra" not in kinds
     assert "unreached_decisive" not in kinds
     assert "functional" not in kinds
+
+
+_AMBIENT_ONLY_LOG = (
+    [{"cmd": "list", "ok": True, "error": ""},
+     {"cmd": "daemon_status", "ok": True, "error": ""}] * 45)
+
+
+def test_run_gui_journey_non_core_lazy_bail_flips_unreached_decisive(monkeypatch):
+    """H2 (run-4 skeptic): a non-core journey (no `core: true` step) whose
+    Actor clicks once and stops, leaving an invoke_log of nothing but the
+    app's ambient list/daemon_status polling, must not grade silently
+    positive — reproduces run 4's `manifest-stale-token-refusal` shape
+    exactly (1 action, ~90 alternating list/daemon_status entries, zero
+    product invokes)."""
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"'] * 3,
+                        invoke_log=_AMBIENT_ONLY_LOG)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "manifest-stale-token-refusal", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "click the stale sandbox row",
+                          "expect": "izba.yml changed since you viewed this "
+                                    "diff. Refresh and review again."}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    unreached = [c for c in res["candidates"] if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1
+    assert "ambient polling" in unreached[0]["detail"]
+    assert res["decisive_credits"] == []
+
+
+def test_run_gui_journey_non_core_with_manifest_invokes_unaffected(monkeypatch):
+    """Regression: a normal (multi-action) journey whose invoke_log carries
+    real create + manifest_diff invokes beyond ambient polling must NOT be
+    flipped by the H2 lazy-bail check, core or not."""
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"done": True}])
+    invoke_log = ([{"cmd": "list", "ok": True, "error": ""},
+                   {"cmd": "daemon_status", "ok": True, "error": ""},
+                   {"cmd": "create", "ok": True, "error": ""},
+                   {"cmd": "manifest_diff", "ok": True,
+                    "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"',
+                                   '[@e1] heading "Manifest"'],
+                        invoke_log=invoke_log)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j-normal-non-core", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "create then view manifest", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "unreached_decisive" not in kinds
+
+
+def test_run_gui_journey_newsandbox_read_only_trajectory_not_flipped(monkeypatch):
+    """Regression fixture: run 4's `newsandbox-create-disabled-hints`
+    trajectory (no `core: true` step, 3 actions, invoke_log = ambient
+    list/daemon_status polling PLUS one real `volume_list` read) went
+    genuinely-achieved on dom_expect evidence alone (it invokes nothing
+    'product' in the create/manifest_diff sense). The H2 fix must not flip
+    it: `volume_list` is a real, non-ambient invoke, so
+    `_has_product_invoke` is True and the lazy-bail branch never fires."""
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"click": "@e1"}, {"click": "@e2"}, {"done": True}])
+    invoke_log = ([{"cmd": "list", "ok": True, "error": ""},
+                   {"cmd": "daemon_status", "ok": True, "error": ""},
+                   {"cmd": "volume_list", "ok": True, "error": ""},
+                   {"cmd": "list", "ok": True, "error": ""},
+                   {"cmd": "daemon_status", "ok": True, "error": ""}])
+    driver = FakeDriver(
+        snapshots=['[@e1] button "Create"'] * 4,
+        invoke_log=invoke_log)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "newsandbox-create-disabled-hints", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "try to create without a name",
+                          "expect": "Name is required."}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "unreached_decisive" not in kinds
+
+
+def test_has_product_invoke_true_only_beyond_ambient_polling():
+    import gui.run_gui_journeys as rgj
+    assert rgj._has_product_invoke([]) is False
+    assert rgj._has_product_invoke(
+        [{"cmd": "list"}, {"cmd": "daemon_status"}, {"cmd": "version_info"}]) is False
+    assert rgj._has_product_invoke(
+        [{"cmd": "list"}, {"cmd": "create"}]) is True
 
 
 def test_run_gui_journey_manifest_truth_ctx_carries_sandbox_from_state_evidence(monkeypatch):
