@@ -256,18 +256,18 @@ pub(crate) fn persist_policy(
 /// Persist a programmatically-built egress policy as the sandbox's
 /// `policy.yaml`. Unlike [`persist_policy`] (which copies a user file) this
 /// serializes an in-memory [`EgressPolicyConfig`] — used by `izba build` to arm
-/// the enforcing build-network allow-list. The daemon re-reads `policy.yaml`
-/// when it arms the egress plane at Start, so this must run AFTER Create and
-/// BEFORE Start. Must run after the sandbox dir exists.
+/// the enforcing build-network allow-list, and by `izba create`/`izba run` to
+/// seed a manifest's `spec.egress`. The actual write lives on
+/// `EgressPolicyConfig::write_to` (izba-core) so the desktop app's GUI create
+/// path can share it without depending on izba-cli. The daemon re-reads
+/// `policy.yaml` when it arms the egress plane at Start, so this must run
+/// AFTER Create and BEFORE Start. Must run after the sandbox dir exists.
 pub(crate) fn persist_policy_config(
     paths: &izba_core::paths::Paths,
     name: &str,
     config: &izba_core::daemon::egress::config::EgressPolicyConfig,
 ) -> anyhow::Result<()> {
-    use izba_core::daemon::egress::config::EgressPolicyConfig;
-    let dst = EgressPolicyConfig::path_in(&paths.sandbox_dir(name));
-    std::fs::write(&dst, config.to_yaml()).with_context(|| format!("writing {}", dst.display()))?;
-    Ok(())
+    config.write_to(&paths.sandbox_dir(name))
 }
 
 #[cfg(test)]

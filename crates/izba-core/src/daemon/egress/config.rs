@@ -348,6 +348,20 @@ impl EgressPolicyConfig {
         sandbox_dir.join(POLICY_FILE)
     }
 
+    /// Persist `self` as `sandbox_dir`'s `policy.yaml`, overwriting any
+    /// existing file. Shared by both create paths that seed a policy
+    /// programmatically (rather than copying a user-supplied file): the CLI's
+    /// `izba build`/`izba create --policy`-less-manifest-egress case
+    /// (`izba-cli::commands::persist_policy_config`) and the desktop app's
+    /// GUI create path (`seed_manifest_base` in `app/src-tauri/src/
+    /// commands.rs`, seeding from a workspace `izba.yml`'s `spec.egress`).
+    /// The daemon re-reads `policy.yaml` when it arms the egress plane at
+    /// Start, so this must run AFTER Create and BEFORE Start.
+    pub fn write_to(&self, sandbox_dir: &Path) -> Result<()> {
+        let path = Self::path_in(sandbox_dir);
+        std::fs::write(&path, self.to_yaml()).with_context(|| format!("writing {}", path.display()))
+    }
+
     /// Load a sandbox's policy from its directory; `Ok(None)` if none was
     /// declared (a bare, permissive sandbox).
     pub fn load(sandbox_dir: &Path) -> Result<Option<Self>> {
