@@ -29,7 +29,7 @@
       "journey_id": "manifest-seeded-drift-promote",
       "modality": "gui",
       "tier": "smoke",
-      "rationale": "The headline manifest workflow: someone edits izba.yml (here simulating that edit as a precondition of the step, since the GUI Actor has no file-editing surface of its own), the app must show the drift, and Promote must apply it. This is the harness's ground-truth-verified decisive assertion — manifest_diff's reported state must match `izba diff`'s.",
+      "rationale": "The headline manifest workflow: someone edits izba.yml (here simulating that edit as a precondition of the step, since the GUI Actor has no file-editing surface of its own), the app must show the drift, and Promote must apply it. This is the harness's ground-truth-verified decisive assertion — manifest_diff's reported state must match `izba diff`'s. The GUI creates the sandbox STOPPED and the seeded drift is an image change (alpine:3.20 -> alpine:3.21): the core promote gate (crates/izba-core/src/manifest/promote.rs:254) refuses an image-class change without restart authorization REGARDLESS of run state, so ManifestTab now shows a stopped-case checkbox (`RESTART_CHECKBOX_LABEL_STOPPED_IMAGE`) that must be ticked before Promote is even clickable. Before that fix (dogfood acceptance run 2, PF1) this journey's final step was a dead end: the dialog had no control that could satisfy the gate and Promote always failed underneath a contradictory 'applies on the next start' note.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.2 Promote in the app; ManifestTab.tsx BANNER_TEXT.repo_ahead + Promote dialog"
@@ -51,8 +51,8 @@
           }
         },
         {
-          "intent": "click 'Promote…' on the Manifest tab, then confirm by clicking 'Promote' in the dialog that appears",
-          "expect": "the dialog reports 'Promoted 1 change(s).' and, after closing it and refreshing, the Manifest tab shows 'In sync — izba.yml and managed settings match.'"
+          "intent": "click 'Promote…' on the Manifest tab, tick the 'Start the sandbox to apply the image change (the scratch disk is kept, not reset)' checkbox, then confirm by clicking 'Promote' in the dialog that appears",
+          "expect": "the dialog reports 'Promoted 1 change(s).' and 'Sandbox was started to apply the change.', and, after closing it and refreshing, the Manifest tab shows 'In sync — izba.yml and managed settings match.'"
         }
       ]
     },
