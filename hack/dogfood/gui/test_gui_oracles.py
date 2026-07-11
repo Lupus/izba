@@ -1,6 +1,6 @@
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gui.gui_oracles import (console_oracle, dom_expect_oracle,
+from gui.gui_oracles import (_has_dialog, console_oracle, dom_expect_oracle,
                              manifest_truth_oracle, parse_cli_diff_state,
                              silent_failure_oracle, ui_daemon_diff_oracle)
 
@@ -115,6 +115,81 @@ def test_ui_daemon_diff_suppressed_when_every_snapshot_has_a_dialog():
 def test_ui_daemon_diff_accepts_bare_string_for_backward_compat():
     ev = {"sandboxes": ["web"]}
     assert ui_daemon_diff_oracle('[@e1] row "web running"', ev, REF) == []
+
+
+# ---------- ui_daemon_diff page_text fix (run-3 skeptic H1) ----------
+#
+# Run-3 found Fix 1 (above) ineffective for this app: agent-browser's a11y
+# snapshot for the real promote dialog is `heading "Promote izba.yml
+# changes"` + Cancel/Promote/Close buttons, WITHOUT a `role=dialog` mark —
+# so `_has_dialog` was False for every snapshot and the "last non-dialog"
+# selection degraded to "last snapshot" (the modal), reproducing the exact
+# bug the fix meant to prevent (3/3 firings that run were false positives).
+# These tests reproduce the skeptic's exact scenario (marks-only history
+# with no `role=dialog` mark, modal masking the rail) and the corresponding
+# real-negative case.
+
+def test_ui_daemon_diff_uses_page_text_when_marks_hide_rail_behind_undetected_modal():
+    # Reproduces the run-3 false positive: the final marks snapshot is the
+    # real app's promote dialog rendering (heading + buttons, NO dialog-role
+    # mark — `_has_dialog` alone can't see it), but `page_text` for that same
+    # snapshot still carries the rail's "SANDBOXES · N / <name>" text (a
+    # Radix dialog hides the rail from the a11y tree, not from
+    # `document.body.innerText`; verified against a stored run-3 bundle).
+    ev = {"sandboxes": ["manifest-stopped-demo"]}
+    marks_history = [
+        '[@e1] row "manifest-stopped-demo stopped"',
+        '[@e2] heading "Promote izba.yml changes"\n'
+        '[@e3] button "Cancel"\n[@e4] button "Promote"',
+    ]
+    page_text_history = [
+        "SANDBOXES · 1\nmanifest-stopped-demo\nalpine:3.20",
+        "SANDBOXES · 1\nmanifest-stopped-demo\nalpine:3.20\nPromote izba.yml changes",
+    ]
+    assert ui_daemon_diff_oracle(marks_history, ev, REF,
+                                 page_text_history=page_text_history) == []
+
+
+def test_ui_daemon_diff_flags_when_sandbox_absent_from_both_marks_and_page_text():
+    ev = {"sandboxes": ["manifest-stopped-demo"]}
+    marks_history = [
+        '[@e1] heading "Sandboxes"',
+        '[@e2] heading "Promote izba.yml changes"\n'
+        '[@e3] button "Cancel"\n[@e4] button "Promote"',
+    ]
+    page_text_history = [
+        "SANDBOXES · 0",
+        "Promote izba.yml changes",
+    ]
+    cs = ui_daemon_diff_oracle(marks_history, ev, REF,
+                               page_text_history=page_text_history)
+    assert len(cs) == 1 and cs[0].kind == "ui_daemon_diff"
+
+
+def test_ui_daemon_diff_page_text_history_shorter_than_marks_falls_back_per_index():
+    # An entry beyond page_text_history's length (e.g. an older bundle that
+    # only captured page_text for the final snapshot) falls back to the
+    # marks-only `_has_dialog` check for that entry.
+    ev = {"sandboxes": ["web"]}
+    marks_history = [
+        '[@e1] row "web running"',
+        '[@e2] dialog "Promote izba.yml changes"',
+    ]
+    assert ui_daemon_diff_oracle(marks_history, ev, REF,
+                                 page_text_history=[]) == []
+
+
+def test_has_dialog_detects_modal_heading_and_button_cluster_without_dialog_role():
+    # `_has_dialog` is still exercised as the marks-only fallback (no dead
+    # code): it must recognize THIS app's actual dialog rendering (heading +
+    # button cluster, no role=dialog mark), not just the spec-compliant shape.
+    assert _has_dialog('[@e1] heading "Promote izba.yml changes"\n'
+                       '[@e2] button "Cancel"\n[@e3] button "Promote"') is True
+    # A bare heading match alone (e.g. the un-opened New-sandbox panel, which
+    # also carries a "New sandbox" heading) must NOT false-positive without
+    # the button cluster.
+    assert _has_dialog('[@e1] heading "New sandbox"\n[@e2] textbox "Name"') is False
+    assert _has_dialog('[@e1] row "web running"') is False
 
 
 # ---------- manifest_truth oracle (Task 11) ----------

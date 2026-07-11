@@ -215,7 +215,12 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     # against the last one that isn't a portal-obscured modal, instead of
     # false-positiving whenever the journey happened to end with a dialog
     # open (see gui_oracles.ui_daemon_diff_oracle's docstring).
+    # Fix 2 (run-3 H1): the parallel `document.body.innerText` capture for
+    # each entry above (same index) — this app's dialogs hide the rail from
+    # the a11y tree but not from page_text, so the oracle prefers this union
+    # over the marks-only heuristic (gui_oracles._last_reliable_snapshot).
     marks_history: List[str] = []
+    page_text_history: List[str] = []
     ws_abs = os.path.abspath(workspace) if workspace else ""
     if ws_abs:
         os.makedirs(ws_abs, exist_ok=True)
@@ -236,6 +241,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
             # observation — otherwise it guesses a ref and burns a turn.
             marks_text = render_marks(driver.snapshot())
             marks_history.append(marks_text)
+            page_text_history.append(driver.read_page_text())
             obs: List[Dict[str, Any]] = [{"action": "(opened screen)",
                                           "marks": marks_text}]
             while True:
@@ -264,6 +270,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 if reply.get("read"):
                     marks_text = render_marks(driver.snapshot())
                     marks_history.append(marks_text)
+                    page_text_history.append(driver.read_page_text())
                     obs.append({"action": "read", "marks": marks_text})
                     continue
                 argv = action_to_argv(reply)
@@ -278,6 +285,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 marks_text = render_marks(driver.snapshot())
                 marks_history.append(marks_text)
                 page_text = driver.read_page_text()
+                page_text_history.append(page_text)
                 reconcile = _reconcile_snapshot(izba_bin, data_dir, action_timeout_s)
                 all_console = driver.read_console_errors()
                 console_errors = all_console[console_seen:]
@@ -342,6 +350,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     final_marks = render_marks(driver.snapshot())
     marks_history.append(final_marks)
     final_page_text = driver.read_page_text()
+    page_text_history.append(final_page_text)
     final_ref = {"journey_id": journey_id, "action_index": -1}
     invoke_log = driver.read_invoke_log()
     last_expect = (steps[-1].get("expect", "") if steps else "")
@@ -366,7 +375,8 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     # docstring for the false-negative/false-positive tradeoff rationale).
     all_page_text = "\n".join(
         [a.get("page_text", "") for a in actions] + [final_page_text])
-    end_found = (ui_daemon_diff_oracle(marks_history, state_evidence, final_ref)
+    end_found = (ui_daemon_diff_oracle(marks_history, state_evidence, final_ref,
+                                       page_text_history=page_text_history)
                  + dom_expect_oracle(last_expect, final_marks, final_ref,
                                     page_text=final_page_text)
                  + silent_failure_oracle(silent_failure_log, final_marks, final_ref,
