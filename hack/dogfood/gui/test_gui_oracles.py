@@ -146,3 +146,31 @@ def test_manifest_truth_oracle_result_side_channel():
     ctx = _mt_ctx("in_sync", sandbox_name=None)
     manifest_truth_oracle(ctx)
     assert ctx["manifest_truth_result"] == "no_target"
+
+
+def test_manifest_truth_oracle_no_target_when_workspace_missing():
+    # Complementary to the sandbox_name=None variant above: a missing
+    # workspace (e.g. the GUI create invoke never resolved) must also read
+    # as "couldn't check", never as a confirmed match.
+    ctx = _mt_ctx("in_sync", workspace=None)
+    manifest_truth_oracle(ctx)
+    assert ctx["manifest_truth_result"] == "no_target"
+
+
+def test_manifest_truth_oracle_silent_when_invoke_failed_ok_false():
+    # real-bridge.js never attaches a digest to a rejected invoke (the
+    # ok:false branch pushes {cmd, ok:false, error} with no digest key at
+    # all) — pin that a bare ok:false entry with no digest is correctly
+    # excluded from ground-truth comparison: no shell-out, no crash, and the
+    # side channel reads "no_digest" (nothing usable was ever seen), not a
+    # fabricated match.
+    ctx = {"invoke_log": [{"cmd": "manifest_diff", "ok": False, "error": "boom"}],
+          "sandbox_name": "web", "workspace": "/tmp/ws", "izba_bin": "izba",
+          "data_dir": "/tmp/d", "ref": REF}
+    called = []
+    def fake_run_diff(*a, **k):
+        called.append(a)
+        return "state: repo ahead (promotable)\n"
+    assert manifest_truth_oracle(ctx, run_diff=fake_run_diff) == []
+    assert called == []
+    assert ctx["manifest_truth_result"] == "no_digest"
