@@ -40,6 +40,16 @@ def test_action_allows_optional_gui_fields():
     assert "snapshot" not in schema["definitions"]["action"]["required"]
 
 
+def test_journey_result_allows_workspace():
+    # Task 10: the GUI runner's per-journey workspace path, recorded for the
+    # Phase-3 skeptic — optional (journey_result is additionalProperties:
+    # false, so the field must be declared, but CLI results never set it).
+    schema = _load("trajectory.schema.json")
+    jr = schema["definitions"]["journey_result"]
+    assert jr["properties"]["workspace"]["type"] == "string"
+    assert "workspace" not in jr["required"]
+
+
 def test_gui_skeleton_journeys_are_gui_and_anchored():
     with open(os.path.join(HERE, "fixtures", "journeys.gui-skeleton.json")) as f:
         doc = json.load(f)

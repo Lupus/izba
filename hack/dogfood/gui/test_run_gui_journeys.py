@@ -339,3 +339,130 @@ def test_unusable_reconciler_flags_gui_journey_as_infra(monkeypatch):
     infra = [c for c in res["candidates"] if c["kind"] == "infra"]
     assert len(infra) >= 1
     assert any("reconciler unusable" in c["detail"] for c in infra)
+
+
+# ---------- Task 10: per-journey workspace + seed_files + {workspace} ----------
+
+class _RecordingModel:
+    """Like FakeModel but records, at the instant each next_command call is
+    made, (a) the step['intent'] it was handed and (b) a listing of the
+    workspace dir — so a test can assert BOTH that {workspace} substitution
+    reached the Actor and exactly when seed_files landed relative to that
+    call."""
+
+    def __init__(self, script, workspace):
+        self._script = list(script)
+        self._i = 0
+        self.last_cost_usd = 0.0
+        self.workspace = workspace
+        self.intents = []
+        self.listings = []
+
+    def next_command(self, journey, step, observations):
+        self.last_cost_usd = 0.0
+        self.intents.append(step.get("intent"))
+        self.listings.append(
+            sorted(os.listdir(self.workspace)) if os.path.isdir(self.workspace) else [])
+        if self._i >= len(self._script):
+            return {"done": True}
+        reply = self._script[self._i]
+        self._i += 1
+        return reply
+
+
+def test_run_gui_journey_seeds_journey_level_before_step0(tmp_path, monkeypatch):
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    workspace = tmp_path / "workspace"
+    model = _RecordingModel([{"done": True}], str(workspace))
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"',
+                                   '[@e1] heading "Sandboxes"'])
+    journey = {"journey_id": "j-seed-journey", "modality": "gui",
+               "seed_files": {"izba.yml": "name: web\n"},
+               "steps": [{"intent": "do nothing", "expect": ""}]}
+    run_gui_journey(model, driver, journey, izba_bin="izba",
+                    data_dir=str(tmp_path), max_turns=8, step_cap=10,
+                    action_timeout_s=5, latency_budget_ms=30000,
+                    budget={"usd": 0.0}, max_usd=2.0, workspace=str(workspace))
+    # The file exists on disk...
+    assert (workspace / "izba.yml").read_text() == "name: web\n"
+    # ...and it was ALREADY there the very first time the model was consulted
+    # (i.e. before step 0's first action, not written lazily afterwards).
+    assert model.listings[0] == ["izba.yml"]
+
+
+def test_run_gui_journey_step_seed_lands_before_that_step_not_earlier(tmp_path, monkeypatch):
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    workspace = tmp_path / "workspace"
+    # Two steps, each done in a single next_command call.
+    model = _RecordingModel([{"done": True}, {"done": True}], str(workspace))
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"'] * 3)
+    journey = {"journey_id": "j-seed-step", "modality": "gui",
+               "steps": [
+                   {"intent": "before drift", "expect": "no file yet"},
+                   {"intent": "after drift", "expect": "file present",
+                    "seed_files": {"drift.txt": "drift\n"}},
+               ]}
+    run_gui_journey(model, driver, journey, izba_bin="izba",
+                    data_dir=str(tmp_path), max_turns=8, step_cap=10,
+                    action_timeout_s=5, latency_budget_ms=30000,
+                    budget={"usd": 0.0}, max_usd=2.0, workspace=str(workspace))
+    assert len(model.listings) == 2
+    assert model.listings[0] == [], "drift.txt must not exist before step 1 seeds it"
+    assert model.listings[1] == ["drift.txt"], \
+        "drift.txt must be seeded before step 1's first action"
+    assert (workspace / "drift.txt").read_text() == "drift\n"
+
+
+def test_run_gui_journey_substitutes_workspace_token_in_intent(tmp_path, monkeypatch):
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    workspace = tmp_path / "workspace"
+    model = _RecordingModel([{"click": "@e2"}, {"done": True}], str(workspace))
+    driver = FakeDriver(snapshots=['[@e2] button "Create"',
+                                   '[@e1] row "web running"',
+                                   '[@e1] row "web running"'])
+    journey = {"journey_id": "j-intent-token", "modality": "gui",
+               "steps": [{"intent": "Create a sandbox with workspace {workspace}",
+                          "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir=str(tmp_path), max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0, workspace=str(workspace))
+    expected = f"Create a sandbox with workspace {os.path.abspath(str(workspace))}"
+    # Reaches the fake Actor's next_command call...
+    assert model.intents[0] == expected
+    # ...and lands in the recorded trajectory action's intent too.
+    assert res["actions"][0]["intent"] == expected
+    assert res["workspace"] == os.path.abspath(str(workspace))
+
+
+def test_run_gui_journey_substitutes_workspace_token_in_expect_before_dom_expect(
+        tmp_path, monkeypatch):
+    # {workspace} must be substituted BEFORE dom_expect's keyword extraction:
+    # craft a final screen that contains the real absolute path (as the app
+    # would render it), and an expect referencing {workspace} — if
+    # substitution happens first, the path's distinctive token overlaps the
+    # screen and no dom_expect candidate is raised.
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    workspace = tmp_path / "wsuniquemark123"
+    ws_abs = os.path.abspath(str(workspace))
+    model = FakeModel([{"done": True}])
+    final_marks = f'[@e1] text "workspace path is {ws_abs}"'
+    driver = FakeDriver(snapshots=[final_marks, final_marks])
+    journey = {"journey_id": "j-expect-token", "modality": "gui",
+               "steps": [{"intent": "check path",
+                          "expect": "the workspace path {workspace} is shown"}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir=str(tmp_path), max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0, workspace=str(workspace))
+    dom_expect = [c for c in res["candidates"] if c["kind"] == "dom_expect"]
+    assert dom_expect == [], \
+        f"expected no dom_expect candidate once {{workspace}} is substituted: {dom_expect}"
