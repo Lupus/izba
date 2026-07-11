@@ -125,3 +125,30 @@ export interface PolicyView {
   allow: AllowEntry[];
   git: GitRule[];
 }
+
+/** Drift between the repo's `izba.yml` proposal and the host-managed truth. */
+export type DriftState = "in_sync" | "repo_ahead" | "managed_ahead" | "diverged";
+
+/** One field-level delta in a manifest diff/promote result. */
+export interface DeltaView {
+  field: string;
+  from: string;
+  to: string;
+  class: "live" | "restart" | "image";
+  weakens_egress: boolean;
+}
+
+export interface DiffView {
+  state: DriftState;
+  deltas: DeltaView[];
+}
+
+/** Mirrors izba_core's `PromoteView` (`{state, applied, needs_restart, restarted, stopped, warnings}`). */
+export interface PromoteView {
+  state: DriftState;
+  applied: DeltaView[];
+  needs_restart: boolean;
+  restarted: boolean;
+  stopped: boolean;
+  warnings: string[];
+}

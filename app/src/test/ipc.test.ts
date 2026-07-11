@@ -159,4 +159,44 @@ describe("ipc action wrappers", () => {
       guestPath: "/data",
     });
   });
+
+  // ── manifest diff/export/promote ────────────────────────────────────────
+
+  it("manifestDiff invokes manifest_diff with the name and returns the DiffView", async () => {
+    const diff = {
+      state: "repo_ahead",
+      deltas: [
+        {
+          field: "policy.egress.enforce",
+          from: "true",
+          to: "false",
+          class: "live",
+          weakens_egress: true,
+        },
+      ],
+    };
+    invoke.mockResolvedValue(diff);
+    await expect(api.manifestDiff("web")).resolves.toEqual(diff);
+    expect(invoke).toHaveBeenCalledWith("manifest_diff", { name: "web" });
+  });
+
+  it("manifestExport invokes manifest_export with the name and returns the path", async () => {
+    invoke.mockResolvedValue("/ws/izba.yml");
+    await expect(api.manifestExport("web")).resolves.toBe("/ws/izba.yml");
+    expect(invoke).toHaveBeenCalledWith("manifest_export", { name: "web" });
+  });
+
+  it("manifestPromote invokes manifest_promote with name + restart and returns the PromoteView", async () => {
+    const promoted = {
+      state: "in_sync",
+      applied: [],
+      needs_restart: false,
+      restarted: false,
+      stopped: false,
+      warnings: [],
+    };
+    invoke.mockResolvedValue(promoted);
+    await expect(api.manifestPromote("web", true)).resolves.toEqual(promoted);
+    expect(invoke).toHaveBeenCalledWith("manifest_promote", { name: "web", restart: true });
+  });
 });
