@@ -78,13 +78,72 @@ pub fn remove_core(d: &mut dyn DaemonApi, name: &str, force: bool) -> Result<(),
 }
 
 /// Create a sandbox, forwarding daemon `Progress` messages via `on_progress`.
+/// After the daemon confirms creation, seeds the manifest reconciliation base
+/// from the workspace's `izba.yml` (if any) — see [`seed_manifest_base`] for
+/// why this is required, not cosmetic.
 pub fn create_core(
     d: &mut dyn DaemonApi,
     opts: CreateOpts,
     on_progress: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
     let req = opts.into_daemon_create().map_err(|e| e.to_string())?;
-    d.create(req, on_progress).map_err(|e| e.to_string())
+    let workspace = req.workspace.clone();
+    let name = d.create(req, on_progress).map_err(|e| e.to_string())?;
+    seed_manifest_base(&app_paths(), &name, &workspace)?;
+    Ok(name)
+}
+
+/// GUI-create parity with `izba create`/`izba run` (see
+/// `crates/izba-cli/src/commands/create.rs`): when `workspace` contains a
+/// parseable `izba.yml`, seed the sandbox's manifest reconciliation base
+/// (`manifest.base.yaml`) from it, clear any stale review token, and seed
+/// `policy.yaml` from `spec.egress` (mirroring the CLI's
+/// `persist_policy_config`, via the shared `EgressPolicyConfig::write_to`).
+///
+/// Without this, `compute_diff` (`crates/izba-core/src/manifest/ops.rs`)
+/// falls back to `base = managed.clone()` for a sandbox that has never had a
+/// base written — which makes `managed_ahead` UNREACHABLE for GUI-created
+/// sandboxes: any later in-app change (e.g. editing the egress policy on the
+/// Policy tab) gets misclassified as `repo_ahead` against the *unchanged*
+/// `izba.yml`, and clicking Promote would silently REVERT the user's own
+/// edit instead of the intended Export-to-capture-drift flow.
+///
+/// The base is written from the manifest exactly as it stood at creation
+/// time — it is NOT reconciled against the form-provided `CreateOpts`
+/// (image/cpus/mem stay form-authoritative, matching the CLI's "explicit
+/// flags always win" rule). So a create where the form's image differs from
+/// `izba.yml`'s honestly shows up as `managed_ahead` the moment `izba diff`/
+/// the Manifest tab is opened — same semantics as a CLI flag override, and
+/// exactly what Export exists to capture.
+///
+/// - No `izba.yml` in `workspace`: no-op (`Ok(())`), matching pre-fix
+///   behavior for the common case.
+/// - `izba.yml` present but fails to parse: returns `Err` with the parse
+///   message. CLI parity — `merge_manifest_into_opts` propagates the same
+///   failure and aborts `izba create`. A silent skip here would recreate the
+///   exact `managed_ahead`-unreachable bug for a typo'd manifest (the
+///   sandbox would exist with no base, same as the missing-file case).
+/// - Valid manifest: writes `manifest.base.yaml`, clears any stale review
+///   token, and seeds `policy.yaml` from `spec.egress` when declared. The
+///   GUI create flow has no `--policy`-file input, so — unlike the CLI's
+///   `merged.policy.is_none()` gate — this is unconditional.
+pub(crate) fn seed_manifest_base(
+    paths: &Paths,
+    name: &str,
+    workspace: &std::path::Path,
+) -> Result<(), String> {
+    if !workspace.join("izba.yml").exists() {
+        return Ok(());
+    }
+    let (m, _raw, _dockerfile) =
+        izba_core::manifest::ops::load_repo_manifest(workspace).map_err(|e| e.to_string())?;
+    let sandbox_dir = paths.sandbox_dir(name);
+    if let Some(ref eg) = m.spec.egress {
+        eg.write_to(&sandbox_dir).map_err(|e| e.to_string())?;
+    }
+    store::write_base(&sandbox_dir, &m).map_err(|e| e.to_string())?;
+    store::clear_review(&sandbox_dir).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Core of `read_netlog`: per-endpoint aggregated audit summaries.
@@ -442,6 +501,174 @@ mod tests {
         bad.name = "Bad Name".into();
         let err = create_core(&mut d, bad, &mut |_| {}).unwrap_err();
         assert!(err.contains("invalid sandbox name"), "got: {err}");
+    }
+
+    /// `create_core` must seed the manifest reconciliation base from the
+    /// chosen workspace's `izba.yml` — CLI parity, see `seed_manifest_base`'s
+    /// doc comment for why a missing base makes `managed_ahead` unreachable.
+    #[test]
+    fn create_core_seeds_manifest_base_from_workspace_izba_yml() {
+        let guard = HomeGuard::new();
+        let ws = guard.home.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("izba.yml"), MINIMAL_MANIFEST).unwrap();
+
+        let paths = app_paths();
+        // The real daemon's Create RPC creates the sandbox dir on disk before
+        // replying `Created`; `FakeDaemon` never touches disk, so create it
+        // here to let `seed_manifest_base`'s writes land, mirroring reality.
+        std::fs::create_dir_all(paths.sandbox_dir("new")).unwrap();
+
+        let mut d = FakeDaemon::default();
+        let mut opts = create_opts();
+        opts.workspace = ws.display().to_string();
+        let name = create_core(&mut d, opts, &mut |_| {}).unwrap();
+
+        assert!(
+            store::read_base(&paths.sandbox_dir(&name))
+                .unwrap()
+                .is_some(),
+            "create_core must write manifest.base.yaml from the workspace izba.yml"
+        );
+    }
+
+    /// A workspace with no `izba.yml` leaves `create_core` exactly as before
+    /// this fix: no base is written, no error.
+    #[test]
+    fn create_core_no_manifest_is_noop_for_base_seeding() {
+        let guard = HomeGuard::new();
+        let ws = guard.home.join("ws-bare");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let paths = app_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("new")).unwrap();
+
+        let mut d = FakeDaemon::default();
+        let mut opts = create_opts();
+        opts.workspace = ws.display().to_string();
+        let name = create_core(&mut d, opts, &mut |_| {}).unwrap();
+
+        assert!(store::read_base(&paths.sandbox_dir(&name))
+            .unwrap()
+            .is_none());
+    }
+
+    /// A workspace with a syntactically broken `izba.yml` must fail the
+    /// create outright (CLI parity) rather than silently skip base-seeding —
+    /// a silent skip would recreate the exact bug this fix closes.
+    #[test]
+    fn create_core_fails_on_unparseable_workspace_manifest() {
+        let guard = HomeGuard::new();
+        let ws = guard.home.join("ws-broken");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("izba.yml"), "not: [valid, izba.yml").unwrap();
+
+        let paths = app_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("new")).unwrap();
+
+        let mut d = FakeDaemon::default();
+        let mut opts = create_opts();
+        opts.workspace = ws.display().to_string();
+        let err = create_core(&mut d, opts, &mut |_| {}).unwrap_err();
+        assert!(err.contains("parsing izba.yml"), "got: {err}");
+    }
+
+    /// A fresh scratch dir under the OS temp dir, nanosecond-tagged like the
+    /// other ad-hoc temp dirs in this file (this crate has no `tempfile`
+    /// dev-dependency). Caller is responsible for `remove_dir_all` cleanup.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("izba-app-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `seed_manifest_base` is the pure, unit-testable core of the create-time
+    /// seeding `create_core` wires up above. No `izba.yml` in `workspace` is a
+    /// no-op — matches pre-fix behavior for the (still common) manifest-less
+    /// create.
+    #[test]
+    fn seed_manifest_base_noop_when_no_manifest() {
+        let tmp = scratch_dir("seed-noop");
+        let paths = Paths::with_root(tmp.join("izba"));
+        let ws = tmp.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        seed_manifest_base(&paths, "nomanifest", &ws).unwrap();
+
+        assert!(store::read_base(&paths.sandbox_dir("nomanifest"))
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A valid `izba.yml` with a declared `spec.egress` must: write
+    /// `manifest.base.yaml`, clear any stale review token, and seed
+    /// `policy.yaml` from the declared egress config.
+    #[test]
+    fn seed_manifest_base_valid_manifest_writes_base_and_seeds_policy() {
+        let tmp = scratch_dir("seed-valid");
+        let paths = Paths::with_root(tmp.join("izba"));
+        let name = "seeded";
+        let sandbox_dir = paths.sandbox_dir(name);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        // A stale review token from some earlier state must be cleared —
+        // mirrors the CLI's `store::clear_review` call in `create.rs`.
+        store::write_review(&sandbox_dir, "stale-token").unwrap();
+
+        let ws = tmp.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("izba.yml"),
+            "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3\n  egress:\n    enforce: true\n    allow:\n      - github.com\n",
+        )
+        .unwrap();
+
+        seed_manifest_base(&paths, name, &ws).unwrap();
+
+        let base = store::read_base(&sandbox_dir).unwrap();
+        assert!(base.is_some(), "manifest.base.yaml must be written");
+        assert_eq!(base.unwrap().spec.image.as_deref(), Some("alpine:3"));
+
+        assert!(
+            store::read_review(&sandbox_dir).unwrap().is_none(),
+            "stale review token must be cleared"
+        );
+
+        let policy = izba_core::daemon::egress::config::EgressPolicyConfig::load(&sandbox_dir)
+            .unwrap()
+            .expect("policy.yaml should be seeded from spec.egress");
+        assert!(policy.enforce);
+        assert_eq!(policy.allow.len(), 1);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A syntactically broken `izba.yml` returns the parse error verbatim and
+    /// does NOT write a base — a silent skip would recreate the
+    /// `managed_ahead`-unreachable bug for a typo'd manifest.
+    #[test]
+    fn seed_manifest_base_parse_error_returns_err() {
+        let tmp = scratch_dir("seed-parse-error");
+        let paths = Paths::with_root(tmp.join("izba"));
+        let name = "broken";
+        std::fs::create_dir_all(paths.sandbox_dir(name)).unwrap();
+
+        let ws = tmp.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("izba.yml"), "not: [valid, izba.yml").unwrap();
+
+        let err = seed_manifest_base(&paths, name, &ws).unwrap_err();
+        assert!(err.contains("parsing izba.yml"), "got: {err}");
+        assert!(store::read_base(&paths.sandbox_dir(name))
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
