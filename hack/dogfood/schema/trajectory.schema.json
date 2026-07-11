@@ -47,7 +47,20 @@
             }
           }
         },
-        "invoke_log": { "type": "array", "items": { "type": "object" }, "description": "GUI only: the in-page bridge's invoke log (command, ok/error, duration) captured at journey end — the evidence behind silent_failure verdicts." }
+        "invoke_log": { "type": "array", "items": { "type": "object" }, "description": "GUI only: the in-page bridge's invoke log (command, ok/error, duration) captured at journey end — the evidence behind silent_failure verdicts." },
+        "decisive_credits": {
+          "type": "array",
+          "description": "Audit trail for H3 crediting: each entry records a decisive step whose own pointer produced no actions but was graded functionally from an EARLIER step's action (via that step's expect_cmd_re). A broad pattern (e.g. a bare 'izba') can match an unrelated command, so every credit — including ones that graded to a silent pass — is recorded here for the Phase-3 skeptic to audit, not just the failures.",
+          "items": {
+            "type": "object",
+            "required": ["step_index", "action_index", "graded_cmd"],
+            "properties": {
+              "step_index": { "type": "integer", "description": "Index of the decisive step that was credited." },
+              "action_index": { "type": "integer", "description": "Index into the journey's actions array of the action the credit was graded from." },
+              "graded_cmd": { "type": "string", "description": "The exact command that was graded for this credit." }
+            }
+          }
+        }
       }
     },
     "action": {

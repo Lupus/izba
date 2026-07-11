@@ -488,7 +488,16 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id):
     step. When the step declares ``expect_cmd_re``, scan ALL journey actions for
     the LAST match and grade THAT action functionally. Returns None when the
     step has no usable ``expect_cmd_re`` or nothing matched (caller then flags
-    ``unreached_decisive``); an empty list means exercised-and-passed."""
+    ``unreached_decisive``); otherwise a dict with the graded candidates plus
+    the crediting pointer (``action_index``/``graded_cmd``).
+
+    A broad ``expect_cmd_re`` (e.g. a bare ``izba``) is not machine-decidable
+    from breadth alone — legitimate patterns are broad too (``izba diff`` must
+    match ``izba diff --name x``). So instead of trying to reject "too broad"
+    patterns here, every credit is recorded verbatim by the caller into the
+    journey's ``decisive_credits``: a decisive step credited from another
+    step's action is a CLAIM the Phase-3 skeptic must be able to see and
+    audit, including when the grade was a silent pass."""
     pattern = step.get("expect_cmd_re")
     if not (isinstance(pattern, str) and pattern):
         return None
@@ -518,7 +527,12 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id):
             cd["decisive"] = True
             cd["graded_cmd"] = a.get("command", "")
             out.append(cd)
-        return out
+        return {
+            "step_index": None,  # caller fills the decisive step index
+            "action_index": idx,
+            "graded_cmd": a.get("command", ""),
+            "candidates": out,
+        }
     return None
 
 
@@ -539,6 +553,7 @@ def run_journey(
     journey_id = journey.get("journey_id", "")
     actions: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
+    decisive_credits: List[Dict[str, Any]] = []
     ctx: Dict[str, Any] = {"turns": 0, "prev_reconcile": None, "starved": []}
     # The Actor's shell cwd — a real project dir, kept OUT of the izba data dir
     # so the user's files (e.g. a policy.yaml they write) don't mingle with
@@ -584,7 +599,9 @@ def run_journey(
             s = steps[i]
             graded = _grade_decisive_from_observed(s, actions, journey, journey_id)
             if graded is not None:
-                candidates.extend(graded)
+                graded["step_index"] = i
+                candidates.extend(graded.pop("candidates"))
+                decisive_credits.append(graded)
                 continue
             candidates.append({
                 "kind": "unreached_decisive",
@@ -619,7 +636,7 @@ def run_journey(
     except Exception as e:  # defensive: teardown_journey shouldn't raise
         log(f"{journey_id}: teardown error: {e!r}")
     return {"journey_id": journey_id, "actions": actions, "candidates": candidates,
-            "state_evidence": state_evidence}
+            "state_evidence": state_evidence, "decisive_credits": decisive_credits}
 
 
 def build_model(args) -> Any:
