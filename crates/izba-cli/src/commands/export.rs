@@ -40,7 +40,7 @@ mod tests {
         std::fs::write(dir.join("izba.yml"), b"{ invalid: yaml: [broken").unwrap();
         // load_repo_manifest is the function the name-resolution delegates to
         // when izba.yml exists.  It must return Err on a broken file.
-        let result = super::super::load_repo_manifest(dir);
+        let result = izba_core::manifest::ops::load_repo_manifest(dir);
         assert!(
             result.is_err(),
             "a present-but-malformed izba.yml must propagate a parse error, got Ok"
@@ -63,7 +63,7 @@ mod tests {
         );
         // Confirm that load_repo_manifest itself would error (so the exists()
         // guard is necessary and not dead code).
-        let result = super::super::load_repo_manifest(dir);
+        let result = izba_core::manifest::ops::load_repo_manifest(dir);
         assert!(
             result.is_err(),
             "load_repo_manifest with no izba.yml must return Err (not found)"
