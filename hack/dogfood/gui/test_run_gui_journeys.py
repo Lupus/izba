@@ -441,6 +441,165 @@ def test_run_gui_journey_substitutes_workspace_token_in_intent(tmp_path, monkeyp
     assert res["workspace"] == os.path.abspath(str(workspace))
 
 
+def test_run_gui_journey_no_manifest_invoke_no_decisive_wiring(monkeypatch):
+    """Task 11 regression guard: a GUI journey that never touches the
+    Manifest tab (the vast majority) must be completely unaffected by
+    decisive wiring — manifest_truth_oracle is never even called, and
+    decisive_credits stays empty, even though this step declares core: true
+    (the fallback-to-last-step decisive index always exists)."""
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"',
+                                   '[@e1] heading "Sandboxes"'])
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    called = []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle",
+                        lambda ctx, **k: called.append(1) or [])
+    journey = {"journey_id": "j-no-manifest", "modality": "gui",
+               "steps": [{"intent": "look around", "expect": "", "core": True}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert called == []
+    assert res["decisive_credits"] == []
+    assert not [c for c in res["candidates"] if c["kind"] == "functional"]
+
+
+def test_run_gui_journey_decisive_manifest_mismatch_flips_negative(monkeypatch):
+    """Step 3: a core: true step whose manifest_truth ground truth disagrees
+    with the UI's last manifest_diff digest must emit a `functional`
+    candidate tagged decisive=True — the collector's contract for flipping a
+    journey negative on its decisive step (schema: `decisive` on candidate)."""
+    import gui.run_gui_journeys as rgj
+    from oracles import Candidate
+
+    model = FakeModel([{"done": True}])
+    invoke_log = [{"cmd": "manifest_diff", "ok": True,
+                  "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"',
+                                   '[@e1] heading "Manifest"'],
+                        invoke_log=invoke_log)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    monkeypatch.setattr(
+        rgj, "manifest_truth_oracle",
+        lambda ctx, **k: [Candidate(
+            kind="functional", detail="manifest_truth: mismatch",
+            violated_expectation="drift state must match", source="izba diff",
+            trajectory_ref=dict(ctx["ref"]))])
+    journey = {"journey_id": "j-mt-mismatch", "modality": "gui",
+               "steps": [{"intent": "view manifest diff", "expect": "state shown",
+                          "core": True}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1
+    assert functional[0]["decisive"] is True
+    assert functional[0]["detail"].startswith("manifest_truth:")
+    assert res["decisive_credits"] == []  # a flip, not a credited pass
+
+
+def test_run_gui_journey_decisive_manifest_match_records_credit(monkeypatch):
+    """Step 3: matching ground truth grades positive AND records a
+    decisive_credits audit-trail entry (schema parity with the CLI runner's
+    #126/PR#129 credit mechanism) — the skeptic must be able to see the
+    decisive step WAS honestly exercised, not silently skipped."""
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"done": True}])
+    invoke_log = [{"cmd": "manifest_diff", "ok": True,
+                  "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"',
+                                   '[@e1] heading "Manifest"'],
+                        invoke_log=invoke_log)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+
+    def fake_mt(ctx, **k):
+        # Mirrors the real oracle's side channel: a confirmed match sets
+        # ctx["manifest_truth_result"] = "matched" (an empty return alone is
+        # ambiguous — see gui_oracles.manifest_truth_oracle's docstring).
+        ctx["manifest_truth_result"] = "matched"
+        return []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle", fake_mt)
+    journey = {"journey_id": "j-mt-match", "modality": "gui",
+               "steps": [{"intent": "view manifest diff", "expect": "state shown",
+                          "core": True}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert not [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "manifest_truth: izba diff ground truth (matched)",
+    }]
+
+
+def test_run_gui_journey_manifest_truth_unparseable_records_no_false_credit(monkeypatch):
+    """An empty manifest_truth_oracle result is ambiguous by itself: it means
+    EITHER a verified match OR that ground truth couldn't be checked at all
+    (izba diff subprocess failure/timeout/unparseable output). The runner
+    must only credit a decisive pass when the oracle's side channel says
+    'matched' — never fabricate a credit off a bare empty return."""
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"done": True}])
+    invoke_log = [{"cmd": "manifest_diff", "ok": True,
+                  "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"',
+                                   '[@e1] heading "Manifest"'],
+                        invoke_log=invoke_log)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+
+    def fake_mt_unparseable(ctx, **k):
+        ctx["manifest_truth_result"] = "unparseable"  # e.g. izba diff timed out
+        return []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle", fake_mt_unparseable)
+    journey = {"journey_id": "j-mt-unparseable", "modality": "gui",
+               "steps": [{"intent": "view manifest diff", "expect": "state shown",
+                          "core": True}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert not [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert res["decisive_credits"] == []  # not a fabricated pass
+
+
+def test_run_gui_journey_manifest_truth_ctx_carries_sandbox_from_state_evidence(monkeypatch):
+    """The sandbox name/workspace passed to manifest_truth_oracle come from
+    the runner's existing state_evidence (capture_state_evidence) plumbing,
+    not new invoke-log arg capture — pin the exact ctx shape."""
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"done": True}])
+    invoke_log = [{"cmd": "manifest_diff", "ok": True,
+                  "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"',
+                                   '[@e1] heading "Manifest"'],
+                        invoke_log=invoke_log)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)  # sandboxes=["web"]
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    seen_ctx = {}
+    def fake_mt(ctx, **k):
+        seen_ctx.update(ctx)
+        return []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle", fake_mt)
+    journey = {"journey_id": "j-mt-ctx", "modality": "gui",
+               "steps": [{"intent": "view manifest diff", "expect": "", "core": True}]}
+    run_gui_journey(model, driver, journey, izba_bin="izba",
+                    data_dir="/tmp/x", max_turns=8, step_cap=10,
+                    action_timeout_s=5, latency_budget_ms=30000,
+                    budget={"usd": 0.0}, max_usd=2.0)
+    assert seen_ctx["sandbox_name"] == "web"
+    assert seen_ctx["invoke_log"] == invoke_log
+    assert seen_ctx["izba_bin"] == "izba"
+    assert seen_ctx["data_dir"] == "/tmp/x"
+
+
 def test_run_gui_journey_substitutes_workspace_token_in_expect_before_dom_expect(
         tmp_path, monkeypatch):
     # {workspace} must be substituted BEFORE dom_expect's keyword extraction:

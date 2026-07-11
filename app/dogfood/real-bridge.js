@@ -6,6 +6,38 @@
 // for the dogfood oracles. Loaded as the FIRST <script> in the dogfood
 // index.html so it defines __TAURI_INTERNALS__ before the app bundle runs.
 (function () {
+  // ---- manifest result digest (kept tiny: strings/bools/ints only) ----
+  // The GUI dogfood harness's `manifest_truth` oracle (hack/dogfood/gui/
+  // gui_oracles.py) needs to know what the UI's last manifest_diff/promote/
+  // export call actually showed, without shipping the full DiffView/
+  // PromoteView payload into the invoke log. This is a pure summary of the
+  // sidecar's JSON result — no daemon/DOM access — so it stays testable via
+  // the runner's fixture/parse path (real-bridge.js itself has no JS test
+  // rig; see the oracle's docstring for how the digest is consumed).
+  function __dfManifestDigest(cmd, result) {
+    if (cmd === "manifest_diff" && result && typeof result === "object") {
+      var deltas = Array.isArray(result.deltas) ? result.deltas : [];
+      return {
+        state: String(result.state || ""),
+        deltas: deltas.length,
+        weakens: deltas.filter(function (d) { return !!(d && d.weakens_egress); }).length,
+      };
+    }
+    if (cmd === "manifest_promote" && result && typeof result === "object") {
+      var applied = Array.isArray(result.applied) ? result.applied : [];
+      return {
+        state: String(result.state || ""),
+        applied: applied.length,
+        needs_restart: !!result.needs_restart,
+        stopped: !!result.stopped,
+      };
+    }
+    if (cmd === "manifest_export") {
+      return { path: String(result || "") };
+    }
+    return null;
+  }
+
   // ---- pure protocol handler (also exported for unit tests) ----
   function __dfHandleMessage(state, raw) {
     var msg;
@@ -29,7 +61,12 @@
       var cmd = state.lastCmd.get(msg.id) || "";
       state.lastCmd.delete(msg.id);
       if (msg.ok) {
-        state.invokeLog.push({ cmd: cmd, ok: true, error: "" });
+        var entry = { cmd: cmd, ok: true, error: "" };
+        if (cmd.indexOf("manifest_") === 0) {
+          var digest = __dfManifestDigest(cmd, msg.result);
+          if (digest) entry.digest = digest;
+        }
+        state.invokeLog.push(entry);
         p.resolve(msg.result);
       } else {
         state.invokeLog.push({ cmd: cmd, ok: false, error: String(msg.error || "") });
@@ -39,7 +76,7 @@
   }
 
   if (typeof module !== "undefined" && module) {
-    module.exports = { __dfHandleMessage: __dfHandleMessage };
+    module.exports = { __dfHandleMessage: __dfHandleMessage, __dfManifestDigest: __dfManifestDigest };
     if (typeof window === "undefined") return; // unit-test load: stop here
     if (typeof WebSocket === "undefined") return; // no real WS — skip browser install
   }

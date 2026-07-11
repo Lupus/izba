@@ -146,6 +146,58 @@ def test_deep_seeded_fixture_shape():
     assert core_step["expect_exit"] == "nonzero"
 
 
+def test_invoke_log_entry_allows_digest():
+    # Task 11: manifest_* invoke-log entries carry a small result digest
+    # (real-bridge.js) for the manifest_truth oracle. cmd is the only
+    # required field (existing GUI test fixtures omit ok/error freely).
+    schema = _load("trajectory.schema.json")
+    entry = schema["definitions"]["invoke_log_entry"]
+    assert entry["required"] == ["cmd"]
+    assert entry["properties"]["digest"]["type"] == "object"
+
+
+def _minimal_bundle_with_invoke_log(invoke_log):
+    return {
+        "shard": 0,
+        "feature": "test-feature",
+        "results": [{
+            "journey_id": "j1",
+            "actions": [],
+            "candidates": [],
+            "invoke_log": invoke_log,
+        }],
+    }
+
+
+def test_invoke_log_digest_round_trips_and_validates():
+    # Step 2: a fixture invoke-log entry with `digest` fields (the shape
+    # real-bridge.js emits for manifest_diff/promote/export) must validate
+    # cleanly against trajectory.schema.json.
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("trajectory.schema.json")
+    bundle = _minimal_bundle_with_invoke_log([
+        {"cmd": "manifest_diff", "ok": True, "error": "",
+         "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}},
+        {"cmd": "manifest_promote", "ok": True, "error": "",
+         "digest": {"state": "repo_ahead", "applied": 2,
+                    "needs_restart": True, "stopped": False}},
+        {"cmd": "manifest_export", "ok": True, "error": "",
+         "digest": {"path": "/tmp/ws/izba.yml"}},
+        {"cmd": "list", "ok": True, "error": ""},
+    ])
+    jsonschema.validate(bundle, schema)  # must not raise
+
+
+def test_invoke_log_entry_rejects_unknown_property():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("trajectory.schema.json")
+    bundle = _minimal_bundle_with_invoke_log([
+        {"cmd": "manifest_diff", "bogus": "nope"},
+    ])
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(bundle, schema)
+
+
 def test_all_cli_fixtures_validate_against_schema():
     # Guarded: jsonschema is the same validator dispatch-swarm.sh uses to reject a
     # malformed journeys.json before a swarm; skip cleanly if it isn't installed.
