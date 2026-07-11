@@ -419,11 +419,11 @@ class HarnessImprovementTests(unittest.TestCase):
 
 
 class SeedFilesTests(unittest.TestCase):
-    def test_write_seed_files_writes_nested_and_rejects_traversal(self):
+    def test_write_seeds_writes_nested_and_rejects_traversal(self):
         with tempfile.TemporaryDirectory() as d:
             wd = os.path.join(d, "proj")
             os.makedirs(wd)
-            run_journeys._write_seed_files(wd, {
+            run_journeys._write_seeds(wd, {
                 "izba.yml": "version: 1\n",
                 "sub/dir/f.txt": "hi",
                 "../escape.txt": "bad",        # rejected (traversal)
@@ -438,11 +438,93 @@ class SeedFilesTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(d, "escape.txt")))
             self.assertFalse(os.path.exists("/abs.txt"))
 
-    def test_write_seed_files_report_only_on_non_dict(self):
+    def test_write_seeds_report_only_on_non_dict(self):
         # None / non-dict is a no-op, never raises (report-only).
         with tempfile.TemporaryDirectory() as d:
-            run_journeys._write_seed_files(d, None)
-            run_journeys._write_seed_files(d, "not-a-dict")
+            run_journeys._write_seeds(d, None)
+            run_journeys._write_seeds(d, "not-a-dict")
+
+
+class StepSeedFilesTests(unittest.TestCase):
+    def test_step_seed_files_land_before_that_step_not_earlier(self):
+        # A two-step journey: step 0 has no seed_files, step 1 does. The seed
+        # must be ABSENT while step 0 runs and PRESENT (with the declared
+        # content) when step 1's action runs — mid-journey drift, the Task 10
+        # GUI-manifest primitive.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            manifest = "spec:\n  image: alpine\n"
+            jf = _journeys_file(d, [{
+                "journey_id": "mid-drift",
+                "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"},
+                "steps": [
+                    {"intent": "look before the drift", "expect": "no file yet"},
+                    {"intent": "look after the drift", "expect": "file present",
+                     "seed_files": {"izba.yml": manifest}},
+                ],
+            }])
+            out = os.path.join(d, "traj.json")
+            script = [
+                {"command": "cat izba.yml 2>&1 || echo MISSING"}, {"done": True},
+                {"command": "cat izba.yml"}, {"done": True},
+            ]
+            rc = run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps(script),
+            ])
+            self.assertEqual(rc, 0)
+            with open(out) as f:
+                bundle = json.load(f)
+            actions = bundle["results"][0]["actions"]
+            # Exactly the two Actor commands — the seed write is not itself an
+            # action (so it can never be graded as the step's command).
+            self.assertEqual(len(actions), 2)
+            self.assertIn("MISSING", actions[0]["stdout_tail"],
+                          "izba.yml must not exist before step 1 seeds it")
+            self.assertEqual(actions[1]["stdout_tail"], manifest,
+                             "izba.yml must be seeded before step 1's action runs")
+            # The file also lands on disk in the journey's workdir.
+            jdir = run_journeys._journey_data_dir(d, "mid-drift")
+            with open(os.path.join(jdir, "proj", "izba.yml")) as f:
+                self.assertEqual(f.read(), manifest)
+
+    def test_step_seed_files_do_not_override_journey_level_for_other_steps(self):
+        # Journey-level seed_files ("before step 0") and step-level seed_files
+        # on a later step coexist: the journey-level file must still be there
+        # for step 0, and the step-level file only appears starting its step.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            jf = _journeys_file(d, [{
+                "journey_id": "layered-seeds",
+                "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"},
+                "seed_files": {"base.txt": "base\n"},
+                "steps": [
+                    {"intent": "step0", "expect": "base file present"},
+                    {"intent": "step1", "expect": "drift file present",
+                     "seed_files": {"drift.txt": "drift\n"}},
+                ],
+            }])
+            out = os.path.join(d, "traj.json")
+            script = [
+                {"command": "cat base.txt; test -f drift.txt && echo HAS_DRIFT || echo NO_DRIFT"},
+                {"done": True},
+                {"command": "cat drift.txt"}, {"done": True},
+            ]
+            rc = run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps(script),
+            ])
+            self.assertEqual(rc, 0)
+            with open(out) as f:
+                bundle = json.load(f)
+            actions = bundle["results"][0]["actions"]
+            self.assertIn("base\n", actions[0]["stdout_tail"])
+            self.assertIn("NO_DRIFT", actions[0]["stdout_tail"])
+            self.assertEqual(actions[1]["stdout_tail"], "drift\n")
 
 
 class ProductCommandGradingTest(unittest.TestCase):

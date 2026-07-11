@@ -109,6 +109,11 @@
         "expect_cmd_re": {
           "type": "string",
           "description": "Optional regex anchoring WHICH of the step's actions the functional/expect_exit verdict is graded against: the LAST action whose command matches. Without it the step's final action is graded — which false-fires when the Actor runs a trailing verify (e.g. `izba ls`) after the intent-bearing command. Compiler rule: set it on refusal/expect_exit steps to the distinctive token of the command under test (e.g. 'promote'); never anchor to an exact full command line (that would leak a prescription to the swarm's benefit — the regex lives here, invisible to the Actor). Decisive (core) steps SHOULD declare expect_cmd_re: it also lets the runner credit a decisive assertion satisfied under an earlier step instead of flagging unreached_decisive. Anchor the pattern to the full product invocation (e.g. 'izba promote' or a subcommand-specific regex), never a bare token like 'izba' — over-broad patterns can credit the decisive step from an unrelated command; every credit is recorded in the bundle's decisive_credits for the skeptic to audit."
+        },
+        "seed_files": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Precondition files materialized into the journey's workdir (HOST-side, same target as the journey-level field of the same name) IMMEDIATELY BEFORE THIS STEP's first action — not before step 0: a map of relative path -> file content. Models drift introduced MID-journey (e.g. the agent edits izba.yml between steps to exercise the diff/promote reconciler on a change it didn't itself make), the same way the journey-level field models a precondition present from the start. NOT a hint to the Actor: seed content lives here in journeys.json, which the Actor never sees, and the write itself is not a graded action — the step's functional assertion is still graded on the Actor's own command, never on this write. Traversal-guarded (relative paths only, no '..' escape). Compiler rule: seed a precondition/drift event, NEVER the thing under test. Optional."
         }
       }
     }
