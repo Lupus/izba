@@ -624,6 +624,12 @@ mod tests {
     #[test]
     fn create_core_seeding_failure_reports_created_sandbox() {
         let guard = HomeGuard::new();
+        // HomeGuard only redirects `$HOME`, which Windows paths ignore
+        // (LOCALAPPDATA) — pin the data root explicitly so the "sandbox dir
+        // does not exist" premise holds on every platform. ENV_LOCK (held by
+        // the guard) serializes this against the other env-mutating tests.
+        let original = std::env::var_os("IZBA_DATA_DIR");
+        std::env::set_var("IZBA_DATA_DIR", guard.home.join("izba-data"));
         let ws = guard.home.join("ws-seedfail");
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(
@@ -642,6 +648,10 @@ mod tests {
             !d.calls.is_empty(),
             "the daemon create must have happened for this error to be honest"
         );
+        match original {
+            Some(v) => std::env::set_var("IZBA_DATA_DIR", v),
+            None => std::env::remove_var("IZBA_DATA_DIR"),
+        }
     }
 
     /// A fresh scratch dir under the OS temp dir, nanosecond-tagged like the
