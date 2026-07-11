@@ -45,17 +45,41 @@ const MISSING_MANIFEST_BODY =
 
 const RESTART_NOTE = "Changes that need a restart apply on the next start.";
 const RESTART_CHECKBOX_LABEL = "Restart now to apply restart-class changes";
+// The core promote gate refuses an image-class change without `restart:true`
+// REGARDLESS of run state (crates/izba-core/src/manifest/promote.rs:254) — a
+// new image needs the rw scratch overlay reconciled with it. On a STOPPED
+// sandbox there is no separate "restart" to opt into, so this checkbox is the
+// only control that can satisfy the gate; ticking it calls
+// `api.manifestPromote(name, true)` same as the running-state checkbox.
+// Label is deliberately NOT "reset"/"reset scratch": the app's promote bridge
+// (`manifest_promote_core` in app/src-tauri/src/commands.rs) hardcodes
+// `reset_scratch: false` — "scratch is never wiped from the app" — so ticking
+// this box starts the sandbox on the new image while KEEPING the existing
+// scratch overlay, not resetting it. Verified against promote.rs's stopped
+// branch: `restart:true` unconditionally sends `Start` once any restart-class
+// field is pending, whether or not the sandbox was previously running.
+const RESTART_CHECKBOX_LABEL_STOPPED_IMAGE =
+  "Start the sandbox to apply the image change (the scratch disk is kept, not reset)";
 const WEAKENS_ACK_LABEL = "I understand this weakens the egress firewall";
 const STALE_TOKEN_ERROR =
   "izba.yml changed since you viewed this diff. Refresh and review again.";
 const NEVER_REVIEWED_ERROR = "Review the diff first — open this tab's latest state, then Promote.";
+const IMAGE_RESTART_REQUIRED_ERROR =
+  "This image change needs the checkbox above ticked before Promote can continue.";
 const RESTART_CLASS_KINDS: ReadonlySet<DeltaView["class"]> = new Set(["restart", "image"]);
 
-/** Substring-based mapping of the two known promote gate errors to their
- *  copy; anything else passes through as the raw message. */
+/** Substring-based mapping of the known promote gate errors to their copy;
+ *  anything else passes through as the raw message. The `requires --restart`
+ *  case is the image-change gate (promote.rs:254) — with the restart/reset
+ *  checkbox now gating the Promote button (see
+ *  `RESTART_CHECKBOX_LABEL_STOPPED_IMAGE` above) this should be rare, but the
+ *  backend can still be reached in a race (e.g. the diff went stale between
+ *  render and click), so this stays belt-and-braces rather than leaking the
+ *  raw `--restart`/`--reset-scratch` CLI flags into the GUI. */
 function mapPromoteError(message: string): string {
   if (message.includes("izba.yml changed")) return STALE_TOKEN_ERROR;
   if (message.includes("no reviewed diff")) return NEVER_REVIEWED_ERROR;
+  if (message.includes("requires --restart")) return IMAGE_RESTART_REQUIRED_ERROR;
   return message;
 }
 
@@ -134,10 +158,27 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
 
   const pendingDeltas = diff?.deltas ?? [];
   const hasNonLiveDelta = pendingDeltas.some((d) => d.class !== "live");
-  const showRestartNote = hasNonLiveDelta || !running;
-  const showRestartCheckbox = running && pendingDeltas.some((d) => RESTART_CLASS_KINDS.has(d.class));
+  const hasImageDelta = pendingDeltas.some((d) => d.class === "image");
+  // The image-change gate applies REGARDLESS of run state (see
+  // RESTART_CHECKBOX_LABEL_STOPPED_IMAGE above), so suppress the generic
+  // "apply on next start" note whenever it's in play — that note otherwise
+  // contradicts the promote gate, which needs authorization now, not "on the
+  // next start" for free.
+  const showRestartNote = !hasImageDelta && (hasNonLiveDelta || !running);
+  const showRestartCheckbox = running
+    ? pendingDeltas.some((d) => RESTART_CLASS_KINDS.has(d.class))
+    : hasImageDelta;
+  const restartCheckboxLabel = running ? RESTART_CHECKBOX_LABEL : RESTART_CHECKBOX_LABEL_STOPPED_IMAGE;
   const requiresWeakensAck = pendingDeltas.some((d) => d.weakens_egress);
-  const confirmDisabled = promoting || (requiresWeakensAck && !weakensAck);
+  // Mirrors the weakens-ack gate: an image delta always needs the checkbox
+  // ticked (running or stopped — promote.rs:254 doesn't care which), so block
+  // the click client-side instead of letting the backend bail with a raw
+  // `--restart` CLI error.
+  const requiresRestartForImage = hasImageDelta && !restartChecked;
+  const confirmDisabled = promoting || (requiresWeakensAck && !weakensAck) || requiresRestartForImage;
+  const confirmHint = requiresRestartForImage
+    ? "Tick the checkbox above to authorize the image change."
+    : undefined;
 
   function openPromote() {
     setWeakensAck(false);
@@ -261,8 +302,12 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
           {promoteOutcome ? (
             <div className="flex flex-col gap-2 text-sm">
               <div className="text-success">Promoted {promoteOutcome.applied.length} change(s).</div>
-              {promoteOutcome.stopped && (
-                <div>Sandbox is stopped — changes apply on next start.</div>
+              {promoteOutcome.restarted ? (
+                <div>Sandbox was started to apply the change.</div>
+              ) : (
+                promoteOutcome.stopped && (
+                  <div>Sandbox is stopped — changes apply on next start.</div>
+                )
               )}
               {promoteOutcome.needs_restart && <div>Some changes apply on the next restart.</div>}
               {promoteOutcome.warnings.map((w) => (
@@ -301,9 +346,9 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
                   <Checkbox
                     checked={restartChecked}
                     onCheckedChange={(v) => setRestartChecked(v === true)}
-                    aria-label={RESTART_CHECKBOX_LABEL}
+                    aria-label={restartCheckboxLabel}
                   />
-                  {RESTART_CHECKBOX_LABEL}
+                  {restartCheckboxLabel}
                 </label>
               )}
 
@@ -336,6 +381,7 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
                   type="button"
                   variant="default"
                   disabled={confirmDisabled}
+                  title={confirmHint}
                   onClick={() => void confirmPromote()}
                 >
                   Promote

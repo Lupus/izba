@@ -258,11 +258,12 @@ describe("ManifestTab promote dialog", () => {
     await waitFor(() => expect(api.manifestPromote).toHaveBeenCalledWith("web", true));
   });
 
-  it("does not show the restart checkbox when the sandbox is stopped", async () => {
+  it("does not show the restart checkbox when the sandbox is stopped and only restart-class (non-image) deltas are pending, and promotes with restart=false", async () => {
     (api.manifestDiff as Mock).mockResolvedValue({
       state: "repo_ahead",
       deltas: [{ field: "mem_mb", from: "2048", to: "4096", class: "restart", weakens_egress: false }],
     });
+    (api.manifestPromote as Mock).mockResolvedValue(promoteView({ needs_restart: true, stopped: true }));
     render(<ManifestTab name="web" running={false} />);
     await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
     fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
@@ -271,6 +272,107 @@ describe("ManifestTab promote dialog", () => {
     expect(
       within(dialog).queryByRole("checkbox", { name: "Restart now to apply restart-class changes" }),
     ).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /^promote$/i }));
+    await waitFor(() => expect(api.manifestPromote).toHaveBeenCalledWith("web", false));
+  });
+
+  it("shows the stopped-image checkbox for a STOPPED sandbox with an image delta, disables confirm until checked, and promotes with restart=true", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "image", from: "alpine:3.20", to: "alpine:3.21", class: "image", weakens_egress: false }],
+    });
+    (api.manifestPromote as Mock).mockResolvedValue(
+      promoteView({
+        applied: [{ field: "image", from: "alpine:3.20", to: "alpine:3.21", class: "image", weakens_egress: false }],
+        restarted: true,
+        stopped: true,
+      }),
+    );
+    render(<ManifestTab name="web" running={false} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    // The generic "apply on next start" note must not appear alongside an
+    // image delta — it would contradict the gate, which needs the checkbox
+    // ticked now rather than promising automatic application later.
+    expect(
+      within(dialog).queryByText("Changes that need a restart apply on the next start."),
+    ).not.toBeInTheDocument();
+
+    const checkbox = within(dialog).getByRole("checkbox", {
+      name: "Start the sandbox to apply the image change (the scratch disk is kept, not reset)",
+    });
+    const confirm = within(dialog).getByRole("button", { name: /^promote$/i });
+    expect(confirm).toBeDisabled();
+
+    fireEvent.click(checkbox);
+    expect(confirm).not.toBeDisabled();
+
+    fireEvent.click(confirm);
+    await waitFor(() => expect(api.manifestPromote).toHaveBeenCalledWith("web", true));
+    // The pre-promote state was "stopped", but the promote actually started
+    // it (restarted:true) — the outcome text must say so, not repeat the
+    // stale "Sandbox is stopped" line.
+    expect(await within(dialog).findByText("Sandbox was started to apply the change.")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Sandbox is stopped — changes apply on next start.")).not.toBeInTheDocument();
+  });
+
+  it("shows the running restart-checkbox label (unchanged) for an image delta while running, and gates confirm on it", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "image", from: "alpine:3.20", to: "alpine:3.21", class: "image", weakens_egress: false }],
+    });
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    const checkbox = within(dialog).getByRole("checkbox", {
+      name: "Restart now to apply restart-class changes",
+    });
+    const confirm = within(dialog).getByRole("button", { name: /^promote$/i });
+    expect(confirm).toBeDisabled();
+
+    fireEvent.click(checkbox);
+    expect(confirm).not.toBeDisabled();
+
+    fireEvent.click(confirm);
+    await waitFor(() => expect(api.manifestPromote).toHaveBeenCalledWith("web", true));
+  });
+
+  it("maps an image-change-requires-restart promote rejection to its GUI copy (belt and braces)", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "image", from: "alpine:3.20", to: "alpine:3.21", class: "image", weakens_egress: false }],
+    });
+    (api.manifestPromote as Mock).mockRejectedValue(
+      new Error(
+        "image change requires --restart (the rw scratch overlay must be reset on the new base; " +
+          "pass --restart, optionally with --reset-scratch=false to keep the old overlay at your own risk)",
+      ),
+    );
+    render(<ManifestTab name="web" running={false} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "Start the sandbox to apply the image change (the scratch disk is kept, not reset)",
+      }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /^promote$/i }));
+
+    expect(
+      await within(dialog).findByText(
+        "This image change needs the checkbox above ticked before Promote can continue.",
+      ),
+    ).toBeInTheDocument();
+    expect(within(dialog).queryByText(/--restart/)).not.toBeInTheDocument();
+    expect(within(dialog).queryByText(/--reset-scratch/)).not.toBeInTheDocument();
   });
 
   it("maps a stale-token promote rejection to its copy", async () => {
