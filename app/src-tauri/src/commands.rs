@@ -101,7 +101,19 @@ pub fn create_core(
     let manifest = parse_workspace_manifest(&workspace)?;
     let name = d.create(req, on_progress).map_err(|e| e.to_string())?;
     if let Some(m) = manifest {
-        write_manifest_base(&app_paths(), &name, &m)?;
+        // The sandbox EXISTS from here on. A seeding failure (rare: fs errors
+        // under the data dir) must not masquerade as a failed create — that
+        // sends the user into an "already exists" retry loop. Report the
+        // truth and the recovery path instead of attempting a rollback
+        // (destroying a just-created sandbox over a bookkeeping write is
+        // worse than partial manifest state, which `izba diff` self-reports).
+        write_manifest_base(&app_paths(), &name, &m).map_err(|e| {
+            format!(
+                "sandbox '{name}' was created, but applying izba.yml state failed: {e}. \
+                 The sandbox exists with partial manifest state — check the Manifest tab, \
+                 or remove it and create again."
+            )
+        })?;
     }
     Ok(name)
 }
@@ -600,6 +612,35 @@ mod tests {
             d.calls.is_empty(),
             "daemon must never be asked to create a sandbox for an unparseable manifest, got: {:?}",
             d.calls
+        );
+    }
+
+    /// Greptile P1 (PR #130): a seeding failure AFTER the daemon created the
+    /// sandbox must not masquerade as a failed create (retry → "already
+    /// exists" loop). The error must state the sandbox exists and how to
+    /// recover. Natural failure here: the fake daemon returns a name but no
+    /// sandbox dir exists under the data root, so `write_manifest_base`'s
+    /// first write fails.
+    #[test]
+    fn create_core_seeding_failure_reports_created_sandbox() {
+        let guard = HomeGuard::new();
+        let ws = guard.home.join("ws-seedfail");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("izba.yml"),
+            "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n",
+        )
+        .unwrap();
+
+        let mut d = FakeDaemon::default();
+        let mut opts = create_opts();
+        opts.workspace = ws.display().to_string();
+        let err = create_core(&mut d, opts, &mut |_| {}).unwrap_err();
+        assert!(err.contains("was created"), "got: {err}");
+        assert!(err.contains("remove it and create again"), "got: {err}");
+        assert!(
+            !d.calls.is_empty(),
+            "the daemon create must have happened for this error to be honest"
         );
     }
 
