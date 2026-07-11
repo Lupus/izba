@@ -44,7 +44,7 @@ interface PortRow {
   guest: string;
 }
 
-export function NewSandbox({ onClose, onCreated }: Props) {
+export function NewSandbox({ onClose, onCreated }: Readonly<Props>) {
   const [name, setName] = useState("");
   const [image, setImage] = useState("ubuntu:24.04");
   const [cpus, setCpus] = useState(2);
@@ -142,12 +142,17 @@ export function NewSandbox({ onClose, onCreated }: Props) {
 
   const volumesInvalid = volumeRows.some((r) => !isBlankVolRow(r) && !isValidVolRow(r));
 
-  const canCreate =
-    name.trim().length > 0 &&
-    workspace.trim().length > 0 &&
-    !busy &&
-    !portsInvalid &&
-    !volumesInvalid;
+  // Every reason Create is disabled, in one list, so the boolean below and the
+  // on-screen explanation can never drift apart. `busy` isn't listed here: the
+  // button already says "Creating…" while it's true, which is self-explanatory.
+  const createBlockers: string[] = [
+    ...(name.trim().length === 0 ? ["Name is required."] : []),
+    ...(workspace.trim().length === 0 ? ["Workspace folder is required."] : []),
+    ...(portsInvalid ? ["Fix the invalid port row above."] : []),
+    ...(volumesInvalid ? ["Fix the invalid volume row above."] : []),
+  ];
+
+  const canCreate = createBlockers.length === 0 && !busy;
 
   return (
     <Dialog
@@ -363,11 +368,19 @@ export function NewSandbox({ onClose, onCreated }: Props) {
           <Button
             type="button"
             disabled={!canCreate}
+            aria-describedby={createBlockers.length > 0 ? "ns-create-hints" : undefined}
             onClick={() => void submit()}
           >
             {busy ? "Creating…" : "Create"}
           </Button>
         </DialogFooter>
+        {createBlockers.length > 0 && (
+          <div id="ns-create-hints" className="text-right text-xs text-muted-foreground-2">
+            {createBlockers.map((hint) => (
+              <div key={hint}>{hint}</div>
+            ))}
+          </div>
+        )}
       </DialogContent>
     </Dialog>
   );
