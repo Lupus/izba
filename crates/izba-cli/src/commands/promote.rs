@@ -50,6 +50,7 @@ pub fn run(
 ) -> Result<i32> {
     // #123: NAME-or-DIR positional through the shared resolver.
     let r = super::sandbox_ref::resolve(paths, target)?;
+    super::sandbox_ref::check_name_override(&r, name_override)?;
     let dir = r
         .workspace
         .clone()

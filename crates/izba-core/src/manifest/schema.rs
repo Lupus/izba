@@ -312,7 +312,10 @@ spec:
         let m = Manifest::load_str(y).expect("partial blocks must parse");
         assert_eq!(m.spec.resources.cpus, 4, "explicit override wins");
         assert_eq!(m.spec.resources.memory, DEFAULT_MEMORY, "memory inherited");
-        assert_eq!(m.spec.root_disk.size, DEFAULT_ROOT_DISK_SIZE, "size inherited");
+        assert_eq!(
+            m.spec.root_disk.size, DEFAULT_ROOT_DISK_SIZE,
+            "size inherited"
+        );
     }
 
     /// The string defaults and the numeric defaults must agree — the numeric

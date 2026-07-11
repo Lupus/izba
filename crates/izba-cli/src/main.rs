@@ -445,8 +445,12 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             commands::stop::run(paths, &name)
         }
         Cmd::Rm { target, force } => {
-            let name = commands::sandbox_ref::resolve(paths, target.as_deref())?.name;
-            commands::rm::run(paths, &name, force)
+            let omitted = target.is_none();
+            let r = commands::sandbox_ref::resolve(paths, target.as_deref())?;
+            if omitted {
+                commands::sandbox_ref::ensure_cwd_is_workspace(paths, &r)?;
+            }
+            commands::rm::run(paths, &r.name, force)
         }
         Cmd::Netlog {
             name,

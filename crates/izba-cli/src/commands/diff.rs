@@ -11,6 +11,7 @@ pub fn run(paths: &Paths, target: Option<&str>, name_override: Option<&str>) -> 
     // #123: NAME-or-DIR positional through the shared resolver. A bare sandbox
     // name resolves to the workspace recorded in its config.json.
     let r = super::sandbox_ref::resolve(paths, target)?;
+    super::sandbox_ref::check_name_override(&r, name_override)?;
     let dir = r
         .workspace
         .clone()

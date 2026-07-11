@@ -17,6 +17,12 @@ pub(crate) struct SandboxRef {
     /// `Some` for workspace-form references and for name-form references whose
     /// config.json records a workspace; `None` only if that record is missing.
     pub workspace: Option<PathBuf>,
+    /// `true` only for the bare-word existing-sandbox arm of [`resolve`] — the
+    /// positional itself pinned the sandbox name. `false` for every
+    /// workspace-form reference (including the omitted-arg and path-syntax
+    /// arms), where a `--name` override legitimately retargets which sandbox
+    /// the workspace's managed truth belongs to.
+    pub by_name: bool,
 }
 
 /// Path syntax is decided SYNTACTICALLY, never from disk state: `.`/`..`, any
@@ -56,6 +62,7 @@ fn workspace_ref(dir: &Path) -> anyhow::Result<SandboxRef> {
     Ok(SandboxRef {
         name,
         workspace: Some(dir.to_path_buf()),
+        by_name: false,
     })
 }
 
@@ -93,6 +100,7 @@ pub(crate) fn resolve(paths: &Paths, arg: Option<&str>) -> anyhow::Result<Sandbo
         return Ok(SandboxRef {
             name: arg.to_string(),
             workspace: recorded_workspace(paths, arg)?,
+            by_name: true,
         });
     }
     if dir_has_manifest {
@@ -105,6 +113,51 @@ pub(crate) fn resolve(paths: &Paths, arg: Option<&str>) -> anyhow::Result<Sandbo
          sandbox, use `izba create` (or `izba run` to create + start + exec \
          in one step)"
     )
+}
+
+/// `--name` retargets the SANDBOX while the positional supplies the
+/// WORKSPACE — that only makes sense for a workspace-form positional. A
+/// bare-name positional already pins the sandbox, so a DIFFERENT --name is
+/// contradictory: refuse instead of comparing one sandbox's workspace
+/// against another's managed truth.
+pub(crate) fn check_name_override(
+    r: &SandboxRef,
+    name_override: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(n) = name_override {
+        if r.by_name && n != r.name {
+            anyhow::bail!(
+                "positional '{}' is a sandbox name and --name {n} names a different \
+                 sandbox — pass a workspace directory with --name, or drop --name",
+                r.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Omitted-positional guard for DESTRUCTIVE commands: the resolved sandbox's
+/// recorded workspace (config.json) must actually be the current directory —
+/// a mere basename/metadata.name coincidence must not delete an unrelated
+/// sandbox. Lenient when the sandbox has no config (the command's own
+/// not-found error is better) — this guards misdirection, not existence.
+pub(crate) fn ensure_cwd_is_workspace(paths: &Paths, r: &SandboxRef) -> anyhow::Result<()> {
+    let Some(recorded) = recorded_workspace(paths, &r.name)? else {
+        return Ok(());
+    };
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let rec = recorded.canonicalize().unwrap_or(recorded);
+    if rec != cwd {
+        anyhow::bail!(
+            "current directory is not the recorded workspace of sandbox '{}' \
+             (recorded: {}) — pass the sandbox name or its workspace directory \
+             explicitly",
+            r.name,
+            rec.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -141,6 +194,7 @@ mod tests {
         let r = resolve(&paths, Some("myapp")).unwrap();
         assert_eq!(r.name, "myapp");
         assert_eq!(r.workspace.as_deref(), Some(ws.as_path()));
+        assert!(r.by_name, "bare-word existing-sandbox arm must set by_name");
     }
 
     #[test]
@@ -154,6 +208,7 @@ mod tests {
         let r = resolve(&paths, Some(&dir_s)).unwrap();
         assert_eq!(r.name, "myapp", "basename-derived name");
         assert_eq!(r.workspace.as_deref(), Some(dir.as_path()));
+        assert!(!r.by_name, "path-syntax positional is workspace-form");
     }
 
     #[test]
@@ -165,6 +220,7 @@ mod tests {
         let expected = super::super::workspace_default_name(Path::new(".")).unwrap();
         assert_eq!(r.name, expected);
         assert_eq!(r.workspace.as_deref(), Some(Path::new(".")));
+        assert!(!r.by_name, "omitted-arg positional is workspace-form");
     }
 
     #[test]
@@ -251,5 +307,99 @@ mod tests {
         let r = r.unwrap();
         assert_eq!(r.name, "proj");
         assert_eq!(r.workspace.as_deref(), Some(ws.as_path()));
+    }
+
+    // -- check_name_override --------------------------------------------
+
+    #[test]
+    fn check_name_override_rejects_different_name_when_by_name() {
+        let r = SandboxRef {
+            name: "myapp".to_string(),
+            workspace: None,
+            by_name: true,
+        };
+        let err = check_name_override(&r, Some("other"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("myapp"), "{err}");
+        assert!(err.contains("other"), "{err}");
+    }
+
+    #[test]
+    fn check_name_override_allows_same_name_when_by_name() {
+        let r = SandboxRef {
+            name: "myapp".to_string(),
+            workspace: None,
+            by_name: true,
+        };
+        assert!(check_name_override(&r, Some("myapp")).is_ok());
+    }
+
+    #[test]
+    fn check_name_override_allows_different_name_for_workspace_form() {
+        let r = SandboxRef {
+            name: "myapp".to_string(),
+            workspace: Some(PathBuf::from("/some/dir")),
+            by_name: false,
+        };
+        assert!(check_name_override(&r, Some("other")).is_ok());
+    }
+
+    #[test]
+    fn check_name_override_allows_none() {
+        let r = SandboxRef {
+            name: "myapp".to_string(),
+            workspace: None,
+            by_name: true,
+        };
+        assert!(check_name_override(&r, None).is_ok());
+    }
+
+    // -- ensure_cwd_is_workspace ------------------------------------------
+
+    #[test]
+    fn ensure_cwd_is_workspace_rejects_mismatch() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let (_tmp, paths, _ws) = fixture("myapp");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(elsewhere.path()).unwrap();
+        let r = SandboxRef {
+            name: "myapp".to_string(),
+            workspace: None,
+            by_name: true,
+        };
+        let res = ensure_cwd_is_workspace(&paths, &r);
+        std::env::set_current_dir(prev).unwrap();
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("myapp"), "{err}");
+    }
+
+    #[test]
+    fn ensure_cwd_is_workspace_allows_match() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let (_tmp, paths, ws) = fixture("myapp");
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&ws).unwrap();
+        let r = SandboxRef {
+            name: "myapp".to_string(),
+            workspace: None,
+            by_name: true,
+        };
+        let res = ensure_cwd_is_workspace(&paths, &r);
+        std::env::set_current_dir(prev).unwrap();
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    #[test]
+    fn ensure_cwd_is_workspace_allows_missing_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let r = SandboxRef {
+            name: "ghost".to_string(),
+            workspace: None,
+            by_name: true,
+        };
+        assert!(ensure_cwd_is_workspace(&paths, &r).is_ok());
     }
 }

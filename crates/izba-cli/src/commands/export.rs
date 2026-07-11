@@ -11,6 +11,7 @@ pub fn run(paths: &Paths, target: Option<&str>, name_override: Option<&str>) -> 
     // silently exporting under the wrong name) or the dir basename; for the
     // name form the workspace comes from config.json.
     let r = super::sandbox_ref::resolve(paths, target)?;
+    super::sandbox_ref::check_name_override(&r, name_override)?;
     let dir = r
         .workspace
         .clone()

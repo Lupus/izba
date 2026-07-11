@@ -497,6 +497,10 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id):
     except re.error as e:
         log(f"{journey_id}: invalid expect_cmd_re {pattern!r}: {e}")
         return None
+    if rx.search(""):
+        log(f"{journey_id}: expect_cmd_re {pattern!r} matches the empty string; "
+            f"too broad to credit an unreached decisive step")
+        return None
     for idx in range(len(actions) - 1, -1, -1):
         a = actions[idx]
         if not rx.search(a.get("command", "")):
