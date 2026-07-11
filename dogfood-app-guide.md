@@ -67,16 +67,29 @@ glance:
 When there's a difference, a table below the banner lists each changed
 field with its old and new value, plus a small tag showing when the change
 takes effect: **live** (immediately), **restart** (on the sandbox's next
-start), or **image** (next start, with a new image). A change that would
-loosen the egress firewall is flagged with a red **⚠ weakens egress** marker.
+start), or **image** (a new base image). A change that would loosen the
+egress firewall is flagged with a red **⚠ weakens egress** marker.
 
 - **Promote…** opens a confirmation dialog listing exactly what will
   change, then applies izba.yml's pending changes to the sandbox. If any
   change weakens the firewall, you must check "I understand this weakens the
   egress firewall" before you can confirm. If the sandbox is running and a
-  change needs a restart, you can optionally check "Restart now to apply
-  restart-class changes" to apply it right away instead of waiting for the
-  next start. The button is disabled when there's nothing to promote.
+  non-image change needs a restart, you can optionally check "Restart now to
+  apply restart-class changes" to apply it right away instead of waiting for
+  the next start.
+  An **image** change is different: it always needs your explicit go-ahead,
+  whether the sandbox is running or stopped, because it can't just "apply on
+  the next start" for free — the Promote button stays disabled until you
+  tick the checkbox. While running, that's the same "Restart now..."
+  checkbox. While stopped, the dialog shows "Start the sandbox to apply the
+  image change (the scratch disk is kept, not reset)" — ticking it and
+  confirming writes the new image and starts the sandbox on it, keeping
+  whatever's already on its scratch disk (nothing is wiped from the app; if
+  you installed packages against the old image, they may not work on the
+  new one — use `izba promote --restart` from a terminal instead if you want
+  a clean overlay: the CLI resets the scratch disk by default, unlike the
+  app). The Promote button itself is disabled
+  whenever there's nothing to promote.
 - **Export to izba.yml** writes the sandbox's current live settings back
   into izba.yml, so a change made another way ends up captured in the file.
   It's disabled when there's no live-side drift to capture.
