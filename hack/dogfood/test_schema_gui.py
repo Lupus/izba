@@ -73,6 +73,45 @@ def test_journey_allows_seed_files():
     assert "seed_files" not in schema["definitions"]["journey"]["required"]
 
 
+def test_step_allows_seed_files():
+    # Step-level seed_files (mid-journey drift, Task 9): same shape as the
+    # journey-level field, optional.
+    schema = _load("journeys.schema.json")
+    seed = schema["definitions"]["step"]["properties"]["seed_files"]
+    assert seed["type"] == "object"
+    assert seed["additionalProperties"]["type"] == "string"
+    assert schema["definitions"]["step"]["required"] == ["intent", "expect"]
+
+
+def _minimal_journey_doc(step_extra):
+    step = {"intent": "do a thing", "expect": "it works"}
+    step.update(step_extra)
+    return {
+        "feature": "test-feature",
+        "journeys": [{
+            "journey_id": "j1",
+            "rationale": "r",
+            "source": {"kind": "spec", "ref": "x"},
+            "steps": [step],
+        }],
+    }
+
+
+def test_step_seed_files_accepted():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    doc = _minimal_journey_doc({"seed_files": {"izba.yml": "spec:\n  image: alpine\n"}})
+    jsonschema.validate(doc, schema)  # must not raise
+
+
+def test_step_seed_files_rejects_non_object():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    doc = _minimal_journey_doc({"seed_files": "not-an-object"})
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(doc, schema)
+
+
 def test_candidate_allows_decisive():
     # The collector reads `decisive` to decide whether a functional candidate may
     # flip a journey negative (Part A).

@@ -390,9 +390,16 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
     action ``actions[start:][-1]``): we snapshot ``start`` before the loop and
     grade what the step produced, tagging the candidate ``decisive`` per this
     step's role. Grading in a ``finally`` guarantees it also runs when a cap trips
-    or a report-only error ends the step early."""
+    or a report-only error ends the step early.
+
+    Step-level ``seed_files`` (mid-journey drift) is materialized into
+    ``workdir`` here, immediately before the step's first action and after cwd
+    setup (cwd already persists via ``cwd_file`` from the journey's start) —
+    NOT inside the loop, so it lands exactly once per step regardless of how
+    many turns/retries the step takes."""
     seen: set = set()
     start = len(actions)  # index of this step's first action; actions[start:] = its own
+    _write_seeds(workdir, step.get("seed_files"))
     try:
         while True:
             if len(actions) >= step_cap:
@@ -443,13 +450,18 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
                 len(actions) - 1))
 
 
-def _write_seed_files(workdir: str, seed_files: Optional[Dict[str, Any]]) -> None:
-    """Materialize a journey's ``seed_files`` (relpath -> content) into ``workdir``.
+def _write_seeds(workdir: str, seed_files: Optional[Dict[str, Any]]) -> None:
+    """Materialize a ``seed_files`` mapping (relpath -> content) into ``workdir``.
 
     A precondition-seeding primitive (Part E): each entry is written under
-    ``workdir``, creating parent dirs. Traversal-guarded exactly like
-    ``_journey_data_dir`` reasons about ``base`` — an agent-authored path must not
-    escape the project dir:
+    ``workdir``, creating parent dirs. Shared by two callers: the journey-level
+    ``seed_files`` (written once, before step 0) and the per-step ``seed_files``
+    (written immediately before that step's first action — the mid-journey-drift
+    primitive, e.g. editing ``izba.yml`` between steps to exercise the diff/promote
+    reconciler). Both model an environment precondition, never the thing under
+    test — see the schema field's description for the compiler rule. Traversal-
+    guarded exactly like ``_journey_data_dir`` reasons about ``base`` — an
+    agent-authored path must not escape the project dir:
 
     - reject a non-str / empty key, or a non-str content;
     - reject an absolute path or one whose ``normpath`` starts with ``..``
@@ -576,7 +588,7 @@ def run_journey(
     # Materialize precondition files (Part E) into the workdir BEFORE any step, so
     # a deep journey can start at the feature's real surface (e.g. a valid izba.yml
     # already present) instead of burning its steps authoring the prerequisite.
-    _write_seed_files(workdir, journey.get("seed_files"))
+    _write_seeds(workdir, journey.get("seed_files"))
     # One cwd file per journey so cwd persists across actions like a real shell
     # (Part D). NOT pre-created: run_action treats its absence as "start in
     # workdir", so the first action naturally begins there.
