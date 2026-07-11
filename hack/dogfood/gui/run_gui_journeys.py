@@ -120,6 +120,18 @@ def _cmd_hash(journey_id: str, command: str) -> str:
     return hashlib.sha256(f"{journey_id}\0{command}".encode("utf-8")).hexdigest()
 
 
+def _is_daemon_spawn_failure(entry: Any) -> bool:
+    """True for an invoke-log rejection whose error is a `DaemonClient` spawn
+    failure — the ``spawning [...]`` anyhow context string
+    (`procmgr::spawn_detached`, wrapped by `DaemonClient::connect_spawning_izba`)
+    surfacing because the headless sidecar couldn't find/exec the `izba`
+    binary. Every invoke in a journey fails identically once the daemon can't
+    spawn at all, so this is ONE root cause, not one independent product
+    finding per rejected invoke."""
+    return (isinstance(entry, dict) and entry.get("ok") is False
+            and "spawning [" in str(entry.get("error", "")))
+
+
 def _infra_candidate(journey_id: str, detail: str) -> Dict[str, Any]:
     """Flipping infra candidate — same shape as the CLI runner's (a broken
     model/driver plumbing means the journey verified nothing)."""
@@ -313,9 +325,22 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     final_ref = {"journey_id": journey_id, "action_index": -1}
     invoke_log = driver.read_invoke_log()
     last_expect = (steps[-1].get("expect", "") if steps else "")
+    # A daemon that can't spawn rejects EVERY invoke identically: fold those
+    # into one flipping infra candidate (the run measured nothing, once) and
+    # suppress the matching per-entry silent_failure duplicates — they are
+    # one root cause, not hundreds of product findings. All other rejection
+    # kinds keep the normal silent_failure treatment unchanged.
+    spawn_failed = [e for e in (invoke_log or []) if _is_daemon_spawn_failure(e)]
+    if spawn_failed:
+        candidates.append(_infra_candidate(
+            journey_id,
+            f"daemon failed to spawn ({len(spawn_failed)} rejected invoke(s)); "
+            f"first: {spawn_failed[0].get('error')!r}"))
+    silent_failure_log = [e for e in (invoke_log or [])
+                          if not _is_daemon_spawn_failure(e)]
     end_found = (ui_daemon_diff_oracle(final_marks, state_evidence, final_ref)
                  + dom_expect_oracle(last_expect, final_marks, final_ref)
-                 + silent_failure_oracle(invoke_log, final_marks, final_ref))
+                 + silent_failure_oracle(silent_failure_log, final_marks, final_ref))
 
     # Decisive wiring (Task 11 + Critical-finding fix): manifest_truth is the
     # GUI runner's only `functional`-candidate-producing oracle, so it
@@ -440,10 +465,19 @@ def _serve_dir(directory: str, port: int) -> http.server.ThreadingHTTPServer:
     return httpd
 
 
-def _spawn_sidecar(sidecar_bin: str, data_dir: str, ws_port: int):
+def _spawn_sidecar(sidecar_bin: str, izba_bin: str, data_dir: str, ws_port: int):
+    """Spawn the headless bridge sidecar. Its `DaemonClient::connect_spawning_izba`
+    resolves the `izba` binary as a sibling of its own current_exe (nothing
+    there for a CI-built sidecar), then falls back to bare `izba` on PATH — so
+    the sidecar's PATH must carry the directory holding ``izba_bin``, or every
+    daemon-touching invoke fails with a `spawning [...]` error (see
+    `_is_daemon_spawn_failure` / the runner's end-of-journey folding of those
+    rejections into a single infra candidate)."""
     env = dict(os.environ)
     env["IZBA_DATA_DIR"] = data_dir
     env["IZBA_DOGFOOD_WS_PORT"] = str(ws_port)
+    izba_dir = os.path.dirname(os.path.abspath(izba_bin))
+    env["PATH"] = izba_dir + os.pathsep + env.get("PATH", "")
     return subprocess.Popen([sidecar_bin], env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -534,7 +568,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             workspace = os.path.join(jdir, "workspace")
             os.makedirs(workspace, exist_ok=True)
             ws_port = _free_port()
-            sidecar = _spawn_sidecar(args.sidecar_bin, jdir, ws_port)
+            sidecar = _spawn_sidecar(args.sidecar_bin, args.izba_bin, jdir, ws_port)
             try:
                 if not _wait_port(ws_port):
                     # A dead sidecar means the journey measured NOTHING — record
