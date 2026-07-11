@@ -1,12 +1,15 @@
-use std::path::Path;
+use std::path::PathBuf;
 
 use crate::daemon::DaemonApi;
 use crate::views::{
-    app_build_info, CreateOpts, DaemonStatusView, DiffView, PolicyView, PortRuleView,
+    app_build_info, CreateOpts, DaemonStatusView, DiffView, PolicyView, PortRuleView, PromoteView,
     SandboxDetailView, SandboxView, SeedEntry, VersionView, VolumeInfoView,
 };
 use izba_core::daemon::egress::audit::EndpointSummary;
 use izba_core::daemon::egress::config::{AllowEntry, GitRule};
+use izba_core::manifest::store;
+use izba_core::paths::Paths;
+use izba_core::state::{load_json, SandboxConfig, CONFIG_FILE};
 
 /// Core of the `list` command: maps daemon errors to a UI-friendly string.
 pub fn list_core(d: &mut dyn DaemonApi) -> Result<Vec<SandboxView>, String> {
@@ -224,24 +227,81 @@ pub fn volume_prune_core(d: &mut dyn DaemonApi) -> Result<izba_core::volume::Pru
     d.volume_prune().map_err(|e| e.to_string())
 }
 
-/// Core of `manifest_diff`: compute the structural diff between `workspace/izba.yml`
-/// and the managed truth for sandbox `name`. Does NOT write the review token —
-/// the app diff is a read-only preview; promote is a deferred follow-up.
-pub fn manifest_diff_core(workspace: &str, name: &str) -> Result<DiffView, String> {
-    let paths = izba_core::paths::Paths::from_env_or_default(None);
-    let (state, deltas, _token) =
-        izba_core::manifest::ops::compute_diff(&paths, Path::new(workspace), name)
-            .map_err(|e| e.to_string())?;
+/// Resolve sandbox `name`'s workspace directory from its `config.json` — the
+/// single source of truth for "where is this sandbox's `izba.yml`". Name-only
+/// manifest cores never take a frontend-supplied path (the config.json
+/// record is host-authoritative; see the CLI's `sandbox_ref` by-name
+/// resolution, which this mirrors).
+fn workspace_for(paths: &Paths, name: &str) -> Result<PathBuf, String> {
+    let cfg: Option<SandboxConfig> =
+        load_json(&paths.sandbox_dir(name).join(CONFIG_FILE)).map_err(|e| e.to_string())?;
+    let cfg = cfg.ok_or_else(|| format!("sandbox '{name}' not found"))?;
+    if cfg.workspace.as_os_str().is_empty() {
+        return Err(format!("sandbox '{name}' has no recorded workspace"));
+    }
+    Ok(cfg.workspace)
+}
+
+/// Core of `manifest_diff`: compute the structural diff between the sandbox's
+/// recorded workspace `izba.yml` and the managed truth for sandbox `name`.
+/// WRITES the review token — rendering the diff to the user IS the review
+/// that gates a subsequent `manifest_promote` (mirrors the CLI's `izba diff`).
+pub fn manifest_diff_core(name: &str) -> Result<DiffView, String> {
+    let paths = Paths::from_env_or_default(None);
+    let ws = workspace_for(&paths, name)?;
+    let (state, deltas, token) =
+        izba_core::manifest::ops::compute_diff(&paths, &ws, name).map_err(|e| e.to_string())?;
+    store::write_review(&paths.sandbox_dir(name), &token).map_err(|e| e.to_string())?;
     Ok(DiffView::new(state, &deltas))
 }
 
-/// Core of `manifest_export`: write the managed truth back into `workspace/izba.yml`
-/// and return the path written as a string.
-pub fn manifest_export_core(workspace: &str, name: &str) -> Result<String, String> {
-    let paths = izba_core::paths::Paths::from_env_or_default(None);
-    izba_core::manifest::ops::export(&paths, Path::new(workspace), name)
+/// Core of `manifest_export`: write the managed truth back into the sandbox's
+/// recorded workspace `izba.yml` and return the path written as a string.
+pub fn manifest_export_core(name: &str) -> Result<String, String> {
+    let paths = Paths::from_env_or_default(None);
+    let ws = workspace_for(&paths, name)?;
+    izba_core::manifest::ops::export(&paths, &ws, name)
         .map(|p| p.display().to_string())
         .map_err(|e| e.to_string())
+}
+
+/// Core of `manifest_promote`: apply the reviewed `izba.yml` -> managed truth
+/// for sandbox `name` (never `--force`s the review gate; `restart` mirrors
+/// the CLI's `--restart` flag; scratch is never wiped from the app).
+/// `spec.build:` promotion needs a whole throwaway builder-sandbox
+/// orchestration that only the CLI drives today
+/// (`izba-cli::commands::build::build_image`); the app surfaces a clear error
+/// instead of attempting it.
+// `crate-type = ["staticlib", "cdylib", "rlib"]` makes rustc's dead-code
+// analysis treat `pub` items as internal (only `#[no_mangle] extern "C"`
+// exports count as external for staticlib/cdylib), so this — unlike the
+// other `*_core` functions, which are already reached via the `#[tauri::
+// command]` shims in lib.rs — is genuinely unreached until Task 3 wires the
+// `manifest_promote` shim + dispatch arm in the same PR. Drop this once that
+// lands.
+#[allow(dead_code)]
+pub fn manifest_promote_core(name: &str, restart: bool) -> Result<PromoteView, String> {
+    let paths = Paths::from_env_or_default(None);
+    let ws = workspace_for(&paths, name)?;
+    let opts = izba_core::manifest::promote::PromoteOpts {
+        force: false,
+        restart,
+        reset_scratch: false,
+    };
+    let outcome = izba_core::manifest::promote::run(
+        &paths,
+        &ws,
+        name,
+        opts,
+        &mut |_event| {},
+        &mut |_dir, _build| {
+            Err(anyhow::anyhow!(
+                "spec.build is not supported from the app yet — use 'izba promote' in a terminal"
+            ))
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(PromoteView::new(outcome))
 }
 
 /// Core of `volume_attach`: attach a volume spec (parsed from `spec_str`) to sandbox `name`.
@@ -264,6 +324,51 @@ mod tests {
     use super::*;
     use crate::fake::FakeDaemon;
     use crate::views::{CreateOpts, SbxState};
+
+    /// Serializes tests that redirect `$HOME` (and therefore
+    /// `Paths::from_env_or_default`'s default data root) — env vars are
+    /// process-global, so two such tests running concurrently in this test
+    /// binary would clobber each other's sandbox trees.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII: points `$HOME` at a fresh, empty tempdir for the test's
+    /// duration (isolating `manifest_*_core`'s internal
+    /// `Paths::from_env_or_default(None)` from the real machine), restoring
+    /// the original value and cleaning up on drop.
+    struct HomeGuard {
+        original: Option<String>,
+        home: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        fn new() -> Self {
+            let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos();
+            let home = std::env::temp_dir().join(format!("izba-app-cmd-test-home-{nanos}"));
+            std::fs::create_dir_all(&home).unwrap();
+            let original = std::env::var("HOME").ok();
+            std::env::set_var("HOME", &home);
+            HomeGuard {
+                original,
+                home,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
 
     fn create_opts() -> CreateOpts {
         CreateOpts {
@@ -487,5 +592,91 @@ mod tests {
         volume_detach_core(&mut d, "web", "/data".into()).unwrap();
         assert!(d.calls.iter().any(|c| c == "vattach:web:/data"));
         assert!(d.calls.iter().any(|c| c == "vdetach:web:/data"));
+    }
+
+    /// A minimal image-only `izba.yml` — defaults from #122 (PR #129's
+    /// era) fill in `resources`/`rootDisk`, so this is enough to be a valid
+    /// manifest for `compute_diff`/`export`/`promote::run`.
+    const MINIMAL_MANIFEST: &str =
+        "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: ubuntu:24.04\n";
+
+    /// Sets up sandbox `name` under `guard`'s redirected `$HOME`: a workspace
+    /// dir containing a minimal `izba.yml`, plus a `config.json` under
+    /// `<data>/sandboxes/<name>/` recording that workspace — the on-disk
+    /// shape `workspace_for` reads. Returns `(Paths, workspace dir)`.
+    fn setup_sandbox(guard: &HomeGuard, name: &str) -> (Paths, PathBuf) {
+        let paths = Paths::from_env_or_default(None);
+
+        let ws = guard.home.join("ws").join(name);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("izba.yml"), MINIMAL_MANIFEST).unwrap();
+
+        let sandbox_dir = paths.sandbox_dir(name);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        let cfg = SandboxConfig {
+            image_digest: "sha256:abc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 1,
+            mem_mb: 1024,
+            workspace: ws.clone(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+            rw_size_gb: 1,
+        };
+        std::fs::write(
+            sandbox_dir.join(CONFIG_FILE),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        (paths, ws)
+    }
+
+    #[test]
+    fn manifest_diff_core_resolves_workspace_and_writes_review() {
+        let guard = HomeGuard::new();
+        let name = "web";
+        let (paths, _ws) = setup_sandbox(&guard, name);
+
+        manifest_diff_core(name).unwrap();
+
+        let token = store::read_review(&paths.sandbox_dir(name)).unwrap();
+        assert!(
+            token.is_some(),
+            "manifest_diff_core must write the review token"
+        );
+    }
+
+    #[test]
+    fn manifest_diff_core_missing_sandbox_err() {
+        let _guard = HomeGuard::new();
+        let err = manifest_diff_core("ghost").unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn manifest_export_core_writes_workspace_yaml() {
+        let guard = HomeGuard::new();
+        let name = "web";
+        let (_paths, ws) = setup_sandbox(&guard, name);
+
+        let written = manifest_export_core(name).unwrap();
+        assert_eq!(written, ws.join("izba.yml").display().to_string());
+    }
+
+    #[test]
+    fn manifest_export_core_missing_sandbox_err() {
+        let _guard = HomeGuard::new();
+        let err = manifest_export_core("ghost").unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn manifest_promote_core_missing_sandbox_err() {
+        let _guard = HomeGuard::new();
+        let err = manifest_promote_core("ghost", false).unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
     }
 }

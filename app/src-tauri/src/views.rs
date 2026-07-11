@@ -261,36 +261,75 @@ pub struct DiffView {
     pub deltas: Vec<DeltaView>,
 }
 
+/// Map the 3-way drift state to the frontend's string tag. Shared by
+/// `DiffView::new` and `PromoteView::new` so both surfaces agree on the same
+/// vocabulary.
+fn drift_state_str(state: izba_core::manifest::DriftState) -> &'static str {
+    use izba_core::manifest::DriftState;
+    match state {
+        DriftState::InSync => "in_sync",
+        DriftState::RepoAhead => "repo_ahead",
+        DriftState::ManagedAhead => "managed_ahead",
+        DriftState::Diverged => "diverged",
+    }
+}
+
+/// Map one core `FieldDelta` to its frontend view. Shared by `DiffView::new`
+/// and `PromoteView::new`.
+fn delta_view(d: &izba_core::manifest::diff::FieldDelta) -> DeltaView {
+    use izba_core::manifest::diff::FieldClass;
+    DeltaView {
+        field: d.field.clone(),
+        from: d.from.clone(),
+        to: d.to.clone(),
+        class: match d.class {
+            FieldClass::Live => "live".to_string(),
+            FieldClass::Restart => "restart".to_string(),
+            FieldClass::Image => "image".to_string(),
+        },
+        weakens_egress: d.weakens_egress,
+    }
+}
+
 impl DiffView {
     pub fn new(
         state: izba_core::manifest::DriftState,
         deltas: &[izba_core::manifest::diff::FieldDelta],
     ) -> Self {
-        use izba_core::manifest::diff::FieldClass;
-        use izba_core::manifest::DriftState;
-        let state_str = match state {
-            DriftState::InSync => "in_sync",
-            DriftState::RepoAhead => "repo_ahead",
-            DriftState::ManagedAhead => "managed_ahead",
-            DriftState::Diverged => "diverged",
-        };
-        let delta_views = deltas
-            .iter()
-            .map(|d| DeltaView {
-                field: d.field.clone(),
-                from: d.from.clone(),
-                to: d.to.clone(),
-                class: match d.class {
-                    FieldClass::Live => "live".to_string(),
-                    FieldClass::Restart => "restart".to_string(),
-                    FieldClass::Image => "image".to_string(),
-                },
-                weakens_egress: d.weakens_egress,
-            })
-            .collect();
         DiffView {
-            state: state_str.to_string(),
-            deltas: delta_views,
+            state: drift_state_str(state).to_string(),
+            deltas: deltas.iter().map(delta_view).collect(),
+        }
+    }
+}
+
+/// Result of a `manifest_promote` run, mapped for the frontend. Mirrors
+/// `DiffView`'s state/class vocabulary (via the shared helpers above) so the
+/// promote confirmation view and the diff preview read consistently.
+// See the matching #[allow(dead_code)] on `commands::manifest_promote_core`:
+// unreached until Task 3 wires the `manifest_promote` shim in the same PR.
+#[allow(dead_code)]
+#[derive(Serialize, Debug)]
+pub struct PromoteView {
+    /// "in_sync" | "repo_ahead" | "managed_ahead" | "diverged" — the 3-way
+    /// drift state computed BEFORE this run applied anything.
+    pub state: String,
+    pub applied: Vec<DeltaView>,
+    pub needs_restart: bool,
+    pub restarted: bool,
+    pub stopped: bool,
+    pub warnings: Vec<String>,
+}
+
+impl PromoteView {
+    pub fn new(o: izba_core::manifest::promote::PromoteOutcome) -> Self {
+        PromoteView {
+            state: drift_state_str(o.state).to_string(),
+            applied: o.applied.iter().map(delta_view).collect(),
+            needs_restart: o.needs_restart,
+            restarted: o.restarted,
+            stopped: o.stopped,
+            warnings: o.warnings,
         }
     }
 }
@@ -377,6 +416,38 @@ mod tests {
         assert_eq!(v.deltas[1].class, "image");
         assert_eq!(v.deltas[2].class, "live");
         assert!(v.deltas[2].weakens_egress);
+    }
+
+    #[test]
+    fn promote_view_maps_outcome() {
+        use izba_core::manifest::diff::{FieldClass, FieldDelta};
+        use izba_core::manifest::promote::PromoteOutcome;
+        use izba_core::manifest::DriftState;
+
+        let outcome = PromoteOutcome {
+            state: DriftState::RepoAhead,
+            applied: vec![FieldDelta {
+                field: "ports".into(),
+                from: "".into(),
+                to: "8080:80".into(),
+                class: FieldClass::Live,
+                weakens_egress: false,
+            }],
+            needs_restart: true,
+            restarted: false,
+            stopped: false,
+            warnings: vec!["w".into()],
+        };
+
+        let v = PromoteView::new(outcome);
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(j["state"], "repo_ahead");
+        assert_eq!(j["applied"][0]["class"], "live");
+        assert_eq!(j["applied"][0]["field"], "ports");
+        assert_eq!(j["warnings"], serde_json::json!(["w"]));
+        assert_eq!(j["needs_restart"], true);
+        assert_eq!(j["restarted"], false);
+        assert_eq!(j["stopped"], false);
     }
 
     #[test]
