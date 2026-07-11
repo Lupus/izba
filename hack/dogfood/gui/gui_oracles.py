@@ -16,6 +16,29 @@ _STOP = {"the", "a", "an", "is", "are", "in", "to", "of", "and", "it", "its",
          "for", "on", "list", "view", "screen"}
 _WORD_RE = re.compile(r"[a-zA-Z0-9_-]{3,}")
 
+# Mirrors `mapPromoteError` (app/src/components/ManifestTab.tsx): substring
+# token -> the friendly GUI copy the app actually renders instead of the raw
+# backend error. A rejected invoke whose raw message matches one of these
+# tokens surfaces to the user as the MAPPED copy, not the raw text — so
+# `silent_failure_oracle` must search for both (Fix 2). Tokens are lowercase
+# (matched against an already-lowercased error message); kept in sync by
+# hand since the harness has no build step that imports the TS source.
+_ERROR_COPY_MAP: List[tuple] = [
+    ("izba.yml changed",
+     "izba.yml changed since you viewed this diff. Refresh and review again."),
+    ("no reviewed diff",
+     "Review the diff first — open this tab's latest state, then Promote."),
+    ("requires --restart",
+     "This image change needs the checkbox above ticked before Promote can continue."),
+]
+
+
+def _mapped_error_copies(lower_msg: str) -> List[str]:
+    """The GUI's mapped friendly-copy string(s) for a (lowercased) raw error
+    message, per `_ERROR_COPY_MAP` — empty if no token matches (the app
+    would have rendered the raw message verbatim)."""
+    return [copy for token, copy in _ERROR_COPY_MAP if token in lower_msg]
+
 
 def expectation_keywords(expect: str) -> List[str]:
     """Significant lowercased tokens of an expectation (stopwords dropped)."""
@@ -34,14 +57,41 @@ def console_oracle(console_errors: List[str], ref: Dict[str, Any]) -> List[Candi
     return out
 
 
-def dom_expect_oracle(expect: str, marks_text: str, ref: Dict[str, Any]) -> List[Candidate]:
+def _has_dialog(marks_text: str) -> bool:
+    """True if a rendered marks snapshot (``render_marks`` output, one
+    ``[@eN] role "name"`` line per mark) contains a ``dialog``-role element.
+    A Radix/shadcn ``<Dialog>`` portals its content to the end of
+    ``document.body`` and the accessibility tree marks its container `role
+    "dialog"`, aria-modal — when one is open, agent-browser's snapshot only
+    lists that portaled subtree, so the rail/list *behind* the modal is
+    invisible (not merely un-highlighted: genuinely absent from the marks).
+    Case-insensitive: shrugs off a future role-casing change rather than
+    silently stop detecting dialogs."""
+    return bool(re.search(r'\]\s*dialog\s+"', marks_text or "", re.IGNORECASE))
+
+
+def _last_non_dialog_marks(marks_history: List[str]) -> Optional[str]:
+    """The last entry of ``marks_history`` (chronological, oldest-first) that
+    has no dialog open, or ``None`` if every entry does (or the history is
+    empty) — i.e. there is no reliable non-modal view to grade against."""
+    for text in reversed(marks_history or []):
+        if not _has_dialog(text):
+            return text
+    return None
+
+
+def dom_expect_oracle(expect: str, marks_text: str, ref: Dict[str, Any],
+                      page_text: str = "") -> List[Candidate]:
     """If NONE of the expectation's significant keywords appears in the final
-    screen, the user-observable outcome is missing. Conservative (needs zero
-    overlap) to stay low-noise — the skeptic adjudicates borderline cases."""
+    screen — the accessibility marks OR the raw rendered page text (Fix 2:
+    plain-`<div>` outcome/error copy the marks never capture, e.g. "Promoted
+    N change(s).") — the user-observable outcome is missing. Conservative
+    (needs zero overlap across BOTH surfaces) to stay low-noise — the
+    skeptic adjudicates borderline cases."""
     kws = expectation_keywords(expect)
     if not kws:
         return []
-    hay = (marks_text or "").lower()
+    hay = ((marks_text or "") + "\n" + (page_text or "")).lower()
     if any(re.search(rf'\b{re.escape(k)}\b', hay) for k in kws):
         return []
     return [Candidate(
@@ -52,16 +102,40 @@ def dom_expect_oracle(expect: str, marks_text: str, ref: Dict[str, Any]) -> List
 
 
 def silent_failure_oracle(invoke_log: List[Dict[str, Any]], marks_text: str,
-                          ref: Dict[str, Any]) -> List[Candidate]:
+                          ref: Dict[str, Any],
+                          page_text: str = "") -> List[Candidate]:
     """A backend invoke that rejected but left no visible error surface (no
-    'alert'/'error'/the error text) in the screen = the user wasn't told."""
-    hay = (marks_text or "").lower()
+    'alert'/'error'/the error text, in EITHER the accessibility marks or the
+    raw rendered page text) = the user wasn't told.
+
+    Fix 2 (run-2 skeptic): the app renders promote/create error copy as plain
+    `<div>` text (e.g. "izba.yml changed since you viewed this diff. Refresh
+    and review again." — `mapPromoteError`'s friendly copy in
+    `ManifestTab.tsx`), which agent-browser's accessibility snapshot never
+    captures (no role/name). ``page_text`` is `document.body.innerText`
+    (`driver.read_page_text`), which does. ``page_text`` is expected to be the
+    UNION of every action's captured page text across the whole journey (see
+    run_gui_journeys.py), not just the final one — the harness has no
+    timestamp/index correlation between a specific `invoke_log` rejection and
+    a specific action, so rather than risk a false positive from an
+    under-scoped window, this checks the widest reasonable "at-or-after the
+    rejection" approximation: the error's own raw text (or its 40-char
+    prefix), OR its `_ERROR_COPY_MAP`-mapped GUI copy (the app renders the
+    MAPPED string, not the raw backend error, for known token errors —
+    matching only the raw text would still false-positive on those),
+    appearing ANYWHERE the journey rendered text. This trades a theoretical
+    false negative (an error string that happens to also appear earlier,
+    unrelated) for eliminating the false positives the skeptic found (3/3 of
+    this oracle's non-spawn firings were real error copy the marks-only
+    check couldn't see)."""
+    hay = ((marks_text or "") + "\n" + (page_text or "")).lower()
     surfaced = ("alert" in hay) or ("error" in hay) or ("failed" in hay)
     out: List[Candidate] = []
     for e in invoke_log or []:
         if isinstance(e, dict) and e.get("ok") is False:
             msg = str(e.get("error", "")).lower()
-            if surfaced or (msg and msg[:40] in hay):
+            mapped = [c.lower() for c in _mapped_error_copies(msg)]
+            if surfaced or (msg and msg[:40] in hay) or any(c in hay for c in mapped):
                 continue
             out.append(Candidate(
                 kind="silent_failure",
@@ -72,12 +146,33 @@ def silent_failure_oracle(invoke_log: List[Dict[str, Any]], marks_text: str,
     return out
 
 
-def ui_daemon_diff_oracle(marks_text: str, state_evidence: Dict[str, Any],
+def ui_daemon_diff_oracle(marks_history: Any, state_evidence: Dict[str, Any],
                           ref: Dict[str, Any]) -> List[Candidate]:
     """Differential: every sandbox the daemon reports must be visible in the
-    final UI. A sandbox in daemon truth but absent from the screen = the UI
-    lies about / drops real state."""
-    hay = (marks_text or "").lower()
+    UI. A sandbox in daemon truth but absent from the screen = the UI lies
+    about / drops real state.
+
+    Fix 1 (run-2 skeptic, all 3/3 of this oracle's firings): grading strictly
+    against the journey's FINAL snapshot false-positives whenever that
+    snapshot was captured with a dialog open (e.g. the promote confirm) —
+    Radix/shadcn portals dialog content to the end of `document.body`, so the
+    accessibility snapshot only lists the dialog subtree and the rail
+    (which DOES list the sandbox, one snapshot earlier) reads as "absent".
+    ``marks_history`` is the chronological list of every marks snapshot taken
+    during the journey (oldest first, typically ending with the final
+    post-journey capture); a bare ``str`` is also accepted (wrapped as a
+    single-element history) for callers/tests that only ever have one
+    snapshot. This oracle grades against the LAST entry that has no
+    `dialog`-role mark (see `_has_dialog`/`_last_non_dialog_marks`) rather
+    than strictly the last entry. If every snapshot in the history has a
+    dialog open, there is no reliable non-modal view to grade — the oracle
+    stays silent (report-only bias: never claim a sandbox is UI-dropped from
+    a view we know is a portal-obscured modal)."""
+    history = [marks_history] if isinstance(marks_history, str) else list(marks_history or [])
+    graded = _last_non_dialog_marks(history)
+    if graded is None:
+        return []
+    hay = graded.lower()
     out: List[Candidate] = []
     for name in (state_evidence or {}).get("sandboxes", []) or []:
         if not re.search(r'\b' + re.escape(str(name).lower()) + r'\b', hay):

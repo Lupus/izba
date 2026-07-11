@@ -101,6 +101,7 @@
           }
         },
         "snapshot": { "type": "string", "description": "GUI only: the rendered accessibility set-of-marks the Actor saw after this action (role + name + @ref lines), trimmed. Empty for CLI actions." },
+        "page_text": { "type": "string", "description": "GUI only (Fix 2, run-2 skeptic): document.body.innerText captured alongside the accessibility marks after this action, capped (with a truncation note) — catches plain-<div> error/outcome copy the marks-only accessibility snapshot never captures (no role/name)." },
         "console_errors": { "type": "array", "items": { "type": "string" }, "description": "GUI only: uncaught JS errors / unhandled rejections collected by the in-page bridge during this action." },
         "screenshot_ref": { "type": "string", "description": "GUI only: artifact-relative path of an annotated screenshot captured on failure (for the Phase-3 skeptic). Absent on success." }
       }

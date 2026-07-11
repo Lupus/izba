@@ -24,6 +24,14 @@ def test_dom_expect_oracle_flags_when_absent():
     assert len(cs) == 1 and cs[0].kind == "dom_expect"
 
 
+def test_dom_expect_oracle_passes_when_keyword_only_in_page_text():
+    # Fix 2: a plain-<div> outcome string ("Promoted N change(s).") has no
+    # accessible role/name, so the marks miss it — page_text must too be
+    # searched, not just marks_text.
+    assert dom_expect_oracle("promoted 1 change", '[@e1] heading "Sandboxes"',
+                             REF, page_text="Promoted 1 change(s).") == []
+
+
 def test_silent_failure_oracle_flags_rejected_invoke_with_no_error_surface():
     log = [{"cmd": "create", "ok": False, "error": "boom"}]
     cs = silent_failure_oracle(log, '[@e1] heading "Sandboxes"', REF)
@@ -33,6 +41,25 @@ def test_silent_failure_oracle_flags_rejected_invoke_with_no_error_surface():
 def test_silent_failure_oracle_quiet_when_error_is_shown():
     log = [{"cmd": "create", "ok": False, "error": "boom"}]
     assert silent_failure_oracle(log, '[@e1] alert "boom"', REF) == []
+
+
+def test_silent_failure_oracle_quiet_when_error_surfaced_only_in_page_text():
+    # Fix 2: the stale-token/image-change gate errors render as plain text
+    # nodes (mapPromoteError's friendly copy) that the a11y marks never
+    # capture. page_text (document.body.innerText) does.
+    log = [{"cmd": "manifest_promote",
+           "ok": False,
+           "error": "izba.yml changed since `izba diff`"}]
+    page_text = "izba.yml changed since you viewed this diff. Refresh and review again."
+    assert silent_failure_oracle(log, '[@e1] heading "Promote izba.yml changes"',
+                                 REF, page_text=page_text) == []
+
+
+def test_silent_failure_oracle_flags_when_neither_surface_shows_it():
+    log = [{"cmd": "manifest_promote", "ok": False, "error": "boom"}]
+    cs = silent_failure_oracle(log, '[@e1] heading "Sandboxes"', REF,
+                               page_text="some unrelated page text")
+    assert len(cs) == 1 and cs[0].kind == "silent_failure"
 
 
 def test_ui_daemon_diff_flags_sandbox_missing_from_ui():
@@ -52,6 +79,42 @@ def test_ui_daemon_diff_word_boundary_run_not_suppressed_by_running():
     ev = {"sandboxes": ["run"]}
     cs = ui_daemon_diff_oracle('[@e1] status "running"', ev, REF)
     assert len(cs) == 1 and cs[0].kind == "ui_daemon_diff"
+
+
+# ---------- ui_daemon_diff modal fix (Fix 1) ----------
+
+def test_ui_daemon_diff_uses_last_non_dialog_snapshot_when_final_is_a_modal():
+    # Final snapshot is captured with the Promote modal open (rail portaled
+    # away); an earlier snapshot shows the sandbox in the rail.
+    ev = {"sandboxes": ["web"]}
+    history = [
+        '[@e1] row "web running"',
+        '[@e2] heading "Promote izba.yml changes"\n[@e3] dialog "Promote izba.yml changes"',
+    ]
+    assert ui_daemon_diff_oracle(history, ev, REF) == []
+
+
+def test_ui_daemon_diff_flags_when_absent_from_all_non_dialog_snapshots():
+    ev = {"sandboxes": ["web"]}
+    history = [
+        '[@e1] heading "Sandboxes"',
+        '[@e2] dialog "Promote izba.yml changes"',
+    ]
+    cs = ui_daemon_diff_oracle(history, ev, REF)
+    assert len(cs) == 1 and cs[0].kind == "ui_daemon_diff"
+
+
+def test_ui_daemon_diff_suppressed_when_every_snapshot_has_a_dialog():
+    # No reliable non-modal view exists at all: stay silent rather than
+    # falsely claim the sandbox is UI-dropped.
+    ev = {"sandboxes": ["web"]}
+    history = ['[@e1] dialog "Promote izba.yml changes"']
+    assert ui_daemon_diff_oracle(history, ev, REF) == []
+
+
+def test_ui_daemon_diff_accepts_bare_string_for_backward_compat():
+    ev = {"sandboxes": ["web"]}
+    assert ui_daemon_diff_oracle('[@e1] row "web running"', ev, REF) == []
 
 
 # ---------- manifest_truth oracle (Task 11) ----------

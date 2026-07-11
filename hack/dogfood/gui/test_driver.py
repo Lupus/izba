@@ -1,6 +1,8 @@
+import json
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gui.driver import parse_snapshot, render_marks, action_to_argv, Mark, _validate_args
+from gui.driver import (FakeDriver, Mark, _validate_args, action_to_argv,
+                        parse_snapshot, render_marks)
 
 
 def test_parse_snapshot_text_form():
@@ -155,3 +157,34 @@ def test_read_console_errors_through_real_envelope():
     out = ('{"success":true,"data":{"origin":"o",'
            '"result":"[\\"boom\\"]"},"error":null}')
     assert _stub_driver(out).read_console_errors() == ["boom"]
+
+
+# --- read_page_text (Fix 2) ---
+
+def test_read_page_text_through_real_envelope():
+    # JSON.stringify(document.body.innerText||'') round-trips like the other
+    # eval calls: data.result carries a JSON-encoded string of the JS value.
+    out = ('{"success":true,"data":{"origin":"o",'
+           '"result":"\\"Promoted 1 change(s).\\""},"error":null}')
+    assert _stub_driver(out).read_page_text() == "Promoted 1 change(s)."
+
+
+def test_read_page_text_caps_and_marks_truncation():
+    long_text = "x" * 5000
+    out_json = json.dumps(json.dumps(long_text))
+    out = ('{"success":true,"data":{"origin":"o","result":' + out_json + '},"error":null}')
+    text = _stub_driver(out).read_page_text(cap_chars=100)
+    assert len(text) == 100 + len("...[truncated]")
+    assert text.endswith("...[truncated]")
+    assert text.startswith("x" * 100)
+
+
+def test_read_page_text_garbage_is_empty_string():
+    assert _stub_driver("not json").read_page_text() == ""
+
+
+def test_fake_driver_read_page_text_pops_scripted_values_and_caps():
+    d = FakeDriver(page_texts=["short text", "y" * 10])
+    assert d.read_page_text() == "short text"
+    assert d.read_page_text(cap_chars=5) == "yyyyy...[truncated]"
+    assert d.read_page_text() == ""  # exhausted -> empty, never raises
