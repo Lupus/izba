@@ -969,6 +969,62 @@ mod tests {
         assert!(matches!(&events[0], PromoteEvent::Warn(m) if m.contains("not running")));
     }
 
+    /// A STOPPED sandbox with `--restart` AND a pending restart-class delta:
+    /// `will_start` must suppress the "not running" warning (it's about to
+    /// Start anyway) and the restart dance must skip `Stop` (nothing is
+    /// running to stop) but still send `Start`. Distinguishes this from
+    /// `run_with_client_stopped_sandbox_defers_changes_to_next_start`, where
+    /// `restart` is false and the right-hand side of `will_start`'s `&&`
+    /// (`!p.restart_fields.is_empty()`) is never actually exercised.
+    #[test]
+    fn run_with_client_restart_flag_starts_a_stopped_sandbox_without_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml("testimg", 4, "");
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(&paths, "web", "testimg", 2, vec![], vec![], None);
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "testimg");
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "stopped");
+            // No Stop expected — the sandbox was never running.
+            expect_and_ok(
+                &mut s,
+                |r| matches!(r, DaemonRequest::Start { name, .. } if name == "web"),
+                "Start",
+            );
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let outcome = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, true, true), // restart: true
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.applied[0].field, "cpus");
+        assert!(outcome.stopped, "was stopped at the start");
+        assert!(outcome.restarted);
+        assert!(!outcome.needs_restart);
+        assert!(
+            outcome.warnings.is_empty(),
+            "will_start must suppress the 'not running' warning"
+        );
+        assert!(
+            matches!(&events[0], PromoteEvent::Info(m) if m.starts_with("restarted to apply: cpus")),
+            "no Warn event should precede it either"
+        );
+    }
+
     /// A restart-class delta (cpus) WITHOUT `--restart`: nothing is applied
     /// live, `needs_restart` is reported, and the CLI-facing message is an
     /// `Info` (not a `Warn`) pointing at `izba promote --restart`.
@@ -1142,6 +1198,10 @@ mod tests {
     /// `--restart` on an image-change delta drives the full Stop -> Start
     /// dance (skipping `reset_rw_scratch` here via `reset_scratch: false`,
     /// which also exercises the "keeps the old overlay" expert warning).
+    /// `state.json` is seeded with a DEGRADED (unconfined) confinement status
+    /// so `allow_unconfined` is actually computed through the `!c.is_confined()`
+    /// mapping (a None `RunState` — the untested-elsewhere default — would
+    /// short-circuit to `false` regardless, masking that line).
     #[test]
     fn run_with_client_restart_flag_drives_stop_start_dance_and_expert_warning() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1154,6 +1214,18 @@ mod tests {
         let token = store::review_token(&yaml, None);
         store::write_review(&sandbox_dir, &token).unwrap();
         seed_cached_image(&paths, "newimg");
+        // Degraded (unconfined) confinement -> is_confined() == false ->
+        // allow_unconfined must come out TRUE on the Start that follows.
+        let run_state = RunState {
+            vmm_pid: crate::state::PidIdentity {
+                pid: 1,
+                starttime: 1,
+            },
+            sidecar_pids: vec![],
+            started_unix_ms: 0,
+            confinement: Some(crate::procmgr::ConfinementStatus::degraded("test")),
+        };
+        save_json(&sandbox_dir.join(STATE_FILE), &run_state).unwrap();
 
         let mut client = fake_daemon(|mut s| {
             expect_inspect_reply(&mut s, "web", "running");
@@ -1164,7 +1236,7 @@ mod tests {
             );
             expect_and_ok(
                 &mut s,
-                |r| matches!(r, DaemonRequest::Start { name, allow_unconfined } if name == "web" && !allow_unconfined),
+                |r| matches!(r, DaemonRequest::Start { name, allow_unconfined } if name == "web" && *allow_unconfined),
                 "Start",
             );
         });
