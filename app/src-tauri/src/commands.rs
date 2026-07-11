@@ -227,6 +227,19 @@ pub fn volume_prune_core(d: &mut dyn DaemonApi) -> Result<izba_core::volume::Pru
     d.volume_prune().map_err(|e| e.to_string())
 }
 
+/// Resolve this app's data root the same way the CLI does:
+/// `IZBA_DATA_DIR` wins when set, otherwise the per-OS default (mirrors
+/// `crates/izba-cli/src/main.rs`'s `Paths::from_env_or_default(std::env::
+/// var_os("IZBA_DATA_DIR")...)` line exactly). Without this the app silently
+/// ignored the env var and every sandbox landed under the real `$HOME`
+/// regardless — the GUI dogfood headless sidecar
+/// (`hack/dogfood/gui/run_gui_journeys.py`) sets `IZBA_DATA_DIR` per journey
+/// and depends on the app honoring it for per-journey isolation and the
+/// reconcile oracle. Used by `RealDaemon::new` and the manifest cores below.
+pub(crate) fn app_paths() -> Paths {
+    Paths::from_env_or_default(std::env::var_os("IZBA_DATA_DIR").map(PathBuf::from))
+}
+
 /// Resolve sandbox `name`'s workspace directory from its `config.json` — the
 /// single source of truth for "where is this sandbox's `izba.yml`". Name-only
 /// manifest cores never take a frontend-supplied path (the config.json
@@ -247,7 +260,7 @@ fn workspace_for(paths: &Paths, name: &str) -> Result<PathBuf, String> {
 /// WRITES the review token — rendering the diff to the user IS the review
 /// that gates a subsequent `manifest_promote` (mirrors the CLI's `izba diff`).
 pub fn manifest_diff_core(name: &str) -> Result<DiffView, String> {
-    let paths = Paths::from_env_or_default(None);
+    let paths = app_paths();
     let ws = workspace_for(&paths, name)?;
     let (state, deltas, token) =
         izba_core::manifest::ops::compute_diff(&paths, &ws, name).map_err(|e| e.to_string())?;
@@ -258,7 +271,7 @@ pub fn manifest_diff_core(name: &str) -> Result<DiffView, String> {
 /// Core of `manifest_export`: write the managed truth back into the sandbox's
 /// recorded workspace `izba.yml` and return the path written as a string.
 pub fn manifest_export_core(name: &str) -> Result<String, String> {
-    let paths = Paths::from_env_or_default(None);
+    let paths = app_paths();
     let ws = workspace_for(&paths, name)?;
     izba_core::manifest::ops::export(&paths, &ws, name)
         .map(|p| p.display().to_string())
@@ -272,16 +285,8 @@ pub fn manifest_export_core(name: &str) -> Result<String, String> {
 /// orchestration that only the CLI drives today
 /// (`izba-cli::commands::build::build_image`); the app surfaces a clear error
 /// instead of attempting it.
-// `crate-type = ["staticlib", "cdylib", "rlib"]` makes rustc's dead-code
-// analysis treat `pub` items as internal (only `#[no_mangle] extern "C"`
-// exports count as external for staticlib/cdylib), so this — unlike the
-// other `*_core` functions, which are already reached via the `#[tauri::
-// command]` shims in lib.rs — is genuinely unreached until Task 3 wires the
-// `manifest_promote` shim + dispatch arm in the same PR. Drop this once that
-// lands.
-#[allow(dead_code)]
 pub fn manifest_promote_core(name: &str, restart: bool) -> Result<PromoteView, String> {
-    let paths = Paths::from_env_or_default(None);
+    let paths = app_paths();
     let ws = workspace_for(&paths, name)?;
     let opts = izba_core::manifest::promote::PromoteOpts {
         force: false,
@@ -325,11 +330,11 @@ mod tests {
     use crate::fake::FakeDaemon;
     use crate::views::{CreateOpts, SbxState};
 
-    /// Serializes tests that redirect `$HOME` (and therefore
-    /// `Paths::from_env_or_default`'s default data root) — env vars are
-    /// process-global, so two such tests running concurrently in this test
-    /// binary would clobber each other's sandbox trees.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes tests that mutate process-global env vars consulted by
+    /// `app_paths()`/`Paths::from_env_or_default` (`$HOME`, `IZBA_DATA_DIR`)
+    /// — two such tests running concurrently in this test binary would
+    /// clobber each other's sandbox trees or each other's restored values.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// RAII: points `$HOME` at a fresh, empty tempdir for the test's
     /// duration (isolating `manifest_*_core`'s internal
@@ -343,7 +348,7 @@ mod tests {
 
     impl HomeGuard {
         fn new() -> Self {
-            let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -678,5 +683,49 @@ mod tests {
         let _guard = HomeGuard::new();
         let err = manifest_promote_core("ghost", false).unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
+    }
+
+    /// `app_paths()` must honor `IZBA_DATA_DIR` exactly like the CLI does —
+    /// this is what lets the GUI dogfood headless sidecar isolate each
+    /// journey's sandboxes instead of silently landing them under the real
+    /// `$HOME`.
+    #[test]
+    fn app_paths_honors_izba_data_dir() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("izba-app-paths-test-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = std::env::var_os("IZBA_DATA_DIR");
+        std::env::set_var("IZBA_DATA_DIR", &dir);
+
+        let paths = app_paths();
+        assert_eq!(paths.root(), dir.as_path());
+
+        match original {
+            Some(v) => std::env::set_var("IZBA_DATA_DIR", v),
+            None => std::env::remove_var("IZBA_DATA_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without `IZBA_DATA_DIR` set, `app_paths()` must fall back to the same
+    /// per-OS default `Paths::from_env_or_default(None)` uses (here, the
+    /// redirected `$HOME` from `HomeGuard`).
+    #[test]
+    fn app_paths_falls_back_to_default_without_izba_data_dir() {
+        let _guard = HomeGuard::new(); // holds ENV_LOCK + redirects $HOME
+        let original = std::env::var_os("IZBA_DATA_DIR");
+        std::env::remove_var("IZBA_DATA_DIR");
+
+        let expected = Paths::from_env_or_default(None);
+        let actual = app_paths();
+        assert_eq!(actual.root(), expected.root());
+
+        if let Some(v) = original {
+            std::env::set_var("IZBA_DATA_DIR", v);
+        }
     }
 }

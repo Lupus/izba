@@ -140,7 +140,7 @@ impl Default for RealDaemon {
 impl RealDaemon {
     pub fn new() -> Self {
         RealDaemon {
-            paths: Paths::from_env_or_default(None),
+            paths: crate::commands::app_paths(),
             client: None,
         }
     }
