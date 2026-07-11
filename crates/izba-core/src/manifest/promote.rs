@@ -1281,4 +1281,126 @@ mod tests {
         );
         assert!(matches!(&events[2], PromoteEvent::Info(m) if m == "promoted web"));
     }
+
+    /// `--restart` WITH `reset_scratch: true` (the common case): the expert
+    /// "keeps the old overlay" warning must NOT fire, and `reset_rw_scratch`
+    /// actually runs against a real `rw.img` on disk. Distinguishes `if
+    /// p.image_changed && !reset_scratch` from a `&&`->`||` mutation, which
+    /// the `reset_scratch: false` sibling test above cannot: there,
+    /// `!reset_scratch` is already `true`, so `image_changed || true` and
+    /// `image_changed && true` agree.
+    #[test]
+    fn run_with_client_restart_with_reset_scratch_true_skips_expert_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml("newimg", 2, "");
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(&paths, "web", "testimg", 2, vec![], vec![], None);
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "newimg");
+        // reset_rw_scratch needs a real rw.img to read the size of and
+        // recreate blank; a small sparse file keeps mkfs.ext4 fast.
+        let rw = sandbox_dir.join("rw.img");
+        let f = std::fs::File::create(&rw).unwrap();
+        f.set_len(64 << 20).unwrap();
+        drop(f);
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "running");
+            expect_and_ok(
+                &mut s,
+                |r| matches!(r, DaemonRequest::Stop { name } if name == "web"),
+                "Stop",
+            );
+            expect_and_ok(
+                &mut s,
+                |r| matches!(r, DaemonRequest::Start { name, .. } if name == "web"),
+                "Start",
+            );
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let outcome = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, true, true), // restart: true, reset_scratch: true
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap();
+
+        assert!(outcome.restarted);
+        assert!(
+            outcome.warnings.is_empty(),
+            "reset_scratch: true must NOT trigger the 'keeps old overlay' warning"
+        );
+        assert!(rw.is_file(), "rw.img must still exist after the reset");
+        assert_eq!(
+            events.len(),
+            2,
+            "restarted info + promoted info, no expert warning"
+        );
+        assert!(
+            matches!(&events[0], PromoteEvent::Info(m) if m.starts_with("restarted to apply: image"))
+        );
+    }
+
+    /// A STOPPED sandbox with `--restart` but NO restart-class delta at all
+    /// (only a Live-class ports change): the restart block never runs
+    /// (`p.restart_fields` is empty), so `--restart` doesn't actually start
+    /// anything — the "not running" warning must still fire. Distinguishes
+    /// `will_start = restart && !p.restart_fields.is_empty()` from a
+    /// `&&`->`||` mutation, which
+    /// `run_with_client_restart_flag_starts_a_stopped_sandbox_without_stop`
+    /// cannot: there `!p.restart_fields.is_empty()` is already `true`, so
+    /// `restart || true` and `restart && true` agree.
+    #[test]
+    fn run_with_client_restart_flag_stopped_with_no_restart_delta_still_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml(
+            "testimg",
+            2,
+            "  ports:\n    - { guest: 81, host: 3333, bind: 127.0.0.1 }\n",
+        );
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(&paths, "web", "testimg", 2, vec![], vec![], None);
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "testimg");
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "stopped");
+            // No further RPC: nothing restart-class to apply, live RPCs are
+            // skipped because the sandbox isn't running.
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let outcome = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, true, true), // restart: true, but nothing restart-class pending
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap();
+
+        assert!(outcome.stopped);
+        assert!(!outcome.restarted, "nothing restart-class to apply");
+        assert_eq!(
+            outcome.warnings,
+            vec!["sandbox not running — changes apply on next start".to_string()],
+            "--restart alone must not silence the warning when there's nothing to restart"
+        );
+        assert!(matches!(&events[0], PromoteEvent::Warn(m) if m.contains("not running")));
+    }
 }
