@@ -33,15 +33,20 @@
 //!
 //! ## Test coverage note
 //!
-//! The orchestration itself (the live daemon RPC sequencing: `ReloadPolicy`,
-//! `Port*`/`Volume*` deltas, the Stop/reset-scratch/Start restart dance)
-//! drives a live daemon and a real sandbox, so it has no fake-daemon unit
-//! test in this module — `run()` is `#[mutants::skip]`, e2e-only, and is
-//! pinned by `daemon_e2e` steps [9]-[11]
-//! (`crates/izba-cli/tests/daemon_e2e.rs`, `manifest_diff_promote_live_path`).
-//! Do not weaken those steps when touching this file; the decision logic it
-//! composes (`gate`, `apply::plan`, `diff_normalized`, `classify`) is
-//! unit-tested in its own module (`diff.rs`, `apply.rs`) and here.
+//! `run()` is a thin wrapper (`#[mutants::skip]`, e2e-only) that opens a real
+//! `DaemonClient::connect(paths)` and delegates to `run_with_client`, which
+//! carries the actual orchestration (the RPC sequencing: `ReloadPolicy`,
+//! `Port*`/`Volume*` deltas, the Stop/reset-scratch/Start restart dance) over
+//! an already-connected client — the seam that lets the `run_with_client_*`
+//! tests below drive it against a scripted fake daemon on a `UnixStream::pair()`
+//! (see `fake_daemon` in this module's test code, mirroring
+//! `daemon::client::tests::fake_daemon`) instead of a live one. The full
+//! live-daemon path (real sandbox, real VMM) is still pinned end-to-end by
+//! `daemon_e2e` steps [9]-[11] (`crates/izba-cli/tests/daemon_e2e.rs`,
+//! `manifest_diff_promote_live_path`) — do not weaken those steps when
+//! touching this file. The decision logic `run_with_client` composes (`gate`,
+//! `apply::plan`, `diff_normalized`, `classify`) is unit-tested in its own
+//! module (`diff.rs`, `apply.rs`) and here.
 
 use std::path::Path;
 
@@ -154,7 +159,7 @@ fn send_ok(
 /// `validate_name`). `resolve_build_image` builds a `spec.build:` image and
 /// returns its digest — the CLI wires this to `commands::build::build_image`;
 /// a `spec.image:` ref is resolved in-line via `image::ensure_image`.
-#[mutants::skip] // reason: drives a live daemon (ReloadPolicy/Port*/Volume*/Stop/Start/Inspect over the socket) + image build/pull; e2e-only (daemon_e2e manifest_diff_promote_live_path). The decision logic it composes (gate, apply::plan, diff_normalized, classify) is unit-tested separately.
+#[mutants::skip] // reason: thin wrapper that only opens the live daemon connection; e2e-only (daemon_e2e manifest_diff_promote_live_path). The orchestration it delegates to, `run_with_client`, is unit-tested against a fake daemon — see the `run_with_client_*` tests below.
 pub fn run(
     paths: &Paths,
     dir: &Path,
@@ -162,6 +167,32 @@ pub fn run(
     opts: PromoteOpts,
     on_event: &mut dyn FnMut(PromoteEvent),
     resolve_build_image: &mut dyn FnMut(&Path, &BuildSpec) -> Result<String>,
+) -> Result<PromoteOutcome> {
+    let mut client = DaemonClient::connect(paths)?;
+    run_with_client(
+        paths,
+        dir,
+        name,
+        opts,
+        on_event,
+        resolve_build_image,
+        &mut client,
+    )
+}
+
+/// The actual promote orchestration, over an already-connected `client` — the
+/// seam that makes this unit-testable with a fake daemon (`UdsStream::pair`)
+/// rather than a live one. `run()` above is the thin production wrapper that
+/// supplies a real `DaemonClient::connect(paths)`.
+#[allow(clippy::too_many_arguments)]
+fn run_with_client(
+    paths: &Paths,
+    dir: &Path,
+    name: &str,
+    opts: PromoteOpts,
+    on_event: &mut dyn FnMut(PromoteEvent),
+    resolve_build_image: &mut dyn FnMut(&Path, &BuildSpec) -> Result<String>,
+    client: &mut DaemonClient,
 ) -> Result<PromoteOutcome> {
     let PromoteOpts {
         force,
@@ -263,8 +294,6 @@ pub fn run(
         );
     }
 
-    let mut client = DaemonClient::connect(paths)?;
-
     // Fix 5: Skip live daemon RPCs when the sandbox is not running — the
     // managed config committed below takes effect on the next `izba start`.
     // Stop/Start (the restart branch below) is a lifecycle operation, not a
@@ -292,7 +321,7 @@ pub fn run(
         if p.policy_changed {
             apply::write_policy(&dir_managed, &repo.egress)?;
             send_ok(
-                &mut client,
+                client,
                 &DaemonRequest::ReloadPolicy {
                     name: name.to_string(),
                 },
@@ -302,7 +331,7 @@ pub fn run(
         }
         for r in &p.ports_removed {
             send_ok(
-                &mut client,
+                client,
                 &DaemonRequest::PortUnpublish {
                     name: name.to_string(),
                     bind: r.bind,
@@ -314,7 +343,7 @@ pub fn run(
         }
         for r in &p.ports_added {
             send_ok(
-                &mut client,
+                client,
                 &DaemonRequest::PortPublish {
                     name: name.to_string(),
                     rule: r.clone(),
@@ -326,7 +355,7 @@ pub fn run(
         }
         for gp in &p.volumes_removed {
             send_ok(
-                &mut client,
+                client,
                 &DaemonRequest::VolumeDetach {
                     name: name.to_string(),
                     guest_path: gp.clone(),
@@ -337,7 +366,7 @@ pub fn run(
         }
         for v in &p.volumes_added {
             send_ok(
-                &mut client,
+                client,
                 &DaemonRequest::VolumeAttach {
                     name: name.to_string(),
                     spec: v.clone(),
@@ -385,7 +414,7 @@ pub fn run(
             // non-running sandbox may error from the daemon and is unnecessary.
             if is_running {
                 send_ok(
-                    &mut client,
+                    client,
                     &DaemonRequest::Stop {
                         name: name.to_string(),
                     },
@@ -401,7 +430,7 @@ pub fn run(
             // Fix 3b: Surface a helpful retry hint if Start fails after Stop —
             // the config was already committed so a plain `izba start` is safe.
             if let Err(err) = send_ok(
-                &mut client,
+                client,
                 &DaemonRequest::Start {
                     name: name.to_string(),
                     allow_unconfined,
@@ -495,6 +524,23 @@ mod tests {
         assert_eq!(gate(Some(&reviewed), &current, false), GateOutcome::Stale);
     }
 
+    /// `emit_warn` is the single choke point every warning flows through: it
+    /// must BOTH push the message into `warnings` AND emit it via `on_event`
+    /// — kills the `replace emit_warn with ()` mutant, which would make
+    /// neither happen.
+    #[test]
+    fn emit_warn_pushes_and_emits() {
+        let mut warnings: Vec<String> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut on_event = |e: PromoteEvent| match e {
+            PromoteEvent::Warn(m) => seen.push(m),
+            PromoteEvent::Info(m) => panic!("unexpected Info: {m}"),
+        };
+        emit_warn(&mut warnings, &mut on_event, "uh oh".to_string());
+        assert_eq!(warnings, vec!["uh oh".to_string()]);
+        assert_eq!(seen, vec!["uh oh".to_string()]);
+    }
+
     /// `PromoteOpts::default()` must be the all-false, safest-by-default
     /// posture (no forced gate bypass, no implicit restart, no scratch wipe) —
     /// a caller that forgets to set a field never silently escalates.
@@ -514,17 +560,653 @@ mod tests {
     /// string literals while describing/exercising this very check.
     #[test]
     fn promote_rs_never_prints_directly() {
-        let src = include_str!("promote.rs");
-        let production = src.split("\n#[cfg(test)]\n").next().unwrap_or(src);
+        // Normalize CRLF -> LF first: on a CRLF checkout (Windows `core.autocrlf`)
+        // the literal `"\n#[cfg(test)]\n"` needle never matches (the real
+        // separator is `\r\n#[cfg(test)]\r\n`), so `production` would silently
+        // fall back to the WHOLE file — including this test module, whose own
+        // source mentions the forbidden macro names in string literals/comments
+        // and self-trips the assert below.
+        let src = include_str!("promote.rs").replace("\r\n", "\n");
+        let production = src.split("\n#[cfg(test)]\n").next().unwrap_or(&src);
+        // Build the forbidden needles via `concat!` so this very check line can
+        // never match itself (a plain `"println!"` literal here would appear in
+        // `production` — this file is above `mod tests` — and self-trip).
+        let println_macro = concat!("print", "ln!(");
+        let eprintln_macro = concat!("e", "print", "ln!(");
         for line in production.lines() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {
                 continue;
             }
             assert!(
-                !trimmed.contains("println!") && !trimmed.contains("eprintln!"),
+                !trimmed.contains(println_macro) && !trimmed.contains(eprintln_macro),
                 "promote.rs must not print directly, found: {line:?}"
             );
         }
+    }
+
+    // ── `run_with_client` orchestration tests (fake daemon over a socketpair) ──
+    //
+    // These exercise the seam that makes `run_with_client` unit-testable: it
+    // takes an already-connected `DaemonClient`, so a scripted fake daemon on
+    // the peer end of `UdsStream::pair()` stands in for izbad — mirroring
+    // `daemon::client::tests::fake_daemon`. Unit tests never bind unix/vsock
+    // listeners (some sandboxes deny `bind`); the socketpair sidesteps that
+    // entirely. Image-digest resolution is made hermetic by pre-seeding a
+    // local tag (`crate::image::set_tag`) pointing at a fake cached
+    // `rootfs.erofs`, so `ensure_image` short-circuits before ever reaching
+    // `pull::resolve` (no network, no `mkfs.erofs` dependency).
+
+    use crate::daemon::egress::config::EgressPolicyConfig;
+    use crate::daemon::proto::{DaemonHello, SandboxDetail, DAEMON_PROTO_VERSION};
+    use crate::state::{save_json, PortRule, SandboxConfig, CONFIG_FILE};
+    use crate::vmm::UdsStream;
+    use crate::volume::VolumeSpec;
+    use izba_proto::{read_frame, write_frame};
+
+    /// A scripted fake daemon on the peer end of a socketpair: answers the
+    /// hello, then runs `script` on the connection. Mirrors
+    /// `daemon::client::tests::fake_daemon`.
+    fn fake_daemon(script: impl FnOnce(UdsStream) + Send + 'static) -> DaemonClient {
+        let (client_end, server_end) = UdsStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut s = server_end;
+            let _hello: DaemonHello = match read_frame(&mut s) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            let hello_ok = DaemonResponse::HelloOk {
+                version: "test".into(),
+                proto: DAEMON_PROTO_VERSION,
+                build: crate::build_info::BuildInfoOwned::default(),
+            };
+            if write_frame(&mut s, &hello_ok).is_err() {
+                return;
+            }
+            script(s);
+        });
+        DaemonClient::handshake(client_end, "test").unwrap()
+    }
+
+    /// A fake daemon that never expects a request beyond the hello — for gate
+    /// refusals, where `run_with_client` bails before ever touching `client`.
+    fn idle_daemon() -> DaemonClient {
+        fake_daemon(|_s| {})
+    }
+
+    /// Read the next request, assert it matches `expect`, reply `Ok`.
+    fn expect_and_ok(s: &mut UdsStream, expect: impl Fn(&DaemonRequest) -> bool, what: &str) {
+        let req: DaemonRequest = read_frame(s).unwrap();
+        assert!(expect(&req), "expected {what}, got {req:?}");
+        write_frame(s, &DaemonResponse::Ok).unwrap();
+    }
+
+    /// Read the next request, assert it's `Inspect{name}`, reply with a
+    /// minimal `SandboxDetail` at the given `status`.
+    fn expect_inspect_reply(s: &mut UdsStream, name: &str, status: &str) {
+        let req: DaemonRequest = read_frame(s).unwrap();
+        assert!(
+            matches!(&req, DaemonRequest::Inspect { name: n } if n == name),
+            "expected Inspect, got {req:?}"
+        );
+        let det = SandboxDetail {
+            name: name.to_string(),
+            image_ref: "testimg".into(),
+            image_digest: "sha256:whatever".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: "/workspace".into(),
+            status: status.to_string(),
+            ports: vec![],
+            volumes: vec![],
+            confinement: None,
+            container: None,
+        };
+        write_frame(s, &DaemonResponse::Inspect(det)).unwrap();
+    }
+
+    /// Seed a fake cached image + local tag so `ensure_image(paths, tag)`
+    /// resolves offline: `tags::resolve_tag` hits, `ImageStore::is_cached`
+    /// hits, and `pull::resolve` (network) is never reached.
+    fn seed_cached_image(paths: &Paths, tag: &str) {
+        let digest = format!("sha256:{}", "e".repeat(64));
+        crate::image::set_tag(paths, tag, &digest).unwrap();
+        let dir = paths.image_dir(&digest);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("rootfs.erofs"), b"fake erofs").unwrap();
+    }
+
+    /// A minimal `spec.image:`-only manifest, with optional extra YAML lines
+    /// spliced into `spec:` (egress/ports/volumes blocks). Returns the exact
+    /// raw string written, so callers can compute a matching review token.
+    fn manifest_yaml(image: &str, cpus: u32, extra: &str) -> String {
+        format!(
+            "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: {image}\n  resources: {{ cpus: {cpus}, memory: 4Gi }}\n  rootDisk: {{ size: 8Gi }}\n{extra}"
+        )
+    }
+
+    /// Seed `config.json` (+ optional `policy.yaml`) as `name`'s managed
+    /// truth, as `ops::managed_normalized` reads it.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_managed(
+        paths: &Paths,
+        name: &str,
+        image_ref: &str,
+        cpus: u32,
+        ports: Vec<PortRule>,
+        volumes: Vec<VolumeSpec>,
+        egress: Option<EgressPolicyConfig>,
+    ) -> std::path::PathBuf {
+        let dir = paths.sandbox_dir(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = SandboxConfig {
+            image_digest: "sha256:existing".into(),
+            image_ref: image_ref.into(),
+            cpus,
+            mem_mb: 4096,
+            workspace: "/workspace".into(),
+            ports,
+            volumes,
+            builder: false,
+            build: None,
+            rw_size_gb: 8,
+        };
+        save_json(&dir.join(CONFIG_FILE), &cfg).unwrap();
+        if let Some(eg) = egress {
+            eg.write_to(&dir).unwrap();
+        }
+        dir
+    }
+
+    fn opts(force: bool, restart: bool, reset_scratch: bool) -> PromoteOpts {
+        PromoteOpts {
+            force,
+            restart,
+            reset_scratch,
+        }
+    }
+
+    fn no_build(_dir: &Path, _b: &BuildSpec) -> Result<String> {
+        unreachable!("these tests never declare spec.build:")
+    }
+
+    /// Gate refusal: no review token on disk at all. `run_with_client` must
+    /// bail BEFORE touching the daemon (the idle fake daemon never sees a
+    /// request) or resolving the image.
+    #[test]
+    fn run_with_client_bails_when_never_reviewed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("izba.yml"), manifest_yaml("testimg", 2, "")).unwrap();
+
+        let mut client = idle_daemon();
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let err = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, false, true),
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no reviewed diff"), "{err}");
+        assert!(events.is_empty(), "no event before the gate bail");
+    }
+
+    /// Gate refusal: a review token on disk that no longer matches (izba.yml
+    /// edited since `izba diff`). Same "no daemon contact" guarantee.
+    #[test]
+    fn run_with_client_bails_when_review_is_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml("testimg", 2, "");
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = paths.sandbox_dir("web");
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        // A token for a DIFFERENT manifest -> stale.
+        let stale_token = store::review_token(&manifest_yaml("testimg", 99, ""), None);
+        store::write_review(&sandbox_dir, &stale_token).unwrap();
+
+        let mut client = idle_daemon();
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let err = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, false, true),
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("changed since"), "{err}");
+        assert!(events.is_empty(), "no event before the gate bail");
+    }
+
+    /// `--force` over a NEVER-reviewed manifest that is otherwise IDENTICAL to
+    /// managed: the gate warning fires (kills the `emit_warn` mutant a second
+    /// way — through the ForcedUnreviewed arm) and, with nothing to apply, the
+    /// run completes as a clean no-op promote.
+    #[test]
+    fn run_with_client_forced_unreviewed_promotes_with_no_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml("testimg", 2, "");
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        // No review token written at all.
+        seed_managed(&paths, "web", "testimg", 2, vec![], vec![], None);
+        seed_cached_image(&paths, "testimg");
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "running");
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let outcome = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(true, false, true),
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap();
+
+        assert!(outcome.applied.is_empty(), "identical configs, no deltas");
+        assert!(!outcome.needs_restart);
+        assert!(!outcome.restarted);
+        assert!(!outcome.stopped);
+        assert_eq!(
+            outcome.warnings,
+            vec!["WARNING: --force: promoting changes that were never reviewed".to_string()]
+        );
+        assert_eq!(events.len(), 2, "gate warning + final promoted info");
+        assert!(matches!(&events[0], PromoteEvent::Warn(m) if m.contains("--force")));
+        assert!(matches!(&events[1], PromoteEvent::Info(m) if m == "promoted web"));
+    }
+
+    /// Live promote on a RUNNING sandbox: an egress-only delta drives exactly
+    /// one `ReloadPolicy` RPC, and because the delta ADDS an allowed host it
+    /// must be flagged `weakens_egress` — surfaced via `on_event` AND
+    /// `PromoteOutcome::warnings` (kills the `emit_warn -> ()` mutant).
+    #[test]
+    fn run_with_client_live_promote_reloads_policy_and_warns_weakens_egress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml(
+            "testimg",
+            2,
+            "  egress:\n    enforce: true\n    allow: [github.com]\n",
+        );
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(
+            &paths,
+            "web",
+            "testimg",
+            2,
+            vec![],
+            vec![],
+            Some(EgressPolicyConfig {
+                enforce: true,
+                allow: vec![],
+                git: vec![],
+            }),
+        );
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "testimg");
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "running");
+            expect_and_ok(
+                &mut s,
+                |r| matches!(r, DaemonRequest::ReloadPolicy { name } if name == "web"),
+                "ReloadPolicy",
+            );
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let outcome = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, false, true),
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.applied.len(), 1);
+        assert_eq!(outcome.applied[0].field, "egress");
+        assert!(outcome.applied[0].weakens_egress);
+        assert!(!outcome.needs_restart);
+        assert!(!outcome.restarted);
+        assert!(!outcome.stopped);
+        assert_eq!(
+            outcome.warnings,
+            vec!["WARNING: weakens egress: egress".to_string()]
+        );
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], PromoteEvent::Warn(m) if m.contains("weakens egress")));
+        assert!(matches!(&events[1], PromoteEvent::Info(m) if m == "promoted web"));
+    }
+
+    /// A STOPPED sandbox: live RPCs are skipped entirely (only `Inspect` is
+    /// sent), `stopped` is reported, and the pending delta warns "changes
+    /// apply on next start" rather than trying to reach a dead guest.
+    #[test]
+    fn run_with_client_stopped_sandbox_defers_changes_to_next_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml(
+            "testimg",
+            2,
+            "  ports:\n    - { guest: 81, host: 3333, bind: 127.0.0.1 }\n",
+        );
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(
+            &paths,
+            "web",
+            "testimg",
+            2,
+            vec![PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: 2222,
+                guest_port: 80,
+            }],
+            vec![],
+            None,
+        );
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "testimg");
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "stopped");
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let outcome = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, false, true),
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.applied.len(),
+            1,
+            "the ports delta is still recorded"
+        );
+        assert_eq!(outcome.applied[0].field, "ports");
+        assert!(outcome.stopped);
+        assert!(!outcome.needs_restart);
+        assert_eq!(
+            outcome.warnings,
+            vec!["sandbox not running — changes apply on next start".to_string()]
+        );
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], PromoteEvent::Warn(m) if m.contains("not running")));
+    }
+
+    /// A restart-class delta (cpus) WITHOUT `--restart`: nothing is applied
+    /// live, `needs_restart` is reported, and the CLI-facing message is an
+    /// `Info` (not a `Warn`) pointing at `izba promote --restart`.
+    #[test]
+    fn run_with_client_restart_class_delta_without_restart_flag_needs_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml("testimg", 4, "");
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(&paths, "web", "testimg", 2, vec![], vec![], None);
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "testimg");
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "running");
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let outcome = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, false, true), // restart: false
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.applied[0].field, "cpus");
+        assert!(outcome.needs_restart, "restart-class delta must be flagged");
+        assert!(!outcome.restarted);
+        assert!(!outcome.stopped);
+        assert!(outcome.warnings.is_empty(), "a plain cpu bump never warns");
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], PromoteEvent::Info(m) if m.starts_with("pending restart to apply: cpus"))
+        );
+    }
+
+    /// Port AND volume deltas on a RUNNING sandbox drive the full RPC
+    /// sequence in order: `PortUnpublish` -> `PortPublish` -> `VolumeDetach`
+    /// -> `VolumeAttach` (mirrors `apply::plan`'s field order).
+    #[test]
+    fn run_with_client_applies_port_and_volume_deltas_when_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml(
+            "testimg",
+            2,
+            "  ports:\n    - { guest: 81, host: 3333, bind: 127.0.0.1 }\n  volumes:\n    - { name: d2, mountPath: /new, size: 1Gi }\n",
+        );
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(
+            &paths,
+            "web",
+            "testimg",
+            2,
+            vec![PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: 2222,
+                guest_port: 80,
+            }],
+            vec![VolumeSpec {
+                name: Some("d".into()),
+                guest_path: "/old".into(),
+                size_bytes: 1 << 30,
+                eph_id: None,
+            }],
+            None,
+        );
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "testimg");
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "running");
+            expect_and_ok(
+                &mut s,
+                |r| {
+                    matches!(r, DaemonRequest::PortUnpublish { name, host_port, .. }
+                        if name == "web" && *host_port == 2222)
+                },
+                "PortUnpublish",
+            );
+            expect_and_ok(
+                &mut s,
+                |r| {
+                    matches!(r, DaemonRequest::PortPublish { name, rule, persist }
+                        if name == "web" && rule.host_port == 3333 && *persist)
+                },
+                "PortPublish",
+            );
+            expect_and_ok(
+                &mut s,
+                |r| {
+                    matches!(r, DaemonRequest::VolumeDetach { name, guest_path }
+                        if name == "web" && guest_path == std::path::Path::new("/old"))
+                },
+                "VolumeDetach",
+            );
+            expect_and_ok(
+                &mut s,
+                |r| {
+                    matches!(r, DaemonRequest::VolumeAttach { name, spec }
+                        if name == "web" && spec.guest_path == std::path::Path::new("/new"))
+                },
+                "VolumeAttach",
+            );
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let outcome = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, false, true),
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap();
+
+        let fields: Vec<&str> = outcome.applied.iter().map(|d| d.field.as_str()).collect();
+        assert!(fields.contains(&"ports"));
+        assert!(fields.contains(&"volumes"));
+        assert!(!outcome.needs_restart);
+        assert!(!outcome.stopped);
+        assert!(outcome.warnings.is_empty());
+    }
+
+    /// An image change WITHOUT `--restart` must bail (Fix 2) before ever
+    /// touching the daemon or resolving the new digest — a promoted
+    /// config.json pointing at a new image with the OLD rw overlay could be
+    /// unbootable.
+    #[test]
+    fn run_with_client_bails_on_image_change_without_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml("newimg", 2, "");
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(&paths, "web", "testimg", 2, vec![], vec![], None);
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        // Deliberately do NOT seed a cached "newimg" tag: a correct
+        // implementation must bail before ever resolving it.
+
+        let mut client = idle_daemon();
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let err = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, false, true), // restart: false
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--restart"), "{err}");
+    }
+
+    /// `--restart` on an image-change delta drives the full Stop -> Start
+    /// dance (skipping `reset_rw_scratch` here via `reset_scratch: false`,
+    /// which also exercises the "keeps the old overlay" expert warning).
+    #[test]
+    fn run_with_client_restart_flag_drives_stop_start_dance_and_expert_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml("newimg", 2, "");
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(&paths, "web", "testimg", 2, vec![], vec![], None);
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "newimg");
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "running");
+            expect_and_ok(
+                &mut s,
+                |r| matches!(r, DaemonRequest::Stop { name } if name == "web"),
+                "Stop",
+            );
+            expect_and_ok(
+                &mut s,
+                |r| matches!(r, DaemonRequest::Start { name, allow_unconfined } if name == "web" && !allow_unconfined),
+                "Start",
+            );
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let outcome = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, true, false), // restart: true, reset_scratch: false
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.applied[0].field, "image");
+        assert!(outcome.restarted);
+        assert!(
+            !outcome.needs_restart,
+            "restarted this run, nothing pending"
+        );
+        assert!(!outcome.stopped, "was running at the start");
+        assert_eq!(
+            outcome.warnings,
+            vec![
+                "WARNING: --reset-scratch=false keeps the rw overlay built on the PREVIOUS image. \
+                 Packages installed (e.g. apt-get) against the old base may have missing libs / \
+                 wrong ABI on the new image and can render the guest UNBOOTABLE. Proceed only if \
+                 you understand overlay semantics."
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            events.len(),
+            3,
+            "expert warning + restarted info + promoted info"
+        );
+        assert!(matches!(&events[0], PromoteEvent::Warn(_)));
+        assert!(
+            matches!(&events[1], PromoteEvent::Info(m) if m.starts_with("restarted to apply: image"))
+        );
+        assert!(matches!(&events[2], PromoteEvent::Info(m) if m == "promoted web"));
     }
 }
