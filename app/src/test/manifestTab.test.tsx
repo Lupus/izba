@@ -1,14 +1,28 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach, type Mock } from "vitest";
 import { ManifestTab } from "../components/ManifestTab";
 import { api } from "../lib/ipc";
+import type { PromoteView } from "../lib/types";
 
 vi.mock("../lib/ipc", () => ({
   api: {
     manifestDiff: vi.fn(),
     manifestExport: vi.fn(),
+    manifestPromote: vi.fn(),
   },
 }));
+
+function promoteView(overrides: Partial<PromoteView> = {}): PromoteView {
+  return {
+    state: "in_sync",
+    applied: [],
+    needs_restart: false,
+    restarted: false,
+    stopped: false,
+    warnings: [],
+    ...overrides,
+  };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -119,5 +133,152 @@ describe("ManifestTab", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /^refresh$/i }));
     await waitFor(() => expect(api.manifestDiff).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe("ManifestTab promote dialog", () => {
+  it("opens listing the delta fields for a repo_ahead diff", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "cpus", from: "2", to: "4", class: "restart", weakens_egress: false }],
+    });
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Promote izba.yml changes")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("The following changes will be applied to 'web':"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("cpus")).toBeInTheDocument();
+  });
+
+  it("keeps the Promote confirm disabled until the weakens-egress ack is checked", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [
+        {
+          field: "policy.egress.enforce",
+          from: "true",
+          to: "false",
+          class: "live",
+          weakens_egress: true,
+        },
+      ],
+    });
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    const confirm = within(dialog).getByRole("button", { name: /^promote$/i });
+    expect(confirm).toBeDisabled();
+
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "I understand this weakens the egress firewall",
+      }),
+    );
+    expect(confirm).not.toBeDisabled();
+  });
+
+  it("confirms, calls manifestPromote(name, false), renders the outcome, and refetches the diff", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "cpus", from: "2", to: "4", class: "live", weakens_egress: false }],
+    });
+    (api.manifestPromote as Mock).mockResolvedValue(
+      promoteView({
+        applied: [{ field: "cpus", from: "2", to: "4", class: "live", weakens_egress: false }],
+        warnings: ["port 8080 already published"],
+      }),
+    );
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /^promote$/i }));
+
+    await waitFor(() => expect(api.manifestPromote).toHaveBeenCalledWith("web", false));
+    expect(await within(dialog).findByText("Promoted 1 change(s).")).toBeInTheDocument();
+    expect(within(dialog).getByText("port 8080 already published")).toBeInTheDocument();
+    await waitFor(() => expect(api.manifestDiff).toHaveBeenCalledTimes(2));
+  });
+
+  it("shows a restart checkbox for a restart-class delta while running and promotes with restart=true", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "mem_mb", from: "2048", to: "4096", class: "restart", weakens_egress: false }],
+    });
+    (api.manifestPromote as Mock).mockResolvedValue(promoteView({ needs_restart: true }));
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", { name: "Restart now to apply restart-class changes" }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /^promote$/i }));
+
+    await waitFor(() => expect(api.manifestPromote).toHaveBeenCalledWith("web", true));
+  });
+
+  it("does not show the restart checkbox when the sandbox is stopped", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "mem_mb", from: "2048", to: "4096", class: "restart", weakens_egress: false }],
+    });
+    render(<ManifestTab name="web" running={false} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(
+      within(dialog).queryByRole("checkbox", { name: "Restart now to apply restart-class changes" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("maps a stale-token promote rejection to its copy", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "cpus", from: "2", to: "4", class: "live", weakens_egress: false }],
+    });
+    (api.manifestPromote as Mock).mockRejectedValue(new Error("izba.yml changed since last review"));
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /^promote$/i }));
+
+    expect(
+      await within(dialog).findByText(
+        "izba.yml changed since you viewed this diff. Refresh and review again.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("maps a never-reviewed promote rejection to its copy", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "cpus", from: "2", to: "4", class: "live", weakens_egress: false }],
+    });
+    (api.manifestPromote as Mock).mockRejectedValue(new Error("no reviewed diff on file"));
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
+
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /^promote$/i }));
+
+    expect(
+      await within(dialog).findByText(
+        "Review the diff first — open this tab's latest state, then Promote.",
+      ),
+    ).toBeInTheDocument();
   });
 });
