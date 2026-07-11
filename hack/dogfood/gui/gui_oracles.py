@@ -57,26 +57,72 @@ def console_oracle(console_errors: List[str], ref: Dict[str, Any]) -> List[Candi
     return out
 
 
+# Run-3 skeptic H1: this app's Radix/shadcn `<Dialog>` does NOT render a
+# `role=dialog` mark in agent-browser's a11y snapshot — only a `heading`
+# carrying the dialog's title plus its button cluster (Cancel/Promote/Close
+# or Create/Cancel/Close). Matched together (never on the heading alone —
+# a bare "New sandbox" heading also appears on the un-opened NewSandbox
+# panel) this is still just a heuristic over ONE app's rendering, which is
+# exactly why `page_text` is now the primary grading signal below and this
+# is demoted to a marks-only fallback.
+_MODAL_HEADING_RE = re.compile(
+    r'heading\s+"(?:Promote izba\.yml changes|New sandbox)"', re.IGNORECASE)
+_MODAL_BUTTON_RE = re.compile(
+    r'button\s+"(?:Cancel|Promote|Close|Create)"', re.IGNORECASE)
+
+
 def _has_dialog(marks_text: str) -> bool:
     """True if a rendered marks snapshot (``render_marks`` output, one
-    ``[@eN] role "name"`` line per mark) contains a ``dialog``-role element.
-    A Radix/shadcn ``<Dialog>`` portals its content to the end of
-    ``document.body`` and the accessibility tree marks its container `role
-    "dialog"`, aria-modal — when one is open, agent-browser's snapshot only
-    lists that portaled subtree, so the rail/list *behind* the modal is
-    invisible (not merely un-highlighted: genuinely absent from the marks).
+    ``[@eN] role "name"`` line per mark) has DATA evidence of an open dialog.
+    Two signals: (1) an explicit ``role=dialog`` mark — the spec-compliant
+    a11y-tree shape, kept for other apps'/future bundles; (2) this app's
+    actual empirically-observed rendering (run-3 skeptic H1): a known modal
+    heading plus its button cluster, with no ``role=dialog`` mark anywhere.
     Case-insensitive: shrugs off a future role-casing change rather than
-    silently stop detecting dialogs."""
-    return bool(re.search(r'\]\s*dialog\s+"', marks_text or "", re.IGNORECASE))
+    silently stop detecting dialogs. Even (2) is a heuristic over marks
+    alone — the real fix is grading against ``page_text`` instead of relying
+    on this function at all (see ``ui_daemon_diff_oracle``); this stays only
+    as the fallback for snapshots that carry no page_text."""
+    text = marks_text or ""
+    if re.search(r'\]\s*dialog\s+"', text, re.IGNORECASE):
+        return True
+    return bool(_MODAL_HEADING_RE.search(text) and _MODAL_BUTTON_RE.search(text))
 
 
-def _last_non_dialog_marks(marks_history: List[str]) -> Optional[str]:
-    """The last entry of ``marks_history`` (chronological, oldest-first) that
-    has no dialog open, or ``None`` if every entry does (or the history is
-    empty) — i.e. there is no reliable non-modal view to grade against."""
-    for text in reversed(marks_history or []):
-        if not _has_dialog(text):
-            return text
+def _last_reliable_snapshot(marks_history: List[str],
+                            page_text_history: List[str]) -> Optional[str]:
+    """The union haystack (``marks + "\\n" + page_text``) of the last
+    snapshot in the history that is reliable evidence of the real UI state,
+    or ``None`` if none is.
+
+    Run-2's fix tried to detect the promote/create dialog purely from the
+    a11y marks (``_has_dialog``) and graded against the last snapshot that
+    had none open. Run-3's skeptic found that fix ineffective for this app:
+    its Radix/shadcn ``<Dialog>`` never renders a ``role=dialog`` mark, so
+    every snapshot "looked" dialog-free and the LAST one — typically the
+    modal itself — was graded as if it were the rail (all 3 `ui_daemon_diff`
+    firings that run were false positives from exactly this).
+
+    Fix (run-3 H1): ``page_text`` (``document.body.innerText``) is not
+    subject to the same failure — a Radix dialog overlays the rail visually
+    and hides it from the accessibility tree (``aria-hidden``), but does NOT
+    remove its text nodes from the DOM, so ``page_text`` still contains
+    "SANDBOXES · N / <name>" even while the dialog is open (verified against
+    a stored run-3 trajectory bundle:
+    ``manifest-promote-stopped-next-start`` action 5 onward keeps
+    "SANDBOXES · 1\\nmanifest-stopped-demo" in `page_text` through the
+    promote-dialog actions). So a snapshot that carries page_text is ALWAYS
+    treated as reliable, regardless of what `_has_dialog` says about its
+    marks. Only a snapshot with NO page_text at all (an older bundle that
+    predates its per-snapshot capture) falls back to the marks-only
+    `_has_dialog` heuristic — the same one run-2 shipped, now demoted from
+    primary signal to fallback."""
+    n = max(len(marks_history), len(page_text_history))
+    for i in range(n - 1, -1, -1):
+        marks_i = marks_history[i] if i < len(marks_history) else ""
+        page_i = page_text_history[i] if i < len(page_text_history) else ""
+        if page_i or not _has_dialog(marks_i):
+            return (marks_i or "") + "\n" + (page_i or "")
     return None
 
 
@@ -147,7 +193,8 @@ def silent_failure_oracle(invoke_log: List[Dict[str, Any]], marks_text: str,
 
 
 def ui_daemon_diff_oracle(marks_history: Any, state_evidence: Dict[str, Any],
-                          ref: Dict[str, Any]) -> List[Candidate]:
+                          ref: Dict[str, Any],
+                          page_text_history: Any = None) -> List[Candidate]:
     """Differential: every sandbox the daemon reports must be visible in the
     UI. A sandbox in daemon truth but absent from the screen = the UI lies
     about / drops real state.
@@ -158,18 +205,41 @@ def ui_daemon_diff_oracle(marks_history: Any, state_evidence: Dict[str, Any],
     Radix/shadcn portals dialog content to the end of `document.body`, so the
     accessibility snapshot only lists the dialog subtree and the rail
     (which DOES list the sandbox, one snapshot earlier) reads as "absent".
+    That fix graded against the last marks-only snapshot without a
+    `dialog`-role mark — but run-3's skeptic found it INEFFECTIVE for this
+    app: its dialogs never render a `role=dialog` mark at all, so every
+    snapshot "looked" non-modal and the fix degraded to "grade the final
+    snapshot", reproducing the exact bug it meant to fix (3/3 firings this
+    run were false positives from this).
+
+    Fix 2 (run-3 H1): grade against the UNION of marks + `page_text`
+    (`document.body.innerText`) per snapshot — a Radix dialog hides the rail
+    from the accessibility tree but does not remove its text from the DOM,
+    so `page_text` still contains it even with the dialog open (see
+    `_last_reliable_snapshot`'s docstring for the verified evidence). Any
+    snapshot that carries page_text is graded directly; the marks-only
+    `_has_dialog` dialog-skip only kicks in as a fallback for a snapshot with
+    no page_text (older bundles predating its per-snapshot capture).
+
     ``marks_history`` is the chronological list of every marks snapshot taken
     during the journey (oldest first, typically ending with the final
     post-journey capture); a bare ``str`` is also accepted (wrapped as a
     single-element history) for callers/tests that only ever have one
-    snapshot. This oracle grades against the LAST entry that has no
-    `dialog`-role mark (see `_has_dialog`/`_last_non_dialog_marks`) rather
-    than strictly the last entry. If every snapshot in the history has a
-    dialog open, there is no reliable non-modal view to grade — the oracle
+    snapshot. ``page_text_history`` is the parallel per-snapshot
+    `document.body.innerText` list (same indexing as ``marks_history``);
+    omitted/``None``/shorter than ``marks_history`` degrades gracefully to
+    the marks-only fallback for the missing entries. If no snapshot is
+    reliable (every entry lacks page_text AND has a dialog open), the oracle
     stays silent (report-only bias: never claim a sandbox is UI-dropped from
     a view we know is a portal-obscured modal)."""
     history = [marks_history] if isinstance(marks_history, str) else list(marks_history or [])
-    graded = _last_non_dialog_marks(history)
+    if page_text_history is None:
+        page_history: List[str] = []
+    elif isinstance(page_text_history, str):
+        page_history = [page_text_history]
+    else:
+        page_history = list(page_text_history or [])
+    graded = _last_reliable_snapshot(history, page_history)
     if graded is None:
         return []
     hay = graded.lower()
