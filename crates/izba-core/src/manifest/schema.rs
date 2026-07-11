@@ -62,18 +62,30 @@ pub struct SandboxSpec {
     pub egress: Option<EgressPolicyConfig>,
 }
 
+fn default_cpus() -> u32 {
+    DEFAULT_CPUS
+}
+fn default_memory() -> String {
+    DEFAULT_MEMORY.to_string()
+}
+fn default_root_disk_size() -> String {
+    DEFAULT_ROOT_DISK_SIZE.to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resources {
+    #[serde(default = "default_cpus")]
     pub cpus: u32,
+    #[serde(default = "default_memory")]
     pub memory: String,
 }
 
 impl Default for Resources {
     fn default() -> Self {
         Resources {
-            cpus: DEFAULT_CPUS,
-            memory: DEFAULT_MEMORY.to_string(),
+            cpus: default_cpus(),
+            memory: default_memory(),
         }
     }
 }
@@ -81,13 +93,14 @@ impl Default for Resources {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootDisk {
+    #[serde(default = "default_root_disk_size")]
     pub size: String,
 }
 
 impl Default for RootDisk {
     fn default() -> Self {
         RootDisk {
-            size: DEFAULT_ROOT_DISK_SIZE.to_string(),
+            size: default_root_disk_size(),
         }
     }
 }
@@ -281,6 +294,25 @@ spec:
         assert_eq!(m.spec.resources.cpus, DEFAULT_CPUS);
         assert_eq!(m.spec.resources.memory, DEFAULT_MEMORY);
         assert_eq!(m.spec.root_disk.size, DEFAULT_ROOT_DISK_SIZE);
+    }
+
+    /// Greptile P1: a PARTIAL resources/rootDisk block inherits per-field
+    /// defaults — overriding one field must not force spelling out the rest.
+    #[test]
+    fn partial_resources_and_root_disk_inherit_field_defaults() {
+        let y = concat!(
+            "apiVersion: izba.dev/v1alpha1\n",
+            "kind: Sandbox\n",
+            "spec:\n",
+            "  image: ubuntu:24.04\n",
+            "  resources:\n",
+            "    cpus: 4\n",
+            "  rootDisk: {}\n",
+        );
+        let m = Manifest::load_str(y).expect("partial blocks must parse");
+        assert_eq!(m.spec.resources.cpus, 4, "explicit override wins");
+        assert_eq!(m.spec.resources.memory, DEFAULT_MEMORY, "memory inherited");
+        assert_eq!(m.spec.root_disk.size, DEFAULT_ROOT_DISK_SIZE, "size inherited");
     }
 
     /// The string defaults and the numeric defaults must agree — the numeric
