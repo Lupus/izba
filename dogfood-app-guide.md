@@ -41,9 +41,9 @@ ssh izba-<name>
 
 The app manages the SSH config entry automatically; no manual setup required.
 
-## Firewall / egress policy
+## Policy / egress firewall
 
-Each sandbox enforces an egress policy. In the detail panel, click **Firewall**
+Each sandbox enforces an egress policy. In the detail panel, click **Policy**
 to view or edit the active policy YAML. Rules control which hostnames and ports
 outbound traffic is allowed to reach. Changes take effect immediately; the app
 saves the policy file without restarting the sandbox.
@@ -51,7 +51,7 @@ saves the policy file without restarting the sandbox.
 ## Manifest (izba.yml)
 
 If the sandbox's workspace has an `izba.yml`, the detail panel's **Manifest**
-tab (right after **Firewall**) shows how that file compares to the sandbox's
+tab (right after **Policy**) shows how that file compares to the sandbox's
 actual, running settings. A banner at the top gives you the state at a
 glance:
 
@@ -60,7 +60,7 @@ glance:
   izba.yml; review the changes below, then **Promote**.
 - **Live settings have drifted from izba.yml** — something changed the
   sandbox another way (for example, toggling the firewall on the
-  **Firewall** tab) without updating the file; **Export** to capture it.
+  **Policy** tab) without updating the file; **Export** to capture it.
 - **Diverged** — both sides changed. Promoting applies izba.yml's version;
   Exporting overwrites izba.yml with the live version instead.
 
