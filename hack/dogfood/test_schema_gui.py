@@ -208,3 +208,51 @@ def test_all_cli_fixtures_validate_against_schema():
                  "journeys.deep-seeded-cli.json"):
         with open(os.path.join(HERE, "fixtures", name)) as f:
             jsonschema.validate(json.load(f), schema)
+
+
+def _load_manifest_gui_corpus():
+    with open(os.path.join(HERE, "journeys", "manifest-gui.json")) as f:
+        return json.load(f)
+
+
+def test_manifest_gui_corpus_validates_against_schema():
+    # The committed GUI manifest corpus (hack/dogfood/journeys/manifest-gui.json)
+    # had no schema-validation test at all before run-3 H3 — add one so a
+    # future edit (e.g. moving `core` between steps) can't silently corrupt it.
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    jsonschema.validate(_load_manifest_gui_corpus(), schema)
+
+
+def test_manifest_gui_corpus_core_counts():
+    # Every journey marks at most one decisive (core) step; a journey with
+    # NO core step (manifest-missing-manifest-guidance) is intentional — its
+    # manifest_diff call never carries a digest, so a core step there would
+    # falsely flip `unreached_decisive` (see the journey's own rationale).
+    doc = _load_manifest_gui_corpus()
+    for j in doc["journeys"]:
+        n_core = sum(1 for s in j["steps"] if s.get("core"))
+        assert n_core <= 1, j["journey_id"]
+    with_core = {j["journey_id"]
+                for j in doc["journeys"]
+                if any(s.get("core") for s in j["steps"])}
+    assert with_core == {"manifest-open-tab-in-sync",
+                         "manifest-seeded-drift-promote",
+                         "manifest-managed-ahead-export"}
+
+
+def test_manifest_gui_managed_ahead_export_core_is_the_export_step():
+    # H3 (run-3 skeptic): the flagship's Export half went unverified because
+    # `core` sat on the managed_ahead-VIEW step — a journey could reach that
+    # banner, stop, and still read as a fully verified positive. `core` now
+    # sits on the Export step itself (whose own post-export manifest_diff
+    # refetch is the digest manifest_truth_oracle ground-truths), so a
+    # journey that never clicks Export flips `unreached_decisive` instead of
+    # a silent pass.
+    doc = _load_manifest_gui_corpus()
+    journey = next(j for j in doc["journeys"]
+                  if j["journey_id"] == "manifest-managed-ahead-export")
+    core_steps = [s for s in journey["steps"] if s.get("core")]
+    assert len(core_steps) == 1
+    assert "export" in core_steps[0]["intent"].lower()
+    assert "exported to" in core_steps[0]["expect"].lower()
