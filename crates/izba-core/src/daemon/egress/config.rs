@@ -710,6 +710,34 @@ mod tests {
         assert_eq!(cfg.allow, vec![AllowEntry::Host("api.openai.com".into())]);
     }
 
+    /// `write_to` must actually write `path_in(sandbox_dir)` — kills the
+    /// `replace write_to -> Ok(())` mutant, which would return success
+    /// without writing anything (a silent no-op that `load` would see as
+    /// "no policy declared").
+    #[test]
+    fn write_to_round_trips_through_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Host("api.x.com".into()),
+                AllowEntry::Scoped {
+                    host: "db.internal".into(),
+                    ports: Some(vec![5432]),
+                    access: Access::Read,
+                },
+            ],
+            git: vec![],
+        };
+        cfg.write_to(dir.path()).unwrap();
+        assert!(
+            EgressPolicyConfig::path_in(dir.path()).exists(),
+            "write_to must create policy.yaml"
+        );
+        let reloaded = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
+        assert_eq!(reloaded, cfg);
+    }
+
     #[test]
     fn edit_policy_file_creates_then_rereads() {
         let dir = tempfile::tempdir().unwrap();
