@@ -28,6 +28,26 @@
   const listeners = new Map(); // event name -> Set<handler id>
   let deferredCreate = null;
 
+  // Canned manifest_diff/manifest_export/manifest_promote responses, overridable
+  // per-test via window.__MOCK_MANIFEST__ = { diff, export, promote }.
+  const DEFAULT_MANIFEST_DELTA = {
+    field: "policy.egress.enforce",
+    from: "true",
+    to: "false",
+    class: "live",
+    weakens_egress: true,
+  };
+  const DEFAULT_MANIFEST_DIFF = { state: "repo_ahead", deltas: [DEFAULT_MANIFEST_DELTA] };
+  const DEFAULT_MANIFEST_EXPORT = "/ws/izba.yml";
+  const DEFAULT_MANIFEST_PROMOTE = {
+    state: "in_sync",
+    applied: [DEFAULT_MANIFEST_DELTA],
+    needs_restart: false,
+    restarted: false,
+    stopped: false,
+    warnings: ["promote: ⚠ weakens egress"],
+  };
+
   // The event module's unlisten() calls
   // __TAURI_EVENT_PLUGIN_INTERNALS__.unregisterListener(event, id) BEFORE the
   // `plugin:event|unlisten` invoke (see @tauri-apps/api/event.js), so the real
@@ -159,6 +179,28 @@
       case "shell_close":
         calls.push("shell_close:" + args.id);
         return action();
+
+      // Manifest diff/export/promote. Canned defaults below; specs override
+      // per-call via window.__MOCK_MANIFEST__ = { diff, export, promote }
+      // (read live here, not captured at init, so a spec can set it after
+      // the page has loaded but before triggering the invoke).
+      case "manifest_diff":
+        calls.push("manifest_diff:" + args.name);
+        return Promise.resolve(
+          (window.__MOCK_MANIFEST__ && window.__MOCK_MANIFEST__.diff) || DEFAULT_MANIFEST_DIFF
+        );
+      case "manifest_export":
+        calls.push("manifest_export:" + args.name);
+        return Promise.resolve(
+          (window.__MOCK_MANIFEST__ && window.__MOCK_MANIFEST__.export) ||
+            DEFAULT_MANIFEST_EXPORT
+        );
+      case "manifest_promote":
+        calls.push("manifest_promote:" + args.name + ":" + args.restart);
+        return Promise.resolve(
+          (window.__MOCK_MANIFEST__ && window.__MOCK_MANIFEST__.promote) ||
+            DEFAULT_MANIFEST_PROMOTE
+        );
 
       default:
         return err("unmocked command: " + cmd);

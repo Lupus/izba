@@ -15,6 +15,8 @@ import type {
   PortRule,
   VolumeInfo,
   SandboxDetail,
+  DiffView,
+  PromoteView,
 } from "./types";
 
 export const api = {
@@ -64,6 +66,10 @@ export const api = {
   volumeAttach: (name: string, spec: string) => invoke<void>("volume_attach", { name, spec }),
   volumeDetach: (name: string, guestPath: string) =>
     invoke<void>("volume_detach", { name, guestPath }),
+  manifestDiff: (name: string) => invoke<DiffView>("manifest_diff", { name }),
+  manifestExport: (name: string) => invoke<string>("manifest_export", { name }),
+  manifestPromote: (name: string, restart: boolean) =>
+    invoke<PromoteView>("manifest_promote", { name, restart }),
 };
 
 /** Decode a base64 string to raw bytes (xterm.write accepts Uint8Array). */
