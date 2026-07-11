@@ -31,14 +31,15 @@ from oracles import (  # noqa: E402
 )
 from run_journeys import (  # noqa: E402
     select_shard, _journey_data_dir, _write_seeds, BudgetExceeded, count_degraded,
-    CATASTROPHIC_DEGRADED_FRACTION, EXIT_CATASTROPHIC_INFRA,
+    CATASTROPHIC_DEGRADED_FRACTION, EXIT_CATASTROPHIC_INFRA, _decisive_step_indices,
 )
 from gui.driver import (  # noqa: E402
     AgentBrowserDriver, FakeDriver, action_to_argv, render_marks,
 )
 from gui.gui_model import build_gui_model  # noqa: E402
 from gui.gui_oracles import (  # noqa: E402
-    console_oracle, dom_expect_oracle, silent_failure_oracle, ui_daemon_diff_oracle,
+    console_oracle, dom_expect_oracle, manifest_truth_oracle, silent_failure_oracle,
+    ui_daemon_diff_oracle,
 )
 
 DEFAULT_LATENCY_BUDGET_MS = 30_000
@@ -315,8 +316,51 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     end_found = (ui_daemon_diff_oracle(final_marks, state_evidence, final_ref)
                  + dom_expect_oracle(last_expect, final_marks, final_ref)
                  + silent_failure_oracle(invoke_log, final_marks, final_ref))
+
+    # Decisive wiring (Task 11): manifest_truth is the GUI runner's only
+    # `functional`-candidate-producing oracle, so it doubles as the decisive
+    # (core: true, else last-step) grading mechanism — mirroring the CLI
+    # runner's contract (run_journeys._decisive_step_indices, imported
+    # unchanged: pure over `steps`, nothing CLI-shaped to fake). Gated on
+    # whether the journey ever invoked manifest_diff at all, so a GUI journey
+    # unrelated to the Manifest tab (the vast majority today) is completely
+    # unaffected — its fallback-to-last-step decisive index never gets
+    # graded, exactly like before this task. Side-effect constraint: the
+    # oracle shells out to `izba diff`, which WRITES the review token, so it
+    # is called exactly ONCE here, post-journey (see its docstring).
+    decisive_credits: List[Dict[str, Any]] = []
+    mt_found: List[Any] = []
+    manifest_diff_seen = any(
+        isinstance(e, dict) and e.get("cmd") == "manifest_diff"
+        and isinstance(e.get("digest"), dict) for e in invoke_log)
+    if manifest_diff_seen and steps:
+        sandbox_name = (state_evidence.get("sandboxes") or [None])[-1]
+        mt_ctx: Dict[str, Any] = {
+            "invoke_log": invoke_log, "sandbox_name": sandbox_name,
+            "workspace": ws_abs, "izba_bin": izba_bin, "data_dir": data_dir,
+            "timeout_s": action_timeout_s, "ref": dict(final_ref)}
+        mt_found = manifest_truth_oracle(mt_ctx)
+        decisive_idx = _decisive_step_indices(steps)
+        # An empty mt_found is ambiguous by itself (it means EITHER "verified
+        # equal" OR "couldn't check" — a subprocess failure/timeout/unparseable
+        # `izba diff` output must never be read as a confirmed pass). Only
+        # ctx["manifest_truth_result"] == "matched" is an honest positive;
+        # "unparseable"/"no_target" leave the decisive step ungraded (no
+        # credit fabricated) rather than lying about what was verified.
+        if decisive_idx and mt_ctx.get("manifest_truth_result") == "matched":
+            # Ground truth matched what the UI showed: the decisive
+            # assertion passed. Recorded as an audit-trail credit (schema
+            # parity with the CLI runner's decisive_credits) even though
+            # nothing flips negative — the skeptic must be able to see
+            # this journey's decisive step WAS honestly exercised, not
+            # silently skipped.
+            decisive_credits.append({
+                "step_index": min(decisive_idx),
+                "action_index": final_ref["action_index"],
+                "graded_cmd": "manifest_truth: izba diff ground truth (matched)",
+            })
     # Capture an annotated screenshot only if the journey produced any candidate.
-    if (candidates or end_found) and artifact_dir:
+    if (candidates or end_found or mt_found) and artifact_dir:
         shot = os.path.join(artifact_dir, f"{journey_id}.png")
         try:
             driver.screenshot(shot)
@@ -328,9 +372,14 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     for c in end_found:
         cd = c.to_dict(); cd["trajectory_ref"] = dict(final_ref)
         candidates.append(cd)
+    for c in mt_found:
+        cd = c.to_dict()
+        cd["trajectory_ref"] = dict(final_ref)
+        cd["decisive"] = True
+        candidates.append(cd)
     return {"journey_id": journey_id, "actions": actions, "candidates": candidates,
             "state_evidence": state_evidence, "invoke_log": invoke_log,
-            "workspace": str(ws_abs)}
+            "workspace": str(ws_abs), "decisive_credits": decisive_credits}
 
 
 # ---------- CI orchestration (static server + sidecar lifecycle) ----------

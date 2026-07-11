@@ -21,6 +21,21 @@
     }
   },
   "definitions": {
+    "invoke_log_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cmd"],
+      "properties": {
+        "cmd": { "type": "string", "description": "The Tauri/dispatch command name (e.g. 'manifest_diff')." },
+        "ok": { "type": "boolean" },
+        "error": { "type": "string" },
+        "digest": {
+          "type": "object",
+          "description": "Task 11: a small result summary real-bridge.js records for manifest_* invokes (strings/bools/ints only, kept tiny) — the evidence the manifest_truth oracle compares against `izba diff` ground truth. Shape varies by cmd: manifest_diff -> {state, deltas, weakens}; manifest_promote -> {state, applied, needs_restart, stopped}; manifest_export -> {path}.",
+          "additionalProperties": { "type": ["string", "boolean", "integer"] }
+        }
+      }
+    },
     "journey_result": {
       "type": "object",
       "additionalProperties": false,
@@ -47,7 +62,7 @@
             }
           }
         },
-        "invoke_log": { "type": "array", "items": { "type": "object" }, "description": "GUI only: the in-page bridge's invoke log (command, ok/error, duration) captured at journey end — the evidence behind silent_failure verdicts." },
+        "invoke_log": { "type": "array", "items": { "$ref": "#/definitions/invoke_log_entry" }, "description": "GUI only: the in-page bridge's invoke log (command, ok/error, duration) captured at journey end — the evidence behind silent_failure verdicts." },
         "workspace": { "type": "string", "description": "GUI only (Task 10): absolute path of this journey's per-journey workspace dir (<journey_data_dir>/workspace), where journey-/step-level seed_files land and that the literal {workspace} token in a step's intent/expect is substituted with — recorded so the Phase-3 skeptic can inspect what the Actor was told/seeded." },
         "decisive_credits": {
           "type": "array",
