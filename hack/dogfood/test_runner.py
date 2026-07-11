@@ -843,6 +843,29 @@ class DecisiveByObservedCommandTest(unittest.TestCase):
         kinds = [c.get("kind") for c in res["candidates"]]
         self.assertIn("unreached_decisive", kinds)
 
+    def test_degenerate_expect_cmd_re_does_not_credit_unreached_decisive(self):
+        # A decisive step declaring `expect_cmd_re: ".*"` matches EVERY action
+        # (including the empty string) — crediting it against an earlier,
+        # unrelated action would be a false green. It must still flag
+        # unreached_decisive, even though earlier steps produced actions.
+        import run_journeys as rj
+        from model import FakeModel
+        model = FakeModel([{"command": "true"}, {"done": True}, {"done": True}])
+        journey = {"journey_id": "degenerate-regex",
+                   "steps": [
+                       {"intent": "explore", "expect": ""},
+                       {"intent": "verify", "expect": "", "core": True,
+                        "expect_cmd_re": ".*"}]}
+        with tempfile.TemporaryDirectory() as td:
+            res = rj.run_journey(
+                model, journey, izba_bin="/bin/false", data_dir=td,
+                max_turns=8, step_cap=8, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
+        kinds = [c.get("kind") for c in res["candidates"]]
+        self.assertIn(
+            "unreached_decisive", kinds,
+            f"degenerate expect_cmd_re must not be credited: {res['candidates']}")
+
 
 class ReconcileViolationTests(unittest.TestCase):
     def _stub_with_violations(self, d):
