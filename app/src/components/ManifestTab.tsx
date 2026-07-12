@@ -111,6 +111,74 @@ function mapPromoteWarning(message: string): string {
   return message;
 }
 
+/** The per-field delta table (or its "nothing changed" placeholder), shared
+ *  by the tab body and the promote confirm dialog's delta list. Hoisted out
+ *  of `ManifestTab` (rust:S3776-equivalent typescript:S3776) so the ternary +
+ *  `.map` + weakens-egress conditional it contains don't add to that
+ *  component's cognitive complexity; behavior/markup is unchanged. */
+function DeltaTable({ deltas }: Readonly<{ deltas: DeltaView[] }>) {
+  if (deltas.length === 0) {
+    return (
+      <div className="text-sm text-muted-foreground-2">
+        No field changes between izba.yml and managed settings.
+      </div>
+    );
+  }
+  return (
+    <table className="w-full text-sm">
+      <thead>
+        <tr className="text-left text-xs text-muted-foreground-2">
+          <th className="pb-1 font-normal">Field</th>
+          <th className="pb-1 font-normal">From</th>
+          <th className="pb-1 font-normal">To</th>
+          <th className="pb-1 font-normal" />
+        </tr>
+      </thead>
+      <tbody>
+        {deltas.map((d) => (
+          <tr key={d.field} className="border-t border-border">
+            <td className="py-2 font-mono">{d.field}</td>
+            <td className="py-2 pl-2 font-mono text-muted-foreground">{d.from}</td>
+            <td className="py-2 pl-2 font-mono">{d.to}</td>
+            <td className="py-2 pl-2">
+              <span className="inline-flex items-center gap-2">
+                <Badge variant="secondary" title={CLASS_TOOLTIP[d.class]}>
+                  {d.class}
+                </Badge>
+                {d.weakens_egress && <span className="text-destructive">⚠ weakens egress</span>}
+              </span>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+/** The promote confirm dialog's post-promote summary: what happened
+ *  (restarted / stopped-pending / needs-restart) plus any warnings. Hoisted
+ *  out of `ManifestTab` (typescript:S3776) so its nested
+ *  restarted-vs-stopped ternary and warnings `.map` don't add to that
+ *  component's cognitive complexity; behavior/markup is unchanged. */
+function PromoteOutcomeSummary({ outcome }: Readonly<{ outcome: PromoteView }>) {
+  return (
+    <div className="flex flex-col gap-2 text-sm">
+      <div className="text-success">Promoted {outcome.applied.length} change(s).</div>
+      {outcome.restarted ? (
+        <div>Sandbox was started to apply the change.</div>
+      ) : (
+        outcome.stopped && <div>Sandbox is stopped — changes apply on next start.</div>
+      )}
+      {outcome.needs_restart && <div>Some changes apply on the next restart.</div>}
+      {outcome.warnings.map((w) => (
+        <div key={w} className="text-destructive">
+          {mapPromoteWarning(w)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** Drift view over `izba.yml` vs. the host-managed truth: a banner keyed on
  *  `DriftState`, a per-field delta table, Export, and a Promote confirm
  *  dialog (weakens-egress acknowledgment, optional restart, outcome/error
@@ -180,7 +248,7 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
   // CORRUPT izba.yml also produces an error mentioning "izba.yml" (a parse
   // failure), and that must render honestly in the raw error area below
   // instead of being told the file doesn't exist.
-  const missingManifest = error !== null && error.includes("no izba.yml found");
+  const missingManifest = error?.includes("no izba.yml found") ?? false;
   const canPromote = diff !== null && (diff.state === "repo_ahead" || diff.state === "diverged");
   const canExport = diff !== null && (diff.state === "managed_ahead" || diff.state === "diverged");
 
@@ -280,39 +348,7 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
             {BANNER_TEXT[diff.state]}
           </div>
 
-          {diff.deltas.length === 0 ? (
-            <div className="text-sm text-muted-foreground-2">
-              No field changes between izba.yml and managed settings.
-            </div>
-          ) : (
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-xs text-muted-foreground-2">
-                  <th className="pb-1 font-normal">Field</th>
-                  <th className="pb-1 font-normal">From</th>
-                  <th className="pb-1 font-normal">To</th>
-                  <th className="pb-1 font-normal" />
-                </tr>
-              </thead>
-              <tbody>
-                {diff.deltas.map((d) => (
-                  <tr key={d.field} className="border-t border-border">
-                    <td className="py-2 font-mono">{d.field}</td>
-                    <td className="py-2 pl-2 font-mono text-muted-foreground">{d.from}</td>
-                    <td className="py-2 pl-2 font-mono">{d.to}</td>
-                    <td className="py-2 pl-2">
-                      <span className="inline-flex items-center gap-2">
-                        <Badge variant="secondary" title={CLASS_TOOLTIP[d.class]}>
-                          {d.class}
-                        </Badge>
-                        {d.weakens_egress && <span className="text-destructive">⚠ weakens egress</span>}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
+          <DeltaTable deltas={diff.deltas} />
         </>
       )}
 
@@ -328,22 +364,7 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
           </DialogHeader>
 
           {promoteOutcome ? (
-            <div className="flex flex-col gap-2 text-sm">
-              <div className="text-success">Promoted {promoteOutcome.applied.length} change(s).</div>
-              {promoteOutcome.restarted ? (
-                <div>Sandbox was started to apply the change.</div>
-              ) : (
-                promoteOutcome.stopped && (
-                  <div>Sandbox is stopped — changes apply on next start.</div>
-                )
-              )}
-              {promoteOutcome.needs_restart && <div>Some changes apply on the next restart.</div>}
-              {promoteOutcome.warnings.map((w) => (
-                <div key={w} className="text-destructive">
-                  {mapPromoteWarning(w)}
-                </div>
-              ))}
-            </div>
+            <PromoteOutcomeSummary outcome={promoteOutcome} />
           ) : (
             <div className="flex flex-col gap-3 text-sm">
               <div>The following changes will be applied to &apos;{name}&apos;:</div>

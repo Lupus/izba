@@ -289,7 +289,14 @@ _CLI_LABEL_TO_STATE = {
     "managed ahead (export to capture)": "managed_ahead",
     "diverged (repo and managed both changed)": "diverged",
 }
-_STATE_LINE_RE = re.compile(r'^state:\s*(.+?)\s*$', re.MULTILINE)
+# A single greedy `.*` capture, not the earlier `\s*(.+?)\s*$`: `\s` and `.`
+# overlap (both match plain spaces/tabs), so the old pattern had three
+# adjacent quantifiers all eligible to claim the same whitespace run —
+# super-linear backtracking on a non-matching line of many trailing spaces
+# (rust:S8786 / python:S8786). `parse_cli_diff_state` below already calls
+# `.strip()` on the captured group, so trimming leading/trailing whitespace
+# via the regex itself was redundant besides being unsafe.
+_STATE_LINE_RE = re.compile(r'^state:(.*)$', re.MULTILINE)
 
 # Injectable CLI runner signature: (izba_bin, workspace, name, data_dir,
 # timeout_s) -> stdout text.
