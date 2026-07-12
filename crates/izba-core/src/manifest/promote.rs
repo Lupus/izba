@@ -451,8 +451,8 @@ fn run_with_client(
                         "failed to reset the rw scratch disk after promote (config already \
                          committed; the OLD scratch overlay was kept — `izba start {name}` will \
                          boot the NEW image over the OLD overlay and may misbehave or fail to \
-                         boot; recreate the sandbox, or revert the image change and re-promote, \
-                         if so): {err}"
+                         boot — if so, recreate the sandbox or revert the image change and \
+                         re-promote): {err}"
                     );
                 }
             }
