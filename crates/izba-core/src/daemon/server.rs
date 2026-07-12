@@ -17,6 +17,7 @@ use crate::daemon::proto::{
 };
 use crate::daemon::registry::Registry;
 use crate::daemon::relays::{self, RelayManager};
+use crate::daemon::supervisor::StartsInFlight;
 use crate::daemon::{supervisor, transport};
 use crate::liveness::Liveness;
 use crate::paths::Paths;
@@ -118,6 +119,10 @@ pub struct Daemon {
     pub registry: Registry,
     pub relays: RelayManager,
     pub egress: EgressManager,
+    /// Sandboxes with a `Start` in flight — see [`StartsInFlight`]. Consulted
+    /// by the supervisor tick so it doesn't clobber a booting sandbox's
+    /// egress listener/relays while the disk still honestly says Stopped.
+    starting: StartsInFlight,
     started: Instant,
     active_conns: AtomicUsize,
     shutdown: AtomicBool,
@@ -140,6 +145,7 @@ impl Daemon {
             registry: Registry::new(),
             relays: RelayManager::new(),
             egress,
+            starting: StartsInFlight::new(),
             started: Instant::now(),
             active_conns: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
@@ -440,6 +446,13 @@ fn handle_start(
     let config: SandboxConfig = load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
         .with_context(|| format!("no config.json for '{name}'"))?;
     let art = (d.deps.artifacts)(&d.paths)?;
+    // Held across the whole listener-bind → boot → relay-republish window
+    // (dropped on return, success or error): tells the supervisor tick to
+    // spare this sandbox's egress/relays while state.json doesn't exist yet
+    // and the disk scan honestly (but prematurely) reports it Stopped
+    // (#134). The guard only gates the TICK's stops — this handler's own
+    // error-path `egress.stop` below still runs normally while it's held.
+    let _start_guard = d.starting.begin(&name);
     d.egress.ensure_listening(&d.paths, &name)?;
     if let Err(e) = sandbox::start(
         &d.paths,
@@ -817,7 +830,14 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
             if d.shutdown_requested() {
                 return;
             }
-            supervisor::tick(&d.paths, &d.registry, &d.relays, &d.egress, d.connector());
+            supervisor::tick(
+                &d.paths,
+                &d.registry,
+                &d.relays,
+                &d.egress,
+                d.connector(),
+                &d.starting,
+            );
             std::thread::sleep(supervisor::tick_interval());
         });
     }
