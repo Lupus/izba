@@ -466,9 +466,12 @@ jobs:
       # main coverage on the Sonar dashboard refreshes on that cadence — a
       # manual `Run workflow` on E2E refreshes it on demand. continue-on-error
       # so a Sonar/network hiccup can never turn the e2e run red; the report
-      # artifact above is the durable record either way.
+      # artifact above is the durable record either way. The ref guard is
+      # load-bearing: this submits a MAIN-labeled analysis, so a manual
+      # dispatch on a feature branch must never run it — that would poison
+      # the main dashboard with branch code (as happened 2026-07-12).
       - name: SonarQube Scan (main, host + real-VM coverage)
-        if: ${{ always() && hashFiles('target/coverage/lcov-e2e.info') != '' }}
+        if: ${{ always() && github.ref == 'refs/heads/main' && hashFiles('target/coverage/lcov-e2e.info') != '' }}
         continue-on-error: true
         uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
         env:
