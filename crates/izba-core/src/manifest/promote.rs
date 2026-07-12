@@ -310,10 +310,17 @@ fn run_with_client(
     let stopped = !is_running;
 
     if is_running {
-        // Atomicity: enact the live daemon effects FIRST, and only commit the
-        // durable config.json AFTER they succeed. If a live RPC fails partway,
-        // config.json stays at the OLD state so a retry recomputes the correct
-        // deltas (rather than computing an empty diff against a half-applied truth).
+        // Atomicity (two-phase, #131): enact the live daemon effects FIRST,
+        // and only commit the durable managed truth (config.json/policy.yaml
+        // + manifest.base.yaml + the consumed review token, all below) AFTER
+        // they succeed. If a live RPC fails partway, config.json stays at the
+        // OLD state so a retry recomputes the correct deltas (rather than
+        // computing an empty diff against a half-applied truth). Everything
+        // AFTER that commit point — the Stop/reset-scratch/Start restart leg
+        // — is a lifecycle action on already-committed config: its failures
+        // must never re-diverge the commit unit, so they bail with an honest
+        // "config already committed, here's how to recover" message instead
+        // of leaving `izba diff` reporting a divergence no user edit explains.
 
         // policy.yaml is the one durable file that must land BEFORE its live RPC:
         // `ReloadPolicy` re-reads policy.yaml from disk. Writing it first is safe to
@@ -394,6 +401,15 @@ fn run_with_client(
     // the restart branch.
     apply::write_managed(paths, name, &repo, &digest)?;
 
+    // #131: advance the base + consume the review token in the SAME commit
+    // unit as config.json/policy.yaml above — all four record one fact,
+    // "this manifest revision was promoted". The restart leg below is a
+    // lifecycle action on already-committed config: if it fails, `izba diff`
+    // stays in-sync (repo == managed == base) and `izba start` is the whole
+    // recovery — never a diverged state no user edit explains.
+    store::write_base(&dir_managed, &m)?;
+    store::clear_review(&dir_managed)?;
+
     // Restart-class fields (cpus, memory, image): apply now or note for later.
     let mut restarted = false;
     if !p.restart_fields.is_empty() {
@@ -413,19 +429,30 @@ fn run_with_client(
             // Only Stop when the sandbox is actually running; sending Stop to a
             // non-running sandbox may error from the daemon and is unnecessary.
             if is_running {
-                send_ok(
+                if let Err(err) = send_ok(
                     client,
                     &DaemonRequest::Stop {
                         name: name.to_string(),
                     },
                     &mut warnings,
                     on_event,
-                )?;
+                ) {
+                    bail!(
+                        "failed to stop sandbox for restart (the promote itself \
+                         is committed; restart manually to apply): {err}"
+                    );
+                }
             }
             // Reset the rw scratch overlay to a blank state on the new base
             // before starting, so the image change boots cleanly.
             if p.image_changed && reset_scratch {
-                crate::sandbox::reset_rw_scratch(paths, name)?;
+                if let Err(err) = crate::sandbox::reset_rw_scratch(paths, name) {
+                    bail!(
+                        "failed to reset the rw scratch disk after promote \
+                         (config already committed); run `izba start {name}` \
+                         to retry: {err}"
+                    );
+                }
             }
             // Fix 3b: Surface a helpful retry hint if Start fails after Stop —
             // the config was already committed so a plain `izba start` is safe.
@@ -456,9 +483,6 @@ fn run_with_client(
         }
     }
 
-    // Advance the base + clear the consumed review token.
-    store::write_base(&dir_managed, &m)?;
-    store::clear_review(&dir_managed)?;
     on_event(PromoteEvent::Info(format!("promoted {name}")));
 
     Ok(PromoteOutcome {
@@ -639,6 +663,24 @@ mod tests {
         let req: DaemonRequest = read_frame(s).unwrap();
         assert!(expect(&req), "expected {what}, got {req:?}");
         write_frame(s, &DaemonResponse::Ok).unwrap();
+    }
+
+    /// Read the next request, assert it matches `expect`, reply `Error{message}`.
+    fn expect_and_error(
+        s: &mut UdsStream,
+        expect: impl Fn(&DaemonRequest) -> bool,
+        what: &str,
+        message: &str,
+    ) {
+        let req: DaemonRequest = read_frame(s).unwrap();
+        assert!(expect(&req), "expected {what}, got {req:?}");
+        write_frame(
+            s,
+            &DaemonResponse::Error {
+                message: message.to_string(),
+            },
+        )
+        .unwrap();
     }
 
     /// Read the next request, assert it's `Inspect{name}`, reply with a
@@ -1402,5 +1444,126 @@ mod tests {
             "--restart alone must not silence the warning when there's nothing to restart"
         );
         assert!(matches!(&events[0], PromoteEvent::Warn(m) if m.contains("not running")));
+    }
+
+    /// #131: a Start failure during the restart leg must NOT leave the drift
+    /// bookkeeping diverged — the commit unit (config.json, manifest.base.yaml,
+    /// and the consumed review token) lands before the lifecycle leg, so
+    /// afterwards `izba diff` reports in-sync and `izba start` is the whole
+    /// recovery.
+    #[test]
+    fn run_with_client_start_failure_still_advances_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml("newimg", 2, "");
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(&paths, "web", "testimg", 2, vec![], vec![], None);
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "newimg");
+        // Give reset_rw_scratch a real rw.img (reset_scratch: true path).
+        let f = std::fs::File::create(sandbox_dir.join("rw.img")).unwrap();
+        f.set_len(64 << 20).unwrap();
+        drop(f);
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "running");
+            expect_and_ok(
+                &mut s,
+                |r| matches!(r, DaemonRequest::Stop { name } if name == "web"),
+                "Stop",
+            );
+            expect_and_error(
+                &mut s,
+                |r| matches!(r, DaemonRequest::Start { name, .. } if name == "web"),
+                "Start",
+                "vmm exploded",
+            );
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let err = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, true, true),
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("config already committed"), "{msg}");
+        assert!(msg.contains("izba start web"), "{msg}");
+        // The commit unit landed: base == repo manifest, token consumed.
+        let base = store::read_base(&sandbox_dir)
+            .unwrap()
+            .expect("base written");
+        let base_n = Normalized::from_manifest(&base, "web").unwrap();
+        let repo_n =
+            Normalized::from_manifest(&ops::load_repo_manifest(&repo_dir).unwrap().0, "web")
+                .unwrap();
+        assert_eq!(base_n, repo_n, "base must record the promoted manifest");
+        assert!(store::read_review(&sandbox_dir).unwrap().is_none());
+        // Drift is in-sync, not diverged: managed was written before the leg.
+        let managed = ops::managed_normalized(&paths, "web").unwrap();
+        assert_eq!(
+            crate::manifest::classify(&base_n, &repo_n, &managed),
+            DriftState::InSync
+        );
+    }
+
+    /// #131 (Stop leg): a Stop failure equally lands the commit unit first,
+    /// with an error saying the promote itself is committed.
+    #[test]
+    fn run_with_client_stop_failure_still_advances_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml("newimg", 2, "");
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(&paths, "web", "testimg", 2, vec![], vec![], None);
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "newimg");
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "running");
+            expect_and_error(
+                &mut s,
+                |r| matches!(r, DaemonRequest::Stop { name } if name == "web"),
+                "Stop",
+                "stop refused",
+            );
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let err = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, true, true),
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("the promote itself is committed"), "{msg}");
+        let base = store::read_base(&sandbox_dir)
+            .unwrap()
+            .expect("base written");
+        let base_n = Normalized::from_manifest(&base, "web").unwrap();
+        assert_eq!(
+            base_n.image,
+            ImageSource::Ref("newimg".into()),
+            "base must record the promoted manifest"
+        );
+        assert!(store::read_review(&sandbox_dir).unwrap().is_none());
     }
 }
