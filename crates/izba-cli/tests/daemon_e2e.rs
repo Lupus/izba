@@ -937,18 +937,22 @@ fn cli_surface_lifecycle() {
 
     // [6] `stop` the running sandbox; `ls` reflects stopped.
     assert_ok(&izba(&data, no_env, &["stop", "cli"]), "stop");
+    let o = izba(&data, no_env, &["ls"]);
     assert!(
-        stdout_of(&izba(&data, no_env, &["ls"])).contains("stopped"),
-        "stopped after stop"
+        stdout_of(&o).contains("stopped"),
+        "stopped after stop: {}",
+        stdout_of(&o)
     );
 
     // [6b] `start` re-boots the stopped sandbox WITHOUT exec'ing (symmetric with
     // `stop`); `ls` reflects running again. Then stop once more so the rm step
     // below operates on a stopped sandbox.
     assert_ok(&izba(&data, no_env, &["start", "cli"]), "start");
+    let o = izba(&data, no_env, &["ls"]);
     assert!(
-        stdout_of(&izba(&data, no_env, &["ls"])).contains("running"),
-        "running after start"
+        stdout_of(&o).contains("running"),
+        "running after start: {}",
+        stdout_of(&o)
     );
     assert_ok(&izba(&data, no_env, &["stop", "cli"]), "stop after start");
 
@@ -958,9 +962,11 @@ fn cli_surface_lifecycle() {
 
     // [7] non-force `rm` on a stopped sandbox removes it; `ls` no longer lists it.
     assert_ok(&izba(&data, no_env, &["rm", "cli"]), "rm (non-force)");
+    let o = izba(&data, no_env, &["ls"]);
     assert!(
-        !stdout_of(&izba(&data, no_env, &["ls"])).contains("cli"),
-        "removed sandbox is gone"
+        !stdout_of(&o).contains("cli"),
+        "removed sandbox is gone: {}",
+        stdout_of(&o)
     );
 
     // [8] `run --rm`: a throwaway run creates + starts + execs, then tears the
