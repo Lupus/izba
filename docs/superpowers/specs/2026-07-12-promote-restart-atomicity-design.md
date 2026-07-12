@@ -35,7 +35,13 @@ With the reorder, any restart-leg failure leaves `repo == managed == base`
 (drift: **in sync**), review token consumed, sandbox stopped (or still running
 old config if Stop itself failed). This is exactly the same durable state as a
 successful `promote` *without* `--restart` — config applies on the next start
-— so `izba diff` stays truthful and re-running promote is a natural no-op.
+— so `izba diff` stays truthful. Re-running `promote` is NOT a no-op, though:
+the review token was already consumed by the commit unit, so a bare re-promote
+bails `no reviewed diff — run `izba diff` first (or --force)`. The actual
+recovery is `izba start <name>` (config is already committed; starting it
+applies the promoted config), or — if the manifest needs another look — a
+fresh `izba diff`, which will correctly report **in sync** rather than a
+lingering divergence.
 
 The Start-failure error already says "config already committed; run
 `izba start <name>` to retry" — now that hint is fully accurate (previously a
@@ -56,9 +62,15 @@ promote itself is committed).
 - Wrap the two restart-leg failures that previously propagated raw:
   - `Stop` failure → error context: `failed to stop sandbox for restart
     (the promote itself is committed; restart manually to apply): {err}`
-  - `reset_rw_scratch` failure → error context: `failed to reset the rw
-    scratch disk after promote (config already committed); run `izba start
-    {name}` to retry: {err}`
+  - `reset_rw_scratch` failure → error context:
+    ``failed to reset the rw scratch disk after promote (config already
+    committed; the OLD scratch overlay was kept — `izba start {name}` will
+    boot the NEW image over the OLD overlay and may misbehave or fail to
+    boot; recreate the sandbox, or revert the image change and re-promote,
+    if so): {err}`` — `reset_rw_scratch` is atomic (tmp+rename), so a
+    mid-reset failure never touches the old file; the honest hazard isn't
+    "retry the reset", it's "the new digest is already committed over an
+    overlay built for the old one."
   - `Start` failure keeps its existing message (already accurate post-fix).
 - Update the atomicity doc-comment (the "enact live effects FIRST" block) to
   document the two-phase contract: live RPCs → commit unit (managed + base +
@@ -75,6 +87,21 @@ promote itself is committed).
 - `run_with_client_stop_failure_still_advances_base` — same setup; fake
   daemon replies `Error` to Stop. Assert: `Err` with the "promote itself is
   committed" context; base advanced; review cleared.
+
+Final-review follow-ups (upper-bound pin + honest scratch-reset hint):
+
+- `run_with_client_live_rpc_failure_leaves_commit_unit_unwritten` — running
+  sandbox, egress delta, fake daemon Oks `Inspect` then errors `ReloadPolicy`.
+  Pins the ordering contract's UPPER bound (the mirror image of the two tests
+  above, which pin the lower bound): `store::read_base` stays `None`,
+  `store::read_review` stays `Some`, and `config.json`'s `image_digest` stays
+  at the seeded placeholder — `write_managed` never ran, because it sits
+  strictly after the live-RPC block.
+- `run_with_client_scratch_reset_failure_gives_honest_recovery_hint` —
+  running sandbox, image change, `restart: true`; no `rw.img` seeded so
+  `reset_rw_scratch` fails hermetically at its first step (reading the file
+  size), before `Start` is ever sent. Asserts the new message text and that
+  the commit unit (base/review) still landed.
 
 ### 2. GUI error copy (`app/src/components/ManifestTab.tsx`)
 
