@@ -68,6 +68,16 @@ const IMAGE_RESTART_REQUIRED_ERROR =
   "This image change needs the checkbox above ticked before Promote can continue.";
 const RESTART_CLASS_KINDS: ReadonlySet<DeltaView["class"]> = new Set(["restart", "image"]);
 
+// The core's restart-leg failure errors (izba-core/src/manifest/promote.rs):
+// the config write has already committed, only the follow-up Start/Stop
+// call failed. Both carry a `run \`izba start <name>\`` / CLI-speak tail
+// that would be meaningless in the GUI, so they get their own friendly copy
+// instead of falling through to the raw message.
+const PROMOTE_START_FAILED_ERROR =
+  "Promoted, but the sandbox failed to start on the new configuration. Use Start on the sandbox to retry.";
+const PROMOTE_STOP_FAILED_ERROR =
+  "Promoted, but the sandbox could not be stopped to apply restart-class changes. Stop and Start it manually.";
+
 /** Substring-based mapping of the known promote gate errors to their copy;
  *  anything else passes through as the raw message. The `requires --restart`
  *  case is the image-change gate (promote.rs:254) — with the restart/reset
@@ -80,6 +90,8 @@ function mapPromoteError(message: string): string {
   if (message.includes("izba.yml changed")) return STALE_TOKEN_ERROR;
   if (message.includes("no reviewed diff")) return NEVER_REVIEWED_ERROR;
   if (message.includes("requires --restart")) return IMAGE_RESTART_REQUIRED_ERROR;
+  if (message.includes("failed to start sandbox after promote")) return PROMOTE_START_FAILED_ERROR;
+  if (message.includes("failed to stop sandbox for restart")) return PROMOTE_STOP_FAILED_ERROR;
   return message;
 }
 

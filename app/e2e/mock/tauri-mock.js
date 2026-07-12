@@ -29,7 +29,10 @@
   let deferredCreate = null;
 
   // Canned manifest_diff/manifest_export/manifest_promote responses, overridable
-  // per-test via window.__MOCK_MANIFEST__ = { diff, export, promote }.
+  // per-test via window.__MOCK_MANIFEST__ = { diff, export, promote, promoteError }.
+  // promoteError, when set, makes manifest_promote reject with that message
+  // instead of resolving `promote` — used to exercise ManifestTab's
+  // mapPromoteError() copy mapping for the backend's raw CLI-speak errors.
   const DEFAULT_MANIFEST_DELTA = {
     field: "policy.egress.enforce",
     from: "true",
@@ -197,6 +200,9 @@
         );
       case "manifest_promote":
         calls.push("manifest_promote:" + args.name + ":" + args.restart);
+        if (window.__MOCK_MANIFEST__ && window.__MOCK_MANIFEST__.promoteError) {
+          return err(window.__MOCK_MANIFEST__.promoteError);
+        }
         return Promise.resolve(
           (window.__MOCK_MANIFEST__ && window.__MOCK_MANIFEST__.promote) ||
             DEFAULT_MANIFEST_PROMOTE
