@@ -448,9 +448,11 @@ fn run_with_client(
             if p.image_changed && reset_scratch {
                 if let Err(err) = crate::sandbox::reset_rw_scratch(paths, name) {
                     bail!(
-                        "failed to reset the rw scratch disk after promote \
-                         (config already committed); run `izba start {name}` \
-                         to retry: {err}"
+                        "failed to reset the rw scratch disk after promote (config already \
+                         committed; the OLD scratch overlay was kept — `izba start {name}` will \
+                         boot the NEW image over the OLD overlay and may misbehave or fail to \
+                         boot; recreate the sandbox, or revert the image change and re-promote, \
+                         if so): {err}"
                     );
                 }
             }
@@ -623,7 +625,7 @@ mod tests {
 
     use crate::daemon::egress::config::EgressPolicyConfig;
     use crate::daemon::proto::{DaemonHello, SandboxDetail, DAEMON_PROTO_VERSION};
-    use crate::state::{save_json, PortRule, SandboxConfig, CONFIG_FILE};
+    use crate::state::{load_json, save_json, PortRule, SandboxConfig, CONFIG_FILE};
     use crate::vmm::UdsStream;
     use crate::volume::VolumeSpec;
     use izba_proto::{read_frame, write_frame};
@@ -1563,6 +1565,158 @@ mod tests {
             base_n.image,
             ImageSource::Ref("newimg".into()),
             "base must record the promoted manifest"
+        );
+        assert!(store::read_review(&sandbox_dir).unwrap().is_none());
+    }
+
+    /// #131 UPPER-BOUND pin: on a RUNNING sandbox, a failing *live* RPC (here
+    /// `ReloadPolicy`) must leave the WHOLE commit unit unwritten — not just
+    /// `manifest.base.yaml`/the review token, but `config.json` itself, which
+    /// only `apply::write_managed` ever touches and which sits strictly AFTER
+    /// the live-RPC block. This is the mirror image of
+    /// `run_with_client_start_failure_still_advances_base` /
+    /// `run_with_client_stop_failure_still_advances_base` (which pin the
+    /// LOWER bound: lifecycle-leg failures must NOT prevent the commit): this
+    /// test pins the UPPER bound, so a future hoist of
+    /// `write_base`/`clear_review` (or `write_managed`) above the live-RPC
+    /// block can't pass silently — it would leave this test observing a
+    /// committed `config.json` despite the RPC still failing.
+    ///
+    /// Note: `policy.yaml` is a deliberate, documented exception (see the
+    /// "policy.yaml is the one durable file that must land BEFORE its live
+    /// RPC" comment above) — it is written before `ReloadPolicy` because the
+    /// RPC re-reads it from disk, and `write_managed` re-writes it identically
+    /// on success. So this test does not assert policy.yaml is unchanged; it
+    /// pins `config.json`'s `image_digest`, which is untouched until
+    /// `write_managed` runs.
+    #[test]
+    fn run_with_client_live_rpc_failure_leaves_commit_unit_unwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml(
+            "testimg",
+            2,
+            "  egress:\n    enforce: true\n    allow: [github.com]\n",
+        );
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(
+            &paths,
+            "web",
+            "testimg",
+            2,
+            vec![],
+            vec![],
+            Some(EgressPolicyConfig {
+                enforce: true,
+                allow: vec![],
+                git: vec![],
+            }),
+        );
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "testimg");
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "running");
+            expect_and_error(
+                &mut s,
+                |r| matches!(r, DaemonRequest::ReloadPolicy { name } if name == "web"),
+                "ReloadPolicy",
+                "policy reload refused",
+            );
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let err = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, false, true),
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("policy reload refused"), "{err}");
+
+        // The commit unit never landed: base absent, review token intact.
+        assert!(
+            store::read_base(&sandbox_dir).unwrap().is_none(),
+            "base must NOT advance while a live RPC is still failing"
+        );
+        assert!(
+            store::read_review(&sandbox_dir).unwrap().is_some(),
+            "the review token must survive a failed live RPC"
+        );
+        // config.json itself was never rewritten: `write_managed` sits
+        // strictly AFTER the live-RPC block, so the seeded placeholder digest
+        // must survive untouched.
+        let cfg: SandboxConfig = load_json(&sandbox_dir.join(CONFIG_FILE))
+            .unwrap()
+            .expect("config.json still present");
+        assert_eq!(
+            cfg.image_digest, "sha256:existing",
+            "config.json must not be committed while a live RPC is still failing"
+        );
+    }
+
+    /// (Final-review finding, minor) `reset_rw_scratch` failing must give an
+    /// HONEST recovery hint: the config is already committed, the OLD scratch
+    /// overlay was KEPT (the reset is atomic — tmp+rename — so a failure
+    /// never touches the surviving old file), and a plain `izba start` would
+    /// boot the NEW image over that OLD (mismatched) overlay — which may
+    /// misbehave or fail to boot, not a safe blind retry. Hermetic: an absent
+    /// `rw.img` makes `reset_rw_scratch` fail deterministically at its very
+    /// first step (reading the file's size) — no need to fake a mid-write I/O
+    /// error — so `Start` is never even sent.
+    #[test]
+    fn run_with_client_scratch_reset_failure_gives_honest_recovery_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let yaml = manifest_yaml("newimg", 2, "");
+        std::fs::write(repo_dir.join("izba.yml"), &yaml).unwrap();
+        let sandbox_dir = seed_managed(&paths, "web", "testimg", 2, vec![], vec![], None);
+        let token = store::review_token(&yaml, None);
+        store::write_review(&sandbox_dir, &token).unwrap();
+        seed_cached_image(&paths, "newimg");
+        // Deliberately do NOT seed rw.img: reset_rw_scratch's first step
+        // (reading its size) fails deterministically and hermetically.
+
+        let mut client = fake_daemon(|mut s| {
+            expect_inspect_reply(&mut s, "web", "running");
+            expect_and_ok(
+                &mut s,
+                |r| matches!(r, DaemonRequest::Stop { name } if name == "web"),
+                "Stop",
+            );
+            // No Start expected: reset_rw_scratch fails before Start is sent.
+        });
+        let mut events: Vec<PromoteEvent> = Vec::new();
+        let mut on_event = |e: PromoteEvent| events.push(e);
+        let err = run_with_client(
+            &paths,
+            &repo_dir,
+            "web",
+            opts(false, true, true), // restart: true, reset_scratch: true
+            &mut on_event,
+            &mut no_build,
+            &mut client,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("config already committed"), "{msg}");
+        assert!(msg.contains("OLD scratch overlay was kept"), "{msg}");
+        assert!(msg.contains("izba start web"), "{msg}");
+        // The restart-leg failure must not un-commit the promote itself.
+        assert!(
+            store::read_base(&sandbox_dir).unwrap().is_some(),
+            "base must still advance despite the restart-leg failure"
         );
         assert!(store::read_review(&sandbox_dir).unwrap().is_none());
     }
