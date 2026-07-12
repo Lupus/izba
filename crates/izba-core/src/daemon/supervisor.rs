@@ -20,6 +20,9 @@ pub fn tick(
     egress: &EgressManager,
     connector: Connector,
 ) {
+    // Snapshot BEFORE the disk scan: a handler write landing while the scan
+    // is in flight must survive the coming `replace_all` (see its doc).
+    let snap = registry.snapshot();
     let infos = match sandbox::list(paths, connector) {
         Ok(i) => i,
         Err(e) => {
@@ -38,7 +41,7 @@ pub fn tick(
             let _ = egress.ensure_listening(paths, &info.name);
         }
     }
-    registry.replace_all(infos);
+    registry.replace_all(snap, infos);
 }
 
 pub fn tick_interval() -> Duration {

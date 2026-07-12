@@ -695,6 +695,12 @@ pub fn adopt(d: &Arc<Daemon>) {
             }
         }
     }
+    // Snapshot BEFORE the disk scan: adoption runs before the accept loop
+    // and the supervisor thread are started, so in practice nothing can
+    // mutate the registry concurrently here — but taking the snapshot
+    // first keeps this call site honest with the same contract as the
+    // supervisor tick's (see registry::Registry::replace_all's doc).
+    let snap = d.registry.snapshot();
     let infos = match sandbox::list(&d.paths, d.connector()) {
         Ok(i) => i,
         Err(e) => {
@@ -736,7 +742,7 @@ pub fn adopt(d: &Arc<Daemon>) {
             }
         }
     }
-    d.registry.replace_all(infos);
+    d.registry.replace_all(snap, infos);
 }
 
 /// One exit decision. Shutdown always wins; otherwise exit only when the
