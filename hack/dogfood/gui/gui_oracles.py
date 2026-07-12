@@ -44,6 +44,15 @@ _ERROR_COPY_MAP: List[tuple] = [
     # the rendered heading.
     ("no izba.yml found",
      "No izba.yml found in this sandbox's workspace."),
+    # #131: promote's restart leg (Start/Stop) can fail AFTER the config
+    # write already committed (izba-core/src/manifest/promote.rs). Both raw
+    # errors carry an `izba start <name>`-flavored CLI tail that would be
+    # meaningless in the GUI; ManifestTab.tsx's mapPromoteError() maps them
+    # to friendly copy instead.
+    ("failed to start sandbox after promote",
+     "Promoted, but the sandbox failed to start on the new configuration. Use Start on the sandbox to retry."),
+    ("failed to stop sandbox for restart",
+     "Promoted, but the sandbox could not be stopped to apply restart-class changes. Stop and Start it manually."),
 ]
 
 
