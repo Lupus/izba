@@ -30,13 +30,21 @@ impl StartsInFlight {
         Self::default()
     }
 
-    /// Marks `name` in flight; the returned guard un-marks on drop.
-    pub fn begin(&self, name: &str) -> StartGuard<'_> {
-        self.0.lock().unwrap().insert(name.to_string());
-        StartGuard {
+    /// Marks `name` in flight and returns the guard that un-marks it on
+    /// drop — `None` if a `Start` for `name` is already in flight. One
+    /// `Start` owns a name's boot window: concurrent duplicates must fail
+    /// fast, with no side effects, rather than both proceed (a loser's
+    /// error-path `egress.stop`/relay teardown would otherwise sabotage the
+    /// winner's mid-boot listener).
+    pub fn begin(&self, name: &str) -> Option<StartGuard<'_>> {
+        let mut set = self.0.lock().unwrap();
+        if !set.insert(name.to_string()) {
+            return None;
+        }
+        Some(StartGuard {
             set: self,
             name: name.to_string(),
-        }
+        })
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -180,12 +188,16 @@ mod tests {
         assert_eq!(registry.liveness("down"), Some(Liveness::Stopped));
     }
 
-    /// #134: a `Start` mid-boot has no state.json yet, so the disk scan
-    /// honestly reports the sandbox Stopped. Without the starts-in-flight
-    /// guard the tick would tear its egress listener and relays down while
-    /// the guest is mid-boot-dial against them.
-    #[test]
-    fn tick_spares_egress_and_relays_of_starting_sandbox() {
+    /// Shared setup for the two guard-window tests below: creates a
+    /// sandbox named "boot" (no state.json — disk honestly reports it
+    /// Stopped, the mid-boot snapshot the guard exists for), binds its
+    /// egress listener, and publishes one port rule. Returns `None`
+    /// (having already logged why, house runtime-skip pattern) when the
+    /// sandbox denies bind — callers just propagate that as their own
+    /// early return.
+    fn setup_booting_sandbox(
+        test_name: &str,
+    ) -> Option<(tempfile::TempDir, Paths, EgressManager, RelayManager)> {
         let (dir, paths) = test_paths();
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -201,17 +213,13 @@ mod tests {
             builder: false,
         };
         crate::sandbox::create(&paths, "boot", &opts).unwrap();
-        // No state.json written: disk says Stopped, exactly the mid-boot
-        // snapshot the guard exists for.
 
         let egress = test_egress();
         match egress.ensure_listening(&paths, "boot") {
             Ok(()) => {}
             Err(e) if is_permission_denied(&e) => {
-                eprintln!(
-                    "SKIP tick_spares_egress_and_relays_of_starting_sandbox: bind denied: {e:#}"
-                );
-                return;
+                eprintln!("SKIP {test_name}: bind denied: {e:#}");
+                return None;
             }
             Err(e) => panic!("ensure_listening: {e:#}"),
         }
@@ -223,17 +231,29 @@ mod tests {
         };
         if let Err(e) = relays.publish(&paths, "boot", rule) {
             if is_permission_denied(&e) {
-                eprintln!(
-                    "SKIP tick_spares_egress_and_relays_of_starting_sandbox: publish denied: {e:#}"
-                );
-                return;
+                eprintln!("SKIP {test_name}: publish denied: {e:#}");
+                return None;
             }
             panic!("publish: {e:#}");
         }
+        Some((dir, paths, egress, relays))
+    }
+
+    /// #134: a `Start` mid-boot has no state.json yet, so the disk scan
+    /// honestly reports the sandbox Stopped. Without the starts-in-flight
+    /// guard the tick would tear its egress listener and relays down while
+    /// the guest is mid-boot-dial against them.
+    #[test]
+    fn tick_spares_egress_and_relays_of_starting_sandbox() {
+        let Some((_dir, paths, egress, relays)) =
+            setup_booting_sandbox("tick_spares_egress_and_relays_of_starting_sandbox")
+        else {
+            return;
+        };
 
         let registry = Registry::new();
         let starting = StartsInFlight::new();
-        let _g = starting.begin("boot");
+        let _g = starting.begin("boot").expect("first begin succeeds");
         let log = Arc::new(Mutex::new(Vec::new()));
         let conn = fake_connector(log, None);
         tick(&paths, &registry, &relays, &egress, &conn, &starting);
@@ -253,48 +273,11 @@ mod tests {
     /// down. Kills the condition-negation mutant on the guard check.
     #[test]
     fn tick_stops_egress_and_relays_of_genuinely_stopped_sandbox() {
-        let (dir, paths) = test_paths();
-        let ws = dir.path().join("ws");
-        std::fs::create_dir_all(&ws).unwrap();
-        let opts = CreateOpts {
-            image_digest: "sha256:abc".into(),
-            image_ref: "ubuntu:24.04".into(),
-            cpus: 1,
-            mem_mb: 256,
-            workspace: ws,
-            rw_size_gb: 1,
-            ports: Vec::new(),
-            volumes: Vec::new(),
-            builder: false,
+        let Some((_dir, paths, egress, relays)) =
+            setup_booting_sandbox("tick_stops_egress_and_relays_of_genuinely_stopped_sandbox")
+        else {
+            return;
         };
-        crate::sandbox::create(&paths, "boot", &opts).unwrap();
-
-        let egress = test_egress();
-        match egress.ensure_listening(&paths, "boot") {
-            Ok(()) => {}
-            Err(e) if is_permission_denied(&e) => {
-                eprintln!(
-                    "SKIP tick_stops_egress_and_relays_of_genuinely_stopped_sandbox: bind denied: {e:#}"
-                );
-                return;
-            }
-            Err(e) => panic!("ensure_listening: {e:#}"),
-        }
-        let relays = RelayManager::new();
-        let rule = PortRule {
-            bind: "127.0.0.1".parse().unwrap(),
-            host_port: free_port(),
-            guest_port: 80,
-        };
-        if let Err(e) = relays.publish(&paths, "boot", rule) {
-            if is_permission_denied(&e) {
-                eprintln!(
-                    "SKIP tick_stops_egress_and_relays_of_genuinely_stopped_sandbox: publish denied: {e:#}"
-                );
-                return;
-            }
-            panic!("publish: {e:#}");
-        }
 
         let registry = Registry::new();
         let starting = StartsInFlight::new(); // nothing marked in flight
@@ -317,15 +300,15 @@ mod tests {
         let starting = StartsInFlight::new();
         assert!(!starting.contains("a"));
         {
-            let _g = starting.begin("a");
+            let _g = starting.begin("a").expect("first begin succeeds");
             assert!(starting.contains("a"));
             assert!(!starting.contains("b"), "unrelated name unaffected");
         }
         assert!(!starting.contains("a"), "un-marked on drop");
 
         // Two concurrent guards on different names don't interfere.
-        let g1 = starting.begin("a");
-        let g2 = starting.begin("b");
+        let g1 = starting.begin("a").expect("first begin on 'a' succeeds");
+        let g2 = starting.begin("b").expect("first begin on 'b' succeeds");
         assert!(starting.contains("a"));
         assert!(starting.contains("b"));
         drop(g1);
@@ -333,6 +316,38 @@ mod tests {
         assert!(starting.contains("b"), "'b' still held by g2");
         drop(g2);
         assert!(!starting.contains("b"));
+    }
+
+    /// The race this whole guard exists to close (see #134 follow-up):
+    /// two concurrent `Start{name}` calls both reach `begin()`. The second
+    /// must fail fast with no side effects rather than proceed and later
+    /// sabotage the winner's boot via its own error-path teardown.
+    #[test]
+    fn begin_refuses_duplicate_in_flight_name() {
+        let starting = StartsInFlight::new();
+
+        let g1 = starting.begin("web").expect("first begin succeeds");
+        assert!(starting.contains("web"));
+        assert!(
+            starting.begin("web").is_none(),
+            "a second concurrent begin for the same name must be refused"
+        );
+        // Refusal must be side-effect-free: the winner's mark survives.
+        assert!(starting.contains("web"));
+
+        drop(g1);
+        assert!(!starting.contains("web"));
+        starting
+            .begin("web")
+            .expect("begin succeeds again once the prior guard is dropped");
+
+        // Different names concurrently don't interfere.
+        let ga = starting.begin("a").expect("begin 'a' succeeds");
+        let gb = starting.begin("b").expect("begin 'b' succeeds");
+        assert!(starting.contains("a"));
+        assert!(starting.contains("b"));
+        drop(ga);
+        drop(gb);
     }
 
     #[test]

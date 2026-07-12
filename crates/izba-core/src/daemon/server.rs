@@ -452,7 +452,15 @@ fn handle_start(
     // and the disk scan honestly (but prematurely) reports it Stopped
     // (#134). The guard only gates the TICK's stops — this handler's own
     // error-path `egress.stop` below still runs normally while it's held.
-    let _start_guard = d.starting.begin(&name);
+    //
+    // `begin` refuses a duplicate in-flight name: two concurrent
+    // `Start{name}` calls both racing here would otherwise both bind the
+    // listener and both call `sandbox::start`, and the loser of `start`'s
+    // internal flock would hit the error path below and tear down the
+    // WINNER's listener mid-boot. Bail before any side effect.
+    let Some(_start_guard) = d.starting.begin(&name) else {
+        bail!("a start for '{name}' is already in progress");
+    };
     d.egress.ensure_listening(&d.paths, &name)?;
     if let Err(e) = sandbox::start(
         &d.paths,
@@ -1190,6 +1198,53 @@ mod tests {
         ));
         assert!(!d.egress.listening("web"));
         assert!(!egress::listener_path(&d.paths, "web").exists());
+    }
+
+    /// A `Start` racing a name that's already mid-boot must bail fast,
+    /// honestly, and WITHOUT touching egress — never reach
+    /// `ensure_listening`/`sandbox::start`, and never sabotage a real
+    /// winner's listener via the error-path `egress.stop`. Simulates the
+    /// "winner mid-boot" window by holding the `StartsInFlight` guard
+    /// directly (the same guard `handle_start` holds across its own
+    /// listener-bind → boot → relay-republish window) rather than racing
+    /// two real threads through the flock in `sandbox::start`.
+    #[test]
+    fn concurrent_start_of_same_name_fails_fast_without_touching_egress() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        assert!(!d.egress.listening("web"), "nothing started yet");
+
+        // Hold the in-flight mark as a real winner's `handle_start` would.
+        let _winner_guard = d
+            .starting
+            .begin("web")
+            .expect("first begin for 'web' succeeds");
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::Start {
+                name: "web".into(),
+                allow_unconfined: false,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(
+                    message.contains("already in progress"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected an in-progress error, got: {other:?}"),
+        }
+        // The loser must not have touched egress at all — no bind attempt,
+        // and (were a real winner mid-boot) no `egress.stop` sabotage.
+        assert!(
+            !d.egress.listening("web"),
+            "loser must not bind/touch the egress listener"
+        );
     }
 
     #[test]
