@@ -65,6 +65,14 @@ impl StartsInFlight {
     /// good (Greptile P1, PR #135 / #134 follow-up). `begin` and
     /// `StartGuard::drop` lock this same mutex, which is the serialization
     /// this relies on.
+    ///
+    /// Costs, accepted deliberately: the set (and thus this lock) is
+    /// daemon-wide, so a teardown for sandbox A briefly blocks `begin()` for
+    /// ANY sandbox — bounded by the relay/egress thread joins (~100 ms poll
+    /// loops), negligible next to a multi-second boot. And a panic inside
+    /// `teardown` would poison the mutex, bricking every later `Start` until
+    /// the daemon restarts — the closure only calls `stop_all`/`egress.stop`,
+    /// which are non-panicking by contract (log-and-continue teardown).
     pub fn teardown_unless_starting(&self, name: &str, teardown: impl FnOnce()) {
         let set = self.0.lock().unwrap();
         if !set.contains(name) {
