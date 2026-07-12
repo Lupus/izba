@@ -180,6 +180,204 @@ pub fn run(
     )
 }
 
+/// Check the review gate and emit the matching event: `Ok` on a clean pass or
+/// an explicit `--force` override (which also records the WARNING), `Err` on
+/// a refusal. Extracted from `run_with_client` (rust:S3776) — same match arms,
+/// same messages, same ordering; only the bail! sites moved.
+fn check_gate(
+    review: Option<&str>,
+    token: &str,
+    force: bool,
+    warnings: &mut Vec<String>,
+    on_event: &mut dyn FnMut(PromoteEvent),
+) -> Result<()> {
+    match gate(review, token, force) {
+        GateOutcome::Ok => Ok(()),
+        GateOutcome::NeverReviewed => {
+            bail!("no reviewed diff — run `izba diff` first (or --force)")
+        }
+        GateOutcome::Stale => {
+            bail!("izba.yml changed since `izba diff` — re-run it (or --force)")
+        }
+        GateOutcome::ForcedUnreviewed => {
+            emit_warn(
+                warnings,
+                on_event,
+                "WARNING: --force: promoting changes that were never reviewed".to_string(),
+            );
+            Ok(())
+        }
+        GateOutcome::ForcedStale => {
+            emit_warn(
+                warnings,
+                on_event,
+                "WARNING: --force: izba.yml changed since review — promoting UNREVIEWED changes"
+                    .to_string(),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Drive the live daemon RPCs for a RUNNING sandbox: `ReloadPolicy` (if the
+/// policy changed) then the `Port*`/`Volume*` deltas, in `apply::plan`'s
+/// field order. Extracted from `run_with_client` (rust:S3776) — same RPCs,
+/// same order, same error propagation via `send_ok`'s `?`.
+#[allow(clippy::too_many_arguments)]
+fn apply_live_deltas(
+    client: &mut DaemonClient,
+    name: &str,
+    dir_managed: &Path,
+    p: &apply::ApplyPlan,
+    egress: &crate::daemon::egress::config::EgressPolicyConfig,
+    warnings: &mut Vec<String>,
+    on_event: &mut dyn FnMut(PromoteEvent),
+) -> Result<()> {
+    // policy.yaml is the one durable file that must land BEFORE its live RPC:
+    // `ReloadPolicy` re-reads policy.yaml from disk. Writing it first is safe to
+    // retry (idempotent) and `write_managed` rewrites it identically below.
+    if p.policy_changed {
+        apply::write_policy(dir_managed, egress)?;
+        send_ok(
+            client,
+            &DaemonRequest::ReloadPolicy {
+                name: name.to_string(),
+            },
+            warnings,
+            on_event,
+        )?;
+    }
+    for r in &p.ports_removed {
+        send_ok(
+            client,
+            &DaemonRequest::PortUnpublish {
+                name: name.to_string(),
+                bind: r.bind,
+                host_port: r.host_port,
+            },
+            warnings,
+            on_event,
+        )?;
+    }
+    for r in &p.ports_added {
+        send_ok(
+            client,
+            &DaemonRequest::PortPublish {
+                name: name.to_string(),
+                rule: r.clone(),
+                persist: true,
+            },
+            warnings,
+            on_event,
+        )?;
+    }
+    for gp in &p.volumes_removed {
+        send_ok(
+            client,
+            &DaemonRequest::VolumeDetach {
+                name: name.to_string(),
+                guest_path: gp.clone(),
+            },
+            warnings,
+            on_event,
+        )?;
+    }
+    for v in &p.volumes_added {
+        send_ok(
+            client,
+            &DaemonRequest::VolumeAttach {
+                name: name.to_string(),
+                spec: v.clone(),
+            },
+            warnings,
+            on_event,
+        )?;
+    }
+    Ok(())
+}
+
+/// Run the restart leg (Stop/reset-scratch/Start) once the caller has decided
+/// a restart is actually happening (`restart_fields` non-empty AND
+/// `opts.restart`). Extracted from `run_with_client` (rust:S3776) — same
+/// confinement read, same Stop/reset/Start sequencing, same honest bail
+/// messages on failure (the promote itself is already committed by the time
+/// this runs — see the `#131` comment at the call site).
+#[allow(clippy::too_many_arguments)]
+fn run_restart_leg(
+    client: &mut DaemonClient,
+    paths: &Paths,
+    name: &str,
+    p: &apply::ApplyPlan,
+    reset_scratch: bool,
+    is_running: bool,
+    warnings: &mut Vec<String>,
+    on_event: &mut dyn FnMut(PromoteEvent),
+) -> Result<()> {
+    // Fix 3a: Read the confinement mode BEFORE Stop — stop clears
+    // state.json, so we must capture allow_unconfined before the VMM
+    // is torn down. Default to false (confined, safe) when the file is
+    // absent or unreadable (sandbox already stopped).
+    let run_state: Option<RunState> = load_json(&paths.sandbox_dir(name).join(STATE_FILE))
+        .ok()
+        .flatten();
+    let allow_unconfined = run_state
+        .and_then(|s| s.confinement)
+        .map(|c| !c.is_confined())
+        .unwrap_or(false);
+
+    // Only Stop when the sandbox is actually running; sending Stop to a
+    // non-running sandbox may error from the daemon and is unnecessary.
+    if is_running {
+        if let Err(err) = send_ok(
+            client,
+            &DaemonRequest::Stop {
+                name: name.to_string(),
+            },
+            warnings,
+            on_event,
+        ) {
+            bail!(
+                "failed to stop sandbox for restart (the promote itself \
+                 is committed; restart manually to apply): {err}"
+            );
+        }
+    }
+    // Reset the rw scratch overlay to a blank state on the new base
+    // before starting, so the image change boots cleanly.
+    if p.image_changed && reset_scratch {
+        if let Err(err) = crate::sandbox::reset_rw_scratch(paths, name) {
+            bail!(
+                "failed to reset the rw scratch disk after promote (config already \
+                 committed; the OLD scratch overlay was kept — `izba start {name}` will \
+                 boot the NEW image over the OLD overlay and may misbehave or fail to \
+                 boot — if so, recreate the sandbox or revert the image change and \
+                 re-promote): {err}"
+            );
+        }
+    }
+    // Fix 3b: Surface a helpful retry hint if Start fails after Stop —
+    // the config was already committed so a plain `izba start` is safe.
+    if let Err(err) = send_ok(
+        client,
+        &DaemonRequest::Start {
+            name: name.to_string(),
+            allow_unconfined,
+        },
+        warnings,
+        on_event,
+    ) {
+        bail!(
+            "failed to start sandbox after promote (config already committed); \
+             run `izba start {name}` to retry: {err}"
+        );
+    }
+    on_event(PromoteEvent::Info(format!(
+        "restarted to apply: {}",
+        p.restart_fields.join(", ")
+    )));
+    Ok(())
+}
+
 /// The actual promote orchestration, over an already-connected `client` — the
 /// seam that makes this unit-testable with a fake daemon (`UdsStream::pair`)
 /// rather than a live one. `run()` above is the thin production wrapper that
@@ -208,30 +406,13 @@ fn run_with_client(
 
     // Review gate: the token binds the human review to the exact manifest+Dockerfile bytes.
     let token = store::review_token(&raw, dockerfile.as_deref());
-    match gate(store::read_review(&dir_managed)?.as_deref(), &token, force) {
-        GateOutcome::Ok => {}
-        GateOutcome::NeverReviewed => {
-            bail!("no reviewed diff — run `izba diff` first (or --force)")
-        }
-        GateOutcome::Stale => {
-            bail!("izba.yml changed since `izba diff` — re-run it (or --force)")
-        }
-        GateOutcome::ForcedUnreviewed => {
-            emit_warn(
-                &mut warnings,
-                on_event,
-                "WARNING: --force: promoting changes that were never reviewed".to_string(),
-            );
-        }
-        GateOutcome::ForcedStale => {
-            emit_warn(
-                &mut warnings,
-                on_event,
-                "WARNING: --force: izba.yml changed since review — promoting UNREVIEWED changes"
-                    .to_string(),
-            );
-        }
-    }
+    check_gate(
+        store::read_review(&dir_managed)?.as_deref(),
+        &token,
+        force,
+        &mut warnings,
+        on_event,
+    )?;
 
     let managed = ops::managed_normalized(paths, name)?;
 
@@ -322,66 +503,15 @@ fn run_with_client(
         // "config already committed, here's how to recover" message instead
         // of leaving `izba diff` reporting a divergence no user edit explains.
 
-        // policy.yaml is the one durable file that must land BEFORE its live RPC:
-        // `ReloadPolicy` re-reads policy.yaml from disk. Writing it first is safe to
-        // retry (idempotent) and `write_managed` rewrites it identically below.
-        if p.policy_changed {
-            apply::write_policy(&dir_managed, &repo.egress)?;
-            send_ok(
-                client,
-                &DaemonRequest::ReloadPolicy {
-                    name: name.to_string(),
-                },
-                &mut warnings,
-                on_event,
-            )?;
-        }
-        for r in &p.ports_removed {
-            send_ok(
-                client,
-                &DaemonRequest::PortUnpublish {
-                    name: name.to_string(),
-                    bind: r.bind,
-                    host_port: r.host_port,
-                },
-                &mut warnings,
-                on_event,
-            )?;
-        }
-        for r in &p.ports_added {
-            send_ok(
-                client,
-                &DaemonRequest::PortPublish {
-                    name: name.to_string(),
-                    rule: r.clone(),
-                    persist: true,
-                },
-                &mut warnings,
-                on_event,
-            )?;
-        }
-        for gp in &p.volumes_removed {
-            send_ok(
-                client,
-                &DaemonRequest::VolumeDetach {
-                    name: name.to_string(),
-                    guest_path: gp.clone(),
-                },
-                &mut warnings,
-                on_event,
-            )?;
-        }
-        for v in &p.volumes_added {
-            send_ok(
-                client,
-                &DaemonRequest::VolumeAttach {
-                    name: name.to_string(),
-                    spec: v.clone(),
-                },
-                &mut warnings,
-                on_event,
-            )?;
-        }
+        apply_live_deltas(
+            client,
+            name,
+            &dir_managed,
+            &p,
+            &repo.egress,
+            &mut warnings,
+            on_event,
+        )?;
     } else {
         // Live RPCs are skipped when the sandbox is not running. Only warn
         // "changes apply on next start" when --restart won't Start it anyway.
@@ -407,76 +537,31 @@ fn run_with_client(
     // lifecycle action on already-committed config: if it fails, `izba diff`
     // stays in-sync (repo == managed == base) and `izba start` is the whole
     // recovery — never a diverged state no user edit explains.
-    store::write_base(&dir_managed, &m)?;
-    store::clear_review(&dir_managed)?;
+    if let Err(err) =
+        store::write_base(&dir_managed, &m).and_then(|()| store::clear_review(&dir_managed))
+    {
+        bail!(
+            "failed to record the promoted base after committing config (drift may \
+             read diverged until then; re-run `izba diff` then `izba promote`, and \
+             restart the sandbox manually if the change needs a restart): {err}"
+        );
+    }
 
     // Restart-class fields (cpus, memory, image): apply now or note for later.
     let mut restarted = false;
     if !p.restart_fields.is_empty() {
         if restart {
-            // Fix 3a: Read the confinement mode BEFORE Stop — stop clears
-            // state.json, so we must capture allow_unconfined before the VMM
-            // is torn down. Default to false (confined, safe) when the file is
-            // absent or unreadable (sandbox already stopped).
-            let run_state: Option<RunState> = load_json(&paths.sandbox_dir(name).join(STATE_FILE))
-                .ok()
-                .flatten();
-            let allow_unconfined = run_state
-                .and_then(|s| s.confinement)
-                .map(|c| !c.is_confined())
-                .unwrap_or(false);
-
-            // Only Stop when the sandbox is actually running; sending Stop to a
-            // non-running sandbox may error from the daemon and is unnecessary.
-            if is_running {
-                if let Err(err) = send_ok(
-                    client,
-                    &DaemonRequest::Stop {
-                        name: name.to_string(),
-                    },
-                    &mut warnings,
-                    on_event,
-                ) {
-                    bail!(
-                        "failed to stop sandbox for restart (the promote itself \
-                         is committed; restart manually to apply): {err}"
-                    );
-                }
-            }
-            // Reset the rw scratch overlay to a blank state on the new base
-            // before starting, so the image change boots cleanly.
-            if p.image_changed && reset_scratch {
-                if let Err(err) = crate::sandbox::reset_rw_scratch(paths, name) {
-                    bail!(
-                        "failed to reset the rw scratch disk after promote (config already \
-                         committed; the OLD scratch overlay was kept — `izba start {name}` will \
-                         boot the NEW image over the OLD overlay and may misbehave or fail to \
-                         boot — if so, recreate the sandbox or revert the image change and \
-                         re-promote): {err}"
-                    );
-                }
-            }
-            // Fix 3b: Surface a helpful retry hint if Start fails after Stop —
-            // the config was already committed so a plain `izba start` is safe.
-            if let Err(err) = send_ok(
+            run_restart_leg(
                 client,
-                &DaemonRequest::Start {
-                    name: name.to_string(),
-                    allow_unconfined,
-                },
+                paths,
+                name,
+                &p,
+                reset_scratch,
+                is_running,
                 &mut warnings,
                 on_event,
-            ) {
-                bail!(
-                    "failed to start sandbox after promote (config already committed); \
-                     run `izba start {name}` to retry: {err}"
-                );
-            }
+            )?;
             restarted = true;
-            on_event(PromoteEvent::Info(format!(
-                "restarted to apply: {}",
-                p.restart_fields.join(", ")
-            )));
         } else {
             on_event(PromoteEvent::Info(format!(
                 "pending restart to apply: {} (run `izba promote --restart` or restart manually)",
