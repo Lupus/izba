@@ -215,6 +215,24 @@ impl Registry {
         inner.removed.retain(|_, gen| *gen > snapshot);
         inner.entries = fresh;
     }
+
+    /// Test-only visibility into the removal tombstones (name -> generation),
+    /// so the trim boundary in `replace_all` (tombstones with `gen <=
+    /// snapshot` are dropped, `gen > snapshot` are kept) is pinned by unit
+    /// tests instead of being unobservable through the public API.
+    #[cfg(test)]
+    pub(crate) fn tombstones(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = self
+            .inner
+            .lock()
+            .unwrap()
+            .removed
+            .iter()
+            .map(|(name, gen)| (name.clone(), *gen))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -388,5 +406,52 @@ mod tests {
         r.set("web", "x", Liveness::Stopped);
         r.replace_all(snap, vec![info("web", Liveness::Running)]);
         assert_eq!(r.liveness("web"), Some(Liveness::Stopped));
+    }
+
+    /// `replace_all` must trim exactly the tombstones whose generation is
+    /// `<= snapshot`, and keep the ones `> snapshot` — a stricter check than
+    /// "some trimming happened," since `>=`/`==`/`<` boundary bugs all leave
+    /// an observably wrong tombstone set for this fixture (two tombstones on
+    /// either side of the same `snap`).
+    #[test]
+    fn replace_all_trims_only_pre_snapshot_tombstones() {
+        let r = Registry::new();
+        r.set("a", "x", Liveness::Running);
+        r.remove("a");
+        let snap = r.snapshot(); // == "a"'s tombstone generation
+
+        r.set("b", "x", Liveness::Running);
+        r.remove("b");
+
+        let before = r.tombstones();
+        assert_eq!(before.len(), 2);
+        let gen_a = before.iter().find(|(n, _)| n == "a").unwrap().1;
+        let gen_b = before.iter().find(|(n, _)| n == "b").unwrap().1;
+        assert_eq!(gen_a, snap, "a's removal is exactly the snapshot gen");
+        assert!(gen_b > snap, "b's removal happened after the snapshot");
+
+        r.replace_all(snap, vec![]);
+
+        // Only "b" (gen > snap) survives; "a" (gen == snap) is trimmed.
+        assert_eq!(r.tombstones(), vec![("b".to_string(), gen_b)]);
+    }
+
+    /// Rule 2's boundary: a scan whose snapshot was taken AT the removal's
+    /// generation (`removed_gen == snapshot`, not `>`) is authoritative for
+    /// that name, so an incoming sighting must be applied (not skipped as
+    /// "removed after the scan began"). This also exercises the tombstone
+    /// trim at the same boundary: the now-consulted tombstone must be gone
+    /// afterward.
+    #[test]
+    fn replace_all_applies_scan_begun_at_removal() {
+        let r = Registry::new();
+        r.set("web", "x", Liveness::Running);
+        r.remove("web");
+        let snap = r.snapshot(); // == the removal's generation
+
+        r.replace_all(snap, vec![info("web", Liveness::Running)]);
+
+        assert_eq!(r.liveness("web"), Some(Liveness::Running));
+        assert!(r.tombstones().is_empty());
     }
 }
