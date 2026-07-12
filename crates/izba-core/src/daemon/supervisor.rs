@@ -50,6 +50,27 @@ impl StartsInFlight {
     pub fn contains(&self, name: &str) -> bool {
         self.0.lock().unwrap().contains(name)
     }
+
+    /// Run `teardown` iff no `Start` for `name` is in flight, atomically:
+    /// the set's mutex is held across the teardown, so a concurrent
+    /// `begin(name)` blocks until the teardown completes (and a teardown
+    /// requested while a start holds the name is skipped outright). This
+    /// closes the check-then-act window a per-call `contains()` then
+    /// `stop_all`/`egress.stop()` had: the tick used to release the mutex
+    /// between checking membership and tearing down, so a start thread
+    /// could `begin()` + `egress.ensure_listening()` in that gap and the
+    /// tick would then kill the freshly bound listener — worse, because the
+    /// name was now in flight, EVERY later tick would skip the Stopped-arm
+    /// for it too, leaving the guest to boot with a dead egress plane for
+    /// good (Greptile P1, PR #135 / #134 follow-up). `begin` and
+    /// `StartGuard::drop` lock this same mutex, which is the serialization
+    /// this relies on.
+    pub fn teardown_unless_starting(&self, name: &str, teardown: impl FnOnce()) {
+        let set = self.0.lock().unwrap();
+        if !set.contains(name) {
+            teardown();
+        }
+    }
 }
 
 /// RAII un-mark: drops `name` out of its [`StartsInFlight`] set, on both the
@@ -85,16 +106,23 @@ pub fn tick(
     };
     for info in &infos {
         if info.liveness == Liveness::Stopped {
-            if starting.contains(&info.name) {
-                // A Start is mid-boot: the disk scan honestly reports
-                // Stopped until state.json lands post-boot, but this tick
-                // must not tear down the listener/relays the guest is
-                // dialing against right now (#134). `handle_start`'s guard
-                // drops when it returns; the next tick reassesses then.
-                continue;
-            }
-            relays.stop_all(&info.name);
-            egress.stop(paths, &info.name);
+            // A Start may be mid-boot: the disk scan honestly reports
+            // Stopped until state.json lands post-boot, but this tick must
+            // not tear down the listener/relays the guest is dialing
+            // against right now (#134). `teardown_unless_starting` decides
+            // membership and runs the teardown under the SAME lock as
+            // `begin()`/`StartGuard::drop` — load-bearing atomicity: a
+            // check-then-act version (contains() then teardown as two
+            // separate lock acquisitions) let a start's `begin()` +
+            // `egress.ensure_listening()` land in the gap, so the tick
+            // killed the freshly bound listener and then, because the name
+            // was now in flight, every later tick skipped this arm for it
+            // too — dead egress plane for the sandbox's whole boot
+            // (Greptile P1, PR #135).
+            starting.teardown_unless_starting(&info.name, || {
+                relays.stop_all(&info.name);
+                egress.stop(paths, &info.name);
+            });
         } else {
             relays.respawn_dead(paths, &info.name);
             // Idempotent: a no-op if the listener is alive, a crash-respawn
@@ -316,6 +344,97 @@ mod tests {
         assert!(starting.contains("b"), "'b' still held by g2");
         drop(g2);
         assert!(!starting.contains("b"));
+    }
+
+    /// `teardown_unless_starting` must not run the teardown while the name
+    /// is marked in flight, and must run it once the guard is dropped.
+    #[test]
+    fn teardown_unless_starting_skips_in_flight() {
+        let starting = StartsInFlight::new();
+        let ran = std::sync::atomic::AtomicBool::new(false);
+
+        let g = starting.begin("web").expect("first begin succeeds");
+        starting.teardown_unless_starting("web", || {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "teardown must not run while a start is in flight"
+        );
+
+        drop(g);
+        starting.teardown_unless_starting("web", || {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "teardown must run once no start is in flight"
+        );
+    }
+
+    /// Greptile P1 (PR #135): the tick's check-then-act window let a
+    /// `begin()` land between the tick's membership check and its
+    /// teardown, so the tick killed a freshly bound listener. Proves the
+    /// fix is atomic by event ordering: a `teardown_unless_starting` call
+    /// holding the lock inside its closure must fully finish before a
+    /// concurrent `begin()` on the SAME name can return — a regression to
+    /// the old check-then-act shape would let `begin()` return while the
+    /// teardown closure is still running (or hasn't started), which shows
+    /// up as "began" logged before "teardown-done".
+    #[test]
+    fn begin_blocks_until_teardown_completes() {
+        use std::sync::mpsc;
+
+        let starting = Arc::new(StartsInFlight::new());
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let starting_a = Arc::clone(&starting);
+        let events_a = Arc::clone(&events);
+        let teardown_thread = std::thread::spawn(move || {
+            starting_a.teardown_unless_starting("boot", || {
+                entered_tx.send(()).unwrap();
+                // Bounded wait: with correct (mutex-serialized) code this
+                // never has to wait long, since B can't even attempt
+                // `begin` until this closure returns. A generous timeout
+                // just turns a regression into a fast test failure instead
+                // of a hang.
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("main thread released the teardown in time");
+                events_a.lock().unwrap().push("teardown-done");
+            });
+        });
+
+        // Don't race the teardown thread to the lock: wait until it's
+        // actually inside the closure before starting thread B.
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("teardown closure entered in time");
+
+        let starting_b = Arc::clone(&starting);
+        let events_b = Arc::clone(&events);
+        let begin_thread = std::thread::spawn(move || {
+            let _g = starting_b
+                .begin("boot")
+                .expect("begin succeeds once the teardown lock is released");
+            events_b.lock().unwrap().push("began");
+        });
+
+        // Let the teardown closure finish; B's `begin()` must not have been
+        // able to return before this point.
+        release_tx.send(()).unwrap();
+
+        teardown_thread.join().unwrap();
+        begin_thread.join().unwrap();
+
+        let log = events.lock().unwrap();
+        assert_eq!(
+            log.as_slice(),
+            &["teardown-done", "began"],
+            "begin() must block until the concurrent teardown fully completes"
+        );
     }
 
     /// The race this whole guard exists to close (see #134 follow-up):
