@@ -66,8 +66,8 @@ promote itself is committed).
     ``failed to reset the rw scratch disk after promote (config already
     committed; the OLD scratch overlay was kept — `izba start {name}` will
     boot the NEW image over the OLD overlay and may misbehave or fail to
-    boot; recreate the sandbox, or revert the image change and re-promote,
-    if so): {err}`` — `reset_rw_scratch` is atomic (tmp+rename), so a
+    boot — if so, recreate the sandbox or revert the image change and
+    re-promote): {err}`` — `reset_rw_scratch` is atomic (tmp+rename), so a
     mid-reset failure never touches the old file; the honest hazard isn't
     "retry the reset", it's "the new digest is already committed over an
     overlay built for the old one."
