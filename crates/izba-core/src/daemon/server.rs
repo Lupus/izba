@@ -2053,4 +2053,93 @@ mod tests {
             "tombstone swept"
         );
     }
+
+    /// Kills the "replace `run_daemon_with` body with `Ok(())`" mutant: it
+    /// actually binds the real daemon socket, adopts, serves the accept
+    /// loop, and honors `Shutdown` — none of which happens if the body is a
+    /// no-op stub. Real `UnixListener::bind`, so it follows the house
+    /// runtime-skip convention (see `full_connect_via_listener` in
+    /// `vsock.rs`, `bind_creates_dir_and_replaces_stale_socket` in
+    /// `transport.rs`): some sandboxes deny `bind` with EPERM. Locally that
+    /// means this test SKIPs; CI's runners (incl. the mutation-gate host)
+    /// bind for real and this is what kills the mutant there.
+    #[test]
+    fn run_daemon_with_actually_serves() {
+        let (dir, paths) = test_paths();
+
+        // Pre-probe bind permission on a throwaway socket before starting
+        // the daemon thread, so a denied environment skips cleanly instead
+        // of the daemon thread returning an opaque bind error.
+        let probe_sock = dir.path().join("probe.sock");
+        match transport::UdsListener::bind(&probe_sock) {
+            Ok(l) => drop(l),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP: sandbox denies UnixListener::bind: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected bind probe failure: {e}"),
+        }
+        let _ = std::fs::remove_file(&probe_sock);
+
+        let daemon_paths = paths.clone();
+        let handle = std::thread::spawn(move || run_daemon_with(&daemon_paths, test_deps()));
+
+        // Poll for the daemon to actually bind+listen (thread scheduling is
+        // not synchronized with us).
+        let sock_path = paths.daemon_socket();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut client = loop {
+            match UdsStream::connect(&sock_path) {
+                Ok(c) => break c,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("could not connect to daemon socket within 5s: {e}"),
+            }
+        };
+
+        write_frame(
+            &mut client,
+            &DaemonHello {
+                version: "whatever".into(),
+                proto: crate::daemon::proto::DAEMON_PROTO_VERSION,
+            },
+        )
+        .unwrap();
+        match read_frame::<_, DaemonResponse>(&mut client).unwrap() {
+            DaemonResponse::HelloOk { version, proto, .. } => {
+                assert_eq!(version, "testv");
+                assert_eq!(proto, crate::daemon::proto::DAEMON_PROTO_VERSION);
+            }
+            other => panic!("expected HelloOk, got {other:?}"),
+        }
+
+        write_frame(&mut client, &DaemonRequest::List).unwrap();
+        match read_frame::<_, DaemonResponse>(&mut client).unwrap() {
+            DaemonResponse::List { sandboxes } => {
+                assert!(sandboxes.is_empty(), "fresh data dir has no sandboxes")
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+
+        write_frame(&mut client, &DaemonRequest::Shutdown).unwrap();
+        match read_frame::<_, DaemonResponse>(&mut client).unwrap() {
+            DaemonResponse::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        drop(client);
+
+        // Bounded join: Shutdown must make the accept loop exit (server.rs
+        // `should_exit`), polled every 100ms — 10s is generous headroom.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => panic!("run_daemon_with returned an error: {e:#}"),
+            Ok(Err(_)) => panic!("run_daemon_with thread panicked"),
+            Err(_) => panic!("run_daemon_with did not exit within 10s of Shutdown"),
+        }
+    }
 }
