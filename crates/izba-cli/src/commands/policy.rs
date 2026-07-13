@@ -7,37 +7,69 @@ use izba_core::paths::Paths;
 #[derive(Debug, Subcommand)]
 pub enum PolicyCmd {
     /// Print the effective allow-list (host + ports) and enforce posture (on/off)
-    Show { name: String },
+    Show {
+        /// Sandbox name (or dir)
+        name: String,
+    },
     /// Allow an HTTP(S) destination: HOST or HOST:PORT (port defaults to 443;
     /// access is read-write). To actually block anything else, enforcement must
     /// be on (see `enforce`). Auto-reloads a running sandbox.
-    Allow { name: String, target: String },
+    Allow {
+        /// Sandbox name (or dir)
+        name: String,
+        /// Destination to allow: HOST or HOST:PORT (port defaults to 443)
+        target: String,
+    },
     /// Block a destination: HOST or HOST:PORT (port defaults to 443); auto-reloads
-    Block { name: String, target: String },
+    Block {
+        /// Sandbox name (or dir)
+        name: String,
+        /// Destination to remove: HOST or HOST:PORT (port defaults to 443)
+        target: String,
+    },
     /// Seed the allow-list from the sandbox's currently-allowed traffic, then reload
-    Enable { name: String },
+    Enable {
+        /// Sandbox name (or dir)
+        name: String,
+    },
     /// Re-read a sandbox's policy.yaml and apply it to new connections (no restart)
-    Reload { name: String },
+    Reload {
+        /// Sandbox name (or dir)
+        name: String,
+    },
     /// Fine-grained git controls (clone/fetch/push per repo)
     #[command(subcommand)]
     Git(GitSub),
     /// Turn the firewall on (default-deny: only allow-listed egress) or off
     /// (log-only: everything allowed). A bare sandbox is off; an empty
     /// allow-list with enforce on denies all egress.
-    Enforce { name: String, state: EnforceState },
+    Enforce {
+        /// Sandbox name (or dir)
+        name: String,
+        /// on (default-deny) or off (log-only)
+        state: EnforceState,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum GitSub {
     /// Allow git on REPO (host/owner/repo, globs ok) or a whole HOST; read unless --write
     Allow {
+        /// Sandbox name (or dir)
         name: String,
+        /// Git target: REPO (host/owner/repo, globs ok) or a whole HOST
         target: String,
+        /// Also allow push (read-only otherwise)
         #[arg(long)]
         write: bool,
     },
     /// Remove a git rule for REPO/HOST
-    Block { name: String, target: String },
+    Block {
+        /// Sandbox name (or dir)
+        name: String,
+        /// Git target to remove: REPO (host/owner/repo) or HOST
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
