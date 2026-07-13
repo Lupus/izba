@@ -320,8 +320,17 @@ _IMPLICIT_RE = re.compile(
 )
 
 
-def implicit_oracle(action: Action) -> List[Candidate]:
-    """Scrape output for crash markers; decode the izba exit-code contract."""
+def implicit_oracle(action: Action, *, expect_nonzero: bool = False) -> List[Candidate]:
+    """Scrape output for crash markers; decode the izba exit-code contract.
+
+    Crash MARKERS scraped from output (panic, assertion, anchored ERROR/FATAL,
+    sanitizer) always flag — they are never anticipated. The exit-code DECODE
+    branch (127 -> CommandNotFound, 255 -> transport failure, 128+n -> Signal n)
+    is expectation-aware: when ``expect_nonzero`` is set the step itself declared a
+    non-zero/decoded exit (via ``expect_exit`` or refusal phrasing), so those codes
+    are the anticipated outcome and no candidate is emitted — this is what stops a
+    journey like ``exec-exit-code-contract`` (whose whole point is to observe 127
+    and 128+n) from self-flipping."""
     out: List[Candidate] = []
     ref = {"journey_id": "", "action_index": -1}
 
@@ -336,6 +345,11 @@ def implicit_oracle(action: Action) -> List[Candidate]:
                 source="contract: clean exit, no panics",
                 trajectory_ref=dict(ref),
             ))
+
+    # A step that anticipated a non-zero/decoded exit turns these decodes into the
+    # expected result, not a crash symptom — so skip the exit-code-decode branch.
+    if expect_nonzero:
+        return out
 
     code = action.exit_code
     if code == 127:
@@ -445,6 +459,23 @@ def expects_failure(expect: str) -> bool:
     """True if a step's expectation describes the command being refused/rejected,
     so a non-zero exit is the intended outcome rather than a candidate finding."""
     return bool(_EXPECT_FAILURE_RE.search(expect or ""))
+
+
+def step_expects_nonzero(expect: str = "", expect_exit: Any = None) -> bool:
+    """True if a step's own expectation anticipates a non-zero/decoded exit.
+
+    Used to make ``implicit_oracle``'s exit-code decode (127 / 255 / 128+n)
+    expectation-aware: on a step that DECLARED a non-zero outcome those codes are
+    the anticipated result, not a crash symptom. Mirrors the declarative-over-
+    keyword precedence of ``functional_oracle``: ``expect_exit == "nonzero"`` or a
+    non-zero integer means non-zero; ``expect_exit == 0`` still means success is
+    expected; otherwise fall back to the ``expects_failure`` phrasing inference.
+    ``bool`` is excluded (``expect_exit: true`` is not a meaningful exit code)."""
+    if expect_exit == "nonzero":
+        return True
+    if isinstance(expect_exit, int) and not isinstance(expect_exit, bool):
+        return expect_exit != 0
+    return expects_failure(expect)
 
 
 # A trailing `|| <trivial-cmd>` short-circuit whose fallback arm is itself a
