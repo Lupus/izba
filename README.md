@@ -106,6 +106,15 @@ Key properties:
   **bare** (non-enforcing) sandbox does NOT intercept TLS and ships no CA —
   connections dial straight through.
 
+  **Verifying enforcement: test with a real request, not a bare TCP connect.**
+  Because the allow/deny verdict is rendered per request/SNI at the interception
+  layer, `izbad` accepts the TCP connection *first* and decides *after* — so a
+  bare `nc host 443` or bash `/dev/tcp/host/443` prints OPEN even for a denied
+  host. Denial surfaces as the fetch failing, not as a refused connect. Probe
+  with an actual request (e.g. `curl https://host/`): an allowed host returns a
+  response, a denied one fails the TLS/HTTP exchange, and `izba netlog NAME`
+  records the verdict either way.
+
   **Working under enforce: allow-list what your tooling needs.** Default-deny
   means a fresh enforcing sandbox can reach *nothing* — including your package
   mirror — so installs and fetches fail until you grant the hosts. Add them
