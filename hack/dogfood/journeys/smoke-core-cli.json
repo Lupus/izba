@@ -90,8 +90,8 @@
           "expect": "an empty list (or a clear 'no sandboxes' message), exit 0"
         },
         {
-          "intent": "run the consistency reconciler",
-          "expect": "zero violations"
+          "intent": "check the daemon's health on this fresh install",
+          "expect": "`izba daemon status` reports a healthy daemon with no supervised sandboxes, exit 0"
         }
       ]
     },
