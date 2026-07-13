@@ -170,7 +170,7 @@
       "steps": [
         {
           "intent": "Start a sandbox and make an outbound network request from inside the guest",
-          "expect": "the request completes (or is denied by policy)"
+          "expect": "the outbound request completes (egress is off-by-default log-only on a bare sandbox) and izba records the connection for later inspection"
         },
         {
           "intent": "Look at what network activity izba recorded for that sandbox",
