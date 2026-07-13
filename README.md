@@ -17,8 +17,10 @@ pulls, builds erofs with the bundled native `mkfs.erofs.exe`, and boots
 sandboxes under OpenVMM — full CLI parity is script-validated on Windows 11
 24H2. See the
 [Windows-port design + bring-up findings](docs/superpowers/specs/2026-06-10-izba-windows-port-design.md)
-and the staging runbook in [hack/README.md](hack/README.md); there is no
-installer yet (binaries are staged by script).
+and the staging runbook in [hack/README.md](hack/README.md). Self-contained
+installers ship on `v*` tags from the [GitHub Releases](../../releases) page: a
+Linux `izba_*_amd64.deb` (bundling the CLI, cloud-hypervisor, virtiofsd, the
+kernel, and the initramfs) and a Windows `izba-setup-*.exe` (Inno Setup).
 
 ## How it works
 
@@ -117,6 +119,12 @@ Key properties:
   sandboxes.
 
 ## Quickstart
+
+**Installed from a release?** Grab the latest `izba_*_amd64.deb` (Linux/WSL2) or
+`izba-setup-*.exe` (Windows) from the [Releases](../../releases) page and install
+it — the package is self-contained (CLI + cloud-hypervisor + virtiofsd + kernel +
+initramfs), so you can **skip the artifact-staging steps below**, which are for
+building from source. Jump straight to **3. Run a sandbox**.
 
 **1. Install runtime dependencies**
 
