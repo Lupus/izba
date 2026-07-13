@@ -2,9 +2,9 @@
 //! provisioning, deprovisioning, and orphan cleanup.
 //!
 //! All three verbs call into `izba_core::jail_account::orchestrate` via the
-//! real [`WinBackend`].  On non-Windows the backend's methods return a
-//! "windows-only" error which propagates naturally; the verbs remain available
-//! on all platforms so that scripts stay portable.
+//! real [`WinBackend`].  On non-Windows the backend's methods return a clear
+//! "only available on Windows hosts" error which propagates naturally; the verbs
+//! remain available on all platforms so that scripts stay portable.
 
 use anyhow::bail;
 use izba_core::jail_account::orchestrate::{self, LockdownOutcome, WinBackend};
@@ -152,8 +152,8 @@ mod tests {
         let sb_dir = paths.sandbox_dir("test");
         std::fs::create_dir_all(&sb_dir).unwrap();
         // Write a minimal valid SandboxConfig so lockdown() can deserialise it
-        // before calling the backend's elevate() — which is where "windows-only"
-        // comes from on non-Windows.
+        // before calling the backend's elevate() — which is where the
+        // "only available on Windows hosts" error comes from on non-Windows.
         save_json(
             &sb_dir.join(CONFIG_FILE),
             &SandboxConfig {
@@ -174,7 +174,7 @@ mod tests {
         let result = run(&paths, "test");
         let err = result.unwrap_err();
         assert!(
-            format!("{err:#}").contains("windows-only"),
+            format!("{err:#}").contains("only available on Windows"),
             "expected windows-only error, got: {err:#}"
         );
     }
@@ -189,8 +189,8 @@ mod tests {
         let sb_dir = paths.sandbox_dir("test");
         std::fs::create_dir_all(&sb_dir).unwrap();
         // Write a minimal valid SandboxConfig so the existence check passes
-        // and we reach the backend's elevate() — which returns "windows-only"
-        // on non-Windows.
+        // and we reach the backend's elevate() — which returns the
+        // "only available on Windows hosts" error on non-Windows.
         save_json(
             &sb_dir.join(CONFIG_FILE),
             &SandboxConfig {
@@ -211,7 +211,7 @@ mod tests {
         let result = unlock(&paths, "test");
         let err = result.unwrap_err();
         assert!(
-            format!("{err:#}").contains("windows-only"),
+            format!("{err:#}").contains("only available on Windows"),
             "expected windows-only error, got: {err:#}"
         );
     }
@@ -237,7 +237,7 @@ mod tests {
         let result = cleanup(&paths);
         let err = result.unwrap_err();
         assert!(
-            format!("{err:#}").contains("windows-only"),
+            format!("{err:#}").contains("only available on Windows"),
             "expected windows-only error, got: {err:#}"
         );
     }

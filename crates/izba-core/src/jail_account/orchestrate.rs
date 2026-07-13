@@ -70,7 +70,11 @@ pub struct WinBackend;
 #[cfg(not(windows))]
 impl LockdownBackend for WinBackend {
     fn elevate(&self, _argv: &[String]) -> Result<ElevationOutcome, String> {
-        Err("windows-only".into())
+        Err(format!(
+            "per-sandbox Windows account lock-down is only available on Windows hosts \
+             (this build is running on {})",
+            std::env::consts::OS
+        ))
     }
 
     fn seal(&self, _plain: &[u8]) -> Result<Vec<u8>, String> {
@@ -188,7 +192,7 @@ pub fn lockdown<B: LockdownBackend>(
     let argv = provision_argv(name, &grants, &ro, &sid_out, &cred_out);
     match backend
         .elevate(&argv)
-        .map_err(|e| anyhow!("elevate provision: {e}"))?
+        .map_err(|e| anyhow!("cannot lock down {name:?}: {e}"))?
     {
         ElevationOutcome::Cancelled => return Ok(LockdownOutcome::Cancelled),
         ElevationOutcome::Failed(msg) => bail!("provision helper failed: {msg}"),
@@ -257,7 +261,7 @@ pub fn unlock<B: LockdownBackend>(backend: &B, paths: &Paths, name: &str) -> any
     let argv = deprovision_argv(name);
     match backend
         .elevate(&argv)
-        .map_err(|e| anyhow!("elevate deprovision: {e}"))?
+        .map_err(|e| anyhow!("cannot unlock {name:?}: {e}"))?
     {
         ElevationOutcome::Cancelled => bail!("unlock cancelled by user"),
         ElevationOutcome::Failed(msg) => bail!("deprovision helper failed: {msg}"),
@@ -293,7 +297,7 @@ pub fn windows_cleanup<B: LockdownBackend>(
     let argv = gc_argv(live);
     match backend
         .elevate(&argv)
-        .map_err(|e| anyhow!("elevate gc: {e}"))?
+        .map_err(|e| anyhow!("cannot sweep orphaned lock-down accounts: {e}"))?
     {
         ElevationOutcome::Cancelled => bail!("gc cancelled by user"),
         ElevationOutcome::Failed(msg) => bail!("gc helper failed: {msg}"),
