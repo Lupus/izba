@@ -13,6 +13,7 @@ from oracles import (  # noqa: E402
     Candidate,
     expects_failure,
     functional_oracle,
+    masks_exit_status_with_echo,
     masks_success_with_trivial_fallback,
     implicit_oracle,
     latency_oracle,
@@ -156,6 +157,36 @@ class FunctionalOracleTests(unittest.TestCase):
         for cmd in ("test -f x", "cmd || grep foo", "cmd || echoserver",
                     "cmd && echo ok", "cmd || izba status"):
             self.assertFalse(masks_success_with_trivial_fallback(cmd), cmd)
+
+    def test_echo_status_tail_masks_expected_failure(self):
+        # run-rm-throwaway-propagates-exit: the trailing `; echo $?` resets the
+        # compound exit to 0, so an expected-nonzero step reads exit 0 as a false
+        # divergence even though izba propagated 42 (proven by stdout). Flag it as
+        # a masked_probe instead of a spurious functional divergence.
+        c = functional_oracle(
+            "izba run --rm -- sh -c 'exit 42'; echo $?", 0,
+            "izba propagates the workload's non-zero exit code",
+            expect_exit="nonzero")
+        self.assertTrue(any(x.kind == "masked_probe" for x in c))
+        self.assertIn("unverifiable", c[0].detail)
+
+    def test_echo_status_tail_masks_expected_success(self):
+        # Same masking corrupts an expected-SUCCESS step: exit 0 is unverifiable,
+        # not a corroborated pass.
+        c = functional_oracle(
+            "izba exec vol -- test -f /data/hello.txt; echo $?", 0,
+            "the persisted file is still present after restart")
+        self.assertTrue(any(x.kind == "masked_probe" for x in c))
+
+    def test_masks_exit_status_with_echo_heuristic(self):
+        for cmd in ("izba run --rm -- sh -c 'exit 42'; echo $?",
+                    "cmd ;echo $?", 'cmd; echo "$?"', "cmd; echo $?   "):
+            self.assertTrue(masks_exit_status_with_echo(cmd), cmd)
+        for cmd in ("echo $?",                       # whole command, no probe
+                    "izba exec x -- sh -c 'echo $? > /tmp/rc'; izba ls",  # not trailing
+                    "izba run -- sh -c 'test $? -eq 0'",  # $? mid-command
+                    "cmd && echo $?"):               # not a `;` reset
+            self.assertFalse(masks_exit_status_with_echo(cmd), cmd)
 
     def test_candidate_is_dataclass_with_ref(self):
         c = functional_oracle("izba x", 1, "succeeds",
