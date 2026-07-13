@@ -13,6 +13,7 @@ from oracles import (  # noqa: E402
     Candidate,
     expects_failure,
     functional_oracle,
+    masks_success_with_trivial_fallback,
     implicit_oracle,
     latency_oracle,
     reconcile_seq_oracle,
@@ -120,6 +121,41 @@ class FunctionalOracleTests(unittest.TestCase):
 
     def test_empty_expect_never_fires(self):
         self.assertEqual(functional_oracle("izba ls", 1, ""), [])
+
+    def test_masked_probe_false_green_is_flagged(self):
+        # izba#78: the `|| echo` arm makes the compound exit 0 even though the
+        # file is gone, so exit 0 must NOT be credited as an expected success.
+        c = functional_oracle(
+            "izba exec vol -- sh -c 'test -f /data/hello.txt || echo \"file does not exist\"'",
+            0, "the persisted file is still present after restart")
+        self.assertTrue(any(x.kind == "masked_probe" for x in c))
+        self.assertIn("unverifiable", c[0].detail)
+
+    def test_masked_probe_does_not_flip_expected_failure(self):
+        # A legit `cmd || true` on an expected-FAILURE step: the refusal path
+        # owns exit 0 (silent success == bug) and masking must not double-count
+        # or reclassify it. Exit non-zero here is the intended pass -> clean.
+        self.assertEqual(
+            functional_oracle("izba volume rm in-use || true", 1,
+                              "the removal is refused with a clear in-use error"),
+            [])
+
+    def test_plain_success_command_unchanged(self):
+        # No masking tail -> the ordinary expected-success path is untouched.
+        self.assertEqual(
+            functional_oracle("izba exec vol -- test -f /data/hello.txt", 0,
+                              "the persisted file is still present"), [])
+        c = functional_oracle("izba exec vol -- test -f /data/hello.txt", 1,
+                              "the persisted file is still present")
+        self.assertTrue(any(x.kind == "functional" for x in c))
+
+    def test_masks_success_with_trivial_fallback_heuristic(self):
+        for cmd in ("test -f x || echo gone", "cmd || true", "cmd || :",
+                    "cmd || printf no"):
+            self.assertTrue(masks_success_with_trivial_fallback(cmd), cmd)
+        for cmd in ("test -f x", "cmd || grep foo", "cmd || echoserver",
+                    "cmd && echo ok", "cmd || izba status"):
+            self.assertFalse(masks_success_with_trivial_fallback(cmd), cmd)
 
     def test_candidate_is_dataclass_with_ref(self):
         c = functional_oracle("izba x", 1, "succeeds",

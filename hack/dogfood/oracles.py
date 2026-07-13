@@ -57,7 +57,7 @@ class Action:
 class Candidate:
     """A possible-bug finding emitted by an oracle. Matches trajectory.schema.json."""
 
-    kind: str  # functional | latency | implicit | reconcile_seq
+    kind: str  # functional | masked_probe | latency | implicit | reconcile_seq
               # | reconcile_violation | guest_console (and runner-emitted: infra | unreached_decisive)
     detail: str
     violated_expectation: str = ""
@@ -447,6 +447,25 @@ def expects_failure(expect: str) -> bool:
     return bool(_EXPECT_FAILURE_RE.search(expect or ""))
 
 
+# A trailing `|| <trivial-cmd>` short-circuit whose fallback arm is itself a
+# trivially-succeeding command (echo/printf/true/:). The compound's overall exit
+# status is then 0 even when the real probe on the left failed, so exit 0 cannot
+# corroborate an expected-success step. Deliberately narrow (word-boundaried,
+# no arbitrary-shell parsing) so it only fires on the unambiguous masking shape.
+_TRIVIAL_FALLBACK_RE = re.compile(r"\|\|\s*(?:echo\b|printf\b|true\b|:)")
+
+
+def masks_success_with_trivial_fallback(command: str) -> bool:
+    """True if ``command`` ends a ``||`` short-circuit with a trivially-succeeding
+    fallback (echo/printf/true/:), so its overall exit 0 can hide a failed probe.
+
+    A conservative heuristic, NOT a shell parser: it recognizes only the
+    ``<probe> || <trivial>`` masking shape that silently turns a failed
+    persistence/existence check into a false green (izba#78:
+    ``test -f /data/hello.txt || echo "file does not exist"`` always exits 0)."""
+    return bool(_TRIVIAL_FALLBACK_RE.search(command or ""))
+
+
 def functional_oracle(
     command: str,
     exit_code: int,
@@ -524,6 +543,22 @@ def functional_oracle(
                 trajectory_ref=ref,
             )]
         return []
+    # Expected-success path. Before crediting exit 0 as corroborating success,
+    # reject an exit status that a trailing `|| <trivial>` fallback has masked:
+    # the compound exits 0 regardless of whether the probe passed, so this is an
+    # UNVERIFIABLE success, not a pass (izba#78 false green). Only fires on
+    # expected-success steps — an expected-failure step is handled above, so a
+    # legit `cmd || true` there is never flipped.
+    if exit_code == 0 and masks_success_with_trivial_fallback(command):
+        return [Candidate(
+            kind="masked_probe",
+            detail=(f"command {command!r} exited 0 but a trailing '|| <trivial>' "
+                    f"fallback masks the probe's real exit status — its success "
+                    f"is unverifiable, not corroborated"),
+            violated_expectation=expect,
+            source=source,
+            trajectory_ref=ref,
+        )]
     if exit_code != 0:
         return [Candidate(
             kind="functional",
