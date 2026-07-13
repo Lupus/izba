@@ -176,7 +176,12 @@ class FunctionalOracleTests(unittest.TestCase):
                     "cmd || printf no"):
             self.assertTrue(masks_success_with_trivial_fallback(cmd), cmd)
         for cmd in ("test -f x", "cmd || grep foo", "cmd || echoserver",
-                    "cmd && echo ok", "cmd || izba status"):
+                    "cmd && echo ok", "cmd || izba status",
+                    # a mid-command fallback does not own the compound's exit
+                    # (Greptile P1 on PR #137): a later clause decides it.
+                    "check || echo warning; verify",
+                    "check || echo warn && verify",
+                    "check || true; verify"):
             self.assertFalse(masks_success_with_trivial_fallback(cmd), cmd)
 
     def test_echo_status_tail_masks_expected_failure(self):
@@ -261,13 +266,17 @@ class StepExpectsNonzeroTests(unittest.TestCase):
     def test_expect_exit_zero_is_success(self):
         self.assertFalse(step_expects_nonzero("", 0))
 
-    def test_expect_exit_true_bool_falls_back_to_phrasing(self):
-        # `expect_exit: true` is not a meaningful code -> phrasing governs.
+    def test_expect_exit_true_bool_is_not_a_code(self):
+        # `expect_exit: true` is not a meaningful code -> declarative-only, no
+        # phrasing fallback: prose must never suppress the implicit decode.
         self.assertFalse(step_expects_nonzero("succeeds", True))
-        self.assertTrue(step_expects_nonzero("the command is refused", True))
+        self.assertFalse(step_expects_nonzero("the command is refused", True))
 
-    def test_phrasing_fallback(self):
-        self.assertTrue(step_expects_nonzero("the command is refused"))
+    def test_no_phrasing_fallback(self):
+        # Prose alone never anticipates non-zero (Greptile P1 on PR #137): a
+        # broad "should not corrupt state" must not hide a real exit-139 crash.
+        self.assertFalse(step_expects_nonzero("the command is refused"))
+        self.assertFalse(step_expects_nonzero("the daemon should not corrupt state"))
         self.assertFalse(step_expects_nonzero("succeeds with no error"))
 
 
