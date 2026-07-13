@@ -466,24 +466,33 @@ def step_expects_nonzero(expect: str = "", expect_exit: Any = None) -> bool:
 
     Used to make ``implicit_oracle``'s exit-code decode (127 / 255 / 128+n)
     expectation-aware: on a step that DECLARED a non-zero outcome those codes are
-    the anticipated result, not a crash symptom. Mirrors the declarative-over-
-    keyword precedence of ``functional_oracle``: ``expect_exit == "nonzero"`` or a
-    non-zero integer means non-zero; ``expect_exit == 0`` still means success is
-    expected; otherwise fall back to the ``expects_failure`` phrasing inference.
+    the anticipated result, not a crash symptom. DECLARATIVE ONLY:
+    ``expect_exit == "nonzero"`` or a non-zero integer means non-zero;
+    ``expect_exit == 0`` still means success is expected. Unlike
+    ``functional_oracle`` this deliberately does NOT fall back to the
+    ``expects_failure`` phrasing inference — broad prose ("the daemon should not
+    corrupt state") must never suppress the implicit decode of a real signal
+    crash (Greptile P1 on PR #137); a journey that anticipates non-zero exits
+    declares ``expect_exit`` explicitly.
     ``bool`` is excluded (``expect_exit: true`` is not a meaningful exit code)."""
     if expect_exit == "nonzero":
         return True
     if isinstance(expect_exit, int) and not isinstance(expect_exit, bool):
         return expect_exit != 0
-    return expects_failure(expect)
+    return False
 
 
 # A trailing `|| <trivial-cmd>` short-circuit whose fallback arm is itself a
 # trivially-succeeding command (echo/printf/true/:). The compound's overall exit
 # status is then 0 even when the real probe on the left failed, so exit 0 cannot
 # corroborate an expected-success step. Deliberately narrow (word-boundaried,
-# no arbitrary-shell parsing) so it only fires on the unambiguous masking shape.
-_TRIVIAL_FALLBACK_RE = re.compile(r"\|\|\s*(?:echo\b|printf\b|true\b|:)")
+# no arbitrary-shell parsing) so it only fires on the unambiguous masking shape —
+# and only when the trivial fallback is the FINAL clause: a `|| echo`
+# mid-command (`check || echo warn; verify`) does not own the compound's exit,
+# so it must not fire (Greptile P1 on PR #137).
+_TRIVIAL_FALLBACK_RE = re.compile(
+    r"\|\|\s*(?:(?:echo|printf)\b[^;|&]*|true\b\s*|:\s*)[\"']?\s*$"
+)
 
 
 def masks_success_with_trivial_fallback(command: str) -> bool:
