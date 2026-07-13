@@ -69,6 +69,14 @@ pub struct WinBackend;
 
 #[cfg(not(windows))]
 impl LockdownBackend for WinBackend {
+    // `#[mutants::skip]`: structurally uncoverable on every gate platform — the
+    // `Ok(Default::default())` mutant is unviable on Linux (`ElevationOutcome`
+    // has no `Default`, so it does not compile) and this cfg(not(windows)) body
+    // is compiled out on the Windows shards, where the mutation trivially
+    // survives as a no-op. The stub's only behavior (the clear not-on-Windows
+    // error) is pinned by the lockdown_*_returns_windows_only_on_non_windows
+    // CLI tests.
+    #[mutants::skip]
     fn elevate(&self, _argv: &[String]) -> Result<ElevationOutcome, String> {
         Err(format!(
             "per-sandbox Windows account lock-down is only available on Windows hosts \
