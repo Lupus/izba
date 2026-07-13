@@ -32,7 +32,8 @@ fn short_version() -> &'static str {
 /// Options shared by `create` and `run`.
 #[derive(Debug, Clone, Args)]
 struct SandboxOpts {
-    /// Container image to boot
+    /// Container image to boot (supplies the guest's tooling; minimal images
+    /// lack curl/python3/sudo — install via its package manager)
     #[arg(long, default_value_t = commands::DEFAULT_IMAGE.to_string())]
     image: String,
     /// Number of virtual CPUs

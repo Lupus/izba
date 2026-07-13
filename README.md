@@ -152,6 +152,14 @@ izba run --image alpine:3.20 .
 This creates (if needed), starts, and drops you into a shell inside the
 sandbox, with your current directory shared at `/workspace`.
 
+Your tooling comes from the image: minimal bases (`alpine:3.20`, the default
+`ubuntu:24.04`) ship without `curl`, `python3`, `sudo`, and friends, so a first
+task like "fetch a URL" or "run a server" hits command-not-found. Install what
+you need via the image's package manager (`apk add …`, `apt-get install …`) or
+pick a fuller image. Under an **enforcing** egress policy the sandbox reaches
+nothing by default, so allow-list your package mirror first (see "Working under
+enforce" above) or the install itself fails.
+
 See [`docs/testing.md`](docs/testing.md) for the full runbook and the
 integration test suite.
 
