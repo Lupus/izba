@@ -466,6 +466,30 @@ def masks_success_with_trivial_fallback(command: str) -> bool:
     return bool(_TRIVIAL_FALLBACK_RE.search(command or ""))
 
 
+# A trailing ``; echo $?`` (and close variants) appended to a graded command:
+# the ``echo`` always exits 0, so the compound's exit status no longer reflects
+# the probe on its left. Anchored at end-of-command (allowing trailing whitespace
+# and quoting around ``$?``); no shell parsing — only the unambiguous trailing
+# ``echo $?`` shape fires. The leading ``;`` is required so a bare ``echo $?``
+# whole-command (which merely PRINTS the status without owning a probe) is left
+# alone, as is any ``$?`` used mid-command.
+_ECHO_STATUS_TAIL_RE = re.compile(r";\s*echo\s+[\"']?\$\?[\"']?\s*$")
+
+
+def masks_exit_status_with_echo(command: str) -> bool:
+    """True if ``command`` ends in a trailing ``; echo $?`` (and close variants
+    ``;echo $?`` / ``; echo "$?"``), which RESETS the compound's exit status to
+    the echo's own 0 — the graded exit then no longer reflects the probe.
+
+    Unlike the ``|| <trivial>`` fallback (which only masks a FAILURE), this masks
+    symmetrically: it corrupts both expected-success grading (false green) and
+    expected-failure grading (a correctly-failed probe reads as exit 0, i.e. a
+    false divergence). izba's ``run-rm-throwaway-propagates-exit`` was falsely
+    flipped by exactly this: ``izba run --rm -- sh -c 'exit 42'; echo $?`` exits
+    0 even though izba propagated 42 correctly (the ``42`` on stdout proves it)."""
+    return bool(_ECHO_STATUS_TAIL_RE.search(command or ""))
+
+
 def functional_oracle(
     command: str,
     exit_code: int,
@@ -504,6 +528,30 @@ def functional_oracle(
     "expected success, hard error" / "expected refusal, silent success" cases.
     """
     ref = dict(ref or {"journey_id": "", "action_index": -1})
+    # A trailing `; echo $?` RESETS the compound's exit status to the echo's own
+    # 0, so the graded exit no longer reflects the probe. Unlike the `|| <trivial>`
+    # fallback (which only masks failure, handled in the expected-success path
+    # below), this corrupts BOTH expected-success grading (false green) and
+    # expected-failure grading (a correctly-failed probe reads as exit 0 -> false
+    # divergence). Flag it symmetrically, before any exit-status verdict is drawn,
+    # whenever a verdict WOULD be drawn (some `expect`/`expect_exit` grading applies).
+    _grading = (
+        expect_exit == "nonzero"
+        or (isinstance(expect_exit, int) and not isinstance(expect_exit, bool))
+        or bool(expect)
+    )
+    if _grading and masks_exit_status_with_echo(command):
+        return [Candidate(
+            kind="masked_probe",
+            detail=(f"command {command!r} ends in a trailing '; echo $?' which "
+                    f"resets the compound's exit status to 0 — the graded exit no "
+                    f"longer reflects the probe, so its verdict is unverifiable"),
+            violated_expectation=(
+                expect or (f"expect_exit: {expect_exit}"
+                           if expect_exit is not None else "")),
+            source=source,
+            trajectory_ref=ref,
+        )]
     # Declarative assertion takes precedence over the fragile keyword heuristic.
     # `bool` is a subclass of `int`, so exclude it explicitly — `expect_exit:
     # true` is not a meaningful exit code and must not be read as `1`.
