@@ -19,6 +19,7 @@ from oracles import (  # noqa: E402
     latency_oracle,
     reconcile_seq_oracle,
     run_action,
+    step_expects_nonzero,
 )
 
 
@@ -76,6 +77,26 @@ class OracleTests(unittest.TestCase):
         c = implicit_oracle(act(command="izba foo", stderr_tail="panic"))
         self.assertTrue(c)
         self.assertIsInstance(c[0], Candidate)
+
+    def test_expected_nonzero_suppresses_signal_decode(self):
+        # A step that anticipated a non-zero exit (exec-exit-code-contract) must
+        # NOT self-flip: exit 137 = Signal(9) is the anticipated outcome.
+        self.assertEqual(
+            implicit_oracle(act(exit_code=137), expect_nonzero=True), [])
+
+    def test_expected_success_still_flags_signal_decode(self):
+        # Unchanged: a step expecting success that dies from a signal is a finding.
+        c = implicit_oracle(act(exit_code=137), expect_nonzero=False)
+        self.assertTrue(any("Signal(9)" in x.detail for x in c))
+
+    def test_expected_nonzero_still_flags_crash_marker(self):
+        # Crash MARKERS flag unconditionally — only the exit-code decode is
+        # expectation-aware.
+        c = implicit_oracle(
+            act(exit_code=137, stderr_tail="thread 'main' panicked at foo.rs:1"),
+            expect_nonzero=True)
+        self.assertTrue(any("panicked" in x.detail for x in c))
+        self.assertFalse(any("Signal" in x.detail for x in c))
 
 
 class FunctionalOracleTests(unittest.TestCase):
@@ -228,6 +249,26 @@ class ExpectExitOracleTests(unittest.TestCase):
         # A True bool must NOT be read as exit code 1 -> still falls back.
         self.assertTrue(functional_oracle(
             "izba create x", 1, "create succeeds", expect_exit=True))
+
+
+class StepExpectsNonzeroTests(unittest.TestCase):
+    def test_expect_exit_nonzero_string(self):
+        self.assertTrue(step_expects_nonzero("", "nonzero"))
+
+    def test_expect_exit_nonzero_integer(self):
+        self.assertTrue(step_expects_nonzero("", 137))
+
+    def test_expect_exit_zero_is_success(self):
+        self.assertFalse(step_expects_nonzero("", 0))
+
+    def test_expect_exit_true_bool_falls_back_to_phrasing(self):
+        # `expect_exit: true` is not a meaningful code -> phrasing governs.
+        self.assertFalse(step_expects_nonzero("succeeds", True))
+        self.assertTrue(step_expects_nonzero("the command is refused", True))
+
+    def test_phrasing_fallback(self):
+        self.assertTrue(step_expects_nonzero("the command is refused"))
+        self.assertFalse(step_expects_nonzero("succeeds with no error"))
 
 
 class ExitCodeMappingTests(unittest.TestCase):

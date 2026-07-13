@@ -49,6 +49,7 @@ from oracles import (  # noqa: E402
     latency_oracle,
     reconcile_seq_oracle,
     run_action,
+    step_expects_nonzero,
     teardown_journey,
 )
 
@@ -259,7 +260,14 @@ def _collect_candidates(action, command, action_index, prev_reconcile,
     so an intermediate recovery action inside an otherwise-passing step no longer
     emits a spurious functional candidate (the #111 setup-noise false-negative)."""
     ref = {"journey_id": journey_id, "action_index": action_index}
-    found = implicit_oracle(action) + latency_oracle(action, latency_budget_ms)
+    # The implicit oracle's exit-code decode (127/255/128+n) is suppressed when the
+    # step itself declared a non-zero/decoded exit — those codes are then the
+    # anticipated outcome, not a crash (crash markers still flag unconditionally).
+    found = implicit_oracle(
+        action,
+        expect_nonzero=step_expects_nonzero(
+            step.get("expect", ""), step.get("expect_exit")),
+    ) + latency_oracle(action, latency_budget_ms)
     if prev_reconcile is not None:
         found += reconcile_seq_oracle(prev_reconcile, action.reconcile)
     violations = _flipping_violations(
