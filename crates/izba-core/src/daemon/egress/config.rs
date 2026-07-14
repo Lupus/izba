@@ -130,7 +130,7 @@ impl GitTarget {
 }
 
 /// A sandbox's egress policy, parsed from its `--policy` YAML.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct EgressPolicyConfig {
     /// Explicit posture. Always written by izba (smell: empty-vs-missing). A
     /// present file with no `enforce:` key resolves to `true` (see `from_yaml`).
@@ -141,6 +141,20 @@ pub struct EgressPolicyConfig {
     /// Git-specific rules (target + access verb).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub git: Vec<GitRule>,
+}
+
+impl<'de> Deserialize<'de> for EgressPolicyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Every deserialization of this type — the izba.yml manifest's
+        // `spec.egress` block included — funnels through the same strict
+        // walk as `from_yaml`, so an unknown key can never silently widen
+        // egress scope on any ingestion path (#138).
+        let doc = serde_yaml::Value::deserialize(deserializer)?;
+        Self::from_value(&doc).map_err(|e| serde::de::Error::custom(format!("{e:#}")))
+    }
 }
 
 impl EgressPolicyConfig {
@@ -183,13 +197,16 @@ impl EgressPolicyConfig {
     /// deny-all — a declared-but-allow-nothing sandbox. A present file without
     /// an explicit `enforce:` key defaults to `enforce: true` (authoring intent).
     ///
-    /// Parsed MANUALLY over `serde_yaml::Value`, not via the derived
-    /// `Deserialize`: the untagged `AllowEntry` and flattened `GitRule` make
-    /// `#[serde(deny_unknown_fields)]` inert, and a typo'd key silently
+    /// Parsed MANUALLY over `serde_yaml::Value`, not via a derived
+    /// `Deserialize`: the untagged `AllowEntry` and flattened `GitRule` would
+    /// make `#[serde(deny_unknown_fields)]` inert, and a typo'd key silently
     /// falling back to the permissive default is a security footgun (#138).
     /// The manual walk hard-rejects unknown keys at every level and names the
-    /// offending field path plus its valid alternatives (#83). The derived
-    /// impls remain for the `izba.yml` manifest path and for serialization.
+    /// offending field path plus its valid alternatives (#83).
+    /// `EgressPolicyConfig`'s `Deserialize` impl (below) delegates to
+    /// `from_value` too, so every ingestion path — `policy.yaml` via
+    /// `from_yaml`/`load` AND the `izba.yml` manifest's `spec.egress` block —
+    /// shares this exact strict walk; only `Serialize` stays derived.
     pub fn from_yaml(s: &str) -> Result<Self> {
         // serde_yaml maps an all-comments/empty document to `null`; treat that
         // as present-but-empty (enforce=true, no rules). Syntax errors keep

@@ -2,11 +2,12 @@
 //! `spec`. The `egress` block reuses `EgressPolicyConfig` verbatim — it is
 //! structurally identical to `policy.yaml`.
 //!
-//! NOTE: `spec.egress` deserializes via `EgressPolicyConfig`'s *derived*
-//! `Deserialize` impl, not the strict manual walk in `from_yaml`/`from_value`
-//! (#138). A stray/misspelled key under `spec.egress` is silently dropped
-//! here instead of hard-erroring; extending #138's strict-key validation to
-//! the manifest path is a tracked follow-up (#138 manifest-path residual).
+//! `spec.egress` deserializes via `EgressPolicyConfig`'s manual `Deserialize`
+//! impl, which delegates to the same strict `from_value` walk `policy.yaml`
+//! gets via `from_yaml` (#138). A stray/misspelled key under `spec.egress` is
+//! a hard error naming the field path and valid keys, not a silent drop — the
+//! manifest path is an agent-writable trust boundary, so this closes the
+//! #138 residual there too.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -64,8 +65,8 @@ pub struct SandboxSpec {
     pub volumes: Vec<VolumeMount>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortMapping>,
-    /// Deserialized via the DERIVED impl (unknown keys silently dropped, not
-    /// the strict `from_yaml` walk `policy.yaml` gets) — see the module doc.
+    /// Shares `EgressPolicyConfig`'s strict `from_value` walk — the same
+    /// validation `policy.yaml` gets via `from_yaml` — see the module doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressPolicyConfig>,
 }
@@ -335,6 +336,63 @@ spec:
         assert_eq!(
             quantity::parse_gib(DEFAULT_ROOT_DISK_SIZE).unwrap(),
             DEFAULT_RW_GB
+        );
+    }
+
+    // ── #138 manifest-path residual: spec.egress strict validation ─────────────
+
+    /// A `portz:` typo in an `allow` entry must be a hard error, not silently
+    /// dropped down to the permissive bare-host default (the #138 footgun,
+    /// now closed on the manifest ingestion path too).
+    #[test]
+    fn egress_unknown_allow_key_is_rejected() {
+        let y = SAMPLE.replace(
+            "  egress:\n    enforce: true\n    allow:\n      - github.com\n",
+            "  egress:\n    enforce: true\n    allow:\n      - host: github.com\n        portz: [80]\n",
+        );
+        // `{:#}` pulls in the full anyhow chain — the top-level context is
+        // just "parsing izba.yml"; the field-path detail lives in the source.
+        let err = format!("{:#}", Manifest::load_str(&y).unwrap_err());
+        assert!(err.contains("portz"), "got: {err}");
+        assert!(err.contains("valid keys"), "got: {err}");
+    }
+
+    #[test]
+    fn egress_unknown_top_level_key_is_rejected() {
+        let y = SAMPLE.replace(
+            "  egress:\n    enforce: true\n",
+            "  egress:\n    enforce: true\n    bad_field: true\n",
+        );
+        let err = format!("{:#}", Manifest::load_str(&y).unwrap_err());
+        assert!(err.contains("bad_field"), "got: {err}");
+    }
+
+    #[test]
+    fn egress_unknown_git_key_is_rejected() {
+        let y = SAMPLE.replace(
+            "  egress:\n    enforce: true\n    allow:\n      - github.com\n",
+            "  egress:\n    enforce: true\n    git:\n      - target: github.com/me/repo\n",
+        );
+        let err = format!("{:#}", Manifest::load_str(&y).unwrap_err());
+        assert!(err.contains("target"), "got: {err}");
+        assert!(err.contains("repo"), "got: {err}");
+    }
+
+    /// An `egress:` block present without an `enforce:` key now defaults to
+    /// `enforce: true` (authoring intent), matching `policy.yaml`'s
+    /// `from_yaml` semantics — was a hard "missing field `enforce`" error
+    /// under the old derived `Deserialize`.
+    #[test]
+    fn egress_without_enforce_defaults_to_enforcing() {
+        let y = SAMPLE.replace(
+            "  egress:\n    enforce: true\n    allow:\n      - github.com\n",
+            "  egress:\n    allow:\n      - github.com\n",
+        );
+        let m = Manifest::load_str(&y).expect("egress without enforce must parse");
+        let eg = m.spec.egress.as_ref().unwrap();
+        assert!(
+            eg.enforce,
+            "present egress block without enforce: defaults true"
         );
     }
 }
