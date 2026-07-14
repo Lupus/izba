@@ -198,6 +198,7 @@ mod tests {
     fn test_paths() -> (tempfile::TempDir, Paths) {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::with_root(dir.path().join("izba"));
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
         std::fs::create_dir_all(paths.run_dir("web")).unwrap();
         (dir, paths)
     }

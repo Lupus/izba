@@ -40,7 +40,23 @@ impl Paths {
         self.root.join("images")
     }
 
+    /// Per-sandbox runtime (socket) dir: `<root>/run/<hex8(sha256(name))>`.
+    ///
+    /// Deliberately short and name-length-independent: every AF_UNIX socket a
+    /// sandbox needs (hybrid-vsock, egress `_1027`, virtiofsd, CH API) lives
+    /// here, and `sun_path` caps the whole path at 108 bytes. Hashing the
+    /// name keeps a 64-char valid name from overflowing the cap (#85) and
+    /// maximizes the data-dir depth budget (#71). The dir for an
+    /// already-running sandbox is recorded in its `state.json` (`RunState::
+    /// run_dir`); this accessor is the *start-context* chooser.
     pub fn run_dir(&self, name: &str) -> PathBuf {
+        self.root.join("run").join(short_name_hash(name))
+    }
+
+    /// The pre-hash runtime-dir layout (`<root>/sandboxes/<name>/run`), kept
+    /// only to manage sandboxes started by an older izba: a `state.json`
+    /// without `run_dir` resolves here. Never used for new starts.
+    pub fn legacy_run_dir(&self, name: &str) -> PathBuf {
         self.sandbox_dir(name).join("run")
     }
 
@@ -163,6 +179,13 @@ fn windows_default_root(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
         .join("izba")
 }
 
+/// First 8 hex chars of `sha256(name)` — the runtime-dir leaf component.
+fn short_name_hash(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(name.as_bytes());
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,10 +201,7 @@ mod tests {
             p.image_dir("sha256:abc"),
             PathBuf::from("/data/izba/images/sha256-abc")
         );
-        assert_eq!(
-            p.run_dir("web"),
-            PathBuf::from("/data/izba/sandboxes/web/run")
-        );
+        assert!(p.run_dir("web").starts_with("/data/izba/run"));
         assert_eq!(
             p.logs_dir("web"),
             PathBuf::from("/data/izba/sandboxes/web/logs")
@@ -194,6 +214,41 @@ mod tests {
         assert_eq!(
             p.daemon_log(),
             PathBuf::from("/data/izba/daemon/daemon.log")
+        );
+    }
+
+    #[test]
+    fn run_dir_is_short_and_name_hashed() {
+        let p = Paths::with_root("/data/izba".into());
+        let d = p.run_dir("web");
+        // `<root>/run/<8 hex>` — the name itself must NOT appear (SUN_LEN, #85).
+        assert!(d.starts_with("/data/izba/run"), "{d:?}");
+        let leaf = d.file_name().unwrap().to_str().unwrap();
+        assert_eq!(leaf.len(), 8, "{leaf}");
+        assert!(leaf.chars().all(|c| c.is_ascii_hexdigit()), "{leaf}");
+        // Deterministic and per-name unique.
+        assert_eq!(d, p.run_dir("web"));
+        assert_ne!(d, p.run_dir("web2"));
+    }
+
+    #[test]
+    fn run_dir_length_is_name_independent() {
+        // The #85 guarantee: a max-length (64-char) valid name yields exactly
+        // the same socket-path length as a 1-char name.
+        let p = Paths::with_root("/data/izba".into());
+        let long = "a".repeat(64);
+        assert_eq!(
+            p.run_dir(&long).as_os_str().len(),
+            p.run_dir("b").as_os_str().len()
+        );
+    }
+
+    #[test]
+    fn legacy_run_dir_is_the_pre_hash_layout() {
+        let p = Paths::with_root("/data/izba".into());
+        assert_eq!(
+            p.legacy_run_dir("web"),
+            PathBuf::from("/data/izba/sandboxes/web/run")
         );
     }
 
