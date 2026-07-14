@@ -110,14 +110,20 @@ pub enum LockdownOutcome {
 /// Compute the set of host paths the sandbox account must be able to read/write
 /// (`Modify` DACL level).
 ///
-/// Returns `[workspace, sandbox_dir]` plus the image path for every
+/// Returns `[workspace, sandbox_dir, run_dir]` plus the image path for every
 /// **persistent** (named) volume.  Anonymous volumes live under `sandbox_dir`
 /// and are therefore already covered.
 ///
 /// This function is pure — it performs no I/O — and is therefore host-testable
 /// on all platforms.
 pub fn compute_grants(config: &SandboxConfig, paths: &Paths, name: &str) -> Vec<PathBuf> {
-    let mut grants = vec![config.workspace.clone(), paths.sandbox_dir(name)];
+    // The hashed runtime dir holds the AF_UNIX sockets the VMM must bind and
+    // lives OUTSIDE sandbox_dir (SUN_LEN, #71/#85) — grant it explicitly.
+    let mut grants = vec![
+        config.workspace.clone(),
+        paths.sandbox_dir(name),
+        paths.run_dir(name),
+    ];
     for v in &config.volumes {
         if v.is_persistent() {
             // Persistent volumes are keyed by name; `volume_image` returns
@@ -164,7 +170,7 @@ pub fn compute_ro_grants(config: &SandboxConfig, paths: &Paths) -> Vec<PathBuf> 
 /// # Steps
 ///
 /// 1. Load `config.json` from the sandbox directory.
-/// 2. Compute grants (workspace + sandbox dir + named volume images).
+/// 2. Compute grants (workspace + sandbox dir + run dir + named volume images).
 /// 3. Run the elevated helper via `backend.elevate(provision_argv(…))`.
 /// 4. Read the SID + credential written by the helper to temporary files.
 /// 5. Seal the credential with `backend.seal` (DPAPI on Windows).
@@ -670,6 +676,30 @@ mod tests {
         assert!(!grants.contains(&anon_path));
         // But sandbox_dir itself is still there.
         assert!(grants.contains(&paths.sandbox_dir(SANDBOX_NAME)));
+    }
+
+    #[test]
+    fn compute_grants_includes_the_hashed_runtime_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let cfg = SandboxConfig {
+            image_digest: "sha256:abc".to_string(),
+            image_ref: "ubuntu:22.04".to_string(),
+            cpus: 2,
+            mem_mb: 512,
+            workspace: PathBuf::from("/my/workspace"),
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            builder: false,
+            build: None,
+            rw_size_gb: 8,
+        };
+        let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
+        assert!(grants.contains(&paths.run_dir(SANDBOX_NAME)), "{grants:?}");
+        assert!(
+            grants.contains(&paths.sandbox_dir(SANDBOX_NAME)),
+            "{grants:?}"
+        );
     }
 
     // ── lockdown happy path ───────────────────────────────────────────────────
