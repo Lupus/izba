@@ -14,7 +14,9 @@ fn force_rm_warning(detail: &SandboxDetail) -> Option<String> {
     let names: Vec<String> = detail
         .volumes
         .iter()
-        .filter(|v| v.is_persistent())
+        // A volume is persistent exactly when it has a name (`is_persistent()`
+        // is defined as `name.is_some()`), so filter_map on the name alone
+        // already selects exactly the persistent volumes.
         .filter_map(|v| v.name.as_ref())
         .map(|n| format!("'{n}'"))
         .collect();
@@ -78,7 +80,6 @@ pub fn run(paths: &Paths, name: &str, force: bool) -> anyhow::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use izba_core::daemon::proto::SandboxDetail;
     use izba_core::volume::VolumeSpec;
 
     fn detail(status: &str, volumes: Vec<VolumeSpec>) -> SandboxDetail {
