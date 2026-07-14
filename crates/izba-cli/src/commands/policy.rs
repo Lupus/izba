@@ -90,13 +90,15 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
         PolicyCmd::Show { name } => show(paths, name),
         PolicyCmd::Allow { name, target } => {
             let (host, port) = parse_target(target)?;
-            apply_edit(&paths.sandbox_dir(name), Edit::Allow, &host, port)?;
+            let dir = require_sandbox_dir(paths, name)?;
+            apply_edit(&dir, Edit::Allow, &host, port)?;
             maybe_reload(paths, name);
             Ok(0)
         }
         PolicyCmd::Block { name, target } => {
             let (host, port) = parse_target(target)?;
-            apply_edit(&paths.sandbox_dir(name), Edit::Block, &host, port)?;
+            let dir = require_sandbox_dir(paths, name)?;
+            apply_edit(&dir, Edit::Block, &host, port)?;
             maybe_reload(paths, name);
             Ok(0)
         }
@@ -113,7 +115,8 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
                 Access::Read
             };
             let gt = GitTarget::parse(target);
-            edit_policy_file(&paths.sandbox_dir(name), |c| {
+            let dir = require_sandbox_dir(paths, name)?;
+            edit_policy_file(&dir, |c| {
                 c.git_allow(gt.clone(), access);
             })?;
             maybe_reload(paths, name);
@@ -121,7 +124,8 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
         }
         PolicyCmd::Git(GitSub::Block { name, target }) => {
             let gt = GitTarget::parse(target);
-            edit_policy_file(&paths.sandbox_dir(name), |c| {
+            let dir = require_sandbox_dir(paths, name)?;
+            edit_policy_file(&dir, |c| {
                 c.git_block(&gt);
             })?;
             maybe_reload(paths, name);
@@ -129,7 +133,8 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
         }
         PolicyCmd::Enforce { name, state } => {
             let on = matches!(state, EnforceState::On);
-            edit_policy_file(&paths.sandbox_dir(name), |c| {
+            let dir = require_sandbox_dir(paths, name)?;
+            edit_policy_file(&dir, |c| {
                 c.set_enforce(on);
             })?;
             maybe_reload(paths, name);
@@ -151,6 +156,17 @@ pub(crate) fn parse_target(s: &str) -> anyhow::Result<(String, u16)> {
     }
 }
 
+/// Every policy verb addresses an existing sandbox. Fail with a clean domain
+/// error — not a raw ENOENT that leaks the data-dir path — when it doesn't
+/// exist (#82). Mirrors the guard `show`/`enable` already had.
+fn require_sandbox_dir(paths: &Paths, name: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = paths.sandbox_dir(name);
+    if !dir.exists() {
+        anyhow::bail!("no such sandbox: {name}");
+    }
+    Ok(dir)
+}
+
 /// The daemon-free core of allow/block: persist the edit to `policy.yaml`.
 pub(crate) fn apply_edit(
     sandbox_dir: &std::path::Path,
@@ -170,10 +186,7 @@ pub(crate) fn apply_edit(
 }
 
 fn show(paths: &Paths, name: &str) -> anyhow::Result<i32> {
-    let dir = paths.sandbox_dir(name);
-    if !dir.exists() {
-        anyhow::bail!("no such sandbox: {name}");
-    }
+    let dir = require_sandbox_dir(paths, name)?;
     match EgressPolicyConfig::load(&dir)? {
         None => println!("'{name}' has no egress policy (all egress allowed)"),
         Some(cfg) => {
@@ -214,10 +227,7 @@ fn show(paths: &Paths, name: &str) -> anyhow::Result<i32> {
 
 fn enable(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     use izba_core::daemon::egress::audit::{aggregate, parse_line};
-    let dir = paths.sandbox_dir(name);
-    if !dir.exists() {
-        anyhow::bail!("no such sandbox: {name}");
-    }
+    let dir = require_sandbox_dir(paths, name)?;
     let audit_path = paths.logs_dir(name).join("egress-audit.jsonl");
     let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
     let summaries = aggregate(text.lines().filter_map(parse_line));
@@ -325,5 +335,41 @@ mod tests {
             .unwrap()
             .allow
             .is_empty());
+    }
+
+    #[test]
+    fn mutating_verbs_bail_cleanly_on_unknown_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().to_path_buf());
+        let cases: Vec<PolicyCmd> = vec![
+            PolicyCmd::Allow {
+                name: "ghost".into(),
+                target: "example.com".into(),
+            },
+            PolicyCmd::Block {
+                name: "ghost".into(),
+                target: "example.com".into(),
+            },
+            PolicyCmd::Enforce {
+                name: "ghost".into(),
+                state: EnforceState::On,
+            },
+            PolicyCmd::Git(GitSub::Allow {
+                name: "ghost".into(),
+                target: "github.com/foo/bar".into(),
+                write: false,
+            }),
+            PolicyCmd::Git(GitSub::Block {
+                name: "ghost".into(),
+                target: "github.com".into(),
+            }),
+        ];
+        for cmd in cases {
+            let err = run(&paths, &cmd).expect_err("unknown sandbox must fail");
+            let msg = format!("{err:#}");
+            assert_eq!(msg, "no such sandbox: ghost", "cmd {cmd:?} leaked: {msg}");
+        }
+        // The failed verbs must not have created any stub state.
+        assert!(!paths.sandbox_dir("ghost").exists());
     }
 }
