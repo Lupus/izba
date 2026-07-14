@@ -261,6 +261,32 @@ fn compute_launch_lockdown(_paths: &Paths, _name: &str) -> anyhow::Result<Option
     Ok(None)
 }
 
+/// Name-claim marker inside a hashed runtime dir: detects an 8-hex hash
+/// collision between two sandbox names. Rare enough to never engineer
+/// around, common enough across a fleet to refuse LOUDLY instead of letting
+/// two sandboxes share sockets.
+pub(crate) const RUN_DIR_OWNER: &str = "owner";
+
+/// Create (0700) and claim the hashed runtime dir for `name`. Errors if the
+/// dir is already claimed by a different sandbox name.
+fn claim_run_dir(paths: &Paths, name: &str) -> anyhow::Result<()> {
+    let run = paths.run_dir(name);
+    crate::paths::create_dir_700(&run, paths.root())?;
+    let marker = run.join(RUN_DIR_OWNER);
+    match fs::read_to_string(&marker) {
+        Ok(owner) if owner != name => bail!(
+            "runtime dir {} is already claimed by sandbox '{owner}' — its name \
+             hashes to the same short id as '{name}'; rename one of them",
+            run.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::write(&marker, name).with_context(|| format!("writing {}", marker.display()))
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", marker.display())),
+    }
+}
+
 pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()> {
     validate_name(name)?;
     crate::paths::ensure_socket_budget(paths, name)?;
@@ -276,7 +302,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
     // Anything failing past this point leaves a partial sandbox — clean it up.
     let populate = || -> anyhow::Result<()> {
         crate::paths::create_dir_700(&paths.logs_dir(name), paths.root())?;
-        crate::paths::create_dir_700(&paths.run_dir(name), paths.root())?;
+        claim_run_dir(paths, name)?;
 
         // Assign stable ids to ephemeral volumes before building config and
         // provisioning, so the id is persisted in config.json and stays stable
@@ -694,6 +720,10 @@ pub fn start_with_timeouts(
     validate_name(name)?;
     crate::paths::ensure_socket_budget(paths, name)?;
     let _lock = lock_sandbox(paths, name)?;
+    // Re-verify the claim right before spec-building: covers a pre-marker
+    // runtime dir left by a sandbox created before this claim mechanism
+    // shipped (claim-if-absent), while still refusing a genuine collision.
+    claim_run_dir(paths, name)?;
 
     let config: SandboxConfig = load_json(&paths.sandbox_dir(name).join(CONFIG_FILE))?
         .with_context(|| format!("no such sandbox '{name}'"))?;
@@ -908,15 +938,21 @@ fn record_run_state(paths: &Paths, name: &str, handle: &dyn VmHandle) -> anyhow:
     save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)
 }
 
-/// Best-effort removal of regular files in the run dir (sockets, pid files).
+/// Best-effort removal of socket/pid files in the runtime dir — BOTH the
+/// hashed dir and the legacy `<sandbox>/run` (a pre-upgrade run's sockets
+/// live there). The `owner` claim marker is preserved.
 fn clear_run_dir_files(paths: &Paths, name: &str) {
-    let run = paths.run_dir(name);
-    let Ok(entries) = fs::read_dir(&run) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_type().map(|t| !t.is_dir()).unwrap_or(false) {
-            let _ = fs::remove_file(entry.path());
+    for run in [paths.run_dir(name), paths.legacy_run_dir(name)] {
+        let Ok(entries) = fs::read_dir(&run) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_str() == Some(RUN_DIR_OWNER) {
+                continue;
+            }
+            if entry.file_type().map(|t| !t.is_dir()).unwrap_or(false) {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 }
@@ -1111,10 +1147,15 @@ fn cleanup_runtime(paths: &Paths, name: &str) -> anyhow::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("removing {}", state_path.display())),
     }
-    let run = paths.run_dir(name);
-    if run.is_dir() {
+    for run in [paths.run_dir(name), paths.legacy_run_dir(name)] {
+        if !run.is_dir() {
+            continue;
+        }
         for entry in fs::read_dir(&run)? {
             let entry = entry?;
+            if entry.file_name().to_str() == Some(RUN_DIR_OWNER) {
+                continue;
+            }
             if entry.file_type()?.is_dir() {
                 fs::remove_dir_all(entry.path())?;
             } else {
@@ -1152,6 +1193,16 @@ pub fn remove(paths: &Paths, name: &str, connector: Connector, force: bool) -> a
             "warning: sandbox '{name}' renamed to {} but final deletion failed: {e}",
             tombstone.display()
         );
+    }
+    // The hashed runtime dir lives outside the sandbox dir — remove it too.
+    // (NotFound-tolerant: pre-upgrade sandboxes never had one.)
+    if let Err(e) = fs::remove_dir_all(paths.run_dir(name)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "warning: removing runtime dir {} failed: {e}",
+                paths.run_dir(name).display()
+            );
+        }
     }
     // Best-effort: the lock file is inert debris once the sandbox is gone
     // (a late-coming locker bails on the missing dir before creating one).
@@ -2223,13 +2274,16 @@ mod tests {
             !paths.sandbox_dir("web").join(STATE_FILE).exists(),
             "state.json must not be written on boot failure"
         );
+        // The `owner` claim marker is preserved by design (it is not run
+        // debris); every other file must be swept.
         let leftovers: Vec<_> = fs::read_dir(paths.run_dir("web"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_str() != Some(RUN_DIR_OWNER))
             .collect();
         assert!(
             leftovers.is_empty(),
-            "run/ must be cleared on boot failure, found: {leftovers:?}"
+            "run/ must be cleared (except the owner marker) on boot failure, found: {leftovers:?}"
         );
     }
 
@@ -2345,6 +2399,55 @@ mod tests {
 
         assert!(!paths.sandbox_dir("web").exists(), "dir must be gone");
         assert!(wait_dead(&sleep_id), "force remove must kill the vmm");
+    }
+
+    #[test]
+    fn create_claims_the_runtime_dir_and_detects_collisions() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let owner = paths.run_dir("web").join(RUN_DIR_OWNER);
+        assert_eq!(fs::read_to_string(&owner).unwrap(), "web");
+
+        // Simulate an 8-hex hash collision: another name's marker in OUR dir.
+        fs::write(&owner, "impostor").unwrap();
+        fs::remove_dir_all(paths.sandbox_dir("web")).unwrap();
+        let err = format!("{:#}", create(&paths, "web", &opts(&ws)).unwrap_err());
+        assert!(err.contains("impostor"), "{err}");
+        assert!(err.contains("web"), "{err}");
+    }
+
+    #[test]
+    fn rm_removes_the_hashed_runtime_dir() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        assert!(paths.run_dir("web").is_dir());
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log, None); // sandbox was never started — never dialed
+        remove(&paths, "web", &conn, false).unwrap();
+        assert!(!paths.run_dir("web").exists());
+        assert!(!paths.sandbox_dir("web").exists());
+    }
+
+    #[test]
+    fn cleanup_clears_sockets_in_both_layouts_but_keeps_the_owner_marker() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        fs::create_dir_all(paths.legacy_run_dir("web")).unwrap();
+        fs::write(paths.run_dir("web").join("vsock.sock"), b"").unwrap();
+        fs::write(paths.legacy_run_dir("web").join("vsock.sock"), b"").unwrap();
+
+        clear_run_dir_files(&paths, "web");
+
+        assert!(!paths.run_dir("web").join("vsock.sock").exists());
+        assert!(!paths.legacy_run_dir("web").join("vsock.sock").exists());
+        assert!(paths.run_dir("web").join(RUN_DIR_OWNER).exists());
     }
 
     #[test]
