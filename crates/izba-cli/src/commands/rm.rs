@@ -34,6 +34,7 @@ fn force_rm_warning(detail: &SandboxDetail) -> Option<String> {
     ))
 }
 
+#[mutants::skip] // reason: drives a live daemon (Inspect pre-flight + Rm over the socket); e2e-only (daemon_e2e exercises rm --force). The #78 warning decision logic (force_rm_warning) is unit-tested below.
 pub fn run(paths: &Paths, name: &str, force: bool) -> anyhow::Result<i32> {
     // Best-effort: if the sandbox is locked down, release the Windows account
     // before deleting the sandbox directory (the account must be deprovisioned
