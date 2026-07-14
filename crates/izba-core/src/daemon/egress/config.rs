@@ -1345,6 +1345,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_mapping_top_level_document() {
+        let msg = parse_err("- example.com\n");
+        assert!(msg.contains("must be a YAML mapping"), "{msg}");
+        assert!(msg.contains("enforce, allow, git"), "{msg}");
+    }
+
+    #[test]
     fn rejects_unknown_allow_entry_key_instead_of_permissive_fallback() {
         // The #138 footgun: `portz` typo used to be silently dropped, widening
         // the entry to the permissive default ports.
