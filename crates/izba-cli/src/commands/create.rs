@@ -17,6 +17,11 @@ pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32>
     // Validate --policy BEFORE the daemon Create RPC: a missing or invalid
     // file must fail here, leaving no stub sandbox registered (#139).
     let policy_raw = super::read_policy(merged.policy.as_deref())?;
+    // Reject a data root too deep for the VM runtime sockets BEFORE any
+    // daemon connect: a raw SUN_LEN bind failure at start time is not
+    // actionable, and this must fire even before connect (the daemon socket
+    // path itself may already be too long) (#71).
+    izba_core::paths::ensure_socket_budget(paths, &name)?;
     let mut client = DaemonClient::connect(paths)?;
     // `izba create` has no unconfined opt-out (that is a run/start flag), so it
     // always creates with confined intent: the daemon runs the workspace
