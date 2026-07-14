@@ -191,6 +191,17 @@ pub fn lockdown<B: LockdownBackend>(
         .with_context(|| format!("loading config for sandbox {name:?}"))?
         .ok_or_else(|| anyhow!("no config.json for sandbox {name:?}"))?;
 
+    // Claim-if-absent the hashed run dir before computing grants: a sandbox
+    // created by a pre-hashed-run-dir izba build never had `claim_run_dir`
+    // run against it, so `paths.run_dir(name)` may not exist yet. Unlike the
+    // RO grants, the Windows Modify-ACL step does not skip missing RW paths,
+    // so provisioning would otherwise hard-fail on this path. Mirrors the
+    // claim-if-absent call in `sandbox::start_with_timeouts`. This runs
+    // before any account provisioning starts, so a claim error (e.g. a hash
+    // collision with another sandbox) surfaces with nothing to roll back.
+    crate::sandbox::claim_run_dir(paths, name)
+        .with_context(|| format!("claiming runtime dir for sandbox {name:?}"))?;
+
     let grants = compute_grants(&config, paths, name);
     let ro = compute_ro_grants(&config, paths);
 
@@ -775,6 +786,36 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(msg.contains("provision helper failed"), "msg: {msg}");
+    }
+
+    // ── lockdown claims a missing hashed run dir (legacy sandbox) ────────────
+
+    /// A pre-change ("legacy") sandbox has `config.json` but never had
+    /// `claim_run_dir` run against it (created by an izba build before the
+    /// hashed run-dir move), so `paths.run_dir(name)` does not exist on disk.
+    /// `lockdown` must claim/create it before `compute_grants` runs: the
+    /// Windows Modify-ACL step does not skip missing RW paths (unlike the
+    /// RO grants), so provisioning would otherwise hard-fail on a path that
+    /// has never existed.
+    #[test]
+    fn lockdown_claims_missing_run_dir_before_provisioning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        write_config(&paths, SANDBOX_NAME, Vec::new());
+
+        let run_dir = paths.run_dir(SANDBOX_NAME);
+        assert!(!run_dir.exists(), "precondition: no hashed run dir yet");
+
+        let backend = FakeBackend::ok();
+        let outcome = lockdown(&backend, &paths, SANDBOX_NAME).unwrap();
+        assert!(matches!(outcome, LockdownOutcome::Locked(_)));
+
+        assert!(
+            run_dir.exists(),
+            "lockdown must claim the hashed run dir: {run_dir:?}"
+        );
+        let marker = std::fs::read_to_string(run_dir.join(crate::sandbox::RUN_DIR_OWNER)).unwrap();
+        assert_eq!(marker, SANDBOX_NAME);
     }
 
     // ── unlock ────────────────────────────────────────────────────────────────

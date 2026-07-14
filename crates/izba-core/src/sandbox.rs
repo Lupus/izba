@@ -269,7 +269,12 @@ pub(crate) const RUN_DIR_OWNER: &str = "owner";
 
 /// Create (0700) and claim the hashed runtime dir for `name`. Errors if the
 /// dir is already claimed by a different sandbox name.
-fn claim_run_dir(paths: &Paths, name: &str) -> anyhow::Result<()> {
+///
+/// `pub(crate)` so `jail_account::orchestrate::lockdown` can claim-if-absent
+/// a legacy sandbox's run dir before computing Windows ACL grants (#run-dir
+/// lockdown follow-up) — the same claim-if-absent pattern used here by
+/// `start_with_timeouts`.
+pub(crate) fn claim_run_dir(paths: &Paths, name: &str) -> anyhow::Result<()> {
     let run = paths.run_dir(name);
     crate::paths::create_dir_700(&run, paths.root())?;
     let marker = run.join(RUN_DIR_OWNER);
