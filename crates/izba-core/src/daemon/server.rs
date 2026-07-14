@@ -475,7 +475,8 @@ fn handle_start(
     let Some(_start_guard) = d.starting.begin(&name) else {
         bail!("a start for '{name}' is already in progress");
     };
-    d.egress.ensure_listening(&d.paths, &name)?;
+    d.egress
+        .ensure_listening(&d.paths, &name, &d.paths.run_dir(&name))?;
     if let Err(e) = sandbox::start(
         &d.paths,
         &name,
@@ -483,8 +484,11 @@ fn handle_start(
         &art,
         allow_unconfined,
     ) {
-        // Boot never happened — tear the listener back down.
-        d.egress.stop(&d.paths, &name);
+        // Boot never happened — tear the listener back down. Nothing landed
+        // in state.json, so the LIVE dir is still `paths.run_dir` (the one
+        // just bound above).
+        d.egress
+            .stop(&name, &crate::sandbox::live_run_dir(&d.paths, &name));
         return Err(e);
     }
     // (Re-)apply the persisted publish rules afresh, as threads.
@@ -512,7 +516,8 @@ fn handle_start(
 fn handle_stop(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> {
     sandbox::stop(&d.paths, &name, d.connector(), STOP_TIMEOUT)?;
     d.relays.stop_all(&name);
-    d.egress.stop(&d.paths, &name);
+    d.egress
+        .stop(&name, &crate::sandbox::live_run_dir(&d.paths, &name));
     let _ = std::fs::remove_file(relays::rules_path(&d.paths, &name));
     d.registry.set_liveness(&name, Liveness::Stopped);
     regen_ssh_config(d);
@@ -522,7 +527,8 @@ fn handle_stop(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> 
 fn handle_rm(d: &Arc<Daemon>, name: String, force: bool) -> anyhow::Result<DaemonResponse> {
     sandbox::remove(&d.paths, &name, d.connector(), force)?;
     d.relays.stop_all(&name);
-    d.egress.stop(&d.paths, &name);
+    d.egress
+        .stop(&name, &crate::sandbox::live_run_dir(&d.paths, &name));
     d.registry.remove(&name);
     regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
@@ -770,9 +776,13 @@ pub fn adopt(d: &Arc<Daemon>) {
             Err(e) => eprintln!("izbad: ports.json for '{}': {e:#}", info.name),
         }
         // Rebind the egress listener for every live sandbox; a bind failure
-        // is logged but never aborts adoption of the rest.
+        // is logged but never aborts adoption of the rest. Adoption serves
+        // an already-running VM, so it must bind in the LIVE dir recorded in
+        // state.json (a pre-hash-scheme sandbox's legacy dir), never blindly
+        // in the new-scheme dir.
         if info.liveness != Liveness::Stopped {
-            if let Err(e) = d.egress.ensure_listening(&d.paths, &info.name) {
+            let run_dir = crate::sandbox::live_run_dir(&d.paths, &info.name);
+            if let Err(e) = d.egress.ensure_listening(&d.paths, &info.name, &run_dir) {
                 eprintln!("izbad: egress listener for '{}': {e:#}", info.name);
             }
         }
@@ -1258,7 +1268,8 @@ mod tests {
             other => panic!("start: {other:?}"),
         }
         assert!(d.egress.listening("web"));
-        assert!(egress::listener_path(&d.paths, "web").exists());
+        // Start binds in the new-scheme dir (no state.json existed yet).
+        assert!(egress::listener_path(&d.paths.run_dir("web")).exists());
 
         write_state(&d.paths, "web", vmm.clone());
         assert!(matches!(
@@ -1266,7 +1277,7 @@ mod tests {
             DaemonResponse::Ok
         ));
         assert!(!d.egress.listening("web"));
-        assert!(!egress::listener_path(&d.paths, "web").exists());
+        assert!(!egress::listener_path(&d.paths.run_dir("web")).exists());
     }
 
     /// A `Start` racing a name that's already mid-boot must bail fast,

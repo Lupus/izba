@@ -1114,11 +1114,11 @@ fn guest_networking() {
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
-    mgr.ensure_listening(&tb.paths, "net")
+    mgr.ensure_listening(&tb.paths, "net", &tb.paths.run_dir("net"))
         .expect("bind vsock_1027 listener");
 
     if let Err(e) = start_sandbox(&env, &tb, "net") {
-        mgr.stop(&tb.paths, "net");
+        mgr.stop("net", &tb.paths.run_dir("net"));
         panic!(
             "boot of 'net' failed: {e:#}\nconsole tail:\n{}",
             console_tail(&tb.paths, "net")
@@ -1146,7 +1146,7 @@ fn guest_networking() {
     );
 
     stop_sandbox(&tb, "net");
-    mgr.stop(&tb.paths, "net");
+    mgr.stop("net", &tb.paths.run_dir("net"));
 }
 
 /// Boot `name` with a stand-in izbad egress listener (the daemonless suite
@@ -1169,10 +1169,10 @@ fn start_with_egress(
         None,
         AuditSink::new(tb.paths.clone()),
     );
-    mgr.ensure_listening(&tb.paths, name)
+    mgr.ensure_listening(&tb.paths, name, &tb.paths.run_dir(name))
         .expect("bind vsock_1027 listener");
     if let Err(e) = start_sandbox(env, tb, name) {
-        mgr.stop(&tb.paths, name);
+        mgr.stop(name, &tb.paths.run_dir(name));
         panic!(
             "boot of '{name}' failed: {e:#}\nconsole tail:\n{}",
             console_tail(&tb.paths, name)
@@ -1207,7 +1207,7 @@ fn egress_dns_via_izbad() {
     );
 
     stop_sandbox(&tb, "egress-dns");
-    mgr.stop(&tb.paths, "egress-dns");
+    mgr.stop("egress-dns", &tb.paths.run_dir("egress-dns"));
 }
 
 /// Transparent-reply fix (M4 prereq for docker/build-in-VM): a client that
@@ -1241,7 +1241,7 @@ fn egress_dns_hardcoded_external_resolver() {
     );
 
     stop_sandbox(&tb, "egress-dns-hard");
-    mgr.stop(&tb.paths, "egress-dns-hard");
+    mgr.stop("egress-dns-hard", &tb.paths.run_dir("egress-dns-hard"));
 }
 
 /// Completeness companion to `egress_dns_hardcoded_external_resolver`: DNS over
@@ -1277,7 +1277,7 @@ fn egress_dns_tcp_hardcoded_external_resolver() {
     );
 
     stop_sandbox(&tb, "egress-dns-tcp");
-    mgr.stop(&tb.paths, "egress-dns-tcp");
+    mgr.stop("egress-dns-tcp", &tb.paths.run_dir("egress-dns-tcp"));
 }
 
 /// M1 phase B exit: guest TCP egress rides the stub. The guest wgets a
@@ -1315,11 +1315,11 @@ fn egress_http_via_stub() {
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
-    mgr.ensure_listening(&tb.paths, "egress-http")
+    mgr.ensure_listening(&tb.paths, "egress-http", &tb.paths.run_dir("egress-http"))
         .expect("bind vsock_1027 listener");
 
     if let Err(e) = start_sandbox(&env, &tb, "egress-http") {
-        mgr.stop(&tb.paths, "egress-http");
+        mgr.stop("egress-http", &tb.paths.run_dir("egress-http"));
         panic!(
             "boot of 'egress-http' failed: {e:#}\nconsole tail:\n{}",
             console_tail(&tb.paths, "egress-http")
@@ -1338,7 +1338,7 @@ fn egress_http_via_stub() {
 
     srv.join().unwrap();
     stop_sandbox(&tb, "egress-http");
-    mgr.stop(&tb.paths, "egress-http");
+    mgr.stop("egress-http", &tb.paths.run_dir("egress-http"));
 }
 
 /// M2 exit: the agent firewall MITMs guest HTTP(S) under a declared policy. A
@@ -1447,7 +1447,7 @@ fn mitm_firewall_allows_and_denies_real_vm() {
     );
 
     stop_sandbox(&tb, "mitm");
-    mgr.stop(&tb.paths, "mitm");
+    mgr.stop("mitm", &tb.paths.run_dir("mitm"));
 }
 
 /// Create a sandbox, write an egress `policy_yaml`, build a MITM-enabled
@@ -1460,7 +1460,7 @@ fn mitm_firewall_allows_and_denies_real_vm() {
 /// (SonarCloud duplication gate).
 ///
 /// Returns `(mgr, audit)` — the caller drives assertions against `audit`
-/// records and calls `mgr.stop(paths, name)` after the test.
+/// records and calls `mgr.stop(name, run_dir)` after the test.
 fn setup_mitm_sandbox(
     env: &TestEnv,
     tb: &mut TestBox,
@@ -1504,11 +1504,11 @@ fn setup_mitm_sandbox(
         Some(mitm),
         audit.clone(),
     );
-    mgr.ensure_listening(&tb.paths, name)
+    mgr.ensure_listening(&tb.paths, name, &tb.paths.run_dir(name))
         .expect("bind vsock_1027 listener");
 
     if let Err(e) = start_sandbox(env, tb, name) {
-        mgr.stop(&tb.paths, name);
+        mgr.stop(name, &tb.paths.run_dir(name));
         panic!(
             "boot of {name:?} failed: {e:#}\nconsole tail:\n{}",
             console_tail(&tb.paths, name)
@@ -1575,9 +1575,10 @@ fn egress_throughput_baseline() {
         None,
         izba_core::daemon::egress::audit::AuditSink::new(tb.paths.clone()),
     );
-    mgr.ensure_listening(&tb.paths, "egress-tput").unwrap();
+    mgr.ensure_listening(&tb.paths, "egress-tput", &tb.paths.run_dir("egress-tput"))
+        .unwrap();
     if let Err(e) = start_sandbox(&env, &tb, "egress-tput") {
-        mgr.stop(&tb.paths, "egress-tput");
+        mgr.stop("egress-tput", &tb.paths.run_dir("egress-tput"));
         panic!(
             "boot of 'egress-tput' failed: {e:#}\nconsole tail:\n{}",
             console_tail(&tb.paths, "egress-tput")
@@ -1602,7 +1603,7 @@ fn egress_throughput_baseline() {
 
     srv.join().unwrap();
     stop_sandbox(&tb, "egress-tput");
-    mgr.stop(&tb.paths, "egress-tput");
+    mgr.stop("egress-tput", &tb.paths.run_dir("egress-tput"));
 }
 
 #[test]
@@ -2121,5 +2122,5 @@ fn git_read_only_repo_allows_clone_denies_push() {
     );
 
     stop_sandbox(&tb, "git-ro");
-    mgr.stop(&tb.paths, "git-ro");
+    mgr.stop("git-ro", &tb.paths.run_dir("git-ro"));
 }

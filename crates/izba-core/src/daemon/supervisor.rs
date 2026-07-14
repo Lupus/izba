@@ -129,13 +129,17 @@ pub fn tick(
             // (Greptile P1, PR #135).
             starting.teardown_unless_starting(&info.name, || {
                 relays.stop_all(&info.name);
-                egress.stop(paths, &info.name);
+                let run_dir = sandbox::live_run_dir(paths, &info.name);
+                egress.stop(&info.name, &run_dir);
             });
         } else {
             relays.respawn_dead(paths, &info.name);
             // Idempotent: a no-op if the listener is alive, a crash-respawn
-            // otherwise. Every running sandbox owns a vsock_1027 plane.
-            let _ = egress.ensure_listening(paths, &info.name);
+            // otherwise. Every running sandbox owns a vsock_1027 plane. This
+            // tick serves already-running VMs, so it must rebind in the LIVE
+            // dir recorded in state.json, never blindly in the new-scheme dir.
+            let run_dir = sandbox::live_run_dir(paths, &info.name);
+            let _ = egress.ensure_listening(paths, &info.name, &run_dir);
         }
     }
     registry.replace_all(snap, infos);
@@ -251,7 +255,7 @@ mod tests {
         crate::sandbox::create(&paths, "boot", &opts).unwrap();
 
         let egress = test_egress();
-        match egress.ensure_listening(&paths, "boot") {
+        match egress.ensure_listening(&paths, "boot", &paths.run_dir("boot")) {
             Ok(()) => {}
             Err(e) if is_permission_denied(&e) => {
                 eprintln!("SKIP {test_name}: bind denied: {e:#}");
