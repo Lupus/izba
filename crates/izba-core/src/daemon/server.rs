@@ -361,6 +361,10 @@ fn dispatch_inner(
             // the caller (#138/#83), not silently arm deny-all — the live
             // policy stays unchanged. (resolve_policy still fails closed for
             // the unattended paths: daemon start / ensure_listening.)
+            // Scope: this catches read/parse/unknown-key errors; a config that
+            // parses but fails into_policy() Rego compilation (unreachable
+            // today — the embedded Rego is valid) still falls to
+            // resolve_policy's fail-closed deny-all.
             crate::daemon::egress::config::EgressPolicyConfig::load(&d.paths.sandbox_dir(&name))?;
             d.egress.reload_policy(&d.paths, &name);
             Ok(DaemonResponse::Ok)

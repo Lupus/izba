@@ -89,15 +89,15 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
     match cmd {
         PolicyCmd::Show { name } => show(paths, name),
         PolicyCmd::Allow { name, target } => {
-            let (host, port) = parse_target(target)?;
             let dir = require_sandbox_dir(paths, name)?;
+            let (host, port) = parse_target(target)?;
             apply_edit(&dir, Edit::Allow, &host, port)?;
             maybe_reload(paths, name);
             Ok(0)
         }
         PolicyCmd::Block { name, target } => {
-            let (host, port) = parse_target(target)?;
             let dir = require_sandbox_dir(paths, name)?;
+            let (host, port) = parse_target(target)?;
             apply_edit(&dir, Edit::Block, &host, port)?;
             maybe_reload(paths, name);
             Ok(0)
@@ -363,6 +363,16 @@ mod tests {
                 name: "ghost".into(),
                 target: "github.com".into(),
             }),
+            // A malformed target must not surface "invalid port" for a sandbox
+            // that doesn't exist in the first place — the sandbox guard wins.
+            PolicyCmd::Allow {
+                name: "ghost".into(),
+                target: "example.com:notaport".into(),
+            },
+            PolicyCmd::Block {
+                name: "ghost".into(),
+                target: "example.com:notaport".into(),
+            },
         ];
         for cmd in cases {
             let err = run(&paths, &cmd).expect_err("unknown sandbox must fail");

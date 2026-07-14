@@ -1,6 +1,12 @@
 //! The `izba.yml` document model. k8s-style: `apiVersion`/`kind`/`metadata`/
 //! `spec`. The `egress` block reuses `EgressPolicyConfig` verbatim — it is
 //! structurally identical to `policy.yaml`.
+//!
+//! NOTE: `spec.egress` deserializes via `EgressPolicyConfig`'s *derived*
+//! `Deserialize` impl, not the strict manual walk in `from_yaml`/`from_value`
+//! (#138). A stray/misspelled key under `spec.egress` is silently dropped
+//! here instead of hard-erroring; extending #138's strict-key validation to
+//! the manifest path is a tracked follow-up (#138 manifest-path residual).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -58,6 +64,8 @@ pub struct SandboxSpec {
     pub volumes: Vec<VolumeMount>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortMapping>,
+    /// Deserialized via the DERIVED impl (unknown keys silently dropped, not
+    /// the strict `from_yaml` walk `policy.yaml` gets) — see the module doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressPolicyConfig>,
 }
