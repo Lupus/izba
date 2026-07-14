@@ -2327,6 +2327,60 @@ mod tests {
         );
     }
 
+    /// Kills the "replace `!=` with `==`" mutant in `adopt`'s egress-rebind
+    /// guard: a STOPPED sandbox (config.json present, no live pid — the
+    /// mutant's flipped condition would treat it as live and bind an egress
+    /// listener for it) must come out of adoption with NO egress listener
+    /// bound and no `vsock.sock_1027` file in either runtime-dir layout.
+    /// (The running side of the guard — that a live sandbox DOES get its
+    /// listener rebound on adoption — is covered by
+    /// `stop_removes_legacy_egress_listener_of_adopted_sandbox` and
+    /// `rm_force_removes_legacy_egress_listener_of_adopted_sandbox`, which
+    /// both call `d.egress.ensure_listening` directly to simulate exactly
+    /// what adoption does for a live sandbox, then assert the listener is
+    /// live before tearing it down.)
+    #[test]
+    fn adopt_does_not_bind_egress_for_a_stopped_sandbox() {
+        use crate::daemon::egress;
+        let (dir, d) = test_daemon();
+        crate::sandbox::create(
+            &d.paths,
+            "web",
+            &CreateOpts {
+                image_digest: "sha256:abc".into(),
+                image_ref: "ubuntu:24.04".into(),
+                cpus: 1,
+                mem_mb: 256,
+                workspace: dir.path().join("ws"),
+                rw_size_gb: 1,
+                ports: Vec::new(),
+                volumes: Vec::new(),
+                builder: false,
+            },
+        )
+        .unwrap();
+        // No write_state call: no state.json ⇒ Liveness::Stopped.
+
+        adopt(&d);
+
+        assert_eq!(
+            d.registry.liveness("web"),
+            Some(crate::liveness::Liveness::Stopped)
+        );
+        assert!(
+            !d.egress.listening("web"),
+            "adoption must not bind an egress listener for a stopped sandbox"
+        );
+        assert!(
+            !egress::listener_path(&d.paths.run_dir("web")).exists(),
+            "no vsock.sock_1027 in the new-scheme run dir"
+        );
+        assert!(
+            !egress::listener_path(&d.paths.legacy_run_dir("web")).exists(),
+            "no vsock.sock_1027 in the legacy run dir"
+        );
+    }
+
     /// Kills the "replace `run_daemon_with` body with `Ok(())`" mutant: it
     /// actually binds the real daemon socket, adopts, serves the accept
     /// loop, and honors `Shutdown` — none of which happens if the body is a
