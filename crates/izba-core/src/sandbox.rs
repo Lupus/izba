@@ -29,6 +29,17 @@ const DEFAULT_BOOT_POLL: Duration = Duration::from_millis(200);
 /// Per-attempt deadline for any single control-plane request/response.
 const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Grace granted to a *forced* removal of a running sandbox that has named
+/// persistent volumes attached (#78). Root cause of the data loss this
+/// prevents: a bare SIGKILL of the VMM drops dirty ext4 buffers still in the
+/// guest page cache, silently losing recent writes to the volume image; the
+/// graceful path is durable only because init syncs before power-off
+/// (`izba-init/src/main.rs`, `Request::Shutdown` → `sync()` → RB_POWER_OFF).
+/// So the force path sends the same Shutdown and waits this long before
+/// escalating. Best-effort by design: a hung guest is still killed when the
+/// grace expires (the CLI warns about that residual risk).
+const FORCE_RM_SYNC_GRACE: Duration = Duration::from_secs(5);
+
 /// Boot health budget: `IZBA_BOOT_TIMEOUT_SECS` env override, else 30s.
 /// CI runners with slow nested virtualization set this; the strict local
 /// default is intentionally unchanged.
@@ -1192,6 +1203,16 @@ fn run_dir_removal_warning(run: &Path, e: &std::io::Error) -> Option<String> {
     }
 }
 
+/// Whether the sandbox's config declares at least one named persistent
+/// volume. Unreadable or missing config reads as "no" — force-remove of a
+/// corrupt sandbox must not be blocked by a durability nicety.
+fn has_persistent_volumes(paths: &Paths, name: &str) -> bool {
+    load_json::<SandboxConfig>(&paths.sandbox_dir(name).join(CONFIG_FILE))
+        .ok()
+        .flatten()
+        .is_some_and(|c| c.volumes.iter().any(|v| v.is_persistent()))
+}
+
 pub fn remove(paths: &Paths, name: &str, connector: Connector, force: bool) -> anyhow::Result<()> {
     validate_name(name)?;
     let dir = paths.sandbox_dir(name);
@@ -1209,7 +1230,18 @@ pub fn remove(paths: &Paths, name: &str, connector: Connector, force: bool) -> a
         match liveness_of(paths, name, connector)? {
             Liveness::Stopped => {}
             _ if !force => bail!("sandbox '{name}' is running (use force to remove)"),
-            _ => stop_locked(paths, name, connector, Duration::ZERO, false)?,
+            _ => {
+                // #78: killing a live guest outright loses page-cache writes
+                // not yet flushed to the volume images. With persistent
+                // volumes attached, try the graceful Shutdown (guest syncs
+                // before power-off) under a short grace before escalating.
+                let (grace, graceful) = if has_persistent_volumes(paths, name) {
+                    (FORCE_RM_SYNC_GRACE, true)
+                } else {
+                    (Duration::ZERO, false)
+                };
+                stop_locked(paths, name, connector, grace, graceful)?
+            }
         }
         fs::rename(&dir, &tombstone)
             .with_context(|| format!("renaming {} for removal", dir.display()))?;
@@ -2422,6 +2454,94 @@ mod tests {
 
         assert!(!paths.sandbox_dir("web").exists(), "dir must be gone");
         assert!(wait_dead(&sleep_id), "force remove must kill the vmm");
+    }
+
+    /// Returns `opts(ws)` extended with one named persistent volume, the
+    /// shape a `--volume data:/data:64M` create would persist.
+    fn opts_with_persistent_volume(workspace: &Path) -> CreateOpts {
+        let mut o = opts(workspace);
+        o.volumes.push(crate::volume::VolumeSpec {
+            name: Some("data".into()),
+            guest_path: "/data".into(),
+            size_bytes: 64 << 20,
+            eph_id: None,
+        });
+        o
+    }
+
+    #[test]
+    fn rm_force_syncs_guest_when_persistent_volume_attached() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts_with_persistent_volume(&ws)).unwrap();
+
+        // Real short-lived child stands in for the VMM; the fake guest kills
+        // it on Shutdown, so the force path observes a graceful death well
+        // inside FORCE_RM_SYNC_GRACE.
+        let sleep_id = spawn_sleep(dir.path());
+        write_state(&paths, "web", sleep_id.clone());
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log.clone(), Some(sleep_id.clone()));
+        remove(&paths, "web", &conn, true).unwrap();
+
+        assert_eq!(
+            count_shutdowns(&log),
+            1,
+            "force-rm with a persistent volume must attempt the guest sync"
+        );
+        assert!(!paths.sandbox_dir("web").exists(), "dir must be gone");
+        assert!(wait_dead(&sleep_id), "vmm stand-in must be dead");
+        assert!(
+            paths.volume_image("data").exists(),
+            "persistent volume image must survive rm"
+        );
+    }
+
+    #[test]
+    fn rm_force_stays_abrupt_without_persistent_volumes() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let sleep_id = spawn_sleep(dir.path());
+        write_state(&paths, "web", sleep_id.clone());
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log.clone(), None);
+        remove(&paths, "web", &conn, true).unwrap();
+
+        assert_eq!(
+            count_shutdowns(&log),
+            0,
+            "nothing durable is attached — keep the instant-kill semantics"
+        );
+        assert!(!paths.sandbox_dir("web").exists(), "dir must be gone");
+        assert!(wait_dead(&sleep_id), "force remove must kill the vmm");
+    }
+
+    #[test]
+    fn rm_force_escalates_when_guest_ignores_shutdown() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts_with_persistent_volume(&ws)).unwrap();
+
+        let sleep_id = spawn_sleep(dir.path());
+        write_state(&paths, "web", sleep_id.clone());
+
+        // Guest acks Shutdown but never powers off → after FORCE_RM_SYNC_GRACE
+        // the removal must escalate to SIGKILL and still succeed. (This test
+        // deliberately waits out the full grace — ~5s wall clock.)
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log.clone(), None);
+        remove(&paths, "web", &conn, true).unwrap();
+
+        assert_eq!(count_shutdowns(&log), 1, "sync must have been attempted");
+        assert!(!paths.sandbox_dir("web").exists(), "dir must be gone");
+        assert!(wait_dead(&sleep_id), "escalation must kill the vmm");
     }
 
     #[test]
