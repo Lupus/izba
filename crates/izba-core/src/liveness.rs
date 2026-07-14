@@ -114,6 +114,7 @@ mod tests {
                 .collect(),
             started_unix_ms: 0,
             confinement: None,
+            run_dir: None,
         }
     }
 

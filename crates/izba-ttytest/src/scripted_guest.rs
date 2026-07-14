@@ -116,6 +116,7 @@ impl ScriptedGuest {
                 sidecar_pids: vec![],
                 started_unix_ms: 0,
                 confinement: None,
+                run_dir: Some(run.clone()),
             },
         )
         .context("write state.json")?;
