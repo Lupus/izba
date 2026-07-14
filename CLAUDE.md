@@ -110,7 +110,13 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - **Disk-state invariant (daemon-first):** a sandbox = its dir under
   `~/.local/share/izba/sandboxes/<name>/` + live processes; liveness is
   always re-verified via pid + `/proc/<pid>/stat` starttime identity — never
-  trusted from `state.json` alone. `izbad` (auto-started `izba daemon run`,
+  trusted from `state.json` alone. Runtime sockets live OUTSIDE that dir, in
+  a short hashed dir (`<data>/run/<hex8(sha256(name))>/`, keeping AF_UNIX
+  paths under the SUN_LEN budget — #71/#85), claimed by an `owner` marker,
+  recorded per-run in `state.json`'s `run_dir` field, and removed by `rm`; a
+  data root deeper than the socket budget (~72 bytes) is rejected at
+  `create`/`start` with an actionable error, never a raw SUN_LEN bind
+  failure. `izbad` (auto-started `izba daemon run`,
   socket `<data>/daemon/izbad.sock`, framed-JSON `daemon::proto`) holds NO
   authoritative state: it adopts everything from disk at startup, so
   killing/upgrading it never harms sandboxes. Port relays are daemon
@@ -125,15 +131,19 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   (`CONTROL_PORT`/`STREAM_PORT`/`EGRESS_PORT` in izba-proto). Stream conns send
   ONE `StreamOpen` frame (`Attach` exec streams / `TcpDial` port relays /
   `TarExtract`+`TarCreate` for cp), then bytes per the variant's framing. Host
-  reaches them via Cloud Hypervisor hybrid-vsock: `CONNECT <port>\n` on
-  `run/vsock.sock`, response read byte-by-byte (buffering eats stream data). CH
-  does NOT propagate vsock half-close guest→host: teardown must be full
+  reaches them via Cloud Hypervisor hybrid-vsock: `CONNECT <port>\n` on the
+  sandbox's runtime socket `<data>/run/<hex8(sha256(name))>/vsock.sock`
+  (recorded in `state.json`'s `run_dir`; a pre-upgrade record with no
+  `run_dir` means the legacy layout `sandboxes/<name>/run/vsock.sock` — see
+  `sandbox::live_run_dir`), response read byte-by-byte (buffering eats
+  stream data). CH does NOT propagate vsock half-close guest→host: teardown must be full
   `SHUT_RDWR` once TX is done. CLI streams now reach the guest through izbad's
   `OpenStream` splice (client sends the guest `StreamOpen` in-band after the
   daemon replies Ok); the framing after the splice is unchanged.
   **Egress is INVERTED (guest-initiated):** the guest dials CID 2:1027; the
-  VMM bridges that to izbad's `run/vsock.sock_1027` unix listener (Firecracker
-  hybrid-vsock convention, shared by CH and OpenVMM). The guest sends one
+  VMM bridges that to izbad's `<run dir>/vsock.sock_1027` unix listener (same
+  runtime dir as above, Firecracker hybrid-vsock convention, shared by CH and
+  OpenVMM). The guest sends one
   `StreamOpen::TcpConnect{addr,port}` (TcpDial's reply contract inverted:
   izbad dials out + replies `Ok`/`Error`, then raw byte pipe) or
   `StreamOpen::Dns` (RFC 1035 2-byte-BE length framing per `izba_proto::dns`,

@@ -221,9 +221,13 @@ def _journey_data_dir(base: str, journey_id: str) -> str:
     ``"a b"`` vs ``"a-b"``) in distinct dirs rather than silently sharing state.
 
     The readable prefix is capped so the per-journey component stays short: the
-    sandbox runtime socket (``<dir>/sandboxes/<name>/run/vsock.sock_1027``) must
-    fit the ~108-byte AF_UNIX ``sun_path`` limit, and a long journey id otherwise
-    pushes it over (see izba#71)."""
+    sandbox runtime socket (``<dir>/run/<hex8>/vsock.sock_1027``) must fit the
+    ~108-byte AF_UNIX ``sun_path`` limit, and a long journey id otherwise
+    pushes it over (see izba#71). The product now enforces its own budget at
+    ``create``/``start`` time (an actionable error instead of a raw SUN_LEN
+    bind failure — izba#71/#85); this harness-side cap is belt-and-suspenders,
+    keeping ``IZBA_DATA_DIR`` short so journeys never even approach that
+    limit."""
     journey_id = journey_id or ""  # tolerate None/empty
     safe = (_SAFE_RE.sub("-", journey_id).strip(".-") or "journey")[:16]
     short = hashlib.sha256(journey_id.encode("utf-8")).hexdigest()[:8]
