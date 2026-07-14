@@ -241,7 +241,8 @@ enum Cmd {
         /// directory's sandbox)
         #[arg(value_name = "NAME_OR_DIR")]
         target: Option<String>,
-        /// Stop and remove even if running
+        /// Stop and remove even if running (best-effort guest sync for
+        /// persistent volumes; unsynced writes may be lost)
         #[arg(long)]
         force: bool,
     },
