@@ -82,7 +82,9 @@ impl ScriptedGuest {
         let paths = izba_core::paths::Paths::with_root(data_root.clone());
         let sb = paths.sandbox_dir(&name);
         let run = paths.run_dir(&name);
-        // run_dir is sandbox_dir/run, so create_dir_all(&run) also creates sb.
+        // run_dir is now `<root>/run/<hash>` — create the sandbox dir (which
+        // holds config/state) separately.
+        std::fs::create_dir_all(&sb).context("create sandbox dir")?;
         std::fs::create_dir_all(&run).context("create run dir")?;
 
         // Fabricate config.json: the daemon-first CLI's adoption pass sweeps

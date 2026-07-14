@@ -333,10 +333,10 @@ mod tests {
 
     #[test]
     fn listener_path_follows_vmm_convention() {
-        let p = Paths::with_root("/data/izba".into());
+        let paths = Paths::with_root(PathBuf::from("/data"));
         assert_eq!(
-            listener_path(&p, "web"),
-            PathBuf::from("/data/izba/sandboxes/web/run/vsock.sock_1027")
+            listener_path(&paths, "web"),
+            paths.run_dir("web").join("vsock.sock_1027")
         );
     }
 
