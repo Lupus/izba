@@ -137,7 +137,8 @@ Check 'exec -i round-trips stdin' ("$out".Trim() -eq 'ping')
 
 # [5a] M1 phase A: egress DNS via izbad (runtime exercise of OpenVMM
 # guest-initiated hybrid vsock — guest connect(CID 2, 1027) must reach
-# izbad's run\vsock.sock_1027 listener, which izbad binds before VM boot).
+# izbad's <root>\run\<hex8(sha256(name))>\vsock.sock_1027 listener (the
+# hashed per-sandbox runtime dir, #71/#85), which izbad binds before VM boot).
 $egFailsBefore = $fails
 # egress-a is the SECOND concurrent nested microVM (valid8 is still running).
 # On hosted GitHub Windows runners the nested WHP partition occasionally fails
@@ -161,7 +162,11 @@ if (-not ($egRc -eq 0 -and $egOut -match 'example\.com')) {
         [Console]::Error.WriteLine("  --- egress-a console.log tail ---")
         Get-Content $egConsole -Tail 25 | ForEach-Object { [Console]::Error.WriteLine("  $_") }
     }
-    $egListener = "$env:LOCALAPPDATA\izba\sandboxes\egress-a\run\vsock.sock_1027"
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $hash = ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes("egress-a")) |
+        ForEach-Object { $_.ToString("x2") }) -join ""
+    $runDir = "$env:LOCALAPPDATA\izba\run\$($hash.Substring(0, 8))"
+    $egListener = "$runDir\vsock.sock_1027"
     [Console]::Error.WriteLine("  vsock.sock_1027 present: $(Test-Path $egListener)")
 }
 
