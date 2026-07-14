@@ -137,6 +137,19 @@ fn run_inner(
     allow_unconfined: bool,
     cmd: Vec<String>,
 ) -> anyhow::Result<i32> {
+    // Reject a data root too deep for the VM runtime sockets BEFORE the daemon
+    // connect: `DaemonClient::connect` binds/spawns the daemon's own control
+    // socket under this root, so a raw "path must be shorter than SUN_LEN"
+    // from std — exactly the opaque error #71 exists to eliminate — would
+    // otherwise fire here first, and roots in the merely-deep (not yet
+    // catastrophic) range would pay for a spawned daemon before the check in
+    // `resolve_or_create` ever ran. The real sandbox name isn't resolved yet
+    // at this point, but the check doesn't need it: `Paths::run_dir` hashes
+    // every name to exactly 8 hex chars, so the result is name-independent
+    // (pinned by `run_dir_length_is_name_independent` in
+    // `crates/izba-core/src/paths.rs`) — any probe name reports the same
+    // verdict as the real one.
+    izba_core::paths::ensure_socket_budget(paths, "sunlen-probe")?;
     let mut client = DaemonClient::connect(paths)?;
     let (name, was_created) =
         resolve_or_create(&mut client, paths, opts, name_or_dir, allow_unconfined)?;
@@ -245,12 +258,10 @@ fn resolve_or_create(
     // Validate --policy BEFORE the daemon Create RPC: a missing or invalid
     // file must fail here, leaving no stub sandbox registered (#139).
     let policy_raw = super::read_policy(merged.policy.as_deref())?;
-    // Reject a data root too deep for the VM runtime sockets BEFORE the
-    // daemon Create RPC, same as `create` — actionable, not a raw SUN_LEN
-    // bind failure at start time (#71). Only the create-new path needs this:
-    // an already-existing sandbox (`reconcile_existing`, Cases A/B above) was
-    // already checked when it was first created.
-    izba_core::paths::ensure_socket_budget(paths, &name)?;
+    // NOTE: no `ensure_socket_budget` check here — `run_inner` (the only
+    // caller of `resolve_or_create`) already runs it before the daemon
+    // connect, and the check is name-independent (see the comment there), so
+    // repeating it here would be redundant.
     // Carry the run's confinement intent into create: `run --allow-unconfined`
     // on a workspace that can't be relabelled must still create (the VMM will run
     // unconfined and never relabel it), so skip the create-time preflight.
