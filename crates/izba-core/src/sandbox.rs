@@ -366,6 +366,11 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
     };
     let result = populate();
     if result.is_err() {
+        // Intentionally does NOT remove the hashed run dir claimed above
+        // (`claim_run_dir`): a same-name retry after this failure reclaims
+        // it via the `owner == name` arm (no-op), and blindly removing it
+        // here would, in the hash-collision-bail case, delete a DIFFERENT,
+        // already-claimed sandbox's run dir out from under it.
         let _ = fs::remove_dir_all(&dir);
     }
     result

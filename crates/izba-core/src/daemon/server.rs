@@ -475,6 +475,12 @@ fn handle_start(
     let Some(_start_guard) = d.starting.begin(&name) else {
         bail!("a start for '{name}' is already in progress");
     };
+    // A non-CLI client (e.g. the GUI) can hit this RPC directly for a
+    // pre-existing (legacy) sandbox without ever going through the CLI's own
+    // `ensure_socket_budget` precheck (`create.rs`/`run.rs`) — give it the
+    // same actionable "IZBA_DATA_DIR too deep" message instead of a raw
+    // SUN_LEN bind error surfacing from `ensure_listening` below (#71).
+    crate::paths::ensure_socket_budget(&d.paths, &name)?;
     d.egress
         .ensure_listening(&d.paths, &name, &d.paths.run_dir(&name))?;
     if let Err(e) = sandbox::start(
@@ -917,7 +923,7 @@ mod tests {
     use super::*;
     use crate::daemon::proto::*;
     use crate::sandbox::CreateOpts;
-    use crate::state::{load_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
+    use crate::state::{load_json, save_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
     use crate::testutil::{
         fake_connector, live_identity, spawn_sleep, test_paths, wait_dead, write_state,
         write_state_with_run_dir, MockDriver,
@@ -1290,6 +1296,49 @@ mod tests {
         ));
         assert!(!d.egress.listening("web"));
         assert!(!egress::listener_path(&d.paths.run_dir("web")).exists());
+    }
+
+    /// A non-CLI client (e.g. the GUI) can call `Start` directly for a
+    /// pre-existing sandbox without ever going through the CLI's own
+    /// `ensure_socket_budget` precheck (`create.rs`/`run.rs`). `handle_start`
+    /// must reject a too-deep root with the same actionable
+    /// "IZBA_DATA_DIR too deep" message BEFORE binding the egress listener,
+    /// not a raw SUN_LEN bind error surfacing from `ensure_listening`
+    /// (review follow-up on #71). The sandbox dir + config.json are
+    /// hand-written here (bypassing `sandbox::create`'s own check) to
+    /// stand in for that direct-RPC path.
+    #[test]
+    fn handle_start_rejects_deep_root_before_binding_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep_root = dir.path().join("d".repeat(100));
+        let paths = Paths::with_root(deep_root);
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        save_json(
+            &paths.sandbox_dir("web").join(CONFIG_FILE),
+            &SandboxConfig {
+                image_digest: "sha256:abc".into(),
+                image_ref: "ubuntu:24.04".into(),
+                cpus: 1,
+                mem_mb: 256,
+                workspace: dir.path().join("ws"),
+                ports: Vec::new(),
+                volumes: Vec::new(),
+                builder: false,
+                build: None,
+                rw_size_gb: 1,
+            },
+        )
+        .unwrap();
+        let d = Arc::new(Daemon::new(paths, test_deps()));
+        let mut progress_log = Vec::new();
+        let err = handle_start(&d, "web".into(), false, &mut |s| progress_log.push(s))
+            .expect_err("deep root must be rejected before binding the listener");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("IZBA_DATA_DIR"), "{msg}");
+        assert!(
+            !d.egress.listening("web"),
+            "listener must not have been bound"
+        );
     }
 
     /// A pre-upgrade ("legacy") sandbox — adopted with `RunState.run_dir:

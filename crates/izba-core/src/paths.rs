@@ -198,8 +198,10 @@ const SUN_PATH_MAX: usize = 107;
 /// Reject a data root too deep for the VM runtime sockets — early and
 /// actionably, instead of the raw "path must be shorter than SUN_LEN" that
 /// a bind would produce at start time (#71). The hashed run dir makes the
-/// result name-independent, but the check takes `name` so the reported path
-/// is the sandbox's real one.
+/// result name-independent (see `run_dir_length_is_name_independent`), so
+/// `name` need not be the sandbox's real one — a probe name works just as
+/// well (e.g. `run.rs`'s pre-check, before the real sandbox name is even
+/// resolved).
 pub fn ensure_socket_budget(paths: &Paths, name: &str) -> anyhow::Result<()> {
     use anyhow::bail;
     let worst = paths.run_dir(name).join(LONGEST_RUNTIME_SOCKET);
