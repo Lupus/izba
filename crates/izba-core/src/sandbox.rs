@@ -2523,6 +2523,36 @@ mod tests {
     }
 
     #[test]
+    fn rm_force_stays_abrupt_with_only_ephemeral_volumes() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let mut o = opts(&ws);
+        o.volumes.push(crate::volume::VolumeSpec {
+            name: None,
+            guest_path: "/eph".into(),
+            size_bytes: 64 << 20,
+            eph_id: None,
+        });
+        create(&paths, "web", &o).unwrap();
+
+        let sleep_id = spawn_sleep(dir.path());
+        write_state(&paths, "web", sleep_id.clone());
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log.clone(), None);
+        remove(&paths, "web", &conn, true).unwrap();
+
+        assert_eq!(
+            count_shutdowns(&log),
+            0,
+            "ephemeral volumes die with the sandbox — no sync attempt"
+        );
+        assert!(!paths.sandbox_dir("web").exists(), "dir must be gone");
+        assert!(wait_dead(&sleep_id), "force remove must kill the vmm");
+    }
+
+    #[test]
     fn rm_force_escalates_when_guest_ignores_shutdown() {
         let (dir, paths) = test_paths();
         let ws = dir.path().join("ws");
