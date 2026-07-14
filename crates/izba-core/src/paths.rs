@@ -186,6 +186,37 @@ fn short_name_hash(name: &str) -> String {
     digest[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The longest socket basename any sandbox runtime dir can hold — the
+/// virtiofsd socket of the `izba-buildout` share (builder VMs). Grep-anchor:
+/// if a longer-named share tag is ever added, update this constant or the
+/// budget check silently under-estimates.
+pub const LONGEST_RUNTIME_SOCKET: &str = "fs-izba-buildout.sock";
+
+/// AF_UNIX `sun_path` holds at most 108 bytes including the NUL terminator.
+const SUN_PATH_MAX: usize = 107;
+
+/// Reject a data root too deep for the VM runtime sockets — early and
+/// actionably, instead of the raw "path must be shorter than SUN_LEN" that
+/// a bind would produce at start time (#71). The hashed run dir makes the
+/// result name-independent, but the check takes `name` so the reported path
+/// is the sandbox's real one.
+pub fn ensure_socket_budget(paths: &Paths, name: &str) -> anyhow::Result<()> {
+    use anyhow::bail;
+    let worst = paths.run_dir(name).join(LONGEST_RUNTIME_SOCKET);
+    let len = worst.as_os_str().len();
+    if len > SUN_PATH_MAX {
+        let overhead = len - paths.root().as_os_str().len();
+        bail!(
+            "data dir too deep for VM runtime sockets: {} would be {len} bytes, \
+             but unix socket paths are capped at 108 bytes — \
+             use an IZBA_DATA_DIR of at most {} bytes",
+            worst.display(),
+            SUN_PATH_MAX - overhead,
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +378,33 @@ mod tests {
                 .join("Local")
                 .join("izba")
         );
+    }
+
+    #[test]
+    fn socket_budget_accepts_normal_roots() {
+        let p = Paths::with_root("/home/user/.local/share/izba".into());
+        ensure_socket_budget(&p, &"a".repeat(64)).unwrap();
+    }
+
+    #[test]
+    fn socket_budget_rejects_deep_roots_with_actionable_error() {
+        // 100-byte root ⇒ worst socket path is well over 107 bytes.
+        let deep = format!("/{}", "d".repeat(99));
+        let p = Paths::with_root(deep.into());
+        let err = format!("{:#}", ensure_socket_budget(&p, "web").unwrap_err());
+        // Actionable: names the env var, the byte budget, and the limit —
+        // never the raw kernel "SUN_LEN" string alone.
+        assert!(err.contains("IZBA_DATA_DIR"), "{err}");
+        assert!(err.contains("108"), "{err}");
+        assert!(err.contains("72"), "{err}");
+    }
+
+    #[test]
+    fn socket_budget_boundary_is_exact() {
+        // Boundary: worst path = root + "/run/" + 8 + "/" + 21. 107-35 = 72.
+        let ok = Paths::with_root(format!("/{}", "r".repeat(71)).into()); // 72 bytes
+        ensure_socket_budget(&ok, "web").unwrap();
+        let over = Paths::with_root(format!("/{}", "r".repeat(72)).into()); // 73 bytes
+        assert!(ensure_socket_budget(&over, "web").is_err());
     }
 }

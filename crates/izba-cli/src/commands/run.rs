@@ -245,6 +245,12 @@ fn resolve_or_create(
     // Validate --policy BEFORE the daemon Create RPC: a missing or invalid
     // file must fail here, leaving no stub sandbox registered (#139).
     let policy_raw = super::read_policy(merged.policy.as_deref())?;
+    // Reject a data root too deep for the VM runtime sockets BEFORE the
+    // daemon Create RPC, same as `create` — actionable, not a raw SUN_LEN
+    // bind failure at start time (#71). Only the create-new path needs this:
+    // an already-existing sandbox (`reconcile_existing`, Cases A/B above) was
+    // already checked when it was first created.
+    izba_core::paths::ensure_socket_budget(paths, &name)?;
     // Carry the run's confinement intent into create: `run --allow-unconfined`
     // on a workspace that can't be relabelled must still create (the VMM will run
     // unconfined and never relabel it), so skip the create-time preflight.

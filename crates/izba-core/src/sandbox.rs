@@ -246,6 +246,7 @@ fn compute_launch_lockdown(_paths: &Paths, _name: &str) -> anyhow::Result<Option
 
 pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()> {
     validate_name(name)?;
+    crate::paths::ensure_socket_budget(paths, name)?;
     let dir = paths.sandbox_dir(name);
     if dir.exists() {
         bail!("sandbox '{name}' already exists");
@@ -674,6 +675,7 @@ pub fn start_with_timeouts(
     poll: Duration,
 ) -> anyhow::Result<()> {
     validate_name(name)?;
+    crate::paths::ensure_socket_budget(paths, name)?;
     let _lock = lock_sandbox(paths, name)?;
 
     let config: SandboxConfig = load_json(&paths.sandbox_dir(name).join(CONFIG_FILE))?
@@ -1572,6 +1574,20 @@ mod tests {
     // -----------------------------------------------------------------------
     // Sandbox-specific helpers (not shared)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_rejects_a_data_root_too_deep_for_sockets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("d".repeat(100));
+        let paths = Paths::with_root(deep);
+        let err = format!(
+            "{:#}",
+            create(&paths, "web", &opts(Path::new("/tmp/ws"))).unwrap_err()
+        );
+        assert!(err.contains("IZBA_DATA_DIR"), "{err}");
+        // No stub sandbox dir may be left behind (mirrors #139).
+        assert!(!paths.sandbox_dir("web").exists());
+    }
 
     #[test]
     fn create_provisions_volume_images() {
