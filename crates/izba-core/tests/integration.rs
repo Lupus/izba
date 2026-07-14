@@ -1057,6 +1057,73 @@ fn volumes_persist_reattach_and_prune() {
 }
 
 #[test]
+fn volume_survives_force_rm_of_running_sandbox() {
+    // #78 regression: rm --force of a RUNNING sandbox must not lose unsynced
+    // persistent-volume writes. The force path now sends the guest Shutdown
+    // (init syncs the page cache before power-off) under a bounded grace.
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("fvol");
+    create_sandbox_with_volumes(
+        &env,
+        &mut tb,
+        "fvol",
+        &ws,
+        vec![izba_core::volume::VolumeSpec {
+            name: Some("fdata".into()),
+            guest_path: "/data".into(),
+            size_bytes: 64 << 20,
+            eph_id: None,
+        }],
+    );
+    if let Err(e) = start_sandbox(&env, &tb, "fvol") {
+        panic!(
+            "boot of 'fvol' failed: {e:#}\nconsole tail:\n{}",
+            boot_diag(&tb.paths, "fvol")
+        );
+    }
+
+    // Write WITHOUT an explicit sync: the sentinel sits in the guest page
+    // cache, exactly the state the old abrupt kill lost.
+    exec_ok(&tb.paths, "fvol", &["sh", "-c", "echo forced > /data/s"]);
+
+    // Force-remove while still running.
+    let connector = sandbox::default_connector();
+    sandbox::remove(&tb.paths, "fvol", &connector, true).expect("force rm running fvol");
+    tb.names.retain(|n| n != "fvol");
+    assert!(
+        tb.paths.volume_image("fdata").exists(),
+        "persistent volume must survive force rm"
+    );
+
+    // Re-attach in a fresh sandbox: the unsynced write must have survived.
+    let ws2 = tb.workspace("fvol2");
+    create_sandbox_with_volumes(
+        &env,
+        &mut tb,
+        "fvol2",
+        &ws2,
+        vec![izba_core::volume::VolumeSpec {
+            name: Some("fdata".into()),
+            guest_path: "/data".into(),
+            size_bytes: 64 << 20,
+            eph_id: None,
+        }],
+    );
+    if let Err(e) = start_sandbox(&env, &tb, "fvol2") {
+        panic!(
+            "boot of 'fvol2' failed: {e:#}\nconsole tail:\n{}",
+            boot_diag(&tb.paths, "fvol2")
+        );
+    }
+    assert_eq!(
+        exec_ok(&tb.paths, "fvol2", &["cat", "/data/s"]),
+        "forced\n",
+        "write made just before rm --force of the running sandbox must survive"
+    );
+}
+
+#[test]
 fn first_boot_formats_blank_rw() {
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
