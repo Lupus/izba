@@ -40,10 +40,10 @@ pub fn listener_path(paths: &Paths, name: &str) -> PathBuf {
 
 /// A swappable holder for a sandbox's live egress policy. The accept loop reads
 /// it per connection via [`PolicyCell::load`], so a [`PolicyCell::store`] from a
-/// reload takes effect on the *next* connection; in-flight connections keep the
-/// `Arc` they already cloned. The lock is held only for an `Arc` clone/replace,
-/// never across I/O, so a plain `Mutex` is contention-free here (one accept
-/// thread per sandbox).
+/// reload (see [`EgressManager::apply_policy`]) takes effect on the *next*
+/// connection; in-flight connections keep the `Arc` they already cloned. The
+/// lock is held only for an `Arc` clone/replace, never across I/O, so a plain
+/// `Mutex` is contention-free here (one accept thread per sandbox).
 pub(crate) struct PolicyCell {
     inner: Mutex<Arc<dyn Policy>>,
 }
@@ -69,7 +69,7 @@ impl PolicyCell {
 struct EgressSlot {
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
-    /// The sandbox's live policy, swappable by `reload_policy`. Shared with the
+    /// The sandbox's live policy, swappable by `apply_policy`. Shared with the
     /// accept thread, which reads it per connection.
     policy: Arc<PolicyCell>,
 }
@@ -260,15 +260,17 @@ impl EgressManager {
             .unwrap_or(false)
     }
 
-    /// Re-read `name`'s `policy.yaml` from disk and hot-swap it into the live
-    /// egress slot. Takes effect on new connections only (in-flight flows keep
-    /// their snapshot). No-op when `name` has no live slot — the file on disk is
-    /// already what the next start will read. The resolve (file I/O) happens
-    /// off-lock; only the `Arc` swap is under the slot lock.
-    pub fn reload_policy(&self, paths: &Paths, name: &str) {
-        let new = resolve_policy(paths, name);
+    /// Hot-swap `name`'s live policy to an already-validated, compiled
+    /// snapshot. The caller loads+compiles the policy exactly once (from
+    /// `ReloadPolicy`'s dispatch handler) and hands it here to apply — this
+    /// is the TOCTOU-free companion to the old re-read-by-path design: there
+    /// is no second file read that could observe a different (or broken)
+    /// file than the one that was validated. Takes effect on new connections
+    /// only (in-flight flows keep their snapshot). No-op when `name` has no
+    /// live slot — the file on disk is already what the next start will read.
+    pub fn apply_policy(&self, name: &str, policy: Arc<dyn Policy>) {
         if let Some(slot) = self.inner.lock().unwrap().get(name) {
-            slot.policy.store(new);
+            slot.policy.store(policy);
         }
     }
 
@@ -401,33 +403,40 @@ mod tests {
         assert!(cell.load().enforces(), "swapped-in RegoPolicy enforces");
     }
 
+    /// Companion to the daemon's `ReloadPolicy` dispatch: the caller loads +
+    /// compiles a policy exactly once and hands the compiled snapshot to
+    /// `apply_policy`, which just swaps the live slot — no re-read of
+    /// `policy.yaml` happens here (that's the whole point: no TOCTOU window
+    /// between validating and applying).
     #[test]
-    fn reload_policy_swaps_a_live_slot() {
-        let (_tmp, paths) = test_paths();
+    fn apply_policy_swaps_a_live_slot() {
         let mgr = mgr(); // default policy is the bare AllowAll
         mgr.insert_for_test("web");
         assert_eq!(mgr.slot_enforces("web"), Some(false), "starts bare");
 
-        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
-        std::fs::write(
-            EgressPolicyConfig::path_in(&paths.sandbox_dir("web")),
-            "allow:\n  - api.anthropic.com\n",
-        )
+        let enforcing = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![crate::daemon::egress::config::AllowEntry::Host(
+                "api.anthropic.com".into(),
+            )],
+            git: vec![],
+        }
+        .into_policy("web")
         .unwrap();
-        mgr.reload_policy(&paths, "web");
+        mgr.apply_policy("web", enforcing);
 
         assert_eq!(
             mgr.slot_enforces("web"),
             Some(true),
-            "after reload the slot enforces the written allow-list"
+            "after apply_policy the slot enforces the compiled allow-list"
         );
     }
 
     #[test]
-    fn reload_policy_unknown_sandbox_is_a_noop() {
-        let (_tmp, paths) = test_paths();
+    fn apply_policy_unknown_sandbox_is_a_noop() {
         let mgr = mgr();
-        mgr.reload_policy(&paths, "ghost"); // must not panic
+        let policy: Arc<dyn Policy> = Arc::new(AllowAll);
+        mgr.apply_policy("ghost", policy); // must not panic
         assert_eq!(mgr.slot_enforces("ghost"), None);
     }
 

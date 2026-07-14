@@ -357,16 +357,21 @@ fn dispatch_inner(
         }
         DaemonRequest::ReloadPolicy { name } => {
             sandbox_must_exist(&d.paths, &name)?;
-            // Validate BEFORE swapping: a broken policy.yaml must surface to
-            // the caller (#138/#83), not silently arm deny-all — the live
-            // policy stays unchanged. (resolve_policy still fails closed for
-            // the unattended paths: daemon start / ensure_listening.)
-            // Scope: this catches read/parse/unknown-key errors; a config that
-            // parses but fails into_policy() Rego compilation (unreachable
-            // today — the embedded Rego is valid) still falls to
-            // resolve_policy's fail-closed deny-all.
-            crate::daemon::egress::config::EgressPolicyConfig::load(&d.paths.sandbox_dir(&name))?;
-            d.egress.reload_policy(&d.paths, &name);
+            // Load + compile ONCE and apply that exact snapshot. Validating
+            // here and then having the egress manager re-read the file by
+            // path would be a TOCTOU: if policy.yaml is replaced/broken
+            // between the two reads, the second read fails and the manager's
+            // fail-closed fallback silently arms deny-all while this RPC
+            // still answers Ok — the validated config would never be the one
+            // applied. Both parse and compile errors surface to the caller
+            // (#138/#83); the live policy is untouched on failure. (The
+            // unattended paths — daemon start / ensure_listening — still
+            // fail closed via resolve_policy.)
+            let cfg = crate::daemon::egress::config::EgressPolicyConfig::load_or_materialize(
+                &d.paths.sandbox_dir(&name),
+            )?;
+            let policy = cfg.into_policy(&name)?;
+            d.egress.apply_policy(&name, policy);
             Ok(DaemonResponse::Ok)
         }
         DaemonRequest::Shutdown => {
@@ -1116,6 +1121,35 @@ mod tests {
                 assert!(message.contains("portz"), "{message}")
             }
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// TOCTOU-fix acceptance: a well-formed `policy.yaml` is loaded and
+    /// compiled exactly once and that snapshot is applied — the reload
+    /// answers `Ok` rather than erroring or silently arming deny-all. The
+    /// egress manager's live-slot swap on a real listener is covered at the
+    /// unit level by `egress::mod::tests::apply_policy_swaps_a_live_slot`
+    /// (no live listener exists here — `Create` never arms one — so
+    /// `apply_policy` is a documented no-op on the manager side; the RPC
+    /// result is what this test asserts).
+    #[test]
+    fn reload_policy_applies_a_valid_snapshot() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "fw2")),
+            DaemonResponse::Created { .. }
+        ));
+
+        std::fs::write(
+            d.paths.sandbox_dir("fw2").join("policy.yaml"),
+            "enforce: true\nallow:\n  - api.anthropic.com\n",
+        )
+        .unwrap();
+
+        match rpc(&mut c, &DaemonRequest::ReloadPolicy { name: "fw2".into() }) {
+            DaemonResponse::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 
