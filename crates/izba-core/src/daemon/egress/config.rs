@@ -1349,6 +1349,7 @@ mod tests {
         let msg = parse_err("- example.com\n");
         assert!(msg.contains("must be a YAML mapping"), "{msg}");
         assert!(msg.contains("enforce, allow, git"), "{msg}");
+        assert!(msg.contains("got a list"), "{msg}");
     }
 
     #[test]
@@ -1400,6 +1401,7 @@ mod tests {
             msg.contains("enforce") && msg.contains("expected true or false"),
             "{msg}"
         );
+        assert!(msg.contains("got a string"), "{msg}");
     }
 
     #[test]
