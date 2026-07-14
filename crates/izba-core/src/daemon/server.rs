@@ -357,6 +357,11 @@ fn dispatch_inner(
         }
         DaemonRequest::ReloadPolicy { name } => {
             sandbox_must_exist(&d.paths, &name)?;
+            // Validate BEFORE swapping: a broken policy.yaml must surface to
+            // the caller (#138/#83), not silently arm deny-all — the live
+            // policy stays unchanged. (resolve_policy still fails closed for
+            // the unattended paths: daemon start / ensure_listening.)
+            crate::daemon::egress::config::EgressPolicyConfig::load(&d.paths.sandbox_dir(&name))?;
             d.egress.reload_policy(&d.paths, &name);
             Ok(DaemonResponse::Ok)
         }
@@ -1081,6 +1086,32 @@ mod tests {
                 assert!(message.contains("no such sandbox"), "{message}")
             }
             other => panic!("inspect ghost: {other:?}"),
+        }
+    }
+
+    /// #138/#83 reload acceptance criterion: a broken `policy.yaml` must
+    /// surface a parse error to the caller instead of the daemon silently
+    /// swapping in a deny-all live policy.
+    #[test]
+    fn reload_policy_surfaces_parse_error_instead_of_silent_deny_all() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "fw")),
+            DaemonResponse::Created { .. }
+        ));
+
+        std::fs::write(
+            d.paths.sandbox_dir("fw").join("policy.yaml"),
+            "portz: [80]\n",
+        )
+        .unwrap();
+
+        match rpc(&mut c, &DaemonRequest::ReloadPolicy { name: "fw".into() }) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("portz"), "{message}")
+            }
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 
