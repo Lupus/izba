@@ -242,6 +242,9 @@ fn resolve_or_create(
     }
     let ports = super::parse_publish(&merged.publish)?;
     let volumes = super::parse_volumes(&merged.volumes)?;
+    // Validate --policy BEFORE the daemon Create RPC: a missing or invalid
+    // file must fail here, leaving no stub sandbox registered (#139).
+    let policy_raw = super::read_policy(merged.policy.as_deref())?;
     // Carry the run's confinement intent into create: `run --allow-unconfined`
     // on a workspace that can't be relabelled must still create (the VMM will run
     // unconfined and never relabel it), so skip the create-time preflight.
@@ -258,7 +261,7 @@ fn resolve_or_create(
         DaemonResponse::Error { message } => bail!(message),
         other => bail!("unexpected daemon reply: {other:?}"),
     }
-    super::persist_policy(paths, &name, merged.policy.as_deref())?;
+    super::write_policy(paths, &name, policy_raw.as_deref())?;
     // Seed the manifest base so `izba diff` reads in-sync right after create.
     if let Some(ref m) = manifest_for_base {
         if merged.policy.is_none() {

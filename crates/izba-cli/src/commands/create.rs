@@ -14,6 +14,9 @@ pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32>
     let name = super::name_for(&merged, &workspace)?;
     let ports = super::parse_publish(&merged.publish)?;
     let volumes = super::parse_volumes(&merged.volumes)?;
+    // Validate --policy BEFORE the daemon Create RPC: a missing or invalid
+    // file must fail here, leaving no stub sandbox registered (#139).
+    let policy_raw = super::read_policy(merged.policy.as_deref())?;
     let mut client = DaemonClient::connect(paths)?;
     // `izba create` has no unconfined opt-out (that is a run/start flag), so it
     // always creates with confined intent: the daemon runs the workspace
@@ -23,7 +26,7 @@ pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32>
     ));
     match client.request(&req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Created { name } => {
-            super::persist_policy(paths, &name, merged.policy.as_deref())?;
+            super::write_policy(paths, &name, policy_raw.as_deref())?;
             // Seed the manifest base so `izba diff` reads in-sync right after create.
             if let Some(ref m) = manifest_for_base {
                 if merged.policy.is_none() {

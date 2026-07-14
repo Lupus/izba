@@ -231,26 +231,50 @@ pub(crate) fn merge_manifest_into_opts(
     Ok(Some(m))
 }
 
-/// Validate a `--policy` file and persist it into the sandbox directory as
-/// `policy.yaml` (the daemon loads it when arming the sandbox's egress plane).
-/// No-op when no policy was given. Must run after the sandbox dir exists.
-pub(crate) fn persist_policy(
-    paths: &izba_core::paths::Paths,
-    name: &str,
-    policy: Option<&Path>,
-) -> anyhow::Result<()> {
+/// Read and validate a `--policy` file WITHOUT touching any sandbox state,
+/// returning the raw YAML to persist after the sandbox exists. Runs BEFORE
+/// the daemon Create RPC so a missing/invalid file fails the invocation
+/// without leaving a stub sandbox registered (#139).
+pub(crate) fn read_policy(policy: Option<&Path>) -> anyhow::Result<Option<String>> {
     use izba_core::daemon::egress::config::EgressPolicyConfig;
     let Some(src) = policy else {
-        return Ok(());
+        return Ok(None);
     };
     let raw = std::fs::read_to_string(src)
         .with_context(|| format!("reading egress policy {}", src.display()))?;
     // Fail fast at create on a malformed allow-list rather than at boot.
     EgressPolicyConfig::from_yaml(&raw)
         .with_context(|| format!("invalid egress policy {}", src.display()))?;
+    Ok(Some(raw))
+}
+
+/// Persist pre-validated policy text into the sandbox directory as
+/// `policy.yaml` (the daemon loads it when arming the sandbox's egress
+/// plane). No-op for `None`. Must run after the sandbox dir exists.
+pub(crate) fn write_policy(
+    paths: &izba_core::paths::Paths,
+    name: &str,
+    raw: Option<&str>,
+) -> anyhow::Result<()> {
+    use izba_core::daemon::egress::config::EgressPolicyConfig;
+    let Some(raw) = raw else {
+        return Ok(());
+    };
     let dst = EgressPolicyConfig::path_in(&paths.sandbox_dir(name));
     std::fs::write(&dst, raw).with_context(|| format!("writing {}", dst.display()))?;
     Ok(())
+}
+
+/// Validate a `--policy` file and persist it into the sandbox directory —
+/// [`read_policy`] + [`write_policy`] composed, for call sites where the
+/// sandbox already exists (run's reconcile path).
+pub(crate) fn persist_policy(
+    paths: &izba_core::paths::Paths,
+    name: &str,
+    policy: Option<&Path>,
+) -> anyhow::Result<()> {
+    let raw = read_policy(policy)?;
+    write_policy(paths, name, raw.as_deref())
 }
 
 /// Persist a programmatically-built egress policy as the sandbox's
@@ -627,5 +651,44 @@ mod tests {
         );
         // Name should be resolved from the manifest metadata.
         assert_eq!(o.name.as_deref(), Some("myproject"));
+    }
+
+    #[test]
+    fn read_policy_missing_file_errors() {
+        let err = read_policy(Some(std::path::Path::new("/nonexistent-policy.yaml")))
+            .expect_err("missing file must fail");
+        assert!(
+            format!("{err:#}").contains("reading egress policy"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn read_policy_invalid_content_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("p.yaml");
+        std::fs::write(&f, "allow:\n  - host: example.com\n    portz: [80]\n").unwrap();
+        let err = read_policy(Some(&f)).expect_err("bad key must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid egress policy"), "{msg}");
+        assert!(msg.contains("portz"), "{msg}");
+    }
+
+    #[test]
+    fn read_policy_none_is_none() {
+        assert!(read_policy(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn write_policy_persists_validated_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.sandbox_dir("fw")).unwrap();
+        let raw = "enforce: true\nallow:\n  - example.com\n";
+        write_policy(&paths, "fw", Some(raw)).unwrap();
+        let dst = EgressPolicyConfig::path_in(&paths.sandbox_dir("fw"));
+        assert_eq!(std::fs::read_to_string(dst).unwrap(), raw);
+        // None is a no-op.
+        write_policy(&paths, "fw", None).unwrap();
     }
 }
