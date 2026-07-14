@@ -66,6 +66,20 @@ pub(crate) fn wait_dead(id: &PidIdentity) -> bool {
 }
 
 pub(crate) fn write_state(paths: &Paths, name: &str, vmm: PidIdentity) {
+    write_state_with_run_dir(paths, name, vmm, None);
+}
+
+/// Like [`write_state`], but lets the caller pin `RunState.run_dir`
+/// explicitly — needed by tests that overwrite a real post-`Start`
+/// `state.json` (which always records `Some(paths.run_dir(name))`, per
+/// `record_run_state`) and must not accidentally clobber it back to the
+/// legacy-adoption `None` sentinel.
+pub(crate) fn write_state_with_run_dir(
+    paths: &Paths,
+    name: &str,
+    vmm: PidIdentity,
+    run_dir: Option<std::path::PathBuf>,
+) {
     save_json(
         &paths.sandbox_dir(name).join(STATE_FILE),
         &RunState {
@@ -73,7 +87,7 @@ pub(crate) fn write_state(paths: &Paths, name: &str, vmm: PidIdentity) {
             sidecar_pids: vec![],
             started_unix_ms: 0,
             confinement: None,
-            run_dir: None,
+            run_dir,
         },
     )
     .unwrap();
