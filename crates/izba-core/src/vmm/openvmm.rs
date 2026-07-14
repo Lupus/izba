@@ -202,10 +202,11 @@ fn spawn_locked_vmm(
 /// writing UP to Medium-IL objects, so the VM would never boot (empty
 /// console.log) and the guest could not write /workspace.  Low-label EVERY
 /// host path the confined VMM must write (`VmSpec::confined_write_surfaces`:
-/// the scratch dir, the virtiofs shares, and writable disk backing files incl.
-/// named volumes outside the scratch). Lowering is a write-DOWN for izbad
-/// (Medium → Low), so izbad keeps full control; the labels are restored to
-/// Medium on teardown (sandbox::restore_confined_workspace). Inheritance is
+/// the hashed run dir, the logs dir, the virtiofs shares, and writable disk
+/// backing files incl. named volumes outside the per-sandbox dir). Lowering
+/// is a write-DOWN for izbad (Medium → Low), so izbad keeps full control; the
+/// labels are restored to Medium on teardown
+/// (sandbox::restore_confined_workspace). Inheritance is
 /// robust for plain creates; documented residuals (atomic-rename-in,
 /// post-teardown Low files) live in the design spec / F-06 finding.
 ///

@@ -83,25 +83,40 @@ pub struct VmSpec {
 impl VmSpec {
     /// Host paths the confined (Low-IL) VMM must be able to WRITE — hence the
     /// set that must be Low-labelled before a confined launch and restored to
-    /// Medium on teardown (MIC no-write-up otherwise blocks every write):
+    /// Medium on teardown (MIC no-write-up otherwise blocks every write).
     ///
-    ///   - the per-sandbox **scratch dir** (`run_dir`'s parent) — `run/` (vsock
-    ///     socket), `logs/` (console.log + vmm.log), `rw.img`, and any anonymous
-    ///     volume images all live under it; one inheritable label covers them;
-    ///   - each **virtiofs share**'s host dir (the user's workspace) — the guest
-    ///     writes it through the in-process virtiofs running inside the VMM;
-    ///   - every **writable disk** backing file — notably NAMED persistent
-    ///     volumes under `<data>/volumes`, which live OUTSIDE the scratch dir.
-    ///     (`rw.img` / anon volumes are under the scratch dir already, so they
-    ///     are covered twice — harmless.)
+    /// Since #85 (the hashed-runtime-dir move), `run_dir` is
+    /// `<root>/run/<hex8(sha256(name))>` — a per-sandbox dir, but its
+    /// **parent is the SHARED `<root>/run` tree**, holding every sibling
+    /// sandbox's own hashed dir. That parent must NEVER be labelled: Low-
+    /// labelling it would flip the inheritable integrity label of every
+    /// sibling sandbox's run dir in one shot, and teardown's restore-to-
+    /// Medium would then corrupt any sibling still confined and running.
+    /// So write coverage is now split into two independent surfaces instead
+    /// of the old single "scratch dir" (pre-#85, `run_dir`'s parent WAS the
+    /// per-sandbox scratch dir covering everything below):
+    ///
+    ///   - **`run_dir` itself** — the hashed per-sandbox dir where the vsock
+    ///     control socket is created; labelled directly (not via its parent);
+    ///   - **`console_log`'s parent** — the per-sandbox `logs/` dir, opened
+    ///     for write by the Low-IL VMM via `--com1 file=`; without this,
+    ///     `console.log` is unreachable and every default confined Windows
+    ///     boot fails at MIC's no-write-up check;
+    ///   - each **virtiofs share**'s host dir (the user's workspace) — the
+    ///     guest writes it through the in-process virtiofs running inside the
+    ///     VMM;
+    ///   - every **writable disk** backing file — `rw.img`, anonymous volume
+    ///     images, and NAMED persistent volumes under `<data>/volumes` (which
+    ///     live outside the per-sandbox dir entirely).
     ///
     /// The read-only rootfs (erofs) is omitted: a Low-IL process may read UP to
     /// a Medium object (no-read-up is not part of MIC's default policy), so the
     /// RO image needs no label.
     pub fn confined_write_surfaces(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();
-        if let Some(scratch) = self.run_dir.parent() {
-            out.push(scratch.to_path_buf());
+        out.push(self.run_dir.clone());
+        if let Some(logs) = self.console_log.parent() {
+            out.push(logs.to_path_buf());
         }
         for s in &self.shares {
             out.push(s.host_path.clone());
@@ -154,6 +169,14 @@ pub fn reject_commas(spec: &VmSpec) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// Realistic post-#85 layout: `run_dir` is the hashed dir directly under
+    /// the SHARED `<root>/run` (its parent is NOT per-sandbox), while
+    /// `console_log` lives under the per-sandbox `sandboxes/<name>/logs`
+    /// dir. A test that instead hand-builds `run_dir: "/sbx/web/run"` (old
+    /// pre-#85 layout, where `run_dir.parent()` WAS the per-sandbox scratch
+    /// dir) would mask a regression where `confined_write_surfaces` still
+    /// labels `run_dir.parent()` — see
+    /// `confined_write_surfaces_covers_scratch_shares_and_writable_disks_only`.
     fn spec_with(disks: Vec<BlockDisk>, shares: Vec<FsShare>) -> VmSpec {
         VmSpec {
             kernel: PathBuf::from("/k"),
@@ -163,8 +186,8 @@ mod tests {
             mem_mb: 256,
             disks,
             shares,
-            console_log: PathBuf::from("/sbx/web/logs/console.log"),
-            run_dir: PathBuf::from("/sbx/web/run"),
+            console_log: PathBuf::from("/data/sandboxes/web/logs/console.log"),
+            run_dir: PathBuf::from("/data/run/aabbccdd"),
             allow_unconfined: false,
             lockdown: None,
         }
@@ -241,8 +264,11 @@ mod tests {
             }],
         );
         let s = spec.confined_write_surfaces();
-        // scratch dir (run_dir's parent)
-        assert!(s.contains(&PathBuf::from("/sbx/web")));
+        // the per-sandbox hashed run dir itself (needed for socket creation)
+        assert!(s.contains(&PathBuf::from("/data/run/aabbccdd")));
+        // the logs dir (console_log's parent) — covers console.log, opened
+        // for write by the Low-IL VMM via `--com1 file=`
+        assert!(s.contains(&PathBuf::from("/data/sandboxes/web/logs")));
         // virtiofs share host dir
         assert!(s.contains(&PathBuf::from("/home/user/project")));
         // writable disks (rw.img + the named volume OUTSIDE the scratch dir)
@@ -250,5 +276,14 @@ mod tests {
         assert!(s.contains(&PathBuf::from("/data/volumes/cache.img")));
         // the read-only rootfs must NOT be labelled (read-up is allowed)
         assert!(!s.contains(&PathBuf::from("/img/rootfs.erofs")));
+        // the SHARED `<root>/run` parent must NEVER be labelled — it holds
+        // every sibling sandbox's hashed run dir; Low-labelling it would
+        // flip every sibling's inheritable integrity label, and teardown
+        // restore would corrupt concurrently-running confined siblings.
+        assert!(!s.contains(&PathBuf::from("/data/run")));
+        // the sandbox dir must NOT be labelled wholesale — under the new
+        // layout it is not a single scratch dir covering run/, only logs/
+        // (+ rw.img, covered separately via the writable-disks loop).
+        assert!(!s.contains(&PathBuf::from("/data/sandboxes/web")));
     }
 }
