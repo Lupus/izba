@@ -484,11 +484,12 @@ fn handle_start(
         &art,
         allow_unconfined,
     ) {
-        // Boot never happened — tear the listener back down. Nothing landed
-        // in state.json, so the LIVE dir is still `paths.run_dir` (the one
-        // just bound above).
-        d.egress
-            .stop(&name, &crate::sandbox::live_run_dir(&d.paths, &name));
+        // Boot never happened — tear the listener back down, in the SAME
+        // dir the bind above used. Not `live_run_dir`: a stale pre-upgrade
+        // state.json (crashed old run, `run_dir: None`, dead pid) would
+        // make it resolve to the legacy dir and miss the listener just
+        // bound in `paths.run_dir`.
+        d.egress.stop(&name, &d.paths.run_dir(&name));
         return Err(e);
     }
     // (Re-)apply the persisted publish rules afresh, as threads.
@@ -1328,15 +1329,20 @@ mod tests {
             .ensure_listening(&d.paths, "web", &d.paths.legacy_run_dir("web"))
         {
             Ok(()) => {}
+            // Chain-aware guard (house pattern from egress/mod.rs tests):
+            // anyhow's plain Display prints only the OUTERMOST context
+            // ("binding egress listener <path>"), so string-matching `e`
+            // would hard-fail instead of skipping in a bind-denied sandbox.
             Err(e)
-                if e.to_string().contains("denied")
-                    || e.to_string().contains("Permission")
-                    || e.to_string().contains("not permitted") =>
+                if e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                }) =>
             {
-                eprintln!("SKIP stop_removes_legacy_egress_listener: bind denied: {e}");
+                eprintln!("SKIP stop_removes_legacy_egress_listener: bind denied: {e:#}");
                 return;
             }
-            Err(e) => panic!("ensure_listening: {e}"),
+            Err(e) => panic!("ensure_listening: {e:#}"),
         }
         assert!(d.egress.listening("web"));
         let legacy_sock = egress::listener_path(&d.paths.legacy_run_dir("web"));
@@ -1384,15 +1390,17 @@ mod tests {
             .ensure_listening(&d.paths, "web", &d.paths.legacy_run_dir("web"))
         {
             Ok(()) => {}
+            // Chain-aware guard — same rationale as the Stop test above.
             Err(e)
-                if e.to_string().contains("denied")
-                    || e.to_string().contains("Permission")
-                    || e.to_string().contains("not permitted") =>
+                if e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                }) =>
             {
-                eprintln!("SKIP rm_force_removes_legacy_egress_listener: bind denied: {e}");
+                eprintln!("SKIP rm_force_removes_legacy_egress_listener: bind denied: {e:#}");
                 return;
             }
-            Err(e) => panic!("ensure_listening: {e}"),
+            Err(e) => panic!("ensure_listening: {e:#}"),
         }
         assert!(d.egress.listening("web"));
         let legacy_sock = egress::listener_path(&d.paths.legacy_run_dir("web"));
