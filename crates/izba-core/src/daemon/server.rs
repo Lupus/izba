@@ -514,10 +514,14 @@ fn handle_start(
 // once the VM dies, which relay_one handles (logged, conn
 // closed) — same ordering as the pre-daemon relay teardown.
 fn handle_stop(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> {
+    // Resolve the LIVE run dir before `sandbox::stop` deletes state.json —
+    // once it's gone, `live_run_dir` can only fall back to the new-scheme
+    // dir, missing the true legacy dir of a pre-upgrade (adopted) sandbox
+    // whose `RunState.run_dir` was `None` (review follow-up).
+    let run_dir = crate::sandbox::live_run_dir(&d.paths, &name);
     sandbox::stop(&d.paths, &name, d.connector(), STOP_TIMEOUT)?;
     d.relays.stop_all(&name);
-    d.egress
-        .stop(&name, &crate::sandbox::live_run_dir(&d.paths, &name));
+    d.egress.stop(&name, &run_dir);
     let _ = std::fs::remove_file(relays::rules_path(&d.paths, &name));
     d.registry.set_liveness(&name, Liveness::Stopped);
     regen_ssh_config(d);
@@ -525,10 +529,11 @@ fn handle_stop(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> 
 }
 
 fn handle_rm(d: &Arc<Daemon>, name: String, force: bool) -> anyhow::Result<DaemonResponse> {
+    // Same ordering concern as `handle_stop` above: resolve before delete.
+    let run_dir = crate::sandbox::live_run_dir(&d.paths, &name);
     sandbox::remove(&d.paths, &name, d.connector(), force)?;
     d.relays.stop_all(&name);
-    d.egress
-        .stop(&name, &crate::sandbox::live_run_dir(&d.paths, &name));
+    d.egress.stop(&name, &run_dir);
     d.registry.remove(&name);
     regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
@@ -913,7 +918,8 @@ mod tests {
     use crate::sandbox::CreateOpts;
     use crate::state::{load_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
     use crate::testutil::{
-        fake_connector, live_identity, spawn_sleep, test_paths, wait_dead, write_state, MockDriver,
+        fake_connector, live_identity, spawn_sleep, test_paths, wait_dead, write_state,
+        write_state_with_run_dir, MockDriver,
     };
     use crate::vmm::UdsStream;
     use izba_proto::{read_frame, write_frame, Request, Response};
@@ -1271,13 +1277,143 @@ mod tests {
         // Start binds in the new-scheme dir (no state.json existed yet).
         assert!(egress::listener_path(&d.paths.run_dir("web")).exists());
 
-        write_state(&d.paths, "web", vmm.clone());
+        // Swap the MockDriver-recorded vmm identity for the disposable
+        // child, same as the sibling test above — but keep the real
+        // `run_dir: Some(paths.run_dir(name))` that `record_run_state`
+        // wrote for this (non-legacy) Start, or `Stop` would resolve the
+        // wrong (legacy) dir and never see this test's listener.
+        write_state_with_run_dir(&d.paths, "web", vmm.clone(), Some(d.paths.run_dir("web")));
         assert!(matches!(
             rpc(&mut c, &DaemonRequest::Stop { name: "web".into() }),
             DaemonResponse::Ok
         ));
         assert!(!d.egress.listening("web"));
         assert!(!egress::listener_path(&d.paths.run_dir("web")).exists());
+    }
+
+    /// A pre-upgrade ("legacy") sandbox — adopted with `RunState.run_dir:
+    /// None`, so its egress listener actually lives at
+    /// `paths.legacy_run_dir(name)`, not the new-scheme `paths.run_dir(name)`
+    /// — must have that TRUE legacy socket removed by `Stop`. `handle_stop`
+    /// used to resolve `live_run_dir` AFTER `sandbox::stop` deletes
+    /// `state.json`; with the state gone, `live_run_dir` can only fall back
+    /// to the new-scheme dir, leaking the legacy socket file forever
+    /// (review follow-up). Runtime-skips where the sandbox denies bind.
+    #[test]
+    fn stop_removes_legacy_egress_listener_of_adopted_sandbox() {
+        use crate::daemon::egress;
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let vmm = spawn_sleep(dir.path());
+        let mut deps = test_deps();
+        deps.connector = Box::new(fake_connector(
+            Arc::new(Mutex::new(Vec::new())),
+            Some(vmm.clone()),
+        ));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+
+        // Simulate adoption of a pre-upgrade sandbox: `state.json` with
+        // `run_dir: None` (the legacy sentinel `write_state` already
+        // writes), and the egress listener actually bound in the legacy
+        // dir — exactly what daemon-startup adoption does for such a
+        // sandbox (`live_run_dir` resolves `None` to `legacy_run_dir`).
+        write_state(&d.paths, "web", vmm.clone());
+        match d
+            .egress
+            .ensure_listening(&d.paths, "web", &d.paths.legacy_run_dir("web"))
+        {
+            Ok(()) => {}
+            Err(e)
+                if e.to_string().contains("denied")
+                    || e.to_string().contains("Permission")
+                    || e.to_string().contains("not permitted") =>
+            {
+                eprintln!("SKIP stop_removes_legacy_egress_listener: bind denied: {e}");
+                return;
+            }
+            Err(e) => panic!("ensure_listening: {e}"),
+        }
+        assert!(d.egress.listening("web"));
+        let legacy_sock = egress::listener_path(&d.paths.legacy_run_dir("web"));
+        assert!(legacy_sock.exists(), "precondition: legacy socket bound");
+
+        assert!(matches!(
+            rpc(&mut c, &DaemonRequest::Stop { name: "web".into() }),
+            DaemonResponse::Ok
+        ));
+        assert!(!d.egress.listening("web"));
+        assert!(
+            !legacy_sock.exists(),
+            "Stop must remove the TRUE (legacy) egress socket, not just the \
+             new-scheme dir's (which never had one)"
+        );
+    }
+
+    /// Same bug, `handle_rm` side: `sandbox::remove` renames the whole
+    /// sandbox dir (including `state.json`) to a tombstone and deletes it —
+    /// an even more thorough state wipe than `Stop`'s `cleanup_runtime`.
+    /// `Rm --force` on a legacy-adopted ("running") sandbox must still find
+    /// and remove the TRUE legacy egress socket.
+    #[test]
+    fn rm_force_removes_legacy_egress_listener_of_adopted_sandbox() {
+        use crate::daemon::egress;
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let vmm = spawn_sleep(dir.path());
+        let mut deps = test_deps();
+        deps.connector = Box::new(fake_connector(
+            Arc::new(Mutex::new(Vec::new())),
+            Some(vmm.clone()),
+        ));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+
+        // Same legacy-adoption simulation as the Stop test above.
+        write_state(&d.paths, "web", vmm.clone());
+        match d
+            .egress
+            .ensure_listening(&d.paths, "web", &d.paths.legacy_run_dir("web"))
+        {
+            Ok(()) => {}
+            Err(e)
+                if e.to_string().contains("denied")
+                    || e.to_string().contains("Permission")
+                    || e.to_string().contains("not permitted") =>
+            {
+                eprintln!("SKIP rm_force_removes_legacy_egress_listener: bind denied: {e}");
+                return;
+            }
+            Err(e) => panic!("ensure_listening: {e}"),
+        }
+        assert!(d.egress.listening("web"));
+        let legacy_sock = egress::listener_path(&d.paths.legacy_run_dir("web"));
+        assert!(legacy_sock.exists(), "precondition: legacy socket bound");
+
+        assert!(matches!(
+            rpc(
+                &mut c,
+                &DaemonRequest::Rm {
+                    name: "web".into(),
+                    force: true,
+                }
+            ),
+            DaemonResponse::Ok
+        ));
+        assert!(!d.egress.listening("web"));
+        assert!(
+            !legacy_sock.exists(),
+            "Rm --force must remove the TRUE (legacy) egress socket, not just \
+             the new-scheme dir's (which never had one)"
+        );
     }
 
     /// A `Start` racing a name that's already mid-boot must bail fast,
