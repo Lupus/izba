@@ -45,6 +45,7 @@ fn run_on_deep_data_dir_fails_early_and_leaves_no_daemon() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("IZBA_DATA_DIR"), "stderr: {stderr}");
+    assert!(stderr.contains("108"), "stderr: {stderr}");
     assert!(
         !stderr.contains("SUN_LEN"),
         "raw kernel error leaked: {stderr}"
