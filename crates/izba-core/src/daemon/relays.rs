@@ -175,7 +175,7 @@ fn spawn_slot(paths: &Paths, name: &str, rule: PortRule) -> anyhow::Result<Relay
     let listener = TcpListener::bind((rule.bind, rule.host_port))
         .with_context(|| format!("host port {}:{} is unavailable", rule.bind, rule.host_port))?;
     let stop = Arc::new(AtomicBool::new(false));
-    let vsock = paths.run_dir(name).join("vsock.sock");
+    let vsock = crate::sandbox::live_run_dir(paths, name).join("vsock.sock");
     let stop2 = Arc::clone(&stop);
     let rule2 = rule.clone();
     let thread = std::thread::spawn(move || {

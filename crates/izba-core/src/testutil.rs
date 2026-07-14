@@ -73,6 +73,7 @@ pub(crate) fn write_state(paths: &Paths, name: &str, vmm: PidIdentity) {
             sidecar_pids: vec![],
             started_unix_ms: 0,
             confinement: None,
+            run_dir: None,
         },
     )
     .unwrap();
@@ -91,6 +92,7 @@ pub(crate) fn write_state_with_sidecars(
             sidecar_pids: sidecars,
             started_unix_ms: 0,
             confinement: None,
+            run_dir: None,
         },
     )
     .unwrap();

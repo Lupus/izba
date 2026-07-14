@@ -80,6 +80,14 @@ pub struct RunState {
     /// deserializes (it then reads as `None` ⇒ "unknown" in status).
     #[serde(default)]
     pub confinement: Option<crate::procmgr::ConfinementStatus>,
+    /// The runtime (socket) dir this run's VMM was launched with. `Option` +
+    /// `serde(default)` so a `state.json` written before this field still
+    /// deserializes — `None` ⇒ the pre-hash legacy `<sandbox>/run` layout,
+    /// which is exactly where such a run's sockets live. Live-management
+    /// paths (egress rebind/stop, connectors, relays) resolve through
+    /// [`crate::sandbox::live_run_dir`], never `Paths::run_dir` directly.
+    #[serde(default)]
+    pub run_dir: Option<std::path::PathBuf>,
 }
 
 /// Crash-safe write: serialise to a sibling `.tmp` file in the same directory,
@@ -178,6 +186,7 @@ mod tests {
             ],
             started_unix_ms: 1_700_000_000_000,
             confinement: None,
+            run_dir: None,
         }
     }
 
@@ -235,6 +244,18 @@ mod tests {
         save_json(&path, &s).unwrap();
         let loaded: RunState = load_json(&path).unwrap().unwrap();
         assert_eq!(loaded.confinement, s.confinement);
+    }
+
+    #[test]
+    fn run_state_without_run_dir_deserializes_to_none() {
+        // A state.json written before the field existed (disk back-compat).
+        let json = r#"{
+            "vmm_pid": {"pid": 1, "starttime": 2},
+            "sidecar_pids": [],
+            "started_unix_ms": 3
+        }"#;
+        let s: RunState = serde_json::from_str(json).unwrap();
+        assert_eq!(s.run_dir, None);
     }
 
     #[test]

@@ -76,7 +76,7 @@ pub type Connector<'a> = &'a dyn Fn(&Paths, &str) -> anyhow::Result<Box<dyn IoSt
 /// The production connector: hybrid-vsock through `run/vsock.sock`.
 pub fn default_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn IoStream>> {
     |paths: &Paths, name: &str| {
-        let sock = paths.run_dir(name).join("vsock.sock");
+        let sock = live_run_dir(paths, name).join("vsock.sock");
         let s = crate::vsock::hybrid_connect(&sock, CONTROL_PORT)?;
         Ok(Box::new(s) as Box<dyn IoStream>)
     }
@@ -91,8 +91,25 @@ pub fn default_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn Io
 pub fn default_stream_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<crate::vmm::UdsStream>
 {
     |paths: &Paths, name: &str| {
-        let sock = paths.run_dir(name).join("vsock.sock");
+        let sock = live_run_dir(paths, name).join("vsock.sock");
         crate::vsock::hybrid_connect(&sock, STREAM_PORT)
+    }
+}
+
+/// The runtime (socket) dir of the sandbox's CURRENT run: the dir recorded in
+/// its `state.json` (a pre-upgrade record without the field means the legacy
+/// `<sandbox>/run` layout), or — when nothing is recorded, i.e. nothing is
+/// running — the dir the next start will use. Every live-management path
+/// (connectors, port relays, egress rebind/stop) must resolve through this,
+/// or a daemon upgraded mid-run would look for sockets where the running VMM
+/// never put them.
+pub fn live_run_dir(paths: &Paths, name: &str) -> PathBuf {
+    let state: Option<RunState> = load_json(&paths.sandbox_dir(name).join(STATE_FILE))
+        .ok()
+        .flatten();
+    match state {
+        Some(s) => s.run_dir.unwrap_or_else(|| paths.legacy_run_dir(name)),
+        None => paths.run_dir(name),
     }
 }
 
@@ -886,6 +903,7 @@ fn record_run_state(paths: &Paths, name: &str, handle: &dyn VmHandle) -> anyhow:
             .unwrap_or_default()
             .as_millis() as u64,
         confinement: Some(handle.confinement()),
+        run_dir: Some(paths.run_dir(name)),
     };
     save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)
 }
@@ -1524,6 +1542,42 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+
+    // -----------------------------------------------------------------------
+    // live_run_dir resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_run_dir_resolution_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+
+        // 1. No state.json ⇒ the next start's dir (new scheme).
+        assert_eq!(live_run_dir(&paths, "web"), paths.run_dir("web"));
+
+        // 2. RunState without run_dir (pre-upgrade start) ⇒ legacy dir.
+        let legacy = RunState {
+            vmm_pid: crate::state::PidIdentity {
+                pid: 1,
+                starttime: 2,
+            },
+            sidecar_pids: vec![],
+            started_unix_ms: 0,
+            confinement: None,
+            run_dir: None,
+        };
+        save_json(&paths.sandbox_dir("web").join(STATE_FILE), &legacy).unwrap();
+        assert_eq!(live_run_dir(&paths, "web"), paths.legacy_run_dir("web"));
+
+        // 3. RunState with a recorded dir ⇒ exactly that dir.
+        let recorded = RunState {
+            run_dir: Some(paths.run_dir("web")),
+            ..legacy
+        };
+        save_json(&paths.sandbox_dir("web").join(STATE_FILE), &recorded).unwrap();
+        assert_eq!(live_run_dir(&paths, "web"), paths.run_dir("web"));
+    }
 
     // -----------------------------------------------------------------------
     // workspace_owner (Option A userns anchor)
@@ -2507,6 +2561,7 @@ mod tests {
                 confinement: Some(procmgr::ConfinementStatus::applied(
                     &procmgr::ConfinementPolicy::vmm_default(),
                 )),
+                run_dir: None,
             },
         )
         .unwrap();
@@ -2534,6 +2589,7 @@ mod tests {
             confinement: Some(procmgr::ConfinementStatus::applied(
                 &procmgr::ConfinementPolicy::vmm_default(),
             )),
+            run_dir: None,
         };
         save_json(&sdir.join(STATE_FILE), &confined).unwrap();
         restore_confined_workspace(&paths, "box"); // Ok(None) arm

@@ -1353,6 +1353,7 @@ mod tests {
             sidecar_pids: vec![],
             started_unix_ms: 0,
             confinement: Some(crate::procmgr::ConfinementStatus::degraded("test")),
+            run_dir: None,
         };
         save_json(&sandbox_dir.join(STATE_FILE), &run_state).unwrap();
 
