@@ -338,10 +338,13 @@ mod tests {
     }
 
     #[test]
-    fn mutating_verbs_bail_cleanly_on_unknown_sandbox() {
+    fn verbs_bail_cleanly_on_unknown_sandbox() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_root(tmp.path().to_path_buf());
         let cases: Vec<PolicyCmd> = vec![
+            PolicyCmd::Show {
+                name: "ghost".into(),
+            },
             PolicyCmd::Allow {
                 name: "ghost".into(),
                 target: "example.com".into(),
@@ -349,6 +352,9 @@ mod tests {
             PolicyCmd::Block {
                 name: "ghost".into(),
                 target: "example.com".into(),
+            },
+            PolicyCmd::Enable {
+                name: "ghost".into(),
             },
             PolicyCmd::Enforce {
                 name: "ghost".into(),
