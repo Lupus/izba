@@ -14,7 +14,7 @@ pub mod sys_resolver;
 
 use anyhow::Context;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -31,11 +31,11 @@ use izba_proto::EGRESS_PORT;
 
 /// Host-side unix path the VMM bridges guest-initiated vsock connections
 /// to (Firecracker convention, shared by CH and OpenVMM):
-/// `<vsock.sock>_<port>`.
-pub fn listener_path(paths: &Paths, name: &str) -> PathBuf {
-    paths
-        .run_dir(name)
-        .join(format!("vsock.sock_{EGRESS_PORT}"))
+/// `<run dir>/vsock.sock_<port>`. The caller supplies the run dir — the
+/// start path passes the new run's dir, adoption/stop pass the LIVE dir
+/// recorded in state.json (see `sandbox::live_run_dir`).
+pub fn listener_path(run_dir: &Path) -> PathBuf {
+    run_dir.join(format!("vsock.sock_{EGRESS_PORT}"))
 }
 
 /// A swappable holder for a sandbox's live egress policy. The accept loop reads
@@ -145,7 +145,20 @@ impl EgressManager {
     /// Idempotent: bind the egress listener for `name` unless one is
     /// already alive. A finished (crashed) accept thread is rebound — this
     /// doubles as the supervisor's respawn path.
-    pub fn ensure_listening(&self, paths: &Paths, name: &str) -> anyhow::Result<()> {
+    ///
+    /// `run_dir` is caller-supplied: the Start RPC passes `paths.run_dir(name)`
+    /// (the new run's dir — a stale `state.json` from a crashed pre-upgrade
+    /// run must not drag the new bind to the legacy dir), while adoption at
+    /// daemon startup and the supervisor's rebind tick pass
+    /// `sandbox::live_run_dir(paths, name)` (the dir the CURRENT run actually
+    /// used). `paths` is still needed to read `policy.yaml` from the sandbox
+    /// dir via `resolve_policy`.
+    pub fn ensure_listening(
+        &self,
+        paths: &Paths,
+        name: &str,
+        run_dir: &Path,
+    ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.get(name) {
             if !slot.thread.is_finished() {
@@ -156,16 +169,23 @@ impl EgressManager {
             // leaves a finished thread behind. Drop it and rebind below.
             inner.remove(name);
         }
-        let path = listener_path(paths, name);
+        let path = listener_path(run_dir);
+        // The hashed run dir may not exist yet on the adoption path (a
+        // pre-upgrade sandbox's legacy dir, or a fresh Start racing the rest
+        // of `sandbox::start`'s directory setup) — create it first.
+        crate::paths::create_dir_700(run_dir, paths.root())
+            .with_context(|| format!("creating run dir {}", run_dir.display()))?;
         // This socket is an unauthenticated outbound proxy (AllowAll until
         // M2 policy) — keep it reachable only via a 0700 run dir, the same
         // defense-in-depth the daemon control socket gets (transport.rs).
+        // `create_dir_700` above already hardens a freshly-created dir, but
+        // the dir may pre-exist with looser perms (e.g. Task 5's `create`),
+        // so re-assert the mode unconditionally.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let run = paths.run_dir(name);
-            std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("chmod 0700 {}", run.display()))?;
+            std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
         }
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -242,13 +262,17 @@ impl EgressManager {
     /// socket file so a later VMM bridge attempt fails fast. Only the accept
     /// loop is joined: in-flight connection threads are detached and finish
     /// on their own — their guest leg breaks once the VM stops.
-    pub fn stop(&self, paths: &Paths, name: &str) {
+    ///
+    /// `run_dir` is caller-supplied: it must be the LIVE dir the current run
+    /// actually bound in (`sandbox::live_run_dir`), or the removal targets
+    /// the wrong directory and leaves the real socket file behind.
+    pub fn stop(&self, name: &str, run_dir: &Path) {
         let Some(slot) = self.inner.lock().unwrap().remove(name) else {
             return;
         };
         slot.stop.store(true, Ordering::SeqCst);
         let _ = slot.thread.join();
-        let _ = std::fs::remove_file(listener_path(paths, name));
+        let _ = std::fs::remove_file(listener_path(run_dir));
     }
 
     pub fn listening(&self, name: &str) -> bool {
@@ -333,10 +357,9 @@ mod tests {
 
     #[test]
     fn listener_path_follows_vmm_convention() {
-        let paths = Paths::with_root(PathBuf::from("/data"));
         assert_eq!(
-            listener_path(&paths, "web"),
-            paths.run_dir("web").join("vsock.sock_1027")
+            listener_path(Path::new("/data/run/aabbccdd")),
+            PathBuf::from("/data/run/aabbccdd/vsock.sock_1027")
         );
     }
 
@@ -345,8 +368,9 @@ mod tests {
     #[test]
     fn ensure_listening_accepts_and_routes() {
         let (_d, paths) = test_paths();
+        let run_dir = paths.run_dir("web");
         let m = mgr();
-        match m.ensure_listening(&paths, "web") {
+        match m.ensure_listening(&paths, "web", &run_dir) {
             Ok(()) => {}
             Err(e)
                 if e.chain().any(|c| {
@@ -361,27 +385,56 @@ mod tests {
         }
         assert!(m.listening("web"));
         // Idempotent.
-        m.ensure_listening(&paths, "web").unwrap();
+        m.ensure_listening(&paths, "web", &run_dir).unwrap();
 
         // Drive one DNS exchange through the real listener.
-        let mut c = UdsStream::connect(listener_path(&paths, "web")).unwrap();
+        let mut c = UdsStream::connect(listener_path(&run_dir)).unwrap();
         write_frame(&mut c, &StreamOpen::Dns).unwrap();
         pdns::write_dns_msg(&mut c, b"ping").unwrap();
         assert_eq!(pdns::read_dns_msg(&mut c).unwrap().unwrap(), b"ping");
         drop(c);
 
-        m.stop(&paths, "web");
+        m.stop("web", &run_dir);
         assert!(!m.listening("web"));
         assert!(
-            !listener_path(&paths, "web").exists(),
+            !listener_path(&run_dir).exists(),
             "socket file removed on stop"
         );
+    }
+
+    /// Adoption hands a LEGACY dir for pre-upgrade sandboxes; the bind must
+    /// land exactly there, not in the new hashed dir. Runtime-skip where the
+    /// sandbox denies bind (house pattern).
+    #[test]
+    fn ensure_listening_binds_in_the_dir_it_is_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let legacy = paths.legacy_run_dir("web");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        let mgr = mgr();
+        match mgr.ensure_listening(&paths, "web", &legacy) {
+            Ok(()) => {}
+            Err(e)
+                if e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                }) =>
+            {
+                eprintln!("SKIP ensure_listening_binds_in_the_dir_it_is_given: bind denied: {e:#}");
+                return;
+            }
+            Err(e) => panic!("ensure_listening: {e:#}"),
+        }
+        assert!(listener_path(&legacy).exists());
+        assert!(!listener_path(&paths.run_dir("web")).exists());
+        mgr.stop("web", &legacy);
     }
 
     #[test]
     fn stop_unknown_is_a_noop() {
         let (_d, paths) = test_paths();
-        mgr().stop(&paths, "ghost");
+        mgr().stop("ghost", &paths.run_dir("ghost"));
     }
 
     #[test]
@@ -446,10 +499,11 @@ mod tests {
     #[test]
     fn ensure_listening_rebinds_a_crashed_slot() {
         let (_d, paths) = test_paths();
+        let run_dir = paths.run_dir("web");
         let m = mgr();
         m.insert_for_test("web");
         assert!(!m.listening("web"), "the seeded slot is already finished");
-        match m.ensure_listening(&paths, "web") {
+        match m.ensure_listening(&paths, "web", &run_dir) {
             Ok(()) => {}
             Err(e)
                 if e.chain().any(|c| {
@@ -463,7 +517,7 @@ mod tests {
             Err(e) => panic!("ensure_listening: {e:#}"),
         }
         assert!(m.listening("web"), "rebound a fresh accept thread");
-        assert!(listener_path(&paths, "web").exists(), "socket file rebound");
-        m.stop(&paths, "web");
+        assert!(listener_path(&run_dir).exists(), "socket file rebound");
+        m.stop("web", &run_dir);
     }
 }
