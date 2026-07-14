@@ -365,8 +365,10 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           # Short data-dir base: the sandbox runtime socket lives under
-          # <data-dir>/sandboxes/<name>/run/vsock.sock_1027 and must fit the
-          # ~108-byte AF_UNIX sun_path limit; $RUNNER_TEMP is too deep (izba#71).
+          # <data-dir>/run/<hex8>/vsock.sock_1027 and must fit the ~108-byte
+          # AF_UNIX sun_path limit; $RUNNER_TEMP is too deep (izba#71). The
+          # product now enforces its own budget at create/start time
+          # (izba#71/#85); this stays belt-and-suspenders.
           # The Actor (a real shell user) reads the same docs a user would: the
           # product README + the run-specific context pack (its environment).
           # Both live at the repo root on the dispatched branch.
