@@ -82,6 +82,9 @@ Key properties:
     - host: github.com                 # or scope a whole host instead of a repo
   ```
 
+  Unknown keys anywhere in `policy.yaml` are rejected with an error naming the
+  key and its valid alternatives — a typo can never silently widen egress scope.
+
   A bare host authorizes ports 80 and 443 only. To reach any other port,
   list it explicitly with `ports:` — explicit ports replace, not extend, the
   web default. (Before M2.1 a bare allow-list host reached every TCP port;

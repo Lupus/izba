@@ -143,17 +143,6 @@ pub struct EgressPolicyConfig {
     pub git: Vec<GitRule>,
 }
 
-/// Parse helper: `enforce` is `Option` so we can tell "key absent" (→ true,
-/// authoring intent) from an explicit value.
-#[derive(Deserialize)]
-struct RawConfig {
-    enforce: Option<bool>,
-    #[serde(default)]
-    allow: Vec<AllowEntry>,
-    #[serde(default)]
-    git: Vec<GitRule>,
-}
-
 impl EgressPolicyConfig {
     /// The dedicated build-network policy: enforcing, allow-listing the
     /// Docker Hub hosts the **in-guest `FROM` base-image pull** needs, plus
@@ -193,21 +182,78 @@ impl EgressPolicyConfig {
     /// Parse the YAML policy file. An empty/comment-only file is a valid
     /// deny-all — a declared-but-allow-nothing sandbox. A present file without
     /// an explicit `enforce:` key defaults to `enforce: true` (authoring intent).
+    ///
+    /// Parsed MANUALLY over `serde_yaml::Value`, not via the derived
+    /// `Deserialize`: the untagged `AllowEntry` and flattened `GitRule` make
+    /// `#[serde(deny_unknown_fields)]` inert, and a typo'd key silently
+    /// falling back to the permissive default is a security footgun (#138).
+    /// The manual walk hard-rejects unknown keys at every level and names the
+    /// offending field path plus its valid alternatives (#83). The derived
+    /// impls remain for the `izba.yml` manifest path and for serialization.
     pub fn from_yaml(s: &str) -> Result<Self> {
         // serde_yaml maps an all-comments/empty document to `null`; treat that
-        // as present-but-empty (enforce=true, no rules).
-        let raw: Option<RawConfig> =
+        // as present-but-empty (enforce=true, no rules). Syntax errors keep
+        // serde_yaml's "at line N column M" location.
+        let doc: serde_yaml::Value =
             serde_yaml::from_str(s).context("parsing egress policy YAML")?;
-        let raw = raw.unwrap_or(RawConfig {
-            enforce: None,
-            allow: vec![],
-            git: vec![],
-        });
+        Self::from_value(&doc)
+    }
+
+    fn from_value(doc: &serde_yaml::Value) -> Result<Self> {
+        use serde_yaml::Value;
+        let map = match doc {
+            Value::Null => {
+                return Ok(Self {
+                    enforce: true,
+                    allow: vec![],
+                    git: vec![],
+                })
+            }
+            Value::Mapping(m) => m,
+            other => anyhow::bail!(
+                "egress policy must be a YAML mapping (valid keys: enforce, allow, git), got {}",
+                yaml_kind(other)
+            ),
+        };
+        let mut enforce = None;
+        let mut allow = Vec::new();
+        let mut git = Vec::new();
+        for (k, v) in map {
+            match key_str("egress policy", k)?.as_str() {
+                // `enforce:` with no value (null) keeps the key-absent default.
+                "enforce" if v.is_null() => {}
+                "enforce" => enforce = Some(as_bool("enforce", v)?),
+                "allow" => {
+                    let Value::Sequence(items) = v else {
+                        anyhow::bail!("allow: expected a list of entries, got {}", yaml_kind(v));
+                    };
+                    allow = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| parse_allow_entry(i, e))
+                        .collect::<Result<_>>()?;
+                }
+                "git" => {
+                    let Value::Sequence(items) = v else {
+                        anyhow::bail!("git: expected a list of entries, got {}", yaml_kind(v));
+                    };
+                    git = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| parse_git_rule(i, e))
+                        .collect::<Result<_>>()?;
+                }
+                other => anyhow::bail!(
+                    "unknown key '{other}' in egress policy (valid keys: enforce, allow, git); \
+                     see the egress-policy section in README.md"
+                ),
+            }
+        }
         Ok(Self {
             // Present file without `enforce:` → enforce (authoring = intent).
-            enforce: raw.enforce.unwrap_or(true),
-            allow: raw.allow,
-            git: raw.git,
+            enforce: enforce.unwrap_or(true),
+            allow,
+            git,
         })
     }
 
@@ -430,6 +476,154 @@ impl EgressPolicyConfig {
     pub fn to_yaml(&self) -> String {
         serde_yaml::to_string(self).expect("EgressPolicyConfig serializes")
     }
+}
+
+/// Human name for a YAML value's type, for parse-error messages.
+fn yaml_kind(v: &serde_yaml::Value) -> &'static str {
+    use serde_yaml::Value;
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Sequence(_) => "a list",
+        Value::Mapping(_) => "a mapping",
+        Value::Tagged(_) => "a tagged value",
+    }
+}
+
+fn key_str(ctx: &str, k: &serde_yaml::Value) -> Result<String> {
+    match k {
+        serde_yaml::Value::String(s) => Ok(s.clone()),
+        other => anyhow::bail!(
+            "{ctx}: mapping keys must be strings, got {}",
+            yaml_kind(other)
+        ),
+    }
+}
+
+fn as_str(field: &str, v: &serde_yaml::Value) -> Result<String> {
+    match v {
+        serde_yaml::Value::String(s) => Ok(s.clone()),
+        other => anyhow::bail!("{field}: expected a string, got {}", yaml_kind(other)),
+    }
+}
+
+fn as_bool(field: &str, v: &serde_yaml::Value) -> Result<bool> {
+    match v {
+        serde_yaml::Value::Bool(b) => Ok(*b),
+        other => anyhow::bail!("{field}: expected true or false, got {}", yaml_kind(other)),
+    }
+}
+
+fn as_port(field: &str, v: &serde_yaml::Value) -> Result<u16> {
+    if let serde_yaml::Value::Number(n) = v {
+        if let Some(p) = n.as_u64().and_then(|p| u16::try_from(p).ok()) {
+            return Ok(p);
+        }
+    }
+    anyhow::bail!(
+        "{field}: expected a port number (0-65535), got {}",
+        yaml_kind(v)
+    )
+}
+
+fn parse_ports(field: &str, v: &serde_yaml::Value) -> Result<Vec<u16>> {
+    let serde_yaml::Value::Sequence(items) = v else {
+        anyhow::bail!(
+            "{field}: expected a list of port numbers, got {}",
+            yaml_kind(v)
+        );
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(j, p)| as_port(&format!("{field}[{j}]"), p))
+        .collect()
+}
+
+fn parse_access(field: &str, v: &serde_yaml::Value) -> Result<Access> {
+    if let serde_yaml::Value::String(s) = v {
+        match s.as_str() {
+            "read" => return Ok(Access::Read),
+            "read-write" => return Ok(Access::ReadWrite),
+            other => anyhow::bail!("{field}: expected 'read' or 'read-write', got '{other}'"),
+        }
+    }
+    anyhow::bail!(
+        "{field}: expected 'read' or 'read-write', got {}",
+        yaml_kind(v)
+    )
+}
+
+fn parse_allow_entry(i: usize, v: &serde_yaml::Value) -> Result<AllowEntry> {
+    use serde_yaml::Value;
+    match v {
+        // Bare host string → default web ports, read-write.
+        Value::String(s) => Ok(AllowEntry::Host(s.clone())),
+        Value::Mapping(m) => {
+            let mut host = None;
+            let mut ports = None;
+            let mut access = Access::default();
+            for (k, val) in m {
+                match key_str(&format!("allow[{i}]"), k)?.as_str() {
+                    "host" => host = Some(as_str(&format!("allow[{i}].host"), val)?),
+                    "ports" => ports = Some(parse_ports(&format!("allow[{i}].ports"), val)?),
+                    "access" => access = parse_access(&format!("allow[{i}].access"), val)?,
+                    other => anyhow::bail!(
+                        "allow[{i}]: unknown key '{other}' (valid keys: host, ports, access)"
+                    ),
+                }
+            }
+            let host =
+                host.ok_or_else(|| anyhow::anyhow!("allow[{i}]: missing required key 'host'"))?;
+            Ok(AllowEntry::Scoped {
+                host,
+                ports,
+                access,
+            })
+        }
+        other => anyhow::bail!(
+            "allow[{i}]: expected a host string or a mapping with keys host, ports, access; \
+             got {}",
+            yaml_kind(other)
+        ),
+    }
+}
+
+fn parse_git_rule(i: usize, v: &serde_yaml::Value) -> Result<GitRule> {
+    use serde_yaml::Value;
+    let Value::Mapping(m) = v else {
+        anyhow::bail!(
+            "git[{i}]: expected a mapping with keys repo (or host) and access, got {}",
+            yaml_kind(v)
+        );
+    };
+    let mut target: Option<GitTarget> = None;
+    let mut access = Access::default();
+    for (k, val) in m {
+        let key = key_str(&format!("git[{i}]"), k)?;
+        match key.as_str() {
+            "repo" | "host" => {
+                if target.is_some() {
+                    anyhow::bail!("git[{i}]: exactly one of 'repo' or 'host' is required");
+                }
+                let s = as_str(&format!("git[{i}].{key}"), val)?;
+                target = Some(if key == "repo" {
+                    GitTarget::Repo(s)
+                } else {
+                    GitTarget::Host(s)
+                });
+            }
+            "access" => access = parse_access(&format!("git[{i}].access"), val)?,
+            other => {
+                anyhow::bail!("git[{i}]: unknown key '{other}' (valid keys: repo, host, access)")
+            }
+        }
+    }
+    let target = target
+        .ok_or_else(|| anyhow::anyhow!("git[{i}]: exactly one of 'repo' or 'host' is required"))?;
+    Ok(GitRule { target, access })
 }
 
 /// Load a sandbox's policy (or default-empty), apply `f`, persist the result to
@@ -1132,5 +1326,122 @@ mod tests {
             p.check(&flow_with_host("builder", "evil.example.com", 443)),
             Verdict::Deny
         );
+    }
+
+    // ── Task 2: strict, friendly YAML parsing (#138 + #83) ────────────────────
+
+    fn parse_err(yaml: &str) -> String {
+        format!(
+            "{:#}",
+            EgressPolicyConfig::from_yaml(yaml).expect_err("must reject")
+        )
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_key() {
+        let msg = parse_err("bad_field: true\n");
+        assert!(msg.contains("unknown key 'bad_field'"), "{msg}");
+        assert!(msg.contains("enforce, allow, git"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_unknown_allow_entry_key_instead_of_permissive_fallback() {
+        // The #138 footgun: `portz` typo used to be silently dropped, widening
+        // the entry to the permissive default ports.
+        let msg = parse_err("allow:\n  - host: example.com\n    portz: [80]\n");
+        assert!(msg.contains("allow[0]"), "{msg}");
+        assert!(msg.contains("unknown key 'portz'"), "{msg}");
+        assert!(msg.contains("host, ports, access"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_unknown_git_entry_key_with_valid_alternatives() {
+        // The #83 F3b repro: `target:` instead of `repo:`/`host:`.
+        let msg = parse_err("git:\n  - target: github.com/foo/bar\n");
+        assert!(msg.contains("git[0]"), "{msg}");
+        assert!(msg.contains("unknown key 'target'"), "{msg}");
+        assert!(msg.contains("repo"), "{msg}");
+        assert!(msg.contains("host"), "{msg}");
+        assert!(
+            !msg.contains("no variant of enum"),
+            "raw serde text leaked: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_git_entry_with_both_repo_and_host() {
+        let msg = parse_err("git:\n  - repo: github.com/foo/bar\n    host: github.com\n");
+        assert!(
+            msg.contains("git[0]") && msg.contains("exactly one of 'repo' or 'host'"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_git_entry_with_neither_repo_nor_host() {
+        let msg = parse_err("git:\n  - access: read\n");
+        assert!(
+            msg.contains("git[0]") && msg.contains("exactly one of 'repo' or 'host'"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_type_for_enforce() {
+        let msg = parse_err("enforce: \"yes\"\n");
+        assert!(
+            msg.contains("enforce") && msg.contains("expected true or false"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_list_ports() {
+        let msg = parse_err("allow:\n  - host: example.com\n    ports: 80\n");
+        assert!(
+            msg.contains("allow[0].ports") && msg.contains("expected a list"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_access_value() {
+        let msg = parse_err("allow:\n  - host: example.com\n    access: rw\n");
+        assert!(msg.contains("allow[0].access"), "{msg}");
+        assert!(msg.contains("'read' or 'read-write'"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_scoped_allow_entry_without_host() {
+        let msg = parse_err("allow:\n  - ports: [80]\n");
+        assert!(msg.contains("allow[0]") && msg.contains("'host'"), "{msg}");
+    }
+
+    #[test]
+    fn error_text_never_leaks_serde_internals() {
+        for bad in [
+            "git:\n  - target: x\n",
+            "allow:\n  - host: h\n    portz: [80]\n",
+            "bad_field: true\n",
+            "allow: 5\n",
+            "git: {}\n",
+        ] {
+            let msg = parse_err(bad);
+            for leak in [
+                "no variant of enum",
+                "untagged enum",
+                "flattened data",
+                "RawConfig",
+            ] {
+                assert!(!msg.contains(leak), "input {bad:?} leaked {leak:?}: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_null_enforce_still_defaults_true() {
+        // `enforce:` with no value parsed as enforce=true before; preserve it.
+        let cfg = EgressPolicyConfig::from_yaml("enforce:\nallow:\n  - example.com\n").unwrap();
+        assert!(cfg.enforce);
     }
 }
