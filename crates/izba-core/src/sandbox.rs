@@ -1176,6 +1176,22 @@ fn cleanup_runtime(paths: &Paths, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The warning `remove()` prints after `fs::remove_dir_all(run_dir)` fails —
+/// `None` for the NotFound-tolerant case (pre-upgrade sandboxes never had a
+/// hashed runtime dir), `Some(message)` for every other error kind. Split out
+/// so the predicate+message is unit-testable without going through a whole
+/// `remove()` call (the branch is otherwise only observable via `eprintln!`).
+fn run_dir_removal_warning(run: &Path, e: &std::io::Error) -> Option<String> {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        None
+    } else {
+        Some(format!(
+            "warning: removing runtime dir {} failed: {e}",
+            run.display()
+        ))
+    }
+}
+
 pub fn remove(paths: &Paths, name: &str, connector: Connector, force: bool) -> anyhow::Result<()> {
     validate_name(name)?;
     let dir = paths.sandbox_dir(name);
@@ -1207,11 +1223,8 @@ pub fn remove(paths: &Paths, name: &str, connector: Connector, force: bool) -> a
     // The hashed runtime dir lives outside the sandbox dir — remove it too.
     // (NotFound-tolerant: pre-upgrade sandboxes never had one.)
     if let Err(e) = fs::remove_dir_all(paths.run_dir(name)) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "warning: removing runtime dir {} failed: {e}",
-                paths.run_dir(name).display()
-            );
+        if let Some(msg) = run_dir_removal_warning(&paths.run_dir(name), &e) {
+            eprintln!("{msg}");
         }
     }
     // Best-effort: the lock file is inert debris once the sandbox is gone
@@ -2428,6 +2441,52 @@ mod tests {
         assert!(err.contains("web"), "{err}");
     }
 
+    /// Kills the "replace `e.kind() == NotFound` with `true`" mutant in
+    /// `claim_run_dir`: a marker read failure that is NOT NotFound (here, the
+    /// marker path is a directory, so `read_to_string` fails with a non-NotFound
+    /// `io::ErrorKind`) must surface the "reading <marker>" contextual error and
+    /// must NOT fall through to `fs::write` (which would itself fail — a
+    /// directory can't be overwritten by `write` — producing a "writing
+    /// <marker>" error instead). The mutant treats every read error as
+    /// "unclaimed" and attempts the write, so only the original code takes the
+    /// "reading " branch.
+    #[test]
+    fn claim_run_dir_reports_reading_error_when_marker_is_unreadable() {
+        let (_dir, paths) = test_paths();
+        let run = paths.run_dir("web");
+        fs::create_dir_all(run.join(RUN_DIR_OWNER)).unwrap();
+
+        let err = format!("{:#}", claim_run_dir(&paths, "web").unwrap_err());
+        assert!(
+            err.contains("reading "),
+            "expected a 'reading' error: {err}"
+        );
+        assert!(
+            !err.contains("writing "),
+            "must not fall through to the write path: {err}"
+        );
+    }
+
+    /// Kills the "replace `!=` with `==`" mutant in `remove()`'s post-
+    /// `remove_dir_all(run_dir)` warning branch, extracted into
+    /// `run_dir_removal_warning` so the predicate is directly testable
+    /// (the branch is otherwise only observable via `eprintln!`). NotFound
+    /// (pre-upgrade sandboxes never had a hashed runtime dir) must be
+    /// silent; every other error kind must produce a warning naming the dir.
+    #[test]
+    fn run_dir_removal_warning_is_none_for_not_found_some_otherwise() {
+        let run = Path::new("/tmp/izba-test-run-dir");
+
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "no such dir");
+        assert_eq!(run_dir_removal_warning(run, &not_found), None);
+
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let msg = run_dir_removal_warning(run, &denied)
+            .expect("non-NotFound error must produce a warning");
+        assert!(msg.contains(&run.display().to_string()), "{msg}");
+        assert!(msg.contains("denied"), "{msg}");
+    }
+
     #[test]
     fn rm_removes_the_hashed_runtime_dir() {
         let (dir, paths) = test_paths();
@@ -2458,6 +2517,36 @@ mod tests {
         assert!(!paths.run_dir("web").join("vsock.sock").exists());
         assert!(!paths.legacy_run_dir("web").join("vsock.sock").exists());
         assert!(paths.run_dir("web").join(RUN_DIR_OWNER).exists());
+    }
+
+    /// Kills the "replace `==` with `!=`" mutant in `cleanup_runtime`'s
+    /// marker-skip comparison: the mutant would delete the `owner` claim
+    /// marker itself (matching everything EXCEPT it) while leaving the real
+    /// socket files behind (since they'd fail the flipped comparison's
+    /// "skip" condition). `cleanup_clears_sockets_in_both_layouts_but_keeps_
+    /// the_owner_marker` above pins the sibling `clear_run_dir_files`
+    /// helper but not this one — `cleanup_runtime` is a separate function
+    /// with its own copy of the same comparison (used by `Stop`/`Rm`'s
+    /// terminal teardown, vs. `clear_run_dir_files`'s best-effort mid-life
+    /// socket wipe).
+    #[test]
+    fn cleanup_runtime_clears_sockets_in_both_layouts_but_keeps_the_owner_marker() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        fs::create_dir_all(paths.legacy_run_dir("web")).unwrap();
+        fs::write(paths.run_dir("web").join("vsock.sock"), b"").unwrap();
+        fs::write(paths.legacy_run_dir("web").join("vsock.sock"), b"").unwrap();
+
+        cleanup_runtime(&paths, "web").unwrap();
+
+        assert!(!paths.run_dir("web").join("vsock.sock").exists());
+        assert!(!paths.legacy_run_dir("web").join("vsock.sock").exists());
+        assert_eq!(
+            fs::read_to_string(paths.run_dir("web").join(RUN_DIR_OWNER)).unwrap(),
+            "web"
+        );
     }
 
     #[test]
