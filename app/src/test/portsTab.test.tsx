@@ -122,21 +122,28 @@ describe("PortsTab", () => {
     await waitFor(() => expect(portList).toHaveBeenCalledTimes(2));
   });
 
-  it("add-forward form is disabled when the sandbox is stopped", async () => {
+  it("add-forward form is disabled when the sandbox is stopped, with a visible hint why", async () => {
     render(<PortsTab sandbox={stopped} />);
     // inputs and add button should be disabled
     await screen.findByLabelText(/host port/i);
     expect(screen.getByLabelText(/host port/i)).toBeDisabled();
     expect(screen.getByLabelText(/guest port/i)).toBeDisabled();
     expect(screen.getByRole("button", { name: /^add forward$/i })).toBeDisabled();
+    // and the UI says why (same affordance as the Shell tab's stopped-state hint)
+    expect(
+      screen.getByText("Start the sandbox to add port forwards."),
+    ).toBeInTheDocument();
   });
 
-  it("add-forward form is enabled when the sandbox is running", async () => {
+  it("add-forward form is enabled when the sandbox is running, without the stopped hint", async () => {
     render(<PortsTab sandbox={running} />);
     await screen.findByLabelText(/host port/i);
     expect(screen.getByLabelText(/host port/i)).not.toBeDisabled();
     expect(screen.getByLabelText(/guest port/i)).not.toBeDisabled();
     expect(screen.getByRole("button", { name: /^add forward$/i })).not.toBeDisabled();
+    expect(
+      screen.queryByText("Start the sandbox to add port forwards."),
+    ).not.toBeInTheDocument();
   });
 
   it("submitting the add-forward form calls portPublish with persist=false", async () => {
