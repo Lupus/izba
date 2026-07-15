@@ -179,6 +179,36 @@ pub fn reconcile(
     })
 }
 
+/// Two-sample reconcile (#67): the daemon's status is a cache refreshed by
+/// the supervisor tick, so a single-sample alive⇄stopped disagreement during
+/// a start/stop transition is expected, not a violation. Sample once; if
+/// violations are found, wait `settle` (callers pass one tick + margin),
+/// re-fetch a FRESH daemon view, re-run, and keep only violations present in
+/// BOTH passes (matched by kind + sandbox). Returns the second pass's report
+/// (fresher snapshots), filtered.
+pub fn reconcile_settled(
+    paths: &Paths,
+    fetch_daemon_view: &mut dyn FnMut() -> anyhow::Result<Option<Vec<SandboxSummary>>>,
+    probes: &dyn Probes,
+    settle: std::time::Duration,
+) -> anyhow::Result<ReconcileReport> {
+    let first_view = fetch_daemon_view()?;
+    let first = reconcile(paths, first_view.as_deref(), probes)?;
+    if first.violations.is_empty() {
+        return Ok(first);
+    }
+    std::thread::sleep(settle);
+    let second_view = fetch_daemon_view()?;
+    let mut second = reconcile(paths, second_view.as_deref(), probes)?;
+    second.violations.retain(|v| {
+        first
+            .violations
+            .iter()
+            .any(|f| f.kind == v.kind && f.sandbox == v.sandbox)
+    });
+    Ok(second)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +415,129 @@ mod tests {
             "dead legacy relay is the normal migrated state: {:?}",
             report.violations
         );
+    }
+
+    /// Inverse direction of `daemon_running_but_vmm_pid_dead_is_disk_live_mismatch`:
+    /// state.json references a pid FakeProbes reports ALIVE, but the daemon's
+    /// view says "stopped" — still exactly one DiskLiveMismatch.
+    #[test]
+    fn daemon_stopped_but_pid_alive_is_disk_live_mismatch() {
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("box")).unwrap();
+        let vmm = live_identity();
+        write_state(&paths, "box", vmm.clone());
+        let view = vec![summary("box", "stopped")]; // daemon thinks it's stopped
+        let probes = FakeProbes {
+            alive: vec![vmm],
+            control: true,
+        };
+        let report = reconcile(&paths, Some(&view), &probes).unwrap();
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::DiskLiveMismatch
+                && v.sandbox.as_deref() == Some("box")));
+        let snap = report.sandboxes.iter().find(|s| s.name == "box").unwrap();
+        assert_eq!(snap.status_daemon.as_deref(), Some("stopped"));
+        assert_ne!(snap.status_disk, "stopped");
+    }
+
+    /// #67: a single-sample alive⇄stopped disagreement during a start/stop
+    /// transition is expected of the tick-refreshed daemon cache, not a real
+    /// violation — `reconcile_settled` must drop one that does not persist
+    /// into a second, later sample.
+    #[test]
+    fn settled_drops_a_transient_mismatch() {
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("box")).unwrap();
+        let vmm = live_identity();
+        write_state(&paths, "box", vmm.clone());
+        let probes = FakeProbes {
+            alive: vec![vmm],
+            control: true,
+        };
+        let calls = std::cell::RefCell::new(0);
+        let mut fetch = || -> anyhow::Result<Option<Vec<SandboxSummary>>> {
+            let mut n = calls.borrow_mut();
+            *n += 1;
+            let status = if *n == 1 { "stopped" } else { "running" };
+            Ok(Some(vec![summary("box", status)]))
+        };
+        let report =
+            reconcile_settled(&paths, &mut fetch, &probes, std::time::Duration::ZERO).unwrap();
+        assert!(
+            report.violations.is_empty(),
+            "transient mismatch must not survive the settle re-sample: {:?}",
+            report.violations
+        );
+    }
+
+    /// #67: a mismatch present in BOTH samples is a real violation and must
+    /// be reported exactly once (not duplicated across the two passes).
+    #[test]
+    fn settled_reports_a_persistent_mismatch_once() {
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("box")).unwrap();
+        let vmm = live_identity();
+        write_state(&paths, "box", vmm.clone());
+        let probes = FakeProbes {
+            alive: vec![vmm],
+            control: true,
+        };
+        let calls = std::cell::RefCell::new(0);
+        let mut fetch = || -> anyhow::Result<Option<Vec<SandboxSummary>>> {
+            let mut n = calls.borrow_mut();
+            *n += 1;
+            Ok(Some(vec![summary("box", "stopped")]))
+        };
+        let report =
+            reconcile_settled(&paths, &mut fetch, &probes, std::time::Duration::ZERO).unwrap();
+        let matches: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| {
+                v.kind == ViolationKind::DiskLiveMismatch && v.sandbox.as_deref() == Some("box")
+            })
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "persistent mismatch must be reported exactly once: {:?}",
+            report.violations
+        );
+    }
+
+    /// #67: when the first pass is already clean, `reconcile_settled` must
+    /// not pay for a second (settle-delayed) fetch.
+    #[test]
+    fn settled_fetches_once_when_first_pass_is_clean() {
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("box")).unwrap();
+        let vmm = live_identity();
+        write_state(&paths, "box", vmm.clone());
+        let view = vec![summary("box", "running")];
+        let probes = FakeProbes {
+            alive: vec![vmm],
+            control: true,
+        };
+        let calls = std::cell::RefCell::new(0);
+        let mut fetch = || -> anyhow::Result<Option<Vec<SandboxSummary>>> {
+            *calls.borrow_mut() += 1;
+            Ok(Some(view.clone()))
+        };
+        let report = reconcile_settled(
+            &paths,
+            &mut fetch,
+            &probes,
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        assert!(
+            report.violations.is_empty(),
+            "clean first pass: {:?}",
+            report.violations
+        );
+        assert_eq!(*calls.borrow(), 1, "must not fetch a second time");
     }
 
     #[test]
