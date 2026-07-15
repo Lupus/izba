@@ -110,6 +110,36 @@
           "type": "string",
           "description": "Optional regex anchoring WHICH of the step's actions the functional/expect_exit verdict is graded against: the LAST action whose command matches. Without it the step's final action is graded — which false-fires when the Actor runs a trailing verify (e.g. `izba ls`) after the intent-bearing command. Compiler rule: set it on refusal/expect_exit steps to the distinctive token of the command under test (e.g. 'promote'); never anchor to an exact full command line (that would leak a prescription to the swarm's benefit — the regex lives here, invisible to the Actor). Decisive (core) steps SHOULD declare expect_cmd_re: it also lets the runner credit a decisive assertion satisfied under an earlier step instead of flagging unreached_decisive. Anchor the pattern to the full product invocation (e.g. 'izba promote' or a subcommand-specific regex), never a bare token like 'izba' — over-broad patterns can credit the decisive step from an unrelated command; every credit is recorded in the bundle's decisive_credits for the skeptic to audit."
         },
+        "expect_text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "GUI decisive grading hook — the GUI analog of expect_exit/expect_cmd_re. An EXACT, case-insensitive LITERAL substring that must appear in the captured page text (document.body.innerText, the per-action `page_text` — deliberately NOT the accessibility marks: Radix/shadcn dialogs and plain-<div> outcome copy are invisible to the a11y snapshot, see gui_oracles). Graded on a `core: true` step of a modality:'gui' journey when the journey did NOT drive manifest_diff (manifest_truth then takes precedence); the CLI runner ignores it. Search window: every page-text capture at/after this core step — the step's own opening snapshot (so pure-observation steps grade), each of its and any later action's captures, and the final post-settle capture (an async create/boot may render the outcome after the last action). Compiler rules: (1) choose an OUTCOME string the app renders only when the asserted outcome actually happened — banner/result copy ('Promoted 2 change(s).'), a rendered row's name+status — NEVER dialog chrome (headings, button/field/tab labels render whether or not the outcome happened: the known dom_expect chrome false-pass class from PR #121/#130); (2) this is an exact-substring match, not fuzzy keywords — no keyword soup. The literal token {workspace} is substituted with the journey's absolute workspace path. A core step carrying neither expect_text nor expect_state in a journey that drives no manifest_diff flips unreached_decisive. Invisible to the Actor (fair-test boundary, like expect_cmd_re). Optional."
+        },
+        "expect_state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sandbox"],
+          "anyOf": [
+            { "required": ["exists"] },
+            { "required": ["status"] }
+          ],
+          "properties": {
+            "sandbox": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The sandbox name the assertion targets — normally the literal name the step's intent prescribes (e.g. 'manifest-sync-demo'). The literal token {workspace} is substituted with the journey's absolute workspace path (same single-token templating as intent/expect)."
+            },
+            "exists": {
+              "type": "boolean",
+              "description": "true ⇒ the named sandbox must be present in the daemon's end-of-journey sandbox list; false ⇒ it must be absent (the way to assert a completed remove)."
+            },
+            "status": {
+              "type": "string",
+              "description": "The sandbox's reconciled status must equal this string exactly (e.g. 'running', 'stopped' — the product's own status vocabulary, status_disk falling back to status_daemon). Implies existence: an absent sandbox fails a status assertion."
+            }
+          },
+          "description": "GUI decisive grading hook — a small daemon-truth assertion graded against the runner's end-of-journey state evidence (the post-settle `izba __reconcile` snapshot: product ground truth, not what the UI happens to render). Graded on a `core: true` step of a modality:'gui' journey when the journey did NOT drive manifest_diff (manifest_truth then takes precedence); the CLI runner ignores it. ALL declared sub-assertions (and any sibling expect_text) must pass for the decisive step to grade positive; a failed assertion flips the journey via a decisive functional candidate; an ungradable one (the reconcile snapshot itself errored) degrades the journey via a flipping infra candidate — never a silent pass. Invisible to the Actor (fair-test boundary). Optional."
+        },
         "seed_files": {
           "type": "object",
           "additionalProperties": { "type": "string" },

@@ -272,3 +272,111 @@ def test_manifest_gui_managed_ahead_export_core_is_the_export_step():
     assert len(core_steps) == 1
     assert "export" in core_steps[0]["intent"].lower()
     assert "exported to" in core_steps[0]["expect"].lower()
+
+
+# ---------- generalized GUI decisive grading hooks (expect_text/expect_state) ----------
+
+def test_step_allows_expect_text_and_expect_state():
+    schema = _load("journeys.schema.json")
+    step = schema["definitions"]["step"]["properties"]
+    assert step["expect_text"]["type"] == "string"
+    assert step["expect_text"]["minLength"] == 1
+    es = step["expect_state"]
+    assert es["type"] == "object"
+    assert es["additionalProperties"] is False
+    assert es["required"] == ["sandbox"]
+    # at least one of exists/status must be declared
+    assert {"required": ["exists"]} in es["anyOf"]
+    assert {"required": ["status"]} in es["anyOf"]
+    assert es["properties"]["exists"]["type"] == "boolean"
+    assert es["properties"]["status"]["type"] == "string"
+    # both hooks stay optional (step required list unchanged)
+    assert schema["definitions"]["step"]["required"] == ["intent", "expect"]
+
+
+def test_expect_text_description_bans_chrome_and_keyword_soup():
+    # The description is fed verbatim to the journey compiler: it must carry
+    # the outcome-string-not-chrome rule (the dom_expect chrome false-pass
+    # class) and the exact-substring-not-keywords rule.
+    schema = _load("journeys.schema.json")
+    desc = schema["definitions"]["step"]["properties"]["expect_text"]["description"]
+    assert "chrome" in desc.lower()
+    assert "outcome" in desc.lower()
+    assert "case-insensitive" in desc.lower()
+
+
+def test_step_with_hooks_validates():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    doc = _minimal_journey_doc({
+        "core": True,
+        "expect_text": "web · running",
+        "expect_state": {"sandbox": "web", "exists": True,
+                         "status": "running"},
+    })
+    jsonschema.validate(doc, schema)  # must not raise
+
+
+def test_expect_state_requires_sandbox_and_an_assertion():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    # missing sandbox
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"exists": True}}), schema)
+    # sandbox alone: no exists/status assertion declared
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web"}}), schema)
+    # unknown sub-property rejected (additionalProperties: false)
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web", "exists": True,
+                              "bogus": 1}}), schema)
+
+
+def test_expect_text_rejects_empty_and_non_string():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc({"expect_text": ""}), schema)
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc({"expect_text": 42}), schema)
+
+
+def test_journey_result_allows_initial_observation():
+    # H-GUI-2: the GUI runner persists the journey-start capture so a
+    # zero-action journey still carries page evidence in the bundle.
+    schema = _load("trajectory.schema.json")
+    jr = schema["definitions"]["journey_result"]
+    obs = jr["properties"]["initial_observation"]
+    assert obs["type"] == "object"
+    assert "marks" in obs["properties"]
+    assert "page_text" in obs["properties"]
+    assert "initial_observation" not in jr["required"]
+
+
+def test_gui_bundle_with_initial_observation_validates():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("trajectory.schema.json")
+    bundle = {
+        "shard": 0, "feature": "f",
+        "results": [{
+            "journey_id": "app-open-empty-list",
+            "actions": [], "candidates": [],
+            "initial_observation": {
+                "marks": '[@e1] heading "Sandboxes"',
+                "page_text": "No sandboxes yet. Create one to get started.",
+            },
+        }],
+    }
+    jsonschema.validate(bundle, schema)  # must not raise
+
+
+def test_committed_journeys_corpora_validate_against_schema():
+    # The two committed corpora must stay valid under the extended schema.
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    for name in ("manifest-gui.json", "smoke-core-cli.json"):
+        with open(os.path.join(HERE, "journeys", name)) as f:
+            jsonschema.validate(json.load(f), schema)

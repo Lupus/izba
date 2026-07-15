@@ -64,6 +64,14 @@
         },
         "invoke_log": { "type": "array", "items": { "$ref": "#/definitions/invoke_log_entry" }, "description": "GUI only: the in-page bridge's invoke log (command, ok/error, duration) captured at journey end — the evidence behind silent_failure verdicts." },
         "workspace": { "type": "string", "description": "GUI only (Task 10): absolute path of this journey's per-journey workspace dir (<journey_data_dir>/workspace), where journey-/step-level seed_files land and that the literal {workspace} token in a step's intent/expect is substituted with — recorded so the Phase-3 skeptic can inspect what the Actor was told/seeded." },
+        "initial_observation": {
+          "type": "object",
+          "description": "GUI only (smoke-run H-GUI-2): the accessibility marks + page text captured at journey start, BEFORE the Actor's first turn — persisted so even a zero-action journey (an Actor that decides pure observation needs no interaction) carries gradable page evidence in the bundle, and so a pure-observation core step's expect_text has an on-record capture to grade against.",
+          "properties": {
+            "marks": { "type": "string", "description": "The rendered accessibility set-of-marks of the opening screen." },
+            "page_text": { "type": "string", "description": "document.body.innerText of the opening screen, capped like every per-action page_text." }
+          }
+        },
         "decisive_credits": {
           "type": "array",
           "description": "Audit trail for H3 crediting: each entry records a decisive step whose own pointer produced no actions but was graded functionally from an EARLIER step's action (via that step's expect_cmd_re). A broad pattern (e.g. a bare 'izba') can match an unrelated command, so every credit — including ones that graded to a silent pass — is recorded here for the Phase-3 skeptic to audit, not just the failures.",

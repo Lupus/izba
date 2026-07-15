@@ -945,3 +945,337 @@ def test_run_gui_journey_substitutes_workspace_token_in_expect_before_dom_expect
     dom_expect = [c for c in res["candidates"] if c["kind"] == "dom_expect"]
     assert dom_expect == [], \
         f"expected no dom_expect candidate once {{workspace}} is substituted: {dom_expect}"
+
+
+# ---------- generalized decisive grading: expect_text / expect_state ----------
+# (the product-wide GUI corpus fix: non-manifest core steps get a REAL grading
+# path; every instrument-honesty flip is preserved)
+
+def _evidence(names, recon_sandboxes):
+    """A capture_state_evidence-shaped stub with a REAL reconcile shape (the
+    default _reconcile stub's empty reconcile dict is structurally absent
+    evidence, which expect_state honestly refuses to grade)."""
+    return {"sandboxes": list(names),
+            "reconcile": {"violations": [], "sandboxes": list(recon_sandboxes)},
+            "per_sandbox": {}}
+
+
+def _run(journey, model, driver, monkeypatch, evidence=None):
+    import gui.run_gui_journeys as rgj
+    ev = evidence if evidence is not None else _evidence(
+        ["web"], [{"name": "web", "status_disk": "running"}])
+    monkeypatch.setattr(rgj, "capture_state_evidence", lambda *a, **k: ev)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot",
+                        lambda *a, **k: {"violations": []})
+    return run_gui_journey(model, driver, journey, izba_bin="izba",
+                           data_dir="/tmp/x", max_turns=8, step_cap=10,
+                           action_timeout_s=5, latency_budget_ms=30000,
+                           budget={"usd": 0.0}, max_usd=2.0)
+
+
+def test_core_step_passing_expect_text_grades_and_credits(monkeypatch):
+    # A non-manifest core step with a matching expect_text must grade
+    # genuinely: no unreached_decisive, no functional flip, and an auditable
+    # decisive_credits entry (the skeptic must see the assertion WAS checked).
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(
+        snapshots=['[@e1] button "Create"', '[@e1] row "web running"',
+                   '[@e1] row "web running"'],
+        page_texts=["", "SANDBOXES · 1\nweb · running",
+                    "SANDBOXES · 1\nweb · running"])
+    journey = {"journey_id": "j-text-pass", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "create a sandbox web",
+                          "expect": "web appears running", "core": True,
+                          "expect_text": "web · running"}]}
+    res = _run(journey, model, driver, monkeypatch)
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "unreached_decisive" not in kinds
+    assert "functional" not in kinds
+    assert "infra" not in kinds
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "expect_text: 'web · running' (matched)"}]
+    # H-GUI-2: the opening capture is persisted in the bundle.
+    assert res["initial_observation"]["marks"] == '[@e1] button "Create"'
+    assert res["initial_observation"]["page_text"] == ""
+
+
+def test_core_step_failing_expect_text_flips_decisive_functional(monkeypatch):
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(
+        snapshots=['[@e1] button "Create"', '[@e1] row "web"',
+                   '[@e1] row "web"'],
+        page_texts=["", "something about web", "something about web"])
+    journey = {"journey_id": "j-text-fail", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "promote", "expect": "", "core": True,
+                          "expect_text": "Promoted 1 change(s)."}]}
+    res = _run(journey, model, driver, monkeypatch)
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1
+    assert functional[0]["decisive"] is True
+    assert functional[0]["detail"].startswith("expect_text:")
+    assert functional[0]["trajectory_ref"] == {"journey_id": "j-text-fail",
+                                               "action_index": -1}
+    assert res["decisive_credits"] == []
+    assert not [c for c in res["candidates"]
+                if c["kind"] == "unreached_decisive"]
+
+
+def test_core_step_expect_text_without_any_page_text_degrades_infra(monkeypatch):
+    # Zero page text captured across the whole journey: the assertion is
+    # UNGRADABLE — a flipping infra candidate (harness degradation), never a
+    # silent pass and never a fabricated product finding.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "web"'] * 3)  # no page_texts
+    journey = {"journey_id": "j-text-noev", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "look", "expect": "", "core": True,
+                          "expect_text": "web · running"}]}
+    res = _run(journey, model, driver, monkeypatch)
+    infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+    assert len(infra) == 1
+    assert "expect_text" in infra[0]["detail"]
+    assert res["decisive_credits"] == []
+
+
+def test_core_step_passing_expect_state_grades_and_credits(monkeypatch):
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(
+        snapshots=['[@e1] button "Create"', '[@e1] row "web running"',
+                   '[@e1] row "web running"'],
+        page_texts=["", "web · running", "web · running"])
+    journey = {"journey_id": "j-state-pass", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "create web", "expect": "", "core": True,
+                          "expect_state": {"sandbox": "web", "exists": True,
+                                           "status": "running"}}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence(["web"],
+                                  [{"name": "web", "status_disk": "running"}]))
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "unreached_decisive" not in kinds
+    assert "functional" not in kinds
+    assert "infra" not in kinds
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "expect_state: sandbox 'web' (matched)"}]
+
+
+def test_core_step_failing_expect_state_flips_decisive_functional(monkeypatch):
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(
+        snapshots=['[@e1] row "web stopped"'] * 3,
+        page_texts=["web · stopped", "web · stopped", "web · stopped"])
+    journey = {"journey_id": "j-state-fail", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "start web", "expect": "", "core": True,
+                          "expect_state": {"sandbox": "web",
+                                           "status": "running"}}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence(["web"],
+                                  [{"name": "web", "status_disk": "stopped"}]))
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1
+    assert functional[0]["decisive"] is True
+    assert functional[0]["detail"].startswith("expect_state:")
+    assert res["decisive_credits"] == []
+
+
+def test_core_step_expect_state_on_errored_reconcile_degrades_infra(monkeypatch):
+    # Daemon truth never observed (errored end-of-journey reconcile):
+    # expect_state (even `exists: false`, which an empty errored snapshot
+    # would falsely satisfy) must degrade via infra, never pass.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "x"'] * 3,
+                        page_texts=["x", "x", "x"])
+    journey = {"journey_id": "j-state-noev", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "remove web", "expect": "", "core": True,
+                          "expect_state": {"sandbox": "web",
+                                           "exists": False}}]}
+    ev = {"sandboxes": [],
+          "reconcile": {"error": "izba died", "violations": [],
+                        "sandboxes": []},
+          "per_sandbox": {}}
+    res = _run(journey, model, driver, monkeypatch, evidence=ev)
+    infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+    assert len(infra) == 1
+    assert "expect_state" in infra[0]["detail"]
+    assert res["decisive_credits"] == []
+
+
+def test_core_step_all_declared_hooks_must_pass(monkeypatch):
+    # expect_text hits but expect_state diverges: the journey must still flip
+    # (ALL declared hooks must pass); the text hook's credit stays on record
+    # for the skeptic (it WAS checked), alongside the flipping candidate.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(
+        snapshots=['[@e1] row "web running"'] * 3,
+        page_texts=["", "web · running", "web · running"])
+    journey = {"journey_id": "j-both-hooks", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "start web", "expect": "", "core": True,
+                          "expect_text": "web · running",
+                          "expect_state": {"sandbox": "web",
+                                           "status": "running"}}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence(["web"],
+                                  [{"name": "web", "status_disk": "stopped"}]))
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1
+    assert functional[0]["detail"].startswith("expect_state:")
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "expect_text: 'web · running' (matched)"}]
+
+
+def test_core_step_without_hooks_flips_unreached_with_annotation_reason(monkeypatch):
+    # The no-hook core step still flips (widening what is gradable, not
+    # weakening the flip) and the reason now teaches the compiler what to
+    # annotate.
+    model = FakeModel([{"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"'] * 2,
+                        page_texts=["Sandboxes", "Sandboxes"])
+    journey = {"journey_id": "j-no-hooks", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "look around", "expect": "", "core": True}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence([], []))
+    unreached = [c for c in res["candidates"]
+                 if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1
+    assert "no gradable hook" in unreached[0]["detail"]
+    assert "expect_text/expect_state" in unreached[0]["detail"]
+    assert "manifest_diff" in unreached[0]["detail"]
+    assert res["decisive_credits"] == []
+
+
+def test_zero_action_journey_passing_expect_text_on_initial_snapshot(monkeypatch):
+    # H-GUI-2: an Actor that decides pure observation needs no interaction
+    # produces ZERO actions — the journey start's capture (before the first
+    # turn) is still page evidence: a matching expect_text grades genuinely,
+    # and the bundle persists the initial observation.
+    model = FakeModel([{"done": True}])
+    empty_copy = "No sandboxes yet. Create one to get started."
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"'] * 2,
+                        page_texts=[empty_copy, empty_copy])
+    journey = {"journey_id": "app-open-empty-list", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "look at the window", "expect": "",
+                          "core": True,
+                          "expect_text": "No sandboxes yet"}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence([], []))
+    assert res["actions"] == []
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "unreached_decisive" not in kinds
+    assert "functional" not in kinds
+    assert "infra" not in kinds
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "expect_text: 'No sandboxes yet' (matched)"}]
+    assert res["initial_observation"]["page_text"] == empty_copy
+
+
+def test_zero_action_journey_failing_expect_text_flips(monkeypatch):
+    model = FakeModel([{"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"'] * 2,
+                        page_texts=["some other copy", "some other copy"])
+    journey = {"journey_id": "app-open-empty-list-fail", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "look at the window", "expect": "",
+                          "core": True,
+                          "expect_text": "No sandboxes yet"}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence([], []))
+    assert res["actions"] == []
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1
+    assert functional[0]["decisive"] is True
+    assert res["decisive_credits"] == []
+
+
+def test_expect_text_window_starts_at_the_core_step_not_earlier(monkeypatch):
+    # The outcome string appearing ONLY in captures BEFORE the core step must
+    # not credit it: "at/after the core step" is the window (the outcome of
+    # step 1 can't be evidenced by step 0's screen).
+    model = FakeModel([{"click": "@e1"}, {"done": True}, {"done": True}])
+    driver = FakeDriver(
+        snapshots=['[@e1] row "web"'] * 4,
+        page_texts=["", "OUTCOME MARKER web", "web list", "web list"])
+    journey = {"journey_id": "j-window", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [
+                   {"intent": "step zero", "expect": ""},
+                   {"intent": "the decisive one", "expect": "", "core": True,
+                    "expect_text": "OUTCOME MARKER"},
+               ]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence(["web"],
+                                  [{"name": "web", "status_disk": "running"}]))
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1
+    assert functional[0]["detail"].startswith("expect_text:")
+    assert res["decisive_credits"] == []
+
+
+def test_expect_text_hit_in_final_settle_capture_counts(monkeypatch):
+    # An async create can land its row only after the end-of-journey settle:
+    # the FINAL capture is part of the core step's window.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(
+        snapshots=['[@e1] button "Create"', '[@e1] button "Create"',
+                   '[@e1] row "web running"'],
+        page_texts=["", "creating…", "SANDBOXES · 1\nweb · running"])
+    journey = {"journey_id": "j-late-settle", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "create web", "expect": "", "core": True,
+                          "expect_text": "web · running"}]}
+    res = _run(journey, model, driver, monkeypatch)
+    assert not [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "expect_text: 'web · running' (matched)"}]
+
+
+def test_manifest_diff_journey_precedence_ignores_hooks(monkeypatch):
+    # A journey that DID drive manifest_diff keeps the manifest_truth path
+    # exactly (its tests pin it): hooks on the core step are not graded — the
+    # only decisive credit is the manifest one.
+    import gui.run_gui_journeys as rgj
+    model = FakeModel([{"done": True}])
+    invoke_log = [{"cmd": "manifest_diff", "ok": True,
+                   "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"'] * 2,
+                        page_texts=["Manifest", "Manifest"],
+                        invoke_log=invoke_log)
+
+    def fake_mt(ctx, **k):
+        ctx["manifest_truth_result"] = "matched"
+        return []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle", fake_mt)
+    journey = {"journey_id": "j-mt-precedence", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "view diff", "expect": "", "core": True,
+                          "expect_text": "THIS STRING IS NOWHERE"}]}
+    res = _run(journey, model, driver, monkeypatch)
+    # expect_text would have flipped functional if graded; precedence says no.
+    assert not [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "manifest_truth: izba diff ground truth (matched)"}]
+
+
+def test_substitute_steps_workspace_covers_decisive_hooks():
+    from gui.run_gui_journeys import _substitute_steps_workspace
+    steps = [{"intent": "i {workspace}", "expect": "e",
+              "expect_text": "exported to {workspace}/izba.yml",
+              "expect_state": {"sandbox": "{workspace}", "exists": True}}]
+    out = _substitute_steps_workspace(steps, "/abs/ws")
+    assert out[0]["expect_text"] == "exported to /abs/ws/izba.yml"
+    assert out[0]["expect_state"]["sandbox"] == "/abs/ws"
+    # the caller's step objects are never mutated (shallow copies all the way)
+    assert steps[0]["expect_text"] == "exported to {workspace}/izba.yml"
+    assert steps[0]["expect_state"]["sandbox"] == "{workspace}"
