@@ -211,6 +211,8 @@ impl DaemonApi for FakeDaemon {
     }
     fn policy_allow(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
         self.calls.push(format!("allow:{name}:{host}:{port}"));
+        // Mirror the real daemon so a follow-up policy_show observes the grant.
+        self.policy.allow(host, port);
         Ok(())
     }
     fn policy_block(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
@@ -360,11 +362,15 @@ impl DaemonApi for FakeDaemon {
     ) -> anyhow::Result<()> {
         self.calls
             .push(format!("vattach:{name}:{}", spec.guest_path.display()));
+        // Mirror the real daemon so a follow-up inspect observes the volume.
+        self.detail_volumes.push(spec);
         Ok(())
     }
 
     fn volume_detach(&mut self, name: &str, guest_path: String) -> anyhow::Result<()> {
         self.calls.push(format!("vdetach:{name}:{guest_path}"));
+        self.detail_volumes
+            .retain(|s| s.guest_path != std::path::Path::new(&guest_path));
         Ok(())
     }
 }
