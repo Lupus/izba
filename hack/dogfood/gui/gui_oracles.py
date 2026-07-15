@@ -360,6 +360,84 @@ def parse_volume_ls(stdout: str) -> Optional[Dict[str, List[str]]]:
     return out
 
 
+# `izba port ls <name>` renders one `bind:host_port -> guest_port` line per
+# ACTIVE forward (crates/izba-cli/src/commands/port.rs `ls`), e.g.
+# `127.0.0.1:8082 -> 80`.
+_PORT_LS_LINE_RE = re.compile(
+    r'^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\s*->\s*(\d{1,5})$')
+
+
+def parse_port_ls(stdout: str) -> Optional[List[Dict[str, Any]]]:
+    """Parse `izba port ls <name>` stdout into the ACTIVE forward rules:
+    ``[{"bind": str, "host_port": int, "guest_port": int}, ...]``.
+
+    Unlike ``volume ls`` there is no empty sentinel — NO output at all is the
+    valid "no active forwards" state (``[]``). Best-effort: returns ``None``
+    when any non-blank line doesn't match the known shape — a CLI
+    output-format change must make port grading go ``no_evidence``, never
+    silently pass or fabricate a product finding."""
+    rules: List[Dict[str, Any]] = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _PORT_LS_LINE_RE.match(line)
+        if m is None:
+            return None
+        rules.append({"bind": m.group(1), "host_port": int(m.group(2)),
+                      "guest_port": int(m.group(3))})
+    return rules
+
+
+def _grade_port_assertion(pspec: Dict[str, Any],
+                          sb_entry: Dict[str, Any]) -> tuple:
+    """``(failure strings, unverifiable)`` for one ``expect_state.port``
+    assertion graded against a sandbox's per-sandbox state evidence.
+
+    ``exists`` grades against the ACTIVE forwards (the ``port_ls`` capture);
+    ``persistent`` against the PERSISTED rules (``ports_persisted`` — the
+    sandbox config.json's ``ports`` array, what `izba port publish --persist`
+    / the app's Make-persistent writes). The split matters because `izba port
+    ls` renders identically for an ephemeral and a persisted forward, so only
+    the config capture can grade a Make-persistent promise (D-GUI-7). Either
+    side's evidence being unusable makes THAT assertion unverifiable
+    (``no_evidence`` at the caller) — never a silent pass."""
+    host = pspec.get("host")
+    failures: List[str] = []
+    unverifiable = False
+    if "exists" in pspec:
+        cap = (sb_entry or {}).get("port_ls")
+        active = (parse_port_ls(cap.get("stdout") or "")
+                  if isinstance(cap, dict) and cap.get("exit_code") == 0
+                  else None)
+        if active is None:
+            unverifiable = True
+        else:
+            present = any(r.get("host_port") == host for r in active)
+            want = bool(pspec["exists"])
+            if present != want:
+                failures.append(
+                    f"port exists: expected an active forward on host port "
+                    f"{host} to be {'present' if want else 'absent'}, "
+                    f"`izba port ls` reports it "
+                    f"{'present' if present else 'absent'}")
+    if "persistent" in pspec:
+        persisted = (sb_entry or {}).get("ports_persisted")
+        if not isinstance(persisted, list):
+            unverifiable = True
+        else:
+            present = any(isinstance(r, dict) and r.get("host_port") == host
+                          for r in persisted)
+            want = bool(pspec["persistent"])
+            if present != want:
+                failures.append(
+                    f"port persistent: expected host port {host} to be "
+                    f"{'recorded' if want else 'absent'} in the sandbox's "
+                    f"persisted config ports, it is "
+                    f"{'recorded' if present else 'absent'}")
+    return failures, unverifiable
+
+
 def _usable_volume_evidence(ev: Dict[str, Any]) -> Optional[Dict[str, List[str]]]:
     """The parsed ``volume ls`` truth from a state-evidence snapshot, or
     ``None`` when it is unusable: no ``volume_ls`` capture at all (a pre-fix
@@ -413,8 +491,10 @@ def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
     """Grade a core step's ``expect_state`` hook against daemon ground truth.
 
     ``spec`` is the compiler-authored assertion object
-    (``{"sandbox": name, "exists": bool?, "status": str?, "volume": {...}?}``
-    — schema-shaped; at least one assertion declared). ``state_evidence`` is
+    (``{"sandbox": name?, "exists": bool?, "status": str?, "volume": {...}?,
+    "port": {...}?, "sandboxes_exact": [name, ...]?}`` — schema-shaped; at
+    least one assertion declared; ``sandbox`` is required for the per-sandbox
+    assertions, optional for a pure ``sandboxes_exact`` spec). ``state_evidence`` is
     the runner's end-of-journey ``capture_state_evidence`` snapshot (taken
     AFTER the create-settle poll, so an async create/boot has had its bounded
     chance to register): the PRODUCT's own reconcile state + ``volume ls``
@@ -429,14 +509,27 @@ def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
       absent sandbox fails a status assertion (status implies existence);
     - ``volume``: the named persistent volume's existence/attachment per the
       ``izba volume ls`` capture (see ``_grade_volume_assertion``;
-      ``attached_to: null`` = detached-but-existing).
+      ``attached_to: null`` = detached-but-existing);
+    - ``port``: an active/persisted forward on the given host port for the
+      named sandbox, per the per-sandbox ``port_ls`` capture (active truth)
+      and ``ports_persisted`` config capture (persist truth — `izba port ls`
+      cannot distinguish the two; see ``_grade_port_assertion``). Implies
+      sandbox existence: a port assertion on an absent sandbox fails;
+    - ``sandboxes_exact``: the daemon's END-OF-JOURNEY sandbox set equals
+      EXACTLY the given name set, order-insensitive (an empty list asserts NO
+      sandboxes). This is the multi-entity removal differential a single
+      ``exists: false`` cannot express (the D-GUI-2 false-green: 'drop-demo
+      absent' is trivially true when the actor never created it, while the
+      surviving-set promise 'exactly {keep-demo}' went unchecked).
 
     Verdicts: ``"matched"``; ``"mismatch"`` with ONE flipping ``functional``
     candidate listing every failed sub-assertion; ``"no_evidence"`` when a
     declared assertion's evidence is missing — the reconcile snapshot errored
     or is structurally absent (no ``sandboxes`` key and no ``error``) for
-    exists/status, or no usable ``volume_ls`` capture (pre-fix bundle /
-    non-zero exit / unparseable) for volume — the truth was never observed,
+    exists/status/port/sandboxes_exact, no usable ``volume_ls`` capture
+    (pre-fix bundle / non-zero exit / unparseable) for volume, or no usable
+    ``port_ls``/``ports_persisted`` capture for the declared half of a port
+    assertion — the truth was never observed,
     so neither pass NOR product-bug can honestly be claimed (an errored
     snapshot would otherwise make ``exists: false`` a guaranteed false
     pass); the caller flips via infra. Precedence: a REAL failure on a
@@ -481,10 +574,40 @@ def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
             unverifiable = True
         else:
             failures.extend(_grade_volume_assertion(vspec, vols))
+    pspec = spec.get("port")
+    if isinstance(pspec, dict):
+        if not reconcile_usable:
+            unverifiable = True
+        elif name not in (ev.get("sandboxes") or []):
+            failures.append(
+                f"port: host port {pspec.get('host')} asserted but sandbox "
+                f"{name!r} is absent from daemon truth")
+        else:
+            pfail, punver = _grade_port_assertion(
+                pspec, (ev.get("per_sandbox") or {}).get(name) or {})
+            failures.extend(pfail)
+            unverifiable = unverifiable or punver
+    if "sandboxes_exact" in spec:
+        if not reconcile_usable:
+            unverifiable = True
+        else:
+            want = {str(n) for n in (spec.get("sandboxes_exact") or [])}
+            actual = {str(n) for n in (ev.get("sandboxes") or [])}
+            if actual != want:
+                missing = sorted(want - actual)
+                unexpected = sorted(actual - want)
+                parts = [p for p in (
+                    f"missing {missing!r}" if missing else "",
+                    f"unexpected {unexpected!r}" if unexpected else "") if p]
+                failures.append(
+                    f"sandboxes_exact: expected exactly {sorted(want)!r}, "
+                    f"daemon reports {sorted(actual)!r} "
+                    f"({'; '.join(parts)})")
     if failures:
+        label = f"sandbox {name!r}" if name else "daemon sandbox set"
         return "mismatch", [Candidate(
             kind="functional",
-            detail=(f"expect_state: sandbox {name!r} diverges from daemon "
+            detail=(f"expect_state: {label} diverges from daemon "
                     f"truth at core step {step_index}: " + "; ".join(failures)),
             violated_expectation=expect or f"expect_state: {spec!r}",
             source=source, trajectory_ref=dict(ref))]

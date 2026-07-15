@@ -118,17 +118,29 @@
         "expect_state": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["sandbox"],
           "anyOf": [
-            { "required": ["exists"] },
-            { "required": ["status"] },
-            { "required": ["volume"] }
+            { "required": ["sandbox", "exists"] },
+            { "required": ["sandbox", "status"] },
+            { "required": ["sandbox", "volume"] },
+            { "required": ["sandbox", "port"] },
+            { "required": ["sandboxes_exact"] }
           ],
+          "dependencies": {
+            "exists": ["sandbox"],
+            "status": ["sandbox"],
+            "volume": ["sandbox"],
+            "port": ["sandbox"]
+          },
           "properties": {
             "sandbox": {
               "type": "string",
               "minLength": 1,
-              "description": "The sandbox name the assertion targets — normally the literal name the step's intent prescribes (e.g. 'manifest-sync-demo'). The literal token {workspace} is substituted with the journey's absolute workspace path (same single-token templating as intent/expect)."
+              "description": "The sandbox name the per-sandbox assertions (exists/status/volume/port) target — normally the literal name the step's intent prescribes (e.g. 'manifest-sync-demo'). Required alongside any of those keys; optional for a spec that only declares sandboxes_exact. The literal token {workspace} is substituted with the journey's absolute workspace path (same single-token templating as intent/expect)."
+            },
+            "sandboxes_exact": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "description": "The daemon's end-of-journey sandbox set must equal EXACTLY this set of names, order-insensitive; an EMPTY array asserts that NO sandboxes exist. This is the multi-entity differential the single-sandbox exists key cannot express: a removal journey asserting only {removed-name, exists: false} is trivially true when the Actor never created it (the deep-remove-updates false-green class, D-GUI-2) — assert the POSITIVE surviving set here instead (e.g. [\"keep-demo\"]). Compiler rule: every multi-sandbox create/remove differential's core step should carry this. Composes with the sibling keys (ALL declared assertions must pass); graded against the same post-settle reconcile snapshot, and a failing assertion is settle re-sampled like the rest. No {workspace} substitution (sandbox names here are compiler-chosen literals). Optional."
             },
             "exists": {
               "type": "boolean",
@@ -165,9 +177,35 @@
                 }
               },
               "description": "Optional persistent-volume assertion, graded from the SAME end-of-journey state evidence (the `izba volume ls` capture — product truth, never UI text). At least one of exists/attached_to must be declared. Composes with the sibling sandbox exists/status keys: ALL declared assertions must pass. Compiler rule: use this (not expect_text over the Volumes tab) to grade attach/detach outcomes — the tab renders staged, unsaved rows that expect_text would falsely credit (the volumes-detach cheat class)."
+            },
+            "port": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["host"],
+              "anyOf": [
+                { "required": ["exists"] },
+                { "required": ["persistent"] }
+              ],
+              "properties": {
+                "host": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65535,
+                  "description": "The HOST port of the forward rule the assertion targets (e.g. 8082 for the rule rendered '8082 → 80')."
+                },
+                "exists": {
+                  "type": "boolean",
+                  "description": "true ⇒ an ACTIVE forward on this host port must be present in the daemon's `izba port ls <sandbox>` truth; false ⇒ absent (the way to assert a completed unpublish). Active = a live relay thread — a stopped sandbox has no active forwards regardless of persisted rules."
+                },
+                "persistent": {
+                  "type": "boolean",
+                  "description": "true ⇒ a rule on this host port must be recorded in the sandbox's PERSISTED config (config.json's `ports` array — what 'Make persistent' / `izba port publish --persist` writes, re-applied on every start); false ⇒ it must not be. This is the only machine-checkable persist truth: `izba port ls` renders identically for ephemeral and persisted forwards (the ports-make-persistent gap, D-GUI-7)."
+                }
+              },
+              "description": "Optional port-forward assertion for the sandbox named by the required sibling `sandbox` key, graded from the end-of-journey per-sandbox port evidence (the `izba port ls` capture for `exists`; the persisted config.json `ports` capture for `persistent`). At least one of exists/persistent must be declared; implies sandbox existence (a port assertion on an absent sandbox fails); composes with the sibling keys (ALL declared assertions must pass). Compiler rule: grade a Make-persistent promise with {persistent: true} — never expect_text over the forward's row copy, which renders the same for both states."
             }
           },
-          "description": "GUI decisive grading hook — a small daemon-truth assertion graded against the runner's end-of-journey state evidence (the post-settle `izba __reconcile` snapshot + `izba volume ls` capture: product ground truth, not what the UI happens to render). Graded on a `core: true` step of a modality:'gui' journey when the journey did NOT drive manifest_diff (manifest_truth then takes precedence); the CLI runner ignores it. ALL declared sub-assertions (and any sibling expect_text) must pass for the decisive step to grade positive; a failed assertion flips the journey via a decisive functional candidate; an ungradable one (the reconcile snapshot itself errored, or a volume assertion with no usable `izba volume ls` evidence) degrades the journey via a flipping infra candidate — never a silent pass. A failing assertion is first re-sampled across a bounded settle window (--expect-state-settle-s, default 45s): lifecycle teardown and volume-save operations land asynchronously, so only divergence that PERSISTS across the settle flips — both the first and settled samples are recorded in the bundle for the skeptic. Invisible to the Actor (fair-test boundary). Optional."
+          "description": "GUI decisive grading hook — a small daemon-truth assertion graded against the runner's end-of-journey state evidence (the post-settle `izba __reconcile` snapshot + `izba volume ls` capture + per-sandbox `izba port ls`/persisted-ports captures: product ground truth, not what the UI happens to render). Graded on a `core: true` step of a modality:'gui' journey when the journey did NOT drive manifest_diff (manifest_truth then takes precedence); the CLI runner ignores it. Vocabulary: per-sandbox `exists`/`status`/`volume`/`port` (each requires the `sandbox` key), plus the set-level `sandboxes_exact` (which needs no `sandbox`). ALL declared sub-assertions (and any sibling expect_text) must pass for the decisive step to grade positive; a failed assertion flips the journey via a decisive functional candidate; an ungradable one (the reconcile snapshot itself errored, a volume assertion with no usable `izba volume ls` evidence, or a port assertion with no usable port evidence) degrades the journey via a flipping infra candidate — never a silent pass. A failing assertion is first re-sampled across a bounded settle window (--expect-state-settle-s, default 45s): lifecycle teardown and volume-save operations land asynchronously, so only divergence that PERSISTS across the settle flips — both the first and settled samples are recorded in the bundle for the skeptic. Invisible to the Actor (fair-test boundary). Optional."
         },
         "seed_files": {
           "type": "object",

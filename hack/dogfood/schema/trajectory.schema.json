@@ -58,7 +58,7 @@
             "reconcile": { "type": "object" },
             "per_sandbox": {
               "type": "object",
-              "description": "Keyed by sandbox name; each has policy_show + netlog capture results (argv/exit_code/stdout/stderr). per_sandbox entries also carry console_tail (last 8 KiB of the guest serial console)."
+              "description": "Keyed by sandbox name; each has policy_show + netlog + port_ls capture results (argv/exit_code/stdout/stderr — port_ls is `izba port ls <name>`, the ACTIVE forwards), ports_persisted (the sandbox config.json's persisted `ports` rules, null when unreadable — the persist ground truth behind expect_state.port that `port ls` cannot express), and console_tail (last 8 KiB of the guest serial console)."
             }
           }
         },

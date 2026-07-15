@@ -270,6 +270,27 @@ def _izba_capture(izba_bin: str, argv: List[str],
         return {"argv": argv, "exit_code": 124, "stdout": "", "stderr": f"[harness] {e}"}
 
 
+def _read_persisted_ports(data_dir: str, name: str) -> Optional[List[Any]]:
+    """The sandbox's PERSISTED port-publish rules: config.json's ``ports``
+    array (izba-core ``state.rs`` SandboxConfig — what `izba port publish
+    --persist` / the app's Make-persistent button writes; re-applied on every
+    start). `izba port ls` shows only the ACTIVE relay rules and renders
+    identically for an ephemeral and a persisted forward, so this host-side
+    config read is the only machine-checkable persist ground truth (the GUI
+    ports-make-persistent gap, D-GUI-7). ``None`` = the file is
+    unreadable/absent or ill-shaped — a ``persistent`` port assertion must
+    then grade ``no_evidence``, never fabricate. Report-only."""
+    import json
+    try:
+        with open(os.path.join(data_dir, "sandboxes", name, "config.json"),
+                  encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    ports = cfg.get("ports") if isinstance(cfg, dict) else None
+    return ports if isinstance(ports, list) else None
+
+
 def capture_state_evidence(
     izba_bin: str, data_dir: str, timeout_s: float,
     env: Optional[Dict[str, str]] = None,
@@ -286,7 +307,12 @@ def capture_state_evidence(
     is the daemon-truth surface behind the GUI ``expect_state.volume``
     assertion — the reconcile snapshot itself carries NO volume list (only
     informational orphan_volume violations for UNreferenced volumes), so
-    attach/detach outcomes are only observable here. Report-only."""
+    attach/detach outcomes are only observable here. Per sandbox, the paired
+    port-forward truth (behind the GUI ``expect_state.port`` assertion):
+    ``port_ls`` (`izba port ls <name>` — the ACTIVE forwards) and
+    ``ports_persisted`` (the config.json ``ports`` rules — the persist
+    ground truth `port ls` cannot express; see ``_read_persisted_ports``).
+    Report-only."""
     run_env = _shell_env(izba_bin, data_dir, env)
     reconcile = _snapshot_reconcile(izba_bin, data_dir, timeout_s, run_env)
     volume_ls = _izba_capture(izba_bin, ["volume", "ls"], timeout_s, run_env)
@@ -310,6 +336,9 @@ def capture_state_evidence(
                                          timeout_s, run_env),
             "netlog": _izba_capture(izba_bin, ["netlog", name, "--summary"],
                                     timeout_s, run_env),
+            "port_ls": _izba_capture(izba_bin, ["port", "ls", name],
+                                     timeout_s, run_env),
+            "ports_persisted": _read_persisted_ports(data_dir, name),
             "console_tail": console_tail,
         }
     return {"sandboxes": names, "reconcile": reconcile,

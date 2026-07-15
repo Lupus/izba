@@ -97,6 +97,36 @@ def _settle_for_sandbox(izba_bin: str, data_dir: str, timeout_s: float,
         time.sleep(poll_s)
 
 
+# D-GUI-5 (deep-tier skeptic): the app's TopBar renders exactly one
+# daemon-status line (app/src/components/TopBar.tsx) — "Connecting…" while
+# the headless bridge/daemon is still coming up, "daemon unreachable" when
+# the connection failed, or "daemon running · vX" once ready. Two deep
+# journeys recorded ZERO actions because the Actor's first observation
+# caught the mid-"Connecting…" screen and the cheap actor gave up — so the
+# runner gates the Actor's first turn on this ready marker.
+_APP_READY_MARKER = "daemon running"
+
+
+def _wait_app_ready(driver, timeout_s: float, poll_s: float = 1.0) -> tuple:
+    """Bounded poll of the page text until the daemon-status line carries
+    ``_APP_READY_MARKER`` (case-insensitive). Returns ``(ready,
+    last_page_text)``. A persisting "Connecting…"/"daemon unreachable"
+    screen is a HARNESS degradation (the bridge sidecar/daemon never came
+    up), not a product finding — on timeout the caller records a flipping
+    infra candidate and never starts the Actor, instead of letting it flail
+    against a mid-connect screen (the D-GUI-5 zero-action class).
+    Report-only: never raises."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        text = driver.read_page_text() or ""
+        if _APP_READY_MARKER in text.lower():
+            return True, text
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, text
+        time.sleep(min(poll_s, remaining))
+
+
 def _action_dict(intent: str, command: str, res, marks_text: str,
                  reconcile: Dict[str, Any], console_errors: List[str],
                  screenshot_ref: str = "", page_text: str = "") -> Dict[str, Any]:
@@ -253,25 +283,63 @@ def _valid_volume_spec(vspec: Any) -> bool:
             and ("exists" in vspec or "attached_to" in vspec))
 
 
+def _valid_port_spec(pspec: Any) -> bool:
+    """True iff ``pspec`` is a schema-shaped ``expect_state.port`` object: a
+    dict with an integer ``host`` (bool rejected — Python bools are ints) and
+    at least one of ``exists``/``persistent`` declared."""
+    return (isinstance(pspec, dict)
+            and isinstance(pspec.get("host"), int)
+            and not isinstance(pspec.get("host"), bool)
+            and ("exists" in pspec or "persistent" in pspec))
+
+
+def _valid_sandboxes_exact(v: Any) -> bool:
+    """True iff ``v`` is a schema-shaped ``expect_state.sandboxes_exact``
+    value: a list — possibly EMPTY (asserts no sandboxes exist at all) — of
+    non-empty strings."""
+    return (isinstance(v, list)
+            and all(isinstance(n, str) and n for n in v))
+
+
+def _state_hook_label(state_hook: Dict[str, Any]) -> str:
+    """Human label for an expect_state hook's target — the named sandbox for
+    per-sandbox assertions, the daemon set for a pure sandboxes_exact spec."""
+    name = state_hook.get("sandbox")
+    return (f"sandbox {name!r}" if name
+            else "the daemon sandbox set (sandboxes_exact)")
+
+
 def _step_decisive_hooks(step: Dict[str, Any]) -> tuple:
     """The (expect_text, expect_state) declarative hooks a step carries, with
     malformed values normalized to absent (``None``): a hook the schema would
-    reject (non-str/empty expect_text; expect_state without a ``sandbox``,
-    without at least one assertion among ``exists``/``status``/``volume``,
-    or with a half-formed ``volume`` object — a declared assertion must
-    never be silently dropped) is NOT gradable and must fall through to the
+    reject (non-str/empty expect_text; expect_state carrying a per-sandbox
+    assertion — ``exists``/``status``/``volume``/``port`` — without a
+    ``sandbox`` target, without at least one assertion among those plus
+    ``sandboxes_exact``, or with a half-formed ``volume``/``port``/
+    ``sandboxes_exact`` value — a declared assertion must never be silently
+    dropped) is NOT gradable and must fall through to the
     unreached_decisive flip — never a silent pass on a half-formed
     assertion."""
     text = step.get("expect_text")
     if not (isinstance(text, str) and text):
         text = None
     state = step.get("expect_state")
-    if not (isinstance(state, dict) and state.get("sandbox")
-            and ("exists" in state or "status" in state
-                 or "volume" in state)):
+    if not isinstance(state, dict):
         state = None
-    elif "volume" in state and not _valid_volume_spec(state.get("volume")):
-        state = None
+    else:
+        per_sandbox = [k for k in ("exists", "status", "volume", "port")
+                       if k in state]
+        if per_sandbox and not state.get("sandbox"):
+            state = None  # per-sandbox assertions need a sandbox target
+        elif not per_sandbox and "sandboxes_exact" not in state:
+            state = None  # no assertion declared at all
+        elif "volume" in state and not _valid_volume_spec(state.get("volume")):
+            state = None
+        elif "port" in state and not _valid_port_spec(state.get("port")):
+            state = None
+        elif ("sandboxes_exact" in state
+              and not _valid_sandboxes_exact(state.get("sandboxes_exact"))):
+            state = None
     return text, state
 
 
@@ -473,8 +541,8 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
                 if verdict == "mismatch":
                     candidates.append(_zero_action_unreached(
                         journey_id, s, source,
-                        f"expect_state for sandbox "
-                        f"{state_hook.get('sandbox')!r} presupposes an "
+                        f"expect_state for {_state_hook_label(state_hook)} "
+                        f"presupposes an "
                         f"interaction the actor never attempted"))
                     continue
             elif (verdict == "mismatch" and settle_s > 0
@@ -488,12 +556,13 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
                     first_evidence=current_evidence)
             _apply_hook_verdict(
                 verdict, found,
-                hook=f"expect_state: sandbox {state_hook.get('sandbox')!r}",
+                hook=f"expect_state: {_state_hook_label(state_hook)}",
                 no_evidence_detail=(
                     "expect_state: daemon state evidence unavailable "
-                    "(reconcile snapshot errored/absent, or no usable "
-                    "`izba volume ls` capture for a volume assertion), "
-                    "assertion unverifiable"),
+                    "(reconcile snapshot errored/absent, no usable "
+                    "`izba volume ls` capture for a volume assertion, or no "
+                    "usable port_ls/ports_persisted capture for a port "
+                    "assertion), assertion unverifiable"),
                 journey_id=journey_id, step_idx=step_idx,
                 candidates=candidates, decisive_credits=decisive_credits)
 
@@ -505,7 +574,8 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                     artifact_dir: str = "",
                     create_settle_s: float = 0.0,
                     expect_state_settle_s: float = 0.0,
-                    workspace: str = "") -> Dict[str, Any]:
+                    workspace: str = "",
+                    app_ready_timeout_s: float = 0.0) -> Dict[str, Any]:
     """Run one GUI journey under all caps. Returns a journey_result dict.
 
     ``create_settle_s`` bounds an end-of-journey wait for an in-flight async
@@ -531,7 +601,17 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     step-level ``seed_files`` immediately before that step's first action
     (same timing semantics as ``run_journeys._run_step``). The literal token
     ``{workspace}`` in a step's ``intent``/``expect`` is replaced with this
-    absolute path before the Actor or the dom_expect oracle ever see it."""
+    absolute path before the Actor or the dom_expect oracle ever see it.
+
+    ``app_ready_timeout_s`` (D-GUI-5) bounds a pre-Actor wait for the app's
+    daemon-status line to reach "daemon running" (see ``_wait_app_ready``):
+    an Actor whose first observation catches the mid-"Connecting…" boot
+    screen tends to give up with zero actions. On timeout the journey
+    returns immediately with ONE flipping infra candidate (harness
+    degradation — the bridge/daemon never came up; nothing was measured) and
+    the last-seen page text as its ``initial_observation``. Readiness also
+    guarantees the H-GUI-2 opening capture shows the READY page. 0 disables
+    it (the unit tests' default; CI runs the parse_args default)."""
     journey_id = journey.get("journey_id", "")
     actions: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
@@ -561,6 +641,28 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     steps = journey.get("steps", []) or [{"intent": journey.get("rationale", ""),
                                           "expect": ""}]
     steps = _substitute_steps_workspace(steps, ws_abs)
+    # D-GUI-5 readiness gate: never start the Actor against a mid-connect
+    # screen. On timeout the journey verified NOTHING — one flipping infra
+    # candidate (the same degradation shape as a dead sidecar), with the
+    # last-seen page text on record for the skeptic.
+    if app_ready_timeout_s > 0:
+        ready, boot_text = _wait_app_ready(driver, app_ready_timeout_s)
+        if not ready:
+            log(f"{journey_id}: app not ready after {app_ready_timeout_s:g}s; "
+                f"skipping the Actor")
+            return {
+                "journey_id": journey_id, "actions": [],
+                "candidates": [_infra_candidate(
+                    journey_id,
+                    f"app never showed the ready daemon-status line "
+                    f"({_APP_READY_MARKER!r}) within {app_ready_timeout_s:g}s "
+                    f"— the Actor was not started (last page text: "
+                    f"{(boot_text or '')[:200]!r})")],
+                "invoke_log": driver.read_invoke_log(),
+                "workspace": str(ws_abs), "decisive_credits": [],
+                "initial_observation": {"marks": "",
+                                        "page_text": boot_text or ""},
+            }
     # Fix 2 (manifest_truth TOCTOU): the workspace izba.yml content as of
     # each digest-carrying manifest_diff invoke, in invoke order. The
     # end-of-journey `izba diff` ground truth otherwise runs against the
@@ -1034,6 +1136,13 @@ def parse_args(argv):
                         "land asynchronously, so a transient divergence is "
                         "re-sampled until it settles; a genuinely-wrong settled "
                         "state still flips, and both samples are recorded")
+    p.add_argument("--app-ready-timeout-s", type=float, default=30.0,
+                   help="bounded pre-Actor wait for the app to leave its "
+                        "'Connecting…' boot state (the TopBar 'daemon "
+                        "running' status line); on timeout the journey "
+                        "records a flipping infra candidate instead of "
+                        "letting the Actor flail against a mid-connect "
+                        "screen (0 disables)")
     p.add_argument("--readme", default="README.md")
     p.add_argument("--app-guide", default="dogfood-app-guide.md")
     p.add_argument("--fake-model", default=None)
@@ -1091,7 +1200,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     budget=budget, max_usd=args.max_usd, artifact_dir=args.artifact_dir,
                     create_settle_s=args.create_settle_s,
                     expect_state_settle_s=args.expect_state_settle_s,
-                    workspace=workspace)
+                    workspace=workspace,
+                    app_ready_timeout_s=args.app_ready_timeout_s)
                 driver.close()
                 results.append(res)
             except BudgetExceeded:

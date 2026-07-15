@@ -284,10 +284,17 @@ def test_step_allows_expect_text_and_expect_state():
     es = step["expect_state"]
     assert es["type"] == "object"
     assert es["additionalProperties"] is False
-    assert es["required"] == ["sandbox"]
-    # at least one of exists/status must be declared
-    assert {"required": ["exists"]} in es["anyOf"]
-    assert {"required": ["status"]} in es["anyOf"]
+    # D-GUI-2 widening: `sandbox` is no longer globally required — a pure
+    # sandboxes_exact spec targets the daemon SET, not one sandbox. The
+    # per-sandbox assertions still each require the sandbox target, both via
+    # the pair-wise anyOf arms and via dependencies (so a spec sneaking a
+    # per-sandbox key in through the sandboxes_exact arm still fails).
+    assert "required" not in es
+    assert {"required": ["sandbox", "exists"]} in es["anyOf"]
+    assert {"required": ["sandbox", "status"]} in es["anyOf"]
+    assert {"required": ["sandboxes_exact"]} in es["anyOf"]
+    for key in ("exists", "status", "volume", "port"):
+        assert es["dependencies"][key] == ["sandbox"], key
     assert es["properties"]["exists"]["type"] == "boolean"
     assert es["properties"]["status"]["type"] == "string"
     # both hooks stay optional (step required list unchanged)
@@ -342,9 +349,10 @@ def test_expect_state_allows_volume_assertion():
     schema = _load("journeys.schema.json")
     es = schema["definitions"]["step"]["properties"]["expect_state"]
     # volume joins exists/status as a valid sole assertion (sandbox stays
-    # required as the assertion's target context).
-    assert es["required"] == ["sandbox"]
-    assert {"required": ["volume"]} in es["anyOf"]
+    # required as the assertion's target context, via the pair-wise anyOf
+    # arm + the dependencies map).
+    assert {"required": ["sandbox", "volume"]} in es["anyOf"]
+    assert es["dependencies"]["volume"] == ["sandbox"]
     vol = es["properties"]["volume"]
     assert vol["type"] == "object"
     assert vol["additionalProperties"] is False
@@ -397,6 +405,112 @@ def test_expect_state_volume_validation():
             {"expect_state": {"sandbox": "web",
                               "volume": {"name": "v", "exists": True,
                                          "bogus": 1}}}), schema)
+
+
+def test_expect_state_allows_sandboxes_exact():
+    # D-GUI-2 enabler: the exact-set assertion the removal differential
+    # needs (the single-sandbox exists key can't express a surviving set).
+    schema = _load("journeys.schema.json")
+    es = schema["definitions"]["step"]["properties"]["expect_state"]
+    se = es["properties"]["sandboxes_exact"]
+    assert se["type"] == "array"
+    assert se["items"] == {"type": "string", "minLength": 1}
+    # No minItems: the EMPTY list is meaningful (asserts no sandboxes).
+    assert "minItems" not in se
+    # Compiler guidance: the description must carry the false-green lesson
+    # (assert the POSITIVE surviving set) and the empty-list semantics.
+    desc = se["description"].lower()
+    assert "surviving" in desc
+    assert "empty" in desc
+    assert "order-insensitive" in desc
+
+
+def test_expect_state_sandboxes_exact_validation():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    # A pure set-level assertion needs no sandbox key...
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_state": {"sandboxes_exact": ["keep-demo"]}}), schema)
+    # ...including the empty list (asserts NO sandboxes exist).
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_state": {"sandboxes_exact": []}}), schema)
+    # ...and it composes with per-sandbox assertions.
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_state": {"sandbox": "keep-demo", "exists": True,
+                          "sandboxes_exact": ["keep-demo"]}}), schema)
+    # Entries must be non-empty strings.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandboxes_exact": [""]}}), schema)
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandboxes_exact": [1]}}), schema)
+    # A per-sandbox key smuggled in WITHOUT its sandbox target still fails
+    # (dependencies), even though the sandboxes_exact anyOf arm is satisfied.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandboxes_exact": ["a"], "exists": True}}),
+            schema)
+
+
+def test_expect_state_allows_port_assertion():
+    # D-GUI-7 enabler: the Make-persistent promise needs machine-checkable
+    # persist truth — `izba port ls` renders identically for both states.
+    schema = _load("journeys.schema.json")
+    es = schema["definitions"]["step"]["properties"]["expect_state"]
+    assert {"required": ["sandbox", "port"]} in es["anyOf"]
+    port = es["properties"]["port"]
+    assert port["type"] == "object"
+    assert port["additionalProperties"] is False
+    assert port["required"] == ["host"]
+    assert {"required": ["exists"]} in port["anyOf"]
+    assert {"required": ["persistent"]} in port["anyOf"]
+    assert port["properties"]["host"]["type"] == "integer"
+    assert port["properties"]["exists"]["type"] == "boolean"
+    assert port["properties"]["persistent"]["type"] == "boolean"
+    # Compiler guidance: persistent grades the persisted config, and
+    # expect_text over the row copy is called out as the trap.
+    desc = port["properties"]["persistent"]["description"].lower()
+    assert "persist" in desc
+    assert "port ls" in desc
+
+
+def test_expect_state_port_validation():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_state": {"sandbox": "web",
+                          "port": {"host": 8082, "persistent": True}}}),
+        schema)
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_state": {"sandbox": "web", "status": "running",
+                          "port": {"host": 8082, "exists": True,
+                                   "persistent": False}}}), schema)
+    # host is required and must be a valid port number.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web",
+                              "port": {"exists": True}}}), schema)
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web",
+                              "port": {"host": 0, "exists": True}}}), schema)
+    # at least one of exists/persistent must be declared.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web",
+                              "port": {"host": 8082}}}), schema)
+    # port without the sandbox target fails.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"port": {"host": 8082, "exists": True}}}),
+            schema)
+    # unknown port sub-property rejected (additionalProperties: false).
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web",
+                              "port": {"host": 8082, "exists": True,
+                                       "bogus": 1}}}), schema)
 
 
 def test_journey_result_allows_settle_and_snapshot_audit_fields():
