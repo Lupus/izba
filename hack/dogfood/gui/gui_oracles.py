@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 from typing import Any, Callable, Dict, List, Optional
 
 from oracles import Candidate  # noqa: E402
@@ -328,58 +330,157 @@ def expect_text_oracle(expect_text: str, page_texts: List[str],
         source=source, trajectory_ref=dict(ref))]
 
 
+def parse_volume_ls(stdout: str) -> Optional[Dict[str, List[str]]]:
+    """Parse `izba volume ls` stdout into ``{volume_name: [referencing
+    sandboxes]}`` daemon truth.
+
+    Two known shapes (crates/izba-cli/src/commands/volume.rs `ls`): the empty
+    sentinel line ``no persistent volumes``, or a header row starting with
+    ``NAME`` followed by ``name size used used_by`` rows where ``used_by``
+    is ``-`` (unreferenced) or a comma-joined sandbox list. Best-effort:
+    returns ``None`` when the output matches neither shape — a CLI
+    output-format change must make the volume grading go ``no_evidence``,
+    never silently pass or fabricate a product finding."""
+    text = (stdout or "").strip()
+    if not text:
+        return None
+    lines = text.splitlines()
+    if lines[0].strip() == "no persistent volumes":
+        return {}
+    if not lines[0].lstrip().startswith("NAME"):
+        return None
+    out: Dict[str, List[str]] = {}
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 4:
+            continue  # blank/odd line — never a data row of this format
+        used_by = parts[3]
+        out[parts[0]] = ([] if used_by == "-"
+                         else [s for s in used_by.split(",") if s])
+    return out
+
+
+def _usable_volume_evidence(ev: Dict[str, Any]) -> Optional[Dict[str, List[str]]]:
+    """The parsed ``volume ls`` truth from a state-evidence snapshot, or
+    ``None`` when it is unusable: no ``volume_ls`` capture at all (a pre-fix
+    bundle), a non-zero exit (daemon unreachable), or unparseable stdout."""
+    cap = ev.get("volume_ls")
+    if not isinstance(cap, dict) or cap.get("exit_code") != 0:
+        return None
+    return parse_volume_ls(cap.get("stdout") or "")
+
+
+def _grade_volume_assertion(vspec: Dict[str, Any],
+                            vols: Dict[str, List[str]]) -> List[str]:
+    """Failure strings for one ``expect_state.volume`` assertion graded
+    against parsed ``izba volume ls`` truth (empty = all declared
+    sub-assertions hold). ``attached_to`` implies existence — including
+    ``attached_to: null``, which asserts DETACHED-BUT-EXISTING (the whole
+    point of the volumes-detach grading: a Saved detach lands in daemon
+    truth, it does not delete the persistent volume)."""
+    vname = vspec.get("name")
+    present = vname in vols
+    failures: List[str] = []
+    if "exists" in vspec:
+        want = bool(vspec["exists"])
+        if present != want:
+            failures.append(
+                f"volume exists: expected {want}, daemon reports volume "
+                f"{vname!r} {'present' if present else 'absent'}")
+    if "attached_to" in vspec:
+        want_att = vspec["attached_to"]
+        if not present:
+            failures.append(
+                f"volume attached_to: expected {want_att!r} but volume "
+                f"{vname!r} is absent from daemon truth")
+        else:
+            refs = vols.get(vname) or []
+            if want_att is None:
+                if refs:
+                    failures.append(
+                        f"volume attached_to: expected detached (null), "
+                        f"daemon reports {vname!r} referenced by {refs!r}")
+            elif want_att not in refs:
+                failures.append(
+                    f"volume attached_to: expected {want_att!r}, daemon "
+                    f"reports {vname!r} referenced by {refs!r}")
+    return failures
+
+
 def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
                         ref: Dict[str, Any], *, step_index: int = 0,
                         expect: str = "", source: str = "journey step"):
     """Grade a core step's ``expect_state`` hook against daemon ground truth.
 
     ``spec`` is the compiler-authored assertion object
-    (``{"sandbox": name, "exists": bool?, "status": str?}`` — schema-shaped;
-    at least one of exists/status declared). ``state_evidence`` is the
-    runner's end-of-journey ``capture_state_evidence`` snapshot (taken AFTER
-    the create-settle poll, so an async create/boot has had its bounded
-    chance to register): the PRODUCT's own reconcile state, never what the
-    UI happened to render. All declared sub-assertions must hold:
+    (``{"sandbox": name, "exists": bool?, "status": str?, "volume": {...}?}``
+    — schema-shaped; at least one assertion declared). ``state_evidence`` is
+    the runner's end-of-journey ``capture_state_evidence`` snapshot (taken
+    AFTER the create-settle poll, so an async create/boot has had its bounded
+    chance to register): the PRODUCT's own reconcile state + ``volume ls``
+    capture, never what the UI happened to render. All declared
+    sub-assertions must hold:
 
     - ``exists``: the named sandbox present (true) / absent (false) in the
       daemon's sandbox list;
     - ``status``: the sandbox's reconciled status (``status_disk`` falling
       back to ``status_daemon`` — the same precedence
       ``reconcile_seq_oracle`` uses) equals the given string exactly; an
-      absent sandbox fails a status assertion (status implies existence).
+      absent sandbox fails a status assertion (status implies existence);
+    - ``volume``: the named persistent volume's existence/attachment per the
+      ``izba volume ls`` capture (see ``_grade_volume_assertion``;
+      ``attached_to: null`` = detached-but-existing).
 
     Verdicts: ``"matched"``; ``"mismatch"`` with ONE flipping ``functional``
-    candidate listing every failed sub-assertion; ``"no_evidence"`` when the
-    reconcile snapshot itself errored or is structurally absent (no
-    ``sandboxes`` key and no ``error``) — daemon truth was never observed,
+    candidate listing every failed sub-assertion; ``"no_evidence"`` when a
+    declared assertion's evidence is missing — the reconcile snapshot errored
+    or is structurally absent (no ``sandboxes`` key and no ``error``) for
+    exists/status, or no usable ``volume_ls`` capture (pre-fix bundle /
+    non-zero exit / unparseable) for volume — the truth was never observed,
     so neither pass NOR product-bug can honestly be claimed (an errored
     snapshot would otherwise make ``exists: false`` a guaranteed false
-    pass); the caller flips via infra."""
+    pass); the caller flips via infra. Precedence: a REAL failure on a
+    gradable assertion beats an unverifiable sibling — evidence of
+    divergence flips even when another declared assertion couldn't be
+    checked."""
     ev = state_evidence or {}
     reconcile = ev.get("reconcile") or {}
-    if reconcile.get("error") or "sandboxes" not in reconcile:
-        return "no_evidence", []
+    reconcile_usable = (not reconcile.get("error")
+                        and "sandboxes" in reconcile)
     name = spec.get("sandbox")
     failures: List[str] = []
-    names = ev.get("sandboxes") or []
-    if "exists" in spec:
-        want = bool(spec["exists"])
-        present = name in names
-        if present != want:
-            failures.append(
-                f"exists: expected {want}, daemon reports "
-                f"{'present' if present else 'absent'}")
-    if "status" in spec:
-        entry = next((s for s in (reconcile.get("sandboxes") or [])
-                      if isinstance(s, dict) and s.get("name") == name), None)
-        if entry is None:
-            failures.append(f"status: expected {spec['status']!r} but the "
-                            f"sandbox is absent from daemon truth")
+    unverifiable = False
+    if "exists" in spec or "status" in spec:
+        if not reconcile_usable:
+            unverifiable = True
         else:
-            actual = entry.get("status_disk") or entry.get("status_daemon")
-            if actual != spec["status"]:
-                failures.append(f"status: expected {spec['status']!r}, "
-                                f"daemon reports {actual!r}")
+            names = ev.get("sandboxes") or []
+            if "exists" in spec:
+                want = bool(spec["exists"])
+                present = name in names
+                if present != want:
+                    failures.append(
+                        f"exists: expected {want}, daemon reports "
+                        f"{'present' if present else 'absent'}")
+            if "status" in spec:
+                entry = next((s for s in (reconcile.get("sandboxes") or [])
+                              if isinstance(s, dict) and s.get("name") == name),
+                             None)
+                if entry is None:
+                    failures.append(f"status: expected {spec['status']!r} but "
+                                    f"the sandbox is absent from daemon truth")
+                else:
+                    actual = entry.get("status_disk") or entry.get("status_daemon")
+                    if actual != spec["status"]:
+                        failures.append(f"status: expected {spec['status']!r}, "
+                                        f"daemon reports {actual!r}")
+    vspec = spec.get("volume")
+    if isinstance(vspec, dict):
+        vols = _usable_volume_evidence(ev)
+        if vols is None:
+            unverifiable = True
+        else:
+            failures.extend(_grade_volume_assertion(vspec, vols))
     if failures:
         return "mismatch", [Candidate(
             kind="functional",
@@ -387,6 +488,8 @@ def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
                     f"truth at core step {step_index}: " + "; ".join(failures)),
             violated_expectation=expect or f"expect_state: {spec!r}",
             source=source, trajectory_ref=dict(ref))]
+    if unverifiable:
+        return "no_evidence", []
     return "matched", []
 
 
@@ -445,6 +548,52 @@ def _default_run_diff(izba_bin: str, workspace: str, name: str,
         return ""
 
 
+def _read_file_or_none(path: str) -> Optional[str]:
+    """File content as text, or ``None`` when unreadable/absent. Report-only."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _workspace_as_of_last_diff(ctx: Dict[str, Any], workspace: str,
+                               n_digests: int):
+    """``(workspace_to_diff, tmp_dir_or_None)`` for the TOCTOU guard.
+
+    When ``ctx["manifest_yml_snapshots"]`` carries a snapshot for the LAST
+    digest-carrying manifest_diff (index ``n_digests - 1``) and the live
+    workspace izba.yml has CHANGED since, restore the snapshot into a temp
+    COPY of the workspace (the whole tree is copied — the review token covers
+    any referenced Dockerfile too — and the journey workspace is never
+    mutated) and return it, with the temp root for the caller to clean up.
+    Every other case — no snapshots (pre-fix bundle), fewer snapshots than
+    digests, an unreadable snapshot (``None`` entry), an unchanged file, or a
+    copy failure — keeps the current behavior: diff the live workspace."""
+    snapshots = ctx.get("manifest_yml_snapshots")
+    if not (isinstance(snapshots, list) and len(snapshots) >= n_digests
+            and n_digests > 0):
+        return workspace, None
+    snap = snapshots[n_digests - 1]
+    if not isinstance(snap, str):
+        return workspace, None
+    if _read_file_or_none(os.path.join(workspace, "izba.yml")) == snap:
+        return workspace, None
+    tmp_dir = None
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix="dogfood-manifest-truth-")
+        restored = os.path.join(tmp_dir, "ws")
+        shutil.copytree(workspace, restored)
+        with open(os.path.join(restored, "izba.yml"), "w",
+                  encoding="utf-8") as f:
+            f.write(snap)
+        return restored, tmp_dir
+    except OSError:  # report-only fallback: grade the live file as before
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return workspace, None
+
+
 def manifest_truth_oracle(ctx: Dict[str, Any], *,
                           run_diff: Optional[RunDiff] = None) -> List[Candidate]:
     """Ground-truth check for the GUI's Manifest tab: compares the LAST
@@ -479,6 +628,23 @@ def manifest_truth_oracle(ctx: Dict[str, Any], *,
     timeout_s) -> stdout`` runner (default: a real `izba diff` subprocess
     call) so tests can supply ground truth without a real binary/daemon.
 
+    **TOCTOU guard:** this ground truth runs POST-journey, but the UI's last
+    manifest_diff digest describes the izba.yml as it was WHEN THE UI DIFFED
+    IT — seeded-drift journeys legitimately edit/revert the workspace file
+    mid-journey, after the UI's last diff, and grading the current file
+    against the stale digest false-flips a correct UI. The runner therefore
+    snapshots the workspace izba.yml content at each digest-carrying
+    manifest_diff invoke (``ctx["manifest_yml_snapshots"]``, aligned with the
+    digest order). When the snapshot matching the LAST digest exists and the
+    live file has since changed, the diff runs against a temp copy of the
+    workspace with that snapshot restored (the journey workspace is never
+    mutated); an unchanged file — or a bundle with no snapshots (pre-fix) —
+    keeps the current live-workspace behavior. Honesty: a UI that genuinely
+    showed stale state still flips — the snapshot is the file the UI
+    actually diffed, so ground truth over it exposes a lying digest exactly
+    as before. The side channel ``ctx["manifest_truth_workspace_source"]``
+    records ``"snapshot"``/``"live"`` for the skeptic.
+
     As a side channel for the caller, this also writes
     ``ctx["manifest_truth_result"]`` — an empty candidate list is ambiguous
     (it means either "verified equal" or "couldn't check at all", and a
@@ -504,8 +670,16 @@ def manifest_truth_oracle(ctx: Dict[str, Any], *,
         return []
     ui_state = manifest_digests[-1].get("state")
     runner = run_diff or _default_run_diff
-    stdout = runner(ctx.get("izba_bin", "izba"), workspace, name,
-                    ctx.get("data_dir", ""), float(ctx.get("timeout_s", 30.0)))
+    diff_workspace, tmp_dir = _workspace_as_of_last_diff(
+        ctx, workspace, len(manifest_digests))
+    ctx["manifest_truth_workspace_source"] = (
+        "snapshot" if tmp_dir else "live")
+    try:
+        stdout = runner(ctx.get("izba_bin", "izba"), diff_workspace, name,
+                        ctx.get("data_dir", ""), float(ctx.get("timeout_s", 30.0)))
+    finally:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
     truth_state = parse_cli_diff_state(stdout)
     if truth_state is None:
         ctx["manifest_truth_result"] = "unparseable"
@@ -515,12 +689,16 @@ def manifest_truth_oracle(ctx: Dict[str, Any], *,
         return []
     ctx["manifest_truth_result"] = "mismatch"
     ref = dict(ctx.get("ref") or {"journey_id": "", "action_index": -1})
+    snapshot_note = (
+        " (ground truth computed against the izba.yml snapshot as-of the "
+        "UI's last manifest_diff — the live workspace file changed after "
+        "that diff)" if tmp_dir else "")
     return [Candidate(
         kind="functional",
         detail=(f"manifest_truth: the UI's last manifest_diff showed state "
                 f"{ui_state!r}, but `izba diff` ground truth reports "
                 f"{truth_state!r} for sandbox {name!r} "
-                f"(raw: {stdout.strip()[:200]!r})"),
+                f"(raw: {stdout.strip()[:200]!r})" + snapshot_note),
         violated_expectation="the Manifest tab's drift state must match "
                              "izba's own computed drift state (izba diff)",
         source="contract: manifest diff ground truth",

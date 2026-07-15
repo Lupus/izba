@@ -335,6 +335,102 @@ def test_expect_state_requires_sandbox_and_an_assertion():
                               "bogus": 1}}), schema)
 
 
+def test_expect_state_allows_volume_assertion():
+    # P2 enabler: the expect_state hook speaks persistent-volume daemon truth
+    # (the volumes-detach cheat class needs it) — schema shape pinned with
+    # the same rigor as the sandbox keys.
+    schema = _load("journeys.schema.json")
+    es = schema["definitions"]["step"]["properties"]["expect_state"]
+    # volume joins exists/status as a valid sole assertion (sandbox stays
+    # required as the assertion's target context).
+    assert es["required"] == ["sandbox"]
+    assert {"required": ["volume"]} in es["anyOf"]
+    vol = es["properties"]["volume"]
+    assert vol["type"] == "object"
+    assert vol["additionalProperties"] is False
+    assert vol["required"] == ["name"]
+    assert {"required": ["exists"]} in vol["anyOf"]
+    assert {"required": ["attached_to"]} in vol["anyOf"]
+    assert vol["properties"]["name"]["minLength"] == 1
+    assert vol["properties"]["exists"]["type"] == "boolean"
+    # attached_to is a sandbox name OR null (null = detached-but-existing).
+    att = vol["properties"]["attached_to"]["anyOf"]
+    assert {"type": "string", "minLength": 1} in att
+    assert {"type": "null"} in att
+    # Compiler guidance: the description must carry the staged-unsaved-UI
+    # trap (grade daemon truth, not the Volumes tab's optimistic text).
+    assert "unsaved" in vol["description"].lower()
+
+
+def test_expect_state_volume_validation():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    # volume-only assertion (with the required sandbox context) validates...
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_state": {"sandbox": "web",
+                          "volume": {"name": "v", "attached_to": None}}}),
+        schema)
+    # ...and composes with the sandbox keys.
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_state": {"sandbox": "web", "status": "running",
+                          "volume": {"name": "v", "exists": True,
+                                     "attached_to": "web"}}}), schema)
+    # name is required.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web",
+                              "volume": {"exists": True}}}), schema)
+    # at least one of exists/attached_to must be declared.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web",
+                              "volume": {"name": "v"}}}), schema)
+    # attached_to must be a non-empty string or null.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web",
+                              "volume": {"name": "v", "attached_to": 7}}}),
+            schema)
+    # unknown volume sub-property rejected (additionalProperties: false).
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web",
+                              "volume": {"name": "v", "exists": True,
+                                         "bogus": 1}}}), schema)
+
+
+def test_journey_result_allows_settle_and_snapshot_audit_fields():
+    # Fix 1 / Fix 2 audit fields on the (additionalProperties: false)
+    # journey_result: the pre-settle state sample and the per-manifest_diff
+    # izba.yml snapshots. Both optional.
+    schema = _load("trajectory.schema.json")
+    jr = schema["definitions"]["journey_result"]
+    assert jr["properties"]["state_evidence_presettle"]["type"] == "object"
+    snaps = jr["properties"]["manifest_yml_snapshots"]
+    assert snaps["type"] == "array"
+    assert snaps["items"]["type"] == ["string", "null"]
+    assert "state_evidence_presettle" not in jr["required"]
+    assert "manifest_yml_snapshots" not in jr["required"]
+
+
+def test_gui_bundle_with_settle_and_snapshot_fields_validates():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("trajectory.schema.json")
+    bundle = {
+        "shard": 0, "feature": "f",
+        "results": [{
+            "journey_id": "stop-sandbox-confirm",
+            "actions": [], "candidates": [],
+            "state_evidence": {"sandboxes": ["web"], "reconcile": {},
+                               "per_sandbox": {}},
+            "state_evidence_presettle": {"sandboxes": ["web"],
+                                         "reconcile": {}, "per_sandbox": {}},
+            "manifest_yml_snapshots": ["spec:\n  image: alpine:3.21\n", None],
+        }],
+    }
+    jsonschema.validate(bundle, schema)  # must not raise
+
+
 def test_expect_text_rejects_empty_and_non_string():
     jsonschema = pytest.importorskip("jsonschema")
     schema = _load("journeys.schema.json")

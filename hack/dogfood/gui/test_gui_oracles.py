@@ -336,6 +336,125 @@ def test_manifest_truth_oracle_silent_when_invoke_failed_ok_false():
     assert ctx["manifest_truth_result"] == "no_digest"
 
 
+# ---------- manifest_truth TOCTOU guard (Fix 2) ----------
+
+def _ws_with_yml(tmp_path, content):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "izba.yml").write_text(content)
+    return str(ws)
+
+
+def test_manifest_truth_grades_snapshot_when_workspace_changed_since_diff(tmp_path):
+    # The confirmed false flip: the UI's last diff saw the seeded 3.21 file
+    # (repo_ahead), then the journey reverted izba.yml to match managed; the
+    # post-journey ground truth over the CURRENT file says in_sync and the
+    # oracle flipped a CORRECT UI. With the snapshot, ground truth runs
+    # against the file the UI actually diffed — in a temp restore, never
+    # mutating the journey workspace.
+    snap = "spec:\n  image: alpine:3.21\n"
+    live = "spec:\n  image: alpine:3.20\n"
+    workspace = _ws_with_yml(tmp_path, live)
+    ctx = _mt_ctx("repo_ahead", workspace=workspace,
+                  manifest_yml_snapshots=[snap])
+    seen = {}
+
+    def fake_run_diff(izba_bin, ws, name, data_dir, timeout_s):
+        seen["workspace"] = ws
+        with open(ws + "/izba.yml") as f:
+            seen["yml"] = f.read()
+        # Ground truth over the snapshot agrees with the UI.
+        return "state: repo ahead (promotable)\n"
+
+    assert manifest_truth_oracle(ctx, run_diff=fake_run_diff) == []
+    assert ctx["manifest_truth_result"] == "matched"
+    assert ctx["manifest_truth_workspace_source"] == "snapshot"
+    # Diffed a RESTORED temp copy carrying the snapshot content...
+    assert seen["workspace"] != workspace
+    assert seen["yml"] == snap
+    # ...and the journey workspace itself was never mutated.
+    with open(workspace + "/izba.yml") as f:
+        assert f.read() == live
+    # The temp restore is cleaned up.
+    assert not __import__("os").path.exists(seen["workspace"])
+
+
+def test_manifest_truth_genuinely_stale_ui_still_flips_via_snapshot(tmp_path):
+    # Honesty: a UI that genuinely lied (digest in_sync while the file it
+    # diffed was drifted) must still flip — the snapshot IS that file, so
+    # ground truth over it exposes the lie.
+    snap = "spec:\n  image: alpine:3.21\n"
+    workspace = _ws_with_yml(tmp_path, "spec:\n  image: alpine:3.20\n")
+    ctx = _mt_ctx("in_sync", workspace=workspace,
+                  manifest_yml_snapshots=[snap])
+
+    def fake_run_diff(izba_bin, ws, name, data_dir, timeout_s):
+        with open(ws + "/izba.yml") as f:
+            assert f.read() == snap
+        return "state: repo ahead (promotable)\n"
+
+    cs = manifest_truth_oracle(ctx, run_diff=fake_run_diff)
+    assert len(cs) == 1
+    assert ctx["manifest_truth_result"] == "mismatch"
+    assert "as-of the UI's last manifest_diff" in cs[0].detail
+
+
+def test_manifest_truth_unchanged_workspace_keeps_live_grading(tmp_path):
+    same = "spec:\n  image: alpine:3.21\n"
+    workspace = _ws_with_yml(tmp_path, same)
+    ctx = _mt_ctx("in_sync", workspace=workspace,
+                  manifest_yml_snapshots=[same])
+    seen = {}
+
+    def fake_run_diff(izba_bin, ws, name, data_dir, timeout_s):
+        seen["workspace"] = ws
+        return "state: in sync\n"
+
+    assert manifest_truth_oracle(ctx, run_diff=fake_run_diff) == []
+    assert seen["workspace"] == workspace  # the live workspace, no temp copy
+    assert ctx["manifest_truth_workspace_source"] == "live"
+
+
+def test_manifest_truth_without_snapshots_keeps_current_behavior(tmp_path):
+    # Pre-fix bundles carry no manifest_yml_snapshots: current behavior —
+    # ground truth over the live workspace, source recorded as "live".
+    workspace = _ws_with_yml(tmp_path, "spec:\n  image: alpine:3.20\n")
+    ctx = _mt_ctx("in_sync", workspace=workspace)
+    seen = {}
+
+    def fake_run_diff(izba_bin, ws, name, data_dir, timeout_s):
+        seen["workspace"] = ws
+        return "state: in sync\n"
+
+    assert manifest_truth_oracle(ctx, run_diff=fake_run_diff) == []
+    assert seen["workspace"] == workspace
+    assert ctx["manifest_truth_workspace_source"] == "live"
+
+
+def test_manifest_truth_snapshot_matches_last_digest_not_first(tmp_path):
+    # Two diffs: the snapshot aligned with the LAST digest is the one graded.
+    first_snap = "spec:\n  image: alpine:3.19\n"
+    last_snap = "spec:\n  image: alpine:3.21\n"
+    workspace = _ws_with_yml(tmp_path, "spec:\n  image: alpine:3.20\n")
+    ctx = _mt_ctx("repo_ahead", workspace=workspace,
+                  manifest_yml_snapshots=[first_snap, last_snap])
+    ctx["invoke_log"] = [
+        {"cmd": "manifest_diff", "ok": True,
+         "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}},
+        {"cmd": "manifest_diff", "ok": True,
+         "digest": {"state": "repo_ahead", "deltas": 1, "weakens": 0}},
+    ]
+    seen = {}
+
+    def fake_run_diff(izba_bin, ws, name, data_dir, timeout_s):
+        with open(ws + "/izba.yml") as f:
+            seen["yml"] = f.read()
+        return "state: repo ahead (promotable)\n"
+
+    assert manifest_truth_oracle(ctx, run_diff=fake_run_diff) == []
+    assert seen["yml"] == last_snap
+
+
 # ---------- declarative decisive hooks: expect_text_oracle ----------
 
 def test_expect_text_oracle_matched_case_insensitive():
@@ -491,3 +610,136 @@ def test_expect_state_oracle_structurally_absent_reconcile_is_no_evidence():
         {"sandbox": "web", "exists": False}, ev, REF)
     assert verdict == "no_evidence"
     assert found == []
+
+
+# ---------- expect_state volume vocabulary (P2 enabler) ----------
+
+_VOL_LS_TABLE = ("NAME                       SIZE       USED  USED BY\n"
+                 "detach-vol           1073741824    1048576  -\n"
+                 "shared-vol           1073741824    2097152  web,api\n")
+
+
+def test_parse_volume_ls_table_and_empty_sentinel():
+    from gui.gui_oracles import parse_volume_ls
+    assert parse_volume_ls("no persistent volumes\n") == {}
+    parsed = parse_volume_ls(_VOL_LS_TABLE)
+    assert parsed == {"detach-vol": [], "shared-vol": ["web", "api"]}
+
+
+def test_parse_volume_ls_unrecognized_is_none():
+    from gui.gui_oracles import parse_volume_ls
+    assert parse_volume_ls("") is None
+    assert parse_volume_ls("error: daemon unreachable\n") is None
+
+
+def _vol_evidence(stdout, exit_code=0, names=("web",),
+                  recon=({"name": "web", "status_disk": "running"},)):
+    ev = _state_evidence(list(names), list(recon))
+    ev["volume_ls"] = {"argv": ["volume", "ls"], "exit_code": exit_code,
+                       "stdout": stdout, "stderr": ""}
+    return ev
+
+
+def test_expect_state_volume_exists_true_passes_and_false_flips():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _vol_evidence(_VOL_LS_TABLE)
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "volume": {"name": "detach-vol", "exists": True}},
+        ev, REF)
+    assert (verdict, found) == ("matched", [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "volume": {"name": "detach-vol", "exists": False}},
+        ev, REF)
+    assert verdict == "mismatch"
+    assert len(found) == 1
+    assert "volume exists:" in found[0].detail
+
+
+def test_expect_state_volume_exists_false_passes_on_absent():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _vol_evidence("no persistent volumes\n")
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "volume": {"name": "gone-vol", "exists": False}},
+        ev, REF)
+    assert (verdict, found) == ("matched", [])
+
+
+def test_expect_state_volume_attached_to_sandbox():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _vol_evidence(_VOL_LS_TABLE)
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "volume": {"name": "shared-vol", "attached_to": "web"}}, ev, REF)
+    assert (verdict, found) == ("matched", [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "volume": {"name": "shared-vol", "attached_to": "other"}}, ev, REF)
+    assert verdict == "mismatch"
+    assert "volume attached_to:" in found[0].detail
+    assert "'other'" in found[0].detail
+
+
+def test_expect_state_volume_attached_to_null_asserts_detached_but_existing():
+    # The volumes-detach cheat killer: attached_to null passes ONLY when the
+    # volume exists AND is referenced by no sandbox — staged-unsaved UI text
+    # can't fake `izba volume ls`.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _vol_evidence(_VOL_LS_TABLE)
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "volume": {"name": "detach-vol", "attached_to": None}}, ev, REF)
+    assert (verdict, found) == ("matched", [])
+    # Still attached ⇒ mismatch.
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "volume": {"name": "shared-vol", "attached_to": None}}, ev, REF)
+    assert verdict == "mismatch"
+    assert "detached (null)" in found[0].detail
+    # attached_to implies existence: an absent volume fails attached_to null.
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "volume": {"name": "gone-vol", "attached_to": None}}, ev, REF)
+    assert verdict == "mismatch"
+    assert "absent from daemon truth" in found[0].detail
+
+
+def test_expect_state_volume_composes_with_sandbox_assertions():
+    # ALL declared assertions must pass: a passing volume assertion cannot
+    # rescue a failing sandbox status (and vice versa) — one folded candidate.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _vol_evidence(_VOL_LS_TABLE,
+                       recon=[{"name": "web", "status_disk": "stopped"}])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "exists": True, "status": "running",
+         "volume": {"name": "detach-vol", "exists": True}}, ev, REF)
+    assert verdict == "mismatch"
+    assert len(found) == 1
+    assert "status:" in found[0].detail
+    assert "volume exists:" not in found[0].detail  # the volume half passed
+
+
+def test_expect_state_volume_no_usable_evidence_is_no_evidence():
+    from gui.gui_oracles import expect_state_oracle
+    spec = {"sandbox": "web", "volume": {"name": "v", "exists": True}}
+    # Pre-fix bundle: no volume_ls capture at all.
+    ev = _state_evidence(["web"], [{"name": "web", "status_disk": "running"}])
+    assert expect_state_oracle(spec, ev, REF) == ("no_evidence", [])
+    # Capture failed (non-zero exit).
+    assert expect_state_oracle(
+        spec, _vol_evidence("", exit_code=1), REF) == ("no_evidence", [])
+    # Unparseable stdout (CLI format drift must not fabricate a verdict).
+    assert expect_state_oracle(
+        spec, _vol_evidence("something unexpected\n"), REF) == ("no_evidence", [])
+
+
+def test_expect_state_real_failure_beats_unverifiable_volume_sibling():
+    # Precedence: evidence of a REAL sandbox-status divergence flips even
+    # when the sibling volume assertion couldn't be checked — a harness gap
+    # must not absorb a product finding.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence(["web"], [{"name": "web", "status_disk": "stopped"}])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "status": "running",
+         "volume": {"name": "v", "exists": True}}, ev, REF)
+    assert verdict == "mismatch"
+    assert "status:" in found[0].detail
