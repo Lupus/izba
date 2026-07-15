@@ -234,7 +234,6 @@ def _snapshot_reconcile(
     Report-only, but honest: a FAILED snapshot returns an ``error`` key so a
     broken reconciler is distinguishable from a clean one (previously both
     yielded the same empty shape, hiding a dead oracle)."""
-    import json
 
     err = "unknown"
     try:
@@ -281,7 +280,6 @@ def _read_persisted_ports(data_dir: str, name: str) -> Optional[List[Any]]:
     ports-make-persistent gap, D-GUI-7). ``None`` = the file is
     unreadable/absent or ill-shaped — a ``persistent`` port assertion must
     then grade ``no_evidence``, never fabricate. Report-only."""
-    import json
     try:
         with open(os.path.join(data_dir, "sandboxes", name, "config.json"),
                   encoding="utf-8") as f:
