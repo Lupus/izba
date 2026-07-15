@@ -505,6 +505,53 @@ mod tests {
             "persistent mismatch must be reported exactly once: {:?}",
             report.violations
         );
+        assert_eq!(
+            *calls.borrow(),
+            2,
+            "a persistent mismatch must trigger exactly one settle re-fetch"
+        );
+    }
+
+    /// Kills the `&&`→`||` mutant on `reconcile_settled`'s intersection
+    /// retain (`f.kind == v.kind && f.sandbox == v.sandbox`): two sandboxes'
+    /// violations swap between passes, so sandbox `a`'s pass-1-only mismatch
+    /// heals by pass 2, while `b`'s mismatch appears only in pass 2 (never in
+    /// pass 1) and must likewise not be reported. Under `||`, `b`'s pass-2
+    /// DiskLiveMismatch kind-matches `a`'s pass-1 DiskLiveMismatch on kind
+    /// alone and wrongly survives the retain.
+    #[test]
+    fn settled_crossover_violations_do_not_survive_intersection() {
+        let (_tmp, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("a")).unwrap();
+        std::fs::create_dir_all(paths.sandbox_dir("b")).unwrap();
+        let vmm = live_identity();
+        write_state(&paths, "a", vmm.clone());
+        write_state(&paths, "b", vmm.clone());
+        let probes = FakeProbes {
+            alive: vec![vmm],
+            control: true,
+        };
+        let calls = std::cell::RefCell::new(0);
+        let mut fetch = || -> anyhow::Result<Option<Vec<SandboxSummary>>> {
+            let mut n = calls.borrow_mut();
+            *n += 1;
+            let view = if *n == 1 {
+                // pass 1: a mismatches (stopped daemon / alive disk), b clean
+                vec![summary("a", "stopped"), summary("b", "running")]
+            } else {
+                // pass 2: a heals, b now mismatches instead
+                vec![summary("a", "running"), summary("b", "stopped")]
+            };
+            Ok(Some(view))
+        };
+        let report =
+            reconcile_settled(&paths, &mut fetch, &probes, std::time::Duration::ZERO).unwrap();
+        assert!(
+            report.violations.is_empty(),
+            "crossover violations (kind-matching a different sandbox) must not survive \
+             the intersection: {:?}",
+            report.violations
+        );
     }
 
     /// #67: when the first pass is already clean, `reconcile_settled` must
