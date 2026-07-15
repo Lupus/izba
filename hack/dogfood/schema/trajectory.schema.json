@@ -64,7 +64,20 @@
         },
         "state_evidence_presettle": {
           "type": "object",
-          "description": "GUI only (expect_state settle): the FIRST end-of-journey state-evidence sample, recorded only when a failing core-step expect_state assertion triggered the bounded settle re-sample — `state_evidence` then holds the SETTLED sample the decisive grading was drawn from. Both samples stay on record so the Phase-3 skeptic can audit that only a transient divergence (e.g. a mid-ACPI-S5 teardown window) was absorbed; a genuinely-wrong settled state still flips."
+          "description": "GUI only (expect_state settle): the chronologically FIRST end-of-journey state-evidence sample, recorded only when a failing core-step expect_state assertion triggered the bounded settle re-sample — `state_evidence` then holds the SETTLED sample the decisive grading was drawn from. Both samples stay on record so the Phase-3 skeptic can audit that only a transient divergence (e.g. a mid-ACPI-S5 teardown window) was absorbed; a genuinely-wrong settled state still flips. When MORE than one core step triggered the settle, see `state_evidence_settles` for the full per-step audit."
+        },
+        "state_evidence_settles": {
+          "type": "object",
+          "description": "GUI only (expect_state settle, multi-core-step audit): present only when MORE than one core step triggered the settle re-sample — the single `state_evidence_presettle`/`state_evidence` pair cannot then carry every step's audit. Keyed by decimal step index; each entry records that step's pre-settle sample, the settled sample its grading was drawn from, and the seconds waited. Single-settle bundles omit this field and look exactly as before.",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["presettle", "settled"],
+            "properties": {
+              "presettle": { "type": "object", "description": "That step's state-evidence sample before its settle re-sample." },
+              "settled": { "type": "object", "description": "The settled state-evidence sample that step's grading was drawn from." },
+              "waited_s": { "type": "number", "description": "Seconds the settle window waited for this step." }
+            }
+          }
         },
         "manifest_yml_snapshots": {
           "type": "array",

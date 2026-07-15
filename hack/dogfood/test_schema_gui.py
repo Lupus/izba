@@ -525,6 +525,15 @@ def test_journey_result_allows_settle_and_snapshot_audit_fields():
     assert snaps["items"]["type"] == ["string", "null"]
     assert "state_evidence_presettle" not in jr["required"]
     assert "manifest_yml_snapshots" not in jr["required"]
+    # Greptile round: the multi-core-step per-step settle audit map —
+    # optional, keyed by step index, each entry a presettle/settled pair.
+    settles = jr["properties"]["state_evidence_settles"]
+    assert settles["type"] == "object"
+    entry = settles["additionalProperties"]
+    assert entry["required"] == ["presettle", "settled"]
+    assert entry["properties"]["presettle"]["type"] == "object"
+    assert entry["properties"]["settled"]["type"] == "object"
+    assert "state_evidence_settles" not in jr["required"]
 
 
 def test_gui_bundle_with_settle_and_snapshot_fields_validates():
@@ -539,6 +548,12 @@ def test_gui_bundle_with_settle_and_snapshot_fields_validates():
                                "per_sandbox": {}},
             "state_evidence_presettle": {"sandboxes": ["web"],
                                          "reconcile": {}, "per_sandbox": {}},
+            "state_evidence_settles": {
+                "0": {"presettle": {"sandboxes": ["web"]},
+                      "settled": {"sandboxes": ["web"]}, "waited_s": 3.1},
+                "2": {"presettle": {"sandboxes": ["web"]},
+                      "settled": {"sandboxes": ["web"]}, "waited_s": 6.2},
+            },
             "manifest_yml_snapshots": ["spec:\n  image: alpine:3.21\n", None],
         }],
     }
