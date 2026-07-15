@@ -277,6 +277,119 @@ def ui_daemon_diff_oracle(marks_history: Any, state_evidence: Dict[str, Any],
     return out
 
 
+# --- declarative decisive hooks (expect_text / expect_state) -----------------
+#
+# The GUI analog of the CLI corpus's expect_exit/expect_cmd_re: privileged,
+# compiler-authored, machine-checkable assertions on a core step, so a
+# NON-manifest core step (navigation/create/lifecycle/ports/volumes outcomes)
+# has a REAL grading path instead of structurally flipping unreached_decisive
+# ("never invoked manifest_diff"). Both return a (verdict, candidates) pair:
+# verdict "matched" (verified pass), "mismatch" (candidates carry the flip),
+# or "no_evidence" (the harness could not check at all — the CALLER must
+# degrade the journey via infra, never read it as a pass; the same
+# empty-list-is-ambiguous contract manifest_truth_oracle documents).
+
+
+def expect_text_oracle(expect_text: str, page_texts: List[str],
+                       ref: Dict[str, Any], *, step_index: int = 0,
+                       expect: str = "", source: str = "journey step"):
+    """Grade a core step's ``expect_text`` hook against captured page text.
+
+    ``expect_text`` is an EXACT case-insensitive literal substring chosen by
+    the privileged journey compiler (an outcome string, never dialog chrome —
+    see the schema field's description); ``page_texts`` is the chronological
+    list of ``document.body.innerText`` captures at/after the core step
+    (its opening snapshot, its and later actions' captures, the final
+    post-settle capture). page_text — NOT the a11y marks — is deliberately
+    the only surface graded: this app's Radix dialogs and plain-<div>
+    outcome copy are invisible to the accessibility snapshot
+    (see ``_last_reliable_snapshot``'s verified evidence).
+
+    Verdicts: ``"matched"`` when the substring appears in any capture;
+    ``"mismatch"`` with one flipping ``functional`` candidate when every
+    non-empty capture lacks it; ``"no_evidence"`` when NO capture carries any
+    text at all (a driver that never captured page text is a harness
+    degradation, not a product finding — the caller flips via infra).
+    Truncation caveat: each capture is capped (~4 KB, marked
+    ``...[truncated]``), so an outcome string cut by the cap grades as a
+    miss — a false FLIP, honest direction, never a false pass."""
+    texts = [t for t in (page_texts or []) if t]
+    if not texts:
+        return "no_evidence", []
+    needle = (expect_text or "").lower()
+    if any(needle in t.lower() for t in texts):
+        return "matched", []
+    return "mismatch", [Candidate(
+        kind="functional",
+        detail=(f"expect_text: {expect_text!r} absent from every page-text "
+                f"capture at/after core step {step_index} "
+                f"({len(texts)} capture(s) searched)"),
+        violated_expectation=expect or f"expect_text: {expect_text}",
+        source=source, trajectory_ref=dict(ref))]
+
+
+def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
+                        ref: Dict[str, Any], *, step_index: int = 0,
+                        expect: str = "", source: str = "journey step"):
+    """Grade a core step's ``expect_state`` hook against daemon ground truth.
+
+    ``spec`` is the compiler-authored assertion object
+    (``{"sandbox": name, "exists": bool?, "status": str?}`` — schema-shaped;
+    at least one of exists/status declared). ``state_evidence`` is the
+    runner's end-of-journey ``capture_state_evidence`` snapshot (taken AFTER
+    the create-settle poll, so an async create/boot has had its bounded
+    chance to register): the PRODUCT's own reconcile state, never what the
+    UI happened to render. All declared sub-assertions must hold:
+
+    - ``exists``: the named sandbox present (true) / absent (false) in the
+      daemon's sandbox list;
+    - ``status``: the sandbox's reconciled status (``status_disk`` falling
+      back to ``status_daemon`` — the same precedence
+      ``reconcile_seq_oracle`` uses) equals the given string exactly; an
+      absent sandbox fails a status assertion (status implies existence).
+
+    Verdicts: ``"matched"``; ``"mismatch"`` with ONE flipping ``functional``
+    candidate listing every failed sub-assertion; ``"no_evidence"`` when the
+    reconcile snapshot itself errored or is structurally absent (no
+    ``sandboxes`` key and no ``error``) — daemon truth was never observed,
+    so neither pass NOR product-bug can honestly be claimed (an errored
+    snapshot would otherwise make ``exists: false`` a guaranteed false
+    pass); the caller flips via infra."""
+    ev = state_evidence or {}
+    reconcile = ev.get("reconcile") or {}
+    if reconcile.get("error") or "sandboxes" not in reconcile:
+        return "no_evidence", []
+    name = spec.get("sandbox")
+    failures: List[str] = []
+    names = ev.get("sandboxes") or []
+    if "exists" in spec:
+        want = bool(spec["exists"])
+        present = name in names
+        if present != want:
+            failures.append(
+                f"exists: expected {want}, daemon reports "
+                f"{'present' if present else 'absent'}")
+    if "status" in spec:
+        entry = next((s for s in (reconcile.get("sandboxes") or [])
+                      if isinstance(s, dict) and s.get("name") == name), None)
+        if entry is None:
+            failures.append(f"status: expected {spec['status']!r} but the "
+                            f"sandbox is absent from daemon truth")
+        else:
+            actual = entry.get("status_disk") or entry.get("status_daemon")
+            if actual != spec["status"]:
+                failures.append(f"status: expected {spec['status']!r}, "
+                                f"daemon reports {actual!r}")
+    if failures:
+        return "mismatch", [Candidate(
+            kind="functional",
+            detail=(f"expect_state: sandbox {name!r} diverges from daemon "
+                    f"truth at core step {step_index}: " + "; ".join(failures)),
+            violated_expectation=expect or f"expect_state: {spec!r}",
+            source=source, trajectory_ref=dict(ref))]
+    return "matched", []
+
+
 # --- manifest_truth oracle (Task 11) -----------------------------------------
 
 # `izba diff` renders `state: <label>` (crates/izba-cli/src/commands/diff.rs

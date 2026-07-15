@@ -38,8 +38,8 @@ from gui.driver import (  # noqa: E402
 )
 from gui.gui_model import build_gui_model  # noqa: E402
 from gui.gui_oracles import (  # noqa: E402
-    console_oracle, dom_expect_oracle, manifest_truth_oracle, silent_failure_oracle,
-    ui_daemon_diff_oracle,
+    console_oracle, dom_expect_oracle, expect_state_oracle, expect_text_oracle,
+    manifest_truth_oracle, silent_failure_oracle, ui_daemon_diff_oracle,
 )
 
 DEFAULT_LATENCY_BUDGET_MS = 30_000
@@ -195,12 +195,14 @@ def _substitute_workspace(text: Any, workspace: str) -> Any:
 
 def _substitute_steps_workspace(steps: List[Dict[str, Any]],
                                 workspace: str) -> List[Dict[str, Any]]:
-    """Shallow-copy each step, substituting ``{workspace}`` in ``intent`` and
-    ``expect`` only (``seed_files`` and everything else pass through
+    """Shallow-copy each step, substituting ``{workspace}`` in ``intent``,
+    ``expect``, and the declarative decisive hooks ``expect_text`` /
+    ``expect_state.sandbox`` (``seed_files`` and everything else pass through
     untouched). Done ONCE up front so both the Actor loop (which reads
-    ``step['intent']`` every turn) and the end-of-journey dom_expect grading
-    (which reads ``steps[-1]['expect']``) see the same substituted text —
-    the substitution must land before ``expectation_keywords`` tokenizes it."""
+    ``step['intent']`` every turn) and the end-of-journey grading (dom_expect
+    on ``steps[-1]['expect']``, the hook oracles on the core step) see the
+    same substituted text — the substitution must land before
+    ``expectation_keywords`` tokenizes it / the hook oracles match it."""
     if not workspace:
         return steps
     out = []
@@ -210,8 +212,142 @@ def _substitute_steps_workspace(steps: List[Dict[str, Any]],
             s["intent"] = _substitute_workspace(s.get("intent"), workspace)
         if "expect" in s:
             s["expect"] = _substitute_workspace(s.get("expect"), workspace)
+        if "expect_text" in s:
+            s["expect_text"] = _substitute_workspace(s.get("expect_text"),
+                                                     workspace)
+        if isinstance(s.get("expect_state"), dict):
+            es = dict(s["expect_state"])
+            if "sandbox" in es:
+                es["sandbox"] = _substitute_workspace(es.get("sandbox"),
+                                                      workspace)
+            s["expect_state"] = es
         out.append(s)
     return out
+
+
+def _step_decisive_hooks(step: Dict[str, Any]) -> tuple:
+    """The (expect_text, expect_state) declarative hooks a step carries, with
+    malformed values normalized to absent (``None``): a hook the schema would
+    reject (non-str/empty expect_text; expect_state without a ``sandbox`` or
+    without at least one of ``exists``/``status``) is NOT gradable and must
+    fall through to the unreached_decisive flip — never a silent pass on a
+    half-formed assertion."""
+    text = step.get("expect_text")
+    if not (isinstance(text, str) and text):
+        text = None
+    state = step.get("expect_state")
+    if not (isinstance(state, dict) and state.get("sandbox")
+            and ("exists" in state or "status" in state)):
+        state = None
+    return text, state
+
+
+def _apply_hook_verdict(verdict: str, found: List[Any], *, hook: str,
+                        no_evidence_detail: str, journey_id: str,
+                        step_idx: int, candidates: List[Dict[str, Any]],
+                        decisive_credits: List[Dict[str, Any]]) -> None:
+    """Fold one hook oracle's ``(verdict, candidates)`` into the journey per
+    the instrument-honesty contract: ``matched`` ⇒ an auditable
+    decisive_credits entry (the skeptic must see the decisive assertion WAS
+    checked, mirroring the manifest_truth credit shape); ``mismatch`` ⇒ the
+    oracle's ``functional`` candidate(s) tagged ``decisive`` (the collector's
+    flip contract); ``no_evidence`` ⇒ a flipping ``infra`` candidate
+    (couldn't verify — harness degradation, not a product bug, and NEVER a
+    silent pass)."""
+    if verdict == "matched":
+        decisive_credits.append({
+            "step_index": step_idx, "action_index": -1,
+            "graded_cmd": f"{hook} (matched)",
+        })
+        return
+    if verdict == "no_evidence":
+        candidates.append(_infra_candidate(
+            journey_id, f"{no_evidence_detail} (core decisive step {step_idx})"))
+        return
+    for c in found:
+        cd = c.to_dict()
+        cd["decisive"] = True
+        candidates.append(cd)
+
+
+def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
+                           steps: List[Dict[str, Any]],
+                           page_text_history: List[str],
+                           step_hist_start: Dict[int, int],
+                           state_evidence: Dict[str, Any],
+                           candidates: List[Dict[str, Any]],
+                           decisive_credits: List[Dict[str, Any]]) -> None:
+    """Grade every declared ``core: true`` step of a NON-manifest GUI journey
+    through its declarative hooks — precedence rung 2 of the decisive wiring
+    (see run_gui_journey's comment block). Mutates ``candidates`` /
+    ``decisive_credits`` in place. Only called when the journey declares a
+    core step and drove no manifest_diff, so ``_decisive_step_indices`` here
+    yields exactly the core steps (never the fallback last step).
+
+    Per core step:
+
+    - no valid hook ⇒ one flipping ``unreached_decisive`` whose reason names
+      the hooks (so the journey compiler learns to annotate every core step);
+    - ``expect_text`` ⇒ graded over the page-text window starting at the
+      step's own first capture (its "opened screen" snapshot — a
+      pure-observation step's outcome is already on screen, and a zero-action
+      journey's initial observation is exactly this entry) through every
+      later capture including the final post-settle one (an async
+      create/boot lands its row only after the settle poll). A core step the
+      Actor never entered falls back to the final capture alone — the
+      outcome being observably present at journey end is still honest
+      evidence, mirroring the CLI runner's satisfied-under-an-earlier-step
+      crediting (_grade_decisive_from_observed);
+    - ``expect_state`` ⇒ graded against the end-of-journey daemon state
+      evidence (post-settle ``capture_state_evidence`` — product truth).
+
+    ALL declared hooks must pass; verdict folding per _apply_hook_verdict."""
+    source = journey.get("source", {}).get("ref", "journey step")
+    final_hist_idx = max(len(page_text_history) - 1, 0)
+    for step_idx in sorted(_decisive_step_indices(steps)):
+        s = steps[step_idx] if step_idx < len(steps) else {}
+        ref = {"journey_id": journey_id, "action_index": -1}
+        text_hook, state_hook = _step_decisive_hooks(s)
+        if text_hook is None and state_hook is None:
+            candidates.append({
+                "kind": "unreached_decisive",
+                "detail": (f"decisive step {step_idx} "
+                           f"({s.get('intent', '')[:80]!r}) carries no "
+                           f"gradable hook (expect_text/expect_state) and "
+                           f"the journey drove no manifest_diff — its "
+                           f"assertion was never exercised"),
+                "violated_expectation": s.get("expect", "")
+                                        or "decisive step must be exercised",
+                "source": source,
+                "trajectory_ref": dict(ref),
+            })
+            continue
+        if text_hook is not None:
+            start = min(step_hist_start.get(step_idx, final_hist_idx),
+                        final_hist_idx)
+            verdict, found = expect_text_oracle(
+                text_hook, page_text_history[start:], ref,
+                step_index=step_idx, expect=s.get("expect", ""), source=source)
+            _apply_hook_verdict(
+                verdict, found, hook=f"expect_text: {text_hook!r}",
+                no_evidence_detail=(
+                    "expect_text: no page text was ever captured to grade "
+                    "the assertion against"),
+                journey_id=journey_id, step_idx=step_idx,
+                candidates=candidates, decisive_credits=decisive_credits)
+        if state_hook is not None:
+            verdict, found = expect_state_oracle(
+                state_hook, state_evidence, ref,
+                step_index=step_idx, expect=s.get("expect", ""), source=source)
+            _apply_hook_verdict(
+                verdict, found,
+                hook=f"expect_state: sandbox {state_hook.get('sandbox')!r}",
+                no_evidence_detail=(
+                    "expect_state: daemon state evidence unavailable "
+                    "(reconcile snapshot errored/absent), assertion "
+                    "unverifiable"),
+                journey_id=journey_id, step_idx=step_idx,
+                candidates=candidates, decisive_credits=decisive_credits)
 
 
 def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
@@ -254,6 +390,12 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     # over the marks-only heuristic (gui_oracles._last_reliable_snapshot).
     marks_history: List[str] = []
     page_text_history: List[str] = []
+    # Index into the histories where each step's captures begin (the step's
+    # own pre-turn "opened screen" snapshot is entry 0 of its window) — the
+    # expect_text hook grades "at/after the core step", which needs to know
+    # where that step's evidence starts. A step the Actor never entered has
+    # no entry (grading then falls back to the final capture alone).
+    step_hist_start: Dict[int, int] = {}
     ws_abs = os.path.abspath(workspace) if workspace else ""
     if ws_abs:
         os.makedirs(ws_abs, exist_ok=True)
@@ -263,11 +405,12 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     # Journey-level seed_files (precondition), written before step 0.
     _write_seeds(ws_abs, journey.get("seed_files"))
     try:
-        for step in steps:
+        for step_i, step in enumerate(steps):
             # Step-level seed_files (mid-journey drift) land immediately
             # before this step's first action — never inside its while loop,
             # so they're written exactly once per step regardless of turns.
             _write_seeds(ws_abs, step.get("seed_files"))
+            step_hist_start[step_i] = len(page_text_history)
             seen: set = set()
             # Seed the Actor with the current screen so its FIRST decision sees
             # the accessibility marks (real refs to act on) rather than an empty
@@ -415,27 +558,40 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                  + silent_failure_oracle(silent_failure_log, final_marks, final_ref,
                                          page_text=all_page_text))
 
-    # Decisive wiring (Task 11 + Critical-finding fix): manifest_truth is the
-    # GUI runner's only `functional`-candidate-producing oracle, so it
-    # doubles as the decisive (core: true, else last-step) grading mechanism
-    # — mirroring the CLI runner's contract (run_journeys._decisive_step_
-    # indices, imported unchanged: pure over `steps`, nothing CLI-shaped to
-    # fake). A journey WITHOUT any core: true step keeps the original Task-11
+    # Decisive wiring (Task 11 + Critical-finding fix + product-wide
+    # generalization): the decisive (core: true, else last-step) grading
+    # mechanism mirrors the CLI runner's contract (run_journeys._decisive_
+    # step_indices, imported unchanged: pure over `steps`, nothing CLI-shaped
+    # to fake). Grading PRECEDENCE for a journey with a core step:
+    #   1. journey drove manifest_diff ⇒ manifest_truth ground truth
+    #      (unchanged Task-11 behavior, its tests pin it);
+    #   2. else, the core step carries declarative hooks (`expect_text` /
+    #      `expect_state`, compiler-authored, invisible to the Actor) ⇒
+    #      grade those — ALL declared hooks must pass (see
+    #      _grade_core_step_hooks). This is what gives the product-wide GUI
+    #      corpus (navigation/create/lifecycle/ports/volumes outcomes, which
+    #      never open the Manifest tab) a REAL grading path instead of
+    #      structurally flipping unreached_decisive;
+    #   3. else ⇒ unreached_decisive, exactly as before — widening what is
+    #      GRADABLE, never weakening the flip: an ungradable core step still
+    #      flips, with a reason that tells the compiler what to annotate.
+    # A journey WITHOUT any core: true step keeps the original Task-11
     # behavior exactly: decisive wiring only activates when the journey
     # happened to invoke manifest_diff — its fallback-to-last-step decisive
     # index never gets graded otherwise. A journey that explicitly DECLARES a
     # core: true step, though, is asserting "this step's assertion must be
     # verified" — so those journeys must never grade silently positive when
-    # the decisive assertion was never actually checked. Three unverifiable
-    # paths, mirroring the CLI runner's #126/PR#129 unreached_decisive fix
+    # the decisive assertion was never actually checked. The unverifiable
+    # paths mirror the CLI runner's #126/PR#129 unreached_decisive fix
     # (run_journeys.py ~618-640) so the collector/skeptic see ONE convention
-    # across CLI and GUI bundles: (a) manifest_diff never invoked at all ⇒
-    # flip via the exact `unreached_decisive` kind/shape; (b) ground truth
-    # couldn't be computed (`no_target`/`unparseable`) ⇒ flip via `infra`
-    # (harness degradation — couldn't verify — not a product bug). Side-
-    # effect constraint: the oracle shells out to `izba diff`, which WRITES
-    # the review token, so it is called exactly ONCE here, post-journey (see
-    # its docstring).
+    # across CLI and GUI bundles: (a) no gradable route to the assertion at
+    # all ⇒ flip via the exact `unreached_decisive` kind/shape; (b) ground
+    # truth couldn't be computed (manifest `no_target`/`unparseable`, an
+    # errored reconcile under expect_state, zero page-text captures under
+    # expect_text) ⇒ flip via `infra` (harness degradation — couldn't verify
+    # — not a product bug). Side-effect constraint: the manifest oracle
+    # shells out to `izba diff`, which WRITES the review token, so it is
+    # called exactly ONCE here, post-journey (see its docstring).
     decisive_credits: List[Dict[str, Any]] = []
     mt_found: List[Any] = []
     has_core_step = any(isinstance(s, dict) and s.get("core") for s in steps)
@@ -480,24 +636,15 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 f"manifest_truth: ground truth could not be verified "
                 f"({mt_result}) for a core decisive step"))
     elif has_core_step and steps:
-        # The journey declares a core: true step but the Actor never even
-        # opened the Manifest tab (no manifest_diff invoke at all): the
-        # decisive assertion was never exercised. Mirrors the CLI runner's
-        # unreached_decisive shape exactly (run_journeys.py ~631-640).
-        decisive_idx = _decisive_step_indices(steps)
-        step_idx = min(decisive_idx) if decisive_idx else 0
-        s = steps[step_idx] if step_idx < len(steps) else {}
-        source = journey.get("source", {}).get("ref", "journey step")
-        candidates.append({
-            "kind": "unreached_decisive",
-            "detail": (f"decisive step {step_idx} "
-                       f"({s.get('intent', '')[:80]!r}) never invoked "
-                       f"manifest_diff — its assertion was never exercised"),
-            "violated_expectation": s.get("expect", "")
-                                    or "decisive step must be exercised",
-            "source": source,
-            "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
-        })
+        # No manifest_diff to ground-truth: grade each declared core step
+        # through its declarative hooks (expect_text/expect_state), or flip
+        # it unreached_decisive when it carries none — see the precedence
+        # comment above.
+        _grade_core_step_hooks(
+            journey=journey, journey_id=journey_id, steps=steps,
+            page_text_history=page_text_history,
+            step_hist_start=step_hist_start, state_evidence=state_evidence,
+            candidates=candidates, decisive_credits=decisive_credits)
     elif not has_core_step and steps and not _has_product_invoke(invoke_log):
         # H2 (run-4 skeptic): a NON-core journey (no declared `core: true`
         # step, so the branches above never engage) whose Actor bailed
@@ -546,9 +693,20 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
         cd["trajectory_ref"] = dict(final_ref)
         cd["decisive"] = True
         candidates.append(cd)
+    # H-GUI-2 (smoke-run skeptic): persist the journey's OPENING capture —
+    # history entry 0 is step 0's pre-turn "opened screen" snapshot, taken
+    # before the Actor's first decision — so a zero-action journey (an Actor
+    # that decides pure observation needs no interaction) still carries page
+    # evidence in the bundle instead of an evidence-free positive, and a
+    # pure-observation expect_text has an on-record capture behind its grade.
+    initial_observation = {
+        "marks": marks_history[0] if marks_history else "",
+        "page_text": page_text_history[0] if page_text_history else "",
+    }
     return {"journey_id": journey_id, "actions": actions, "candidates": candidates,
             "state_evidence": state_evidence, "invoke_log": invoke_log,
-            "workspace": str(ws_abs), "decisive_credits": decisive_credits}
+            "workspace": str(ws_abs), "decisive_credits": decisive_credits,
+            "initial_observation": initial_observation}
 
 
 # ---------- CI orchestration (static server + sidecar lifecycle) ----------

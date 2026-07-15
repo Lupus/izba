@@ -334,3 +334,160 @@ def test_manifest_truth_oracle_silent_when_invoke_failed_ok_false():
     assert manifest_truth_oracle(ctx, run_diff=fake_run_diff) == []
     assert called == []
     assert ctx["manifest_truth_result"] == "no_digest"
+
+
+# ---------- declarative decisive hooks: expect_text_oracle ----------
+
+def test_expect_text_oracle_matched_case_insensitive():
+    from gui.gui_oracles import expect_text_oracle
+    verdict, found = expect_text_oracle(
+        "Promoted 2 change(s).",
+        ["some other screen", "banner: PROMOTED 2 CHANGE(S). done"], REF)
+    assert verdict == "matched"
+    assert found == []
+
+
+def test_expect_text_oracle_mismatch_flips_functional():
+    from gui.gui_oracles import expect_text_oracle
+    verdict, found = expect_text_oracle(
+        "Promoted 2 change(s).", ["nothing here", "still nothing"], REF,
+        step_index=1, expect="promote applies the change",
+        source="spec §3.2")
+    assert verdict == "mismatch"
+    assert len(found) == 1
+    c = found[0]
+    assert c.kind == "functional"
+    assert "Promoted 2 change(s)." in c.detail
+    assert "core step 1" in c.detail
+    assert c.violated_expectation == "promote applies the change"
+    assert c.source == "spec §3.2"
+    assert c.trajectory_ref == REF
+
+
+def test_expect_text_oracle_exact_substring_not_keyword_soup():
+    # The hook is an EXACT substring, not fuzzy keywords: every individual
+    # word being present must NOT count when the literal string is absent.
+    from gui.gui_oracles import expect_text_oracle
+    verdict, found = expect_text_oracle(
+        "sandbox web is running",
+        ["web sandbox status: running is shown elsewhere"], REF)
+    assert verdict == "mismatch"
+    assert len(found) == 1
+
+
+def test_expect_text_oracle_no_evidence_when_all_captures_empty():
+    # A driver that never captured any page text is a harness degradation:
+    # neither a pass nor a product finding — the caller must flip via infra.
+    from gui.gui_oracles import expect_text_oracle
+    for window in ([], ["", "", ""]):
+        verdict, found = expect_text_oracle("anything", window, REF)
+        assert verdict == "no_evidence"
+        assert found == []
+
+
+def test_expect_text_oracle_partial_empty_captures_still_grade():
+    # Empty captures are dropped; a hit in the one non-empty capture matches.
+    from gui.gui_oracles import expect_text_oracle
+    verdict, found = expect_text_oracle(
+        "web · running", ["", "SANDBOXES · 1\nweb · running", ""], REF)
+    assert verdict == "matched"
+    assert found == []
+
+
+# ---------- declarative decisive hooks: expect_state_oracle ----------
+
+def _state_evidence(names, reconcile_sandboxes, error=None):
+    reconcile = {"violations": [], "sandboxes": reconcile_sandboxes}
+    if error is not None:
+        reconcile["error"] = error
+    return {"sandboxes": names, "reconcile": reconcile, "per_sandbox": {}}
+
+
+def test_expect_state_oracle_exists_and_status_match():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence(["web"], [{"name": "web", "status_disk": "running"}])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "exists": True, "status": "running"}, ev, REF)
+    assert verdict == "matched"
+    assert found == []
+
+
+def test_expect_state_oracle_status_falls_back_to_status_daemon():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence(["web"], [{"name": "web", "status_daemon": "stopped"}])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "status": "stopped"}, ev, REF)
+    assert verdict == "matched"
+
+
+def test_expect_state_oracle_status_mismatch_flips():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence(["web"], [{"name": "web", "status_disk": "stopped"}])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "status": "running"}, ev, REF, step_index=2)
+    assert verdict == "mismatch"
+    assert len(found) == 1
+    assert found[0].kind == "functional"
+    assert "'running'" in found[0].detail and "'stopped'" in found[0].detail
+    assert "core step 2" in found[0].detail
+
+
+def test_expect_state_oracle_exists_false_passes_on_absent():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence([], [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "gone", "exists": False}, ev, REF)
+    assert verdict == "matched"
+    assert found == []
+
+
+def test_expect_state_oracle_exists_true_flips_on_absent():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence([], [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "exists": True}, ev, REF)
+    assert verdict == "mismatch"
+    assert len(found) == 1
+    assert "absent" in found[0].detail
+
+
+def test_expect_state_oracle_status_implies_existence():
+    # status on an absent sandbox is a mismatch, never a silent skip.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence([], [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "status": "running"}, ev, REF)
+    assert verdict == "mismatch"
+    assert "absent from daemon truth" in found[0].detail
+
+
+def test_expect_state_oracle_multiple_failures_fold_into_one_candidate():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence([], [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "exists": True, "status": "running"}, ev, REF)
+    assert verdict == "mismatch"
+    assert len(found) == 1
+    assert "exists:" in found[0].detail and "status:" in found[0].detail
+
+
+def test_expect_state_oracle_errored_reconcile_is_no_evidence():
+    # An errored reconcile snapshot means daemon truth was never observed —
+    # `exists: false` would otherwise be a guaranteed false pass.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence([], [], error="izba died")
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "exists": False}, ev, REF)
+    assert verdict == "no_evidence"
+    assert found == []
+
+
+def test_expect_state_oracle_structurally_absent_reconcile_is_no_evidence():
+    # The runner's capture_state_evidence exception fallback carries an
+    # empty reconcile dict (no sandboxes key, no error): still no evidence.
+    from gui.gui_oracles import expect_state_oracle
+    ev = {"sandboxes": [], "reconcile": {}, "per_sandbox": {}}
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "exists": False}, ev, REF)
+    assert verdict == "no_evidence"
+    assert found == []
