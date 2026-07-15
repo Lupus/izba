@@ -466,6 +466,20 @@ def test_expect_text_oracle_matched_case_insensitive():
     assert found == []
 
 
+def test_expect_text_oracle_css_uppercased_rendering_matches_title_case_pin():
+    # D-GUI-3 regression pin: Rail.tsx renders `Sandboxes · {n}` under CSS
+    # class `uppercase`, so page_text captures 'SANDBOXES · N'. The deep-tier
+    # skeptic claimed a title-case pin 'Sandboxes · 2' "can never match" that
+    # rendering — refuted: matching is case-INsensitive per the documented
+    # d074d0bf semantics (both needle and haystack are lowercased), so the
+    # compiler's title-case pin grades the uppercase-rendered rail correctly.
+    from gui.gui_oracles import expect_text_oracle
+    verdict, found = expect_text_oracle(
+        "Sandboxes · 2", ["SANDBOXES · 2\nmulti-a\nmulti-b · running"], REF)
+    assert verdict == "matched"
+    assert found == []
+
+
 def test_expect_text_oracle_mismatch_flips_functional():
     from gui.gui_oracles import expect_text_oracle
     verdict, found = expect_text_oracle(
@@ -741,5 +755,222 @@ def test_expect_state_real_failure_beats_unverifiable_volume_sibling():
     verdict, found = expect_state_oracle(
         {"sandbox": "web", "status": "running",
          "volume": {"name": "v", "exists": True}}, ev, REF)
+    assert verdict == "mismatch"
+    assert "status:" in found[0].detail
+
+
+# ---------- expect_state.sandboxes_exact (D-GUI-2 enabler) ----------
+
+def test_expect_state_sandboxes_exact_matches_order_insensitively():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence(["keep-demo", "other"],
+                         [{"name": "keep-demo", "status_disk": "running"},
+                          {"name": "other", "status_disk": "stopped"}])
+    verdict, found = expect_state_oracle(
+        {"sandboxes_exact": ["other", "keep-demo"]}, ev, REF)
+    assert (verdict, found) == ("matched", [])
+
+
+def test_expect_state_sandboxes_exact_superset_in_daemon_flips():
+    # The daemon holds an UNEXPECTED extra sandbox: exact-set must flip.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence(["keep-demo", "stray"],
+                         [{"name": "keep-demo"}, {"name": "stray"}])
+    verdict, found = expect_state_oracle(
+        {"sandboxes_exact": ["keep-demo"]}, ev, REF, step_index=1)
+    assert verdict == "mismatch"
+    assert len(found) == 1
+    assert "sandboxes_exact:" in found[0].detail
+    assert "unexpected ['stray']" in found[0].detail
+    assert "core step 1" in found[0].detail
+
+
+def test_expect_state_sandboxes_exact_missing_survivor_flips():
+    # The D-GUI-2 false-green killer: the actor removed the SURVIVOR (or
+    # never created it) — daemon truth [] must flip 'exactly {keep-demo}'.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence([], [])
+    verdict, found = expect_state_oracle(
+        {"sandboxes_exact": ["keep-demo"]}, ev, REF)
+    assert verdict == "mismatch"
+    assert "missing ['keep-demo']" in found[0].detail
+
+
+def test_expect_state_sandboxes_exact_empty_list_semantics():
+    from gui.gui_oracles import expect_state_oracle
+    # Empty list asserts NO sandboxes: passes on an empty daemon set...
+    verdict, found = expect_state_oracle(
+        {"sandboxes_exact": []}, _state_evidence([], []), REF)
+    assert (verdict, found) == ("matched", [])
+    # ...and flips when anything survives.
+    verdict, found = expect_state_oracle(
+        {"sandboxes_exact": []},
+        _state_evidence(["leftover"], [{"name": "leftover"}]), REF)
+    assert verdict == "mismatch"
+    assert "unexpected ['leftover']" in found[0].detail
+
+
+def test_expect_state_sandboxes_exact_composes_with_status_and_volume():
+    # ALL declared assertions must pass; a passing exact-set cannot rescue a
+    # failing status (and vice versa) — one folded candidate.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _vol_evidence(_VOL_LS_TABLE,
+                       recon=[{"name": "web", "status_disk": "running"}])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "status": "running",
+         "volume": {"name": "detach-vol", "exists": True},
+         "sandboxes_exact": ["web"]}, ev, REF)
+    assert (verdict, found) == ("matched", [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "status": "running",
+         "volume": {"name": "detach-vol", "exists": True},
+         "sandboxes_exact": ["web", "ghost"]}, ev, REF)
+    assert verdict == "mismatch"
+    assert len(found) == 1
+    assert "sandboxes_exact:" in found[0].detail
+    assert "status:" not in found[0].detail  # the status half passed
+
+
+def test_expect_state_sandboxes_exact_errored_reconcile_is_no_evidence():
+    # Daemon truth never observed ⇒ an exact-set assertion (even the empty
+    # one, which an errored snapshot would falsely satisfy) is unverifiable.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence([], [], error="izba died")
+    verdict, found = expect_state_oracle(
+        {"sandboxes_exact": []}, ev, REF)
+    assert (verdict, found) == ("no_evidence", [])
+
+
+# ---------- expect_state.port vocabulary (D-GUI-7 enabler) ----------
+
+def test_parse_port_ls_rules_and_empty():
+    from gui.gui_oracles import parse_port_ls
+    # No output at all = no active forwards (valid; there is no sentinel).
+    assert parse_port_ls("") == []
+    assert parse_port_ls("\n") == []
+    parsed = parse_port_ls("127.0.0.1:8082 -> 80\n0.0.0.0:9000 -> 9000\n")
+    assert parsed == [
+        {"bind": "127.0.0.1", "host_port": 8082, "guest_port": 80},
+        {"bind": "0.0.0.0", "host_port": 9000, "guest_port": 9000}]
+
+
+def test_parse_port_ls_unrecognized_is_none():
+    from gui.gui_oracles import parse_port_ls
+    assert parse_port_ls("error: daemon unreachable\n") is None
+    # One good line + one alien line: format drift must not half-parse.
+    assert parse_port_ls("127.0.0.1:8082 -> 80\nTOTALLY NEW FORMAT\n") is None
+
+
+def _port_evidence(port_ls_stdout, ports_persisted, exit_code=0,
+                   names=("web",),
+                   recon=({"name": "web", "status_disk": "running"},)):
+    ev = _state_evidence(list(names), list(recon))
+    ev["per_sandbox"] = {"web": {
+        "port_ls": {"argv": ["port", "ls", "web"], "exit_code": exit_code,
+                    "stdout": port_ls_stdout, "stderr": ""},
+        "ports_persisted": ports_persisted,
+    }}
+    return ev
+
+
+_RULE_8082 = {"bind": "127.0.0.1", "host_port": 8082, "guest_port": 80}
+
+
+def test_expect_state_port_exists_true_passes_and_false_flips():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _port_evidence("127.0.0.1:8082 -> 80\n", [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "port": {"host": 8082, "exists": True}}, ev, REF)
+    assert (verdict, found) == ("matched", [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "port": {"host": 8082, "exists": False}}, ev, REF)
+    assert verdict == "mismatch"
+    assert "port exists:" in found[0].detail
+
+
+def test_expect_state_port_exists_false_passes_after_unpublish():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _port_evidence("", [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "port": {"host": 8082, "exists": False}}, ev, REF)
+    assert (verdict, found) == ("matched", [])
+
+
+def test_expect_state_port_persistent_grades_config_not_port_ls():
+    # The D-GUI-7 promise: `port ls` shows the forward either way; only the
+    # persisted-config capture distinguishes Make-persistent from ephemeral.
+    from gui.gui_oracles import expect_state_oracle
+    # Active AND persisted ⇒ persistent: true passes.
+    ev = _port_evidence("127.0.0.1:8082 -> 80\n", [_RULE_8082])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "port": {"host": 8082, "persistent": True}},
+        ev, REF)
+    assert (verdict, found) == ("matched", [])
+    # Active but NOT persisted ⇒ persistent: true flips (the ephemeral rule
+    # `port ls` alone could never distinguish).
+    ev = _port_evidence("127.0.0.1:8082 -> 80\n", [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "port": {"host": 8082, "persistent": True}},
+        ev, REF)
+    assert verdict == "mismatch"
+    assert "port persistent:" in found[0].detail
+    # ...and persistent: false passes on the same evidence.
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "port": {"host": 8082, "persistent": False}},
+        ev, REF)
+    assert (verdict, found) == ("matched", [])
+
+
+def test_expect_state_port_composes_exists_and_persistent():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _port_evidence("127.0.0.1:8082 -> 80\n", [_RULE_8082])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "exists": True,
+         "port": {"host": 8082, "exists": True, "persistent": True}},
+        ev, REF)
+    assert (verdict, found) == ("matched", [])
+
+
+def test_expect_state_port_implies_sandbox_existence():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence([], [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "port": {"host": 8082, "exists": True}}, ev, REF)
+    assert verdict == "mismatch"
+    assert "absent from daemon truth" in found[0].detail
+
+
+def test_expect_state_port_no_usable_evidence_is_no_evidence():
+    from gui.gui_oracles import expect_state_oracle
+    exists_spec = {"sandbox": "web", "port": {"host": 8082, "exists": True}}
+    persist_spec = {"sandbox": "web",
+                    "port": {"host": 8082, "persistent": True}}
+    # Pre-fix bundle: per_sandbox entry has no port captures at all.
+    ev = _state_evidence(["web"], [{"name": "web", "status_disk": "running"}])
+    ev["per_sandbox"] = {"web": {}}
+    assert expect_state_oracle(exists_spec, ev, REF) == ("no_evidence", [])
+    assert expect_state_oracle(persist_spec, ev, REF) == ("no_evidence", [])
+    # port ls capture failed (non-zero exit) / unparseable stdout.
+    assert expect_state_oracle(
+        exists_spec, _port_evidence("", [], exit_code=1),
+        REF) == ("no_evidence", [])
+    assert expect_state_oracle(
+        exists_spec, _port_evidence("weird output\n", []),
+        REF) == ("no_evidence", [])
+    # config.json unreadable ⇒ persisted truth unknown (None), never a pass.
+    assert expect_state_oracle(
+        persist_spec, _port_evidence("127.0.0.1:8082 -> 80\n", None),
+        REF) == ("no_evidence", [])
+
+
+def test_expect_state_real_failure_beats_unverifiable_port_sibling():
+    # Same precedence rule as the volume sibling: a REAL status divergence
+    # flips even when the port assertion couldn't be checked.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _state_evidence(["web"], [{"name": "web", "status_disk": "stopped"}])
+    ev["per_sandbox"] = {"web": {}}
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "status": "running",
+         "port": {"host": 8082, "exists": True}}, ev, REF)
     assert verdict == "mismatch"
     assert "status:" in found[0].detail

@@ -1609,3 +1609,190 @@ def test_substitute_steps_workspace_covers_decisive_hooks():
     # the caller's step objects are never mutated (shallow copies all the way)
     assert steps[0]["expect_text"] == "exported to {workspace}/izba.yml"
     assert steps[0]["expect_state"]["sandbox"] == "{workspace}"
+
+
+# ---------- expect_state vocabulary widening: sandboxes_exact / port ----------
+
+def test_step_decisive_hooks_accepts_sandboxes_exact_only_spec():
+    from gui.run_gui_journeys import _step_decisive_hooks
+    # No `sandbox` key needed for a pure set-level assertion — including the
+    # empty list (asserts NO sandboxes).
+    for exact in (["keep-demo"], []):
+        _, state = _step_decisive_hooks(
+            {"expect_state": {"sandboxes_exact": exact}})
+        assert state == {"sandboxes_exact": exact}
+
+
+def test_step_decisive_hooks_accepts_port_spec():
+    from gui.run_gui_journeys import _step_decisive_hooks
+    spec = {"sandbox": "web", "port": {"host": 8082, "persistent": True}}
+    _, state = _step_decisive_hooks({"expect_state": spec})
+    assert state == spec
+
+
+def test_step_decisive_hooks_rejects_malformed_new_vocabulary():
+    # A declared assertion must never be silently dropped: any half-formed
+    # value invalidates the whole hook (⇒ unreached_decisive downstream).
+    from gui.run_gui_journeys import _step_decisive_hooks
+    bad_specs = [
+        # sandboxes_exact must be a list of non-empty strings.
+        {"sandboxes_exact": "keep-demo"},
+        {"sandboxes_exact": [""]},
+        {"sandboxes_exact": [{"name": "keep-demo"}]},
+        # port needs an int host and at least one of exists/persistent.
+        {"sandbox": "web", "port": {"host": 8082}},
+        {"sandbox": "web", "port": {"host": "8082", "exists": True}},
+        {"sandbox": "web", "port": {"host": True, "exists": True}},
+        {"sandbox": "web", "port": {"exists": True}},
+        # per-sandbox assertions (incl. port) still need a sandbox target.
+        {"port": {"host": 8082, "exists": True}},
+        {"exists": True, "sandboxes_exact": ["web"]},
+    ]
+    for spec in bad_specs:
+        _, state = _step_decisive_hooks({"expect_state": spec})
+        assert state is None, spec
+
+
+def test_core_step_sandboxes_exact_false_green_class_flips(monkeypatch):
+    # The D-GUI-2 replay: the journey promises 'daemon set is exactly
+    # {keep-demo}' but the actor created only keep-demo and then removed it
+    # (daemon truth: []). The old {drop-demo, exists: false} was trivially
+    # true; sandboxes_exact must flip this decisively.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "Remove"'] * 3,
+                        page_texts=["x", "x", "x"])
+    journey = {"journey_id": "j-exact-fail", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "remove drop-demo only", "expect": "",
+                          "core": True,
+                          "expect_state": {
+                              "sandboxes_exact": ["keep-demo"]}}]}
+    res = _run(journey, model, driver, monkeypatch, evidence=_evidence([], []))
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1
+    assert functional[0]["decisive"] is True
+    assert "sandboxes_exact" in functional[0]["detail"]
+    assert res["decisive_credits"] == []
+
+
+def test_core_step_sandboxes_exact_passing_credits(monkeypatch):
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "keep-demo"'] * 3,
+                        page_texts=["keep-demo"] * 3)
+    journey = {"journey_id": "j-exact-pass", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "remove drop-demo only", "expect": "",
+                          "core": True,
+                          "expect_state": {
+                              "sandboxes_exact": ["keep-demo"]}}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence(["keep-demo"], [{"name": "keep-demo"}]))
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "functional" not in kinds
+    assert "unreached_decisive" not in kinds
+    assert "infra" not in kinds
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "expect_state: the daemon sandbox set "
+                      "(sandboxes_exact) (matched)"}]
+
+
+# ---------- D-GUI-5: actor readiness gate ----------
+
+def test_app_ready_timeout_default_is_30s():
+    # dogfood.yml's GUI job passes no --app-ready-timeout-s, so this default
+    # IS the effective CI value — pin it (0 would silently regress to the
+    # zero-action mid-'Connecting…' class the gate exists to stop).
+    args = parse_args([
+        "--journeys", "j.json", "--izba-bin", "izba",
+        "--sidecar-bin", "sidecar", "--frontend-dir", "dist",
+        "--data-dir", "/tmp/d", "--out", "out.json"])
+    assert args.app_ready_timeout_s == 30.0
+
+
+def test_wait_app_ready_returns_immediately_on_ready_page():
+    from gui.run_gui_journeys import _wait_app_ready
+    driver = FakeDriver(page_texts=["izba\ndaemon running · v0.1.0\nAbout"])
+    ready, text = _wait_app_ready(driver, timeout_s=5.0)
+    assert ready is True
+    assert "daemon running" in text
+
+
+def test_wait_app_ready_polls_past_connecting_state():
+    from gui.run_gui_journeys import _wait_app_ready
+    driver = FakeDriver(page_texts=["izba\nConnecting…\nAbout",
+                                    "izba\nConnecting…\nAbout",
+                                    "izba\ndaemon running · v0.1.0\nAbout"])
+    ready, text = _wait_app_ready(driver, timeout_s=5.0, poll_s=0.01)
+    assert ready is True
+    assert "daemon running" in text
+
+
+def test_wait_app_ready_times_out_on_persistent_connecting():
+    from gui.run_gui_journeys import _wait_app_ready
+    driver = FakeDriver(page_texts=["izba\nConnecting…\nAbout"] * 50)
+    ready, _ = _wait_app_ready(driver, timeout_s=0.05, poll_s=0.01)
+    assert ready is False
+
+
+def test_run_gui_journey_never_ready_flips_infra_and_skips_actor(monkeypatch):
+    # D-GUI-5: an app stuck mid-'Connecting…' is a HARNESS degradation — one
+    # flipping infra candidate, ZERO actor turns (the model is never asked),
+    # and the last-seen boot page on record as the initial_observation.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "About"'] * 5,
+                        page_texts=["izba\nConnecting…\nAbout"] * 50)
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot",
+                        lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j-not-ready", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "create a sandbox", "expect": "",
+                          "core": True, "expect_text": "web · running"}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0,
+                          app_ready_timeout_s=0.05)
+    assert res["actions"] == []
+    assert driver.actions == []  # the Actor never acted
+    infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+    assert len(infra) == 1
+    assert "daemon running" in infra[0]["detail"]
+    assert "Actor was not started" in infra[0]["detail"]
+    # The infra flip REPLACES the actor flail: no unreached/functional noise.
+    assert {c["kind"] for c in res["candidates"]} == {"infra"}
+    assert "Connecting…" in res["initial_observation"]["page_text"]
+    assert res["decisive_credits"] == []
+
+
+def test_run_gui_journey_ready_page_reaches_actor_and_h_gui_2(monkeypatch):
+    # Once the gate sees 'daemon running', the journey proceeds normally and
+    # the H-GUI-2 opening capture (initial_observation) shows the READY page.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(
+        snapshots=['[@e1] button "New sandbox"', '[@e1] row "web running"',
+                   '[@e1] row "web running"'],
+        page_texts=["izba\ndaemon running · v0.1.0\nAbout",
+                    "daemon running · v0.1.0\nSANDBOXES · 0",
+                    "daemon running · v0.1.0\nweb · running",
+                    "daemon running · v0.1.0\nweb · running"])
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot",
+                        lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j-ready", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "create a sandbox web",
+                          "expect": "web appears"}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0,
+                          app_ready_timeout_s=5.0)
+    assert driver.actions == [["click", "@e1"]]
+    assert not [c for c in res["candidates"] if c["kind"] == "infra"]
+    # H-GUI-2: the persisted opening capture is the post-gate (READY) page.
+    assert "daemon running" in res["initial_observation"]["page_text"]
+    assert "Connecting" not in res["initial_observation"]["page_text"]

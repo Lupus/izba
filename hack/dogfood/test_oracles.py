@@ -432,6 +432,52 @@ class RunActionTests(unittest.TestCase):
             self.assertEqual(ev["volume_ls"]["exit_code"], 0)
             self.assertIn("detach-vol", ev["volume_ls"]["stdout"])
 
+    def test_capture_state_evidence_snapshots_port_truth(self):
+        # D-GUI-7: per sandbox, the ACTIVE forwards (`izba port ls <name>`)
+        # AND the persisted config.json `ports` rules — `port ls` renders
+        # identically for ephemeral and persisted forwards, so only the
+        # config capture can grade a Make-persistent promise.
+        import json as _json
+        from oracles import capture_state_evidence
+        with tempfile.TemporaryDirectory() as d:
+            stub = os.path.join(d, "izba")
+            with open(stub, "w") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'if [ "$1" = "__reconcile" ]; then echo \'{"sandboxes":[{"name":"sb1"}]}\'; exit 0; fi\n'
+                    'if [ "$1" = "port" ]; then echo "127.0.0.1:8082 -> 80"; exit 0; fi\n'
+                    "exit 0\n")
+            os.chmod(stub, 0o755)
+            sbdir = os.path.join(d, "sandboxes", "sb1")
+            os.makedirs(sbdir)
+            with open(os.path.join(sbdir, "config.json"), "w") as f:
+                _json.dump({"ports": [{"bind": "127.0.0.1",
+                                       "host_port": 8082,
+                                       "guest_port": 80}]}, f)
+            ev = capture_state_evidence(stub, d, timeout_s=10)
+            sb = ev["per_sandbox"]["sb1"]
+            self.assertEqual(sb["port_ls"]["argv"], ["port", "ls", "sb1"])
+            self.assertEqual(sb["port_ls"]["exit_code"], 0)
+            self.assertIn("8082 -> 80", sb["port_ls"]["stdout"])
+            self.assertEqual(sb["ports_persisted"],
+                             [{"bind": "127.0.0.1", "host_port": 8082,
+                               "guest_port": 80}])
+
+    def test_capture_state_evidence_ports_persisted_none_when_unreadable(self):
+        # No config.json (or an ill-shaped one) ⇒ null, never a fabricated
+        # empty list — a `persistent` assertion must grade no_evidence.
+        from oracles import capture_state_evidence
+        with tempfile.TemporaryDirectory() as d:
+            stub = os.path.join(d, "izba")
+            with open(stub, "w") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'if [ "$1" = "__reconcile" ]; then echo \'{"sandboxes":[{"name":"sb1"}]}\'; exit 0; fi\n'
+                    "exit 0\n")
+            os.chmod(stub, 0o755)
+            ev = capture_state_evidence(stub, d, timeout_s=10)
+            self.assertIsNone(ev["per_sandbox"]["sb1"]["ports_persisted"])
+
     def test_run_action_cwd_file_persists_across_two_calls(self):
         # With a cwd_file, `cd sub` in one action must persist so a command in the
         # next action runs inside sub — a real shell session, not fresh each time.
