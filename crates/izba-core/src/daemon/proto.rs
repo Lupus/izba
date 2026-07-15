@@ -185,6 +185,12 @@ pub struct SandboxDetail {
     /// so a stale daemon's reply self-heals into `None` rather than erroring.
     #[serde(default)]
     pub container: Option<izba_proto::ContainerState>,
+    /// Present when the image's symbolic USER could not be resolved and the
+    /// workload runs as root (#114): the original declared USER string.
+    /// Additive + serde(default) → no DAEMON_PROTO_VERSION bump; None →
+    /// the CLI prints nothing.
+    #[serde(default)]
+    pub user_fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,6 +411,7 @@ mod tests {
                 volumes: vec![],
                 confinement: Some("confined: restricted(limited)+low-il+job".into()),
                 container: Some(izba_proto::ContainerState::Running),
+                user_fallback: Some("node".into()),
             }),
             DaemonResponse::Ports { rules: vec![] },
             DaemonResponse::Pruned {
@@ -503,6 +510,7 @@ mod tests {
                 assert_eq!(det.container, None);
                 assert_eq!(det.volumes.len(), 0);
                 assert_eq!(det.confinement, None);
+                assert_eq!(det.user_fallback, None);
             }
             other => panic!("expected Inspect, got {other:?}"),
         }
@@ -522,6 +530,7 @@ mod tests {
             volumes: vec![],
             confinement: None,
             container: Some(izba_proto::ContainerState::Stopped),
+            user_fallback: None,
         });
         let json = serde_json::to_string(&resp).unwrap();
         let back: DaemonResponse = serde_json::from_str(&json).unwrap();

@@ -556,11 +556,20 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
         .describe();
     // Host-side VMM confinement is recorded in state.json at launch.
     // None (stopped / pre-confinement state) ⇒ CLI shows "unknown".
-    let confinement = load_json::<crate::state::RunState>(
+    let run_state = load_json::<crate::state::RunState>(
         &d.paths.sandbox_dir(&name).join(crate::state::STATE_FILE),
-    )?
-    .and_then(|s| s.confinement)
-    .map(|c| c.summary());
+    )?;
+    let confinement = run_state
+        .as_ref()
+        .and_then(|s| s.confinement.clone())
+        .map(|c| c.summary());
+    // Symbolic-USER→root fallback (#114): also recorded in state.json at
+    // launch. None ⇒ the image's USER resolved normally, or the sandbox
+    // predates this field — the CLI prints nothing either way.
+    let user_fallback = run_state
+        .as_ref()
+        .and_then(|s| s.user_fallback.as_ref())
+        .map(|f| f.declared.clone());
     // Honesty: the VM (liveness) being up does not mean the workload container
     // inside it is. Probe the guest's container state best-effort; any failure
     // (unreachable/wedged guest, or a guest that doesn't report it) maps to
@@ -583,6 +592,7 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
         volumes: config.volumes,
         confinement,
         container,
+        user_fallback,
     }))
 }
 
@@ -923,7 +933,9 @@ mod tests {
     use super::*;
     use crate::daemon::proto::*;
     use crate::sandbox::CreateOpts;
-    use crate::state::{load_json, save_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
+    use crate::state::{
+        load_json, save_json, RunState, SandboxConfig, UserFallback, CONFIG_FILE, STATE_FILE,
+    };
     use crate::testutil::{
         fake_connector, live_identity, spawn_sleep, test_paths, wait_dead, write_state,
         write_state_with_run_dir, MockDriver,
@@ -1104,6 +1116,8 @@ mod tests {
                 // A stopped VM can't hold a live container; the daemon skips the
                 // probe and reports None → CLI "unknown" (never falsely healthy).
                 assert_eq!(det.container, None);
+                // No state.json ⇒ no recorded symbolic-USER fallback either.
+                assert_eq!(det.user_fallback, None);
             }
             other => panic!("inspect: {other:?}"),
         }
@@ -1118,6 +1132,39 @@ mod tests {
                 assert!(message.contains("no such sandbox"), "{message}")
             }
             other => panic!("inspect ghost: {other:?}"),
+        }
+    }
+
+    /// #114 surface acceptance: a persisted symbolic-USER→root fallback in
+    /// state.json is read back through `Inspect` unchanged.
+    #[test]
+    fn inspect_surfaces_persisted_user_fallback() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+
+        match rpc(&mut c, &create_req(&dir, "web")) {
+            DaemonResponse::Created { name } => assert_eq!(name, "web"),
+            other => panic!("create: {other:?}"),
+        }
+
+        save_json(
+            &d.paths.sandbox_dir("web").join(STATE_FILE),
+            &RunState {
+                vmm_pid: live_identity(),
+                sidecar_pids: vec![],
+                started_unix_ms: 0,
+                confinement: None,
+                run_dir: None,
+                user_fallback: Some(UserFallback::new("node")),
+            },
+        )
+        .unwrap();
+
+        match rpc(&mut c, &DaemonRequest::Inspect { name: "web".into() }) {
+            DaemonResponse::Inspect(det) => {
+                assert_eq!(det.user_fallback, Some("node".into()));
+            }
+            other => panic!("inspect: {other:?}"),
         }
     }
 

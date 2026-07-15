@@ -619,6 +619,7 @@ mod tests {
             volumes: vec![],
             confinement: None,
             container: None,
+            user_fallback: None,
         };
         let v = SandboxDetailView::from(detail);
         assert_eq!(v.name, "web");

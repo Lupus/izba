@@ -26,7 +26,7 @@ pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
 fn render(paths: &Paths, det: &SandboxDetail) -> String {
     let confinement = det.confinement.as_deref().unwrap_or("unknown");
     let lockdown = lockdown_state(paths, &det.name).summary();
-    format!(
+    let mut out = format!(
         "name:        {}\n\
          image:       {}\n\
          digest:      {}\n\
@@ -47,7 +47,17 @@ fn render(paths: &Paths, det: &SandboxDetail) -> String {
         container_label(det.container),
         confinement,
         lockdown,
-    )
+    );
+    if let Some(declared) = det.user_fallback.as_deref() {
+        // Loud-on-degradation (#114): the workload runs as root because the
+        // image's symbolic USER could not be resolved host-side. Persisted in
+        // state.json (Task 2) so this line re-surfaces the degradation on
+        // every `izba status`, not just the one-shot start-time warning.
+        out.push_str(&format!(
+            "user:        root — image USER '{declared}' could not be resolved (symbolic-USER fallback)\n"
+        ));
+    }
+    out
 }
 
 /// Human-readable label for the in-guest container state. `None` (stopped
@@ -96,6 +106,7 @@ mod tests {
             volumes: vec![],
             confinement: confinement.map(String::from),
             container,
+            user_fallback: None,
         }
     }
 
@@ -189,6 +200,26 @@ mod tests {
         );
         assert_eq!(container_label(Some(ContainerState::Paused)), "paused");
         assert_eq!(container_label(Some(ContainerState::Creating)), "creating");
+    }
+
+    #[test]
+    fn renders_user_fallback_prominently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.user_fallback = Some("node".into());
+        let out = render(&paths, &det);
+        assert!(out.contains("root"), "got: {out}");
+        assert!(out.contains("'node'"), "got: {out}");
+        assert!(out.contains("user:        root"), "got: {out}");
+    }
+
+    #[test]
+    fn no_user_line_without_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let out = render(&paths, &detail(None));
+        assert!(!out.contains("USER"), "got: {out}");
     }
 
     #[test]

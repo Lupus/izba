@@ -790,6 +790,7 @@ mod tests {
             volumes: vec![],
             confinement: None,
             container: None,
+            user_fallback: None,
         };
         write_frame(s, &DaemonResponse::Inspect(det)).unwrap();
     }
