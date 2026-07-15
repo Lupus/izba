@@ -20,6 +20,7 @@ Everything here is pure/stdlib so it is unit-testable anywhere (see
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
