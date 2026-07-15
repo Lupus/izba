@@ -536,7 +536,27 @@ impl Probes for RealProbes<'_> {
     }
 }
 
-fn liveness_of(paths: &Paths, name: &str, connector: Connector) -> anyhow::Result<Liveness> {
+/// Typed marker for `start`'s idempotent refusal so the daemon can tell
+/// "the sandbox is alive" apart from a genuine boot failure (#67). The CLI
+/// string-matches the Display text (run.rs) — keep it stable.
+#[derive(Debug)]
+pub struct AlreadyRunning {
+    pub name: String,
+}
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sandbox '{}' is already running", self.name)
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
+pub(crate) fn liveness_of(
+    paths: &Paths,
+    name: &str,
+    connector: Connector,
+) -> anyhow::Result<Liveness> {
     let state: Option<RunState> = load_json(&paths.sandbox_dir(name).join(STATE_FILE))?;
     let probes = RealProbes {
         connector,
@@ -751,7 +771,10 @@ pub fn start_with_timeouts(
 
     let conn = default_connector();
     if liveness_of(paths, name, &conn)? != Liveness::Stopped {
-        bail!("sandbox '{name}' is already running");
+        return Err(AlreadyRunning {
+            name: name.to_string(),
+        }
+        .into());
     }
 
     let console_log = paths.logs_dir(name).join("console.log");
@@ -2431,6 +2454,24 @@ mod tests {
 
         let err = start(&paths, "web", &driver, &arts(), false).unwrap_err();
         assert!(err.to_string().contains("already running"), "got: {err:#}");
+    }
+
+    #[test]
+    fn start_already_running_is_typed() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
+
+        let err = start(&paths, "web", &driver, &arts(), false).unwrap_err();
+        assert!(
+            err.downcast_ref::<AlreadyRunning>().is_some(),
+            "start's already-running bail must be downcastable, got: {err:#}"
+        );
+        assert_eq!(err.to_string(), "sandbox 'web' is already running");
     }
 
     #[test]
