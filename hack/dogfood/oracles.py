@@ -281,9 +281,15 @@ def capture_state_evidence(
     a guest command's exit code. Per sandbox the journey created we capture
     ``izba policy show`` (effective allow-list + enforce posture) and
     ``izba netlog --summary`` (what the firewall actually allowed/denied), plus
-    the lifecycle ``__reconcile`` snapshot. Report-only."""
+    the lifecycle ``__reconcile`` snapshot. The top-level ``volume_ls`` capture
+    (``izba volume ls``: name/size/usage + the USED-BY referencing sandboxes)
+    is the daemon-truth surface behind the GUI ``expect_state.volume``
+    assertion — the reconcile snapshot itself carries NO volume list (only
+    informational orphan_volume violations for UNreferenced volumes), so
+    attach/detach outcomes are only observable here. Report-only."""
     run_env = _shell_env(izba_bin, data_dir, env)
     reconcile = _snapshot_reconcile(izba_bin, data_dir, timeout_s, run_env)
+    volume_ls = _izba_capture(izba_bin, ["volume", "ls"], timeout_s, run_env)
     names = [s.get("name") for s in (reconcile.get("sandboxes") or [])
              if s.get("name")]
     per_sandbox: Dict[str, Any] = {}
@@ -306,7 +312,8 @@ def capture_state_evidence(
                                     timeout_s, run_env),
             "console_tail": console_tail,
         }
-    return {"sandboxes": names, "reconcile": reconcile, "per_sandbox": per_sandbox}
+    return {"sandboxes": names, "reconcile": reconcile,
+            "per_sandbox": per_sandbox, "volume_ls": volume_ls}
 
 
 # --- Implicit oracle ---------------------------------------------------------

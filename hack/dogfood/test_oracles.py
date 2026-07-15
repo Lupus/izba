@@ -410,6 +410,28 @@ class RunActionTests(unittest.TestCase):
             self.assertIn("enforce: on", ev["per_sandbox"]["sb1"]["policy_show"]["stdout"])
             self.assertIn("ALLOW", ev["per_sandbox"]["sb1"]["netlog"]["stdout"])
 
+    def test_capture_state_evidence_snapshots_volume_ls(self):
+        # The `izba volume ls` capture is the daemon-truth surface behind the
+        # GUI expect_state.volume assertion (the reconcile snapshot carries
+        # no volume list at all): it must land as a top-level volume_ls
+        # capture with the standard argv/exit_code/stdout/stderr shape.
+        from oracles import capture_state_evidence
+        with tempfile.TemporaryDirectory() as d:
+            stub = os.path.join(d, "izba")
+            with open(stub, "w") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'if [ "$1" = "__reconcile" ]; then echo \'{"sandboxes":[]}\'; exit 0; fi\n'
+                    'if [ "$1" = "volume" ]; then\n'
+                    '  printf "NAME SIZE USED  USED BY\\ndetach-vol 1024 10  -\\n"; exit 0\n'
+                    "fi\n"
+                    "exit 0\n")
+            os.chmod(stub, 0o755)
+            ev = capture_state_evidence(stub, d, timeout_s=10)
+            self.assertEqual(ev["volume_ls"]["argv"], ["volume", "ls"])
+            self.assertEqual(ev["volume_ls"]["exit_code"], 0)
+            self.assertIn("detach-vol", ev["volume_ls"]["stdout"])
+
     def test_run_action_cwd_file_persists_across_two_calls(self):
         # With a cwd_file, `cd sub` in one action must persist so a command in the
         # next action runs inside sub — a real shell session, not fresh each time.

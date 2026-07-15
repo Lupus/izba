@@ -32,6 +32,7 @@ from oracles import (  # noqa: E402
 from run_journeys import (  # noqa: E402
     select_shard, _journey_data_dir, _write_seeds, BudgetExceeded, count_degraded,
     CATASTROPHIC_DEGRADED_FRACTION, EXIT_CATASTROPHIC_INFRA, _decisive_step_indices,
+    _flipping_violations,
 )
 from gui.driver import (  # noqa: E402
     AgentBrowserDriver, FakeDriver, action_to_argv, render_marks,
@@ -125,6 +126,25 @@ def _action_dict(intent: str, command: str, res, marks_text: str,
 
 def _cmd_hash(journey_id: str, command: str) -> str:
     return hashlib.sha256(f"{journey_id}\0{command}".encode("utf-8")).hexdigest()
+
+
+def _count_manifest_digests(invoke_log: List[Dict[str, Any]]) -> int:
+    """How many digest-carrying ``manifest_diff`` invokes the log holds — the
+    same filter manifest_truth_oracle applies, so the runner's per-invoke
+    izba.yml snapshots (Fix 2, TOCTOU) stay index-aligned with the digest
+    list the oracle grades."""
+    return sum(1 for e in invoke_log or []
+               if isinstance(e, dict) and e.get("cmd") == "manifest_diff"
+               and isinstance(e.get("digest"), dict))
+
+
+def _read_workspace_file(path: str) -> Optional[str]:
+    """File content, or None when unreadable/absent. Report-only."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 # The app's ambient background polling commands (app/src/lib/ipc.ts's
@@ -225,19 +245,32 @@ def _substitute_steps_workspace(steps: List[Dict[str, Any]],
     return out
 
 
+def _valid_volume_spec(vspec: Any) -> bool:
+    """True iff ``vspec`` is a schema-shaped ``expect_state.volume`` object:
+    a dict with a non-empty ``name`` and at least one of
+    ``exists``/``attached_to`` declared."""
+    return (isinstance(vspec, dict) and bool(vspec.get("name"))
+            and ("exists" in vspec or "attached_to" in vspec))
+
+
 def _step_decisive_hooks(step: Dict[str, Any]) -> tuple:
     """The (expect_text, expect_state) declarative hooks a step carries, with
     malformed values normalized to absent (``None``): a hook the schema would
-    reject (non-str/empty expect_text; expect_state without a ``sandbox`` or
-    without at least one of ``exists``/``status``) is NOT gradable and must
-    fall through to the unreached_decisive flip — never a silent pass on a
-    half-formed assertion."""
+    reject (non-str/empty expect_text; expect_state without a ``sandbox``,
+    without at least one assertion among ``exists``/``status``/``volume``,
+    or with a half-formed ``volume`` object — a declared assertion must
+    never be silently dropped) is NOT gradable and must fall through to the
+    unreached_decisive flip — never a silent pass on a half-formed
+    assertion."""
     text = step.get("expect_text")
     if not (isinstance(text, str) and text):
         text = None
     state = step.get("expect_state")
     if not (isinstance(state, dict) and state.get("sandbox")
-            and ("exists" in state or "status" in state)):
+            and ("exists" in state or "status" in state
+                 or "volume" in state)):
+        state = None
+    elif "volume" in state and not _valid_volume_spec(state.get("volume")):
         state = None
     return text, state
 
@@ -270,13 +303,86 @@ def _apply_hook_verdict(verdict: str, found: List[Any], *, hook: str,
         candidates.append(cd)
 
 
+_ZERO_ACTION_REASON = ("actor performed no actions; decisive assertion "
+                       "never exercised")
+
+
+def _zero_action_unreached(journey_id: str, step: Dict[str, Any],
+                           source: str, hook_desc: str) -> Dict[str, Any]:
+    """The Fix-4 reclassification candidate: a decisive hook that FAILED on a
+    journey whose Actor never acted is an unreached/engagement failure (the
+    swarm never attempted the interaction), NOT a product-functional flip —
+    'absent from every capture' over an untouched screen reads as a product
+    failure but proves nothing about the product."""
+    return {
+        "kind": "unreached_decisive",
+        "detail": f"{_ZERO_ACTION_REASON} ({hook_desc})",
+        "violated_expectation": step.get("expect", "") or hook_desc,
+        "source": source,
+        "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
+    }
+
+
+def _settle_expect_state(state_hook: Dict[str, Any], first_verdict: str,
+                         first_found: List[Any], *, resample_state,
+                         settle_s: float, poll_s: float, ref: Dict[str, Any],
+                         step_idx: int, expect: str, source: str,
+                         settle_out: Dict[str, Any],
+                         first_evidence: Dict[str, Any]):
+    """Fix 1 (expect_state settle): confirm a failing expect_state assertion
+    across a bounded re-sample window before letting it flip.
+
+    A GUI stop/restart returns while the guest is still mid-ACPI-S5 teardown;
+    the post-journey state evidence can sample the transient window where the
+    VMM pid is not yet reaped but a sidecar already exited — liveness then
+    honestly reports 'degraded (sidecar … died)' where the SETTLED truth is
+    'stopped'/'running'. Mirrors the create-settle mechanism (bounded poll,
+    report-only): re-capture the state evidence every ``poll_s`` until the
+    assertion stops mismatching or ``settle_s`` elapses, and grade the
+    SETTLED sample. Honesty: a genuinely-wrong settled state still flips —
+    only divergence that VANISHES within the window is absorbed; and both
+    the first and settled samples are recorded (``settle_out``) so the
+    skeptic can audit exactly what was absorbed. Returns
+    ``(verdict, found, settled_evidence)``."""
+    verdict, found, evidence = first_verdict, first_found, first_evidence
+    start = time.monotonic()
+    deadline = start + settle_s
+    resampled = False
+    while time.monotonic() < deadline:
+        time.sleep(poll_s)
+        ev2 = resample_state()
+        if ev2 is None:
+            continue  # a failed re-capture is not evidence; keep polling
+        resampled = True
+        evidence = ev2
+        verdict, found = expect_state_oracle(
+            state_hook, ev2, ref, step_index=step_idx, expect=expect,
+            source=source)
+        if verdict != "mismatch":
+            break
+    if resampled:
+        settle_out["first"] = first_evidence
+        settle_out["settled"] = evidence
+        settle_out["waited_s"] = round(time.monotonic() - start, 1)
+        if verdict == "mismatch":
+            for c in found:  # the flip is CONFIRMED, not a transient sample
+                c.detail += (f" (confirmed across a {settle_s:g}s "
+                             f"expect_state settle re-sample)")
+    return verdict, found, evidence
+
+
 def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
                            steps: List[Dict[str, Any]],
                            page_text_history: List[str],
                            step_hist_start: Dict[int, int],
                            state_evidence: Dict[str, Any],
                            candidates: List[Dict[str, Any]],
-                           decisive_credits: List[Dict[str, Any]]) -> None:
+                           decisive_credits: List[Dict[str, Any]],
+                           zero_actions: bool = False,
+                           resample_state=None,
+                           settle_s: float = 0.0,
+                           settle_poll_s: float = 3.0,
+                           settle_out: Optional[Dict[str, Any]] = None) -> None:
     """Grade every declared ``core: true`` step of a NON-manifest GUI journey
     through its declarative hooks — precedence rung 2 of the decisive wiring
     (see run_gui_journey's comment block). Mutates ``candidates`` /
@@ -290,8 +396,7 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
       the hooks (so the journey compiler learns to annotate every core step);
     - ``expect_text`` ⇒ graded over the page-text window starting at the
       step's own first capture (its "opened screen" snapshot — a
-      pure-observation step's outcome is already on screen, and a zero-action
-      journey's initial observation is exactly this entry) through every
+      pure-observation step's outcome is already on screen) through every
       later capture including the final post-settle one (an async
       create/boot lands its row only after the settle poll). A core step the
       Actor never entered falls back to the final capture alone — the
@@ -299,11 +404,26 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
       evidence, mirroring the CLI runner's satisfied-under-an-earlier-step
       crediting (_grade_decisive_from_observed);
     - ``expect_state`` ⇒ graded against the end-of-journey daemon state
-      evidence (post-settle ``capture_state_evidence`` — product truth).
+      evidence (post-settle ``capture_state_evidence`` — product truth). A
+      MISMATCH is first confirmed across a bounded settle re-sample
+      (``settle_s``/``resample_state``, Fix 1 — see _settle_expect_state);
+      only divergence that persists flips.
+
+    ``zero_actions`` (Fix 4): a journey whose Actor performed ZERO browser
+    actions never exercised anything, so hook grading applies ONLY the
+    initial-observation window: an ``expect_text`` that passes THERE is
+    genuine credit (pure-observation journeys — the H-GUI-2 contract), and a
+    passing ``expect_state`` (state that needs no interaction — rare) is
+    credited too; but a FAILING hook on a zero-action journey flips as
+    ``unreached_decisive`` (the actor never attempted the interaction the
+    assertion presupposes), never as a product-functional flip. No settle is
+    attempted either — there is no in-flight operation to settle. The
+    ``no_evidence`` ⇒ infra degradation is unchanged.
 
     ALL declared hooks must pass; verdict folding per _apply_hook_verdict."""
     source = journey.get("source", {}).get("ref", "journey step")
     final_hist_idx = max(len(page_text_history) - 1, 0)
+    current_evidence = state_evidence
     for step_idx in sorted(_decisive_step_indices(steps)):
         s = steps[step_idx] if step_idx < len(steps) else {}
         ref = {"journey_id": journey_id, "action_index": -1}
@@ -323,29 +443,57 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
             })
             continue
         if text_hook is not None:
-            start = min(step_hist_start.get(step_idx, final_hist_idx),
-                        final_hist_idx)
+            if zero_actions:
+                window = page_text_history[:1]
+            else:
+                start = min(step_hist_start.get(step_idx, final_hist_idx),
+                            final_hist_idx)
+                window = page_text_history[start:]
             verdict, found = expect_text_oracle(
-                text_hook, page_text_history[start:], ref,
+                text_hook, window, ref,
                 step_index=step_idx, expect=s.get("expect", ""), source=source)
-            _apply_hook_verdict(
-                verdict, found, hook=f"expect_text: {text_hook!r}",
-                no_evidence_detail=(
-                    "expect_text: no page text was ever captured to grade "
-                    "the assertion against"),
-                journey_id=journey_id, step_idx=step_idx,
-                candidates=candidates, decisive_credits=decisive_credits)
+            if zero_actions and verdict == "mismatch":
+                candidates.append(_zero_action_unreached(
+                    journey_id, s, source,
+                    f"expect_text {text_hook!r} not present in the initial "
+                    f"observation"))
+            else:
+                _apply_hook_verdict(
+                    verdict, found, hook=f"expect_text: {text_hook!r}",
+                    no_evidence_detail=(
+                        "expect_text: no page text was ever captured to grade "
+                        "the assertion against"),
+                    journey_id=journey_id, step_idx=step_idx,
+                    candidates=candidates, decisive_credits=decisive_credits)
         if state_hook is not None:
             verdict, found = expect_state_oracle(
-                state_hook, state_evidence, ref,
+                state_hook, current_evidence, ref,
                 step_index=step_idx, expect=s.get("expect", ""), source=source)
+            if zero_actions:
+                if verdict == "mismatch":
+                    candidates.append(_zero_action_unreached(
+                        journey_id, s, source,
+                        f"expect_state for sandbox "
+                        f"{state_hook.get('sandbox')!r} presupposes an "
+                        f"interaction the actor never attempted"))
+                    continue
+            elif (verdict == "mismatch" and settle_s > 0
+                    and resample_state is not None):
+                verdict, found, current_evidence = _settle_expect_state(
+                    state_hook, verdict, found,
+                    resample_state=resample_state, settle_s=settle_s,
+                    poll_s=settle_poll_s, ref=ref, step_idx=step_idx,
+                    expect=s.get("expect", ""), source=source,
+                    settle_out=settle_out if settle_out is not None else {},
+                    first_evidence=current_evidence)
             _apply_hook_verdict(
                 verdict, found,
                 hook=f"expect_state: sandbox {state_hook.get('sandbox')!r}",
                 no_evidence_detail=(
                     "expect_state: daemon state evidence unavailable "
-                    "(reconcile snapshot errored/absent), assertion "
-                    "unverifiable"),
+                    "(reconcile snapshot errored/absent, or no usable "
+                    "`izba volume ls` capture for a volume assertion), "
+                    "assertion unverifiable"),
                 journey_id=journey_id, step_idx=step_idx,
                 candidates=candidates, decisive_credits=decisive_credits)
 
@@ -356,6 +504,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                     budget: Dict[str, float], max_usd: float,
                     artifact_dir: str = "",
                     create_settle_s: float = 0.0,
+                    expect_state_settle_s: float = 0.0,
                     workspace: str = "") -> Dict[str, Any]:
     """Run one GUI journey under all caps. Returns a journey_result dict.
 
@@ -364,6 +513,16 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     state-evidence snapshot (the GUI ``create`` invoke resolves asynchronously,
     so a journey can otherwise end before its sandbox appears). 0 disables it
     (used by the unit tests, which mock the reconcile).
+
+    ``expect_state_settle_s`` (Fix 1) bounds the settle re-sample window when
+    a core step's ``expect_state`` assertion fails on the first post-journey
+    sample: lifecycle teardown (stop/restart) and volume-save operations land
+    asynchronously, so the first sample can catch a transient window (vmm pid
+    unreaped, sidecar already exited ⇒ 'degraded (sidecar … died)') whose
+    settled truth is the asserted state. Only divergence that persists across
+    the window flips; both samples land in the bundle (``state_evidence`` =
+    settled, ``state_evidence_presettle`` = first). 0 disables it (the unit
+    tests' default; CI runs the parse_args default).
 
     ``workspace`` (Task 10) is a per-journey directory the GUI swarm can type
     a real path into (e.g. the NewSandbox form) and that mid-journey
@@ -402,6 +561,25 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     steps = journey.get("steps", []) or [{"intent": journey.get("rationale", ""),
                                           "expect": ""}]
     steps = _substitute_steps_workspace(steps, ws_abs)
+    # Fix 2 (manifest_truth TOCTOU): the workspace izba.yml content as of
+    # each digest-carrying manifest_diff invoke, in invoke order. The
+    # end-of-journey `izba diff` ground truth otherwise runs against the
+    # CURRENT file — which a seeded-drift step may have edited/reverted
+    # AFTER the UI's last diff, making truth and UI legitimately diverge and
+    # false-flipping a correct UI. Snapshots are caught up right after every
+    # action, right before a step's seed write lands (closing the gap where
+    # an async diff resolves between the previous action's poll and the
+    # seed), and once at journey end.
+    manifest_yml_snapshots: List[Optional[str]] = []
+
+    def _snap_manifest_yml(inv: Optional[List[Dict[str, Any]]] = None) -> None:
+        log_now = inv if inv is not None else driver.read_invoke_log()
+        n = _count_manifest_digests(log_now)
+        while len(manifest_yml_snapshots) < n:
+            manifest_yml_snapshots.append(
+                _read_workspace_file(os.path.join(ws_abs, "izba.yml"))
+                if ws_abs else None)
+
     # Journey-level seed_files (precondition), written before step 0.
     _write_seeds(ws_abs, journey.get("seed_files"))
     try:
@@ -409,6 +587,10 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
             # Step-level seed_files (mid-journey drift) land immediately
             # before this step's first action — never inside its while loop,
             # so they're written exactly once per step regardless of turns.
+            # Any manifest_diff that resolved since the last poll must be
+            # snapshotted BEFORE the seed rewrites izba.yml.
+            if step.get("seed_files"):
+                _snap_manifest_yml()
             _write_seeds(ws_abs, step.get("seed_files"))
             step_hist_start[step_i] = len(page_text_history)
             seen: set = set()
@@ -463,6 +645,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 page_text = driver.read_page_text()
                 page_text_history.append(page_text)
                 reconcile = _reconcile_snapshot(izba_bin, data_dir, action_timeout_s)
+                _snap_manifest_yml()  # Fix 2: pair new diffs with the file NOW
                 all_console = driver.read_console_errors()
                 console_errors = all_console[console_seen:]
                 console_seen = len(all_console)
@@ -487,7 +670,15 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 # Reconcile violations flip the journey (parity with the CLI
                 # runner's _collect_candidates): declared state != reality is
                 # a product finding regardless of which surface drove it.
-                violations = (reconcile or {}).get("violations") or []
+                # Fix 3: same parity for the product's self-labeled
+                # `informational:` items (e.g. orphan_volume after rm — the
+                # DOCUMENTED persistent-volumes-survive-rm contract,
+                # reconcile.rs prefixes the detail): they stay on record in
+                # the action's reconcile snapshot (audit trail) but never
+                # produce a flipping candidate; every other violation flips
+                # exactly as before.
+                violations = _flipping_violations(
+                    (reconcile or {}).get("violations") or [])
                 if violations:
                     preview = json.dumps(violations[:3])[:400]
                     candidates.append({
@@ -529,6 +720,10 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     page_text_history.append(final_page_text)
     final_ref = {"journey_id": journey_id, "action_index": -1}
     invoke_log = driver.read_invoke_log()
+    # Fix 2: a manifest_diff that resolved after the last per-action poll is
+    # caught up here against the current file — seeds only land before a
+    # step's first action, so nothing rewrote izba.yml since.
+    _snap_manifest_yml(invoke_log)
     last_expect = (steps[-1].get("expect", "") if steps else "")
     # A daemon that can't spawn rejects EVERY invoke identically: fold those
     # into one flipping infra candidate (the run measured nothing, once) and
@@ -594,6 +789,19 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     # called exactly ONCE here, post-journey (see its docstring).
     decisive_credits: List[Dict[str, Any]] = []
     mt_found: List[Any] = []
+    # Fix 1 plumbing: the settle re-sampler + its audit record. The closure
+    # resolves capture_state_evidence at call time through module globals so
+    # the unit tests' monkeypatch reaches it.
+    settle_out: Dict[str, Any] = {}
+
+    def _resample_state() -> Optional[Dict[str, Any]]:
+        try:
+            return capture_state_evidence(izba_bin, data_dir, action_timeout_s,
+                                          env={"IZBA_DATA_DIR": data_dir})
+        except Exception as e:  # report-only
+            log(f"{journey_id}: settle re-sample error: {e!r}")
+            return None
+
     has_core_step = any(isinstance(s, dict) and s.get("core") for s in steps)
     manifest_diff_seen = any(
         isinstance(e, dict) and e.get("cmd") == "manifest_diff"
@@ -603,7 +811,8 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
         mt_ctx: Dict[str, Any] = {
             "invoke_log": invoke_log, "sandbox_name": sandbox_name,
             "workspace": ws_abs, "izba_bin": izba_bin, "data_dir": data_dir,
-            "timeout_s": action_timeout_s, "ref": dict(final_ref)}
+            "timeout_s": action_timeout_s, "ref": dict(final_ref),
+            "manifest_yml_snapshots": list(manifest_yml_snapshots)}
         mt_found = manifest_truth_oracle(mt_ctx)
         decisive_idx = _decisive_step_indices(steps)
         mt_result = mt_ctx.get("manifest_truth_result")
@@ -644,7 +853,11 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
             journey=journey, journey_id=journey_id, steps=steps,
             page_text_history=page_text_history,
             step_hist_start=step_hist_start, state_evidence=state_evidence,
-            candidates=candidates, decisive_credits=decisive_credits)
+            candidates=candidates, decisive_credits=decisive_credits,
+            zero_actions=not actions,
+            resample_state=_resample_state,
+            settle_s=expect_state_settle_s,
+            settle_out=settle_out)
     elif not has_core_step and steps and not _has_product_invoke(invoke_log):
         # H2 (run-4 skeptic): a NON-core journey (no declared `core: true`
         # step, so the branches above never engage) whose Actor bailed
@@ -703,10 +916,20 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
         "marks": marks_history[0] if marks_history else "",
         "page_text": page_text_history[0] if page_text_history else "",
     }
-    return {"journey_id": journey_id, "actions": actions, "candidates": candidates,
-            "state_evidence": state_evidence, "invoke_log": invoke_log,
-            "workspace": str(ws_abs), "decisive_credits": decisive_credits,
-            "initial_observation": initial_observation}
+    result = {"journey_id": journey_id, "actions": actions,
+              "candidates": candidates,
+              # Fix 1: when the settle re-sampled, the SETTLED sample is the
+              # truth the decisive grading used, so it becomes the journey's
+              # state_evidence; the first sample stays on record below.
+              "state_evidence": settle_out.get("settled", state_evidence),
+              "invoke_log": invoke_log,
+              "workspace": str(ws_abs), "decisive_credits": decisive_credits,
+              "initial_observation": initial_observation}
+    if "first" in settle_out:
+        result["state_evidence_presettle"] = settle_out["first"]
+    if manifest_yml_snapshots:
+        result["manifest_yml_snapshots"] = manifest_yml_snapshots
+    return result
 
 
 # ---------- CI orchestration (static server + sidecar lifecycle) ----------
@@ -804,6 +1027,13 @@ def parse_args(argv):
     p.add_argument("--create-settle-s", type=float, default=90.0,
                    help="bounded end-of-journey wait for an async create/boot to "
                         "register a sandbox before grading (0 disables)")
+    p.add_argument("--expect-state-settle-s", type=float, default=45.0,
+                   help="bounded settle re-sample window when a core step's "
+                        "expect_state assertion fails on the first post-journey "
+                        "sample (0 disables): lifecycle teardown / volume saves "
+                        "land asynchronously, so a transient divergence is "
+                        "re-sampled until it settles; a genuinely-wrong settled "
+                        "state still flips, and both samples are recorded")
     p.add_argument("--readme", default="README.md")
     p.add_argument("--app-guide", default="dogfood-app-guide.md")
     p.add_argument("--fake-model", default=None)
@@ -859,7 +1089,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     action_timeout_s=args.action_timeout_s,
                     latency_budget_ms=args.latency_budget_ms,
                     budget=budget, max_usd=args.max_usd, artifact_dir=args.artifact_dir,
-                    create_settle_s=args.create_settle_s, workspace=workspace)
+                    create_settle_s=args.create_settle_s,
+                    expect_state_settle_s=args.expect_state_settle_s,
+                    workspace=workspace)
                 driver.close()
                 results.append(res)
             except BudgetExceeded:

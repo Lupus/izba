@@ -62,6 +62,15 @@
             }
           }
         },
+        "state_evidence_presettle": {
+          "type": "object",
+          "description": "GUI only (expect_state settle): the FIRST end-of-journey state-evidence sample, recorded only when a failing core-step expect_state assertion triggered the bounded settle re-sample — `state_evidence` then holds the SETTLED sample the decisive grading was drawn from. Both samples stay on record so the Phase-3 skeptic can audit that only a transient divergence (e.g. a mid-ACPI-S5 teardown window) was absorbed; a genuinely-wrong settled state still flips."
+        },
+        "manifest_yml_snapshots": {
+          "type": "array",
+          "items": { "type": ["string", "null"] },
+          "description": "GUI only (manifest_truth TOCTOU guard): the workspace izba.yml content captured at each manifest_diff invoke that carried a digest, in invoke order (null = the file was unreadable/absent at that instant). The manifest_truth oracle runs its `izba diff` ground truth against the snapshot matching the UI's LAST manifest_diff whenever the live workspace file changed after that diff (mid-journey seeded drift/revert) — never against a file the UI never saw."
+        },
         "invoke_log": { "type": "array", "items": { "$ref": "#/definitions/invoke_log_entry" }, "description": "GUI only: the in-page bridge's invoke log (command, ok/error, duration) captured at journey end — the evidence behind silent_failure verdicts." },
         "workspace": { "type": "string", "description": "GUI only (Task 10): absolute path of this journey's per-journey workspace dir (<journey_data_dir>/workspace), where journey-/step-level seed_files land and that the literal {workspace} token in a step's intent/expect is substituted with — recorded so the Phase-3 skeptic can inspect what the Actor was told/seeded." },
         "initial_observation": {

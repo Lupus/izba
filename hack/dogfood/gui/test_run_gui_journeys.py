@@ -60,6 +60,17 @@ def test_max_turns_default_is_20():
     assert args.max_turns == 20
 
 
+def test_expect_state_settle_default_is_45s():
+    # Fix 1: dogfood.yml's GUI job passes no --expect-state-settle-s, so this
+    # default IS the effective CI value — pin it (0 would silently regress to
+    # the teardown-window false flips; the settle must stay on by default).
+    args = parse_args([
+        "--journeys", "j.json", "--izba-bin", "izba",
+        "--sidecar-bin", "sidecar", "--frontend-dir", "dist",
+        "--data-dir", "/tmp/d", "--out", "out.json"])
+    assert args.expect_state_settle_s == 45.0
+
+
 def test_run_gui_journey_happy_path_records_actions_and_state(monkeypatch):
     # Actor: click create, then done.
     model = FakeModel([{"click": "@e2"}, {"done": True}])
@@ -419,6 +430,62 @@ def test_reconcile_violations_flip_gui_journey(monkeypatch):
     rv = [c for c in res["candidates"] if c["kind"] == "reconcile_violation"]
     assert len(rv) == 1
     assert "orphan-relay" in rv[0]["detail"]
+
+
+def test_informational_reconcile_violations_recorded_but_not_flipped(monkeypatch):
+    # Fix 3 (gui-handover skeptic): reconcile items the PRODUCT self-labels
+    # `informational:` (orphan_volume after rm — the documented persistent-
+    # volumes-survive-rm contract, reconcile.rs:145/169) must not flip a GUI
+    # journey (parity with the CLI runner's _flipping_violations, H2). They
+    # stay on record in the action's reconcile snapshot for the skeptic.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "Remove"'] * 4)
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    info = {"kind": "orphan_volume", "sandbox": None,
+            "detail": "informational: named volume 'del-vol' is unreferenced "
+                      "(persistent volumes survive rm)"}
+    monkeypatch.setattr(rgj, "_reconcile_snapshot",
+                        lambda *a, **k: {"violations": [info], "sandboxes": []})
+    journey = {"journey_id": "storage-remove-unused-volume", "modality": "gui",
+               "steps": [{"intent": "remove the sandbox", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert [c for c in res["candidates"]
+            if c["kind"] == "reconcile_violation"] == []
+    # Audit trail preserved: the raw snapshot on the action still carries it.
+    assert res["actions"][0]["reconcile"]["violations"] == [info]
+
+
+def test_mixed_violations_flip_only_on_the_real_one(monkeypatch):
+    # A real violation alongside an informational one still flips, and the
+    # candidate's count/preview cover only the flipping items.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "Remove"'] * 4)
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    violations = [
+        {"kind": "orphan_volume",
+         "detail": "informational: named volume 'x' is unreferenced"},
+        {"kind": "disk_live_mismatch",
+         "detail": "daemon status \"running\" but disk/pid assessment is \"stopped\""},
+    ]
+    monkeypatch.setattr(
+        rgj, "_reconcile_snapshot",
+        lambda *a, **k: {"violations": violations, "sandboxes": []})
+    journey = {"journey_id": "jv-mixed", "modality": "gui",
+               "steps": [{"intent": "click", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    rv = [c for c in res["candidates"] if c["kind"] == "reconcile_violation"]
+    assert len(rv) == 1
+    assert "1 violation(s)" in rv[0]["detail"]
+    assert "disk_live_mismatch" in rv[0]["detail"]
+    assert "informational" not in rv[0]["detail"]
 
 
 def test_unusable_reconciler_flags_gui_journey_as_infra(monkeypatch):
@@ -920,6 +987,54 @@ def test_run_gui_journey_manifest_truth_ctx_carries_sandbox_from_state_evidence(
     assert seen_ctx["data_dir"] == "/tmp/x"
 
 
+def test_manifest_yml_snapshot_taken_at_diff_time_not_post_seed(tmp_path, monkeypatch):
+    """Fix 2 (manifest_truth TOCTOU): the runner snapshots the workspace
+    izba.yml PER digest-carrying manifest_diff invoke — a later step's
+    seed_files rewrite (the seeded-drift revert class) must not leak into the
+    snapshot the ground truth will be graded against. The snapshots reach
+    both the bundle (audit) and manifest_truth_oracle's ctx."""
+    import gui.run_gui_journeys as rgj
+    workspace = tmp_path / "workspace"
+    v1 = "spec:\n  image: alpine:3.21\n"
+    v2 = "spec:\n  image: alpine:3.20\n"
+    # One digest-carrying manifest_diff in the (cumulative) invoke log: the
+    # per-action poll after step 0's single action pairs it with v1.
+    invoke_log = [{"cmd": "manifest_diff", "ok": True,
+                   "digest": {"state": "repo_ahead", "deltas": 1, "weakens": 0}}]
+    model = FakeModel([{"click": "@e1"}, {"done": True}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] tab "Manifest"'] * 4,
+                        invoke_log=invoke_log)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot",
+                        lambda *a, **k: {"violations": []})
+    seen_ctx = {}
+
+    def fake_mt(ctx, **k):
+        seen_ctx.update(ctx)
+        ctx["manifest_truth_result"] = "matched"
+        return []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle", fake_mt)
+    journey = {"journey_id": "manifest-seeded-drift", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "seed_files": {"izba.yml": v1},
+               "steps": [
+                   {"intent": "open the manifest tab", "expect": "",
+                    "core": True},
+                   {"intent": "after the revert", "expect": "",
+                    "seed_files": {"izba.yml": v2}},
+               ]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir=str(tmp_path), max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0,
+                          workspace=str(workspace))
+    # The snapshot is v1 (the file the UI diffed), NOT the v2 the later seed
+    # rewrote — and the workspace file itself ends at v2.
+    assert res["manifest_yml_snapshots"] == [v1]
+    assert seen_ctx["manifest_yml_snapshots"] == [v1]
+    assert (workspace / "izba.yml").read_text() == v2
+
+
 def test_run_gui_journey_substitutes_workspace_token_in_expect_before_dom_expect(
         tmp_path, monkeypatch):
     # {workspace} must be substituted BEFORE dom_expect's keyword extraction:
@@ -1179,7 +1294,15 @@ def test_zero_action_journey_passing_expect_text_on_initial_snapshot(monkeypatch
     assert res["initial_observation"]["page_text"] == empty_copy
 
 
-def test_zero_action_journey_failing_expect_text_flips(monkeypatch):
+def test_zero_action_journey_failing_expect_text_reclassified_unreached(monkeypatch):
+    # Fix 4 (gui-handover skeptic): an Actor that performed ZERO browser
+    # actions never exercised anything — "absent from every capture" over an
+    # untouched screen reads as a product failure but proves nothing about
+    # the product (run: shell-tab-stopped-hint / create-invalid-volume-row,
+    # both pinned strings correctly wired in the app, the actor just never
+    # engaged). The journey still FLIPS — but as unreached_decisive, never a
+    # functional product flip. (This test previously asserted the functional
+    # flip; Fix 4 legitimately reclassifies it.)
     model = FakeModel([{"done": True}])
     driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"'] * 2,
                         page_texts=["some other copy", "some other copy"])
@@ -1191,10 +1314,217 @@ def test_zero_action_journey_failing_expect_text_flips(monkeypatch):
     res = _run(journey, model, driver, monkeypatch,
                evidence=_evidence([], []))
     assert res["actions"] == []
+    assert [c for c in res["candidates"] if c["kind"] == "functional"] == []
+    unreached = [c for c in res["candidates"]
+                 if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1
+    assert unreached[0]["detail"].startswith(
+        "actor performed no actions; decisive assertion never exercised")
+    assert res["decisive_credits"] == []
+
+
+def test_zero_action_expect_text_hit_only_in_later_capture_not_credited(monkeypatch):
+    # Fix 4 honesty edge: with zero actions the grading window is ONLY the
+    # initial observation — an outcome string that appears only in a LATER
+    # capture (state that changed without any actor action) must not credit
+    # the decisive step; the journey is unreached, not passed.
+    model = FakeModel([{"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"'] * 2,
+                        page_texts=["opening copy", "No sandboxes yet"])
+    journey = {"journey_id": "zero-late-hit", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "look", "expect": "", "core": True,
+                          "expect_text": "No sandboxes yet"}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence([], []))
+    assert res["actions"] == []
+    assert res["decisive_credits"] == []
+    unreached = [c for c in res["candidates"]
+                 if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1
+    assert "actor performed no actions" in unreached[0]["detail"]
+
+
+def test_zero_action_journey_passing_expect_state_credits(monkeypatch):
+    # Fix 4: a zero-action expect_state that PASSES (state needing no
+    # interaction — rare) is genuine credit, same as the pure-observation
+    # expect_text case.
+    model = FakeModel([{"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "web running"'] * 2,
+                        page_texts=["web · running", "web · running"])
+    journey = {"journey_id": "zero-state-pass", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "look", "expect": "", "core": True,
+                          "expect_state": {"sandbox": "web",
+                                           "exists": True}}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence(["web"],
+                                  [{"name": "web", "status_disk": "running"}]))
+    assert res["actions"] == []
+    kinds = {c["kind"] for c in res["candidates"]}
+    assert "unreached_decisive" not in kinds
+    assert "functional" not in kinds
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "expect_state: sandbox 'web' (matched)"}]
+
+
+def test_zero_action_journey_failing_expect_state_reclassified_unreached(monkeypatch):
+    # Fix 4: a failing expect_state on a zero-action journey — the actor
+    # never attempted the interaction the state assertion presupposes —
+    # flips unreached_decisive, never functional.
+    model = FakeModel([{"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Sandboxes"'] * 2,
+                        page_texts=["Sandboxes", "Sandboxes"])
+    journey = {"journey_id": "zero-state-fail", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "create web", "expect": "", "core": True,
+                          "expect_state": {"sandbox": "web",
+                                           "exists": True}}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence([], []))
+    assert res["actions"] == []
+    assert [c for c in res["candidates"] if c["kind"] == "functional"] == []
+    unreached = [c for c in res["candidates"]
+                 if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1
+    assert "actor performed no actions" in unreached[0]["detail"]
+    assert "never attempted" in unreached[0]["detail"]
+    assert res["decisive_credits"] == []
+
+
+# ---------- Fix 1: expect_state settle across lifecycle teardown ----------
+
+def _run_with_settle(journey, model, driver, monkeypatch, evidence_seq,
+                     settle_s):
+    """Like _run but capture_state_evidence yields evidence_seq[0] on the
+    first call (the runner's end-of-journey sample) and then the LAST entry
+    for every settle re-sample; time.sleep is a no-op so the poll spins."""
+    import gui.run_gui_journeys as rgj
+    calls = {"n": 0}
+
+    def fake_capture(*a, **k):
+        i = min(calls["n"], len(evidence_seq) - 1)
+        calls["n"] += 1
+        return evidence_seq[i]
+
+    monkeypatch.setattr(rgj, "capture_state_evidence", fake_capture)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot",
+                        lambda *a, **k: {"violations": []})
+    monkeypatch.setattr(rgj.time, "sleep", lambda s: None)
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0,
+                          expect_state_settle_s=settle_s)
+    return res, calls["n"]
+
+
+def _stop_journey():
+    return {"journey_id": "stop-sandbox-confirm", "modality": "gui",
+            "source": {"kind": "spec", "ref": "x"},
+            "steps": [{"intent": "stop web", "expect": "", "core": True,
+                       "expect_state": {"sandbox": "web",
+                                        "status": "stopped"}}]}
+
+
+def test_expect_state_transient_divergence_settles_and_credits(monkeypatch):
+    # The confirmed failure mode: the first post-journey sample catches the
+    # mid-ACPI-S5 teardown window ('degraded (sidecar virtiofsd:workspace
+    # died)'), the settled truth is 'stopped'. The settle re-sample absorbs
+    # ONLY the transient: the journey credits the decisive step, and BOTH
+    # samples land in the bundle for the skeptic.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "web"'] * 3,
+                        page_texts=["web", "Stopping…", "web · stopped"])
+    transient = _evidence(
+        ["web"], [{"name": "web",
+                   "status_disk": "degraded (sidecar virtiofsd:workspace died)"}])
+    settled = _evidence(["web"], [{"name": "web", "status_disk": "stopped"}])
+    res, n_captures = _run_with_settle(_stop_journey(), model, driver,
+                                       monkeypatch, [transient, settled],
+                                       settle_s=5.0)
+    assert n_captures >= 2  # re-sampled at least once
+    assert [c for c in res["candidates"] if c["kind"] == "functional"] == []
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "expect_state: sandbox 'web' (matched)"}]
+    # Auditability: first sample recorded alongside the settled truth.
+    assert res["state_evidence_presettle"] == transient
+    assert res["state_evidence"] == settled
+
+
+def test_expect_state_genuinely_wrong_settled_state_still_flips(monkeypatch):
+    # Honesty: divergence that PERSISTS across the whole settle window is a
+    # real product finding — it must still flip, with the settle confirmation
+    # on record in the candidate detail.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "web"'] * 3,
+                        page_texts=["web", "Stopping…", "web"])
+    wrong = _evidence(["web"], [{"name": "web", "status_disk": "running"}])
+    res, n_captures = _run_with_settle(_stop_journey(), model, driver,
+                                       monkeypatch, [wrong, wrong],
+                                       settle_s=0.2)
+    assert n_captures >= 2
     functional = [c for c in res["candidates"] if c["kind"] == "functional"]
     assert len(functional) == 1
     assert functional[0]["decisive"] is True
+    assert "settle re-sample" in functional[0]["detail"]
+    assert "'stopped'" in functional[0]["detail"]
     assert res["decisive_credits"] == []
+    # Both samples still recorded (identical here, but on record).
+    assert res["state_evidence_presettle"] == wrong
+    assert res["state_evidence"] == wrong
+
+
+def test_expect_state_settle_disabled_flips_on_first_sample(monkeypatch):
+    # settle_s=0 (the unit-test default elsewhere) keeps the old single-
+    # sample behavior: no re-sample, no presettle record.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "web"'] * 3,
+                        page_texts=["web", "web", "web"])
+    wrong = _evidence(["web"], [{"name": "web", "status_disk": "running"}])
+    res, n_captures = _run_with_settle(_stop_journey(), model, driver,
+                                       monkeypatch, [wrong], settle_s=0.0)
+    assert n_captures == 1
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1
+    assert "settle re-sample" not in functional[0]["detail"]
+    assert "state_evidence_presettle" not in res
+
+
+def test_expect_state_volume_assertion_settles_uniformly(monkeypatch):
+    # The Fix-1 settle applies to volume assertions too (a detach lands via
+    # an async Save invoke): transiently-still-attached settles to detached
+    # and credits.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "vol-demo"'] * 3,
+                        page_texts=["v", "Saving…", "No volumes"])
+
+    def ev(used_by):
+        e = _evidence(["vol-demo"],
+                      [{"name": "vol-demo", "status_disk": "running"}])
+        e["volume_ls"] = {"argv": ["volume", "ls"], "exit_code": 0,
+                          "stdout": ("NAME SIZE USED  USED BY\n"
+                                     f"detach-vol 1024 10  {used_by}\n"),
+                          "stderr": ""}
+        return e
+
+    journey = {"journey_id": "volumes-detach", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "detach and save", "expect": "",
+                          "core": True,
+                          "expect_state": {"sandbox": "vol-demo",
+                                           "volume": {"name": "detach-vol",
+                                                      "exists": True,
+                                                      "attached_to": None}}}]}
+    res, n_captures = _run_with_settle(journey, model, driver, monkeypatch,
+                                       [ev("vol-demo"), ev("-")], settle_s=5.0)
+    assert n_captures >= 2
+    assert [c for c in res["candidates"] if c["kind"] == "functional"] == []
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "expect_state: sandbox 'vol-demo' (matched)"}]
 
 
 def test_expect_text_window_starts_at_the_core_step_not_earlier(monkeypatch):

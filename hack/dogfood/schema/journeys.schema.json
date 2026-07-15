@@ -121,7 +121,8 @@
           "required": ["sandbox"],
           "anyOf": [
             { "required": ["exists"] },
-            { "required": ["status"] }
+            { "required": ["status"] },
+            { "required": ["volume"] }
           ],
           "properties": {
             "sandbox": {
@@ -136,9 +137,37 @@
             "status": {
               "type": "string",
               "description": "The sandbox's reconciled status must equal this string exactly (e.g. 'running', 'stopped' — the product's own status vocabulary, status_disk falling back to status_daemon). Implies existence: an absent sandbox fails a status assertion."
+            },
+            "volume": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name"],
+              "anyOf": [
+                { "required": ["exists"] },
+                { "required": ["attached_to"] }
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "The persistent (named) volume the assertion targets — the literal volume name the step's intent prescribes (e.g. 'detach-vol'), never a guest mountpoint path. No {workspace} substitution (volume names are compiler-chosen literals)."
+                },
+                "exists": {
+                  "type": "boolean",
+                  "description": "true ⇒ the named volume must be present in the daemon's end-of-journey `izba volume ls` truth (e.g. a persistent volume surviving sandbox rm); false ⇒ it must be absent (the way to assert a completed volume rm/prune)."
+                },
+                "attached_to": {
+                  "anyOf": [
+                    { "type": "string", "minLength": 1 },
+                    { "type": "null" }
+                  ],
+                  "description": "A sandbox name ⇒ the volume must exist AND be referenced by that sandbox's config (`izba volume ls`'s USED BY column — a Saved attach that actually landed in daemon truth); null ⇒ the volume must exist but be referenced by NO sandbox (detached-but-existing — the way to assert a Saved detach landed, instead of crediting the Volumes tab's staged, unsaved 'No volumes' text). Implies existence: an absent volume fails an attached_to assertion, including attached_to: null."
+                }
+              },
+              "description": "Optional persistent-volume assertion, graded from the SAME end-of-journey state evidence (the `izba volume ls` capture — product truth, never UI text). At least one of exists/attached_to must be declared. Composes with the sibling sandbox exists/status keys: ALL declared assertions must pass. Compiler rule: use this (not expect_text over the Volumes tab) to grade attach/detach outcomes — the tab renders staged, unsaved rows that expect_text would falsely credit (the volumes-detach cheat class)."
             }
           },
-          "description": "GUI decisive grading hook — a small daemon-truth assertion graded against the runner's end-of-journey state evidence (the post-settle `izba __reconcile` snapshot: product ground truth, not what the UI happens to render). Graded on a `core: true` step of a modality:'gui' journey when the journey did NOT drive manifest_diff (manifest_truth then takes precedence); the CLI runner ignores it. ALL declared sub-assertions (and any sibling expect_text) must pass for the decisive step to grade positive; a failed assertion flips the journey via a decisive functional candidate; an ungradable one (the reconcile snapshot itself errored) degrades the journey via a flipping infra candidate — never a silent pass. Invisible to the Actor (fair-test boundary). Optional."
+          "description": "GUI decisive grading hook — a small daemon-truth assertion graded against the runner's end-of-journey state evidence (the post-settle `izba __reconcile` snapshot + `izba volume ls` capture: product ground truth, not what the UI happens to render). Graded on a `core: true` step of a modality:'gui' journey when the journey did NOT drive manifest_diff (manifest_truth then takes precedence); the CLI runner ignores it. ALL declared sub-assertions (and any sibling expect_text) must pass for the decisive step to grade positive; a failed assertion flips the journey via a decisive functional candidate; an ungradable one (the reconcile snapshot itself errored, or a volume assertion with no usable `izba volume ls` evidence) degrades the journey via a flipping infra candidate — never a silent pass. A failing assertion is first re-sampled across a bounded settle window (--expect-state-settle-s, default 45s): lifecycle teardown and volume-save operations land asynchronously, so only divergence that PERSISTS across the settle flips — both the first and settled samples are recorded in the bundle for the skeptic. Invisible to the Actor (fair-test boundary). Optional."
         },
         "seed_files": {
           "type": "object",
