@@ -457,6 +457,12 @@ pub fn dispatch(
             .map(|s| s.to_string())
             .ok_or_else(|| format!("missing string arg '{key}'"))
     }
+    fn arg_u16(args: &serde_json::Value, key: &str) -> Result<u16, String> {
+        args.get(key)
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+            .ok_or_else(|| format!("missing u16 arg '{key}'"))
+    }
     fn to_json<T: serde::Serialize>(v: T) -> Result<serde_json::Value, String> {
         serde_json::to_value(v).map_err(|e| format!("serialize error: {e}"))
     }
@@ -479,8 +485,109 @@ pub fn dispatch(
             to_json(commands::remove_core(d, &arg_str(&args, "name")?, force)?)
         }
         "inspect" => to_json(commands::inspect_core(d, &arg_str(&args, "name")?)?),
+        "read_netlog" => to_json(commands::read_netlog_core(d, &arg_str(&args, "name")?)?),
+        "port_list" => to_json(commands::port_list_core(d, &arg_str(&args, "name")?)?),
+        // NOTE on arg names: Tauri camelCases Rust snake_case command args in
+        // invoke payloads, so the frontend (src/lib/ipc.ts) sends `ruleSpec`,
+        // `hostPort`, and `guestPath` — the bridge must accept those exact
+        // keys, not the Rust-side `rule_spec`/`host_port`/`guest_path`.
+        "port_publish" => {
+            let persist = args
+                .get("persist")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            to_json(commands::port_publish_core(
+                d,
+                &arg_str(&args, "name")?,
+                &arg_str(&args, "ruleSpec")?,
+                persist,
+            )?)
+        }
+        "port_unpublish" => {
+            // `bind` arrives as a dotted-quad string (Ipv4Addr serializes as one).
+            let bind: std::net::Ipv4Addr = arg_str(&args, "bind")?
+                .parse()
+                .map_err(|e| format!("bad bind: {e}"))?;
+            to_json(commands::port_unpublish_core(
+                d,
+                &arg_str(&args, "name")?,
+                bind,
+                arg_u16(&args, "hostPort")?,
+            )?)
+        }
         "volume_list" => to_json(commands::volume_list_core(d)?),
+        "volume_remove" => to_json(commands::volume_remove_core(d, &arg_str(&args, "name")?)?),
+        "volume_prune" => to_json(commands::volume_prune_core(d)?),
+        "volume_attach" => to_json(commands::volume_attach_core(
+            d,
+            &arg_str(&args, "name")?,
+            &arg_str(&args, "spec")?,
+        )?),
+        "volume_detach" => to_json(commands::volume_detach_core(
+            d,
+            &arg_str(&args, "name")?,
+            arg_str(&args, "guestPath")?,
+        )?),
         "policy_show" => to_json(commands::policy_show_core(d, &arg_str(&args, "name")?)?),
+        "policy_allow" => to_json(commands::policy_allow_core(
+            d,
+            &arg_str(&args, "name")?,
+            &arg_str(&args, "host")?,
+            arg_u16(&args, "port")?,
+        )?),
+        "policy_block" => to_json(commands::policy_block_core(
+            d,
+            &arg_str(&args, "name")?,
+            &arg_str(&args, "host")?,
+            arg_u16(&args, "port")?,
+        )?),
+        "policy_set" => {
+            let allow: Vec<izba_core::daemon::egress::config::AllowEntry> = serde_json::from_value(
+                args.get("allow")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|e| format!("bad allow: {e}"))?;
+            to_json(commands::policy_set_core(
+                d,
+                &arg_str(&args, "name")?,
+                allow,
+            )?)
+        }
+        "policy_add_endpoints" => {
+            let entries: Vec<SeedEntry> = serde_json::from_value(
+                args.get("entries")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|e| format!("bad entries: {e}"))?;
+            let enforce = args
+                .get("enforce")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            to_json(commands::policy_add_endpoints_core(
+                d,
+                &arg_str(&args, "name")?,
+                entries,
+                enforce,
+            )?)
+        }
+        // `target` is the raw glob string ("host/owner/repo" or "host") — the
+        // core fn parses it into a GitTarget (mirrors src/lib/ipc.ts).
+        "policy_git_allow" => {
+            let write = args.get("write").and_then(|v| v.as_bool()).unwrap_or(false);
+            to_json(commands::policy_git_allow_core(
+                d,
+                &arg_str(&args, "name")?,
+                &arg_str(&args, "target")?,
+                write,
+            )?)
+        }
+        "policy_git_block" => to_json(commands::policy_git_block_core(
+            d,
+            &arg_str(&args, "name")?,
+            &arg_str(&args, "target")?,
+        )?),
         "policy_set_enforce" => {
             let on = args.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
             to_json(commands::policy_set_enforce_core(
@@ -704,6 +811,250 @@ mod dispatch_tests {
         )
         .unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_port_publish_list_unpublish_round_trip() {
+        // Payload shapes mirror src/lib/ipc.ts exactly: portPublish sends
+        // `ruleSpec` and portUnpublish sends `hostPort` (Tauri camelCases the
+        // Rust snake_case args in invoke payloads).
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        dispatch(
+            &st,
+            "port_publish",
+            serde_json::json!({"name": "web", "ruleSpec": "127.0.0.1:8080:80", "persist": true}),
+            &mut emit,
+        )
+        .unwrap();
+
+        let listed = dispatch(
+            &st,
+            "port_list",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(listed[0]["bind"], "127.0.0.1");
+        assert_eq!(listed[0]["host_port"], 8080);
+        assert_eq!(listed[0]["guest_port"], 80);
+
+        dispatch(
+            &st,
+            "port_unpublish",
+            serde_json::json!({"name": "web", "bind": "127.0.0.1", "hostPort": 8080}),
+            &mut emit,
+        )
+        .unwrap();
+        let listed = dispatch(
+            &st,
+            "port_list",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn dispatch_port_publish_rejects_snake_case_arg() {
+        // Arg-shape guard: the frontend sends `ruleSpec` (camelCase); a
+        // snake_case `rule_spec` payload is NOT what crosses the bridge and
+        // must be rejected as a missing arg, not silently accepted.
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let err = dispatch(
+            &st,
+            "port_publish",
+            serde_json::json!({"name": "web", "rule_spec": "8080:80", "persist": false}),
+            &mut emit,
+        )
+        .unwrap_err();
+        assert!(err.contains("ruleSpec"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_volume_attach_detach_round_trip() {
+        // volumeDetach sends `guestPath` (camelCase) per src/lib/ipc.ts.
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        dispatch(
+            &st,
+            "volume_attach",
+            serde_json::json!({"name": "web", "spec": "cache:/data:1g"}),
+            &mut emit,
+        )
+        .unwrap();
+        let detail = dispatch(
+            &st,
+            "inspect",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(detail["volumes"][0]["guest_path"], "/data");
+
+        dispatch(
+            &st,
+            "volume_detach",
+            serde_json::json!({"name": "web", "guestPath": "/data"}),
+            &mut emit,
+        )
+        .unwrap();
+        let detail = dispatch(
+            &st,
+            "inspect",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(detail["volumes"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn dispatch_volume_remove_and_prune() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(
+            &st,
+            "volume_remove",
+            serde_json::json!({"name": "cache"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert!(out.is_null());
+        let pruned = dispatch(&st, "volume_prune", serde_json::json!({}), &mut emit).unwrap();
+        assert_eq!(pruned["removed"][0], "old");
+        assert_eq!(pruned["reclaimed_bytes"], 1024);
+    }
+
+    #[test]
+    fn dispatch_policy_allow_shows_up_in_policy_show() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        dispatch(
+            &st,
+            "policy_allow",
+            serde_json::json!({"name": "web", "host": "pypi.org", "port": 443}),
+            &mut emit,
+        )
+        .unwrap();
+        let shown = dispatch(
+            &st,
+            "policy_show",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        let hosts: Vec<&str> = shown["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["host"].as_str())
+            .collect();
+        assert!(hosts.contains(&"pypi.org"), "got: {shown}");
+    }
+
+    #[test]
+    fn dispatch_policy_block_and_set_accept_frontend_shapes() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        dispatch(
+            &st,
+            "policy_block",
+            serde_json::json!({"name": "web", "host": "evil.example", "port": 443}),
+            &mut emit,
+        )
+        .unwrap();
+        dispatch(
+            &st,
+            "policy_set",
+            serde_json::json!({
+                "name": "web",
+                "allow": [{"host": "api.example.com", "ports": [443], "access": "read-write"}],
+            }),
+            &mut emit,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dispatch_policy_add_endpoints_then_show() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        dispatch(
+            &st,
+            "policy_add_endpoints",
+            serde_json::json!({
+                "name": "web",
+                "entries": [{"kind": "http", "host": "crates.io", "port": 443, "access": "read"}],
+                "enforce": true,
+            }),
+            &mut emit,
+        )
+        .unwrap();
+        let shown = dispatch(
+            &st,
+            "policy_show",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(shown["enforcing"], true);
+    }
+
+    #[test]
+    fn dispatch_policy_git_allow_block_round_trip() {
+        // `target` is the raw glob string, exactly as ipc.ts sends it.
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        dispatch(
+            &st,
+            "policy_git_allow",
+            serde_json::json!({"name": "web", "target": "github.com/o/r", "write": true}),
+            &mut emit,
+        )
+        .unwrap();
+        let shown = dispatch(
+            &st,
+            "policy_show",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(shown["git"].as_array().unwrap().len(), 1);
+
+        dispatch(
+            &st,
+            "policy_git_block",
+            serde_json::json!({"name": "web", "target": "github.com/o/r"}),
+            &mut emit,
+        )
+        .unwrap();
+        let shown = dispatch(
+            &st,
+            "policy_show",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(shown["git"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn dispatch_read_netlog_returns_summaries() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(
+            &st,
+            "read_netlog",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        let rows = out.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["host"], "api.x.com");
     }
 
     #[test]
