@@ -490,6 +490,17 @@ fn handle_start(
         &art,
         allow_unconfined,
     ) {
+        if e.downcast_ref::<sandbox::AlreadyRunning>().is_some() {
+            // The sandbox is alive: the listener bound by its original
+            // start is still serving (ensure_listening above was a no-op)
+            // — leave it. And heal a stale registry entry so a redundant
+            // `izba run` self-corrects List/Inspect instead of returning
+            // success while the daemon keeps reporting "stopped" (#67).
+            if let Ok(live) = sandbox::liveness_of(&d.paths, &name, d.connector()) {
+                d.registry.set(&name, &config.image_ref, live);
+            }
+            return Err(e);
+        }
         // Boot never happened — tear the listener back down, in the SAME
         // dir the bind above used. Not `live_run_dir`: a stale pre-upgrade
         // state.json (crashed old run, `run_dir: None`, dead pid) would
@@ -1564,6 +1575,81 @@ mod tests {
         assert!(
             !d.egress.listening("web"),
             "loser must not bind/touch the egress listener"
+        );
+    }
+
+    /// #67: a redundant Start on an already-running sandbox must (a) heal a
+    /// stale registry entry to the actual liveness and (b) NOT tear down the
+    /// live sandbox's egress listener. Before the fix, `handle_start` took
+    /// the generic boot-failure error path: it called `d.egress.stop` on the
+    /// listener `ensure_listening` had just no-op'd (already bound), and
+    /// returned before ever reaching `registry.set(Running)`.
+    #[test]
+    fn start_already_running_heals_registry_and_keeps_egress() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let vmm = spawn_sleep(dir.path());
+        let mut deps = test_deps();
+        deps.connector = Box::new(fake_connector(
+            Arc::new(Mutex::new(Vec::new())),
+            Some(vmm.clone()),
+        ));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        // `Create` seeds the registry Stopped — exactly the stale cache
+        // entry a crashed/never-adopted daemon would carry for a sandbox
+        // that is, in fact, live on disk right now.
+        assert_eq!(d.registry.liveness("web"), Some(Liveness::Stopped));
+
+        // Make the sandbox actually live: a real pid + state.json in the
+        // new-scheme run dir (what a real post-Start state.json records),
+        // and its egress listener already bound there — exactly what the
+        // FIRST (real) Start would have left behind.
+        write_state_with_run_dir(&d.paths, "web", vmm.clone(), Some(d.paths.run_dir("web")));
+        match d
+            .egress
+            .ensure_listening(&d.paths, "web", &d.paths.run_dir("web"))
+        {
+            Ok(()) => {}
+            // Chain-aware guard — same rationale as the legacy-egress tests
+            // above: a bind-denying sandbox must skip, not fail.
+            Err(e)
+                if e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                }) =>
+            {
+                eprintln!("SKIP start_already_running_heals_registry_and_keeps_egress: bind denied: {e:#}");
+                return;
+            }
+            Err(e) => panic!("ensure_listening: {e:#}"),
+        }
+        assert!(d.egress.listening("web"), "precondition: listener bound");
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::Start {
+                name: "web".into(),
+                allow_unconfined: false,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("already running"), "got: {message}");
+            }
+            other => panic!("expected an already-running error, got: {other:?}"),
+        }
+        assert!(
+            d.egress.listening("web"),
+            "the redundant Start must NOT tear down the live sandbox's egress listener"
+        );
+        assert_eq!(
+            d.registry.liveness("web"),
+            Some(Liveness::Running),
+            "the redundant Start must heal the stale registry entry"
         );
     }
 
