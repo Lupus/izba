@@ -162,6 +162,11 @@ export function PortsTab({ sandbox }: Props) {
 
       <div className="mt-2 grid gap-2">
         <span className="text-xs font-medium text-muted-foreground">Add forward</span>
+        {!running && (
+          <div className="text-sm text-muted-foreground-2">
+            Start the sandbox to add port forwards.
+          </div>
+        )}
         <div className="flex flex-wrap items-center gap-2">
           <Input
             aria-label="Bind address"
