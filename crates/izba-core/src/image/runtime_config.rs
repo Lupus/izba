@@ -341,20 +341,17 @@ impl UserDb {
 /// - symbolic (`"node"`, `"1000:wheel"`) resolved against `db` (the image's
 ///   `/etc/passwd`+`/etc/group`) -> resolved pair, no warning.
 /// - symbolic but unresolvable (name absent from the image's passwd/group, or a
-///   legacy cache with no captured db) -> `((0,0), Some(msg))` naming the USER.
-///   izba never silently downgrades security, so the fallback is loud.
-pub fn resolve_process_user(declared: Option<&str>, db: &UserDb) -> ((u32, u32), Option<String>) {
+///   legacy cache with no captured db) -> `((0,0), Some(fallback))` naming the
+///   USER. izba never silently downgrades security, so the fallback is loud.
+pub fn resolve_process_user(
+    declared: Option<&str>,
+    db: &UserDb,
+) -> ((u32, u32), Option<crate::state::UserFallback>) {
     match declared {
         None | Some("") => ((0, 0), None),
         Some(u) => match db.resolve(u) {
             Some(ids) => (ids, None),
-            None => (
-                (0, 0),
-                Some(format!(
-                    "image USER '{u}' could not be resolved against the image's /etc/passwd \
-                     — running the workload as root (uid 0)"
-                )),
-            ),
+            None => ((0, 0), Some(crate::state::UserFallback::new(u))),
         },
     }
 }
@@ -1065,9 +1062,11 @@ mod tests {
 
     #[test]
     fn resolve_process_user_unresolvable_is_loud_root() {
-        let ((uid, gid), warn) = resolve_process_user(Some("ghost"), &db_with_node());
+        let ((uid, gid), fb) = resolve_process_user(Some("ghost"), &db_with_node());
         assert_eq!((uid, gid), (0, 0));
-        assert!(warn.expect("must warn").contains("ghost"));
+        let fb = fb.expect("unresolvable symbolic USER produces a fallback");
+        assert_eq!(fb.declared, "ghost");
+        assert!(fb.reason.contains("USER 'ghost'"), "got: {}", fb.reason);
     }
 
     // ---- full spec assembly ----

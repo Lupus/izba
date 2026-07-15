@@ -613,7 +613,7 @@ fn write_oci_bundle(
     ca_present: bool,
     workspace: &Path,
     privileged: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<crate::state::UserFallback>> {
     // Gate the CA trust-env defaults on the bundle actually being present —
     // same gate the guest applies in `build_env_overlay` (trust_bundle_present).
     // Today the host always writes ca.pem so this is always-open, but encoding
@@ -625,12 +625,12 @@ fn write_oci_bundle(
         Vec::new()
     };
     let pause_argv: Vec<String> = vec![PAUSE_GUEST_PATH.to_string(), "__pause".to_string()];
-    let ((uid, gid), user_warn) = crate::image::runtime_config::resolve_process_user(
+    let ((uid, gid), user_fallback) = crate::image::runtime_config::resolve_process_user(
         image_config.and_then(|c| c.user.as_deref()),
         user_db,
     );
-    if let Some(w) = user_warn {
-        eprintln!("warning: sandbox '{name}': {w}");
+    if let Some(fb) = &user_fallback {
+        eprintln!("warning: sandbox '{name}': {}", fb.reason);
     }
     // Option A anchor: the host (uid, gid) that owns the virtiofs `workspace`,
     // as the guest will see it. izba's virtiofsd runs UNPRIVILEGED and applies
@@ -679,7 +679,7 @@ fn write_oci_bundle(
     }
     tmp.persist(oci_dir.join("config.json"))
         .context("persisting oci/config.json")?;
-    Ok(())
+    Ok(user_fallback)
 }
 
 /// Writes the SSH host key and authorized_keys into the per-sandbox ssh share
@@ -794,7 +794,7 @@ pub fn start_with_timeouts(
     let (passwd, group) = store.load_user_dbs(&config.image_digest)?;
     let user_db =
         crate::image::runtime_config::UserDb::from_files(passwd.as_deref(), group.as_deref());
-    write_oci_bundle(
+    let user_fallback = write_oci_bundle(
         &oci_dir,
         name,
         image_config,
@@ -867,7 +867,7 @@ pub fn start_with_timeouts(
     // would be orphaned with no state.json pointing at it.
     let booted = (|| -> anyhow::Result<()> {
         wait_for_boot(handle.as_ref(), name, &console_log, boot_timeout, poll)?;
-        record_run_state(paths, name, handle.as_ref())
+        record_run_state(paths, name, handle.as_ref(), user_fallback)
     })();
 
     if let Err(e) = booted {
@@ -939,7 +939,12 @@ fn control_is_healthy(handle: &dyn VmHandle, attempt_timeout: Duration) -> bool 
 /// pid list) plus the remaining sidecar pids, the start timestamp, and the
 /// host-side confinement actually achieved for the VMM (so status can report it
 /// honestly — and loudly when unconfined).
-fn record_run_state(paths: &Paths, name: &str, handle: &dyn VmHandle) -> anyhow::Result<()> {
+fn record_run_state(
+    paths: &Paths,
+    name: &str,
+    handle: &dyn VmHandle,
+    user_fallback: Option<crate::state::UserFallback>,
+) -> anyhow::Result<()> {
     let mut pids = handle.pids();
     let vmm_idx = pids
         .iter()
@@ -955,6 +960,7 @@ fn record_run_state(paths: &Paths, name: &str, handle: &dyn VmHandle) -> anyhow:
             .as_millis() as u64,
         confinement: Some(handle.confinement()),
         run_dir: Some(paths.run_dir(name)),
+        user_fallback,
     };
     save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)
 }
@@ -1672,6 +1678,7 @@ mod tests {
             started_unix_ms: 0,
             confinement: None,
             run_dir: None,
+            user_fallback: None,
         };
         save_json(&paths.sandbox_dir("web").join(STATE_FILE), &legacy).unwrap();
         assert_eq!(live_run_dir(&paths, "web"), paths.legacy_run_dir("web"));
@@ -2038,6 +2045,49 @@ mod tests {
             .expect("state.json written");
         assert_eq!(state.vmm_pid, live_identity());
         assert!(state.sidecar_pids.is_empty());
+        // No image config was cached for this digest, so there is no declared
+        // USER to fail resolving — record_run_state must persist None (#114).
+        assert!(state.user_fallback.is_none());
+    }
+
+    /// #114 persist side: an image that declares a symbolic `USER` this host
+    /// cannot resolve (no captured `/etc/passwd` entry for it) falls back to
+    /// root, and `record_run_state` must durably record that fallback in
+    /// `state.json` — not just the one-shot stderr warning.
+    #[test]
+    fn start_records_user_fallback_for_unresolvable_symbolic_user() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let o = opts(&ws);
+
+        let image_dir = paths.image_dir(&o.image_digest);
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(
+            image_dir.join("config.json"),
+            r#"{
+                "architecture": "amd64",
+                "os": "linux",
+                "rootfs": { "type": "layers", "diff_ids": [] },
+                "config": { "User": "ghost" }
+            }"#,
+        )
+        .unwrap();
+
+        create(&paths, "web", &o).unwrap();
+
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
+
+        let state: RunState = load_json(&paths.sandbox_dir("web").join(STATE_FILE))
+            .unwrap()
+            .expect("state.json written");
+        let fb = state
+            .user_fallback
+            .expect("unresolvable symbolic USER must persist a fallback");
+        assert_eq!(fb.declared, "ghost");
+        assert!(fb.reason.contains("USER 'ghost'"), "got: {}", fb.reason);
+        assert!(fb.reason.contains("root"), "got: {}", fb.reason);
     }
 
     #[test]
@@ -2914,6 +2964,7 @@ mod tests {
                     &procmgr::ConfinementPolicy::vmm_default(),
                 )),
                 run_dir: None,
+                user_fallback: None,
             },
         )
         .unwrap();
@@ -2942,6 +2993,7 @@ mod tests {
                 &procmgr::ConfinementPolicy::vmm_default(),
             )),
             run_dir: None,
+            user_fallback: None,
         };
         save_json(&sdir.join(STATE_FILE), &confined).unwrap();
         restore_confined_workspace(&paths, "box"); // Ok(None) arm

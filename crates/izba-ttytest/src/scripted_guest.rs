@@ -117,6 +117,7 @@ impl ScriptedGuest {
                 started_unix_ms: 0,
                 confinement: None,
                 run_dir: Some(run.clone()),
+                user_fallback: None,
             },
         )
         .context("write state.json")?;

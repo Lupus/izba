@@ -88,6 +88,7 @@ pub(crate) fn write_state_with_run_dir(
             started_unix_ms: 0,
             confinement: None,
             run_dir,
+            user_fallback: None,
         },
     )
     .unwrap();
@@ -107,6 +108,7 @@ pub(crate) fn write_state_with_sidecars(
             started_unix_ms: 0,
             confinement: None,
             run_dir: None,
+            user_fallback: None,
         },
     )
     .unwrap();

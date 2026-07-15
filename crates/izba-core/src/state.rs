@@ -69,6 +69,30 @@ pub struct PortRecord {
     pub relay: PidIdentity,
 }
 
+/// A symbolic image USER that could not be resolved host-side, forcing the
+/// workload to run as root (#114). Persisted per-run so `izba status` can
+/// re-surface the degradation durably — the start-time stderr warning is
+/// one-shot and easy to miss (loud-on-degradation rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserFallback {
+    /// The image's original (unresolved) symbolic USER string.
+    pub declared: String,
+    /// Human-readable reason; also the body of the start-time warning.
+    pub reason: String,
+}
+
+impl UserFallback {
+    pub fn new(declared: &str) -> Self {
+        Self {
+            reason: format!(
+                "image USER '{declared}' could not be resolved against the image's /etc/passwd \
+                 — running the workload as root (uid 0)"
+            ),
+            declared: declared.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
     pub vmm_pid: PidIdentity,
@@ -88,6 +112,11 @@ pub struct RunState {
     /// [`crate::sandbox::live_run_dir`], never `Paths::run_dir` directly.
     #[serde(default)]
     pub run_dir: Option<std::path::PathBuf>,
+    /// Present when the image declared a symbolic USER that could not be
+    /// resolved host-side and the workload fell back to root (#114).
+    /// `serde(default)`: absent in pre-#114 state.json → None.
+    #[serde(default)]
+    pub user_fallback: Option<UserFallback>,
 }
 
 /// Crash-safe write: serialise to a sibling `.tmp` file in the same directory,
@@ -187,6 +216,7 @@ mod tests {
             started_unix_ms: 1_700_000_000_000,
             confinement: None,
             run_dir: None,
+            user_fallback: None,
         }
     }
 
@@ -244,6 +274,26 @@ mod tests {
         save_json(&path, &s).unwrap();
         let loaded: RunState = load_json(&path).unwrap().unwrap();
         assert_eq!(loaded.confinement, s.confinement);
+    }
+
+    #[test]
+    fn run_state_without_user_fallback_defaults_none() {
+        // A pre-#114 state.json (no user_fallback key) must deserialize.
+        let mut v = serde_json::to_value(sample_run_state()).unwrap();
+        v.as_object_mut().unwrap().remove("user_fallback");
+        let parsed: RunState = serde_json::from_value(v).unwrap();
+        assert!(parsed.user_fallback.is_none());
+    }
+
+    #[test]
+    fn run_state_roundtrips_user_fallback() {
+        let mut rs = sample_run_state();
+        rs.user_fallback = Some(UserFallback::new("node"));
+        let parsed: RunState = serde_json::from_str(&serde_json::to_string(&rs).unwrap()).unwrap();
+        let fb = parsed.user_fallback.expect("fallback survives roundtrip");
+        assert_eq!(fb.declared, "node");
+        assert!(fb.reason.contains("USER 'node'"), "got: {}", fb.reason);
+        assert!(fb.reason.contains("root"), "got: {}", fb.reason);
     }
 
     #[test]
