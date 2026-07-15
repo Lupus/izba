@@ -410,7 +410,12 @@ def _settle_expect_state(state_hook: Dict[str, Any], first_verdict: str,
     SETTLED sample. Honesty: a genuinely-wrong settled state still flips —
     only divergence that VANISHES within the window is absorbed; and both
     the first and settled samples are recorded (``settle_out``) so the
-    skeptic can audit exactly what was absorbed. Returns
+    skeptic can audit exactly what was absorbed. ``settle_out`` keeps the
+    chronologically FIRST pre-settle sample under ``"first"`` and the
+    chronologically LAST settled sample under ``"settled"`` (never
+    clobbering an earlier step's ``"first"``), plus a per-step audit under
+    ``"steps"`` keyed by ``step_idx`` — so when several core steps each
+    trigger the settle, no step's pre-settle evidence is lost. Returns
     ``(verdict, found, settled_evidence)``."""
     verdict, found, evidence = first_verdict, first_found, first_evidence
     start = time.monotonic()
@@ -429,9 +434,14 @@ def _settle_expect_state(state_hook: Dict[str, Any], first_verdict: str,
         if verdict != "mismatch":
             break
     if resampled:
-        settle_out["first"] = first_evidence
+        settle_out.setdefault("first", first_evidence)
         settle_out["settled"] = evidence
         settle_out["waited_s"] = round(time.monotonic() - start, 1)
+        settle_out.setdefault("steps", {})[step_idx] = {
+            "presettle": first_evidence,
+            "settled": evidence,
+            "waited_s": settle_out["waited_s"],
+        }
         if verdict == "mismatch":
             for c in found:  # the flip is CONFIRMED, not a transient sample
                 c.detail += (f" (confirmed across a {settle_s:g}s "
@@ -591,8 +601,10 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     unreaped, sidecar already exited ⇒ 'degraded (sidecar … died)') whose
     settled truth is the asserted state. Only divergence that persists across
     the window flips; both samples land in the bundle (``state_evidence`` =
-    settled, ``state_evidence_presettle`` = first). 0 disables it (the unit
-    tests' default; CI runs the parse_args default).
+    settled, ``state_evidence_presettle`` = first; when several core steps
+    each trigger the settle, ``state_evidence_settles`` additionally keys
+    every step's presettle/settled pair by step index). 0 disables it (the
+    unit tests' default; CI runs the parse_args default).
 
     ``workspace`` (Task 10) is a per-journey directory the GUI swarm can type
     a real path into (e.g. the NewSandbox form) and that mid-journey
@@ -1029,6 +1041,15 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
               "initial_observation": initial_observation}
     if "first" in settle_out:
         result["state_evidence_presettle"] = settle_out["first"]
+        # When MORE than one core step triggered the settle, the single
+        # first/settled pair above cannot carry every step's audit: persist
+        # the full per-step record too (keyed by decimal step index).
+        # Single-settle bundles stay byte-identical to the pre-existing
+        # shape — the common ≤1-core-step convention is unchanged.
+        steps_audit = settle_out.get("steps") or {}
+        if len(steps_audit) > 1:
+            result["state_evidence_settles"] = {
+                str(i): steps_audit[i] for i in sorted(steps_audit)}
     if manifest_yml_snapshots:
         result["manifest_yml_snapshots"] = manifest_yml_snapshots
     return result

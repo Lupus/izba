@@ -1452,6 +1452,8 @@ def test_expect_state_transient_divergence_settles_and_credits(monkeypatch):
     # Auditability: first sample recorded alongside the settled truth.
     assert res["state_evidence_presettle"] == transient
     assert res["state_evidence"] == settled
+    # Single-settle bundles keep the pre-existing shape: no per-step map.
+    assert "state_evidence_settles" not in res
 
 
 def test_expect_state_genuinely_wrong_settled_state_still_flips(monkeypatch):
@@ -1491,6 +1493,56 @@ def test_expect_state_settle_disabled_flips_on_first_sample(monkeypatch):
     assert len(functional) == 1
     assert "settle re-sample" not in functional[0]["detail"]
     assert "state_evidence_presettle" not in res
+
+
+def test_expect_state_settle_audits_survive_across_multiple_core_steps(monkeypatch):
+    # Greptile round: TWO core steps each trigger the settle re-sample —
+    # the shared audit record must not let the second settle clobber the
+    # first step's pre-settle evidence. Both per-step audits land in
+    # state_evidence_settles (keyed by step index), while the
+    # backward-compatible top-level pair keeps the chronological extremes
+    # (presettle = the very first sample, state_evidence = the last settled).
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "web" row "api"'] * 4,
+                        page_texts=["web api", "Stopping…", "stopped",
+                                    "stopped"])
+    journey = {"journey_id": "stop-two-sandboxes", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [
+                   {"intent": "stop web", "expect": "", "core": True,
+                    "expect_state": {"sandbox": "web", "status": "stopped"}},
+                   {"intent": "stop api", "expect": "", "core": True,
+                    "expect_state": {"sandbox": "api", "status": "stopped"}},
+               ]}
+
+    def ev(web_status, api_status):
+        return _evidence(["web", "api"],
+                         [{"name": "web", "status_disk": web_status},
+                          {"name": "api", "status_disk": api_status}])
+
+    transient = "degraded (sidecar virtiofsd:workspace died)"
+    e1 = ev(transient, transient)   # end-of-journey sample: both mid-teardown
+    e2 = ev("stopped", transient)   # step 0's settle: web settled, api not yet
+    e3 = ev("stopped", "stopped")   # step 1's settle: api settled too
+    res, n_captures = _run_with_settle(journey, model, driver, monkeypatch,
+                                       [e1, e2, e3], settle_s=5.0)
+    assert n_captures >= 3  # one end-of-journey sample + a settle per step
+    assert [c for c in res["candidates"] if c["kind"] == "functional"] == []
+    assert sorted(c["graded_cmd"] for c in res["decisive_credits"]) == [
+        "expect_state: sandbox 'api' (matched)",
+        "expect_state: sandbox 'web' (matched)"]
+    # Backward-compatible pair: the chronological extremes.
+    assert res["state_evidence_presettle"] == e1
+    assert res["state_evidence"] == e3
+    # Per-step audit: BOTH settles on record, neither clobbered.
+    settles = res["state_evidence_settles"]
+    assert sorted(settles) == ["0", "1"]
+    assert settles["0"]["presettle"] == e1
+    assert settles["0"]["settled"] == e2
+    assert settles["1"]["presettle"] == e2  # step 1 graded from step 0's settled
+    assert settles["1"]["settled"] == e3
+    for s in settles.values():
+        assert s["waited_s"] >= 0
 
 
 def test_expect_state_volume_assertion_settles_uniformly(monkeypatch):

@@ -956,6 +956,40 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn dispatch_policy_block_shows_up_in_policy_show() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        dispatch(
+            &st,
+            "policy_allow",
+            serde_json::json!({"name": "web", "host": "pypi.org", "port": 443}),
+            &mut emit,
+        )
+        .unwrap();
+        dispatch(
+            &st,
+            "policy_block",
+            serde_json::json!({"name": "web", "host": "pypi.org", "port": 443}),
+            &mut emit,
+        )
+        .unwrap();
+        let shown = dispatch(
+            &st,
+            "policy_show",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        let hosts: Vec<&str> = shown["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["host"].as_str())
+            .collect();
+        assert!(!hosts.contains(&"pypi.org"), "block not reflected: {shown}");
+    }
+
+    #[test]
     fn dispatch_policy_block_and_set_accept_frontend_shapes() {
         let st = state_with(FakeDaemon::default());
         let mut emit = |_: &str, _: serde_json::Value| {};
