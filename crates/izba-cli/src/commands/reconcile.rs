@@ -33,9 +33,16 @@ pub fn run(paths: &Paths, json: bool) -> anyhow::Result<i32> {
         }
     };
     // One supervisor tick + margin: long enough for the daemon's cached
-    // status to self-correct after a transition (#67).
-    let settle =
-        izba_core::daemon::supervisor::tick_interval() + std::time::Duration::from_millis(500);
+    // status to self-correct after a transition (#67). `tick_interval()`
+    // reads THIS process's IZBA_DAEMON_TICK_MS — the same env the daemon
+    // inherited when the CLI auto-spawned it, so the two agree in normal
+    // operation. Floor at the 2 s default tick so a test-scoped (smaller)
+    // override in the CLI's env can never undershoot a default-tick daemon;
+    // a daemon deliberately started with a LONGER tick than our env says is
+    // out of reach from here and may still outlast the settle (best-effort).
+    let settle = izba_core::daemon::supervisor::tick_interval()
+        .max(std::time::Duration::from_secs(2))
+        + std::time::Duration::from_millis(500);
     let report = reconcile_settled(paths, &mut fetch, &PidProbes, settle)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
