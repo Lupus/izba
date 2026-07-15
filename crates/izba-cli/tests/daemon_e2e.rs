@@ -14,6 +14,7 @@ use std::process::Output;
 use std::time::{Duration, Instant};
 
 use izba_core::state::{load_json, RunState, STATE_FILE};
+use serde_json::Value;
 
 const IMAGE: &str = "alpine:3.20";
 
@@ -1061,5 +1062,45 @@ fn cli_surface_lifecycle() {
         "rm detached",
     );
 
+    let _ = izba(&data, no_env, &["daemon", "stop"]);
+}
+
+/// #67 regression: right after `izba run`, the reconciler must see a
+/// consistent daemon-vs-disk view (the settle re-sample absorbs the
+/// supervisor tick's cache lag; the Start heal covers the idempotent path).
+#[test]
+fn reconcile_is_clean_right_after_run() {
+    if !want() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+    let name = "reconcile-e2e";
+
+    let o = izba(
+        &data,
+        no_env,
+        &["run", "-d", "--image", IMAGE, "--name", name, &ws_s],
+    );
+    assert_ok(&o, "run -d");
+
+    let o = izba(&data, no_env, &["__reconcile", "--json"]);
+    assert_ok(&o, "__reconcile --json");
+    let out = stdout_of(&o);
+    let report: Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("reconcile output not JSON: {e}\n{out}"));
+    let violations = report["violations"]
+        .as_array()
+        .expect("violations is an array");
+    assert!(
+        violations.is_empty(),
+        "reconcile must be clean right after run: {out}"
+    );
+
+    let _ = izba(&data, no_env, &["rm", "--force", name]);
     let _ = izba(&data, no_env, &["daemon", "stop"]);
 }
