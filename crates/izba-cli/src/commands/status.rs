@@ -50,9 +50,13 @@ fn render(paths: &Paths, det: &SandboxDetail) -> String {
     );
     if let Some(declared) = det.user_fallback.as_deref() {
         // Loud-on-degradation (#114): the workload runs as root because the
-        // image's symbolic USER could not be resolved host-side. Persisted in
-        // state.json (Task 2) so this line re-surfaces the degradation on
-        // every `izba status`, not just the one-shot start-time warning.
+        // image's symbolic USER could not be resolved host-side — this line
+        // re-surfaces the degradation on every `izba status`, not just the
+        // one-shot start-time warning. The wording is authored here, NOT
+        // copied from the persisted `UserFallback::reason`: only the declared
+        // USER string crosses the Inspect wire, and the reason's phrasing
+        // targets the start-time warning context ("running the workload as
+        // root"), which reads wrong next to a `user:` label.
         out.push_str(&format!(
             "user:        root — image USER '{declared}' could not be resolved (symbolic-USER fallback)\n"
         ));
