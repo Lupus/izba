@@ -69,6 +69,15 @@ docker run --rm \
   # `crun`, so generate it first — the tarball ships .tarball-git-version.h that
   # its rule copies into place (no git repo needed).
   make -j"$(nproc)" git-version.h
+  # Same BUILT_SOURCES hole, bigger member (issue #110): libocispec'\''s
+  # generated headers/sources hang off stamp rules inside the SUB-make,
+  # so the top-level "make crun" -j build can compile crun .o files that
+  # #include e.g. runtime_spec_schema_config_windows.h while the
+  # sub-make'\''s generate.py is still writing it (intermittent
+  # "unterminated #ifndef"). Build libocispec.la to completion first:
+  # its own stamp dependencies order codegen internally (parallel-safe),
+  # and afterwards every generated header exists before any crun compile.
+  make -j"$(nproc)" -C libocispec libocispec.la
   # crun links via libtool; -static alone leaves system libs (seccomp/cap)
   # dynamic. -all-static is libtool'\''s fully-static flag (same as build-nft.sh),
   # applied at link time so it does not break configure'\''s compile probes.
