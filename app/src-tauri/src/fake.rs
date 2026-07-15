@@ -301,6 +301,7 @@ impl DaemonApi for FakeDaemon {
             volumes: self.detail_volumes.clone(),
             confinement: None,
             container: None,
+            user_fallback: None,
         })
     }
 

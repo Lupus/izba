@@ -96,6 +96,7 @@ mod tests {
             volumes,
             confinement: None,
             container: None,
+            user_fallback: None,
         }
     }
 
