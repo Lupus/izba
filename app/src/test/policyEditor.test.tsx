@@ -266,4 +266,33 @@ describe("PolicyEditor", () => {
       ),
     );
   });
+
+  it("accepts a wildcard host pattern and saves it", async () => {
+    (api.policyShow as Mock).mockResolvedValue({ enforcing: true, allow: [], git: [] });
+    render(<PolicyEditor name="web" />);
+    fireEvent.click(await screen.findByRole("button", { name: /Add host/i }));
+    fireEvent.change(screen.getByPlaceholderText(/example\.com/i), {
+      target: { value: "*.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [{ host: "*.example.com", ports: [443], access: "read-write" }],
+        [],
+      ),
+    );
+  });
+
+  it("rejects a malformed wildcard pattern before saving", async () => {
+    (api.policyShow as Mock).mockResolvedValue({ enforcing: true, allow: [], git: [] });
+    render(<PolicyEditor name="web" />);
+    fireEvent.click(await screen.findByRole("button", { name: /Add host/i }));
+    fireEvent.change(screen.getByPlaceholderText(/example\.com/i), {
+      target: { value: "foo.*.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(screen.getByText(/foo\.\*\.com/)).toBeInTheDocument());
+    expect(api.policySetFull).not.toHaveBeenCalled();
+  });
 });
