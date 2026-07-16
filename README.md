@@ -71,6 +71,8 @@ Key properties:
   enforce: true                  # false (or omitted) = log-only, allow everything
   allow:
     - api.anthropic.com          # web ports only: 80 and 443
+    - "*.mydomain.com"           # one subdomain label (api.mydomain.com; quote it — YAML)
+    - "**.mydomain.com"          # any depth (a.b.mydomain.com); apex needs its own entry
     - host: db.internal
       ports: [5432]              # exactly 5432 — explicit ports replace the default
     - host: docs.internal
@@ -91,6 +93,14 @@ Key properties:
   that loophole is now closed.) `access:` defaults to `read-write` for HTTP
   hosts; `git:` rules are vendor-neutral (keyed on the git wire protocol, not a
   hostname) and read-only unless `access: read-write`.
+
+  Host entries may be wildcards: `*.mydomain.com` matches exactly one
+  subdomain label (`api.mydomain.com`, not `a.b.mydomain.com`), and
+  `**.mydomain.com` matches any depth. The apex (`mydomain.com`) never
+  matches a wildcard — list it explicitly alongside. Patterns apply on both
+  enforcement paths (decrypted SNI/Host and the DNS-snooped connect gate),
+  and a malformed pattern (`foo.*.com`) is rejected loudly when the policy
+  loads. Quote wildcard entries in YAML — a bare `*` is YAML syntax.
 
   **HTTPS under enforce is intercepted (MITM) — the izba CA is auto-trusted.**
   To apply the allow-list and the `access:`/`git:` rules to *encrypted* traffic,
