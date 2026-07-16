@@ -54,10 +54,25 @@ pub(crate) fn render_deltas(state: DriftState, deltas: &[FieldDelta]) -> String 
         } else {
             ""
         };
-        s.push_str(&format!(
-            "  {}: {} -> {}  [{}]{}\n",
-            d.field, d.from, d.to, class, warn
-        ));
+        if d.from.contains('\n') || d.to.contains('\n') {
+            // Multi-line value (egress YAML, per-line ports/volumes): the
+            // inline `from -> to` form would embed raw newlines mid-sentence,
+            // so render an indented from/to block instead.
+            s.push_str(&format!("  {}:  [{}]{}\n", d.field, class, warn));
+            s.push_str("    from:\n");
+            for l in d.from.lines() {
+                s.push_str(&format!("      {l}\n"));
+            }
+            s.push_str("    to:\n");
+            for l in d.to.lines() {
+                s.push_str(&format!("      {l}\n"));
+            }
+        } else {
+            s.push_str(&format!(
+                "  {}: {} -> {}  [{}]{}\n",
+                d.field, d.from, d.to, class, warn
+            ));
+        }
     }
     s
 }
@@ -97,5 +112,30 @@ mod tests {
     fn render_in_sync_is_terse() {
         let s = render_deltas(DriftState::InSync, &[]);
         assert!(s.to_lowercase().contains("in sync"));
+    }
+
+    /// A multi-line value (egress YAML, per-line ports) renders as an indented
+    /// from/to block — never inline, which would splice raw newlines into the
+    /// middle of a `from -> to` sentence.
+    #[test]
+    fn render_multiline_value_as_indented_block() {
+        let deltas = vec![FieldDelta {
+            field: "ports".into(),
+            from: "(none)".into(),
+            to: "127.0.0.1:8080:80\n0.0.0.0:9000:90".into(),
+            class: FieldClass::Live,
+            weakens_egress: false,
+        }];
+        let s = render_deltas(DriftState::RepoAhead, &deltas);
+        assert!(s.contains("  ports:  [live]\n"), "block header: {s}");
+        assert!(s.contains("    from:\n      (none)\n"), "from block: {s}");
+        assert!(
+            s.contains("    to:\n      127.0.0.1:8080:80\n      0.0.0.0:9000:90\n"),
+            "to block keeps one item per line: {s}"
+        );
+        assert!(
+            !s.contains("-> 127.0.0.1"),
+            "multi-line values must not render inline: {s}"
+        );
     }
 }
