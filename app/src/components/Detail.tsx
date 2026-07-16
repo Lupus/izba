@@ -10,6 +10,7 @@ import { ShellPanel } from "./ShellPanel";
 import { PortsTab } from "./PortsTab";
 import { VolumesTab } from "./VolumesTab";
 import { ManifestTab } from "./ManifestTab";
+import { WorkspacePath } from "./WorkspacePath";
 import { Spinner } from "./Spinner";
 import { Button } from "@/components/ui/button";
 import { api } from "../lib/ipc";
@@ -122,6 +123,7 @@ export function Detail({ sandbox, onChanged }: Props) {
       <div className="mt-4 flex min-h-0 flex-1 flex-col">
         {tab === "overview" && (
           <div className="flex flex-col gap-3">
+            <WorkspacePath name={name} />
             <FirewallStatus name={name} />
             <div className="flex flex-wrap gap-2">
               {running ? (

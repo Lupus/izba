@@ -337,6 +337,9 @@ pub struct SandboxDetailView {
     pub name: String,
     pub image: String,
     pub status: String,
+    /// Host workspace directory, rendered for humans (`display_path` strips
+    /// the Windows `\\?\` verbatim prefix a canonicalized record carries).
+    pub workspace: String,
     pub ports: Vec<PortRuleView>,
     pub volumes: Vec<VolumeSpecView>,
 }
@@ -347,6 +350,7 @@ impl From<SandboxDetail> for SandboxDetailView {
             name: d.name,
             image: d.image_ref,
             status: d.status,
+            workspace: izba_core::paths::display_path(std::path::Path::new(&d.workspace)),
             ports: d.ports.into_iter().map(PortRuleView::from).collect(),
             volumes: d.volumes.into_iter().map(VolumeSpecView::from).collect(),
         }
@@ -625,8 +629,32 @@ mod tests {
         assert_eq!(v.name, "web");
         assert_eq!(v.image, "ubuntu:24.04");
         assert_eq!(v.status, "running");
+        assert_eq!(v.workspace, "/ws");
         assert_eq!(v.ports.len(), 1);
         assert_eq!(v.ports[0].host_port, 8080);
         assert!(v.volumes.is_empty());
+    }
+
+    /// A Windows workspace recorded canonicalized (`\\?\C:\...`) surfaces to
+    /// the UI without the verbatim prefix — this is what the user sees on the
+    /// Overview/Manifest tabs.
+    #[test]
+    fn sandbox_detail_view_strips_verbatim_workspace_prefix() {
+        let detail = izba_core::daemon::proto::SandboxDetail {
+            name: "web".into(),
+            image_ref: "ubuntu:24.04".into(),
+            image_digest: "sha256:x".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: r"\\?\C:\Users\u\proj".into(),
+            status: "stopped".into(),
+            ports: vec![],
+            volumes: vec![],
+            confinement: None,
+            container: None,
+            user_fallback: None,
+        };
+        let v = SandboxDetailView::from(detail);
+        assert_eq!(v.workspace, r"C:\Users\u\proj");
     }
 }

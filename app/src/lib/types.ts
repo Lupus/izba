@@ -61,6 +61,8 @@ export interface SandboxDetail {
   name: string;
   image: string;
   status: string;
+  /** Host workspace directory (human-rendered; no Windows `\\?\` prefix). */
+  workspace: string;
   ports: PortRule[];
   volumes: VolumeSpec[];
 }

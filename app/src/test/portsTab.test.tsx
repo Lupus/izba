@@ -28,7 +28,7 @@ const stopped: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind
 const rule: PortRule = { bind: "127.0.0.1", host_port: 8080, guest_port: 80 };
 
 function detail(ports: PortRule[] = []): SandboxDetail {
-  return { name: "web", image: "ubuntu:24.04", status: "running", ports, volumes: [] };
+  return { name: "web", image: "ubuntu:24.04", status: "running", workspace: "/ws", ports, volumes: [] };
 }
 
 beforeEach(() => {
