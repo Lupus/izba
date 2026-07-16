@@ -227,8 +227,10 @@ def test_manifest_gui_corpus_validates_against_schema():
 def test_manifest_gui_corpus_core_counts():
     # Every journey marks at most one decisive (core) step. The corpus was
     # extended from 4 to the full 10-journey acceptance set (final-polish
-    # Fix 3, sourced from the run-4 confirming swarm's journeys-run4.json);
-    # 7 of the 10 declare a core step. The 3 without one are intentional:
+    # Fix 3, sourced from the run-4 confirming swarm's journeys-run4.json),
+    # then to 11 with manifest-export-bootstrap-missing (the owner-reported
+    # D4 regression: Export disabled in the missing-izba.yml empty state);
+    # 8 of the 11 declare a core step. The 3 without one are intentional:
     # - manifest-missing-manifest-guidance: its manifest_diff call never
     #   carries a digest (a rejected invoke), so a core step there would
     #   falsely flip `unreached_decisive` (see the journey's own rationale).
@@ -237,7 +239,7 @@ def test_manifest_gui_corpus_core_counts():
     #   either is now caught instead by the H2 all-ambient-invoke_log check
     #   in run_gui_journeys.py (_has_product_invoke), not the core-step path.
     doc = _load_manifest_gui_corpus()
-    assert len(doc["journeys"]) == 10
+    assert len(doc["journeys"]) == 11
     for j in doc["journeys"]:
         n_core = sum(1 for s in j["steps"] if s.get("core"))
         assert n_core <= 1, j["journey_id"]
@@ -246,6 +248,7 @@ def test_manifest_gui_corpus_core_counts():
                 if any(s.get("core") for s in j["steps"])}
     assert with_core == {"manifest-open-tab-in-sync",
                          "manifest-seeded-drift-promote",
+                         "manifest-export-bootstrap-missing",
                          "manifest-managed-ahead-export",
                          "manifest-weakens-egress-ack",
                          "manifest-promote-live-running-no-restart",

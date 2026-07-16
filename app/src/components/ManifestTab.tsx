@@ -250,7 +250,14 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
   // instead of being told the file doesn't exist.
   const missingManifest = error?.includes("no izba.yml found") ?? false;
   const canPromote = diff !== null && (diff.state === "repo_ahead" || diff.state === "diverged");
-  const canExport = diff !== null && (diff.state === "managed_ahead" || diff.state === "diverged");
+  // `missingManifest` also enables Export: a workspace with no izba.yml is the
+  // BOOTSTRAP case — `izba_core::manifest::ops::export` never reads an existing
+  // izba.yml (it writes managed truth, advances base, clears review), so Export
+  // is exactly how the file gets created. Without this, the empty-state
+  // guidance above says "use Export here" while the button stays permanently
+  // disabled (diff is null because manifest_diff errored on the missing file).
+  const canExport =
+    missingManifest || (diff !== null && (diff.state === "managed_ahead" || diff.state === "diverged"));
 
   const pendingDeltas = diff?.deltas ?? [];
   const hasNonLiveDelta = pendingDeltas.some((d) => d.class !== "live");
