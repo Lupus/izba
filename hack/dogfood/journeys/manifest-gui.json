@@ -77,6 +77,31 @@
       ]
     },
     {
+      "journey_id": "manifest-export-bootstrap-missing",
+      "modality": "gui",
+      "tier": "core",
+      "rationale": "The bootstrap chicken-and-egg the empty state itself advertises: a workspace with NO izba.yml shows the missing-manifest guidance ('... use Export here after making changes in the app'), so Export must be clickable there and must CREATE the file. Found by the owner post-campaign on a pre-existing sandbox (D4 flag): ManifestTab's canExport gated solely on a non-null diff state (managed_ahead/diverged), but with no izba.yml manifest_diff errors and diff stays null, so 'Export to izba.yml' was permanently disabled in exactly the state whose guidance says to use it — while the backend (izba_core::manifest::ops::export) never reads an existing izba.yml (it writes managed truth, advances base, clears review) and always supported bootstrap export. core sits on the Export click: doExport's automatic post-export diff refetch is the digest-carrying manifest_diff the manifest_truth oracle grades against `izba diff` ground truth, which must now be in_sync — verifying the file was genuinely written, not just that a banner rendered. No expect_text/expect_state hooks: manifest_truth takes precedence for a journey that drives manifest_diff, matching this corpus's other manifest journeys.",
+      "source": {
+        "kind": "pr",
+        "ref": "PR #145 dogfood-fixes/gui-handover (owner-reported post-campaign, D4): ManifestTab.tsx canExport missing-manifest bootstrap fix + MISSING_MANIFEST_BODY 'use Export here' + doExport refetch; crates/izba-core/src/manifest/ops.rs export"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field and 'manifest-bootstrap-demo' into the Name field (leave Image at its default), then click Create to create a new sandbox from this empty workspace",
+          "expect": "a sandbox named manifest-bootstrap-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the manifest-bootstrap-demo sandbox's detail view and click its Manifest tab",
+          "expect": "the Manifest tab shows \"No izba.yml found in this sandbox's workspace.\" along with guidance to run 'izba export' or use Export to create one, and the 'Export to izba.yml' button is enabled"
+        },
+        {
+          "intent": "click 'Export to izba.yml' on the Manifest tab to create the file from the sandbox's managed settings, then observe the tab",
+          "expect": "the Manifest tab shows 'Exported to {workspace}/izba.yml' and the banner now reads 'In sync — izba.yml and managed settings match.' — the export bootstrapped the missing izba.yml and the tab's own diff refetch confirms it matches managed truth",
+          "core": true
+        }
+      ]
+    },
+    {
       "journey_id": "manifest-managed-ahead-export",
       "modality": "gui",
       "tier": "smoke",

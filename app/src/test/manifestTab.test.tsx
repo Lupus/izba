@@ -129,6 +129,44 @@ describe("ManifestTab", () => {
     ).toBeInTheDocument();
   });
 
+  it("enables Export (no disabled hint) in the missing-manifest state — the bootstrap case", async () => {
+    (api.manifestDiff as Mock).mockRejectedValue(new Error("no izba.yml found in workspace"));
+    render(<ManifestTab name="web" running={true} />);
+
+    await screen.findByText("No izba.yml found in this sandbox's workspace.");
+    const exportBtn = screen.getByRole("button", { name: /^export to izba\.yml$/i });
+    // The empty-state guidance says "use Export here" — the button must not be
+    // permanently disabled just because manifest_diff errored on the missing
+    // file (the backend's export never reads an existing izba.yml).
+    expect(exportBtn).not.toBeDisabled();
+    expect(exportBtn).not.toHaveAttribute("title");
+  });
+
+  it("bootstrap-exports from the missing-manifest state: calls manifestExport, shows the confirmation, and lands in_sync", async () => {
+    (api.manifestDiff as Mock).mockRejectedValue(new Error("no izba.yml found in workspace"));
+    (api.manifestExport as Mock).mockResolvedValue("/ws/izba.yml");
+    render(<ManifestTab name="web" running={true} />);
+
+    await screen.findByText("No izba.yml found in this sandbox's workspace.");
+    const exportBtn = screen.getByRole("button", { name: /^export to izba\.yml$/i });
+    expect(exportBtn).not.toBeDisabled();
+
+    // The post-export refetch finds the just-written file in sync — mirrors
+    // the real backend, where export writes izba.yml from managed truth.
+    (api.manifestDiff as Mock).mockResolvedValue({ state: "in_sync", deltas: [] });
+    fireEvent.click(exportBtn);
+    await waitFor(() => expect(api.manifestExport).toHaveBeenCalledWith("web"));
+
+    expect(await screen.findByText("Exported to /ws/izba.yml")).toBeInTheDocument();
+    expect(
+      await screen.findByText("In sync — izba.yml and managed settings match."),
+    ).toBeInTheDocument();
+    // The missing-manifest guidance is gone — the file exists now.
+    expect(
+      screen.queryByText("No izba.yml found in this sandbox's workspace."),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows the raw message in the error area for a non-manifest error", async () => {
     (api.manifestDiff as Mock).mockRejectedValue(new Error("daemon unreachable"));
     render(<ManifestTab name="web" running={true} />);
