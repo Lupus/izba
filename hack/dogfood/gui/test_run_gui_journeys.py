@@ -244,6 +244,43 @@ def test_non_spawn_rejection_still_flags_silent_failure(monkeypatch):
     assert [c for c in res["candidates"] if c["kind"] == "infra"] == []
 
 
+def test_silent_failure_sees_guidance_rendered_only_between_actions(monkeypatch):
+    # Live-verification FP (journey manifest-export-bootstrap-missing): the
+    # FIRST manifest_diff on a no-izba.yml workspace rejects with the sentinel
+    # "no izba.yml found in workspace"; ManifestTab renders the missing-
+    # manifest guidance (the _ERROR_COPY_MAP-mapped copy) instead of an error
+    # banner; the Actor confirms it via `read` observations; then the Export
+    # click replaces it with the export outcome. The guidance therefore lives
+    # ONLY in the step-opening/`read` page-text captures (page_text_history)
+    # — never in a per-action capture nor the final one — and the old
+    # action-captures-only union fed to silent_failure_oracle false-fired on
+    # a rejection the UI had deliberately, visibly surfaced.
+    model = FakeModel([{"read": True}, {"click": "@e2"}, {"done": True}])
+    guidance = ("Manifest\nExport to izba.yml\n"
+                "No izba.yml found in this sandbox's workspace.\n"
+                "Create an izba.yml in the workspace to manage this sandbox "
+                "declaratively.")
+    outcome = "Manifest\nExported to /ws/izba.yml\nIn sync"
+    invoke_log = [{"cmd": "manifest_diff", "ok": False,
+                   "error": "no izba.yml found in workspace"}]
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"'] * 4,
+                        invoke_log=invoke_log,
+                        # opening, read (guidance visible), post-Export
+                        # action capture, final — guidance gone from the
+                        # last two.
+                        page_texts=["Manifest tab", guidance, outcome, outcome])
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j-bootstrap-guidance", "modality": "gui",
+               "steps": [{"intent": "export to bootstrap izba.yml", "expect": ""}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=8, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert [c for c in res["candidates"] if c["kind"] == "silent_failure"] == []
+
+
 def test_console_errors_are_per_action_deltas(monkeypatch):
     # FakeDriver.read_console_errors returns a GROWING cumulative list: ["e1"]
     # after action 1, ["e1", "e2"] after action 2. Each action must record

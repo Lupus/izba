@@ -77,6 +77,19 @@ def test_silent_failure_oracle_quiet_on_missing_manifest_guidance_copy():
                                  page_text=page_text) == []
 
 
+def test_silent_failure_oracle_flags_missing_manifest_without_guidance():
+    # Counterpart to the quiet case above: the missing-manifest sentinel
+    # rejection with NO guidance panel (and no other error surface) anywhere
+    # in the rendered text is a GENUINE silent failure and must still flip —
+    # the _ERROR_COPY_MAP entry suppresses only a visibly-rendered guidance.
+    log = [{"cmd": "manifest_diff", "ok": False,
+           "error": "no izba.yml found in workspace"}]
+    page_text = "Manifest\nRefresh\nExport to izba.yml\nPromote…"
+    cs = silent_failure_oracle(log, '[@e1] heading "Manifest"', REF,
+                               page_text=page_text)
+    assert len(cs) == 1 and cs[0].kind == "silent_failure"
+
+
 def test_silent_failure_oracle_flags_when_neither_surface_shows_it():
     log = [{"cmd": "manifest_promote", "ok": False, "error": "boom"}]
     cs = silent_failure_oracle(log, '[@e1] heading "Sandboxes"', REF,

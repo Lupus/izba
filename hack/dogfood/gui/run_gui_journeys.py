@@ -854,12 +854,20 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                           if not _is_daemon_spawn_failure(e)]
     # Fix 2 (run-2 skeptic): silent_failure has no timestamp/index
     # correlation between a specific invoke-log rejection and a specific
-    # action, so it checks the union of every action's page_text across the
-    # whole journey (plus the final one) — the widest reasonable "at-or-after
-    # the rejection" approximation (see gui_oracles.silent_failure_oracle's
-    # docstring for the false-negative/false-positive tradeoff rationale).
-    all_page_text = "\n".join(
-        [a.get("page_text", "") for a in actions] + [final_page_text])
+    # action, so it checks the union of ALL captured page text across the
+    # whole journey — the widest reasonable "at-or-after the rejection"
+    # approximation (see gui_oracles.silent_failure_oracle's docstring for
+    # the false-negative/false-positive tradeoff rationale). That union is
+    # `page_text_history`, a superset of the per-action captures: it also
+    # holds each step's opening snapshot, the Actor's `read` observations,
+    # and the final post-journey capture. The per-action-only union
+    # false-fired on manifest-export-bootstrap-missing (live verification):
+    # the missing-manifest guidance (the _ERROR_COPY_MAP-mapped copy for the
+    # rejected first manifest_diff) rendered on the Manifest tab's
+    # opening/`read` snapshots, then was replaced by the export outcome
+    # before the next action capture — visibly surfaced, captured, but never
+    # searched.
+    all_page_text = "\n".join(page_text_history)
     end_found = (ui_daemon_diff_oracle(marks_history, state_evidence, final_ref,
                                        page_text_history=page_text_history)
                  + dom_expect_oracle(last_expect, final_marks, final_ref,
