@@ -657,4 +657,142 @@ mod tests {
         post.method = Some("POST".into());
         assert_eq!(p.check(&post), Verdict::Allow);
     }
+
+    /// Data doc with ONLY wildcard rules (per-sandbox), for the wildcard tests.
+    fn wildcard_policy(sandbox: &str, rules_json: serde_json::Value) -> RegoPolicy {
+        let data = serde_json::json!({
+            "host_rules": {},
+            "sandbox_host_rules": {},
+            "wildcard_host_rules": [],
+            "sandbox_wildcard_host_rules": { sandbox: rules_json },
+            "sandbox_git_rules": {}
+        });
+        RegoPolicy::new(RegoPolicy::REGO, &data.to_string()).unwrap()
+    }
+
+    /// An L7 GET flow whose decrypted host == dialed addr (tier-1 shape).
+    fn l7_get(sandbox: &str, host: &str, port: u16) -> FlowDesc {
+        let mut f = flow(sandbox, host, port);
+        f.host = Some(host.into());
+        f.method = Some("GET".into());
+        f
+    }
+
+    /// `*.example.com` matches exactly one extra label — not the apex, not
+    /// deeper subdomains, and never a suffix-embedded lookalike host.
+    #[test]
+    fn single_label_wildcard_matches_one_label_only() {
+        let p = wildcard_policy(
+            "web",
+            serde_json::json!([{"pattern": "*.example.com", "ports": [80, 443], "access": "read-write"}]),
+        );
+        assert_eq!(
+            p.check(&l7_get("web", "api.example.com", 443)),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check(&l7_get("web", "a.b.example.com", 443)),
+            Verdict::Deny,
+            "one-label wildcard must not match a deeper subdomain"
+        );
+        assert_eq!(
+            p.check(&l7_get("web", "example.com", 443)),
+            Verdict::Deny,
+            "the apex never matches a wildcard"
+        );
+        assert_eq!(
+            p.check(&l7_get("web", "evilexample.com", 443)),
+            Verdict::Deny,
+            "suffix embedding must not match (no '.' boundary)"
+        );
+    }
+
+    /// `**.example.com` matches any depth >= 1, still never the apex.
+    #[test]
+    fn deep_wildcard_matches_any_depth() {
+        let p = wildcard_policy(
+            "web",
+            serde_json::json!([{"pattern": "**.example.com", "ports": [80, 443], "access": "read-write"}]),
+        );
+        assert_eq!(
+            p.check(&l7_get("web", "a.example.com", 443)),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check(&l7_get("web", "a.b.c.example.com", 443)),
+            Verdict::Allow
+        );
+        assert_eq!(p.check(&l7_get("web", "example.com", 443)), Verdict::Deny);
+        assert_eq!(
+            p.check(&l7_get("web", "evilexample.com", 443)),
+            Verdict::Deny
+        );
+    }
+
+    /// Wildcard rules carry the same ports/access semantics as exact rules.
+    #[test]
+    fn wildcard_rule_respects_ports_and_access() {
+        let p = wildcard_policy(
+            "web",
+            serde_json::json!([{"pattern": "*.internal.corp", "ports": [8443], "access": "read"}]),
+        );
+        assert_eq!(
+            p.check(&l7_get("web", "api.internal.corp", 8443)),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check(&l7_get("web", "api.internal.corp", 443)),
+            Verdict::Deny,
+            "explicit ports replace the web default on wildcard rules too"
+        );
+        let mut post = l7_get("web", "api.internal.corp", 8443);
+        post.method = Some("POST".into());
+        assert_eq!(p.check(&post), Verdict::Deny, "access: read blocks POST");
+    }
+
+    /// A bare L3 flow (tier-2 shape: no decrypted host, no method) matches a
+    /// wildcard via the `dest_name := input.dest` fallback — the DNS-snoop path.
+    #[test]
+    fn wildcard_matches_tier2_bare_flow() {
+        let p = wildcard_policy(
+            "web",
+            serde_json::json!([{"pattern": "*.example.com", "ports": [80, 443], "access": "read-write"}]),
+        );
+        assert_eq!(
+            p.check(&flow("web", "api.example.com", 443)),
+            Verdict::Allow
+        );
+        assert_eq!(p.check(&flow("web", "example.com", 443)), Verdict::Deny);
+    }
+
+    /// Per-sandbox wildcard rules do not leak across sandboxes; global
+    /// `wildcard_host_rules` apply to every sandbox.
+    #[test]
+    fn wildcard_scoping_global_vs_sandbox() {
+        let data = serde_json::json!({
+            "host_rules": {},
+            "sandbox_host_rules": {},
+            "wildcard_host_rules": [
+                {"pattern": "*.shared.corp", "ports": [443], "access": "read-write"}
+            ],
+            "sandbox_wildcard_host_rules": {
+                "build": [{"pattern": "*.build.corp", "ports": [443], "access": "read-write"}]
+            },
+            "sandbox_git_rules": {}
+        });
+        let p = RegoPolicy::new(RegoPolicy::REGO, &data.to_string()).unwrap();
+        assert_eq!(
+            p.check(&l7_get("web", "x.shared.corp", 443)),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check(&l7_get("build", "x.build.corp", 443)),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.check(&l7_get("web", "x.build.corp", 443)),
+            Verdict::Deny,
+            "web must not inherit build's per-sandbox wildcard"
+        );
+    }
 }
