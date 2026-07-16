@@ -137,6 +137,8 @@ impl RegoPolicy {
         let data = serde_json::json!({
             "host_rules": hosts,
             "sandbox_host_rules": {},
+            "wildcard_host_rules": [],
+            "sandbox_wildcard_host_rules": {},
             "sandbox_git_rules": {},
         });
         Self::new(Self::REGO, &data.to_string())

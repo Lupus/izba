@@ -334,19 +334,31 @@ impl EgressPolicyConfig {
 
     /// The regorus data document for `sandbox`: emits `host_rules` (always
     /// empty — a `--policy` file is scoped to one sandbox), `sandbox_host_rules`
-    /// (host → `{ports, access}` per sandbox), and `sandbox_git_rules` (list of
-    /// `{repo|host, access}` per sandbox).
+    /// (host → `{ports, access}` per sandbox), `wildcard_host_rules` (always
+    /// empty — a `--policy` file is per-sandbox), `sandbox_wildcard_host_rules`
+    /// (patterns → `{pattern, ports, access}` per sandbox), and `sandbox_git_rules`
+    /// (list of `{repo|host, access}` per sandbox). Hosts are normalized to
+    /// ASCII lowercase with trailing dots stripped; wildcard patterns
+    /// (`*.` / `**.` prefix) are split into a separate list.
     pub fn to_rego_data_json(&self, sandbox: &str) -> String {
         let mut hosts = serde_json::Map::new();
+        let mut wildcards: Vec<serde_json::Value> = Vec::new();
         for e in &self.allow {
             let access = match e.access() {
                 Access::Read => "read",
                 Access::ReadWrite => "read-write",
             };
-            hosts.insert(
-                e.host().to_string(),
-                serde_json::json!({ "ports": e.ports(), "access": access }),
-            );
+            let host = normalize_policy_host(e.host());
+            if is_wildcard_host(&host) {
+                wildcards.push(
+                    serde_json::json!({ "pattern": host, "ports": e.ports(), "access": access }),
+                );
+            } else {
+                hosts.insert(
+                    host,
+                    serde_json::json!({ "ports": e.ports(), "access": access }),
+                );
+            }
         }
         let git: Vec<serde_json::Value> = self
             .git
@@ -363,6 +375,8 @@ impl EgressPolicyConfig {
         serde_json::json!({
             "host_rules": {},
             "sandbox_host_rules": { sandbox: hosts },
+            "wildcard_host_rules": [],
+            "sandbox_wildcard_host_rules": { sandbox: wildcards },
             "sandbox_git_rules": { sandbox: git },
         })
         .to_string()
@@ -493,6 +507,19 @@ impl EgressPolicyConfig {
     pub fn to_yaml(&self) -> String {
         serde_yaml::to_string(self).expect("EgressPolicyConfig serializes")
     }
+}
+
+/// Normalize a policy-side host or pattern to request-side form: ASCII
+/// lowercase + trailing dot stripped. The request side already normalizes
+/// (`mitm::normalize_host`, `dns_snoop::normalize`); without this a
+/// mixed-case policy entry silently never matches.
+fn normalize_policy_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Is this allow-entry host a wildcard pattern (`*.x` / `**.x`)?
+fn is_wildcard_host(host: &str) -> bool {
+    host.starts_with("*.") || host.starts_with("**.")
 }
 
 /// Human name for a YAML value's type, for parse-error messages.
@@ -1469,5 +1496,94 @@ mod tests {
         // `enforce:` with no value parsed as enforce=true before; preserve it.
         let cfg = EgressPolicyConfig::from_yaml("enforce:\nallow:\n  - example.com\n").unwrap();
         assert!(cfg.enforce);
+    }
+
+    // ── Task 2: Wildcard splitting + normalization ───────────────────────────
+
+    #[test]
+    fn data_doc_splits_wildcards_from_exact_hosts() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "allow:\n  - api.example.com\n  - '*.internal.corp'\n  - host: '**.deep.corp'\n    ports: [8443]\n    access: read\n",
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
+        // Exact host stays in the map; wildcards move to the list.
+        assert!(doc["sandbox_host_rules"]["web"]["api.example.com"].is_object());
+        assert!(doc["sandbox_host_rules"]["web"]
+            .get("*.internal.corp")
+            .is_none());
+        let wc = doc["sandbox_wildcard_host_rules"]["web"]
+            .as_array()
+            .unwrap();
+        assert_eq!(wc.len(), 2);
+        assert_eq!(wc[0]["pattern"], "*.internal.corp");
+        assert_eq!(wc[1]["pattern"], "**.deep.corp");
+        assert_eq!(wc[1]["ports"], serde_json::json!([8443]));
+        assert_eq!(wc[1]["access"], "read");
+        // The global wildcard list exists (empty — a --policy file is per-sandbox).
+        assert!(doc["wildcard_host_rules"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn data_doc_normalizes_case_and_trailing_dot() {
+        let cfg =
+            EgressPolicyConfig::from_yaml("allow:\n  - API.Example.com.\n  - '*.Internal.CORP.'\n")
+                .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
+        assert!(
+            doc["sandbox_host_rules"]["web"]["api.example.com"].is_object(),
+            "policy-side hosts must be lowercased + trailing-dot-stripped to match the normalized request side"
+        );
+        let wc = doc["sandbox_wildcard_host_rules"]["web"]
+            .as_array()
+            .unwrap();
+        assert_eq!(wc[0]["pattern"], "*.internal.corp");
+    }
+
+    /// End-to-end through the real pipeline: YAML -> data doc -> Rego -> verdict.
+    #[test]
+    fn wildcard_yaml_policy_enforces_end_to_end() {
+        let cfg = EgressPolicyConfig::from_yaml("enforce: true\nallow:\n  - '*.internal.corp'\n")
+            .unwrap();
+        let p = cfg.into_policy("web").unwrap();
+        let l7 = |host: &str| FlowDesc {
+            sandbox: "web".into(),
+            addr: host.into(),
+            port: 443,
+            host: Some(host.into()),
+            method: Some("GET".into()),
+            path: None,
+            query: None,
+        };
+        assert_eq!(p.check(&l7("api.internal.corp")), Verdict::Allow);
+        assert_eq!(
+            p.check(&l7("internal.corp")),
+            Verdict::Deny,
+            "apex not matched"
+        );
+        assert_eq!(
+            p.check(&l7("a.b.internal.corp")),
+            Verdict::Deny,
+            "one label only"
+        );
+    }
+
+    /// Regression for the pre-existing footgun: a mixed-case exact host in
+    /// policy.yaml now matches the (lowercased) request host.
+    #[test]
+    fn mixed_case_exact_host_matches_after_normalization() {
+        let cfg =
+            EgressPolicyConfig::from_yaml("enforce: true\nallow:\n  - API.Example.com\n").unwrap();
+        let p = cfg.into_policy("web").unwrap();
+        let f = FlowDesc {
+            sandbox: "web".into(),
+            addr: "api.example.com".into(),
+            port: 443,
+            host: Some("api.example.com".into()),
+            method: Some("GET".into()),
+            path: None,
+            query: None,
+        };
+        assert_eq!(p.check(&f), Verdict::Allow);
     }
 }
