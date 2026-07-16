@@ -53,32 +53,6 @@ pub fn extract_a_aaaa(resp: &[u8]) -> Vec<(String, IpAddr, u32)> {
     out
 }
 
-/// Does `fqdn` match any allow-list rule? Rules (mirroring Cilium toFQDNs):
-/// - exact: `api.github.com`
-/// - `*.github.com` — exactly ONE extra label (`api.github.com`, not `a.b...`)
-/// - `**.github.com` — any depth (`a.b.github.com`); the apex itself never
-///   matches a wildcard.
-pub fn allowlist_matches(rules: &[String], fqdn: &str) -> bool {
-    let fqdn = normalize(fqdn);
-    rules.iter().any(|rule| {
-        let rule = rule.trim().to_ascii_lowercase();
-        if let Some(suffix) = rule.strip_prefix("**.") {
-            // Any subdomain (≥1 label) of `suffix`.
-            matches!(fqdn.strip_suffix(&suffix), Some(p) if p.ends_with('.') && p.len() > 1)
-        } else if let Some(suffix) = rule.strip_prefix("*.") {
-            // Exactly one label before `suffix`.
-            match fqdn.strip_suffix(&suffix) {
-                Some(p) => {
-                    matches!(p.strip_suffix('.'), Some(l) if !l.is_empty() && !l.contains('.'))
-                }
-                None => false,
-            }
-        } else {
-            rule == fqdn
-        }
-    })
-}
-
 struct FqdnEntry {
     fqdn: String,
     expiry: Instant,
@@ -247,31 +221,6 @@ mod tests {
         assert!(store.fqdns_for_at("web", ip, base).is_empty());
         // Map fully collapsed (no empty sandbox shells left behind).
         assert!(store.inner.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn wildcard_match_one_label_and_deep() {
-        let one = vec!["*.github.com".to_string()];
-        assert!(allowlist_matches(&one, "api.github.com"));
-        assert!(!allowlist_matches(&one, "a.b.github.com"));
-        assert!(
-            !allowlist_matches(&one, "github.com"),
-            "apex not matched by *."
-        );
-        assert!(!allowlist_matches(&one, "notgithub.com"), "label boundary");
-
-        let deep = vec!["**.github.com".to_string()];
-        assert!(allowlist_matches(&deep, "a.b.github.com"));
-        assert!(allowlist_matches(&deep, "api.github.com"));
-        assert!(!allowlist_matches(&deep, "github.com"));
-
-        let exact = vec!["api.anthropic.com".to_string()];
-        assert!(allowlist_matches(&exact, "api.anthropic.com"));
-        assert!(
-            allowlist_matches(&exact, "API.Anthropic.COM."),
-            "case + root dot"
-        );
-        assert!(!allowlist_matches(&exact, "evil.anthropic.com"));
     }
 
     // ---------- mutation-gap closures ----------
