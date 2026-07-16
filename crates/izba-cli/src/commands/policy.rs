@@ -11,20 +11,24 @@ pub enum PolicyCmd {
         /// Sandbox name (or dir)
         name: String,
     },
-    /// Allow an HTTP(S) destination: HOST or HOST:PORT (port defaults to 443;
-    /// access is read-write). To actually block anything else, enforcement must
-    /// be on (see `enforce`). Auto-reloads a running sandbox.
+    /// Allow an HTTP(S) destination: HOST, a wildcard (*.HOST = one subdomain
+    /// label, **.HOST = any depth; the apex needs its own entry), or
+    /// HOST:PORT (port defaults to 443; access is read-write). To actually
+    /// block anything else, enforcement must be on (see `enforce`).
+    /// Auto-reloads a running sandbox.
     Allow {
         /// Sandbox name (or dir)
         name: String,
-        /// Destination to allow: HOST or HOST:PORT (port defaults to 443)
+        /// Destination to allow: HOST, *.HOST, **.HOST, or HOST:PORT (port defaults to 443)
         target: String,
     },
-    /// Block a destination: HOST or HOST:PORT (port defaults to 443); auto-reloads
+    /// Block a destination: HOST, a wildcard (*.HOST = one subdomain
+    /// label, **.HOST = any depth; the apex needs its own entry), or
+    /// HOST:PORT (port defaults to 443); auto-reloads.
     Block {
         /// Sandbox name (or dir)
         name: String,
-        /// Destination to remove: HOST or HOST:PORT (port defaults to 443)
+        /// Destination to remove: HOST, *.HOST, **.HOST, or HOST:PORT (port defaults to 443)
         target: String,
     },
     /// Seed the allow-list from the sandbox's currently-allowed traffic, then reload
@@ -335,6 +339,38 @@ mod tests {
             .unwrap()
             .allow
             .is_empty());
+    }
+
+    #[test]
+    fn allow_accepts_wildcard_target() {
+        use izba_core::daemon::egress::config::{Access, AllowEntry, EgressPolicyConfig};
+        let dir = tempfile::tempdir().unwrap();
+        apply_edit(dir.path(), Edit::Allow, "*.example.com", 443).unwrap();
+        let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "*.example.com".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            }]
+        );
+    }
+
+    #[test]
+    fn allow_rejects_malformed_wildcard_target_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = apply_edit(dir.path(), Edit::Allow, "foo.*.com", 443)
+            .expect_err("mid-label wildcard must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("foo.*.com"),
+            "must name the bad pattern: {msg}"
+        );
+        assert!(
+            !dir.path().join("policy.yaml").exists(),
+            "failed edit must leave no policy.yaml"
+        );
     }
 
     #[test]
