@@ -34,6 +34,23 @@ allow if {
     host_access_ok(rule.access)
 }
 
+# --- Wildcard HTTP host allow-list ---
+# `glob.match` with `.` as the delimiter gives Cilium toFQDNs semantics:
+# `*` = exactly one label, `**` = any depth (>= 1); the apex itself never
+# matches — the literal `.` after the wildcard has nothing to consume.
+allow if {
+    some rule in data.wildcard_host_rules
+    glob.match(rule.pattern, ["."], dest_name)
+    input.port in rule.ports
+    host_access_ok(rule.access)
+}
+allow if {
+    some rule in data.sandbox_wildcard_host_rules[input.sandbox]
+    glob.match(rule.pattern, ["."], dest_name)
+    input.port in rule.ports
+    host_access_ok(rule.access)
+}
+
 # --- Vendor-neutral git rules ---
 service_kind("git-upload-pack") := "read"
 service_kind("git-receive-pack") := "write"
