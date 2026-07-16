@@ -185,8 +185,13 @@ def silent_failure_oracle(invoke_log: List[Dict[str, Any]], marks_text: str,
     `ManifestTab.tsx`), which agent-browser's accessibility snapshot never
     captures (no role/name). ``page_text`` is `document.body.innerText`
     (`driver.read_page_text`), which does. ``page_text`` is expected to be the
-    UNION of every action's captured page text across the whole journey (see
-    run_gui_journeys.py), not just the final one — the harness has no
+    UNION of every captured page text across the whole journey — each step's
+    opening snapshot, `read` observations, per-action captures, and the final
+    capture (`page_text_history` in run_gui_journeys.py), not just the final
+    or per-action ones: error/guidance copy that renders between actions and
+    is replaced before the next one (e.g. ManifestTab's missing-manifest
+    guidance, swapped for the export outcome by an Export click) exists ONLY
+    in the opening/read captures — the harness has no
     timestamp/index correlation between a specific `invoke_log` rejection and
     a specific action, so rather than risk a false positive from an
     under-scoped window, this checks the widest reasonable "at-or-after the
