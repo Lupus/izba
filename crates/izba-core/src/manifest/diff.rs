@@ -41,6 +41,53 @@ fn image_str(i: &ImageSource) -> String {
     }
 }
 
+/// Human `from`/`to` for the ports field: the CLI flag syntax
+/// (`BIND:HOST:GUEST`), one rule per line so diff renderers can compare
+/// line-wise. NOT the derived `Debug` of `Vec<PortRule>`, which leaked Rust
+/// struct syntax into `izba diff` and the app's Manifest tab.
+fn ports_str(ports: &[crate::state::PortRule]) -> String {
+    if ports.is_empty() {
+        return "(none)".into();
+    }
+    ports
+        .iter()
+        .map(|p| format!("{}:{}:{}", p.bind, p.host_port, p.guest_port))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A volume size in the CLI flag units (`10g` / `512m`), falling back to raw
+/// bytes for a value neither unit divides (never produced by the flag parser,
+/// but honest if it appears).
+fn size_str(bytes: u64) -> String {
+    if bytes > 0 && bytes.is_multiple_of(1 << 30) {
+        format!("{}g", bytes >> 30)
+    } else if bytes > 0 && bytes.is_multiple_of(1 << 20) {
+        format!("{}m", bytes >> 20)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// Human `from`/`to` for the volumes field: the CLI flag syntax
+/// (`[NAME:]GUEST_PATH:SIZE`), one volume per line. See `ports_str`.
+fn volumes_str(vols: &[crate::volume::VolumeSpec]) -> String {
+    if vols.is_empty() {
+        return "(none)".into();
+    }
+    vols.iter()
+        .map(|v| {
+            let path = v.guest_path.display();
+            let size = size_str(v.size_bytes);
+            match &v.name {
+                Some(n) => format!("{n}:{path}:{size}"),
+                None => format!("{path}:{size}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Build a (host, port) -> max-access view of an allow-list for comparison.
 ///
 /// Expanding to per-port rows prevents the old host-keyed last-wins collapse:
@@ -138,8 +185,8 @@ pub fn diff(from: &Normalized, to: &Normalized) -> Vec<FieldDelta> {
     if from.ports != to.ports {
         out.push(FieldDelta {
             field: "ports".into(),
-            from: format!("{:?}", from.ports),
-            to: format!("{:?}", to.ports),
+            from: ports_str(&from.ports),
+            to: ports_str(&to.ports),
             class: FieldClass::Live,
             weakens_egress: false,
         });
@@ -147,8 +194,8 @@ pub fn diff(from: &Normalized, to: &Normalized) -> Vec<FieldDelta> {
     if from.volumes != to.volumes {
         out.push(FieldDelta {
             field: "volumes".into(),
-            from: format!("{:?}", from.volumes),
-            to: format!("{:?}", to.volumes),
+            from: volumes_str(&from.volumes),
+            to: volumes_str(&to.volumes),
             class: FieldClass::Live,
             weakens_egress: false,
         });
@@ -269,6 +316,73 @@ mod tests {
         let d = diff(&base(), &to);
         assert_eq!(d[0].field, "ports");
         assert_eq!(d[0].class, FieldClass::Live);
+    }
+
+    /// Port deltas render in the CLI flag syntax (`BIND:HOST:GUEST`, one rule
+    /// per line) — never `Vec<PortRule>`'s Rust `Debug` output, which is what
+    /// users used to see in `izba diff` and the app's Manifest tab.
+    #[test]
+    fn port_delta_renders_flag_syntax_one_per_line() {
+        let mut to = base();
+        to.ports = vec![
+            PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: 8080,
+                guest_port: 80,
+            },
+            PortRule {
+                bind: "0.0.0.0".parse().unwrap(),
+                host_port: 9000,
+                guest_port: 90,
+            },
+        ];
+        let d = diff(&base(), &to);
+        assert_eq!(d[0].from, "(none)");
+        assert_eq!(d[0].to, "127.0.0.1:8080:80\n0.0.0.0:9000:90");
+        assert!(
+            !d[0].to.contains("PortRule"),
+            "no Rust Debug syntax in user-facing delta: {:?}",
+            d[0].to
+        );
+    }
+
+    /// Volume deltas render in the CLI flag syntax (`[NAME:]GUEST_PATH:SIZE`,
+    /// one per line) with `g`/`m` size units matching `parse_size`.
+    #[test]
+    fn volume_delta_renders_flag_syntax_one_per_line() {
+        use crate::volume::VolumeSpec;
+        let mut to = base();
+        to.volumes = vec![
+            VolumeSpec {
+                name: Some("cache".into()),
+                guest_path: "/data".into(),
+                size_bytes: 1 << 30,
+                eph_id: None,
+            },
+            VolumeSpec {
+                name: None,
+                guest_path: "/scratch".into(),
+                size_bytes: 512 << 20,
+                eph_id: None,
+            },
+        ];
+        let d = diff(&base(), &to);
+        assert_eq!(d[0].from, "(none)");
+        assert_eq!(d[0].to, "cache:/data:1g\n/scratch:512m");
+        assert!(
+            !d[0].to.contains("VolumeSpec"),
+            "no Rust Debug syntax in user-facing delta: {:?}",
+            d[0].to
+        );
+    }
+
+    /// `size_str` unit selection: whole GiB wins over MiB, and a value neither
+    /// unit divides falls back to honest raw bytes.
+    #[test]
+    fn size_str_picks_largest_exact_unit() {
+        assert_eq!(size_str(2 << 30), "2g");
+        assert_eq!(size_str(512 << 20), "512m");
+        assert_eq!(size_str((1 << 30) + 1), "1073741825 bytes");
     }
 
     #[test]
