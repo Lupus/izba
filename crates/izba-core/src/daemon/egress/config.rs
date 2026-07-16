@@ -8,10 +8,11 @@
 //! `enforce: false` materialized on first arm — the one-representation
 //! invariant that kills the empty-vs-missing-file footgun.
 //!
-//! Domains are EXACT-match in M2 (the shipped `egress.rego` matches on `in`).
-//! Wildcard rules (`*.`/`**.`, see [`super::dns_snoop::allowlist_matches`]) are
-//! a planned extension; `from_yaml` accepts them syntactically so a policy
-//! written today keeps parsing once enforcement lands.
+//! Host matching supports exact names plus Cilium-style wildcards (`*.x` =
+//! exactly one extra label, `**.x` = any depth; the apex itself never matches
+//! a wildcard). Wildcards compile to `wildcard_host_rules` in the Rego data
+//! doc and are matched by `glob.match` in `egress.rego`; malformed patterns
+//! are rejected loudly by [`validate_host_pattern`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
