@@ -89,7 +89,7 @@ Mechanism (Cilium toFQDNs + Azure Firewall network rules):
    the connection that prompted the lookup. Re-resolution refreshes.
 3. On `TcpConnect{addr=IP}`: look up which FQDN(s) *this sandbox* resolved to
    that IP, match against the allow-list (exact / `*.x` one-label / `**.x` any
-   depth, Cilium semantics)*(Shipped: matched in `egress.rego` via `glob.match`
+   depth, Cilium semantics) *(Shipped: matched in `egress.rego` via `glob.match`
    with a `.` delimiter — one canonical matcher for both MITM and snoop tiers)*,
    Allow/Deny + **audit record**.
 4. **No snoop record ⇒ default-Deny.** An agent dialing a raw IP it never
