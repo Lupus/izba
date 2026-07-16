@@ -295,4 +295,22 @@ describe("PolicyEditor", () => {
     await waitFor(() => expect(screen.getByText(/foo\.\*\.com/)).toBeInTheDocument());
     expect(api.policySetFull).not.toHaveBeenCalled();
   });
+
+  it("rejects a wildcard pattern containing glob metacharacters before saving", async () => {
+    // *.git{hub.com,evil.com} looks like a well-formed leading-'*.' wildcard
+    // but `{}` is a wax glob alternation metacharacter — regorus glob.match
+    // would treat it as matching either "githu.com" branch, silently
+    // widening egress far beyond what the pattern's author intended.
+    (api.policyShow as Mock).mockResolvedValue({ enforcing: true, allow: [], git: [] });
+    render(<PolicyEditor name="web" />);
+    fireEvent.click(await screen.findByRole("button", { name: /Add host/i }));
+    fireEvent.change(screen.getByPlaceholderText(/example\.com/i), {
+      target: { value: "*.git{hub.com,evil.com}" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/git\{hub\.com,evil\.com\}/)).toBeInTheDocument(),
+    );
+    expect(api.policySetFull).not.toHaveBeenCalled();
+  });
 });

@@ -679,7 +679,18 @@ fn parse_git_rule(i: usize, v: &serde_yaml::Value) -> Result<GitRule> {
 /// with `*.` (one label) / `**.` (any depth) as the LEADING label only.
 /// Anything else fails loudly — under M2 a malformed pattern was accepted
 /// and silently never matched, which is a security footgun.
+///
+/// For WILDCARD patterns only, the remainder after the `*.`/`**.` prefix is
+/// further restricted to ASCII alphanumerics, `-`, `.`, and `_`: wildcard
+/// patterns are fed verbatim to regorus `glob.match` (the `wax` engine),
+/// which treats `{}`, `[]`, `?`, `<>` (and more) as glob metacharacters —
+/// e.g. `*.git{hub.com,evil.com}` would otherwise validate as a well-formed
+/// wildcard yet actually match far more than intended (`api.gitevil.com`),
+/// silently widening egress. EXACT hosts (no `*` anywhere) are UNCHANGED by
+/// this: they are matched by literal map-key equality, never globbed, and
+/// may legitimately contain other characters (e.g. `:` in an IPv6 literal).
 pub fn validate_host_pattern(host: &str) -> Result<()> {
+    let is_wildcard = host.starts_with("*.") || host.starts_with("**.");
     let rest = host
         .strip_prefix("**.")
         .or_else(|| host.strip_prefix("*."))
@@ -691,7 +702,25 @@ pub fn validate_host_pattern(host: &str) -> Result<()> {
              '**.example.com', or an exact host like 'api.example.com'"
         );
     }
+    if is_wildcard {
+        if let Some(bad) = rest.chars().find(|c| !is_wildcard_remainder_char(*c)) {
+            anyhow::bail!(
+                "invalid host pattern '{host}': wildcard remainder '{rest}' contains \
+                 '{bad}', which regorus glob.match treats as a metacharacter — only \
+                 ASCII alphanumerics, '-', '.', and '_' are allowed after the \
+                 '*.'/'**.' prefix"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Charset allowed in a wildcard pattern's remainder (after the `*.`/`**.`
+/// prefix is stripped): ASCII alphanumeric, `-`, `.`, `_` — real hostname
+/// characters (underscore occurs in internal DNS names), none of which are
+/// wax glob metacharacters.
+fn is_wildcard_remainder_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_'
 }
 
 /// Load a sandbox's policy (or default-empty), apply `f`, persist the result to
@@ -1624,6 +1653,8 @@ mod tests {
             "**.example.com",
             "*.x",
             "localhost",
+            "*.my-host.internal",
+            "*.foo_bar.corp",
         ] {
             assert!(validate_host_pattern(ok).is_ok(), "{ok} must be accepted");
         }
@@ -1636,6 +1667,10 @@ mod tests {
             "*foo.com",
             "api.*",
             "a.**.b",
+            "*.git{hub.com,evil.com}",
+            "*.githu?.com",
+            "*.githu[bc].com",
+            "**.a<b>.com",
         ] {
             let err = validate_host_pattern(bad).expect_err(&format!("{bad} must be rejected"));
             let msg = format!("{err:#}");
@@ -1643,6 +1678,34 @@ mod tests {
             assert!(
                 msg.contains("*."),
                 "error must show the accepted forms: {msg}"
+            );
+        }
+    }
+
+    /// The glob-metacharacter rejects specifically: these patterns pass the
+    /// "leading `*.`/`**.` only" check but must be caught by the wildcard
+    /// remainder charset check, since regorus `glob.match`'s `wax` engine
+    /// treats `{}`, `[]`, `?`, `<>` as metacharacters — see
+    /// `glob_metacharacters_widen_scope_hence_validation` in policy.rs for
+    /// proof that an unvalidated pattern like this actually over-matches.
+    #[test]
+    fn validate_host_pattern_rejects_glob_metacharacters_in_wildcard_remainder() {
+        for (bad, offending) in [
+            ("*.git{hub.com,evil.com}", '{'),
+            ("*.githu?.com", '?'),
+            ("*.githu[bc].com", '['),
+            ("**.a<b>.com", '<'),
+        ] {
+            let err = validate_host_pattern(bad).expect_err(&format!("{bad} must be rejected"));
+            let msg = format!("{err:#}");
+            assert!(msg.contains(bad), "error must name the pattern: {msg}");
+            assert!(
+                msg.contains(offending),
+                "error must name the offending character '{offending}': {msg}"
+            );
+            assert!(
+                msg.contains("metacharacter") || msg.contains("only ASCII"),
+                "error must explain the allowed charset: {msg}"
             );
         }
     }

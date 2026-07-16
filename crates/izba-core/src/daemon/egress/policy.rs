@@ -797,4 +797,30 @@ mod tests {
             "web must not inherit build's per-sandbox wildcard"
         );
     }
+
+    /// WHY the config.rs charset validation matters: `glob.match`'s `wax`
+    /// engine treats `{}` as an alternation metacharacter, so a pattern like
+    /// `*.git{hub.com,evil.com}` — which `validate_host_pattern` now rejects
+    /// before it ever reaches this data doc — would, if it slipped through
+    /// (e.g. a pre-fix policy.yaml on disk), match `api.gitevil.com`: real
+    /// egress-scope widening, not a theoretical concern. This pins the Rego
+    /// engine's actual behavior on that unvalidated pattern.
+    #[test]
+    fn glob_metacharacters_widen_scope_hence_validation() {
+        let p = wildcard_policy(
+            "web",
+            serde_json::json!([{
+                "pattern": "*.git{hub.com,evil.com}",
+                "ports": [80, 443],
+                "access": "read-write"
+            }]),
+        );
+        assert_eq!(
+            p.check(&l7_get("web", "api.gitevil.com", 443)),
+            Verdict::Allow,
+            "wax's '{{}}' alternation metacharacter widens the match far beyond \
+             what the pattern's author intended — proof that config.rs's \
+             validate_host_pattern MUST reject this pattern"
+        );
+    }
 }

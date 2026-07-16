@@ -45,11 +45,20 @@ function toGitRule(target: string, access: Access): GitRule {
 }
 
 /** Mirror of the daemon's validate_host_pattern: '*' only as a leading
- *  '*.'/'**.' label. The daemon re-validates on save — this is UX only. */
+ *  '*.'/'**.' label, and — for wildcard patterns only — the remainder is
+ *  restricted to hostname characters (regorus glob.match's `wax` engine
+ *  treats `{}[]?<>` etc. as metacharacters, so e.g. `*.git{hub.com,evil.com}`
+ *  would otherwise "validate" yet match far more than intended). Exact hosts
+ *  (no `*` anywhere) are unaffected. The daemon re-validates on save — this
+ *  is UX only. */
 export function hostPatternError(host: string): string | null {
+  const isWildcard = host.startsWith("**.") || host.startsWith("*.");
   const rest = host.startsWith("**.") ? host.slice(3) : host.startsWith("*.") ? host.slice(2) : host;
   if (rest === "" || rest.includes("*")) {
     return `Invalid host pattern "${host}": * is only allowed as a leading *. (one label) or **. (any depth) — e.g. *.example.com`;
+  }
+  if (isWildcard && !/^[a-zA-Z0-9._-]+$/.test(rest)) {
+    return `Invalid host pattern "${host}": wildcard remainder "${rest}" may only contain letters, digits, '-', '.', and '_' — glob metacharacters like {}[]?<> would silently widen what the pattern matches`;
   }
   return null;
 }
