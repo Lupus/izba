@@ -44,6 +44,16 @@ function toGitRule(target: string, access: Access): GitRule {
   return target.includes("/") ? { repo: target, access } : { host: target, access };
 }
 
+/** Mirror of the daemon's validate_host_pattern: '*' only as a leading
+ *  '*.'/'**.' label. The daemon re-validates on save — this is UX only. */
+export function hostPatternError(host: string): string | null {
+  const rest = host.startsWith("**.") ? host.slice(3) : host.startsWith("*.") ? host.slice(2) : host;
+  if (rest === "" || rest.includes("*")) {
+    return `Invalid host pattern "${host}": * is only allowed as a leading *. (one label) or **. (any depth) — e.g. *.example.com`;
+  }
+  return null;
+}
+
 /** Per-host ports shown as removable chips plus a numeric "add port" field. */
 function PortEditor({
   ports,
@@ -230,6 +240,15 @@ export function PolicyEditor({ name }: { name: string }) {
     setError(null);
     setSaved(false);
     try {
+      for (const r of hosts) {
+        const h = r.host.trim();
+        if (h === "") continue;
+        const bad = hostPatternError(h);
+        if (bad) {
+          setError(bad);
+          return;
+        }
+      }
       const allow: AllowEntry[] = hosts
         .filter((r) => r.host.trim() !== "")
         .map((r) => ({ host: r.host.trim(), ports: r.ports, access: r.access }));
@@ -258,7 +277,9 @@ export function PolicyEditor({ name }: { name: string }) {
         <div className="flex flex-col gap-3 pb-3">
           <Section title="Hosts">
             <p className="mb-2 text-sm text-muted-foreground">
-              Hosts this sandbox may reach. Add a port to a host, or remove one with its ✕.
+              Hosts this sandbox may reach — exact (api.example.com) or wildcard
+              (*.example.com = one subdomain label, **.example.com = any depth; the
+              apex needs its own entry). Add a port to a host, or remove one with its ✕.
             </p>
             <EditableList
               density="card"
@@ -270,7 +291,7 @@ export function PolicyEditor({ name }: { name: string }) {
                     <Input
                       value={r.host}
                       onChange={(e) => setHost(i, e.target.value)}
-                      placeholder="api.example.com"
+                      placeholder="api.example.com or *.example.com"
                       className="flex-1 font-mono text-sm"
                     />
                   </div>
