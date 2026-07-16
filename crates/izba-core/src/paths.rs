@@ -153,6 +153,25 @@ pub fn create_dir_700(path: &Path, root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A path rendered for HUMANS: `Path::display()` minus the Windows verbatim
+/// prefix that `std::fs::canonicalize` bakes in (`\\?\C:\x` → `C:\x`,
+/// `\\?\UNC\srv\share` → `\\srv\share`). Recorded workspaces on Windows carry
+/// the prefix (they are canonicalized at create time), so every user-facing
+/// print of one goes through here. Display-only — never feed the result back
+/// into filesystem calls, the verbatim form is the correct one for those.
+/// String-based on purpose: works identically on all hosts, so Unix builds
+/// exercise the same code the Windows app ships.
+pub fn display_path(p: &Path) -> String {
+    let s = p.display().to_string();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s
+    }
+}
+
 /// Both platform rules always compile (`cfg!`, not `#[cfg]`) so each is
 /// unit-tested regardless of the build target.
 fn default_root(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
@@ -399,6 +418,26 @@ mod tests {
         assert!(err.contains("IZBA_DATA_DIR"), "{err}");
         assert!(err.contains("108"), "{err}");
         assert!(err.contains("72"), "{err}");
+    }
+
+    #[test]
+    fn display_path_strips_windows_verbatim_prefixes() {
+        // Drive-letter verbatim (what canonicalize produces on Windows).
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\u\proj")),
+            r"C:\Users\u\proj"
+        );
+        // Verbatim UNC keeps its network-share shape.
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\srv\share\dir")),
+            r"\\srv\share\dir"
+        );
+        // Non-verbatim paths pass through untouched.
+        assert_eq!(display_path(Path::new("/home/u/proj")), "/home/u/proj");
+        assert_eq!(
+            display_path(Path::new(r"C:\Users\u\proj")),
+            r"C:\Users\u\proj"
+        );
     }
 
     #[test]
