@@ -604,7 +604,10 @@ fn parse_allow_entry(i: usize, v: &serde_yaml::Value) -> Result<AllowEntry> {
     use serde_yaml::Value;
     match v {
         // Bare host string → default web ports, read-write.
-        Value::String(s) => Ok(AllowEntry::Host(s.clone())),
+        Value::String(s) => {
+            validate_host_pattern(s).with_context(|| format!("allow[{i}]"))?;
+            Ok(AllowEntry::Host(s.clone()))
+        }
         Value::Mapping(m) => {
             let mut host = None;
             let mut ports = None;
@@ -621,6 +624,7 @@ fn parse_allow_entry(i: usize, v: &serde_yaml::Value) -> Result<AllowEntry> {
             }
             let host =
                 host.ok_or_else(|| anyhow::anyhow!("allow[{i}]: missing required key 'host'"))?;
+            validate_host_pattern(&host).with_context(|| format!("allow[{i}]"))?;
             Ok(AllowEntry::Scoped {
                 host,
                 ports,
@@ -670,6 +674,25 @@ fn parse_git_rule(i: usize, v: &serde_yaml::Value) -> Result<GitRule> {
     Ok(GitRule { target, access })
 }
 
+/// Validate an allow-entry host: an exact hostname (no `*`) or a wildcard
+/// with `*.` (one label) / `**.` (any depth) as the LEADING label only.
+/// Anything else fails loudly — under M2 a malformed pattern was accepted
+/// and silently never matched, which is a security footgun.
+pub fn validate_host_pattern(host: &str) -> Result<()> {
+    let rest = host
+        .strip_prefix("**.")
+        .or_else(|| host.strip_prefix("*."))
+        .unwrap_or(host);
+    if rest.is_empty() || rest.contains('*') {
+        anyhow::bail!(
+            "invalid host pattern '{host}': '*' is only allowed as a leading '*.' \
+             (one subdomain label) or '**.' (any depth) — e.g. '*.example.com', \
+             '**.example.com', or an exact host like 'api.example.com'"
+        );
+    }
+    Ok(())
+}
+
 /// Load a sandbox's policy (or default-empty), apply `f`, persist the result to
 /// the sandbox's `policy.yaml`, and return the new config so the caller can
 /// decide whether to fire a `ReloadPolicy`.
@@ -679,6 +702,9 @@ pub fn edit_policy_file(
 ) -> Result<EgressPolicyConfig> {
     let mut cfg = EgressPolicyConfig::load(sandbox_dir)?.unwrap_or_default();
     f(&mut cfg);
+    for e in &cfg.allow {
+        validate_host_pattern(e.host())?;
+    }
     let path = EgressPolicyConfig::path_in(sandbox_dir);
     std::fs::write(&path, cfg.to_yaml()).with_context(|| format!("writing {}", path.display()))?;
     Ok(cfg)
@@ -1585,5 +1611,77 @@ mod tests {
             query: None,
         };
         assert_eq!(p.check(&f), Verdict::Allow);
+    }
+
+    // ── Task 3: Loud validation of host patterns ──────────────────────────
+
+    #[test]
+    fn validate_host_pattern_matrix() {
+        for ok in [
+            "api.example.com",
+            "*.example.com",
+            "**.example.com",
+            "*.x",
+            "localhost",
+        ] {
+            assert!(validate_host_pattern(ok).is_ok(), "{ok} must be accepted");
+        }
+        for bad in [
+            "*",
+            "**",
+            "*.",
+            "**.",
+            "foo.*.com",
+            "*foo.com",
+            "api.*",
+            "a.**.b",
+        ] {
+            let err = validate_host_pattern(bad).expect_err(&format!("{bad} must be rejected"));
+            let msg = format!("{err:#}");
+            assert!(msg.contains(bad), "error must name the entry: {msg}");
+            assert!(
+                msg.contains("*."),
+                "error must show the accepted forms: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_yaml_rejects_malformed_wildcard_loudly() {
+        let err = EgressPolicyConfig::from_yaml("allow:\n  - 'foo.*.com'\n")
+            .expect_err("mid-label wildcard must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("allow[0]"),
+            "must name the entry position: {msg}"
+        );
+        assert!(
+            msg.contains("foo.*.com"),
+            "must name the offending value: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_yaml_accepts_wildcard_entries() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "allow:\n  - '*.example.com'\n  - host: '**.example.com'\n    ports: [443]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.allow[0].host(), "*.example.com");
+        assert_eq!(cfg.allow[1].host(), "**.example.com");
+    }
+
+    #[test]
+    fn edit_policy_file_rejects_malformed_pattern_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = edit_policy_file(dir.path(), |cfg| {
+            cfg.allow("foo.*.com", 443);
+        })
+        .expect_err("malformed pattern must not be persisted");
+        assert!(format!("{err:#}").contains("foo.*.com"));
+        assert!(
+            !EgressPolicyConfig::path_in(dir.path()).exists(),
+            "no policy.yaml stub may be left behind"
+        );
     }
 }
