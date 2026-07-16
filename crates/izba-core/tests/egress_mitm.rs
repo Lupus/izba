@@ -205,3 +205,109 @@ fn mitm_firewall_allows_and_denies_by_decrypted_host() {
         );
     });
 }
+
+/// Wildcard allow entries enforce through the real MITM path: the policy is
+/// compiled from `policy.yaml` text (YAML -> data doc -> Rego), a one-label
+/// wildcard admits `api.example.test` and refuses both the apex and a
+/// deeper subdomain on the decrypted Host.
+#[test]
+fn mitm_firewall_enforces_wildcard_hosts() {
+    install_ring();
+    if !can_bind() {
+        eprintln!("SKIP mitm_firewall_enforces_wildcard_hosts: bind denied");
+        return;
+    }
+
+    // The fake upstream's own CA (created sync so the MITM upstream config can
+    // trust it before the runtime starts).
+    let up_ca = IzbaCa::generate().unwrap();
+    let up_ca_der: CertificateDer<'static> = up_ca.cert_der();
+    let up_cache = Arc::new(CertCache::new(up_ca));
+    let mut up_roots = rustls::RootCertStore::empty();
+    up_roots.add(up_ca_der).unwrap();
+    let upstream_cfg = upstream_client_config(up_roots);
+
+    // The izba CA the guest trusts + the cert cache that signs the leaves.
+    let izba_ca = IzbaCa::generate().unwrap();
+    let izba_ca_der = izba_ca.cert_der();
+    let izba_certs = Arc::new(CertCache::new(izba_ca));
+
+    // Start the MITM runtime (sync context — its own runtime can block_on bind).
+    let audit =
+        izba_core::daemon::egress::audit::AuditSink::new(izba_core::paths::Paths::with_root(
+            std::env::temp_dir().join("izba-egress-mitm-wildcard-test-audit"),
+        ));
+    let mitm = MitmRuntime::start(izba_certs, upstream_cfg, audit).expect("start MITM runtime");
+
+    // Guest rustls config: trusts ONLY the izba CA (proves leaves chain to it).
+    let mut guest_roots = rustls::RootCertStore::empty();
+    guest_roots.add(izba_ca_der).unwrap();
+    let mut gcfg = rustls::ClientConfig::builder()
+        .with_root_certificates(guest_roots)
+        .with_no_client_auth();
+    gcfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let gcfg = Arc::new(gcfg);
+
+    // Drive the guest-side async work on a dedicated runtime (kept separate from
+    // the MITM runtime; both drop cleanly in this sync test).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let up_port = spawn_upstream(up_cache, "UPSTREAM-PONG").await;
+
+        // Policy compiled from YAML text through the real from_yaml -> data doc
+        // -> Rego pipeline: a one-label wildcard on `example.test`. M2.1 is
+        // port-aware (see `mitm_firewall_allows_and_denies_by_decrypted_host`
+        // above), so the scoped `ports:` names the (ephemeral) upstream port
+        // this test actually dials — the bare-string form from the task brief
+        // would default to [80, 443], which this loopback fixture never binds.
+        let cfg = izba_core::daemon::egress::config::EgressPolicyConfig::from_yaml(&format!(
+            "enforce: true\nallow:\n  - host: '*.example.test'\n    ports: [{up_port}]\n"
+        ))
+        .unwrap();
+        let policy = cfg.into_policy("web").unwrap();
+
+        // ALLOW: api.example.test is one label under the wildcard -> 200 from upstream.
+        let allowed = guest_request(
+            &mitm,
+            &policy,
+            &gcfg,
+            "api.example.test",
+            up_port,
+            "GET /v1/messages",
+        )
+        .await;
+        assert!(allowed.contains("200 OK"), "allowed flow status: {allowed}");
+        assert!(
+            allowed.contains("UPSTREAM-PONG"),
+            "allowed flow body must come from the real upstream through the MITM: {allowed}"
+        );
+
+        // DENY: example.test is the apex, which a wildcard never matches -> 403.
+        let denied_apex =
+            guest_request(&mitm, &policy, &gcfg, "example.test", up_port, "GET /x").await;
+        assert!(
+            denied_apex.contains("403"),
+            "apex flow status: {denied_apex}"
+        );
+        assert!(
+            denied_apex.contains("izba egress policy"),
+            "apex flow must be izbad's synthesized 403: {denied_apex}"
+        );
+
+        // DENY: a.b.example.test is two labels deep, past the one-label wildcard -> 403.
+        let denied_deep =
+            guest_request(&mitm, &policy, &gcfg, "a.b.example.test", up_port, "GET /x").await;
+        assert!(
+            denied_deep.contains("403"),
+            "deep flow status: {denied_deep}"
+        );
+        assert!(
+            denied_deep.contains("izba egress policy"),
+            "deep flow must be izbad's synthesized 403: {denied_deep}"
+        );
+    });
+}
