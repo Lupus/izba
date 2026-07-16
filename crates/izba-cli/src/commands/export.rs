@@ -21,7 +21,12 @@ pub fn run(paths: &Paths, target: Option<&str>, name_override: Option<&str>) -> 
         None => r.name,
     };
     let path = izba_core::manifest::ops::export(paths, &dir, &name)?;
-    println!("exported managed truth -> {}", path.display());
+    // display_path: a Windows workspace recorded canonicalized carries the
+    // `\\?\` verbatim prefix — correct for I/O, noise for humans.
+    println!(
+        "exported managed truth -> {}",
+        izba_core::paths::display_path(&path)
+    );
     Ok(0)
 }
 
