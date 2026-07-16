@@ -9,6 +9,15 @@ vi.mock("../lib/ipc", () => ({
     stop: vi.fn().mockResolvedValue(undefined),
     restart: vi.fn().mockResolvedValue(undefined),
     remove: vi.fn().mockResolvedValue(undefined),
+    // Consumed by the WorkspacePath line on the Overview tab.
+    inspect: vi.fn().mockResolvedValue({
+      name: "web",
+      image: "ubuntu:24.04",
+      status: "running",
+      workspace: "C:\\Users\\u\\proj",
+      ports: [],
+      volumes: [],
+    }),
   },
 }));
 
@@ -38,6 +47,12 @@ describe("Detail", () => {
     render(<Detail sandbox={sbx} onChanged={noop} />);
     expect(screen.getByText("web")).toBeInTheDocument();
     expect(screen.getByText("ubuntu:24.04")).toBeInTheDocument();
+  });
+
+  it("shows the workspace path on the Overview tab", async () => {
+    const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
+    render(<Detail sandbox={sbx} onChanged={noop} />);
+    expect(await screen.findByText("C:\\Users\\u\\proj")).toBeInTheDocument();
   });
 
   it("surfaces the degraded reason", () => {

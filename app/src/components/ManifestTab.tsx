@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import type { DeltaView, DiffView, DriftState, PromoteView } from "../lib/types";
 import { api } from "../lib/ipc";
+import { diffLines } from "../lib/linediff";
+import { WorkspacePath } from "./WorkspacePath";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -111,11 +113,52 @@ function mapPromoteWarning(message: string): string {
   return message;
 }
 
-/** The per-field delta table (or its "nothing changed" placeholder), shared
- *  by the tab body and the promote confirm dialog's delta list. Hoisted out
- *  of `ManifestTab` (rust:S3776-equivalent typescript:S3776) so the ternary +
- *  `.map` + weakens-egress conditional it contains don't add to that
- *  component's cognitive complexity; behavior/markup is unchanged. */
+/** Side-by-side, line-aligned From/To rendering of one delta's values with
+ *  the actual differences highlighted: removed lines tint red on the From
+ *  side, added lines green on the To side, common lines stay plain. The
+ *  values are multi-line strings (egress policy YAML, one port/volume rule
+ *  per line), so `whitespace-pre-wrap` is load-bearing — without it the
+ *  newlines collapse into the wall of text the field report showed. Each
+ *  visual row is one CSS grid row, so wrapped lines keep the two sides
+ *  height-aligned. Index keys are safe: rows are a pure recompute of
+ *  (from, to) with no per-row state. */
+function ValueDiff({ from, to }: Readonly<{ from: string; to: string }>) {
+  const rows = diffLines(from, to);
+  return (
+    <div className="grid grid-cols-2 gap-x-4 font-mono text-xs leading-5">
+      <div className="pb-0.5 font-sans text-muted-foreground-2">From</div>
+      <div className="pb-0.5 font-sans text-muted-foreground-2">To</div>
+      {rows.map((r, i) => (
+        <Fragment key={`${i}-${r.from ?? ""}-${r.to ?? ""}`}>
+          <div
+            className={
+              "whitespace-pre-wrap break-all rounded-sm px-1 " +
+              (r.changed && r.from !== null
+                ? "bg-destructive/10 text-destructive"
+                : "text-muted-foreground")
+            }
+          >
+            {r.from ?? " "}
+          </div>
+          <div
+            className={
+              "whitespace-pre-wrap break-all rounded-sm px-1 " +
+              (r.changed && r.to !== null ? "bg-success/10 text-success" : "")
+            }
+          >
+            {r.to ?? " "}
+          </div>
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
+/** The per-field delta list (or its "nothing changed" placeholder), shared by
+ *  the tab body and the promote confirm dialog: one block per field — name +
+ *  class badge + weakens-egress flag on the header line, then the highlighted
+ *  `ValueDiff` under it. Hoisted out of `ManifestTab` (typescript:S3776) so
+ *  its conditionals don't add to that component's cognitive complexity. */
 function DeltaTable({ deltas }: Readonly<{ deltas: DeltaView[] }>) {
   if (deltas.length === 0) {
     return (
@@ -125,33 +168,22 @@ function DeltaTable({ deltas }: Readonly<{ deltas: DeltaView[] }>) {
     );
   }
   return (
-    <table className="w-full text-sm">
-      <thead>
-        <tr className="text-left text-xs text-muted-foreground-2">
-          <th className="pb-1 font-normal">Field</th>
-          <th className="pb-1 font-normal">From</th>
-          <th className="pb-1 font-normal">To</th>
-          <th className="pb-1 font-normal" />
-        </tr>
-      </thead>
-      <tbody>
-        {deltas.map((d) => (
-          <tr key={d.field} className="border-t border-border">
-            <td className="py-2 font-mono">{d.field}</td>
-            <td className="py-2 pl-2 font-mono text-muted-foreground">{d.from}</td>
-            <td className="py-2 pl-2 font-mono">{d.to}</td>
-            <td className="py-2 pl-2">
-              <span className="inline-flex items-center gap-2">
-                <Badge variant="secondary" title={CLASS_TOOLTIP[d.class]}>
-                  {d.class}
-                </Badge>
-                {d.weakens_egress && <span className="text-destructive">⚠ weakens egress</span>}
-              </span>
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <div className="flex flex-col text-sm">
+      {deltas.map((d) => (
+        <div key={d.field} className="border-t border-border py-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-mono">{d.field}</span>
+            <Badge variant="secondary" title={CLASS_TOOLTIP[d.class]}>
+              {d.class}
+            </Badge>
+            {d.weakens_egress && <span className="text-destructive">⚠ weakens egress</span>}
+          </div>
+          <div className="mt-1.5">
+            <ValueDiff from={d.from} to={d.to} />
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -338,6 +370,8 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
         </Button>
       </div>
 
+      <WorkspacePath name={name} />
+
       {error && !missingManifest && <div className="text-sm text-destructive">{error}</div>}
 
       {missingManifest && (
@@ -376,22 +410,7 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
             <div className="flex flex-col gap-3 text-sm">
               <div>The following changes will be applied to &apos;{name}&apos;:</div>
 
-              <ul className="flex flex-col gap-1">
-                {pendingDeltas.map((d) => (
-                  <li key={d.field} className="flex items-center gap-2">
-                    <span className="font-mono">{d.field}</span>
-                    <span className="text-muted-foreground">
-                      {d.from} → {d.to}
-                    </span>
-                    <Badge variant="secondary" title={CLASS_TOOLTIP[d.class]}>
-                      {d.class}
-                    </Badge>
-                    {d.weakens_egress && (
-                      <span className="text-destructive">⚠ weakens egress</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
+              <DeltaTable deltas={pendingDeltas} />
 
               {showRestartNote && (
                 <div className="text-muted-foreground-2">{RESTART_NOTE}</div>

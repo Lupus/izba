@@ -372,12 +372,15 @@ pub fn manifest_diff_core(name: &str) -> Result<DiffView, String> {
 }
 
 /// Core of `manifest_export`: write the managed truth back into the sandbox's
-/// recorded workspace `izba.yml` and return the path written as a string.
+/// recorded workspace `izba.yml` and return the path written as a string —
+/// human-rendered via `display_path` (a Windows workspace recorded
+/// canonicalized carries the `\\?\` verbatim prefix, which leaked into the
+/// "Exported to ..." confirmation as `\\?\C:\...`).
 pub fn manifest_export_core(name: &str) -> Result<String, String> {
     let paths = app_paths();
     let ws = workspace_for(&paths, name)?;
     izba_core::manifest::ops::export(&paths, &ws, name)
-        .map(|p| p.display().to_string())
+        .map(|p| izba_core::paths::display_path(&p))
         .map_err(|e| e.to_string())
 }
 

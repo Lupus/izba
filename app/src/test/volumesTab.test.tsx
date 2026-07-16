@@ -37,6 +37,7 @@ function makeDetail(overrides: Partial<SandboxDetail> = {}): SandboxDetail {
     name: "mysbx",
     image: "ubuntu:24.04",
     status: "running",
+    workspace: "/ws",
     ports: [],
     volumes: [],
     ...overrides,

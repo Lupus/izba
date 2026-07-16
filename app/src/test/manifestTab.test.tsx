@@ -9,6 +9,15 @@ vi.mock("../lib/ipc", () => ({
     manifestDiff: vi.fn(),
     manifestExport: vi.fn(),
     manifestPromote: vi.fn(),
+    // Consumed by the WorkspacePath line at the top of the tab.
+    inspect: vi.fn().mockResolvedValue({
+      name: "web",
+      image: "ubuntu:24.04",
+      status: "running",
+      workspace: "/home/u/proj",
+      ports: [],
+      volumes: [],
+    }),
   },
 }));
 
@@ -51,6 +60,74 @@ describe("ManifestTab", () => {
     expect(screen.getByText("live")).toBeInTheDocument();
     expect(screen.getByText("⚠ weakens egress")).toBeInTheDocument();
     expect(api.manifestDiff).toHaveBeenCalledWith("web");
+  });
+
+  it("shows the sandbox's workspace path so the user can locate izba.yml", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({ state: "in_sync", deltas: [] });
+    render(<ManifestTab name="web" running={true} />);
+
+    expect(await screen.findByText("/home/u/proj")).toBeInTheDocument();
+    expect(api.inspect).toHaveBeenCalledWith("web");
+  });
+
+  it("renders a multi-line delta line-by-line and highlights only the added line", async () => {
+    // The field report: egress YAML rendered as one collapsed wall of text
+    // with no indication of what actually differs. Each line must be its own
+    // element, common lines plain, the one added line green on the To side.
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [
+        {
+          field: "egress",
+          from: "enforce: true\nallow:\n- host: a.com\n",
+          to: "enforce: true\nallow:\n- host: a.com\n- host: b.com\n",
+          class: "live",
+          weakens_egress: true,
+        },
+      ],
+    });
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("egress");
+
+    // Common lines appear once per side, unhighlighted.
+    const common = screen.getAllByText("- host: a.com");
+    expect(common).toHaveLength(2);
+    for (const el of common) {
+      expect(el.className).not.toContain("bg-success");
+      expect(el.className).not.toContain("bg-destructive");
+    }
+    // Only the added line is highlighted, on the To side.
+    const added = screen.getByText("- host: b.com");
+    expect(added.className).toContain("bg-success");
+    // Column headers orient the two sides.
+    expect(screen.getByText("From")).toBeInTheDocument();
+    expect(screen.getByText("To")).toBeInTheDocument();
+  });
+
+  it("highlights a removed line on the From side", async () => {
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [
+        {
+          field: "ports",
+          from: "127.0.0.1:8080:80\n127.0.0.1:9000:90",
+          to: "127.0.0.1:8080:80",
+          class: "live",
+          weakens_egress: false,
+        },
+      ],
+    });
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("ports");
+
+    const removed = screen.getByText("127.0.0.1:9000:90");
+    expect(removed.className).toContain("bg-destructive");
+    const kept = screen.getAllByText("127.0.0.1:8080:80");
+    expect(kept).toHaveLength(2);
+    for (const el of kept) {
+      expect(el.className).not.toContain("bg-destructive");
+      expect(el.className).not.toContain("bg-success");
+    }
   });
 
   it("renders the in_sync banner and disables Promote/Export with hint titles", async () => {
