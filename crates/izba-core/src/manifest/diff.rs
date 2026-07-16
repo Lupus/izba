@@ -377,12 +377,14 @@ mod tests {
     }
 
     /// `size_str` unit selection: whole GiB wins over MiB, and a value neither
-    /// unit divides falls back to honest raw bytes.
+    /// unit divides falls back to honest raw bytes. Zero is "0 bytes", not
+    /// "0g" — the `bytes > 0` guards are load-bearing (every unit divides 0).
     #[test]
     fn size_str_picks_largest_exact_unit() {
         assert_eq!(size_str(2 << 30), "2g");
         assert_eq!(size_str(512 << 20), "512m");
         assert_eq!(size_str((1 << 30) + 1), "1073741825 bytes");
+        assert_eq!(size_str(0), "0 bytes");
     }
 
     #[test]
