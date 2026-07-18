@@ -131,10 +131,13 @@ Key properties:
   **Working under enforce: allow-list what your tooling needs.** Default-deny
   means a fresh enforcing sandbox can reach *nothing* — including your package
   mirror — so installs and fetches fail until you grant the hosts. Add them
-  first (e.g. `izba policy allow NAME archive.ubuntu.com` for apt on Ubuntu,
-  plus whatever package index or registry you use), or pre-seed them in
-  `policy.yaml`. `izba netlog NAME` lists exactly which endpoints were denied,
-  so the log tells you what to allow next.
+  first (e.g. `izba policy allow NAME archive.ubuntu.com:80` and
+  `izba policy allow NAME security.ubuntu.com:80` for apt on Ubuntu, plus
+  whatever package index or registry you use), or pre-seed them in
+  `policy.yaml`. `izba policy allow` defaults to port 443 (HTTPS), so HTTP-only
+  clients like apt need the `:80` spelled out explicitly — otherwise the fetch
+  still fails with `DENY l7 host:80`. `izba netlog NAME` lists exactly which
+  endpoints were denied, so the log tells you what to allow next.
 - **OCI → erofs + overlay rootfs.** Images are pulled, flattened to a single
   erofs image (read-only), and combined with a sparse ext4 rw disk via
   overlayfs inside the guest. The erofs is content-addressed and shared across
