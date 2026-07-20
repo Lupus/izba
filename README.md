@@ -131,13 +131,13 @@ Key properties:
   **Working under enforce: allow-list what your tooling needs.** Default-deny
   means a fresh enforcing sandbox can reach *nothing* — including your package
   mirror — so installs and fetches fail until you grant the hosts. Add them
-  first (e.g. `izba policy allow NAME archive.ubuntu.com:80` and
-  `izba policy allow NAME security.ubuntu.com:80` for apt on Ubuntu, plus
+  first (e.g. `izba policy allow NAME archive.ubuntu.com` and
+  `izba policy allow NAME security.ubuntu.com` for apt on Ubuntu, plus
   whatever package index or registry you use), or pre-seed them in
-  `policy.yaml`. `izba policy allow` defaults to port 443 (HTTPS), so HTTP-only
-  clients like apt need the `:80` spelled out explicitly — otherwise the fetch
-  still fails with `DENY l7 host:80`. `izba netlog NAME` lists exactly which
-  endpoints were denied, so the log tells you what to allow next.
+  `policy.yaml`. A bare host opens the web ports 80 + 443 — the same meaning
+  it has in `policy.yaml` — while `HOST:PORT` opens exactly that one port.
+  `izba netlog NAME` lists exactly which endpoints were denied, so the log
+  tells you what to allow next.
 - **OCI → erofs + overlay rootfs.** Images are pulled, flattened to a single
   erofs image (read-only), and combined with a sparse ext4 rw disk via
   overlayfs inside the guest. The erofs is content-addressed and shared across
@@ -208,8 +208,8 @@ izba daemon stop                        # stop the daemon; sandboxes keep runnin
 izba netlog  NAME [--summary] [--follow]   # egress audit log; --summary aggregates per endpoint
 izba policy  show NAME                    # print the effective allow-list + enforce posture (on/off)
 izba policy  enforce NAME on|off          # turn the firewall on (default-deny) or off (log-only)
-izba policy  allow NAME HOST[:PORT]       # allow a destination (port defaults to 443); live-reloads
-izba policy  block NAME HOST[:PORT]       # remove a destination (port defaults to 443); live-reloads
+izba policy  allow NAME HOST[:PORT]       # allow a destination (bare host = web ports 80+443); live-reloads
+izba policy  block NAME HOST[:PORT]       # remove a destination (bare host = web ports 80+443); live-reloads
 izba policy  git allow NAME TARGET [--write]  # allow git on a repo/host (clone/fetch; --write adds push)
 izba policy  git block NAME TARGET        # remove a git rule
 izba policy  enable NAME                  # seed the allow-list from observed allowed traffic; live-reloads
