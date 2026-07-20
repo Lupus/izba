@@ -218,7 +218,7 @@ export function PolicyEditor({ name }: { name: string }) {
     editHosts((rs) => rs.map((r, j) => (j === i ? { ...r, ports: r.ports.filter((p) => p !== port) } : r)));
   }
   function addRow() {
-    editHosts((rs) => [...rs, { host: "", ports: [443], access: "read-write" }]);
+    editHosts((rs) => [...rs, { host: "", ports: [...WEB_DEFAULT_PORTS], access: "read-write" }]);
   }
   function removeRow(i: number) {
     editHosts((rs) => rs.filter((_, j) => j !== i));
