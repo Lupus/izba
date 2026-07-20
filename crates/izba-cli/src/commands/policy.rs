@@ -14,6 +14,7 @@ pub enum PolicyCmd {
         name: String,
     },
     /// Add HOST to the sandbox's HTTP(S) allow-list. A bare HOST opens the web ports (80 + 443); HOST:PORT opens exactly that port; access is read-write.
+    /// `*.HOST` matches exactly one subdomain label and `**.HOST` matches any depth; the apex HOST is never matched by a wildcard and needs its own entry.
     /// To actually block anything else, enforcement must be on (see `enforce`).
     /// Auto-reloads a running sandbox.
     Allow {
@@ -23,6 +24,7 @@ pub enum PolicyCmd {
         target: String,
     },
     /// Remove HOST from the allow-list. A bare HOST removes the web ports (80 + 443); HOST:PORT removes exactly that port; auto-reloads.
+    /// `*.HOST` matches exactly one subdomain label and `**.HOST` matches any depth; the apex HOST is never matched by a wildcard and needs its own entry.
     Block {
         /// Sandbox name (or dir)
         name: String,
