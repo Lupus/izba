@@ -1,6 +1,8 @@
 use anyhow::Context;
 use clap::Subcommand;
-use izba_core::daemon::egress::config::{edit_policy_file, Access, EgressPolicyConfig, GitTarget};
+use izba_core::daemon::egress::config::{
+    edit_policy_file, Access, AllowEntry, EgressPolicyConfig, GitTarget,
+};
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
 
@@ -11,24 +13,20 @@ pub enum PolicyCmd {
         /// Sandbox name (or dir)
         name: String,
     },
-    /// Allow an HTTP(S) destination: HOST, a wildcard (*.HOST = one subdomain
-    /// label, **.HOST = any depth; the apex needs its own entry), or
-    /// HOST:PORT (port defaults to 443; access is read-write). To actually
-    /// block anything else, enforcement must be on (see `enforce`).
+    /// Add HOST to the sandbox's HTTP(S) allow-list. A bare HOST opens the web ports (80 + 443); HOST:PORT opens exactly that port; access is read-write.
+    /// To actually block anything else, enforcement must be on (see `enforce`).
     /// Auto-reloads a running sandbox.
     Allow {
         /// Sandbox name (or dir)
         name: String,
-        /// Destination to allow: HOST, *.HOST, **.HOST, or HOST:PORT (port defaults to 443)
+        /// Destination to allow: HOST, *.HOST, **.HOST, or HOST:PORT (bare host = web ports 80+443; :PORT = exactly that port)
         target: String,
     },
-    /// Block a destination: HOST, a wildcard (*.HOST = one subdomain
-    /// label, **.HOST = any depth; the apex needs its own entry), or
-    /// HOST:PORT (port defaults to 443); auto-reloads.
+    /// Remove HOST from the allow-list. A bare HOST removes the web ports (80 + 443); HOST:PORT removes exactly that port; auto-reloads.
     Block {
         /// Sandbox name (or dir)
         name: String,
-        /// Destination to remove: HOST, *.HOST, **.HOST, or HOST:PORT (port defaults to 443)
+        /// Destination to remove: HOST, *.HOST, **.HOST, or HOST:PORT (bare host = web ports 80+443; :PORT = exactly that port)
         target: String,
     },
     /// Seed the allow-list from the sandbox's currently-allowed traffic, then reload
@@ -94,15 +92,15 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
         PolicyCmd::Show { name } => show(paths, name),
         PolicyCmd::Allow { name, target } => {
             let dir = require_sandbox_dir(paths, name)?;
-            let (host, port) = parse_target(target)?;
-            apply_edit(&dir, Edit::Allow, &host, port)?;
+            let (host, ports) = parse_target(target)?;
+            apply_edit(&dir, Edit::Allow, &host, &ports)?;
             maybe_reload(paths, name);
             Ok(0)
         }
         PolicyCmd::Block { name, target } => {
             let dir = require_sandbox_dir(paths, name)?;
-            let (host, port) = parse_target(target)?;
-            apply_edit(&dir, Edit::Block, &host, port)?;
+            let (host, ports) = parse_target(target)?;
+            apply_edit(&dir, Edit::Block, &host, &ports)?;
             maybe_reload(paths, name);
             Ok(0)
         }
@@ -147,16 +145,18 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
     }
 }
 
-/// Parse a `HOST` or `HOST:PORT` target (port defaults to 443).
-pub(crate) fn parse_target(s: &str) -> anyhow::Result<(String, u16)> {
+/// Parse a `HOST` or `HOST:PORT` target. A bare `HOST` means the web ports
+/// (80 + 443, `AllowEntry::DEFAULT_PORTS`) — the same meaning a bare host
+/// has in `policy.yaml`; `HOST:PORT` means exactly that one port.
+pub(crate) fn parse_target(s: &str) -> anyhow::Result<(String, Vec<u16>)> {
     match s.rsplit_once(':') {
         Some((host, port)) => {
             let port: u16 = port
                 .parse()
                 .with_context(|| format!("invalid port in '{s}'"))?;
-            Ok((host.to_string(), port))
+            Ok((host.to_string(), vec![port]))
         }
-        None => Ok((s.to_string(), 443)),
+        None => Ok((s.to_string(), AllowEntry::DEFAULT_PORTS.to_vec())),
     }
 }
 
@@ -176,14 +176,18 @@ pub(crate) fn apply_edit(
     sandbox_dir: &std::path::Path,
     edit: Edit,
     host: &str,
-    port: u16,
+    ports: &[u16],
 ) -> anyhow::Result<()> {
-    edit_policy_file(sandbox_dir, |cfg| match edit {
-        Edit::Allow => {
-            cfg.allow(host, port);
-        }
-        Edit::Block => {
-            let _ = cfg.block(host, port);
+    edit_policy_file(sandbox_dir, |cfg| {
+        for &port in ports {
+            match edit {
+                Edit::Allow => {
+                    cfg.allow(host, port);
+                }
+                Edit::Block => {
+                    let _ = cfg.block(host, port);
+                }
+            }
         }
     })?;
     Ok(())
@@ -305,47 +309,62 @@ mod tests {
     }
 
     #[test]
-    fn parse_target_defaults_to_443() {
+    fn parse_target_bare_host_means_web_ports() {
+        // a bare host must mean the same thing it means in policy.yaml
         assert_eq!(
             parse_target("api.x.com").unwrap(),
-            ("api.x.com".to_string(), 443)
+            ("api.x.com".to_string(), vec![80, 443])
+        );
+    }
+
+    #[test]
+    fn parse_target_explicit_port_is_exactly_that_port() {
+        assert_eq!(
+            parse_target("api.x.com:8080").unwrap(),
+            ("api.x.com".to_string(), vec![8080])
         );
         assert_eq!(
             parse_target("db.internal:5432").unwrap(),
-            ("db.internal".to_string(), 5432)
+            ("db.internal".to_string(), vec![5432])
         );
         assert!(parse_target("api.x.com:notaport").is_err());
     }
 
     #[test]
-    fn allow_then_block_round_trips_a_policy_file() {
-        use izba_core::daemon::egress::config::{AllowEntry, EgressPolicyConfig};
+    fn bare_allow_and_block_are_symmetric_web_ports() {
+        use izba_core::daemon::egress::config::EgressPolicyConfig;
         let dir = tempfile::tempdir().unwrap();
-        // `apply_edit` is the daemon-free core of the allow/block verbs.
-        apply_edit(dir.path(), Edit::Allow, "api.x.com", 443).unwrap();
+        apply_edit(dir.path(), Edit::Allow, "api.x.com", &[80, 443]).unwrap();
         let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
-        use izba_core::daemon::egress::config::Access;
         assert_eq!(
-            cfg.allow,
-            vec![AllowEntry::Scoped {
-                host: "api.x.com".into(),
-                ports: Some(vec![443]),
+            cfg.allow[0],
+            AllowEntry::Scoped {
+                host: "api.x.com".to_string(),
+                ports: Some(vec![80, 443]),
                 access: Access::ReadWrite,
-            }]
+            }
         );
-        apply_edit(dir.path(), Edit::Block, "api.x.com", 443).unwrap();
-        assert!(EgressPolicyConfig::load(dir.path())
-            .unwrap()
-            .unwrap()
-            .allow
-            .is_empty());
+        apply_edit(dir.path(), Edit::Block, "api.x.com", &[80, 443]).unwrap();
+        let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
+        assert!(cfg.allow.is_empty());
+    }
+
+    #[test]
+    fn bare_block_leaves_explicitly_added_ports() {
+        use izba_core::daemon::egress::config::EgressPolicyConfig;
+        let dir = tempfile::tempdir().unwrap();
+        apply_edit(dir.path(), Edit::Allow, "api.x.com", &[80, 443]).unwrap();
+        apply_edit(dir.path(), Edit::Allow, "api.x.com", &[8443]).unwrap();
+        apply_edit(dir.path(), Edit::Block, "api.x.com", &[80, 443]).unwrap();
+        let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
+        assert_eq!(cfg.allow[0].ports(), vec![8443]);
     }
 
     #[test]
     fn allow_accepts_wildcard_target() {
-        use izba_core::daemon::egress::config::{Access, AllowEntry, EgressPolicyConfig};
+        use izba_core::daemon::egress::config::EgressPolicyConfig;
         let dir = tempfile::tempdir().unwrap();
-        apply_edit(dir.path(), Edit::Allow, "*.example.com", 443).unwrap();
+        apply_edit(dir.path(), Edit::Allow, "*.example.com", &[443]).unwrap();
         let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
         assert_eq!(
             cfg.allow,
@@ -360,7 +379,7 @@ mod tests {
     #[test]
     fn allow_rejects_malformed_wildcard_target_loudly() {
         let dir = tempfile::tempdir().unwrap();
-        let err = apply_edit(dir.path(), Edit::Allow, "foo.*.com", 443)
+        let err = apply_edit(dir.path(), Edit::Allow, "foo.*.com", &[443])
             .expect_err("mid-label wildcard must fail");
         let msg = format!("{err:#}");
         assert!(
