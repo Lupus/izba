@@ -464,10 +464,11 @@ impl EgressPolicyConfig {
             }
             ports.push(port);
             ports.sort_unstable();
+            let access = entry.access();
             *entry = AllowEntry::Scoped {
                 host: host.to_string(),
                 ports: Some(ports),
-                access: Access::ReadWrite,
+                access,
             };
             true
         } else {
@@ -495,10 +496,11 @@ impl EgressPolicyConfig {
         if ports.is_empty() {
             self.allow.remove(idx);
         } else {
+            let access = self.allow[idx].access();
             self.allow[idx] = AllowEntry::Scoped {
                 host: host.to_string(),
                 ports: Some(ports),
-                access: Access::ReadWrite,
+                access,
             };
         }
         true
@@ -947,6 +949,32 @@ mod tests {
         );
     }
 
+    /// Allowing a new port on an existing read-only entry must NOT silently
+    /// widen it to read-write — that's a security-relevant clobber, not a
+    /// side effect of adding a port.
+    #[test]
+    fn allow_preserves_existing_access_on_rewrite() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            }],
+            git: vec![],
+        };
+        assert!(cfg.allow("api.x.com", 80));
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: Some(vec![80, 443]),
+                access: Access::Read,
+            }],
+            "adding a port must not clobber the entry's existing access"
+        );
+    }
+
     #[test]
     fn block_removes_port_then_host_when_last() {
         let mut cfg = EgressPolicyConfig {
@@ -971,6 +999,31 @@ mod tests {
         assert!(
             !cfg.block("api.x.com", 80),
             "blocking an absent host is a no-op"
+        );
+    }
+
+    /// Blocking one port of a multi-port read-only entry must leave the
+    /// remaining ports' access untouched, not silently widen it to read-write.
+    #[test]
+    fn block_preserves_existing_access_on_remaining_ports() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: Some(vec![80, 443]),
+                access: Access::Read,
+            }],
+            git: vec![],
+        };
+        assert!(cfg.block("api.x.com", 80));
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            }],
+            "removing a port must not clobber the remaining entry's access"
         );
     }
 
