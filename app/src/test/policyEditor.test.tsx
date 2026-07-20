@@ -278,9 +278,19 @@ describe("PolicyEditor", () => {
     await waitFor(() =>
       expect(api.policySetFull).toHaveBeenCalledWith(
         "web",
-        [{ host: "*.example.com", ports: [443], access: "read-write" }],
+        [{ host: "*.example.com", ports: [80, 443], access: "read-write" }],
         [],
       ),
+    );
+  });
+
+  it("Add host seeds the web default ports 80 and 443", async () => {
+    (api.policyShow as Mock).mockResolvedValue({ enforcing: true, allow: [], git: [] });
+    render(<PolicyEditor name="web" />);
+    fireEvent.click(await screen.findByRole("button", { name: /Add host/i }));
+    const chips = screen.getAllByText(/^(80|443)$/);
+    expect(chips.map((c) => c.textContent)).toEqual(
+      expect.arrayContaining(["80", "443"]),
     );
   });
 
