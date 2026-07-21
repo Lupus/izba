@@ -98,10 +98,45 @@ pub fn ensure_include_line(user_config: &Path, include_target: &Path) -> anyhow:
     atomic_write(user_config, new_content.as_bytes())
 }
 
+/// Idempotently remove the exact `Include "<include_target>"` directive line
+/// previously injected by [`ensure_include_line`] (plus the one blank
+/// separator line it wrote). Everything else is preserved; a missing file or
+/// absent directive is a no-op.
+pub fn remove_include_line(user_config: &Path, include_target: &Path) -> anyhow::Result<()> {
+    if !user_config.exists() {
+        return Ok(());
+    }
+    let existing = std::fs::read_to_string(user_config)
+        .with_context(|| format!("reading {}", user_config.display()))?;
+    let include_line = format!("Include \"{}\"", include_target.to_string_lossy());
+    if !existing.lines().any(|l| l.trim() == include_line) {
+        return Ok(());
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut lines = existing.lines().peekable();
+    while let Some(l) = lines.next() {
+        if l.trim() == include_line {
+            if lines.peek().is_some_and(|n| n.trim().is_empty()) {
+                lines.next(); // the separator blank ensure_include_line added
+            }
+            continue;
+        }
+        out.push(l);
+    }
+    let mut new_content = out.join("\n");
+    if existing.ends_with('\n') && !new_content.is_empty() {
+        new_content.push('\n');
+    }
+    atomic_write(user_config, new_content.as_bytes())
+}
+
 /// Regenerate the izba-managed SSH config and inject the Include line,
 /// reading the home directory via `env` instead of the process environment.
 ///
-/// Early-returns `Ok(())` if `config_management` is disabled in settings.
+/// When `config_management` is disabled in settings, no config is written and
+/// a previously-injected Include line is REMOVED from the user config — the
+/// managed file stops tracking reality the moment management is off, so
+/// leaving the Include behind would serve stale data forever.
 pub fn regenerate_with(
     paths: &Paths,
     sandbox_names: &[String],
@@ -109,6 +144,9 @@ pub fn regenerate_with(
 ) -> anyhow::Result<()> {
     let ssh_dir = paths.ssh_dir();
     if !settings::load(&ssh_dir).config_management {
+        if let Some(user_cfg) = user_ssh_config_path_with(env) {
+            remove_include_line(&user_cfg, &ssh_dir.join("config"))?;
+        }
         return Ok(());
     }
     let id = identity::ensure_identity(&ssh_dir)?;
@@ -230,7 +268,7 @@ mod tests {
     #[test]
     fn regenerate_skips_when_config_management_disabled() {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::with_root(tmp.path().to_path_buf());
+        let paths = Paths::with_root(tmp.path().join("data"));
         let ssh_dir = paths.ssh_dir();
         std::fs::create_dir_all(&ssh_dir).unwrap();
         // Write settings with config_management = false
@@ -241,7 +279,10 @@ mod tests {
             },
         )
         .unwrap();
-        regenerate(&paths, &[]).unwrap();
+        let home = tmp.path().join("home");
+        let home_str = home.to_string_lossy().to_string();
+        let env = move |k: &str| (k == "HOME" || k == "USERPROFILE").then(|| home_str.clone());
+        regenerate_with(&paths, &[], &env).unwrap();
         // The managed config should NOT have been written
         assert!(
             !ssh_dir.join("config").exists(),
@@ -251,5 +292,62 @@ mod tests {
             !ssh_dir.join("known_hosts").exists(),
             "known_hosts written despite disabled"
         );
+        // And no user config should have been created either.
+        assert!(
+            !home.join(".ssh").join("config").exists(),
+            "user config created despite disabled"
+        );
+    }
+
+    #[test]
+    fn disabling_config_management_removes_stale_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("data"));
+        let ssh_dir = paths.ssh_dir();
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        // Simulate the managed era: the Include was injected into the user
+        // config alongside the user's own content.
+        let home = tmp.path().join("home");
+        let user_cfg = home.join(".ssh").join("config");
+        std::fs::create_dir_all(user_cfg.parent().unwrap()).unwrap();
+        std::fs::write(&user_cfg, "Host myserver\n    HostName example.com\n").unwrap();
+        ensure_include_line(&user_cfg, &ssh_dir.join("config")).unwrap();
+        assert!(std::fs::read_to_string(&user_cfg)
+            .unwrap()
+            .contains("Include "));
+
+        // Now the user turns management off: the next regenerate must clean
+        // up the Include instead of leaving it pointing at a stale file.
+        crate::ssh::settings::save(
+            &ssh_dir,
+            &crate::ssh::settings::SshSettings {
+                config_management: false,
+            },
+        )
+        .unwrap();
+        let home_str = home.to_string_lossy().to_string();
+        let env = move |k: &str| (k == "HOME" || k == "USERPROFILE").then(|| home_str.clone());
+        regenerate_with(&paths, &[], &env).unwrap();
+
+        let body = std::fs::read_to_string(&user_cfg).unwrap();
+        assert!(
+            !body.contains("Include "),
+            "stale Include left behind: {body}"
+        );
+        assert!(body.contains("Host myserver"), "user content lost: {body}");
+    }
+
+    #[test]
+    fn remove_include_line_is_noop_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        // Missing file: fine.
+        remove_include_line(&cfg, Path::new("/data/ssh/config")).unwrap();
+        assert!(!cfg.exists());
+        // Present file without the directive: byte-identical afterwards.
+        let initial = "Host myserver\n    HostName example.com\n";
+        std::fs::write(&cfg, initial).unwrap();
+        remove_include_line(&cfg, Path::new("/data/ssh/config")).unwrap();
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), initial);
     }
 }
