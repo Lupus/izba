@@ -266,8 +266,21 @@ preference for this repo only:
 - **Push feature branches** to `origin` (`git push`, `--force-with-lease` after a
   rebase). Never push to `main` directly.
 - **Open and update pull requests** (`gh pr create` / `gh pr edit`). PR bodies
-  end with the Claude Code attribution trailer.
+  end with the Claude Code attribution trailer. **Never open a PR as a draft
+  (`--draft`) and never convert one to draft** — draft status gates the
+  Greptile review app (it won't review a draft), and the intent is to iterate on
+  review from the moment the PR exists. Open every PR **ready for review**; if a
+  PR is somehow already a draft, `gh pr ready <n>` it before iterating.
 - **Trigger and watch CI** (`gh workflow run`, `gh run watch`, `gh pr checks`).
+
+**"CI iteration" / "iterate on CI" means:** drive the PR until **every** check is
+green — all GitHub Actions required checks pass **and** the SonarCloud/SonarQube
+quality gate passes (`mergeStateStatus: CLEAN`, not `UNSTABLE`) **and** the
+Greptile review is satisfied (5/5, no unresolved actionable comments — see the
+`greploop` skill). Re-run genuinely-infra-flaky jobs (e.g. the known Windows
+partner-runner `install-action` bash-startup hang) rather than treating them as
+real failures, but never paper over a real red check. Only report the work
+delivered once the PR is CLEAN on all three fronts.
 
 These need the Bash sandbox disabled and a `gh` token with `repo`+`workflow`
 scope; the Windows-host build path (`powershell.exe`, `/mnt/c`, `~/.cache`) is
