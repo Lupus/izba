@@ -109,25 +109,26 @@ pub fn remove_include_line(user_config: &Path, include_target: &Path) -> anyhow:
     let existing = std::fs::read_to_string(user_config)
         .with_context(|| format!("reading {}", user_config.display()))?;
     let include_line = format!("Include \"{}\"", include_target.to_string_lossy());
-    let mut out: Vec<&str> = Vec::new();
-    let mut lines = existing.lines().peekable();
-    while let Some(l) = lines.next() {
-        if l.trim() == include_line {
-            if lines.peek().is_some_and(|n| n.trim().is_empty()) {
-                lines.next(); // the separator blank ensure_include_line added
+    // Preserve every OTHER line verbatim — including its own terminator — so a
+    // CRLF Windows config is not silently rewritten to LF (and a missing final
+    // newline stays missing). `split_inclusive('\n')` keeps each line's `\n`,
+    // so a "…\r\n" segment round-trips unchanged; `.trim()` still matches the
+    // izba Include line regardless of terminator. Only that line (and the one
+    // blank separator `ensure_include_line` wrote after it) is dropped. Always
+    // rewrite: the walk is byte-identical when the directive is absent, so a
+    // skip-when-unchanged guard would only save an mtime touch (no test-pinnable
+    // effect) — deliberately omitted rather than left mutation-untested.
+    let mut new_content = String::with_capacity(existing.len());
+    let mut segments = existing.split_inclusive('\n').peekable();
+    while let Some(seg) = segments.next() {
+        if seg.trim() == include_line {
+            if segments.peek().is_some_and(|n| n.trim().is_empty()) {
+                segments.next(); // the separator blank ensure_include_line added
             }
             continue;
         }
-        out.push(l);
+        new_content.push_str(seg);
     }
-    let mut new_content = out.join("\n");
-    if existing.ends_with('\n') && !new_content.is_empty() {
-        new_content.push('\n');
-    }
-    // Always rewrite (the loop is a byte-identical no-op when the directive was
-    // absent, so this is safe): a "skip write when unchanged" guard would only
-    // save an mtime touch, an optimization whose absence of side effect no test
-    // can pin — so it is deliberately omitted rather than left mutation-untested.
     atomic_write(user_config, new_content.as_bytes())
 }
 
@@ -388,6 +389,27 @@ mod tests {
             std::fs::read_to_string(&cfg3).unwrap(),
             "Host c\n",
             "only the include line should be removed when no separator follows"
+        );
+    }
+
+    #[test]
+    fn remove_include_line_preserves_crlf_terminators() {
+        // A Windows config using CRLF must NOT be silently reformatted to LF:
+        // removing izba's Include line leaves every other line's \r\n intact.
+        let inc = Path::new("/data/ssh/config");
+        let include = format!("Include \"{}\"", inc.display());
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::write(
+            &cfg,
+            format!("{include}\r\n\r\nHost win\r\n    HostName x\r\n"),
+        )
+        .unwrap();
+        remove_include_line(&cfg, inc).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            "Host win\r\n    HostName x\r\n",
+            "CRLF terminators on unrelated lines must survive removal verbatim"
         );
     }
 }
