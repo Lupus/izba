@@ -160,15 +160,15 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   (see Cmdline chain). Max 24 volumes (26 virtio-blk slots − vda − vdb).
   Named volumes are persistent (`<data>/volumes/<name>.img`, survive `rm`,
   single-writer); anonymous are ephemeral (in the sandbox dir).
-- **Cmdline chain:** `console=ttyS0 izba.hostname=<name> izba.egress=1
-  [izba.volumes=<p0>,<p1>,…]` ↔
+- **Cmdline chain:** `console=ttyS0 izba.hostname=<name>
+  [izba.volumes=<p0>,<p1>,…] [izba.buildout=1]` ↔
   `hack/kernel.config` (`SERIAL_8250_CONSOLE`; netfilter/nftables —
   `NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK` — + `CONFIG_DUMMY`) ↔ init
   reads `izba.hostname` for sethostname and `izba.volumes` (ordered,
   comma-separated guest mountpoints, one per user volume in `vd{c…}` order) for
   the volume format+mount pass. NO `ip=dhcp`: the guest is a NIC-less
-  vsock island. `izba.egress=1` is vestigial — init no longer reads it; the
-  egress stub is always-on. init brings up `lo` + `dummy0`
+  vsock island. (`izba.egress=1` was vestigial — init never read it — and is
+  gone; the egress stub is always-on.) init brings up `lo` + `dummy0`
   (`192.168.127.2/24`, alias `192.168.127.1` as the default-route gateway via
   `net.rs`): `dummy0` is the structural deny — anything the stub does not
   intercept has nowhere to go. resolv.conf = `nameserver 127.0.0.1`

@@ -395,7 +395,7 @@ mod tests {
         VmSpec {
             kernel: PathBuf::from("/img/vmlinux"),
             initramfs: PathBuf::from("/img/initramfs.img"),
-            cmdline: "console=ttyS0 izba.hostname=box izba.egress=1".to_string(),
+            cmdline: "console=ttyS0 izba.hostname=box".to_string(),
             cpus: 2,
             mem_mb: 4096,
             disks: vec![
@@ -444,7 +444,7 @@ mod tests {
                 "--initrd",
                 "/img/initramfs.img",
                 "-c",
-                "console=ttyS0 izba.hostname=box izba.egress=1",
+                "console=ttyS0 izba.hostname=box",
                 "--hv",
                 "--processors",
                 "2",
