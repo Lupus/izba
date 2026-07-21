@@ -4,7 +4,7 @@
 > service mesh + credential vault"). Technical rationale lives in the
 > [mesh networking design](superpowers/specs/2026-06-12-izba-mesh-networking-design.md)
 > (its §8 staging is the engineering skeleton this roadmap re-cuts into
-> user-value milestones). Updated **2026-06-18**.
+> user-value milestones). Updated **2026-07-21**.
 
 ## Where we are
 
@@ -37,6 +37,28 @@ CH path-comma rejection (F-24). DNS also hardened: a self-healing
 forwarder), DNS-over-TCP for >512-byte answers, and metric-ordered Windows
 upstream selection.
 
+**The MVP bundle (A–D below) has since landed** (status recorded 2026-07-21):
+git-aware vendor-neutral egress policy (`access: read|read-write`, `izba policy
+git allow/block` — MVP-A, PR #54), fail-closed Linux VMM confinement
+(seccomp + Landlock + virtiofsd namespace/chroot — MVP-C, PR #52), the Windows
+per-sandbox account + `izba lockdown`/`unlock` (MVP-D, PR #53), and the app's
+Ports/Volumes/Policy/Netlog wiring (MVP-B; the owner-verified-on-a-real-build
+checkbox is the remaining sliver). **Shipped beyond the plan**, unrecorded here
+until now:
+
+- **Single-sandbox manifest** — `izba.yml` (`apiVersion: izba.dev/v1alpha1`,
+  `kind: Sandbox`) with the `izba diff` / `izba promote` / `izba export`
+  review loop: host-only managed truth, TOCTOU review token, `⚠ weakens
+  egress` flagging, plus the app's Manifest tab. This front-ran M4's manifest
+  work in single-VM form; the format decision it forced is now locked (see the
+  decisions log: `kind: Sandbox` is the v1alpha1, M4 evolves it to
+  `kind: Project`).
+- **SSH access** — `ssh izba-<name>` via a vendored static sshd, the hidden
+  `izba __ssh-proxy` ProxyCommand bridge over `TcpDial{22}` (no proto bump),
+  and managed `~/.ssh/config` Include (PR #87). VS Code Remote-SSH works.
+- **Build-in-VM** — `izba build` / `izba run --build` (throwaway builder VM,
+  BuildKit in-guest).
+
 **Adoption infrastructure (Track T) is largely in place**: CI six gates +
 real-VM e2e, published artifacts, coverage + SonarCloud gates, build-version
 reporting, on-demand devbuild installers. **The first real release tag is held
@@ -47,13 +69,15 @@ is a defensible product, not a demo.
 
 What does **not** exist yet:
 
-- The mesh/governance staging steps beyond the firewall — no `izba.yaml`
-  manifest, no project object, no east–west mesh, no credential vault (M4/M5).
-- A few security findings remain open — the two open **HIGH**s are **F-06
-  (Linux half)** (unjailed VMM + virtiofsd as the full host user, = MVP-C) and
-  **F-07** (virtiofsd `--sandbox none`), plus F-09 (no izbad peer-cred) and
-  F-05 (DNS resolve-and-pin, now unblocked by the hickory adoption). See
-  Track S.
+- The mesh/governance staging steps beyond the firewall — no **project**
+  object (multi-VM `kind: Project` manifest), no east–west mesh, no credential
+  vault (M4/M5). The *single-sandbox* manifest + review loop exists (above).
+- Security findings still open: **F-05** (DNS is monitor-only even for
+  enforcing sandboxes — escalated 2026-07-21 to P1 backlog issue
+  [#148](https://github.com/Lupus/izba/issues/148)) and F-09 (no izbad
+  peer-cred), plus the deferred F-28 (cgroup bounding) / F-29 (per-sandbox
+  uid). The former open HIGHs — F-06 (Linux half) and F-07 — were closed by
+  MVP-C. See Track S.
 
 The **OpenVMM vsock-assert crash** under stream churn (the declared hard gate
 for putting all traffic on vsock) is **fixed** as of 2026-06-12 — see M0 below.
@@ -144,14 +168,17 @@ Shipped: TLS-MITM datapath + two-tier policy plane (regorus L7 + DNS-snoop) +
 `izba netlog` audit + per-sandbox `--policy` + CA-in-guest, daemon-activated and
 failing **closed** for enforcing sandboxes. Code: `daemon/egress/{mitm,
 mitm_runtime,dns_snoop,audit,policy}.rs`, `ca.rs`, init `trust.rs`,
-`crates/izba-cli/src/commands/netlog.rs`. This was the first release-tag moment.
+`crates/izba-cli/src/commands/netlog.rs`. (This was originally slated as the
+first release-tag moment; the 2026-06-18 re-plan moved the first tag behind the
+MVP bundle — see Track T.)
 
 **Restructured 2026-06-14 (the M5 leapfrog):** M2 absorbs M5's MITM datapath —
 the OpenShell-salvage spike proved it cheap (compiles, tests green, Windows
 cross-check green). North–south plane, **single sandboxes**, the headline
 feature: *"my agent can only reach `api.anthropic.com` and `github.com`, every
 connection it tried is in `izba netlog`, and there are no uninspectable
-channels."* This is the first release-tag moment (see Track T).
+channels."* (Originally the first release-tag moment; superseded by the
+2026-06-18 re-plan — the tag follows the MVP bundle, see Track T.)
 
 Scope: a TLS-MITM datapath in izbad (terminate guest HTTPS, mint per-SNI leaves
 under an izba CA, re-originate upstream — salvaged from the spike), reached via a
@@ -213,7 +240,15 @@ compose stack on a sized `/var/lib/docker` volume — that lands as part of M4's
 docker-in-VM bring-up (and is gated on the hardcoded-external-UDP-resolver DNS
 fix; see risk #3).
 
-### MVP bundle — production-ready single sandbox (pre-tag) — ⏭️ NEXT
+### MVP bundle — production-ready single sandbox (pre-tag) — ✅ LANDED (status 2026-07-21)
+
+> **Status:** MVP-A ✅ (PR #54, vendor-neutral git read/write policy +
+> `access:` grammar), MVP-B ✅ code-wise (app Ports/Volumes tabs + policy/netlog
+> surface; the **owner-verified-on-a-real-build** checkbox is the remaining
+> sliver before the tag), MVP-C ✅ (PR #52, fail-closed seccomp + Landlock +
+> virtiofsd namespace/chroot), MVP-D ✅ (PR #53, per-sandbox Windows account +
+> `izba lockdown`). The paragraphs below are the original scope brief, kept for
+> rationale.
 
 Decided 2026-06-18 (owner). Before the first release tag and before M4, ship the
 cut that makes **one** sandbox genuinely defensible and genuinely usable — a real
@@ -344,14 +379,13 @@ SNI/Host/keep-alive bypasses), F-06 (Windows VMM confinement), F-08 (host-side
 `cp` tar containment), F-15 (0700 data dirs), F-22 (cargo-deny gate), F-24 (CH
 path-comma reject). **Still open — the near-term floor:**
 
-- **Linux host confinement epic (= MVP-C).** The whole host-side Linux
-  confinement is missing, so the register is widened from the two atomic findings
-  to an epic: **F-06 (Linux half, HIGH — still open)** unjailed VMM + virtiofsd
-  as the full host user; **F-07 (HIGH)** virtiofsd `--sandbox none`; plus new
-  sub-findings **F-27** host-process privilege drop / dedicated uid+gid, **F-28**
-  cgroup resource bounding, **F-29** landlock/seccomp filesystem confinement.
-  Built-ins first, then a per-uid jailer (see MVP-C; numbers tentative until
-  written into the register).
+- **Linux host confinement epic (= MVP-C) — ✅ closed 2026-06 (PR #52).**
+  F-06 (Linux half) and F-07 are fixed: fail-closed floor of CH seccomp +
+  Landlock + virtiofsd `--sandbox namespace` (chroot fallback), achieved mode
+  recorded in `state.json` and surfaced by `izba status`, bypass only via
+  explicit `--allow-unconfined`. Residuals deliberately deferred with
+  rationale in the register: per-sandbox uid/principal and cgroup resource
+  bounding (rlimits proved incompatible with a confined VMM launch).
 - **Windows host confinement epic.** F-06-Windows is **done** (PR #37: restricted
   token + Low IL + job + mitigations). The dedicated-identity model (MVP-D) is a
   *hardening enhancement* beyond the finding — the next confinement tier, not a
@@ -359,9 +393,10 @@ path-comma reject). **Still open — the near-term floor:**
 - **F-09 (MED):** izbad's AF_UNIX control socket has no `SO_PEERCRED` check —
   any local process gets full sandbox control. Cheap, high-value; good to land
   alongside the MVP confinement work.
-- **F-05 (MED):** DNS resolve-and-pin + QNAME-gate + rate-limit. **Now
-  unblocked** by the hickory-resolver adoption (the two DNS efforts no longer
-  collide); context stub in `docs/security/egress-firewall-p3-dns-resolve-and-pin.md`.
+- **F-05 (MED → P1 backlog):** DNS has **no enforcement tier at all** — even
+  an enforcing sandbox forwards every QNAME to the host resolver before any
+  policy check (QNAME exfil/C2 channel). Escalated 2026-07-21 to backlog issue
+  [#148](https://github.com/Lupus/izba/issues/148) (P1, top of queue).
   Pairs naturally with M4's hardcoded-external-UDP-resolver fix (risk #3).
 - The remaining mediums/lows (F-04/F-10/F-12/F-13/F-17/F-23, F-16/F-18/F-25)
   batch into a later pass. **Owed across the board:** PoCs for the HIGH
@@ -384,7 +419,16 @@ Runs parallel to everything; first slice landed during M0/M1.
 - **Quickstart that works from a clean machine**, refreshed each milestone;
   `izba.yaml` reference when M4 lands.
 
-## Next steps (groomed 2026-06-18)
+## Next steps (groomed 2026-06-18; status 2026-07-21)
+
+> **2026-07-21 re-groom:** the MVP bundle landed (see its status box), so the
+> plan below is largely executed. What actually remains before the first tag:
+> (a) the owner verifying ports + volumes end-to-end on a real devbuild
+> (MVP-B's last checkbox); (b) deciding whether
+> [#148](https://github.com/Lupus/izba/issues/148) (DNS enforcement, P1) gates
+> the tag or ships in the first patch release; then tag → M4. The 2026-07-21
+> product review also seeded a groomed UX/consistency backlog
+> (issues #149–#162, ranked on the project board).
 
 The MVP bundle (above) is the next focus and **redefines the first release** —
 M2+M3 plus fine-grained policy + real host confinement + verified ports/volumes,
@@ -447,13 +491,23 @@ its milestone starts).
 - **Performance:** measured baseline in the suite; no gate.
 - **MITM posture:** intercept everything; L7 policy (URL/method/body);
   injection for arbitrary endpoints; cert-pinning clients knowingly broken.
+- **Manifest format (2026-07-21, owner):** the shipped `kind: Sandbox`
+  `izba.yml` (`apiVersion: izba.dev/v1alpha1`) **is** the v1alpha1 project
+  manifest; M4 evolves it to `kind: Project` in the same envelope — no
+  separate compose-shaped `izba.yaml` grammar. See vision.md decision 3.
+- **Daemon proto discipline (2026-07-21):** any new `DaemonRequest` variant is
+  a wire-breaking change and bumps `DAEMON_PROTO_VERSION` (v2 retro-covered
+  the v1-era `ReloadPolicy`/`Volume*` additions); a `#[serde(other)]` catch-all
+  now converts any future slip into a clean error instead of a dropped
+  connection.
 
 ## Open decisions (resolve in working sessions, not ad hoc)
 
-- **Manifest grammar finalization** (design §9): exact key names, `volumes`
-  lifecycle verbs (create/resize/prune), schema **versioning from day one** —
-  now also carries the M5 credential-mapping grammar (role + destination
-  pattern → secret + injection shape).
+- **Manifest grammar finalization** (design §9): the *envelope* is decided
+  (k8s-style `kind: Sandbox` → `kind: Project`, see decisions log); still open
+  are the `kind: Project` key names (members/expose/depends_on), `volumes`
+  lifecycle verbs (create/resize/prune), and the M5 credential-mapping grammar
+  (role + destination pattern → secret + injection shape).
 - **Hardcoded external-UDP-resolver DNS** (forum: before M3/M4 docker-in-VM
   work). The M1 `udp dport 53` REDIRECT reply path is broken (source-mismatch;
   see risk #3). Decide the `IP_ORIGDSTADDR`/`IP_PKTINFO` transparent-reply fix

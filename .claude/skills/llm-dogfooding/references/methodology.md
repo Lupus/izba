@@ -51,7 +51,9 @@ swarm's candidates and are the anti-slop spine (see `hack/dogfood/oracles.py`):
   the swarm's narration; the skeptic uses it to corroborate claims.
 - **Implicit** — scrape output for crash markers (`panic`, `assertion failed`,
   anchored `ERROR`/`FATAL`, sanitizer) and decode the exit-code contract
-  (e.g. 127 → command-not-found, 128+n → signal n).
+  (128+n → signal n; a missing command inside the container is crun's honest
+  non-zero — rc 1 with `executable file ... not found` on stderr, docker-parity,
+  NOT a synthetic 127; see the exit-code mapping contract in CLAUDE.md).
 - **Latency** — flag actions slower than a human would tolerate (a hang is a
   finding) — but a hang *inside* the swarm's own command (infinite loop in
   `exec`) is self-inflicted, not the product's fault.

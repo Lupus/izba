@@ -145,11 +145,14 @@ Key properties:
 
 ## Quickstart
 
-**Installed from a release?** Grab the latest `izba_*_amd64.deb` (Linux/WSL2) or
-`izba-setup-*.exe` (Windows) from the [Releases](../../releases) page and install
-it — the package is self-contained (CLI + cloud-hypervisor + virtiofsd + kernel +
-initramfs), so you can **skip the artifact-staging steps below**, which are for
-building from source. Jump straight to **3. Run a sandbox**.
+**Installed from a release?** Installers (`izba_*_amd64.deb` for Linux/WSL2,
+`izba-setup-*.exe` for Windows) are cut on `v*` tags; the
+[Releases](../../releases) page currently carries **validation prereleases** —
+the first stable tag lands when the MVP milestone completes (see
+[docs/roadmap.md](docs/roadmap.md)). A prerelease package is self-contained
+(CLI + cloud-hypervisor + virtiofsd + kernel + initramfs), so it lets you
+**skip the artifact-staging steps below**, which are for building from source.
+With one installed, jump straight to **3. Run a sandbox**.
 
 **1. Install runtime dependencies**
 
@@ -345,7 +348,7 @@ in `diff` and `promote` output. You cannot miss a loosened firewall.
 that covers the exact `izba.yml` (and any referenced `Dockerfile`) it just
 showed. `izba promote` requires that token to match the current file — a TOCTOU
 guard: if the manifest changes after `diff` but before `promote`, the promote
-fails with "manifest changed since review — re-run `izba diff`". Use `--force`
+fails with ``izba.yml changed since `izba diff` — re-run it``. Use `--force`
 to bypass (with a loud warning naming exactly what is being promoted unreviewed).
 The token is host-only, so the in-guest agent cannot fabricate a reviewed state.
 

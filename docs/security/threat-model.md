@@ -165,17 +165,26 @@ violated invariant is a failing test, not a judgment call.
    unavailable denies, never downgrades. Today: **holds** for the MITM tier
    (router.rs:96-124, well-tested) — a genuine strength.
 3. **No SSRF to private/loopback/link-local/metadata** from the egress proxy.
-   Today: guarded only on tier-2; absent on the tier-1 MITM dial and the
-   AllowAll path (F-01, F-05).
+   Today: **holds** — an unconditional `is_hard_denied` floor runs before any
+   policy on every path (tier-1 MITM dial, tier-2, and the AllowAll path), so
+   loopback/link-local/metadata/unspecified are denied even for a bare sandbox
+   (F-01 SSRF-half closed, PR #32). The DNS path is the remaining exfil channel
+   (F-05 → backlog #148), not an SSRF-to-private-IP gap.
 4. **The allow-list is domain *and* port** and re-checked per request. Today:
-   domain-only, first-request-only (F-02, F-03).
+   **holds** — port is enforced by the rego (a global host on a non-web port is
+   denied) and every request on a kept-alive MITM connection is re-classified
+   (F-02, F-03 closed, PR #32).
 5. **The CA private key never leaves the host and never enters a guest.**
    Today: **holds** (only `ca.pem` is shared, read-only) — a strength;
    residual same-user-process exposure (F-16).
 6. **Control-plane authority requires authenticating the caller.** Today: only
    filesystem perms (F-09).
 7. **A VMM/virtiofsd compromise is contained below host-user privilege** (A2).
-   Today: **not met** (F-06/F-07).
+   Today: **largely met** — Windows runs a restricted-token + Low-IL + job
+   confinement (F-06-Windows, PR #37) and Linux a fail-closed seccomp +
+   Landlock + virtiofsd-namespace floor (F-06-Linux/F-07 closed, MVP-C PR #52).
+   Residual: no per-sandbox principal yet (Linux runs as the invoking uid,
+   F-29 deferred), and Windows integrity-confinement gives no read-confinement.
 8. **All untrusted parsers are bounded** (frame size, file count, recursion,
    total bytes). Today: partial (16 MiB frame cap exists but is per-frame, not
    per-peer; no image size caps) (F-12, F-17).
@@ -184,10 +193,12 @@ violated invariant is a failing test, not a judgment call.
    manifest, vault material) is host-pinned at apply time and re-activation after
    any change is an explicit host-side act; the guest can never edit what the host
    then trusts. Today: **holds for the live egress policy** (enforced from the
-   host state-dir copy, never re-read in-guest) but the workspace-resident-source
-   ergonomics invite a re-persist footgun, and the guest-flag-only RO on the
-   trust/ssh/oci shares lets a hostile kernel write back into host state
-   (F-30, F-31).
+   host state-dir copy, never re-read in-guest). The single-sandbox `izba.yml`
+   manifest (now shipped) realizes exactly this model — the agent-writable file
+   is an *untrusted proposal*; managed truth (`config.json` + `policy.yaml`) is
+   host-only, and `izba promote`'s TOCTOU review token gates every change. The
+   residual re-persist footgun and the guest-flag-only RO on the trust/ssh/oci
+   shares (a hostile kernel can write back into host state) remain (F-30, F-31).
 
 ## 8. Out of scope / accepted risks (record explicitly)
 
