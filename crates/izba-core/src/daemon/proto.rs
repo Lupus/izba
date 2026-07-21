@@ -24,8 +24,13 @@ use izba_proto::{Request, Response};
 /// Wire-protocol version exchanged in the hello frame. The CLI↔daemon
 /// **compatibility** gate compares THIS (not the now-sha-bearing display
 /// string), so a dev rebuild of the same protocol never churn-restarts the
-/// daemon. Bump only on a wire-breaking change to any daemon frame.
-pub const DAEMON_PROTO_VERSION: u32 = 1;
+/// daemon. Bump on any wire-breaking change to any daemon frame — including
+/// NEW `DaemonRequest` variants: a same-version daemon that predates the
+/// variant would otherwise fail the frame read instead of self-healing.
+/// (v2 retro-covers `ReloadPolicy` + the `Volume*` requests that landed
+/// during v1; the `Unknown` catch-all below turns any future slip into a
+/// clean error instead of a dropped connection.)
+pub const DAEMON_PROTO_VERSION: u32 = 2;
 
 /// First frame on every daemon connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,12 +135,14 @@ pub enum DaemonRequest {
     VolumeRemove {
         name: String,
     },
-    /// Attach a volume to a running sandbox.
+    /// Record a volume on a sandbox's config. Takes effect on the next
+    /// start — there is no hotplug; a running VM keeps its current disks.
     VolumeAttach {
         name: String,
         spec: crate::volume::VolumeSpec,
     },
-    /// Detach a volume from a running sandbox by its guest mount-point.
+    /// Remove a volume from a sandbox's config by its guest mount-point.
+    /// Like `VolumeAttach`, applies on the next start (no hot-unplug).
     VolumeDetach {
         name: String,
         guest_path: PathBuf,
@@ -148,6 +155,13 @@ pub enum DaemonRequest {
     /// Graceful daemon exit. Sandboxes keep running (detached children);
     /// in-daemon port relays pause until the next daemon adopts.
     Shutdown,
+    /// Catch-all for a request `type` this daemon build does not know (a
+    /// newer client talking to an older daemon within the same proto
+    /// version). `#[serde(other)]` makes the frame read succeed so the
+    /// server can reply an honest error instead of dropping the connection
+    /// mid-conversation. Never sent by a client on purpose.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

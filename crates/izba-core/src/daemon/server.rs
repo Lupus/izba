@@ -384,6 +384,11 @@ fn dispatch_inner(
         DaemonRequest::VolumeList => handle_volume_list(d),
         DaemonRequest::VolumeRemove { name } => handle_volume_remove(d, name),
         DaemonRequest::VolumeAttach { name, spec } => handle_volume_attach(d, name, spec),
+        DaemonRequest::Unknown => Err(anyhow::anyhow!(
+            "unknown request type: this izbad build is older than the izba CLI \
+             talking to it; restart the daemon (`izba daemon stop` — the next \
+             CLI command respawns it) or upgrade so both ends match"
+        )),
         DaemonRequest::VolumeDetach { name, guest_path } => {
             handle_volume_detach(d, name, guest_path)
         }
@@ -1091,6 +1096,26 @@ mod tests {
     fn hello_reports_server_version() {
         let (_dir, d) = test_daemon();
         let _c = client_conn(&d); // assertions inside
+    }
+
+    #[test]
+    fn unknown_request_variant_gets_clean_error() {
+        // A request `type` this build doesn't know (a newer client inside the
+        // same proto version) must produce an honest Error reply — not the
+        // pre-v2 behavior of failing the frame read and dropping the
+        // connection with no explanation.
+        let req: DaemonRequest =
+            serde_json::from_str(r#"{"type":"volume_defrag","name":"x"}"#).unwrap();
+        assert!(matches!(req, DaemonRequest::Unknown));
+
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        match rpc(&mut c, &req) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("unknown request type"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]
