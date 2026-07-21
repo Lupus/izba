@@ -109,9 +109,6 @@ pub fn remove_include_line(user_config: &Path, include_target: &Path) -> anyhow:
     let existing = std::fs::read_to_string(user_config)
         .with_context(|| format!("reading {}", user_config.display()))?;
     let include_line = format!("Include \"{}\"", include_target.to_string_lossy());
-    if !existing.lines().any(|l| l.trim() == include_line) {
-        return Ok(());
-    }
     let mut out: Vec<&str> = Vec::new();
     let mut lines = existing.lines().peekable();
     while let Some(l) = lines.next() {
@@ -127,6 +124,10 @@ pub fn remove_include_line(user_config: &Path, include_target: &Path) -> anyhow:
     if existing.ends_with('\n') && !new_content.is_empty() {
         new_content.push('\n');
     }
+    // Always rewrite (the loop is a byte-identical no-op when the directive was
+    // absent, so this is safe): a "skip write when unchanged" guard would only
+    // save an mtime touch, an optimization whose absence of side effect no test
+    // can pin — so it is deliberately omitted rather than left mutation-untested.
     atomic_write(user_config, new_content.as_bytes())
 }
 
@@ -329,12 +330,11 @@ mod tests {
         let env = move |k: &str| (k == "HOME" || k == "USERPROFILE").then(|| home_str.clone());
         regenerate_with(&paths, &[], &env).unwrap();
 
+        // Exact bytes: the Include + its separator blank are gone and the
+        // user's original content is restored verbatim (trailing newline
+        // preserved) — pins the round-trip, not just substring survival.
         let body = std::fs::read_to_string(&user_cfg).unwrap();
-        assert!(
-            !body.contains("Include "),
-            "stale Include left behind: {body}"
-        );
-        assert!(body.contains("Host myserver"), "user content lost: {body}");
+        assert_eq!(body, "Host myserver\n    HostName example.com\n");
     }
 
     #[test]
@@ -349,5 +349,45 @@ mod tests {
         std::fs::write(&cfg, initial).unwrap();
         remove_include_line(&cfg, Path::new("/data/ssh/config")).unwrap();
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), initial);
+    }
+
+    #[test]
+    fn remove_include_line_exact_bytes_removal() {
+        let inc = Path::new("/data/ssh/config");
+        let include = format!("Include \"{}\"", inc.display());
+
+        // Trailing-newline case: file ends with '\n' → result keeps it.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::write(&cfg, format!("{include}\n\nHost a\n    HostName x\n")).unwrap();
+        remove_include_line(&cfg, inc).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            "Host a\n    HostName x\n",
+            "removal must preserve the trailing newline"
+        );
+
+        // No-trailing-newline case: file does NOT end with '\n' → result
+        // must NOT gain one (kills the `&&`→`||` mutant on the newline guard).
+        let cfg2 = tmp.path().join("config2");
+        std::fs::write(&cfg2, format!("{include}\n\nHost b")).unwrap();
+        remove_include_line(&cfg2, inc).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cfg2).unwrap(),
+            "Host b",
+            "removal must not fabricate a trailing newline"
+        );
+
+        // Include directly followed by a NON-blank line (no separator blank):
+        // only the include line is dropped, the next line survives — pins the
+        // blank-detection so a "swallow next unconditionally" mutant dies.
+        let cfg3 = tmp.path().join("config3");
+        std::fs::write(&cfg3, format!("{include}\nHost c\n")).unwrap();
+        remove_include_line(&cfg3, inc).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cfg3).unwrap(),
+            "Host c\n",
+            "only the include line should be removed when no separator follows"
+        );
     }
 }
