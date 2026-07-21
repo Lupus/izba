@@ -72,6 +72,15 @@ spec; this list is the "don't relitigate" set.
    what makes izba **flexible but secure-by-default**: bring any image and any
    storage you like, but nothing is reachable unless the manifest declares it.
 
+   **Manifest format (decided 2026-07-21):** the shipped single-sandbox
+   `izba.yml` (`apiVersion: izba.dev/v1alpha1`, `kind: Sandbox`) **is** the
+   v1alpha1 of this manifest. The multi-VM project surface arrives as its
+   evolution — a `kind: Project` document in the same `apiVersion` family, not
+   a separate compose-shaped `izba.yaml` grammar. "Loosely modeled on docker
+   compose" refers to the *concepts* (members, ports, volumes, policy planes),
+   not the file syntax; the k8s-style envelope is the committed syntax, and the
+   diff/promote review flow carries over to `kind: Project` unchanged.
+
 4. **`izbad` is the policy enforcement point.** All egress (north–south, to the
    internet) and all inter-service traffic (east–west) transits the host daemon
    over vsock. One enforcement point, two policy planes (egress allow-lists +
