@@ -225,7 +225,7 @@ fn build_vm_disks(
 /// mountpoints (vdc, vdd, …) only when volumes are present. `izba.buildout=1`
 /// is appended for builder VMs so the guest mounts the `izba-buildout` share.
 fn build_cmdline(name: &str, volumes: &[crate::volume::VolumeSpec], builder: bool) -> String {
-    let mut c = format!("console=ttyS0 izba.hostname={name} izba.egress=1");
+    let mut c = format!("console=ttyS0 izba.hostname={name}");
     if !volumes.is_empty() {
         c.push_str(&format!(
             " izba.volumes={}",
@@ -840,8 +840,9 @@ pub fn start_with_timeouts(
         });
     }
 
-    // The guest is a pure vsock island: no NIC, no DHCP. izba.egress=1 is
-    // always on — guest egress rides the izbad-owned vsock 1027 plane.
+    // The guest is a pure vsock island: no NIC, no DHCP. Guest egress always
+    // rides the izbad-owned vsock 1027 plane (init's stub is unconditional —
+    // no cmdline flag gates it).
     // izba.volumes (when present) carries the ordered guest mountpoints.
     // izba.buildout=1 (when present) signals the guest to mount the buildout share.
     let cmdline = build_cmdline(name, &config.volumes, config.builder);
@@ -2005,8 +2006,7 @@ mod tests {
         assert_eq!(spec.kernel, PathBuf::from("/art/vmlinux"));
         assert_eq!(spec.initramfs, PathBuf::from("/art/initramfs.img"));
         assert!(
-            spec.cmdline
-                .contains("console=ttyS0 izba.hostname=web izba.egress=1"),
+            spec.cmdline.contains("console=ttyS0 izba.hostname=web"),
             "cmdline: {}",
             spec.cmdline
         );
@@ -2327,8 +2327,10 @@ mod tests {
     }
 
     #[test]
-    fn start_cmdline_egress_flag() {
-        // izba.egress=1 is unconditional (the guest is always a vsock island).
+    fn start_cmdline_has_no_egress_flag() {
+        // izba.egress=1 was vestigial (init never read it; the egress stub is
+        // unconditional) and was dropped from the cmdline — pin its absence so
+        // it doesn't creep back in as a phantom control.
         let (dir, paths) = test_paths();
         let ws = dir.path().join("ws");
         fs::create_dir_all(&ws).unwrap();
@@ -2338,8 +2340,8 @@ mod tests {
         start(&paths, "web", &driver, &arts(), false).unwrap();
         let spec = driver.captured.lock().unwrap().take().expect("spec");
         assert!(
-            spec.cmdline.contains("izba.egress=1"),
-            "cmdline must contain izba.egress=1: {}",
+            !spec.cmdline.contains("izba.egress"),
+            "izba.egress must be absent: {}",
             spec.cmdline
         );
     }
