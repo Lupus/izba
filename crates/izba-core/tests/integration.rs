@@ -337,7 +337,7 @@ fn log_tail(path: &Path) -> String {
 fn boot_diag(paths: &Paths, name: &str) -> String {
     let logs = paths.logs_dir(name);
     let mut out = console_tail(paths, name);
-    for log in ["vmm.log", "passt.log", "virtiofsd-workspace.log"] {
+    for log in ["vmm.log", "virtiofsd-workspace.log"] {
         out.push_str(&format!("\n--- {log} tail ---\n"));
         out.push_str(&log_tail(&logs.join(log)));
     }
