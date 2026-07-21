@@ -734,8 +734,8 @@ pub fn edit_policy_file(
 ) -> Result<EgressPolicyConfig> {
     let mut cfg = EgressPolicyConfig::load(sandbox_dir)?.unwrap_or_default();
     f(&mut cfg);
-    for e in &cfg.allow {
-        validate_host_pattern(e.host())?;
+    for (i, e) in cfg.allow.iter().enumerate() {
+        validate_host_pattern(e.host()).with_context(|| format!("allow[{i}]"))?;
     }
     let path = EgressPolicyConfig::path_in(sandbox_dir);
     std::fs::write(&path, cfg.to_yaml()).with_context(|| format!("writing {}", path.display()))?;
