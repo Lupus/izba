@@ -65,10 +65,16 @@ pub trait Policy: Send + Sync {
 
     /// Port/access-agnostic DNS gate: may this QNAME be resolved at all under
     /// an enforcing policy? Only consulted by the egress router when
-    /// `enforces()` is true. Default permissive so a non-enforcing / future
-    /// policy never blocks DNS by accident.
+    /// `enforces()` is true.
+    ///
+    /// The default is fail-CLOSED for an enforcing policy: any `Policy` whose
+    /// `enforces()` is true MUST override this to authorize the names it allows,
+    /// or every DNS name is denied. A non-enforcing policy keeps DNS
+    /// pass-through (`!self.enforces()` is `true`), so it never blocks
+    /// resolution by accident. `RegoPolicy` overrides this with the real
+    /// `data.egress.resolvable` decision.
     fn allows_name(&self, _sandbox: &str, _name: &str) -> bool {
-        true
+        !self.enforces()
     }
 }
 
@@ -937,6 +943,25 @@ mod tests {
 
     #[test]
     fn allow_all_allows_any_name() {
+        assert!(AllowAll.allows_name("web", "anything.example.com"));
+    }
+
+    #[test]
+    fn allows_name_default_is_fail_closed_for_enforcing_policy() {
+        // A Policy that overrides only `check` inherits enforces()=true; its
+        // default allows_name MUST deny (fail-closed), not resolve every name.
+        struct EnforcingNoOverride;
+        impl Policy for EnforcingNoOverride {
+            fn check(&self, _f: &FlowDesc) -> Verdict {
+                Verdict::Deny
+            }
+        }
+        assert!(EnforcingNoOverride.enforces(), "defaults to enforcing");
+        assert!(
+            !EnforcingNoOverride.allows_name("web", "example.com"),
+            "enforcing policy without an allows_name override must fail closed"
+        );
+        // A non-enforcing policy keeps DNS pass-through.
         assert!(AllowAll.allows_name("web", "anything.example.com"));
     }
 
