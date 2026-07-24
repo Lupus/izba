@@ -62,6 +62,14 @@ pub trait Policy: Send + Sync {
     fn enforces(&self) -> bool {
         true
     }
+
+    /// Port/access-agnostic DNS gate: may this QNAME be resolved at all under
+    /// an enforcing policy? Only consulted by the egress router when
+    /// `enforces()` is true. Default permissive so a non-enforcing / future
+    /// policy never blocks DNS by accident.
+    fn allows_name(&self, _sandbox: &str, _name: &str) -> bool {
+        true
+    }
 }
 
 /// Default policy for a bare sandbox (no declared `--policy`): everything
@@ -228,6 +236,22 @@ impl Policy for RegoPolicy {
             // dropped here; the audit sink records the resulting Deny.
             Ok(false) | Err(_) => Verdict::Deny,
         }
+    }
+
+    fn allows_name(&self, sandbox: &str, name: &str) -> bool {
+        // Port/access-agnostic evaluation of `data.egress.resolvable`. Any
+        // engine error is a fail-closed `false` — mirrors `check`.
+        let input = serde_json::json!({ "sandbox": sandbox, "host": name }).to_string();
+        let mut engine = self.template.clone();
+        let verdict = (|| -> anyhow::Result<bool> {
+            engine
+                .set_input_json(&input)
+                .map_err(|e| anyhow::anyhow!("set_input_json: {e}"))?;
+            engine
+                .eval_bool_query("data.egress.resolvable".to_string(), false)
+                .map_err(|e| anyhow::anyhow!("eval_bool_query: {e}"))
+        })();
+        matches!(verdict, Ok(true))
     }
 }
 
@@ -805,6 +829,92 @@ mod tests {
     /// (e.g. a pre-fix policy.yaml on disk), match `api.gitevil.com`: real
     /// egress-scope widening, not a theoretical concern. This pins the Rego
     /// engine's actual behavior on that unvalidated pattern.
+    // ── Policy::allows_name (DNS-resolvability gate) ────────────────────────
+
+    #[test]
+    fn allows_name_exact_and_unlisted() {
+        let p = RegoPolicy::embedded().unwrap();
+        assert!(
+            p.allows_name("web", "api.anthropic.com"),
+            "listed global host resolvable"
+        );
+        assert!(
+            !p.allows_name("web", "evil.example.com"),
+            "unlisted host not resolvable"
+        );
+    }
+
+    #[test]
+    fn allows_name_is_port_agnostic() {
+        // A host scoped to a single non-web port is still resolvable (the bug a
+        // fixed-port probe would cause).
+        let data = r#"{"host_rules":{},"sandbox_host_rules":{"web":{"db.internal":{"ports":[5432],"access":"read-write"}}},"sandbox_git_rules":{}}"#;
+        let p = RegoPolicy::with_data(data).unwrap();
+        assert!(
+            p.allows_name("web", "db.internal"),
+            "port-agnostic: 5432-only host resolvable"
+        );
+    }
+
+    #[test]
+    fn allows_name_wildcard_and_apex() {
+        let data = serde_json::json!({
+            "host_rules": {}, "sandbox_host_rules": {},
+            "wildcard_host_rules": [], "sandbox_git_rules": {},
+            "sandbox_wildcard_host_rules": { "web": [{"pattern": "*.example.com", "ports": [443], "access": "read"}] }
+        });
+        let p = RegoPolicy::new(RegoPolicy::REGO, &data.to_string()).unwrap();
+        assert!(
+            p.allows_name("web", "api.example.com"),
+            "wildcard child resolvable"
+        );
+        assert!(!p.allows_name("web", "example.com"), "apex not resolvable");
+        assert!(
+            !p.allows_name("web", "a.b.example.com"),
+            "single-label wildcard depth"
+        );
+    }
+
+    #[test]
+    fn allows_name_git_host_and_repo_prefix() {
+        let p = policy_with_git(
+            "web",
+            r#"[{"repo":"github.com/myorg/app","access":"read"},{"host":"gitlab.com","access":"read"}]"#,
+            "{}",
+        );
+        assert!(
+            p.allows_name("web", "github.com"),
+            "git repo host resolvable"
+        );
+        assert!(
+            p.allows_name("web", "gitlab.com"),
+            "git host-scope resolvable"
+        );
+        assert!(
+            !p.allows_name("web", "bitbucket.org"),
+            "unlisted git host not resolvable"
+        );
+    }
+
+    #[test]
+    fn allows_name_is_per_sandbox_isolated() {
+        let data = serde_json::json!({
+            "host_rules": {}, "sandbox_git_rules": {},
+            "sandbox_host_rules": { "build": {"registry.corp": {"ports": [443], "access": "read"}} }
+        });
+        let p = RegoPolicy::new(RegoPolicy::REGO, &data.to_string()).unwrap();
+        assert!(p.allows_name("build", "registry.corp"));
+        assert!(
+            !p.allows_name("web", "registry.corp"),
+            "web must not inherit build's grant"
+        );
+    }
+
+    #[test]
+    fn allow_all_allows_any_name() {
+        assert!(AllowAll.allows_name("web", "anything.example.com"));
+    }
+
     #[test]
     fn glob_metacharacters_widen_scope_hence_validation() {
         let p = wildcard_policy(
