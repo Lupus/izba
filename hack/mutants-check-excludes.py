@@ -57,6 +57,13 @@ EXPECTED = {
             ("crates/izba-proto/src/dns.rs", "replace | with ^ in servfail"): 1,
         },
     },
+    r"replace \| with \^ in nxdomain": {
+        "reason": "nxdomain (resp[3] & 0xf0) | 0x03 — `| -> ^` is an equivalent "
+        "mutant (the mask clears the low nibble), same as servfail.",
+        "matches": {
+            ("crates/izba-proto/src/dns.rs", "replace | with ^ in nxdomain"): 1,
+        },
+    },
     # tarfs.rs open-flag `| -> ^` mutants: EQUIVALENT (O_RDONLY is 0, so
     # `0 ^ x == 0 | x`; O_DIRECTORY/O_CLOEXEC are disjoint bits, so `^ == |`).
     # `open_root_dir` has TWO such `|` (count 2); the others have one each.
