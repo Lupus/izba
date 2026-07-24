@@ -41,8 +41,8 @@ pub fn handle_conn(
         ),
         // `Dns` is UDP-origin (cap answers at 512, TC=1 on overflow); `DnsTcp`
         // is TCP-origin (return the full answer, up to 64 KiB).
-        StreamOpen::Dns => dns_loop(conn, resolver, sandbox, snoop, false),
-        StreamOpen::DnsTcp => dns_loop(conn, resolver, sandbox, snoop, true),
+        StreamOpen::Dns => dns_loop(conn, &*policy, resolver, sandbox, audit, snoop, false),
+        StreamOpen::DnsTcp => dns_loop(conn, &*policy, resolver, sandbox, audit, snoop, true),
         _ => {
             let _ = write_frame(
                 &mut conn,
@@ -76,7 +76,7 @@ fn tcp_connect(
         if write_frame(&mut conn, &Response::Ok).is_err() {
             return;
         }
-        dns_loop(conn, resolver, sandbox, snoop, true);
+        dns_loop(conn, &*policy, resolver, sandbox, audit, snoop, true);
         return;
     }
     let ip: IpAddr = match addr.parse() {
@@ -388,18 +388,53 @@ fn is_lan(ip: IpAddr) -> bool {
     }
 }
 
-/// Framed query/response pairs until EOF; resolver failures become SERVFAIL
-/// so the guest client fails fast instead of timing out. Each answer is snooped
-/// into `snoop` (IP→FQDN for tier-2) BEFORE the reply is written, so the mapping
-/// is installed before the guest can dial the resolved address.
+/// Framed query/response pairs until EOF. Under an ENFORCING policy each query
+/// is gated on its QNAME: a name the policy could not authorize is denied with
+/// NXDOMAIN (an unparseable query with SERVFAIL) and audit-logged, and is NEVER
+/// forwarded upstream — closing the QNAME-exfil channel. Allowed (and all
+/// non-enforcing) queries forward as before; resolver failures become SERVFAIL.
+/// Each forwarded answer is snooped (IP→FQDN for tier-2) BEFORE its reply is
+/// written, so the mapping is installed before the guest can dial the address.
+#[allow(clippy::too_many_arguments)]
 fn dns_loop(
     mut conn: UdsStream,
+    policy: &dyn Policy,
     resolver: &dyn Resolver,
     sandbox: &str,
+    audit: &AuditSink,
     snoop: &SnoopStore,
     over_tcp: bool,
 ) {
     while let Ok(Some(query)) = dns::read_dns_msg(&mut conn) {
+        if policy.enforces() {
+            // The QNAME decision is on the first question. A multi-question message
+            // (QDCOUNT > 1) is not an exfil channel: it goes to one upstream resolver,
+            // which processes only the first question and never routes a smuggled
+            // second question to an attacker nameserver — matching standard resolver
+            // behavior. (qname_of returns the first question's name.)
+            let name = dns_snoop::qname_of(&query);
+            let authorized = name
+                .as_deref()
+                .is_some_and(|n| policy.allows_name(sandbox, n));
+            if !authorized {
+                let (reply, rule): (Vec<u8>, &str) = match &name {
+                    Some(_) => (dns::nxdomain(&query), "DNS: not in allow-list"),
+                    None => (dns::servfail(&query), "DNS: unparseable query (enforcing)"),
+                };
+                audit.record(AuditRecord::deny(
+                    sandbox,
+                    Ipv4Addr::UNSPECIFIED.into(),
+                    53,
+                    name.as_deref(),
+                    Tier::L3,
+                    rule,
+                ));
+                if dns::write_dns_msg(&mut conn, &reply).is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
         let result = if over_tcp {
             resolver.handle_tcp(&query)
         } else {
@@ -740,9 +775,13 @@ mod tests {
         let _ = dns_snoop::extract_a_aaaa(&[]); // (parser exercised by its own tests)
 
         let (mut c, server) = UdsStream::pair().unwrap();
+        let audit = AuditSink::new(crate::paths::Paths::with_root(
+            std::env::temp_dir().join("izba-router-dnsloop-test"),
+        ));
         // Borrow `snoop`/`resolver` into the scoped thread that runs dns_loop.
         std::thread::scope(|s| {
-            let h = s.spawn(|| dns_loop(server, &resolver, "web", &snoop, false));
+            let h =
+                s.spawn(|| dns_loop(server, &AllowAll, &resolver, "web", &audit, &snoop, false));
             dns::write_dns_msg(&mut c, b"q").unwrap();
             let _ = dns::read_dns_msg(&mut c).unwrap(); // the resolved answer
             c.shutdown(std::net::Shutdown::Write).unwrap();
@@ -898,7 +937,18 @@ mod tests {
             let mut s = server;
             let open: StreamOpen = read_frame(&mut s).unwrap();
             assert!(matches!(open, StreamOpen::Dns));
-            dns_loop(s, &FakeResolver, "web", &SnoopStore::new(), false);
+            let audit = AuditSink::new(crate::paths::Paths::with_root(
+                std::env::temp_dir().join("izba-router-dnsloop-test"),
+            ));
+            dns_loop(
+                s,
+                &AllowAll,
+                &FakeResolver,
+                "web",
+                &audit,
+                &SnoopStore::new(),
+                false,
+            );
         });
         write_frame(&mut c, &StreamOpen::Dns).unwrap();
         // Happy-path: one round-trip confirms the loop is running.
@@ -914,6 +964,106 @@ mod tests {
         drop(c);
         h.join()
             .expect("dns_loop must not hang after write failure");
+    }
+
+    /// Build a minimal A-record DNS query for `name` with a fixed ID.
+    fn dns_query(name: &str) -> Vec<u8> {
+        use hickory_proto::op::{Message, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+        let mut m = Message::query();
+        m.metadata.id = 0x1234;
+        m.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+        m.to_vec().unwrap()
+    }
+
+    /// Enforcing + unlisted QNAME → NXDOMAIN, and the query is NOT forwarded
+    /// (a forwarded FakeResolver reply would be `ans:...`, not a valid NXDOMAIN
+    /// derived from our query ID).
+    #[test]
+    fn enforcing_denies_unlisted_qname_with_nxdomain() {
+        let mut c = spawn_handler(Arc::new(RegoPolicy::embedded().unwrap()), &FakeResolver);
+        write_frame(&mut c, &StreamOpen::Dns).unwrap();
+        let q = dns_query("evil.example.com.");
+        dns::write_dns_msg(&mut c, &q).unwrap();
+        let resp = dns::read_dns_msg(&mut c).unwrap().unwrap();
+        assert_eq!(
+            &resp[..2],
+            &q[..2],
+            "our query ID preserved (not a resolver echo)"
+        );
+        assert_eq!(resp[3] & 0x0f, 0x03, "RCODE=NXDOMAIN");
+    }
+
+    /// Enforcing + allow-listed QNAME → forwarded (FakeResolver echoes `ans:`).
+    #[test]
+    fn enforcing_allows_listed_qname_and_forwards() {
+        let mut c = spawn_handler(Arc::new(RegoPolicy::embedded().unwrap()), &FakeResolver);
+        write_frame(&mut c, &StreamOpen::Dns).unwrap();
+        let q = dns_query("api.anthropic.com.");
+        dns::write_dns_msg(&mut c, &q).unwrap();
+        let resp = dns::read_dns_msg(&mut c).unwrap().unwrap();
+        assert_eq!(&resp[..4], b"ans:", "listed name forwarded to the resolver");
+    }
+
+    /// Non-enforcing (bare) sandbox → unchanged pass-through for ANY name.
+    #[test]
+    fn non_enforcing_forwards_any_qname() {
+        let mut c = spawn_handler(Arc::new(AllowAll), &FakeResolver);
+        write_frame(&mut c, &StreamOpen::Dns).unwrap();
+        let q = dns_query("evil.example.com.");
+        dns::write_dns_msg(&mut c, &q).unwrap();
+        let resp = dns::read_dns_msg(&mut c).unwrap().unwrap();
+        assert_eq!(&resp[..4], b"ans:", "bare sandbox forwards unchanged");
+    }
+
+    /// DnsTcp gets identical enforcement to UDP Dns.
+    #[test]
+    fn enforcing_denies_unlisted_over_dnstcp() {
+        let mut c = spawn_handler(Arc::new(RegoPolicy::embedded().unwrap()), &FakeResolver);
+        write_frame(&mut c, &StreamOpen::DnsTcp).unwrap();
+        let q = dns_query("evil.example.com.");
+        dns::write_dns_msg(&mut c, &q).unwrap();
+        let resp = dns::read_dns_msg(&mut c).unwrap().unwrap();
+        assert_eq!(resp[3] & 0x0f, 0x03, "DnsTcp denial is NXDOMAIN too");
+    }
+
+    /// TcpConnect:53 (the guest dialing an upstream resolver) gets identical
+    /// enforcement after the Ok handshake.
+    #[test]
+    fn enforcing_denies_unlisted_over_tcpconnect53() {
+        let mut c = spawn_handler(Arc::new(RegoPolicy::embedded().unwrap()), &FakeResolver);
+        write_frame(
+            &mut c,
+            &StreamOpen::TcpConnect {
+                addr: "8.8.8.8".into(),
+                port: 53,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, Response>(&mut c).unwrap(),
+            Response::Ok
+        ));
+        let q = dns_query("evil.example.com.");
+        dns::write_dns_msg(&mut c, &q).unwrap();
+        let resp = dns::read_dns_msg(&mut c).unwrap().unwrap();
+        assert_eq!(resp[3] & 0x0f, 0x03, "TcpConnect:53 denial is NXDOMAIN too");
+    }
+
+    /// Enforcing + unparseable query → SERVFAIL (fail-closed), not forwarded.
+    #[test]
+    fn enforcing_servfails_unparseable_query() {
+        let mut c = spawn_handler(Arc::new(RegoPolicy::embedded().unwrap()), &FakeResolver);
+        write_frame(&mut c, &StreamOpen::Dns).unwrap();
+        // Not a DNS message; >=4 bytes so servfail() can still write RCODE bits.
+        dns::write_dns_msg(&mut c, &[0xff, 0x00, 0x01, 0x02]).unwrap();
+        let resp = dns::read_dns_msg(&mut c).unwrap().unwrap();
+        assert_eq!(
+            resp[3] & 0x0f,
+            0x02,
+            "unparseable under enforce -> SERVFAIL"
+        );
     }
 
     #[test]
