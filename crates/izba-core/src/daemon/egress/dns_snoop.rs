@@ -53,6 +53,21 @@ pub fn extract_a_aaaa(resp: &[u8]) -> Vec<(String, IpAddr, u32)> {
     out
 }
 
+/// The first question's name in a DNS query — lowercased, trailing dot trimmed
+/// (`api.anthropic.com`). `None` if the message does not parse, has no question,
+/// or is a root (`.`) query. The egress router treats `None` as a fail-closed
+/// deny (SERVFAIL) under an enforcing policy.
+pub fn qname_of(msg: &[u8]) -> Option<String> {
+    let parsed = Message::from_vec(msg).ok()?;
+    let q = parsed.queries.first()?;
+    let name = normalize(&q.name().to_utf8());
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 struct FqdnEntry {
     fqdn: String,
     expiry: Instant,
@@ -324,6 +339,37 @@ mod tests {
             store.inner.lock().unwrap().is_empty(),
             "an entry must be swept at its exact expiry instant"
         );
+    }
+
+    #[test]
+    fn qname_of_extracts_lowercased_dotless_name() {
+        use hickory_proto::op::Query;
+        use hickory_proto::rr::{Name, RecordType};
+
+        let mut m = Message::query();
+        m.add_query(Query::query(
+            Name::from_str("API.Anthropic.COM.").unwrap(),
+            RecordType::A,
+        ));
+        let bytes = m.to_vec().unwrap();
+        assert_eq!(qname_of(&bytes).as_deref(), Some("api.anthropic.com"));
+    }
+
+    #[test]
+    fn qname_of_none_on_garbage_and_empty() {
+        assert_eq!(qname_of(&[0xff, 0x00, 0x01]), None, "unparseable -> None");
+        assert_eq!(qname_of(&[]), None, "empty -> None");
+    }
+
+    #[test]
+    fn qname_of_none_on_root_query() {
+        use hickory_proto::op::Query;
+        use hickory_proto::rr::{Name, RecordType};
+
+        let mut m = Message::query();
+        m.add_query(Query::query(Name::root(), RecordType::NS));
+        let bytes = m.to_vec().unwrap();
+        assert_eq!(qname_of(&bytes), None, "root '.' query -> None");
     }
 
     #[test]
