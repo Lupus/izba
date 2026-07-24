@@ -45,6 +45,9 @@ exclude_re = [
     # Named exclusion keeps servfail's other mutants under test, unlike a
     # function-wide `#[mutants::skip]`.
     "replace \\| with \\^ in servfail",
+    # dns.rs nxdomain `(resp[3] & 0xf0) | 0x03`: the `| -> ^` mutant is EQUIVALENT
+    # for the same reason as servfail above (mask clears the low nibble).
+    "replace \\| with \\^ in nxdomain",
     # tarfs.rs (guest cp extract/create) — see the "Mutation note" blocks there.
     # The open-flag `| -> ^` mutants are EQUIVALENT: `O_RDONLY` is 0
     # (`0 ^ x == 0 | x`) and `O_DIRECTORY`/`O_CLOEXEC` are disjoint bits

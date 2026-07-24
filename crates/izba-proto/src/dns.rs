@@ -45,6 +45,24 @@ pub fn servfail(query: &[u8]) -> Vec<u8> {
     resp
 }
 
+/// Turn `query` into an NXDOMAIN response in place: QR=1, RA=1, RCODE=3.
+/// ID and question section are preserved so the client can match it. The
+/// egress router uses this to deny a DNS name an enforcing policy did not
+/// authorize — the query is never forwarded upstream.
+//
+// Mutation note: like `servfail`, the `| -> ^` mutant of `(resp[3] & 0xf0) | 0x03`
+// is EQUIVALENT — `& 0xf0` clears the low nibble, so `| 0x03` and `^ 0x03` always
+// agree — hence unkillable, and excluded by name in `.cargo/mutants.toml`.
+pub fn nxdomain(query: &[u8]) -> Vec<u8> {
+    let mut resp = query.to_vec();
+    if resp.len() >= 4 {
+        resp[2] |= 0x80; // QR: this is a response
+        resp[3] = (resp[3] & 0xf0) | 0x03; // RCODE = NXDOMAIN
+        resp[3] |= 0x80; // RA
+    }
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +102,23 @@ mod tests {
     #[test]
     fn servfail_on_runt_query_does_not_panic() {
         assert_eq!(servfail(&[0x01]), vec![0x01]);
+    }
+
+    #[test]
+    fn nxdomain_sets_qr_ra_rcode_keeps_id() {
+        // 12-byte header: ID=0xbeef, flags=0x0100 (RD), 1 question.
+        let q = [0xbeu8, 0xef, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        let r = nxdomain(&q);
+        assert_eq!(&r[..2], &[0xbe, 0xef], "ID preserved");
+        assert_eq!(r[2], 0x81, "QR set, RD preserved");
+        assert_eq!(r[3], 0x83, "RA set, RCODE=3 (NXDOMAIN)");
+        assert_eq!(&r[4..6], &q[4..6], "QDCOUNT preserved");
+        assert_eq!(r.len(), q.len());
+    }
+
+    #[test]
+    fn nxdomain_on_runt_query_does_not_panic() {
+        assert_eq!(nxdomain(&[0x01]), vec![0x01]);
     }
 
     // -------------------------------------------------------------------------
@@ -168,6 +203,25 @@ mod tests {
                     &query[4..6],
                     "QDCOUNT (bytes 4..6) must be preserved"
                 );
+            }
+        }
+
+        /// nxdomain on arbitrary query bytes must never panic; length preserved,
+        /// ID preserved, and for >=4-byte inputs QR+RA set and RCODE low nibble = 3.
+        #[test]
+        fn prop_nxdomain_robustness(query in proptest::collection::vec(any::<u8>(), 0..=512usize)) {
+            let resp = nxdomain(&query);
+            prop_assert_eq!(resp.len(), query.len(), "length must be preserved");
+            if query.len() >= 2 {
+                prop_assert_eq!(&resp[..2], &query[..2], "ID preserved");
+            }
+            if query.len() >= 4 {
+                prop_assert_eq!(resp[2], query[2] | 0x80, "QR set, other bits preserved");
+                prop_assert!(resp[3] & 0x80 != 0, "RA set");
+                prop_assert_eq!(resp[3] & 0x0f, 0x03, "RCODE = NXDOMAIN");
+            }
+            if query.len() >= 6 {
+                prop_assert_eq!(&resp[4..6], &query[4..6], "QDCOUNT preserved");
             }
         }
     }
