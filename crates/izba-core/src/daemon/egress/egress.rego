@@ -99,3 +99,28 @@ allow if {
     git_kind == "write"
     rule.access == "read-write"
 }
+
+# --- DNS resolvability (port/access-agnostic) ---
+# May this QNAME be resolved at all? A name is resolvable iff SOME allow rule
+# could match this host — port/method/access are deliberately ignored here and
+# still enforced at connect time (tier-1 MITM / tier-2). This closes the
+# QNAME-exfil channel: a name absent from every rule is never sent upstream.
+default resolvable := false
+resolvable if data.host_rules[input.host]
+resolvable if data.sandbox_host_rules[input.sandbox][input.host]
+resolvable if {
+    some rule in data.wildcard_host_rules
+    glob.match(rule.pattern, ["."], input.host)
+}
+resolvable if {
+    some rule in data.sandbox_wildcard_host_rules[input.sandbox]
+    glob.match(rule.pattern, ["."], input.host)
+}
+resolvable if {
+    some rule in data.sandbox_git_rules[input.sandbox]
+    rule.host == input.host
+}
+resolvable if {
+    some rule in data.sandbox_git_rules[input.sandbox]
+    startswith(rule.repo, sprintf("%s/", [input.host]))
+}
