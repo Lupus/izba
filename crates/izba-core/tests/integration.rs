@@ -1221,16 +1221,28 @@ fn guest_networking() {
 /// guest boots and dials it. Panics with the console tail on boot failure;
 /// returns the manager so the caller stops it at the end. Shared by the
 /// `egress_dns_*` tests so their setup isn't copy-pasted (CPD gate).
+///
+/// `policy_yaml`, when `Some`, is installed as the sandbox's egress policy
+/// (via the same `EgressPolicyConfig::write_to` the CLI's
+/// `persist_policy_config` uses) BEFORE `ensure_listening` — which resolves
+/// the sandbox's policy once, at arm time — so an enforcing policy is live
+/// for the whole boot. `None` keeps the bare/non-enforcing AllowAll default.
 fn start_with_egress(
     env: &TestEnv,
     tb: &mut TestBox,
     name: &str,
     ws: &Path,
+    policy_yaml: Option<&str>,
 ) -> izba_core::daemon::egress::EgressManager {
     use izba_core::daemon::egress::{
-        audit::AuditSink, sys_resolver::SystemResolver, EgressManager,
+        audit::AuditSink, config::EgressPolicyConfig, sys_resolver::SystemResolver, EgressManager,
     };
     create_sandbox(env, tb, name, ws);
+    if let Some(yaml) = policy_yaml {
+        let cfg = EgressPolicyConfig::from_yaml(yaml).expect("parsing egress policy yaml");
+        cfg.write_to(&tb.paths.sandbox_dir(name))
+            .expect("writing egress policy.yaml");
+    }
     let mgr = EgressManager::new(
         SystemResolver::new().expect("system resolver"),
         None,
@@ -1256,7 +1268,7 @@ fn egress_dns_via_izbad() {
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("egress-dns");
-    let mgr = start_with_egress(&env, &mut tb, "egress-dns", &ws);
+    let mgr = start_with_egress(&env, &mut tb, "egress-dns", &ws, None);
 
     // getent uses the guest resolv.conf (nameserver 127.0.0.1 -> the izba-init
     // DNS stub on 0.0.0.0:53 -> vsock Dns stream -> izbad SystemResolver ->
@@ -1277,6 +1289,78 @@ fn egress_dns_via_izbad() {
     mgr.stop("egress-dns", &tb.paths.run_dir("egress-dns"));
 }
 
+/// #148 e2e: an ENFORCING policy that allow-lists only `example.com` denies
+/// DNS for an unlisted name (`example.org`), NXDOMAIN'd by the host-side gate
+/// in `dns_loop` (`daemon/egress/router.rs`) and never forwarded upstream.
+/// Both names are real, live domains that resolve fine with no izba involved
+/// at all — so any observed difference between them is proof of izba's own
+/// enforcement, not network happenstance.
+#[test]
+fn egress_dns_enforce_denies_unlisted() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("egress-dns-enforce");
+    let name = "egress-dns-enforce";
+    let mgr = start_with_egress(
+        &env,
+        &mut tb,
+        name,
+        &ws,
+        Some("enforce: true\nallow:\n  - example.com\n"),
+    );
+
+    // Allowed: example.com is on the allow-list, forwarded upstream as usual.
+    let out = exec_ok(&tb.paths, name, &["sh", "-lc", "getent hosts example.com"]);
+    assert!(
+        out.contains("example.com"),
+        "expected the allow-listed example.com to resolve, got: {out:?}"
+    );
+
+    // Denied: example.org is NOT on the allow-list, so the enforcing gate
+    // must answer NXDOMAIN instead of forwarding upstream. `getent` exits
+    // non-zero on NXDOMAIN, so `exec_collect` (not `exec_ok`) is required.
+    let (status, stdout, stderr) = exec_collect(
+        &tb.paths,
+        name,
+        &["sh", "-lc", "getent hosts example.org"],
+        None,
+    )
+    .expect("exec getent example.org");
+    assert_ne!(
+        status,
+        ExitStatus::Code(0),
+        "expected getent to fail (NXDOMAIN) for the unlisted example.org, \
+         stdout: {stdout:?} stderr: {stderr:?}"
+    );
+    assert!(
+        !stdout.contains("example.org"),
+        "expected NO resolved address for the denied example.org, got: {stdout:?}"
+    );
+
+    // The denial must be audit-logged: one JSONL line with a deny verdict, a
+    // DNS-tier rule, for the denied host.
+    let audit_path = tb.paths.logs_dir(name).join("egress-audit.jsonl");
+    let audit_text = fs::read_to_string(&audit_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", audit_path.display()));
+    let denied = audit_text.lines().any(|line| {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        v.get("verdict").and_then(|x| x.as_str()) == Some("deny")
+            && v.get("rule")
+                .and_then(|x| x.as_str())
+                .is_some_and(|r| r.starts_with("DNS:"))
+            && v.get("host").and_then(|x| x.as_str()) == Some("example.org")
+    });
+    assert!(
+        denied,
+        "expected a deny audit record for example.org (a 'DNS:' rule), got:\n{audit_text}"
+    );
+
+    stop_sandbox(&tb, name);
+    mgr.stop(name, &tb.paths.run_dir(name));
+}
+
 /// Transparent-reply fix (M4 prereq for docker/build-in-VM): a client that
 /// hardcodes an external UDP resolver (e.g. dockerd/buildkit falling back to
 /// 8.8.8.8:53 after stripping the loopback resolv.conf) resolves names. The
@@ -1291,7 +1375,7 @@ fn egress_dns_hardcoded_external_resolver() {
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("egress-dns-hard");
-    let mgr = start_with_egress(&env, &mut tb, "egress-dns-hard", &ws);
+    let mgr = start_with_egress(&env, &mut tb, "egress-dns-hard", &ws, None);
 
     // Query 8.8.8.8 explicitly: the datagram leaves for 8.8.8.8:53, nft
     // REDIRECTs it to the guest stub, izbad resolves via the host upstream,
@@ -1327,7 +1411,7 @@ fn egress_dns_tcp_hardcoded_external_resolver() {
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("egress-dns-tcp");
-    let mgr = start_with_egress(&env, &mut tb, "egress-dns-tcp", &ws);
+    let mgr = start_with_egress(&env, &mut tb, "egress-dns-tcp", &ws, None);
 
     // DNS/TCP query for example.com A IN (id 0xABCD), 2-byte length-prefixed;
     // octal escapes keep printf busybox-portable. The pipeline's exit status is
