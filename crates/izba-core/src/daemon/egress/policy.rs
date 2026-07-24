@@ -897,6 +897,31 @@ mod tests {
     }
 
     #[test]
+    fn allows_name_git_repo_host_wildcard_matches_allow_predicate() {
+        let p = policy_with_git(
+            "web",
+            r#"[{"repo":"*.github.com/org/app","access":"read"}]"#,
+            "{}",
+        );
+        assert!(
+            p.allows_name("web", "sub.github.com"),
+            "host-wildcard repo host resolvable"
+        );
+        assert!(
+            !p.allows_name("web", "evil.com"),
+            "non-matching host not resolvable"
+        );
+        // A literal-host repo rule still resolves exactly its host, nothing else.
+        let q = policy_with_git(
+            "web",
+            r#"[{"repo":"github.com/myorg/app","access":"read"}]"#,
+            "{}",
+        );
+        assert!(q.allows_name("web", "github.com"));
+        assert!(!q.allows_name("web", "gitlab.com"));
+    }
+
+    #[test]
     fn allows_name_is_per_sandbox_isolated() {
         let data = serde_json::json!({
             "host_rules": {}, "sandbox_git_rules": {},

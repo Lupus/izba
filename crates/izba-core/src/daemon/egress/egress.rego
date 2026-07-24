@@ -122,5 +122,6 @@ resolvable if {
 }
 resolvable if {
     some rule in data.sandbox_git_rules[input.sandbox]
-    startswith(rule.repo, sprintf("%s/", [input.host]))
+    rule.repo
+    glob.match(split(rule.repo, "/")[0], ["/"], input.host)
 }
