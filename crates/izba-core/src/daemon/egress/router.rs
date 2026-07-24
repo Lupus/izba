@@ -407,6 +407,11 @@ fn dns_loop(
 ) {
     while let Ok(Some(query)) = dns::read_dns_msg(&mut conn) {
         if policy.enforces() {
+            // The QNAME decision is on the first question. A multi-question message
+            // (QDCOUNT > 1) is not an exfil channel: it goes to one upstream resolver,
+            // which processes only the first question and never routes a smuggled
+            // second question to an attacker nameserver — matching standard resolver
+            // behavior. (qname_of returns the first question's name.)
             let name = dns_snoop::qname_of(&query);
             let authorized = name
                 .as_deref()
