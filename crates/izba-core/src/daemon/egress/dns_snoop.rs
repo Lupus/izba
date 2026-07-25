@@ -53,14 +53,20 @@ pub fn extract_a_aaaa(resp: &[u8]) -> Vec<(String, IpAddr, u32)> {
     out
 }
 
-/// The first question's name in a DNS query — lowercased, trailing dot trimmed
-/// (`api.anthropic.com`). `None` if the message does not parse, has no question,
-/// or is a root (`.`) query. The egress router treats `None` as a fail-closed
-/// deny (SERVFAIL) under an enforcing policy.
+/// The QNAME a DNS query is asking about — lowercased, trailing dot trimmed
+/// (`api.anthropic.com`). `None` if the message does not parse, is a root (`.`)
+/// query, or does not contain EXACTLY one question. The egress router treats
+/// `None` as a fail-closed deny under an enforcing policy — so a multi-question
+/// message (QDCOUNT != 1) is denied rather than forwarded: it has no single
+/// QNAME to authorize, and would otherwise let a second, exfil-bearing question
+/// ride along in a packet whose first question is allow-listed.
 pub fn qname_of(msg: &[u8]) -> Option<String> {
     let parsed = Message::from_vec(msg).ok()?;
-    let q = parsed.queries.first()?;
-    let name = normalize(&q.name().to_utf8());
+    // Exactly one question, or there is no single QNAME to gate on.
+    if parsed.queries.len() != 1 {
+        return None;
+    }
+    let name = normalize(&parsed.queries[0].name().to_utf8());
     if name.is_empty() {
         None
     } else {
@@ -359,6 +365,27 @@ mod tests {
     fn qname_of_none_on_garbage_and_empty() {
         assert_eq!(qname_of(&[0xff, 0x00, 0x01]), None, "unparseable -> None");
         assert_eq!(qname_of(&[]), None, "empty -> None");
+    }
+
+    /// A multi-question message (QDCOUNT != 1) has no single QNAME to gate on,
+    /// so it returns `None` → the enforcing gate denies it rather than forwarding
+    /// a packet whose second question could smuggle exfil data past the first.
+    #[test]
+    fn qname_of_none_on_multi_question() {
+        use hickory_proto::op::Query;
+        use hickory_proto::rr::{Name, RecordType};
+
+        let mut m = Message::query();
+        m.add_query(Query::query(
+            Name::from_str("allowed.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        m.add_query(Query::query(
+            Name::from_str("exfil.evil.example.com.").unwrap(),
+            RecordType::TXT,
+        ));
+        let bytes = m.to_vec().unwrap();
+        assert_eq!(qname_of(&bytes), None, "two-question query -> None");
     }
 
     #[test]

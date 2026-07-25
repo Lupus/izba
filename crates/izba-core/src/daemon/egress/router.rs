@@ -407,11 +407,10 @@ fn dns_loop(
 ) {
     while let Ok(Some(query)) = dns::read_dns_msg(&mut conn) {
         if policy.enforces() {
-            // The QNAME decision is on the first question. A multi-question message
-            // (QDCOUNT > 1) is not an exfil channel: it goes to one upstream resolver,
-            // which processes only the first question and never routes a smuggled
-            // second question to an attacker nameserver — matching standard resolver
-            // behavior. (qname_of returns the first question's name.)
+            // The gate authorizes a single QNAME. `qname_of` returns `None` for a
+            // multi-question message (QDCOUNT != 1) as well as an unparseable one,
+            // so a packet that pairs an allow-listed first question with a smuggled
+            // exfil-bearing second question is denied fail-closed, never forwarded.
             let name = dns_snoop::qname_of(&query);
             let authorized = name
                 .as_deref()
@@ -1063,6 +1062,44 @@ mod tests {
             resp[3] & 0x0f,
             0x02,
             "unparseable under enforce -> SERVFAIL"
+        );
+    }
+
+    /// Enforcing + a multi-question query whose FIRST question is allow-listed is
+    /// STILL denied (fail-closed, not forwarded): `qname_of` yields no single
+    /// QNAME for QDCOUNT != 1, closing the second-question smuggling channel. The
+    /// deny is a SERVFAIL derived from our query (ID preserved), not a resolver
+    /// echo (`ans:...`) — proving the packet never reached the resolver.
+    #[test]
+    fn enforcing_denies_multi_question_even_with_allowed_first() {
+        use hickory_proto::op::{Message, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+        let mut m = Message::query();
+        m.metadata.id = 0x5678;
+        m.add_query(Query::query(
+            Name::from_str("api.anthropic.com.").unwrap(), // allow-listed first
+            RecordType::A,
+        ));
+        m.add_query(Query::query(
+            Name::from_str("exfil.evil.example.com.").unwrap(), // smuggled second
+            RecordType::TXT,
+        ));
+        let q = m.to_vec().unwrap();
+
+        let mut c = spawn_handler(Arc::new(RegoPolicy::embedded().unwrap()), &FakeResolver);
+        write_frame(&mut c, &StreamOpen::Dns).unwrap();
+        dns::write_dns_msg(&mut c, &q).unwrap();
+        let resp = dns::read_dns_msg(&mut c).unwrap().unwrap();
+        assert_eq!(
+            &resp[..2],
+            &q[..2],
+            "our query ID preserved (not a resolver echo)"
+        );
+        assert_eq!(
+            resp[3] & 0x0f,
+            0x02,
+            "multi-question under enforce -> SERVFAIL, not forwarded"
         );
     }
 

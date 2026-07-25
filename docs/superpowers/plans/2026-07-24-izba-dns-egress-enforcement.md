@@ -236,9 +236,14 @@ resolvable if {
 }
 resolvable if {
     some rule in data.sandbox_git_rules[input.sandbox]
-    startswith(rule.repo, sprintf("%s/", [input.host]))
+    glob.match(split(rule.repo, "/")[0], ["/"], input.host)
 }
 ```
+
+> Note (as shipped): the git-repo branch glob-matches the repo pattern's host
+> segment (`split(rule.repo, "/")[0]`) so a host-wildcarded rule like
+> `*.github.com/org/app` resolves consistently with `allow` — a literal
+> `startswith(rule.repo, "<host>/")` would wrongly deny it. See the design spec.
 
 - [ ] **Step 4: Add the trait method + `RegoPolicy` override**
 
@@ -300,7 +305,7 @@ git commit -m "feat(core): add port-agnostic resolvable rule + Policy::allows_na
 - Modify: `crates/izba-core/src/daemon/egress/dns_snoop.rs` (add `qname_of` + tests)
 
 **Interfaces:**
-- Produces: `pub fn qname_of(msg: &[u8]) -> Option<String>` — first question's name, lowercased, trailing dot trimmed; `None` on parse failure, no question, or a root (`.`) query.
+- Produces: `pub fn qname_of(msg: &[u8]) -> Option<String>` — the QNAME of a single-question query, lowercased, trailing dot trimmed; `None` on parse failure, a root (`.`) query, or any message that does not have exactly one question (a `QDCOUNT != 1` message is denied fail-closed, closing the multi-question smuggling channel).
 
 - [ ] **Step 1: Write the failing tests**
 

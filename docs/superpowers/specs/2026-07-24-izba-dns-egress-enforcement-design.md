@@ -138,9 +138,18 @@ resolvable if {
 }
 resolvable if {
     some rule in data.sandbox_git_rules[input.sandbox]
-    startswith(rule.repo, sprintf("%s/", [input.host]))
+    glob.match(split(rule.repo, "/")[0], ["/"], input.host)
 }
 ```
+
+> **Implementation note (git-repo host segment):** the git-repo branch matches
+> the repo pattern's *host segment* (`split(rule.repo, "/")[0]`) with the same
+> `/`-delimited `glob.match` that `allow`'s `git_rule_matches` applies to the
+> whole repo id — not a literal `startswith(rule.repo, "<host>/")`. A literal
+> prefix would wrongly deny a host-wildcarded repo rule such as
+> `*.github.com/org/app` (which `allow` *does* permit), so glob-matching the host
+> segment keeps `resolvable` consistent with `allow`. (Verified by
+> `allows_name_git_repo_host_wildcard_matches_allow_predicate`.)
 
 This reuses the exact host-matching predicates of `allow` (exact host,
 per-sandbox scoping, `*`/`**` wildcard glob) — no logic is duplicated in Rust,
@@ -153,15 +162,22 @@ right now". That means a name reachable on some port always resolves (never
 breaks a legitimate flow), while the real port/method/access gate still runs at
 connect time. A hostile QNAME (`<secret>.evil.com`) resolves only if `evil.com`
 or `*.evil.com` is itself listed — which it is not, by definition — so exfil is
-still denied. The git-host `startswith` check is likewise a coarse
-over-approximation over hosts that are already legitimately listed.
+still denied. The git-host glob check is likewise a coarse over-approximation
+over hosts that are already legitimately listed.
 
 ### 3. QNAME extraction — `qname_of`
 
 Add `qname_of(msg: &[u8]) -> Option<String>` in `dns_snoop.rs` (which already
-depends on `hickory-proto` for `extract_a_aaaa`): parse the message, take the
-first question's name, lowercase it, trim the trailing dot. `None` on a parse
-failure or a query with no question section → the fail-closed deny path.
+depends on `hickory-proto` for `extract_a_aaaa`): parse the message, and if it
+contains **exactly one** question, lowercase that question's name and trim the
+trailing dot. `None` on a parse failure, a root (`.`) query, or a query that
+does not have exactly one question → the fail-closed deny path.
+
+Requiring a single question closes the multi-question smuggling channel: a
+`QDCOUNT != 1` message has no single QNAME to authorize, and forwarding one whose
+first question is allow-listed would let a second, exfil-bearing question ride
+along in the same UDP datagram to the upstream resolver. Under enforce such a
+message is denied, never forwarded (non-enforcing sandboxes keep pass-through).
 
 ### 4. Denial synthesis — `nxdomain`
 
