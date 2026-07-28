@@ -148,7 +148,7 @@ make olddefconfig
 echo "Verifying fragment symbols survived olddefconfig..."
 MISSING_Y=""
 UNEXPECTED_Y=""
-while IFS= read -r line; do
+while IFS= read -r line || [[ -n "$line" ]]; do
     case "$line" in
         CONFIG_*=y)
             # e.g. "CONFIG_USER_NS=y" -> symbol "CONFIG_USER_NS"
