@@ -131,6 +131,59 @@ bash scripts/kconfig/merge_config.sh -m .config "$FRAGMENT"
 make olddefconfig
 
 # ---------------------------------------------------------------------------
+# Verify the merge landed: assert every symbol the fragment pins survived
+# `make olddefconfig`.
+# ---------------------------------------------------------------------------
+# THE FOOTGUN this guards: if a `CONFIG_X=y` line in the fragment has an unmet
+# Kconfig dependency, olddefconfig SILENTLY drops it from the final .config —
+# and the kernel still compiles. A green build therefore does NOT prove a
+# requested feature is present. We assert it here so a dropped symbol becomes a
+# loud build failure (naming the symbol) instead of a runtime mystery in-guest.
+#
+# Two checks, parsed from the fragment itself (no second list to drift):
+#   - every `CONFIG_X=y`            line  ⇒  must be `CONFIG_X=y` in .config
+#   - every `# CONFIG_X is not set` line  ⇒  must NOT be `CONFIG_X=y` in .config
+# The =y check is the one that matters (the silent-drop case); the not-set
+# check is a cheap belt-and-braces against an unexpected force-`select`.
+echo "Verifying fragment symbols survived olddefconfig..."
+MISSING_Y=""
+UNEXPECTED_Y=""
+while IFS= read -r line; do
+    case "$line" in
+        CONFIG_*=y)
+            # e.g. "CONFIG_USER_NS=y" -> symbol "CONFIG_USER_NS"
+            sym="${line%%=*}"
+            if ! grep -qx "${sym}=y" .config; then
+                MISSING_Y="$MISSING_Y $sym"
+            fi
+            ;;
+        "# CONFIG_"*" is not set")
+            # e.g. "# CONFIG_IPV6 is not set" -> symbol "CONFIG_IPV6"
+            sym="${line#\# }"
+            sym="${sym%% *}"
+            if grep -qx "${sym}=y" .config; then
+                UNEXPECTED_Y="$UNEXPECTED_Y $sym"
+            fi
+            ;;
+    esac
+done <"$FRAGMENT"
+
+if [[ -n "$MISSING_Y" ]]; then
+    echo "error: fragment symbols requested =y but DROPPED by olddefconfig" >&2
+    echo "       (almost always an unmet Kconfig dependency — chase the" >&2
+    echo "        symbol's 'depends on' chain and pin the missing parent =y):" >&2
+    for s in $MISSING_Y; do echo "         $s" >&2; done
+    exit 1
+fi
+if [[ -n "$UNEXPECTED_Y" ]]; then
+    echo "error: fragment requested these NOT set, but .config has them =y" >&2
+    echo "       (something still-enabled force-selects them):" >&2
+    for s in $UNEXPECTED_Y; do echo "         $s" >&2; done
+    exit 1
+fi
+echo "All fragment symbols verified."
+
+# ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 echo "Building vmlinux ($(nproc) jobs)..."
