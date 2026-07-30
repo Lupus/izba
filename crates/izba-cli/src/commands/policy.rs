@@ -559,6 +559,57 @@ mod tests {
         assert_eq!(cfg4.allow[0].access(), Access::Read);
     }
 
+    /// Greptile P1 regression (#84 fix-wave): `izba policy allow --read
+    /// api.x.com` followed by a PLAIN `izba policy allow API.X.COM` (a
+    /// different case spelling of the same host) must NOT create a second,
+    /// separate read-write entry that silently wins at Rego-compile time
+    /// (later duplicate JSON key overwrites the earlier one). The two CLI
+    /// invocations must collapse into exactly one allow-list entry that
+    /// stays `Access::Read`.
+    #[test]
+    fn allow_case_variant_does_not_widen_existing_read_entry() {
+        use izba_core::daemon::egress::config::EgressPolicyConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+
+        run(
+            &paths,
+            &PolicyCmd::Allow {
+                name: "web".into(),
+                target: "api.x.com".into(),
+                read: true,
+            },
+        )
+        .unwrap();
+        run(
+            &paths,
+            &PolicyCmd::Allow {
+                name: "web".into(),
+                target: "API.X.COM".into(),
+                read: false,
+            },
+        )
+        .unwrap();
+
+        let cfg = EgressPolicyConfig::load(&paths.sandbox_dir("web"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "a case-variant spelling must merge into the same entry, not append a new one: {:?}",
+            cfg.allow
+        );
+        assert_eq!(cfg.allow[0].host(), "api.x.com");
+        assert_eq!(
+            cfg.allow[0].access(),
+            Access::Read,
+            "the plain (non-read) allow of a case variant must not widen the existing read entry"
+        );
+    }
+
     // ── show()/render_policy ──────────────────────────────────────────────────
 
     #[test]

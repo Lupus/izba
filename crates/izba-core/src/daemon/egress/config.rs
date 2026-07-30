@@ -288,7 +288,12 @@ impl EgressPolicyConfig {
     /// Set the access verb for `host` (adding the entry if absent). Returns
     /// `true` if the config changed.
     pub fn set_host_access(&mut self, host: &str, access: Access) -> bool {
-        if let Some(e) = self.allow.iter_mut().find(|e| e.host() == host) {
+        let normalized = normalize_policy_host(host);
+        if let Some(e) = self
+            .allow
+            .iter_mut()
+            .find(|e| normalize_policy_host(e.host()) == normalized)
+        {
             if e.access() == access {
                 return false;
             }
@@ -297,14 +302,14 @@ impl EgressPolicyConfig {
                 p => Some(p),
             };
             *e = AllowEntry::Scoped {
-                host: host.to_string(),
+                host: normalized,
                 ports,
                 access,
             };
             true
         } else {
             self.allow.push(AllowEntry::Scoped {
-                host: host.to_string(),
+                host: normalized,
                 ports: None,
                 access,
             });
@@ -457,7 +462,12 @@ impl EgressPolicyConfig {
     /// needed. Normalizes the entry to the explicit `Scoped` form. Returns
     /// `true` if the config changed, `false` if `port` was already authorized.
     pub fn allow(&mut self, host: &str, port: u16) -> bool {
-        if let Some(entry) = self.allow.iter_mut().find(|e| e.host() == host) {
+        let normalized = normalize_policy_host(host);
+        if let Some(entry) = self
+            .allow
+            .iter_mut()
+            .find(|e| normalize_policy_host(e.host()) == normalized)
+        {
             let mut ports = entry.ports();
             if ports.contains(&port) {
                 return false;
@@ -466,14 +476,14 @@ impl EgressPolicyConfig {
             ports.sort_unstable();
             let access = entry.access();
             *entry = AllowEntry::Scoped {
-                host: host.to_string(),
+                host: normalized,
                 ports: Some(ports),
                 access,
             };
             true
         } else {
             self.allow.push(AllowEntry::Scoped {
-                host: host.to_string(),
+                host: normalized,
                 ports: Some(vec![port]),
                 access: Access::ReadWrite,
             });
@@ -484,7 +494,12 @@ impl EgressPolicyConfig {
     /// Remove `port` from `host`; drop the host entirely once its last port is
     /// gone. Returns `true` if the config changed.
     pub fn block(&mut self, host: &str, port: u16) -> bool {
-        let Some(idx) = self.allow.iter().position(|e| e.host() == host) else {
+        let normalized = normalize_policy_host(host);
+        let Some(idx) = self
+            .allow
+            .iter()
+            .position(|e| normalize_policy_host(e.host()) == normalized)
+        else {
             return false;
         };
         let mut ports = self.allow[idx].ports();
@@ -498,7 +513,7 @@ impl EgressPolicyConfig {
         } else {
             let access = self.allow[idx].access();
             self.allow[idx] = AllowEntry::Scoped {
-                host: host.to_string(),
+                host: normalized,
                 ports: Some(ports),
                 access,
             };
@@ -1417,6 +1432,136 @@ mod tests {
             },
             "default ports must normalize to None on an access change"
         );
+    }
+
+    // ── Greptile P1 (#84): normalized host matching in mutations ─────────────
+    // `to_rego_data_json` normalizes every host (trim + trailing-dot strip +
+    // ascii-lowercase) into a JSON map keyed by the normalized spelling, where
+    // a later duplicate key silently overwrites an earlier one. Before this
+    // fix, `allow`/`block`/`set_host_access` matched existing entries by RAW
+    // string equality, so e.g. `allow --read api.x.com` followed by a plain
+    // `allow API.X.COM` appended a SEPARATE read-write entry that silently won
+    // at compile time — widening a read-only host to read-write. These tests
+    // pin normalization-aware matching so equivalent spellings always collapse
+    // into one entry.
+
+    /// The exact regression scenario: `allow --read` then a plain `allow` of a
+    /// different-case spelling of the same host must merge into ONE entry,
+    /// keeping the read-only access — not append a second read-write entry.
+    #[test]
+    fn allow_case_variant_merges_into_existing_read_entry() {
+        let mut cfg = EgressPolicyConfig::default();
+        assert!(cfg.allow("api.x.com", 443));
+        assert!(cfg.set_host_access("api.x.com", Access::Read));
+        // Same host, different case, same port: must match the existing entry
+        // (not append a second one) and must be a true no-op since 443 is
+        // already authorized (case-insensitively).
+        let changed = cfg.allow("API.X.COM", 443);
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "a case-variant host must merge into the single existing entry: {:?}",
+            cfg.allow
+        );
+        assert_eq!(cfg.allow[0].host(), "api.x.com");
+        assert_eq!(
+            cfg.allow[0].access(),
+            Access::Read,
+            "matching a case variant must not silently widen the entry's access"
+        );
+        assert!(
+            !changed,
+            "port 443 was already authorized (case-insensitively)"
+        );
+    }
+
+    /// A trailing-dot spelling of the same host also merges — `allow` on
+    /// `api.x.com.` with a NEW port must extend the existing `api.x.com`
+    /// entry's ports rather than creating a second entry.
+    #[test]
+    fn allow_trailing_dot_variant_merges_ports_into_existing_entry() {
+        let mut cfg = EgressPolicyConfig::default();
+        assert!(cfg.allow("api.x.com", 443));
+        assert!(cfg.allow("api.x.com.", 8443));
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: Some(vec![443, 8443]),
+                access: Access::ReadWrite,
+            }],
+            "a trailing-dot spelling must merge into the same entry: {:?}",
+            cfg.allow
+        );
+    }
+
+    /// `block` must also match case/trailing-dot variants: blocking
+    /// `API.X.COM.` (port 443) must remove that port from the entry stored as
+    /// `api.x.com`.
+    #[test]
+    fn block_matches_case_and_trailing_dot_variant() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Host("api.x.com".into())], // {80,443}
+            git: vec![],
+        };
+        assert!(cfg.block("API.X.COM.", 443));
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: Some(vec![80]),
+                access: Access::ReadWrite,
+            }],
+            "block must match a case/trailing-dot variant of the stored host"
+        );
+    }
+
+    /// `set_host_access` must match a case-variant spelling of an existing
+    /// entry (updating it, not appending a new one), and must normalize the
+    /// stored host when it CREATES a brand-new entry from a mixed-case,
+    /// trailing-dot spelling.
+    #[test]
+    fn set_host_access_matches_case_variant_and_normalizes_new_entries() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Host("pypi.org".into())],
+            git: vec![],
+        };
+        assert!(cfg.set_host_access("PyPI.org", Access::Read));
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "a case-variant spelling must update the existing entry, not add one: {:?}",
+            cfg.allow
+        );
+        assert_eq!(cfg.allow[0].host(), "pypi.org");
+        assert_eq!(cfg.allow[0].access(), Access::Read);
+
+        assert!(cfg.set_host_access("MiXeD.Example.COM.", Access::Read));
+        assert_eq!(cfg.allow.len(), 2);
+        assert_eq!(
+            cfg.allow[1].host(),
+            "mixed.example.com",
+            "a newly-created entry must store the normalized host spelling"
+        );
+    }
+
+    /// Wildcard entries flow through `allow` too; `normalize_policy_host` is
+    /// lowercase+dot-trim only, so it is safe on `*.example.com` patterns —
+    /// prove there's no regression: a mixed-case wildcard is stored
+    /// normalized, and re-allowing the already-normalized spelling with the
+    /// same port is a true no-op (no duplicate wildcard entry).
+    #[test]
+    fn allow_wildcard_host_normalizes_and_dedupes() {
+        let mut cfg = EgressPolicyConfig::default();
+        assert!(cfg.allow("*.Example.COM", 443));
+        assert_eq!(cfg.allow[0].host(), "*.example.com");
+        assert!(
+            !cfg.allow("*.example.com", 443),
+            "re-allowing the already-authorized normalized wildcard+port must be a no-op"
+        );
+        assert_eq!(cfg.allow.len(), 1);
     }
 
     // ── Task 6: build_network policy tests ───────────────────────────────────
