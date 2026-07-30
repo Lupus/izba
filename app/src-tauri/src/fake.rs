@@ -262,7 +262,7 @@ impl DaemonApi for FakeDaemon {
         git: Vec<izba_core::daemon::egress::config::GitRule>,
     ) -> anyhow::Result<()> {
         self.calls.push(format!("set_full:{name}"));
-        self.policy.allow = allow;
+        self.policy.replace_allow(allow);
         self.policy.git = git;
         Ok(())
     }

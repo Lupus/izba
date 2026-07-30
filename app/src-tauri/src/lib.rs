@@ -786,6 +786,49 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn dispatch_policy_set_full_normalizes_and_collapses_duplicate_hosts() {
+        // Regression (#171): the GUI's wholesale Save path must route through
+        // `EgressPolicyConfig::replace_allow` so normalize-equal duplicate
+        // hosts (differing only in trailing dot / case) collapse to one
+        // canonical-spelled entry instead of both persisting and colliding
+        // with compile-time host matching.
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(
+            &st,
+            "policy_set_full",
+            serde_json::json!({
+                "name": "web",
+                "allow": [
+                    {"host": "Host.com.", "ports": [443], "access": "read-write"},
+                    {"host": "host.com", "ports": [8080], "access": "read"},
+                ],
+                "git": [],
+            }),
+            &mut emit,
+        )
+        .unwrap();
+        assert!(out.is_null());
+
+        let shown = dispatch(
+            &st,
+            "policy_show",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        let allow = shown["allow"].as_array().unwrap();
+        assert_eq!(
+            allow.len(),
+            1,
+            "normalize-equal duplicates must collapse to one entry: {shown}"
+        );
+        assert_eq!(allow[0]["host"], "host.com");
+        assert_eq!(allow[0]["ports"], serde_json::json!([8080]));
+        assert_eq!(allow[0]["access"], "read");
+    }
+
+    #[test]
     fn dispatch_manifest_diff_unknown_sandbox() {
         let st = state_with(FakeDaemon::default());
         let mut emit = |_: &str, _: serde_json::Value| {};

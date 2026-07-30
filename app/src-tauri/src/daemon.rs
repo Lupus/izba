@@ -348,7 +348,7 @@ impl DaemonApi for RealDaemon {
         allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
     ) -> anyhow::Result<()> {
         self.edit_and_reload(name, move |cfg| {
-            cfg.allow = allow;
+            cfg.replace_allow(allow);
         })
     }
 
@@ -385,7 +385,7 @@ impl DaemonApi for RealDaemon {
         git: Vec<izba_core::daemon::egress::config::GitRule>,
     ) -> anyhow::Result<()> {
         self.edit_and_reload(name, move |cfg| {
-            cfg.allow = allow;
+            cfg.replace_allow(allow);
             cfg.git = git;
         })
     }
