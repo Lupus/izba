@@ -13,7 +13,7 @@ pub enum PolicyCmd {
         /// Sandbox name (or dir)
         name: String,
     },
-    /// Add HOST to the sandbox's HTTP(S) allow-list. A bare HOST opens the web ports (80 + 443); HOST:PORT opens exactly that port; access is read-write.
+    /// Add HOST to the sandbox's HTTP(S) allow-list. A bare HOST opens the web ports (80 + 443); HOST:PORT opens exactly that port; access is read-write unless --read.
     /// `*.HOST` matches exactly one subdomain label and `**.HOST` matches any depth; the apex HOST is never matched by a wildcard and needs its own entry.
     /// To actually block anything else, enforcement must be on (see `enforce`).
     /// Auto-reloads a running sandbox.
@@ -22,6 +22,9 @@ pub enum PolicyCmd {
         name: String,
         /// Destination to allow: HOST, *.HOST, **.HOST, or HOST:PORT (bare host = web ports 80+443; :PORT = exactly that port)
         target: String,
+        /// Restrict to read-only HTTP access (GET/HEAD only); default is read-write
+        #[arg(long)]
+        read: bool,
     },
     /// Remove HOST from the allow-list. A bare HOST removes the web ports (80 + 443); HOST:PORT removes exactly that port; auto-reloads.
     /// `*.HOST` matches exactly one subdomain label and `**.HOST` matches any depth; the apex HOST is never matched by a wildcard and needs its own entry.
@@ -92,10 +95,15 @@ pub(crate) enum Edit {
 pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
     match cmd {
         PolicyCmd::Show { name } => show(paths, name),
-        PolicyCmd::Allow { name, target } => {
+        PolicyCmd::Allow { name, target, read } => {
             let dir = require_sandbox_dir(paths, name)?;
             let (host, ports) = parse_target(target)?;
             apply_edit(&dir, Edit::Allow, &host, &ports)?;
+            if *read {
+                edit_policy_file(&dir, |cfg| {
+                    cfg.set_host_access(&host, Access::Read);
+                })?;
+            }
             maybe_reload(paths, name);
             Ok(0)
         }
@@ -197,15 +205,28 @@ pub(crate) fn apply_edit(
 
 fn show(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     let dir = require_sandbox_dir(paths, name)?;
-    match EgressPolicyConfig::load(&dir)? {
-        None => println!("'{name}' has no egress policy (all egress allowed)"),
+    let cfg = EgressPolicyConfig::load(&dir)?;
+    print!("{}", render_policy(name, cfg.as_ref()));
+    Ok(0)
+}
+
+/// Render a loaded policy config for `policy show`, as a pure string builder
+/// so the rendering can be unit-tested without a sandbox dir. Every line ends
+/// in `\n`; `show()` prints the result verbatim.
+fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    match cfg {
+        None => {
+            let _ = writeln!(out, "'{name}' has no egress policy (all egress allowed)");
+        }
         Some(cfg) => {
             let enforce_str = if cfg.enforce { "on" } else { "off" };
-            println!("'{name}' egress policy (enforce: {enforce_str}):");
+            let _ = writeln!(out, "'{name}' egress policy (enforce: {enforce_str}):");
             if cfg.allow.is_empty() {
-                println!("  http: deny all (empty allow-list)");
+                let _ = writeln!(out, "  http: deny all (empty allow-list)");
             } else {
-                println!("  http allow-list:");
+                let _ = writeln!(out, "  http allow-list:");
                 for e in &cfg.allow {
                     let ports = e
                         .ports()
@@ -213,11 +234,15 @@ fn show(paths: &Paths, name: &str) -> anyhow::Result<i32> {
                         .map(u16::to_string)
                         .collect::<Vec<_>>()
                         .join(", ");
-                    println!("    {}  [{ports}]", e.host());
+                    let access_str = match e.access() {
+                        Access::Read => "read",
+                        Access::ReadWrite => "read-write",
+                    };
+                    let _ = writeln!(out, "    {}  [{ports}] ({access_str})", e.host());
                 }
             }
             if !cfg.git.is_empty() {
-                println!("  git:");
+                let _ = writeln!(out, "  git:");
                 for r in &cfg.git {
                     let target_str = match &r.target {
                         GitTarget::Repo(s) => s.as_str(),
@@ -227,12 +252,12 @@ fn show(paths: &Paths, name: &str) -> anyhow::Result<i32> {
                         Access::Read => "read",
                         Access::ReadWrite => "read-write",
                     };
-                    println!("    {target_str} ({access_str})");
+                    let _ = writeln!(out, "    {target_str} ({access_str})");
                 }
             }
         }
     }
-    Ok(0)
+    out
 }
 
 fn enable(paths: &Paths, name: &str) -> anyhow::Result<i32> {
@@ -297,6 +322,28 @@ mod tests {
         assert_eq!(name, "web");
         assert_eq!(target, "github.com/o/a");
         assert!(write, "--write flag must be true");
+    }
+
+    #[test]
+    fn parse_policy_allow_read() {
+        use clap::Parser;
+        let cli =
+            crate::Cli::try_parse_from(["izba", "policy", "allow", "web", "api.x.com", "--read"])
+                .unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Allow { name, target, read }) = cli.cmd else {
+            panic!("expected policy allow");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(target, "api.x.com");
+        assert!(read, "--read flag must be true");
+
+        // Without --read, the field must be false (back-compat default).
+        let cli =
+            crate::Cli::try_parse_from(["izba", "policy", "allow", "web", "api.x.com"]).unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Allow { read, .. }) = cli.cmd else {
+            panic!("expected policy allow");
+        };
+        assert!(!read, "read must default to false");
     }
 
     #[test]
@@ -394,6 +441,159 @@ mod tests {
         );
     }
 
+    /// `izba policy allow NAME HOST --read` / without `--read` through the full
+    /// `run()` entry point (not just `apply_edit`), pinning both the new
+    /// `--read` behavior and the back-compat "plain allow never widens an
+    /// existing read entry" contract (#147-style, now through the CLI).
+    #[test]
+    fn allow_read_records_read_access() {
+        use izba_core::daemon::egress::config::EgressPolicyConfig;
+
+        // Fresh dir, allow with --read -> Access::Read.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        run(
+            &paths,
+            &PolicyCmd::Allow {
+                name: "web".into(),
+                target: "api.x.com".into(),
+                read: true,
+            },
+        )
+        .unwrap();
+        let cfg = EgressPolicyConfig::load(&paths.sandbox_dir("web"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.allow[0].access(), Access::Read);
+
+        // Fresh dir, allow WITHOUT --read -> Access::ReadWrite (back-compat pin).
+        let tmp2 = tempfile::tempdir().unwrap();
+        let paths2 = Paths::with_root(tmp2.path().to_path_buf());
+        std::fs::create_dir_all(paths2.sandbox_dir("web")).unwrap();
+        run(
+            &paths2,
+            &PolicyCmd::Allow {
+                name: "web".into(),
+                target: "api.x.com".into(),
+                read: false,
+            },
+        )
+        .unwrap();
+        let cfg2 = EgressPolicyConfig::load(&paths2.sandbox_dir("web"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg2.allow[0].access(), Access::ReadWrite);
+
+        // Plain allow (no --read) on a different port of an EXISTING read
+        // entry must NOT silently widen it to read-write.
+        let tmp3 = tempfile::tempdir().unwrap();
+        let paths3 = Paths::with_root(tmp3.path().to_path_buf());
+        std::fs::create_dir_all(paths3.sandbox_dir("web")).unwrap();
+        run(
+            &paths3,
+            &PolicyCmd::Allow {
+                name: "web".into(),
+                target: "api.x.com:443".into(),
+                read: true,
+            },
+        )
+        .unwrap();
+        run(
+            &paths3,
+            &PolicyCmd::Allow {
+                name: "web".into(),
+                target: "api.x.com:8443".into(),
+                read: false,
+            },
+        )
+        .unwrap();
+        let cfg3 = EgressPolicyConfig::load(&paths3.sandbox_dir("web"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg3.allow[0].access(),
+            Access::Read,
+            "plain allow must not widen an existing read entry"
+        );
+        assert_eq!(cfg3.allow[0].ports(), vec![443, 8443]);
+
+        // allow --read on an existing read-write entry -> explicit narrowing.
+        let tmp4 = tempfile::tempdir().unwrap();
+        let paths4 = Paths::with_root(tmp4.path().to_path_buf());
+        std::fs::create_dir_all(paths4.sandbox_dir("web")).unwrap();
+        run(
+            &paths4,
+            &PolicyCmd::Allow {
+                name: "web".into(),
+                target: "api.x.com".into(),
+                read: false,
+            },
+        )
+        .unwrap();
+        run(
+            &paths4,
+            &PolicyCmd::Allow {
+                name: "web".into(),
+                target: "api.x.com".into(),
+                read: true,
+            },
+        )
+        .unwrap();
+        let cfg4 = EgressPolicyConfig::load(&paths4.sandbox_dir("web"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg4.allow[0].access(), Access::Read);
+    }
+
+    // ── show()/render_policy ──────────────────────────────────────────────────
+
+    #[test]
+    fn render_policy_shows_no_policy() {
+        let out = render_policy("web", None);
+        assert!(out.contains("'web' has no egress policy (all egress allowed)"));
+    }
+
+    #[test]
+    fn render_policy_shows_empty_allow_list() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![],
+            git: vec![],
+        };
+        let out = render_policy("web", Some(&cfg));
+        assert!(out.contains("http: deny all (empty allow-list)"));
+    }
+
+    #[test]
+    fn render_policy_annotates_read_and_read_write_hosts() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Scoped {
+                    host: "pypi.org".into(),
+                    ports: None,
+                    access: Access::Read,
+                },
+                AllowEntry::Scoped {
+                    host: "api.x.com".into(),
+                    ports: None,
+                    access: Access::ReadWrite,
+                },
+            ],
+            git: vec![],
+        };
+        let out = render_policy("web", Some(&cfg));
+        assert!(
+            out.contains("pypi.org  [80, 443] (read)"),
+            "missing read annotation, got:\n{out}"
+        );
+        assert!(
+            out.contains("api.x.com  [80, 443] (read-write)"),
+            "missing read-write annotation, got:\n{out}"
+        );
+    }
+
     #[test]
     fn verbs_bail_cleanly_on_unknown_sandbox() {
         let tmp = tempfile::tempdir().unwrap();
@@ -405,6 +605,7 @@ mod tests {
             PolicyCmd::Allow {
                 name: "ghost".into(),
                 target: "example.com".into(),
+                read: false,
             },
             PolicyCmd::Block {
                 name: "ghost".into(),
@@ -431,6 +632,7 @@ mod tests {
             PolicyCmd::Allow {
                 name: "ghost".into(),
                 target: "example.com:notaport".into(),
+                read: false,
             },
             PolicyCmd::Block {
                 name: "ghost".into(),
