@@ -85,32 +85,34 @@ pub enum EnforceState {
     Off,
 }
 
-/// Which mutation an edit verb performs.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Edit {
-    Allow,
-    Block,
-}
-
 pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
     match cmd {
         PolicyCmd::Show { name } => show(paths, name),
         PolicyCmd::Allow { name, target, read } => {
             let dir = require_sandbox_dir(paths, name)?;
             let (host, ports) = parse_target(target)?;
-            apply_edit(&dir, Edit::Allow, &host, &ports)?;
-            if *read {
-                edit_policy_file(&dir, |cfg| {
+            // One write: grant the port(s), then (only when --read) narrow the
+            // access verb, all in the same edit_policy_file closure. Folding
+            // both mutations into a single write matters here — splitting them
+            // across two `edit_policy_file` calls would leave a window where a
+            // crash between the writes persists the host at the WIDER
+            // read-write default, which is the wrong failure direction for a
+            // security-posture flag (#84 fix-wave finding 1).
+            edit_policy_file(&dir, |cfg| {
+                for &port in &ports {
+                    cfg.allow(&host, port);
+                }
+                if *read {
                     cfg.set_host_access(&host, Access::Read);
-                })?;
-            }
+                }
+            })?;
             maybe_reload(paths, name);
             Ok(0)
         }
         PolicyCmd::Block { name, target } => {
             let dir = require_sandbox_dir(paths, name)?;
             let (host, ports) = parse_target(target)?;
-            apply_edit(&dir, Edit::Block, &host, &ports)?;
+            apply_block_edit(&dir, &host, &ports)?;
             maybe_reload(paths, name);
             Ok(0)
         }
@@ -181,23 +183,18 @@ fn require_sandbox_dir(paths: &Paths, name: &str) -> anyhow::Result<std::path::P
     Ok(dir)
 }
 
-/// The daemon-free core of allow/block: persist the edit to `policy.yaml`.
-pub(crate) fn apply_edit(
+/// The daemon-free core of `policy block`: persist the port removal(s) to
+/// `policy.yaml`. (The `allow` side is inlined in `run()`'s `Allow` arm as a
+/// single `edit_policy_file` closure — see the comment there — so this is
+/// block-only now; it used to be a shared `Edit::{Allow,Block}` dispatcher.)
+pub(crate) fn apply_block_edit(
     sandbox_dir: &std::path::Path,
-    edit: Edit,
     host: &str,
     ports: &[u16],
 ) -> anyhow::Result<()> {
     edit_policy_file(sandbox_dir, |cfg| {
         for &port in ports {
-            match edit {
-                Edit::Allow => {
-                    cfg.allow(host, port);
-                }
-                Edit::Block => {
-                    let _ = cfg.block(host, port);
-                }
-            }
+            let _ = cfg.block(host, port);
         }
     })?;
     Ok(())
@@ -298,6 +295,21 @@ fn maybe_reload(paths: &Paths, name: &str) {
 mod tests {
     use super::*;
 
+    /// Test-only convenience mirroring the pre-fix-wave `apply_edit(...,
+    /// Edit::Allow, ...)` shape: grant `ports` on `host`, no access change.
+    /// Kept INSIDE the test module (not a crate-level `pub(crate)` fn) so it
+    /// never appears in the non-test build — a crate-level helper used only
+    /// by tests would itself become the same "never constructed outside
+    /// tests" dead-code trap that motivated removing `Edit::Allow`.
+    fn allow_ports(dir: &std::path::Path, host: &str, ports: &[u16]) -> anyhow::Result<()> {
+        edit_policy_file(dir, |cfg| {
+            for &port in ports {
+                cfg.allow(host, port);
+            }
+        })?;
+        Ok(())
+    }
+
     #[test]
     fn parse_policy_git_allow_write() {
         use clap::Parser;
@@ -383,7 +395,7 @@ mod tests {
     fn bare_allow_and_block_are_symmetric_web_ports() {
         use izba_core::daemon::egress::config::EgressPolicyConfig;
         let dir = tempfile::tempdir().unwrap();
-        apply_edit(dir.path(), Edit::Allow, "api.x.com", &[80, 443]).unwrap();
+        allow_ports(dir.path(), "api.x.com", &[80, 443]).unwrap();
         let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
         assert_eq!(
             cfg.allow[0],
@@ -393,7 +405,7 @@ mod tests {
                 access: Access::ReadWrite,
             }
         );
-        apply_edit(dir.path(), Edit::Block, "api.x.com", &[80, 443]).unwrap();
+        apply_block_edit(dir.path(), "api.x.com", &[80, 443]).unwrap();
         let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
         assert!(cfg.allow.is_empty());
     }
@@ -402,9 +414,9 @@ mod tests {
     fn bare_block_leaves_explicitly_added_ports() {
         use izba_core::daemon::egress::config::EgressPolicyConfig;
         let dir = tempfile::tempdir().unwrap();
-        apply_edit(dir.path(), Edit::Allow, "api.x.com", &[80, 443]).unwrap();
-        apply_edit(dir.path(), Edit::Allow, "api.x.com", &[8443]).unwrap();
-        apply_edit(dir.path(), Edit::Block, "api.x.com", &[80, 443]).unwrap();
+        allow_ports(dir.path(), "api.x.com", &[80, 443]).unwrap();
+        allow_ports(dir.path(), "api.x.com", &[8443]).unwrap();
+        apply_block_edit(dir.path(), "api.x.com", &[80, 443]).unwrap();
         let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
         assert_eq!(cfg.allow[0].ports(), vec![8443]);
     }
@@ -413,7 +425,7 @@ mod tests {
     fn allow_accepts_wildcard_target() {
         use izba_core::daemon::egress::config::EgressPolicyConfig;
         let dir = tempfile::tempdir().unwrap();
-        apply_edit(dir.path(), Edit::Allow, "*.example.com", &[443]).unwrap();
+        allow_ports(dir.path(), "*.example.com", &[443]).unwrap();
         let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
         assert_eq!(
             cfg.allow,
@@ -428,8 +440,8 @@ mod tests {
     #[test]
     fn allow_rejects_malformed_wildcard_target_loudly() {
         let dir = tempfile::tempdir().unwrap();
-        let err = apply_edit(dir.path(), Edit::Allow, "foo.*.com", &[443])
-            .expect_err("mid-label wildcard must fail");
+        let err =
+            allow_ports(dir.path(), "foo.*.com", &[443]).expect_err("mid-label wildcard must fail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("foo.*.com"),
@@ -442,9 +454,10 @@ mod tests {
     }
 
     /// `izba policy allow NAME HOST --read` / without `--read` through the full
-    /// `run()` entry point (not just `apply_edit`), pinning both the new
-    /// `--read` behavior and the back-compat "plain allow never widens an
-    /// existing read entry" contract (#147-style, now through the CLI).
+    /// `run()` entry point (the single `edit_policy_file` closure, not a
+    /// lower-level helper), pinning both the new `--read` behavior and the
+    /// back-compat "plain allow never widens an existing read entry" contract
+    /// (#147-style, now through the CLI).
     #[test]
     fn allow_read_records_read_access() {
         use izba_core::daemon::egress::config::EgressPolicyConfig;
