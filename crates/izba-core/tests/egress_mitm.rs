@@ -318,9 +318,10 @@ fn mitm_firewall_enforces_wildcard_hosts() {
 /// AC4: a host entry built the exact way `izba policy allow HOST --read`
 /// writes it (`EgressPolicyConfig::allow` + `set_host_access(.., Access::Read)`,
 /// `enforce: true`) must, through the real MITM enforcement layer, allow GET
-/// and deny POST on that host, with an audit (netlog) record for each. This
-/// pins the CLI-written config *shape* compiling through `into_policy` into a
-/// real enforcing policy — not a hand-written rego data doc.
+/// and HEAD (the two methods `--help` promises for `read`) and deny POST on
+/// that host, with an audit (netlog) record for each. This pins the
+/// CLI-written config *shape* compiling through `into_policy` into a real
+/// enforcing policy — not a hand-written rego data doc.
 #[test]
 fn mitm_firewall_cli_shaped_read_access_allows_get_denies_post() {
     install_ring();
@@ -397,6 +398,24 @@ fn mitm_firewall_cli_shaped_read_access_allows_get_denies_post() {
             "GET flow body must come from the real upstream through the MITM: {allowed}"
         );
 
+        // ALLOW: HEAD is the OTHER method Access::Read permits (read =
+        // GET/HEAD only) -> 200, reaching the real upstream exactly like GET.
+        // A real HEAD response carries no body, so assert on the status line
+        // rather than the (fake-upstream-echoed) body text.
+        let head_allowed = guest_request(
+            &mitm,
+            &policy,
+            &gcfg,
+            "api.anthropic.com",
+            up_port,
+            "HEAD /v1/messages",
+        )
+        .await;
+        assert!(
+            head_allowed.contains("200 OK"),
+            "HEAD flow status: {head_allowed}"
+        );
+
         // DENY: POST is refused under Access::Read (read = GET/HEAD only) ->
         // izbad's synthesized 403, never reaching the upstream (which would
         // otherwise happily answer any method with 200 UPSTREAM-PONG).
@@ -445,6 +464,26 @@ fn mitm_firewall_cli_shaped_read_access_allows_get_denies_post() {
             get_record.host.as_deref(),
             Some("api.anthropic.com"),
             "GET audit record: {get_record:?}"
+        );
+
+        let head_record = records
+            .iter()
+            .find(|r| r.method.as_deref() == Some("HEAD"))
+            .expect("an audit record for the HEAD flow");
+        assert_eq!(
+            head_record.verdict,
+            Verdict::Allow,
+            "HEAD audit record: {head_record:?}"
+        );
+        assert_eq!(
+            head_record.tier,
+            Tier::L7,
+            "HEAD audit record: {head_record:?}"
+        );
+        assert_eq!(
+            head_record.host.as_deref(),
+            Some("api.anthropic.com"),
+            "HEAD audit record: {head_record:?}"
         );
 
         let post_record = records
