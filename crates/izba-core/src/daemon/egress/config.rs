@@ -639,9 +639,12 @@ impl EgressPolicyConfig {
     /// A wildcard host's normalize-equal entries enforce a UNION (see
     /// `collapse_duplicate_hosts`), so a grant only truly disappears once NO
     /// equivalent entry keeps the port — the port is removed from EVERY
-    /// matching entry, and any entry left with no ports is dropped. An exact
-    /// host always has at most one matching entry after the collapse, so
-    /// this reduces to the prior single-entry behavior there.
+    /// matching entry that actually carries it, and any entry left with no
+    /// ports is dropped. An exact host always has at most one matching entry
+    /// after the collapse, so this reduces to the prior single-entry
+    /// behavior there. A matching entry that never carried `port` is left
+    /// COMPLETELY untouched (spelling included) — `false` means zero
+    /// mutation, not just "no net-visible change".
     pub fn block(&mut self, host: &str, port: u16) -> bool {
         self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
@@ -651,13 +654,15 @@ impl EgressPolicyConfig {
                 continue;
             }
             let mut ports = e.ports();
-            let before = ports.len();
+            if !ports.contains(&port) {
+                // This entry never granted `port` -- leave it COMPLETELY
+                // untouched (including its original host spelling). A
+                // no-op `block` must mutate nothing, matching the
+                // changed-bool contract: `false` means zero state change.
+                continue;
+            }
             ports.retain(|p| *p != port);
-            changed |= ports.len() != before;
-            // Canonicalize every touched entry's host spelling, whether or
-            // not this particular entry carried `port` -- consistent with
-            // `allow`/`set_host_access` normalizing on any write that
-            // touches an entry.
+            changed = true;
             let access = e.access();
             *e = AllowEntry::Scoped {
                 host: normalized.clone(),
@@ -1998,7 +2003,13 @@ mod tests {
              must remain: {:?}",
             cfg.allow
         );
-        assert_eq!(cfg.allow[0].host(), "*.x");
+        // The surviving entry never contained port 443, so it must be left
+        // COMPLETELY untouched -- including its original (unnormalized)
+        // spelling "*.X" -- not silently rewritten to the canonical "*.x"
+        // just because some other equivalent entry was mutated (#84
+        // tightening: block() must be a true no-op on entries it doesn't
+        // actually change).
+        assert_eq!(cfg.allow[0].host(), "*.X");
         assert_eq!(cfg.allow[0].ports(), vec![8443]);
         assert_eq!(cfg.allow[0].access(), Access::Read);
     }
@@ -2095,6 +2106,62 @@ mod tests {
                 access: Access::Read,
             }],
             "same-access wildcard duplicates must merge to one union-ports entry: {:?}",
+            cfg.allow
+        );
+    }
+
+    // ── #84 tightening: block() must be a TRUE no-op on entries it doesn't
+    // change ─────────────────────────────────────────────────────────────────
+    // block() must only rewrite an entry when its port list actually shrank.
+    // An entry that never carried the target port has to come out of the
+    // call byte-for-byte identical -- including its ORIGINAL (unnormalized)
+    // host spelling -- not silently canonicalized just because some other
+    // equivalent entry (or none at all) got touched. Otherwise a returns-false
+    // no-op call still mutates struct state, which is both a spec violation
+    // (the changed-bool contract implies zero mutation on `false`) and an
+    // untested behavior delta ripe for a surviving mutant.
+
+    #[test]
+    fn block_noop_on_exact_host_leaves_original_spelling_untouched() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "API.X.COM".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            }],
+            git: vec![],
+        };
+        let before = cfg.allow.clone();
+        assert!(
+            !cfg.block("api.x.com", 9999),
+            "port 9999 was never granted -- block must report no change"
+        );
+        assert_eq!(
+            cfg.allow, before,
+            "a no-op block must leave the config byte-for-byte identical, including the \
+             original unnormalized host spelling: {:?}",
+            cfg.allow
+        );
+        assert_eq!(cfg.allow[0].host(), "API.X.COM");
+    }
+
+    #[test]
+    fn block_noop_on_wildcard_duplicates_leaves_both_entries_untouched() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: mixed_access_wildcard_dupes(),
+            git: vec![],
+        };
+        let before = cfg.allow.clone();
+        assert!(
+            !cfg.block("*.x", 9999),
+            "port 9999 is granted by neither equivalent wildcard entry -- block must no-op"
+        );
+        assert_eq!(
+            cfg.allow, before,
+            "a no-op block must leave BOTH equivalent wildcard entries byte-for-byte \
+             identical, including their original spellings (\"*.x\" and \"*.X\"): {:?}",
             cfg.allow
         );
     }
