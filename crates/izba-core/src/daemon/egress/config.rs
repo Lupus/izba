@@ -285,9 +285,71 @@ impl EgressPolicyConfig {
         }
     }
 
+    /// Collapse normalize-equal duplicate entries in `self.allow` with
+    /// LAST-WINS whole-entry semantics — exactly mirroring
+    /// `to_rego_data_json`'s map-overwrite (a later entry's `{ports, access}`
+    /// clobbers an earlier one under the same normalized key). A legacy or
+    /// hand-edited `policy.yaml` can carry case-/trailing-dot-equivalent
+    /// duplicates (e.g. `api.x.com` + `API.X.COM`); before this pass,
+    /// `allow`/`block`/`set_host_access` matched only the FIRST such entry
+    /// while compilation actually enforced the LAST — so an edit could
+    /// "succeed" on an entry that was never the one in force. Calling this at
+    /// the top of every mutation means the entry a caller finds and edits is
+    /// always the one that already wins at compile time, so it can never
+    /// change enforcement semantics on its own.
+    ///
+    /// The surviving entry lands at the FIRST duplicate's position (host
+    /// normalized), carrying the LAST duplicate's ports/access/spelling;
+    /// every other duplicate is dropped. Non-duplicated entries and overall
+    /// list order are untouched.
+    fn collapse_duplicate_hosts(&mut self) {
+        use std::collections::HashMap;
+
+        let mut indices_by_key: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, e) in self.allow.iter().enumerate() {
+            indices_by_key
+                .entry(normalize_policy_host(e.host()))
+                .or_default()
+                .push(i);
+        }
+        if indices_by_key.values().all(|idxs| idxs.len() <= 1) {
+            return; // common case: no duplicates, nothing to do
+        }
+
+        let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut winners: Vec<(usize, AllowEntry)> = Vec::new();
+        for (key, idxs) in &indices_by_key {
+            if idxs.len() <= 1 {
+                continue;
+            }
+            let first = idxs[0];
+            let last = *idxs.last().expect("idxs.len() > 1");
+            let winner = match &self.allow[last] {
+                AllowEntry::Host(_) => AllowEntry::Host(key.clone()),
+                AllowEntry::Scoped { ports, access, .. } => AllowEntry::Scoped {
+                    host: key.clone(),
+                    ports: ports.clone(),
+                    access: *access,
+                },
+            };
+            winners.push((first, winner));
+            drop.extend(idxs.iter().skip(1).copied());
+        }
+        for (idx, winner) in winners {
+            self.allow[idx] = winner;
+        }
+        let mut i = 0;
+        self.allow.retain(|_| {
+            let keep = !drop.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+
     /// Set the access verb for `host` (adding the entry if absent). Returns
     /// `true` if the config changed.
     pub fn set_host_access(&mut self, host: &str, access: Access) -> bool {
+        self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
         if let Some(e) = self
             .allow
@@ -462,6 +524,7 @@ impl EgressPolicyConfig {
     /// needed. Normalizes the entry to the explicit `Scoped` form. Returns
     /// `true` if the config changed, `false` if `port` was already authorized.
     pub fn allow(&mut self, host: &str, port: u16) -> bool {
+        self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
         if let Some(entry) = self
             .allow
@@ -494,6 +557,7 @@ impl EgressPolicyConfig {
     /// Remove `port` from `host`; drop the host entirely once its last port is
     /// gone. Returns `true` if the config changed.
     pub fn block(&mut self, host: &str, port: u16) -> bool {
+        self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
         let Some(idx) = self
             .allow
@@ -1562,6 +1626,194 @@ mod tests {
             "re-allowing the already-authorized normalized wildcard+port must be a no-op"
         );
         assert_eq!(cfg.allow.len(), 1);
+    }
+
+    // ── Greptile P1 #2 (#84): legacy raw duplicates must collapse to the
+    // compile-winning entry before mutations ─────────────────────────────────
+    // `to_rego_data_json` inserts each entry into a JSON map keyed by its
+    // normalized host, so among normalize-equal RAW duplicates (a legacy or
+    // hand-edited `policy.yaml`, or a file written before 2aeaac9a) the LAST
+    // one in list order wins the whole `{ports, access}` value at compile
+    // time. Before `collapse_duplicate_hosts`, `allow`/`block`/
+    // `set_host_access` matched only the FIRST such duplicate (`find`/
+    // `position`), so an edit could report success while acting on an entry
+    // that was never the one actually enforced. These tests construct raw
+    // duplicates directly (bypassing `from_yaml`, which never produces them)
+    // to pin the collapse.
+
+    #[test]
+    fn set_host_access_edits_the_compile_winning_duplicate() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Scoped {
+                    host: "api.x.com".into(),
+                    ports: Some(vec![443]),
+                    access: Access::Read,
+                },
+                AllowEntry::Scoped {
+                    host: "API.X.COM".into(),
+                    ports: Some(vec![443]),
+                    access: Access::ReadWrite,
+                },
+            ],
+            git: vec![],
+        };
+        // Compile-consistency baseline: the LAST duplicate already wins at
+        // compile time, regardless of the first entry's `Read`.
+        let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
+        assert_eq!(
+            doc["sandbox_host_rules"]["web"]["api.x.com"]["access"], "read-write",
+            "pre-fix baseline: compilation already enforces the LAST duplicate"
+        );
+
+        assert!(cfg.set_host_access("api.x.com", Access::Read));
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "normalize-equal raw duplicates must collapse to one entry: {:?}",
+            cfg.allow
+        );
+        assert_eq!(cfg.allow[0].host(), "api.x.com");
+        assert_eq!(cfg.allow[0].access(), Access::Read);
+
+        // Compile-consistency: exactly one key for the host, matching the
+        // struct's post-edit state.
+        let doc2: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
+        let hosts = doc2["sandbox_host_rules"]["web"].as_object().unwrap();
+        assert_eq!(hosts.len(), 1, "exactly one compiled key for the host");
+        assert_eq!(hosts["api.x.com"]["access"], "read");
+    }
+
+    #[test]
+    fn allow_extends_the_compile_winning_duplicate() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Scoped {
+                    host: "api.x.com".into(),
+                    ports: Some(vec![443]),
+                    access: Access::Read,
+                },
+                AllowEntry::Scoped {
+                    host: "API.X.COM".into(),
+                    ports: Some(vec![443]),
+                    access: Access::ReadWrite,
+                },
+            ],
+            git: vec![],
+        };
+        assert!(cfg.allow("api.x.com", 8443));
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "duplicates must collapse before the port is added: {:?}",
+            cfg.allow
+        );
+        assert_eq!(cfg.allow[0].host(), "api.x.com");
+        assert_eq!(
+            cfg.allow[0].access(),
+            Access::ReadWrite,
+            "the surviving access must be the LAST duplicate's (the one actually enforced), \
+             not the first"
+        );
+        assert_eq!(cfg.allow[0].ports(), vec![443, 8443]);
+    }
+
+    #[test]
+    fn block_operates_on_the_compile_winning_duplicates_ports() {
+        let dup_base = || {
+            vec![
+                AllowEntry::Scoped {
+                    host: "a".into(),
+                    ports: Some(vec![443]),
+                    access: Access::ReadWrite,
+                },
+                AllowEntry::Scoped {
+                    host: "A.".into(),
+                    ports: Some(vec![8443]),
+                    access: Access::ReadWrite,
+                },
+            ]
+        };
+
+        // The last duplicate's ports ([8443]) are the ones actually
+        // enforced; blocking that port must remove it, dropping the entry
+        // (its only port).
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: dup_base(),
+            git: vec![],
+        };
+        assert!(cfg.block("a", 8443));
+        assert!(
+            cfg.allow.is_empty(),
+            "blocking the winning duplicate's only port must drop the entry: {:?}",
+            cfg.allow
+        );
+
+        // Port 443 belongs only to the LOSING (first, shadowed) duplicate —
+        // it was never enforced, so blocking it must be a no-op.
+        let mut cfg2 = EgressPolicyConfig {
+            enforce: true,
+            allow: dup_base(),
+            git: vec![],
+        };
+        assert!(
+            !cfg2.block("a", 443),
+            "port 443 was never enforced (shadowed by the winning duplicate) -- block must no-op"
+        );
+        assert_eq!(
+            cfg2.allow,
+            vec![AllowEntry::Scoped {
+                host: "a".into(),
+                ports: Some(vec![8443]),
+                access: Access::ReadWrite,
+            }],
+            "collapse must still have happened even though the block itself no-oped"
+        );
+    }
+
+    /// A bare `Host` duplicate collapses per last-wins too: a `Scoped` read
+    /// entry shadowed by a later bare `Host` entry must collapse to the
+    /// bare/default-ports read-write semantics (the bare entry is what
+    /// compilation actually enforced).
+    #[test]
+    fn allow_collapses_bare_and_scoped_duplicate_pair() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Scoped {
+                    host: "api.x.com".into(),
+                    ports: Some(vec![22]),
+                    access: Access::Read,
+                },
+                AllowEntry::Host("API.X.COM".into()),
+            ],
+            git: vec![],
+        };
+        // Pre-collapse compile baseline: the bare entry (default web ports,
+        // read-write) is what's actually enforced.
+        let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
+        assert_eq!(
+            doc["sandbox_host_rules"]["web"]["api.x.com"]["ports"],
+            serde_json::json!([80, 443])
+        );
+        assert_eq!(
+            doc["sandbox_host_rules"]["web"]["api.x.com"]["access"],
+            "read-write"
+        );
+
+        assert!(cfg.allow("api.x.com", 22));
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "the bare/scoped duplicate pair must collapse: {:?}",
+            cfg.allow
+        );
+        assert_eq!(cfg.allow[0].host(), "api.x.com");
+        assert_eq!(cfg.allow[0].access(), Access::ReadWrite);
+        assert_eq!(cfg.allow[0].ports(), vec![22, 80, 443]);
     }
 
     // ── Task 6: build_network policy tests ───────────────────────────────────
