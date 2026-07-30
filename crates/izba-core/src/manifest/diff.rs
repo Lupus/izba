@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::daemon::egress::config::{Access, EgressPolicyConfig};
+use crate::daemon::egress::config::{normalize_policy_host, Access, EgressPolicyConfig};
 use crate::manifest::normalize::{ImageSource, Normalized};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,10 +94,16 @@ fn volumes_str(vols: &[crate::volume::VolumeSpec]) -> String {
 /// two entries for the same host with different verbs (e.g. one port read-only,
 /// another read-write) are now distinct cells, so a verb widening on one of them
 /// is correctly flagged as a firewall loosening even when the other tightens.
+///
+/// Keyed on `normalize_policy_host` (trim + trailing-dot strip + lowercase),
+/// the same comparison identity `EgressPolicyConfig`'s own mutation methods
+/// and `to_rego_data_json` use (#170) — so a pure respelling of the same host
+/// (`"API.example.com."` vs `"api.example.com"`) folds into one cell instead
+/// of being treated as two different hosts.
 fn allow_index(eg: &EgressPolicyConfig) -> BTreeMap<(String, u16), Access> {
     let mut m: BTreeMap<(String, u16), Access> = BTreeMap::new();
     for e in &eg.allow {
-        let host = e.host().to_string();
+        let host = normalize_policy_host(e.host());
         let acc = e.access();
         for p in e.ports() {
             // Take max-access across duplicate (host, port) pairs so the "from"
@@ -613,6 +619,122 @@ mod tests {
         assert!(
             !diff(&from, &to)[0].weakens_egress,
             "allow entries are inert while unenforced"
+        );
+    }
+
+    /// #170: a pure respelling of the same host (case + trailing dot) must not
+    /// be flagged as weakening, and must produce no egress delta at all — the
+    /// allow-index keys on normalized identity, not raw string equality.
+    #[test]
+    fn respelling_only_host_change_does_not_weaken() {
+        let mut from = base();
+        from.egress.allow = vec![AllowEntry::Scoped {
+            host: "api.example.com".into(),
+            ports: Some(vec![443]),
+            access: Access::Read,
+        }];
+        let mut to = from.clone();
+        if let AllowEntry::Scoped { host, .. } = &mut to.egress.allow[0] {
+            *host = "API.example.com.".into();
+        }
+        assert!(!egress_weakens(&from.egress, &to.egress));
+        // The raw host spelling still differs between the two configs (this is
+        // a structural diff, and human-facing output must keep the source
+        // spelling verbatim — see the module doc), so `diff()` may still
+        // report an "egress" delta reflecting that respelling; but it must
+        // never be flagged as a firewall weakening.
+        if let Some(d0) = diff(&from, &to).into_iter().find(|f| f.field == "egress") {
+            assert!(
+                !d0.weakens_egress,
+                "a pure respelling must not be flagged ⚠ weakens egress"
+            );
+        }
+    }
+
+    /// #170: raw normalize-equal duplicates ("Host.com" and "host.com") must
+    /// fold to a single max-access cell, exactly like literal duplicates do.
+    #[test]
+    fn normalize_equal_duplicates_fold_max_access() {
+        let mut from = base();
+        from.egress.allow = vec![
+            AllowEntry::Scoped {
+                host: "Host.com".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            },
+            AllowEntry::Scoped {
+                host: "host.com".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            },
+        ];
+        let mut to = base();
+        to.egress.allow = vec![AllowEntry::Scoped {
+            host: "host.com".into(),
+            ports: Some(vec![443]),
+            access: Access::ReadWrite,
+        }];
+        assert!(
+            !egress_weakens(&from.egress, &to.egress),
+            "from side already folds to read-write via normalize-equal duplicates"
+        );
+    }
+
+    /// #170: a genuine access widening that happens to also change spelling
+    /// (case) must still be flagged — normalization must not mask a real
+    /// widen.
+    #[test]
+    fn genuine_widen_across_spellings_still_flagged() {
+        let mut from = base();
+        from.egress.allow = vec![AllowEntry::Scoped {
+            host: "Host.com".into(),
+            ports: Some(vec![443]),
+            access: Access::Read,
+        }];
+        let mut to = base();
+        to.egress.allow = vec![AllowEntry::Scoped {
+            host: "host.com".into(),
+            ports: Some(vec![443]),
+            access: Access::ReadWrite,
+        }];
+        assert!(egress_weakens(&from.egress, &to.egress));
+    }
+
+    /// #170: a "new" host that is actually just a respelling of an existing
+    /// host is NOT new — a new port on it still weakens, but the identical
+    /// port/access under a different spelling must not.
+    #[test]
+    fn new_host_detection_across_spellings() {
+        let from_single = {
+            let mut f = base();
+            f.egress.allow = vec![AllowEntry::Scoped {
+                host: "host.com".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            }];
+            f
+        };
+
+        let mut widened_port = base();
+        widened_port.egress.allow = vec![AllowEntry::Scoped {
+            host: "HOST.com".into(),
+            ports: Some(vec![8080]),
+            access: Access::Read,
+        }];
+        assert!(
+            egress_weakens(&from_single.egress, &widened_port.egress),
+            "a new port on a respelled host must still weaken"
+        );
+
+        let mut same_port = base();
+        same_port.egress.allow = vec![AllowEntry::Scoped {
+            host: "HOST.com".into(),
+            ports: Some(vec![443]),
+            access: Access::Read,
+        }];
+        assert!(
+            !egress_weakens(&from_single.egress, &same_port.egress),
+            "the same (host, port, access) under a different spelling must not weaken"
         );
     }
 }
