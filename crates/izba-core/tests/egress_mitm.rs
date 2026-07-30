@@ -13,11 +13,14 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
+use izba_core::daemon::egress::audit::{parse_line, AuditSink, Tier};
+use izba_core::daemon::egress::config::{Access, EgressPolicyConfig};
 use izba_core::daemon::egress::mitm::{
     server_config_with_resolver, upstream_client_config, CertCache, IzbaCa,
 };
 use izba_core::daemon::egress::mitm_runtime::{MitmRuntime, OrigDst};
-use izba_core::daemon::egress::policy::RegoPolicy;
+use izba_core::daemon::egress::policy::{RegoPolicy, Verdict};
+use izba_core::paths::Paths;
 use rustls::pki_types::{CertificateDer, ServerName};
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -308,6 +311,160 @@ fn mitm_firewall_enforces_wildcard_hosts() {
         assert!(
             denied_deep.contains("izba egress policy"),
             "deep flow must be izbad's synthesized 403: {denied_deep}"
+        );
+    });
+}
+
+/// AC4: a host entry built the exact way `izba policy allow HOST --read`
+/// writes it (`EgressPolicyConfig::allow` + `set_host_access(.., Access::Read)`,
+/// `enforce: true`) must, through the real MITM enforcement layer, allow GET
+/// and deny POST on that host, with an audit (netlog) record for each. This
+/// pins the CLI-written config *shape* compiling through `into_policy` into a
+/// real enforcing policy — not a hand-written rego data doc.
+#[test]
+fn mitm_firewall_cli_shaped_read_access_allows_get_denies_post() {
+    install_ring();
+    if !can_bind() {
+        eprintln!("SKIP mitm_firewall_cli_shaped_read_access_allows_get_denies_post: bind denied");
+        return;
+    }
+
+    // The fake upstream's own CA (created sync so the MITM upstream config can
+    // trust it before the runtime starts).
+    let up_ca = IzbaCa::generate().unwrap();
+    let up_ca_der: CertificateDer<'static> = up_ca.cert_der();
+    let up_cache = Arc::new(CertCache::new(up_ca));
+    let mut up_roots = rustls::RootCertStore::empty();
+    up_roots.add(up_ca_der).unwrap();
+    let upstream_cfg = upstream_client_config(up_roots);
+
+    // The izba CA the guest trusts + the cert cache that signs the leaves.
+    let izba_ca = IzbaCa::generate().unwrap();
+    let izba_ca_der = izba_ca.cert_der();
+    let izba_certs = Arc::new(CertCache::new(izba_ca));
+
+    // A fresh, process-unique audit root so this test's assertions on the
+    // written JSONL are not polluted by a stale file from a previous run.
+    let audit_root = std::env::temp_dir().join(format!(
+        "izba-egress-mitm-read-access-test-audit-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&audit_root);
+    let audit_paths = Paths::with_root(audit_root);
+    let audit = AuditSink::new(audit_paths.clone());
+    let mitm = MitmRuntime::start(izba_certs, upstream_cfg, audit).expect("start MITM runtime");
+
+    // Guest rustls config: trusts ONLY the izba CA (proves leaves chain to it).
+    let mut guest_roots = rustls::RootCertStore::empty();
+    guest_roots.add(izba_ca_der).unwrap();
+    let mut gcfg = rustls::ClientConfig::builder()
+        .with_root_certificates(guest_roots)
+        .with_no_client_auth();
+    gcfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let gcfg = Arc::new(gcfg);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let up_port = spawn_upstream(up_cache, "UPSTREAM-PONG").await;
+
+        // Build the policy the SAME way `izba policy allow HOST --read` does:
+        // `allow()` upserts the host/port (default access read-write), then
+        // `set_host_access()` narrows it to Read; `enforce` is set explicitly
+        // because `EgressPolicyConfig::default()` starts non-enforcing.
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.allow("api.anthropic.com", up_port);
+        cfg.set_host_access("api.anthropic.com", Access::Read);
+        cfg.enforce = true;
+        let policy = cfg.into_policy("web").unwrap();
+
+        // ALLOW: GET is permitted under Access::Read -> 200 from the real upstream.
+        let allowed = guest_request(
+            &mitm,
+            &policy,
+            &gcfg,
+            "api.anthropic.com",
+            up_port,
+            "GET /v1/messages",
+        )
+        .await;
+        assert!(allowed.contains("200 OK"), "GET flow status: {allowed}");
+        assert!(
+            allowed.contains("UPSTREAM-PONG"),
+            "GET flow body must come from the real upstream through the MITM: {allowed}"
+        );
+
+        // DENY: POST is refused under Access::Read (read = GET/HEAD only) ->
+        // izbad's synthesized 403, never reaching the upstream (which would
+        // otherwise happily answer any method with 200 UPSTREAM-PONG).
+        let denied = guest_request(
+            &mitm,
+            &policy,
+            &gcfg,
+            "api.anthropic.com",
+            up_port,
+            "POST /v1/messages",
+        )
+        .await;
+        assert!(denied.contains("403"), "POST flow status: {denied}");
+        assert!(
+            denied.contains("izba egress policy"),
+            "POST flow must be izbad's synthesized 403 (upstream never reached): {denied}"
+        );
+        assert!(
+            !denied.contains("UPSTREAM-PONG"),
+            "POST flow must NOT reach the real upstream: {denied}"
+        );
+
+        // Both decisions must land in the audit (netlog) trail: an Allow
+        // record for the GET, a Deny record for the POST, both scoped to the
+        // decrypted Host, tier L7 (MITM-terminated).
+        let audit_file = audit_paths.logs_dir("web").join("egress-audit.jsonl");
+        let text = std::fs::read_to_string(&audit_file)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", audit_file.display()));
+        let records: Vec<_> = text.lines().filter_map(parse_line).collect();
+
+        let get_record = records
+            .iter()
+            .find(|r| r.method.as_deref() == Some("GET"))
+            .expect("an audit record for the GET flow");
+        assert_eq!(
+            get_record.verdict,
+            Verdict::Allow,
+            "GET audit record: {get_record:?}"
+        );
+        assert_eq!(
+            get_record.tier,
+            Tier::L7,
+            "GET audit record: {get_record:?}"
+        );
+        assert_eq!(
+            get_record.host.as_deref(),
+            Some("api.anthropic.com"),
+            "GET audit record: {get_record:?}"
+        );
+
+        let post_record = records
+            .iter()
+            .find(|r| r.method.as_deref() == Some("POST"))
+            .expect("an audit record for the POST flow");
+        assert_eq!(
+            post_record.verdict,
+            Verdict::Deny,
+            "POST audit record: {post_record:?}"
+        );
+        assert_eq!(
+            post_record.tier,
+            Tier::L7,
+            "POST audit record: {post_record:?}"
+        );
+        assert_eq!(
+            post_record.host.as_deref(),
+            Some("api.anthropic.com"),
+            "POST audit record: {post_record:?}"
         );
     });
 }
