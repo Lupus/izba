@@ -285,23 +285,41 @@ impl EgressPolicyConfig {
         }
     }
 
-    /// Collapse normalize-equal duplicate entries in `self.allow` with
-    /// LAST-WINS whole-entry semantics — exactly mirroring
-    /// `to_rego_data_json`'s map-overwrite (a later entry's `{ports, access}`
-    /// clobbers an earlier one under the same normalized key). A legacy or
-    /// hand-edited `policy.yaml` can carry case-/trailing-dot-equivalent
+    /// Collapse normalize-equal duplicate entries in `self.allow`. A legacy
+    /// or hand-edited `policy.yaml` can carry case-/trailing-dot-equivalent
     /// duplicates (e.g. `api.x.com` + `API.X.COM`); before this pass,
     /// `allow`/`block`/`set_host_access` matched only the FIRST such entry
-    /// while compilation actually enforced the LAST — so an edit could
+    /// while compilation could enforce a DIFFERENT one — so an edit could
     /// "succeed" on an entry that was never the one in force. Calling this at
-    /// the top of every mutation means the entry a caller finds and edits is
-    /// always the one that already wins at compile time, so it can never
+    /// the top of every mutation means the entries a caller finds and edits
+    /// are always the ones that already win at compile time, so it can never
     /// change enforcement semantics on its own.
     ///
-    /// The surviving entry lands at the FIRST duplicate's position (host
-    /// normalized), carrying the LAST duplicate's ports/access/spelling;
-    /// every other duplicate is dropped. Non-duplicated entries and overall
-    /// list order are untouched.
+    /// `to_rego_data_json` compiles the two entry kinds very differently, so
+    /// this pass treats them differently too:
+    ///
+    /// - **Exact hosts** compile into `sandbox_host_rules`, a JSON MAP keyed
+    ///   by normalized host — a later entry's whole `{ports, access}`
+    ///   OVERWRITES an earlier one under the same key. So duplicates
+    ///   genuinely collapse with LAST-WINS semantics: the surviving entry
+    ///   lands at the FIRST duplicate's position (host normalized), carrying
+    ///   the LAST duplicate's ports/access/spelling; every other duplicate is
+    ///   dropped.
+    /// - **Wildcard hosts** (`is_wildcard_host`) compile into
+    ///   `sandbox_wildcard_host_rules`, a JSON LIST — every matching rule
+    ///   grants independently (UNION semantics), never overwritten.
+    ///   Collapsing wildcard duplicates with last-wins would silently delete
+    ///   real, still-enforced grants (e.g. `[*.x rw ports:[443], *.X read
+    ///   ports:[8443]]` enforces BOTH 443 read-write AND 8443 read; last-wins
+    ///   would keep only one). So wildcard duplicates only collapse when
+    ///   EVERY one of them shares the same access verb — merging into one
+    ///   entry with the union of ports is then exactly semantics-preserving.
+    ///   When access verbs are mixed, no single `AllowEntry` can represent
+    ///   the per-port access split, so they are left as separate entries
+    ///   entirely untouched; `allow`/`block`/`set_host_access` below handle
+    ///   multiple equivalent wildcard entries directly.
+    ///
+    /// Non-duplicated entries and overall list order are otherwise untouched.
     fn collapse_duplicate_hosts(&mut self) {
         use std::collections::HashMap;
 
@@ -320,6 +338,29 @@ impl EgressPolicyConfig {
         let mut winners: Vec<(usize, AllowEntry)> = Vec::new();
         for (key, idxs) in &indices_by_key {
             if idxs.len() <= 1 {
+                continue;
+            }
+            if is_wildcard_host(key) {
+                let first_access = self.allow[idxs[0]].access();
+                let uniform = idxs.iter().all(|&i| self.allow[i].access() == first_access);
+                if !uniform {
+                    // Mixed access verbs: leave every duplicate as-is, they
+                    // each still enforce their own ports independently.
+                    continue;
+                }
+                let mut ports: Vec<u16> =
+                    idxs.iter().flat_map(|&i| self.allow[i].ports()).collect();
+                ports.sort_unstable();
+                ports.dedup();
+                winners.push((
+                    idxs[0],
+                    AllowEntry::Scoped {
+                        host: key.clone(),
+                        ports: Some(ports),
+                        access: first_access,
+                    },
+                ));
+                drop.extend(idxs.iter().skip(1).copied());
                 continue;
             }
             let first = idxs[0];
@@ -348,35 +389,62 @@ impl EgressPolicyConfig {
 
     /// Set the access verb for `host` (adding the entry if absent). Returns
     /// `true` if the config changed.
+    ///
+    /// A wildcard host can carry multiple normalize-equal entries with mixed
+    /// access verbs after `collapse_duplicate_hosts` (they enforce a union
+    /// and can't be merged automatically — see that method's doc). Setting a
+    /// SINGLE access verb here removes the reason they were kept separate,
+    /// so every equivalent entry is set to `access` and then merged into one
+    /// entry carrying the union of their ports — exactly what
+    /// `collapse_duplicate_hosts` would already do for duplicates that
+    /// shared an access verb. An exact host always has at most one matching
+    /// entry after the collapse, so this reduces to a plain single-entry
+    /// rewrite there, unchanged from before.
     pub fn set_host_access(&mut self, host: &str, access: Access) -> bool {
         self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
-        if let Some(e) = self
+        let idxs: Vec<usize> = self
             .allow
-            .iter_mut()
-            .find(|e| normalize_policy_host(e.host()) == normalized)
-        {
-            if e.access() == access {
-                return false;
-            }
-            let ports = match e.ports() {
-                p if p == AllowEntry::DEFAULT_PORTS.to_vec() => None,
-                p => Some(p),
-            };
-            *e = AllowEntry::Scoped {
-                host: normalized,
-                ports,
-                access,
-            };
-            true
-        } else {
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| normalize_policy_host(e.host()) == normalized)
+            .map(|(i, _)| i)
+            .collect();
+
+        if idxs.is_empty() {
             self.allow.push(AllowEntry::Scoped {
                 host: normalized,
                 ports: None,
                 access,
             });
-            true
+            return true;
         }
+        if idxs.iter().all(|&i| self.allow[i].access() == access) {
+            return false;
+        }
+
+        let mut ports: Vec<u16> = idxs.iter().flat_map(|&i| self.allow[i].ports()).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        let ports = match ports {
+            p if p == AllowEntry::DEFAULT_PORTS.to_vec() => None,
+            p => Some(p),
+        };
+
+        let first = idxs[0];
+        self.allow[first] = AllowEntry::Scoped {
+            host: normalized,
+            ports,
+            access,
+        };
+        let drop: std::collections::HashSet<usize> = idxs[1..].iter().copied().collect();
+        let mut i = 0;
+        self.allow.retain(|_| {
+            let keep = !drop.contains(&i);
+            i += 1;
+            keep
+        });
+        true
     }
 
     /// Upsert a git rule. Returns `true` if added or if the access verb changed.
@@ -523,18 +591,29 @@ impl EgressPolicyConfig {
     /// Ensure `host` authorizes `port`, adding the host and/or the port as
     /// needed. Normalizes the entry to the explicit `Scoped` form. Returns
     /// `true` if the config changed, `false` if `port` was already authorized.
+    ///
+    /// A wildcard host's normalize-equal entries enforce a UNION (see
+    /// `collapse_duplicate_hosts`), so a port counts as already authorized if
+    /// ANY equivalent entry lists it, regardless of that entry's access
+    /// verb — an exact host always has at most one matching entry after the
+    /// collapse, so this reduces to the prior single-entry check there.
     pub fn allow(&mut self, host: &str, port: u16) -> bool {
         self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
+        let already_granted = self
+            .allow
+            .iter()
+            .filter(|e| normalize_policy_host(e.host()) == normalized)
+            .any(|e| e.ports().contains(&port));
+        if already_granted {
+            return false;
+        }
         if let Some(entry) = self
             .allow
             .iter_mut()
             .find(|e| normalize_policy_host(e.host()) == normalized)
         {
             let mut ports = entry.ports();
-            if ports.contains(&port) {
-                return false;
-            }
             ports.push(port);
             ports.sort_unstable();
             let access = entry.access();
@@ -556,33 +635,42 @@ impl EgressPolicyConfig {
 
     /// Remove `port` from `host`; drop the host entirely once its last port is
     /// gone. Returns `true` if the config changed.
+    ///
+    /// A wildcard host's normalize-equal entries enforce a UNION (see
+    /// `collapse_duplicate_hosts`), so a grant only truly disappears once NO
+    /// equivalent entry keeps the port — the port is removed from EVERY
+    /// matching entry, and any entry left with no ports is dropped. An exact
+    /// host always has at most one matching entry after the collapse, so
+    /// this reduces to the prior single-entry behavior there.
     pub fn block(&mut self, host: &str, port: u16) -> bool {
         self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
-        let Some(idx) = self
-            .allow
-            .iter()
-            .position(|e| normalize_policy_host(e.host()) == normalized)
-        else {
-            return false;
-        };
-        let mut ports = self.allow[idx].ports();
-        let before = ports.len();
-        ports.retain(|p| *p != port);
-        if ports.len() == before {
-            return false; // port wasn't authorized
-        }
-        if ports.is_empty() {
-            self.allow.remove(idx);
-        } else {
-            let access = self.allow[idx].access();
-            self.allow[idx] = AllowEntry::Scoped {
-                host: normalized,
+        let mut changed = false;
+        for e in &mut self.allow {
+            if normalize_policy_host(e.host()) != normalized {
+                continue;
+            }
+            let mut ports = e.ports();
+            let before = ports.len();
+            ports.retain(|p| *p != port);
+            changed |= ports.len() != before;
+            // Canonicalize every touched entry's host spelling, whether or
+            // not this particular entry carried `port` -- consistent with
+            // `allow`/`set_host_access` normalizing on any write that
+            // touches an entry.
+            let access = e.access();
+            *e = AllowEntry::Scoped {
+                host: normalized.clone(),
                 ports: Some(ports),
                 access,
             };
         }
-        true
+        if changed {
+            self.allow.retain(|e| {
+                !(normalize_policy_host(e.host()) == normalized && e.ports().is_empty())
+            });
+        }
+        changed
     }
 
     /// Serialize back to canonical `policy.yaml` text (round-trips `from_yaml`).
@@ -1814,6 +1902,201 @@ mod tests {
         assert_eq!(cfg.allow[0].host(), "api.x.com");
         assert_eq!(cfg.allow[0].access(), Access::ReadWrite);
         assert_eq!(cfg.allow[0].ports(), vec![22, 80, 443]);
+    }
+
+    // ── Greptile P1 #3 (#84): wildcard duplicates must preserve UNION
+    // semantics through the collapse, never last-wins ─────────────────────────
+    // `to_rego_data_json` routes wildcard patterns into
+    // `sandbox_wildcard_host_rules` -- a LIST where every matching rule
+    // grants independently (union semantics), NOT the last-wins map used for
+    // exact hosts (`sandbox_host_rules`). Applying `collapse_duplicate_hosts`'s
+    // last-wins rule to normalize-equal WILDCARD duplicates is therefore
+    // wrong: it silently drops whichever duplicate's ports the last one
+    // doesn't share, deleting real grants a mutation never touched.
+
+    fn mixed_access_wildcard_dupes() -> Vec<AllowEntry> {
+        vec![
+            AllowEntry::Scoped {
+                host: "*.x".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            },
+            AllowEntry::Scoped {
+                host: "*.X".into(),
+                ports: Some(vec![8443]),
+                access: Access::Read,
+            },
+        ]
+    }
+
+    /// A mixed-access wildcard duplicate pair enforces the UNION today
+    /// (443 read-write AND 8443 read, independently). An UNRELATED mutation
+    /// must not collapse them via last-wins -- both must survive, and
+    /// `to_rego_data_json` must still carry BOTH wildcard rules.
+    #[test]
+    fn unrelated_mutation_does_not_collapse_mixed_access_wildcard_duplicates() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: mixed_access_wildcard_dupes(),
+            git: vec![],
+        };
+        assert!(cfg.allow("other.host", 443));
+        assert_eq!(
+            cfg.allow.len(),
+            3,
+            "the two mixed-access wildcard entries must survive an unrelated mutation \
+             untouched, plus the one newly-added entry: {:?}",
+            cfg.allow
+        );
+        assert!(
+            cfg.allow
+                .iter()
+                .any(|e| e.host().eq_ignore_ascii_case("*.x")
+                    && e.ports() == vec![443]
+                    && e.access() == Access::ReadWrite),
+            "the read-write/443 wildcard entry must be untouched: {:?}",
+            cfg.allow
+        );
+        assert!(
+            cfg.allow
+                .iter()
+                .any(|e| e.host().eq_ignore_ascii_case("*.x")
+                    && e.ports() == vec![8443]
+                    && e.access() == Access::Read),
+            "the read/8443 wildcard entry must be untouched: {:?}",
+            cfg.allow
+        );
+
+        let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
+        let wildcards = doc["sandbox_wildcard_host_rules"]["web"]
+            .as_array()
+            .unwrap();
+        let x_rules: Vec<_> = wildcards.iter().filter(|w| w["pattern"] == "*.x").collect();
+        assert_eq!(
+            x_rules.len(),
+            2,
+            "both wildcard rules must still compile independently: {wildcards:?}"
+        );
+    }
+
+    /// `block` on a mixed-access wildcard duplicate pair must remove the
+    /// port from EVERY equivalent entry (union semantics: the grant only
+    /// truly disappears once no entry keeps it), dropping any entry whose
+    /// ports become empty.
+    #[test]
+    fn block_removes_port_from_all_equivalent_wildcard_duplicates() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: mixed_access_wildcard_dupes(),
+            git: vec![],
+        };
+        assert!(cfg.block("*.x", 443));
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "the read-write/443 entry (now empty) must be dropped, the read/8443 entry \
+             must remain: {:?}",
+            cfg.allow
+        );
+        assert_eq!(cfg.allow[0].host(), "*.x");
+        assert_eq!(cfg.allow[0].ports(), vec![8443]);
+        assert_eq!(cfg.allow[0].access(), Access::Read);
+    }
+
+    /// `allow` treats a port as already granted if ANY equivalent wildcard
+    /// entry lists it, regardless of that entry's access verb -- port 8443
+    /// is granted (read-only) by the second duplicate, so re-`allow`ing it
+    /// under the default read-write call must be a true no-op, not widen
+    /// the read-only grant or add a redundant entry.
+    #[test]
+    fn allow_is_a_noop_when_any_equivalent_wildcard_entry_already_grants_the_port() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: mixed_access_wildcard_dupes(),
+            git: vec![],
+        };
+        assert!(
+            !cfg.allow("*.x", 8443),
+            "port 8443 is already granted (read-only) by the second duplicate"
+        );
+        assert_eq!(
+            cfg.allow,
+            mixed_access_wildcard_dupes(),
+            "a port already granted by ANY equivalent entry must leave the config untouched"
+        );
+    }
+
+    /// `set_host_access` on a mixed-access wildcard duplicate pair sets the
+    /// access verb uniformly across every equivalent entry, which removes
+    /// the reason they were kept separate -- so they must then merge into
+    /// ONE entry carrying the union of ports, and the compiled data doc must
+    /// carry exactly one wildcard rule for the pattern.
+    #[test]
+    fn set_host_access_unifies_and_merges_mixed_access_wildcard_duplicates() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: mixed_access_wildcard_dupes(),
+            git: vec![],
+        };
+        assert!(cfg.set_host_access("*.x", Access::Read));
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "*.x".into(),
+                ports: Some(vec![443, 8443]),
+                access: Access::Read,
+            }],
+            "setting a uniform access must merge the duplicates into one union-ports entry: {:?}",
+            cfg.allow
+        );
+
+        let doc: serde_json::Value = serde_json::from_str(&cfg.to_rego_data_json("web")).unwrap();
+        let wildcards = doc["sandbox_wildcard_host_rules"]["web"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            wildcards.len(),
+            1,
+            "exactly one compiled wildcard rule after the merge: {wildcards:?}"
+        );
+        assert_eq!(wildcards[0]["ports"], serde_json::json!([443, 8443]));
+        assert_eq!(wildcards[0]["access"], "read");
+    }
+
+    /// Uniform-access wildcard duplicates (no mixed verbs) are exactly
+    /// semantics-preserving to merge -- ANY mutation (even one that targets
+    /// a different host entirely) collapses them into one union-ports entry,
+    /// same as `collapse_duplicate_hosts` already does for exact hosts.
+    #[test]
+    fn uniform_access_wildcard_duplicates_collapse_to_one_union_entry() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Scoped {
+                    host: "*.x".into(),
+                    ports: Some(vec![443]),
+                    access: Access::Read,
+                },
+                AllowEntry::Scoped {
+                    host: "*.X".into(),
+                    ports: Some(vec![8443]),
+                    access: Access::Read,
+                },
+            ],
+            git: vec![],
+        };
+        // An unrelated no-op mutation still triggers the collapse pass.
+        assert!(!cfg.block("nonexistent.example", 1));
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "*.x".into(),
+                ports: Some(vec![443, 8443]),
+                access: Access::Read,
+            }],
+            "same-access wildcard duplicates must merge to one union-ports entry: {:?}",
+            cfg.allow
+        );
     }
 
     // ── Task 6: build_network policy tests ───────────────────────────────────
