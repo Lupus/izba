@@ -658,6 +658,54 @@ mod tests {
         );
     }
 
+    /// Mutation-gap closure (#84 incremental gate): `render_policy`'s git
+    /// section is guarded by `if !cfg.git.is_empty()`; deleting that `!`
+    /// (rendering the section only when git rules are ABSENT) passed the
+    /// whole suite before this test existed. Pin both directions: a config
+    /// with a git rule must render the `git:` header and its entry, and a
+    /// config with none must NOT mention `git:` at all.
+    #[test]
+    fn render_policy_shows_git_section_only_when_rules_present() {
+        use izba_core::daemon::egress::config::GitRule;
+
+        let with_git = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: None,
+                access: Access::ReadWrite,
+            }],
+            git: vec![GitRule {
+                target: GitTarget::Repo("github.com/o/a".into()),
+                access: Access::Read,
+            }],
+        };
+        let out = render_policy("web", Some(&with_git));
+        assert!(
+            out.contains("  git:"),
+            "a config with git rules must render the git: header, got:\n{out}"
+        );
+        assert!(
+            out.contains("    github.com/o/a (read)"),
+            "a config with git rules must render its entry, got:\n{out}"
+        );
+
+        let without_git = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: None,
+                access: Access::ReadWrite,
+            }],
+            git: vec![],
+        };
+        let out2 = render_policy("web", Some(&without_git));
+        assert!(
+            !out2.contains("git:"),
+            "a config with no git rules must not render a git section, got:\n{out2}"
+        );
+    }
+
     #[test]
     fn verbs_bail_cleanly_on_unknown_sandbox() {
         let tmp = tempfile::tempdir().unwrap();
