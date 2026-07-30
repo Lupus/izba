@@ -227,6 +227,8 @@ impl DaemonApi for FakeDaemon {
         allow: Vec<izba_core::daemon::egress::config::AllowEntry>,
     ) -> anyhow::Result<()> {
         self.calls.push(format!("set:{name}:{}", allow.len()));
+        // Mirror the real daemon so a follow-up policy_show observes the replacement.
+        self.policy.replace_allow(allow);
         Ok(())
     }
     fn policy_add_endpoints(

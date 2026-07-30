@@ -643,12 +643,14 @@ mod tests {
         // spelling verbatim — see the module doc), so `diff()` may still
         // report an "egress" delta reflecting that respelling; but it must
         // never be flagged as a firewall weakening.
-        if let Some(d0) = diff(&from, &to).into_iter().find(|f| f.field == "egress") {
-            assert!(
-                !d0.weakens_egress,
-                "a pure respelling must not be flagged ⚠ weakens egress"
-            );
-        }
+        let d0 = diff(&from, &to)
+            .into_iter()
+            .find(|f| f.field == "egress")
+            .expect("respelling rewrites managed yaml, so a delta row is expected");
+        assert!(
+            !d0.weakens_egress,
+            "a pure respelling must not be flagged ⚠ weakens egress"
+        );
     }
 
     /// #170: raw normalize-equal duplicates ("Host.com" and "host.com") must

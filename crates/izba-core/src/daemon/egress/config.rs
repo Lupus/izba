@@ -2731,4 +2731,40 @@ mod tests {
             cfg.allow
         );
     }
+
+    #[test]
+    fn replace_allow_idempotent_on_mixed_access_wildcards() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.replace_allow(vec![
+            AllowEntry::Scoped {
+                host: "*.x".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            },
+            AllowEntry::Scoped {
+                host: "*.X".into(),
+                ports: Some(vec![8443]),
+                access: Access::Read,
+            },
+        ]);
+        assert_eq!(
+            cfg.allow.len(),
+            2,
+            "mixed-access wildcard duplicates must stay separate: {:?}",
+            cfg.allow
+        );
+        let once = cfg.allow.clone();
+        cfg.replace_allow(once.clone());
+        assert_eq!(
+            cfg.allow.len(),
+            2,
+            "a second replace_allow with the previous result must not re-merge or drop entries: {:?}",
+            cfg.allow
+        );
+        assert_eq!(
+            cfg.allow, once,
+            "replacing with the result of a previous replace_allow on mixed-access wildcards must be a no-op: {:?}",
+            cfg.allow
+        );
+    }
 }
