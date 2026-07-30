@@ -387,6 +387,33 @@ impl EgressPolicyConfig {
         });
     }
 
+    /// Wholesale-replace `self.allow` with `allow` -- the entry point for
+    /// callers that hold a full replacement list (the GUI policy editor,
+    /// which lets a user free-edit the whole allow-list at once rather than
+    /// mutating one host at a time).
+    ///
+    /// Contract: the persisted list is canonical-spelled and duplicate-free
+    /// for exact hosts (normalize-equal exact-host entries collapse
+    /// last-wins, exactly like every other mutation method), and wildcard
+    /// union semantics are preserved (uniform-access wildcard duplicates
+    /// merge into one ports-union entry; mixed-access duplicates are left as
+    /// separate entries, each still enforcing its own ports independently --
+    /// see `collapse_duplicate_hosts`). Every entry's host spelling is
+    /// canonicalized via `normalize_policy_host` before the collapse pass
+    /// runs, so hand-typed or GUI-pasted spelling variants collapse exactly
+    /// like they would if entered one at a time through `allow`/`block`/
+    /// `set_host_access`.
+    pub fn replace_allow(&mut self, allow: Vec<AllowEntry>) {
+        self.allow = allow;
+        for e in &mut self.allow {
+            match e {
+                AllowEntry::Host(host) => *host = normalize_policy_host(host),
+                AllowEntry::Scoped { host, .. } => *host = normalize_policy_host(host),
+            }
+        }
+        self.collapse_duplicate_hosts();
+    }
+
     /// Set the access verb for `host` (adding the entry if absent). Returns
     /// `true` if the config changed.
     ///
@@ -688,7 +715,15 @@ impl EgressPolicyConfig {
 /// lowercase + trailing dot stripped. The request side already normalizes
 /// (`mitm::normalize_host`, `dns_snoop::normalize`); without this a
 /// mixed-case policy entry silently never matches.
-fn normalize_policy_host(host: &str) -> String {
+///
+/// `pub(crate)` (not `pub`, not private): `manifest::diff` keys its
+/// proposed-vs-persisted comparison by this same identity function, so its
+/// keying can never silently drift from the mutation/compile identity used
+/// here and in `to_rego_data_json`. External callers never call this
+/// directly -- they go through the mutation methods (`allow`, `block`,
+/// `set_host_access`, `replace_allow`), which normalize as part of their
+/// documented contract.
+pub(crate) fn normalize_policy_host(host: &str) -> String {
     host.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
@@ -2546,6 +2581,154 @@ mod tests {
         assert!(
             !EgressPolicyConfig::path_in(dir.path()).exists(),
             "no policy.yaml stub may be left behind"
+        );
+    }
+
+    // ── replace_allow: the GUI policy editor's wholesale-set entry point ──
+    // (#171) -- must canonicalize every entry's host spelling and collapse
+    // normalize-equal duplicates exactly like the mutation methods above, so
+    // a full-list replacement can never persist a spelling/duplicate that
+    // diverges from compile-time enforcement.
+
+    #[test]
+    fn replace_allow_canonicalizes_spelling() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.replace_allow(vec![AllowEntry::Scoped {
+            host: "API.Example.com.".into(),
+            ports: Some(vec![443]),
+            access: Access::Read,
+        }]);
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "api.example.com".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            }],
+            "the persisted host spelling must be canonicalized: {:?}",
+            cfg.allow
+        );
+    }
+
+    #[test]
+    fn replace_allow_exact_duplicates_last_wins() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.replace_allow(vec![
+            AllowEntry::Scoped {
+                host: "Host.com".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            },
+            AllowEntry::Scoped {
+                host: "host.com.".into(),
+                ports: Some(vec![8080]),
+                access: Access::Read,
+            },
+        ]);
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "host.com".into(),
+                ports: Some(vec![8080]),
+                access: Access::Read,
+            }],
+            "normalize-equal exact hosts must collapse to ONE entry carrying the last \
+             entry's payload at the first entry's position: {:?}",
+            cfg.allow
+        );
+    }
+
+    #[test]
+    fn replace_allow_wildcard_uniform_merges_ports_union() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.replace_allow(vec![
+            AllowEntry::Scoped {
+                host: "*.x".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            },
+            AllowEntry::Scoped {
+                host: "*.X".into(),
+                ports: Some(vec![8443]),
+                access: Access::Read,
+            },
+        ]);
+        assert_eq!(
+            cfg.allow,
+            vec![AllowEntry::Scoped {
+                host: "*.x".into(),
+                ports: Some(vec![443, 8443]),
+                access: Access::Read,
+            }],
+            "uniform-access wildcard duplicates must merge into one union-ports entry: {:?}",
+            cfg.allow
+        );
+    }
+
+    #[test]
+    fn replace_allow_wildcard_mixed_access_stays_separate() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.replace_allow(vec![
+            AllowEntry::Scoped {
+                host: "*.x".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            },
+            AllowEntry::Scoped {
+                host: "*.X".into(),
+                ports: Some(vec![8443]),
+                access: Access::Read,
+            },
+        ]);
+        assert_eq!(
+            cfg.allow.len(),
+            2,
+            "mixed-access wildcard duplicates must stay separate, each enforcing its own \
+             ports independently: {:?}",
+            cfg.allow
+        );
+        assert!(
+            cfg.allow.iter().all(|e| e.host() == "*.x"),
+            "both entries' spellings must still be canonicalized: {:?}",
+            cfg.allow
+        );
+        assert!(
+            cfg.allow
+                .iter()
+                .any(|e| e.ports() == vec![443] && e.access() == Access::ReadWrite),
+            "the read-write/443 entry must survive: {:?}",
+            cfg.allow
+        );
+        assert!(
+            cfg.allow
+                .iter()
+                .any(|e| e.ports() == vec![8443] && e.access() == Access::Read),
+            "the read/8443 entry must survive: {:?}",
+            cfg.allow
+        );
+    }
+
+    #[test]
+    fn replace_allow_is_idempotent() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.replace_allow(vec![
+            AllowEntry::Scoped {
+                host: "Host.com".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            },
+            AllowEntry::Scoped {
+                host: "*.X".into(),
+                ports: Some(vec![8443]),
+                access: Access::Read,
+            },
+        ]);
+        let once = cfg.allow.clone();
+        cfg.replace_allow(once.clone());
+        assert_eq!(
+            cfg.allow, once,
+            "replacing with the result of a previous replace_allow must be a no-op: {:?}",
+            cfg.allow
         );
     }
 }
