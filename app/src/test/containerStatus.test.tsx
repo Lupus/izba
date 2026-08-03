@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
 import type { SandboxDetail } from "../lib/types";
 import { containerLabel } from "../lib/container";
@@ -73,5 +73,24 @@ describe("ContainerStatus", () => {
     // Best-effort like WorkspacePath: a failed inspect leaves no line behind.
     await vi.waitFor(() => expect(inspect).toHaveBeenCalled());
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("re-polls so a workload exiting while mounted flips the label", async () => {
+    inspect.mockResolvedValue(detail("running"));
+    render(<ContainerStatus name="web" pollMs={20} />);
+    expect(await screen.findByText("running")).toBeInTheDocument();
+
+    // The workload exits; `name` never changes — the next poll must notice.
+    inspect.mockResolvedValue(detail("stopped"));
+    expect(await screen.findByText("stopped (workload exited)")).toBeInTheDocument();
+  });
+
+  it("drops the line instead of keeping a stale claim when inspect starts failing", async () => {
+    inspect.mockResolvedValue(detail("running"));
+    const { container } = render(<ContainerStatus name="web" pollMs={20} />);
+    expect(await screen.findByText("running")).toBeInTheDocument();
+
+    inspect.mockRejectedValue(new Error("daemon restarting"));
+    await waitFor(() => expect(container).toBeEmptyDOMElement());
   });
 });
