@@ -870,4 +870,35 @@ mod tests {
             "adding a redundant read duplicate under an rw wildcard is no widen"
         );
     }
+
+    /// #172 mutation-gate kill: a SINGLE wildcard entry's access verb must
+    /// fold through to its cells — read -> read-write on a wildcard pattern
+    /// is a widen and must flag; the reverse tightens and must not. Pins the
+    /// ReadWrite-upgrade guard in `allow_index`'s wildcard arm, which the
+    /// incremental mutation gate reported unkilled (`replace == with !=`):
+    /// that mutant upgrades Read cells to ReadWrite, overstating a wildcard
+    /// from-side and masking exactly this widen.
+    #[test]
+    fn wildcard_single_entry_verb_widening_flags() {
+        let mut from = base();
+        from.egress.allow = vec![AllowEntry::Scoped {
+            host: "*.example.com".into(),
+            ports: Some(vec![443]),
+            access: Access::Read,
+        }];
+        let mut to = base();
+        to.egress.allow = vec![AllowEntry::Scoped {
+            host: "*.example.com".into(),
+            ports: Some(vec![443]),
+            access: Access::ReadWrite,
+        }];
+        assert!(
+            egress_weakens(&from.egress, &to.egress),
+            "wildcard read -> read-write widens"
+        );
+        assert!(
+            !egress_weakens(&to.egress, &from.egress),
+            "wildcard read-write -> read tightens"
+        );
+    }
 }
