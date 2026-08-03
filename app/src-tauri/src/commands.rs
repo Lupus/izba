@@ -858,6 +858,7 @@ mod tests {
         assert_eq!(v.status, "running");
         assert!(v.ports.is_empty());
         assert!(v.volumes.is_empty());
+        assert_eq!(v.container.as_deref(), Some("running"));
     }
 
     #[test]

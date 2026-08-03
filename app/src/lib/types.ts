@@ -65,6 +65,11 @@ export interface SandboxDetail {
   workspace: string;
   ports: PortRule[];
   volumes: VolumeSpec[];
+  /** In-guest workload container state token (`running`, `stopped`, …), or
+   *  `null` when the sandbox is stopped, the guest was unreachable, or the
+   *  daemon predates container-state reporting. `null` and `"unknown"` both
+   *  render as "unknown" — never as a healthy status. */
+  container: string | null;
 }
 
 export interface CreateOpts {
