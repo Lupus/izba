@@ -594,7 +594,7 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
     let container = if status == "stopped" {
         None
     } else {
-        probe_container_state(d, &name)
+        probe_container_state(d, &name, CONTAINER_PROBE_TIMEOUT)
     };
     Ok(DaemonResponse::Inspect(SandboxDetail {
         name,
@@ -612,14 +612,25 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
     }))
 }
 
+/// Upper bound for the guest `Health` probe I/O. A wedged-but-accepting guest
+/// must not pin the inspect handler (and, transitively, a polling GUI client)
+/// forever — after this deadline the probe degrades to `None`/"unknown".
+const CONTAINER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Best-effort probe of a sandbox's in-guest container state via the guest
 /// `Health` RPC. Returns `None` on any failure — a stopped sandbox (the
-/// control dial fails), an unreachable/wedged guest, or a guest old enough that
-/// its `HealthInfo` carries no `container` field — so inspect degrades to
-/// "unknown" instead of erroring. Mirrors `handle_guest_rpc`'s single
-/// request/response exchange, but swallows errors rather than surfacing them.
-fn probe_container_state(d: &Arc<Daemon>, name: &str) -> Option<izba_proto::ContainerState> {
+/// control dial fails), an unreachable/wedged guest (bounded by `timeout`), or
+/// a guest old enough that its `HealthInfo` carries no `container` field — so
+/// inspect degrades to "unknown" instead of erroring. Mirrors
+/// `handle_guest_rpc`'s single request/response exchange, but swallows errors
+/// rather than surfacing them.
+fn probe_container_state(
+    d: &Arc<Daemon>,
+    name: &str,
+    timeout: Duration,
+) -> Option<izba_proto::ContainerState> {
     let mut conn = sandbox::control(&d.paths, name, d.connector()).ok()?;
+    conn.set_io_timeout(Some(timeout)).ok()?;
     write_frame(&mut conn, &izba_proto::Request::Health).ok()?;
     match read_frame::<_, Response>(&mut conn).ok()? {
         Response::Health(h) => h.container,
@@ -953,8 +964,8 @@ mod tests {
         load_json, save_json, RunState, SandboxConfig, UserFallback, CONFIG_FILE, STATE_FILE,
     };
     use crate::testutil::{
-        fake_connector, live_identity, spawn_sleep, test_paths, wait_dead, write_state,
-        write_state_with_run_dir, MockDriver,
+        fake_connector, hanging_connector, live_identity, spawn_sleep, test_paths, wait_dead,
+        write_state, write_state_with_run_dir, MockDriver,
     };
     use crate::vmm::UdsStream;
     use izba_proto::{read_frame, write_frame, Request, Response};
@@ -1810,6 +1821,36 @@ mod tests {
             }
             other => panic!("inspect: {other:?}"),
         }
+    }
+
+    #[test]
+    fn container_probe_times_out_on_wedged_guest() {
+        // A guest that accepts the control connection and reads the Health
+        // request but never replies must not pin the probe (and transitively a
+        // polling GUI's inspect) forever — the bounded probe degrades to None
+        // within its timeout instead of blocking until the peer goes away.
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let mut deps = test_deps();
+        deps.connector = Box::new(hanging_connector());
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        write_state(&d.paths, "web", live_identity());
+
+        let t0 = Instant::now();
+        let state = probe_container_state(&d, "web", Duration::from_millis(200));
+        assert_eq!(state, None);
+        // Well under the hanging fake's 10 s hold: proves the timeout fired,
+        // not the peer's eventual exit.
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "probe blocked {:?} instead of timing out",
+            t0.elapsed()
+        );
     }
 
     #[test]
