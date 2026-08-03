@@ -474,8 +474,10 @@ mod tests {
         assert_eq!(classify(&b, &repo, &managed), DriftState::Diverged);
     }
 
-    /// Fix 1: duplicate allow-list entries for the same host must not collapse
-    /// last-wins. A verb widening on any (host, port) cell must be flagged.
+    /// Duplicate exact-host entries fold last-wins at compile, so the LAST
+    /// entry is the enforced one — widening ITS verb must flag. (Originally
+    /// "Fix 1": a host-keyed index used to mask per-port verb widenings; kept
+    /// as a pin that the enforced cell's widen is always caught.)
     #[test]
     fn duplicate_host_verb_widening_weakens_egress() {
         let mut from = base();
@@ -577,8 +579,8 @@ mod tests {
         );
     }
 
-    /// Fix 1 (negative): a pure tightening on duplicate-host entries must NOT
-    /// flag weakening.
+    /// Fix 1 (negative): tightening the verb on the enforced (last) duplicate
+    /// entry is a pure tightening and must NOT flag.
     #[test]
     fn duplicate_host_pure_tightening_does_not_weaken() {
         let mut from = base();
@@ -759,6 +761,113 @@ mod tests {
         assert!(
             !egress_weakens(&from_single.egress, &same_port.egress),
             "the same (host, port, access) under a different spelling must not weaken"
+        );
+    }
+
+    /// #172: the two-promote widening sequence, end-to-end at the diff layer.
+    /// Step 1 — appending a narrower normalize-equal duplicate
+    /// (`[h rw 443]` -> `[h rw 443, h read 443]`) NARROWS enforcement to read
+    /// (the last duplicate's whole object wins at compile) and must NOT flag.
+    /// Step 2 — dropping the duplicate again (`[h rw 443, h read 443]` ->
+    /// `[h rw 443]`) WIDENS enforcement read -> read-write and MUST flag.
+    /// Before #172, the max-access fold left BOTH steps unflagged.
+    #[test]
+    fn two_promote_duplicate_sequence_flags_the_widening_step() {
+        let mut managed = base();
+        managed.egress.allow = vec![AllowEntry::Scoped {
+            host: "host.com".into(),
+            ports: Some(vec![443]),
+            access: Access::ReadWrite,
+        }];
+        let mut with_dup = base();
+        with_dup.egress.allow = vec![
+            AllowEntry::Scoped {
+                host: "host.com".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            },
+            AllowEntry::Scoped {
+                host: "host.com".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            },
+        ];
+        assert!(
+            !egress_weakens(&managed.egress, &with_dup.egress),
+            "step 1 narrows enforcement (rw -> read); no flag"
+        );
+        assert!(
+            egress_weakens(&with_dup.egress, &managed.egress),
+            "step 2 widens enforcement (read -> rw); MUST flag"
+        );
+    }
+
+    /// #172 per-port variant: `[h{443} read, h{8080} rw]` compiles to ONLY
+    /// 8080/read-write — the last entry's whole `{ports, access}` object wins,
+    /// dropping 443 entirely. A proposal keeping just `[h{443} read]`
+    /// therefore re-opens 443, an effectively NEW (host, port), and must flag
+    /// even though it looks like a pure removal textually.
+    #[test]
+    fn exact_host_whole_entry_overwrite_drops_earlier_ports() {
+        let mut from = base();
+        from.egress.allow = vec![
+            AllowEntry::Scoped {
+                host: "host.com".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            },
+            AllowEntry::Scoped {
+                host: "host.com".into(),
+                ports: Some(vec![8080]),
+                access: Access::ReadWrite,
+            },
+        ];
+        let mut to = base();
+        to.egress.allow = vec![AllowEntry::Scoped {
+            host: "host.com".into(),
+            ports: Some(vec![443]),
+            access: Access::Read,
+        }];
+        assert!(
+            egress_weakens(&from.egress, &to.egress),
+            "443 was not enforced before (8080-only entry won at compile); re-opening it must flag"
+        );
+    }
+
+    /// #172: wildcard duplicates fold as UNION, not last-wins. With
+    /// `[*.x rw 443, *.x read 443]` (rw FIRST, read LAST) the union already
+    /// grants read-write on 443, so collapsing to `[*.x rw 443]` is not a
+    /// widen — a last-wins fold would wrongly call the from-side read and
+    /// false-positive here. Adding a redundant read duplicate to an rw
+    /// wildcard is likewise not a widen.
+    #[test]
+    fn wildcard_duplicates_fold_as_union_not_last_wins() {
+        let mut dup = base();
+        dup.egress.allow = vec![
+            AllowEntry::Scoped {
+                host: "*.example.com".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+            },
+            AllowEntry::Scoped {
+                host: "*.example.com".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            },
+        ];
+        let mut single = base();
+        single.egress.allow = vec![AllowEntry::Scoped {
+            host: "*.example.com".into(),
+            ports: Some(vec![443]),
+            access: Access::ReadWrite,
+        }];
+        assert!(
+            !egress_weakens(&dup.egress, &single.egress),
+            "union already granted rw on 443; collapsing duplicates is no widen"
+        );
+        assert!(
+            !egress_weakens(&single.egress, &dup.egress),
+            "adding a redundant read duplicate under an rw wildcard is no widen"
         );
     }
 }
