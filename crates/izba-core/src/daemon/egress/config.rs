@@ -727,8 +727,10 @@ pub(crate) fn normalize_policy_host(host: &str) -> String {
     host.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Is this allow-entry host a wildcard pattern (`*.x` / `**.x`)?
-fn is_wildcard_host(host: &str) -> bool {
+/// `pub(crate)` so `manifest::diff` classifies entries into the same two
+/// compile targets (`sandbox_host_rules` map vs `sandbox_wildcard_host_rules`
+/// list) that `to_rego_data_json` uses — the fold semantics differ (#172).
+pub(crate) fn is_wildcard_host(host: &str) -> bool {
     host.starts_with("*.") || host.starts_with("**.")
 }
 

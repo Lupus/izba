@@ -4,7 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::daemon::egress::config::{normalize_policy_host, Access, EgressPolicyConfig};
+use crate::daemon::egress::config::{
+    is_wildcard_host, normalize_policy_host, Access, EgressPolicyConfig,
+};
 use crate::manifest::normalize::{ImageSource, Normalized};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,29 +90,44 @@ fn volumes_str(vols: &[crate::volume::VolumeSpec]) -> String {
         .join("\n")
 }
 
-/// Build a (host, port) -> max-access view of an allow-list for comparison.
+/// Build the (host, port) -> access view of an allow-list for comparison,
+/// folded exactly like `to_rego_data_json` compiles it (#172):
 ///
-/// Expanding to per-port rows prevents the old host-keyed last-wins collapse:
-/// two entries for the same host with different verbs (e.g. one port read-only,
-/// another read-write) are now distinct cells, so a verb widening on one of them
-/// is correctly flagged as a firewall loosening even when the other tightens.
+/// - **Exact hosts** compile into `sandbox_host_rules`, a JSON MAP keyed by
+///   normalized host: a later normalize-equal entry's whole `{ports, access}`
+///   object OVERWRITES the earlier one. So each exact-host entry first clears
+///   every cell of that host, then inserts its own ports — last-wins,
+///   whole-entry.
+/// - **Wildcard hosts** compile into `sandbox_wildcard_host_rules`, a JSON
+///   LIST where every rule grants independently (UNION): a cell's effective
+///   access is the max across the entries that carry it, so cells accumulate
+///   and duplicates take max-access.
 ///
 /// Keyed on `normalize_policy_host` (trim + trailing-dot strip + lowercase),
 /// the same comparison identity `EgressPolicyConfig`'s own mutation methods
-/// and `to_rego_data_json` use (#170) — so a pure respelling of the same host
-/// (`"API.example.com."` vs `"api.example.com"`) folds into one cell instead
-/// of being treated as two different hosts.
+/// and `to_rego_data_json` use (#170). Folding compile-faithfully is
+/// load-bearing for the `⚠ weakens egress` gate: a max-access fold overstated
+/// the "from" side of duplicate-carrying configs, letting a two-promote
+/// sequence widen enforcement read -> read-write with neither step flagged
+/// (#172).
 fn allow_index(eg: &EgressPolicyConfig) -> BTreeMap<(String, u16), Access> {
     let mut m: BTreeMap<(String, u16), Access> = BTreeMap::new();
     for e in &eg.allow {
         let host = normalize_policy_host(e.host());
         let acc = e.access();
-        for p in e.ports() {
-            // Take max-access across duplicate (host, port) pairs so the "from"
-            // side is never understated and the "to" side is not over-flagged.
-            let entry = m.entry((host.clone(), p)).or_insert(acc);
-            if acc == Access::ReadWrite {
-                *entry = Access::ReadWrite;
+        if is_wildcard_host(&host) {
+            for p in e.ports() {
+                let entry = m.entry((host.clone(), p)).or_insert(acc);
+                if acc == Access::ReadWrite {
+                    *entry = Access::ReadWrite;
+                }
+            }
+        } else {
+            // JSON-map overwrite: this entry replaces ALL prior cells for
+            // this host, not just the ports it shares with them.
+            m.retain(|(h, _), _| h != &host);
+            for p in e.ports() {
+                m.insert((host.clone(), p), acc);
             }
         }
     }
@@ -653,21 +670,26 @@ mod tests {
         );
     }
 
-    /// #170: raw normalize-equal duplicates ("Host.com" and "host.com") must
-    /// fold to a single max-access cell, exactly like literal duplicates do.
+    /// #172: exact-host duplicates fold LAST-WINS, whole-entry — exactly like
+    /// the `sandbox_host_rules` JSON-map compile — NOT max-access. With
+    /// `[rw first, read last]` the enforced access is read (the last
+    /// normalize-equal entry's whole object wins), so a later single-entry
+    /// `[rw]` proposal is a genuine widen and must be flagged. A max-access
+    /// fold would call the from-side rw and let this widen through unflagged
+    /// (step 2 of the #172 two-promote sequence).
     #[test]
-    fn normalize_equal_duplicates_fold_max_access() {
+    fn exact_host_duplicates_fold_last_wins_not_max() {
         let mut from = base();
         from.egress.allow = vec![
-            AllowEntry::Scoped {
-                host: "Host.com".into(),
-                ports: Some(vec![443]),
-                access: Access::Read,
-            },
             AllowEntry::Scoped {
                 host: "host.com".into(),
                 ports: Some(vec![443]),
                 access: Access::ReadWrite,
+            },
+            AllowEntry::Scoped {
+                host: "Host.com".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
             },
         ];
         let mut to = base();
@@ -677,8 +699,8 @@ mod tests {
             access: Access::ReadWrite,
         }];
         assert!(
-            !egress_weakens(&from.egress, &to.egress),
-            "from side already folds to read-write via normalize-equal duplicates"
+            egress_weakens(&from.egress, &to.egress),
+            "compiled enforcement was read (last duplicate wins); an rw proposal widens and must flag"
         );
     }
 
