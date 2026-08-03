@@ -17,14 +17,22 @@ export function ContainerStatus({ name, pollMs = 3000 }: Readonly<{ name: string
 
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
     setContainer(undefined);
     const tick = async () => {
+      // One probe at a time: a tick that overlaps a slow inspect is skipped,
+      // so replies can never resolve out of order and an older result can
+      // never overwrite a fresher one (and slow daemons see no request pile-up).
+      if (inFlight) return;
+      inFlight = true;
       try {
         const d = await api.inspect(name);
         if (!cancelled) setContainer(d.container ?? null);
       } catch {
         // Hide the line instead of keeping a stale (possibly healthy) claim.
         if (!cancelled) setContainer(undefined);
+      } finally {
+        inFlight = false;
       }
     };
     void tick();

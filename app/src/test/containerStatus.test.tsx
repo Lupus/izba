@@ -93,4 +93,25 @@ describe("ContainerStatus", () => {
     inspect.mockRejectedValue(new Error("daemon restarting"));
     await waitFor(() => expect(container).toBeEmptyDOMElement());
   });
+
+  it("skips overlapping polls so an older reply can never overwrite a fresher one", async () => {
+    let resolveFirst!: (d: SandboxDetail) => void;
+    inspect.mockImplementationOnce(
+      () => new Promise<SandboxDetail>((r) => (resolveFirst = r)),
+    );
+    inspect.mockResolvedValue(detail("stopped"));
+    render(<ContainerStatus name="web" pollMs={20} />);
+
+    // The first probe hangs across several poll intervals: overlapping ticks
+    // are skipped, not raced — no second request goes out.
+    await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 70));
+    expect(inspect).toHaveBeenCalledTimes(1);
+
+    resolveFirst(detail("running"));
+    expect(await screen.findByText("running")).toBeInTheDocument();
+
+    // With the slow probe settled, the next tick fetches the fresh state.
+    expect(await screen.findByText("stopped (workload exited)")).toBeInTheDocument();
+  });
 });
