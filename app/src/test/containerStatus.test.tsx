@@ -114,4 +114,22 @@ describe("ContainerStatus", () => {
     // With the slow probe settled, the next tick fetches the fresh state.
     expect(await screen.findByText("stopped (workload exited)")).toBeInTheDocument();
   });
+
+  it("times out a hung probe so polling recovers instead of stalling forever", async () => {
+    // First probe never settles (live VM accepts the health request but never
+    // answers). The timeout must hide the line and let later polls proceed.
+    inspect.mockImplementationOnce(() => new Promise<SandboxDetail>(() => {}));
+    inspect.mockResolvedValue(detail("stopped"));
+    const { container } = render(
+      <ContainerStatus name="web" pollMs={20} probeTimeoutMs={50} />,
+    );
+
+    await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
+    expect(container).toBeEmptyDOMElement();
+
+    // After the probe times out, the next tick issues a fresh inspect and the
+    // honest state lands.
+    expect(await screen.findByText("stopped (workload exited)")).toBeInTheDocument();
+    expect(inspect.mock.calls.length).toBeGreaterThan(1);
+  });
 });

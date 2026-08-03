@@ -11,7 +11,11 @@ import { containerLabel } from "../lib/container";
  *  Resolution is best-effort like WorkspacePath: while loading or if `inspect`
  *  fails the line doesn't render rather than showing a stale claim. A
  *  *successful* inspect with no container state renders "unknown". */
-export function ContainerStatus({ name, pollMs = 3000 }: Readonly<{ name: string; pollMs?: number }>) {
+export function ContainerStatus({
+  name,
+  pollMs = 3000,
+  probeTimeoutMs = 10_000,
+}: Readonly<{ name: string; pollMs?: number; probeTimeoutMs?: number }>) {
   // undefined = not loaded (or failed) → no line; string|null = loaded token.
   const [container, setContainer] = useState<string | null | undefined>(undefined);
 
@@ -20,18 +24,28 @@ export function ContainerStatus({ name, pollMs = 3000 }: Readonly<{ name: string
     let inFlight = false;
     setContainer(undefined);
     const tick = async () => {
-      // One probe at a time: a tick that overlaps a slow inspect is skipped,
-      // so replies can never resolve out of order and an older result can
-      // never overwrite a fresher one (and slow daemons see no request pile-up).
+      // One observed probe at a time: a tick that overlaps a slow inspect is
+      // skipped, so replies can never resolve out of order and an older result
+      // can never overwrite a fresher one. The probe itself is time-bounded —
+      // an inspect that hangs (e.g. a live VM that accepts the guest health
+      // request but never answers) times out, hides the line, and frees the
+      // loop; its eventual late reply is dropped because the race has settled.
       if (inFlight) return;
       inFlight = true;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const d = await api.inspect(name);
+        const d = await Promise.race([
+          api.inspect(name),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("inspect timed out")), probeTimeoutMs);
+          }),
+        ]);
         if (!cancelled) setContainer(d.container ?? null);
       } catch {
         // Hide the line instead of keeping a stale (possibly healthy) claim.
         if (!cancelled) setContainer(undefined);
       } finally {
+        clearTimeout(timer);
         inFlight = false;
       }
     };
@@ -41,7 +55,7 @@ export function ContainerStatus({ name, pollMs = 3000 }: Readonly<{ name: string
       cancelled = true;
       clearInterval(id);
     };
-  }, [name, pollMs]);
+  }, [name, pollMs, probeTimeoutMs]);
 
   if (container === undefined) return null;
   return (
