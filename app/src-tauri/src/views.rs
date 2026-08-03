@@ -342,6 +342,11 @@ pub struct SandboxDetailView {
     pub workspace: String,
     pub ports: Vec<PortRuleView>,
     pub volumes: Vec<VolumeSpecView>,
+    /// In-guest workload container state token (`running`/`stopped`/…), or
+    /// `None` when the sandbox is stopped, the guest was unreachable, or the
+    /// daemon predates container-state reporting. The frontend renders `None`
+    /// and `unknown` identically — never as a healthy status.
+    pub container: Option<String>,
 }
 
 impl From<SandboxDetail> for SandboxDetailView {
@@ -353,6 +358,7 @@ impl From<SandboxDetail> for SandboxDetailView {
             workspace: izba_core::paths::display_path(std::path::Path::new(&d.workspace)),
             ports: d.ports.into_iter().map(PortRuleView::from).collect(),
             volumes: d.volumes.into_iter().map(VolumeSpecView::from).collect(),
+            container: d.container.map(|c| c.as_str().to_string()),
         }
     }
 }
@@ -622,7 +628,7 @@ mod tests {
             }],
             volumes: vec![],
             confinement: None,
-            container: None,
+            container: Some(izba_proto::ContainerState::Stopped),
             user_fallback: None,
         };
         let v = SandboxDetailView::from(detail);
@@ -633,6 +639,7 @@ mod tests {
         assert_eq!(v.ports.len(), 1);
         assert_eq!(v.ports[0].host_port, 8080);
         assert!(v.volumes.is_empty());
+        assert_eq!(v.container.as_deref(), Some("stopped"));
     }
 
     /// A Windows workspace recorded canonicalized (`\\?\C:\...`) surfaces to
@@ -656,5 +663,6 @@ mod tests {
         };
         let v = SandboxDetailView::from(detail);
         assert_eq!(v.workspace, r"C:\Users\u\proj");
+        assert_eq!(v.container, None);
     }
 }

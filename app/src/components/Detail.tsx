@@ -11,6 +11,7 @@ import { PortsTab } from "./PortsTab";
 import { VolumesTab } from "./VolumesTab";
 import { ManifestTab } from "./ManifestTab";
 import { WorkspacePath } from "./WorkspacePath";
+import { ContainerStatus } from "./ContainerStatus";
 import { Spinner } from "./Spinner";
 import { Button } from "@/components/ui/button";
 import { api } from "../lib/ipc";
@@ -124,6 +125,7 @@ export function Detail({ sandbox, onChanged }: Props) {
         {tab === "overview" && (
           <div className="flex flex-col gap-3">
             <WorkspacePath name={name} />
+            <ContainerStatus name={name} />
             <FirewallStatus name={name} />
             <div className="flex flex-wrap gap-2">
               {running ? (

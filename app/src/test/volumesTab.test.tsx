@@ -40,6 +40,7 @@ function makeDetail(overrides: Partial<SandboxDetail> = {}): SandboxDetail {
     workspace: "/ws",
     ports: [],
     volumes: [],
+    container: null,
     ...overrides,
   };
 }
