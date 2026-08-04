@@ -211,9 +211,14 @@ pub fn decode_op_rep_devlist(buf: &[u8]) -> Result<Vec<UsbDeviceRecord>, UsbipEr
     Ok(devices)
 }
 
-/// One `OP_REP_DEVLIST` record, followed by its interface descriptors.
-fn read_devlist_record(r: &mut Reader<'_>) -> Result<UsbDeviceRecord, UsbipError> {
-    let mut dev = UsbDeviceRecord {
+/// The 312-byte device record.
+///
+/// Byte-for-byte identical in `OP_REP_DEVLIST` and `OP_REP_IMPORT`; only what
+/// precedes it differs (a device count vs nothing) and, in devlist, what
+/// follows it (interface descriptors). Since the reader is sequential, one
+/// function serves both.
+fn read_device_record(r: &mut Reader<'_>) -> Result<UsbDeviceRecord, UsbipError> {
+    Ok(UsbDeviceRecord {
         path: r.fixed_str(PATH_LEN, "path")?,
         busid: r.fixed_str(BUSID_LEN, "busid")?,
         busnum: r.u32()?,
@@ -227,9 +232,13 @@ fn read_devlist_record(r: &mut Reader<'_>) -> Result<UsbDeviceRecord, UsbipError
         b_device_protocol: r.u8()?,
         b_configuration_value: r.u8()?,
         b_num_configurations: r.u8()?,
-        b_num_interfaces: 0,
-    };
-    dev.b_num_interfaces = r.u8()?;
+        b_num_interfaces: r.u8()?,
+    })
+}
+
+/// One `OP_REP_DEVLIST` record, followed by its interface descriptors.
+fn read_devlist_record(r: &mut Reader<'_>) -> Result<UsbDeviceRecord, UsbipError> {
+    let dev = read_device_record(r)?;
 
     // Interface descriptors are metadata izba does not act on, but they must be
     // consumed to find the next record. b_num_interfaces is a u8, so the
@@ -243,9 +252,9 @@ fn read_devlist_record(r: &mut Reader<'_>) -> Result<UsbDeviceRecord, UsbipError
 
 /// Decode `OP_REP_IMPORT`.
 ///
-/// The import reply carries the device record WITHOUT interface descriptors,
-/// and its fields sit at different offsets than in a devlist record (the record
-/// begins immediately after `op_common` rather than after a count).
+/// The import reply carries the same device record as a devlist entry, but
+/// WITHOUT the trailing interface descriptors, and it begins immediately after
+/// `op_common` rather than after a device count.
 ///
 /// izbad must re-verify the returned `busid`/`vid`/`pid` against what it asked
 /// for before splicing: nothing in the protocol binds the import reply to the
@@ -254,24 +263,7 @@ fn read_devlist_record(r: &mut Reader<'_>) -> Result<UsbDeviceRecord, UsbipError
 pub fn decode_op_rep_import(buf: &[u8]) -> Result<UsbDeviceRecord, UsbipError> {
     let mut r = Reader::new(buf);
     read_op_common(&mut r, OP_REP_IMPORT)?;
-    let mut dev = UsbDeviceRecord {
-        path: r.fixed_str(PATH_LEN, "path")?,
-        busid: r.fixed_str(BUSID_LEN, "busid")?,
-        busnum: r.u32()?,
-        devnum: r.u32()?,
-        speed: r.u32()?,
-        id_vendor: r.u16()?,
-        id_product: r.u16()?,
-        bcd_device: r.u16()?,
-        b_device_class: r.u8()?,
-        b_device_subclass: r.u8()?,
-        b_device_protocol: r.u8()?,
-        b_configuration_value: r.u8()?,
-        b_num_configurations: r.u8()?,
-        b_num_interfaces: 0,
-    };
-    dev.b_num_interfaces = r.u8()?;
-    Ok(dev)
+    read_device_record(&mut r)
 }
 
 #[cfg(test)]
