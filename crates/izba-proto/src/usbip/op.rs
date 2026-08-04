@@ -26,10 +26,22 @@ const PATH_LEN: usize = 256;
 /// Bytes per interface descriptor tuple appended to a devlist record.
 const INTERFACE_LEN: usize = 4;
 
+// The record is read field by field, so nothing at runtime would notice if a
+// field were added, dropped, or resized against the documented 312-byte
+// layout. Pin the sum at compile time:
+//   path[256] + busid[32] + 3×u32 + 3×u16 + 6×u8 = 0x138
+const _: () = assert!(PATH_LEN + BUSID_LEN + 3 * 4 + 3 * 2 + 6 == DEVICE_RECORD_LEN);
+
 /// Upper bound on devices in one `OP_REP_DEVLIST`, applied before allocating.
+///
+/// This is the ONLY allocation bound the decoder needs: the vector grows by at
+/// most this many records, and each record only materialises after 312 bytes
+/// have actually been read out of the caller's buffer, so an over-claimed count
+/// fails with `Truncated` long before it can amplify. Bounding the *byte* size
+/// of the reply is the caller's job (it owns the socket read) — and a fixed
+/// byte cap here would be wrong as well as untestable, since a legitimate
+/// maximal reply is 12 + 256 × (312 + 255×4) ≈ 341 KB.
 const MAX_DEVICES: u32 = 256;
-/// Upper bound on a whole devlist reply, applied before allocating.
-const MAX_DEVLIST_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsbipError {
@@ -188,12 +200,8 @@ pub fn encode_op_req_import(busid: &str) -> Result<[u8; OP_COMMON_LEN + BUSID_LE
 /// Decode `OP_REP_DEVLIST`.
 ///
 /// The device count and the per-record interface count are attacker-controlled,
-/// so both the count and the total reply size are bounded before anything is
-/// allocated.
+/// so the count is bounded before anything is allocated (see [`MAX_DEVICES`]).
 pub fn decode_op_rep_devlist(buf: &[u8]) -> Result<Vec<UsbDeviceRecord>, UsbipError> {
-    if buf.len() > MAX_DEVLIST_BYTES {
-        return Err(UsbipError::TooLarge("devlist reply"));
-    }
     let mut r = Reader::new(buf);
     read_op_common(&mut r, OP_REP_DEVLIST)?;
 
@@ -201,10 +209,9 @@ pub fn decode_op_rep_devlist(buf: &[u8]) -> Result<Vec<UsbDeviceRecord>, UsbipEr
     if count > MAX_DEVICES {
         return Err(UsbipError::TooLarge("devlist device count"));
     }
-    // Bound the allocation by what the buffer could possibly hold, not by the
-    // count the peer claims.
-    let feasible = buf.len() / DEVICE_RECORD_LEN + 1;
-    let mut devices = Vec::with_capacity((count as usize).min(feasible));
+    // Deliberately NOT `with_capacity(count)`: a peer-claimed count must never
+    // size an allocation. Each push is backed by 312 bytes already read.
+    let mut devices = Vec::new();
     for _ in 0..count {
         devices.push(read_devlist_record(&mut r)?);
     }
@@ -382,6 +389,51 @@ mod tests {
             decode_op_rep_devlist(&buf).unwrap_err(),
             UsbipError::TooLarge(_)
         ));
+    }
+
+    /// The cap is inclusive: a reply carrying exactly `MAX_DEVICES` devices is
+    /// legitimate and must decode. (Also pins that no fixed byte cap rejects a
+    /// large-but-legal reply — this one is ~81 KB.)
+    #[test]
+    fn rep_devlist_accepts_exactly_max_devices() {
+        let records: Vec<Vec<u8>> = (0..MAX_DEVICES)
+            .map(|i| record_bytes(&format!("3-{i}"), 0x0403, 0x6001, 0))
+            .collect();
+        let devs = decode_op_rep_devlist(&rep_devlist(&records)).unwrap();
+        assert_eq!(devs.len(), MAX_DEVICES as usize);
+        assert_eq!(devs[255].busid, "3-255");
+    }
+
+    /// A record carrying the maximum interface count must still decode, and the
+    /// next record must be found after the descriptors are skipped.
+    #[test]
+    fn rep_devlist_handles_maximum_interface_descriptors() {
+        let buf = rep_devlist(&[
+            record_bytes("3-2", 0x0403, 0x6001, u8::MAX),
+            record_bytes("3-4", 0x10c4, 0xea60, 0),
+        ]);
+        let devs = decode_op_rep_devlist(&buf).unwrap();
+        assert_eq!(devs.len(), 2);
+        assert_eq!(devs[0].b_num_interfaces, u8::MAX);
+        assert_eq!(
+            devs[1].busid, "3-4",
+            "the second record must be found after 255 interface descriptors"
+        );
+    }
+
+    /// Error text reaches daemon logs and CLI messages, so it is asserted
+    /// rather than left to drift.
+    #[test]
+    fn errors_render_actionable_text() {
+        assert!(UsbipError::BadVersion(0x0110)
+            .to_string()
+            .contains("0x0110"));
+        assert!(UsbipError::Status(4).to_string().contains('4'));
+        assert!(UsbipError::TooLarge("devlist device count")
+            .to_string()
+            .contains("devlist device count"));
+        assert!(UsbipError::BadString("busid").to_string().contains("busid"));
+        assert!(!UsbipError::Truncated.to_string().is_empty());
     }
 
     /// A count within the cap but far beyond what the buffer holds must not
