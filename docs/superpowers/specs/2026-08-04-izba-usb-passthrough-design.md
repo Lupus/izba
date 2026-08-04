@@ -96,17 +96,37 @@ has no `vhci` to attach to. D4 keeps that true for sandboxes without USB. But it
 must not be the only defence, and it does not help an enforcing sandbox whose
 policy legitimately allows an IP that happens to run usbipd.
 
-**Rule (approved).** The configured upstream endpoint's resolved addresses, and
-TCP port 3240 generally, are denied **non-overridably** — no policy rule can
-authorise them — for:
+**Rule (approved; revised after product review).** The governing principle is
+that *this default may fill in where the user expressed no decision, and must
+never veto one they made.*
 
-* every **enforcing** sandbox, unconditionally; and
-* every **USB-enabled** sandbox (≥1 grant), enforcing or bare — otherwise the
-  grant model is bypassable from inside.
+* A **bare, USB-enabled** sandbox is denied the configured upstream and TCP
+  3240. It made no per-destination decision (it declined a firewall, so
+  everything non-hard-denied is permitted wholesale), and it holds device grants
+  — a competing consent channel worth defending. To opt out, declare a policy
+  and list the endpoint, which turns it into the case below.
+* An **enforcing** sandbox has its explicit rule **honored**. It is already
+  default-deny, so a check here could only override a deliberate decision — and
+  opening 3240 cannot happen by accident, since a bare host entry authorizes
+  only `[80, 443]`, so the user must literally write `ports: [3240]` against a
+  named host. Instead, writing such a rule prints a warning naming the offending
+  entries, stating that a USB/IP server has no authentication so the rule grants
+  the agent *every* device that server exports, and recommending `izba usb allow`
+  as the per-device alternative.
+* A **bare, non-USB** sandbox keeps today's behaviour: LAN remains reachable,
+  the intended workflow for a user who declined a firewall.
 
-A **bare, non-USB** sandbox keeps today's behaviour: LAN remains reachable,
-which is the intended workflow for a user who declined a firewall, and is inert
-because that sandbox boots a kernel with no `vhci-hcd`.
+This is deliberately weaker than the `is_hard_denied` SSRF floor, which is
+genuinely non-overridable because loopback/link-local/metadata are
+confused-deputy targets — dangerous *because* izbad dials them from the host's
+network position. A usbip server on a LAN address is an ordinary external
+destination the user is naming on purpose.
+
+Two honest limits: it is a default, not a boundary (a usbipd on an unconfigured
+non-3240 port is not matched); and it does **not** depend on the guest lacking
+`vhci-hcd`. That driver is a convenience — the USB/IP protocol is fully usable
+from userspace, so an agent can import a device and drive URBs over plain TCP
+with no kernel support at all.
 
 The deny is by **port and by address**, because a single usbipd is multi-homed
 (loopback, WSL gateway, LAN IP, IPv6, IPv4-mapped and NAT64-embedded forms —

@@ -1,7 +1,8 @@
 use anyhow::Context;
 use clap::Subcommand;
 use izba_core::daemon::egress::config::{
-    edit_policy_file, Access, AllowEntry, EgressPolicyConfig, GitRule, GitTarget,
+    edit_policy_file, usbip_exposure_warning, Access, AllowEntry, EgressPolicyConfig, GitRule,
+    GitTarget,
 };
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
@@ -111,6 +112,7 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             let granted: Vec<AllowEntry> =
                 cfg.entries_for_host(&host).into_iter().cloned().collect();
             print!("{}", render_allow_grant(&granted));
+            warn_usbip_exposure(&cfg);
             maybe_reload(paths, name);
             Ok(0)
         }
@@ -324,6 +326,19 @@ fn reload(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     client.reload_policy(name)?;
     println!("reloaded egress policy for '{name}' (applies to new connections)");
     Ok(0)
+}
+
+/// Print the USB/IP exposure notice when a rule opens a path to a usbip server.
+///
+/// The rule is honored; this steers the user toward izba's per-device allowlist,
+/// which grants ONE device rather than everything the server exports. Written to
+/// stderr so it stands out from the grant echo without polluting stdout.
+fn warn_usbip_exposure(cfg: &EgressPolicyConfig) {
+    // The configured upstream is a phase-2 setting; until it exists, the
+    // well-known port is the signal.
+    if let Some(msg) = usbip_exposure_warning(cfg, None) {
+        eprintln!("\n{msg}");
+    }
 }
 
 /// Live-reload after an edit when the daemon is already running; otherwise note
