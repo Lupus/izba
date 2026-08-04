@@ -211,9 +211,9 @@ izba daemon stop                        # stop the daemon; sandboxes keep runnin
 izba netlog  NAME [--summary] [--follow]   # egress audit log; --summary aggregates per endpoint
 izba policy  show NAME                    # print the effective allow-list + enforce posture (on/off)
 izba policy  enforce NAME on|off          # turn the firewall on (default-deny) or off (log-only)
-izba policy  allow NAME HOST[:PORT]       # allow a destination (bare host = web ports 80+443); live-reloads
+izba policy  allow NAME HOST[:PORT] [--read]  # allow a destination (bare host = web ports 80+443); read-write unless --read (HTTP GET/HEAD only); live-reloads
 izba policy  block NAME HOST[:PORT]       # remove a destination (bare host = web ports 80+443); live-reloads
-izba policy  git allow NAME TARGET [--write]  # allow git on a repo/host (clone/fetch; --write adds push)
+izba policy  git allow NAME TARGET [--write]  # allow git on a repo/host; read-only (clone/fetch) unless --write (adds push)
 izba policy  git block NAME TARGET        # remove a git rule
 izba policy  enable NAME                  # seed the allow-list from observed allowed traffic; live-reloads
 izba policy  reload NAME                  # re-read policy.yaml and apply to new connections (no restart)

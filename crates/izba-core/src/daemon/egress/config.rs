@@ -414,6 +414,21 @@ impl EgressPolicyConfig {
         self.collapse_duplicate_hosts();
     }
 
+    /// All allow-list entries whose host is normalize-equal to `host`, keyed
+    /// by the same `normalize_policy_host` identity the mutation methods use
+    /// — so a caller echoing post-edit state (e.g. the CLI's access-grant
+    /// echo, #149) sees exactly the entry a mutation just touched, under any
+    /// spelling of the host. A mixed-access wildcard host legitimately keeps
+    /// multiple normalize-equal entries (see `collapse_duplicate_hosts`);
+    /// all of them are returned.
+    pub fn entries_for_host(&self, host: &str) -> Vec<&AllowEntry> {
+        let normalized = normalize_policy_host(host);
+        self.allow
+            .iter()
+            .filter(|e| normalize_policy_host(e.host()) == normalized)
+            .collect()
+    }
+
     /// Set the access verb for `host` (adding the entry if absent). Returns
     /// `true` if the config changed.
     ///
@@ -988,6 +1003,55 @@ mod tests {
         );
         assert_eq!(cfg.allow[0].host(), "api.anthropic.com");
         assert_eq!(cfg.allow[0].ports(), vec![80, 443]);
+    }
+
+    /// #149: `entries_for_host` must key on the same normalize identity the
+    /// mutation methods use (trim + trailing-dot strip + lowercase), so a
+    /// caller echoing post-edit state can never miss the entry a mutation
+    /// just touched under a different spelling of the same host.
+    #[test]
+    fn entries_for_host_matches_normalize_equal_spellings() {
+        let cfg = EgressPolicyConfig {
+            enforce: false,
+            allow: vec![
+                AllowEntry::Scoped {
+                    host: "api.x.com".into(),
+                    ports: Some(vec![443]),
+                    access: Access::Read,
+                },
+                AllowEntry::Host("other.com".into()),
+            ],
+            git: vec![],
+        };
+        let hits = cfg.entries_for_host(" API.X.COM. ");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].host(), "api.x.com");
+        assert!(cfg.entries_for_host("missing.com").is_empty());
+    }
+
+    /// #149: a wildcard host may legitimately carry multiple normalize-equal
+    /// entries with mixed access verbs (union enforcement — see
+    /// `collapse_duplicate_hosts`); `entries_for_host` must return ALL of
+    /// them so an echo can render the full effective state.
+    #[test]
+    fn entries_for_host_returns_all_mixed_access_wildcard_entries() {
+        let cfg = EgressPolicyConfig {
+            enforce: false,
+            allow: vec![
+                AllowEntry::Scoped {
+                    host: "*.x.com".into(),
+                    ports: Some(vec![443]),
+                    access: Access::Read,
+                },
+                AllowEntry::Scoped {
+                    host: "*.x.com".into(),
+                    ports: Some(vec![8443]),
+                    access: Access::ReadWrite,
+                },
+            ],
+            git: vec![],
+        };
+        assert_eq!(cfg.entries_for_host("*.X.com").len(), 2);
     }
 
     #[test]
