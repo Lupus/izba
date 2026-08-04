@@ -29,3 +29,17 @@ pub use urb::{
     decode_guest_urb, GuestUrb, MAX_ISO_PACKETS, MAX_TRANSFER_BUFFER, URB_HEADER_LEN,
     USBIP_CMD_SUBMIT, USBIP_CMD_UNLINK, USBIP_RET_SUBMIT, USBIP_RET_UNLINK,
 };
+
+#[cfg(test)]
+mod tests {
+    /// The `usbip_op` fuzz target lives outside the workspace, so a rename here
+    /// would not fail any workspace gate — it would silently break the fuzz job
+    /// instead. This pins the exact re-exported surface that target calls.
+    #[test]
+    fn fuzz_target_surface_is_reachable_from_the_crate_root() {
+        let _ = crate::usbip::decode_op_rep_devlist(&[]);
+        let _ = crate::usbip::decode_op_rep_import(&[]);
+        let header = [0u8; crate::usbip::URB_HEADER_LEN];
+        let _ = crate::usbip::decode_guest_urb(&header);
+    }
+}

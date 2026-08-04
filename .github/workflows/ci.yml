@@ -85,6 +85,7 @@ jobs:
           cd crates/izba-proto
           cargo +nightly fuzz run frame --target x86_64-unknown-linux-gnu -- -max_total_time=45
           cargo +nightly fuzz run dns   --target x86_64-unknown-linux-gnu -- -max_total_time=45
+          cargo +nightly fuzz run usbip_op --target x86_64-unknown-linux-gnu -- -max_total_time=45
       - name: fuzz izba-core (flatten)
         run: |
           cd crates/izba-core

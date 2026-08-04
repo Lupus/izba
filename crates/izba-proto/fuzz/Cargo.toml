@@ -28,5 +28,11 @@ path = "fuzz_targets/dns.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "usbip_op"
+path = "fuzz_targets/usbip_op.rs"
+test = false
+doc = false
+
 # Prevent this from interfering with the workspace.
 [workspace]
