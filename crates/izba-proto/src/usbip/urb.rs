@@ -233,6 +233,23 @@ mod tests {
         assert!(decode_guest_urb(&submit(2, 1, 8, NOT_ISO)).is_err());
     }
 
+    /// Endpoint 15 is the highest legal USB endpoint number and must be
+    /// accepted — the bound is inclusive, not exclusive.
+    #[test]
+    fn highest_legal_endpoint_is_accepted() {
+        let u = decode_guest_urb(&submit(0, 15, 8, NOT_ISO)).unwrap();
+        assert_eq!(u.ep, 15);
+    }
+
+    /// An ordinary bulk transfer must pass. Asserted against a literal size
+    /// rather than the constant, so a mis-specified cap cannot hide behind a
+    /// test that moves with it.
+    #[test]
+    fn ordinary_bulk_transfer_is_accepted() {
+        let u = decode_guest_urb(&submit(0, 2, 65536, NOT_ISO)).unwrap();
+        assert_eq!(u.payload_len, 65536);
+    }
+
     /// The worst legitimate case must not overflow the payload computation.
     #[test]
     fn maximum_legal_frame_does_not_overflow() {
