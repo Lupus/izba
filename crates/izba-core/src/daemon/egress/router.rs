@@ -44,41 +44,63 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// F-USB-1 floor: a sandbox must never reach a usbip upstream over the GENERIC
-/// egress plane, because importing a device that way would bypass the
-/// per-device allowlist izbad enforces on the USB plane entirely.
+/// F-USB-1 default: a **USB-enabled but non-enforcing** sandbox does not reach
+/// a usbip upstream over the generic egress plane, because importing a device
+/// that way would bypass the per-device allowlist izbad enforces on the USB
+/// plane.
 ///
-/// Applies to:
-/// - every **enforcing** sandbox — no policy rule may open it, even one that
-///   lists the upstream's IP for an unrelated purpose; and
-/// - every **USB-enabled** sandbox (one holding ≥1 device grant), bare or not,
-///   since otherwise the grant model is bypassable from inside the guest.
+/// The governing principle is deliberate and narrow: **this default may fill in
+/// where the user has expressed no decision; it must never veto one they made.**
 ///
-/// A bare sandbox with no USB grants is deliberately NOT covered: LAN is
-/// permissive there by design (the user declined a firewall — see [`is_lan`]),
-/// and such a sandbox boots a kernel with no `vhci-hcd`, so an imported device
-/// has nothing to attach to. That carve-out is an approved product decision,
-/// not an oversight.
+/// - A **bare** sandbox has made no per-destination decision (it declined a
+///   firewall, so everything non-hard-denied is permitted wholesale). Where it
+///   also holds USB grants there is a competing consent channel worth
+///   defending, so the default applies. To opt out, declare a policy and list
+///   the endpoint explicitly — which turns it into the enforcing case below.
+/// - An **enforcing** sandbox is already default-deny, so this check would add
+///   nothing except overriding an explicit rule. Reaching a usbip port there
+///   requires the user to literally write `ports: [3240]` against a named host
+///   (a bare host entry authorizes only [80, 443] — see
+///   [`AllowEntry::DEFAULT_PORTS`](super::config::AllowEntry::DEFAULT_PORTS)),
+///   which is about as deliberate as the policy language gets. That rule is
+///   honored; the user is warned instead, at the moment they write it
+///   ([`usbip_exposure_warning`](super::config::usbip_exposure_warning)).
+/// - A **bare sandbox with no USB grants** keeps LAN access, as before.
+///
+/// This is unlike the [`is_hard_denied`] SSRF floor, which is genuinely
+/// non-overridable: loopback / link-local / metadata are confused-deputy
+/// targets, dangerous precisely because izbad dials them from the HOST's
+/// network position, so the guest reaches what it structurally could not reach
+/// itself. A usbip server on a LAN address is an ordinary external destination
+/// the user is naming on purpose, and does not warrant the same veto.
 ///
 /// The check is by port AND by configured endpoint, because one usbipd is
 /// reachable at several addresses at once (loopback, the WSL gateway, a LAN
 /// address, and their IPv6-embedded spellings) and because a usbipd may be
-/// configured to listen somewhere other than 3240.
+/// configured to listen somewhere other than 3240. Note it is a default, not a
+/// boundary: a usbipd on an unconfigured non-3240 port is not matched.
 pub fn usbip_guard(
     guard: UsbGuard,
     enforcing: bool,
     ip: IpAddr,
     port: u16,
 ) -> Option<&'static str> {
-    if !enforcing && !guard.sandbox_usb_enabled {
+    // An explicit policy decision is honored; see the doc comment.
+    if enforcing || !guard.sandbox_usb_enabled {
         return None;
     }
     if port == USBIP_PORT {
-        return Some("usbip upstream (port 3240) is never reachable from a sandbox");
+        return Some(
+            "usbip upstream (port 3240) not reachable from a USB-enabled sandbox \
+             without an explicit policy rule",
+        );
     }
     if let Some((up_ip, up_port)) = guard.upstream {
         if port == up_port && canonical(up_ip) == canonical(ip) {
-            return Some("configured usbip upstream is never reachable from a sandbox");
+            return Some(
+                "configured usbip upstream not reachable from a USB-enabled sandbox \
+                 without an explicit policy rule",
+            );
         }
     }
     None
@@ -205,8 +227,10 @@ fn tcp_connect(
             &Response::Error {
                 kind: ErrorKind::ConnectFailed,
                 message: format!(
-                    "egress to {addr}:{port} denied: {reason}. USB devices are attached \
-                     by the host via `izba usb attach`, never from inside the sandbox."
+                    "egress to {addr}:{port} denied: {reason}. Attach devices with \
+                     `izba usb attach`, which enforces the per-device allowlist; or, to \
+                     reach the server directly anyway, declare an egress policy listing \
+                     this host and port explicitly."
                 ),
             },
         );
@@ -804,27 +828,49 @@ mod tests {
 
     // --- F-USB-1: the usbip upstream is not reachable over generic egress. ---
 
-    /// An ENFORCING sandbox must never reach a usbip upstream, even when its
-    /// own policy explicitly lists that IP and that port for another purpose.
-    /// The whole point of the floor is that policy cannot open it.
+    /// An ENFORCING sandbox's explicit rule is HONORED, not vetoed. Enforcing is
+    /// already default-deny, so a usbip default there could only ever override a
+    /// decision the user made on purpose — and opening 3240 cannot happen by
+    /// accident, since a bare host entry authorizes only [80, 443]. The user is
+    /// warned when they write the rule instead (`usbip_exposure_warning`).
     #[test]
-    fn enforcing_sandbox_cannot_reach_usbip_port_even_if_policy_lists_it() {
+    fn enforcing_sandbox_explicit_usbip_rule_is_honored() {
         let snoop = SnoopStore::new();
         let data = r#"{"host_rules": {"10.1.0.124": {"ports": [3240, 8080], "access": "read-write"}}, "sandbox_host_rules": {}, "sandbox_git_rules": {}}"#;
         let p = RegoPolicy::with_data(data).unwrap();
         let ip: IpAddr = "10.1.0.124".parse().unwrap();
 
         let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 3240, UsbGuard::default());
-        assert_eq!(v, Verdict::Deny, "policy must not be able to open 3240");
-        assert!(rule.contains("usbip"), "{rule}");
-
-        // The same host on another listed port is still governed by policy.
-        let (v, _f, _) = decide_tier2(&p, &snoop, "web", ip, 8080, UsbGuard::default());
         assert_eq!(
             v,
             Verdict::Allow,
-            "the floor must not leak onto other ports"
+            "an explicit rule must not be vetoed: {rule}"
         );
+
+        // Holding USB grants does not change that: the decision is still explicit.
+        let guard = UsbGuard {
+            sandbox_usb_enabled: true,
+            upstream: Some((ip, 3240)),
+        };
+        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 3240, guard);
+        assert_eq!(v, Verdict::Allow, "{rule}");
+    }
+
+    /// An enforcing sandbox remains default-deny for a usbip port it did NOT
+    /// list — the ordinary allow-list rule, with no special-casing either way.
+    #[test]
+    fn enforcing_sandbox_still_denies_unlisted_usbip_port() {
+        let snoop = SnoopStore::new();
+        let p = RegoPolicy::embedded().unwrap();
+        let (v, _f, _) = decide_tier2(
+            &p,
+            &snoop,
+            "web",
+            "10.1.0.124".parse().unwrap(),
+            3240,
+            UsbGuard::default(),
+        );
+        assert_eq!(v, Verdict::Deny);
     }
 
     /// A USB-enabled sandbox must not bypass the device allowlist by speaking
@@ -902,13 +948,32 @@ mod tests {
         }
     }
 
-    /// The floor is inert for a sandbox that is neither enforcing nor
-    /// USB-enabled — pinned directly on the pure function.
+    /// The default applies only where the user expressed no decision: a bare
+    /// USB-enabled sandbox. It never fires for an enforcing sandbox (whose every
+    /// allow is explicit) nor for a bare sandbox without USB grants.
     #[test]
-    fn guard_is_inert_without_enforcement_or_usb() {
+    fn guard_applies_only_to_bare_usb_enabled_sandboxes() {
         let ip: IpAddr = "192.168.1.50".parse().unwrap();
-        assert!(usbip_guard(UsbGuard::default(), false, ip, 3240).is_none());
-        assert!(usbip_guard(UsbGuard::default(), true, ip, 3240).is_some());
+        let usb = UsbGuard {
+            sandbox_usb_enabled: true,
+            upstream: None,
+        };
+        assert!(
+            usbip_guard(usb, false, ip, 3240).is_some(),
+            "bare + USB-enabled: no explicit decision to honor, so default-deny"
+        );
+        assert!(
+            usbip_guard(usb, true, ip, 3240).is_none(),
+            "enforcing: the explicit rule governs, never this default"
+        );
+        assert!(
+            usbip_guard(UsbGuard::default(), false, ip, 3240).is_none(),
+            "bare, no USB: unchanged LAN behaviour"
+        );
+        assert!(
+            usbip_guard(UsbGuard::default(), true, ip, 3240).is_none(),
+            "enforcing without USB: ordinary allow-list rules apply"
+        );
     }
 
     /// Configurable LAN (enforcing): an enforcing sandbox reaches a private IP

@@ -951,6 +951,73 @@ fn is_wildcard_remainder_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_'
 }
 
+/// Warn when a policy rule opens a path straight to a USB/IP server.
+///
+/// Such a rule is **honored** — it is an explicit, granular decision, and a
+/// bare host entry authorizes only [`AllowEntry::DEFAULT_PORTS`], so reaching a
+/// usbip port means the user wrote the port on purpose. But it hands the agent
+/// every device that server exports, which is a strictly coarser grant than
+/// izba's own USB support offers, so it is called out at the moment it is made
+/// rather than discovered later in an audit log.
+///
+/// Returns `None` when no rule exposes a usbip endpoint.
+pub fn usbip_exposure_warning(
+    cfg: &EgressPolicyConfig,
+    upstream: Option<(std::net::IpAddr, u16)>,
+) -> Option<String> {
+    let hits: Vec<String> = cfg
+        .allow
+        .iter()
+        .filter_map(|e| {
+            let ports = e.ports();
+            let host = e.host();
+            // Either the well-known usbip port, or the exact endpoint izba has
+            // been configured to use as its own upstream.
+            let mut matched: Vec<u16> = ports
+                .iter()
+                .copied()
+                .filter(|p| *p == crate::daemon::egress::router::USBIP_PORT)
+                .collect();
+            if let Some((up_ip, up_port)) = upstream {
+                if ports.contains(&up_port)
+                    && host.parse::<std::net::IpAddr>().ok() == Some(up_ip)
+                    && !matched.contains(&up_port)
+                {
+                    matched.push(up_port);
+                }
+            }
+            if matched.is_empty() {
+                return None;
+            }
+            let ports = matched
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("{host}:{ports}"))
+        })
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "⚠  egress policy permits direct USB/IP access: {}\n\
+         \n\
+         A USB/IP server has no authentication: anything it exports is available \n\
+         to whoever can reach it. This rule therefore grants the agent EVERY \n\
+         device that server shares — not a chosen one.\n\
+         \n\
+         izba has built-in USB support with a per-device allowlist, which is the \n\
+         safer and recommended path: the human grants one device to one sandbox \n\
+         (`izba usb allow <sandbox> --device <vid:pid>`), izba brokers the \n\
+         connection, and nothing else on that server is reachable.\n\
+         \n\
+         The rule is being honored — you asked for it explicitly. Keep it only if \n\
+         you know that is what you want.",
+        hits.join(", ")
+    ))
+}
+
 /// Load a sandbox's policy (or default-empty), apply `f`, persist the result to
 /// the sandbox's `policy.yaml`, and return the new config so the caller can
 /// decide whether to fire a `ReloadPolicy`.
@@ -986,6 +1053,102 @@ impl EgressPolicyConfig {
             }
         }
         added
+    }
+}
+
+#[cfg(test)]
+mod usbip_exposure_tests {
+    use super::*;
+
+    fn cfg_with(entries: Vec<AllowEntry>) -> EgressPolicyConfig {
+        EgressPolicyConfig {
+            allow: entries,
+            ..Default::default()
+        }
+    }
+
+    /// The whole point: opening 3240 cannot happen by accident, because a bare
+    /// host entry authorizes only the web ports. No warning for ordinary rules.
+    #[test]
+    fn ordinary_rules_do_not_warn() {
+        let cfg = cfg_with(vec![
+            AllowEntry::Host("github.com".into()),
+            AllowEntry::Scoped {
+                host: "10.1.0.124".into(),
+                ports: Some(vec![8080, 443]),
+                access: Access::default(),
+            },
+        ]);
+        assert!(usbip_exposure_warning(&cfg, None).is_none());
+    }
+
+    /// A bare host must not warn even when its name resembles the upstream —
+    /// it only opens [80, 443].
+    #[test]
+    fn bare_host_never_reaches_the_usbip_port() {
+        let cfg = cfg_with(vec![AllowEntry::Host("10.1.0.124".into())]);
+        let up = Some(("10.1.0.124".parse().unwrap(), 3240));
+        assert!(usbip_exposure_warning(&cfg, up).is_none());
+    }
+
+    #[test]
+    fn explicit_usbip_port_warns_and_recommends_the_device_allowlist() {
+        let cfg = cfg_with(vec![AllowEntry::Scoped {
+            host: "10.1.0.124".into(),
+            ports: Some(vec![3240]),
+            access: Access::default(),
+        }]);
+        let msg = usbip_exposure_warning(&cfg, None).expect("must warn");
+        assert!(msg.contains("10.1.0.124:3240"), "{msg}");
+        assert!(
+            msg.contains("izba usb allow"),
+            "steer to the safer path: {msg}"
+        );
+        assert!(msg.contains("EVERY"), "state the actual exposure: {msg}");
+        assert!(msg.contains("honored"), "say the rule still applies: {msg}");
+    }
+
+    /// A usbipd on a non-default port is caught only when it is the endpoint
+    /// izba itself was configured to use.
+    #[test]
+    fn configured_upstream_on_a_nonstandard_port_warns() {
+        let cfg = cfg_with(vec![AllowEntry::Scoped {
+            host: "172.30.96.1".into(),
+            ports: Some(vec![4000]),
+            access: Access::default(),
+        }]);
+        let up = Some(("172.30.96.1".parse().unwrap(), 4000));
+        let msg = usbip_exposure_warning(&cfg, up).expect("must warn");
+        assert!(msg.contains("172.30.96.1:4000"), "{msg}");
+
+        // A different host on that port is not the configured upstream.
+        let other = cfg_with(vec![AllowEntry::Scoped {
+            host: "10.9.9.9".into(),
+            ports: Some(vec![4000]),
+            access: Access::default(),
+        }]);
+        assert!(usbip_exposure_warning(&other, up).is_none());
+    }
+
+    #[test]
+    fn every_offending_rule_is_named() {
+        let cfg = cfg_with(vec![
+            AllowEntry::Scoped {
+                host: "a.example".into(),
+                ports: Some(vec![3240]),
+                access: Access::default(),
+            },
+            AllowEntry::Host("github.com".into()),
+            AllowEntry::Scoped {
+                host: "b.example".into(),
+                ports: Some(vec![443, 3240]),
+                access: Access::default(),
+            },
+        ]);
+        let msg = usbip_exposure_warning(&cfg, None).expect("must warn");
+        assert!(msg.contains("a.example:3240"), "{msg}");
+        assert!(msg.contains("b.example:3240"), "{msg}");
+        assert!(!msg.contains("github.com"), "{msg}");
     }
 }
 
