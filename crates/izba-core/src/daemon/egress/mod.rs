@@ -234,6 +234,13 @@ impl EgressManager {
                                 mitm.as_deref(),
                                 &audit,
                                 &snoop,
+                                // Phase 1 ships the floor with no per-sandbox USB
+                                // context yet, which already covers every ENFORCING
+                                // sandbox (`usbip_guard` keys the port check on
+                                // enforcement alone). Phase 2 populates this from the
+                                // sandbox's device grants and the configured upstream
+                                // so USB-enabled bare sandboxes are covered too.
+                                router::UsbGuard::default(),
                             )
                         });
                     }

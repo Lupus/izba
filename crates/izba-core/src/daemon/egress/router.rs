@@ -19,6 +19,71 @@ use crate::vmm::UdsStream;
 /// Same cap as the guest-side TcpDial: a wedged dial must not pin a thread.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The IANA-registered USB/IP port. `usbipd-win` and Linux `usbipd` both listen
+/// here by default, and neither offers any authentication or authorization.
+pub const USBIP_PORT: u16 = 3240;
+
+/// Per-sandbox USB context for the F-USB-1 floor (see [`usbip_guard`]).
+///
+/// `Default` is "no USB", which is what a sandbox without device grants gets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsbGuard {
+    /// True when this sandbox holds at least one USB device grant.
+    pub sandbox_usb_enabled: bool,
+    /// The host-configured upstream usbip endpoint, when one is configured.
+    pub upstream: Option<(IpAddr, u16)>,
+}
+
+/// Canonicalize an IPv6-embedded IPv4 address to its v4 form, so a mapped or
+/// compatible spelling cannot slip past an address comparison. Mirrors what
+/// [`is_hard_denied`] and [`is_lan`] already do.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => embedded_v4(v6).map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
+/// F-USB-1 floor: a sandbox must never reach a usbip upstream over the GENERIC
+/// egress plane, because importing a device that way would bypass the
+/// per-device allowlist izbad enforces on the USB plane entirely.
+///
+/// Applies to:
+/// - every **enforcing** sandbox — no policy rule may open it, even one that
+///   lists the upstream's IP for an unrelated purpose; and
+/// - every **USB-enabled** sandbox (one holding ≥1 device grant), bare or not,
+///   since otherwise the grant model is bypassable from inside the guest.
+///
+/// A bare sandbox with no USB grants is deliberately NOT covered: LAN is
+/// permissive there by design (the user declined a firewall — see [`is_lan`]),
+/// and such a sandbox boots a kernel with no `vhci-hcd`, so an imported device
+/// has nothing to attach to. That carve-out is an approved product decision,
+/// not an oversight.
+///
+/// The check is by port AND by configured endpoint, because one usbipd is
+/// reachable at several addresses at once (loopback, the WSL gateway, a LAN
+/// address, and their IPv6-embedded spellings) and because a usbipd may be
+/// configured to listen somewhere other than 3240.
+pub fn usbip_guard(
+    guard: UsbGuard,
+    enforcing: bool,
+    ip: IpAddr,
+    port: u16,
+) -> Option<&'static str> {
+    if !enforcing && !guard.sandbox_usb_enabled {
+        return None;
+    }
+    if port == USBIP_PORT {
+        return Some("usbip upstream (port 3240) is never reachable from a sandbox");
+    }
+    if let Some((up_ip, up_port)) = guard.upstream {
+        if port == up_port && canonical(up_ip) == canonical(ip) {
+            return Some("configured usbip upstream is never reachable from a sandbox");
+        }
+    }
+    None
+}
+
 /// Serve one guest-initiated egress connection (the vsock-1027 bridge).
 /// `mitm` (when present) routes tier-1 HTTP(S) ports through the loopback hop.
 #[allow(clippy::too_many_arguments)]
@@ -30,6 +95,7 @@ pub fn handle_conn(
     mitm: Option<&MitmRuntime>,
     audit: &AuditSink,
     snoop: &SnoopStore,
+    usb: UsbGuard,
 ) {
     let open: StreamOpen = match read_frame(&mut conn) {
         Ok(o) => o,
@@ -37,7 +103,7 @@ pub fn handle_conn(
     };
     match open {
         StreamOpen::TcpConnect { addr, port } => tcp_connect(
-            conn, sandbox, policy, resolver, mitm, audit, snoop, &addr, port,
+            conn, sandbox, policy, resolver, mitm, audit, snoop, usb, &addr, port,
         ),
         // `Dns` is UDP-origin (cap answers at 512, TC=1 on overflow); `DnsTcp`
         // is TCP-origin (return the full answer, up to 64 KiB).
@@ -64,6 +130,7 @@ fn tcp_connect(
     mitm: Option<&MitmRuntime>,
     audit: &AuditSink,
     snoop: &SnoopStore,
+    usb: UsbGuard,
     addr: &str,
     port: u16,
 ) {
@@ -118,6 +185,34 @@ fn tcp_connect(
         return;
     }
 
+    // F-USB-1 floor: no enforcing sandbox, and no USB-enabled sandbox, may
+    // reach a usbip upstream over the generic egress plane — that would import
+    // a device without ever passing the per-device allowlist. Checked BEFORE
+    // tier 1, so a upstream configured on an HTTP(S) port cannot reach the MITM
+    // hop instead. (A bare sandbox with no grants is deliberately unaffected;
+    // see `usbip_guard`.)
+    if let Some(reason) = usbip_guard(usb, policy.enforces(), ip, port) {
+        let flow = FlowDesc::l3(sandbox, addr, port);
+        audit.record(AuditRecord::from_flow(
+            Verdict::Deny,
+            &flow,
+            ip,
+            Tier::L3,
+            reason,
+        ));
+        let _ = write_frame(
+            &mut conn,
+            &Response::Error {
+                kind: ErrorKind::ConnectFailed,
+                message: format!(
+                    "egress to {addr}:{port} denied: {reason}. USB devices are attached \
+                     by the host via `izba usb attach`, never from inside the sandbox."
+                ),
+            },
+        );
+        return;
+    }
+
     // Tier 1 — HTTP(S) under an ENFORCING policy MUST be terminated by the MITM,
     // so the allow-list is judged on the decrypted Host (an IP is never on a
     // domain allow-list, so we do NOT pre-check on the IP here). A bare
@@ -160,7 +255,7 @@ fn tcp_connect(
     // policy is default-deny (a LAN target only via an explicit IP rule, never a
     // rebind-able domain); a bare sandbox is permissive for all non-hard-denied
     // addresses (incl. RFC1918/LAN).
-    let (verdict, flow, rule) = decide_tier2(&*policy, snoop, sandbox, ip, port);
+    let (verdict, flow, rule) = decide_tier2(&*policy, snoop, sandbox, ip, port, usb);
     audit.record(AuditRecord::from_flow(verdict, &flow, ip, Tier::L3, rule));
     if verdict == Verdict::Deny {
         let _ = write_frame(
@@ -266,6 +361,7 @@ pub fn decide_tier2(
     sandbox: &str,
     ip: IpAddr,
     port: u16,
+    usb: UsbGuard,
 ) -> (Verdict, FlowDesc, &'static str) {
     let names = snoop.fqdns_for(sandbox, ip);
     let mut flow = FlowDesc::l3(sandbox, ip.to_string(), port);
@@ -278,6 +374,13 @@ pub fn decide_tier2(
             flow,
             "blocked address (loopback/link-local/metadata)",
         );
+    }
+
+    // F-USB-1 floor (see `usbip_guard`): non-overridable for an enforcing or a
+    // USB-enabled sandbox, and checked before the bare-permissive shortcut so a
+    // USB-enabled bare sandbox cannot walk past it.
+    if let Some(reason) = usbip_guard(usb, policy.enforces(), ip, port) {
+        return (Verdict::Deny, flow, reason);
     }
 
     if !policy.enforces() {
@@ -514,7 +617,16 @@ mod tests {
         ));
         let snoop = SnoopStore::new();
         std::thread::spawn(move || {
-            handle_conn(server, "web", policy, resolver, None, &audit, &snoop)
+            handle_conn(
+                server,
+                "web",
+                policy,
+                resolver,
+                None,
+                &audit,
+                &snoop,
+                UsbGuard::default(),
+            )
         });
         client
     }
@@ -609,7 +721,7 @@ mod tests {
         let p = RegoPolicy::embedded().unwrap();
         let snoop = SnoopStore::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443);
+        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443, UsbGuard::default());
         assert_eq!(v, Verdict::Deny);
         assert_eq!(rule, "not in allow-list", "{rule}");
     }
@@ -620,7 +732,7 @@ mod tests {
         let snoop = SnoopStore::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         snoop.record("web", &[("api.anthropic.com".to_string(), ip, 300)]);
-        let (v, f, rule) = decide_tier2(&p, &snoop, "web", ip, 443);
+        let (v, f, rule) = decide_tier2(&p, &snoop, "web", ip, 443, UsbGuard::default());
         assert_eq!(v, Verdict::Allow);
         assert_eq!(f.host.as_deref(), Some("api.anthropic.com"));
         assert_eq!(rule, "allow-list");
@@ -632,7 +744,7 @@ mod tests {
         let snoop = SnoopStore::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         snoop.record("web", &[("evil.example.com".to_string(), ip, 300)]);
-        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443);
+        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443, UsbGuard::default());
         assert_eq!(v, Verdict::Deny);
         assert_eq!(rule, "not in allow-list");
     }
@@ -646,7 +758,7 @@ mod tests {
         let snoop = SnoopStore::new();
         let ip: IpAddr = "10.0.0.5".parse().unwrap();
         snoop.record("web", &[("api.anthropic.com".to_string(), ip, 300)]);
-        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443);
+        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 8443, UsbGuard::default());
         assert_eq!(v, Verdict::Deny);
         assert!(rule.contains("LAN"), "{rule}");
     }
@@ -657,7 +769,14 @@ mod tests {
     fn decide_tier2_bare_hard_denies_loopback_and_metadata() {
         let snoop = SnoopStore::new();
         for ip in ["127.0.0.1", "169.254.169.254", "0.0.0.0", "::1", "fe80::1"] {
-            let (v, _f, rule) = decide_tier2(&AllowAll, &snoop, "web", ip.parse().unwrap(), 6379);
+            let (v, _f, rule) = decide_tier2(
+                &AllowAll,
+                &snoop,
+                "web",
+                ip.parse().unwrap(),
+                6379,
+                UsbGuard::default(),
+            );
             assert_eq!(v, Verdict::Deny, "bare sandbox must not reach {ip}");
             assert!(rule.contains("blocked address"), "{ip}: {rule}");
         }
@@ -670,10 +789,126 @@ mod tests {
     fn decide_tier2_bare_allows_public_and_lan() {
         let snoop = SnoopStore::new();
         for ip in ["1.2.3.4", "10.0.0.5", "192.168.1.1", "172.16.0.1"] {
-            let (v, _f, rule) = decide_tier2(&AllowAll, &snoop, "web", ip.parse().unwrap(), 8443);
+            let (v, _f, rule) = decide_tier2(
+                &AllowAll,
+                &snoop,
+                "web",
+                ip.parse().unwrap(),
+                8443,
+                UsbGuard::default(),
+            );
             assert_eq!(v, Verdict::Allow, "bare sandbox should reach {ip}");
             assert_eq!(rule, "permissive");
         }
+    }
+
+    // --- F-USB-1: the usbip upstream is not reachable over generic egress. ---
+
+    /// An ENFORCING sandbox must never reach a usbip upstream, even when its
+    /// own policy explicitly lists that IP and that port for another purpose.
+    /// The whole point of the floor is that policy cannot open it.
+    #[test]
+    fn enforcing_sandbox_cannot_reach_usbip_port_even_if_policy_lists_it() {
+        let snoop = SnoopStore::new();
+        let data = r#"{"host_rules": {"10.1.0.124": {"ports": [3240, 8080], "access": "read-write"}}, "sandbox_host_rules": {}, "sandbox_git_rules": {}}"#;
+        let p = RegoPolicy::with_data(data).unwrap();
+        let ip: IpAddr = "10.1.0.124".parse().unwrap();
+
+        let (v, _f, rule) = decide_tier2(&p, &snoop, "web", ip, 3240, UsbGuard::default());
+        assert_eq!(v, Verdict::Deny, "policy must not be able to open 3240");
+        assert!(rule.contains("usbip"), "{rule}");
+
+        // The same host on another listed port is still governed by policy.
+        let (v, _f, _) = decide_tier2(&p, &snoop, "web", ip, 8080, UsbGuard::default());
+        assert_eq!(
+            v,
+            Verdict::Allow,
+            "the floor must not leak onto other ports"
+        );
+    }
+
+    /// A USB-enabled sandbox must not bypass the device allowlist by speaking
+    /// usbip itself — being bare (non-enforcing) does not exempt it.
+    #[test]
+    fn usb_enabled_bare_sandbox_cannot_reach_usbip_port() {
+        let snoop = SnoopStore::new();
+        let guard = UsbGuard {
+            sandbox_usb_enabled: true,
+            upstream: None,
+        };
+        let (v, _f, rule) = decide_tier2(
+            &AllowAll,
+            &snoop,
+            "web",
+            "192.168.1.50".parse().unwrap(),
+            3240,
+            guard,
+        );
+        assert_eq!(v, Verdict::Deny);
+        assert!(rule.contains("usbip"), "{rule}");
+    }
+
+    /// A usbipd may be configured to listen somewhere other than 3240, so the
+    /// configured endpoint is denied on its own port too.
+    #[test]
+    fn configured_upstream_endpoint_is_denied_on_its_own_port() {
+        let snoop = SnoopStore::new();
+        let up: IpAddr = "172.30.96.1".parse().unwrap();
+        let guard = UsbGuard {
+            sandbox_usb_enabled: true,
+            upstream: Some((up, 4000)),
+        };
+        let (v, _f, rule) = decide_tier2(&AllowAll, &snoop, "web", up, 4000, guard);
+        assert_eq!(v, Verdict::Deny);
+        assert!(rule.contains("usbip"), "{rule}");
+
+        // A different port on the same host is not implicated.
+        let (v, _f, _) = decide_tier2(&AllowAll, &snoop, "web", up, 4001, guard);
+        assert_eq!(v, Verdict::Allow);
+    }
+
+    /// The approved carve-out: a bare sandbox with NO USB grants keeps today's
+    /// permissive LAN behaviour. It boots a kernel without `vhci-hcd`, so a
+    /// usbip connection has nothing to attach to.
+    #[test]
+    fn bare_non_usb_sandbox_keeps_lan_access_on_3240() {
+        let snoop = SnoopStore::new();
+        let (v, _f, rule) = decide_tier2(
+            &AllowAll,
+            &snoop,
+            "web",
+            "192.168.1.50".parse().unwrap(),
+            3240,
+            UsbGuard::default(),
+        );
+        assert_eq!(v, Verdict::Allow, "bare non-USB sandbox is unchanged");
+        assert_eq!(rule, "permissive");
+    }
+
+    /// The guard canonicalises IPv6-embedded IPv4 exactly as the SSRF floor
+    /// does, so a mapped spelling of the upstream cannot slip past it.
+    #[test]
+    fn guard_canonicalises_ipv4_mapped_upstream() {
+        let guard = UsbGuard {
+            sandbox_usb_enabled: true,
+            upstream: Some(("172.30.96.1".parse().unwrap(), 4000)),
+        };
+        for spelling in ["::ffff:172.30.96.1", "::172.30.96.1"] {
+            let ip: IpAddr = spelling.parse().unwrap();
+            assert!(
+                usbip_guard(guard, false, ip, 4000).is_some(),
+                "{spelling} must be recognised as the configured upstream"
+            );
+        }
+    }
+
+    /// The floor is inert for a sandbox that is neither enforcing nor
+    /// USB-enabled — pinned directly on the pure function.
+    #[test]
+    fn guard_is_inert_without_enforcement_or_usb() {
+        let ip: IpAddr = "192.168.1.50".parse().unwrap();
+        assert!(usbip_guard(UsbGuard::default(), false, ip, 3240).is_none());
+        assert!(usbip_guard(UsbGuard::default(), true, ip, 3240).is_some());
     }
 
     /// Configurable LAN (enforcing): an enforcing sandbox reaches a private IP
@@ -685,17 +920,31 @@ mod tests {
         let data = r#"{"host_rules": {"10.1.0.124": {"ports": [8080], "access": "read-write"}}, "sandbox_host_rules": {}, "sandbox_git_rules": {}}"#;
         let p = RegoPolicy::with_data(data).unwrap();
         let ip: IpAddr = "10.1.0.124".parse().unwrap();
-        let (v, f, rule) = decide_tier2(&p, &snoop, "web", ip, 8080);
+        let (v, f, rule) = decide_tier2(&p, &snoop, "web", ip, 8080, UsbGuard::default());
         assert_eq!(v, Verdict::Allow, "explicit IP rule must permit the LAN IP");
         assert_eq!(f.host, None, "matched as a raw IP, not a domain");
         assert!(rule.contains("explicit IP"), "{rule}");
         // A LAN IP NOT listed is still denied.
-        let (v2, _f2, _r) = decide_tier2(&p, &snoop, "web", "10.1.0.200".parse().unwrap(), 8080);
+        let (v2, _f2, _r) = decide_tier2(
+            &p,
+            &snoop,
+            "web",
+            "10.1.0.200".parse().unwrap(),
+            8080,
+            UsbGuard::default(),
+        );
         assert_eq!(v2, Verdict::Deny);
         // Loopback stays denied even if (absurdly) listed — the hard floor wins.
         let data2 = r#"{"host_rules": {"127.0.0.1": {"ports": [8080], "access": "read-write"}}, "sandbox_host_rules": {}, "sandbox_git_rules": {}}"#;
         let p2 = RegoPolicy::with_data(data2).unwrap();
-        let (v3, _f3, r3) = decide_tier2(&p2, &snoop, "web", "127.0.0.1".parse().unwrap(), 8080);
+        let (v3, _f3, r3) = decide_tier2(
+            &p2,
+            &snoop,
+            "web",
+            "127.0.0.1".parse().unwrap(),
+            8080,
+            UsbGuard::default(),
+        );
         assert_eq!(v3, Verdict::Deny, "hard floor is non-overridable by policy");
         assert!(r3.contains("blocked address"), "{r3}");
     }
@@ -710,7 +959,8 @@ mod tests {
         snoop.record("web", &[("api.anthropic.com".to_string(), ip, 300)]);
 
         // Web port 443: allow (baseline — ensures the setup is correct).
-        let (v_web, f_web, rule_web) = decide_tier2(&p, &snoop, "web", ip, 443);
+        let (v_web, f_web, rule_web) =
+            decide_tier2(&p, &snoop, "web", ip, 443, UsbGuard::default());
         assert_eq!(
             v_web,
             Verdict::Allow,
@@ -719,7 +969,8 @@ mod tests {
         assert_eq!(f_web.host.as_deref(), Some("api.anthropic.com"));
 
         // Non-web port 22 on the SAME allowed FQDN: the port predicate now denies it.
-        let (v_ssh, _f_ssh, rule_ssh) = decide_tier2(&p, &snoop, "web", ip, 22);
+        let (v_ssh, _f_ssh, rule_ssh) =
+            decide_tier2(&p, &snoop, "web", ip, 22, UsbGuard::default());
         assert_eq!(v_ssh, Verdict::Deny, "port 22 must be denied: {rule_ssh}");
         assert_eq!(rule_ssh, "not in allow-list");
     }
@@ -737,12 +988,13 @@ mod tests {
         snoop.record("web", &[("db.internal".to_string(), ip, 300)]);
 
         // Scoped port 5432: allow.
-        let (v_pg, _f_pg, rule_pg) = decide_tier2(&p, &snoop, "web", ip, 5432);
+        let (v_pg, _f_pg, rule_pg) = decide_tier2(&p, &snoop, "web", ip, 5432, UsbGuard::default());
         assert_eq!(v_pg, Verdict::Allow, "port 5432 must be allowed: {rule_pg}");
         assert_eq!(rule_pg, "allow-list");
 
         // Non-scoped port 443: deny.
-        let (v_tls, _f_tls, rule_tls) = decide_tier2(&p, &snoop, "web", ip, 443);
+        let (v_tls, _f_tls, rule_tls) =
+            decide_tier2(&p, &snoop, "web", ip, 443, UsbGuard::default());
         assert_eq!(v_tls, Verdict::Deny, "port 443 must be denied: {rule_tls}");
         assert_eq!(rule_tls, "not in allow-list");
     }
