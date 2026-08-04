@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::Subcommand;
 use izba_core::daemon::egress::config::{
-    edit_policy_file, Access, AllowEntry, EgressPolicyConfig, GitTarget,
+    edit_policy_file, Access, AllowEntry, EgressPolicyConfig, GitRule, GitTarget,
 };
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
@@ -13,7 +13,8 @@ pub enum PolicyCmd {
         /// Sandbox name (or dir)
         name: String,
     },
-    /// Add HOST to the sandbox's HTTP(S) allow-list. A bare HOST opens the web ports (80 + 443); HOST:PORT opens exactly that port; access is read-write unless --read.
+    /// Add HOST to the sandbox's HTTP(S) allow-list. A bare HOST opens the web ports (80 + 443); HOST:PORT opens exactly that port; access is read-write unless --read
+    /// (NOTE: the opposite default of `policy git allow`, which grants read-only unless --write). Every invocation echoes the effective access level granted.
     /// `*.HOST` matches exactly one subdomain label and `**.HOST` matches any depth; the apex HOST is never matched by a wildcard and needs its own entry.
     /// To actually block anything else, enforcement must be on (see `enforce`).
     /// Auto-reloads a running sandbox.
@@ -60,13 +61,14 @@ pub enum PolicyCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum GitSub {
-    /// Allow git on REPO (host/owner/repo, globs ok) or a whole HOST; read unless --write
+    /// Allow git on REPO (host/owner/repo, globs ok) or a whole HOST; access is read-only (clone/fetch) unless --write
+    /// (NOTE: the opposite default of `policy allow`, which grants read-write unless --read). Every invocation echoes the effective access level granted.
     Allow {
         /// Sandbox name (or dir)
         name: String,
         /// Git target: REPO (host/owner/repo, globs ok) or a whole HOST
         target: String,
-        /// Also allow push (read-only otherwise)
+        /// Also allow push; default is read-only (clone/fetch)
         #[arg(long)]
         write: bool,
     },
@@ -98,7 +100,7 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             // crash between the writes persists the host at the WIDER
             // read-write default, which is the wrong failure direction for a
             // security-posture flag (#84 fix-wave finding 1).
-            edit_policy_file(&dir, |cfg| {
+            let cfg = edit_policy_file(&dir, |cfg| {
                 for &port in &ports {
                     cfg.allow(&host, port);
                 }
@@ -106,6 +108,9 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
                     cfg.set_host_access(&host, Access::Read);
                 }
             })?;
+            let granted: Vec<AllowEntry> =
+                cfg.entries_for_host(&host).into_iter().cloned().collect();
+            print!("{}", render_allow_grant(&granted));
             maybe_reload(paths, name);
             Ok(0)
         }
@@ -133,6 +138,7 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             edit_policy_file(&dir, |c| {
                 c.git_allow(gt.clone(), access);
             })?;
+            print!("{}", render_git_grant(&GitRule { target: gt, access }));
             maybe_reload(paths, name);
             Ok(0)
         }
@@ -198,6 +204,47 @@ pub(crate) fn apply_block_edit(
         }
     })?;
     Ok(())
+}
+
+/// The loud access-grant echo for `policy allow` (#149): one line per
+/// post-edit entry matching the target host, always stating the effective
+/// access level. Read-write points at `--read` (the narrowing flag) because
+/// a user who learned "allow = read-only" from the git verb would otherwise
+/// over-trust the grant; read spells out its GET/HEAD-only meaning. Pure
+/// string builder (same pattern as `render_policy`) so it unit-tests
+/// without a sandbox dir; `run()` prints the result verbatim.
+fn render_allow_grant(entries: &[AllowEntry]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for e in entries {
+        let ports = e
+            .ports()
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let access = match e.access() {
+            Access::Read => "read (HTTP GET/HEAD only)",
+            Access::ReadWrite => "read-write (all methods; --read narrows to GET/HEAD)",
+        };
+        let _ = writeln!(out, "allowed {}  [{ports}]  access: {access}", e.host());
+    }
+    out
+}
+
+/// The loud access-grant echo for `policy git allow` (#149) — the mirror of
+/// `render_allow_grant`, pointing read at `--write` (the widening flag) and
+/// spelling out that read-write includes push.
+fn render_git_grant(rule: &GitRule) -> String {
+    let target = match &rule.target {
+        GitTarget::Repo(s) => s.as_str(),
+        GitTarget::Host(s) => s.as_str(),
+    };
+    let access = match rule.access {
+        Access::Read => "read (clone/fetch only; --write also allows push)",
+        Access::ReadWrite => "read-write (clone/fetch + push)",
+    };
+    format!("allowed git {target}  access: {access}\n")
 }
 
 fn show(paths: &Paths, name: &str) -> anyhow::Result<i32> {
@@ -334,6 +381,152 @@ mod tests {
         assert_eq!(name, "web");
         assert_eq!(target, "github.com/o/a");
         assert!(write, "--write flag must be true");
+
+        // Without --write, the field must be false (read-only default, #149).
+        let cli =
+            crate::Cli::try_parse_from(["izba", "policy", "git", "allow", "web", "github.com/o/a"])
+                .unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Git(GitSub::Allow { write, .. })) = cli.cmd else {
+            panic!("expected policy git allow");
+        };
+        assert!(!write, "write must default to false");
+    }
+
+    /// #149: `policy git allow` through the full `run()` entry point — the
+    /// read-only default and the `--write` widening must be what actually
+    /// lands in `policy.yaml`'s `GitRule`, not just what clap parses.
+    #[test]
+    fn git_allow_default_is_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        run(
+            &paths,
+            &PolicyCmd::Git(GitSub::Allow {
+                name: "web".into(),
+                target: "github.com/o/a".into(),
+                write: false,
+            }),
+        )
+        .unwrap();
+        let cfg = EgressPolicyConfig::load(&paths.sandbox_dir("web"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.git[0].access,
+            Access::Read,
+            "git allow without --write must record read-only"
+        );
+
+        run(
+            &paths,
+            &PolicyCmd::Git(GitSub::Allow {
+                name: "web".into(),
+                target: "github.com/o/a".into(),
+                write: true,
+            }),
+        )
+        .unwrap();
+        let cfg = EgressPolicyConfig::load(&paths.sandbox_dir("web"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.git.len(), 1, "upsert, not append");
+        assert_eq!(cfg.git[0].access, Access::ReadWrite);
+    }
+
+    // ── access-grant echo (#149) ──────────────────────────────────────────────
+
+    /// Every `policy allow` invocation must loudly state the effective access
+    /// level it granted: read-write points at the `--read` narrowing flag,
+    /// read spells out the GET/HEAD-only meaning.
+    #[test]
+    fn render_allow_grant_states_effective_access() {
+        let rw = AllowEntry::Scoped {
+            host: "api.x.com".into(),
+            ports: Some(vec![80, 443]),
+            access: Access::ReadWrite,
+        };
+        let out = render_allow_grant(std::slice::from_ref(&rw));
+        assert!(out.contains("api.x.com"), "must name the host: {out}");
+        assert!(out.contains("[80, 443]"), "must list the ports: {out}");
+        assert!(
+            out.contains("access: read-write"),
+            "must state the effective access: {out}"
+        );
+        assert!(
+            out.contains("--read"),
+            "read-write echo must point at the narrowing flag: {out}"
+        );
+
+        let ro = AllowEntry::Scoped {
+            host: "api.x.com".into(),
+            ports: Some(vec![443]),
+            access: Access::Read,
+        };
+        let out = render_allow_grant(&[ro]);
+        assert!(
+            out.contains("access: read (HTTP GET/HEAD only)"),
+            "read echo must spell out the GET/HEAD meaning: {out}"
+        );
+    }
+
+    /// A mixed-access wildcard host keeps multiple entries (union
+    /// enforcement); the echo must render every one, not just the first.
+    #[test]
+    fn render_allow_grant_lists_every_matching_entry() {
+        let entries = [
+            AllowEntry::Scoped {
+                host: "*.x.com".into(),
+                ports: Some(vec![443]),
+                access: Access::Read,
+            },
+            AllowEntry::Scoped {
+                host: "*.x.com".into(),
+                ports: Some(vec![8443]),
+                access: Access::ReadWrite,
+            },
+        ];
+        let out = render_allow_grant(&entries);
+        assert_eq!(out.lines().count(), 2, "one line per entry: {out}");
+    }
+
+    /// Every `policy git allow` invocation must loudly state the effective
+    /// access level: read points at the `--write` widening flag, read-write
+    /// spells out that push is included.
+    #[test]
+    fn render_git_grant_states_effective_access() {
+        let read = GitRule {
+            target: GitTarget::Repo("github.com/o/a".into()),
+            access: Access::Read,
+        };
+        let out = render_git_grant(&read);
+        assert!(
+            out.contains("github.com/o/a"),
+            "must name the target: {out}"
+        );
+        assert!(
+            out.contains("access: read (clone/fetch only"),
+            "must state the read-only meaning: {out}"
+        );
+        assert!(
+            out.contains("--write"),
+            "read echo must point at the widening flag: {out}"
+        );
+
+        let rw = GitRule {
+            target: GitTarget::Host("github.com".into()),
+            access: Access::ReadWrite,
+        };
+        let out = render_git_grant(&rw);
+        assert!(out.contains("github.com"), "must name the target: {out}");
+        assert!(
+            out.contains("access: read-write"),
+            "must state the effective access: {out}"
+        );
+        assert!(
+            out.contains("push"),
+            "read-write echo must spell out that push is included: {out}"
+        );
     }
 
     #[test]
