@@ -7,8 +7,10 @@
 
 pub mod grants;
 pub mod ids;
+pub mod inventory;
 pub mod settings;
 pub mod trust;
+pub mod usbipd_state;
 
 pub use grants::{UsbConfig, UsbGrant};
 pub use ids::DeviceId;
