@@ -81,7 +81,13 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   manager seams — M1 AllowAll policy + raw-UDP DNS forwarder, M2+ fill in);
   `build_info.rs` compile-time build metadata (git describe/sha/date, rustc,
   target, profile) via a `vergen-gitcl` `build.rs` — the single source of truth
-  for `izba --version` / `izba version`, the daemon hello/status, and the app.
+  for `izba --version` / `izba version`, the daemon hello/status, and the app;
+  `usb/` host-side USB passthrough — `ids` (`vid:pid`), `grants` (the host-only
+  per-sandbox consent record on `SandboxConfig.usb`), `settings`
+  (`<data>/usb/settings.json`; absent ⇒ feature OFF), `trust` (upstream
+  classification: loopback / WSL gateway / LAN / public-refused), `inventory`
+  (host-initiated `OP_REQ_DEVLIST`), `usbipd_state` (reads usbipd-win's table so
+  izba can print the `usbipd bind` command it will never run itself).
 - `izba-init` — guest PID 1 (static musl): mounts, exec engine (PTY + pipes),
   vsock servers, NIC-less net bring-up (`net.rs`) + egress stub (`egress.rs`:
   DNS UDP:53→vsock `Dns` half and TCP nft-REDIRECT→`TcpConnect` half).
