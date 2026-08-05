@@ -57,6 +57,66 @@ pub fn resolve_upstream(s: &UsbSettings) -> Option<(std::net::IpAddr, u16)> {
         .map(|sa| (sa.ip(), up.port))
 }
 
+/// Resolve and classify an upstream host.
+///
+/// An unresolvable host classifies as `Public` — the most restricted class, not
+/// the safest-sounding one: izba does not know whose machine it is, so it does
+/// not grant it the benefit of the doubt.
+pub fn classify_configured(
+    host: &str,
+    port: u16,
+) -> (Option<std::net::IpAddr>, trust::UpstreamTrust) {
+    let resolved = resolve_upstream(&UsbSettings {
+        upstream: Some(Upstream {
+            host: host.to_string(),
+            port,
+        }),
+        allow_remote_upstream: false,
+    })
+    .map(|(ip, _)| ip);
+    let class = match resolved {
+        Some(ip) => trust::classify(
+            ip,
+            trust::host_default_gateway(),
+            trust::running_under_wsl(),
+        ),
+        None => trust::UpstreamTrust::Public,
+    };
+    (resolved, class)
+}
+
+/// Resolve the configured upstream to an address izbad may actually dial,
+/// re-applying the trust decision **at dial time**.
+///
+/// A name classified when it was stored is not a promise about later: the record
+/// can change benignly, or be moved deliberately (DNS rebinding). izbad dials
+/// from the host's network position, so the refusal is enforced again here
+/// rather than trusted from the moment it was configured — otherwise a
+/// private-looking hostname could be re-pointed at a public USB/IP server and
+/// izbad would dial and parse it without the operator's opt-in.
+pub fn dialable_upstream(s: &UsbSettings) -> anyhow::Result<std::net::SocketAddr> {
+    let up = s
+        .upstream
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("usb passthrough is not configured"))?;
+    let (resolved, class) = classify_configured(&up.host, up.port);
+    let ip = resolved.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the configured usbip upstream '{}' does not resolve",
+            up.host
+        )
+    })?;
+    if trust::is_refused(class, s.allow_remote_upstream) {
+        anyhow::bail!(
+            "refusing to dial the configured usbip upstream '{}': it now resolves \
+             to {ip}, which is reachable from the internet. Re-run \
+             `izba usb upstream set` with --allow-remote if that is intended.",
+            up.host
+        );
+    }
+    Ok(std::net::SocketAddr::new(ip, up.port))
+}
+
 /// Read one sandbox's grants off disk, treating anything unreadable as "no
 /// grants" — the direction that never invents consent.
 fn grants_of(paths: &Paths, name: &str) -> UsbConfig {
@@ -231,6 +291,61 @@ mod tests {
     #[test]
     fn an_unconfigured_upstream_resolves_to_nothing() {
         assert_eq!(resolve_upstream(&UsbSettings::default()), None);
+    }
+
+    fn settings_for(host: &str, allow_remote: bool) -> UsbSettings {
+        UsbSettings {
+            upstream: Some(Upstream {
+                host: host.into(),
+                port: 3240,
+            }),
+            allow_remote_upstream: allow_remote,
+        }
+    }
+
+    #[test]
+    fn a_loopback_upstream_is_dialable() {
+        let addr = dialable_upstream(&settings_for("127.0.0.1", false)).unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:3240");
+    }
+
+    #[test]
+    fn a_public_upstream_is_refused_at_dial_time_not_only_when_it_was_set() {
+        // The stored classification is not a promise about later: a name can be
+        // re-pointed at a public address after it was accepted as private, and
+        // izbad dials from the host's network position. So the refusal is
+        // re-applied here, on the address actually about to be dialed.
+        let err = dialable_upstream(&settings_for("203.0.113.7", false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("203.0.113.7"), "{err}");
+        assert!(err.contains("internet"), "{err}");
+        assert!(err.contains("--allow-remote"), "name the opt-in: {err}");
+    }
+
+    #[test]
+    fn a_public_upstream_the_operator_opted_into_is_dialable() {
+        let addr = dialable_upstream(&settings_for("203.0.113.7", true)).unwrap();
+        assert_eq!(addr.to_string(), "203.0.113.7:3240");
+    }
+
+    #[test]
+    fn an_unconfigured_upstream_is_not_dialable() {
+        let err = dialable_upstream(&UsbSettings::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not configured"), "{err}");
+    }
+
+    #[test]
+    fn a_host_that_does_not_resolve_is_not_dialable() {
+        let err = dialable_upstream(&settings_for("no-such-host.invalid", false))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not resolve") || err.contains("internet"),
+            "an unresolvable host must never be dialed: {err}"
+        );
     }
 
     #[test]

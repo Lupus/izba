@@ -1580,6 +1580,28 @@ pub fn detach_volume(
     Ok(())
 }
 
+/// Mutate a sandbox's USB device grants under the **per-sandbox lock**.
+///
+/// Grants are a consent record, and the read-modify-write on `config.json` is
+/// otherwise a lost-update window: two overlapping edits each load the same
+/// file and each write the whole thing back. Losing a *grant* is merely
+/// confusing, but losing a *revoke* leaves consent standing after the user was
+/// told it was withdrawn — so this path takes the lock rather than matching the
+/// unlocked convention its volume neighbours still use (tracked separately).
+pub fn edit_usb_grants<T>(
+    paths: &Paths,
+    name: &str,
+    edit: impl FnOnce(&mut crate::usb::UsbConfig) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _lock = lock_sandbox(paths, name)?;
+    let cfg_path = paths.sandbox_dir(name).join(CONFIG_FILE);
+    let mut cfg: SandboxConfig =
+        load_json(&cfg_path)?.with_context(|| format!("no such sandbox '{name}'"))?;
+    let out = edit(&mut cfg.usb)?;
+    save_json(&cfg_path, &cfg)?;
+    Ok(out)
+}
+
 /// Delete a single persistent volume image. Fails closed if any sandbox config
 /// references it. Returns bytes reclaimed.
 pub fn remove_volume(paths: &Paths, name: &str) -> anyhow::Result<u64> {
@@ -1717,6 +1739,107 @@ mod tests {
         };
         save_json(&paths.sandbox_dir("web").join(STATE_FILE), &recorded).unwrap();
         assert_eq!(live_run_dir(&paths, "web"), paths.run_dir("web"));
+    }
+
+    // -----------------------------------------------------------------------
+    // edit_usb_grants (locked read-modify-write on the consent record)
+    // -----------------------------------------------------------------------
+
+    fn seed_config(paths: &Paths, name: &str) {
+        std::fs::create_dir_all(paths.sandbox_dir(name)).unwrap();
+        let cfg = SandboxConfig {
+            image_digest: "sha256:x".into(),
+            image_ref: "img".into(),
+            cpus: 1,
+            mem_mb: 512,
+            workspace: PathBuf::from("/ws"),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+            rw_size_gb: 0,
+            usb: Default::default(),
+        };
+        save_json(&paths.sandbox_dir(name).join(CONFIG_FILE), &cfg).unwrap();
+    }
+
+    fn grants_on_disk(paths: &Paths, name: &str) -> crate::usb::UsbConfig {
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir(name).join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        cfg.usb
+    }
+
+    #[test]
+    fn edit_usb_grants_persists_and_leaves_the_rest_of_the_config_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        seed_config(&paths, "web");
+
+        edit_usb_grants(&paths, "web", |usb| {
+            crate::usb::grants::grant(
+                usb,
+                crate::usb::UsbGrant {
+                    device: "0403:6001".parse().unwrap(),
+                    busid_pin: None,
+                    description: String::new(),
+                    granted_at_unix_ms: 1,
+                },
+            )
+        })
+        .unwrap();
+
+        assert!(grants_on_disk(&paths, "web").is_enabled());
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.image_ref, "img", "the rest of the config survives");
+    }
+
+    #[test]
+    fn a_failing_edit_writes_nothing() {
+        // A refused grant must not rewrite config.json at all — a consent record
+        // that changed on a rejected request would be the worst of both.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        seed_config(&paths, "web");
+
+        let err = edit_usb_grants(&paths, "web", |usb| {
+            crate::usb::grants::revoke(usb, "0403:6001".parse().unwrap())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not granted"), "{err}");
+        assert!(!grants_on_disk(&paths, "web").is_enabled());
+    }
+
+    #[test]
+    fn edit_usb_grants_holds_the_per_sandbox_lock() {
+        // The lost-update window this closes: without the lock, two overlapping
+        // edits each load the same config.json and each write the whole file
+        // back, so a revoke can be silently undone by a concurrent grant —
+        // leaving consent standing after the user was told it was withdrawn.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        seed_config(&paths, "web");
+
+        let held = lock_sandbox(&paths, "web").expect("take the lock");
+        let err = edit_usb_grants(&paths, "web", |_| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("busy"), "must refuse while locked: {err}");
+        drop(held);
+
+        // Released: the same edit now succeeds.
+        edit_usb_grants(&paths, "web", |_| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn edit_usb_grants_on_an_unknown_sandbox_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        std::fs::create_dir_all(paths.sandboxes_dir()).unwrap();
+        assert!(edit_usb_grants(&paths, "ghost", |_| Ok(())).is_err());
     }
 
     // -----------------------------------------------------------------------

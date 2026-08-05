@@ -794,40 +794,12 @@ fn usb_settings_or_refuse(d: &Arc<Daemon>) -> anyhow::Result<crate::usb::UsbSett
     Ok(s)
 }
 
-/// Resolve and classify an upstream host.
-///
-/// An unresolvable host is classified `Public` — the most restricted class, not
-/// the safest-sounding one: izba does not know whose machine it is, so it must
-/// not grant it the benefit of the doubt.
-fn classify_upstream(
-    host: &str,
-    port: u16,
-) -> (Option<std::net::IpAddr>, crate::usb::trust::UpstreamTrust) {
-    let resolved = crate::usb::resolve_upstream(&crate::usb::UsbSettings {
-        upstream: Some(crate::usb::Upstream {
-            host: host.to_string(),
-            port,
-        }),
-        allow_remote_upstream: false,
-    })
-    .map(|(ip, _)| ip);
-    let trust = match resolved {
-        Some(ip) => crate::usb::trust::classify(
-            ip,
-            crate::usb::trust::host_default_gateway(),
-            crate::usb::trust::running_under_wsl(),
-        ),
-        None => crate::usb::trust::UpstreamTrust::Public,
-    };
-    (resolved, trust)
-}
-
 fn handle_usb_upstream_show(d: &Arc<Daemon>) -> anyhow::Result<DaemonResponse> {
     let s = crate::usb::settings::load(&d.paths.usb_dir());
     let Some(up) = s.upstream.clone() else {
         return Ok(DaemonResponse::UsbUpstream { upstream: None });
     };
-    let (resolved, trust) = classify_upstream(&up.host, up.port);
+    let (resolved, trust) = crate::usb::classify_configured(&up.host, up.port);
     Ok(DaemonResponse::UsbUpstream {
         upstream: Some(crate::daemon::proto::UsbUpstreamInfo {
             warning: crate::usb::trust::describe(trust, &up.host),
@@ -845,7 +817,7 @@ fn handle_usb_upstream_set(
     port: u16,
     allow_remote: bool,
 ) -> anyhow::Result<DaemonResponse> {
-    let (_resolved, trust) = classify_upstream(&host, port);
+    let (_resolved, trust) = crate::usb::classify_configured(&host, port);
     if crate::usb::trust::is_refused(trust, allow_remote) {
         bail!(
             "refusing '{host}' as a usbip upstream: it is reachable from the \
@@ -863,25 +835,13 @@ fn handle_usb_upstream_set(
 
 fn handle_usb_list_devices(d: &Arc<Daemon>) -> anyhow::Result<DaemonResponse> {
     let s = usb_settings_or_refuse(d)?;
-    let (ip, port) = crate::usb::resolve_upstream(&s)
-        .ok_or_else(|| anyhow::anyhow!("the configured usbip upstream does not resolve"))?;
-    let shared = crate::usb::inventory::fetch(std::net::SocketAddr::new(ip, port))?;
+    // Re-classify at dial time: what the name resolved to when it was stored is
+    // not a promise about what it resolves to now.
+    let addr = crate::usb::dialable_upstream(&s)?;
+    let shared = crate::usb::inventory::fetch(addr)?;
     Ok(DaemonResponse::UsbDevices {
         devices: crate::usb::list_devices(&d.paths, &shared, crate::usb::usbipd_state::probe()),
     })
-}
-
-/// Load a sandbox's config for a USB grant edit. Separate from the handlers so
-/// both grant and revoke read and write it the same way.
-fn load_sandbox_config(
-    paths: &Paths,
-    name: &str,
-) -> anyhow::Result<(std::path::PathBuf, crate::state::SandboxConfig)> {
-    sandbox_must_exist(paths, name)?;
-    let path = paths.sandbox_dir(name).join(CONFIG_FILE);
-    let cfg = crate::state::load_json(&path)?
-        .ok_or_else(|| anyhow::anyhow!("sandbox '{name}' has no config"))?;
-    Ok((path, cfg))
 }
 
 fn handle_usb_allow(
@@ -892,17 +852,18 @@ fn handle_usb_allow(
 ) -> anyhow::Result<DaemonResponse> {
     usb_settings_or_refuse(d)?;
     let id: crate::usb::DeviceId = device.parse()?;
-    let (path, mut cfg) = load_sandbox_config(&d.paths, &name)?;
-    crate::usb::grants::grant(
-        &mut cfg.usb,
-        crate::usb::UsbGrant {
-            device: id,
-            busid_pin,
-            description: String::new(),
-            granted_at_unix_ms: crate::usb::now_unix_ms(),
-        },
-    )?;
-    crate::state::save_json(&path, &cfg)?;
+    sandbox_must_exist(&d.paths, &name)?;
+    sandbox::edit_usb_grants(&d.paths, &name, |usb| {
+        crate::usb::grants::grant(
+            usb,
+            crate::usb::UsbGrant {
+                device: id,
+                busid_pin,
+                description: String::new(),
+                granted_at_unix_ms: crate::usb::now_unix_ms(),
+            },
+        )
+    })?;
     // The first grant closes this sandbox's LAN path to the usbip upstream on
     // its NEXT egress connection, not at its next restart.
     d.egress
@@ -917,9 +878,8 @@ fn handle_usb_revoke(
 ) -> anyhow::Result<DaemonResponse> {
     usb_settings_or_refuse(d)?;
     let id: crate::usb::DeviceId = device.parse()?;
-    let (path, mut cfg) = load_sandbox_config(&d.paths, &name)?;
-    crate::usb::grants::revoke(&mut cfg.usb, id)?;
-    crate::state::save_json(&path, &cfg)?;
+    sandbox_must_exist(&d.paths, &name)?;
+    sandbox::edit_usb_grants(&d.paths, &name, |usb| crate::usb::grants::revoke(usb, id))?;
     // Symmetrically: revoking the last grant reopens the sandbox's ordinary LAN
     // access straight away rather than leaving a stale denial behind.
     d.egress
@@ -929,7 +889,10 @@ fn handle_usb_revoke(
 
 fn handle_usb_status(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> {
     usb_settings_or_refuse(d)?;
-    let (_path, cfg) = load_sandbox_config(&d.paths, &name)?;
+    sandbox_must_exist(&d.paths, &name)?;
+    let cfg: crate::state::SandboxConfig =
+        crate::state::load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
+            .ok_or_else(|| anyhow::anyhow!("sandbox '{name}' has no config"))?;
     Ok(DaemonResponse::UsbStatus {
         grants: cfg
             .usb
