@@ -157,6 +157,7 @@ mod tests {
         save_json(
             &sb_dir.join(CONFIG_FILE),
             &SandboxConfig {
+                usb: Default::default(),
                 image_digest: "sha256:abc".into(),
                 image_ref: "ubuntu:24.04".into(),
                 cpus: 2,
@@ -194,6 +195,7 @@ mod tests {
         save_json(
             &sb_dir.join(CONFIG_FILE),
             &SandboxConfig {
+                usb: Default::default(),
                 image_digest: "sha256:abc".into(),
                 image_ref: "ubuntu:24.04".into(),
                 cpus: 2,

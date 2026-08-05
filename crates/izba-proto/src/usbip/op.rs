@@ -18,13 +18,20 @@ pub const OP_REQ_IMPORT: u16 = 0x8003;
 pub const OP_REP_IMPORT: u16 = 0x0003;
 
 /// `op_common`: version, code, status.
-const OP_COMMON_LEN: usize = 8;
+///
+/// Public because a devlist reply is variable-length: a socket reader must know
+/// how much of the head to read before it can learn the message's real size.
+pub const OP_COMMON_LEN: usize = 8;
 /// A device record in `OP_REP_DEVLIST` (interface descriptors follow it).
-const DEVICE_RECORD_LEN: usize = 0x138;
+///
+/// Public for the same reason as [`OP_COMMON_LEN`]: it is the framing stride a
+/// reader walks to find the end of the reply.
+pub const DEVICE_RECORD_LEN: usize = 0x138;
 const BUSID_LEN: usize = 32;
 const PATH_LEN: usize = 256;
-/// Bytes per interface descriptor tuple appended to a devlist record.
-const INTERFACE_LEN: usize = 4;
+/// Bytes per interface descriptor tuple appended to a devlist record. Public as
+/// part of the framing surface (see [`DEVICE_RECORD_LEN`]).
+pub const INTERFACE_LEN: usize = 4;
 
 // The record is read field by field, so nothing at runtime would notice if a
 // field were added, dropped, or resized against the documented 312-byte
@@ -41,7 +48,11 @@ const _: () = assert!(PATH_LEN + BUSID_LEN + 3 * 4 + 3 * 2 + 6 == DEVICE_RECORD_
 /// of the reply is the caller's job (it owns the socket read) — and a fixed
 /// byte cap here would be wrong as well as untestable, since a legitimate
 /// maximal reply is 12 + 256 × (312 + 255×4) ≈ 341 KB.
-const MAX_DEVICES: u32 = 256;
+///
+/// Public so a socket reader can refuse an over-claimed count *before* it reads
+/// that many records — the decoder's bound protects allocation, this one bounds
+/// the read.
+pub const MAX_DEVICES: u32 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsbipError {

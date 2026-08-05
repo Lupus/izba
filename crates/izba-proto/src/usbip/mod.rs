@@ -22,8 +22,8 @@ pub mod urb;
 
 pub use op::{
     decode_op_rep_devlist, decode_op_rep_import, encode_op_req_devlist, encode_op_req_import,
-    UsbDeviceRecord, UsbipError, OP_REP_DEVLIST, OP_REP_IMPORT, OP_REQ_DEVLIST, OP_REQ_IMPORT,
-    USBIP_VERSION,
+    UsbDeviceRecord, UsbipError, DEVICE_RECORD_LEN, INTERFACE_LEN, MAX_DEVICES, OP_COMMON_LEN,
+    OP_REP_DEVLIST, OP_REP_IMPORT, OP_REQ_DEVLIST, OP_REQ_IMPORT, USBIP_VERSION,
 };
 pub use urb::{
     decode_guest_urb, GuestUrb, MAX_ISO_PACKETS, MAX_TRANSFER_BUFFER, URB_HEADER_LEN,
