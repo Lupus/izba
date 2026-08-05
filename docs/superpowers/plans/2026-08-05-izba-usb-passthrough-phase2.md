@@ -1030,7 +1030,7 @@ git commit -m "feat(core): persist per-sandbox USB device grants"
 - Consumes: `izba_proto::usbip::{encode_op_req_devlist, decode_op_rep_devlist,
   UsbDeviceRecord, OP_COMMON_LEN, DEVICE_RECORD_LEN, INTERFACE_LEN, MAX_DEVICES}`;
   `usb::DeviceId`.
-- Produces: `usb::inventory::{UpstreamDevice, exchange_devlist, fetch}`.
+- Produces: `usb::inventory::{UpstreamDevice, read_devlist_reply, fetch}`.
 
 The socket reader must learn the framing (a device count, and each record's
 interface count) to know when the message ends — but it stays a *framer*: the
@@ -1095,16 +1095,13 @@ mod tests {
     }
 
     #[test]
-    fn asks_for_a_devlist_and_parses_the_reply() {
+    fn parses_a_devlist_reply() {
         let reply = devlist_reply(&[
             record("3-2", 0x0403, 0x6001, 1),
             record("1-1.4", 0x1a86, 0x7523, 0),
         ]);
-        let mut sent = Vec::new();
-        let devices =
-            exchange_devlist(&mut std::io::Cursor::new(reply), &mut sent).unwrap();
+        let devices = read_devlist_reply(&mut std::io::Cursor::new(reply)).unwrap();
 
-        assert_eq!(sent, izba_proto::usbip::encode_op_req_devlist().to_vec());
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0].busid, "3-2");
         assert_eq!(devices[0].id.to_string(), "0403:6001");
@@ -1116,7 +1113,7 @@ mod tests {
         // usbipd with nothing bound: the honest answer is "no devices", and the
         // CLI turns that into the `usbipd bind` hint.
         let devices =
-            exchange_devlist(&mut std::io::Cursor::new(devlist_reply(&[])), &mut Vec::new())
+            read_devlist_reply(&mut std::io::Cursor::new(devlist_reply(&[])))
                 .unwrap();
         assert!(devices.is_empty());
     }
@@ -1126,7 +1123,7 @@ mod tests {
         // A record with the maximum interface count must not desynchronise the
         // reader — this is the framing bug that would silently mis-parse device 2.
         let reply = devlist_reply(&[record("3-2", 0x0403, 0x6001, 255), record("3-3", 0x1a86, 0x7523, 0)]);
-        let devices = exchange_devlist(&mut std::io::Cursor::new(reply), &mut Vec::new()).unwrap();
+        let devices = read_devlist_reply(&mut std::io::Cursor::new(reply)).unwrap();
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[1].busid, "3-3");
     }
@@ -1140,7 +1137,7 @@ mod tests {
         reply.extend_from_slice(&0x0005u16.to_be_bytes());
         reply.extend_from_slice(&0u32.to_be_bytes());
         reply.extend_from_slice(&u32::MAX.to_be_bytes());
-        let err = exchange_devlist(&mut std::io::Cursor::new(reply), &mut Vec::new())
+        let err = read_devlist_reply(&mut std::io::Cursor::new(reply))
             .unwrap_err()
             .to_string();
         assert!(err.contains("cap") || err.contains("too many"), "{err}");
@@ -1150,7 +1147,7 @@ mod tests {
     fn a_truncated_reply_is_an_error_not_a_short_device_list() {
         let full = devlist_reply(&[record("3-2", 0x0403, 0x6001, 0)]);
         for cut in [0, 4, OP_COMMON_LEN, OP_COMMON_LEN + 4, full.len() - 1] {
-            let err = exchange_devlist(&mut std::io::Cursor::new(full[..cut].to_vec()), &mut Vec::new());
+            let err = read_devlist_reply(&mut std::io::Cursor::new(full[..cut].to_vec()));
             assert!(err.is_err(), "a reply cut at {cut} must not parse");
         }
     }
@@ -1159,13 +1156,13 @@ mod tests {
     fn a_wrong_version_reply_is_refused() {
         let mut reply = devlist_reply(&[]);
         reply[0..2].copy_from_slice(&0x0110u16.to_be_bytes());
-        assert!(exchange_devlist(&mut std::io::Cursor::new(reply), &mut Vec::new()).is_err());
+        assert!(read_devlist_reply(&mut std::io::Cursor::new(reply)).is_err());
     }
 
     #[test]
     fn devices_matching_a_granted_id_are_identifiable() {
         let reply = devlist_reply(&[record("3-2", 0x0403, 0x6001, 0), record("3-3", 0x0403, 0x6001, 0)]);
-        let devices = exchange_devlist(&mut std::io::Cursor::new(reply), &mut Vec::new()).unwrap();
+        let devices = read_devlist_reply(&mut std::io::Cursor::new(reply)).unwrap();
         let id: crate::usb::DeviceId = "0403:6001".parse().unwrap();
         let matches: Vec<_> = devices.iter().filter(|d| d.id == id).collect();
         assert_eq!(matches.len(), 2, "two identical devices — D9's ambiguity case");
@@ -1176,7 +1173,7 @@ mod tests {
 - [ ] **Step 3: Run to verify failure**
 
 Run: `cargo test -p izba-core usb::inventory`
-Expected: FAIL — `exchange_devlist` not found.
+Expected: FAIL — `read_devlist_reply` not found.
 
 - [ ] **Step 4: Implement the inventory**
 
@@ -1234,11 +1231,12 @@ impl From<UsbDeviceRecord> for UpstreamDevice {
 /// not answer. Short: this runs behind an interactive command.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Perform the exchange over an already-connected stream. `sent` captures the
-/// request so tests can assert on it without a socket.
-pub fn exchange_devlist<R: Read>(reply: &mut R, sent: &mut Vec<u8>) -> Result<Vec<UpstreamDevice>> {
-    sent.extend_from_slice(&encode_op_req_devlist());
-
+/// Read one `OP_REP_DEVLIST` off `reply`.
+///
+/// The caller is responsible for having sent [`encode_op_req_devlist`] first;
+/// this function never writes, which keeps the socket single-writer and lets
+/// tests drive it from a plain `Cursor`.
+pub fn read_devlist_reply<R: Read>(reply: &mut R) -> Result<Vec<UpstreamDevice>> {
     let mut buf = vec![0u8; OP_COMMON_LEN + 4];
     reply
         .read_exact(&mut buf)
@@ -1276,67 +1274,30 @@ pub fn exchange_devlist<R: Read>(reply: &mut R, sent: &mut Vec<u8>) -> Result<Ve
 
 /// Dial `addr` and enumerate. Every phase is time-bounded so a wedged or
 /// silently-accepting upstream cannot hang an interactive command.
-// reason: real-socket glue; `exchange_devlist` carries all the parsing, and the
-// dial/timeout wiring cannot be exercised without binding a listener (which the
-// house test constraint forbids in unit tests).
+// reason: real-socket glue — `read_devlist_reply` carries all the parsing, and
+// exercising the dial/timeout wiring needs a bound listener, which the house
+// unit-test constraint forbids.
 #[mutants::skip]
 pub fn fetch(addr: SocketAddr) -> Result<Vec<UpstreamDevice>> {
     let mut sock = TcpStream::connect_timeout(&addr, IO_TIMEOUT)
         .with_context(|| format!("connecting to the usbip upstream at {addr}"))?;
     sock.set_read_timeout(Some(IO_TIMEOUT))?;
     sock.set_write_timeout(Some(IO_TIMEOUT))?;
-    let mut req = Vec::new();
-    let devices = {
-        let mut probe = Vec::new();
-        exchange_devlist(&mut std::io::empty(), &mut probe).ok();
-        req = probe;
-        sock.write_all(&req)?;
-        sock.flush()?;
-        let mut ignored = Vec::new();
-        exchange_devlist(&mut sock, &mut ignored)?
-    };
-    let _ = req;
-    Ok(devices)
-}
-```
-
-Note on `fetch`: the double-call above is wrong — write it as the single
-straightforward form instead:
-
-```rust
-#[mutants::skip]
-pub fn fetch(addr: SocketAddr) -> Result<Vec<UpstreamDevice>> {
-    let mut sock = TcpStream::connect_timeout(&addr, IO_TIMEOUT)
-        .with_context(|| format!("connecting to the usbip upstream at {addr}"))?;
-    sock.set_read_timeout(Some(IO_TIMEOUT))?;
-    sock.set_write_timeout(Some(IO_TIMEOUT))?;
-    let mut req = Vec::new();
-    let devices = exchange_devlist(&mut sock, &mut req);
-    // `exchange_devlist` appends the request to `req` before reading, so send it
-    // first: split the exchange into write-then-read here.
-    devices
-}
-```
-
-That still reads before writing. Implement `fetch` as:
-
-```rust
-#[mutants::skip]
-pub fn fetch(addr: SocketAddr) -> Result<Vec<UpstreamDevice>> {
-    let mut sock = TcpStream::connect_timeout(&addr, IO_TIMEOUT)
-        .with_context(|| format!("connecting to the usbip upstream at {addr}"))?;
-    sock.set_read_timeout(Some(IO_TIMEOUT))?;
-    sock.set_write_timeout(Some(IO_TIMEOUT))?;
-    sock.write_all(&encode_op_req_devlist())?;
+    sock.write_all(&encode_op_req_devlist())
+        .context("sending OP_REQ_DEVLIST")?;
     sock.flush()?;
-    let mut sent = Vec::new();
-    exchange_devlist(&mut sock, &mut sent)
+    read_devlist_reply(&mut sock)
 }
 ```
 
-and change `exchange_devlist`'s doc to say it *records* the request bytes in
-`sent` for the caller/test to transmit or assert on, and that `fetch` sends the
-same bytes itself. Keep the single-writer property: `exchange_devlist` never
+**Watch the direction of the exchange.** The reader is named
+`read_devlist_reply` and takes only a `Read` on purpose: it must never write to
+the socket, so `fetch` owns sending the request and the socket stays
+single-writer. An API where one function both writes the request and reads the
+reply invites the read-before-write bug — and a test driving it from a
+`Cursor` would not catch that, because a `Cursor` happily "replies" to a request
+that was never sent.
+
 writes to the socket.
 
 - [ ] **Step 5: Run to verify pass**
@@ -2866,9 +2827,8 @@ Task 7; the audit `Tier::Usb` belongs with the datapath in Phase 3. §8 testing
 — unit throughout; `jiegec/usbip` in-process and KVM e2e are Phase 3, since
 there is no datapath to drive here.
 
-**Placeholders.** Task 4 Step 4 shows a first `fetch` draft and then corrects
-it; that is deliberate — the read-before-write bug is exactly the mistake this
-API shape invites, so the plan names it rather than leaving a reader to
+**Placeholders.** Task 4 Step 4 gives `fetch` in its final form and names the
+read-before-write bug the API shape invites, rather than leaving a reader to
 rediscover it. Everything else carries concrete code. Task 8 Step 3 leaves
 `parse_upstream_arg`'s body to the implementer, but pins its full behaviour with
 seven assertions in Step 1, including the IPv6 and out-of-range cases.
