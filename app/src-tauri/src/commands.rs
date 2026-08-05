@@ -950,6 +950,7 @@ mod tests {
         let sandbox_dir = paths.sandbox_dir(name);
         std::fs::create_dir_all(&sandbox_dir).unwrap();
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".into(),
             image_ref: "ubuntu:24.04".into(),
             cpus: 1,
