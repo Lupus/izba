@@ -66,12 +66,39 @@ impl PolicyCell {
     }
 }
 
+/// A swappable holder for a sandbox's USB egress guard, mirroring
+/// [`PolicyCell`]. Read per connection so a grant or revoke takes effect on the
+/// *next* flow rather than at the next VM restart — a revoked sandbox must not
+/// keep paying for a denial it no longer earns, and a freshly-granted one must
+/// not keep an open path to the upstream until it reboots.
+pub(crate) struct UsbGuardCell {
+    inner: Mutex<router::UsbGuard>,
+}
+
+impl UsbGuardCell {
+    pub fn new(guard: router::UsbGuard) -> Self {
+        Self {
+            inner: Mutex::new(guard),
+        }
+    }
+
+    pub fn load(&self) -> router::UsbGuard {
+        *self.inner.lock().unwrap()
+    }
+
+    pub fn store(&self, guard: router::UsbGuard) {
+        *self.inner.lock().unwrap() = guard;
+    }
+}
+
 struct EgressSlot {
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
     /// The sandbox's live policy, swappable by `apply_policy`. Shared with the
     /// accept thread, which reads it per connection.
     policy: Arc<PolicyCell>,
+    /// The sandbox's live USB guard, swappable by `apply_usb_guard`.
+    usb: Arc<UsbGuardCell>,
 }
 
 /// Resolve a sandbox's egress policy from its `--policy` file, materializing
@@ -207,6 +234,10 @@ impl EgressManager {
         let policy = resolve_policy(paths, name);
         let cell = Arc::new(PolicyCell::new(policy));
         let cell_for_thread = Arc::clone(&cell);
+        // The USB guard is resolved from this sandbox's device grants and the
+        // daemon's configured upstream, and kept live by `apply_usb_guard`.
+        let usb_cell = Arc::new(UsbGuardCell::new(crate::usb::guard_for(paths, name)));
+        let usb_for_thread = Arc::clone(&usb_cell);
         let resolver = Arc::clone(&self.resolver);
         let mitm = self.mitm.clone();
         let audit = self.audit.clone();
@@ -220,6 +251,7 @@ impl EgressManager {
                             continue;
                         }
                         let policy = cell_for_thread.load();
+                        let usb = usb_for_thread.load();
                         let resolver = Arc::clone(&resolver);
                         let mitm = mitm.clone();
                         let audit = audit.clone();
@@ -234,13 +266,7 @@ impl EgressManager {
                                 mitm.as_deref(),
                                 &audit,
                                 &snoop,
-                                // Phase 1 ships the floor with no per-sandbox USB
-                                // context yet, which already covers every ENFORCING
-                                // sandbox (`usbip_guard` keys the port check on
-                                // enforcement alone). Phase 2 populates this from the
-                                // sandbox's device grants and the configured upstream
-                                // so USB-enabled bare sandboxes are covered too.
-                                router::UsbGuard::default(),
+                                usb,
                             )
                         });
                     }
@@ -260,6 +286,7 @@ impl EgressManager {
                 stop,
                 thread,
                 policy: cell,
+                usb: usb_cell,
             },
         );
         Ok(())
@@ -305,6 +332,16 @@ impl EgressManager {
         }
     }
 
+    /// Hot-swap `name`'s USB egress guard after a grant or revoke. Takes effect
+    /// on the next connection (in-flight flows keep the guard they cloned);
+    /// no-op when `name` has no live slot, since the next start recomputes it
+    /// from disk anyway.
+    pub fn apply_usb_guard(&self, name: &str, guard: router::UsbGuard) {
+        if let Some(slot) = self.inner.lock().unwrap().get(name) {
+            slot.usb.store(guard);
+        }
+    }
+
     /// Test hook: a slot whose accept thread is already finished (simulated
     /// crash), so `ensure_listening` exercises its rebind path.
     #[cfg(test)]
@@ -319,6 +356,7 @@ impl EgressManager {
                 stop: Arc::new(AtomicBool::new(false)),
                 thread,
                 policy: Arc::new(PolicyCell::new(Arc::new(self::policy::AllowAll))),
+                usb: Arc::new(UsbGuardCell::new(router::UsbGuard::default())),
             },
         );
     }
@@ -330,6 +368,11 @@ impl EgressManager {
             .unwrap()
             .get(name)
             .map(|s| s.policy.load().enforces())
+    }
+
+    #[cfg(test)]
+    fn slot_usb_guard(&self, name: &str) -> Option<router::UsbGuard> {
+        self.inner.lock().unwrap().get(name).map(|s| s.usb.load())
     }
 }
 
@@ -491,6 +534,45 @@ mod tests {
             Some(true),
             "after apply_policy the slot enforces the compiled allow-list"
         );
+    }
+
+    /// Revoking the last grant must reopen the sandbox's ordinary LAN access on
+    /// the NEXT connection, not at its next VM restart — the same liveness
+    /// contract `apply_policy` gives the egress policy.
+    #[test]
+    fn apply_usb_guard_swaps_a_live_slot() {
+        let mgr = mgr();
+        mgr.insert_for_test("web");
+        assert_eq!(
+            mgr.slot_usb_guard("web").map(|g| g.sandbox_usb_enabled),
+            Some(false),
+            "starts with no grants"
+        );
+
+        mgr.apply_usb_guard(
+            "web",
+            router::UsbGuard {
+                sandbox_usb_enabled: true,
+                upstream: Some(("127.0.0.1".parse().unwrap(), 3240)),
+            },
+        );
+        let g = mgr.slot_usb_guard("web").expect("slot still present");
+        assert!(g.sandbox_usb_enabled);
+        assert_eq!(g.upstream, Some(("127.0.0.1".parse().unwrap(), 3240)));
+
+        mgr.apply_usb_guard("web", router::UsbGuard::default());
+        assert_eq!(
+            mgr.slot_usb_guard("web").map(|g| g.sandbox_usb_enabled),
+            Some(false),
+            "a revoke must be able to relax it again"
+        );
+    }
+
+    #[test]
+    fn apply_usb_guard_on_an_unknown_sandbox_is_a_noop() {
+        let mgr = mgr();
+        mgr.apply_usb_guard("ghost", router::UsbGuard::default());
+        assert!(mgr.slot_usb_guard("ghost").is_none());
     }
 
     #[test]
