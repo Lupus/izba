@@ -166,9 +166,13 @@ Key properties:
   standing (they survive replug), live host-side only, and are removed with the
   sandbox by `izba rm`, so a reused sandbox name can never inherit hardware.
 
-  Granting a device also closes that sandbox's ordinary LAN path to the usbip
-  port, so the agent cannot bypass the per-device allow-list by speaking USB/IP
-  itself; revoking reopens it.
+  Granting a device to a sandbox that has **not** declared a firewall also
+  closes that sandbox's ordinary LAN path to the usbip port, so the agent cannot
+  bypass the per-device allow-list by speaking USB/IP itself; revoking reopens
+  it. A sandbox that **is** enforcing is governed by its own allow-list instead:
+  it already denies everything it has not been granted, and if you deliberately
+  write a rule opening the usbip port, izba honors it — and warns that the rule
+  gives the agent every device that server exports rather than a chosen one.
 
   *Status:* the control plane above ships today. Devices do not yet appear
   inside the guest — the datapath (guest kernel, attach, `/dev/ttyACM0`) is the
