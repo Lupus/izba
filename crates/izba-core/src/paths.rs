@@ -111,6 +111,12 @@ impl Paths {
     pub fn ssh_share_dir(&self, name: &str) -> PathBuf {
         self.sandbox_dir(name).join("ssh")
     }
+
+    /// Daemon-level USB passthrough settings (`settings.json`). Host-only: the
+    /// upstream address never reaches a guest.
+    pub fn usb_dir(&self) -> PathBuf {
+        self.root.join("usb")
+    }
 }
 
 /// Create `path` (and any missing ancestors) and harden the izba-owned tree to
@@ -387,6 +393,12 @@ mod tests {
             p.ssh_share_dir("foo"),
             PathBuf::from("/data/sandboxes/foo/ssh")
         );
+    }
+
+    #[test]
+    fn usb_dir_resolves_under_root() {
+        let p = Paths::with_root(PathBuf::from("/data"));
+        assert_eq!(p.usb_dir(), PathBuf::from("/data/usb"));
     }
 
     #[test]

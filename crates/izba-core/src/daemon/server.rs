@@ -1410,6 +1410,7 @@ mod tests {
         save_json(
             &paths.sandbox_dir("web").join(CONFIG_FILE),
             &SandboxConfig {
+                usb: Default::default(),
                 image_digest: "sha256:abc".into(),
                 image_ref: "ubuntu:24.04".into(),
                 cpus: 1,
@@ -2235,6 +2236,7 @@ mod tests {
         let dir = paths.sandbox_dir(name);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".into(),
             image_ref: "ubuntu:24.04".into(),
             cpus: 1,

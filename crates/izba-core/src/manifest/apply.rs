@@ -245,6 +245,7 @@ mod tests {
         std::fs::create_dir_all(paths.sandbox_dir("x")).unwrap();
         // Seed an existing config (write_managed preserves workspace + builder + rw_size_gb).
         let seed = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:old".into(),
             image_ref: "ubuntu:24.04".into(),
             cpus: 2,
@@ -286,6 +287,7 @@ mod tests {
         let paths = crate::paths::Paths::with_root(dir.path().to_path_buf());
         std::fs::create_dir_all(paths.sandbox_dir("y")).unwrap();
         let seed = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:old".into(),
             image_ref: "myapp:latest".into(),
             cpus: 2,
@@ -332,6 +334,7 @@ mod tests {
         let paths = crate::paths::Paths::with_root(dir.path().to_path_buf());
         std::fs::create_dir_all(paths.sandbox_dir("z")).unwrap();
         let seed = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:old".into(),
             image_ref: "myapp:latest".into(),
             cpus: 2,
@@ -380,6 +383,7 @@ mod tests {
         let paths = crate::paths::Paths::with_root(dir.path().to_path_buf());
         std::fs::create_dir_all(paths.sandbox_dir("rw")).unwrap();
         let seed = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:old".into(),
             image_ref: "ubuntu:24.04".into(),
             cpus: 2,

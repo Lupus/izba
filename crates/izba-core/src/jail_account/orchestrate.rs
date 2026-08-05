@@ -523,6 +523,7 @@ mod tests {
         let sandbox_dir = paths.sandbox_dir(name);
         std::fs::create_dir_all(&sandbox_dir).unwrap();
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".to_string(),
             image_ref: "ubuntu:22.04".to_string(),
             cpus: 2,
@@ -541,6 +542,7 @@ mod tests {
 
     fn ro_test_config() -> SandboxConfig {
         SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".to_string(),
             image_ref: "ubuntu:22.04".to_string(),
             cpus: 2,
@@ -615,6 +617,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".to_string(),
             image_ref: "ubuntu:22.04".to_string(),
             cpus: 2,
@@ -636,6 +639,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".to_string(),
             image_ref: "ubuntu:22.04".to_string(),
             cpus: 2,
@@ -661,6 +665,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".to_string(),
             image_ref: "ubuntu:22.04".to_string(),
             cpus: 2,
@@ -694,6 +699,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".to_string(),
             image_ref: "ubuntu:22.04".to_string(),
             cpus: 2,

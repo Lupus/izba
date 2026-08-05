@@ -245,6 +245,7 @@ mod tests {
         std::fs::create_dir_all(&sandbox_dir).unwrap();
 
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".into(),
             image_ref: "ubuntu:22.04".into(),
             cpus: 4,
@@ -287,6 +288,7 @@ mod tests {
 
         // cfg.rw_size_gb == 0 simulates a legacy sandbox (no persisted size).
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".into(),
             image_ref: "ubuntu:24.04".into(),
             cpus: 2,
@@ -338,6 +340,7 @@ mod tests {
         std::fs::create_dir_all(&sandbox_dir).unwrap();
 
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".into(),
             image_ref: "ubuntu:24.04".into(),
             cpus: 2,
@@ -383,6 +386,7 @@ mod tests {
         std::fs::create_dir_all(&sandbox_dir).unwrap();
 
         let cfg = SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".into(),
             image_ref: "ubuntu:24.04".into(),
             cpus: 2,

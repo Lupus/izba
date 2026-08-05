@@ -347,6 +347,9 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             // valid `rootDisk.size` without reading the physical rw.img length
             // (which truncates to 0 for sub-GiB images).
             rw_size_gb: opts.rw_size_gb,
+            // Hardware consent is never implied by creation: a new sandbox holds
+            // no grants until a human runs `izba usb allow`.
+            usb: crate::usb::UsbConfig::default(),
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 
