@@ -97,21 +97,61 @@ pub fn bind_command(d: &UsbipdDevice) -> String {
 /// Run `usbipd.exe state` across the WSL interop boundary. Returns `None` on
 /// any failure — this is decoration, and its absence must never fail a listing
 /// or be mistaken for "you have no devices".
+///
+/// Time-bounded, because the WSL interop hop can wedge and this runs behind an
+/// interactive command: a `usbipd.exe` that never exits must cost the user a few
+/// seconds and an unadorned listing, not a hung terminal. The child is killed on
+/// expiry.
+///
+/// The output is read only after the process exits, so a child that produced
+/// more than one pipe buffer would block writing rather than be read — which the
+/// deadline then resolves. That is the intended outcome: a `state` reply too big
+/// to fit a pipe buffer is not one izba would parse anyway (see
+/// [`MAX_STATE_BYTES`]).
 // reason: process-spawn glue across WSL interop; `parse`/`bind_command` carry
 // the logic and are fully unit-tested.
 #[mutants::skip]
 pub fn probe() -> Option<Vec<UsbipdDevice>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
     if !super::trust::running_under_wsl() {
         return None;
     }
-    let out = std::process::Command::new("usbipd.exe")
+    let mut child = Command::new("usbipd.exe")
         .arg("state")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
-        return None;
+
+    let deadline = Instant::now() + Duration::from_secs(PROBE_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
     }
-    parse(&String::from_utf8(out.stdout).ok()?).ok()
+
+    // Bound the read as well as the wait: `parse` refuses anything over the cap,
+    // so reading past it only wastes memory.
+    let mut buf = String::new();
+    child
+        .stdout
+        .take()?
+        .take(MAX_STATE_BYTES as u64 + 1)
+        .read_to_string(&mut buf)
+        .ok()?;
+    parse(&buf).ok()
 }
 
 #[cfg(test)]
