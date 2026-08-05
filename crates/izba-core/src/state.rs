@@ -50,6 +50,11 @@ pub struct SandboxConfig {
     /// recovery for backwards compatibility".
     #[serde(default)]
     pub rw_size_gb: u64,
+    /// Standing USB device grants for this sandbox (host-only consent record).
+    /// `serde(default)` keeps every `config.json` written before this feature
+    /// deserializing — as no grants, i.e. USB disabled.
+    #[serde(default)]
+    pub usb: crate::usb::UsbConfig,
 }
 
 /// A single host→guest TCP publish rule. Its identity (uniqueness key) is
@@ -155,6 +160,7 @@ mod tests {
 
     fn sample_config() -> SandboxConfig {
         SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:deadbeef".to_string(),
             image_ref: "ubuntu:22.04".to_string(),
             cpus: 2,
@@ -461,5 +467,42 @@ mod tests {
             loaded.rw_size_gb, 16,
             "rw_size_gb must round-trip via save/load"
         );
+    }
+
+    /// Disk-state back-compat: every sandbox on disk today predates the `usb`
+    /// field, and must read back holding no hardware consent.
+    #[test]
+    fn sandbox_config_without_usb_deserializes_to_no_grants() {
+        let legacy = r#"{
+            "image_digest": "sha256:abc",
+            "image_ref": "ubuntu:24.04",
+            "cpus": 2,
+            "mem_mb": 512,
+            "workspace": "/workspace"
+        }"#;
+        let cfg: SandboxConfig = serde_json::from_str(legacy).unwrap();
+        assert!(cfg.usb.devices.is_empty());
+        assert!(!cfg.usb.is_enabled(), "an upgrade must not grant hardware");
+    }
+
+    #[test]
+    fn sandbox_config_usb_grants_roundtrip_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let mut cfg = sample_config();
+        crate::usb::grants::grant(
+            &mut cfg.usb,
+            crate::usb::UsbGrant {
+                device: "0403:6001".parse().unwrap(),
+                busid_pin: Some("3-2".into()),
+                description: "USB Serial Converter".into(),
+                granted_at_unix_ms: 1_700_000_000_000,
+            },
+        )
+        .unwrap();
+        save_json(&path, &cfg).unwrap();
+        let loaded: SandboxConfig = load_json(&path).unwrap().unwrap();
+        assert_eq!(loaded.usb, cfg.usb);
+        assert!(loaded.usb.is_enabled());
     }
 }

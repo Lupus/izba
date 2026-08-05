@@ -296,6 +296,7 @@ spec:
     #[test]
     fn from_managed_renders_ref_image_and_egress() {
         let cfg = crate::state::SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".into(),
             image_ref: "ubuntu:24.04".into(),
             cpus: 4,
@@ -331,6 +332,7 @@ spec:
             resources: None,
         };
         let cfg = crate::state::SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:built".into(),
             image_ref: "myapp:latest".into(),
             cpus: 2,
@@ -349,6 +351,7 @@ spec:
     #[test]
     fn from_managed_with_no_build_yields_ref_image_source() {
         let cfg = crate::state::SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:abc".into(),
             image_ref: "ubuntu:24.04".into(),
             cpus: 2,
@@ -375,6 +378,7 @@ spec:
             resources: None,
         };
         let cfg = crate::state::SandboxConfig {
+            usb: Default::default(),
             image_digest: "sha256:built".into(),
             image_ref: "myapp:latest".into(),
             cpus: 2,
