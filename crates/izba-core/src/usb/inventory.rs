@@ -202,6 +202,26 @@ mod tests {
     }
 
     #[test]
+    fn the_whole_32_bit_count_is_read_not_just_some_of_its_bytes() {
+        // 65536 is 00 01 00 00: every byte differs from its neighbours, so a
+        // reader that picked up the wrong offset would compute 0 and sail past
+        // its own cap. (A count of u32::MAX cannot catch that — all four bytes
+        // are identical, so any mis-indexing reads the same value.) The reader's
+        // own message names the claim, which is what pins the byte order here:
+        // the decoder's later check produces a different, generic message.
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&USBIP_VERSION.to_be_bytes());
+        reply.extend_from_slice(&OP_REP_DEVLIST.to_be_bytes());
+        reply.extend_from_slice(&0u32.to_be_bytes());
+        reply.extend_from_slice(&65_536u32.to_be_bytes());
+        let err = read(reply).unwrap_err().to_string();
+        assert!(
+            err.contains("claims 65536 devices"),
+            "the reader must reject it on its own terms: {err}"
+        );
+    }
+
+    #[test]
     fn exactly_the_cap_is_still_accepted() {
         // The boundary must be inclusive: 256 devices is legal, 257 is not.
         let records: Vec<_> = (0..MAX_DEVICES)

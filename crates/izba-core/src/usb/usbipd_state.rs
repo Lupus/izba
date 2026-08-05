@@ -255,4 +255,21 @@ mod tests {
             .to_string()
             .contains("too large"));
     }
+
+    #[test]
+    fn the_cap_is_roomy_enough_for_a_real_device_table() {
+        // Asserted against a LITERAL, not against MAX_STATE_BYTES: a test
+        // written in terms of the constant moves with it, and so cannot notice
+        // the cap shrinking. A machine with many devices produces tens of KB of
+        // JSON, and a cap that refused that would silently drop the enrichment
+        // telling the user how to share a device.
+        let realistic = "x".repeat(100_000);
+        assert!(
+            !parse(&realistic)
+                .unwrap_err()
+                .to_string()
+                .contains("too large"),
+            "100 KB of output must reach the parser, not the size refusal"
+        );
+    }
 }
