@@ -168,6 +168,44 @@ fn setting_a_loopback_upstream_is_reported_back_without_a_warning() {
 }
 
 #[test]
+fn a_named_upstream_reports_what_it_actually_resolves_to() {
+    // Trust is decided on the resolved address, so when the user typed a name
+    // they must be able to see which machine that name currently points at —
+    // otherwise the trust class is an unexplained verdict.
+    let data = tempfile::tempdir().unwrap();
+    let set = izba(data.path(), &["usb", "upstream", "set", "localhost"]);
+    if daemon_unavailable(&set) {
+        eprintln!("SKIP: daemon socket unavailable in this environment");
+        return;
+    }
+    assert!(set.status.success(), "{set:?}");
+    let stdout = String::from_utf8_lossy(&set.stdout);
+    assert!(stdout.contains("upstream: localhost:3240"), "{stdout}");
+    assert!(
+        stdout.contains("resolves to:"),
+        "a name must report its address: {stdout}"
+    );
+}
+
+#[test]
+fn an_ip_literal_upstream_does_not_repeat_itself() {
+    // "127.0.0.1 resolves to 127.0.0.1" is noise; the line exists only to
+    // explain a name.
+    let data = tempfile::tempdir().unwrap();
+    let set = izba(data.path(), &["usb", "upstream", "set", "127.0.0.1"]);
+    if daemon_unavailable(&set) {
+        eprintln!("SKIP: daemon socket unavailable in this environment");
+        return;
+    }
+    assert!(set.status.success(), "{set:?}");
+    let stdout = String::from_utf8_lossy(&set.stdout);
+    assert!(
+        !stdout.contains("resolves to:"),
+        "an address is not worth restating: {stdout}"
+    );
+}
+
+#[test]
 fn a_public_upstream_is_refused_end_to_end() {
     let data = tempfile::tempdir().unwrap();
     let out = izba(data.path(), &["usb", "upstream", "set", "203.0.113.7"]);
