@@ -381,6 +381,20 @@ fn dispatch_inner(
         DaemonRequest::OpenStream { .. } => {
             bail!("OpenStream is handled at the connection layer")
         }
+        DaemonRequest::UsbUpstreamShow => handle_usb_upstream_show(d),
+        DaemonRequest::UsbUpstreamSet {
+            host,
+            port,
+            allow_remote,
+        } => handle_usb_upstream_set(d, host, port, allow_remote),
+        DaemonRequest::UsbListDevices => handle_usb_list_devices(d),
+        DaemonRequest::UsbAllow {
+            name,
+            device,
+            busid_pin,
+        } => handle_usb_allow(d, name, device, busid_pin),
+        DaemonRequest::UsbRevoke { name, device } => handle_usb_revoke(d, name, device),
+        DaemonRequest::UsbStatus { name } => handle_usb_status(d, name),
         DaemonRequest::VolumeList => handle_volume_list(d),
         DaemonRequest::VolumeRemove { name } => handle_volume_remove(d, name),
         DaemonRequest::VolumeAttach { name, spec } => handle_volume_attach(d, name, spec),
@@ -762,6 +776,175 @@ fn handle_volume_detach(
 }
 
 /// Pre-daemon port commands errored on unknown sandboxes; keep that contract.
+/// The fail-closed gate for USB passthrough.
+///
+/// Called FIRST in every USB handler except the two upstream verbs — before any
+/// address, device id, or sandbox name is examined — so that a daemon whose
+/// operator never configured USB has no USB code path a caller can drive at
+/// all. "Disabled adds zero surface" is a structural claim here, not a flag
+/// check buried after the parsing.
+fn usb_settings_or_refuse(d: &Arc<Daemon>) -> anyhow::Result<crate::usb::UsbSettings> {
+    let s = crate::usb::settings::load(&d.paths.usb_dir());
+    if !crate::usb::is_configured(&s) {
+        bail!(
+            "usb passthrough is not configured — run \
+             `izba usb upstream set <host>` to point izba at a usbip server"
+        );
+    }
+    Ok(s)
+}
+
+/// Resolve and classify an upstream host.
+///
+/// An unresolvable host is classified `Public` — the most restricted class, not
+/// the safest-sounding one: izba does not know whose machine it is, so it must
+/// not grant it the benefit of the doubt.
+fn classify_upstream(
+    host: &str,
+    port: u16,
+) -> (Option<std::net::IpAddr>, crate::usb::trust::UpstreamTrust) {
+    let resolved = crate::usb::resolve_upstream(&crate::usb::UsbSettings {
+        upstream: Some(crate::usb::Upstream {
+            host: host.to_string(),
+            port,
+        }),
+        allow_remote_upstream: false,
+    })
+    .map(|(ip, _)| ip);
+    let trust = match resolved {
+        Some(ip) => crate::usb::trust::classify(
+            ip,
+            crate::usb::trust::host_default_gateway(),
+            crate::usb::trust::running_under_wsl(),
+        ),
+        None => crate::usb::trust::UpstreamTrust::Public,
+    };
+    (resolved, trust)
+}
+
+fn handle_usb_upstream_show(d: &Arc<Daemon>) -> anyhow::Result<DaemonResponse> {
+    let s = crate::usb::settings::load(&d.paths.usb_dir());
+    let Some(up) = s.upstream.clone() else {
+        return Ok(DaemonResponse::UsbUpstream { upstream: None });
+    };
+    let (resolved, trust) = classify_upstream(&up.host, up.port);
+    Ok(DaemonResponse::UsbUpstream {
+        upstream: Some(crate::daemon::proto::UsbUpstreamInfo {
+            warning: crate::usb::trust::describe(trust, &up.host),
+            trust: trust.as_str().to_string(),
+            resolved: resolved.map(|ip| ip.to_string()),
+            host: up.host,
+            port: up.port,
+        }),
+    })
+}
+
+fn handle_usb_upstream_set(
+    d: &Arc<Daemon>,
+    host: String,
+    port: u16,
+    allow_remote: bool,
+) -> anyhow::Result<DaemonResponse> {
+    let (_resolved, trust) = classify_upstream(&host, port);
+    if crate::usb::trust::is_refused(trust, allow_remote) {
+        bail!(
+            "refusing '{host}' as a usbip upstream: it is reachable from the \
+             internet (or does not resolve, which izba treats the same way), and \
+             USB/IP has no authentication or encryption. Pass --allow-remote if \
+             you genuinely mean it."
+        );
+    }
+    let mut s = crate::usb::settings::load(&d.paths.usb_dir());
+    s.upstream = Some(crate::usb::Upstream { host, port });
+    s.allow_remote_upstream = allow_remote;
+    crate::usb::settings::save(&d.paths.usb_dir(), &s)?;
+    Ok(DaemonResponse::Ok)
+}
+
+fn handle_usb_list_devices(d: &Arc<Daemon>) -> anyhow::Result<DaemonResponse> {
+    let s = usb_settings_or_refuse(d)?;
+    let (ip, port) = crate::usb::resolve_upstream(&s)
+        .ok_or_else(|| anyhow::anyhow!("the configured usbip upstream does not resolve"))?;
+    let shared = crate::usb::inventory::fetch(std::net::SocketAddr::new(ip, port))?;
+    Ok(DaemonResponse::UsbDevices {
+        devices: crate::usb::list_devices(&d.paths, &shared, crate::usb::usbipd_state::probe()),
+    })
+}
+
+/// Load a sandbox's config for a USB grant edit. Separate from the handlers so
+/// both grant and revoke read and write it the same way.
+fn load_sandbox_config(
+    paths: &Paths,
+    name: &str,
+) -> anyhow::Result<(std::path::PathBuf, crate::state::SandboxConfig)> {
+    sandbox_must_exist(paths, name)?;
+    let path = paths.sandbox_dir(name).join(CONFIG_FILE);
+    let cfg = crate::state::load_json(&path)?
+        .ok_or_else(|| anyhow::anyhow!("sandbox '{name}' has no config"))?;
+    Ok((path, cfg))
+}
+
+fn handle_usb_allow(
+    d: &Arc<Daemon>,
+    name: String,
+    device: String,
+    busid_pin: Option<String>,
+) -> anyhow::Result<DaemonResponse> {
+    usb_settings_or_refuse(d)?;
+    let id: crate::usb::DeviceId = device.parse()?;
+    let (path, mut cfg) = load_sandbox_config(&d.paths, &name)?;
+    crate::usb::grants::grant(
+        &mut cfg.usb,
+        crate::usb::UsbGrant {
+            device: id,
+            busid_pin,
+            description: String::new(),
+            granted_at_unix_ms: crate::usb::now_unix_ms(),
+        },
+    )?;
+    crate::state::save_json(&path, &cfg)?;
+    // The first grant closes this sandbox's LAN path to the usbip upstream on
+    // its NEXT egress connection, not at its next restart.
+    d.egress
+        .apply_usb_guard(&name, crate::usb::guard_for(&d.paths, &name));
+    Ok(DaemonResponse::Ok)
+}
+
+fn handle_usb_revoke(
+    d: &Arc<Daemon>,
+    name: String,
+    device: String,
+) -> anyhow::Result<DaemonResponse> {
+    usb_settings_or_refuse(d)?;
+    let id: crate::usb::DeviceId = device.parse()?;
+    let (path, mut cfg) = load_sandbox_config(&d.paths, &name)?;
+    crate::usb::grants::revoke(&mut cfg.usb, id)?;
+    crate::state::save_json(&path, &cfg)?;
+    // Symmetrically: revoking the last grant reopens the sandbox's ordinary LAN
+    // access straight away rather than leaving a stale denial behind.
+    d.egress
+        .apply_usb_guard(&name, crate::usb::guard_for(&d.paths, &name));
+    Ok(DaemonResponse::Ok)
+}
+
+fn handle_usb_status(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> {
+    usb_settings_or_refuse(d)?;
+    let (_path, cfg) = load_sandbox_config(&d.paths, &name)?;
+    Ok(DaemonResponse::UsbStatus {
+        grants: cfg
+            .usb
+            .devices
+            .iter()
+            .map(|g| crate::daemon::proto::UsbGrantInfo {
+                device: g.device.to_string(),
+                busid_pin: g.busid_pin.clone(),
+                description: g.description.clone(),
+                granted_at_unix_ms: g.granted_at_unix_ms,
+            })
+            .collect(),
+    })
+}
+
 fn sandbox_must_exist(paths: &Paths, name: &str) -> anyhow::Result<()> {
     if !paths.sandbox_dir(name).join(CONFIG_FILE).is_file() {
         anyhow::bail!("no such sandbox '{name}'");
@@ -1126,6 +1309,241 @@ mod tests {
                 assert!(message.contains("unknown request type"), "{message}");
             }
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    fn expect_ok_resp(resp: DaemonResponse) {
+        match resp {
+            DaemonResponse::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    fn set_loopback_upstream(c: &mut UdsStream) {
+        expect_ok_resp(rpc(
+            c,
+            &DaemonRequest::UsbUpstreamSet {
+                host: "127.0.0.1".into(),
+                port: 3240,
+                allow_remote: false,
+            },
+        ));
+    }
+
+    /// The structural claim behind "disabled USB adds zero attack surface":
+    /// with no upstream configured, every USB verb refuses BEFORE it looks at a
+    /// device id or a sandbox name.
+    #[test]
+    fn usb_requests_refuse_when_no_upstream_is_configured() {
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        for req in [
+            DaemonRequest::UsbListDevices,
+            DaemonRequest::UsbAllow {
+                name: "web".into(),
+                device: "0403:6001".into(),
+                busid_pin: None,
+            },
+            DaemonRequest::UsbRevoke {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+            DaemonRequest::UsbStatus { name: "web".into() },
+        ] {
+            match rpc(&mut c, &req) {
+                DaemonResponse::Error { message } => assert!(
+                    message.contains("not configured"),
+                    "{req:?} must refuse before touching its fields: {message}"
+                ),
+                other => panic!("{req:?} must refuse when USB is off, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn usb_upstream_show_is_answerable_with_the_feature_off() {
+        // The one question a user must be able to ask before configuring
+        // anything: is this on?
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        match rpc(&mut c, &DaemonRequest::UsbUpstreamShow) {
+            DaemonResponse::UsbUpstream { upstream } => assert!(upstream.is_none()),
+            other => panic!("expected UsbUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setting_a_loopback_upstream_persists_it_without_a_warning() {
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        set_loopback_upstream(&mut c);
+
+        let s = crate::usb::settings::load(&d.paths.usb_dir());
+        assert_eq!(s.upstream.as_ref().unwrap().host, "127.0.0.1");
+        assert!(!s.allow_remote_upstream);
+
+        match rpc(&mut c, &DaemonRequest::UsbUpstreamShow) {
+            DaemonResponse::UsbUpstream { upstream } => {
+                let u = upstream.expect("configured");
+                assert_eq!(u.trust, "own-host-loopback");
+                assert_eq!(u.resolved.as_deref(), Some("127.0.0.1"));
+                assert!(u.warning.is_none(), "loopback is the recommended setup");
+            }
+            other => panic!("expected UsbUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_public_upstream_is_refused_unless_explicitly_allowed() {
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        match rpc(
+            &mut c,
+            &DaemonRequest::UsbUpstreamSet {
+                host: "203.0.113.7".into(),
+                port: 3240,
+                allow_remote: false,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("internet"), "{message}");
+                assert!(
+                    message.contains("--allow-remote"),
+                    "name the opt-in: {message}"
+                );
+            }
+            other => panic!("a public upstream must be refused, got {other:?}"),
+        }
+        assert!(
+            crate::usb::settings::load(&d.paths.usb_dir())
+                .upstream
+                .is_none(),
+            "a refused upstream must not be persisted"
+        );
+    }
+
+    #[test]
+    fn a_public_upstream_is_accepted_once_the_user_opts_in_and_still_warns() {
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::UsbUpstreamSet {
+                host: "203.0.113.7".into(),
+                port: 3240,
+                allow_remote: true,
+            },
+        ));
+        match rpc(&mut c, &DaemonRequest::UsbUpstreamShow) {
+            DaemonResponse::UsbUpstream { upstream } => {
+                let u = upstream.expect("configured");
+                assert_eq!(u.trust, "public");
+                assert!(
+                    u.warning.is_some(),
+                    "opting in silences the refusal, never the warning"
+                );
+            }
+            other => panic!("expected UsbUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allow_then_status_then_revoke_round_trips_through_disk() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        rpc(&mut c, &create_req(&dir, "web"));
+        set_loopback_upstream(&mut c);
+
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::UsbAllow {
+                name: "web".into(),
+                device: "0403:6001".into(),
+                busid_pin: Some("3-2".into()),
+            },
+        ));
+
+        match rpc(&mut c, &DaemonRequest::UsbStatus { name: "web".into() }) {
+            DaemonResponse::UsbStatus { grants } => {
+                assert_eq!(grants.len(), 1);
+                assert_eq!(grants[0].device, "0403:6001");
+                assert_eq!(grants[0].busid_pin.as_deref(), Some("3-2"));
+                assert!(grants[0].granted_at_unix_ms > 0, "grants are stamped");
+            }
+            other => panic!("expected UsbStatus, got {other:?}"),
+        }
+        // The grant is the sandbox's own managed truth, on disk.
+        assert!(crate::usb::guard_for(&d.paths, "web").sandbox_usb_enabled);
+
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::UsbRevoke {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+        ));
+        match rpc(&mut c, &DaemonRequest::UsbStatus { name: "web".into() }) {
+            DaemonResponse::UsbStatus { grants } => assert!(grants.is_empty()),
+            other => panic!("expected UsbStatus, got {other:?}"),
+        }
+        assert!(!crate::usb::guard_for(&d.paths, "web").sandbox_usb_enabled);
+    }
+
+    #[test]
+    fn a_malformed_device_id_is_a_clean_error_not_a_grant() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        rpc(&mut c, &create_req(&dir, "web"));
+        set_loopback_upstream(&mut c);
+        match rpc(
+            &mut c,
+            &DaemonRequest::UsbAllow {
+                name: "web".into(),
+                device: "not-an-id".into(),
+                busid_pin: None,
+            },
+        ) {
+            DaemonResponse::Error { message } => assert!(message.contains("vid:pid"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert!(!crate::usb::guard_for(&d.paths, "web").sandbox_usb_enabled);
+    }
+
+    #[test]
+    fn granting_to_a_sandbox_that_does_not_exist_is_refused() {
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        set_loopback_upstream(&mut c);
+        match rpc(
+            &mut c,
+            &DaemonRequest::UsbAllow {
+                name: "ghost".into(),
+                device: "0403:6001".into(),
+                busid_pin: None,
+            },
+        ) {
+            DaemonResponse::Error { message } => assert!(message.contains("ghost"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revoking_a_grant_that_was_never_made_is_refused() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        rpc(&mut c, &create_req(&dir, "web"));
+        set_loopback_upstream(&mut c);
+        match rpc(
+            &mut c,
+            &DaemonRequest::UsbRevoke {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("not granted"), "{message}")
+            }
+            other => panic!("expected an error, got {other:?}"),
         }
     }
 

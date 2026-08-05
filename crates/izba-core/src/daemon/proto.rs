@@ -29,8 +29,10 @@ use izba_proto::{Request, Response};
 /// variant would otherwise fail the frame read instead of self-healing.
 /// (v2 retro-covers `ReloadPolicy` + the `Volume*` requests that landed
 /// during v1; the `Unknown` catch-all below turns any future slip into a
-/// clean error instead of a dropped connection.)
-pub const DAEMON_PROTO_VERSION: u32 = 2;
+/// clean error instead of a dropped connection. v3 covers the `Usb*`
+/// control-plane requests; the guest-facing USB attach/detach RPCs will take
+/// it to 4 when the datapath lands.)
+pub const DAEMON_PROTO_VERSION: u32 = 3;
 
 /// First frame on every daemon connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +154,37 @@ pub enum DaemonRequest {
     ReloadPolicy {
         name: String,
     },
+    /// Report the configured usbip upstream and its trust classification.
+    /// Answerable with the feature OFF — it is how a user asks whether it is on.
+    UsbUpstreamShow,
+    /// Set (or replace) the usbip upstream. `allow_remote` opts into a
+    /// globally-routable address, which is otherwise refused outright.
+    UsbUpstreamSet {
+        host: String,
+        port: u16,
+        #[serde(default)]
+        allow_remote: bool,
+    },
+    /// Enumerate what the upstream exports, annotated with existing grants.
+    UsbListDevices,
+    /// Grant one `vid:pid` to one sandbox. The device travels as a string so a
+    /// malformed id is a clean daemon-side error rather than a frame-read
+    /// failure that would drop the connection.
+    UsbAllow {
+        name: String,
+        device: String,
+        #[serde(default)]
+        busid_pin: Option<String>,
+    },
+    /// Withdraw a grant.
+    UsbRevoke {
+        name: String,
+        device: String,
+    },
+    /// List a sandbox's device grants.
+    UsbStatus {
+        name: String,
+    },
     /// Graceful daemon exit. Sandboxes keep running (detached children);
     /// in-daemon port relays pause until the next daemon adopts.
     Shutdown,
@@ -223,6 +256,47 @@ pub struct DaemonStatus {
     pub sandboxes: Vec<SandboxSummary>,
 }
 
+/// The configured usbip upstream, as reported to a human.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbUpstreamInfo {
+    pub host: String,
+    pub port: u16,
+    /// The address `host` currently resolves to, when it resolves at all.
+    pub resolved: Option<String>,
+    /// `UpstreamTrust` as a stable kebab-case token.
+    pub trust: String,
+    /// The human-facing note for that trust class; `None` for the recommended
+    /// (loopback) configuration, where silence is the honest answer.
+    pub warning: Option<String>,
+}
+
+/// One device the upstream exports — or one usbipd knows about but has not
+/// shared, in which case `bind_command` says how to share it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbDeviceInfo {
+    pub busid: String,
+    /// Canonical `vid:pid`.
+    pub device: String,
+    pub description: String,
+    /// Whether the upstream is currently exporting it (`OP_REP_DEVLIST`).
+    pub shared: bool,
+    /// Sandboxes already holding a grant for this `vid:pid`.
+    #[serde(default)]
+    pub granted_to: Vec<String>,
+    /// For an unshared device: the exact command the human must run elevated.
+    #[serde(default)]
+    pub bind_command: Option<String>,
+}
+
+/// One standing grant, as reported to a human.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbGrantInfo {
+    pub device: String,
+    pub busid_pin: Option<String>,
+    pub description: String,
+    pub granted_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonResponse {
@@ -268,6 +342,18 @@ pub enum DaemonResponse {
     /// Result of a `VolumeList` request.
     Volumes {
         volumes: Vec<crate::volume::VolumeInfo>,
+    },
+    /// Result of `UsbUpstreamShow`. `None` ⇒ USB passthrough is not configured.
+    UsbUpstream {
+        upstream: Option<UsbUpstreamInfo>,
+    },
+    /// Result of `UsbListDevices`.
+    UsbDevices {
+        devices: Vec<UsbDeviceInfo>,
+    },
+    /// Result of `UsbStatus`.
+    UsbStatus {
+        grants: Vec<UsbGrantInfo>,
     },
 }
 
@@ -568,6 +654,139 @@ mod tests {
         match back {
             DaemonResponse::HelloOk { proto, .. } => assert_eq!(proto, DAEMON_PROTO_VERSION),
             other => panic!("expected HelloOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usb_requests_roundtrip() {
+        for req in [
+            DaemonRequest::UsbUpstreamShow,
+            DaemonRequest::UsbUpstreamSet {
+                host: "172.24.32.1".into(),
+                port: 3240,
+                allow_remote: false,
+            },
+            DaemonRequest::UsbListDevices,
+            DaemonRequest::UsbAllow {
+                name: "web".into(),
+                device: "0403:6001".into(),
+                busid_pin: Some("3-2".into()),
+            },
+            DaemonRequest::UsbAllow {
+                name: "web".into(),
+                device: "0403:6001".into(),
+                busid_pin: None,
+            },
+            DaemonRequest::UsbRevoke {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+            DaemonRequest::UsbStatus { name: "web".into() },
+        ] {
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &req).unwrap();
+            let back: DaemonRequest = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
+            assert_eq!(format!("{req:?}"), format!("{back:?}"));
+        }
+    }
+
+    #[test]
+    fn usb_responses_roundtrip() {
+        for resp in [
+            DaemonResponse::UsbUpstream {
+                upstream: Some(UsbUpstreamInfo {
+                    host: "127.0.0.1".into(),
+                    port: 3240,
+                    resolved: Some("127.0.0.1".into()),
+                    trust: "own-host-loopback".into(),
+                    warning: None,
+                }),
+            },
+            DaemonResponse::UsbUpstream { upstream: None },
+            DaemonResponse::UsbDevices {
+                devices: vec![UsbDeviceInfo {
+                    busid: "3-2".into(),
+                    device: "0403:6001".into(),
+                    description: "USB Serial Converter".into(),
+                    shared: true,
+                    granted_to: vec!["web".into()],
+                    bind_command: None,
+                }],
+            },
+            DaemonResponse::UsbStatus {
+                grants: vec![UsbGrantInfo {
+                    device: "0403:6001".into(),
+                    busid_pin: None,
+                    description: "USB Serial Converter".into(),
+                    granted_at_unix_ms: 1_700_000_000_000,
+                }],
+            },
+        ] {
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &resp).unwrap();
+            let back: DaemonResponse = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
+            assert_eq!(format!("{resp:?}"), format!("{back:?}"));
+        }
+    }
+
+    #[test]
+    fn usb_wire_tags_are_stable() {
+        for (req, tag) in [
+            (
+                DaemonRequest::UsbUpstreamShow,
+                r#""type":"usb_upstream_show""#,
+            ),
+            (
+                DaemonRequest::UsbListDevices,
+                r#""type":"usb_list_devices""#,
+            ),
+            (
+                DaemonRequest::UsbStatus { name: "w".into() },
+                r#""type":"usb_status""#,
+            ),
+            (
+                DaemonRequest::UsbRevoke {
+                    name: "w".into(),
+                    device: "0403:6001".into(),
+                },
+                r#""type":"usb_revoke""#,
+            ),
+        ] {
+            let s = serde_json::to_string(&req).unwrap();
+            assert!(s.contains(tag), "{s}");
+        }
+    }
+
+    #[test]
+    fn proto_version_is_bumped_for_the_new_request_variants() {
+        // A same-version daemon predating these variants would fail the frame
+        // read instead of self-healing via a restart, so the COMPATIBILITY gate
+        // must move with them.
+        assert_eq!(DAEMON_PROTO_VERSION, 3);
+    }
+
+    #[test]
+    fn a_usb_allow_without_a_pin_deserializes_unpinned() {
+        // The pin is optional on the wire; its absence must mean "no pin", not
+        // a frame-read failure.
+        let json = r#"{"type":"usb_allow","name":"web","device":"0403:6001"}"#;
+        match serde_json::from_str::<DaemonRequest>(json).unwrap() {
+            DaemonRequest::UsbAllow { busid_pin, .. } => assert!(busid_pin.is_none()),
+            other => panic!("expected UsbAllow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_usb_upstream_set_without_allow_remote_defaults_to_refusing() {
+        let json = r#"{"type":"usb_upstream_set","host":"h","port":3240}"#;
+        match serde_json::from_str::<DaemonRequest>(json).unwrap() {
+            DaemonRequest::UsbUpstreamSet { allow_remote, .. } => {
+                assert!(
+                    !allow_remote,
+                    "a missing opt-in must never read as opted in"
+                );
+            }
+            other => panic!("expected UsbUpstreamSet, got {other:?}"),
         }
     }
 

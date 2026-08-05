@@ -16,10 +16,129 @@ pub use grants::{UsbConfig, UsbGrant};
 pub use ids::DeviceId;
 pub use settings::{Upstream, UsbSettings};
 
+use std::collections::HashMap;
+
+use crate::daemon::egress::router::UsbGuard;
+use crate::daemon::proto::UsbDeviceInfo;
+use crate::paths::Paths;
+
 /// The single "is this feature on?" predicate. USB is configured exactly when a
 /// human set an upstream; nothing else turns it on.
 pub fn is_configured(s: &UsbSettings) -> bool {
     s.upstream.is_some()
+}
+
+/// Wall-clock stamp for a new grant.
+// reason: reads the system clock; there is no behaviour to mutate.
+#[mutants::skip]
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Resolve the configured upstream to an address the egress guard can compare
+/// against.
+///
+/// `None` when USB is unconfigured or the host does not resolve — the guard then
+/// falls back to the well-known port alone, which is the honest answer rather
+/// than a guess at what the user meant.
+pub fn resolve_upstream(s: &UsbSettings) -> Option<(std::net::IpAddr, u16)> {
+    use std::net::ToSocketAddrs;
+    let up = s.upstream.as_ref()?;
+    if let Ok(ip) = up.host.parse::<std::net::IpAddr>() {
+        return Some((ip, up.port));
+    }
+    (up.host.as_str(), up.port)
+        .to_socket_addrs()
+        .ok()?
+        .next()
+        .map(|sa| (sa.ip(), up.port))
+}
+
+/// Read one sandbox's grants off disk, treating anything unreadable as "no
+/// grants" — the direction that never invents consent.
+fn grants_of(paths: &Paths, name: &str) -> UsbConfig {
+    crate::state::load_json::<crate::state::SandboxConfig>(
+        &paths.sandbox_dir(name).join(crate::state::CONFIG_FILE),
+    )
+    .ok()
+    .flatten()
+    .map(|c| c.usb)
+    .unwrap_or_default()
+}
+
+/// Build the egress USB guard for one sandbox.
+///
+/// Enabled exactly when the sandbox holds a grant, and carrying the configured
+/// upstream endpoint so the guard can deny it by address as well as by the
+/// well-known port — a single usbipd is multi-homed (loopback, WSL gateway, LAN
+/// address, and their IPv4-mapped forms).
+pub fn guard_for(paths: &Paths, name: &str) -> UsbGuard {
+    UsbGuard {
+        sandbox_usb_enabled: grants_of(paths, name).is_enabled(),
+        upstream: resolve_upstream(&settings::load(&paths.usb_dir())),
+    }
+}
+
+/// Which sandboxes hold a grant for each device.
+fn grants_by_device(paths: &Paths) -> HashMap<DeviceId, Vec<String>> {
+    let mut out: HashMap<DeviceId, Vec<String>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(paths.sandboxes_dir()) else {
+        return out;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    // Stable output: a listing that reorders between runs reads as churn.
+    names.sort();
+    for name in names {
+        for g in grants_of(paths, &name).devices {
+            out.entry(g.device).or_default().push(name.clone());
+        }
+    }
+    out
+}
+
+/// Annotate the upstream's exported devices with existing grants, then append
+/// the devices usbipd knows about but has not shared — each carrying the exact
+/// command the human must run elevated to share it.
+///
+/// izba never runs that command itself: binding needs Administrator, and
+/// wrapping usbipd-win is explicitly out of scope.
+pub fn list_devices(
+    paths: &Paths,
+    shared: &[inventory::UpstreamDevice],
+    known: Option<Vec<usbipd_state::UsbipdDevice>>,
+) -> Vec<UsbDeviceInfo> {
+    let grants = grants_by_device(paths);
+    let mut out: Vec<UsbDeviceInfo> = shared
+        .iter()
+        .map(|d| UsbDeviceInfo {
+            busid: d.busid.clone(),
+            device: d.id.to_string(),
+            description: d.description.clone(),
+            shared: true,
+            granted_to: grants.get(&d.id).cloned().unwrap_or_default(),
+            bind_command: None,
+        })
+        .collect();
+    // Only the UNBOUND rows are additive: a bound device is already in `shared`,
+    // and listing it twice would read as two pieces of hardware.
+    for k in known.unwrap_or_default().into_iter().filter(|k| !k.bound) {
+        out.push(UsbDeviceInfo {
+            bind_command: Some(usbipd_state::bind_command(&k)),
+            granted_to: grants.get(&k.id).cloned().unwrap_or_default(),
+            busid: k.busid,
+            device: k.id.to_string(),
+            description: k.description,
+            shared: false,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -46,5 +165,191 @@ mod tests {
             upstream: None,
             allow_remote_upstream: true,
         }));
+    }
+
+    fn paths_with_sandboxes(specs: &[(&str, &[&str])]) -> (tempfile::TempDir, Paths) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        for (name, devices) in specs {
+            let dir = paths.sandbox_dir(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut usb = UsbConfig::default();
+            for d in *devices {
+                grants::grant(
+                    &mut usb,
+                    UsbGrant {
+                        device: d.parse().unwrap(),
+                        busid_pin: None,
+                        description: String::new(),
+                        granted_at_unix_ms: 1,
+                    },
+                )
+                .unwrap();
+            }
+            let cfg = crate::state::SandboxConfig {
+                image_digest: "sha256:x".into(),
+                image_ref: "img".into(),
+                cpus: 1,
+                mem_mb: 512,
+                workspace: "/ws".into(),
+                ports: vec![],
+                volumes: vec![],
+                builder: false,
+                build: None,
+                rw_size_gb: 0,
+                usb,
+            };
+            crate::state::save_json(&dir.join(crate::state::CONFIG_FILE), &cfg).unwrap();
+        }
+        (tmp, paths)
+    }
+
+    fn upstream_device(busid: &str, id: &str) -> inventory::UpstreamDevice {
+        inventory::UpstreamDevice {
+            busid: busid.into(),
+            id: id.parse().unwrap(),
+            description: "USB Serial Converter".into(),
+            speed: 2,
+        }
+    }
+
+    #[test]
+    fn an_ip_literal_upstream_needs_no_resolution() {
+        let s = UsbSettings {
+            upstream: Some(Upstream {
+                host: "172.24.32.1".into(),
+                port: 3240,
+            }),
+            allow_remote_upstream: false,
+        };
+        assert_eq!(
+            resolve_upstream(&s),
+            Some(("172.24.32.1".parse().unwrap(), 3240))
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_upstream_resolves_to_nothing() {
+        assert_eq!(resolve_upstream(&UsbSettings::default()), None);
+    }
+
+    #[test]
+    fn a_sandbox_with_no_grants_gets_a_disabled_guard() {
+        let (_t, paths) = paths_with_sandboxes(&[("web", &[])]);
+        let g = guard_for(&paths, "web");
+        assert!(!g.sandbox_usb_enabled);
+        assert!(g.upstream.is_none(), "no upstream is configured");
+    }
+
+    #[test]
+    fn a_sandbox_that_does_not_exist_gets_a_disabled_guard() {
+        // The guard must never invent consent for a name it cannot read.
+        let (_t, paths) = paths_with_sandboxes(&[]);
+        assert!(!guard_for(&paths, "ghost").sandbox_usb_enabled);
+    }
+
+    #[test]
+    fn a_granted_sandbox_gets_an_enabled_guard_carrying_the_upstream() {
+        let (_t, paths) = paths_with_sandboxes(&[("web", &["0403:6001"])]);
+        settings::save(
+            &paths.usb_dir(),
+            &UsbSettings {
+                upstream: Some(Upstream {
+                    host: "127.0.0.1".into(),
+                    port: 3240,
+                }),
+                allow_remote_upstream: false,
+            },
+        )
+        .unwrap();
+
+        let g = guard_for(&paths, "web");
+        assert!(g.sandbox_usb_enabled);
+        assert_eq!(
+            g.upstream,
+            Some(("127.0.0.1".parse().unwrap(), 3240)),
+            "the guard denies the configured endpoint on its own port too"
+        );
+    }
+
+    #[test]
+    fn a_shared_device_is_annotated_with_every_sandbox_holding_it() {
+        let (_t, paths) = paths_with_sandboxes(&[
+            ("web", &["0403:6001"]),
+            ("api", &["0403:6001", "1a86:7523"]),
+            ("idle", &[]),
+        ]);
+        let listed = list_devices(&paths, &[upstream_device("3-2", "0403:6001")], None);
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].shared);
+        assert_eq!(listed[0].granted_to, vec!["api", "web"], "sorted by name");
+        assert!(listed[0].bind_command.is_none(), "already shared");
+    }
+
+    #[test]
+    fn an_ungranted_device_lists_with_no_holders() {
+        let (_t, paths) = paths_with_sandboxes(&[("web", &["1a86:7523"])]);
+        let listed = list_devices(&paths, &[upstream_device("3-2", "0403:6001")], None);
+        assert!(listed[0].granted_to.is_empty());
+    }
+
+    #[test]
+    fn an_unshared_device_is_appended_with_the_command_to_share_it() {
+        let (_t, paths) = paths_with_sandboxes(&[]);
+        let known = vec![usbipd_state::UsbipdDevice {
+            busid: "1-4".into(),
+            id: "1a86:7523".parse().unwrap(),
+            description: "USB-SERIAL CH340".into(),
+            bound: false,
+            attached: false,
+        }];
+        let listed = list_devices(&paths, &[upstream_device("3-2", "0403:6001")], Some(known));
+        assert_eq!(listed.len(), 2);
+        assert!(!listed[1].shared);
+        assert_eq!(
+            listed[1].bind_command.as_deref(),
+            Some("usbipd bind --busid 1-4")
+        );
+    }
+
+    #[test]
+    fn a_bound_device_is_not_listed_twice() {
+        // It already came back in the devlist; repeating it from usbipd's table
+        // would read as two pieces of hardware.
+        let (_t, paths) = paths_with_sandboxes(&[]);
+        let known = vec![usbipd_state::UsbipdDevice {
+            busid: "3-2".into(),
+            id: "0403:6001".parse().unwrap(),
+            description: "USB Serial Converter".into(),
+            bound: true,
+            attached: false,
+        }];
+        let listed = list_devices(&paths, &[upstream_device("3-2", "0403:6001")], Some(known));
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].shared);
+    }
+
+    #[test]
+    fn an_unshared_device_still_shows_who_already_holds_a_grant_for_it() {
+        // A grant can outlive the sharing: the user unbound the device on the
+        // host, and must be able to see that the consent is still standing.
+        let (_t, paths) = paths_with_sandboxes(&[("web", &["1a86:7523"])]);
+        let known = vec![usbipd_state::UsbipdDevice {
+            busid: "1-4".into(),
+            id: "1a86:7523".parse().unwrap(),
+            description: "USB-SERIAL CH340".into(),
+            bound: false,
+            attached: false,
+        }];
+        let listed = list_devices(&paths, &[], Some(known));
+        assert_eq!(listed[0].granted_to, vec!["web"]);
+        assert!(listed[0].bind_command.is_some());
+    }
+
+    #[test]
+    fn a_missing_usbipd_table_just_yields_the_shared_devices() {
+        let (_t, paths) = paths_with_sandboxes(&[]);
+        let listed = list_devices(&paths, &[upstream_device("3-2", "0403:6001")], None);
+        assert_eq!(listed.len(), 1);
     }
 }
