@@ -138,6 +138,41 @@ Key properties:
   it has in `policy.yaml` — while `HOST:PORT` opens exactly that one port.
   `izba netlog NAME` lists exactly which endpoints were denied, so the log
   tells you what to allow next.
+- **USB passthrough (`izba usb`) — consent-gated, per device.** A sandboxed
+  agent can be given a physical device (the motivating case: flashing an ESP32
+  devkit) over [USB/IP](https://docs.kernel.org/usb/usbip_protocol.html), with a
+  human deciding *which* device goes to *which* sandbox.
+
+  **Off unless you configure it.** izba dials a usbip server only after you set
+  one: `izba usb upstream set <host>`. With no upstream configured there is no
+  USB code path at all — every USB command refuses before it looks at its
+  arguments. Loopback is the recommended setup. Because usbip has **no
+  authentication and no encryption**, izba classifies the upstream and tells you
+  whose machine you are trusting: your own host across the WSL boundary is noted,
+  another machine on your LAN is warned about loudly, and a
+  globally-routable address is **refused** unless you pass `--allow-remote`.
+
+  **izba never runs `usbipd bind` for you.** Sharing a device on the USB host
+  needs Administrator, so `izba usb list` shows the devices usbipd knows about
+  and prints the exact command to run elevated — you run it.
+
+  **A grant names one device.** `izba usb allow NAME --device 0403:6001` asks you
+  to type the device id back after a banner stating what you are agreeing to: the
+  agent gets raw transfer-level access (it can reflash or brick the device), USB
+  traffic is **not** visible to the egress firewall or to `izba netlog`, the
+  device is unavailable to the host while attached, and izba can only relay what
+  the server asserts — the USB/IP wire format carries no serial number, so the
+  allow-list expresses your intent, not the device's provenance. Grants are
+  standing (they survive replug), live host-side only, and are removed with the
+  sandbox by `izba rm`, so a reused sandbox name can never inherit hardware.
+
+  Granting a device also closes that sandbox's ordinary LAN path to the usbip
+  port, so the agent cannot bypass the per-device allow-list by speaking USB/IP
+  itself; revoking reopens it.
+
+  *Status:* the control plane above ships today. Devices do not yet appear
+  inside the guest — the datapath (guest kernel, attach, `/dev/ttyACM0`) is the
+  next phase.
 - **OCI → erofs + overlay rootfs.** Images are pulled, flattened to a single
   erofs image (read-only), and combined with a sparse ext4 rw disk via
   overlayfs inside the guest. The erofs is content-addressed and shared across
@@ -217,6 +252,12 @@ izba policy  git allow NAME TARGET [--write]  # allow git on a repo/host; read-o
 izba policy  git block NAME TARGET        # remove a git rule
 izba policy  enable NAME                  # seed the allow-list from observed allowed traffic; live-reloads
 izba policy  reload NAME                  # re-read policy.yaml and apply to new connections (no restart)
+izba usb     upstream show                # print the configured usbip server and how much izba trusts it
+izba usb     upstream set HOST[:PORT] [--allow-remote]   # point izba at a usbip server (default port 3240)
+izba usb     list                         # devices the upstream shares, plus ones it knows but has not shared
+izba usb     allow NAME --device VID:PID [--busid B] [--confirm VID:PID]  # grant one device to one sandbox
+izba usb     revoke NAME --device VID:PID # withdraw a grant
+izba usb     status NAME                  # a sandbox's device grants
 izba diff    [NAME_OR_DIR] [--name NAME]  # show drift between izba.yml and managed truth
 izba promote [NAME_OR_DIR] [--name NAME] [--force] [--restart] [--reset-scratch=BOOL]
                                           # apply manifest → managed truth (human-gated)

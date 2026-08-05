@@ -175,6 +175,31 @@ Pure, no I/O, `&[u8] -> Result<_>` shaped so it is directly fuzzable.
   (read-only verb, fixed path, timeout, capped parse, **never reachable from a
   guest RPC**).
 
+#### 5.2.1 Delivery note (2026-08-05): where these actually landed
+
+The host-side half of §5.2 shipped in USB phase 2 as **`crates/izba-core/src/usb/`**
+rather than `daemon/usb/`: `settings.rs`, `trust.rs`, `inventory.rs`, plus
+`ids.rs` (the `vid:pid` type) and `grants.rs` (the per-sandbox consent record).
+None of it is daemon-server-specific — the CLI and the app read the same model —
+so it sits beside `volume`/`ssh` in the crate root. The broker (`UsbBroker`,
+`ensure_listening`, `session.rs`) will land in the same tree as `usb::broker`.
+
+The broker moved to the **datapath phase**, next to the guest client that is its
+only caller, for two reasons worth keeping:
+
+1. A listener nothing dials cannot be tested against a real datapath. Shipping it
+   with `izba-init`'s client means the splice, the D6 URB validation, and the
+   attach handshake are proven end-to-end by one KVM e2e rather than on
+   in-process faith.
+2. It makes the phase-2 attack-surface claim structural rather than argued:
+   phase 2 adds **no** new listener, **no** new guest frame variant, and **no**
+   guest-reachable parser. The only new I/O is host-initiated, outbound, and
+   happens only once a human has configured an upstream.
+
+Consequently `DAEMON_PROTO_VERSION` went 2 → 3 for the control-plane requests
+(§5.6) and will go 3 → 4 for `UsbAttach`/`UsbDetach`. Two cheap bumps beat
+shipping dead wire variants that answer "not implemented".
+
 ### 5.3 `crates/izba-init/src/usb.rs` (new) — the guest client
 
 ~200 lines, no dependencies, host-testable behind a dialer seam (the
