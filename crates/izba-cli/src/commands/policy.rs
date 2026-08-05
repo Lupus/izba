@@ -112,7 +112,7 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             let granted: Vec<AllowEntry> =
                 cfg.entries_for_host(&host).into_iter().cloned().collect();
             print!("{}", render_allow_grant(&granted));
-            warn_usbip_exposure(&cfg);
+            warn_usbip_exposure(paths, &cfg);
             maybe_reload(paths, name);
             Ok(0)
         }
@@ -333,10 +333,12 @@ fn reload(paths: &Paths, name: &str) -> anyhow::Result<i32> {
 /// The rule is honored; this steers the user toward izba's per-device allowlist,
 /// which grants ONE device rather than everything the server exports. Written to
 /// stderr so it stands out from the grant echo without polluting stdout.
-fn warn_usbip_exposure(cfg: &EgressPolicyConfig) {
-    // The configured upstream is a phase-2 setting; until it exists, the
-    // well-known port is the signal.
-    if let Some(msg) = usbip_exposure_warning(cfg, None) {
+fn warn_usbip_exposure(paths: &Paths, cfg: &EgressPolicyConfig) {
+    // Now that an upstream can be configured, a rule naming that exact endpoint
+    // is flagged even on a non-standard port — not just the well-known 3240.
+    let upstream =
+        izba_core::usb::resolve_upstream(&izba_core::usb::settings::load(&paths.usb_dir()));
+    if let Some(msg) = usbip_exposure_warning(cfg, upstream) {
         eprintln!("\n{msg}");
     }
 }

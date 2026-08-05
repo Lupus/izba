@@ -266,6 +266,9 @@ enum Cmd {
     /// Manage a sandbox's egress policy
     #[command(subcommand)]
     Policy(commands::policy::PolicyCmd),
+    /// Pass a USB device through to a sandbox (usbip)
+    #[command(subcommand)]
+    Usb(commands::usb::UsbCmd),
     /// Manage the izba daemon (auto-started by other commands)
     #[command(subcommand)]
     Daemon(DaemonCmd),
@@ -470,6 +473,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         },
         Cmd::Volume(vc) => commands::volume::run(paths, &vc),
         Cmd::Policy(pc) => commands::policy::run(paths, &pc),
+        Cmd::Usb(uc) => commands::usb::run(paths, &uc),
         Cmd::Version { json } => commands::version::run(paths, json),
         Cmd::Daemon(dc) => match dc {
             DaemonCmd::Run => commands::daemon::run_foreground(paths),

@@ -20,6 +20,7 @@ pub mod ssh_proxy;
 pub mod start;
 pub mod status;
 pub mod stop;
+pub mod usb;
 pub mod version;
 pub mod volume;
 
