@@ -289,14 +289,20 @@ fn allow(
     let id: izba_core::usb::DeviceId = device.parse()?;
     let device = id.to_string();
 
-    if !resolve_confirmation(&device, confirm, std::io::stdin().is_terminal())? {
-        eprint!("{}", consent_banner(name, &device, ""));
-        eprint!("\nType the device id to confirm: ");
-        std::io::stderr().flush()?;
-        if !prompt_confirms(&device)? {
-            eprintln!("aborted");
-            return Ok(1);
+    // One decision, one branch: either the flag already confirmed it, or the
+    // human types the id back after reading the banner.
+    let confirmed = match resolve_confirmation(&device, confirm, std::io::stdin().is_terminal())? {
+        true => true,
+        false => {
+            eprint!("{}", consent_banner(name, &device, ""));
+            eprint!("\nType the device id to confirm: ");
+            std::io::stderr().flush()?;
+            prompt_confirms(&device)?
         }
+    };
+    if !confirmed {
+        eprintln!("aborted");
+        return Ok(1);
     }
 
     let mut client = DaemonClient::connect(paths)?;
