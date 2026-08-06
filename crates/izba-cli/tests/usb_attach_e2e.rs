@@ -198,12 +198,17 @@ fn a_granted_device_reaches_the_workload_and_carries_bytes_both_ways() {
         "expected a ttyACM node in /dev/izba, got: {listing}"
     );
 
-    // The behavioural assertion. `head -c` blocks until the bytes arrive, so a
-    // reply that never comes fails as a timeout rather than an empty pass.
+    // The behavioural assertion. Raw mode first: a tty in its default canonical
+    // mode does not deliver input until a line ends, so a byte-count read would
+    // block forever on data that had in fact arrived — and raw is what a real
+    // serial tool (esptool, picocom) sets anyway. `head -c` then blocks until
+    // the bytes come back, so a reply that never arrives fails as a timeout
+    // rather than passing on an empty read.
     let echoed = exec(
         data.path(),
         &name,
-        "exec 3<>/dev/izba/ttyACM0; printf hello >&3; timeout 10 head -c5 <&3",
+        "stty -F /dev/izba/ttyACM0 raw -echo; exec 3<>/dev/izba/ttyACM0; \
+         printf hello >&3; timeout 10 head -c5 <&3",
     );
     ok(&echoed, "serial echo");
     assert_eq!(

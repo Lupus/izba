@@ -350,15 +350,21 @@ fn write_sysfs(path: &Path, value: &str) -> std::io::Result<()> {
 /// Re-create `src`'s device node at `dst`, world-readable and world-writable.
 ///
 /// Mode 0666 rather than an ownership dance: the workload runs in its own user
-/// namespace, so a uid-based grant would depend on the mapping. What actually
-/// gates reachability is the bind mount (the node exists nowhere else the
-/// container can see) and the cgroup device filter (only the serial majors may
-/// be opened at all).
+/// namespace, so a uid-based grant would depend on the mapping, and the node
+/// would be unusable by any image whose USER is not root. What actually gates
+/// reachability is the bind mount (the node exists nowhere else the container
+/// can see) and the cgroup device filter (only the serial majors may be opened
+/// at all).
+///
+/// The mode is set explicitly AFTER `mknod`, because mknod's mode argument is
+/// masked by the process umask — inherited as 022 here, which would silently
+/// produce 0644 and lock out exactly the non-root workloads this is for.
 // reason: needs a real device node and CAP_MKNOD.
 #[mutants::skip]
 fn mirror(src: &Path, dst: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
     let meta = std::fs::metadata(src)?;
     if !meta.file_type().is_char_device() {
         return Err(std::io::Error::other(format!(
@@ -373,7 +379,8 @@ fn mirror(src: &Path, dst: &Path) -> std::io::Result<()> {
         nix::sys::stat::Mode::from_bits_truncate(0o666),
         meta.rdev(),
     )
-    .map_err(std::io::Error::from)
+    .map_err(std::io::Error::from)?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o666))
 }
 
 /// Find a free vhci port for a device of this speed.
