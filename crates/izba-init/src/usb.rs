@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -62,9 +62,11 @@ pub trait Vhci {
     fn free_port(&self, speed: u32) -> Result<u32, InitError>;
     /// Hand `fd` to the kernel on `port`. After this returns `Ok` the kernel
     /// owns the socket.
-    fn attach(&self, port: u32, fd: i32, devid: u32, speed: u32) -> Result<(), InitError>;
+    fn attach(&self, port: u32, fd: RawFd, devid: u32, speed: u32) -> Result<(), InitError>;
     /// Release `port`.
     fn detach(&self, port: u32) -> Result<(), InitError>;
+    /// Close a descriptor the kernel is finished with.
+    fn close_fd(&self, fd: RawFd);
     /// Snapshot the device names currently present.
     fn devices(&self) -> BTreeSet<String>;
     /// Expose the newly-appeared node `name` to the workload, returning where
@@ -82,12 +84,26 @@ pub struct SysfsVhci;
 struct Attached {
     port: u32,
     node: PathBuf,
+    /// The socket the kernel took ownership of. `vhci` shuts the connection
+    /// down on detach, but nothing closes the descriptor — so init keeps the
+    /// number in order to close it itself. Without this every attach/detach
+    /// cycle leaks one fd in PID 1, and enough cycles exhaust the table for
+    /// every other plane too (exec, cp, relays, ssh).
+    fd: RawFd,
 }
 
 /// The guest's USB state: whether it may attach at all, and what it holds.
 pub struct UsbState {
     enabled: bool,
     attached: Mutex<HashMap<String, Attached>>,
+    /// Devices with an attach in flight. The duplicate check and the insert
+    /// that follows it are separated by the whole dial → import → enumerate
+    /// sequence, which must NOT hold a lock across its I/O — so the claim is
+    /// staked here first. Without it two concurrent attaches of the same device
+    /// both pass the check, land on two vhci ports, and the second insert
+    /// orphans the first: a port and a device node with no map entry, which
+    /// `detach` can never reach and only the VM's death releases.
+    in_flight: Mutex<std::collections::HashSet<String>>,
     /// How long to wait for enumeration. A field rather than a constant so a
     /// test for the "never becomes a serial port" path does not have to spend
     /// the real timeout on every CI run.
@@ -99,6 +115,7 @@ impl UsbState {
         Self {
             enabled,
             attached: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(std::collections::HashSet::new()),
             node_timeout: NODE_TIMEOUT,
         }
     }
@@ -137,12 +154,9 @@ impl UsbState {
         V: Vhci + ?Sized,
     {
         self.gate()?;
-        if self.attached.lock().unwrap().contains_key(device) {
-            return Err((
-                ErrorKind::BadRequest,
-                format!("{device} is already attached"),
-            ));
-        }
+        // Claim the device for the duration, so a concurrent attach of the same
+        // one is refused rather than racing this one to the vhci.
+        let _claim = self.claim(device)?;
 
         let mut conn = dial().map_err(|e| {
             (
@@ -174,24 +188,28 @@ impl UsbState {
 
         let before = vhci.devices();
         let port = vhci.free_port(speed)?;
-        vhci.attach(port, conn.as_raw_fd(), devid, speed)?;
-        // The kernel owns this fd now. Leak it deliberately: dropping `conn`
-        // would close the socket out from under `vhci` and kill the device the
-        // line above just created. Only after a successful attach — on any
-        // earlier failure `conn` is dropped normally.
+        let fd = conn.as_raw_fd();
+        vhci.attach(port, fd, devid, speed)?;
+        // The kernel owns this socket now. Leak the handle deliberately:
+        // dropping `conn` would close the socket out from under `vhci` and kill
+        // the device the line above just created. Only after a successful
+        // attach — on any earlier failure `conn` is dropped normally, so a
+        // refused attach never strands a connection to izbad for the life of
+        // the guest. The raw number is kept so `detach` can close it.
         std::mem::forget(conn);
 
         let node = match self.wait_for_node(&before, vhci) {
             Ok(node) => node,
             Err(e) => {
                 let _ = vhci.detach(port);
+                vhci.close_fd(fd);
                 return Err(e);
             }
         };
         self.attached
             .lock()
             .unwrap()
-            .insert(device.to_string(), Attached { port, node });
+            .insert(device.to_string(), Attached { port, node, fd });
         Ok(())
     }
 
@@ -211,7 +229,36 @@ impl UsbState {
         // The node goes first: once the port is released its major/minor may be
         // reused, and a stale node would then point at someone else's device.
         vhci.unexpose(&a.node);
-        vhci.detach(a.port)
+        let released = vhci.detach(a.port);
+        // vhci shuts the connection down, but the descriptor is still ours.
+        // Closed even when the detach failed: the alternative is leaking it
+        // with nothing left holding a record of it.
+        vhci.close_fd(a.fd);
+        released
+    }
+
+    /// Stake an exclusive claim on `device` for the length of an attach.
+    ///
+    /// Checked against BOTH the in-flight set and what is already attached, so
+    /// the answer is the same whether the other attach finished or is still
+    /// running.
+    fn claim(&self, device: &str) -> Result<Claim<'_>, InitError> {
+        let taken = self.attached.lock().unwrap().contains_key(device);
+        let fresh = self.in_flight.lock().unwrap().insert(device.to_string());
+        if taken || !fresh {
+            if fresh {
+                // We inserted it; take it back out before refusing.
+                self.in_flight.lock().unwrap().remove(device);
+            }
+            return Err((
+                ErrorKind::BadRequest,
+                format!("{device} is already attached"),
+            ));
+        }
+        Ok(Claim {
+            state: self,
+            device: device.to_string(),
+        })
     }
 
     /// The host's decision, enforced before anything else happens.
@@ -275,7 +322,7 @@ impl Vhci for SysfsVhci {
     // reason: a one-line sysfs write; its content comes from the unit-tested
     // `attach_line`.
     #[mutants::skip]
-    fn attach(&self, port: u32, fd: i32, devid: u32, speed: u32) -> Result<(), InitError> {
+    fn attach(&self, port: u32, fd: RawFd, devid: u32, speed: u32) -> Result<(), InitError> {
         write_sysfs(
             &Path::new(VHCI_DIR).join("attach"),
             &attach_line(port, fd, devid, speed),
@@ -293,6 +340,18 @@ impl Vhci for SysfsVhci {
     fn detach(&self, port: u32) -> Result<(), InitError> {
         write_sysfs(&Path::new(VHCI_DIR).join("detach"), &port.to_string())
             .map_err(|e| (ErrorKind::Internal, format!("detaching port {port}: {e}")))
+    }
+
+    // reason: a single close(2).
+    #[mutants::skip]
+    fn close_fd(&self, fd: RawFd) {
+        // Safety: `fd` came from a socket this module leaked with
+        // `mem::forget` after the kernel took it over, and is closed exactly
+        // once — the `Attached` entry holding it is removed under the lock
+        // before this runs, so no other path can reach the same number.
+        unsafe {
+            libc::close(fd);
+        }
     }
 
     // reason: reads the guest's devtmpfs; the diff it feeds is unit-tested.
@@ -335,6 +394,19 @@ impl Vhci for SysfsVhci {
 #[mutants::skip]
 pub fn dial_host() -> std::io::Result<vsock::VsockStream> {
     vsock::VsockStream::connect_with_cid_port(libc::VMADDR_CID_HOST, izba_proto::USB_PORT)
+}
+
+/// Releases an attach claim however the attach ends — including on an early
+/// `?`, which is why this is a guard rather than a pair of calls.
+struct Claim<'a> {
+    state: &'a UsbState,
+    device: String,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.state.in_flight.lock().unwrap().remove(&self.device);
+    }
 }
 
 /// Read the vhci status file and pick a free port for this speed.
@@ -476,6 +548,17 @@ hs  0000 006 003 00030002 000005 3-2
         ] {
             assert_eq!(parse_free_port(s, 3), None, "{s:?}");
         }
+    }
+
+    #[test]
+    fn the_shared_directory_matches_the_path_the_host_binds_into_the_container() {
+        // izba-core binds this exact path to /dev/izba in the OCI spec
+        // (image/runtime_config.rs::USB_SHARED_DIR). The two crates cannot share
+        // a constant — izba-core does not depend on izba-init — so each pins the
+        // literal. Asserting it on only one side leaves the other free to drift,
+        // which would silently bind an empty directory and the device would
+        // simply never appear.
+        assert_eq!(SHARED_DEV_DIR, "/run/izba/usb");
     }
 
     #[test]
@@ -639,6 +722,12 @@ hs  0000 006 003 00030002 000005 3-2
     struct FakeVhci {
         present: Mutex<BTreeSet<String>>,
         calls: Mutex<Vec<String>>,
+        /// The descriptor handed to `attach`, so a test can ask whether the
+        /// socket is still open afterwards. That is the ONLY way to observe the
+        /// `mem::forget` — without it, deleting the forget (or moving it before
+        /// the attach) leaves every unit test green.
+        attached_fd: Mutex<Option<RawFd>>,
+        closed: Mutex<Vec<RawFd>>,
         /// What enumerating produces; `None` models a device that attaches but
         /// never becomes a serial port.
         node_on_attach: Option<String>,
@@ -652,6 +741,8 @@ hs  0000 006 003 00030002 000005 3-2
             Self {
                 present: Mutex::new(["ttyS0".to_string()].into_iter().collect()),
                 calls: Mutex::new(Vec::new()),
+                attached_fd: Mutex::new(None),
+                closed: Mutex::new(Vec::new()),
                 node_on_attach: Some("ttyACM0".into()),
                 free_port: Some(1),
                 attach_ok: true,
@@ -661,6 +752,21 @@ hs  0000 006 003 00030002 000005 3-2
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
+
+        /// Whether the descriptor handed to `attach` is still a live fd.
+        /// `F_GETFD` succeeds on an open descriptor and fails with `EBADF` on a
+        /// closed one, which is exactly the distinction between "the kernel
+        /// kept the socket" and "init dropped it out from under vhci".
+        fn attached_fd_is_open(&self) -> bool {
+            let Some(fd) = *self.attached_fd.lock().unwrap() else {
+                return false;
+            };
+            nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).is_ok()
+        }
+
+        fn closed_fds(&self) -> Vec<RawFd> {
+            self.closed.lock().unwrap().clone()
+        }
     }
 
     impl Vhci for FakeVhci {
@@ -669,11 +775,18 @@ hs  0000 006 003 00030002 000005 3-2
             self.free_port
                 .ok_or((ErrorKind::Internal, "no free vhci port".into()))
         }
-        fn attach(&self, port: u32, _fd: i32, _devid: u32, _speed: u32) -> Result<(), InitError> {
+        fn attach(&self, port: u32, fd: RawFd, _devid: u32, _speed: u32) -> Result<(), InitError> {
             self.calls.lock().unwrap().push(format!("attach({port})"));
+            // The kernel would take the socket here; record the number so the
+            // test can check init did not close it afterwards.
+            assert!(
+                nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).is_ok(),
+                "vhci must be handed a LIVE socket, got a closed fd {fd}"
+            );
             if !self.attach_ok {
                 return Err((ErrorKind::Internal, "vhci refused".into()));
             }
+            *self.attached_fd.lock().unwrap() = Some(fd);
             if let Some(node) = &self.node_on_attach {
                 self.present.lock().unwrap().insert(node.clone());
             }
@@ -702,6 +815,12 @@ hs  0000 006 003 00030002 000005 3-2
                 .lock()
                 .unwrap()
                 .push(format!("unexpose({})", node.display()));
+        }
+        fn close_fd(&self, fd: RawFd) {
+            self.closed.lock().unwrap().push(fd);
+            // Really close it: the tests assert on liveness, so a fake that
+            // only recorded the intent would report an fd as open forever.
+            unsafe { libc::close(fd) };
         }
     }
 
@@ -737,6 +856,49 @@ hs  0000 006 003 00030002 000005 3-2
             vec!["free_port", "attach(1)", "expose(ttyACM0)"],
             "port, then the socket, then the node"
         );
+    }
+
+    #[test]
+    fn the_socket_survives_the_attach_because_the_kernel_now_owns_it() {
+        // Without `mem::forget`, dropping the stream would close the socket out
+        // from under vhci and kill the device that was just created. This is
+        // the only assertion that can see the difference.
+        let vhci = FakeVhci::working();
+        let usb = UsbState::new(true);
+        usb.attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .unwrap();
+        assert!(
+            vhci.attached_fd_is_open(),
+            "the socket handed to vhci must still be open after the attach"
+        );
+        // And detaching hands it back: vhci ends the connection, but the
+        // descriptor is init's to close, and nothing else ever will.
+        usb.detach_on("0403:6001", &vhci).unwrap();
+        assert_eq!(
+            vhci.closed_fds().len(),
+            1,
+            "detach must close exactly the fd it attached"
+        );
+        assert!(
+            !vhci.attached_fd_is_open(),
+            "and it must really be closed, not merely forgotten again"
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_attach_closes_the_socket_rather_than_leaking_it() {
+        // The kernel took the fd and then gave it back via detach. Leaving it
+        // open would leak one descriptor per failed attach, with nothing left
+        // holding a record of it.
+        let vhci = FakeVhci {
+            node_on_attach: None,
+            ..FakeVhci::working()
+        };
+        let usb = UsbState::impatient();
+        assert!(usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .is_err());
+        assert_eq!(vhci.closed_fds().len(), 1, "{:?}", vhci.calls());
     }
 
     #[test]
@@ -824,6 +986,44 @@ hs  0000 006 003 00030002 000005 3-2
             !format!("{again:?}").contains("already attached"),
             "a failed attach must not block a retry: {again:?}"
         );
+    }
+
+    #[test]
+    fn a_second_attach_of_a_device_already_in_flight_is_refused() {
+        // Two concurrent attaches of the same device would otherwise both pass
+        // the duplicate check, land on two vhci ports, and have the second
+        // insert orphan the first — a port and a node with no map entry, which
+        // detach can never reach.
+        let vhci = std::sync::Arc::new(FakeVhci::working());
+        let usb = std::sync::Arc::new(UsbState::new(true));
+        // Hold a claim the way an in-flight attach does, then try again.
+        let claim = usb.claim("0403:6001").expect("first claim");
+        let (kind, msg) = usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &*vhci)
+            .unwrap_err();
+        assert_eq!(kind, ErrorKind::BadRequest);
+        assert!(msg.contains("already attached"), "{msg}");
+        // And the claim is released when the first attach ends, so a later one
+        // succeeds — a claim that outlived its attach would wedge the device.
+        drop(claim);
+        assert!(usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &*vhci)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_failed_attach_releases_its_claim() {
+        let vhci = FakeVhci {
+            attach_ok: false,
+            ..FakeVhci::working()
+        };
+        let usb = UsbState::new(true);
+        assert!(usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .is_err());
+        // The claim guard must have dropped on the early return, or the device
+        // would be permanently unattachable.
+        assert!(usb.claim("0403:6001").is_ok());
     }
 
     #[test]

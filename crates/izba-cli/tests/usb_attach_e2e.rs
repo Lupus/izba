@@ -171,6 +171,26 @@ fn exec_until_ok(data: &Path, name: &str, script: &str, what: &str) -> String {
     }
 }
 
+/// The runtime dirs of every sandbox in this data root.
+///
+/// Returns a non-empty vec or panics: an assertion looping over an empty list
+/// passes without checking anything, which is the failure mode a socket-absence
+/// test is most likely to have.
+fn run_dirs(data: &Path) -> Vec<PathBuf> {
+    let dirs: Vec<PathBuf> = std::fs::read_dir(data.join("run"))
+        .expect("run dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert!(
+        !dirs.is_empty(),
+        "expected at least one runtime dir under {}",
+        data.join("run").display()
+    );
+    dirs
+}
+
 fn teardown(data: &Path, name: &str) {
     let _ = izba(data, &["rm", "-f", name]);
 }
@@ -263,11 +283,7 @@ fn a_sandbox_without_grants_has_no_usb_plane_and_no_usb_kernel() {
     );
     ok(&izba(data.path(), &["start", "plain"]), "start");
 
-    let run_dirs: Vec<PathBuf> = std::fs::read_dir(data.path().join("run"))
-        .expect("run dir")
-        .flatten()
-        .map(|e| e.path())
-        .collect();
+    let run_dirs = run_dirs(data.path());
     for dir in &run_dirs {
         assert!(
             !dir.join("vsock.sock_1028").exists(),
@@ -361,11 +377,7 @@ fn revoking_a_grant_closes_the_plane_on_a_running_sandbox() {
         &izba(data.path(), &["usb", "revoke", &name, "--device", DEVICE]),
         "revoke",
     );
-    let run_dirs: Vec<PathBuf> = std::fs::read_dir(data.path().join("run"))
-        .expect("run dir")
-        .flatten()
-        .map(|e| e.path())
-        .collect();
+    let run_dirs = run_dirs(data.path());
     for dir in &run_dirs {
         assert!(
             !dir.join("vsock.sock_1028").exists(),
@@ -379,6 +391,51 @@ fn revoking_a_grant_closes_the_plane_on_a_running_sandbox() {
         "a revoked device must not attach: {}",
         out(&attach)
     );
+
+    teardown(data.path(), &name);
+}
+
+#[test]
+fn revoking_while_attached_releases_the_device_rather_than_stranding_it() {
+    // Withdrawing consent has to reach the hardware, not just the record. A
+    // revoke that left the device bound to the guest's vhci would keep it
+    // unavailable to the host indefinitely — and, when detach was gated on the
+    // grant, would tell the user to re-grant the device in order to release it.
+    let Some(env) = want() else { return };
+    let fake = FakeUsbipd::start(&env);
+    let data = tempfile::tempdir().unwrap();
+    let name = granted_sandbox(data.path(), &fake, "usbstrand");
+
+    ok(
+        &izba(data.path(), &["usb", "attach", &name, "--device", DEVICE]),
+        "attach",
+    );
+    exec_until_ok(
+        data.path(),
+        &name,
+        "ls /dev/izba/ttyACM0",
+        "the node appearing",
+    );
+
+    ok(
+        &izba(data.path(), &["usb", "revoke", &name, "--device", DEVICE]),
+        "revoke",
+    );
+    // The device is gone from the workload, without anyone having to detach it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if !exec(data.path(), &name, "ls /dev/izba/ttyACM0")
+            .status
+            .success()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "revoke must release an attached device, not strand it"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 
     teardown(data.path(), &name);
 }

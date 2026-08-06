@@ -348,11 +348,17 @@ fn splice(guest: UdsStream, upstream: std::net::TcpStream) {
     let (Ok(guest_r), Ok(up_r)) = (guest.try_clone(), upstream.try_clone()) else {
         return;
     };
-    // URBs arrive at the device's pace; a read timeout here would tear down an
-    // idle-but-healthy attachment.
+    // Both timeouts set by `dial` for the interactive op phase must go before
+    // the splice. The read one because URBs arrive at the device's pace, so a
+    // deadline would tear down an idle-but-healthy attachment. The WRITE one
+    // because a usbipd that stops draining for a few seconds would otherwise
+    // fail a write mid-URB — which not only kills a healthy attachment but
+    // leaves a half-forwarded URB in the host service's parser, exactly what
+    // `pump_guest_to_upstream` promises never to do.
     let _ = up_r.set_read_timeout(None);
     let mut guest_w = guest;
     let mut up_w = upstream;
+    let _ = up_w.set_write_timeout(None);
 
     let out = std::thread::spawn(move || {
         if let Err(e) = session::pump_guest_to_upstream(guest_r, &mut up_w) {
