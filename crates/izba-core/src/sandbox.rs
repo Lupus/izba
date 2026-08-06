@@ -793,6 +793,27 @@ pub fn start_with_timeouts(
     let config: SandboxConfig = load_json(&paths.sandbox_dir(name).join(CONFIG_FILE))?
         .with_context(|| format!("no such sandbox '{name}'"))?;
 
+    // The kernel was chosen by the caller from ONE read of config.json, and the
+    // line above is a SECOND read: a grant (or revoke) landing between the two
+    // would boot a kernel whose USB support disagrees with the cmdline and the
+    // OCI bundle built from `config` below. Refuse rather than hand the guest a
+    // promise its kernel cannot keep — the same fail-closed reasoning as
+    // `artifacts::locate`, applied to the race that locate cannot see.
+    let wants_usb = config.usb.is_enabled();
+    let has_usb_kernel = art.variant == crate::artifacts::KernelVariant::Usb;
+    if wants_usb != has_usb_kernel {
+        bail!(
+            "sandbox '{name}' has {} but the located kernel is {} — its USB grants changed \
+             while it was starting; start it again",
+            if wants_usb {
+                "USB device grants"
+            } else {
+                "no USB device grants"
+            },
+            art.variant.image(),
+        );
+    }
+
     let conn = default_connector();
     if liveness_of(paths, name, &conn)? != Liveness::Stopped {
         return Err(AlreadyRunning {
@@ -919,7 +940,7 @@ pub fn start_with_timeouts(
     // would be orphaned with no state.json pointing at it.
     let booted = (|| -> anyhow::Result<()> {
         wait_for_boot(handle.as_ref(), name, &console_log, boot_timeout, poll)?;
-        record_run_state(paths, name, handle.as_ref(), user_fallback)
+        record_run_state(paths, name, handle.as_ref(), user_fallback, has_usb_kernel)
     })();
 
     if let Err(e) = booted {
@@ -988,14 +1009,16 @@ fn control_is_healthy(handle: &dyn VmHandle, attempt_timeout: Duration) -> bool 
 }
 
 /// Persist the post-boot `state.json`: the VMM pid (split out of the driver's
-/// pid list) plus the remaining sidecar pids, the start timestamp, and the
+/// pid list) plus the remaining sidecar pids, the start timestamp, the
 /// host-side confinement actually achieved for the VMM (so status can report it
-/// honestly — and loudly when unconfined).
+/// honestly — and loudly when unconfined), and which kernel variant booted (so
+/// a grant added later can be told apart from one the running kernel supports).
 fn record_run_state(
     paths: &Paths,
     name: &str,
     handle: &dyn VmHandle,
     user_fallback: Option<crate::state::UserFallback>,
+    usb_kernel: bool,
 ) -> anyhow::Result<()> {
     let mut pids = handle.pids();
     let vmm_idx = pids
@@ -1013,6 +1036,7 @@ fn record_run_state(
         confinement: Some(handle.confinement()),
         run_dir: Some(paths.run_dir(name)),
         user_fallback,
+        usb_kernel,
     };
     save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)
 }
@@ -1753,6 +1777,7 @@ mod tests {
             confinement: None,
             run_dir: None,
             user_fallback: None,
+            usb_kernel: false,
         };
         save_json(&paths.sandbox_dir("web").join(STATE_FILE), &legacy).unwrap();
         assert_eq!(live_run_dir(&paths, "web"), paths.legacy_run_dir("web"));
@@ -2263,6 +2288,85 @@ mod tests {
         assert_eq!(fb.declared, "ghost");
         assert!(fb.reason.contains("USER 'ghost'"), "got: {}", fb.reason);
         assert!(fb.reason.contains("root"), "got: {}", fb.reason);
+    }
+
+    fn arts_usb() -> Artifacts {
+        Artifacts {
+            variant: crate::artifacts::KernelVariant::Usb,
+            kernel: PathBuf::from("/art/vmlinux-usb"),
+            initramfs: PathBuf::from("/art/initramfs.img"),
+        }
+    }
+
+    /// Grant one device so the sandbox is USB-enabled on disk.
+    fn grant_a_device(paths: &Paths, name: &str) {
+        edit_usb_grants(paths, name, |usb| {
+            crate::usb::grants::grant(
+                usb,
+                crate::usb::UsbGrant {
+                    device: "0403:6001".parse().unwrap(),
+                    busid_pin: None,
+                    description: String::new(),
+                    granted_at_unix_ms: 1,
+                },
+            )
+        })
+        .unwrap();
+    }
+
+    fn started_run_state(paths: &Paths, name: &str) -> RunState {
+        load_json(&paths.sandbox_dir(name).join(STATE_FILE))
+            .unwrap()
+            .expect("state.json written")
+    }
+
+    /// A UI cannot ask the guest whether its kernel has a USB stack, so the run
+    /// record has to say. Both directions, against the same writer: a field
+    /// that is always `false` would pass a one-sided test.
+    #[test]
+    fn start_records_which_kernel_variant_it_booted() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        create(&paths, "plain", &opts(&ws)).unwrap();
+        start(&paths, "plain", &MockDriver::new(), &arts(), false).unwrap();
+        assert!(!started_run_state(&paths, "plain").usb_kernel);
+
+        create(&paths, "withusb", &opts(&ws)).unwrap();
+        grant_a_device(&paths, "withusb");
+        start(&paths, "withusb", &MockDriver::new(), &arts_usb(), false).unwrap();
+        assert!(started_run_state(&paths, "withusb").usb_kernel);
+    }
+
+    /// The kernel is picked from one read of config.json and `start` re-reads
+    /// it; a grant landing in between must fail the start rather than boot a
+    /// kernel that disagrees with the cmdline and the OCI bundle.
+    #[test]
+    fn start_refuses_a_kernel_that_disagrees_with_the_grants() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        // Granted, but handed the kernel with no USB stack at all.
+        create(&paths, "granted", &opts(&ws)).unwrap();
+        grant_a_device(&paths, "granted");
+        let err = start(&paths, "granted", &MockDriver::new(), &arts(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("USB device grants"), "got: {err}");
+        assert!(
+            err.contains("vmlinux"),
+            "the error must name the kernel: {err}"
+        );
+
+        // And the mirror: no grants, but handed the USB kernel — which would
+        // give vhci-hcd to a sandbox nobody consented for.
+        create(&paths, "ungranted", &opts(&ws)).unwrap();
+        let err = start(&paths, "ungranted", &MockDriver::new(), &arts_usb(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no USB device grants"), "got: {err}");
     }
 
     #[test]
@@ -3160,6 +3264,7 @@ mod tests {
                 )),
                 run_dir: None,
                 user_fallback: None,
+                usb_kernel: false,
             },
         )
         .unwrap();
@@ -3189,6 +3294,7 @@ mod tests {
             )),
             run_dir: None,
             user_fallback: None,
+            usb_kernel: false,
         };
         save_json(&sdir.join(STATE_FILE), &confined).unwrap();
         restore_confined_workspace(&paths, "box"); // Ok(None) arm

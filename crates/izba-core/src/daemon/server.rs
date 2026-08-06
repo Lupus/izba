@@ -1898,6 +1898,7 @@ mod tests {
                 confinement: None,
                 run_dir: None,
                 user_fallback: Some(UserFallback::new("node")),
+                usb_kernel: false,
             },
         )
         .unwrap();

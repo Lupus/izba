@@ -23,8 +23,9 @@ pub enum KernelVariant {
 }
 
 impl KernelVariant {
-    /// Filename within an artifacts directory.
-    fn image(self) -> &'static str {
+    /// Filename within an artifacts directory. Crate-visible so a start-time
+    /// mismatch can name the kernel it actually located.
+    pub(crate) fn image(self) -> &'static str {
         match self {
             KernelVariant::Base => "vmlinux",
             KernelVariant::Usb => "vmlinux-usb",

@@ -122,6 +122,16 @@ pub struct RunState {
     /// `serde(default)`: absent in pre-#114 state.json → None.
     #[serde(default)]
     pub user_fallback: Option<UserFallback>,
+    /// Whether this run booted the USB kernel variant (`vmlinux-usb`).
+    ///
+    /// The grant record answers "may this sandbox have a device"; only this
+    /// answers "can the kernel it is running actually accept one". The two
+    /// diverge exactly when a grant is added to a running sandbox — the case a
+    /// UI has to warn about instead of offering an attach that cannot work.
+    /// `serde(default)`: a pre-USB `state.json` reads as `false`, which is both
+    /// true of it and the safe direction (never claims support it lacks).
+    #[serde(default)]
+    pub usb_kernel: bool,
 }
 
 /// Crash-safe write: serialise to a sibling `.tmp` file in the same directory,
@@ -223,7 +233,31 @@ mod tests {
             confinement: None,
             run_dir: None,
             user_fallback: None,
+            usb_kernel: false,
         }
+    }
+
+    #[test]
+    fn a_state_json_written_before_usb_reads_as_a_non_usb_kernel() {
+        // The safe direction: an old record must not claim USB support the run
+        // does not have, because that claim is what suppresses the "restart to
+        // use the device you granted" warning.
+        let legacy = r#"{"vmm_pid":{"pid":1,"starttime":2},"sidecar_pids":[],"started_unix_ms":0}"#;
+        let s: RunState = serde_json::from_str(legacy).unwrap();
+        assert!(!s.usb_kernel);
+    }
+
+    #[test]
+    fn the_booted_kernel_variant_survives_a_disk_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let state = RunState {
+            usb_kernel: true,
+            ..sample_run_state()
+        };
+        save_json(&path, &state).unwrap();
+        let loaded: RunState = load_json(&path).unwrap().unwrap();
+        assert!(loaded.usb_kernel);
     }
 
     #[test]
