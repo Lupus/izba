@@ -756,6 +756,11 @@ mod tests {
         let audit = AuditSink::new(paths.clone());
         let attachments = Attachments::new();
         let got = serve_attach(&mut server, sandbox, paths, &audit, dial, &attachments);
+        // Bound the read: the server end is still open here, so a handler that
+        // answered nothing would otherwise park this test forever rather than
+        // failing it — the contract under test is that the guest is ALWAYS
+        // answered, and "hangs" is not a way to satisfy it.
+        guest.set_io_timeout(Some(Duration::from_secs(5))).unwrap();
         let reply: Response = read_frame(&mut guest).expect("the guest is always answered");
         (got.map(|(a, _, _)| a), reply)
     }
