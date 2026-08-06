@@ -9,7 +9,7 @@ use std::io::{BufRead, IsTerminal, Write};
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
-use izba_core::daemon::proto::{DaemonRequest, DaemonResponse, UsbDeviceInfo};
+use izba_core::daemon::proto::{DaemonRequest, DaemonResponse, UsbDeviceInfo, UsbGrantInfo};
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
 use izba_core::usb::settings::DEFAULT_UPSTREAM_PORT;
@@ -274,6 +274,11 @@ pub(crate) fn render_devices(devices: &[UsbDeviceInfo]) -> String {
             granted,
             d.description
         ));
+        if let Some(holder) = &d.attached_to {
+            // A granted device and a device currently gone from your desk are
+            // different situations, and only this line distinguishes them.
+            out.push_str(&format!("  ↳ attached to '{holder}' right now\n"));
+        }
         if let Some(cmd) = &d.bind_command {
             out.push_str(&format!(
                 "  ↳ not shared yet — run this elevated on the USB host:  {cmd}\n"
@@ -333,6 +338,21 @@ fn allow(
         &mut |_| {},
     )?)?;
     println!("granted {device} to '{name}'");
+    // Whether this grant is usable right now is the daemon's answer, never a
+    // client-side guess: the kernel a sandbox is running is recorded per run,
+    // and only izbad reads that record. The grant is durable either way, so a
+    // failure to ask is silence, not an error.
+    if let Ok(DaemonResponse::UsbStatus {
+        restart_required: true,
+        ..
+    }) = client.request(
+        &DaemonRequest::UsbStatus {
+            name: name.to_string(),
+        },
+        &mut |_| {},
+    ) {
+        eprintln!("{}", restart_note(name));
+    }
     Ok(0)
 }
 
@@ -415,6 +435,54 @@ fn interpret_attach_reply(resp: DaemonResponse) -> Result<()> {
     }
 }
 
+/// The one-line fix for a grant the running kernel cannot honour.
+///
+/// The USB kernel is chosen at boot, so a device granted to an already-running
+/// sandbox has nothing to attach to until it restarts. Saying so beats letting
+/// the attach fail inside the guest, where the reason is invisible.
+pub(crate) fn restart_note(name: &str) -> String {
+    format!(
+        "⚠  '{name}' is running a kernel without USB support — \
+         run `izba restart {name}` before attaching."
+    )
+}
+
+/// Render `izba usb status` for one sandbox.
+pub(crate) fn render_status(
+    grants: &[UsbGrantInfo],
+    attached: &[String],
+    restart_required: bool,
+    name: &str,
+) -> String {
+    let mut out = String::new();
+    if grants.is_empty() {
+        out.push_str(&format!("'{name}' has no USB device grants\n"));
+    } else {
+        out.push_str(&format!(
+            "{:<12} {:<8} {:<10} DESCRIPTION\n",
+            "DEVICE", "BUSID", "STATE"
+        ));
+        for g in grants {
+            out.push_str(&format!(
+                "{:<12} {:<8} {:<10} {}\n",
+                g.device,
+                g.busid_pin.as_deref().unwrap_or("-"),
+                if attached.iter().any(|a| a == &g.device) {
+                    "attached"
+                } else {
+                    "-"
+                },
+                g.description
+            ));
+        }
+    }
+    if restart_required {
+        out.push_str(&restart_note(name));
+        out.push('\n');
+    }
+    out
+}
+
 fn status(paths: &Paths, name: &str) -> Result<i32> {
     let mut client = DaemonClient::connect(paths)?;
     match client.request(
@@ -423,20 +491,15 @@ fn status(paths: &Paths, name: &str) -> Result<i32> {
         },
         &mut |_| {},
     )? {
-        DaemonResponse::UsbStatus { grants } => {
-            if grants.is_empty() {
-                println!("'{name}' has no USB device grants");
-            } else {
-                println!("{:<12} {:<8} DESCRIPTION", "DEVICE", "BUSID");
-                for g in &grants {
-                    println!(
-                        "{:<12} {:<8} {}",
-                        g.device,
-                        g.busid_pin.as_deref().unwrap_or("-"),
-                        g.description
-                    );
-                }
-            }
+        DaemonResponse::UsbStatus {
+            grants,
+            attached,
+            restart_required,
+        } => {
+            print!(
+                "{}",
+                render_status(&grants, &attached, restart_required, name)
+            );
             Ok(0)
         }
         DaemonResponse::Error { message } => bail!(message),
@@ -636,8 +699,77 @@ mod tests {
             description: "USB Serial Converter".into(),
             shared,
             granted_to: granted.iter().map(|s| s.to_string()).collect(),
+            attached_to: None,
             bind_command: (!shared).then(|| format!("usbipd bind --busid {busid}")),
         }
+    }
+
+    fn grant(device: &str) -> UsbGrantInfo {
+        UsbGrantInfo {
+            device: device.into(),
+            busid_pin: None,
+            description: "USB Serial Converter".into(),
+            granted_at_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn status_marks_the_attached_grant_and_only_that_one() {
+        let out = render_status(
+            &[grant("0403:6001"), grant("10c4:ea60")],
+            &["10c4:ea60".to_string()],
+            false,
+            "web",
+        );
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains(':')).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("10c4:ea60") && l.contains("attached")),
+            "the held device must read as attached:\n{out}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("0403:6001") && !l.contains("attached")),
+            "the free device must not:\n{out}"
+        );
+    }
+
+    #[test]
+    fn status_warns_about_a_stale_kernel_and_carries_the_fix() {
+        let out = render_status(&[grant("0403:6001")], &[], true, "web");
+        assert!(
+            out.contains("izba restart web"),
+            "a warning without the command is a riddle:\n{out}"
+        );
+    }
+
+    #[test]
+    fn status_of_a_ready_sandbox_says_nothing_about_restarting() {
+        // Silence is the honest answer; a standing warning trains people to
+        // ignore it for the one time it matters.
+        let out = render_status(&[grant("0403:6001")], &[], false, "web");
+        assert!(!out.contains("restart"), "{out}");
+    }
+
+    #[test]
+    fn status_without_grants_says_so_by_name() {
+        let out = render_status(&[], &[], false, "web");
+        assert!(out.contains("'web' has no USB device grants"), "{out}");
+    }
+
+    #[test]
+    fn a_listing_names_the_sandbox_currently_holding_a_device() {
+        // "granted to web" and "web has it right now" are different facts, and
+        // only the second explains why the device vanished from the host.
+        let mut d = dev("3-2", "0403:6001", true, &["web"]);
+        d.attached_to = Some("web".into());
+        let out = render_devices(&[d]);
+        assert!(out.contains("attached to 'web'"), "{out}");
+
+        let free = dev("3-2", "0403:6001", true, &["web"]);
+        assert!(!render_devices(&[free]).contains("attached to"));
     }
 
     #[test]
