@@ -174,9 +174,25 @@ Key properties:
   write a rule opening the usbip port, izba honors it — and warns that the rule
   gives the agent every device that server exports rather than a chosen one.
 
-  *Status:* the control plane above ships today. Devices do not yet appear
-  inside the guest — the datapath (guest kernel, attach, `/dev/ttyACM0`) is the
-  next phase.
+  **The device lands at `/dev/izba/`.** `izba usb attach NAME --device 0403:6001`
+  makes it appear inside the sandbox — `/dev/izba/ttyACM0` for a CDC-ACM board,
+  `/dev/izba/ttyUSB0` for a CP210x/CH341/FTDI/PL2303 adapter. Point your tools
+  at that path (`esptool --port /dev/izba/ttyACM0 …`). Serial classes are the
+  whole of v1: the container may open those two device classes and no others,
+  and may never create a device node of its own.
+
+  **The first grant is a restart-class change**, because a sandbox with device
+  grants boots a different kernel — the only one with a USB stack. Sandboxes
+  without grants boot a kernel that physically cannot talk to a USB device, get
+  no `/dev/izba`, and have no USB socket for anything in the guest to dial.
+  Later grants are live, as is a revoke: it closes the plane immediately rather
+  than at the next restart. Attaches and refusals both show up in
+  `izba netlog NAME` under a `usb` tier, so the log answers for hardware the
+  same way it answers for network traffic.
+
+  Note the honest limit that follows from the wire format having no serial
+  number: if two identical devices are plugged in, izba refuses to guess between
+  them and asks you to pin one with `--busid`.
 - **OCI → erofs + overlay rootfs.** Images are pulled, flattened to a single
   erofs image (read-only), and combined with a sparse ext4 rw disk via
   overlayfs inside the guest. The erofs is content-addressed and shared across
@@ -261,6 +277,8 @@ izba usb     upstream set HOST[:PORT] [--allow-remote]   # point izba at a usbip
 izba usb     list                         # devices the upstream shares, plus ones it knows but has not shared
 izba usb     allow NAME --device VID:PID [--busid B] [--confirm VID:PID]  # grant one device to one sandbox
 izba usb     revoke NAME --device VID:PID # withdraw a grant
+izba usb     attach NAME --device VID:PID  # attach a granted device (appears at /dev/izba/ inside)
+izba usb     detach NAME --device VID:PID  # detach it again
 izba usb     status NAME                  # a sandbox's device grants
 izba diff    [NAME_OR_DIR] [--name NAME]  # show drift between izba.yml and managed truth
 izba promote [NAME_OR_DIR] [--name NAME] [--force] [--restart] [--reset-scratch=BOOL]
