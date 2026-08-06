@@ -119,6 +119,7 @@ impl ScriptedGuest {
                 confinement: None,
                 run_dir: Some(run.clone()),
                 user_fallback: None,
+                usb_kernel: false,
             },
         )
         .context("write state.json")?;

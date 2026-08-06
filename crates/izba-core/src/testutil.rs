@@ -89,6 +89,7 @@ pub(crate) fn write_state_with_run_dir(
             confinement: None,
             run_dir,
             user_fallback: None,
+            usb_kernel: false,
         },
     )
     .unwrap();
@@ -109,6 +110,7 @@ pub(crate) fn write_state_with_sidecars(
             confinement: None,
             run_dir: None,
             user_fallback: None,
+            usb_kernel: false,
         },
     )
     .unwrap();
