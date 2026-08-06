@@ -33,6 +33,9 @@ vi.mock("../components/ShellPanel", () => ({
 vi.mock("../components/ManifestTab", () => ({
   ManifestTab: ({ name }: { name: string }) => <div>manifest-for-{name}</div>,
 }));
+vi.mock("../components/UsbTab", () => ({
+  UsbTab: ({ name }: { name: string }) => <div>usb-for-{name}</div>,
+}));
 
 const noop = () => {};
 
@@ -133,6 +136,15 @@ describe("Detail tabs", () => {
     render(<Detail sandbox={sbx} onChanged={noop} />);
     fireEvent.click(screen.getByRole("tab", { name: /logs/i }));
     expect(screen.getByText("logs-for-web")).toBeInTheDocument();
+  });
+
+  it("has a USB tab that switches to the UsbTab", () => {
+    // Present even with USB unconfigured: the tab is where a user finds out the
+    // feature exists at all.
+    const sbx: SandboxView = { name: "web", image: "u", state: { kind: "running" } };
+    render(<Detail sandbox={sbx} onChanged={noop} />);
+    fireEvent.click(screen.getByRole("tab", { name: /^usb$/i }));
+    expect(screen.getByText("usb-for-web")).toBeInTheDocument();
   });
 
   it("has a Manifest tab that switches to the ManifestTab", () => {

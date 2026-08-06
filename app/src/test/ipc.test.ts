@@ -42,6 +42,27 @@ describe("ipc action wrappers", () => {
     expect(invoke).toHaveBeenCalledWith("create", { opts });
   });
 
+  it("usb wrappers use the camelCase arg names the bridge expects", async () => {
+    await api.usbUpstreamSet("127.0.0.1", 3240, true);
+    await api.usbAllow("web", "0403:6001", "3-2");
+    await api.usbAttach("web", "0403:6001");
+    await api.usbDetach("web", "0403:6001");
+    expect(invoke).toHaveBeenCalledWith("usb_upstream_set", {
+      host: "127.0.0.1",
+      port: 3240,
+      allowRemote: true,
+    });
+    // A pin dropped in transit silently widens the grant to every device with
+    // that vid:pid, so the exact key matters.
+    expect(invoke).toHaveBeenCalledWith("usb_allow", {
+      name: "web",
+      device: "0403:6001",
+      busidPin: "3-2",
+    });
+    expect(invoke).toHaveBeenCalledWith("usb_attach", { name: "web", device: "0403:6001" });
+    expect(invoke).toHaveBeenCalledWith("usb_detach", { name: "web", device: "0403:6001" });
+  });
+
   it("onCreateProgress subscribes to the event", async () => {
     await onCreateProgress(() => {});
     expect(listen).toHaveBeenCalledWith("create-progress", expect.any(Function));

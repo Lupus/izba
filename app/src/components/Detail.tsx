@@ -10,6 +10,7 @@ import { ShellPanel } from "./ShellPanel";
 import { PortsTab } from "./PortsTab";
 import { VolumesTab } from "./VolumesTab";
 import { ManifestTab } from "./ManifestTab";
+import { UsbTab } from "./UsbTab";
 import { WorkspacePath } from "./WorkspacePath";
 import { ContainerStatus } from "./ContainerStatus";
 import { Spinner } from "./Spinner";
@@ -22,7 +23,16 @@ interface Props {
 }
 
 type Pending = { kind: "stop" | "remove"; name: string } | null;
-type Tab = "overview" | "ports" | "volumes" | "logs" | "netlog" | "policy" | "manifest" | "shell";
+type Tab =
+  | "overview"
+  | "ports"
+  | "volumes"
+  | "usb"
+  | "logs"
+  | "netlog"
+  | "policy"
+  | "manifest"
+  | "shell";
 type Action = "start" | "stop" | "restart" | "remove";
 
 // Present-progressive label shown beside the spinner while an action runs.
@@ -81,6 +91,7 @@ export function Detail({ sandbox, onChanged }: Props) {
     { id: "overview", label: "Overview" },
     { id: "ports", label: "Ports" },
     { id: "volumes", label: "Volumes" },
+    { id: "usb", label: "USB" },
     { id: "logs", label: "Logs" },
     { id: "netlog", label: "Netlog" },
     { id: "policy", label: "Policy" },
@@ -171,6 +182,8 @@ export function Detail({ sandbox, onChanged }: Props) {
         {tab === "ports" && <PortsTab sandbox={sandbox} />}
 
         {tab === "volumes" && <VolumesTab sandbox={sandbox} onChanged={onChanged} />}
+
+        {tab === "usb" && <UsbTab name={name} running={running} onChanged={onChanged} />}
 
         {tab === "logs" && <LogsView name={name} />}
 

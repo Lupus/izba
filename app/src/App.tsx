@@ -6,8 +6,9 @@ import { Detail } from "./components/Detail";
 import { About } from "./components/About";
 import { NewSandbox } from "./components/NewSandbox";
 import { StorageView } from "./components/StorageView";
+import { UsbView } from "./components/UsbView";
 
-type View = "sandboxes" | "storage";
+type View = "sandboxes" | "storage" | "usb";
 
 export default function App() {
   const { sandboxes, daemon, phase, refresh } = usePolling(2000);
@@ -31,6 +32,8 @@ export default function App() {
         />
         {view === "storage" ? (
           <StorageView />
+        ) : view === "usb" ? (
+          <UsbView />
         ) : (
           <Detail sandbox={current} onChanged={refresh} />
         )}
