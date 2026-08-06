@@ -380,7 +380,7 @@ fn attach(paths: &Paths, name: &str, device: &str, attach: bool) -> Result<i32> 
             device: id.to_string(),
         }
     };
-    super::expect_ok(client.request(&req, &mut |_| {})?)?;
+    interpret_attach_reply(client.request(&req, &mut |_| {})?)?;
     if attach {
         println!("attached {id} to '{name}' — it appears at /dev/izba inside the sandbox");
         println!(
@@ -390,6 +390,29 @@ fn attach(paths: &Paths, name: &str, device: &str, attach: bool) -> Result<i32> 
         println!("detached {id} from '{name}'");
     }
     Ok(0)
+}
+
+/// Interpret the daemon's reply to an attach or detach.
+///
+/// These two verbs are forwarded to izba-init, so the daemon answers with the
+/// GUEST's reply wrapped in an envelope (`DaemonResponse::Guest`) rather than a
+/// bare `Ok` — which is why `expect_ok` is wrong here. Unwrapping matters twice
+/// over: without it a successful attach is reported as a failure, and the
+/// guest's own refusal (notably "this guest did not boot with USB support",
+/// whose fix is a restart) never reaches the person who needs to read it.
+fn interpret_attach_reply(resp: DaemonResponse) -> Result<()> {
+    use izba_core::daemon::proto::DaemonResponse as R;
+    match resp {
+        R::Guest {
+            payload: izba_proto::Response::Ok,
+        } => Ok(()),
+        R::Guest {
+            payload: izba_proto::Response::Error { message, .. },
+        } => bail!(message),
+        R::Guest { payload } => bail!("unexpected guest reply: {payload:?}"),
+        R::Error { message } => bail!(message),
+        other => bail!("unexpected daemon reply: {other:?}"),
+    }
 }
 
 fn status(paths: &Paths, name: &str) -> Result<i32> {
@@ -423,6 +446,57 @@ fn status(paths: &Paths, name: &str) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    use izba_core::daemon::proto::DaemonResponse;
+
+    #[test]
+    fn a_successful_attach_is_recognised_through_the_guest_envelope() {
+        // attach/detach are forwarded to izba-init, so the daemon answers with
+        // the GUEST's reply wrapped in an envelope. Treating that as an
+        // unexpected reply reported every successful attach as a failure.
+        assert!(interpret_attach_reply(DaemonResponse::Guest {
+            payload: izba_proto::Response::Ok,
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn a_guest_refusal_reaches_the_user_verbatim() {
+        // The guest's message is the actionable one — "this guest did not boot
+        // with USB support" tells the user to restart the sandbox, and nothing
+        // else in the chain knows that.
+        let err = interpret_attach_reply(DaemonResponse::Guest {
+            payload: izba_proto::Response::Error {
+                kind: izba_proto::ErrorKind::UsbUnavailable,
+                message: "this guest did not boot with USB support (izba.usb=1); \
+                          grant a device and restart the sandbox"
+                    .into(),
+            },
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("izba.usb=1"), "{err}");
+        assert!(err.contains("restart"), "{err}");
+    }
+
+    #[test]
+    fn a_daemon_side_refusal_is_reported_too() {
+        let err = interpret_attach_reply(DaemonResponse::Error {
+            message: "0403:6001 is not granted to 'web'".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not granted"), "{err}");
+    }
+
+    #[test]
+    fn a_reply_that_is_neither_is_an_error_not_a_silent_success() {
+        assert!(interpret_attach_reply(DaemonResponse::Ok).is_err());
+        assert!(interpret_attach_reply(DaemonResponse::Guest {
+            payload: izba_proto::Response::ExecStarted { exec_id: 1 },
+        })
+        .is_err());
+    }
+
     use super::*;
 
     #[test]
