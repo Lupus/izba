@@ -646,8 +646,7 @@ fn write_oci_bundle(
     image_config: Option<&oci_client::config::Config>,
     user_db: &crate::image::runtime_config::UserDb,
     ca_present: bool,
-    workspace: &Path,
-    privileged: bool,
+    config: &SandboxConfig,
 ) -> anyhow::Result<Option<crate::state::UserFallback>> {
     // Gate the CA trust-env defaults on the bundle actually being present —
     // same gate the guest applies in `build_env_overlay` (trust_bundle_present).
@@ -672,7 +671,7 @@ fn write_oci_bundle(
     // no uid translation, so the guest sees the share's real host owner; the
     // container user namespace transposes it to the workload USER so the image
     // USER owns `/workspace`. See `compute_userns_mappings`.
-    let host_owner = workspace_owner(workspace);
+    let host_owner = workspace_owner(&config.workspace);
     let params = SpecParams {
         mode: ContainerMode::Interactive {
             pause_argv: &pause_argv,
@@ -690,7 +689,8 @@ fn write_oci_bundle(
         // Builder VMs run the in-guest container privileged (full caps, no
         // userns) so rootful buildkit's overlayfs mounts work; the VM is the
         // boundary. Normal sandboxes stay least-privilege.
-        privileged,
+        privileged: config.builder,
+        usb: config.usb.is_enabled(),
     };
     let spec =
         crate::image::runtime_config::generate_spec(&params).context("generating OCI spec")?;
@@ -838,8 +838,7 @@ pub fn start_with_timeouts(
         image_config,
         &user_db,
         trust_dir.join("ca.pem").exists(),
-        &config.workspace,
-        config.builder,
+        &config,
     )
     .with_context(|| format!("writing oci/config.json for sandbox '{name}'"))?;
 
