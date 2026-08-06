@@ -222,6 +222,103 @@ impl From<VolumeSpec> for VolumeSpecView {
     }
 }
 
+/// The configured usbip upstream as the UI sees it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsbUpstreamView {
+    pub host: String,
+    pub port: u16,
+    pub resolved: Option<String>,
+    /// Stable kebab-case trust token, e.g. `own-host-loopback`.
+    pub trust: String,
+    /// The note for that trust class; `None` for the recommended (loopback)
+    /// configuration, where silence is the honest answer.
+    pub warning: Option<String>,
+}
+
+impl From<izba_core::daemon::proto::UsbUpstreamInfo> for UsbUpstreamView {
+    fn from(u: izba_core::daemon::proto::UsbUpstreamInfo) -> Self {
+        UsbUpstreamView {
+            host: u.host,
+            port: u.port,
+            resolved: u.resolved,
+            trust: u.trust,
+            warning: u.warning,
+        }
+    }
+}
+
+/// One row of the upstream device inventory.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsbDeviceView {
+    pub busid: String,
+    pub device: String,
+    pub description: String,
+    pub shared: bool,
+    pub granted_to: Vec<String>,
+    pub attached_to: Option<String>,
+    /// For an unshared device: the exact command a human must run elevated.
+    /// izba never runs it.
+    pub bind_command: Option<String>,
+}
+
+impl From<izba_core::daemon::proto::UsbDeviceInfo> for UsbDeviceView {
+    fn from(d: izba_core::daemon::proto::UsbDeviceInfo) -> Self {
+        UsbDeviceView {
+            busid: d.busid,
+            device: d.device,
+            description: d.description,
+            shared: d.shared,
+            granted_to: d.granted_to,
+            attached_to: d.attached_to,
+            bind_command: d.bind_command,
+        }
+    }
+}
+
+/// One standing grant, with its live attachment state folded in.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsbGrantView {
+    pub device: String,
+    pub busid_pin: Option<String>,
+    pub description: String,
+    pub granted_at_unix_ms: u64,
+    pub attached: bool,
+}
+
+/// A sandbox's USB state as one object.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsbStatusView {
+    pub grants: Vec<UsbGrantView>,
+    /// The sandbox holds a grant its running kernel cannot honour.
+    pub restart_required: bool,
+}
+
+impl UsbStatusView {
+    /// Fold the wire's parallel `attached` list into the grants it describes.
+    ///
+    /// Done once, here, rather than in every consumer: a UI that joins two
+    /// arrays by string is a UI that will eventually join them wrong.
+    pub fn new(
+        grants: Vec<izba_core::daemon::proto::UsbGrantInfo>,
+        attached: Vec<String>,
+        restart_required: bool,
+    ) -> Self {
+        UsbStatusView {
+            grants: grants
+                .into_iter()
+                .map(|g| UsbGrantView {
+                    attached: attached.contains(&g.device),
+                    device: g.device,
+                    busid_pin: g.busid_pin,
+                    description: g.description,
+                    granted_at_unix_ms: g.granted_at_unix_ms,
+                })
+                .collect(),
+            restart_required,
+        }
+    }
+}
+
 /// A persistent volume record as the UI sees it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct VolumeInfoView {
