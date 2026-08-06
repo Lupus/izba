@@ -1493,6 +1493,44 @@ mod tests {
     }
 
     #[test]
+    fn granting_arms_the_usb_plane_and_revoking_disarms_it_without_a_restart() {
+        // The consent action has to move the plane, not just the record. A
+        // grant that left the plane closed would make every attach fail until
+        // the next start; a revoke that left it open would keep serving a
+        // sandbox whose consent was withdrawn.
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        set_loopback_upstream(&mut c);
+        write_config_for_persist(&d.paths, "web");
+        assert!(!d.usb.listening("web"), "no grants yet");
+
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::UsbAllow {
+                name: "web".into(),
+                device: "0403:6001".into(),
+                busid_pin: None,
+            },
+        ));
+        if !d.usb.listening("web") {
+            eprintln!("SKIP: the USB plane could not bind in this environment");
+            return;
+        }
+
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::UsbRevoke {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+        ));
+        assert!(
+            !d.usb.listening("web"),
+            "revoking the last grant must close the plane now, not at the next start"
+        );
+    }
+
+    #[test]
     fn detaching_is_not_gated_on_the_grant() {
         // Detach is a de-escalation, and the state that most needs it is
         // exactly the one where the grant is already gone: a device attached

@@ -212,6 +212,23 @@ impl UsbBroker {
         let _ = std::fs::remove_file(listener_path(run_dir));
     }
 
+    /// Test hook: a slot whose accept thread has already finished, standing in
+    /// for one that crashed. Mirrors `EgressManager::insert_for_test`.
+    #[cfg(test)]
+    fn insert_finished_slot(&self, name: &str) {
+        let thread = std::thread::spawn(|| {});
+        while !thread.is_finished() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.inner.lock().unwrap().insert(
+            name.to_string(),
+            BrokerSlot {
+                stop: Arc::new(AtomicBool::new(false)),
+                thread,
+            },
+        );
+    }
+
     pub fn listening(&self, name: &str) -> bool {
         self.inner
             .lock()
@@ -1035,6 +1052,117 @@ mod tests {
         b.refresh(&paths, "web", &run).unwrap();
         assert!(!b.listening("web"));
         assert!(!listener_path(&run).exists());
+    }
+
+    #[test]
+    fn the_bound_listener_actually_serves_a_connection() {
+        // Everything else about the plane is tested through `serve_attach`
+        // directly. This is the only check that the accept loop runs at all,
+        // reaches the handler, and keeps going — i.e. that a guest dialing the
+        // socket gets an answer rather than silence.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = seed(tmp.path(), "web", true, true);
+        let run = tmp.path().join("run");
+        let b = UsbBroker::new(AuditSink::new(paths.clone()));
+        match b.refresh(&paths, "web", &run) {
+            Ok(()) => {}
+            Err(e) if bind_denied(&e) => {
+                eprintln!("SKIP: bind denied in this environment: {e:#}");
+                return;
+            }
+            Err(e) => panic!("refresh: {e:#}"),
+        }
+
+        // Twice, so a loop that served exactly one connection and stopped is
+        // caught too.
+        for attempt in 0..2 {
+            let mut c = UdsStream::connect(listener_path(&run))
+                .unwrap_or_else(|e| panic!("attempt {attempt}: connect: {e}"));
+            write_frame(&mut c, &StreamOpen::Dns).unwrap();
+            match read_frame::<_, Response>(&mut c) {
+                Ok(Response::Error { kind, .. }) => assert_eq!(kind, ErrorKind::BadRequest),
+                other => panic!("attempt {attempt}: expected a refusal, got {other:?}"),
+            }
+        }
+        b.stop("web", &run);
+    }
+
+    #[test]
+    fn a_stale_socket_file_is_replaced_rather_than_failing_the_bind() {
+        // A previous daemon's socket file (or any leftover) sits exactly where
+        // this bind needs to go. Leaving it would make every start after an
+        // unclean shutdown fail to arm the plane.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = seed(tmp.path(), "web", true, true);
+        let run = tmp.path().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(listener_path(&run), b"left behind").unwrap();
+
+        let b = UsbBroker::new(AuditSink::new(paths.clone()));
+        match b.refresh(&paths, "web", &run) {
+            Ok(()) => assert!(b.listening("web"), "the stale file must not block the bind"),
+            Err(e) if bind_denied(&e) => eprintln!("SKIP: bind denied: {e:#}"),
+            Err(e) => panic!("refresh: {e:#}"),
+        }
+        b.stop("web", &run);
+    }
+
+    #[test]
+    fn the_inflight_guard_returns_its_slot() {
+        // The cap is only a cap if slots come back. A guard that forgot to
+        // release would let eight connections wedge the plane permanently.
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            n.fetch_add(1, Ordering::SeqCst);
+            let _g = InflightGuard(Arc::clone(&n));
+            assert_eq!(n.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(n.load(Ordering::SeqCst), 0, "the slot must be released");
+    }
+
+    #[test]
+    fn the_handshake_cap_admits_up_to_the_limit_and_then_refuses() {
+        // Mirrors the accept loop's claim: `fetch_add` returns the count BEFORE
+        // the increment, so the comparison must admit exactly
+        // MAX_INFLIGHT_HANDSHAKES connections — one off in either direction
+        // either wedges the plane early or removes the bound entirely.
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut guards = Vec::new();
+        for i in 0..MAX_INFLIGHT_HANDSHAKES {
+            let admitted = n.fetch_add(1, Ordering::SeqCst) < MAX_INFLIGHT_HANDSHAKES;
+            assert!(admitted, "connection {i} must be admitted");
+            guards.push(InflightGuard(Arc::clone(&n)));
+        }
+        assert!(
+            n.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT_HANDSHAKES,
+            "the one past the cap must be refused"
+        );
+        n.fetch_sub(1, Ordering::SeqCst);
+        // And once they finish, the plane is usable again.
+        guards.clear();
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+        assert!(n.fetch_add(1, Ordering::SeqCst) < MAX_INFLIGHT_HANDSHAKES);
+    }
+
+    #[test]
+    fn a_slot_whose_accept_thread_died_is_rebound() {
+        // The supervisor calls `refresh` on every tick precisely so a crashed
+        // accept loop comes back. Treating a dead slot as live would leave the
+        // sandbox with a socket file nothing is listening on — every guest
+        // attach then fails with no explanation on the host side.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = seed(tmp.path(), "web", true, true);
+        let run = tmp.path().join("run");
+        let b = UsbBroker::new(AuditSink::new(paths.clone()));
+        b.insert_finished_slot("web");
+        assert!(!b.listening("web"), "the stand-in slot is already finished");
+
+        match b.refresh(&paths, "web", &run) {
+            Ok(()) => assert!(b.listening("web"), "a dead slot must be rebound"),
+            Err(e) if bind_denied(&e) => eprintln!("SKIP: bind denied: {e:#}"),
+            Err(e) => panic!("refresh: {e:#}"),
+        }
+        b.stop("web", &run);
     }
 
     #[test]

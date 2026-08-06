@@ -516,6 +516,15 @@ hs  0000 006 003 00030002 000005 3-2
     }
 
     #[test]
+    fn only_the_three_fields_this_parser_uses_are_required() {
+        // The parser reads hub, port and state and ignores the rest, so a line
+        // carrying exactly those must still yield a port. Requiring more would
+        // make it brittle against a kernel that changes the trailing columns —
+        // which it has done before (the sockfd column is a recent addition).
+        assert_eq!(parse_free_port("hs  0001 004\n", 3), Some(1));
+    }
+
+    #[test]
     fn a_header_only_or_garbled_status_yields_no_port() {
         for s in [
             "",
@@ -882,6 +891,56 @@ hs  0000 006 003 00030002 000005 3-2
             .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
             .is_err());
         assert_eq!(vhci.closed_fds().len(), 1, "{:?}", vhci.calls());
+    }
+
+    #[test]
+    fn a_node_that_takes_a_moment_to_enumerate_is_still_picked_up() {
+        // Enumeration is several control transfers over the vsock link, so the
+        // node is not there on the first look. The deadline must leave room for
+        // that — a budget that had already expired, or a check with the wrong
+        // sense, would fail an attach that was merely still in progress.
+        let vhci = LateVhci {
+            polls: Mutex::new(0),
+            appears_on_poll: 3,
+            present: Mutex::new(BTreeSet::new()),
+        };
+        let usb = UsbState::new(true);
+        usb.attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .expect("a slow enumeration is not a failure");
+    }
+
+    /// A vhci whose device node only shows up after a few polls of `/dev`.
+    struct LateVhci {
+        polls: Mutex<u32>,
+        appears_on_poll: u32,
+        present: Mutex<BTreeSet<String>>,
+    }
+
+    impl Vhci for LateVhci {
+        fn free_port(&self, _speed: u32) -> Result<u32, InitError> {
+            Ok(1)
+        }
+        fn attach(&self, _p: u32, _fd: RawFd, _d: u32, _s: u32) -> Result<(), InitError> {
+            Ok(())
+        }
+        fn detach(&self, _port: u32) -> Result<(), InitError> {
+            Ok(())
+        }
+        fn close_fd(&self, fd: RawFd) {
+            unsafe { libc::close(fd) };
+        }
+        fn devices(&self) -> BTreeSet<String> {
+            let mut n = self.polls.lock().unwrap();
+            *n += 1;
+            if *n >= self.appears_on_poll {
+                self.present.lock().unwrap().insert("ttyACM0".into());
+            }
+            self.present.lock().unwrap().clone()
+        }
+        fn expose(&self, name: &str) -> Result<PathBuf, InitError> {
+            Ok(PathBuf::from(SHARED_DEV_DIR).join(name))
+        }
+        fn unexpose(&self, _node: &Path) {}
     }
 
     #[test]
