@@ -105,6 +105,7 @@ fn format_summary_row(s: &izba_core::daemon::egress::audit::EndpointSummary) -> 
     let tier = match s.tier {
         izba_core::daemon::egress::audit::Tier::L7 => "l7",
         izba_core::daemon::egress::audit::Tier::L3 => "l3",
+        izba_core::daemon::egress::audit::Tier::Usb => "usb",
     };
     let target = s.host.clone().unwrap_or_else(|| s.dest_ip.to_string());
     let req = match git_op_label(s.last_method.as_deref(), s.last_path.as_deref()) {

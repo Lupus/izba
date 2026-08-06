@@ -22,6 +22,12 @@ pub enum Tier {
     L7,
     /// Tier-2: non-HTTP TCP, decided on the DNS-snoop FQDN (or raw IP).
     L3,
+    /// A USB attach decision on the vsock-1028 plane. Not a network flow: the
+    /// `dest_ip`/`port` are the usbip upstream izbad dialed on the guest's
+    /// behalf, `host` is the granted device id, and `path` is the busid it
+    /// resolved to. It shares the log because it answers the same question —
+    /// what did this sandbox reach, and did izba let it.
+    Usb,
 }
 
 /// One audit line. Field order is the on-disk JSON order. `ts_ms` is 0 until
@@ -237,6 +243,7 @@ pub fn format_record(rec: &AuditRecord) -> String {
     let tier = match rec.tier {
         Tier::L7 => "l7",
         Tier::L3 => "l3",
+        Tier::Usb => "usb",
     };
     let target = rec.host.clone().unwrap_or_else(|| rec.dest_ip.to_string());
     let req = match git_op_label(rec.method.as_deref(), rec.path.as_deref()) {
@@ -450,6 +457,29 @@ mod tests {
         let parsed = parse_line(&rec.to_json()).expect("valid line parses");
         assert_eq!(parsed, rec);
         assert!(parse_line("{not json").is_none(), "junk line is skipped");
+    }
+
+    #[test]
+    fn a_usb_attach_is_auditable_alongside_network_flows() {
+        // A device attach answers the same question `izba netlog` exists for —
+        // what did this sandbox reach, and did izba let it — so it must be
+        // visible there rather than only in the daemon's stderr.
+        assert_eq!(serde_json::to_string(&Tier::Usb).unwrap(), "\"usb\"");
+        let rec = AuditRecord::allow(
+            "web",
+            "127.0.0.1".parse().unwrap(),
+            3240,
+            Some("0403:6001"),
+            Tier::Usb,
+            "usb grant",
+        )
+        .with_request("attach", "3-2");
+        let line = format_record(&rec);
+        assert!(line.contains(" usb "), "the tier is legible: {line}");
+        assert!(line.contains("0403:6001"), "name the device: {line}");
+        assert!(line.contains("3-2"), "and the busid it resolved to: {line}");
+        // Round-trips through the on-disk form the netlog reader parses.
+        assert_eq!(parse_line(&rec.to_json()).unwrap().tier, Tier::Usb);
     }
 
     #[test]

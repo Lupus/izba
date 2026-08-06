@@ -99,6 +99,7 @@ pub fn tick(
     registry: &Registry,
     relays: &RelayManager,
     egress: &EgressManager,
+    usb: &crate::usb::broker::UsbBroker,
     connector: Connector,
     starting: &StartsInFlight,
 ) {
@@ -131,6 +132,7 @@ pub fn tick(
                 relays.stop_all(&info.name);
                 let run_dir = sandbox::live_run_dir(paths, &info.name);
                 egress.stop(&info.name, &run_dir);
+                usb.stop(&info.name, &run_dir);
             });
         } else {
             relays.respawn_dead(paths, &info.name);
@@ -140,6 +142,10 @@ pub fn tick(
             // dir recorded in state.json, never blindly in the new-scheme dir.
             let run_dir = sandbox::live_run_dir(paths, &info.name);
             let _ = egress.ensure_listening(paths, &info.name, &run_dir);
+            // Same idempotent respawn for the USB plane, and the same
+            // grant-driven decision: a sandbox whose last grant was revoked
+            // while the tick was elsewhere gets its listener closed here.
+            let _ = usb.refresh(paths, &info.name, &run_dir);
         }
     }
     registry.replace_all(snap, infos);
@@ -222,7 +228,10 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let conn = fake_connector(log, None);
         let starting = StartsInFlight::new();
-        tick(&paths, &registry, &relays, &egress, &conn, &starting);
+        let usb = crate::usb::broker::UsbBroker::new(crate::daemon::egress::audit::AuditSink::new(
+            paths.clone(),
+        ));
+        tick(&paths, &registry, &relays, &egress, &usb, &conn, &starting);
 
         assert_eq!(registry.liveness("up"), Some(Liveness::Running));
         assert_eq!(registry.liveness("down"), Some(Liveness::Stopped));
@@ -296,7 +305,10 @@ mod tests {
         let _g = starting.begin("boot").expect("first begin succeeds");
         let log = Arc::new(Mutex::new(Vec::new()));
         let conn = fake_connector(log, None);
-        tick(&paths, &registry, &relays, &egress, &conn, &starting);
+        let usb = crate::usb::broker::UsbBroker::new(crate::daemon::egress::audit::AuditSink::new(
+            paths.clone(),
+        ));
+        tick(&paths, &registry, &relays, &egress, &usb, &conn, &starting);
 
         assert!(
             egress.listening("boot"),
@@ -323,7 +335,10 @@ mod tests {
         let starting = StartsInFlight::new(); // nothing marked in flight
         let log = Arc::new(Mutex::new(Vec::new()));
         let conn = fake_connector(log, None);
-        tick(&paths, &registry, &relays, &egress, &conn, &starting);
+        let usb = crate::usb::broker::UsbBroker::new(crate::daemon::egress::audit::AuditSink::new(
+            paths.clone(),
+        ));
+        tick(&paths, &registry, &relays, &egress, &usb, &conn, &starting);
 
         assert!(
             !egress.listening("boot"),

@@ -119,6 +119,9 @@ pub struct Daemon {
     pub registry: Registry,
     pub relays: RelayManager,
     pub egress: EgressManager,
+    /// The guest-facing USB plane. Bound per sandbox only while that sandbox
+    /// holds a grant, so a sandbox without USB has no 1028 socket at all.
+    pub usb: crate::usb::broker::UsbBroker,
     /// Sandboxes with a `Start` in flight — see [`StartsInFlight`]. Consulted
     /// by the supervisor tick so it doesn't clobber a booting sandbox's
     /// egress listener/relays while the disk still honestly says Stopped.
@@ -138,6 +141,7 @@ impl Daemon {
         // downgrading — logged in `build_mitm_runtime`.
         let audit = crate::daemon::egress::audit::AuditSink::new(paths.clone());
         let mitm = build_mitm_runtime(&paths, audit.clone());
+        let usb = crate::usb::broker::UsbBroker::new(audit.clone());
         let egress = EgressManager::new(Arc::clone(&deps.egress_resolver), mitm, audit);
         Self {
             paths,
@@ -145,6 +149,7 @@ impl Daemon {
             registry: Registry::new(),
             relays: RelayManager::new(),
             egress,
+            usb,
             starting: StartsInFlight::new(),
             started: Instant::now(),
             active_conns: AtomicUsize::new(0),
@@ -504,6 +509,9 @@ fn handle_start(
     crate::paths::ensure_socket_budget(&d.paths, &name)?;
     d.egress
         .ensure_listening(&d.paths, &name, &d.paths.run_dir(&name))?;
+    // Same dir, same moment: a granted sandbox must have its USB plane up
+    // before the guest boots and dials it.
+    d.usb.refresh(&d.paths, &name, &d.paths.run_dir(&name))?;
     if let Err(e) = sandbox::start(
         &d.paths,
         &name,
@@ -528,6 +536,7 @@ fn handle_start(
         // make it resolve to the legacy dir and miss the listener just
         // bound in `paths.run_dir`.
         d.egress.stop(&name, &d.paths.run_dir(&name));
+        d.usb.stop(&name, &d.paths.run_dir(&name));
         return Err(e);
     }
     // (Re-)apply the persisted publish rules afresh, as threads.
@@ -561,6 +570,7 @@ fn handle_stop(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> 
     sandbox::stop(&d.paths, &name, d.connector(), STOP_TIMEOUT)?;
     d.relays.stop_all(&name);
     d.egress.stop(&name, &run_dir);
+    d.usb.stop(&name, &run_dir);
     let _ = std::fs::remove_file(relays::rules_path(&d.paths, &name));
     d.registry.set_liveness(&name, Liveness::Stopped);
     regen_ssh_config(d);
@@ -573,6 +583,7 @@ fn handle_rm(d: &Arc<Daemon>, name: String, force: bool) -> anyhow::Result<Daemo
     sandbox::remove(&d.paths, &name, d.connector(), force)?;
     d.relays.stop_all(&name);
     d.egress.stop(&name, &run_dir);
+    d.usb.stop(&name, &run_dir);
     d.registry.remove(&name);
     regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
@@ -870,6 +881,7 @@ fn handle_usb_allow(
     // its NEXT egress connection, not at its next restart.
     d.egress
         .apply_usb_guard(&name, crate::usb::guard_for(&d.paths, &name));
+    refresh_usb_plane(d, &name);
     Ok(DaemonResponse::Ok)
 }
 
@@ -886,6 +898,7 @@ fn handle_usb_revoke(
     // access straight away rather than leaving a stale denial behind.
     d.egress
         .apply_usb_guard(&name, crate::usb::guard_for(&d.paths, &name));
+    refresh_usb_plane(d, &name);
     Ok(DaemonResponse::Ok)
 }
 
@@ -908,6 +921,21 @@ fn handle_usb_status(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResp
             })
             .collect(),
     })
+}
+
+/// Bring `name`'s USB plane in line with the grants just written.
+///
+/// The first grant opens it and the last revoke closes it, both without a
+/// restart — the same "takes effect on the next attempt, not the next boot"
+/// contract as the egress guard beside it. Best-effort: the grant is already
+/// durable on disk, and the next start or supervisor tick rebinds from it, so a
+/// bind failure here must not fail the consent action the user actually asked
+/// for.
+fn refresh_usb_plane(d: &Arc<Daemon>, name: &str) {
+    let run_dir = crate::sandbox::live_run_dir(&d.paths, name);
+    if let Err(e) = d.usb.refresh(&d.paths, name, &run_dir) {
+        eprintln!("izbad: USB listener for '{name}': {e:#}");
+    }
 }
 
 /// Attach or detach one already-granted device on a running sandbox.
@@ -1024,6 +1052,9 @@ pub fn adopt(d: &Arc<Daemon>) {
             if let Err(e) = d.egress.ensure_listening(&d.paths, &info.name, &run_dir) {
                 eprintln!("izbad: egress listener for '{}': {e:#}", info.name);
             }
+            if let Err(e) = d.usb.refresh(&d.paths, &info.name, &run_dir) {
+                eprintln!("izbad: USB listener for '{}': {e:#}", info.name);
+            }
         }
     }
     d.registry.replace_all(snap, infos);
@@ -1106,6 +1137,7 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
                 &d.registry,
                 &d.relays,
                 &d.egress,
+                &d.usb,
                 d.connector(),
                 &d.starting,
             );
