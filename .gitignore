@@ -1,5 +1,9 @@
 /target
 /target-*
+# Out-of-workspace crates carry their own build dirs (each has its own
+# [workspace], so cargo never puts their output under the root /target).
+/hack/fake-usbipd/target
+/crates/*/fuzz/target
 /.toolchain
 /.cargo-env
 /dist

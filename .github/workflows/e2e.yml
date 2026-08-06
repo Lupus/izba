@@ -310,6 +310,19 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           IZBA_INTEGRATION=1 cargo test -p izba-cli --test daemon_e2e -- --test-threads=1 --nocapture
+      - name: Install libusb (fake usbip server only)
+        # Needed by the `usbip` crate's rusb/nusb dependency. It lives in the
+        # excluded hack/fake-usbipd crate and never enters izba's own tree, so
+        # this apt package is confined to this job.
+        run: sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev
+      - name: Build the fake usbip server (excluded crate)
+        run: cargo build --locked --release --manifest-path hack/fake-usbipd/Cargo.toml
+      - name: USB passthrough e2e (real vhci over vsock)
+        env:
+          IZBA_FAKE_USBIPD: ${{ github.workspace }}/hack/fake-usbipd/target/release/fake-usbipd
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          IZBA_INTEGRATION=1 cargo test -p izba-cli --test usb_attach_e2e -- --test-threads=1 --nocapture
       - name: tty Tier-1 scripted (no VM)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
