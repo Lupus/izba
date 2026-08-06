@@ -1,0 +1,17 @@
+[package]
+name = "fake-usbipd"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+# EXCLUDED from the izba workspace on purpose (its own [workspace] table below).
+# `usbip` pulls in rusb/nusb, which link libusb — a C library izba's shipped
+# tree must not acquire, and which `cargo clippy --all-targets` and the
+# windows-gnu cross-check would both try to build if this crate were a member.
+# Only the KVM e2e job builds it.
+[workspace]
+
+[dependencies]
+usbip = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
