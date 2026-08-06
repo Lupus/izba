@@ -754,6 +754,54 @@ fn expect_ok(resp: DaemonResponse) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// A successful attach arrives wrapped in the guest envelope, and reading
+    /// it with `expect_ok` (the obvious-looking choice) reports success as
+    /// failure — the phase-3 bug this function exists to prevent.
+    #[test]
+    fn a_successful_attach_is_recognised_through_the_guest_envelope() {
+        interpret_attach_reply(DaemonResponse::Guest {
+            payload: Response::UsbAttached { devid: 7, speed: 2 },
+        })
+        .expect("usb_attached is a success");
+        // A detach comes back as a bare guest Ok, and the daemon can also
+        // answer Ok itself.
+        interpret_attach_reply(DaemonResponse::Guest {
+            payload: Response::Ok,
+        })
+        .expect("guest ok is a success");
+        interpret_attach_reply(DaemonResponse::Ok).expect("daemon ok is a success");
+    }
+
+    /// The guest's reason is the only actionable half of a failed attach, so it
+    /// must cross verbatim rather than being flattened to "attach failed".
+    #[test]
+    fn a_guest_refusal_reaches_the_caller_with_its_reason() {
+        let err = interpret_attach_reply(DaemonResponse::Guest {
+            payload: Response::Error {
+                kind: izba_proto::ErrorKind::UsbUnavailable,
+                message: "no free vhci port".into(),
+            },
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no free vhci port"), "{err}");
+    }
+
+    #[test]
+    fn a_daemon_side_refusal_is_reported_too() {
+        let err = interpret_attach_reply(DaemonResponse::Error {
+            message: "0403:6001 is not granted to 'web'".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not granted"), "{err}");
+    }
+
+    #[test]
+    fn an_unrelated_reply_is_an_error_not_a_silent_success() {
+        assert!(interpret_attach_reply(DaemonResponse::UsbDevices { devices: vec![] }).is_err());
+    }
+
     /// `policy_show` must reflect the `enforce:` value written to disk, not
     /// hard-code `true` whenever a `policy.yaml` is present.
     #[test]
