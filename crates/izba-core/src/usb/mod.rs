@@ -119,9 +119,20 @@ pub fn dialable_upstream(s: &UsbSettings) -> anyhow::Result<std::net::SocketAddr
     Ok(std::net::SocketAddr::new(ip, up.port))
 }
 
+/// Whether a sandbox should have a USB plane bound at all.
+///
+/// Both halves are required, and each says something different: a grant is the
+/// human's consent, and a configured upstream is the only place a device could
+/// come from. Without the grant there is nothing to authorize; without the
+/// upstream the plane could only ever answer "nowhere to import from" — so
+/// binding it would add a guest-reachable surface that cannot succeed.
+pub fn plane_wanted(paths: &Paths, name: &str) -> bool {
+    grants_of(paths, name).is_enabled() && is_configured(&settings::load(&paths.usb_dir()))
+}
+
 /// Read one sandbox's grants off disk, treating anything unreadable as "no
 /// grants" — the direction that never invents consent.
-fn grants_of(paths: &Paths, name: &str) -> UsbConfig {
+pub fn grants_of(paths: &Paths, name: &str) -> UsbConfig {
     crate::state::load_json::<crate::state::SandboxConfig>(
         &paths.sandbox_dir(name).join(crate::state::CONFIG_FILE),
     )
