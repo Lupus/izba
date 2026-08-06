@@ -35,14 +35,60 @@ pub fn listener_path(run_dir: &Path) -> PathBuf {
     run_dir.join(format!("vsock.sock_{USB_PORT}"))
 }
 
-/// How long a guest may take over the whole attach handshake — the one frame
-/// it sends and everything izbad does before replying. A guest that dials and
-/// then says nothing must not hold a thread or a device claim open.
+/// How long a guest may take over the whole attach handshake — the one frame it
+/// sends and everything izbad does before replying.
+///
+/// Enforced as a TOTAL budget, not a per-read one. A socket timeout bounds each
+/// individual `read(2)`, which a guest defeats trivially by sending one byte
+/// just under the limit forever; [`Deadlined`] is what makes the deadline real.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many attach handshakes may be in flight per sandbox.
+///
+/// Attach is a human-driven action — one at a time in practice — so this sits
+/// far above any legitimate use and exists only to bound a guest that opens
+/// connections in a loop. Past it, connections are dropped at accept rather
+/// than queued: izbad's threads and descriptors are shared with every other
+/// sandbox, which makes an unbounded accept loop here a cross-sandbox denial of
+/// service rather than merely a local one.
+const MAX_INFLIGHT_HANDSHAKES: usize = 8;
+
+/// Wraps a reader so no read is attempted past `deadline`.
+///
+/// The per-socket timeout still bounds each individual read; this bounds their
+/// SUM, which is what turns "a guest cannot hold a thread open" from a claim
+/// into a fact. Once the budget is spent every further read fails immediately,
+/// so a drip-feeding guest is cut off instead of serviced indefinitely.
+struct Deadlined<R> {
+    inner: R,
+    deadline: std::time::Instant,
+}
+
+impl<R: Read> Read for Deadlined<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the USB attach handshake took too long",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
 
 struct BrokerSlot {
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+}
+
+/// Counts handshakes in flight and releases its slot however the connection
+/// ends, including a panic in the handler.
+struct InflightGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// All USB listeners, keyed by sandbox name. The daemon owns one instance for
@@ -106,6 +152,7 @@ impl UsbBroker {
             .context("USB listener nonblocking")?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let paths2 = paths.clone();
         let audit = self.audit.clone();
         let sandbox = name.to_string();
@@ -116,10 +163,25 @@ impl UsbBroker {
                         if conn.set_nonblocking(false).is_err() {
                             continue;
                         }
+                        // Claim a slot BEFORE spawning: a guest that dials in a
+                        // loop must be refused at accept, not after it has
+                        // already cost a thread.
+                        if inflight.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT_HANDSHAKES {
+                            inflight.fetch_sub(1, Ordering::SeqCst);
+                            eprintln!(
+                                "izbad: too many USB handshakes in flight for '{sandbox}'; \
+                                 dropping a connection"
+                            );
+                            continue;
+                        }
+                        let guard = InflightGuard(Arc::clone(&inflight));
                         let paths = paths2.clone();
                         let audit = audit.clone();
                         let sandbox = sandbox.clone();
-                        std::thread::spawn(move || handle_conn(conn, &sandbox, &paths, &audit));
+                        std::thread::spawn(move || {
+                            let _guard = guard;
+                            handle_conn(conn, &sandbox, &paths, &audit)
+                        });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(100));
@@ -166,8 +228,8 @@ impl UsbBroker {
 // real dialer, and the splice, none of which exist without a bound listener.
 #[mutants::skip]
 fn handle_conn(mut conn: UdsStream, sandbox: &str, paths: &Paths, audit: &AuditSink) {
-    // A guest that dials and then says nothing must not hold a thread — or a
-    // claim on somebody's hardware — open.
+    // Two layers, and both are needed: the socket timeout bounds each read, and
+    // `Deadlined` (inside `serve_attach`) bounds their sum.
     let _ = conn.set_io_timeout(Some(HANDSHAKE_TIMEOUT));
     let Some((_attached, upstream)) = serve_attach(&mut conn, sandbox, paths, audit, dial) else {
         return;
@@ -197,7 +259,16 @@ where
     U: Read + Write,
     D: Fn(SocketAddr) -> Result<U>,
 {
-    let open: StreamOpen = read_frame(conn).ok()?;
+    // The frame is read through a total deadline: a guest that dials and then
+    // drip-feeds one byte at a time would otherwise satisfy every per-read
+    // timeout and hold this thread indefinitely.
+    let open: StreamOpen = {
+        let mut bounded = Deadlined {
+            inner: &mut *conn,
+            deadline: std::time::Instant::now() + HANDSHAKE_TIMEOUT,
+        };
+        read_frame(&mut bounded).ok()?
+    };
     let StreamOpen::UsbAttach { device } = open else {
         // This plane exists for exactly one purpose. Anything else arriving on
         // it is a guest probing what it was handed, not a mistake to guess at.
@@ -223,17 +294,55 @@ where
             .ok()?;
             Some((attached, upstream))
         }
-        Err(e) => {
-            // izbad's reason is the useful one and the guest is going to show it
-            // to a human; pass it through rather than reducing it to a code.
+        Err(refusal) => {
+            // Only the guest-safe half crosses the boundary. The full chain is
+            // already in the audit log and the daemon's stderr, both host-only.
             let _ = write_frame(
                 conn,
                 &Response::Error {
                     kind: ErrorKind::BadRequest,
-                    message: format!("{e:#}"),
+                    message: refusal.guest,
                 },
             );
             None
+        }
+    }
+}
+
+/// A refused attach, split into the half the guest may be told and the half the
+/// host keeps.
+///
+/// The split exists because of D1: the guest must never learn the upstream's
+/// address. Host-side errors routinely name it — `connecting to the usbip
+/// upstream at 10.0.0.5:3240` — and izba-init passes izbad's message straight
+/// through to the user, so returning the raw chain would hand the guest the
+/// upstream topology every time a dial failed. The full chain still reaches the
+/// audit log and the daemon's stderr, which are host-only.
+struct Refusal {
+    /// Safe to send across the boundary: device-level facts the guest already
+    /// knows, or a reason with no topology in it.
+    guest: String,
+    /// The real error, for the audit log.
+    host: String,
+}
+
+impl Refusal {
+    /// A reason that is inherently free of host topology — it is about the
+    /// device the guest just named, or the sandbox's own grants.
+    fn device_level(e: impl std::fmt::Display) -> Self {
+        let text = e.to_string();
+        Self {
+            guest: text.clone(),
+            host: text,
+        }
+    }
+
+    /// A reason that touches the upstream. The guest gets the shape of the
+    /// failure and nothing else.
+    fn upstream(guest: &str, host: impl std::fmt::Display) -> Self {
+        Self {
+            guest: guest.to_string(),
+            host: host.to_string(),
         }
     }
 }
@@ -246,7 +355,7 @@ fn attach<U, D>(
     device: &str,
     audit: &AuditSink,
     dial: D,
-) -> Result<(session::Attached, U)>
+) -> std::result::Result<(session::Attached, U), Refusal>
 where
     U: Read + Write,
     D: Fn(SocketAddr) -> Result<U>,
@@ -254,33 +363,43 @@ where
     let settings = crate::usb::settings::load(&paths.usb_dir());
     // Re-classified here, not merely read: a hostname accepted as private when
     // it was configured can resolve somewhere else by the time a guest asks.
-    let addr = crate::usb::dialable_upstream(&settings)?;
-    let id: crate::usb::DeviceId = device.parse()?;
+    // Its refusal names the host, so the guest gets the generic form.
+    let addr = crate::usb::dialable_upstream(&settings)
+        .map_err(|e| Refusal::upstream("usb passthrough is not available for this sandbox", e))?;
+    let id: crate::usb::DeviceId = device.parse().map_err(Refusal::device_level)?;
 
     // The grant is re-read from disk on every attach rather than cached: a
     // revoke must take effect on the next attempt, not at the next restart.
     let grants = crate::usb::grants_of(paths, sandbox);
     let Some(grant) = crate::usb::grants::find(&grants, id).cloned() else {
-        let e = format!("{id} is not granted to '{sandbox}'");
-        deny(audit, sandbox, addr, &id.to_string(), &e);
-        anyhow::bail!(e);
+        let r = Refusal::device_level(format!("{id} is not granted to '{sandbox}'"));
+        deny(audit, sandbox, addr, &id.to_string(), &r.host);
+        return Err(r);
     };
 
-    let outcome = (|| -> Result<(session::Attached, U)> {
+    let outcome = (|| -> std::result::Result<(session::Attached, U), Refusal> {
         // One operation per TCP connection, so this is two dials: the devlist
         // connection is dropped, and the import connection becomes the URB
-        // stream.
-        let mut lister = dial(addr)?;
+        // stream. Every dial and I/O failure names the address, so all of them
+        // are reported to the guest generically.
+        let unreachable = |e| Refusal::upstream("the usbip upstream is not reachable", e);
+        let mut lister = dial(addr).map_err(|e| unreachable(format!("{e:#}")))?;
         lister
             .write_all(&izba_proto::usbip::encode_op_req_devlist())
-            .context("sending OP_REQ_DEVLIST")?;
+            .map_err(|e| unreachable(format!("sending OP_REQ_DEVLIST: {e}")))?;
         lister.flush().ok();
-        let devices = crate::usb::inventory::read_devlist_reply(&mut lister)?;
+        let devices = crate::usb::inventory::read_devlist_reply(&mut lister)
+            .map_err(|e| unreachable(format!("{e:#}")))?;
         drop(lister);
 
-        let chosen = session::resolve(&devices, &grant)?;
-        let mut up = dial(addr)?;
-        let attached = session::import(&mut up, &chosen, &grant)?;
+        // From here the reasons are about the DEVICE — which one the grant
+        // names, and whether the upstream returned it — so they carry no
+        // topology and go through verbatim. They are also the actionable ones.
+        let chosen = session::resolve(&devices, &grant)
+            .map_err(|e| Refusal::device_level(format!("{e:#}")))?;
+        let mut up = dial(addr).map_err(|e| unreachable(format!("{e:#}")))?;
+        let attached = session::import(&mut up, &chosen, &grant)
+            .map_err(|e| Refusal::device_level(format!("{e:#}")))?;
         Ok((attached, up))
     })();
 
@@ -299,9 +418,9 @@ where
             );
             Ok((attached, up))
         }
-        Err(e) => {
-            deny(audit, sandbox, addr, &id.to_string(), &format!("{e:#}"));
-            Err(e)
+        Err(r) => {
+            deny(audit, sandbox, addr, &id.to_string(), &r.host);
+            Err(r)
         }
     }
 }
@@ -729,6 +848,71 @@ mod tests {
     }
 
     #[test]
+    fn no_refusal_ever_tells_the_guest_where_the_upstream_is() {
+        // D1: the guest names a device and learns nothing else. Host-side errors
+        // routinely embed the address ("connecting to the usbip upstream at
+        // 127.0.0.1:3240"), and izba-init passes izbad's message straight
+        // through to the user — so a raw error chain would hand the guest the
+        // upstream's topology on every failed dial.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let leaky = |addr: SocketAddr| -> Result<FakeUpstream> {
+            anyhow::bail!("connecting to the usbip upstream at {addr}: connection refused")
+        };
+        let (_, reply) = exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
+            leaky,
+        );
+        let Response::Error { message, .. } = reply else {
+            panic!("expected a refusal");
+        };
+        for secret in ["127.0.0.1", "3240"] {
+            assert!(
+                !message.contains(secret),
+                "the guest must not learn {secret}: {message}"
+            );
+        }
+        assert!(
+            message.contains("not reachable"),
+            "but it must still learn the SHAPE of the failure: {message}"
+        );
+
+        // The host still gets the whole thing, in the audit log.
+        let log =
+            std::fs::read_to_string(paths.logs_dir("web").join("egress-audit.jsonl")).unwrap();
+        assert!(
+            log.contains("connection refused"),
+            "the real reason must survive host-side: {log}"
+        );
+    }
+
+    #[test]
+    fn a_device_level_refusal_still_reaches_the_guest_verbatim() {
+        // The redaction must not flatten everything into "something failed":
+        // which device is missing, and how to share it, are exactly what the
+        // person reading the guest's error needs, and they name no host.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let (_, reply) = exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
+            dialer(vec![devlist(&[])]),
+        );
+        let Response::Error { message, .. } = reply else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("0403:6001"), "{message}");
+        assert!(message.contains("usbipd bind"), "{message}");
+    }
+
+    #[test]
     fn an_unreachable_upstream_is_reported_rather_than_looking_like_a_missing_grant() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = granted_paths(&tmp);
@@ -742,7 +926,7 @@ mod tests {
         );
         match reply {
             Response::Error { message, .. } => {
-                assert!(message.contains("refused the connection"), "{message}")
+                assert!(message.contains("not reachable"), "{message}")
             }
             other => panic!("expected a dial failure, got {other:?}"),
         }
@@ -763,8 +947,10 @@ mod tests {
             |_: SocketAddr| -> Result<FakeUpstream> { panic!("must not dial") },
         );
         match reply {
+            // Generic on purpose: the underlying refusal can name the host
+            // (a public upstream is refused by name), and that must not cross.
             Response::Error { message, .. } => {
-                assert!(message.contains("not configured"), "{message}")
+                assert!(message.contains("not available"), "{message}")
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
