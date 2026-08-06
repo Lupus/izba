@@ -336,6 +336,25 @@ Adding the **first** grant to a running sandbox is a restart-class change (the
 kernel artifact changes); subsequent grants are live. This is surfaced honestly,
 mirroring the manifest's existing Live/Restart/Image field classes.
 
+**Delivery note (phase 4).** Both surfaces shipped: the CLI verbs above, plus the
+app's **Devices** view (upstream + inventory + `usbipd bind` copy affordance) and
+per-sandbox **USB** tab (grant / revoke / attach / detach behind the same
+typed-back consent gate). Making the restart-class rule *sayable* needed two
+facts no client could compute:
+
+- `state.json` records the kernel variant a run booted (`usb_kernel`), which is
+  the only way to distinguish "this sandbox may have a device" from "the kernel
+  it is running can accept one". `UsbStatus.restart_required` is derived from it.
+- The broker registers each live splice, so `UsbDeviceInfo.attached_to` and
+  `UsbStatus.attached` report what is attached **from the host's own
+  observation** — never by asking the guest, which is the party assumed hostile.
+
+Both are additive fields carrying `#[serde(default)]` on existing wire shapes, so
+`DAEMON_PROTO_VERSION` stayed at 4. The GUI gates every USB call on
+`UsbUpstreamShow` — the only one answerable with the feature off — so an
+unconfigured install renders a setup panel rather than the refusal the others
+would return.
+
 ## 7. Error handling (fail-closed, never silent)
 
 Any parse error, cap breach, timeout, unknown label, identity mismatch after
