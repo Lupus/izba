@@ -527,7 +527,7 @@ mod tests {
         U: Read + Write,
         D: Fn(SocketAddr) -> Result<U>,
     {
-        let (mut guest, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut guest, mut server) = UdsStream::pair().unwrap();
         write_frame(&mut guest, open).unwrap();
         let audit = AuditSink::new(paths.clone());
         let got = serve_attach(&mut server, sandbox, paths, &audit, dial);
@@ -770,7 +770,7 @@ mod tests {
         // is dialed, and the server simply drops it.
         let tmp = tempfile::tempdir().unwrap();
         let paths = granted_paths(&tmp);
-        let (guest, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (guest, mut server) = UdsStream::pair().unwrap();
         drop(guest);
         let audit = AuditSink::new(paths.clone());
         let got = serve_attach(
