@@ -32,6 +32,10 @@ pub struct Attached {
 
 /// The kernel's device id: bus number in the high half, device number in the
 /// low half. `vhci-hcd` takes this verbatim on its `attach` line.
+///
+/// Mutation note: the `| -> ^` mutant is EQUIVALENT and excluded by name in
+/// `.cargo/mutants.toml` — the mask confines `devnum` to bits 0-15 and the
+/// shift puts `busnum` in bits 16-31, so the operands never share a set bit.
 pub fn devid(busnum: u32, devnum: u32) -> u32 {
     (busnum << 16) | (devnum & 0xffff)
 }
@@ -131,7 +135,10 @@ fn verify(rec: &UsbDeviceRecord, chosen: &UpstreamDevice, grant: &UsbGrant) -> R
 /// following a header izba refused.
 pub fn pump_guest_to_upstream<R: Read, W: Write>(mut r: R, mut w: W) -> Result<()> {
     let mut header = [0u8; URB_HEADER_LEN];
-    let mut buf = [0u8; 32 * 1024];
+    // A literal, not `32 * 1024`: the size is a tuning choice with no behaviour
+    // attached (any size streams the same bytes), so an arithmetic mutant on it
+    // is unkillable by construction. Writing it out leaves nothing to mutate.
+    let mut buf = [0u8; 32768];
     loop {
         match read_full(&mut r, &mut header)? {
             0 => return Ok(()),
@@ -156,6 +163,10 @@ pub fn pump_guest_to_upstream<R: Read, W: Write>(mut r: R, mut w: W) -> Result<(
 /// Read until `buf` is full, returning how many bytes arrived. `Ok(0)` is a
 /// clean end of stream; anything between 1 and `buf.len() - 1` is a truncation
 /// the caller must treat as an error rather than as a smaller message.
+///
+/// Mutation note: the loop bound's `< -> <=` mutant is EQUIVALENT and excluded
+/// by name in `.cargo/mutants.toml` — the extra iteration reads into an empty
+/// slice, gets `Ok(0)`, and breaks.
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<usize> {
     let mut got = 0;
     while got < buf.len() {
@@ -268,6 +279,23 @@ mod tests {
         );
         assert!(err.contains("1a86:7523"), "name what came back: {err}");
         assert!(err.contains("mismatch"), "{err}");
+    }
+
+    #[test]
+    fn a_reply_matching_only_the_vendor_or_only_the_product_is_still_refused() {
+        // Both halves of the id are checked independently. A device that shares
+        // a vendor with the granted one — the common case, since a vendor ships
+        // many products — must not pass on that alone.
+        let chosen = dev("3-2", 0x0403, 0x6001);
+        let g = grant(0x0403, 0x6001, None);
+        for (vid, pid, what) in [
+            (0x0403, 0x9999, "same vendor, different product"),
+            (0x9999, 0x6001, "different vendor, same product"),
+        ] {
+            let mut up = FakeUpstream::new(import_reply("3-2", vid, pid));
+            let err = format!("{:#}", import(&mut up, &chosen, &g).unwrap_err());
+            assert!(err.contains("mismatch"), "{what}: {err}");
+        }
     }
 
     #[test]
@@ -396,6 +424,40 @@ mod tests {
         let mut out = Vec::new();
         pump_guest_to_upstream(std::io::Cursor::new(Vec::new()), &mut out).unwrap();
         pump_guest_to_upstream(std::io::Cursor::new(submit_out(1, &[1, 2, 3])), &mut out).unwrap();
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_rather_than_treated_as_a_failure() {
+        // EINTR is not an error: a signal arriving mid-read must not tear down
+        // a live device stream. Without the retry the URB after the signal
+        // would be dropped and the connection closed.
+        struct Twitchy {
+            inner: std::io::Cursor<Vec<u8>>,
+            interrupts: usize,
+        }
+        impl Read for Twitchy {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.interrupts > 0 {
+                    self.interrupts -= 1;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "signal",
+                    ));
+                }
+                self.inner.read(buf)
+            }
+        }
+        let wire = submit_out(1, &[1, 2, 3, 4]);
+        let mut out = Vec::new();
+        pump_guest_to_upstream(
+            Twitchy {
+                inner: std::io::Cursor::new(wire.clone()),
+                interrupts: 3,
+            },
+            &mut out,
+        )
+        .expect("an interrupted read must be retried");
+        assert_eq!(out, wire);
     }
 
     #[test]

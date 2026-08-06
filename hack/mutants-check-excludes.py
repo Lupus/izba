@@ -113,6 +113,30 @@ EXPECTED = {
             ): 1,
         },
     },
+    # session.rs devid: `| -> ^` is equivalent — the mask and the shift put the
+    # two operands in disjoint bit ranges, so they can never both set a bit.
+    r"replace \| with \^ in devid": {
+        "reason": "devid packs busnum<<16 with devnum&0xffff — disjoint bit "
+        "ranges, so `|` and `^` are identical for every input.",
+        "matches": {
+            (
+                "crates/izba-core/src/usb/broker/session.rs",
+                "replace | with ^ in devid",
+            ): 1,
+        },
+    },
+    # session.rs read_full: `< -> <=` is equivalent — the extra iteration reads
+    # an empty slice, gets Ok(0), and breaks.
+    r"session\.rs:\d+:\d+: replace < with <= in read_full": {
+        "reason": "read_full's loop bound: `<=` adds one iteration that reads "
+        "into an empty slice, returns Ok(0) and breaks — same result.",
+        "matches": {
+            (
+                "crates/izba-core/src/usb/broker/session.rs",
+                "replace < with <= in read_full",
+            ): 1,
+        },
+    },
     # run.rs reconcile_existing `if !ignored.is_empty()`: `delete !` only flips
     # whether a stderr warning prints (no return/state change) — unobservable by a
     # unit test. Named exclusion keeps the policy-persist mutants under test.

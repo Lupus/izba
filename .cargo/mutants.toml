@@ -65,6 +65,15 @@ exclude_re = [
     # `O_DIRECTORY` adds is ENOTDIR; any other Internal errno also fails the
     # plain retry, so it propagates identically with or without the guard.
     "tarfs\\.rs:\\d+:\\d+: replace match guard msg.contains\\(\"ENOTDIR\"\\) with true in classify",
+    # session.rs devid `(busnum << 16) | (devnum & 0xffff)`: the `| -> ^` mutant is
+    # EQUIVALENT. The mask confines devnum to bits 0-15 and the shift puts busnum
+    # in bits 16-31, so the two operands never share a set bit and `|` and `^`
+    # always agree — the same shape as the dns.rs entries above.
+    "replace \\| with \\^ in devid",
+    # session.rs read_full `while got < buf.len()`: `< -> <=` is EQUIVALENT. One
+    # extra iteration reads into `buf[buf.len()..]`, an empty slice, which yields
+    # `Ok(0)` and breaks immediately — same bytes read, same value returned.
+    "session\\.rs:\\d+:\\d+: replace < with <= in read_full",
     # run.rs reconcile_existing `if !ignored.is_empty()`: the `delete !` mutant only
     # flips whether a stderr "ignored opts" warning prints (no return/state change),
     # so no unit test can observe it. Named exclusion keeps the function's
