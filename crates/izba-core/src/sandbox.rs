@@ -224,7 +224,12 @@ fn build_vm_disks(
 /// Kernel cmdline for a launch. `izba.volumes` carries the ordered guest
 /// mountpoints (vdc, vdd, …) only when volumes are present. `izba.buildout=1`
 /// is appended for builder VMs so the guest mounts the `izba-buildout` share.
-fn build_cmdline(name: &str, volumes: &[crate::volume::VolumeSpec], builder: bool) -> String {
+fn build_cmdline(
+    name: &str,
+    volumes: &[crate::volume::VolumeSpec],
+    builder: bool,
+    usb: bool,
+) -> String {
     let mut c = format!("console=ttyS0 izba.hostname={name}");
     if !volumes.is_empty() {
         c.push_str(&format!(
@@ -234,6 +239,13 @@ fn build_cmdline(name: &str, volumes: &[crate::volume::VolumeSpec], builder: boo
     }
     if builder {
         c.push_str(" izba.buildout=1");
+    }
+    // Host-authoritative USB support. The cmdline is written by izbad and read
+    // by init before anything in the guest runs, so this is the one channel a
+    // hostile guest cannot forge for itself — and it is why init's refusal for
+    // a sandbox without grants is structural rather than a policy check.
+    if usb {
+        c.push_str(" izba.usb=1");
     }
     c
 }
@@ -848,7 +860,7 @@ pub fn start_with_timeouts(
     // no cmdline flag gates it).
     // izba.volumes (when present) carries the ordered guest mountpoints.
     // izba.buildout=1 (when present) signals the guest to mount the buildout share.
-    let cmdline = build_cmdline(name, &config.volumes, config.builder);
+    let cmdline = build_cmdline(name, &config.volumes, config.builder, config.usb.is_enabled());
     // Resolve per-sandbox account credentials when the sandbox is locked down
     // (Windows MVP-D).  On non-Windows and for unlocked sandboxes this is None
     // and the normal confined/unconfined path is used.
@@ -2030,8 +2042,8 @@ mod tests {
             size_bytes: 1 << 20,
             eph_id: None,
         }];
-        assert!(build_cmdline("web", &vols, false).contains("izba.volumes=/a"));
-        assert!(!build_cmdline("web", &[], false).contains("izba.volumes"));
+        assert!(build_cmdline("web", &vols, false, false).contains("izba.volumes=/a"));
+        assert!(!build_cmdline("web", &[], false, false).contains("izba.volumes"));
     }
 
     fn opts(workspace: &Path) -> CreateOpts {
@@ -3580,10 +3592,18 @@ mod tests {
         );
     }
 
+    /// The USB flag is host-authoritative and rides the cmdline, so a sandbox
+    /// without grants boots a guest that refuses every USB RPC structurally.
+    #[test]
+    fn the_cmdline_declares_usb_only_for_a_sandbox_that_has_grants() {
+        assert!(build_cmdline("web", &[], false, true).contains("izba.usb=1"));
+        assert!(!build_cmdline("web", &[], false, false).contains("izba.usb"));
+    }
+
     /// build_cmdline with builder=true must contain `izba.buildout=1`.
     #[test]
     fn build_cmdline_builder_flag_appended() {
-        let c = build_cmdline("mybox", &[], true);
+        let c = build_cmdline("mybox", &[], true, false);
         assert!(
             c.contains("izba.buildout=1"),
             "builder cmdline must contain izba.buildout=1, got: {c}"
@@ -3593,7 +3613,7 @@ mod tests {
     /// build_cmdline with builder=false must NOT contain `izba.buildout`.
     #[test]
     fn build_cmdline_no_builder_flag_absent() {
-        let c = build_cmdline("mybox", &[], false);
+        let c = build_cmdline("mybox", &[], false, false);
         assert!(
             !c.contains("izba.buildout"),
             "non-builder cmdline must not contain izba.buildout, got: {c}"
