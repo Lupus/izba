@@ -335,6 +335,90 @@ async fn manifest_promote(name: String, restart: bool) -> Result<views::PromoteV
         .map_err(|e| format!("task join error: {e}"))?
 }
 
+#[tauri::command]
+async fn usb_upstream_show(
+    state: State<'_, AppState>,
+) -> Result<Option<views::UsbUpstreamView>, String> {
+    run_action(&state, commands::usb_upstream_show_core).await
+}
+
+#[tauri::command]
+async fn usb_upstream_set(
+    state: State<'_, AppState>,
+    host: String,
+    port: u16,
+    allow_remote: bool,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::usb_upstream_set_core(d, &host, port, allow_remote)
+    })
+    .await
+}
+
+/// Dials the configured upstream, so it can be slow or fail — never on the
+/// shared polling lock, and never on a timer.
+#[tauri::command]
+async fn usb_list_devices(state: State<'_, AppState>) -> Result<Vec<views::UsbDeviceView>, String> {
+    run_action(&state, commands::usb_list_devices_core).await
+}
+
+#[tauri::command]
+async fn usb_status(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<views::UsbStatusView, String> {
+    run_action(&state, move |d| commands::usb_status_core(d, &name)).await
+}
+
+#[tauri::command]
+async fn usb_allow(
+    state: State<'_, AppState>,
+    name: String,
+    device: String,
+    busid_pin: Option<String>,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::usb_allow_core(d, &name, &device, busid_pin)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn usb_revoke(
+    state: State<'_, AppState>,
+    name: String,
+    device: String,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::usb_revoke_core(d, &name, &device)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn usb_attach(
+    state: State<'_, AppState>,
+    name: String,
+    device: String,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::usb_attach_core(d, &name, &device)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn usb_detach(
+    state: State<'_, AppState>,
+    name: String,
+    device: String,
+) -> Result<(), String> {
+    run_action(&state, move |d| {
+        commands::usb_detach_core(d, &name, &device)
+    })
+    .await
+}
+
 #[derive(Clone, serde::Serialize)]
 struct ShellOutput {
     id: String,
@@ -638,6 +722,50 @@ pub fn dispatch(
                 restart,
             )?)
         }
+        // Same camelCase rule as the port/volume arms above: the frontend sends
+        // `allowRemote` and `busidPin`, not the Rust-side snake_case names.
+        "usb_upstream_show" => to_json(commands::usb_upstream_show_core(d)?),
+        "usb_upstream_set" => {
+            let allow_remote = args
+                .get("allowRemote")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            to_json(commands::usb_upstream_set_core(
+                d,
+                &arg_str(&args, "host")?,
+                arg_u16(&args, "port")?,
+                allow_remote,
+            )?)
+        }
+        "usb_list_devices" => to_json(commands::usb_list_devices_core(d)?),
+        "usb_status" => to_json(commands::usb_status_core(d, &arg_str(&args, "name")?)?),
+        "usb_allow" => {
+            let busid_pin = args
+                .get("busidPin")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            to_json(commands::usb_allow_core(
+                d,
+                &arg_str(&args, "name")?,
+                &arg_str(&args, "device")?,
+                busid_pin,
+            )?)
+        }
+        "usb_revoke" => to_json(commands::usb_revoke_core(
+            d,
+            &arg_str(&args, "name")?,
+            &arg_str(&args, "device")?,
+        )?),
+        "usb_attach" => to_json(commands::usb_attach_core(
+            d,
+            &arg_str(&args, "name")?,
+            &arg_str(&args, "device")?,
+        )?),
+        "usb_detach" => to_json(commands::usb_detach_core(
+            d,
+            &arg_str(&args, "name")?,
+            &arg_str(&args, "device")?,
+        )?),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -692,7 +820,15 @@ pub fn run() {
             shell_close,
             manifest_diff,
             manifest_export,
-            manifest_promote
+            manifest_promote,
+            usb_upstream_show,
+            usb_upstream_set,
+            usb_list_devices,
+            usb_status,
+            usb_allow,
+            usb_revoke,
+            usb_attach,
+            usb_detach
         ])
         .run(tauri::generate_context!())
         .expect("error while running izba app");
@@ -731,6 +867,65 @@ mod dispatch_tests {
         let out = dispatch(&st, "volume_list", serde_json::json!({}), &mut emit).unwrap();
         assert!(out.is_array());
         assert_eq!(out.as_array().unwrap().len(), 1);
+    }
+
+    /// The bridge speaks the frontend's arg names, not Rust's. A dropped
+    /// `busidPin` would silently widen a grant from one physical port to every
+    /// device with that `vid:pid`.
+    #[test]
+    fn dispatch_usb_allow_reads_the_camelcase_pin_the_frontend_sends() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        dispatch(
+            &st,
+            "usb_allow",
+            serde_json::json!({"name": "web", "device": "0403:6001", "busidPin": "3-2"}),
+            &mut emit,
+        )
+        .unwrap();
+        let shown = dispatch(
+            &st,
+            "usb_status",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(shown["grants"][0]["device"], "0403:6001");
+        assert_eq!(shown["grants"][0]["busid_pin"], "3-2");
+    }
+
+    #[test]
+    fn dispatch_usb_upstream_show_answers_with_the_feature_off() {
+        // "off" must be a value the UI can render, not an error it must parse.
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(&st, "usb_upstream_show", serde_json::json!({}), &mut emit).unwrap();
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn dispatch_usb_status_folds_attachment_into_the_grants() {
+        let st = state_with(FakeDaemon {
+            usb_grants: vec![izba_core::daemon::proto::UsbGrantInfo {
+                device: "0403:6001".into(),
+                busid_pin: None,
+                description: "FT232".into(),
+                granted_at_unix_ms: 1,
+            }],
+            usb_attached: vec!["0403:6001".into()],
+            usb_restart_required: true,
+            ..FakeDaemon::default()
+        });
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(
+            &st,
+            "usb_status",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(out["grants"][0]["attached"], serde_json::json!(true));
+        assert_eq!(out["restart_required"], serde_json::json!(true));
     }
 
     #[test]

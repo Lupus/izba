@@ -1,6 +1,8 @@
 use crate::views::{DaemonStatusView, SandboxView};
 use izba_core::build_info::BuildInfoOwned;
-use izba_core::daemon::proto::{DaemonCreate, DaemonRequest, DaemonResponse};
+use izba_core::daemon::proto::{
+    DaemonCreate, DaemonRequest, DaemonResponse, UsbDeviceInfo, UsbGrantInfo, UsbUpstreamInfo,
+};
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
 use izba_core::vmm::UdsStream;
@@ -118,6 +120,33 @@ pub trait DaemonApi: Send {
     ) -> anyhow::Result<()>;
     /// Detach the volume at `guest_path` from sandbox `name`.
     fn volume_detach(&mut self, name: &str, guest_path: String) -> anyhow::Result<()>;
+    /// The configured usbip upstream, or `None` when USB passthrough is off.
+    ///
+    /// The ONLY USB call answerable with the feature off — every other one
+    /// refuses. A caller asks this first and stops here when it returns `None`.
+    fn usb_upstream_show(&mut self) -> anyhow::Result<Option<UsbUpstreamInfo>>;
+    /// Point izba at a usbip server. `allow_remote` opts into a globally
+    /// routable address, which is otherwise refused outright.
+    fn usb_upstream_set(&mut self, host: &str, port: u16, allow_remote: bool)
+        -> anyhow::Result<()>;
+    /// Enumerate what the upstream exports, annotated with grants and holders.
+    fn usb_list_devices(&mut self) -> anyhow::Result<Vec<UsbDeviceInfo>>;
+    /// Grant one `vid:pid` to one sandbox.
+    fn usb_allow(
+        &mut self,
+        name: &str,
+        device: &str,
+        busid_pin: Option<String>,
+    ) -> anyhow::Result<()>;
+    /// Withdraw a grant, pulling the device out of the sandbox if it is live.
+    fn usb_revoke(&mut self, name: &str, device: &str) -> anyhow::Result<()>;
+    /// One sandbox's grants, what it is holding, and whether its running kernel
+    /// can honour the grants at all.
+    fn usb_status(&mut self, name: &str) -> anyhow::Result<(Vec<UsbGrantInfo>, Vec<String>, bool)>;
+    /// Attach an already-granted device to a running sandbox.
+    fn usb_attach(&mut self, name: &str, device: &str) -> anyhow::Result<()>;
+    /// Detach a device the sandbox currently holds.
+    fn usb_detach(&mut self, name: &str, device: &str) -> anyhow::Result<()>;
 }
 
 /// Production `DaemonApi`: a lazily-connected `DaemonClient`. Connects via
@@ -535,6 +564,124 @@ impl DaemonApi for RealDaemon {
                 &mut |_| {},
             )?)
         })
+    }
+
+    fn usb_upstream_show(&mut self) -> anyhow::Result<Option<UsbUpstreamInfo>> {
+        self.with_client(
+            |c| match c.request(&DaemonRequest::UsbUpstreamShow, &mut |_| {})? {
+                DaemonResponse::UsbUpstream { upstream } => Ok(upstream),
+                DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected UsbUpstreamShow reply: {other:?}"),
+            },
+        )
+    }
+
+    fn usb_upstream_set(
+        &mut self,
+        host: &str,
+        port: u16,
+        allow_remote: bool,
+    ) -> anyhow::Result<()> {
+        let host = host.to_string();
+        self.with_client(|c| {
+            expect_ok(c.request(
+                &DaemonRequest::UsbUpstreamSet {
+                    host,
+                    port,
+                    allow_remote,
+                },
+                &mut |_| {},
+            )?)
+        })
+    }
+
+    fn usb_list_devices(&mut self) -> anyhow::Result<Vec<UsbDeviceInfo>> {
+        self.with_client(
+            |c| match c.request(&DaemonRequest::UsbListDevices, &mut |_| {})? {
+                DaemonResponse::UsbDevices { devices } => Ok(devices),
+                DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected UsbListDevices reply: {other:?}"),
+            },
+        )
+    }
+
+    fn usb_allow(
+        &mut self,
+        name: &str,
+        device: &str,
+        busid_pin: Option<String>,
+    ) -> anyhow::Result<()> {
+        let (name, device) = (name.to_string(), device.to_string());
+        self.with_client(|c| {
+            expect_ok(c.request(
+                &DaemonRequest::UsbAllow {
+                    name,
+                    device,
+                    busid_pin,
+                },
+                &mut |_| {},
+            )?)
+        })
+    }
+
+    fn usb_revoke(&mut self, name: &str, device: &str) -> anyhow::Result<()> {
+        let (name, device) = (name.to_string(), device.to_string());
+        self.with_client(|c| {
+            expect_ok(c.request(&DaemonRequest::UsbRevoke { name, device }, &mut |_| {})?)
+        })
+    }
+
+    fn usb_status(&mut self, name: &str) -> anyhow::Result<(Vec<UsbGrantInfo>, Vec<String>, bool)> {
+        let name = name.to_string();
+        self.with_client(
+            |c| match c.request(&DaemonRequest::UsbStatus { name }, &mut |_| {})? {
+                DaemonResponse::UsbStatus {
+                    grants,
+                    attached,
+                    restart_required,
+                } => Ok((grants, attached, restart_required)),
+                DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected UsbStatus reply: {other:?}"),
+            },
+        )
+    }
+
+    fn usb_attach(&mut self, name: &str, device: &str) -> anyhow::Result<()> {
+        let (name, device) = (name.to_string(), device.to_string());
+        self.with_client(|c| {
+            interpret_attach_reply(
+                c.request(&DaemonRequest::UsbAttach { name, device }, &mut |_| {})?,
+            )
+        })
+    }
+
+    fn usb_detach(&mut self, name: &str, device: &str) -> anyhow::Result<()> {
+        let (name, device) = (name.to_string(), device.to_string());
+        self.with_client(|c| {
+            interpret_attach_reply(
+                c.request(&DaemonRequest::UsbDetach { name, device }, &mut |_| {})?,
+            )
+        })
+    }
+}
+
+/// Interpret the daemon's reply to an attach or detach.
+///
+/// These two verbs are forwarded to izba-init, so the daemon answers with the
+/// GUEST's reply wrapped in an envelope rather than a bare `Ok` — which is why
+/// `expect_ok` is wrong here. Getting this wrong twice costs the user twice: a
+/// successful attach reported as a failure, and a guest refusal (the actionable
+/// half) swallowed. Mirrors `interpret_attach_reply` in the CLI.
+fn interpret_attach_reply(resp: DaemonResponse) -> anyhow::Result<()> {
+    match resp {
+        DaemonResponse::Ok => Ok(()),
+        DaemonResponse::Guest { payload } => match payload {
+            Response::UsbAttached { .. } | Response::Ok => Ok(()),
+            Response::Error { kind, message } => anyhow::bail!("{message} ({kind:?})"),
+            other => anyhow::bail!("unexpected guest reply: {other:?}"),
+        },
+        DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected usb attach/detach reply: {other:?}"),
     }
 }
 

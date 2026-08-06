@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use crate::daemon::DaemonApi;
 use crate::views::{
     app_build_info, CreateOpts, DaemonStatusView, DiffView, PolicyView, PortRuleView, PromoteView,
-    SandboxDetailView, SandboxView, SeedEntry, VersionView, VolumeInfoView,
+    SandboxDetailView, SandboxView, SeedEntry, UsbDeviceView, UsbStatusView, UsbUpstreamView,
+    VersionView, VolumeInfoView,
 };
 use izba_core::daemon::egress::audit::EndpointSummary;
 use izba_core::daemon::egress::config::{AllowEntry, GitRule};
@@ -432,6 +433,68 @@ pub fn volume_detach_core(
     guest_path: String,
 ) -> Result<(), String> {
     d.volume_detach(name, guest_path).map_err(|e| e.to_string())
+}
+
+/// Core of `usb_upstream_show`.
+///
+/// `Ok(None)` means USB passthrough is switched off — a state, not a failure.
+/// Every other USB call refuses in that state, so a caller asks this first and
+/// stops here; an `Err` would make "off" look like "broken".
+pub fn usb_upstream_show_core(d: &mut dyn DaemonApi) -> Result<Option<UsbUpstreamView>, String> {
+    d.usb_upstream_show()
+        .map(|u| u.map(UsbUpstreamView::from))
+        .map_err(|e| e.to_string())
+}
+
+/// Core of `usb_upstream_set`.
+pub fn usb_upstream_set_core(
+    d: &mut dyn DaemonApi,
+    host: &str,
+    port: u16,
+    allow_remote: bool,
+) -> Result<(), String> {
+    d.usb_upstream_set(host, port, allow_remote)
+        .map_err(|e| e.to_string())
+}
+
+/// Core of `usb_list_devices`: what the upstream shares, plus what usbipd knows
+/// but has not shared.
+pub fn usb_list_devices_core(d: &mut dyn DaemonApi) -> Result<Vec<UsbDeviceView>, String> {
+    d.usb_list_devices()
+        .map(|v| v.into_iter().map(UsbDeviceView::from).collect())
+        .map_err(|e| e.to_string())
+}
+
+/// Core of `usb_status`: one sandbox's grants, folded with what it holds.
+pub fn usb_status_core(d: &mut dyn DaemonApi, name: &str) -> Result<UsbStatusView, String> {
+    let (grants, attached, restart_required) = d.usb_status(name).map_err(|e| e.to_string())?;
+    Ok(UsbStatusView::new(grants, attached, restart_required))
+}
+
+/// Core of `usb_allow`: grant one device to one sandbox.
+pub fn usb_allow_core(
+    d: &mut dyn DaemonApi,
+    name: &str,
+    device: &str,
+    busid_pin: Option<String>,
+) -> Result<(), String> {
+    d.usb_allow(name, device, busid_pin)
+        .map_err(|e| e.to_string())
+}
+
+/// Core of `usb_revoke`.
+pub fn usb_revoke_core(d: &mut dyn DaemonApi, name: &str, device: &str) -> Result<(), String> {
+    d.usb_revoke(name, device).map_err(|e| e.to_string())
+}
+
+/// Core of `usb_attach`.
+pub fn usb_attach_core(d: &mut dyn DaemonApi, name: &str, device: &str) -> Result<(), String> {
+    d.usb_attach(name, device).map_err(|e| e.to_string())
+}
+
+/// Core of `usb_detach`.
+pub fn usb_detach_core(d: &mut dyn DaemonApi, name: &str, device: &str) -> Result<(), String> {
+    d.usb_detach(name, device).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1079,6 +1142,102 @@ mod tests {
             None => std::env::remove_var("IZBA_DATA_DIR"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn usb_grant(device: &str) -> izba_core::daemon::proto::UsbGrantInfo {
+        izba_core::daemon::proto::UsbGrantInfo {
+            device: device.into(),
+            busid_pin: None,
+            description: "FT232".into(),
+            granted_at_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn usb_status_core_marks_only_the_grant_that_is_attached() {
+        let mut d = FakeDaemon {
+            usb_grants: vec![usb_grant("0403:6001"), usb_grant("10c4:ea60")],
+            usb_attached: vec!["10c4:ea60".into()],
+            ..FakeDaemon::default()
+        };
+        let v = usb_status_core(&mut d, "web").unwrap();
+        assert!(!v.grants[0].attached, "0403:6001 is free");
+        assert!(v.grants[1].attached, "10c4:ea60 is held");
+        assert!(!v.restart_required);
+    }
+
+    #[test]
+    fn usb_upstream_show_core_reports_the_feature_being_off_as_none_not_an_error() {
+        // The UI decides what to render from this. An Err would make the
+        // ordinary "not configured yet" state look like a broken daemon.
+        let mut d = FakeDaemon::default();
+        assert!(usb_upstream_show_core(&mut d).unwrap().is_none());
+    }
+
+    #[test]
+    fn usb_upstream_set_core_passes_the_remote_opt_in_through() {
+        let mut d = FakeDaemon::default();
+        usb_upstream_set_core(&mut d, "203.0.113.7", 3240, true).unwrap();
+        assert!(
+            d.calls
+                .iter()
+                .any(|c| c == "usb_upstream_set:203.0.113.7:3240:true"),
+            "an opt-in dropped in transit becomes a refusal the user cannot explain: {:?}",
+            d.calls
+        );
+    }
+
+    #[test]
+    fn usb_allow_core_carries_the_busid_pin() {
+        let mut d = FakeDaemon::default();
+        usb_allow_core(&mut d, "web", "0403:6001", Some("3-2".into())).unwrap();
+        assert!(
+            d.calls.iter().any(|c| c == "usb_allow:web:0403:6001:3-2"),
+            "{:?}",
+            d.calls
+        );
+        // And an unpinned grant stays unpinned rather than inventing a busid.
+        let mut d = FakeDaemon::default();
+        usb_allow_core(&mut d, "web", "0403:6001", None).unwrap();
+        assert!(d.calls.iter().any(|c| c == "usb_allow:web:0403:6001:-"));
+    }
+
+    #[test]
+    fn usb_attach_and_detach_core_report_a_guest_refusal_rather_than_swallowing_it() {
+        // The guest's reason is the only actionable half of a failed attach.
+        let mut d = FakeDaemon {
+            fail_action: true,
+            ..FakeDaemon::default()
+        };
+        let err = usb_attach_core(&mut d, "web", "0403:6001").unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+        let err = usb_detach_core(&mut d, "web", "0403:6001").unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+    }
+
+    #[test]
+    fn usb_list_devices_core_maps_every_row_field() {
+        let mut d = FakeDaemon {
+            usb_devices: vec![izba_core::daemon::proto::UsbDeviceInfo {
+                busid: "1-4".into(),
+                device: "10c4:ea60".into(),
+                description: "CP2102".into(),
+                shared: false,
+                granted_to: vec!["web".into()],
+                attached_to: Some("web".into()),
+                bind_command: Some("usbipd bind --busid 1-4".into()),
+            }],
+            ..FakeDaemon::default()
+        };
+        let rows = usb_list_devices_core(&mut d).unwrap();
+        assert_eq!(rows[0].busid, "1-4");
+        assert_eq!(rows[0].granted_to, vec!["web".to_string()]);
+        assert_eq!(rows[0].attached_to.as_deref(), Some("web"));
+        assert_eq!(
+            rows[0].bind_command.as_deref(),
+            Some("usbipd bind --busid 1-4"),
+            "the command is the whole point of an unshared row"
+        );
     }
 
     /// Without `IZBA_DATA_DIR` set, `app_paths()` must fall back to the same

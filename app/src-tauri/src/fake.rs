@@ -3,7 +3,7 @@ use crate::daemon::{DaemonApi, ShellSession};
 use crate::views::{DaemonStatusView, SandboxView, SbxState};
 use izba_core::build_info::BuildInfoOwned;
 use izba_core::daemon::egress::config::EgressPolicyConfig;
-use izba_core::daemon::proto::DaemonCreate;
+use izba_core::daemon::proto::{DaemonCreate, UsbDeviceInfo, UsbGrantInfo, UsbUpstreamInfo};
 use std::sync::{Arc, Mutex};
 
 /// Scripted `ShellSession` for unit tests. Records writes/resizes/close and
@@ -58,6 +58,14 @@ pub struct FakeDaemon {
     pub volumes: Vec<izba_core::volume::VolumeInfo>,
     /// Volume specs echoed inside `inspect`'s detail response.
     pub detail_volumes: Vec<izba_core::volume::VolumeSpec>,
+    /// Configured upstream echoed by `usb_upstream_show`. `None` — the default —
+    /// is USB switched off, the state every other USB call refuses in.
+    pub usb_upstream: Option<izba_core::daemon::proto::UsbUpstreamInfo>,
+    pub usb_devices: Vec<izba_core::daemon::proto::UsbDeviceInfo>,
+    pub usb_grants: Vec<izba_core::daemon::proto::UsbGrantInfo>,
+    /// `vid:pid` of devices the sandbox is holding.
+    pub usb_attached: Vec<String>,
+    pub usb_restart_required: bool,
 }
 
 impl Default for FakeDaemon {
@@ -101,6 +109,11 @@ impl Default for FakeDaemon {
                 referenced_by: vec!["web".into()],
             }],
             detail_volumes: vec![],
+            usb_upstream: None,
+            usb_devices: vec![],
+            usb_grants: vec![],
+            usb_attached: vec![],
+            usb_restart_required: false,
         }
     }
 }
@@ -375,6 +388,104 @@ impl DaemonApi for FakeDaemon {
         self.calls.push(format!("vdetach:{name}:{guest_path}"));
         self.detail_volumes
             .retain(|s| s.guest_path != std::path::Path::new(&guest_path));
+        Ok(())
+    }
+
+    fn usb_upstream_show(&mut self) -> anyhow::Result<Option<UsbUpstreamInfo>> {
+        self.calls.push("usb_upstream_show".into());
+        Ok(self.usb_upstream.clone())
+    }
+
+    fn usb_upstream_set(
+        &mut self,
+        host: &str,
+        port: u16,
+        allow_remote: bool,
+    ) -> anyhow::Result<()> {
+        self.calls
+            .push(format!("usb_upstream_set:{host}:{port}:{allow_remote}"));
+        if self.fail_action {
+            anyhow::bail!("daemon unreachable");
+        }
+        self.usb_upstream = Some(UsbUpstreamInfo {
+            host: host.to_string(),
+            port,
+            resolved: Some(host.to_string()),
+            trust: "own-host-loopback".into(),
+            warning: None,
+        });
+        Ok(())
+    }
+
+    fn usb_list_devices(&mut self) -> anyhow::Result<Vec<UsbDeviceInfo>> {
+        self.calls.push("usb_list_devices".into());
+        if self.fail_action {
+            anyhow::bail!("the usbip upstream is unreachable");
+        }
+        Ok(self.usb_devices.clone())
+    }
+
+    fn usb_allow(
+        &mut self,
+        name: &str,
+        device: &str,
+        busid_pin: Option<String>,
+    ) -> anyhow::Result<()> {
+        // The pin rides in the call record so a test can catch it being dropped
+        // on the way through — a dropped pin silently widens the grant.
+        self.calls.push(format!(
+            "usb_allow:{name}:{device}:{}",
+            busid_pin.as_deref().unwrap_or("-")
+        ));
+        if self.fail_action {
+            anyhow::bail!("daemon unreachable");
+        }
+        self.usb_grants.push(UsbGrantInfo {
+            device: device.to_string(),
+            busid_pin,
+            description: String::new(),
+            granted_at_unix_ms: 1,
+        });
+        Ok(())
+    }
+
+    fn usb_revoke(&mut self, name: &str, device: &str) -> anyhow::Result<()> {
+        self.calls.push(format!("usb_revoke:{name}:{device}"));
+        if self.fail_action {
+            anyhow::bail!("daemon unreachable");
+        }
+        self.usb_grants.retain(|g| g.device != device);
+        self.usb_attached.retain(|d| d != device);
+        Ok(())
+    }
+
+    fn usb_status(&mut self, name: &str) -> anyhow::Result<(Vec<UsbGrantInfo>, Vec<String>, bool)> {
+        self.calls.push(format!("usb_status:{name}"));
+        if self.fail_action {
+            anyhow::bail!("daemon unreachable");
+        }
+        Ok((
+            self.usb_grants.clone(),
+            self.usb_attached.clone(),
+            self.usb_restart_required,
+        ))
+    }
+
+    fn usb_attach(&mut self, name: &str, device: &str) -> anyhow::Result<()> {
+        self.calls.push(format!("usb_attach:{name}:{device}"));
+        if self.fail_action {
+            anyhow::bail!("the guest refused the attach");
+        }
+        self.usb_attached.push(device.to_string());
+        Ok(())
+    }
+
+    fn usb_detach(&mut self, name: &str, device: &str) -> anyhow::Result<()> {
+        self.calls.push(format!("usb_detach:{name}:{device}"));
+        if self.fail_action {
+            anyhow::bail!("the guest refused the detach");
+        }
+        self.usb_attached.retain(|d| d != device);
         Ok(())
     }
 }
