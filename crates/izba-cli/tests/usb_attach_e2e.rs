@@ -61,7 +61,10 @@ fn want() -> Option<Env> {
         }
     };
     if !missing.is_empty() {
-        panic!("IZBA_INTEGRATION=1 but the USB e2e cannot run:\n  {}", missing.join("\n  "));
+        panic!(
+            "IZBA_INTEGRATION=1 but the USB e2e cannot run:\n  {}",
+            missing.join("\n  ")
+        );
     }
     Some(Env { fake })
 }
@@ -128,14 +131,19 @@ fn granted_sandbox(data: &Path, fake: &FakeUsbipd, name: &str) -> String {
         &izba(data, &["usb", "upstream", "set", &fake.addr]),
         "usb upstream set",
     );
-    ok(
-        &izba(data, &["create", name, "--image", IMAGE]),
-        "create",
-    );
+    ok(&izba(data, &["create", name, "--image", IMAGE]), "create");
     ok(
         &izba(
             data,
-            &["usb", "allow", name, "--device", DEVICE, "--confirm", DEVICE],
+            &[
+                "usb",
+                "allow",
+                name,
+                "--device",
+                DEVICE,
+                "--confirm",
+                DEVICE,
+            ],
         ),
         "usb allow",
     );
@@ -269,7 +277,11 @@ fn a_sandbox_without_grants_has_no_usb_plane_and_no_usb_kernel() {
     }
 
     // Defence in depth behind the grant check: no virtual host controller.
-    let sysfs = exec(data.path(), "plain", "ls /sys/devices/platform/ 2>&1 || true");
+    let sysfs = exec(
+        data.path(),
+        "plain",
+        "ls /sys/devices/platform/ 2>&1 || true",
+    );
     assert!(
         !String::from_utf8_lossy(&sysfs.stdout).contains("vhci"),
         "the default kernel must have no vhci: {}",
@@ -297,7 +309,12 @@ fn detaching_removes_the_device_and_it_can_be_attached_again() {
         &izba(data.path(), &["usb", "attach", &name, "--device", DEVICE]),
         "first attach",
     );
-    exec_until_ok(data.path(), &name, "ls /dev/izba/ttyACM0", "the node appearing");
+    exec_until_ok(
+        data.path(),
+        &name,
+        "ls /dev/izba/ttyACM0",
+        "the node appearing",
+    );
 
     ok(
         &izba(data.path(), &["usb", "detach", &name, "--device", DEVICE]),
@@ -315,7 +332,12 @@ fn detaching_removes_the_device_and_it_can_be_attached_again() {
         &izba(data.path(), &["usb", "attach", &name, "--device", DEVICE]),
         "re-attach",
     );
-    exec_until_ok(data.path(), &name, "ls /dev/izba/ttyACM0", "the node reappearing");
+    exec_until_ok(
+        data.path(),
+        &name,
+        "ls /dev/izba/ttyACM0",
+        "the node reappearing",
+    );
 
     teardown(data.path(), &name);
 }
