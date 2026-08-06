@@ -46,7 +46,36 @@ const VDEV_ST_NULL: &str = "004";
 /// produced no usable device rather than silently succeeding.
 const NODE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often to re-check `/dev` while waiting for enumeration.
+const NODE_POLL: Duration = Duration::from_millis(100);
+
 type InitError = (ErrorKind, String);
+
+/// The kernel-facing operations an attach performs after izbad has replied.
+///
+/// A trait because the ordering around them is the delicate part — the socket
+/// is surrendered to the kernel at one exact moment, and a later failure has to
+/// undo the attach — and that ordering deserves a test rather than a comment.
+/// The real implementation writes sysfs; tests substitute a recorder.
+pub trait Vhci {
+    /// A free port for a device of this speed, or an error explaining why not.
+    fn free_port(&self, speed: u32) -> Result<u32, InitError>;
+    /// Hand `fd` to the kernel on `port`. After this returns `Ok` the kernel
+    /// owns the socket.
+    fn attach(&self, port: u32, fd: i32, devid: u32, speed: u32) -> Result<(), InitError>;
+    /// Release `port`.
+    fn detach(&self, port: u32) -> Result<(), InitError>;
+    /// Snapshot the device names currently present.
+    fn devices(&self) -> BTreeSet<String>;
+    /// Expose the newly-appeared node `name` to the workload, returning where
+    /// it put it.
+    fn expose(&self, name: &str) -> Result<PathBuf, InitError>;
+    /// Withdraw a previously exposed node.
+    fn unexpose(&self, node: &Path);
+}
+
+/// The real thing: sysfs writes plus a devtmpfs mirror.
+pub struct SysfsVhci;
 
 /// One device this guest currently holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +88,10 @@ struct Attached {
 pub struct UsbState {
     enabled: bool,
     attached: Mutex<HashMap<String, Attached>>,
+    /// How long to wait for enumeration. A field rather than a constant so a
+    /// test for the "never becomes a serial port" path does not have to spend
+    /// the real timeout on every CI run.
+    node_timeout: Duration,
 }
 
 impl UsbState {
@@ -66,18 +99,42 @@ impl UsbState {
         Self {
             enabled,
             attached: Mutex::new(HashMap::new()),
+            node_timeout: NODE_TIMEOUT,
         }
     }
 
-    /// Attach `device`, dialing the USB plane through `dial`.
-    ///
-    /// The dialer is a seam so the whole handshake is host-testable without a
-    /// vsock (the pattern `egress.rs` uses). Everything after the reply touches
-    /// sysfs and is exercised only in the guest.
+    /// Attach `device` over the real vsock plane and the real vhci.
     pub fn attach_with<S, D>(&self, device: &str, dial: D) -> Result<(), InitError>
     where
         S: Read + Write + AsRawFd,
         D: FnOnce() -> std::io::Result<S>,
+    {
+        self.attach_on(device, dial, &SysfsVhci)
+    }
+
+    /// Attach `device`, dialing through `dial` and driving `vhci`.
+    ///
+    /// Both are seams so the whole sequence is host-testable: the dialer stands
+    /// in for the vsock (the pattern `egress.rs` uses), and `vhci` for a kernel
+    /// that is not there.
+    ///
+    /// The ordering is the substance of this function:
+    ///
+    /// 1. The host's gate, then the duplicate check — before anything is dialed.
+    /// 2. One frame out, one frame back. izbad's refusal is passed through.
+    /// 3. `/dev` is snapshotted BEFORE the attach, so the node diff afterwards
+    ///    sees only what this attach produced.
+    /// 4. The socket is surrendered to the kernel — and only then leaked, so a
+    ///    failed attach closes it instead of stranding a connection to izbad
+    ///    for the life of the guest.
+    /// 5. If the device never becomes usable, the attach is rolled back: a port
+    ///    holding a device nothing can open still keeps that device away from
+    ///    the host.
+    pub fn attach_on<S, D, V>(&self, device: &str, dial: D, vhci: &V) -> Result<(), InitError>
+    where
+        S: Read + Write + AsRawFd,
+        D: FnOnce() -> std::io::Result<S>,
+        V: Vhci + ?Sized,
     {
         self.gate()?;
         if self.attached.lock().unwrap().contains_key(device) {
@@ -115,32 +172,19 @@ impl UsbState {
             Err(e) => return Err((ErrorKind::Internal, format!("reading the reply: {e}"))),
         };
 
-        let before = dev_entries();
-        let port = free_port(speed)?;
-        write_sysfs(
-            &Path::new(VHCI_DIR).join("attach"),
-            &attach_line(port, conn.as_raw_fd(), devid, speed),
-        )
-        .map_err(|e| {
-            (
-                ErrorKind::Internal,
-                format!("handing the socket to vhci: {e}"),
-            )
-        })?;
+        let before = vhci.devices();
+        let port = vhci.free_port(speed)?;
+        vhci.attach(port, conn.as_raw_fd(), devid, speed)?;
         // The kernel owns this fd now. Leak it deliberately: dropping `conn`
-        // would close the socket out from under `vhci`, killing the device the
-        // line above just created. This happens ONLY after the write succeeded
-        // — on any earlier failure `conn` is dropped normally, so a refused
-        // attach never leaves a connection open to izbad for the guest's life.
+        // would close the socket out from under `vhci` and kill the device the
+        // line above just created. Only after a successful attach — on any
+        // earlier failure `conn` is dropped normally.
         std::mem::forget(conn);
 
-        let node = match self.mirror_node(&before) {
+        let node = match self.wait_for_node(&before, vhci) {
             Ok(node) => node,
             Err(e) => {
-                // Undo the attach: a port holding a device nothing can open is
-                // worse than a clean failure, because the device also stays
-                // unavailable to the host.
-                let _ = write_sysfs(&Path::new(VHCI_DIR).join("detach"), &port.to_string());
+                let _ = vhci.detach(port);
                 return Err(e);
             }
         };
@@ -153,6 +197,10 @@ impl UsbState {
 
     /// Detach a device this guest holds, returning its vhci port to the pool.
     pub fn detach(&self, device: &str) -> Result<(), InitError> {
+        self.detach_on(device, &SysfsVhci)
+    }
+
+    pub fn detach_on<V: Vhci + ?Sized>(&self, device: &str, vhci: &V) -> Result<(), InitError> {
         self.gate()?;
         let Some(a) = self.attached.lock().unwrap().remove(device) else {
             return Err((
@@ -160,15 +208,10 @@ impl UsbState {
                 format!("{device} is not attached to this sandbox"),
             ));
         };
-        // The node goes first: once the port is released the major/minor may be
+        // The node goes first: once the port is released its major/minor may be
         // reused, and a stale node would then point at someone else's device.
-        let _ = std::fs::remove_file(&a.node);
-        write_sysfs(&Path::new(VHCI_DIR).join("detach"), &a.port.to_string()).map_err(|e| {
-            (
-                ErrorKind::Internal,
-                format!("detaching port {}: {e}", a.port),
-            )
-        })
+        vhci.unexpose(&a.node);
+        vhci.detach(a.port)
     }
 
     /// The host's decision, enforced before anything else happens.
@@ -184,30 +227,21 @@ impl UsbState {
         ))
     }
 
-    /// Copy whichever serial node the kernel just created into the shared
-    /// directory the workload can see.
+    /// Wait for the kernel to enumerate the device, then expose its node.
     ///
     /// The kernel picks the minor, so izba must not guess a name: the new node
-    /// is found by diffing `/dev`. The mirror is a fresh `mknod` with the same
-    /// device numbers rather than a link, because the container sees the shared
-    /// directory through a bind mount and `/dev` itself is not in it.
-    // reason: devtmpfs polling + mknod; `new_serial_nodes` and `dev_entries`
-    // carry the logic and are unit-tested, and there is no device node to
-    // create on a host test runner.
-    #[mutants::skip]
-    fn mirror_node(&self, before: &BTreeSet<String>) -> Result<PathBuf, InitError> {
-        let deadline = Instant::now() + NODE_TIMEOUT;
+    /// is found by diffing `/dev`. Enumeration is several control transfers over
+    /// the vsock link, so it is not instant — but a device that never produces a
+    /// serial node is a failure, not a slow success.
+    fn wait_for_node<V: Vhci + ?Sized>(
+        &self,
+        before: &BTreeSet<String>,
+        vhci: &V,
+    ) -> Result<PathBuf, InitError> {
+        let deadline = Instant::now() + self.node_timeout;
         loop {
-            let fresh = new_serial_nodes(before, &dev_entries());
-            if let Some(name) = fresh.first() {
-                let src = Path::new("/dev").join(name);
-                let dst = Path::new(SHARED_DEV_DIR).join(name);
-                return mirror(&src, &dst).map(|()| dst).map_err(|e| {
-                    (
-                        ErrorKind::Internal,
-                        format!("exposing {name} to the workload: {e}"),
-                    )
-                });
+            if let Some(name) = new_serial_nodes(before, &vhci.devices()).first() {
+                return vhci.expose(name);
             }
             if Instant::now() >= deadline {
                 return Err((
@@ -217,8 +251,78 @@ impl UsbState {
                         .into(),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(NODE_POLL.min(self.node_timeout));
         }
+    }
+}
+
+impl Vhci for SysfsVhci {
+    // reason: one sysfs read feeding the unit-tested `parse_free_port`.
+    #[mutants::skip]
+    fn free_port(&self, speed: u32) -> Result<u32, InitError> {
+        let status = std::fs::read_to_string(Path::new(VHCI_DIR).join("status")).map_err(|e| {
+            (
+                ErrorKind::Internal,
+                format!("reading {VHCI_DIR}/status: {e} — is this a USB-capable kernel?"),
+            )
+        })?;
+        parse_free_port(&status, speed).ok_or((
+            ErrorKind::Internal,
+            "no free vhci port — detach a device first".into(),
+        ))
+    }
+
+    // reason: a one-line sysfs write; its content comes from the unit-tested
+    // `attach_line`.
+    #[mutants::skip]
+    fn attach(&self, port: u32, fd: i32, devid: u32, speed: u32) -> Result<(), InitError> {
+        write_sysfs(
+            &Path::new(VHCI_DIR).join("attach"),
+            &attach_line(port, fd, devid, speed),
+        )
+        .map_err(|e| {
+            (
+                ErrorKind::Internal,
+                format!("handing the socket to vhci: {e}"),
+            )
+        })
+    }
+
+    // reason: a one-line sysfs write.
+    #[mutants::skip]
+    fn detach(&self, port: u32) -> Result<(), InitError> {
+        write_sysfs(&Path::new(VHCI_DIR).join("detach"), &port.to_string())
+            .map_err(|e| (ErrorKind::Internal, format!("detaching port {port}: {e}")))
+    }
+
+    // reason: reads the guest's devtmpfs; the diff it feeds is unit-tested.
+    #[mutants::skip]
+    fn devices(&self) -> BTreeSet<String> {
+        std::fs::read_dir("/dev")
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // reason: needs a real device node and CAP_MKNOD.
+    #[mutants::skip]
+    fn expose(&self, name: &str) -> Result<PathBuf, InitError> {
+        let src = Path::new("/dev").join(name);
+        let dst = Path::new(SHARED_DEV_DIR).join(name);
+        mirror(&src, &dst).map(|()| dst).map_err(|e| {
+            (
+                ErrorKind::Internal,
+                format!("exposing {name} to the workload: {e}"),
+            )
+        })
+    }
+
+    #[mutants::skip]
+    fn unexpose(&self, node: &Path) {
+        let _ = std::fs::remove_file(node);
     }
 }
 
@@ -234,20 +338,6 @@ pub fn dial_host() -> std::io::Result<vsock::VsockStream> {
 }
 
 /// Read the vhci status file and pick a free port for this speed.
-// reason: one sysfs read feeding the unit-tested `parse_free_port`.
-#[mutants::skip]
-fn free_port(speed: u32) -> Result<u32, InitError> {
-    let status = std::fs::read_to_string(Path::new(VHCI_DIR).join("status")).map_err(|e| {
-        (
-            ErrorKind::Internal,
-            format!("reading {VHCI_DIR}/status: {e} — is this a USB-capable kernel?"),
-        )
-    })?;
-    parse_free_port(&status, speed).ok_or((
-        ErrorKind::Internal,
-        "no free vhci port — detach a device first".into(),
-    ))
-}
 
 // reason: a one-line sysfs write; the value written is built by the unit-tested
 // `attach_line`.
@@ -255,18 +345,6 @@ fn free_port(speed: u32) -> Result<u32, InitError> {
 fn write_sysfs(path: &Path, value: &str) -> std::io::Result<()> {
     let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
     f.write_all(value.as_bytes())
-}
-
-// reason: reads the guest's devtmpfs; the diff it feeds is unit-tested.
-#[mutants::skip]
-fn dev_entries() -> BTreeSet<String> {
-    std::fs::read_dir("/dev")
-        .map(|d| {
-            d.flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Re-create `src`'s device node at `dst`, world-readable and world-writable.
@@ -533,6 +611,255 @@ hs  0000 006 003 00030002 000005 3-2
         drop(theirs);
         let usb = UsbState::new(true);
         assert!(usb.attach_with("0403:6001", || Ok(mine)).is_err());
+    }
+
+    impl UsbState {
+        /// Same as `new(true)`, but gives up on enumeration quickly — the
+        /// timeout's duration is not what these tests are about.
+        fn impatient() -> Self {
+            Self {
+                node_timeout: Duration::from_millis(150),
+                ..Self::new(true)
+            }
+        }
+    }
+
+    /// A recording `Vhci` over a modelled `/dev`: no kernel, but every call and
+    /// its order is visible, which is what the attach sequence's guarantees are
+    /// actually about. The node appears BECAUSE of the attach, the way devtmpfs
+    /// behaves, so the node-diff logic is genuinely exercised rather than fed a
+    /// scripted answer.
+    struct FakeVhci {
+        present: Mutex<BTreeSet<String>>,
+        calls: Mutex<Vec<String>>,
+        /// What enumerating produces; `None` models a device that attaches but
+        /// never becomes a serial port.
+        node_on_attach: Option<String>,
+        free_port: Option<u32>,
+        attach_ok: bool,
+        expose_ok: bool,
+    }
+
+    impl FakeVhci {
+        fn working() -> Self {
+            Self {
+                present: Mutex::new(["ttyS0".to_string()].into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+                node_on_attach: Some("ttyACM0".into()),
+                free_port: Some(1),
+                attach_ok: true,
+                expose_ok: true,
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Vhci for FakeVhci {
+        fn free_port(&self, _speed: u32) -> Result<u32, InitError> {
+            self.calls.lock().unwrap().push("free_port".into());
+            self.free_port
+                .ok_or((ErrorKind::Internal, "no free vhci port".into()))
+        }
+        fn attach(&self, port: u32, _fd: i32, _devid: u32, _speed: u32) -> Result<(), InitError> {
+            self.calls.lock().unwrap().push(format!("attach({port})"));
+            if !self.attach_ok {
+                return Err((ErrorKind::Internal, "vhci refused".into()));
+            }
+            if let Some(node) = &self.node_on_attach {
+                self.present.lock().unwrap().insert(node.clone());
+            }
+            Ok(())
+        }
+        fn detach(&self, port: u32) -> Result<(), InitError> {
+            self.calls.lock().unwrap().push(format!("detach({port})"));
+            if let Some(node) = &self.node_on_attach {
+                self.present.lock().unwrap().remove(node);
+            }
+            Ok(())
+        }
+        fn devices(&self) -> BTreeSet<String> {
+            self.present.lock().unwrap().clone()
+        }
+        fn expose(&self, name: &str) -> Result<PathBuf, InitError> {
+            self.calls.lock().unwrap().push(format!("expose({name})"));
+            if self.expose_ok {
+                Ok(PathBuf::from(SHARED_DEV_DIR).join(name))
+            } else {
+                Err((ErrorKind::Internal, "mknod failed".into()))
+            }
+        }
+        fn unexpose(&self, node: &Path) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("unexpose({})", node.display()));
+        }
+    }
+
+    /// A fake izbad that answers one attach with `reply`.
+    fn izbad(reply: Response) -> std::os::unix::net::UnixStream {
+        let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut peer = theirs;
+            let _: StreamOpen = read_frame(&mut peer).unwrap();
+            let _ = write_frame(&mut peer, &reply);
+            // Hold the connection until the test drops us: closing here would
+            // race the fd the attach is about to hand to the kernel.
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        mine
+    }
+
+    fn attached_reply() -> Response {
+        Response::UsbAttached {
+            devid: 196_610,
+            speed: 3,
+        }
+    }
+
+    #[test]
+    fn a_successful_attach_runs_the_sequence_in_order() {
+        let vhci = FakeVhci::working();
+        let usb = UsbState::new(true);
+        usb.attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .unwrap();
+        assert_eq!(
+            vhci.calls(),
+            vec!["free_port", "attach(1)", "expose(ttyACM0)"],
+            "port, then the socket, then the node"
+        );
+    }
+
+    #[test]
+    fn a_device_that_never_produces_a_node_rolls_the_attach_back() {
+        // A vhci port holding a device nothing can open is worse than a clean
+        // failure: the device also stays unavailable to the host, and nothing
+        // in the guest would ever release it.
+        let vhci = FakeVhci {
+            node_on_attach: None,
+            ..FakeVhci::working()
+        };
+        let usb = UsbState::impatient();
+        let (kind, msg) = usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .unwrap_err();
+        assert_eq!(kind, ErrorKind::Internal);
+        assert!(msg.contains("serial-class"), "{msg}");
+        assert!(
+            vhci.calls().contains(&"detach(1)".to_string()),
+            "the port must be released again: {:?}",
+            vhci.calls()
+        );
+    }
+
+    #[test]
+    fn a_failure_to_expose_the_node_also_rolls_back() {
+        let vhci = FakeVhci {
+            expose_ok: false,
+            ..FakeVhci::working()
+        };
+        let usb = UsbState::new(true);
+        assert!(usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .is_err());
+        assert!(vhci.calls().contains(&"detach(1)".to_string()));
+    }
+
+    #[test]
+    fn a_vhci_that_refuses_the_attach_is_not_rolled_back() {
+        // Nothing was attached, so there is no port to release — and detaching
+        // one izba does not hold could unplug somebody else's device.
+        let vhci = FakeVhci {
+            attach_ok: false,
+            ..FakeVhci::working()
+        };
+        let usb = UsbState::new(true);
+        assert!(usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .is_err());
+        assert!(
+            !vhci.calls().iter().any(|c| c.starts_with("detach")),
+            "{:?}",
+            vhci.calls()
+        );
+    }
+
+    #[test]
+    fn no_free_port_fails_before_the_socket_is_surrendered() {
+        let vhci = FakeVhci {
+            free_port: None,
+            ..FakeVhci::working()
+        };
+        let usb = UsbState::new(true);
+        let (_, msg) = usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .unwrap_err();
+        assert!(msg.contains("no free vhci port"), "{msg}");
+        assert_eq!(vhci.calls(), vec!["free_port"], "nothing else was touched");
+    }
+
+    #[test]
+    fn a_refused_attach_leaves_nothing_attached_so_it_can_be_retried() {
+        // The duplicate check must reflect what is actually held: a failed
+        // attach that recorded itself would make the retry impossible.
+        let vhci = FakeVhci {
+            attach_ok: false,
+            ..FakeVhci::working()
+        };
+        let usb = UsbState::new(true);
+        assert!(usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .is_err());
+        let again = usb.attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci);
+        assert!(
+            !format!("{again:?}").contains("already attached"),
+            "a failed attach must not block a retry: {again:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_the_same_device_twice_is_refused() {
+        let vhci = FakeVhci::working();
+        let usb = UsbState::new(true);
+        usb.attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .unwrap();
+        let (kind, msg) = usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .unwrap_err();
+        assert_eq!(kind, ErrorKind::BadRequest);
+        assert!(msg.contains("already attached"), "{msg}");
+    }
+
+    #[test]
+    fn detach_releases_the_node_before_the_port() {
+        // Once the port is released its major/minor may be reused, so a node
+        // left behind would point at whatever lands there next.
+        let vhci = FakeVhci::working();
+        let usb = UsbState::new(true);
+        usb.attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .unwrap();
+        usb.detach_on("0403:6001", &vhci).unwrap();
+        let calls = vhci.calls();
+        let unexpose = calls
+            .iter()
+            .position(|c| c.starts_with("unexpose"))
+            .unwrap();
+        let detach = calls.iter().position(|c| c == "detach(1)").unwrap();
+        assert!(unexpose < detach, "{calls:?}");
+    }
+
+    #[test]
+    fn a_detached_device_can_be_attached_again() {
+        let vhci = FakeVhci::working();
+        let usb = UsbState::new(true);
+        usb.attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .unwrap();
+        usb.detach_on("0403:6001", &vhci).unwrap();
+        assert!(usb
+            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
+            .is_ok());
     }
 
     #[test]

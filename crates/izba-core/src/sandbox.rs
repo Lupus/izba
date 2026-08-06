@@ -860,7 +860,12 @@ pub fn start_with_timeouts(
     // no cmdline flag gates it).
     // izba.volumes (when present) carries the ordered guest mountpoints.
     // izba.buildout=1 (when present) signals the guest to mount the buildout share.
-    let cmdline = build_cmdline(name, &config.volumes, config.builder, config.usb.is_enabled());
+    let cmdline = build_cmdline(
+        name,
+        &config.volumes,
+        config.builder,
+        config.usb.is_enabled(),
+    );
     // Resolve per-sandbox account credentials when the sandbox is locked down
     // (Windows MVP-D).  On non-Windows and for unlocked sandboxes this is None
     // and the normal confined/unconfined path is used.
