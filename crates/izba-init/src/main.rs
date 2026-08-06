@@ -205,6 +205,22 @@ fn run_pid1() -> anyhow::Result<()> {
         mounts::apply(&[mounts::buildout_mount_op()]).context("buildout mount")?;
     }
 
+    // USB passthrough, decided by the host: the flag rides the kernel cmdline,
+    // which only izbad writes. Its absence is the guest's refusal to attach
+    // anything, and it is also why the shared device directory exists only for
+    // a sandbox that may actually use it — the container's /dev/izba bind mount
+    // needs a source before crun starts.
+    let usb_enabled = params.get("izba.usb").map(|v| v == "1").unwrap_or(false);
+    if usb_enabled {
+        if let Err(e) = std::fs::create_dir_all(izba_init::usb::SHARED_DEV_DIR) {
+            eprintln!(
+                "izba-init: creating {}: {e}",
+                izba_init::usb::SHARED_DEV_DIR
+            );
+        }
+    }
+    let usb = Arc::new(izba_init::usb::UsbState::new(usb_enabled));
+
     // Static guest networking: lo + dummy0 with the izba subnet. Log and
     // continue on error — exec/cp/vsock still work without IP networking.
     if let Err(e) = net::configure() {
@@ -245,8 +261,8 @@ fn run_pid1() -> anyhow::Result<()> {
     oci::launch_container();
 
     {
-        let (e, s) = (Arc::clone(&engine), Arc::clone(&shutdown));
-        std::thread::spawn(move || server::serve_control(control, e, s));
+        let (e, u, s) = (Arc::clone(&engine), Arc::clone(&usb), Arc::clone(&shutdown));
+        std::thread::spawn(move || server::serve_control(control, e, u, s));
     }
     {
         let e = Arc::clone(&engine);
