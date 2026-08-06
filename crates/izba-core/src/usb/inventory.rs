@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use izba_proto::usbip::{
-    decode_op_rep_devlist, encode_op_req_devlist, UsbDeviceRecord, DEVICE_RECORD_LEN,
-    INTERFACE_LEN, MAX_DEVICES, OP_COMMON_LEN,
+    decode_op_rep_devlist, decode_op_rep_import, encode_op_req_devlist, UsbDeviceRecord,
+    DEVICE_RECORD_LEN, INTERFACE_LEN, MAX_DEVICES, OP_COMMON_LEN,
 };
 
 use super::DeviceId;
@@ -91,6 +91,23 @@ pub fn read_devlist_reply<R: Read>(reply: &mut R) -> Result<Vec<UpstreamDevice>>
 
     let records = decode_op_rep_devlist(&buf).context("decoding the devlist reply")?;
     Ok(records.into_iter().map(UpstreamDevice::from).collect())
+}
+
+/// Read one `OP_REP_IMPORT` off `reply`.
+///
+/// Fixed-length, unlike the devlist: there is no count and no per-record
+/// interface list, so nothing here is framed by an attacker-controlled number.
+/// The whole message is read, then handed to the phase-1 decoder, which
+/// validates the version, the status, and every field it returns.
+///
+/// The caller is responsible for having sent `encode_op_req_import` first; this
+/// function never writes, keeping the socket single-writer.
+pub fn read_import_reply<R: Read>(reply: &mut R) -> Result<UsbDeviceRecord> {
+    let mut buf = vec![0u8; OP_COMMON_LEN + DEVICE_RECORD_LEN];
+    reply
+        .read_exact(&mut buf)
+        .context("reading the import reply")?;
+    decode_op_rep_import(&buf).context("decoding the import reply")
 }
 
 /// Dial `addr` and enumerate. Every phase is time-bounded so a wedged or
