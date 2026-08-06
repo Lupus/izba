@@ -56,19 +56,33 @@ const MAX_INFLIGHT_HANDSHAKES: usize = 8;
 /// How long the nonblocking accept loop sleeps between polls.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
-/// Whether an accept error means "nothing waiting yet" rather than "this
-/// listener is finished".
+/// What a failed `accept` means for the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptError {
+    /// Nothing waiting yet — poll again.
+    Retry,
+    /// The listener is finished; the thread should exit.
+    Fatal,
+}
+
+/// Classify an accept error.
 ///
-/// Only `WouldBlock`, which is what a nonblocking listener returns when no
-/// guest is dialing. Anything else means the listener is broken, and the accept
-/// thread exits so `listening()` reports the truth and the supervisor's next
-/// tick rebinds it — spinning instead would leave a socket file with a live
-/// thread behind it that never serves anyone again.
+/// Only `WouldBlock` is transient — it is what a nonblocking listener returns
+/// when no guest is dialing. Anything else means the listener is broken, and
+/// the accept thread must exit so `listening()` reports the truth and the
+/// supervisor's next tick rebinds it. Spinning instead would leave a socket
+/// file with a live thread behind it that never serves anyone again.
 ///
-/// A named predicate rather than a match guard so the decision can be tested
-/// without a listener that yields an arbitrary errno on demand.
-fn accept_again(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::WouldBlock
+/// A function returning a decision, rather than a match guard at the call site:
+/// a guard can only be exercised by a listener that yields an arbitrary errno
+/// on demand, which the transport does not offer, so the decision would
+/// otherwise be untestable where it is made.
+fn on_accept_error(e: &std::io::Error) -> AcceptError {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        AcceptError::Retry
+    } else {
+        AcceptError::Fatal
+    }
 }
 
 /// Wraps a reader so no read is attempted past `deadline`.
@@ -201,13 +215,13 @@ impl UsbBroker {
                             handle_conn(conn, &sandbox, &paths, &audit)
                         });
                     }
-                    Err(e) if accept_again(&e) => {
-                        std::thread::sleep(ACCEPT_POLL);
-                    }
-                    Err(e) => {
-                        eprintln!("izbad: USB accept for '{sandbox}': {e}");
-                        return;
-                    }
+                    Err(e) => match on_accept_error(&e) {
+                        AcceptError::Retry => std::thread::sleep(ACCEPT_POLL),
+                        AcceptError::Fatal => {
+                            eprintln!("izbad: USB accept for '{sandbox}': {e}");
+                            return;
+                        }
+                    },
                 }
             }
         });
@@ -1128,7 +1142,10 @@ mod tests {
     #[test]
     fn only_would_block_keeps_the_accept_loop_going() {
         use std::io::ErrorKind as K;
-        assert!(accept_again(&std::io::Error::new(K::WouldBlock, "empty")));
+        assert_eq!(
+            on_accept_error(&std::io::Error::new(K::WouldBlock, "empty")),
+            AcceptError::Retry
+        );
         // Anything else means the listener is broken. Retrying would leave a
         // socket file with a live thread behind it that never serves anyone,
         // and `listening()` would keep claiming the plane is up.
@@ -1139,8 +1156,9 @@ mod tests {
             K::InvalidInput,
             K::Interrupted,
         ] {
-            assert!(
-                !accept_again(&std::io::Error::new(kind, "x")),
+            assert_eq!(
+                on_accept_error(&std::io::Error::new(kind, "x")),
+                AcceptError::Fatal,
                 "{kind:?} must end the accept loop"
             );
         }
