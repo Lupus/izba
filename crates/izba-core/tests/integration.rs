@@ -1509,15 +1509,35 @@ fn egress_http_via_stub() {
 /// decrypted Host; an `l7` record on :80 appears only if the cleartext MITM read
 /// the Host without a TLS handshake. Guest exit codes are secondary (busybox
 /// TLS quirks vary by image).
+///
+/// Reaching the MITM at all requires the denied host to RESOLVE: the #148 DNS
+/// gate NXDOMAINs any QNAME outside the allow-list, so the policy lists the
+/// denied host on an unused port to keep it resolvable while :443/:80 stay
+/// denied (see the policy comment in the test body). A fully-unlisted host is
+/// asserted separately as an l3 :53 DENY — the DNS-gate quadrant.
 #[test]
 fn mitm_firewall_allows_and_denies_real_vm() {
     let Some(env) = want() else { return };
     let mut tb = TestBox::new();
     let ws = tb.workspace("mitm");
-    // Declare the per-sandbox egress policy (allow example.com only). Persisting
-    // it makes `resolve_policy` arm an enforcing RegoPolicy at listen time, so
-    // tier-1 HTTPS is routed through the MITM.
-    let (mgr, _audit) = setup_mitm_sandbox(&env, &mut tb, "mitm", &ws, "allow:\n  - example.com\n");
+    // Declare the per-sandbox egress policy. Persisting it makes
+    // `resolve_policy` arm an enforcing RegoPolicy at listen time, so tier-1
+    // HTTPS is routed through the MITM.
+    //
+    // Since the #148 DNS gate, an enforcing sandbox NXDOMAINs any QNAME no
+    // allow rule could match — a host absent from the policy is now denied at
+    // DNS (tier l3) and never opens a TCP connection, so it can never produce
+    // the L7 MITM records this test asserts. To keep exercising the L7 deny
+    // path, www.iana.org is listed on a port it will never dial (9): the
+    // port-agnostic `resolvable` rule lets its DNS through, while
+    // `check(host, 443/80)` still denies — the MITM terminates and answers 403.
+    let (mgr, _audit) = setup_mitm_sandbox(
+        &env,
+        &mut tb,
+        "mitm",
+        &ws,
+        "allow:\n  - example.com\n  - host: www.iana.org\n    ports: [9]\n",
+    );
     // Two datapaths, both routed through the MITM for an enforcing sandbox:
     //
     //   * HTTPS on :443 — a clean TLS handshake to the allowed host (validation
@@ -1546,7 +1566,8 @@ fn mitm_firewall_allows_and_denies_real_vm() {
           sleep 2; \
         done; echo allowed-http-rc=$?; \
         wget -qO- http://www.iana.org/ >/dev/null 2>&1; echo denied-http-wget-rc=$?; \
-        curl -fsS http://www.iana.org/ >/dev/null 2>&1; echo denied-http-curl-rc=$?";
+        curl -fsS http://www.iana.org/ >/dev/null 2>&1; echo denied-http-curl-rc=$?; \
+        wget -qO- https://www.wikipedia.org/ >/dev/null 2>&1; echo dns-denied-rc=$?";
     let (_status, stdout, stderr) = exec_collect(&tb.paths, "mitm", &["sh", "-lc", script], None)
         .unwrap_or_else(|(k, m)| panic!("exec rejected ({k:?}): {m}"));
     eprintln!("guest output:\n{stdout}\n{stderr}");
@@ -1594,6 +1615,27 @@ fn mitm_firewall_allows_and_denies_real_vm() {
     assert!(
         l7("deny", "www.iana.org", 80),
         "expected an L7 DENY for www.iana.org:80 (plaintext HTTP MITM terminated + policy denied).\n{}",
+        dump()
+    );
+    // DNS gate (#148) — a host NO allow rule could match is refused at
+    // resolution: NXDOMAIN + an l3 :53 deny record, and no TCP/L7 record ever
+    // appears for it.
+    let dns_denied = records.iter().any(|r| {
+        r.tier == izba_core::daemon::egress::audit::Tier::L3
+            && r.port == 53
+            && format!("{:?}", r.verdict).to_lowercase().contains("deny")
+            && r.host.as_deref() == Some("www.wikipedia.org")
+    });
+    assert!(
+        dns_denied,
+        "expected an L3 DNS DENY for www.wikipedia.org:53 (enforcing DNS gate refused the QNAME).\n{}",
+        dump()
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|r| r.host.as_deref() == Some("www.wikipedia.org") && r.port != 53),
+        "a DNS-refused host must never reach the TCP/MITM datapath.\n{}",
         dump()
     );
 
