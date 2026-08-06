@@ -112,6 +112,13 @@ fn dispatch_control_request(engine: &ExecEngine, req: Request) -> Response {
             cols,
             rows,
         } => from_unit(engine.resize(exec_id, cols, rows)),
+        // USB support is decided by the HOST, at boot, via `izba.usb=1` on the
+        // kernel cmdline. Until this guest is wired for it, both verbs refuse
+        // on those terms — the fail-closed default a guest cannot argue with.
+        Request::UsbAttach { .. } | Request::UsbDetach { .. } => Response::Error {
+            kind: ErrorKind::UsbUnavailable,
+            message: "this guest did not boot with USB support (izba.usb=1)".into(),
+        },
         // Handled by control_conn (acks then closes the connection).
         Request::Shutdown => unreachable!("Shutdown handled by control_conn"),
     }
@@ -162,6 +169,19 @@ fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, engine: 
                 &Response::Error {
                     kind: ErrorKind::BadRequest,
                     message: "egress variants are not handled by init".into(),
+                },
+            );
+            return;
+        }
+        // The USB plane is izbad's (vsock port 1028) and is dialed BY init,
+        // never served by it. Arriving here means something inside the guest
+        // is probing planes it was not given; refuse rather than guess.
+        StreamOpen::UsbAttach { .. } => {
+            let _ = write_frame(
+                &mut conn,
+                &Response::Error {
+                    kind: ErrorKind::BadRequest,
+                    message: "usb_attach is not handled by init".into(),
                 },
             );
             return;

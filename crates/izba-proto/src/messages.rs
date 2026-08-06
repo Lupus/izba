@@ -16,10 +16,34 @@ pub struct ExecRequest {
 pub enum Request {
     Health,
     Exec(ExecRequest),
-    Wait { exec_id: u32 },
-    Kill { exec_id: u32, signal: i32 },
-    Resize { exec_id: u32, cols: u16, rows: u16 },
+    Wait {
+        exec_id: u32,
+    },
+    Kill {
+        exec_id: u32,
+        signal: i32,
+    },
+    Resize {
+        exec_id: u32,
+        cols: u16,
+        rows: u16,
+    },
     Shutdown,
+    /// Attach a granted USB device inside the guest: init dials the USB plane
+    /// (see [`StreamOpen::UsbAttach`]) and hands the resulting socket to
+    /// `vhci-hcd`. Attach is **host-initiated** — the human runs
+    /// `izba usb attach`, izbad forwards this, and the guest never chooses
+    /// which device or learns where it comes from.
+    ///
+    /// Refused with [`ErrorKind::UsbUnavailable`] unless the guest booted with
+    /// `izba.usb=1`, which only the host can put on the kernel cmdline.
+    UsbAttach {
+        device: String,
+    },
+    /// Detach a device this guest previously attached, by the same `vid:pid`.
+    UsbDetach {
+        device: String,
+    },
 }
 
 /// State of the in-guest OCI workload container, as reported by `crun state`.
@@ -104,16 +128,35 @@ pub enum ErrorKind {
     PathNotFound,
     /// port publish: init could not connect to the requested guest port.
     ConnectFailed,
+    /// USB passthrough is not available in this guest: it did not boot with a
+    /// USB-capable kernel (no `izba.usb=1`). Distinct from `BadRequest` because
+    /// the fix is a restart of the sandbox, not a corrected call — a sandbox
+    /// gains USB support at boot, when its first grant selects the USB kernel.
+    UsbUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Health(HealthInfo),
-    ExecStarted { exec_id: u32 },
-    Wait { status: ExitStatus },
+    ExecStarted {
+        exec_id: u32,
+    },
+    Wait {
+        status: ExitStatus,
+    },
     Ok,
-    Error { kind: ErrorKind, message: String },
+    /// A device was imported for this guest. `devid` and `speed` are what
+    /// `vhci-hcd` needs alongside the socket fd; izbad resolved both from the
+    /// upstream's device record, so the guest never has to enumerate anything.
+    UsbAttached {
+        devid: u32,
+        speed: u32,
+    },
+    Error {
+        kind: ErrorKind,
+        message: String,
+    },
 }
 
 /// First frame on a port-1026 connection, attaching it to an exec's stream.
@@ -174,6 +217,16 @@ pub enum StreamOpen {
     /// split-horizon record set): the UDP reply truncates and the TCP retry,
     /// lacking a path that signals "TCP", would truncate again in a loop.
     DnsTcp,
+    /// Guest USB attach (vsock 1028, guest-initiated): the guest names a
+    /// granted device by `vid:pid` and nothing else — never an address, never
+    /// a busid. izbad resolves it against that sandbox's grants, performs the
+    /// entire USB/IP op phase itself, and replies one `Response` frame
+    /// ([`Response::UsbAttached`] | `Error`). On `UsbAttached` the connection
+    /// becomes the raw USB/IP URB stream, which the guest hands straight to
+    /// `vhci-hcd`; izbad validates every URB header travelling this way (the
+    /// guest → upstream direction terminates in a privileged host service) and
+    /// splices the replies opaquely.
+    UsbAttach { device: String },
 }
 
 pub const CONTROL_PORT: u32 = 1025;
@@ -182,6 +235,11 @@ pub const STREAM_PORT: u32 = 1026;
 /// `run/vsock.sock_1027` unix listener owned by izbad (Firecracker hybrid-
 /// vsock convention, shared by Cloud Hypervisor and OpenVMM).
 pub const EGRESS_PORT: u32 = 1027;
+/// Guest-dialed host port for USB attach streams, bridged the same way to
+/// `run/vsock.sock_1028`. izbad binds it **only** for a sandbox that holds at
+/// least one device grant: with USB off there is nothing to dial, rather than
+/// something that would refuse.
+pub const USB_PORT: u32 = 1028;
 
 /// Guest-side path of the vendored pause binary that izba-init bind-mounts
 /// into the container (shared host↔guest contract: izba-core builds the OCI
@@ -219,6 +277,12 @@ mod tests {
                 rows: 24,
             },
             Request::Shutdown,
+            Request::UsbAttach {
+                device: "0403:6001".into(),
+            },
+            Request::UsbDetach {
+                device: "0403:6001".into(),
+            },
         ] {
             let mut buf = Vec::new();
             crate::write_frame(&mut buf, &req).unwrap();
@@ -271,6 +335,9 @@ mod tests {
             },
             StreamOpen::Dns,
             StreamOpen::DnsTcp,
+            StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
         ] {
             let mut buf = Vec::new();
             crate::write_frame(&mut buf, &open).unwrap();
@@ -297,6 +364,12 @@ mod tests {
             ),
             (StreamOpen::Dns, r#""type":"dns""#),
             (StreamOpen::DnsTcp, r#""type":"dns_tcp""#),
+            (
+                StreamOpen::UsbAttach {
+                    device: "0403:6001".into(),
+                },
+                r#""type":"usb_attach""#,
+            ),
         ] {
             let s = serde_json::to_string(&open).unwrap();
             assert!(s.contains(tag), "{s}");
@@ -327,6 +400,58 @@ mod tests {
     #[test]
     fn egress_port_is_1027() {
         assert_eq!(EGRESS_PORT, 1027);
+    }
+
+    #[test]
+    fn usb_port_is_1028_and_distinct_from_every_other_plane() {
+        // Each plane's port is a contract with the VMM's hybrid-vsock bridge
+        // (`vsock.sock_<port>`); a collision would silently hand one plane's
+        // connections to another's listener.
+        assert_eq!(USB_PORT, 1028);
+        for other in [CONTROL_PORT, STREAM_PORT, EGRESS_PORT] {
+            assert_ne!(USB_PORT, other, "the USB plane needs its own port");
+        }
+    }
+
+    #[test]
+    fn usb_wire_tags_are_stable() {
+        // Host and guest are built and shipped together, but a stale guest
+        // initramfs against a new daemon is a real field state; these tags are
+        // what keep such a pairing an honest error rather than a mis-parse.
+        for (json, tag) in [
+            (
+                serde_json::to_string(&Request::UsbAttach {
+                    device: "0403:6001".into(),
+                })
+                .unwrap(),
+                r#""type":"usb_attach""#,
+            ),
+            (
+                serde_json::to_string(&Request::UsbDetach {
+                    device: "0403:6001".into(),
+                })
+                .unwrap(),
+                r#""type":"usb_detach""#,
+            ),
+            (
+                serde_json::to_string(&Response::UsbAttached {
+                    devid: 196_610,
+                    speed: 3,
+                })
+                .unwrap(),
+                r#""type":"usb_attached""#,
+            ),
+            (
+                serde_json::to_string(&Response::Error {
+                    kind: ErrorKind::UsbUnavailable,
+                    message: "m".into(),
+                })
+                .unwrap(),
+                "usb_unavailable",
+            ),
+        ] {
+            assert!(json.contains(tag), "{json}");
+        }
     }
 
     #[test]
@@ -437,6 +562,10 @@ mod tests {
                 container: None,
             }),
             Response::ExecStarted { exec_id: 42 },
+            Response::UsbAttached {
+                devid: 196_610,
+                speed: 3,
+            },
             Response::Wait {
                 status: ExitStatus::Code(0),
             },

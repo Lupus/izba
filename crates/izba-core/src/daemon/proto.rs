@@ -30,9 +30,9 @@ use izba_proto::{Request, Response};
 /// (v2 retro-covers `ReloadPolicy` + the `Volume*` requests that landed
 /// during v1; the `Unknown` catch-all below turns any future slip into a
 /// clean error instead of a dropped connection. v3 covers the `Usb*`
-/// control-plane requests; the guest-facing USB attach/detach RPCs will take
-/// it to 4 when the datapath lands.)
-pub const DAEMON_PROTO_VERSION: u32 = 3;
+/// control-plane requests; v4 covers `UsbAttach`/`UsbDetach` and the guest
+/// `Request` variants they forward.)
+pub const DAEMON_PROTO_VERSION: u32 = 4;
 
 /// First frame on every daemon connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +184,18 @@ pub enum DaemonRequest {
     /// List a sandbox's device grants.
     UsbStatus {
         name: String,
+    },
+    /// Attach an already-granted device to a running sandbox. izbad checks the
+    /// grant on the host side and then forwards an `izba_proto::Request` to
+    /// izba-init, which dials the USB plane and hands the socket to `vhci-hcd`.
+    UsbAttach {
+        name: String,
+        device: String,
+    },
+    /// Detach a device the sandbox currently holds.
+    UsbDetach {
+        name: String,
+        device: String,
     },
     /// Graceful daemon exit. Sandboxes keep running (detached children);
     /// in-daemon port relays pause until the next daemon adopts.
@@ -762,7 +774,25 @@ mod tests {
         // A same-version daemon predating these variants would fail the frame
         // read instead of self-healing via a restart, so the COMPATIBILITY gate
         // must move with them.
-        assert_eq!(DAEMON_PROTO_VERSION, 3);
+        assert_eq!(DAEMON_PROTO_VERSION, 4);
+    }
+
+    #[test]
+    fn the_usb_datapath_requests_roundtrip() {
+        for req in [
+            DaemonRequest::UsbAttach {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+            DaemonRequest::UsbDetach {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+        ] {
+            let s = serde_json::to_string(&req).unwrap();
+            let back: DaemonRequest = serde_json::from_str(&s).unwrap();
+            assert_eq!(format!("{req:?}"), format!("{back:?}"));
+        }
     }
 
     #[test]
