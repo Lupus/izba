@@ -17,6 +17,9 @@ import type {
   SandboxDetail,
   DiffView,
   PromoteView,
+  UsbUpstream,
+  UsbDevice,
+  UsbStatus,
 } from "./types";
 
 export const api = {
@@ -66,6 +69,18 @@ export const api = {
   volumeAttach: (name: string, spec: string) => invoke<void>("volume_attach", { name, spec }),
   volumeDetach: (name: string, guestPath: string) =>
     invoke<void>("volume_detach", { name, guestPath }),
+  // USB. `usbUpstreamShow` is the only one answerable while the feature is off;
+  // every other call refuses, so callers gate on it rather than probing.
+  usbUpstreamShow: () => invoke<UsbUpstream | null>("usb_upstream_show"),
+  usbUpstreamSet: (host: string, port: number, allowRemote: boolean) =>
+    invoke<void>("usb_upstream_set", { host, port, allowRemote }),
+  usbListDevices: () => invoke<UsbDevice[]>("usb_list_devices"),
+  usbStatus: (name: string) => invoke<UsbStatus>("usb_status", { name }),
+  usbAllow: (name: string, device: string, busidPin: string | null) =>
+    invoke<void>("usb_allow", { name, device, busidPin }),
+  usbRevoke: (name: string, device: string) => invoke<void>("usb_revoke", { name, device }),
+  usbAttach: (name: string, device: string) => invoke<void>("usb_attach", { name, device }),
+  usbDetach: (name: string, device: string) => invoke<void>("usb_detach", { name, device }),
   manifestDiff: (name: string) => invoke<DiffView>("manifest_diff", { name }),
   manifestExport: (name: string) => invoke<string>("manifest_export", { name }),
   manifestPromote: (name: string, restart: boolean) =>

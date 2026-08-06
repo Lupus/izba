@@ -2,7 +2,7 @@ import type { SandboxView } from "../lib/types";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "./StatusDot";
 
-type View = "sandboxes" | "storage";
+type View = "sandboxes" | "storage" | "usb";
 
 interface Props {
   sandboxes: SandboxView[];
@@ -34,6 +34,17 @@ export function Rail({ sandboxes, selected, onSelect, onNew, view, onView }: Pro
         }`}
       >
         Storage
+      </Button>
+      <Button
+        type="button"
+        variant="ghost"
+        onClick={() => onView("usb")}
+        aria-pressed={view === "usb"}
+        className={`flex w-full items-center gap-2 text-left justify-start ${
+          view === "usb" ? "bg-accent font-semibold" : ""
+        }`}
+      >
+        Devices
       </Button>
       <div className="px-2 pt-1 pb-1 text-xs uppercase tracking-wide text-muted-foreground-2 font-bold">
         Sandboxes · {sandboxes.length}

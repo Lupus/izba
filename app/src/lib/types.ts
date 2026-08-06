@@ -159,3 +159,46 @@ export interface PromoteView {
   stopped: boolean;
   warnings: string[];
 }
+
+/** The configured usbip upstream (mirrors `UsbUpstreamView`). */
+export interface UsbUpstream {
+  host: string;
+  port: number;
+  resolved: string | null;
+  /** Stable kebab-case trust token, e.g. "own-host-loopback". */
+  trust: string;
+  /** The note for that trust class; null for the recommended (loopback) one. */
+  warning: string | null;
+}
+
+/** One row of the upstream device inventory (mirrors `UsbDeviceView`). */
+export interface UsbDevice {
+  busid: string;
+  /** Canonical `vid:pid`. */
+  device: string;
+  description: string;
+  /** Whether the upstream is currently exporting it. */
+  shared: boolean;
+  granted_to: string[];
+  /** The sandbox holding it right now, if any. */
+  attached_to: string | null;
+  /** For an unshared device: the exact command a human must run elevated.
+   *  izba never runs it. */
+  bind_command: string | null;
+}
+
+/** One standing grant, with live attachment state folded in. */
+export interface UsbGrant {
+  device: string;
+  busid_pin: string | null;
+  description: string;
+  granted_at_unix_ms: number;
+  attached: boolean;
+}
+
+export interface UsbStatus {
+  grants: UsbGrant[];
+  /** The sandbox holds a grant its running kernel cannot honour: the USB kernel
+   *  is chosen at boot, so this one needs a restart before it can attach. */
+  restart_required: boolean;
+}
