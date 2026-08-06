@@ -9,10 +9,12 @@
 use anyhow::{bail, Result};
 use oci_client::config::Config;
 use oci_spec::runtime::{
-    Capability, LinuxCapabilitiesBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
-    ProcessBuilder, RootBuilder, Spec, UserBuilder,
+    Capability, LinuxCapabilitiesBuilder, LinuxDeviceCgroupBuilder, LinuxDeviceType,
+    LinuxNamespaceBuilder, LinuxNamespaceType, MountBuilder, ProcessBuilder, RootBuilder, Spec,
+    UserBuilder,
 };
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 /// The docker-default capability set for the container's root process.
 ///
@@ -542,7 +544,38 @@ pub struct SpecParams<'a> {
     /// rootful buildkit requires). The network namespace is still dropped (D1).
     /// Normal (non-builder) sandboxes leave this `false` and are UNCHANGED.
     pub privileged: bool,
+    /// This sandbox holds USB device grants, so the workload gets a
+    /// [`USB_SHARED_DIR`] bind at `/dev/izba` and permission to open the serial
+    /// char majors. False for every sandbox without grants, which then has no
+    /// device directory and no device allowances at all.
+    pub usb: bool,
 }
+
+/// Guest path izba-init mirrors attached device nodes into, bind-mounted to
+/// `/dev/izba` in the container.
+///
+/// It lives in init-root `/run`, OUTSIDE the `/rootfs` overlay — mirroring how
+/// the ssh material is kept out of the OCI image — and izba-init creates it
+/// before crun starts, because a bind mount needs its source to exist. It is a
+/// *directory* bind rather than per-device binds because attach happens long
+/// after the container starts: new files inside a bind mount are visible
+/// immediately (same superblock), new mounts would not be.
+///
+/// Must stay in step with `izba_init::usb::SHARED_DEV_DIR`.
+pub const USB_SHARED_DIR: &str = "/run/izba/usb";
+
+/// Where the shared directory appears inside the container.
+pub const USB_CONTAINER_DIR: &str = "/dev/izba";
+
+/// Char-device majors izba will let a workload open: 166 (CDC-ACM, `ttyACM*`)
+/// and 188 (USB serial, `ttyUSB*`).
+///
+/// v1 is serial-class only (design D5), and encoding that as a cgroup device
+/// rule makes it structural rather than a naming convention: a node of any
+/// other class that somehow reached `/dev/izba` still cannot be opened. It is
+/// the same restriction the guest applies when it decides which node to mirror,
+/// enforced independently on the other side.
+const SERIAL_MAJORS: [i64; 2] = [166, 188];
 
 /// Generate the OCI runtime [`Spec`] for the guest's single workload container.
 ///
@@ -661,6 +694,13 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     // podman); `/sys/fs/cgroup` stays a separate mount that crun layers on top.
     rebind_sys_mount(&mut spec);
 
+    // USB passthrough: give the workload somewhere for attached devices to
+    // appear, and permission to open them. Both halves are skipped entirely for
+    // a sandbox without grants — no directory, no device rules.
+    if params.usb {
+        add_usb_device_access(&mut spec)?;
+    }
+
     // Privileged builders: mount `/sys/fs/cgroup` read-WRITE. The OCI default
     // mounts cgroupfs read-only, but rootful BuildKit's OCI worker runs each
     // `RUN` step via a nested runc that must create its own cgroup subtree
@@ -690,6 +730,60 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     }
 
     Ok(spec)
+}
+
+/// Bind the shared device directory into the container and authorise the serial
+/// char majors.
+///
+/// Two independent things, both required. The **bind mount** is how a node that
+/// izba-init creates *after* the container started becomes visible at all: the
+/// container has its own mount namespace and a fresh tmpfs `/dev` from the OCI
+/// default spec, so nothing izba does to the guest's `/dev` reaches the
+/// workload — but a bind mount shares the source directory's superblock, so
+/// files appearing in it later show up immediately.
+///
+/// The **device cgroup rules** are what make the node openable. Under cgroup v2
+/// crun compiles `linux.resources.devices` into an eBPF device filter, and a
+/// major that is not listed is refused with `EPERM` on `open()`. Only the two
+/// serial majors are listed, and only for read/write — never `m` (mknod), so
+/// the workload can use a device izba attached but cannot conjure one of its
+/// own.
+fn add_usb_device_access(spec: &mut Spec) -> Result<()> {
+    if let Some(mounts) = spec.mounts_mut().as_mut() {
+        mounts.push(
+            MountBuilder::default()
+                .destination(PathBuf::from(USB_CONTAINER_DIR))
+                .typ("bind")
+                .source(PathBuf::from(USB_SHARED_DIR))
+                .options(vec![
+                    "rbind".to_string(),
+                    "rw".to_string(),
+                    // A device directory has no business carrying setuid bits or
+                    // executables, and the workload never needs to traverse it
+                    // as code.
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                ])
+                .build()?,
+        );
+    }
+    if let Some(linux) = spec.linux_mut().as_mut() {
+        let mut resources = linux.resources().clone().unwrap_or_default();
+        let mut devices = resources.devices().clone().unwrap_or_default();
+        for major in SERIAL_MAJORS {
+            devices.push(
+                LinuxDeviceCgroupBuilder::default()
+                    .allow(true)
+                    .typ(LinuxDeviceType::C)
+                    .major(major)
+                    .access("rw")
+                    .build()?,
+            );
+        }
+        resources.set_devices(Some(devices));
+        linux.set_resources(Some(resources));
+    }
+    Ok(())
 }
 
 /// Rewrite the spec's `/sys` mount from a fresh `sysfs` mount into a recursive
@@ -1089,7 +1183,142 @@ mod tests {
             hostname: "web",
             terminal: false,
             privileged: false,
+            usb: false,
         }
+    }
+
+    #[test]
+    fn a_usb_sandbox_gets_the_shared_device_directory_bound_in() {
+        // The bind is how a node created AFTER the container started becomes
+        // visible: the container has its own mount namespace and a fresh tmpfs
+        // /dev, but a bind mount shares the source's superblock.
+        let img = image_config(serde_json::json!({"Cmd": ["/bin/sh"]}));
+        let spec = generate_spec(&SpecParams {
+            usb: true,
+            ..base_params(&img)
+        })
+        .unwrap();
+        let m = spec
+            .mounts()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.destination() == std::path::Path::new(USB_CONTAINER_DIR))
+            .expect("no /dev/izba mount");
+        assert_eq!(m.typ().as_deref(), Some("bind"));
+        assert_eq!(
+            m.source().as_deref(),
+            Some(std::path::Path::new(USB_SHARED_DIR))
+        );
+        let opts = m.options().clone().unwrap_or_default();
+        for want in ["rbind", "rw", "nosuid", "noexec"] {
+            assert!(opts.iter().any(|o| o == want), "missing {want}: {opts:?}");
+        }
+    }
+
+    #[test]
+    fn a_sandbox_without_usb_has_no_device_directory_and_no_device_rules() {
+        // The structural half of "disabled USB adds no attack surface": not a
+        // directory that stays empty, but no directory and no allowance at all.
+        let img = image_config(serde_json::json!({"Cmd": ["/bin/sh"]}));
+        let spec = generate_spec(&base_params(&img)).unwrap();
+        assert!(
+            !spec
+                .mounts()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|m| m.destination() == std::path::Path::new(USB_CONTAINER_DIR)),
+            "no USB grants must mean no /dev/izba"
+        );
+        let devices = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .resources()
+            .clone()
+            .unwrap_or_default()
+            .devices()
+            .clone()
+            .unwrap_or_default();
+        assert!(devices.is_empty(), "no USB ⇒ no device rules: {devices:?}");
+    }
+
+    #[test]
+    fn only_the_serial_char_majors_are_authorised_and_never_for_mknod() {
+        // The cgroup rules are what make "serial class only" structural: a node
+        // of any other class that somehow reached /dev/izba still cannot be
+        // opened, and the workload can never create one of its own.
+        let img = image_config(serde_json::json!({"Cmd": ["/bin/sh"]}));
+        let spec = generate_spec(&SpecParams {
+            usb: true,
+            ..base_params(&img)
+        })
+        .unwrap();
+        let devices = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .resources()
+            .clone()
+            .unwrap()
+            .devices()
+            .clone()
+            .unwrap();
+        let majors: Vec<i64> = devices.iter().filter_map(|d| d.major()).collect();
+        assert_eq!(majors, vec![166, 188], "ttyACM and ttyUSB, nothing else");
+        assert!(devices.iter().all(|d| d.allow()));
+        assert!(devices.iter().all(|d| d.typ() == Some(LinuxDeviceType::C)));
+        for d in &devices {
+            let access = d.access().clone().unwrap_or_default();
+            assert!(
+                !access.contains('m'),
+                "mknod must never be granted: {access}"
+            );
+            assert!(access.contains('r') && access.contains('w'), "{access}");
+        }
+    }
+
+    #[test]
+    fn the_shared_directory_path_matches_the_one_izba_init_writes_to() {
+        // Host and guest agree on this path by convention, not by a shared
+        // constant (izba-core does not depend on izba-init). A drift here would
+        // bind an empty directory and the device would simply never appear.
+        assert_eq!(USB_SHARED_DIR, "/run/izba/usb");
+    }
+
+    #[test]
+    fn usb_does_not_disturb_the_rest_of_the_spec() {
+        // The USB additions are additive: the /sys rebind, the dropped network
+        // namespace and the user namespace must all survive.
+        let img = image_config(serde_json::json!({"Cmd": ["/bin/sh"]}));
+        let with = generate_spec(&SpecParams {
+            usb: true,
+            ..base_params(&img)
+        })
+        .unwrap();
+        let without = generate_spec(&base_params(&img)).unwrap();
+        let nss = |s: &Spec| {
+            s.linux()
+                .as_ref()
+                .unwrap()
+                .namespaces()
+                .clone()
+                .unwrap()
+                .iter()
+                .map(|n| format!("{:?}", n.typ()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(nss(&with), nss(&without));
+        let sys = |s: &Spec| {
+            s.mounts()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|m| m.destination() == std::path::Path::new("/sys"))
+                .map(|m| format!("{:?}", m.typ()))
+        };
+        assert_eq!(sys(&with), sys(&without));
     }
 
     #[test]
