@@ -290,10 +290,16 @@ fn a_grant_round_trips_through_allow_status_and_revoke() {
 }
 
 #[test]
-fn the_datapath_verbs_refuse_a_device_that_was_never_granted() {
-    // The grant is the authorization boundary, and it is checked on the host
-    // before the sandbox is contacted — so this holds for a sandbox that has
-    // never been started, which is what keeps the test VM-free.
+fn attaching_a_device_that_was_never_granted_is_refused_and_detaching_is_not() {
+    // The asymmetry is deliberate. Attach is gated on the grant — that is the
+    // authorization boundary, checked on the host before the sandbox is
+    // contacted, which is what keeps this test VM-free.
+    //
+    // Detach is NOT gated, because it is a de-escalation and the state that
+    // most needs it is exactly the one where the grant is already gone: a
+    // device attached before a revoke is still bound to the guest's vhci and
+    // still unavailable to the host. So detach must get past the grant check
+    // and fail on the honest reason — this sandbox is not running.
     let data = tempfile::tempdir().unwrap();
     seed_sandbox(data.path(), "web");
     let set = izba(data.path(), &["usb", "upstream", "set", "127.0.0.1"]);
@@ -303,16 +309,30 @@ fn the_datapath_verbs_refuse_a_device_that_was_never_granted() {
     }
     assert!(set.status.success(), "{set:?}");
 
-    for verb in ["attach", "detach"] {
-        let out = izba(data.path(), &["usb", verb, "web", "--device", "0403:6001"]);
-        assert!(!out.status.success(), "{verb} must refuse: {out:?}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("not granted"), "{verb}: {stderr}");
-        assert!(
-            stderr.contains("izba usb allow"),
-            "{verb} must say how to fix it: {stderr}"
-        );
-    }
+    let attach = izba(
+        data.path(),
+        &["usb", "attach", "web", "--device", "0403:6001"],
+    );
+    assert!(!attach.status.success(), "{attach:?}");
+    let stderr = String::from_utf8_lossy(&attach.stderr);
+    assert!(stderr.contains("not granted"), "{stderr}");
+    assert!(
+        stderr.contains("izba usb allow"),
+        "say how to fix it: {stderr}"
+    );
+
+    let detach = izba(
+        data.path(),
+        &["usb", "detach", "web", "--device", "0403:6001"],
+    );
+    assert!(!detach.status.success(), "{detach:?}");
+    let stderr = String::from_utf8_lossy(&detach.stderr);
+    assert!(
+        !stderr.contains("not granted"),
+        "detach must not be refused for a missing grant — that would tell a user \
+         to re-grant a device in order to release it: {stderr}"
+    );
+    assert!(stderr.contains("not running"), "{stderr}");
 }
 
 #[test]

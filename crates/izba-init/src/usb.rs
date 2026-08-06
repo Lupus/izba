@@ -754,9 +754,13 @@ hs  0000 006 003 00030002 000005 3-2
         }
 
         /// Whether the descriptor handed to `attach` is still a live fd.
+        ///
         /// `F_GETFD` succeeds on an open descriptor and fails with `EBADF` on a
         /// closed one, which is exactly the distinction between "the kernel
-        /// kept the socket" and "init dropped it out from under vhci".
+        /// kept the socket" and "init dropped it out from under vhci". Only
+        /// sound as a POSITIVE check while izba still owns the descriptor: once
+        /// it is closed the number can be reissued to any other thread in this
+        /// process, so absence must be asserted from `closed_fds` instead.
         fn attached_fd_is_open(&self) -> bool {
             let Some(fd) = *self.attached_fd.lock().unwrap() else {
                 return false;
@@ -873,15 +877,16 @@ hs  0000 006 003 00030002 000005 3-2
         );
         // And detaching hands it back: vhci ends the connection, but the
         // descriptor is init's to close, and nothing else ever will.
+        let fd = vhci.attached_fd.lock().unwrap().expect("attached fd");
         usb.detach_on("0403:6001", &vhci).unwrap();
+        // Asserted on the RECORD of the close, not by re-probing the number:
+        // the harness runs tests in parallel threads, so a freed descriptor can
+        // be handed straight to another test's open() and would then look alive
+        // again. The record is deterministic; the probe is a race.
         assert_eq!(
-            vhci.closed_fds().len(),
-            1,
+            vhci.closed_fds(),
+            vec![fd],
             "detach must close exactly the fd it attached"
-        );
-        assert!(
-            !vhci.attached_fd_is_open(),
-            "and it must really be closed, not merely forgotten again"
         );
     }
 
