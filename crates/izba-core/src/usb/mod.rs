@@ -3,8 +3,10 @@
 //! Everything here runs on the host and is reachable only from a human-driven
 //! CLI/GUI action or from izbad's own outbound dial. The guest never sees a
 //! device list and never supplies an upstream address (D1/F-USB-9). The
-//! guest-facing broker plane lands in a later phase as `usb::broker`.
+//! The guest-facing broker plane is [`broker`], which binds a listener only
+//! for a sandbox that already holds a grant.
 
+pub mod broker;
 pub mod grants;
 pub mod ids;
 pub mod inventory;
