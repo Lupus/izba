@@ -1504,6 +1504,19 @@ mod tests {
         write_config_for_persist(&d.paths, "web");
         assert!(!d.usb.listening("web"), "no grants yet");
 
+        // Establish that this environment CAN bind, using a second sandbox and
+        // the manager directly. Skipping on "the plane did not come up" would
+        // otherwise pass a handler that never called refresh at all — the two
+        // look identical from here.
+        write_config_for_persist(&d.paths, "probe");
+        grant_on_disk(&d.paths, "probe");
+        let probe_dir = d.paths.run_dir("probe");
+        if d.usb.refresh(&d.paths, "probe", &probe_dir).is_err() || !d.usb.listening("probe") {
+            eprintln!("SKIP: this environment cannot bind the USB plane");
+            return;
+        }
+        d.usb.stop("probe", &probe_dir);
+
         expect_ok_resp(rpc(
             &mut c,
             &DaemonRequest::UsbAllow {
@@ -1512,10 +1525,10 @@ mod tests {
                 busid_pin: None,
             },
         ));
-        if !d.usb.listening("web") {
-            eprintln!("SKIP: the USB plane could not bind in this environment");
-            return;
-        }
+        assert!(
+            d.usb.listening("web"),
+            "granting must arm the plane now, not at the next start"
+        );
 
         expect_ok_resp(rpc(
             &mut c,
@@ -1528,6 +1541,23 @@ mod tests {
             !d.usb.listening("web"),
             "revoking the last grant must close the plane now, not at the next start"
         );
+    }
+
+    /// Write a grant straight into a sandbox's config, bypassing the RPC — used
+    /// to set up a control case the RPC path is being tested against.
+    fn grant_on_disk(paths: &Paths, name: &str) {
+        crate::sandbox::edit_usb_grants(paths, name, |usb| {
+            crate::usb::grants::grant(
+                usb,
+                crate::usb::UsbGrant {
+                    device: "0403:6001".parse().unwrap(),
+                    busid_pin: None,
+                    description: String::new(),
+                    granted_at_unix_ms: 1,
+                },
+            )
+        })
+        .unwrap();
     }
 
     #[test]
