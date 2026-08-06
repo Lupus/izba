@@ -10,7 +10,10 @@
 //! and everything after the reply is opaque bytes in one direction and
 //! validated URBs in the other. See [`session`] for the op phase.
 
+mod attachments;
 pub mod session;
+
+pub use attachments::Attachments;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -130,6 +133,8 @@ impl Drop for InflightGuard {
 pub struct UsbBroker {
     inner: Mutex<HashMap<String, BrokerSlot>>,
     audit: AuditSink,
+    /// Every device currently spliced, across all sandboxes.
+    attachments: Attachments,
 }
 
 impl UsbBroker {
@@ -137,7 +142,20 @@ impl UsbBroker {
         Self {
             inner: Mutex::new(HashMap::new()),
             audit,
+            attachments: Attachments::new(),
         }
+    }
+
+    /// Device → holding sandbox, for every live attachment this daemon is
+    /// splicing. Empty after a daemon restart, which is honest: a restart
+    /// severs the streams, and the guest sees an unplug.
+    pub fn attached_map(&self) -> HashMap<crate::usb::DeviceId, String> {
+        self.attachments.map()
+    }
+
+    /// What `name` is holding right now.
+    pub fn attached_to(&self, name: &str) -> Vec<crate::usb::DeviceId> {
+        self.attachments.held_by(name)
     }
 
     /// Bind or unbind `name`'s USB plane to match what is on disk right now.
@@ -187,6 +205,7 @@ impl UsbBroker {
         let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let paths2 = paths.clone();
         let audit = self.audit.clone();
+        let attachments = self.attachments.clone();
         let sandbox = name.to_string();
         let thread = std::thread::spawn(move || {
             while !stop2.load(Ordering::SeqCst) {
@@ -210,9 +229,10 @@ impl UsbBroker {
                         let paths = paths2.clone();
                         let audit = audit.clone();
                         let sandbox = sandbox.clone();
+                        let attachments = attachments.clone();
                         std::thread::spawn(move || {
                             let _guard = guard;
-                            handle_conn(conn, &sandbox, &paths, &audit)
+                            handle_conn(conn, &sandbox, &paths, &audit, &attachments)
                         });
                     }
                     Err(e) => match on_accept_error(&e) {
@@ -276,13 +296,23 @@ impl UsbBroker {
 // unit-tested over a `UnixStream` pair; what is left here is the timeout, the
 // real dialer, and the splice, none of which exist without a bound listener.
 #[mutants::skip]
-fn handle_conn(mut conn: UdsStream, sandbox: &str, paths: &Paths, audit: &AuditSink) {
+fn handle_conn(
+    mut conn: UdsStream,
+    sandbox: &str,
+    paths: &Paths,
+    audit: &AuditSink,
+    attachments: &Attachments,
+) {
     // Two layers, and both are needed: the socket timeout bounds each read, and
     // `Deadlined` (inside `serve_attach`) bounds their sum.
     let _ = conn.set_io_timeout(Some(HANDSHAKE_TIMEOUT));
-    let Some((_attached, upstream)) = serve_attach(&mut conn, sandbox, paths, audit, dial) else {
+    let Some((_attached, upstream, _held)) =
+        serve_attach(&mut conn, sandbox, paths, audit, dial, attachments)
+    else {
         return;
     };
+    // `_held` marks the device on loan for exactly the life of the splice below,
+    // however that splice ends.
     // The deadline has to go before the splice: URBs arrive whenever the device
     // has something to say, which may be minutes from now or never.
     let _ = conn.set_io_timeout(None);
@@ -293,16 +323,22 @@ fn handle_conn(mut conn: UdsStream, sandbox: &str, paths: &Paths, audit: &AuditS
 ///
 /// Generic over both streams and over the dialer, so the entire handshake —
 /// including every refusal — is exercised without binding anything. Returns the
-/// imported device and the upstream connection when the caller should now
-/// splice; `None` when the exchange ended, in which case the guest has already
-/// been told why.
+/// imported device, the upstream connection, and the registry guard that marks
+/// the device held, when the caller should now splice; `None` when the exchange
+/// ended, in which case the guest has already been told why.
+///
+/// The registration lives here rather than in the caller so it is covered by the
+/// same tests as the decision it follows: a refusal must leave the device
+/// unheld, and only a device the guest is actually handed may be listed as
+/// attached.
 fn serve_attach<C, U, D>(
     conn: &mut C,
     sandbox: &str,
     paths: &Paths,
     audit: &AuditSink,
     dial: D,
-) -> Option<(session::Attached, U)>
+    attachments: &Attachments,
+) -> Option<(session::Attached, U, attachments::AttachmentGuard)>
 where
     C: Read + Write,
     U: Read + Write,
@@ -333,6 +369,10 @@ where
 
     match attach(sandbox, paths, &device, audit, dial) {
         Ok((attached, upstream)) => {
+            // Held before the reply: from the guest's point of view the device
+            // is its the moment it is told so, and a hold taken afterwards would
+            // leave a window where nothing records the loan.
+            let held = attachments.hold(sandbox, attached.device);
             write_frame(
                 conn,
                 &Response::UsbAttached {
@@ -341,7 +381,7 @@ where
                 },
             )
             .ok()?;
-            Some((attached, upstream))
+            Some((attached, upstream, held))
         }
         Err(refusal) => {
             // Only the guest-safe half crosses the boundary. The full chain is
@@ -704,9 +744,10 @@ mod tests {
         let (mut guest, mut server) = UdsStream::pair().unwrap();
         write_frame(&mut guest, open).unwrap();
         let audit = AuditSink::new(paths.clone());
-        let got = serve_attach(&mut server, sandbox, paths, &audit, dial);
+        let attachments = Attachments::new();
+        let got = serve_attach(&mut server, sandbox, paths, &audit, dial, &attachments);
         let reply: Response = read_frame(&mut guest).expect("the guest is always answered");
-        (got.map(|(a, _)| a), reply)
+        (got.map(|(a, _, _)| a), reply)
     }
 
     fn granted_paths(tmp: &tempfile::TempDir) -> Paths {
@@ -1020,8 +1061,75 @@ mod tests {
             &paths,
             &audit,
             |_: SocketAddr| -> Result<FakeUpstream> { panic!("must not dial") },
+            &Attachments::new(),
         );
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn a_successful_attach_lists_the_device_as_held_until_the_stream_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let rec = device_record("3-2", 0x0403, 0x6001);
+        let (mut guest, mut server) = UdsStream::pair().unwrap();
+        write_frame(
+            &mut guest,
+            &StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
+        )
+        .unwrap();
+        let audit = AuditSink::new(paths.clone());
+        let attachments = Attachments::new();
+        let got = serve_attach(
+            &mut server,
+            "web",
+            &paths,
+            &audit,
+            dialer(vec![devlist(std::slice::from_ref(&rec)), import_reply(rec)]),
+            &attachments,
+        );
+        assert!(got.is_some(), "the handshake must have succeeded");
+        assert_eq!(
+            attachments.held_by("web"),
+            vec!["0403:6001".parse::<crate::usb::DeviceId>().unwrap()],
+            "a device the guest was just handed must read as attached"
+        );
+
+        // Dropping what the caller would have spliced ends the loan.
+        drop(got);
+        assert!(
+            attachments.held_by("web").is_empty(),
+            "the device returns to the host when the stream ends"
+        );
+    }
+
+    #[test]
+    fn a_refused_attach_leaves_the_device_unheld() {
+        // The device was never handed over, so listing it as attached would tell
+        // a user to detach hardware that is sitting on their host.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let (mut guest, mut server) = UdsStream::pair().unwrap();
+        write_frame(
+            &mut guest,
+            &StreamOpen::UsbAttach {
+                device: "1a86:7523".into(),
+            },
+        )
+        .unwrap();
+        let audit = AuditSink::new(paths.clone());
+        let attachments = Attachments::new();
+        let got = serve_attach(
+            &mut server,
+            "web",
+            &paths,
+            &audit,
+            |_: SocketAddr| -> Result<FakeUpstream> { panic!("must not dial an ungranted device") },
+            &attachments,
+        );
+        assert!(got.is_none());
+        assert!(attachments.map().is_empty());
     }
 
     #[test]
