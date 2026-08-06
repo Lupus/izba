@@ -67,6 +67,13 @@ pub struct CreateOpts {
 /// Boot artifacts shared by all sandboxes (kernel + initramfs with izba-init).
 #[derive(Debug, Clone)]
 pub struct Artifacts {
+    /// Which kernel image this is. Carried so `start` can check it against the
+    /// config it loads: the daemon picks the variant from one read of
+    /// `config.json` and `start` re-reads that file, so a grant landing between
+    /// the two would otherwise put `izba.usb=1` and a `/dev/izba` bind on a
+    /// kernel with no vhci — the confusing in-guest failure the fail-closed
+    /// locate logic exists to prevent.
+    pub variant: crate::artifacts::KernelVariant,
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
 }
@@ -2066,6 +2073,7 @@ mod tests {
 
     fn arts() -> Artifacts {
         Artifacts {
+            variant: crate::artifacts::KernelVariant::Base,
             kernel: PathBuf::from("/art/vmlinux"),
             initramfs: PathBuf::from("/art/initramfs.img"),
         }

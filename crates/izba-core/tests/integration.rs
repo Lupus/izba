@@ -282,6 +282,7 @@ fn start_sandbox(env: &TestEnv, tb: &TestBox, name: &str) -> anyhow::Result<()> 
         name,
         &CloudHypervisorDriver,
         &Artifacts {
+            variant: izba_core::artifacts::KernelVariant::Base,
             kernel: env.kernel.clone(),
             initramfs: env.initramfs.clone(),
         },

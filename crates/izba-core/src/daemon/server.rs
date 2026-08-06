@@ -521,8 +521,13 @@ fn handle_start(
     d.egress
         .ensure_listening(&d.paths, &name, &d.paths.run_dir(&name))?;
     // Same dir, same moment: a granted sandbox must have its USB plane up
-    // before the guest boots and dials it.
-    d.usb.refresh(&d.paths, &name, &d.paths.run_dir(&name))?;
+    // before the guest boots and dials it. On failure the egress listener bound
+    // just above is torn down too, so the two planes are armed and disarmed
+    // together rather than leaving one behind for the supervisor to reap.
+    if let Err(e) = d.usb.refresh(&d.paths, &name, &d.paths.run_dir(&name)) {
+        d.egress.stop(&name, &d.paths.run_dir(&name));
+        return Err(e);
+    }
     if let Err(e) = sandbox::start(
         &d.paths,
         &name,
@@ -905,6 +910,19 @@ fn handle_usb_revoke(
     let id: crate::usb::DeviceId = device.parse()?;
     sandbox_must_exist(&d.paths, &name)?;
     sandbox::edit_usb_grants(&d.paths, &name, |usb| crate::usb::grants::revoke(usb, id))?;
+    // Withdrawing consent has to reach the device, not just the record: one
+    // already attached stays bound to the guest's vhci — and unavailable to the
+    // host — until something detaches it. Best-effort, because the sandbox may
+    // well be stopped, and the revoke itself is already durable on disk.
+    if let Err(e) = handle_guest_rpc(
+        d,
+        name.clone(),
+        izba_proto::Request::UsbDetach {
+            device: id.to_string(),
+        },
+    ) {
+        eprintln!("izbad: detaching {id} from '{name}' after revoke: {e:#}");
+    }
     // Symmetrically: revoking the last grant reopens the sandbox's ordinary LAN
     // access straight away rather than leaving a stale denial behind.
     d.egress
@@ -962,6 +980,13 @@ fn refresh_usb_plane(d: &Arc<Daemon>, name: &str) {
 /// the USB plane and hands the resulting socket to `vhci-hcd`. The grant is
 /// re-checked there too, by the broker, against the same on-disk record — this
 /// check is the honest early error, not the boundary.
+///
+/// **Detach is deliberately NOT gated on the grant.** Detaching is a
+/// de-escalation, and the state that most needs it is exactly the one where the
+/// grant is already gone: a device attached before a revoke is still bound to
+/// the guest's vhci and still unavailable to the host. Requiring the grant
+/// there would tell the user to re-grant a device in order to release it, and
+/// leave them no other way out short of stopping the sandbox.
 fn handle_usb_attach(
     d: &Arc<Daemon>,
     name: String,
@@ -971,13 +996,15 @@ fn handle_usb_attach(
     usb_settings_or_refuse(d)?;
     let id: crate::usb::DeviceId = device.parse()?;
     sandbox_must_exist(&d.paths, &name)?;
-    let cfg: crate::state::SandboxConfig =
-        crate::state::load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
-            .ok_or_else(|| anyhow::anyhow!("sandbox '{name}' has no config"))?;
-    if crate::usb::grants::find(&cfg.usb, id).is_none() {
-        anyhow::bail!(
-            "{id} is not granted to '{name}' — run `izba usb allow {name} --device {id}` first"
-        );
+    if attach {
+        let cfg: crate::state::SandboxConfig =
+            crate::state::load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
+                .ok_or_else(|| anyhow::anyhow!("sandbox '{name}' has no config"))?;
+        if crate::usb::grants::find(&cfg.usb, id).is_none() {
+            anyhow::bail!(
+                "{id} is not granted to '{name}' — run `izba usb allow {name} --device {id}` first"
+            );
+        }
     }
     let req = if attach {
         izba_proto::Request::UsbAttach {
@@ -1231,8 +1258,9 @@ mod tests {
                 });
                 Ok(host)
             }),
-            artifacts: Box::new(|_, _| {
+            artifacts: Box::new(|_, variant| {
                 Ok(crate::sandbox::Artifacts {
+                    variant,
                     kernel: "/art/vmlinux".into(),
                     initramfs: "/art/initramfs.img".into(),
                 })
@@ -1446,26 +1474,54 @@ mod tests {
         set_loopback_upstream(&mut c);
         write_config_for_persist(&d.paths, "web");
 
-        for req in [
-            DaemonRequest::UsbAttach {
+        match rpc(
+            &mut c,
+            &DaemonRequest::UsbAttach {
                 name: "web".into(),
                 device: "0403:6001".into(),
             },
-            DaemonRequest::UsbDetach {
-                name: "web".into(),
-                device: "0403:6001".into(),
-            },
-        ] {
-            match rpc(&mut c, &req) {
-                DaemonResponse::Error { message } => {
-                    assert!(message.contains("not granted"), "{req:?}: {message}");
-                    assert!(
-                        message.contains("izba usb allow"),
-                        "say how to fix it: {message}"
-                    );
-                }
-                other => panic!("{req:?} must refuse an ungranted device, got {other:?}"),
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("not granted"), "{message}");
+                assert!(
+                    message.contains("izba usb allow"),
+                    "say how to fix it: {message}"
+                );
             }
+            other => panic!("attach must refuse an ungranted device, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detaching_is_not_gated_on_the_grant() {
+        // Detach is a de-escalation, and the state that most needs it is
+        // exactly the one where the grant is already gone: a device attached
+        // before a revoke is still bound to the guest's vhci and still
+        // unavailable to the host. Refusing there would tell the user to
+        // re-grant a device in order to release it.
+        //
+        // So detach must reach the guest — here it fails on the sandbox being
+        // stopped, which is the honest answer, NOT on the missing grant.
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        set_loopback_upstream(&mut c);
+        write_config_for_persist(&d.paths, "web");
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::UsbDetach {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+        ) {
+            DaemonResponse::Error { message } => assert!(
+                !message.contains("not granted"),
+                "detach must not be refused for a missing grant: {message}"
+            ),
+            // A guest reply at all means it got past the grant check, which is
+            // the whole point.
+            DaemonResponse::Guest { .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
         }
     }
 

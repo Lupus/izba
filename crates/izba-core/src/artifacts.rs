@@ -71,7 +71,13 @@ fn locate_from(
     variant: KernelVariant,
 ) -> anyhow::Result<Artifacts> {
     match (kernel_env, initramfs_env) {
-        (Some(kernel), Some(initramfs)) => return Ok(Artifacts { kernel, initramfs }),
+        (Some(kernel), Some(initramfs)) => {
+            return Ok(Artifacts {
+                variant,
+                kernel,
+                initramfs,
+            })
+        }
         (Some(_), None) | (None, Some(_)) => {
             bail!(
                 "{} and IZBA_INITRAMFS must be set together (or neither)",
@@ -92,7 +98,11 @@ fn locate_from(
         let kernel = dir.join(variant.image());
         let initramfs = dir.join("initramfs.cpio.gz");
         if kernel.is_file() && initramfs.is_file() {
-            return Ok(Artifacts { kernel, initramfs });
+            return Ok(Artifacts {
+                variant,
+                kernel,
+                initramfs,
+            });
         }
     }
 
