@@ -395,6 +395,8 @@ fn dispatch_inner(
         } => handle_usb_allow(d, name, device, busid_pin),
         DaemonRequest::UsbRevoke { name, device } => handle_usb_revoke(d, name, device),
         DaemonRequest::UsbStatus { name } => handle_usb_status(d, name),
+        DaemonRequest::UsbAttach { name, device } => handle_usb_attach(d, name, device, true),
+        DaemonRequest::UsbDetach { name, device } => handle_usb_attach(d, name, device, false),
         DaemonRequest::VolumeList => handle_volume_list(d),
         DaemonRequest::VolumeRemove { name } => handle_volume_remove(d, name),
         DaemonRequest::VolumeAttach { name, spec } => handle_volume_attach(d, name, spec),
@@ -908,6 +910,48 @@ fn handle_usb_status(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResp
     })
 }
 
+/// Attach or detach one already-granted device on a running sandbox.
+///
+/// Both verbs share one shape, and the order of its checks is the point: the
+/// feature gate, the device id, the sandbox, and the grant are all settled on
+/// the host before a single byte reaches the guest. A grant check that ran
+/// after the guest RPC would answer "sandbox is not running" for a device the
+/// user never consented to — reporting the wrong problem, and leaking whether
+/// the sandbox is up to a caller who was never entitled to the device.
+///
+/// izbad does not attach anything itself: it forwards to izba-init, which dials
+/// the USB plane and hands the resulting socket to `vhci-hcd`. The grant is
+/// re-checked there too, by the broker, against the same on-disk record — this
+/// check is the honest early error, not the boundary.
+fn handle_usb_attach(
+    d: &Arc<Daemon>,
+    name: String,
+    device: String,
+    attach: bool,
+) -> anyhow::Result<DaemonResponse> {
+    usb_settings_or_refuse(d)?;
+    let id: crate::usb::DeviceId = device.parse()?;
+    sandbox_must_exist(&d.paths, &name)?;
+    let cfg: crate::state::SandboxConfig =
+        crate::state::load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
+            .ok_or_else(|| anyhow::anyhow!("sandbox '{name}' has no config"))?;
+    if crate::usb::grants::find(&cfg.usb, id).is_none() {
+        anyhow::bail!(
+            "{id} is not granted to '{name}' — run `izba usb allow {name} --device {id}` first"
+        );
+    }
+    let req = if attach {
+        izba_proto::Request::UsbAttach {
+            device: id.to_string(),
+        }
+    } else {
+        izba_proto::Request::UsbDetach {
+            device: id.to_string(),
+        }
+    };
+    handle_guest_rpc(d, name, req)
+}
+
 fn sandbox_must_exist(paths: &Paths, name: &str) -> anyhow::Result<()> {
     if !paths.sandbox_dir(name).join(CONFIG_FILE).is_file() {
         anyhow::bail!("no such sandbox '{name}'");
@@ -1320,6 +1364,109 @@ mod tests {
                 ),
                 other => panic!("{req:?} must refuse when USB is off, got {other:?}"),
             }
+        }
+    }
+
+    /// The datapath verbs join the same refusal set: with USB off, neither
+    /// looks at a device id, a sandbox, or the guest.
+    #[test]
+    fn the_datapath_verbs_also_refuse_when_no_upstream_is_configured() {
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        for req in [
+            DaemonRequest::UsbAttach {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+            DaemonRequest::UsbDetach {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+        ] {
+            match rpc(&mut c, &req) {
+                DaemonResponse::Error { message } => {
+                    assert!(message.contains("not configured"), "{req:?}: {message}")
+                }
+                other => panic!("{req:?} must refuse when USB is off, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn attaching_a_device_that_was_never_granted_is_refused_before_the_guest_is_touched() {
+        // The grant is the authorization boundary. Reaching the guest first
+        // would answer "sandbox is not running" for a device the user never
+        // consented to — the wrong problem, and it tells a caller who is not
+        // entitled to the device whether the sandbox is up.
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        set_loopback_upstream(&mut c);
+        write_config_for_persist(&d.paths, "web");
+
+        for req in [
+            DaemonRequest::UsbAttach {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+            DaemonRequest::UsbDetach {
+                name: "web".into(),
+                device: "0403:6001".into(),
+            },
+        ] {
+            match rpc(&mut c, &req) {
+                DaemonResponse::Error { message } => {
+                    assert!(message.contains("not granted"), "{req:?}: {message}");
+                    assert!(
+                        message.contains("izba usb allow"),
+                        "say how to fix it: {message}"
+                    );
+                }
+                other => panic!("{req:?} must refuse an ungranted device, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_malformed_device_id_never_reaches_the_sandbox_lookup() {
+        // `403:6001` is a plausible typo for a real id; it must be refused on
+        // its own terms rather than as "no such sandbox".
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        set_loopback_upstream(&mut c);
+        match rpc(
+            &mut c,
+            &DaemonRequest::UsbAttach {
+                name: "nonexistent".into(),
+                device: "403:6001".into(),
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("vid:pid"), "{message}");
+                assert!(
+                    !message.contains("no such sandbox"),
+                    "the id is the problem, not the sandbox: {message}"
+                );
+            }
+            other => panic!("expected a parse refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attaching_on_a_sandbox_that_does_not_exist_says_so() {
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        set_loopback_upstream(&mut c);
+        match rpc(
+            &mut c,
+            &DaemonRequest::UsbAttach {
+                name: "nonexistent".into(),
+                device: "0403:6001".into(),
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("no such sandbox"), "{message}")
+            }
+            other => panic!("expected a missing-sandbox refusal, got {other:?}"),
         }
     }
 

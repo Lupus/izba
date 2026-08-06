@@ -331,6 +331,12 @@ fn handle_control_request(req: Request, shared: &Arc<Shared>) -> ControlOutcome 
             }
             Response::Ok
         }
+        // The scripted guest has no vhci and no USB plane; it answers the way a
+        // sandbox booted without USB support does.
+        Request::UsbAttach { .. } | Request::UsbDetach { .. } => Response::Error {
+            kind: ErrorKind::UsbUnavailable,
+            message: "ttytest: no USB support".to_string(),
+        },
         Request::Shutdown => return ControlOutcome::Shutdown,
     };
     ControlOutcome::Reply(resp)
