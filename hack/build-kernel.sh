@@ -9,6 +9,14 @@
 #   OUTPUT   Destination for the built vmlinux.
 #            Defaults to dist/vmlinux (relative to the repo root).
 #
+# IZBA_KERNEL_EXTRA_CONFIG=<path> merges a second fragment ON TOP of
+# hack/kernel.config, for building a variant image. The USB-passthrough kernel
+# is built this way:
+#   IZBA_KERNEL_EXTRA_CONFIG=hack/kernel-usb.config \
+#     hack/build-kernel.sh 6.12.30 dist/vmlinux-usb
+# The extra fragment wins on any symbol both files mention, which is what lets
+# it re-enable something the base fragment deliberately turns off.
+#
 # The kernel source tarball is cached in:
 #   ${XDG_CACHE_HOME:-$HOME/.cache}/izba/kernel/
 # so repeated runs skip the download.
@@ -45,6 +53,19 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/izba/kernel"
 TARBALL="linux-${VERSION}.tar.xz"
 TARBALL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${TARBALL}"
 FRAGMENT="$(pwd)/hack/kernel.config"
+# Resolved to an absolute path here, because the build cd's into the unpacked
+# kernel tree before the merge runs.
+EXTRA_FRAGMENT=""
+if [[ -n "${IZBA_KERNEL_EXTRA_CONFIG:-}" ]]; then
+    case "$IZBA_KERNEL_EXTRA_CONFIG" in
+        /*) EXTRA_FRAGMENT="$IZBA_KERNEL_EXTRA_CONFIG" ;;
+        *) EXTRA_FRAGMENT="$REPO_ROOT/$IZBA_KERNEL_EXTRA_CONFIG" ;;
+    esac
+    if [[ ! -f "$EXTRA_FRAGMENT" ]]; then
+        echo "error: IZBA_KERNEL_EXTRA_CONFIG=$IZBA_KERNEL_EXTRA_CONFIG does not exist" >&2
+        exit 1
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Dependency check
@@ -127,7 +148,7 @@ if [[ ! -f scripts/kconfig/merge_config.sh ]]; then
     echo "error: scripts/kconfig/merge_config.sh not found in kernel tree" >&2
     exit 1
 fi
-bash scripts/kconfig/merge_config.sh -m .config "$FRAGMENT"
+bash scripts/kconfig/merge_config.sh -m .config "$FRAGMENT" ${EXTRA_FRAGMENT:+"$EXTRA_FRAGMENT"}
 make olddefconfig
 
 # ---------------------------------------------------------------------------
@@ -145,7 +166,20 @@ make olddefconfig
 #   - every `# CONFIG_X is not set` line  ⇒  must NOT be `CONFIG_X=y` in .config
 # The =y check is the one that matters (the silent-drop case); the not-set
 # check is a cheap belt-and-braces against an unexpected force-`select`.
+#
+# With an extra fragment the two files may DISAGREE about a symbol — that is the
+# whole point of a variant (the USB fragment re-enables what the base one turns
+# off). So verify against the EFFECTIVE fragment: the concatenation with
+# last-mention-wins per symbol, matching what `merge_config -m` actually did.
 echo "Verifying fragment symbols survived olddefconfig..."
+EFFECTIVE_FRAGMENT="$(mktemp)"
+trap 'rm -f "$EFFECTIVE_FRAGMENT"' EXIT
+cat "$FRAGMENT" ${EXTRA_FRAGMENT:+"$EXTRA_FRAGMENT"} |
+    awk '
+        /^CONFIG_[A-Z0-9_]+=/              { sym = $0; sub(/=.*/, "", sym); last[sym] = $0 }
+        /^# CONFIG_[A-Z0-9_]+ is not set$/ { last[$2] = $0 }
+        END { for (sym in last) print last[sym] }
+    ' >"$EFFECTIVE_FRAGMENT"
 MISSING_Y=""
 UNEXPECTED_Y=""
 while IFS= read -r line || [[ -n "$line" ]]; do
@@ -166,7 +200,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
             fi
             ;;
     esac
-done <"$FRAGMENT"
+done <"$EFFECTIVE_FRAGMENT"
 
 if [[ -n "$MISSING_Y" ]]; then
     echo "error: fragment symbols requested =y but DROPPED by olddefconfig" >&2

@@ -76,8 +76,10 @@ pub type SharedConnector =
 pub type SharedStreamConnector =
     Box<dyn Fn(&Paths, &str) -> anyhow::Result<UdsStream> + Send + Sync>;
 
-/// Seam over `artifacts::locate`.
-pub type ArtifactsFn = Box<dyn Fn(&Paths) -> anyhow::Result<Artifacts> + Send + Sync>;
+/// Seam over `artifacts::locate`. Takes the variant because a sandbox holding
+/// USB grants needs a different kernel image than one that does not.
+pub type ArtifactsFn =
+    Box<dyn Fn(&Paths, crate::artifacts::KernelVariant) -> anyhow::Result<Artifacts> + Send + Sync>;
 
 /// Seam over `image::ensure_image`: image ref → digest (pulling if needed).
 pub type ResolveImageFn = Box<dyn Fn(&Paths, &str) -> anyhow::Result<String> + Send + Sync>;
@@ -485,7 +487,16 @@ fn handle_start(
     // egress is unconditional now.
     let config: SandboxConfig = load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
         .with_context(|| format!("no config.json for '{name}'"))?;
-    let art = (d.deps.artifacts)(&d.paths)?;
+    // A sandbox with device grants boots the USB-capable kernel; every other
+    // one boots a kernel that physically cannot talk to a USB device (D4).
+    // Resolving it here means a missing USB kernel fails the start with an
+    // actionable error rather than booting a guest whose attaches do nothing.
+    let variant = if config.usb.is_enabled() {
+        crate::artifacts::KernelVariant::Usb
+    } else {
+        crate::artifacts::KernelVariant::Base
+    };
+    let art = (d.deps.artifacts)(&d.paths, variant)?;
     // Held across the whole listener-bind → boot → relay-republish window
     // (dropped on return, success or error): tells the supervisor tick to
     // spare this sandbox's egress/relays while state.json doesn't exist yet
@@ -1220,7 +1231,7 @@ mod tests {
                 });
                 Ok(host)
             }),
-            artifacts: Box::new(|_| {
+            artifacts: Box::new(|_, _| {
                 Ok(crate::sandbox::Artifacts {
                     kernel: "/art/vmlinux".into(),
                     initramfs: "/art/initramfs.img".into(),
