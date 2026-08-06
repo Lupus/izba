@@ -43,6 +43,22 @@ pub enum UsbCmd {
         #[arg(short, long)]
         device: String,
     },
+    /// Attach a granted device to a running sandbox
+    Attach {
+        /// Sandbox name
+        name: String,
+        /// Device to attach, as VID:PID
+        #[arg(short, long)]
+        device: String,
+    },
+    /// Detach a device from a running sandbox
+    Detach {
+        /// Sandbox name
+        name: String,
+        /// Device to detach, as VID:PID
+        #[arg(short, long)]
+        device: String,
+    },
     /// Show a sandbox's device grants
     Status {
         /// Sandbox name
@@ -79,6 +95,8 @@ pub fn run(paths: &Paths, cmd: &UsbCmd) -> Result<i32> {
             confirm,
         } => allow(paths, name, device, busid.as_deref(), confirm.as_deref()),
         UsbCmd::Revoke { name, device } => revoke(paths, name, device),
+        UsbCmd::Attach { name, device } => attach(paths, name, device, true),
+        UsbCmd::Detach { name, device } => attach(paths, name, device, false),
         UsbCmd::Status { name } => status(paths, name),
     }
 }
@@ -338,6 +356,39 @@ fn revoke(paths: &Paths, name: &str, device: &str) -> Result<i32> {
         &mut |_| {},
     )?)?;
     println!("revoked {id} from '{name}'");
+    Ok(0)
+}
+
+/// Attach or detach an already-granted device.
+///
+/// No consent prompt: consent was given at `allow` time, and attaching a device
+/// the user already granted is not a second decision. The attach line does say
+/// what it costs elsewhere — the device leaves the host while it is held —
+/// because that is a side effect on hardware outside the sandbox, and nothing
+/// else in the session will mention it.
+fn attach(paths: &Paths, name: &str, device: &str, attach: bool) -> Result<i32> {
+    let id: izba_core::usb::DeviceId = device.parse()?;
+    let mut client = DaemonClient::connect(paths)?;
+    let req = if attach {
+        DaemonRequest::UsbAttach {
+            name: name.to_string(),
+            device: id.to_string(),
+        }
+    } else {
+        DaemonRequest::UsbDetach {
+            name: name.to_string(),
+            device: id.to_string(),
+        }
+    };
+    super::expect_ok(client.request(&req, &mut |_| {})?)?;
+    if attach {
+        println!("attached {id} to '{name}' — it appears at /dev/izba inside the sandbox");
+        println!(
+            "  the device is unavailable to the host and to other sandboxes until you detach it"
+        );
+    } else {
+        println!("detached {id} from '{name}'");
+    }
     Ok(0)
 }
 

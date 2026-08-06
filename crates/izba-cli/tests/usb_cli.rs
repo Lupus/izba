@@ -73,7 +73,9 @@ fn usb_help_lists_every_verb() {
     let out = izba(data.path(), &["usb", "--help"]);
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    for sub in ["upstream", "list", "allow", "revoke", "status"] {
+    for sub in [
+        "upstream", "list", "allow", "revoke", "attach", "detach", "status",
+    ] {
         assert!(text.contains(sub), "missing subcommand {sub}: {text}");
     }
 }
@@ -284,6 +286,47 @@ fn a_grant_round_trips_through_allow_status_and_revoke() {
         String::from_utf8_lossy(&after.stdout).contains("no USB device grants"),
         "{}",
         String::from_utf8_lossy(&after.stdout)
+    );
+}
+
+#[test]
+fn the_datapath_verbs_refuse_a_device_that_was_never_granted() {
+    // The grant is the authorization boundary, and it is checked on the host
+    // before the sandbox is contacted — so this holds for a sandbox that has
+    // never been started, which is what keeps the test VM-free.
+    let data = tempfile::tempdir().unwrap();
+    seed_sandbox(data.path(), "web");
+    let set = izba(data.path(), &["usb", "upstream", "set", "127.0.0.1"]);
+    if daemon_unavailable(&set) {
+        eprintln!("SKIP: daemon socket unavailable in this environment");
+        return;
+    }
+    assert!(set.status.success(), "{set:?}");
+
+    for verb in ["attach", "detach"] {
+        let out = izba(data.path(), &["usb", verb, "web", "--device", "0403:6001"]);
+        assert!(!out.status.success(), "{verb} must refuse: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("not granted"), "{verb}: {stderr}");
+        assert!(
+            stderr.contains("izba usb allow"),
+            "{verb} must say how to fix it: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn the_datapath_verbs_refuse_a_malformed_device_id_on_its_own_terms() {
+    let data = tempfile::tempdir().unwrap();
+    let out = izba(
+        data.path(),
+        &["usb", "attach", "web", "--device", "not-an-id"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("vid:pid"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
