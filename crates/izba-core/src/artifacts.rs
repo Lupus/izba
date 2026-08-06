@@ -162,7 +162,10 @@ mod tests {
             locate_from(None, None, &data, None, KernelVariant::Usb).unwrap_err()
         );
         assert!(err.contains("vmlinux-usb"), "name what is missing: {err}");
-        assert!(err.contains("build-kernel.sh"), "say how to build it: {err}");
+        assert!(
+            err.contains("build-kernel.sh"),
+            "say how to build it: {err}"
+        );
         assert!(
             err.contains("izba usb revoke"),
             "and how to proceed without it: {err}"
@@ -206,8 +209,7 @@ mod tests {
 
     #[test]
     fn one_env_override_is_an_error() {
-        let err =
-            locate_from(
+        let err = locate_from(
             Some(PathBuf::from("/k")),
             None,
             Path::new("/no/data"),
@@ -265,7 +267,14 @@ mod tests {
     #[test]
     fn nothing_found_is_an_error() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let err = locate_from(None, None, &tmp.path().join("nope"), None, KernelVariant::Base).unwrap_err();
+        let err = locate_from(
+            None,
+            None,
+            &tmp.path().join("nope"),
+            None,
+            KernelVariant::Base,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("boot artifacts not found"));
     }
 }

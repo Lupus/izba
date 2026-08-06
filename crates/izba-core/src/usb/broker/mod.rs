@@ -13,7 +13,7 @@
 pub mod session;
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,64 +161,99 @@ impl UsbBroker {
 }
 
 /// Serve one guest-initiated USB connection.
+// reason: transport glue. `serve_attach` below carries every decision and is
+// unit-tested over a `UnixStream` pair; what is left here is the timeout, the
+// real dialer, and the splice, none of which exist without a bound listener.
+#[mutants::skip]
 fn handle_conn(mut conn: UdsStream, sandbox: &str, paths: &Paths, audit: &AuditSink) {
+    // A guest that dials and then says nothing must not hold a thread — or a
+    // claim on somebody's hardware — open.
     let _ = conn.set_io_timeout(Some(HANDSHAKE_TIMEOUT));
-    let open: StreamOpen = match read_frame(&mut conn) {
-        Ok(o) => o,
-        Err(_) => return,
+    let Some((_attached, upstream)) = serve_attach(&mut conn, sandbox, paths, audit, dial) else {
+        return;
     };
+    // The deadline has to go before the splice: URBs arrive whenever the device
+    // has something to say, which may be minutes from now or never.
+    let _ = conn.set_io_timeout(None);
+    splice(conn, upstream);
+}
+
+/// Read the guest's one frame, authorize it, import the device, and reply.
+///
+/// Generic over both streams and over the dialer, so the entire handshake —
+/// including every refusal — is exercised without binding anything. Returns the
+/// imported device and the upstream connection when the caller should now
+/// splice; `None` when the exchange ended, in which case the guest has already
+/// been told why.
+fn serve_attach<C, U, D>(
+    conn: &mut C,
+    sandbox: &str,
+    paths: &Paths,
+    audit: &AuditSink,
+    dial: D,
+) -> Option<(session::Attached, U)>
+where
+    C: Read + Write,
+    U: Read + Write,
+    D: Fn(SocketAddr) -> Result<U>,
+{
+    let open: StreamOpen = read_frame(conn).ok()?;
     let StreamOpen::UsbAttach { device } = open else {
         // This plane exists for exactly one purpose. Anything else arriving on
         // it is a guest probing what it was handed, not a mistake to guess at.
         let _ = write_frame(
-            &mut conn,
+            conn,
             &Response::Error {
                 kind: ErrorKind::BadRequest,
                 message: "only usb_attach is handled on the USB port".into(),
             },
         );
-        return;
+        return None;
     };
 
-    match attach(sandbox, paths, &device, audit) {
+    match attach(sandbox, paths, &device, audit, dial) {
         Ok((attached, upstream)) => {
-            if write_frame(
-                &mut conn,
+            write_frame(
+                conn,
                 &Response::UsbAttached {
                     devid: attached.devid,
                     speed: attached.speed,
                 },
             )
-            .is_err()
-            {
-                return;
-            }
-            // The handshake deadline must go before the splice: URBs arrive
-            // whenever the device has something to say, which may be never.
-            let _ = conn.set_io_timeout(None);
-            splice(conn, upstream);
+            .ok()?;
+            Some((attached, upstream))
         }
         Err(e) => {
+            // izbad's reason is the useful one and the guest is going to show it
+            // to a human; pass it through rather than reducing it to a code.
             let _ = write_frame(
-                &mut conn,
+                conn,
                 &Response::Error {
                     kind: ErrorKind::BadRequest,
                     message: format!("{e:#}"),
                 },
             );
+            None
         }
     }
 }
 
 /// Everything between the guest's frame and its reply: authorize, enumerate,
 /// import, verify. Returns the imported device and the connection carrying it.
-fn attach(
+fn attach<U, D>(
     sandbox: &str,
     paths: &Paths,
     device: &str,
     audit: &AuditSink,
-) -> Result<(session::Attached, std::net::TcpStream)> {
+    dial: D,
+) -> Result<(session::Attached, U)>
+where
+    U: Read + Write,
+    D: Fn(SocketAddr) -> Result<U>,
+{
     let settings = crate::usb::settings::load(&paths.usb_dir());
+    // Re-classified here, not merely read: a hostname accepted as private when
+    // it was configured can resolve somewhere else by the time a guest asks.
     let addr = crate::usb::dialable_upstream(&settings)?;
     let id: crate::usb::DeviceId = device.parse()?;
 
@@ -227,13 +262,22 @@ fn attach(
     let grants = crate::usb::grants_of(paths, sandbox);
     let Some(grant) = crate::usb::grants::find(&grants, id).cloned() else {
         let e = format!("{id} is not granted to '{sandbox}'");
-        deny(audit, sandbox, addr, Some(&id.to_string()), &e);
+        deny(audit, sandbox, addr, &id.to_string(), &e);
         anyhow::bail!(e);
     };
 
-    let outcome = (|| -> Result<(session::Attached, std::net::TcpStream)> {
-        // One operation per connection: enumerate on one, import on another.
-        let devices = crate::usb::inventory::fetch(addr)?;
+    let outcome = (|| -> Result<(session::Attached, U)> {
+        // One operation per TCP connection, so this is two dials: the devlist
+        // connection is dropped, and the import connection becomes the URB
+        // stream.
+        let mut lister = dial(addr)?;
+        lister
+            .write_all(&izba_proto::usbip::encode_op_req_devlist())
+            .context("sending OP_REQ_DEVLIST")?;
+        lister.flush().ok();
+        let devices = crate::usb::inventory::read_devlist_reply(&mut lister)?;
+        drop(lister);
+
         let chosen = session::resolve(&devices, &grant)?;
         let mut up = dial(addr)?;
         let attached = session::import(&mut up, &chosen, &grant)?;
@@ -256,22 +300,26 @@ fn attach(
             Ok((attached, up))
         }
         Err(e) => {
-            deny(
-                audit,
-                sandbox,
-                addr,
-                Some(&id.to_string()),
-                &format!("{e:#}"),
-            );
+            deny(audit, sandbox, addr, &id.to_string(), &format!("{e:#}"));
             Err(e)
         }
     }
 }
 
-fn deny(audit: &AuditSink, sandbox: &str, addr: SocketAddr, host: Option<&str>, rule: &str) {
+/// Audit a refused attach. Every failure path goes through here, so a denial is
+/// as visible in `izba netlog` as an allowed one — a device izba refused is
+/// exactly what a user comes to the log to understand.
+fn deny(audit: &AuditSink, sandbox: &str, addr: SocketAddr, device: &str, rule: &str) {
     audit.record(
-        AuditRecord::deny(sandbox, addr.ip(), addr.port(), host, Tier::Usb, rule)
-            .with_request("attach", String::new()),
+        AuditRecord::deny(
+            sandbox,
+            addr.ip(),
+            addr.port(),
+            Some(device),
+            Tier::Usb,
+            rule,
+        )
+        .with_request("attach", String::new()),
     );
 }
 
@@ -386,6 +434,353 @@ mod tests {
     fn bind_denied(e: &anyhow::Error) -> bool {
         let s = format!("{e:#}");
         s.contains("Permission denied") || s.contains("Operation not permitted")
+    }
+
+    // ---- the handshake, driven over a socket pair with a fake upstream ----
+
+    /// A scripted usbip upstream: answers a devlist with `devices`, then an
+    /// import with whatever record `import_reply` supplies. Built from the
+    /// phase-1 encoders so the test pins the wire format, not our idea of it.
+    struct FakeUpstream {
+        reply: std::io::Cursor<Vec<u8>>,
+        sent: Vec<u8>,
+    }
+
+    impl Read for FakeUpstream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reply.read(buf)
+        }
+    }
+    impl Write for FakeUpstream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sent.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn device_record(busid: &str, vid: u16, pid: u16) -> Vec<u8> {
+        use izba_proto::usbip::DEVICE_RECORD_LEN;
+        let mut b = vec![0u8; DEVICE_RECORD_LEN];
+        let path = "/sys/devices/pci0000:00/usb3";
+        b[..path.len()].copy_from_slice(path.as_bytes());
+        b[0x100..0x100 + busid.len()].copy_from_slice(busid.as_bytes());
+        b[0x120..0x124].copy_from_slice(&3u32.to_be_bytes()); // busnum
+        b[0x124..0x128].copy_from_slice(&2u32.to_be_bytes()); // devnum
+        b[0x128..0x12C].copy_from_slice(&2u32.to_be_bytes()); // speed
+        b[0x12C..0x12E].copy_from_slice(&vid.to_be_bytes());
+        b[0x12E..0x130].copy_from_slice(&pid.to_be_bytes());
+        b
+    }
+
+    fn devlist(records: &[Vec<u8>]) -> Vec<u8> {
+        use izba_proto::usbip::{OP_REP_DEVLIST, USBIP_VERSION};
+        let mut out = Vec::new();
+        out.extend_from_slice(&USBIP_VERSION.to_be_bytes());
+        out.extend_from_slice(&OP_REP_DEVLIST.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&(records.len() as u32).to_be_bytes());
+        for r in records {
+            out.extend_from_slice(r);
+        }
+        out
+    }
+
+    fn import_reply(record: Vec<u8>) -> Vec<u8> {
+        use izba_proto::usbip::{OP_REP_IMPORT, USBIP_VERSION};
+        let mut out = Vec::new();
+        out.extend_from_slice(&USBIP_VERSION.to_be_bytes());
+        out.extend_from_slice(&OP_REP_IMPORT.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&record);
+        out
+    }
+
+    /// A dialer whose Nth call replays the Nth canned reply. Two dials per
+    /// attach — devlist, then import — because USB/IP allows one operation per
+    /// connection.
+    fn dialer(replies: Vec<Vec<u8>>) -> impl Fn(SocketAddr) -> Result<FakeUpstream> {
+        let calls = std::sync::Mutex::new(replies.into_iter());
+        move |_addr| {
+            let next = calls.lock().unwrap().next();
+            match next {
+                Some(reply) => Ok(FakeUpstream {
+                    reply: std::io::Cursor::new(reply),
+                    sent: Vec::new(),
+                }),
+                None => anyhow::bail!("upstream refused the connection"),
+            }
+        }
+    }
+
+    /// Drive one handshake: write `open` to the guest end, run the server half,
+    /// and return what the guest received back.
+    fn exchange<D, U>(
+        paths: &Paths,
+        sandbox: &str,
+        open: &StreamOpen,
+        dial: D,
+    ) -> (Option<session::Attached>, Response)
+    where
+        U: Read + Write,
+        D: Fn(SocketAddr) -> Result<U>,
+    {
+        let (mut guest, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        write_frame(&mut guest, open).unwrap();
+        let audit = AuditSink::new(paths.clone());
+        let got = serve_attach(&mut server, sandbox, paths, &audit, dial);
+        let reply: Response = read_frame(&mut guest).expect("the guest is always answered");
+        (got.map(|(a, _)| a), reply)
+    }
+
+    fn granted_paths(tmp: &tempfile::TempDir) -> Paths {
+        seed(tmp.path(), "web", true, true)
+    }
+
+    #[test]
+    fn a_granted_device_is_imported_and_the_guest_gets_its_devid_and_speed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let rec = device_record("3-2", 0x0403, 0x6001);
+        let (attached, reply) = exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
+            dialer(vec![devlist(std::slice::from_ref(&rec)), import_reply(rec)]),
+        );
+        assert!(attached.is_some(), "the caller is told to splice");
+        match reply {
+            Response::UsbAttached { devid, speed } => {
+                assert_eq!(devid, session::devid(3, 2));
+                assert_eq!(speed, 2);
+            }
+            other => panic!("expected usb_attached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_device_that_was_never_granted_is_refused_and_named() {
+        // The guest asks for something real that this sandbox simply does not
+        // hold. It must be told which device, not merely "no".
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let rec = device_record("1-1", 0x1a86, 0x7523);
+        let (attached, reply) = exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "1a86:7523".into(),
+            },
+            dialer(vec![devlist(std::slice::from_ref(&rec)), import_reply(rec)]),
+        );
+        assert!(attached.is_none());
+        match reply {
+            Response::Error { message, .. } => {
+                assert!(message.contains("1a86:7523"), "{message}");
+                assert!(message.contains("not granted"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_attach_is_audited_as_a_denial() {
+        // A device izba refused is exactly what a user comes to `izba netlog`
+        // to understand, so the deny must reach the log, not just the guest.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "1a86:7523".into(),
+            },
+            dialer(vec![]),
+        );
+        let log = std::fs::read_to_string(paths.logs_dir("web").join("egress-audit.jsonl"))
+            .expect("an audit line was written");
+        assert!(log.contains("\"tier\":\"usb\""), "{log}");
+        assert!(log.contains("deny"), "{log}");
+        assert!(log.contains("1a86:7523"), "name the device: {log}");
+    }
+
+    #[test]
+    fn a_successful_attach_is_audited_with_the_busid_it_resolved_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let rec = device_record("3-2", 0x0403, 0x6001);
+        exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
+            dialer(vec![devlist(std::slice::from_ref(&rec)), import_reply(rec)]),
+        );
+        let log =
+            std::fs::read_to_string(paths.logs_dir("web").join("egress-audit.jsonl")).unwrap();
+        assert!(log.contains("allow"), "{log}");
+        assert!(log.contains("3-2"), "the busid is the useful detail: {log}");
+    }
+
+    #[test]
+    fn any_frame_other_than_usb_attach_is_refused_on_this_plane() {
+        // The USB plane is single-purpose. A guest sending an egress or exec
+        // frame here is probing, and gets one honest refusal.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        for open in [
+            StreamOpen::Dns,
+            StreamOpen::TcpConnect {
+                addr: "1.2.3.4".into(),
+                port: 443,
+            },
+            StreamOpen::TcpDial { port: 22 },
+        ] {
+            let (attached, reply) = exchange(&paths, "web", &open, dialer(vec![]));
+            assert!(attached.is_none());
+            match reply {
+                Response::Error { kind, message } => {
+                    assert_eq!(kind, ErrorKind::BadRequest, "{open:?}");
+                    assert!(message.contains("only usb_attach"), "{open:?}: {message}");
+                }
+                other => panic!("{open:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_malformed_device_id_is_refused_without_dialing_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let (attached, reply) = exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "not-an-id".into(),
+            },
+            |_: SocketAddr| -> Result<FakeUpstream> { panic!("must not dial") },
+        );
+        assert!(attached.is_none());
+        match reply {
+            Response::Error { message, .. } => assert!(message.contains("vid:pid"), "{message}"),
+            other => panic!("expected a parse refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_upstream_that_does_not_export_the_granted_device_is_reported_as_such() {
+        // The grant is fine; the hardware is simply not shared. The guest must
+        // learn that, and the human must learn how to fix it.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let (_, reply) = exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
+            dialer(vec![devlist(&[])]),
+        );
+        match reply {
+            Response::Error { message, .. } => {
+                assert!(message.contains("does not export"), "{message}");
+                assert!(message.contains("usbipd bind"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_upstream_that_hands_back_a_different_device_is_refused_after_import() {
+        // The post-import re-verification, end to end: the devlist is honest and
+        // the import is not. Nothing may reach the guest.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let (attached, reply) = exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
+            dialer(vec![
+                devlist(&[device_record("3-2", 0x0403, 0x6001)]),
+                import_reply(device_record("3-2", 0x1a86, 0x7523)),
+            ]),
+        );
+        assert!(
+            attached.is_none(),
+            "no splice for a device izba did not ask for"
+        );
+        match reply {
+            Response::Error { message, .. } => assert!(message.contains("mismatch"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreachable_upstream_is_reported_rather_than_looking_like_a_missing_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let (_, reply) = exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
+            dialer(vec![]),
+        );
+        match reply {
+            Response::Error { message, .. } => {
+                assert!(message.contains("refused the connection"), "{message}")
+            }
+            other => panic!("expected a dial failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_attach_with_no_upstream_configured_is_refused_before_the_grant_is_read() {
+        // Reaching this at all means the plane was bound without an upstream,
+        // which `refresh` prevents — so this is the belt to that braces.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = seed(tmp.path(), "web", true, false);
+        let (_, reply) = exchange(
+            &paths,
+            "web",
+            &StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
+            |_: SocketAddr| -> Result<FakeUpstream> { panic!("must not dial") },
+        );
+        match reply {
+            Response::Error { message, .. } => {
+                assert!(message.contains("not configured"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_guest_that_says_nothing_gets_no_reply_and_no_dial() {
+        // An empty connection is not an attach: nothing is authorized, nothing
+        // is dialed, and the server simply drops it.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let (guest, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(guest);
+        let audit = AuditSink::new(paths.clone());
+        let got = serve_attach(
+            &mut server,
+            "web",
+            &paths,
+            &audit,
+            |_: SocketAddr| -> Result<FakeUpstream> { panic!("must not dial") },
+        );
+        assert!(got.is_none());
     }
 
     #[test]
