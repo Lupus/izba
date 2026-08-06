@@ -13,6 +13,8 @@
 mod attachments;
 pub mod session;
 
+#[cfg(test)]
+use attachments::AttachmentGuard;
 pub use attachments::Attachments;
 
 use std::collections::HashMap;
@@ -156,6 +158,14 @@ impl UsbBroker {
     /// What `name` is holding right now.
     pub fn attached_to(&self, name: &str) -> Vec<crate::usb::DeviceId> {
         self.attachments.held_by(name)
+    }
+
+    /// Test hook: take a hold on the broker's own registry, standing in for the
+    /// splice that would normally own it. Mirrors `insert_finished_slot` — the
+    /// real path needs a bound listener, which the unit tests cannot have.
+    #[cfg(test)]
+    fn hold_for_test(&self, sandbox: &str, device: crate::usb::DeviceId) -> AttachmentGuard {
+        self.attachments.hold(sandbox, device)
     }
 
     /// Bind or unbind `name`'s USB plane to match what is on disk right now.
@@ -1102,6 +1112,29 @@ mod tests {
             attachments.held_by("web").is_empty(),
             "the device returns to the host when the stream ends"
         );
+    }
+
+    /// The daemon answers `attached_to` / `attached_map` from the broker, so
+    /// these two accessors are what every "is it plugged into a sandbox right
+    /// now" answer in the CLI and the GUI rests on.
+    #[test]
+    fn the_broker_reports_what_its_own_registry_is_holding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = granted_paths(&tmp);
+        let b = UsbBroker::new(AuditSink::new(paths));
+        let dev: crate::usb::DeviceId = "0403:6001".parse().unwrap();
+        assert!(b.attached_map().is_empty());
+        assert!(b.attached_to("web").is_empty());
+
+        let held = b.hold_for_test("web", dev);
+        assert_eq!(b.attached_to("web"), vec![dev]);
+        assert_eq!(b.attached_map().get(&dev).map(String::as_str), Some("web"));
+        // Another sandbox's view of the same daemon must not claim it.
+        assert!(b.attached_to("api").is_empty());
+
+        drop(held);
+        assert!(b.attached_to("web").is_empty());
+        assert!(b.attached_map().is_empty());
     }
 
     #[test]

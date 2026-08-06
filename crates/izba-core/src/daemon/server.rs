@@ -1801,6 +1801,61 @@ mod tests {
         }
     }
 
+    /// The whole point of `restart_required`: a device granted to a sandbox
+    /// that is ALREADY running cannot be attached, because the kernel with the
+    /// USB stack is chosen at boot. All three inputs are varied against the
+    /// real handler, not just the predicate behind it.
+    #[test]
+    fn a_running_sandbox_is_told_to_restart_only_once_it_has_a_grant() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        rpc(&mut c, &create_req(&dir, "web"));
+        set_loopback_upstream(&mut c);
+        d.registry.set_liveness("web", Liveness::Running);
+
+        // Running, but nothing granted: there is nothing to apply, and a
+        // standing restart prompt would just train people to ignore it.
+        assert!(!status_restart_required(&mut c));
+
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::UsbAllow {
+                name: "web".into(),
+                device: "0403:6001".into(),
+                busid_pin: None,
+            },
+        ));
+        assert!(
+            status_restart_required(&mut c),
+            "a grant on a live run of the base kernel needs a restart"
+        );
+
+        // Same grant, but this run booted the USB kernel: nothing to do.
+        save_json(
+            &d.paths.sandbox_dir("web").join(crate::state::STATE_FILE),
+            &RunState {
+                vmm_pid: live_identity(),
+                sidecar_pids: vec![],
+                started_unix_ms: 0,
+                confinement: None,
+                run_dir: None,
+                user_fallback: None,
+                usb_kernel: true,
+            },
+        )
+        .unwrap();
+        assert!(!status_restart_required(&mut c));
+    }
+
+    fn status_restart_required(c: &mut UdsStream) -> bool {
+        match rpc(c, &DaemonRequest::UsbStatus { name: "web".into() }) {
+            DaemonResponse::UsbStatus {
+                restart_required, ..
+            } => restart_required,
+            other => panic!("expected UsbStatus, got {other:?}"),
+        }
+    }
+
     #[test]
     fn allow_then_status_then_revoke_round_trips_through_disk() {
         let (dir, d) = test_daemon();
