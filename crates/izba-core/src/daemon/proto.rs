@@ -295,6 +295,13 @@ pub struct UsbDeviceInfo {
     /// Sandboxes already holding a grant for this `vid:pid`.
     #[serde(default)]
     pub granted_to: Vec<String>,
+    /// The sandbox currently holding this device, when one is. Host-observed —
+    /// izbad is running the splice, so it never has to ask a guest. `None` for
+    /// a free device. `serde(default)`: a pre-phase-4 daemon's frame reads as
+    /// "nothing attached", which is the safe direction (it never invents a
+    /// holder, only fails to name one).
+    #[serde(default)]
+    pub attached_to: Option<String>,
     /// For an unshared device: the exact command the human must run elevated.
     #[serde(default)]
     pub bind_command: Option<String>,
@@ -366,6 +373,15 @@ pub enum DaemonResponse {
     /// Result of `UsbStatus`.
     UsbStatus {
         grants: Vec<UsbGrantInfo>,
+        /// `vid:pid` of every device this sandbox is holding right now.
+        #[serde(default)]
+        attached: Vec<String>,
+        /// The sandbox is running a kernel with no USB stack while holding at
+        /// least one grant, so an attach cannot work until it restarts. Both
+        /// new fields are `serde(default)` — additive on an existing variant,
+        /// so `DAEMON_PROTO_VERSION` stays where it is.
+        #[serde(default)]
+        restart_required: bool,
     },
 }
 
@@ -722,6 +738,7 @@ mod tests {
                     description: "USB Serial Converter".into(),
                     shared: true,
                     granted_to: vec!["web".into()],
+                    attached_to: Some("web".into()),
                     bind_command: None,
                 }],
             },
@@ -732,6 +749,8 @@ mod tests {
                     description: "USB Serial Converter".into(),
                     granted_at_unix_ms: 1_700_000_000_000,
                 }],
+                attached: vec!["0403:6001".into()],
+                restart_required: true,
             },
         ] {
             let mut buf = Vec::new();
@@ -817,6 +836,32 @@ mod tests {
                 );
             }
             other => panic!("expected UsbUpstreamSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pre_phase4_usb_frame_still_deserializes() {
+        // Old daemon, new client. Both new facts must read as "nothing
+        // attached, no restart needed" rather than failing the frame — that is
+        // what keeps these additions off DAEMON_PROTO_VERSION.
+        let d: UsbDeviceInfo = serde_json::from_str(
+            r#"{"busid":"3-2","device":"0403:6001","description":"FT232","shared":true}"#,
+        )
+        .unwrap();
+        assert_eq!(d.attached_to, None);
+
+        let r: DaemonResponse =
+            serde_json::from_str(r#"{"type":"usb_status","grants":[]}"#).unwrap();
+        match r {
+            DaemonResponse::UsbStatus {
+                attached,
+                restart_required,
+                ..
+            } => {
+                assert!(attached.is_empty());
+                assert!(!restart_required);
+            }
+            other => panic!("expected usb_status, got {other:?}"),
         }
     }
 

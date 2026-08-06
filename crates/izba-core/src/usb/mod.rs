@@ -182,10 +182,15 @@ fn grants_by_device(paths: &Paths) -> HashMap<DeviceId, Vec<String>> {
 ///
 /// izba never runs that command itself: binding needs Administrator, and
 /// wrapping usbipd-win is explicitly out of scope.
+///
+/// `attached` is the live device→holder map from the broker, so a row can say
+/// which sandbox currently has the hardware — the difference between "granted"
+/// and "gone from your desk right now".
 pub fn list_devices(
     paths: &Paths,
     shared: &[inventory::UpstreamDevice],
     known: Option<Vec<usbipd_state::UsbipdDevice>>,
+    attached: &HashMap<DeviceId, String>,
 ) -> Vec<UsbDeviceInfo> {
     let grants = grants_by_device(paths);
     let mut out: Vec<UsbDeviceInfo> = shared
@@ -196,6 +201,7 @@ pub fn list_devices(
             description: d.description.clone(),
             shared: true,
             granted_to: grants.get(&d.id).cloned().unwrap_or_default(),
+            attached_to: attached.get(&d.id).cloned(),
             bind_command: None,
         })
         .collect();
@@ -205,6 +211,9 @@ pub fn list_devices(
         out.push(UsbDeviceInfo {
             bind_command: Some(usbipd_state::bind_command(&k)),
             granted_to: grants.get(&k.id).cloned().unwrap_or_default(),
+            // An unshared device cannot be attached, but deriving it the same
+            // way keeps the two arms honest rather than asserting that here.
+            attached_to: attached.get(&k.id).cloned(),
             busid: k.busid,
             device: k.id.to_string(),
             description: k.description,
@@ -407,7 +416,12 @@ mod tests {
             ("api", &["0403:6001", "1a86:7523"]),
             ("idle", &[]),
         ]);
-        let listed = list_devices(&paths, &[upstream_device("3-2", "0403:6001")], None);
+        let listed = list_devices(
+            &paths,
+            &[upstream_device("3-2", "0403:6001")],
+            None,
+            &HashMap::new(),
+        );
         assert_eq!(listed.len(), 1);
         assert!(listed[0].shared);
         assert_eq!(listed[0].granted_to, vec!["api", "web"], "sorted by name");
@@ -417,7 +431,12 @@ mod tests {
     #[test]
     fn an_ungranted_device_lists_with_no_holders() {
         let (_t, paths) = paths_with_sandboxes(&[("web", &["1a86:7523"])]);
-        let listed = list_devices(&paths, &[upstream_device("3-2", "0403:6001")], None);
+        let listed = list_devices(
+            &paths,
+            &[upstream_device("3-2", "0403:6001")],
+            None,
+            &HashMap::new(),
+        );
         assert!(listed[0].granted_to.is_empty());
     }
 
@@ -431,7 +450,12 @@ mod tests {
             bound: false,
             attached: false,
         }];
-        let listed = list_devices(&paths, &[upstream_device("3-2", "0403:6001")], Some(known));
+        let listed = list_devices(
+            &paths,
+            &[upstream_device("3-2", "0403:6001")],
+            Some(known),
+            &HashMap::new(),
+        );
         assert_eq!(listed.len(), 2);
         assert!(!listed[1].shared);
         assert_eq!(
@@ -452,7 +476,12 @@ mod tests {
             bound: true,
             attached: false,
         }];
-        let listed = list_devices(&paths, &[upstream_device("3-2", "0403:6001")], Some(known));
+        let listed = list_devices(
+            &paths,
+            &[upstream_device("3-2", "0403:6001")],
+            Some(known),
+            &HashMap::new(),
+        );
         assert_eq!(listed.len(), 1);
         assert!(listed[0].shared);
     }
@@ -469,7 +498,7 @@ mod tests {
             bound: false,
             attached: false,
         }];
-        let listed = list_devices(&paths, &[], Some(known));
+        let listed = list_devices(&paths, &[], Some(known), &HashMap::new());
         assert_eq!(listed[0].granted_to, vec!["web"]);
         assert!(listed[0].bind_command.is_some());
     }
@@ -477,7 +506,12 @@ mod tests {
     #[test]
     fn a_missing_usbipd_table_just_yields_the_shared_devices() {
         let (_t, paths) = paths_with_sandboxes(&[]);
-        let listed = list_devices(&paths, &[upstream_device("3-2", "0403:6001")], None);
+        let listed = list_devices(
+            &paths,
+            &[upstream_device("3-2", "0403:6001")],
+            None,
+            &HashMap::new(),
+        );
         assert_eq!(listed.len(), 1);
     }
 }

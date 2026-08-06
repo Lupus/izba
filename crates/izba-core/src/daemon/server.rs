@@ -869,7 +869,12 @@ fn handle_usb_list_devices(d: &Arc<Daemon>) -> anyhow::Result<DaemonResponse> {
     let addr = crate::usb::dialable_upstream(&s)?;
     let shared = crate::usb::inventory::fetch(addr)?;
     Ok(DaemonResponse::UsbDevices {
-        devices: crate::usb::list_devices(&d.paths, &shared, crate::usb::usbipd_state::probe()),
+        devices: crate::usb::list_devices(
+            &d.paths,
+            &shared,
+            crate::usb::usbipd_state::probe(),
+            &d.usb.attached_map(),
+        ),
     })
 }
 
@@ -937,6 +942,14 @@ fn handle_usb_status(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResp
     let cfg: crate::state::SandboxConfig =
         crate::state::load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
             .ok_or_else(|| anyhow::anyhow!("sandbox '{name}' has no config"))?;
+    // Liveness and the run record are read exactly as `handle_inspect` reads
+    // them, so the two answers can never disagree about the same sandbox.
+    let running = d.registry.liveness(&name).unwrap_or(Liveness::Stopped) != Liveness::Stopped;
+    let usb_kernel = load_json::<crate::state::RunState>(
+        &d.paths.sandbox_dir(&name).join(crate::state::STATE_FILE),
+    )?
+    .map(|s| s.usb_kernel)
+    .unwrap_or(false);
     Ok(DaemonResponse::UsbStatus {
         grants: cfg
             .usb
@@ -949,7 +962,24 @@ fn handle_usb_status(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResp
                 granted_at_unix_ms: g.granted_at_unix_ms,
             })
             .collect(),
+        attached: d
+            .usb
+            .attached_to(&name)
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+        restart_required: needs_usb_restart(!cfg.usb.devices.is_empty(), running, usb_kernel),
     })
+}
+
+/// Whether a sandbox's grants are ahead of the kernel it is running.
+///
+/// Only a LIVE run can need a restart: a stopped sandbox picks the right kernel
+/// the moment it starts, and telling its owner to restart it would be noise. A
+/// running sandbox that already booted the USB kernel is likewise fine — the
+/// grant it just gained is live.
+fn needs_usb_restart(has_grants: bool, running: bool, usb_kernel: bool) -> bool {
+    has_grants && running && !usb_kernel
 }
 
 /// Bring `name`'s USB plane in line with the grants just written.
@@ -1724,6 +1754,53 @@ mod tests {
         }
     }
 
+    /// All eight combinations, because the field's whole job is the one case
+    /// where consent is ahead of the running kernel.
+    #[test]
+    fn only_a_live_run_on_the_wrong_kernel_needs_a_restart() {
+        assert!(needs_usb_restart(true, true, false));
+
+        // No grants: nothing to apply.
+        assert!(!needs_usb_restart(false, true, false));
+        assert!(!needs_usb_restart(false, true, true));
+        // Stopped: the next start picks the right kernel by itself, so telling
+        // its owner to restart it would be noise.
+        assert!(!needs_usb_restart(true, false, false));
+        assert!(!needs_usb_restart(true, false, true));
+        assert!(!needs_usb_restart(false, false, false));
+        assert!(!needs_usb_restart(false, false, true));
+        // Already running the USB kernel: the grant is live.
+        assert!(!needs_usb_restart(true, true, true));
+    }
+
+    #[test]
+    fn a_stopped_sandbox_with_a_fresh_grant_is_not_told_to_restart() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        rpc(&mut c, &create_req(&dir, "web"));
+        set_loopback_upstream(&mut c);
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::UsbAllow {
+                name: "web".into(),
+                device: "0403:6001".into(),
+                busid_pin: None,
+            },
+        ));
+        match rpc(&mut c, &DaemonRequest::UsbStatus { name: "web".into() }) {
+            DaemonResponse::UsbStatus {
+                grants,
+                attached,
+                restart_required,
+            } => {
+                assert_eq!(grants.len(), 1, "the grant itself is durable");
+                assert!(attached.is_empty(), "nothing is spliced");
+                assert!(!restart_required);
+            }
+            other => panic!("expected UsbStatus, got {other:?}"),
+        }
+    }
+
     #[test]
     fn allow_then_status_then_revoke_round_trips_through_disk() {
         let (dir, d) = test_daemon();
@@ -1741,7 +1818,7 @@ mod tests {
         ));
 
         match rpc(&mut c, &DaemonRequest::UsbStatus { name: "web".into() }) {
-            DaemonResponse::UsbStatus { grants } => {
+            DaemonResponse::UsbStatus { grants, .. } => {
                 assert_eq!(grants.len(), 1);
                 assert_eq!(grants[0].device, "0403:6001");
                 assert_eq!(grants[0].busid_pin.as_deref(), Some("3-2"));
@@ -1760,7 +1837,7 @@ mod tests {
             },
         ));
         match rpc(&mut c, &DaemonRequest::UsbStatus { name: "web".into() }) {
-            DaemonResponse::UsbStatus { grants } => assert!(grants.is_empty()),
+            DaemonResponse::UsbStatus { grants, .. } => assert!(grants.is_empty()),
             other => panic!("expected UsbStatus, got {other:?}"),
         }
         assert!(!crate::usb::guard_for(&d.paths, "web").sandbox_usb_enabled);
