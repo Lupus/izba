@@ -25,6 +25,10 @@ use crate::usb::inventory::{read_import_reply, UpstreamDevice};
 /// What the guest needs in order to hand the socket to `vhci-hcd`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attached {
+    /// The granted `vid:pid` this import satisfied, already verified against
+    /// what the upstream returned. Carried so the caller can register the live
+    /// attachment without re-parsing the guest's frame.
+    pub device: crate::usb::DeviceId,
     pub devid: u32,
     pub speed: u32,
     pub busid: String,
@@ -96,6 +100,9 @@ pub fn import<U: Read + Write>(
     let rec = read_import_reply(up)?;
     verify(&rec, chosen, grant)?;
     Ok(Attached {
+        // `verify` has just established that the record matches the grant, so
+        // the grant's id is the honest label for what was imported.
+        device: grant.device,
         devid: devid(rec.busnum, rec.devnum),
         speed: rec.speed,
         busid: rec.busid,
