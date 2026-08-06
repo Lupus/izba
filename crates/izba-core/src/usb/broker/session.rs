@@ -160,6 +160,19 @@ pub fn pump_guest_to_upstream<R: Read, W: Write>(mut r: R, mut w: W) -> Result<(
     }
 }
 
+/// Whether a failed read should be retried rather than ending the stream.
+///
+/// Only `Interrupted` (EINTR): a signal arriving mid-read is not a failure, and
+/// treating it as one would tear down a live device stream. Everything else is
+/// real and must propagate — retrying a `BrokenPipe` would spin forever on a
+/// connection that is never coming back.
+///
+/// A named predicate rather than a match guard so the decision itself can be
+/// tested; buried in the loop it was only reachable through I/O timing.
+fn retry_after(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Interrupted
+}
+
 /// Read until `buf` is full, returning how many bytes arrived. `Ok(0)` is a
 /// clean end of stream; anything between 1 and `buf.len() - 1` is a truncation
 /// the caller must treat as an error rather than as a smaller message.
@@ -173,7 +186,7 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<usize> {
         match r.read(&mut buf[got..]) {
             Ok(0) => break,
             Ok(n) => got += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(ref e) if retry_after(e) => {}
             Err(e) => return Err(e).context("reading from the guest"),
         }
     }
@@ -424,6 +437,39 @@ mod tests {
         let mut out = Vec::new();
         pump_guest_to_upstream(std::io::Cursor::new(Vec::new()), &mut out).unwrap();
         pump_guest_to_upstream(std::io::Cursor::new(submit_out(1, &[1, 2, 3])), &mut out).unwrap();
+    }
+
+    #[test]
+    fn only_an_interrupted_read_is_retried() {
+        use std::io::ErrorKind as K;
+        assert!(retry_after(&std::io::Error::new(K::Interrupted, "signal")));
+        // Everything else ends the stream. Retrying any of these would spin on
+        // a connection that is never coming back.
+        for kind in [
+            K::BrokenPipe,
+            K::ConnectionReset,
+            K::UnexpectedEof,
+            K::TimedOut,
+            K::WouldBlock,
+            K::PermissionDenied,
+        ] {
+            assert!(
+                !retry_after(&std::io::Error::new(kind, "x")),
+                "{kind:?} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn a_persistent_read_error_ends_the_pump_rather_than_spinning() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"))
+            }
+        }
+        let mut out = Vec::new();
+        assert!(pump_guest_to_upstream(Broken, &mut out).is_err());
     }
 
     #[test]

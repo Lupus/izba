@@ -53,6 +53,24 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// service rather than merely a local one.
 const MAX_INFLIGHT_HANDSHAKES: usize = 8;
 
+/// How long the nonblocking accept loop sleeps between polls.
+const ACCEPT_POLL: Duration = Duration::from_millis(100);
+
+/// Whether an accept error means "nothing waiting yet" rather than "this
+/// listener is finished".
+///
+/// Only `WouldBlock`, which is what a nonblocking listener returns when no
+/// guest is dialing. Anything else means the listener is broken, and the accept
+/// thread exits so `listening()` reports the truth and the supervisor's next
+/// tick rebinds it — spinning instead would leave a socket file with a live
+/// thread behind it that never serves anyone again.
+///
+/// A named predicate rather than a match guard so the decision can be tested
+/// without a listener that yields an arbitrary errno on demand.
+fn accept_again(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock
+}
+
 /// Wraps a reader so no read is attempted past `deadline`.
 ///
 /// The per-socket timeout still bounds each individual read; this bounds their
@@ -183,8 +201,8 @@ impl UsbBroker {
                             handle_conn(conn, &sandbox, &paths, &audit)
                         });
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(100));
+                    Err(e) if accept_again(&e) => {
+                        std::thread::sleep(ACCEPT_POLL);
                     }
                     Err(e) => {
                         eprintln!("izbad: USB accept for '{sandbox}': {e}");
@@ -1105,6 +1123,50 @@ mod tests {
             Err(e) => panic!("refresh: {e:#}"),
         }
         b.stop("web", &run);
+    }
+
+    #[test]
+    fn only_would_block_keeps_the_accept_loop_going() {
+        use std::io::ErrorKind as K;
+        assert!(accept_again(&std::io::Error::new(K::WouldBlock, "empty")));
+        // Anything else means the listener is broken. Retrying would leave a
+        // socket file with a live thread behind it that never serves anyone,
+        // and `listening()` would keep claiming the plane is up.
+        for kind in [
+            K::BrokenPipe,
+            K::ConnectionAborted,
+            K::PermissionDenied,
+            K::InvalidInput,
+            K::Interrupted,
+        ] {
+            assert!(
+                !accept_again(&std::io::Error::new(kind, "x")),
+                "{kind:?} must end the accept loop"
+            );
+        }
+    }
+
+    #[test]
+    fn a_socket_path_that_cannot_be_cleared_fails_on_those_terms() {
+        // A leftover the bind cannot displace must be reported as what it is.
+        // Swallowing every removal error and letting the bind fail instead
+        // would blame the bind for a path problem — and hide, for instance, a
+        // run dir the daemon no longer has permission to write.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = seed(tmp.path(), "web", true, true);
+        let run = tmp.path().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        // A DIRECTORY where the socket goes: `remove_file` refuses it with
+        // something other than NotFound, and `bind` could never succeed either.
+        std::fs::create_dir_all(listener_path(&run).join("occupied")).unwrap();
+
+        let b = UsbBroker::new(AuditSink::new(paths.clone()));
+        let err = format!("{:#}", b.refresh(&paths, "web", &run).unwrap_err());
+        assert!(
+            err.contains("removing stale"),
+            "the removal must be blamed, not the bind: {err}"
+        );
+        assert!(!b.listening("web"));
     }
 
     #[test]

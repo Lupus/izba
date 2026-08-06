@@ -102,7 +102,7 @@ impl Drop for FakeUsbipd {
     }
 }
 
-fn izba(data: &Path, args: &[&str]) -> Output {
+fn izba<S: AsRef<std::ffi::OsStr>>(data: &Path, args: &[S]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_izba"))
         .env("IZBA_DATA_DIR", data)
         .args(args)
@@ -131,7 +131,7 @@ fn granted_sandbox(data: &Path, fake: &FakeUsbipd, name: &str) -> String {
         &izba(data, &["usb", "upstream", "set", &fake.addr]),
         "usb upstream set",
     );
-    ok(&izba(data, &["create", name, "--image", IMAGE]), "create");
+    ok(&izba(data, &create_args(data, name)), "create");
     ok(
         &izba(
             data,
@@ -149,6 +149,27 @@ fn granted_sandbox(data: &Path, fake: &FakeUsbipd, name: &str) -> String {
     );
     ok(&izba(data, &["start", name]), "start");
     name.to_string()
+}
+
+/// `izba create` for a sandbox whose workspace lives under the test's own temp
+/// dir.
+///
+/// The positional argument is the WORKSPACE DIRECTORY, not the name — passing a
+/// bare name creates a directory of that name in the process's cwd, which for
+/// `cargo test` is the crate root. That litters the source tree with sandbox
+/// workspaces, so the name is given explicitly and the workspace is placed where
+/// the rest of the test's state already lives.
+fn create_args(data: &Path, name: &str) -> Vec<String> {
+    let ws = data.join("ws").join(name);
+    std::fs::create_dir_all(&ws).expect("workspace dir");
+    vec![
+        "create".into(),
+        ws.to_string_lossy().into_owned(),
+        "--name".into(),
+        name.into(),
+        "--image".into(),
+        IMAGE.into(),
+    ]
 }
 
 /// Run a shell command inside the sandbox's workload container.
@@ -278,7 +299,7 @@ fn a_sandbox_without_grants_has_no_usb_plane_and_no_usb_kernel() {
     let Some(_env) = want() else { return };
     let data = tempfile::tempdir().unwrap();
     ok(
-        &izba(data.path(), &["create", "plain", "--image", IMAGE]),
+        &izba(data.path(), &create_args(data.path(), "plain")),
         "create",
     );
     ok(&izba(data.path(), &["start", "plain"]), "start");
