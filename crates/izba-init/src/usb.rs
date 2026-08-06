@@ -96,14 +96,20 @@ struct Attached {
 pub struct UsbState {
     enabled: bool,
     attached: Mutex<HashMap<String, Attached>>,
-    /// Devices with an attach in flight. The duplicate check and the insert
-    /// that follows it are separated by the whole dial → import → enumerate
-    /// sequence, which must NOT hold a lock across its I/O — so the claim is
-    /// staked here first. Without it two concurrent attaches of the same device
-    /// both pass the check, land on two vhci ports, and the second insert
-    /// orphans the first: a port and a device node with no map entry, which
-    /// `detach` can never reach and only the VM's death releases.
-    in_flight: Mutex<std::collections::HashSet<String>>,
+    /// Serializes whole attach and detach operations.
+    ///
+    /// A per-device claim is NOT enough, because the resources an attach
+    /// consumes are global: the vhci port pool, and the `/dev` snapshot the new
+    /// node is identified by. Two attaches of *different* devices, overlapping,
+    /// can pick the same free port and can each attribute the other's node to
+    /// itself — leaving a detach that removes the wrong node, or an attachment
+    /// with no map entry that only the VM's death releases.
+    ///
+    /// Held across I/O, which is normally worth avoiding. It is right here:
+    /// attach is a human-driven action taking a second or two, this lock guards
+    /// only USB operations (exec, cp, relays and ssh are untouched), and the
+    /// alternative is a corrupt port table.
+    op: Mutex<()>,
     /// How long to wait for enumeration. A field rather than a constant so a
     /// test for the "never becomes a serial port" path does not have to spend
     /// the real timeout on every CI run.
@@ -115,7 +121,7 @@ impl UsbState {
         Self {
             enabled,
             attached: Mutex::new(HashMap::new()),
-            in_flight: Mutex::new(std::collections::HashSet::new()),
+            op: Mutex::new(()),
             node_timeout: NODE_TIMEOUT,
         }
     }
@@ -154,9 +160,15 @@ impl UsbState {
         V: Vhci + ?Sized,
     {
         self.gate()?;
-        // Claim the device for the duration, so a concurrent attach of the same
-        // one is refused rather than racing this one to the vhci.
-        let _claim = self.claim(device)?;
+        // Everything below shares the vhci port pool and the /dev snapshot, so
+        // it runs as one operation.
+        let _op = self.op.lock().unwrap_or_else(|e| e.into_inner());
+        if self.attached.lock().unwrap().contains_key(device) {
+            return Err((
+                ErrorKind::BadRequest,
+                format!("{device} is already attached"),
+            ));
+        }
 
         let mut conn = dial().map_err(|e| {
             (
@@ -220,6 +232,9 @@ impl UsbState {
 
     pub fn detach_on<V: Vhci + ?Sized>(&self, device: &str, vhci: &V) -> Result<(), InitError> {
         self.gate()?;
+        // Same operation lock as attach: detach frees a vhci port and removes a
+        // node, both of which an in-flight attach is reading.
+        let _op = self.op.lock().unwrap_or_else(|e| e.into_inner());
         let Some(a) = self.attached.lock().unwrap().remove(device) else {
             return Err((
                 ErrorKind::BadRequest,
@@ -235,30 +250,6 @@ impl UsbState {
         // with nothing left holding a record of it.
         vhci.close_fd(a.fd);
         released
-    }
-
-    /// Stake an exclusive claim on `device` for the length of an attach.
-    ///
-    /// Checked against BOTH the in-flight set and what is already attached, so
-    /// the answer is the same whether the other attach finished or is still
-    /// running.
-    fn claim(&self, device: &str) -> Result<Claim<'_>, InitError> {
-        let taken = self.attached.lock().unwrap().contains_key(device);
-        let fresh = self.in_flight.lock().unwrap().insert(device.to_string());
-        if taken || !fresh {
-            if fresh {
-                // We inserted it; take it back out before refusing.
-                self.in_flight.lock().unwrap().remove(device);
-            }
-            return Err((
-                ErrorKind::BadRequest,
-                format!("{device} is already attached"),
-            ));
-        }
-        Ok(Claim {
-            state: self,
-            device: device.to_string(),
-        })
     }
 
     /// The host's decision, enforced before anything else happens.
@@ -394,19 +385,6 @@ impl Vhci for SysfsVhci {
 #[mutants::skip]
 pub fn dial_host() -> std::io::Result<vsock::VsockStream> {
     vsock::VsockStream::connect_with_cid_port(libc::VMADDR_CID_HOST, izba_proto::USB_PORT)
-}
-
-/// Releases an attach claim however the attach ends — including on an early
-/// `?`, which is why this is a guard rather than a pair of calls.
-struct Claim<'a> {
-    state: &'a UsbState,
-    device: String,
-}
-
-impl Drop for Claim<'_> {
-    fn drop(&mut self) {
-        self.state.in_flight.lock().unwrap().remove(&self.device);
-    }
 }
 
 /// Read the vhci status file and pick a free port for this speed.
@@ -994,41 +972,87 @@ hs  0000 006 003 00030002 000005 3-2
     }
 
     #[test]
-    fn a_second_attach_of_a_device_already_in_flight_is_refused() {
-        // Two concurrent attaches of the same device would otherwise both pass
-        // the duplicate check, land on two vhci ports, and have the second
-        // insert orphan the first — a port and a node with no map entry, which
-        // detach can never reach.
-        let vhci = std::sync::Arc::new(FakeVhci::working());
+    fn overlapping_attaches_are_serialized_rather_than_racing_the_port_pool() {
+        // Two attaches of DIFFERENT devices are the dangerous case: they share
+        // the vhci port pool and the /dev snapshot the new node is identified
+        // by, so without one operation lock they can pick the same port and
+        // each attribute the other's node to itself.
+        let vhci = std::sync::Arc::new(SlowVhci::default());
         let usb = std::sync::Arc::new(UsbState::new(true));
-        // Hold a claim the way an in-flight attach does, then try again.
-        let claim = usb.claim("0403:6001").expect("first claim");
-        let (kind, msg) = usb
-            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &*vhci)
-            .unwrap_err();
-        assert_eq!(kind, ErrorKind::BadRequest);
-        assert!(msg.contains("already attached"), "{msg}");
-        // And the claim is released when the first attach ends, so a later one
-        // succeeds — a claim that outlived its attach would wedge the device.
-        drop(claim);
-        assert!(usb
-            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &*vhci)
-            .is_ok());
+
+        let handles: Vec<_> = ["0403:6001", "1a86:7523"]
+            .into_iter()
+            .map(|dev| {
+                let (usb, vhci) = (usb.clone(), vhci.clone());
+                std::thread::spawn(move || {
+                    usb.attach_on(dev, || Ok(izbad(attached_reply())), &*vhci)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("both attaches succeed");
+        }
+        assert!(
+            !vhci.overlapped.load(std::sync::atomic::Ordering::SeqCst),
+            "two attach sequences ran concurrently; they share the port pool"
+        );
+        assert_eq!(
+            vhci.ports.lock().unwrap().len(),
+            2,
+            "each attach must get its own vhci port"
+        );
     }
 
-    #[test]
-    fn a_failed_attach_releases_its_claim() {
-        let vhci = FakeVhci {
-            attach_ok: false,
-            ..FakeVhci::working()
-        };
-        let usb = UsbState::new(true);
-        assert!(usb
-            .attach_on("0403:6001", || Ok(izbad(attached_reply())), &vhci)
-            .is_err());
-        // The claim guard must have dropped on the early return, or the device
-        // would be permanently unattachable.
-        assert!(usb.claim("0403:6001").is_ok());
+    /// A vhci whose attach dwells, and which notices if two operations are ever
+    /// inside it at once. Ports are handed out in order, so a race shows up as
+    /// a duplicate.
+    #[derive(Default)]
+    struct SlowVhci {
+        inside: std::sync::atomic::AtomicUsize,
+        overlapped: std::sync::atomic::AtomicBool,
+        ports: Mutex<Vec<u32>>,
+        next_port: std::sync::atomic::AtomicU32,
+        present: Mutex<BTreeSet<String>>,
+    }
+
+    impl SlowVhci {
+        fn enter(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.inside.fetch_add(1, SeqCst) > 0 {
+                self.overlapped.store(true, SeqCst);
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            self.inside.fetch_sub(1, SeqCst);
+        }
+    }
+
+    impl Vhci for SlowVhci {
+        fn free_port(&self, _speed: u32) -> Result<u32, InitError> {
+            self.enter();
+            let p = self
+                .next_port
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(p)
+        }
+        fn attach(&self, port: u32, _fd: RawFd, _devid: u32, _speed: u32) -> Result<(), InitError> {
+            self.enter();
+            self.ports.lock().unwrap().push(port);
+            self.present.lock().unwrap().insert(format!("ttyACM{port}"));
+            Ok(())
+        }
+        fn detach(&self, _port: u32) -> Result<(), InitError> {
+            Ok(())
+        }
+        fn close_fd(&self, fd: RawFd) {
+            unsafe { libc::close(fd) };
+        }
+        fn devices(&self) -> BTreeSet<String> {
+            self.present.lock().unwrap().clone()
+        }
+        fn expose(&self, name: &str) -> Result<PathBuf, InitError> {
+            Ok(PathBuf::from(SHARED_DEV_DIR).join(name))
+        }
+        fn unexpose(&self, _node: &Path) {}
     }
 
     #[test]
