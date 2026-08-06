@@ -218,6 +218,15 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   bind of init-root `/run/izba/usb` plus cgroup device rules allowing char
   majors 166/188 `rw` (never `m`) — both authored in `image/runtime_config.rs`
   and both absent for a sandbox without grants.
+  `start` re-reads `config.json` after the caller chose the kernel, so it
+  **refuses** a launch where the two disagree (a grant landing in that window),
+  and records the variant it booted in `state.json`'s `usb_kernel`. That record
+  is the only answer to "can the kernel this sandbox is RUNNING accept a
+  device" — `UsbStatus.restart_required` is derived from it, so a change to how
+  the variant is chosen must update the recorded fact in the same commit.
+  Live attachments are host-observed, not asked of the guest: the broker holds
+  one registry entry per splice (`usb/broker/attachments.rs`), which is what
+  `UsbDeviceInfo.attached_to` and `UsbStatus.attached` report.
 - **virtiofs tag** `workspace` (driver `FsShare` ↔ init mount plan) →
   `/workspace` inside the guest, which is also exec's default cwd.
 - **SSH access (`ssh izba-<name>`):** a vendored static OpenSSH `sshd`

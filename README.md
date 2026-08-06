@@ -185,10 +185,19 @@ Key properties:
   grants boots a different kernel — the only one with a USB stack. Sandboxes
   without grants boot a kernel that physically cannot talk to a USB device, get
   no `/dev/izba`, and have no USB socket for anything in the guest to dial.
-  Later grants are live, as is a revoke: it closes the plane immediately rather
-  than at the next restart. Attaches and refusals both show up in
-  `izba netlog NAME` under a `usb` tier, so the log answers for hardware the
-  same way it answers for network traffic.
+  Grant one to a sandbox that is already running and izba says so rather than
+  letting the attach fail inside the guest: `izba usb status NAME` and the
+  desktop app both tell you to restart it first. Later grants are live, as is a
+  revoke: it closes the plane immediately rather than at the next restart.
+  Attaches and refusals both show up in `izba netlog NAME` under a `usb` tier,
+  so the log answers for hardware the same way it answers for network traffic.
+
+  **In the desktop app**, the **Devices** view configures the upstream (with the
+  same trust warnings) and lists everything it shares, marking who holds each
+  device and printing the `usbipd bind` command — with a Copy button, never a
+  Run one — for anything not shared yet. Each sandbox's **USB** tab grants
+  devices behind the same typed-back consent gate as the CLI, and attaches,
+  detaches, and revokes them.
 
   Note the honest limit that follows from the wire format having no serial
   number: if two identical devices are plugged in, izba refuses to guess between
