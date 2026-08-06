@@ -80,16 +80,17 @@ jobs:
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           prefix-key: fuzz-smoke
-      - name: fuzz izba-proto (frame, dns)
+      - name: fuzz izba-proto (frame, dns, usbip_op)
         run: |
           cd crates/izba-proto
           cargo +nightly fuzz run frame --target x86_64-unknown-linux-gnu -- -max_total_time=45
           cargo +nightly fuzz run dns   --target x86_64-unknown-linux-gnu -- -max_total_time=45
           cargo +nightly fuzz run usbip_op --target x86_64-unknown-linux-gnu -- -max_total_time=45
-      - name: fuzz izba-core (flatten)
+      - name: fuzz izba-core (flatten, usbip_pump)
         run: |
           cd crates/izba-core
-          cargo +nightly fuzz run flatten --target x86_64-unknown-linux-gnu -- -max_total_time=45
+          cargo +nightly fuzz run flatten     --target x86_64-unknown-linux-gnu -- -max_total_time=45
+          cargo +nightly fuzz run usbip_pump  --target x86_64-unknown-linux-gnu -- -max_total_time=45
       - name: fuzz izba-init (tar_extract)
         run: |
           cd crates/izba-init

@@ -200,6 +200,42 @@ Consequently `DAEMON_PROTO_VERSION` went 2 → 3 for the control-plane requests
 (§5.6) and will go 3 → 4 for `UsbAttach`/`UsbDetach`. Two cheap bumps beat
 shipping dead wire variants that answer "not implemented".
 
+#### 5.2.2 Delivery note (2026-08-06): the datapath, as shipped
+
+The broker landed as `crates/izba-core/src/usb/broker/` (`mod.rs` +
+`session.rs`), beside the phase-2 modules. Four deviations from §5.2–§5.5 are
+worth recording, each because the spec's version would have been wrong:
+
+1. **Two dials per attach, not one.** §5.2 reads as a single upstream
+   connection carrying `DEVLIST → IMPORT`. USB/IP allows exactly one operation
+   per TCP connection, so `session::resolve` runs against a devlist connection
+   that is then dropped and `session::import` against a fresh one that becomes
+   the URB stream. (This is the same property §4.2 relies on, applied to izba's
+   own client rather than to the guest.)
+2. **`refresh`, not `ensure_listening`.** The lifecycle call binds *or unbinds*
+   from the sandbox's current grants, because revoking the last grant has to
+   close the plane on the next call rather than at the next restart. It also
+   requires a configured upstream: a plane whose every answer would be "nowhere
+   to import from" is guest-reachable surface for no benefit.
+3. **`/dev/izba/ttyACM0`, and no `/dev/ttyACM0` symlink.** §5.4 wanted a symlink
+   for tool compatibility. The OCI runtime spec has no symlink primitive and the
+   container's `/dev` is a private tmpfs izba does not own, so the honest surface
+   is the bind-mounted directory. Documented rather than faked.
+4. **No in-process `jiegec/usbip` layer.** §8 placed a `tokio::io::duplex`
+   exchange between the unit and KVM tiers. Its purpose — a full op phase with
+   no listener bound — is met by byte-level fakes built from the phase-1
+   encoders, with zero dependencies; `usbip` pulls `rusb`, which links libusb
+   and would enter `cargo clippy --all-targets` and the windows-gnu cross-check.
+   The dependency survives only where its fidelity is irreplaceable: driving a
+   real guest kernel in the KVM e2e, from the excluded `hack/fake-usbipd` crate.
+
+§5.4's spike question — whether a node created *after* container start is
+visible through the bind — is answered by construction: a bind mount shares the
+source directory's superblock, so later files appear immediately (which is also
+why it binds a directory rather than the device node, since attach happens long
+after crun does). The cgroup-device and userns halves are settled empirically by
+the KVM e2e, which opens the node from inside the workload.
+
 ### 5.3 `crates/izba-init/src/usb.rs` (new) — the guest client
 
 ~200 lines, no dependencies, host-testable behind a dialer seam (the

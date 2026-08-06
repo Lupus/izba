@@ -87,10 +87,19 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   (`<data>/usb/settings.json`; absent ⇒ feature OFF), `trust` (upstream
   classification: loopback / WSL gateway / LAN / public-refused), `inventory`
   (host-initiated `OP_REQ_DEVLIST`), `usbipd_state` (reads usbipd-win's table so
-  izba can print the `usbipd bind` command it will never run itself).
+  izba can print the `usbipd bind` command it will never run itself), and
+  `broker/` — the guest-facing vsock-1028 plane, bound per sandbox ONLY while it
+  holds a grant AND an upstream is configured (`UsbBroker::refresh`, which also
+  unbinds). `broker/session.rs` is the op phase: resolve `vid:pid` → busid via
+  `OP_REQ_DEVLIST`, import on a SECOND connection (one op per TCP conn),
+  re-verify the returned record, then splice — validating every URB header in
+  the guest→upstream direction only (D6).
 - `izba-init` — guest PID 1 (static musl): mounts, exec engine (PTY + pipes),
   vsock servers, NIC-less net bring-up (`net.rs`) + egress stub (`egress.rs`:
-  DNS UDP:53→vsock `Dns` half and TCP nft-REDIRECT→`TcpConnect` half).
+  DNS UDP:53→vsock `Dns` half and TCP nft-REDIRECT→`TcpConnect` half), and
+  `usb.rs` (dial vsock 1028, hand the raw fd to `vhci-hcd` via sysfs, mirror the
+  resulting serial node into `/run/izba/usb`; gated on `izba.usb=1`, behind a
+  `Vhci` seam so the attach ordering is host-testable).
   Everything except `main.rs` is host-testable.
 - `izba-cli` — thin clap binary over izba-core.
 - `izba-ttytest` — dev/test-support: drives the real `izba` binary through a
@@ -133,8 +142,8 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   shut-down + respawned) plus a display-only `BuildInfoOwned` (git sha/date).
   Both `proto` and `build` are `#[serde(default)]` so a pre-change daemon
   deserializes to proto 0 and self-heals via one restart.
-- **vsock ports:** 1025 control RPC, 1026 streams, 1027 egress
-  (`CONTROL_PORT`/`STREAM_PORT`/`EGRESS_PORT` in izba-proto). Stream conns send
+- **vsock ports:** 1025 control RPC, 1026 streams, 1027 egress, 1028 USB attach
+  (`CONTROL_PORT`/`STREAM_PORT`/`EGRESS_PORT`/`USB_PORT` in izba-proto). Stream conns send
   ONE `StreamOpen` frame (`Attach` exec streams / `TcpDial` port relays /
   `TarExtract`+`TarCreate` for cp), then bytes per the variant's framing. Host
   reaches them via Cloud Hypervisor hybrid-vsock: `CONNECT <port>\n` on the
@@ -167,7 +176,7 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   Named volumes are persistent (`<data>/volumes/<name>.img`, survive `rm`,
   single-writer); anonymous are ephemeral (in the sandbox dir).
 - **Cmdline chain:** `console=ttyS0 izba.hostname=<name>
-  [izba.volumes=<p0>,<p1>,…] [izba.buildout=1]` ↔
+  [izba.volumes=<p0>,<p1>,…] [izba.buildout=1] [izba.usb=1]` ↔
   `hack/kernel.config` (`SERIAL_8250_CONSOLE`; netfilter/nftables —
   `NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK` — + `CONFIG_DUMMY`) ↔ init
   reads `izba.hostname` for sethostname and `izba.volumes` (ordered,
@@ -197,6 +206,18 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   Achieved confinement mode is recorded in `state.json` and surfaced by
   `izba status`. See `crates/izba-core/src/procmgr/jail_linux.rs` and
   `docs/superpowers/specs/2026-06-18-linux-vmm-confinement-design.md`.
+- **USB kernel variant (D4):** a sandbox with `config.usb` grants boots
+  `vmlinux-usb` (built from `hack/kernel.config` + `hack/kernel-usb.config`:
+  `USBIP_VHCI_HCD` + CDC-ACM/cp210x/ch341/ftdi/pl2303, and the PHYSICAL host
+  controllers turned back off); every other sandbox boots `vmlinux`, which has
+  no USB stack at all. `artifacts::locate` takes a `KernelVariant` and FAILS a
+  start when the USB image is missing — never falls back, since the base kernel
+  would boot, accept an attach and silently have no device. Env overrides are
+  separate (`IZBA_KERNEL` vs `IZBA_KERNEL_USB`). The guest half of the same
+  decision is `izba.usb=1` on the cmdline; the container half is a `/dev/izba`
+  bind of init-root `/run/izba/usb` plus cgroup device rules allowing char
+  majors 166/188 `rw` (never `m`) — both authored in `image/runtime_config.rs`
+  and both absent for a sandbox without grants.
 - **virtiofs tag** `workspace` (driver `FsShare` ↔ init mount plan) →
   `/workspace` inside the guest, which is also exec's default cwd.
 - **SSH access (`ssh izba-<name>`):** a vendored static OpenSSH `sshd`

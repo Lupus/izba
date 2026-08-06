@@ -18,5 +18,11 @@ path = "fuzz_targets/flatten.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "usbip_pump"
+path = "fuzz_targets/usbip_pump.rs"
+test = false
+doc = false
+
 # Prevent this from interfering with the workspace.
 [workspace]
