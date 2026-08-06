@@ -465,6 +465,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_usb_status_view_folds_attachment_into_the_grant_it_describes() {
+        let v = UsbStatusView::new(
+            vec![
+                izba_core::daemon::proto::UsbGrantInfo {
+                    device: "0403:6001".into(),
+                    busid_pin: Some("3-2".into()),
+                    description: "FT232".into(),
+                    granted_at_unix_ms: 7,
+                },
+                izba_core::daemon::proto::UsbGrantInfo {
+                    device: "10c4:ea60".into(),
+                    busid_pin: None,
+                    description: "CP2102".into(),
+                    granted_at_unix_ms: 8,
+                },
+            ],
+            vec!["10c4:ea60".into()],
+            true,
+        );
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(j["grants"][0]["device"], "0403:6001");
+        assert_eq!(j["grants"][0]["busid_pin"], "3-2");
+        assert_eq!(j["grants"][0]["attached"], serde_json::json!(false));
+        assert_eq!(j["grants"][1]["attached"], serde_json::json!(true));
+        assert_eq!(j["restart_required"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn a_usb_device_view_carries_every_field_the_ui_renders() {
+        let v = UsbDeviceView::from(izba_core::daemon::proto::UsbDeviceInfo {
+            busid: "1-4".into(),
+            device: "10c4:ea60".into(),
+            description: "CP2102".into(),
+            shared: false,
+            granted_to: vec!["web".into()],
+            attached_to: Some("api".into()),
+            bind_command: Some("usbipd bind --busid 1-4".into()),
+        });
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(j["busid"], "1-4");
+        assert_eq!(j["shared"], serde_json::json!(false));
+        assert_eq!(j["granted_to"], serde_json::json!(["web"]));
+        assert_eq!(j["attached_to"], "api");
+        // The command is the entire point of an unshared row: izba shows it
+        // because it will never run it.
+        assert_eq!(j["bind_command"], "usbipd bind --busid 1-4");
+    }
+
+    #[test]
+    fn a_usb_upstream_view_keeps_the_trust_token_and_its_note() {
+        let v = UsbUpstreamView::from(izba_core::daemon::proto::UsbUpstreamInfo {
+            host: "172.20.0.1".into(),
+            port: 3240,
+            resolved: Some("172.20.0.1".into()),
+            trust: "own-host-wsl-gateway".into(),
+            warning: Some("any other WSL distro can attach the same devices".into()),
+        });
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(j["trust"], "own-host-wsl-gateway");
+        assert_eq!(
+            j["warning"],
+            "any other WSL distro can attach the same devices"
+        );
+    }
+
+    #[test]
     fn diff_view_maps_state_and_deltas() {
         use izba_core::manifest::diff::{FieldClass, FieldDelta};
         use izba_core::manifest::DriftState;
