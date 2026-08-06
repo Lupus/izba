@@ -31,7 +31,12 @@ pub trait Listener {
 /// NOTE: exiting the accept loop is best-effort — a quiet listener blocks in
 /// accept() forever, so `main` watches the flag itself and never joins this
 /// thread; run it as a daemon thread.
-pub fn serve_control<L: Listener>(l: L, engine: Arc<ExecEngine>, shutdown: Arc<AtomicBool>) {
+pub fn serve_control<L: Listener>(
+    l: L,
+    engine: Arc<ExecEngine>,
+    usb: Arc<izba_init::usb::UsbState>,
+    shutdown: Arc<AtomicBool>,
+) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
@@ -49,12 +54,18 @@ pub fn serve_control<L: Listener>(l: L, engine: Arc<ExecEngine>, shutdown: Arc<A
             }
         };
         let engine = Arc::clone(&engine);
+        let usb = Arc::clone(&usb);
         let shutdown = Arc::clone(&shutdown);
-        std::thread::spawn(move || control_conn(conn, engine, shutdown));
+        std::thread::spawn(move || control_conn(conn, engine, usb, shutdown));
     }
 }
 
-fn control_conn<C: Read + Write>(mut conn: C, engine: Arc<ExecEngine>, shutdown: Arc<AtomicBool>) {
+fn control_conn<C: Read + Write>(
+    mut conn: C,
+    engine: Arc<ExecEngine>,
+    usb: Arc<izba_init::usb::UsbState>,
+    shutdown: Arc<AtomicBool>,
+) {
     loop {
         let req: Request = match read_frame(&mut conn) {
             Ok(r) => r,
@@ -70,7 +81,7 @@ fn control_conn<C: Read + Write>(mut conn: C, engine: Arc<ExecEngine>, shutdown:
             let _ = write_frame(&mut conn, &Response::Ok);
             return;
         }
-        let resp = dispatch_control_request(&engine, req);
+        let resp = dispatch_control_request(&engine, &usb, req);
         if write_frame(&mut conn, &resp).is_err() {
             return;
         }
@@ -79,7 +90,11 @@ fn control_conn<C: Read + Write>(mut conn: C, engine: Arc<ExecEngine>, shutdown:
 
 /// Maps a non-`Shutdown` control request to its response. `Shutdown` is handled
 /// by the caller because it must ack then close the connection.
-fn dispatch_control_request(engine: &ExecEngine, req: Request) -> Response {
+fn dispatch_control_request(
+    engine: &ExecEngine,
+    usb: &izba_init::usb::UsbState,
+    req: Request,
+) -> Response {
     let from_unit = |r: Result<(), (ErrorKind, String)>| match r {
         Ok(()) => Response::Ok,
         Err((kind, message)) => Response::Error { kind, message },
@@ -113,12 +128,12 @@ fn dispatch_control_request(engine: &ExecEngine, req: Request) -> Response {
             rows,
         } => from_unit(engine.resize(exec_id, cols, rows)),
         // USB support is decided by the HOST, at boot, via `izba.usb=1` on the
-        // kernel cmdline. Until this guest is wired for it, both verbs refuse
-        // on those terms — the fail-closed default a guest cannot argue with.
-        Request::UsbAttach { .. } | Request::UsbDetach { .. } => Response::Error {
-            kind: ErrorKind::UsbUnavailable,
-            message: "this guest did not boot with USB support (izba.usb=1)".into(),
-        },
+        // kernel cmdline; `UsbState` refuses everything without it. Nothing
+        // inside the guest can turn it on.
+        Request::UsbAttach { device } => {
+            from_unit(usb.attach_with(&device, izba_init::usb::dial_host))
+        }
+        Request::UsbDetach { device } => from_unit(usb.detach(&device)),
         // Handled by control_conn (acks then closes the connection).
         Request::Shutdown => unreachable!("Shutdown handled by control_conn"),
     }
@@ -409,8 +424,11 @@ mod tests {
             let shutdown = Arc::new(AtomicBool::new(false));
 
             let (control_tx, rx) = mpsc::channel();
+            // USB off, the way a sandbox without device grants boots: the
+            // harness proves the RPCs are wired, not that a vhci exists.
+            let usb = Arc::new(izba_init::usb::UsbState::new(false));
             let (e, s) = (Arc::clone(&engine), Arc::clone(&shutdown));
-            std::thread::spawn(move || serve_control(PairListener(Mutex::new(rx)), e, s));
+            std::thread::spawn(move || serve_control(PairListener(Mutex::new(rx)), e, usb, s));
 
             let (stream_tx, rx) = mpsc::channel();
             std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), engine));
@@ -792,6 +810,58 @@ mod tests {
         let mut rest = Vec::new();
         conn.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty());
+    }
+
+    /// The USB RPCs must reach `UsbState` rather than being answered inline:
+    /// the harness boots USB off, so both verbs come back `UsbUnavailable`, and
+    /// the message is the one only `UsbState::gate` produces.
+    #[test]
+    fn usb_rpcs_are_wired_to_the_usb_state_and_refuse_without_izba_usb() {
+        let h = Harness::new();
+        for req in [
+            Request::UsbAttach {
+                device: "0403:6001".into(),
+            },
+            Request::UsbDetach {
+                device: "0403:6001".into(),
+            },
+        ] {
+            let mut c = h.control_conn();
+            match rpc(&mut c, &req) {
+                Response::Error { kind, message } => {
+                    assert_eq!(kind, ErrorKind::UsbUnavailable, "{req:?}");
+                    assert!(message.contains("izba.usb=1"), "{req:?}: {message}");
+                    assert!(
+                        message.contains("restart"),
+                        "the fix is a restart, and must be said: {message}"
+                    );
+                }
+                other => panic!("{req:?} must refuse without USB, got {other:?}"),
+            }
+        }
+    }
+
+    /// A `UsbAttach` arriving on the STREAM port is a guest probing a plane it
+    /// was not given: that variant belongs to izbad on vsock 1028, and init
+    /// only ever dials it.
+    #[test]
+    fn usb_attach_is_rejected_on_the_stream_port() {
+        let h = Harness::new();
+        let mut conn = h.stream_conn();
+        write_frame(
+            &mut conn,
+            &StreamOpen::UsbAttach {
+                device: "0403:6001".into(),
+            },
+        )
+        .unwrap();
+        match read_frame::<_, Response>(&mut conn).unwrap() {
+            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::BadRequest),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let mut rest = Vec::new();
+        conn.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "one error frame, then closed");
     }
 
     /// A Resize RPC against a non-tty exec must round-trip through the control
