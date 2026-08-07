@@ -349,6 +349,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
         // provisioning, so the id is persisted in config.json and stays stable
         // across starts (the disk slot is keyed off id, not list position).
         let mut volumes = opts.volumes.clone();
+        crate::volume::inject_docker_volume(&mut volumes, opts.docker);
         crate::volume::assign_eph_ids(&mut volumes);
 
         // Single-writer guard: persistent volumes may only be referenced by one sandbox.

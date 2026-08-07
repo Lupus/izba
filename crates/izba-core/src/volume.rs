@@ -18,6 +18,13 @@ use crate::paths::Paths;
 /// limit at the host boundary so a clear error replaces a driver panic.
 pub const MAX_VOLUMES: usize = 24;
 
+/// Guest path of docker's storage root. overlay2 refuses an overlayfs
+/// backing store and the workload rootfs IS izba's overlay, so docker mode
+/// needs a real ext4 here (spec §4).
+pub const DOCKER_VOLUME_PATH: &str = "/var/lib/docker";
+/// Sparse size of the auto-provisioned docker volume.
+pub const DOCKER_VOLUME_SIZE: u64 = 10 << 30; // 10 GiB
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeSpec {
     /// `Some` ⇒ persistent (<data>/volumes/<name>.img, survives rm);
@@ -71,6 +78,34 @@ pub fn assign_eph_ids(volumes: &mut [VolumeSpec]) {
             v.eph_id = Some(next);
             next += 1;
         }
+    }
+}
+
+/// Docker mode auto-attaches an anonymous ext4 volume at
+/// [`DOCKER_VOLUME_PATH`] unless the user already declared a volume there
+/// (a named volume then gives persistence across `izba rm`). Component-wise
+/// path comparison so `/var/lib/docker/.` and friends don't slip past the
+/// dedup and double-provision.
+pub fn inject_docker_volume(volumes: &mut Vec<VolumeSpec>, docker: bool) {
+    if !docker {
+        return;
+    }
+    let target: Vec<std::path::Component> = std::path::Path::new(DOCKER_VOLUME_PATH)
+        .components()
+        .collect();
+    let declared = volumes.iter().any(|v| {
+        v.guest_path
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .eq(target.iter().cloned())
+    });
+    if !declared {
+        volumes.push(VolumeSpec {
+            name: None,
+            guest_path: DOCKER_VOLUME_PATH.into(),
+            size_bytes: DOCKER_VOLUME_SIZE,
+            eph_id: None,
+        });
     }
 }
 
@@ -359,5 +394,56 @@ mod tests {
         let mut got = unreferenced_volumes(&on_disk, &referenced);
         got.sort();
         assert_eq!(got, vec!["cache".to_string(), "old".to_string()]);
+    }
+
+    #[test]
+    fn inject_docker_volume_appends_anonymous_when_absent() {
+        let mut vols = vec![];
+        inject_docker_volume(&mut vols, true);
+        assert_eq!(vols.len(), 1);
+        assert_eq!(
+            vols[0].guest_path,
+            std::path::PathBuf::from(DOCKER_VOLUME_PATH)
+        );
+        assert_eq!(vols[0].name, None, "auto volume is anonymous (ephemeral)");
+        assert_eq!(vols[0].size_bytes, DOCKER_VOLUME_SIZE);
+    }
+
+    #[test]
+    fn inject_docker_volume_noop_when_docker_off() {
+        let mut vols = vec![];
+        inject_docker_volume(&mut vols, false);
+        assert!(vols.is_empty());
+    }
+
+    #[test]
+    fn inject_docker_volume_defers_to_user_declared_path() {
+        // A user-declared volume at the path (named → persistent) wins; no
+        // duplicate is appended (validate_volumes would reject it anyway).
+        let mut vols = vec![VolumeSpec {
+            name: Some("dockerlib".into()),
+            guest_path: "/var/lib/docker".into(),
+            size_bytes: 2 << 30,
+            eph_id: None,
+        }];
+        inject_docker_volume(&mut vols, true);
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].name.as_deref(), Some("dockerlib"));
+    }
+
+    #[test]
+    fn inject_docker_volume_matches_by_components_not_string() {
+        // "/var/lib/docker/." and "/var/lib//docker" name the same directory; a
+        // raw PathBuf == comparison would miss them and double-provision.
+        for spelled in ["/var/lib/docker/", "/var/lib/docker/.", "/var/lib//docker"] {
+            let mut vols = vec![VolumeSpec {
+                name: None,
+                guest_path: spelled.into(),
+                size_bytes: 1 << 30,
+                eph_id: None,
+            }];
+            inject_docker_volume(&mut vols, true);
+            assert_eq!(vols.len(), 1, "{spelled:?} must match {DOCKER_VOLUME_PATH}");
+        }
     }
 }
