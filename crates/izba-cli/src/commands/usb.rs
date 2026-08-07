@@ -310,6 +310,16 @@ fn description_of<'a>(devices: &'a [UsbDeviceInfo], device: &str) -> &'a str {
         .unwrap_or_default()
 }
 
+/// The name to put in the banner, given whatever the daemon's listing reply
+/// turned out to be. Split out of `allow` so the rule is observable: any reply
+/// other than a listing means a quieter banner, never a failed grant.
+fn described_from(reply: Result<DaemonResponse>, device: &str) -> String {
+    match reply {
+        Ok(DaemonResponse::UsbDevices { devices }) => description_of(&devices, device).to_string(),
+        _ => String::new(),
+    }
+}
+
 fn allow(
     paths: &Paths,
     name: &str,
@@ -337,12 +347,10 @@ fn allow(
             // Best-effort: a listing needs a configured, reachable upstream, and
             // a grant is a standing config edit that must not depend on either.
             // No name is a quieter banner, not a failed grant.
-            let described = match client.request(&DaemonRequest::UsbListDevices, &mut |_| {}) {
-                Ok(DaemonResponse::UsbDevices { devices }) => {
-                    description_of(&devices, &device).to_string()
-                }
-                _ => String::new(),
-            };
+            let described = described_from(
+                client.request(&DaemonRequest::UsbListDevices, &mut |_| {}),
+                &device,
+            );
             eprint!("{}", consent_banner(name, &device, &described));
             eprint!("\nType the device id to confirm: ");
             std::io::stderr().flush()?;
@@ -632,6 +640,34 @@ mod tests {
         let devices = [dev("12-4", "303a:1001", true, &[])];
         assert_eq!(description_of(&devices, "0403:6001"), "");
         assert_eq!(description_of(&[], "303a:1001"), "");
+    }
+
+    #[test]
+    fn only_a_listing_reply_names_the_device_and_no_other_reply_fails_the_grant() {
+        // Pins the call site, not just the rule: without this, deleting the
+        // success arm in `allow` is invisible to every test, which is the same
+        // untested-wiring class as the empty grant description this PR fixes.
+        let devices = vec![dev("12-4", "303a:1001", true, &[])];
+        assert_eq!(
+            described_from(Ok(DaemonResponse::UsbDevices { devices }), "303a:1001"),
+            "USB Serial Converter"
+        );
+        // A daemon that refuses the listing — no upstream configured, upstream
+        // unreachable — must still let the grant through, with a quieter banner
+        // rather than an error. A grant is a standing config edit.
+        assert_eq!(
+            described_from(
+                Ok(DaemonResponse::Error {
+                    message: "no usb upstream configured".to_string()
+                }),
+                "303a:1001"
+            ),
+            ""
+        );
+        assert_eq!(
+            described_from(Err(anyhow::anyhow!("connection refused")), "303a:1001"),
+            ""
+        );
     }
 
     #[test]
