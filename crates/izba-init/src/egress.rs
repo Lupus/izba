@@ -368,12 +368,16 @@ fn original_dst(conn: &TcpStream) -> io::Result<SocketAddrV4> {
     ))
 }
 
-/// Bind the redirect listener. Split out of `serve_tcp_redirect` so the bind
-/// happens on the main thread BEFORE `apply_nft`: the REDIRECT rule sends all
-/// guest TCP here, so a listener must already exist or every connect gets a
-/// loopback RST. Returning the bound listener gives apply_nft a happens-before.
+/// Bind the redirect listener on the wildcard address. Split out of
+/// `serve_tcp_redirect` so the bind happens on the main thread BEFORE `apply_nft`:
+/// the REDIRECT rule sends all guest TCP here, so a listener must already exist or
+/// every connect gets a loopback RST. Returning the bound listener gives apply_nft
+/// a happens-before. Wildcard bind is necessary because prerouting REDIRECT (docker
+/// mode, spec §3) rewrites the destination to the veth interface's address
+/// (192.168.127.1), not loopback, while output-hook REDIRECT delivers to loopback
+/// — a single listener must accept on any local address.
 pub fn bind_tcp_redirect() -> io::Result<TcpListener> {
-    TcpListener::bind(("127.0.0.1", REDIRECT_PORT))
+    TcpListener::bind(("0.0.0.0", REDIRECT_PORT))
 }
 
 /// Serve the redirect listener forever (daemon thread) on an already-bound
@@ -705,6 +709,22 @@ mod tests {
             dns_tcp < relay,
             "tcp:53 DNS rule must precede the relay rule"
         );
+    }
+
+    #[test]
+    fn tcp_redirect_listener_binds_wildcard() {
+        // Prerouting REDIRECT (docker mode, spec §3) rewrites the destination to
+        // the ingress interface's address (192.168.127.1), not loopback — the
+        // listener must accept on any local address. Wildcard is harmless on the
+        // NIC-less island. Runtime-skip where the sandbox denies bind (repo test
+        // constraint).
+        let l = match bind_tcp_redirect() {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return, // parallel test run owns :15001
+            Err(e) => panic!("bind: {e}"),
+        };
+        assert!(l.local_addr().unwrap().ip().is_unspecified());
     }
 
     /// The transparent-reply plumbing end-to-end on plain loopback (no NAT, so
