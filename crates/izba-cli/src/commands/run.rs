@@ -262,6 +262,16 @@ fn resolve_or_create(
     // caller of `resolve_or_create`) already runs it before the daemon
     // connect, and the check is name-independent (see the comment there), so
     // repeating it here would be redundant.
+    // Docker mode tri-state (#198): an explicit --docker/--no-docker wins;
+    // otherwise None lets the daemon fall back to the image's start-docker
+    // label.
+    let docker = if merged.docker {
+        Some(true)
+    } else if merged.no_docker {
+        Some(false)
+    } else {
+        None
+    };
     // Carry the run's confinement intent into create: `run --allow-unconfined`
     // on a workspace that can't be relabelled must still create (the VMM will run
     // unconfined and never relabel it), so skip the create-time preflight.
@@ -272,6 +282,7 @@ fn resolve_or_create(
         ports,
         volumes,
         allow_unconfined,
+        docker,
     ));
     match client.request(&req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Created { .. } => {}
@@ -363,6 +374,8 @@ mod tests {
             publish: vec![],
             policy: None,
             volumes: vec![],
+            docker: false,
+            no_docker: false,
         }
     }
 

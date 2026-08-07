@@ -532,6 +532,7 @@ mod tests {
             ports: Vec::new(),
             volumes,
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -551,6 +552,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         }
@@ -626,6 +628,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -653,6 +656,7 @@ mod tests {
                 eph_id: None,
             }],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -679,6 +683,7 @@ mod tests {
                 eph_id: None,
             }],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -708,6 +713,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };

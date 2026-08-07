@@ -63,6 +63,15 @@ struct SandboxOpts {
     /// it on later with `izba policy enforce NAME on`.
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
+    /// Enable docker mode: the workload gets its own network namespace,
+    /// userns-scoped admin capabilities, an auto /var/lib/docker volume, and
+    /// the image's Docker Engine is auto-started (overrides the image label).
+    #[arg(long, overrides_with = "no_docker")]
+    docker: bool,
+    /// Disable docker mode even if the image carries the
+    /// com.docker.sandboxes.start-docker label.
+    #[arg(long, overrides_with = "docker")]
+    no_docker: bool,
 }
 
 #[derive(Debug, Subcommand)]

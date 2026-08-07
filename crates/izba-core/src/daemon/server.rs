@@ -439,6 +439,24 @@ fn regen_ssh_config(d: &Arc<Daemon>) {
     }
 }
 
+/// The OCI image label sbx uses to mark engine-bearing images; izba honors it
+/// for sbx parity (spec §1).
+pub const START_DOCKER_LABEL: &str = "com.docker.sandboxes.start-docker";
+
+/// Resolve the sandbox's docker mode: an explicit CLI choice wins; otherwise
+/// the image label enables it iff its value is exactly "true"; otherwise off.
+pub fn resolve_docker_mode(
+    cli: Option<bool>,
+    labels: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    match cli {
+        Some(v) => v,
+        None => labels
+            .and_then(|l| l.get(START_DOCKER_LABEL))
+            .is_some_and(|v| v == "true"),
+    }
+}
+
 fn handle_create(
     d: &Arc<Daemon>,
     c: crate::daemon::proto::DaemonCreate,
@@ -459,6 +477,25 @@ fn handle_create(
         c.image_ref
     ));
     let digest = (d.deps.resolve_image)(&d.paths, &c.image_ref)?;
+    // Docker mode is a create-time decision (spec §1): the CLI's explicit choice
+    // wins, else the sbx start-docker label. Builder sandboxes never get docker
+    // mode — the privileged builder profile skips the userns docker mode
+    // depends on, so the combination is contradictory; builder wins silently
+    // (it is set only by `izba build`, never user-visible).
+    let docker = if c.builder {
+        false
+    } else {
+        let cfg = crate::image::store::ImageStore::new(&d.paths)
+            .load_config(&digest)
+            .ok()
+            .flatten();
+        resolve_docker_mode(
+            c.docker,
+            cfg.as_ref()
+                .and_then(|f| f.config.as_ref())
+                .and_then(|cc| cc.labels.as_ref()),
+        )
+    };
     sandbox::create(
         &d.paths,
         &c.name,
@@ -475,6 +512,7 @@ fn handle_create(
             // with the `izba-buildout` rw share at `/out`; normal create/run
             // leave it false.
             builder: c.builder,
+            docker,
         },
     )?;
     d.registry.set(&c.name, &c.image_ref, Liveness::Stopped);
@@ -1292,6 +1330,28 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn resolve_docker_mode_precedence() {
+        use std::collections::HashMap;
+        let on: HashMap<String, String> = [(
+            "com.docker.sandboxes.start-docker".to_string(),
+            "true".to_string(),
+        )]
+        .into();
+        let off: HashMap<String, String> = [(
+            "com.docker.sandboxes.start-docker".to_string(),
+            "false".to_string(),
+        )]
+        .into();
+        // CLI wins over label, both directions.
+        assert!(!resolve_docker_mode(Some(false), Some(&on)));
+        assert!(resolve_docker_mode(Some(true), None));
+        // Label decides when CLI is silent; only the literal "true" enables.
+        assert!(resolve_docker_mode(None, Some(&on)));
+        assert!(!resolve_docker_mode(None, Some(&off)));
+        assert!(!resolve_docker_mode(None, None));
+    }
+
     /// Deps wired to fakes: mock driver, socketpair guest, static digest.
     fn test_deps() -> DaemonDeps {
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -1424,6 +1484,7 @@ mod tests {
             volumes: Vec::new(),
             allow_unconfined: false,
             builder: false,
+            docker: None,
         })
     }
 
@@ -2404,6 +2465,7 @@ mod tests {
                 builder: false,
                 build: None,
                 rw_size_gb: 1,
+                docker: false,
             },
         )
         .unwrap();
@@ -2977,6 +3039,7 @@ mod tests {
                 ports: Vec::new(),
                 volumes,
                 builder: false,
+                docker: false,
             },
         )
         .unwrap();
@@ -3071,6 +3134,7 @@ mod tests {
                     eph_id: None,
                 }],
                 builder: false,
+                docker: false,
             },
         )
         .unwrap();
@@ -3228,6 +3292,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -3488,6 +3553,7 @@ mod tests {
                 ports: Vec::new(),
                 volumes: Vec::new(),
                 builder: false,
+                docker: false,
             },
         )
         .unwrap();
@@ -3540,6 +3606,7 @@ mod tests {
                 ports: Vec::new(),
                 volumes: Vec::new(),
                 builder: false,
+                docker: false,
             },
         )
         .unwrap();

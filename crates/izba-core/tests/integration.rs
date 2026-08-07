@@ -234,6 +234,7 @@ fn create_sandbox(env: &TestEnv, tb: &mut TestBox, name: &str, ws: &Path) {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            docker: false,
         },
     )
     .expect("create");
@@ -262,6 +263,7 @@ fn create_sandbox_with_volumes(
             ports: Vec::new(),
             volumes,
             builder: false,
+            docker: false,
         },
     )
     .expect("create");
@@ -808,6 +810,7 @@ fn userns_numeric_user_owns_workspace() {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            docker: false,
         },
     )
     .expect("create");
@@ -906,6 +909,7 @@ fn userns_resolves_symbolic_image_user() {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            docker: false,
         },
     )
     .expect("create");
@@ -2020,6 +2024,7 @@ fn port_publish_create_time() {
             }],
             volumes: Vec::new(),
             builder: false,
+            docker: false,
         },
     )
     .expect("create");

@@ -81,6 +81,10 @@ impl CreateOpts {
             volumes,
             allow_unconfined: false,
             builder: false,
+            // The GUI wizard has no docker-mode control yet (#198 is CLI-first);
+            // None defers to the image's start-docker label, same as an
+            // unset CLI flag.
+            docker: None,
         })
     }
 }

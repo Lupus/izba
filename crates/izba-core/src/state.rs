@@ -55,6 +55,13 @@ pub struct SandboxConfig {
     /// deserializing — as no grants, i.e. USB disabled.
     #[serde(default)]
     pub usb: crate::usb::UsbConfig,
+    /// Docker mode (#198): this workload gets the docker OCI profile (own
+    /// netns + veth datapath, userns-scoped SYS_ADMIN/NET_ADMIN caps, cgroup
+    /// delegation) and the engine auto-start. Resolved at create from the CLI
+    /// flag / image label; `#[serde(default)]` keeps pre-feature config.json
+    /// loading (= false).
+    #[serde(default)]
+    pub docker: bool,
 }
 
 /// A single host→guest TCP publish rule. Its identity (uniqueness key) is
@@ -181,6 +188,7 @@ mod tests {
             builder: false,
             build: None,
             rw_size_gb: 8,
+            docker: false,
         }
     }
 
@@ -191,6 +199,14 @@ mod tests {
         let c: SandboxConfig = serde_json::from_str(json).unwrap();
         assert!(c.volumes.is_empty());
         assert!(c.ports.is_empty());
+    }
+
+    /// Pre-docker-mode config.json on disk must load with docker=false.
+    #[test]
+    fn config_without_docker_defaults_false() {
+        let json = r#"{"image_digest":"sha256:x","image_ref":"alpine","cpus":1,"mem_mb":256,"workspace":"/w"}"#;
+        let cfg: SandboxConfig = serde_json::from_str(json).expect("deserialize");
+        assert!(!cfg.docker);
     }
 
     #[test]

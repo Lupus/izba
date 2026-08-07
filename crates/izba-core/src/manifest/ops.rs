@@ -254,6 +254,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -297,6 +298,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 0, // legacy: unknown, must recover from rw.img
         };
@@ -349,6 +351,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 16, // persisted at create time
         };
@@ -395,6 +398,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 0, // legacy: unknown, recover from rw.img
         };

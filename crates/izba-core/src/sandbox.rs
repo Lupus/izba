@@ -62,6 +62,12 @@ pub struct CreateOpts {
     /// When true, this is a builder VM: a read-write `izba-buildout` virtiofs
     /// share is attached at guest `/out` for build artefact output.
     pub builder: bool,
+    /// Docker mode (#198): this workload gets the docker OCI profile (own
+    /// netns + veth datapath, userns-scoped SYS_ADMIN/NET_ADMIN caps, cgroup
+    /// delegation) and the engine auto-start. Resolved by the daemon before
+    /// `create` is called (CLI flag / image label precedence) — `create`
+    /// itself just folds it into `SandboxConfig`.
+    pub docker: bool,
 }
 
 /// Boot artifacts shared by all sandboxes (kernel + initramfs with izba-init).
@@ -361,6 +367,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             ports: opts.ports.clone(),
             volumes: volumes.clone(),
             builder: opts.builder,
+            docker: opts.docker,
             build: None,
             // Persist the requested scratch size so `izba export` can emit a
             // valid `rootDisk.size` without reading the physical rw.img length
@@ -1809,6 +1816,7 @@ mod tests {
             build: None,
             rw_size_gb: 0,
             usb: Default::default(),
+            docker: false,
         };
         save_json(&paths.sandbox_dir(name).join(CONFIG_FILE), &cfg).unwrap();
     }
@@ -2095,6 +2103,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            docker: false,
         }
     }
 

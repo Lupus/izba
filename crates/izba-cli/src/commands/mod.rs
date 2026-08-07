@@ -130,6 +130,7 @@ pub(crate) fn build_create_request(
     ports: Vec<PortRule>,
     volumes: Vec<izba_core::volume::VolumeSpec>,
     allow_unconfined: bool,
+    docker: Option<bool>,
 ) -> izba_core::daemon::proto::DaemonCreate {
     izba_core::daemon::proto::DaemonCreate {
         name,
@@ -143,6 +144,7 @@ pub(crate) fn build_create_request(
         allow_unconfined,
         // `create`/`run` never provision a build host; only `izba build` does.
         builder: false,
+        docker,
     }
 }
 
@@ -311,6 +313,8 @@ mod tests {
             publish: vec![],
             policy: None,
             volumes: vec![],
+            docker: false,
+            no_docker: false,
         }
     }
 
@@ -386,6 +390,7 @@ mod tests {
             vec![],
             vec![],
             false,
+            None,
         );
         assert_eq!(confined.name, "web");
         assert_eq!(confined.image_ref, "ubuntu:24.04");
@@ -396,11 +401,49 @@ mod tests {
         // `create` (and a plain `run`) default to confined intent, so the daemon
         // runs the workspace preflight.
         assert!(!confined.allow_unconfined);
+        // No --docker/--no-docker given: no CLI preference, the label decides.
+        assert_eq!(confined.docker, None);
 
         // `run --allow-unconfined` threads the opt-out so the preflight is skipped.
-        let unconfined =
-            build_create_request("web".into(), &o, PathBuf::from("/ws"), vec![], vec![], true);
+        let unconfined = build_create_request(
+            "web".into(),
+            &o,
+            PathBuf::from("/ws"),
+            vec![],
+            vec![],
+            true,
+            None,
+        );
         assert!(unconfined.allow_unconfined);
+    }
+
+    /// `--docker`/`--no-docker` thread through as the explicit CLI tri-state
+    /// (#198); the daemon resolves the label-decides case, so `create`/`run`
+    /// just forward whatever the caller computed from `opts.docker`/`no_docker`.
+    #[test]
+    fn build_create_request_threads_docker_tri_state() {
+        let o = opts();
+        let on = build_create_request(
+            "web".into(),
+            &o,
+            PathBuf::from("/ws"),
+            vec![],
+            vec![],
+            false,
+            Some(true),
+        );
+        assert_eq!(on.docker, Some(true));
+
+        let off = build_create_request(
+            "web".into(),
+            &o,
+            PathBuf::from("/ws"),
+            vec![],
+            vec![],
+            false,
+            Some(false),
+        );
+        assert_eq!(off.docker, Some(false));
     }
 
     /// Fix 4: manifest volumes are adopted into opts when the user passed none.

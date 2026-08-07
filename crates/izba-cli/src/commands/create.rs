@@ -23,11 +23,21 @@ pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32>
     // path itself may already be too long) (#71).
     izba_core::paths::ensure_socket_budget(paths, &name)?;
     let mut client = DaemonClient::connect(paths)?;
+    // Docker mode tri-state (#198): an explicit --docker/--no-docker wins;
+    // otherwise None lets the daemon fall back to the image's start-docker
+    // label.
+    let docker = if merged.docker {
+        Some(true)
+    } else if merged.no_docker {
+        Some(false)
+    } else {
+        None
+    };
     // `izba create` has no unconfined opt-out (that is a run/start flag), so it
     // always creates with confined intent: the daemon runs the workspace
     // confinement preflight and refuses an unrelabellable dir up front.
     let req = DaemonRequest::Create(super::build_create_request(
-        name, &merged, workspace, ports, volumes, false,
+        name, &merged, workspace, ports, volumes, false, docker,
     ));
     match client.request(&req, &mut |m| eprintln!("{m}"))? {
         DaemonResponse::Created { name } => {
@@ -65,6 +75,8 @@ mod tests {
             publish: vec![],
             policy: None,
             volumes: vec![],
+            docker: false,
+            no_docker: false,
         }
     }
 
