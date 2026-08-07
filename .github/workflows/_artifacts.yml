@@ -33,6 +33,36 @@ jobs:
           path: dist/vmlinux
           if-no-files-found: error
 
+  kernel-usb:
+    name: vmlinux-usb (USB passthrough variant)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Restore built vmlinux-usb
+        id: vmlinux_usb
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: dist/vmlinux-usb
+          # Hashes BOTH fragments: the variant is the base config plus the USB
+          # overlay, so a change to either must rebuild it.
+          key: vmlinux-usb-${{ hashFiles('hack/kernel.config', 'hack/kernel-usb.config', 'hack/build-kernel.sh') }}
+      - name: Install kernel build deps
+        if: steps.vmlinux_usb.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential flex bison bc libelf-dev
+      - name: Build USB kernel
+        if: steps.vmlinux_usb.outputs.cache-hit != 'true'
+        env:
+          IZBA_KERNEL_EXTRA_CONFIG: hack/kernel-usb.config
+        run: hack/build-kernel.sh 6.12.30 dist/vmlinux-usb
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vmlinux-usb
+          path: dist/vmlinux-usb
+          if-no-files-found: error
+
   mke2fs:
     name: static mke2fs (pinned e2fsprogs 1.47.2)
     runs-on: ubuntu-latest
@@ -251,7 +281,7 @@ jobs:
 
   manifest:
     name: SHA256SUMS + provenance
-    needs: [kernel, initramfs, mke2fs, nft, ip, crun, sshd, erofs-parity, izba-windows]
+    needs: [kernel, kernel-usb, initramfs, mke2fs, nft, ip, crun, sshd, erofs-parity, izba-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
