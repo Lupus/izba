@@ -193,12 +193,17 @@ pub fn list_devices(
     attached: &HashMap<DeviceId, String>,
 ) -> Vec<UsbDeviceInfo> {
     let grants = grants_by_device(paths);
+    let known = known.unwrap_or_default();
     let mut out: Vec<UsbDeviceInfo> = shared
         .iter()
         .map(|d| UsbDeviceInfo {
             busid: d.busid.clone(),
             device: d.id.to_string(),
-            description: d.description.clone(),
+            // The wire format carries only a sysfs path; usbipd knows the
+            // product name. Prefer the name, keep the path as the fallback.
+            description: usbipd_state::describe(&known, &d.busid, d.id)
+                .unwrap_or(&d.description)
+                .to_string(),
             shared: true,
             granted_to: grants.get(&d.id).cloned().unwrap_or_default(),
             attached_to: attached.get(&d.id).cloned(),
@@ -207,7 +212,7 @@ pub fn list_devices(
         .collect();
     // Only the UNBOUND rows are additive: a bound device is already in `shared`,
     // and listing it twice would read as two pieces of hardware.
-    for k in known.unwrap_or_default().into_iter().filter(|k| !k.bound) {
+    for k in known.into_iter().filter(|k| !k.bound) {
         out.push(UsbDeviceInfo {
             bind_command: Some(usbipd_state::bind_command(&k)),
             granted_to: grants.get(&k.id).cloned().unwrap_or_default(),
@@ -501,6 +506,34 @@ mod tests {
         let listed = list_devices(&paths, &[], Some(known), &HashMap::new());
         assert_eq!(listed[0].granted_to, vec!["web"]);
         assert!(listed[0].bind_command.is_some());
+    }
+
+    #[test]
+    fn a_shared_row_borrows_the_product_name_usbipd_knows_for_it() {
+        let (_tmp, paths) = paths_with_sandboxes(&[]);
+        let shared = [upstream_device("12-4", "303a:1001")];
+        let known = vec![usbipd_state::UsbipdDevice {
+            busid: "12-4".to_string(),
+            id: "303a:1001".parse().unwrap(),
+            description: "USB JTAG/serial debug unit".to_string(),
+            bound: true,
+            attached: false,
+        }];
+        let out = list_devices(&paths, &shared, Some(known), &HashMap::new());
+        assert_eq!(out.len(), 1, "a bound device must not be listed twice");
+        assert_eq!(out[0].description, "USB JTAG/serial debug unit");
+    }
+
+    #[test]
+    fn a_shared_row_keeps_its_own_description_when_usbipd_offers_no_better_name() {
+        let (_tmp, paths) = paths_with_sandboxes(&[]);
+        let shared = [upstream_device("12-4", "303a:1001")];
+        let out = list_devices(&paths, &shared, None, &HashMap::new());
+        assert_eq!(
+            out[0].description, "USB Serial Converter",
+            "expected the unenriched fallback, got {:?}",
+            out[0].description
+        );
     }
 
     #[test]

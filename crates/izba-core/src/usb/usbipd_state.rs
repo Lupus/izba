@@ -95,6 +95,35 @@ pub fn bind_command(d: &UsbipdDevice) -> String {
     format!("usbipd bind --busid {}", d.busid)
 }
 
+/// The human-readable product name usbipd knows for a device, if it can be
+/// matched without guessing.
+///
+/// The USB/IP wire format carries no product string — `OP_REP_DEVLIST` gives a
+/// sysfs path and nothing friendlier — so the only source of "USB JTAG/serial
+/// debug unit" is usbipd's own state table, and getting it onto a shared row is
+/// a join rather than a new field (#190).
+///
+/// Match rule, in order:
+/// 1. busid AND id both equal — unambiguous.
+/// 2. id equal and exactly one row carries it — the busid spellings need not
+///    agree between usbipd and the upstream's export, and one device of that
+///    model cannot be confused with another.
+///
+/// Never busid alone: a busid is host-local, so against a remote upstream that
+/// would paste this machine's device name onto someone else's hardware.
+pub fn describe<'a>(known: &'a [UsbipdDevice], busid: &str, id: DeviceId) -> Option<&'a str> {
+    let non_empty = |d: &'a UsbipdDevice| Some(d.description.as_str()).filter(|s| !s.is_empty());
+    if let Some(d) = known.iter().find(|d| d.busid == busid && d.id == id) {
+        return non_empty(d);
+    }
+    let mut by_id = known.iter().filter(|d| d.id == id);
+    let only = by_id.next()?;
+    if by_id.next().is_some() {
+        return None;
+    }
+    non_empty(only)
+}
+
 /// Run `usbipd.exe state` across the WSL interop boundary. Returns `None` on
 /// any failure — this is decoration, and its absence must never fail a listing
 /// or be mistaken for "you have no devices".
@@ -271,6 +300,117 @@ mod tests {
                 .to_string()
                 .contains("too large"),
             "100 KB of output must reach the parser, not the size refusal"
+        );
+    }
+
+    fn known(busid: &str, vid: u16, pid: u16, desc: &str) -> UsbipdDevice {
+        UsbipdDevice {
+            busid: busid.to_string(),
+            id: DeviceId { vid, pid },
+            description: desc.to_string(),
+            bound: true,
+            attached: false,
+        }
+    }
+
+    #[test]
+    fn a_row_matching_on_both_busid_and_id_gets_the_product_name() {
+        let table = [known("12-4", 0x303a, 0x1001, "USB JTAG/serial debug unit")];
+        assert_eq!(
+            describe(
+                &table,
+                "12-4",
+                DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001
+                }
+            ),
+            Some("USB JTAG/serial debug unit")
+        );
+    }
+
+    #[test]
+    fn a_busid_match_with_a_different_device_never_lends_its_name() {
+        // A busid is host-local. Against a remote upstream the same string can
+        // name entirely different hardware, and pasting a local product name
+        // (worse: one carrying a local COM port) onto it would be a lie.
+        let table = [known("12-4", 0x303a, 0x1001, "USB JTAG/serial debug unit")];
+        assert_eq!(
+            describe(
+                &table,
+                "12-4",
+                DeviceId {
+                    vid: 0x0403,
+                    pid: 0x6001
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_unique_id_still_matches_when_the_busids_differ() {
+        // usbipd's busid and the upstream's exported busid need not be spelled
+        // the same. One unambiguous device of that model is still safe to name.
+        let table = [known("3-2", 0x303a, 0x1001, "USB JTAG/serial debug unit")];
+        assert_eq!(
+            describe(
+                &table,
+                "12-4",
+                DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001
+                }
+            ),
+            Some("USB JTAG/serial debug unit")
+        );
+    }
+
+    #[test]
+    fn two_identical_models_are_ambiguous_and_neither_name_is_borrowed() {
+        let table = [
+            known("3-2", 0x303a, 0x1001, "board on the left"),
+            known("3-3", 0x303a, 0x1001, "board on the right"),
+        ];
+        // Neither busid matches, and the id alone cannot pick between them.
+        assert_eq!(
+            describe(
+                &table,
+                "12-4",
+                DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001
+                }
+            ),
+            None
+        );
+        // …but an exact busid match still resolves it.
+        assert_eq!(
+            describe(
+                &table,
+                "3-3",
+                DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001
+                }
+            ),
+            Some("board on the right")
+        );
+    }
+
+    #[test]
+    fn an_empty_usbipd_description_is_not_worth_borrowing() {
+        let table = [known("12-4", 0x303a, 0x1001, "")];
+        assert_eq!(
+            describe(
+                &table,
+                "12-4",
+                DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001
+                }
+            ),
+            None
         );
     }
 }
