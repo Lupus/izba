@@ -229,6 +229,7 @@ pub struct PasswdEntry {
 pub struct GroupEntry {
     pub name: String,
     pub gid: u32,
+    pub members: Vec<String>,
 }
 
 /// Parse `/etc/passwd` content into entries. Standard 7-field colon format;
@@ -276,9 +277,19 @@ pub fn parse_group(content: &str) -> Vec<GroupEntry> {
             if name.is_empty() {
                 return None;
             }
+            let members = f
+                .next()
+                .map(|m| {
+                    m.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(GroupEntry {
                 name: name.to_string(),
                 gid,
+                members,
             })
         })
         .collect()
@@ -332,6 +343,33 @@ impl UserDb {
             },
         };
         Some((uid, gid))
+    }
+
+    /// Supplementary gids for the image `USER`: the gids of every `/etc/group`
+    /// entry listing the user as a member — group-file order, deduped. The
+    /// primary gid is excluded by construction (membership lists carry
+    /// secondary groups). A numeric USER is reverse-resolved to a name via
+    /// passwd first (docker-faithful); no passwd match, no declared USER, or an
+    /// unresolvable name ⇒ empty (the direction that never invents privilege).
+    pub fn supplementary_gids(&self, declared: Option<&str>) -> Vec<u32> {
+        let user_part = match declared {
+            None | Some("") => return Vec::new(),
+            Some(u) => u.split_once(':').map_or(u, |(user, _)| user),
+        };
+        let name: &str = match user_part.parse::<u32>() {
+            Ok(n) => match self.passwd.iter().find(|e| e.uid == n) {
+                Some(e) => &e.name,
+                None => return Vec::new(),
+            },
+            Err(_) => user_part,
+        };
+        let mut seen = HashSet::new();
+        self.group
+            .iter()
+            .filter(|g| g.members.iter().any(|m| m == name))
+            .map(|g| g.gid)
+            .filter(|gid| seen.insert(*gid))
+            .collect()
     }
 }
 
@@ -549,6 +587,9 @@ pub struct SpecParams<'a> {
     /// char majors. False for every sandbox without grants, which then has no
     /// device directory and no device allowances at all.
     pub usb: bool,
+    /// Supplementary gids for the container process user (the image USER's
+    /// /etc/group memberships — e.g. `docker`). Empty when none resolve.
+    pub additional_gids: &'a [u32],
 }
 
 /// Guest path izba-init mirrors attached device nodes into, bind-mounted to
@@ -611,10 +652,11 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     };
     let env = merge_env(&image_env, params.trust_env, params.env_overrides);
 
-    let user = UserBuilder::default()
-        .uid(params.user.0)
-        .gid(params.user.1)
-        .build()?;
+    let mut user_builder = UserBuilder::default().uid(params.user.0).gid(params.user.1);
+    if !params.additional_gids.is_empty() {
+        user_builder = user_builder.additional_gids(params.additional_gids.to_vec());
+    }
+    let user = user_builder.build()?;
     // Privileged builder VMs get the full capability set (rootful buildkit needs
     // CAP_SYS_ADMIN for its overlayfs bind/overlay mounts); normal sandboxes get
     // the least-privilege docker-default set.
@@ -1184,7 +1226,28 @@ mod tests {
             terminal: false,
             privileged: false,
             usb: false,
+            additional_gids: &[],
         }
+    }
+
+    #[test]
+    fn generate_spec_populates_additional_gids() {
+        let img = image_config(serde_json::json!({"Cmd": ["/bin/sh"]}));
+        let spec = generate_spec(&SpecParams {
+            additional_gids: &[999, 29],
+            ..base_params(&img)
+        })
+        .unwrap();
+        let user = spec.process().as_ref().unwrap().user().clone();
+        assert_eq!(user.additional_gids().clone().unwrap(), vec![999, 29]);
+        assert_eq!(user.uid(), base_params(&img).user.0);
+
+        // Empty ⇒ additionalGids absent from the spec entirely (never an
+        // empty-array field), matching every pre-existing sandbox with no
+        // supplementary groups.
+        let spec_empty = generate_spec(&base_params(&img)).unwrap();
+        let user_empty = spec_empty.process().as_ref().unwrap().user().clone();
+        assert!(user_empty.additional_gids().is_none());
     }
 
     #[test]
@@ -1765,6 +1828,71 @@ mod tests {
             "a #-commented row must never be parsed as a group: {g:?}"
         );
         assert_eq!((g[1].name.as_str(), g[1].gid), ("wheel", 10));
+        assert_eq!(g[0].members, Vec::<String>::new());
+        assert_eq!(g[1].members, vec!["node".to_string()]);
+    }
+
+    #[test]
+    fn parse_group_reads_member_list() {
+        let g = parse_group("docker:x:999:agent,deploy\nnogroup:x:65534:\n");
+        assert_eq!(
+            g[0].members,
+            vec!["agent".to_string(), "deploy".to_string()]
+        );
+        assert_eq!(g[1].members, Vec::<String>::new());
+    }
+
+    #[test]
+    fn supplementary_gids_symbolic_user_collects_memberships() {
+        let db = UserDb::from_files(
+            Some("agent:x:1000:1000::/home/agent:/bin/bash\n"),
+            Some("agent:x:1000:\ndocker:x:999:agent\naudio:x:29:pulse,agent\nother:x:5:pulse\n"),
+        );
+        // Member-of groups only, group-file order; the primary gid (1000) is NOT
+        // repeated here.
+        assert_eq!(db.supplementary_gids(Some("agent")), vec![999, 29]);
+    }
+
+    #[test]
+    fn supplementary_gids_numeric_user_reverse_resolves_via_passwd() {
+        let db = UserDb::from_files(
+            Some("agent:x:1000:1000::/home/agent:/bin/bash\n"),
+            Some("docker:x:999:agent\n"),
+        );
+        // USER 1000: uid reverse-looked-up to "agent", memberships apply
+        // (docker-faithful); USER 1000:0 strips the :group part first.
+        assert_eq!(db.supplementary_gids(Some("1000")), vec![999]);
+        assert_eq!(db.supplementary_gids(Some("1000:0")), vec![999]);
+    }
+
+    #[test]
+    fn supplementary_gids_unknown_or_absent_user_is_empty() {
+        let db = UserDb::from_files(None, Some("docker:x:999:agent\n"));
+        assert_eq!(db.supplementary_gids(Some("ghost")), Vec::<u32>::new());
+        assert_eq!(db.supplementary_gids(None), Vec::<u32>::new());
+        assert_eq!(db.supplementary_gids(Some("")), Vec::<u32>::new());
+        // Numeric uid with no passwd row: no name to match members against.
+        assert_eq!(db.supplementary_gids(Some("4242")), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn supplementary_gids_dedupes_repeated_membership() {
+        let db = UserDb::from_files(
+            Some("agent:x:1000:1000::/h:/bin/sh\n"),
+            Some("docker:x:999:agent\ndup:x:999:agent\n"),
+        );
+        assert_eq!(db.supplementary_gids(Some("agent")), vec![999]);
+    }
+
+    #[test]
+    fn additional_gids_are_always_inside_the_gid_map() {
+        // transpose_identity_map is a bijection over 0..USERNS_RANGE_END, so any
+        // gid the image's /etc/group can name (u32 < u32::MAX) is mapped; this
+        // pins that invariant so a future map change can't silently strand
+        // additionalGids outside the userns (setgroups would then fail).
+        let (_uids, gids) = compute_userns_mappings((1000, 1000), (0, 0));
+        let covered: u64 = gids.iter().map(|m| m.size() as u64).sum();
+        assert_eq!(covered, USERNS_RANGE_END as u64);
     }
 
     #[test]

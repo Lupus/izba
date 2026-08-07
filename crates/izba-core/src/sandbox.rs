@@ -673,6 +673,7 @@ fn write_oci_bundle(
     if let Some(fb) = &user_fallback {
         eprintln!("warning: sandbox '{name}': {}", fb.reason);
     }
+    let additional_gids = user_db.supplementary_gids(image_config.and_then(|c| c.user.as_deref()));
     // Option A anchor: the host (uid, gid) that owns the virtiofs `workspace`,
     // as the guest will see it. izba's virtiofsd runs UNPRIVILEGED and applies
     // no uid translation, so the guest sees the share's real host owner; the
@@ -698,6 +699,7 @@ fn write_oci_bundle(
         // boundary. Normal sandboxes stay least-privilege.
         privileged: config.builder,
         usb: config.usb.is_enabled(),
+        additional_gids: &additional_gids,
     };
     let spec =
         crate::image::runtime_config::generate_spec(&params).context("generating OCI spec")?;
