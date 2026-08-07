@@ -1166,6 +1166,140 @@ Closes #189"
 
 ---
 
+### Task 8: Make the grant-description *wiring* testable (#195, gap found in review)
+
+Tasks 4 and 3 test `grant_description` and `describe` as pure functions, but
+nothing asserts that `handle_usb_allow` and `handle_usb_list_devices` actually
+call them — the two handlers reach `usbipd_state::probe()` directly, which spawns
+a process and so cannot run in a unit test. That is precisely the gap issue #195
+names ("a test that grants through `handle_usb_allow` and asserts a non-empty
+description would pin it") and the same class of miss that let the original
+defect survive a mutation-clean gate: **coverage of a predicate is not coverage
+of its call site.**
+
+**Files:**
+- Modify: `crates/izba-core/src/daemon/server.rs` — `DaemonDeps` (line 89),
+  `DaemonDeps::production` (line 100), `test_deps` (line 1292),
+  `handle_usb_list_devices` (line 875), `handle_usb_allow`
+- Test: same file, `mod tests`
+
+**Interfaces:**
+- Consumes: `usbipd_state::{probe, UsbipdDevice}`; the existing `test_deps()`
+  fixture and whatever helper builds a `Daemon` around it.
+- Produces: `pub type UsbipdProbeFn = Box<dyn Fn() -> Option<Vec<UsbipdDevice>> +
+  Send + Sync>` and a `pub usbipd_probe: UsbipdProbeFn` field on `DaemonDeps`,
+  following the established `artifacts: ArtifactsFn` / `resolve_image:
+  ResolveImageFn` seam pattern exactly.
+
+- [ ] **Step 1: Write the failing wiring test**
+
+Add to `mod tests` in `crates/izba-core/src/daemon/server.rs`. Build a `Daemon`
+whose `deps.usbipd_probe` returns a fixed table, drive the **real**
+`handle_usb_allow`, then read the grant back off disk:
+
+```rust
+    #[test]
+    fn granting_through_the_rpc_stores_the_name_usbipd_reported() {
+        // The pure `grant_description` tests above prove the match rule. This one
+        // proves the handler actually calls it — the defect in #195 was a live
+        // wire that went nowhere, and a predicate test could never have seen it.
+        let (_tmp, paths) = /* the module's existing paths+sandbox fixture */;
+        let mut deps = test_deps();
+        deps.usbipd_probe = Box::new(|| {
+            Some(vec![crate::usb::usbipd_state::UsbipdDevice {
+                busid: "12-4".to_string(),
+                id: crate::usb::DeviceId { vid: 0x303a, pid: 0x1001 },
+                description: "USB JTAG/serial debug unit".to_string(),
+                bound: true,
+                attached: false,
+            }])
+        });
+        let d = /* build the Arc<Daemon> the other USB handler tests build */;
+
+        handle_usb_allow(&d, "web".to_string(), "303a:1001".to_string(), None)
+            .expect("grant should succeed");
+
+        let cfg = /* read the sandbox config back off disk, as grant_on_disk's
+                     readers do */;
+        assert_eq!(
+            cfg.usb.devices[0].description, "USB JTAG/serial debug unit",
+            "the handler must record the name, not an empty string"
+        );
+    }
+```
+
+Fill the three `/* … */` slots from the neighbouring USB handler tests in that
+module — reuse their fixtures verbatim rather than inventing new ones. The
+sandbox must exist and an upstream must be configured, or `handle_usb_allow`
+bails before reaching the description (see `usb_settings_or_refuse`).
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test -p izba-core --lib daemon::server::tests::granting_through_the_rpc`
+Expected: FAIL — `no field 'usbipd_probe' on type 'DaemonDeps'`.
+
+- [ ] **Step 3: Add the seam**
+
+Beside the existing `ArtifactsFn` / `ResolveImageFn` type aliases, add:
+
+```rust
+/// Injectable usbipd probe. Production spawns `usbipd.exe`; tests hand over a
+/// fixed table, which is the only way the handlers' *use* of it is observable.
+pub type UsbipdProbeFn = Box<dyn Fn() -> Option<Vec<crate::usb::usbipd_state::UsbipdDevice>> + Send + Sync>;
+```
+
+Add `pub usbipd_probe: UsbipdProbeFn,` to `DaemonDeps`; in `production()` set
+`usbipd_probe: Box::new(crate::usb::usbipd_state::probe),`; in `test_deps()` set
+`usbipd_probe: Box::new(|| None),` — the honest default for a host with no local
+usbipd, and it keeps every existing test's behaviour unchanged.
+
+- [ ] **Step 4: Route both call sites through it**
+
+In `handle_usb_allow`, replace `crate::usb::usbipd_state::probe().as_deref()`
+with `(d.deps.usbipd_probe)().as_deref()`.
+
+In `handle_usb_list_devices`, replace `crate::usb::usbipd_state::probe()` with
+`(d.deps.usbipd_probe)()`.
+
+- [ ] **Step 5: Add the listing wiring test too**
+
+Same seam, same reason — `list_devices`' enrichment is only reachable in
+production through this handler:
+
+```rust
+    #[test]
+    fn the_listing_names_devices_from_the_probe_the_daemon_was_given() {
+        // Pins handle_usb_list_devices → list_devices → describe. Without the
+        // seam this path could only be exercised by a machine that happens to
+        // have usbipd installed, i.e. never in CI.
+    }
+```
+
+Write it only if the module already has a fixture that lets
+`handle_usb_list_devices` reach `inventory::fetch` without a real socket (it
+dials the upstream, so it may not be reachable in a unit test). **If it is not
+reachable without binding a socket, skip this step and say so in your report** —
+the constraint that tests never bind wins over the extra coverage.
+
+- [ ] **Step 6: Run the gates and commit**
+
+```bash
+cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --target x86_64-pc-windows-gnu --all-targets -p izba-proto -p izba-core -p izba-cli -- -D warnings
+git add crates/izba-core/src/daemon/server.rs
+git commit -m "test(core): pin the grant description to the handler, not just the rule
+
+Tasks 4's tests prove the match rule; nothing proved handle_usb_allow calls
+it, and an untested call site is exactly how #195 survived a mutation-clean
+gate in the first place. Inject the usbipd probe through DaemonDeps like the
+artifacts and image seams, so a grant made through the real RPC can be read
+back off disk and asserted.
+
+Refs #195"
+```
+
+---
+
 ## Self-Review
 
 **1. Spec coverage.** Issue → task: #187 → Task 1. #188 → Task 2. #190 → Task 3.
