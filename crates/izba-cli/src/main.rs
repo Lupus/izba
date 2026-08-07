@@ -858,6 +858,58 @@ mod tests {
         assert_eq!(opts.policy, None);
     }
 
+    /// #198: `--docker`/`--no-docker` are `overrides_with` each other so the
+    /// last one wins on the command line — a dropped `overrides_with` would
+    /// silently bias the pair toward leaving BOTH flags set, and
+    /// `build_create_request`'s tri-state derivation (`if opts.docker {
+    /// Some(true) } else if opts.no_docker { Some(false) } else { None }`)
+    /// checks `docker` first, so that failure mode would bias toward
+    /// ENABLING docker mode even when the user's last word was --no-docker.
+    #[test]
+    fn parse_create_docker_flags() {
+        // Neither flag: no CLI preference (label decides).
+        let bare = Cli::try_parse_from(["izba", "create"]).unwrap();
+        let Cmd::Create { opts, .. } = bare.cmd else {
+            panic!("expected create");
+        };
+        assert!(!opts.docker);
+        assert!(!opts.no_docker);
+
+        // --docker alone.
+        let on = Cli::try_parse_from(["izba", "create", "--docker"]).unwrap();
+        let Cmd::Create { opts, .. } = on.cmd else {
+            panic!("expected create");
+        };
+        assert!(opts.docker);
+        assert!(!opts.no_docker);
+
+        // --no-docker alone.
+        let off = Cli::try_parse_from(["izba", "create", "--no-docker"]).unwrap();
+        let Cmd::Create { opts, .. } = off.cmd else {
+            panic!("expected create");
+        };
+        assert!(!opts.docker);
+        assert!(opts.no_docker);
+
+        // --docker --no-docker: last flag wins, clearing the earlier one.
+        let docker_then_no =
+            Cli::try_parse_from(["izba", "create", "--docker", "--no-docker"]).unwrap();
+        let Cmd::Create { opts, .. } = docker_then_no.cmd else {
+            panic!("expected create");
+        };
+        assert!(!opts.docker, "the later --no-docker must clear --docker");
+        assert!(opts.no_docker);
+
+        // --no-docker --docker: last flag wins, the other direction.
+        let no_then_docker =
+            Cli::try_parse_from(["izba", "create", "--no-docker", "--docker"]).unwrap();
+        let Cmd::Create { opts, .. } = no_then_docker.cmd else {
+            panic!("expected create");
+        };
+        assert!(opts.docker);
+        assert!(!opts.no_docker, "the later --docker must clear --no-docker");
+    }
+
     #[test]
     fn parse_netlog_flags() {
         let cli = Cli::try_parse_from(["izba", "netlog", "web", "--follow"]).unwrap();
