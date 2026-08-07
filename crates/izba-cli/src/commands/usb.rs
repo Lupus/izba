@@ -300,6 +300,16 @@ fn list(paths: &Paths) -> Result<i32> {
     }
 }
 
+/// The description the daemon's listing carries for `device`, or "" if it has
+/// none. Pure so the banner's naming is testable without a daemon.
+fn description_of<'a>(devices: &'a [UsbDeviceInfo], device: &str) -> &'a str {
+    devices
+        .iter()
+        .find(|d| d.device == device)
+        .map(|d| d.description.as_str())
+        .unwrap_or_default()
+}
+
 fn allow(
     paths: &Paths,
     name: &str,
@@ -312,12 +322,28 @@ fn allow(
     let id: izba_core::usb::DeviceId = device.parse()?;
     let device = id.to_string();
 
+    // Decide the scripted cases before touching the daemon: refusing an
+    // unconfirmed grant is a client-side decision, and spawning a daemon to
+    // reject it would replace an actionable message with a connection error.
+    let preconfirmed = resolve_confirmation(&device, confirm, std::io::stdin().is_terminal())?;
+
+    let mut client = DaemonClient::connect(paths)?;
+
     // One decision, one branch: either the flag already confirmed it, or the
     // human types the id back after reading the banner.
-    let confirmed = match resolve_confirmation(&device, confirm, std::io::stdin().is_terminal())? {
+    let confirmed = match preconfirmed {
         true => true,
         false => {
-            eprint!("{}", consent_banner(name, &device, ""));
+            // Best-effort: a listing needs a configured, reachable upstream, and
+            // a grant is a standing config edit that must not depend on either.
+            // No name is a quieter banner, not a failed grant.
+            let described = match client.request(&DaemonRequest::UsbListDevices, &mut |_| {}) {
+                Ok(DaemonResponse::UsbDevices { devices }) => {
+                    description_of(&devices, &device).to_string()
+                }
+                _ => String::new(),
+            };
+            eprint!("{}", consent_banner(name, &device, &described));
             eprint!("\nType the device id to confirm: ");
             std::io::stderr().flush()?;
             prompt_confirms(&device)?
@@ -328,7 +354,6 @@ fn allow(
         return Ok(1);
     }
 
-    let mut client = DaemonClient::connect(paths)?;
     super::expect_ok(client.request(
         &DaemonRequest::UsbAllow {
             name: name.to_string(),
@@ -587,6 +612,26 @@ mod tests {
         let b = consent_banner("web", "0403:6001", "");
         assert!(b.contains("Granting 0403:6001 to"), "{b}");
         assert!(!b.contains("()"), "{b}");
+    }
+
+    #[test]
+    fn the_banner_names_the_device_when_the_listing_knows_it() {
+        // The consent banner is the loudest, most safety-relevant surface in the
+        // feature — it asks a human to type an id back to confirm they are
+        // handing raw transfer-level access to a physical object. Identifying
+        // that object by four hex digits is exactly where it must not stop.
+        let devices = [dev("12-4", "303a:1001", true, &[])];
+        assert_eq!(
+            description_of(&devices, "303a:1001"),
+            "USB Serial Converter"
+        );
+    }
+
+    #[test]
+    fn an_unknown_device_yields_no_description_rather_than_a_wrong_one() {
+        let devices = [dev("12-4", "303a:1001", true, &[])];
+        assert_eq!(description_of(&devices, "0403:6001"), "");
+        assert_eq!(description_of(&[], "303a:1001"), "");
     }
 
     #[test]
