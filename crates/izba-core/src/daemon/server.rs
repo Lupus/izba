@@ -2225,6 +2225,48 @@ mod tests {
         }
     }
 
+    /// #198: `handle_create`'s `if c.builder { false } else { … }` guard must
+    /// win over an explicit `--docker`, not just over the label
+    /// (`resolve_docker_mode_precedence` only pins the pure fn's own
+    /// precedence — this pins the call site's builder short-circuit, which
+    /// never even calls `resolve_docker_mode`). A `builder: izba build`
+    /// create with `docker: Some(true)` must still persist `docker: false`.
+    #[test]
+    fn handle_create_forces_docker_off_for_a_builder_sandbox_even_with_docker_true() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::Create(DaemonCreate {
+                name: "builder-web".into(),
+                image_ref: "ubuntu:24.04".into(),
+                cpus: 1,
+                mem_mb: 256,
+                workspace: dir.path().join("ws"),
+                rw_size_gb: 1,
+                ports: Vec::new(),
+                volumes: Vec::new(),
+                allow_unconfined: false,
+                builder: true,
+                docker: Some(true),
+            }),
+        ) {
+            DaemonResponse::Created { name } => assert_eq!(name, "builder-web"),
+            other => panic!("create: {other:?}"),
+        }
+        let config: SandboxConfig =
+            load_json(&d.paths.sandbox_dir("builder-web").join(CONFIG_FILE))
+                .unwrap()
+                .unwrap();
+        assert!(config.builder, "builder flag itself must still persist");
+        assert!(
+            !config.docker,
+            "builder wins silently: docker must be forced off even though \
+             the request asked for it"
+        );
+    }
+
     /// #114 surface acceptance: a persisted symbolic-USER→root fallback in
     /// state.json is read back through `Inspect` unchanged.
     #[test]
