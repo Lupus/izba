@@ -715,9 +715,12 @@ fn write_oci_bundle(
         privileged: config.builder,
         usb: config.usb.is_enabled(),
         // Defense-in-depth on top of Task 1's create-side guard (which already
-        // rejects `--docker` together with `--builder`): docker and privileged
-        // are mutually exclusive OCI profiles (fresh userns-scoped caps vs. no
-        // userns at all), so re-assert it here rather than trust the caller.
+        // silently forces docker off — coerces `config.docker` to `false` —
+        // whenever `--builder` is also set; see
+        // `handle_create_forces_docker_off_..._even_with_docker_true`): docker
+        // and privileged are mutually exclusive OCI profiles (fresh
+        // userns-scoped caps vs. no userns at all), so re-assert it here
+        // rather than trust the caller.
         docker: config.docker && !config.builder,
         additional_gids: &additional_gids,
     };
@@ -909,12 +912,17 @@ pub fn start_with_timeouts(
     // no cmdline flag gates it).
     // izba.volumes (when present) carries the ordered guest mountpoints.
     // izba.buildout=1 (when present) signals the guest to mount the buildout share.
+    // Mirrors the `SpecParams.docker` guard above: the guest must never be
+    // told to bring up docker-mode plumbing (izba.docker=1 — veth datapath +
+    // auto-started dockerd) for a sandbox whose OCI spec was built with
+    // `docker: false` (dropped netns, no docker-mode caps) — that combination
+    // would be a self-contradictory guest state.
     let cmdline = build_cmdline(
         name,
         &config.volumes,
         config.builder,
         config.usb.is_enabled(),
-        config.docker,
+        config.docker && !config.builder,
     );
     // Resolve per-sandbox account credentials when the sandbox is locked down
     // (Windows MVP-D).  On non-Windows and for unlocked sandboxes this is None
@@ -3772,6 +3780,13 @@ mod tests {
         assert!(on.contains(" izba.docker=1"));
         let off = build_cmdline("s", &[], false, false, false);
         assert!(!off.contains("izba.docker"));
+        // Mirrors the real call site's `config.docker && !config.builder`
+        // guard: a builder sandbox that also requested docker mode must be
+        // computed down to `docker=false` BEFORE reaching build_cmdline, so
+        // the emitted cmdline never contradicts a `docker:false` OCI spec.
+        let (builder, docker_requested) = (true, true);
+        let guarded = build_cmdline("s", &[], builder, false, docker_requested && !builder);
+        assert!(!guarded.contains("izba.docker"));
     }
 
     /// `SandboxConfig` without a `builder` field in JSON deserializes to `builder == false`.
