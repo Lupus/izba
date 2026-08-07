@@ -84,6 +84,11 @@ pub type ArtifactsFn =
 /// Seam over `image::ensure_image`: image ref → digest (pulling if needed).
 pub type ResolveImageFn = Box<dyn Fn(&Paths, &str) -> anyhow::Result<String> + Send + Sync>;
 
+/// Injectable usbipd probe. Production spawns `usbipd.exe`; tests hand over a
+/// fixed table, which is the only way the handlers' *use* of it is observable.
+pub type UsbipdProbeFn =
+    Box<dyn Fn() -> Option<Vec<crate::usb::usbipd_state::UsbipdDevice>> + Send + Sync>;
+
 /// Injectable seams: production wiring in [`DaemonDeps::production`], fakes
 /// in tests (mirrors the `Connector` convention in sandbox.rs).
 pub struct DaemonDeps {
@@ -93,6 +98,7 @@ pub struct DaemonDeps {
     pub stream_connector: SharedStreamConnector,
     pub artifacts: ArtifactsFn,
     pub resolve_image: ResolveImageFn,
+    pub usbipd_probe: UsbipdProbeFn,
     pub egress_resolver: std::sync::Arc<dyn crate::daemon::egress::dns::Resolver>,
 }
 
@@ -109,6 +115,7 @@ impl DaemonDeps {
             stream_connector: Box::new(sandbox::default_stream_connector()),
             artifacts: Box::new(crate::artifacts::locate),
             resolve_image: Box::new(crate::image::ensure_image),
+            usbipd_probe: Box::new(crate::usb::usbipd_state::probe),
             egress_resolver: crate::daemon::egress::sys_resolver::SystemResolver::new()
                 .expect("build system DNS resolver"),
         }
@@ -872,7 +879,7 @@ fn handle_usb_list_devices(d: &Arc<Daemon>) -> anyhow::Result<DaemonResponse> {
         devices: crate::usb::list_devices(
             &d.paths,
             &shared,
-            crate::usb::usbipd_state::probe(),
+            (d.deps.usbipd_probe)(),
             &d.usb.attached_map(),
         ),
     })
@@ -908,11 +915,8 @@ fn handle_usb_allow(
     // Derived host-side, never accepted from the client: the grant record is
     // host-only managed truth (D1), and this is the value every later surface
     // shows the human.
-    let description = grant_description(
-        crate::usb::usbipd_state::probe().as_deref(),
-        id,
-        busid_pin.as_deref(),
-    );
+    let description =
+        grant_description((d.deps.usbipd_probe)().as_deref(), id, busid_pin.as_deref());
     sandbox::edit_usb_grants(&d.paths, &name, |usb| {
         crate::usb::grants::grant(
             usb,
@@ -1322,6 +1326,9 @@ mod tests {
                 })
             }),
             resolve_image: Box::new(|_, _| Ok("sha256:abc".into())),
+            // The honest default for a host with no local usbipd, and it leaves
+            // every other test's behaviour exactly as it was.
+            usbipd_probe: Box::new(|| None),
             egress_resolver: std::sync::Arc::new(crate::daemon::egress::dns::UdpForwarder::new(
                 "127.0.0.1:53".parse().unwrap(),
             )),
@@ -1681,6 +1688,43 @@ mod tests {
                 Some("3-3"),
             ),
             "board on the right"
+        );
+    }
+
+    #[test]
+    fn granting_through_the_rpc_stores_the_name_usbipd_reported() {
+        // The pure `grant_description` tests above prove the match rule. This one
+        // proves the handler actually calls it — the defect in #195 was a live
+        // wire that went nowhere, and a predicate test could never have seen it.
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let mut deps = test_deps();
+        deps.usbipd_probe = Box::new(|| {
+            Some(vec![crate::usb::usbipd_state::UsbipdDevice {
+                busid: "12-4".to_string(),
+                id: crate::usb::DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001,
+                },
+                description: "USB JTAG/serial debug unit".to_string(),
+                bound: true,
+                attached: false,
+            }])
+        });
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        set_loopback_upstream(&mut c);
+        write_config_for_persist(&d.paths, "web");
+
+        handle_usb_allow(&d, "web".to_string(), "303a:1001".to_string(), None)
+            .expect("grant should succeed");
+
+        let cfg: SandboxConfig = load_json(&d.paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.usb.devices[0].description, "USB JTAG/serial debug unit",
+            "the handler must record the name, not an empty string"
         );
     }
 
