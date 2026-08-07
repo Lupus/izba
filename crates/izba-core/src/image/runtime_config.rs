@@ -53,6 +53,28 @@ fn docker_default_caps() -> Result<oci_spec::runtime::LinuxCapabilities> {
         .build()?)
 }
 
+/// Docker-mode capability set (spec §2): the docker-default least-privilege
+/// set plus the admin caps dockerd + nested runc need — ALL scoped inside
+/// the container's user namespace (a userns `CAP_SYS_ADMIN` cannot mount real
+/// block devices or touch init's namespaces). Strictly weaker than the
+/// privileged builder profile ([`all_caps`]), which drops the userns entirely.
+pub fn docker_mode_caps() -> Result<oci_spec::runtime::LinuxCapabilities> {
+    let base = docker_default_caps()?;
+    let mut set: HashSet<Capability> = base.bounding().clone().unwrap_or_default();
+    set.extend([
+        Capability::SysAdmin,
+        Capability::NetAdmin,
+        Capability::SysPtrace,
+    ]);
+    Ok(LinuxCapabilitiesBuilder::default()
+        .bounding(set.clone())
+        .effective(set.clone())
+        .permitted(set)
+        .inheritable(HashSet::new())
+        .ambient(HashSet::new())
+        .build()?)
+}
+
 /// The FULL capability set, for **privileged builder VMs only** (see
 /// [`SpecParams::privileged`]).
 ///
@@ -589,6 +611,10 @@ pub struct SpecParams<'a> {
     /// char majors. False for every sandbox without grants, which then has no
     /// device directory and no device allowances at all.
     pub usb: bool,
+    /// Docker mode (spec §2-§3): fresh userns-owned network namespace instead
+    /// of sharing init's, the docker-mode capability set, and the rw cgroupfs
+    /// treatment. Mutually exclusive with `privileged` (callers guarantee it).
+    pub docker: bool,
     /// Supplementary gids for the container process user (the image USER's
     /// /etc/group memberships — e.g. `docker`). Empty when none resolve.
     pub additional_gids: &'a [u32],
@@ -660,10 +686,14 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     }
     let user = user_builder.build()?;
     // Privileged builder VMs get the full capability set (rootful buildkit needs
-    // CAP_SYS_ADMIN for its overlayfs bind/overlay mounts); normal sandboxes get
-    // the least-privilege docker-default set.
+    // CAP_SYS_ADMIN for its overlayfs bind/overlay mounts); docker-mode sandboxes
+    // get the docker-default set plus the userns-scoped admin caps a nested
+    // dockerd + runc need ([`docker_mode_caps`]); normal sandboxes get the
+    // least-privilege docker-default set.
     let caps = if params.privileged {
         all_caps()?
+    } else if params.docker {
+        docker_mode_caps()?
     } else {
         docker_default_caps()?
     };
@@ -690,6 +720,12 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     // D1: the container shares izba-init's network namespace — drop `network`
     // from the namespace set so crun does not unshare a fresh (routeless) one.
     //
+    // EXCEPTION (docker mode, spec §3): a nested dockerd needs its OWN network
+    // namespace to run its bridge/NAT plumbing without fighting init's egress
+    // stub for the same netns, so docker-mode sandboxes keep the default
+    // (pathless) `network` namespace entry instead of dropping it — crun then
+    // creates a fresh one that the nested dockerd owns exclusively.
+    //
     // Option A: add a `user` namespace and the uid/gid transposition so the
     // image USER owns the host-owned virtiofs `/workspace` (and image-root files
     // keep mapping to container-root, so setuid `sudo` works). VMM-independent —
@@ -704,7 +740,11 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     // too — they share init's netns for gated egress).
     if let Some(linux) = spec.linux_mut().as_mut() {
         if let Some(mut nss) = linux.namespaces().clone() {
-            nss.retain(|n| n.typ() != LinuxNamespaceType::Network);
+            // Docker mode keeps the default set's `network` entry (see the D1
+            // EXCEPTION above); every other mode drops it.
+            if !params.docker {
+                nss.retain(|n| n.typ() != LinuxNamespaceType::Network);
+            }
             if !params.privileged && !nss.iter().any(|n| n.typ() == LinuxNamespaceType::User) {
                 // Idempotent: only add the user namespace if the default set lacks it.
                 nss.push(
@@ -724,7 +764,9 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
 
     // Present `/sys` as a recursive bind of the host `/sys`, not a fresh `sysfs`
     // mount. The container runs in the Option-A user namespace (above) while
-    // still SHARING izba-init's network namespace (D1, `network` dropped). The
+    // still SHARING izba-init's network namespace (D1, `network` dropped —
+    // except docker mode, which owns a fresh netns of its own; the bind stays
+    // correct there too since a recursive bind needs no netns ownership). The
     // Linux kernel refuses to mount a NEW `sysfs` instance from a user namespace
     // that does not OWN the network namespace that sysfs would expose, so crun's
     // default `type:sysfs` `/sys` mount fails with `mount sysfs: Operation not
@@ -745,14 +787,17 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
         add_usb_device_access(&mut spec)?;
     }
 
-    // Privileged builders: mount `/sys/fs/cgroup` read-WRITE. The OCI default
-    // mounts cgroupfs read-only, but rootful BuildKit's OCI worker runs each
-    // `RUN` step via a nested runc that must create its own cgroup subtree
-    // (`mkdir /sys/fs/cgroup/<id>`) — read-only cgroupfs fails it with
-    // "unable to apply cgroup configuration: ... read-only file system". The
-    // throwaway builder VM is the trust boundary, so a writable cgroupfs is
-    // acceptable. Normal sandboxes keep the read-only default.
-    if params.privileged {
+    // Privileged builders AND docker-mode sandboxes: mount `/sys/fs/cgroup`
+    // read-WRITE. The OCI default mounts cgroupfs read-only, but both
+    // consumers run a nested runc that must create its own cgroup subtree
+    // (`mkdir /sys/fs/cgroup/<id>`) — rootful BuildKit's OCI worker for the
+    // former, dockerd's own containerd-shim+runc for the latter — and
+    // read-only cgroupfs fails that with "unable to apply cgroup
+    // configuration: ... read-only file system". The throwaway builder VM is
+    // the trust boundary for `privileged`; the userns-scoped `docker` caps
+    // ([`docker_mode_caps`]) are the equivalent boundary here. Normal
+    // sandboxes keep the read-only default.
+    if params.privileged || params.docker {
         if let Some(mounts) = spec.mounts_mut().as_mut() {
             for m in mounts.iter_mut() {
                 if m.destination().to_string_lossy() == "/sys/fs/cgroup" {
@@ -1228,6 +1273,7 @@ mod tests {
             terminal: false,
             privileged: false,
             usb: false,
+            docker: false,
             additional_gids: &[],
         }
     }
@@ -1653,6 +1699,74 @@ mod tests {
             // dangerous caps stay dropped — the VM is the boundary.
             assert!(!set.contains(&Capability::SysAdmin));
         }
+    }
+
+    // ---- docker mode spec ----
+
+    #[test]
+    fn docker_mode_caps_is_default_plus_admin_set() {
+        let caps = docker_mode_caps().unwrap();
+        let bounding = caps.bounding().clone().unwrap();
+        for c in [
+            Capability::SysAdmin,
+            Capability::NetAdmin,
+            Capability::SysPtrace,
+        ] {
+            assert!(
+                bounding.contains(&c),
+                "{c:?} missing from docker-mode bounding set"
+            );
+        }
+        // Strictly weaker than privileged: docker mode must NOT be all_caps.
+        let all = all_caps().unwrap();
+        assert!(bounding.len() < all.bounding().clone().unwrap().len());
+        // And a superset of the docker-default set.
+        let dflt = docker_default_caps().unwrap();
+        for c in dflt.bounding().clone().unwrap() {
+            assert!(bounding.contains(&c), "{c:?} from default set missing");
+        }
+    }
+
+    #[test]
+    fn docker_mode_spec_keeps_fresh_network_namespace() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut params = base_params(&img);
+        params.docker = true;
+        let spec = generate_spec(&params).unwrap();
+        let nss = spec.linux().as_ref().unwrap().namespaces().clone().unwrap();
+        let net = nss
+            .iter()
+            .find(|n| n.typ() == LinuxNamespaceType::Network)
+            .expect("docker mode must keep a network namespace");
+        assert!(net.path().is_none(), "fresh netns, not a joined one");
+        // The userns + mappings must still be present (docker mode is NOT privileged).
+        assert!(nss.iter().any(|n| n.typ() == LinuxNamespaceType::User));
+        assert!(spec.linux().as_ref().unwrap().uid_mappings().is_some());
+    }
+
+    #[test]
+    fn non_docker_spec_still_drops_network_namespace() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let spec = generate_spec(&base_params(&img)).unwrap();
+        let nss = spec.linux().as_ref().unwrap().namespaces().clone().unwrap();
+        assert!(!nss.iter().any(|n| n.typ() == LinuxNamespaceType::Network));
+    }
+
+    #[test]
+    fn docker_mode_gets_rw_cgroup_mount() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut params = base_params(&img);
+        params.docker = true;
+        let spec = generate_spec(&params).unwrap();
+        let m = spec
+            .mounts()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.destination().to_string_lossy() == "/sys/fs/cgroup")
+            .unwrap();
+        let opts = m.options().clone().unwrap();
+        assert!(opts.iter().any(|o| o == "rw") && !opts.iter().any(|o| o == "ro"));
     }
 
     // ---- privileged builder spec ----
