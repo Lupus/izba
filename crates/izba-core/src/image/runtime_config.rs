@@ -224,7 +224,7 @@ pub struct PasswdEntry {
     pub gid: u32,
 }
 
-/// One `/etc/group` row reduced to `(name, gid)`.
+/// One `/etc/group` row: `(name, gid)` plus the member list (field 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupEntry {
     pub name: String,
@@ -347,8 +347,10 @@ impl UserDb {
 
     /// Supplementary gids for the image `USER`: the gids of every `/etc/group`
     /// entry listing the user as a member — group-file order, deduped. The
-    /// primary gid is excluded by construction (membership lists carry
-    /// secondary groups). A numeric USER is reverse-resolved to a name via
+    /// primary gid is normally absent because `/etc/group` membership lists
+    /// conventionally carry only secondary groups; an image that lists a user
+    /// in their own primary group produces a redundant entry, which is harmless
+    /// to setgroups. A numeric USER is reverse-resolved to a name via
     /// passwd first (docker-faithful); no passwd match, no declared USER, or an
     /// unresolvable name ⇒ empty (the direction that never invents privilege).
     pub fn supplementary_gids(&self, declared: Option<&str>) -> Vec<u32> {
