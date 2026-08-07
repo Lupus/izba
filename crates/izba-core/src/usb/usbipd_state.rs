@@ -16,8 +16,9 @@ use super::DeviceId;
 /// Cap on the JSON izba will parse. A realistic table is a few KiB.
 pub const MAX_STATE_BYTES: usize = 256 * 1024;
 
-/// How long izba waits for `usbipd.exe state`. The WSL interop hop is slow but
-/// not unbounded; past this the listing proceeds without enrichment.
+/// How long izba waits for `usbipd.exe state`. Sized for the WSL interop hop,
+/// which is the slow case; a native Windows spawn returns far inside it. Past
+/// this the listing proceeds without enrichment.
 pub const PROBE_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +117,7 @@ pub fn probe() -> Option<Vec<UsbipdDevice>> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    if !super::trust::running_under_wsl() {
+    if !super::trust::can_probe_usbipd() {
         return None;
     }
     let mut child = Command::new("usbipd.exe")
