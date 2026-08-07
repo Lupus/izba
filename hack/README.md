@@ -102,6 +102,27 @@ vendored `sftp-server` *inside* the workload container: izba-init copies it
 into the container overlay at boot and `sshd_config` points `Subsystem sftp`
 at that in-container path.
 
+### `build-ip.sh`
+
+Builds a static `ip` (iproute2 CLI) for the initramfs, via a throwaway
+Alpine container (musl).  It compiles iproute2 from the source tarball published
+at kernel.org, configures it for static linking (no external libc/libm
+dependencies), strips it, and writes it to `dist/ip`.
+
+Docker-mode veth setup requires netlink sockets; izba-init's net.rs uses
+ioctl-only networking (NIC-less model) and cannot reach its workload without
+an `ip link add veth` plane. A static `ip` binary embedded in the initramfs
+connects the docker-mode workload container's own network namespace to init's
+netns within one sandbox.
+
+```sh
+hack/build-ip.sh              # writes dist/ip (~1.5 MB, statically linked)
+./dist/ip link help           # smoke-test: static linux binary, runs on WSL
+```
+
+Embed it via `IZBA_IP=dist/ip hack/build-initramfs.sh`.  Requires Docker.
+Pinned: iproute2 6.x, kernel.org tarball sha256-verified in-container.
+
 ### `build-kernel.sh`
 
 Downloads a Linux kernel source tarball (default: **6.12.30 LTS**), applies
@@ -272,6 +293,7 @@ cargo build --release -p izba-cli
 | `IZBA_NFT` | Optional path to a static `nft` binary to embed in the initramfs at `/sbin/nft` (required for the M1 izbad-egress TCP REDIRECT stub; built by `build-nft.sh`). |
 | `IZBA_CRUN` | Optional path to a static `crun` binary to embed in the initramfs at `/sbin/crun` (the in-guest OCI workload runtime, Stance B; built by `build-crun.sh`). |
 | `IZBA_SSHD` | Optional path to a static `sshd` binary to embed in the initramfs at `/sbin/sshd` (required for the SSH access feature; built by `build-sshd.sh`). |
+| `IZBA_IP` | Optional path to a static `ip` binary to embed in the initramfs at `/sbin/ip` (enables netlink-based veth setup for docker-mode container-netns veth setup (#198); built by `build-ip.sh`). |
 | `VIRTIOFSD_VERSION` | virtiofsd release tag for `fetch-artifacts.sh`. Defaults to a pinned known-good version. |
 | `IZBA_MKFS_EROFS` | Absolute path to `mkfs.erofs` (or `mkfs.erofs.exe` on Windows). Overrides the bundled libexec copy and `$PATH`. |
 
