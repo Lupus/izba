@@ -132,6 +132,22 @@ pub fn wsl_from_signals(release: &str, run_wsl_marker: bool, binfmt_marker: bool
     wsl_from_osrelease(release) || run_wsl_marker || binfmt_marker
 }
 
+/// Whether a local `usbipd.exe` is reachable from this process.
+///
+/// Deliberately NOT "am I under WSL?" — that question and this one coincide only
+/// on stock WSL. On Windows izbad runs natively beside usbipd-win and can invoke
+/// it directly (#188); under WSL it reaches it over interop (#187); on a plain
+/// Linux host there is nothing to ask, and probing would only burn the timeout.
+pub fn usbipd_is_local(is_windows: bool, under_wsl: bool) -> bool {
+    is_windows || under_wsl
+}
+
+/// Impure shim over [`usbipd_is_local`].
+#[mutants::skip]
+pub fn can_probe_usbipd() -> bool {
+    usbipd_is_local(cfg!(windows), running_under_wsl())
+}
+
 /// Read the host's default gateway. `None` on any platform or failure — the
 /// caller then classifies without the WSL special case, which is the safe
 /// direction (knowing the gateway can only ever *soften* a warning).
@@ -377,5 +393,25 @@ eth0\t0000E0AC\t00000000\t0001\t0\t0\t0\t0000F0FF\n";
     fn a_plain_linux_host_is_not_wsl() {
         assert!(!wsl_from_signals("6.8.0-45-generic", false, false));
         assert!(!wsl_from_signals("", false, false));
+    }
+
+    #[test]
+    fn usbipd_is_reachable_natively_on_windows() {
+        // izbad on Windows runs *beside* usbipd-win — no interop hop at all.
+        // This is the platform usbipd-win actually targets, and it was the one
+        // where the probe never ran (#188).
+        assert!(usbipd_is_local(true, false));
+    }
+
+    #[test]
+    fn usbipd_is_reachable_across_the_wsl_interop_boundary() {
+        assert!(usbipd_is_local(false, true));
+    }
+
+    #[test]
+    fn a_plain_linux_host_has_no_local_usbipd_to_ask() {
+        // Its upstream is another machine; spawning usbipd.exe there would only
+        // burn the probe timeout.
+        assert!(!usbipd_is_local(false, false));
     }
 }
