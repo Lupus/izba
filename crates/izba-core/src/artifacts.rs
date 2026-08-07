@@ -23,6 +23,10 @@ pub enum KernelVariant {
 }
 
 impl KernelVariant {
+    /// Every variant, so a consumer that must handle all of them (packaging
+    /// checks, docs) cannot silently miss one added later.
+    pub const ALL: [KernelVariant; 2] = [KernelVariant::Base, KernelVariant::Usb];
+
     /// Filename within an artifacts directory. Crate-visible so a start-time
     /// mismatch can name the kernel it actually located.
     pub(crate) fn image(self) -> &'static str {
@@ -287,5 +291,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("boot artifacts not found"));
+    }
+
+    #[test]
+    fn every_kernel_variant_is_installed_by_the_debian_package() {
+        // The defect this pins (#189): KernelVariant::Usb was added, artifacts
+        // resolution learned to demand `vmlinux-usb`, and the packaging manifest
+        // was never told — so a sandbox with grants hit a hard stop telling a
+        // packaged user to go build a kernel. A test over the *enum* catches the
+        // next variant too, which a hardcoded filename list would not.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let script = std::fs::read_to_string(root.join("packaging/build-deb.sh"))
+            .expect("packaging/build-deb.sh must be readable from the crate");
+        for v in KernelVariant::ALL {
+            let dest = format!("usr/lib/izba/artifacts/{}", v.image());
+            assert!(
+                script.contains(&dest),
+                "packaging/build-deb.sh installs no {dest}: a sandbox needing the \
+                 {:?} kernel cannot start from an installed build",
+                v
+            );
+        }
     }
 }

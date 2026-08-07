@@ -8,6 +8,7 @@
 ;   <StageDir>\bin\libexec\openvmm.exe
 ;   <StageDir>\bin\libexec\mkfs.erofs.exe
 ;   <StageDir>\artifacts\vmlinux
+;   <StageDir>\artifacts\vmlinux-usb
 ;   <StageDir>\artifacts\initramfs.cpio.gz
 
 #ifndef MyAppVersion
