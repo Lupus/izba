@@ -118,6 +118,20 @@ pub fn wsl_from_osrelease(release: &str) -> bool {
     r.contains("microsoft") || r.contains("wsl")
 }
 
+/// Decide WSL-ness from every signal available to a *daemon*.
+///
+/// The kernel release string alone is not enough: a custom WSL2 kernel carries
+/// neither "microsoft" nor "wsl" (izba issue #187), and concluding "not WSL"
+/// there silently kills the `usbipd bind` affordance. The filesystem markers are
+/// process-independent on purpose — `WSL_INTEROP` and `WSL_DISTRO_NAME` are
+/// login-shell environment, which izbad may never have inherited.
+///
+/// Widening only: any single positive signal is enough, so a machine that was
+/// already detected keeps being detected.
+pub fn wsl_from_signals(release: &str, run_wsl_marker: bool, binfmt_marker: bool) -> bool {
+    wsl_from_osrelease(release) || run_wsl_marker || binfmt_marker
+}
+
 /// Read the host's default gateway. `None` on any platform or failure — the
 /// caller then classifies without the WSL special case, which is the safe
 /// direction (knowing the gateway can only ever *soften* a warning).
@@ -129,14 +143,20 @@ pub fn host_default_gateway() -> Option<IpAddr> {
     default_gateway_from_proc_route(&table)
 }
 
-/// Whether izbad is running under WSL. `false` on any failure — again the safe
-/// direction, since the WSL case is the one that downgrades a warning.
-// reason: thin /proc reader; `wsl_from_osrelease` carries the logic.
+/// Whether izbad is running inside WSL. Impure shim over [`wsl_from_signals`];
+/// every signal it reads is a file, so the decision itself stays testable.
+///
+/// `false` on any failure — the safe direction, since the WSL case is the one
+/// that downgrades a warning.
+// reason: thin filesystem reader; `wsl_from_signals` carries the logic.
 #[mutants::skip]
 pub fn running_under_wsl() -> bool {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|r| wsl_from_osrelease(&r))
-        .unwrap_or(false)
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    wsl_from_signals(
+        &release,
+        std::path::Path::new("/run/WSL").exists(),
+        std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists(),
+    )
 }
 
 #[cfg(test)]
@@ -329,5 +349,33 @@ eth0\t0000E0AC\t00000000\t0001\t0\t0\t0\t0000F0FF\n";
         assert!(wsl_from_osrelease("6.6.0-MICROSOFT"));
         assert!(!wsl_from_osrelease("6.8.0-45-generic"));
         assert!(!wsl_from_osrelease(""));
+    }
+
+    #[test]
+    fn a_custom_wsl_kernel_is_still_wsl_when_the_interop_markers_are_present() {
+        // The reported case: a self-built WSL2 kernel whose release string
+        // carries neither "microsoft" nor "wsl", on a machine where interop
+        // plainly works.
+        assert!(wsl_from_signals("6.6.87.2-cilium-6.6.87.2+", true, false));
+        assert!(wsl_from_signals("6.6.87.2-cilium-6.6.87.2+", false, true));
+        assert!(wsl_from_signals("6.6.87.2-cilium-6.6.87.2+", true, true));
+    }
+
+    #[test]
+    fn a_stock_wsl_kernel_is_wsl_even_with_no_markers_readable() {
+        // The markers are a widening, never a narrowing: a release string that
+        // already says microsoft must not start depending on /run/WSL being
+        // readable by whatever user izbad runs as.
+        assert!(wsl_from_signals(
+            "5.15.167.4-microsoft-standard-WSL2",
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_plain_linux_host_is_not_wsl() {
+        assert!(!wsl_from_signals("6.8.0-45-generic", false, false));
+        assert!(!wsl_from_signals("", false, false));
     }
 }
