@@ -513,6 +513,7 @@ mod tests {
             volumes: vec![],
             allow_unconfined: false,
             builder: false,
+            docker: None,
         }
     }
 

@@ -188,6 +188,9 @@ fn builder_create_request(name: String, opts: &BuildOpts, workspace: PathBuf) ->
         }],
         allow_unconfined: false,
         builder: true,
+        // Builder VMs never get docker mode: `handle_create` forces it off
+        // whenever `builder` is set, so this is inert either way.
+        docker: None,
     }
 }
 

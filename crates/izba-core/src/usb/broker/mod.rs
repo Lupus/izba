@@ -641,6 +641,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 0,
             usb,

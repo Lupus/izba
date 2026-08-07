@@ -285,6 +285,7 @@ mod tests {
                 ports: vec![],
                 volumes: vec![],
                 builder: false,
+                docker: false,
                 build: None,
                 rw_size_gb: 0,
                 usb,

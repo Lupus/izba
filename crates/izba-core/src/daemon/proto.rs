@@ -74,6 +74,14 @@ pub struct DaemonCreate {
     /// bump (a pre-feature client's frame deserializes to `false`).
     #[serde(default)]
     pub builder: bool,
+    /// Docker mode (#198): the CLI's explicit choice. `Some(true)` = --docker,
+    /// `Some(false)` = --no-docker, `None` = no preference (the image's
+    /// `com.docker.sandboxes.start-docker` label decides). Resolved to the
+    /// persisted `SandboxConfig.docker` bool by the daemon at create, where the
+    /// image config is in hand. Additive + serde-default → no
+    /// `DAEMON_PROTO_VERSION` bump.
+    #[serde(default)]
+    pub docker: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +421,7 @@ mod tests {
                 }],
                 allow_unconfined: false,
                 builder: true,
+                docker: Some(true),
             }),
             DaemonRequest::VolumePrune,
             DaemonRequest::Start {
@@ -499,6 +508,19 @@ mod tests {
         assert!(!c.builder, "absent builder field defaults to false");
         assert!(!c.allow_unconfined);
         assert!(c.volumes.is_empty());
+    }
+
+    /// A pre-feature client's frame has no `docker` key; it must deserialize
+    /// to None (= "no CLI preference, label decides") — additive field, no
+    /// DAEMON_PROTO_VERSION bump.
+    #[test]
+    fn create_without_docker_defaults_none() {
+        let json = r#"{"type":"create","name":"s","image_ref":"alpine","cpus":1,"mem_mb":256,"workspace":"/w","rw_size_gb":8,"ports":[]}"#;
+        let req: DaemonRequest = serde_json::from_str(json).expect("deserialize");
+        match req {
+            DaemonRequest::Create(c) => assert_eq!(c.docker, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]

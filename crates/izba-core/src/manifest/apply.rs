@@ -254,6 +254,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -296,6 +297,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -343,6 +345,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -392,6 +395,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 12, // persisted at create time
         };

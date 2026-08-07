@@ -305,6 +305,7 @@ spec:
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -341,6 +342,7 @@ spec:
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: Some(build_spec.clone()),
             rw_size_gb: 8,
         };
@@ -360,6 +362,7 @@ spec:
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -387,6 +390,7 @@ spec:
             ports: vec![],
             volumes: vec![],
             builder: false,
+            docker: false,
             build: Some(build_spec.clone()),
             rw_size_gb: 8,
         };
