@@ -12,6 +12,10 @@
 #   IZBA_NFT=/path/to/static/nft  (optional, see hack/build-nft.sh)
 #       If set, the binary is embedded in /sbin/nft for the egress stub's
 #       TCP REDIRECT ruleset (M1 izbad-owned egress).
+#   IZBA_IP=/path/to/static/ip  (optional, see hack/build-ip.sh)
+#       If set, the binary is embedded in /sbin/ip for docker-mode veth setup
+#       (netlink-based link/addr/route configuration; init's net.rs is
+#       ioctl-only by design).
 #   IZBA_CRUN=/path/to/static/crun  (optional, see hack/build-crun.sh)
 #       If set, the binary is embedded in /sbin/crun — the OCI runtime izba
 #       runs the user's workload container under inside the guest (Stance B).
@@ -88,6 +92,17 @@ if [[ -n "${IZBA_NFT:-}" ]]; then
     cp "$IZBA_NFT" "$WORK/sbin/nft"
     chmod 755 "$WORK/sbin/nft"
     echo "  embedded nft from $IZBA_NFT"
+fi
+
+# Optional static iproute2 ip (docker-mode veth setup; see hack/build-ip.sh).
+if [[ -n "${IZBA_IP:-}" ]]; then
+    if [[ ! -f "$IZBA_IP" ]]; then
+        echo "error: IZBA_IP='$IZBA_IP' does not exist" >&2
+        exit 1
+    fi
+    cp "$IZBA_IP" "$WORK/sbin/ip"
+    chmod 755 "$WORK/sbin/ip"
+    echo "  embedded ip from $IZBA_IP"
 fi
 
 # Optional static crun — the OCI runtime for the in-guest workload container.
