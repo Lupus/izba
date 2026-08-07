@@ -122,6 +122,10 @@ jobs:
           path: dl/art
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: vmlinux-usb
+          path: dl/art
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
           name: initramfs
           path: dl/art
       - name: Fetch pinned cloud-hypervisor + virtiofsd
@@ -135,6 +139,7 @@ jobs:
           IZBA_CH: ${{ github.workspace }}/dl/vmm/cloud-hypervisor
           IZBA_VIRTIOFSD: ${{ github.workspace }}/dl/vmm/virtiofsd
           IZBA_VMLINUX: ${{ github.workspace }}/dl/art/vmlinux
+          IZBA_VMLINUX_USB: ${{ github.workspace }}/dl/art/vmlinux-usb
           IZBA_INITRAMFS: ${{ github.workspace }}/dl/art/initramfs.cpio.gz
           VERSION: ${{ needs.version.outputs.version }}
         run: |
@@ -164,6 +169,10 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: vmlinux
+          path: stage/artifacts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vmlinux-usb
           path: stage/artifacts
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

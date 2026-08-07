@@ -4,7 +4,7 @@
 #   $WIN_ROOT\bin\izba.exe
 #   $WIN_ROOT\bin\izba-jail-helper.exe
 #   $WIN_ROOT\bin\libexec\{openvmm.exe, mkfs.erofs.exe}
-#   %LOCALAPPDATA%\izba\artifacts\{vmlinux, initramfs.cpio.gz}
+#   %LOCALAPPDATA%\izba\artifacts\{vmlinux, vmlinux-usb, initramfs.cpio.gz}
 # Override WIN_ROOT (default /mnt/c/izba) and WIN_LOCALAPPDATA if needed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -28,6 +28,9 @@ cp "$IZBA_JAIL_HELPER_EXE"  "$WIN_ROOT/bin/izba-jail-helper.exe"
 cp dist/openvmm.exe       "$WIN_ROOT/bin/libexec/openvmm.exe"
 cp dist/mkfs.erofs.exe    "$WIN_ROOT/bin/libexec/mkfs.erofs.exe"
 cp dist/vmlinux           "$WIN_LOCALAPPDATA/izba/artifacts/vmlinux"
+# The USB kernel variant is a dev-loop convenience here, so staging still
+# works for someone who has not built it (unlike the .deb, which requires it).
+[[ -f dist/vmlinux-usb ]] && cp dist/vmlinux-usb "$WIN_LOCALAPPDATA/izba/artifacts/vmlinux-usb"
 cp dist/initramfs.cpio.gz "$WIN_LOCALAPPDATA/izba/artifacts/initramfs.cpio.gz"
 
 echo "OK: staged to $WIN_ROOT (bin + libexec) and $WIN_LOCALAPPDATA/izba/artifacts"
