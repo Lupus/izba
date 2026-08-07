@@ -242,6 +242,7 @@ fn build_cmdline(
     volumes: &[crate::volume::VolumeSpec],
     builder: bool,
     usb: bool,
+    docker: bool,
 ) -> String {
     let mut c = format!("console=ttyS0 izba.hostname={name}");
     if !volumes.is_empty() {
@@ -259,6 +260,12 @@ fn build_cmdline(
     // a sandbox without grants is structural rather than a policy check.
     if usb {
         c.push_str(" izba.usb=1");
+    }
+    // Same host-authoritative channel as USB: izba-init reads izba.docker=1
+    // before the container starts, to bring up the extra plumbing docker mode
+    // needs (fresh netns bring-up, rw cgroup already baked into the OCI spec).
+    if docker {
+        c.push_str(" izba.docker=1");
     }
     c
 }
@@ -707,6 +714,11 @@ fn write_oci_bundle(
         // boundary. Normal sandboxes stay least-privilege.
         privileged: config.builder,
         usb: config.usb.is_enabled(),
+        // Defense-in-depth on top of Task 1's create-side guard (which already
+        // rejects `--docker` together with `--builder`): docker and privileged
+        // are mutually exclusive OCI profiles (fresh userns-scoped caps vs. no
+        // userns at all), so re-assert it here rather than trust the caller.
+        docker: config.docker && !config.builder,
         additional_gids: &additional_gids,
     };
     let spec =
@@ -902,6 +914,7 @@ pub fn start_with_timeouts(
         &config.volumes,
         config.builder,
         config.usb.is_enabled(),
+        config.docker,
     );
     // Resolve per-sandbox account credentials when the sandbox is locked down
     // (Windows MVP-D).  On non-Windows and for unlocked sandboxes this is None
@@ -2089,8 +2102,8 @@ mod tests {
             size_bytes: 1 << 20,
             eph_id: None,
         }];
-        assert!(build_cmdline("web", &vols, false, false).contains("izba.volumes=/a"));
-        assert!(!build_cmdline("web", &[], false, false).contains("izba.volumes"));
+        assert!(build_cmdline("web", &vols, false, false, false).contains("izba.volumes=/a"));
+        assert!(!build_cmdline("web", &[], false, false, false).contains("izba.volumes"));
     }
 
     fn opts(workspace: &Path) -> CreateOpts {
@@ -3726,14 +3739,14 @@ mod tests {
     /// without grants boots a guest that refuses every USB RPC structurally.
     #[test]
     fn the_cmdline_declares_usb_only_for_a_sandbox_that_has_grants() {
-        assert!(build_cmdline("web", &[], false, true).contains("izba.usb=1"));
-        assert!(!build_cmdline("web", &[], false, false).contains("izba.usb"));
+        assert!(build_cmdline("web", &[], false, true, false).contains("izba.usb=1"));
+        assert!(!build_cmdline("web", &[], false, false, false).contains("izba.usb"));
     }
 
     /// build_cmdline with builder=true must contain `izba.buildout=1`.
     #[test]
     fn build_cmdline_builder_flag_appended() {
-        let c = build_cmdline("mybox", &[], true, false);
+        let c = build_cmdline("mybox", &[], true, false, false);
         assert!(
             c.contains("izba.buildout=1"),
             "builder cmdline must contain izba.buildout=1, got: {c}"
@@ -3743,11 +3756,22 @@ mod tests {
     /// build_cmdline with builder=false must NOT contain `izba.buildout`.
     #[test]
     fn build_cmdline_no_builder_flag_absent() {
-        let c = build_cmdline("mybox", &[], false, false);
+        let c = build_cmdline("mybox", &[], false, false, false);
         assert!(
             !c.contains("izba.buildout"),
             "non-builder cmdline must not contain izba.buildout, got: {c}"
         );
+    }
+
+    /// The docker flag is host-authoritative and rides the cmdline exactly
+    /// like the USB flag, so init only brings up docker-mode plumbing when
+    /// the host actually put the sandbox in docker mode.
+    #[test]
+    fn cmdline_includes_docker_flag_only_when_enabled() {
+        let on = build_cmdline("s", &[], false, false, true);
+        assert!(on.contains(" izba.docker=1"));
+        let off = build_cmdline("s", &[], false, false, false);
+        assert!(!off.contains("izba.docker"));
     }
 
     /// `SandboxConfig` without a `builder` field in JSON deserializes to `builder == false`.
