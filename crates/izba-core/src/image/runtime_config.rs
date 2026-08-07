@@ -613,7 +613,18 @@ pub struct SpecParams<'a> {
     pub usb: bool,
     /// Docker mode (spec §2-§3): fresh userns-owned network namespace instead
     /// of sharing init's, the docker-mode capability set, and the rw cgroupfs
-    /// treatment. Mutually exclusive with `privileged` (callers guarantee it).
+    /// treatment.
+    ///
+    /// Mutually exclusive with `privileged` — this is a CALLER-SIDE invariant
+    /// `generate_spec` ASSUMES rather than one it enforces or makes safe. The
+    /// caps `if/else` below picks `privileged`'s `all_caps()` before ever
+    /// looking at `docker`, but the netns block further down is gated on
+    /// `docker` independently of that same `if/else`; a caller that violates
+    /// the invariant (both `true`) would therefore get `all_caps()` (incl.
+    /// `CAP_SYS_ADMIN`) PLUS a fresh container-owned network namespace and no
+    /// user namespace — strictly MORE dangerous than either mode alone, not a
+    /// safe fallback. Callers (`sandbox.rs`) must guarantee exclusivity
+    /// themselves; see `docker: config.docker && !config.builder` there.
     pub docker: bool,
     /// Supplementary gids for the container process user (the image USER's
     /// /etc/group memberships — e.g. `docker`). Empty when none resolve.
@@ -689,7 +700,11 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     // CAP_SYS_ADMIN for its overlayfs bind/overlay mounts); docker-mode sandboxes
     // get the docker-default set plus the userns-scoped admin caps a nested
     // dockerd + runc need ([`docker_mode_caps`]); normal sandboxes get the
-    // least-privilege docker-default set.
+    // least-privilege docker-default set. `privileged` is checked first, but
+    // that ordering is NOT what keeps `privileged && docker` safe — see
+    // [`SpecParams::docker`] for why that combination (a caller-side invariant
+    // this function assumes, never enforces) is strictly more dangerous than
+    // either mode alone, not a safe fallback.
     let caps = if params.privileged {
         all_caps()?
     } else if params.docker {
