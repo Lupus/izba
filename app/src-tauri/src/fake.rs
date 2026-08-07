@@ -443,7 +443,14 @@ impl DaemonApi for FakeDaemon {
         self.usb_grants.push(UsbGrantInfo {
             device: device.to_string(),
             busid_pin,
-            description: String::new(),
+            // Mirrors the daemon, which derives the name host-side at allow
+            // time: a fake that stored "" could not see that fix regress.
+            description: self
+                .usb_devices
+                .iter()
+                .find(|d| d.device == device)
+                .map(|d| d.description.clone())
+                .unwrap_or_default(),
             granted_at_unix_ms: 1,
         });
         Ok(())

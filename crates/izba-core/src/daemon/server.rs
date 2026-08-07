@@ -878,6 +878,24 @@ fn handle_usb_list_devices(d: &Arc<Daemon>) -> anyhow::Result<DaemonResponse> {
     })
 }
 
+/// The description to store on a new grant. Pure so the match rule is testable
+/// without a live usbipd.
+///
+/// Best-effort by design (D-E): a grant is a standing config edit and must not
+/// fail because the name is unavailable. When there is no pin, an unpinned grant
+/// matches any busid, so the id-alone rule in `usbipd_state::describe` is the
+/// right one; a pinned grant names the exact device it pinned.
+fn grant_description(
+    known: Option<&[crate::usb::usbipd_state::UsbipdDevice]>,
+    id: crate::usb::DeviceId,
+    busid_pin: Option<&str>,
+) -> String {
+    known
+        .and_then(|k| crate::usb::usbipd_state::describe(k, busid_pin.unwrap_or(""), id))
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn handle_usb_allow(
     d: &Arc<Daemon>,
     name: String,
@@ -887,13 +905,21 @@ fn handle_usb_allow(
     usb_settings_or_refuse(d)?;
     let id: crate::usb::DeviceId = device.parse()?;
     sandbox_must_exist(&d.paths, &name)?;
+    // Derived host-side, never accepted from the client: the grant record is
+    // host-only managed truth (D1), and this is the value every later surface
+    // shows the human.
+    let description = grant_description(
+        crate::usb::usbipd_state::probe().as_deref(),
+        id,
+        busid_pin.as_deref(),
+    );
     sandbox::edit_usb_grants(&d.paths, &name, |usb| {
         crate::usb::grants::grant(
             usb,
             crate::usb::UsbGrant {
                 device: id,
-                busid_pin,
-                description: String::new(),
+                busid_pin: busid_pin.clone(),
+                description: description.clone(),
                 granted_at_unix_ms: crate::usb::now_unix_ms(),
             },
         )
@@ -1570,6 +1596,91 @@ mod tests {
         assert!(
             !d.usb.listening("web"),
             "revoking the last grant must close the plane now, not at the next start"
+        );
+    }
+
+    #[test]
+    fn a_grant_records_the_product_name_izba_already_knows() {
+        // The grant record is what every later surface reads — `izba usb status`,
+        // the app's granted list, and the CLI consent banner. Storing an empty
+        // description there makes all three name a physical device by four hex
+        // digits, which is exactly where "is this the board on my desk?" needs
+        // answering.
+        let known = vec![crate::usb::usbipd_state::UsbipdDevice {
+            busid: "12-4".to_string(),
+            id: crate::usb::DeviceId {
+                vid: 0x303a,
+                pid: 0x1001,
+            },
+            description: "USB JTAG/serial debug unit".to_string(),
+            bound: true,
+            attached: false,
+        }];
+        assert_eq!(
+            grant_description(
+                Some(&known),
+                crate::usb::DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001
+                },
+                None
+            ),
+            "USB JTAG/serial debug unit"
+        );
+    }
+
+    #[test]
+    fn a_grant_with_no_name_available_records_an_empty_one_rather_than_failing() {
+        // A grant is a standing config edit; it must keep working with no local
+        // usbipd and no reachable upstream. Every surface already renders an
+        // empty description cleanly (the consent banner drops the parentheses).
+        assert_eq!(
+            grant_description(
+                None,
+                crate::usb::DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001
+                },
+                None
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_pinned_grant_takes_the_name_of_the_device_it_pinned() {
+        let known = vec![
+            crate::usb::usbipd_state::UsbipdDevice {
+                busid: "3-2".to_string(),
+                id: crate::usb::DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001,
+                },
+                description: "board on the left".to_string(),
+                bound: true,
+                attached: false,
+            },
+            crate::usb::usbipd_state::UsbipdDevice {
+                busid: "3-3".to_string(),
+                id: crate::usb::DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001,
+                },
+                description: "board on the right".to_string(),
+                bound: true,
+                attached: false,
+            },
+        ];
+        assert_eq!(
+            grant_description(
+                Some(&known),
+                crate::usb::DeviceId {
+                    vid: 0x303a,
+                    pid: 0x1001
+                },
+                Some("3-3"),
+            ),
+            "board on the right"
         );
     }
 
