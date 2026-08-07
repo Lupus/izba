@@ -7,6 +7,7 @@
 mod cmdline;
 mod egress;
 mod exec;
+mod hosts;
 mod mounts;
 mod net;
 mod oci;
@@ -227,6 +228,12 @@ fn run_pid1() -> anyhow::Result<()> {
         eprintln!("izba-init: network configure: {e}");
     }
     write_resolv_conf();
+    write_etc_hosts(
+        params
+            .get("izba.hostname")
+            .map(String::as_str)
+            .filter(|h| !h.is_empty()),
+    );
     write_trust_anchor();
     ssh::launch();
 
@@ -384,6 +391,19 @@ fn write_resolv_conf() {
     let conf = format!("nameserver {}\n", net::DNS_LOOPBACK);
     if let Err(e) = std::fs::write("/rootfs/etc/resolv.conf", conf) {
         eprintln!("izba-init: writing resolv.conf: {e}");
+    }
+}
+
+/// Ensures `localhost` and the sandbox hostname resolve in the workload's
+/// `/etc/hosts` (see `hosts::ensure_entries` for the why). Best-effort: a
+/// failure costs only the cosmetic per-invocation warnings this fixes.
+// reason: PID-1-only glue — the read-modify-write logic lives in
+// `hosts::sync_file` (unit-tested); only the fixed overlay path and the
+// best-effort console log remain here, exercised by the KVM e2e boot.
+#[mutants::skip]
+fn write_etc_hosts(hostname: Option<&str>) {
+    if let Err(e) = hosts::sync_file(Path::new("/rootfs/etc/hosts"), hostname) {
+        eprintln!("izba-init: writing /etc/hosts: {e}");
     }
 }
 
