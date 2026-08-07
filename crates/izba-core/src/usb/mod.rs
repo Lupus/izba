@@ -183,14 +183,17 @@ fn grants_by_device(paths: &Paths) -> HashMap<DeviceId, Vec<String>> {
 /// izba never runs that command itself: binding needs Administrator, and
 /// wrapping usbipd-win is explicitly out of scope.
 ///
-/// `attached` is the live device→holder map from the broker, so a row can say
-/// which sandbox currently has the hardware — the difference between "granted"
-/// and "gone from your desk right now".
+/// `attached` is the live attachment→holder map from the broker, so a row can
+/// say which sandbox currently has the hardware — the difference between
+/// "granted" and "gone from your desk right now". It is keyed on
+/// `(vid:pid, busid)`, so a row is attributed to whoever holds **that port**:
+/// two identical boards are two rows, and one being on loan says nothing about
+/// the other.
 pub fn list_devices(
     paths: &Paths,
     shared: &[inventory::UpstreamDevice],
     known: Option<Vec<usbipd_state::UsbipdDevice>>,
-    attached: &HashMap<DeviceId, String>,
+    attached: &broker::AttachmentMap,
 ) -> Vec<UsbDeviceInfo> {
     let grants = grants_by_device(paths);
     let known = known.unwrap_or_default();
@@ -206,7 +209,7 @@ pub fn list_devices(
                 .to_string(),
             shared: true,
             granted_to: grants.get(&d.id).cloned().unwrap_or_default(),
-            attached_to: attached.get(&d.id).cloned(),
+            attached_to: attached.get(&(d.id, d.busid.clone())).cloned(),
             bind_command: None,
         })
         .collect();
@@ -218,7 +221,7 @@ pub fn list_devices(
             granted_to: grants.get(&k.id).cloned().unwrap_or_default(),
             // An unshared device cannot be attached, but deriving it the same
             // way keeps the two arms honest rather than asserting that here.
-            attached_to: attached.get(&k.id).cloned(),
+            attached_to: attached.get(&(k.id, k.busid.clone())).cloned(),
             busid: k.busid,
             device: k.id.to_string(),
             description: k.description,
@@ -431,6 +434,61 @@ mod tests {
         assert!(listed[0].shared);
         assert_eq!(listed[0].granted_to, vec!["api", "web"], "sorted by name");
         assert!(listed[0].bind_command.is_none(), "already shared");
+    }
+
+    #[test]
+    fn a_row_is_attributed_to_whoever_holds_that_port_not_that_vid_pid() {
+        // Two identical boards, granted to two sandboxes and imported from two
+        // ports. One being on loan says nothing about the other — attributing
+        // by `vid:pid` alone would name the wrong sandbox on one row and, once
+        // the other detaches, report a spliced device as free.
+        let (_t, paths) = paths_with_sandboxes(&[("web", &["303a:1001"]), ("api", &["303a:1001"])]);
+        let attached: broker::AttachmentMap = [(
+            ("303a:1001".parse::<DeviceId>().unwrap(), "3-3".to_string()),
+            "api".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let listed = list_devices(
+            &paths,
+            &[
+                upstream_device("3-2", "303a:1001"),
+                upstream_device("3-3", "303a:1001"),
+            ],
+            None,
+            &attached,
+        );
+        assert_eq!(listed[0].busid, "3-2");
+        assert_eq!(
+            listed[0].attached_to, None,
+            "the board on 3-2 is still sitting on the host"
+        );
+        assert_eq!(listed[1].busid, "3-3");
+        assert_eq!(listed[1].attached_to.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn an_unshared_row_is_not_claimed_by_a_holder_of_an_identical_board() {
+        // The appended arm derives `attached_to` the same way, so it must be
+        // just as port-specific: an unbound device cannot be attached, and a
+        // twin on another port being on loan must not say it is.
+        let (_t, paths) = paths_with_sandboxes(&[]);
+        let known = vec![usbipd_state::UsbipdDevice {
+            busid: "1-4".into(),
+            id: "303a:1001".parse().unwrap(),
+            description: "USB JTAG/serial debug unit".into(),
+            bound: false,
+            attached: false,
+        }];
+        let attached: broker::AttachmentMap = [(
+            ("303a:1001".parse::<DeviceId>().unwrap(), "3-3".to_string()),
+            "api".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let listed = list_devices(&paths, &[], Some(known), &attached);
+        assert_eq!(listed[0].busid, "1-4");
+        assert_eq!(listed[0].attached_to, None);
     }
 
     #[test]

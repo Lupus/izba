@@ -15,7 +15,7 @@ pub mod session;
 
 #[cfg(test)]
 use attachments::AttachmentGuard;
-pub use attachments::Attachments;
+pub use attachments::{AttachmentKey, AttachmentMap, Attachments};
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -148,10 +148,12 @@ impl UsbBroker {
         }
     }
 
-    /// Device → holding sandbox, for every live attachment this daemon is
-    /// splicing. Empty after a daemon restart, which is honest: a restart
-    /// severs the streams, and the guest sees an unplug.
-    pub fn attached_map(&self) -> HashMap<crate::usb::DeviceId, String> {
+    /// Every live attachment this daemon is splicing → the sandbox holding it,
+    /// keyed by [`attachments::AttachmentKey`] so two identical boards on two
+    /// upstream ports stay two separate loans. Empty after a daemon restart,
+    /// which is honest: a restart severs the streams, and the guest sees an
+    /// unplug.
+    pub fn attached_map(&self) -> attachments::AttachmentMap {
         self.attachments.map()
     }
 
@@ -164,8 +166,13 @@ impl UsbBroker {
     /// splice that would normally own it. Mirrors `insert_finished_slot` — the
     /// real path needs a bound listener, which the unit tests cannot have.
     #[cfg(test)]
-    fn hold_for_test(&self, sandbox: &str, device: crate::usb::DeviceId) -> AttachmentGuard {
-        self.attachments.hold(sandbox, device)
+    fn hold_for_test(
+        &self,
+        sandbox: &str,
+        device: crate::usb::DeviceId,
+        busid: &str,
+    ) -> AttachmentGuard {
+        self.attachments.hold(sandbox, device, busid)
     }
 
     /// Bind or unbind `name`'s USB plane to match what is on disk right now.
@@ -382,7 +389,7 @@ where
             // Held before the reply: from the guest's point of view the device
             // is its the moment it is told so, and a hold taken afterwards would
             // leave a window where nothing records the loan.
-            let held = attachments.hold(sandbox, attached.device);
+            let held = attachments.hold(sandbox, attached.device, &attached.busid);
             write_frame(
                 conn,
                 &Response::UsbAttached {
@@ -1131,9 +1138,14 @@ mod tests {
         assert!(b.attached_map().is_empty());
         assert!(b.attached_to("web").is_empty());
 
-        let held = b.hold_for_test("web", dev);
+        let held = b.hold_for_test("web", dev, "3-2");
         assert_eq!(b.attached_to("web"), vec![dev]);
-        assert_eq!(b.attached_map().get(&dev).map(String::as_str), Some("web"));
+        assert_eq!(
+            b.attached_map()
+                .get(&(dev, "3-2".to_string()))
+                .map(String::as_str),
+            Some("web")
+        );
         // Another sandbox's view of the same daemon must not claim it.
         assert!(b.attached_to("api").is_empty());
 
