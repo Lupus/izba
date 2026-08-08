@@ -20,6 +20,7 @@ import type {
   UsbUpstream,
   UsbDevice,
   UsbStatus,
+  SandboxStats,
 } from "./types";
 
 export const api = {
@@ -58,6 +59,7 @@ export const api = {
   policyGitBlock: (name: string, target: string) =>
     invoke<void>("policy_git_block", { name, target }),
   inspect: (name: string) => invoke<SandboxDetail>("inspect", { name }),
+  stats: (name: string) => invoke<SandboxStats>("stats", { name }),
   portList: (name: string) => invoke<PortRule[]>("port_list", { name }),
   portPublish: (name: string, rule: string, persist: boolean) =>
     invoke<void>("port_publish", { name, ruleSpec: rule, persist }),

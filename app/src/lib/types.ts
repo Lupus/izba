@@ -70,6 +70,103 @@ export interface SandboxDetail {
    *  daemon predates container-state reporting. `null` and `"unknown"` both
    *  render as "unknown" — never as a healthy status. */
   container: string | null;
+  /** Whether this sandbox runs in docker mode (#198). */
+  docker: boolean;
+  cpus: number;
+  mem_mb: number;
+  /** Host-side VMM confinement summary, or `null` when the sandbox is
+   *  stopped / its state predates the field — the UI renders `null` as
+   *  "unknown". */
+  confinement: string | null;
+}
+
+/** One process in the guest's mini-top (mirrors `ProcessView`). `state` is
+ *  the kernel state char rendered as a JSON-friendly string ("R", "S", …). */
+export interface ProcSample {
+  pid: number;
+  comm: string;
+  state: string;
+  cpu_permille: number;
+  rss_kb: number;
+}
+
+/** Filesystem-level fullness of one guest mount (mirrors `MountView`). */
+export interface MountUsage {
+  path: string;
+  total_bytes: number;
+  avail_bytes: number;
+}
+
+/** Nested Docker Engine liveness (mirrors `DockerEngineView`). */
+export interface DockerEngine {
+  running: boolean;
+  /** When `!running`: a bounded tail of the engine log. */
+  detail: string | null;
+}
+
+/** Host-observed process resource usage for a running sandbox's VMM
+ *  (mirrors `HostResourcesView`). */
+export interface HostResources {
+  /** CPU share over the sampling interval, in permille of one host CPU.
+   *  `null` when a single sample can't yet yield a rate (first read). */
+  cpu_permille: number | null;
+  rss_kb: number;
+  cpus_limit: number;
+  mem_limit_mb: number;
+}
+
+/** One declared volume's disk footprint (mirrors `VolumeDiskView`). */
+export interface VolumeDisk {
+  guest_path: string;
+  allocated_bytes: number;
+  /** Whether this is the auto-provisioned docker-mode volume. */
+  docker: boolean;
+}
+
+/** Host-computed on-disk footprint for a sandbox (mirrors `HostDiskView`). */
+export interface HostDisk {
+  rw_img_bytes: number;
+  volumes: VolumeDisk[];
+  logs_bytes: number;
+  /** The rootfs image's on-disk size. Shared by every sandbox created from
+   *  the same image — do NOT sum across sandboxes. */
+  image_bytes: number;
+}
+
+/** Guest-side stats payload (mirrors `GuestStatsView`). Everything here is
+ *  guest-reported and already sanitized by the daemon before it reaches the
+ *  frontend. */
+export interface GuestStats {
+  /** Top processes by CPU over the sampling interval, descending. */
+  processes: ProcSample[];
+  /** Total live processes in the guest. */
+  process_count: number;
+  /** Load averages × 100. */
+  load1_centi: number;
+  load5_centi: number;
+  load15_centi: number;
+  mem_total_kb: number;
+  mem_available_kb: number;
+  mounts: MountUsage[];
+  /** `null` unless the guest booted with `izba.docker=1`. */
+  docker: DockerEngine | null;
+  /** In-guest workload container state token, or `null`. */
+  container: string | null;
+}
+
+/** Resource stats for one sandbox (#203, mirrors `SandboxStatsView`). */
+export interface SandboxStats {
+  name: string;
+  running: boolean;
+  /** Wall time since the VM process started, when running. */
+  uptime_ms: number | null;
+  /** Host-observed CPU/RSS + the sandbox's configured limits. `null` when
+   *  not running. */
+  host: HostResources | null;
+  disk: HostDisk;
+  /** Sanitized guest-reported mini-top/mounts/docker-engine snapshot.
+   *  `null` when the sandbox is stopped or the guest could not be reached. */
+  guest: GuestStats | null;
 }
 
 export interface CreateOpts {

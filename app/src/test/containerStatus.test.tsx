@@ -24,6 +24,10 @@ function detail(container: string | null): SandboxDetail {
     ports: [],
     volumes: [],
     container,
+    docker: false,
+    cpus: 2,
+    mem_mb: 4096,
+    confinement: null,
   };
 }
 
