@@ -407,6 +407,14 @@ mod tests {
         );
         assert_eq!(vols[0].name, None, "auto volume is anonymous (ephemeral)");
         assert_eq!(vols[0].size_bytes, DOCKER_VOLUME_SIZE);
+        // Pin the concrete byte count, not just equality to the constant: a
+        // shift-direction slip (`10 << 30` → `10 >> 30`) collapses the volume
+        // to 0 bytes but would still equal a same-mutated `DOCKER_VOLUME_SIZE`.
+        assert_eq!(
+            DOCKER_VOLUME_SIZE,
+            10 * 1024 * 1024 * 1024,
+            "docker volume is 10 GiB"
+        );
     }
 
     #[test]

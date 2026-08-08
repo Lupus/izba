@@ -721,7 +721,7 @@ fn write_oci_bundle(
         // and privileged are mutually exclusive OCI profiles (fresh
         // userns-scoped caps vs. no userns at all), so re-assert it here
         // rather than trust the caller.
-        docker: config.docker && !config.builder,
+        docker: config.docker_effective(),
         additional_gids: &additional_gids,
     };
     let spec =
@@ -922,7 +922,7 @@ pub fn start_with_timeouts(
         &config.volumes,
         config.builder,
         config.usb.is_enabled(),
-        config.docker && !config.builder,
+        config.docker_effective(),
     );
     // Resolve per-sandbox account credentials when the sandbox is locked down
     // (Windows MVP-D).  On non-Windows and for unlocked sandboxes this is None
@@ -3780,12 +3780,25 @@ mod tests {
         assert!(on.contains(" izba.docker=1"));
         let off = build_cmdline("s", &[], false, false, false);
         assert!(!off.contains("izba.docker"));
-        // Mirrors the real call site's `config.docker && !config.builder`
-        // guard: a builder sandbox that also requested docker mode must be
-        // computed down to `docker=false` BEFORE reaching build_cmdline, so
-        // the emitted cmdline never contradicts a `docker:false` OCI spec.
-        let (builder, docker_requested) = (true, true);
-        let guarded = build_cmdline("s", &[], builder, false, docker_requested && !builder);
+        // Exercises the REAL guard (`SandboxConfig::docker_effective`): a
+        // builder sandbox that also requested docker mode must be computed down
+        // to `docker=false` BEFORE reaching build_cmdline, so the emitted
+        // cmdline never contradicts a `docker:false` OCI spec.
+        let cfg = SandboxConfig {
+            image_digest: "sha256:x".into(),
+            image_ref: "img".into(),
+            cpus: 1,
+            mem_mb: 512,
+            workspace: PathBuf::from("/ws"),
+            ports: vec![],
+            volumes: vec![],
+            builder: true,
+            build: None,
+            rw_size_gb: 0,
+            usb: Default::default(),
+            docker: true,
+        };
+        let guarded = build_cmdline("s", &[], cfg.builder, false, cfg.docker_effective());
         assert!(!guarded.contains("izba.docker"));
     }
 
