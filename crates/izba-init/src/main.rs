@@ -338,9 +338,23 @@ fn run_pid1() -> anyhow::Result<()> {
         }
     }
 
+    let stats_ctx = Arc::new(stats::StatsContext {
+        procfs: "/proc".into(),
+        rootfs: "/rootfs".into(),
+        volume_paths: vols.iter().map(|s| s.to_string()).collect(),
+        docker,
+        engine_log: docker::ENGINE_LOG.into(),
+        clk_tck: unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64,
+        page_kb: (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1024) as u64) / 1024,
+    });
     {
-        let (e, u, s) = (Arc::clone(&engine), Arc::clone(&usb), Arc::clone(&shutdown));
-        std::thread::spawn(move || server::serve_control(control, e, u, s));
+        let (e, u, st, s) = (
+            Arc::clone(&engine),
+            Arc::clone(&usb),
+            Arc::clone(&stats_ctx),
+            Arc::clone(&shutdown),
+        );
+        std::thread::spawn(move || server::serve_control(control, e, u, st, s));
     }
     {
         let e = Arc::clone(&engine);
