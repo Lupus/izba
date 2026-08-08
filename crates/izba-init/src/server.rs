@@ -9,6 +9,7 @@ use izba_proto::{
 };
 use std::fs::File;
 use std::io::{Read, Write};
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -141,7 +142,15 @@ fn dispatch_control_request(
 
 /// Serves stream attachments; never returns under normal operation
 /// (run as a daemon thread). Logs and retries on accept errors.
-pub fn serve_streams<L: Listener>(l: L, engine: Arc<ExecEngine>) {
+///
+/// `docker` selects the `tcp_dial` fallback address: in docker mode the
+/// workload (including docker-proxy's published ports) runs in its own
+/// netns at `net::GUEST_IP`, not init's loopback, so a `TcpDial` that finds
+/// nothing on `127.0.0.1` needs a second try there. Computed once here
+/// rather than per-connection since it never changes for the process's
+/// lifetime.
+pub fn serve_streams<L: Listener>(l: L, engine: Arc<ExecEngine>, docker: bool) {
+    let fallback = docker.then_some(crate::net::GUEST_IP);
     loop {
         let conn = match l.accept() {
             Ok(c) => c,
@@ -153,11 +162,15 @@ pub fn serve_streams<L: Listener>(l: L, engine: Arc<ExecEngine>) {
             }
         };
         let engine = Arc::clone(&engine);
-        std::thread::spawn(move || stream_conn(conn, engine));
+        std::thread::spawn(move || stream_conn(conn, engine, fallback));
     }
 }
 
-fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, engine: Arc<ExecEngine>) {
+fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(
+    mut conn: C,
+    engine: Arc<ExecEngine>,
+    fallback: Option<Ipv4Addr>,
+) {
     let open: StreamOpen = match read_frame(&mut conn) {
         Ok(o) => o,
         Err(_) => return,
@@ -173,7 +186,7 @@ fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, engine: 
             return;
         }
         StreamOpen::TcpDial { port } => {
-            tcp_dial(conn, port);
+            tcp_dial(conn, port, fallback);
             return;
         }
         // Egress variants are handled by izbad on the host (vsock port 1027),
@@ -284,24 +297,57 @@ fn tar_create<C: Read + Write>(conn: &mut C, engine: &ExecEngine, src: &str) {
 /// `C` is the vsock connection (host side). On guest-socket EOF we
 /// `shutdown(Write)` toward the host and drain the remaining host->guest bytes;
 /// this graceful teardown is also the planned OpenVMM vsock-churn mitigation.
-fn tcp_dial<C: Read + Write + AsRawFd + Send + 'static>(mut conn: C, port: u16) {
+///
+/// `fallback`, when set (docker mode: `net::GUEST_IP`), is dialed AFTER
+/// loopback refuses. Docker-mode workload listeners — including
+/// docker-proxy's published ports — live in the container's own netns at
+/// that address, while init-netns services (sshd on `:22`) stay on
+/// loopback; trying loopback first keeps those reachable, and the fallback
+/// is what makes docker-published ports reachable at all. Both attempts
+/// share the 10 s cap.
+fn tcp_dial<C: Read + Write + AsRawFd + Send + 'static>(
+    mut conn: C,
+    port: u16,
+    fallback: Option<Ipv4Addr>,
+) {
     use std::net::{Shutdown, SocketAddr, TcpStream};
     // Spec §5: 10 s dial cap. Loopback normally refuses instantly; the cap
     // guards pathological guest states (e.g. workload firewall DROP rules)
     // so a relay thread can never hang in connect forever.
+    let timeout = std::time::Duration::from_secs(10);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let target = match TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10)) {
+    let target = match TcpStream::connect_timeout(&addr, timeout) {
         Ok(t) => t,
-        Err(e) => {
-            let _ = write_frame(
-                &mut conn,
-                &Response::Error {
-                    kind: ErrorKind::ConnectFailed,
-                    message: e.to_string(),
-                },
-            );
-            return;
-        }
+        Err(first) => match fallback {
+            Some(ip) => {
+                let fb_addr = SocketAddr::from((ip, port));
+                match TcpStream::connect_timeout(&fb_addr, timeout) {
+                    Ok(t) => t,
+                    Err(second) => {
+                        let _ = write_frame(
+                            &mut conn,
+                            &Response::Error {
+                                kind: ErrorKind::ConnectFailed,
+                                message: format!(
+                                    "127.0.0.1:{port}: {first}; {ip}:{port}: {second}"
+                                ),
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+            None => {
+                let _ = write_frame(
+                    &mut conn,
+                    &Response::Error {
+                        kind: ErrorKind::ConnectFailed,
+                        message: first.to_string(),
+                    },
+                );
+                return;
+            }
+        },
     };
     if write_frame(&mut conn, &Response::Ok).is_err() {
         return;
@@ -431,7 +477,7 @@ mod tests {
             std::thread::spawn(move || serve_control(PairListener(Mutex::new(rx)), e, usb, s));
 
             let (stream_tx, rx) = mpsc::channel();
-            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), engine));
+            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), engine, false));
 
             Self {
                 control_tx,
@@ -561,7 +607,7 @@ mod tests {
         {
             let e = Arc::clone(&engine);
             let _ = &shutdown;
-            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), e));
+            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), e, false));
         }
         let stream_conn = || {
             let (mine, theirs) = UnixStream::pair().unwrap();
@@ -631,7 +677,7 @@ mod tests {
         let (stream_tx, rx) = mpsc::channel();
         {
             let e = Arc::clone(&engine);
-            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), e));
+            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), e, false));
         }
         let (mut mine, theirs) = UnixStream::pair().unwrap();
         stream_tx.send(theirs).unwrap();
@@ -675,7 +721,7 @@ mod tests {
         });
 
         let (mut client, server) = UnixStream::pair().unwrap();
-        let h = std::thread::spawn(move || tcp_dial(server, port));
+        let h = std::thread::spawn(move || tcp_dial(server, port, None));
 
         // First frame the init side sends is the Ok response.
         match read_frame::<_, Response>(&mut client).unwrap() {
@@ -692,11 +738,59 @@ mod tests {
         h.join().unwrap();
     }
 
-    /// A `TcpDial` to a refused loopback port must reply Error{ConnectFailed}
-    /// and close. Port 1 is privileged/closed for an unprivileged dial; if the
-    /// dial unexpectedly succeeds the assert fails loudly.
+    /// Test-only entry into `stream_conn` bypassing `serve_streams`' Listener
+    /// plumbing: builds a throwaway direct-spawn engine (never touched by a
+    /// `TcpDial` frame's dispatch — it returns before any exec lookup) and
+    /// drives one connection with the given fallback address, exercising the
+    /// real `StreamOpen` → `tcp_dial` threading path end to end.
+    fn stream_conn_for_test<C: Read + Write + AsRawFd + Send + 'static>(
+        conn: C,
+        fallback: Option<Ipv4Addr>,
+    ) {
+        let engine = Arc::new(ExecEngine::new_direct(None));
+        stream_conn(conn, engine, fallback);
+    }
+
+    /// A `TcpDial` whose loopback attempt refuses must fall back to the
+    /// docker-mode veth address (here: a second loopback address, 127.0.0.2,
+    /// standing in for `net::GUEST_IP` — still 127/8 and bindable without
+    /// extra setup) and succeed there.
     #[test]
-    fn tcp_dial_refused_reports_connect_failed() {
+    fn tcp_dial_falls_back_to_secondary_address() {
+        let l = match std::net::TcpListener::bind(("127.0.0.2", 0)) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "SKIP tcp_dial_falls_back_to_secondary_address: sandbox denies bind: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected bind failure: {e}"),
+        };
+        let port = l.local_addr().unwrap().port();
+        let (a, b) = UnixStream::pair().unwrap();
+        let t = std::thread::spawn(move || {
+            let mut conn = a;
+            write_frame(&mut conn, &StreamOpen::TcpDial { port }).unwrap();
+            let resp: Response = read_frame(&mut conn).unwrap();
+            // Accept the fallback dial and drop it: the relay's target-side
+            // read needs that EOF to finish, and `stream_conn_for_test`
+            // (below, on the test's main thread) doesn't return until the
+            // relay does — accepting after it returned would deadlock.
+            let (accepted, _) = l.accept().unwrap();
+            drop(accepted);
+            matches!(resp, Response::Ok)
+        });
+        stream_conn_for_test(b, Some(Ipv4Addr::new(127, 0, 0, 2)));
+        assert!(t.join().unwrap());
+    }
+
+    /// A `TcpDial` to a refused loopback port with no fallback configured
+    /// must reply Error{ConnectFailed} and close. Port 1 is privileged/closed
+    /// for an unprivileged dial; if the dial unexpectedly succeeds the assert
+    /// fails loudly.
+    #[test]
+    fn tcp_dial_without_fallback_reports_connect_failed() {
         // Bind-and-drop to obtain a definitely-free port, then dial it.
         use std::net::TcpListener;
         let port = match TcpListener::bind(("127.0.0.1", 0)) {
@@ -706,13 +800,15 @@ mod tests {
                 p
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("SKIP tcp_dial_refused_reports_connect_failed: sandbox denies bind: {e}");
+                eprintln!(
+                    "SKIP tcp_dial_without_fallback_reports_connect_failed: sandbox denies bind: {e}"
+                );
                 return;
             }
             Err(e) => panic!("unexpected bind failure: {e}"),
         };
         let (mut client, server) = UnixStream::pair().unwrap();
-        let h = std::thread::spawn(move || tcp_dial(server, port));
+        let h = std::thread::spawn(move || tcp_dial(server, port, None));
         match read_frame::<_, Response>(&mut client).unwrap() {
             Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::ConnectFailed),
             other => panic!("expected ConnectFailed, got {other:?}"),

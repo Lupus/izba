@@ -343,7 +343,7 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     {
         let e = Arc::clone(&engine);
-        std::thread::spawn(move || server::serve_streams(streams, e));
+        std::thread::spawn(move || server::serve_streams(streams, e, docker));
     }
 
     // Zombie policy (v1): every engine exec is reaped by its dedicated
