@@ -2,7 +2,7 @@
 //! VMM confinement actually achieved at launch (see `VmHandle::confinement`).
 
 use anyhow::bail;
-use izba_core::daemon::proto::{DaemonRequest, DaemonResponse, SandboxDetail};
+use izba_core::daemon::proto::{DaemonRequest, DaemonResponse, SandboxDetail, SandboxStats};
 use izba_core::daemon::DaemonClient;
 use izba_core::jail_account::orchestrate::lockdown_state;
 use izba_core::paths::Paths;
@@ -11,7 +11,19 @@ pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     let mut client = DaemonClient::connect(paths)?;
     match client.request(&DaemonRequest::Inspect { name: name.into() }, &mut |_| {})? {
         DaemonResponse::Inspect(det) => {
-            print!("{}", render(paths, &det));
+            // #203: for a running docker-mode sandbox, fetch guest stats to
+            // surface nested-Docker-Engine liveness. Best-effort: any
+            // transport error or non-Stats reply degrades to `None`
+            // ("unknown") rather than failing `status` outright.
+            let stats = if det.docker && det.status == "running" {
+                match client.request(&DaemonRequest::Stats { name: name.into() }, &mut |_| {}) {
+                    Ok(DaemonResponse::Stats(s)) => Some(s),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            print!("{}", render(paths, &det, stats.as_ref()));
             Ok(0)
         }
         DaemonResponse::Error { message } => bail!(message),
@@ -23,7 +35,7 @@ pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
 /// sandbox is unconfined the summary already starts with `UNCONFINED — …`, so
 /// it stands out; `None` (stopped / pre-confinement state) renders as
 /// `unknown`.
-fn render(paths: &Paths, det: &SandboxDetail) -> String {
+fn render(paths: &Paths, det: &SandboxDetail, stats: Option<&SandboxStats>) -> String {
     let confinement = det.confinement.as_deref().unwrap_or("unknown");
     let lockdown = lockdown_state(paths, &det.name).summary();
     let mut out = format!(
@@ -55,6 +67,14 @@ fn render(paths: &Paths, det: &SandboxDetail) -> String {
         // must be visible in `status`/`inspect`. Only shown when on — a normal
         // sandbox stays lean.
         out.push_str("mode:        docker (nested Docker Engine)\n");
+        if det.status == "running" {
+            // #203: a running docker-mode sandbox must show whether the
+            // nested Docker Engine is actually up — a dead dockerd inside a
+            // healthy-looking VM is otherwise invisible. Stopped sandboxes
+            // print no engine line (there's nothing to report on).
+            out.push_str(&engine_line(stats));
+            out.push('\n');
+        }
     }
     if let Some(declared) = det.user_fallback.as_deref() {
         // Loud-on-degradation (#114): the workload runs as root because the
@@ -70,6 +90,26 @@ fn render(paths: &Paths, det: &SandboxDetail) -> String {
         ));
     }
     out
+}
+
+/// The `engine:` line for a docker-mode sandbox (#203): a dead/absent
+/// nested Docker Engine must be visible, not a silent "running" sandbox.
+/// `stats` is None when the daemon Stats call itself failed.
+fn engine_line(stats: Option<&SandboxStats>) -> String {
+    let engine = stats
+        .and_then(|s| s.guest.as_ref())
+        .and_then(|g| g.docker.as_ref());
+    match engine {
+        Some(e) if e.running => "engine:      running".to_string(),
+        Some(e) => match &e.detail {
+            // Daemon-sanitized (control chars stripped), safe to print.
+            Some(d) => format!("engine:      not running ({d})"),
+            None => {
+                "engine:      not running (see /var/log/izba-dockerd.log in the guest)".to_string()
+            }
+        },
+        None => "engine:      unknown (guest not responding)".to_string(),
+    }
 }
 
 /// Human-readable label for the in-guest container state. `None` (stopped
@@ -130,6 +170,7 @@ mod tests {
         let out = render(
             &paths,
             &detail(Some("confined: restricted(limited)+low-il+job")),
+            None,
         );
         assert!(
             out.contains("confinement: confined: restricted(limited)+low-il+job"),
@@ -147,6 +188,7 @@ mod tests {
             &detail(Some(
                 "UNCONFINED — --allow-unconfined: host-side VMM confinement disabled by user",
             )),
+            None,
         );
         // The prominent UNCONFINED marker must survive verbatim.
         assert!(out.contains("confinement: UNCONFINED — "), "{out}");
@@ -156,7 +198,7 @@ mod tests {
     fn renders_unknown_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(&tmp);
-        let out = render(&paths, &detail(None));
+        let out = render(&paths, &detail(None), None);
         assert!(out.contains("confinement: unknown"), "{out}");
     }
 
@@ -167,6 +209,7 @@ mod tests {
         let out = render(
             &paths,
             &detail_with_container(None, Some(izba_proto::ContainerState::Running)),
+            None,
         );
         assert!(out.contains("container:   running"), "{out}");
     }
@@ -180,6 +223,7 @@ mod tests {
         let out = render(
             &paths,
             &detail_with_container(None, Some(izba_proto::ContainerState::Stopped)),
+            None,
         );
         assert!(
             out.contains("container:   stopped (workload exited)"),
@@ -193,7 +237,7 @@ mod tests {
         // "unknown", never a healthy claim.
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(&tmp);
-        let out = render(&paths, &detail_with_container(None, None));
+        let out = render(&paths, &detail_with_container(None, None), None);
         assert!(out.contains("container:   unknown"), "{out}");
     }
 
@@ -221,7 +265,7 @@ mod tests {
         let paths = test_paths(&tmp);
         let mut det = detail(None);
         det.user_fallback = Some("node".into());
-        let out = render(&paths, &det);
+        let out = render(&paths, &det, None);
         assert!(out.contains("root"), "got: {out}");
         assert!(out.contains("'node'"), "got: {out}");
         assert!(out.contains("user:        root"), "got: {out}");
@@ -231,7 +275,7 @@ mod tests {
     fn no_user_line_without_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(&tmp);
-        let out = render(&paths, &detail(None));
+        let out = render(&paths, &detail(None), None);
         assert!(!out.contains("USER"), "got: {out}");
     }
 
@@ -242,15 +286,46 @@ mod tests {
         let paths = test_paths(&tmp);
         let mut det = detail(None);
         det.docker = true;
-        let out = render(&paths, &det);
+        let out = render(&paths, &det, None);
         assert!(out.contains("mode:        docker"), "got: {out}");
+    }
+
+    #[test]
+    fn renders_engine_line_for_running_docker_sandbox() {
+        // #203: the engine line rides directly under `mode:` when stats are
+        // unavailable it still degrades to the honest "unknown" line rather
+        // than being omitted.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.docker = true;
+        det.status = "running".into();
+        let out = render(&paths, &det, None);
+        assert!(
+            out.contains("mode:        docker (nested Docker Engine)\nengine:      unknown (guest not responding)\n"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn no_engine_line_for_stopped_docker_sandbox() {
+        // Spec §5: a stopped docker-mode sandbox has no live guest to report
+        // on, so `status` prints no `engine:` line at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.docker = true;
+        det.status = "stopped".into();
+        let out = render(&paths, &det, None);
+        assert!(out.contains("mode:        docker"), "got: {out}");
+        assert!(!out.contains("engine:"), "got: {out}");
     }
 
     #[test]
     fn no_docker_line_for_a_normal_sandbox() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(&tmp);
-        let out = render(&paths, &detail(None));
+        let out = render(&paths, &detail(None), None);
         assert!(!out.contains("mode:"), "got: {out}");
     }
 
@@ -258,8 +333,69 @@ mod tests {
     fn renders_lockdown_unlocked_by_default() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(&tmp);
-        let out = render(&paths, &detail(None));
+        let out = render(&paths, &detail(None), None);
         assert!(out.contains("lock-down:   unlocked"), "{out}");
+    }
+
+    #[test]
+    fn engine_line_renders_all_states() {
+        use izba_core::daemon::proto::SandboxStats;
+        fn stats_with(docker: Option<izba_proto::DockerEngine>) -> SandboxStats {
+            SandboxStats {
+                name: "web".into(),
+                running: true,
+                uptime_ms: None,
+                host: None,
+                disk: izba_core::daemon::proto::HostDisk {
+                    rw_img_bytes: 0,
+                    volumes: vec![],
+                    logs_bytes: 0,
+                    image_bytes: 0,
+                },
+                guest: docker.map(|d| izba_proto::GuestStats {
+                    processes: vec![],
+                    process_count: 0,
+                    load1_centi: 0,
+                    load5_centi: 0,
+                    load15_centi: 0,
+                    mem_total_kb: 0,
+                    mem_available_kb: 0,
+                    mounts: vec![],
+                    docker: Some(d),
+                    container: None,
+                }),
+            }
+        }
+        assert_eq!(
+            engine_line(Some(&stats_with(Some(izba_proto::DockerEngine {
+                running: true,
+                detail: None
+            })))),
+            "engine:      running"
+        );
+        assert_eq!(
+            engine_line(Some(&stats_with(Some(izba_proto::DockerEngine {
+                running: false,
+                detail: Some("failed to start daemon: no cgroup".into()),
+            })))),
+            "engine:      not running (failed to start daemon: no cgroup)"
+        );
+        assert_eq!(
+            engine_line(Some(&stats_with(Some(izba_proto::DockerEngine {
+                running: false,
+                detail: None
+            })))),
+            "engine:      not running (see /var/log/izba-dockerd.log in the guest)"
+        );
+        // Guest unreachable, or a pre-stats guest: honest unknown.
+        assert_eq!(
+            engine_line(None),
+            "engine:      unknown (guest not responding)"
+        );
+        assert_eq!(
+            engine_line(Some(&stats_with(None))),
+            "engine:      unknown (guest not responding)"
+        );
     }
 
     #[test]
@@ -283,7 +419,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = render(&paths, &detail(None));
+        let out = render(&paths, &detail(None), None);
         assert!(
             out.contains("lock-down:   locked(account=izba-sb-web"),
             "{out}"
