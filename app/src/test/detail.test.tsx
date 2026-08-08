@@ -146,6 +146,18 @@ describe("Detail tabs", () => {
     expect(screen.getByRole("button", { name: /^stop$/i })).toBeInTheDocument();
   });
 
+  it("keeps the lifecycle actions in the header row on every tab", () => {
+    // The buttons live in the detail header, not in the Overview body: they
+    // act on the sandbox, so switching tabs must not take them away.
+    const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
+    render(<Detail sandbox={sbx} onChanged={noop} />);
+    fireEvent.click(screen.getByRole("tab", { name: /logs/i }));
+    expect(screen.getByText("logs-for-web")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^stop$/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^restart$/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^remove$/i })).toBeInTheDocument();
+  });
+
   it("switches to the Logs tab", () => {
     const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
     render(<Detail sandbox={sbx} onChanged={noop} />);

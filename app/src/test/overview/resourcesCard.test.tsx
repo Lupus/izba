@@ -38,6 +38,23 @@ describe("ResourcesCard", () => {
     expect(screen.getByText("guest: 1.9 GiB used of 4.0 GiB")).toBeInTheDocument();
   });
 
+  it("keeps the host bars live when the guest is unreachable", () => {
+    // Spec §7: the host tier is measured on the host — an unresponsive guest
+    // must not blank the bars, only the guest-reported secondary lines.
+    render(<ResourcesCard stats={runningStats({ guest: null })} />);
+    expect(screen.getByRole("meter", { name: /cpu/i })).toBeInTheDocument();
+    expect(screen.getByRole("meter", { name: /mem/i })).toBeInTheDocument();
+    expect(screen.getByText("34%")).toBeInTheDocument();
+    expect(screen.queryByText(/^guest:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^load /)).not.toBeInTheDocument();
+  });
+
+  it("says plainly that no tier reported when both are absent", () => {
+    render(<ResourcesCard stats={runningStats({ host: null, guest: null })} />);
+    expect(screen.getByText("no resource data")).toBeInTheDocument();
+    expect(screen.queryByRole("meter")).not.toBeInTheDocument();
+  });
+
   it("omits the CPU bar until the sampler has a rate", () => {
     const s = runningStats();
     render(<ResourcesCard stats={runningStats({ host: { ...s.host!, cpu_permille: null } })} />);

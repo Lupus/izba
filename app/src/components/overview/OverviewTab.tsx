@@ -12,7 +12,7 @@ import { ProcessesCard } from "./ProcessesCard";
  *  runs — workspace, confinement, docker mode). Each card takes its data
  *  slice as props, so every degraded state is a plain-props case. */
 export function OverviewTab({ sandbox }: Readonly<{ sandbox: SandboxView }>) {
-  const { stats } = useStats(sandbox.name);
+  const { stats, error } = useStats(sandbox.name);
   const [detail, setDetail] = useState<SandboxDetail | null>(null);
 
   useEffect(() => {
@@ -35,7 +35,26 @@ export function OverviewTab({ sandbox }: Readonly<{ sandbox: SandboxView }>) {
     // `overflow-auto`: the tab body is a fixed-height flex child, and four
     // cards + a ten-row process table can outgrow a short window.
     <div className="grid gap-4 overflow-auto md:grid-cols-2">
-      <SandboxCard name={sandbox.name} state={sandbox.state} detail={detail} stats={stats} />
+      {/* The poller keeps its last good snapshot through a failure, so the
+          user MUST be told the numbers may no longer be true — a silent stale
+          "running · 2h 14m" is exactly the false-health claim the rest of the
+          product refuses to make. SandboxCard degrades its live readings too. */}
+      {error !== null && (
+        <div
+          role="status"
+          title={error}
+          className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive md:col-span-2"
+        >
+          stats unavailable — last update may be stale
+        </div>
+      )}
+      <SandboxCard
+        name={sandbox.name}
+        state={sandbox.state}
+        detail={detail}
+        stats={stats}
+        stale={error !== null}
+      />
       <ResourcesCard stats={stats} />
       <div className="md:col-span-2">
         <StorageCard stats={stats} />
