@@ -7,23 +7,27 @@
 //! **Command-form decision (verified against the real vendored binary):**
 //! iproute2's `-n`/`--netns` global option does NOT accept an arbitrary
 //! `/proc/<pid>/ns/net` path — it always resolves its argument as a NAME
-//! under `/var/run/netns/` (`ip/lib/namespace.c:netns_switch`). Confirmed by
-//! running the actual vendored `dist/ip` (iproute2 6.12.0) unsandboxed:
-//! `ip -n /proc/self/ns/net link show lo` fails with `Cannot open network
-//! namespace "/proc/self/ns/net": No such file or directory` even though the
-//! path itself exists — the binary is not treating it as a path at all.
-//! `ip netns attach <name> <pid>` IS present in this build (`ip netns help`
-//! lists it) and is the supported way to give a live process's netns a name
-//! iproute2 will accept via `-n`; it failed only on `mkdir /var/run/netns:
-//! Permission denied` when tried unprivileged here, which will NOT be a
-//! problem for izba-init running as PID 1 (root) in the guest. So `commands`
-//! emits: create the pair, push the container end into the container's netns
-//! by PID directly (`ip link set … netns <pid>`, which — unlike the `-n`
-//! option — DOES accept a bare pid), attach a named handle to that pid's
-//! netns, then address/route the container side via `-n <NETNS_NAME>`.
-//! Task 7 e2e should confirm the full sequence end-to-end as root in a real
-//! guest (this host could not exercise the attach + `-n <name>` roundtrip
-//! without root).
+//! under `/var/run/netns/` (iproute2's `ip netns` option handling; exact
+//! source file not pinned here — verified by binary behavior, not by reading
+//! iproute2's source). Confirmed by running the actual vendored `dist/ip`
+//! (iproute2 6.12.0) unsandboxed: `ip -n /proc/self/ns/net link show lo`
+//! fails with `Cannot open network namespace "/proc/self/ns/net": No such
+//! file or directory` even though the path itself exists — the binary is not
+//! treating it as a path at all. `ip netns attach <name> <pid>` IS present in
+//! this build (`ip netns help` lists it) and is the supported way to give a
+//! live process's netns a name iproute2 will accept via `-n`; it failed only
+//! on `mkdir /var/run/netns: Permission denied` when tried unprivileged here
+//! (this dev host already had `/var/run`, so the failure was pure
+//! permissions) — that mkdir call is what `apply` now covers up front for the
+//! guest, whose initramfs has no `/var` at all (see `apply`'s doc). So
+//! `commands` emits: create the pair, push the container end into the
+//! container's netns by PID directly (`ip link set … netns <pid>`, which —
+//! unlike the `-n` option — DOES accept a bare pid), attach a named handle to
+//! that pid's netns, then address/route the container side via
+//! `-n <NETNS_NAME>`. Task 7 e2e should confirm the full sequence end-to-end
+//! as root in a real guest — including that `apply`'s `create_dir_all` +
+//! `netns attach` actually succeeds against the initramfs's real (missing)
+//! `/var/run/netns`, not just this dev host's pre-existing one.
 
 pub const IP_PATH: &str = "/sbin/ip";
 pub const VETH_INIT: &str = "veth0";
@@ -82,6 +86,15 @@ pub fn commands(container_pid: u32) -> Vec<Vec<String>> {
 // command plan is unit-tested via `commands`.
 #[mutants::skip]
 pub fn apply(container_pid: u32) -> std::io::Result<()> {
+    // `ip netns attach` registers the named handle by bind-mounting it at
+    // /var/run/netns/<name>, and only mkdirs that FINAL component (not
+    // recursively) — so it silently assumes /var/run already exists. izba's
+    // initramfs ships no /var at all (see hack/build-initramfs.sh's
+    // skeleton), so without this the guest's first `netns attach` would fail
+    // ENOENT on the missing parent. create_dir_all (mkdir -p) makes /var and
+    // /var/run too, so this is correct regardless of what the initramfs
+    // happens to pre-create.
+    std::fs::create_dir_all("/var/run/netns")?;
     for c in commands(container_pid) {
         let status = std::process::Command::new(&c[0]).args(&c[1..]).status()?;
         if !status.success() {

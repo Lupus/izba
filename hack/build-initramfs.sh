@@ -63,9 +63,12 @@ chmod 755 "$WORK"  # mktemp creates 700; initramfs root must be world-traversabl
 trap 'rm -rf "$WORK"' EXIT
 
 # Minimal directory skeleton that izba-init expects to find at boot.
+# var/run/netns: belt-and-suspenders for docker-mode's `ip netns attach`
+# (veth::apply's create_dir_all("/var/run/netns") is the load-bearing fix —
+# this just means the guest never has to create /var itself).
 mkdir -p "$WORK/sbin" "$WORK/proc" "$WORK/sys" "$WORK/dev" \
          "$WORK/tmp" "$WORK/lower" "$WORK/upper" "$WORK/rootfs" \
-         "$WORK/etc/ssh" "$WORK/run/sshd"
+         "$WORK/etc/ssh" "$WORK/run/sshd" "$WORK/var/run/netns"
 
 # /init must be at the root and executable.
 cp "$INIT_BIN" "$WORK/init"
