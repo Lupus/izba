@@ -785,6 +785,48 @@ mod tests {
         assert!(t.join().unwrap());
     }
 
+    /// With a fallback configured, when BOTH dials refuse the single
+    /// `ConnectFailed` message must name both attempts — the operator needs
+    /// to see that a second address was tried and what each one said.
+    #[test]
+    fn tcp_dial_both_attempts_fail_reports_both_addresses() {
+        // Bind-and-drop on the wildcard address so the port is free on every
+        // local address (both 127.0.0.1 and the 127.0.0.2 fallback).
+        use std::net::TcpListener;
+        let port = match TcpListener::bind(("0.0.0.0", 0)) {
+            Ok(l) => {
+                let p = l.local_addr().unwrap().port();
+                drop(l); // nothing is listening on p now
+                p
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "SKIP tcp_dial_both_attempts_fail_reports_both_addresses: sandbox denies bind: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected bind failure: {e}"),
+        };
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let fallback = Some(Ipv4Addr::new(127, 0, 0, 2));
+        let h = std::thread::spawn(move || tcp_dial(server, port, fallback));
+        match read_frame::<_, Response>(&mut client).unwrap() {
+            Response::Error { kind, message } => {
+                assert_eq!(kind, ErrorKind::ConnectFailed);
+                assert!(
+                    message.contains(&format!("127.0.0.1:{port}")),
+                    "message must name the loopback attempt: {message}"
+                );
+                assert!(
+                    message.contains(&format!("127.0.0.2:{port}")),
+                    "message must name the fallback attempt: {message}"
+                );
+            }
+            other => panic!("expected ConnectFailed, got {other:?}"),
+        }
+        h.join().unwrap();
+    }
+
     /// A `TcpDial` to a refused loopback port with no fallback configured
     /// must reply Error{ConnectFailed} and close. Port 1 is privileged/closed
     /// for an unprivileged dial; if the dial unexpectedly succeeds the assert
