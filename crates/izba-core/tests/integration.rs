@@ -2655,7 +2655,7 @@ fn docker_mode_engine_runs_containers() {
     match read_frame::<_, Response>(&mut stats_conn).expect("stats reply") {
         Response::Stats(g) => {
             assert!(
-                g.process_count >= 1,
+                g.process_count >= 3,
                 "at least init+crun+dockerd: {}",
                 g.process_count
             );

@@ -1,5 +1,5 @@
 import { render, screen } from "@testing-library/react";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { runningStats, stoppedStats } from "./fixtures";
 
 import { ProcessesCard } from "../../components/overview/ProcessesCard";
@@ -43,5 +43,31 @@ describe("ProcessesCard", () => {
     render(<ProcessesCard stats={stoppedStats()} />);
     expect(screen.getByText("not running")).toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  });
+
+  describe("with a hostile guest reporting duplicate pids", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("does not warn React about a duplicate/missing \"key\" prop", () => {
+      // The guest is untrusted (see the file-header comment): it can report
+      // the same pid twice. A key derived from pid alone would collide and
+      // trip React's duplicate-key warning; the row index must be folded in.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const s = runningStats();
+      const dup = [
+        { pid: 7, comm: "a", state: "S", cpu_permille: 1, rss_kb: 1 },
+        { pid: 7, comm: "b", state: "S", cpu_permille: 2, rss_kb: 2 },
+      ];
+      render(<ProcessesCard stats={runningStats({ guest: { ...s.guest!, processes: dup } })} />);
+      const keyWarnings = errorSpy.mock.calls.filter((args) =>
+        String(args[0]).includes("key"),
+      );
+      expect(keyWarnings).toHaveLength(0);
+      // Both duplicate-pid rows still render distinctly.
+      expect(screen.getByText("a")).toBeInTheDocument();
+      expect(screen.getByText("b")).toBeInTheDocument();
+    });
   });
 });
