@@ -4,6 +4,8 @@
 //! [`DaemonDeps`] so unit tests run against socketpair fakes.
 
 use anyhow::{bail, Context};
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,7 +15,8 @@ use izba_proto::{read_frame, write_frame, Response};
 
 use crate::daemon::egress::EgressManager;
 use crate::daemon::proto::{
-    DaemonHello, DaemonRequest, DaemonResponse, DaemonStatus, SandboxDetail,
+    DaemonHello, DaemonRequest, DaemonResponse, DaemonStatus, HostDisk, HostResources,
+    SandboxDetail, SandboxStats, VolumeDisk,
 };
 use crate::daemon::registry::Registry;
 use crate::daemon::relays::{self, RelayManager};
@@ -139,6 +142,12 @@ pub struct Daemon {
     active_conns: AtomicUsize,
     shutdown: AtomicBool,
     idle_since: Mutex<Instant>,
+    /// Ephemeral per-sandbox CPU sample cache for `Stats` (#203). NOT
+    /// authoritative disk state — see [`StatsCpuCache`]'s own doc. Linux-only:
+    /// the host CPU/RSS tier itself is Linux-only (`/proc`), so a build for
+    /// any other target would otherwise carry a permanently-unread field.
+    #[cfg(target_os = "linux")]
+    stats_cpu: StatsCpuCache,
 }
 
 impl Daemon {
@@ -164,6 +173,8 @@ impl Daemon {
             active_conns: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             idle_since: Mutex::new(Instant::now()),
+            #[cfg(target_os = "linux")]
+            stats_cpu: StatsCpuCache::default(),
         }
     }
 
@@ -336,10 +347,7 @@ fn dispatch_inner(
             sandboxes: d.registry.summaries(),
         }),
         DaemonRequest::Inspect { name } => handle_inspect(d, name),
-        // Handler lands in a follow-up task (#203 stats facelift task 5); the
-        // wire types/proto bump land first so the shapes are fixed for the
-        // client/GUI work that consumes them.
-        DaemonRequest::Stats { .. } => bail!("stats RPC not yet implemented"),
+        DaemonRequest::Stats { name } => handle_stats(d, name),
         DaemonRequest::GuestRpc { name, req } => handle_guest_rpc(d, name, req),
         DaemonRequest::PortPublish {
             name,
@@ -728,6 +736,216 @@ fn probe_container_state(
     match read_frame::<_, Response>(&mut conn).ok()? {
         Response::Health(h) => h.container,
         _ => None,
+    }
+}
+
+/// Ephemeral per-sandbox CPU sample cache. NOT authoritative state (the
+/// disk-state invariant is untouched): losing it costs exactly one `None`
+/// cpu_permille sample. Keyed by PidIdentity so a restarted VMM (same pid,
+/// different starttime) never splices two processes' tick counters.
+///
+/// Linux-only, like the whole host CPU/RSS tier it backs (`/proc`-derived) —
+/// see `host_resources`'s `#[cfg(target_os = "linux")]` split.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub(crate) struct StatsCpuCache {
+    inner: Mutex<HashMap<String, (crate::state::PidIdentity, u64, Instant)>>,
+}
+
+#[cfg(target_os = "linux")]
+impl StatsCpuCache {
+    /// Record `ticks` for `name`/`id` at `now`; returns cpu_permille vs the
+    /// previous sample when identities match, else None.
+    fn observe(
+        &self,
+        name: &str,
+        id: &crate::state::PidIdentity,
+        ticks: u64,
+        now: Instant,
+    ) -> Option<u32> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = inner.insert(name.to_string(), (id.clone(), ticks, now));
+        let (pid, pticks, pat) = prev?;
+        if pid != *id {
+            return None;
+        }
+        let elapsed_ms = now.duration_since(pat).as_millis() as u64;
+        cpu_permille(pticks, ticks, elapsed_ms, host_clk_tck())
+    }
+}
+
+/// permille of one CPU given a tick delta over `elapsed_ms`. None on zero
+/// elapsed or non-monotonic ticks (an honest gap beats a junk spike).
+#[cfg(target_os = "linux")]
+fn cpu_permille(prev_ticks: u64, ticks: u64, elapsed_ms: u64, clk_tck: u64) -> Option<u32> {
+    if elapsed_ms == 0 || ticks < prev_ticks {
+        return None;
+    }
+    let delta = ticks - prev_ticks;
+    Some((delta.saturating_mul(1_000_000) / clk_tck.max(1).saturating_mul(elapsed_ms)) as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn host_clk_tck() -> u64 {
+    use nix::libc;
+    // SAFETY: sysconf is async-signal-safe and takes no pointers.
+    (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as u64
+}
+
+/// utime+stime (fields 14+15) from a /proc/<pid>/stat line.
+#[cfg(target_os = "linux")]
+fn vmm_ticks_from_stat(line: &str) -> Option<u64> {
+    let close = line.rfind(')')?;
+    let rest: Vec<&str> = line[close + 1..].split_ascii_whitespace().collect();
+    Some(rest.get(11)?.parse::<u64>().ok()? + rest.get(12)?.parse::<u64>().ok()?)
+}
+
+/// VmRSS from /proc/<pid>/status.
+#[cfg(target_os = "linux")]
+fn rss_kb_from_status(s: &str) -> Option<u64> {
+    s.lines()
+        .find(|l| l.starts_with("VmRSS:"))?
+        .split_ascii_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Guest Stats probe deadline — same wedged-guest discipline as
+/// CONTAINER_PROBE_TIMEOUT, plus headroom for the in-guest 250 ms sampling.
+const STATS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn handle_stats(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> {
+    let config: SandboxConfig = load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
+        .with_context(|| format!("no such sandbox '{name}'"))?;
+    let status = d
+        .registry
+        .liveness(&name)
+        .unwrap_or(Liveness::Stopped)
+        .describe();
+    let running = status != "stopped";
+    let run_state = load_json::<crate::state::RunState>(
+        &d.paths.sandbox_dir(&name).join(crate::state::STATE_FILE),
+    )?;
+    let disk = host_disk(&d.paths, &name, &config);
+    let (host, uptime_ms) = if running {
+        match &run_state {
+            Some(rs) => (
+                host_resources(d, &name, &config, &rs.vmm_pid),
+                Some(crate::usb::now_unix_ms().saturating_sub(rs.started_unix_ms)),
+            ),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+    let guest = if running {
+        probe_guest_stats(d, &name, STATS_PROBE_TIMEOUT)
+            .map(crate::daemon::stats::sanitize_guest_stats)
+    } else {
+        None
+    };
+    Ok(DaemonResponse::Stats(SandboxStats {
+        name,
+        running,
+        uptime_ms,
+        host,
+        disk,
+        guest,
+    }))
+}
+
+/// Best-effort guest Stats fetch, probe-shaped like probe_container_state:
+/// any failure (unreachable, wedged, pre-stats guest replying Error or
+/// dropping the conn) degrades to None, never an error or a hang.
+fn probe_guest_stats(
+    d: &Arc<Daemon>,
+    name: &str,
+    timeout: Duration,
+) -> Option<izba_proto::GuestStats> {
+    let mut conn = sandbox::control(&d.paths, name, d.connector()).ok()?;
+    conn.set_io_timeout(Some(timeout)).ok()?;
+    write_frame(&mut conn, &izba_proto::Request::Stats).ok()?;
+    match read_frame::<_, Response>(&mut conn).ok()? {
+        Response::Stats(g) => Some(g),
+        _ => None,
+    }
+}
+
+/// Trusted host-tier resources; Linux-only (/proc). PidIdentity is
+/// re-verified first so a recycled pid can never be read as the VMM.
+#[cfg(target_os = "linux")]
+fn host_resources(
+    d: &Arc<Daemon>,
+    name: &str,
+    config: &SandboxConfig,
+    id: &crate::state::PidIdentity,
+) -> Option<HostResources> {
+    if !crate::procmgr::pid_alive(id) {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", id.pid)).ok()?;
+    let status = std::fs::read_to_string(format!("/proc/{}/status", id.pid)).ok()?;
+    let ticks = vmm_ticks_from_stat(&stat)?;
+    let rss_kb = rss_kb_from_status(&status)?;
+    let cpu_permille = d.stats_cpu.observe(name, id, ticks, Instant::now());
+    Some(HostResources {
+        cpu_permille,
+        rss_kb,
+        cpus_limit: config.cpus,
+        mem_limit_mb: config.mem_mb,
+    })
+}
+#[cfg(not(target_os = "linux"))]
+fn host_resources(
+    _d: &Arc<Daemon>,
+    _name: &str,
+    _config: &SandboxConfig,
+    _id: &crate::state::PidIdentity,
+) -> Option<HostResources> {
+    None // Windows host tier is spec §9 out-of-scope; guest+disk tiers still work.
+}
+
+/// Host-disk breakdown; sparse-aware via allocated_bytes; works stopped.
+/// image_bytes is the content-addressed rootfs.erofs — SHARED between
+/// sandboxes on the same image, reported separately, never summed into the
+/// per-sandbox footprint by consumers.
+fn host_disk(paths: &Paths, name: &str, config: &SandboxConfig) -> HostDisk {
+    let alloc = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .map(|m| crate::sandbox::allocated_bytes(&m))
+            .unwrap_or(0)
+    };
+    let rw_img_bytes = alloc(&paths.sandbox_dir(name).join("rw.img"));
+    let volumes = config
+        .volumes
+        .iter()
+        // Ephemeral volumes get their eph_id at provision time (assign_eph_ids,
+        // run before config.json is ever persisted); a spec with neither a name
+        // nor an eph_id would panic VolumeSpec::image_path. Skip it defensively
+        // rather than crash the daemon on a request that is otherwise read-only.
+        .filter(|v| v.name.is_some() || v.eph_id.is_some())
+        .map(|v| VolumeDisk {
+            guest_path: v.guest_path.display().to_string(),
+            allocated_bytes: alloc(&v.image_path(paths, name)),
+            docker: crate::volume::is_docker_volume_path(&v.guest_path),
+        })
+        .collect();
+    let logs_bytes = std::fs::read_dir(paths.logs_dir(name))
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| crate::sandbox::allocated_bytes(&m))
+                .sum()
+        })
+        .unwrap_or(0);
+    let image_bytes = alloc(&paths.image_dir(&config.image_digest).join("rootfs.erofs"));
+    HostDisk {
+        rw_img_bytes,
+        volumes,
+        logs_bytes,
+        image_bytes,
     }
 }
 
@@ -3766,5 +3984,177 @@ mod tests {
             Ok(Err(_)) => panic!("run_daemon_with thread panicked"),
             Err(_) => panic!("run_daemon_with did not exit within 10s of Shutdown"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // #203 Stats handler (Task 5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn stats_on_stopped_sandbox_reports_disk_breakdown() {
+        let (dir, d) = test_daemon();
+        let name = "web";
+        let sdir = d.paths.sandbox_dir(name);
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::create_dir_all(d.paths.logs_dir(name)).unwrap();
+
+        let docker_vol = crate::volume::VolumeSpec {
+            name: None,
+            guest_path: "/var/lib/docker".into(),
+            size_bytes: 10 << 30,
+            eph_id: Some(0),
+        };
+        let config = SandboxConfig {
+            image_digest: "sha256:abc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 1,
+            mem_mb: 256,
+            workspace: dir.path().join("ws"),
+            ports: vec![],
+            volumes: vec![docker_vol.clone()],
+            builder: false,
+            build: None,
+            rw_size_gb: 1,
+            usb: Default::default(),
+            docker: true,
+        };
+        save_json(&sdir.join(CONFIG_FILE), &config).unwrap();
+
+        // sandbox_dir/rw.img: sparse 1 GiB, 1 MiB of real data written.
+        let rw_path = sdir.join("rw.img");
+        {
+            let f = std::fs::File::create(&rw_path).unwrap();
+            f.set_len(1 << 30).unwrap();
+        }
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&rw_path)
+                .unwrap();
+            f.write_all(&vec![0xABu8; 1 << 20]).unwrap();
+        }
+        // Sparse-aware skip: a filesystem that cannot represent holes (some
+        // container overlays / exotic tmpfs configs) would allocate the full
+        // apparent length up front, which would fail the `< len` assertion
+        // below for a reason that has nothing to do with the Stats handler.
+        let rw_allocated = crate::sandbox::allocated_bytes(&std::fs::metadata(&rw_path).unwrap());
+        if rw_allocated >= 1 << 30 {
+            eprintln!(
+                "SKIP stats_on_stopped_sandbox_reports_disk_breakdown: {} does not support sparse files",
+                sdir.display()
+            );
+            return;
+        }
+
+        // Docker volume image: sparse, 2 MiB of real data written.
+        let vol_path = docker_vol.image_path(&d.paths, name);
+        std::fs::create_dir_all(vol_path.parent().unwrap()).unwrap();
+        {
+            let f = std::fs::File::create(&vol_path).unwrap();
+            f.set_len(10 << 30).unwrap();
+        }
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&vol_path)
+                .unwrap();
+            f.write_all(&vec![0xCDu8; 2 << 20]).unwrap();
+        }
+
+        // logs_dir/console.log — 4096 bytes.
+        std::fs::write(d.paths.logs_dir(name).join("console.log"), vec![0u8; 4096]).unwrap();
+
+        // image_dir(digest)/rootfs.erofs — 8192 bytes.
+        let img_dir = d.paths.image_dir(&config.image_digest);
+        std::fs::create_dir_all(&img_dir).unwrap();
+        std::fs::write(img_dir.join("rootfs.erofs"), vec![0u8; 8192]).unwrap();
+
+        let mut c = client_conn(&d);
+        match rpc(&mut c, &DaemonRequest::Stats { name: name.into() }) {
+            DaemonResponse::Stats(s) => {
+                assert!(!s.running);
+                assert_eq!(s.uptime_ms, None);
+                assert!(s.host.is_none());
+                assert!(s.guest.is_none());
+                assert!(
+                    s.disk.rw_img_bytes >= 1024 * 1024,
+                    "sparse-aware: allocated, not len; got {}",
+                    s.disk.rw_img_bytes
+                );
+                assert!(
+                    s.disk.rw_img_bytes < 1024 * 1024 * 1024,
+                    "must not report the sparse length"
+                );
+                let dv = s
+                    .disk
+                    .volumes
+                    .iter()
+                    .find(|v| v.docker)
+                    .expect("docker volume attributed");
+                assert!(dv.allocated_bytes >= 2 * 1024 * 1024 - 65536);
+                assert!(s.disk.logs_bytes >= 4096);
+                assert!(s.disk.image_bytes >= 8192);
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_on_missing_sandbox_errors() {
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        match rpc(
+            &mut c,
+            &DaemonRequest::Stats {
+                name: "nope".into(),
+            },
+        ) {
+            DaemonResponse::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_permille_from_tick_delta() {
+        // 50 ticks over 1000 ms at 100 Hz = half a CPU = 500 permille.
+        assert_eq!(cpu_permille(1000, 1050, 1000, 100), Some(500));
+        // Non-monotonic (VMM restarted / cache stale): honest None, never junk.
+        assert_eq!(cpu_permille(2000, 1000, 1000, 100), None);
+        assert_eq!(cpu_permille(0, 0, 0, 100), None); // zero elapsed
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_vmm_stat_ticks_and_status_rss() {
+        let stat =
+            "1234 (cloud-hyperviso) S 1 1 1 0 -1 4194560 0 0 0 0 700 300 0 0 20 0 8 0 555 0 99999 0";
+        assert_eq!(vmm_ticks_from_stat(stat), Some(1000));
+        let status = "Name:\tcloud-hyperviso\nVmPeak:\t 9999 kB\nVmRSS:\t 2621440 kB\n";
+        assert_eq!(rss_kb_from_status(status), Some(2_621_440));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stats_cache_is_keyed_by_pid_identity() {
+        let cache = StatsCpuCache::default();
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let id_a = crate::state::PidIdentity {
+            pid: 10,
+            starttime: 111,
+        };
+        let id_b = crate::state::PidIdentity {
+            pid: 10,
+            starttime: 222,
+        }; // reused pid
+        assert_eq!(cache.observe("web", &id_a, 1000, ms(0)), None); // first sample
+                                                                    // Same identity, second sample: yields a rate rather than None. The exact
+                                                                    // permille value depends on the host's actual CLK_TCK (host_clk_tck() is
+                                                                    // NOT injectable here — this asserts the presence of a rate, not its
+                                                                    // magnitude, which is covered precisely by cpu_permille_from_tick_delta).
+        assert!(cache.observe("web", &id_a, 1100, ms(1000)).is_some());
+        // Same pid, NEW process: must reset, never splice tick counters.
+        assert_eq!(cache.observe("web", &id_b, 50, ms(2000)), None);
     }
 }

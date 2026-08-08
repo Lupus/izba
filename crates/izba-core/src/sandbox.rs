@@ -1569,7 +1569,7 @@ fn ensure_volume_not_shared(paths: &Paths, vol: &str, current: &str) -> anyhow::
     Ok(())
 }
 /// On-disk allocation: blocks × 512 on Unix, file length elsewhere.
-fn allocated_bytes(meta: &fs::Metadata) -> u64 {
+pub(crate) fn allocated_bytes(meta: &fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
