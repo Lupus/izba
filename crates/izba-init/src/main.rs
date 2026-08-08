@@ -5,6 +5,7 @@
 //! Shutdown: kill all workloads, sync, power off.
 
 mod cmdline;
+mod docker;
 mod egress;
 mod exec;
 mod hosts;
@@ -294,6 +295,33 @@ fn run_pid1() -> anyhow::Result<()> {
                         "izba-init: *** DOCKER-MODE VETH SETUP FAILED *** {e}; the container has no network"
                     );
                 }
+                // Cgroup delegation: dockerd running inside the container
+                // needs `+controller` entries in every ancestor's
+                // cgroup.subtree_control to create its own nested cgroups.
+                // Best-effort (loud, non-fatal) — a kernel/controller gap
+                // degrades nested resource limits but must not block the
+                // engine from starting at all.
+                let cgroup_path = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                    .ok()
+                    .and_then(|s| docker::parse_cgroup_path(&s));
+                match cgroup_path {
+                    Some(cg) => {
+                        if let Err(e) =
+                            docker::apply_delegation(std::path::Path::new("/sys/fs/cgroup"), &cg)
+                        {
+                            eprintln!(
+                                "izba-init: docker-mode cgroup delegation incomplete: {e} (nested container limits degraded)"
+                            );
+                        }
+                    }
+                    None => eprintln!(
+                        "izba-init: docker-mode cgroup delegation skipped: container cgroup unknown"
+                    ),
+                }
+                // Auto-start the engine regardless of delegation outcome —
+                // dockerd still runs (with degraded nested limits) rather
+                // than never starting at all.
+                docker::start_engine();
             }
             None => eprintln!(
                 "izba-init: *** DOCKER-MODE VETH SETUP SKIPPED *** container pid unavailable (container not running?)"
