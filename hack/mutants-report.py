@@ -82,18 +82,43 @@ def read_caught(out_dir):
     return ids
 
 
+def read_unviable(out_dir):
+    """Set of id_hashes for mutants UNVIABLE in this run (<out_dir>/unviable.txt).
+
+    Same line format as missed.txt/caught.txt. An unviable mutant failed to
+    BUILD on the platform that actually compiles that code (e.g. cargo-mutants
+    generating `Some(Default::default())` for a type with no `Default` impl) —
+    it is not evidence of a test-coverage gap, so it must suppress the phantom
+    "missed" the OTHER platform reports where the code is cfg'd out. Without
+    this, a cfg-gated function whose generated mutant cannot compile is an
+    unfixable false survivor (issue #208).
+    """
+    fp = os.path.join(out_dir, "unviable.txt")
+    if not os.path.exists(fp):
+        return set()
+    ids = set()
+    with open(fp) as f:
+        for raw in f:
+            m = _parse_line(raw)
+            if m:
+                ids.add(m.id_hash)
+    return ids
+
+
 def merge(dirs):
     """Real survivors across one or more runs (shards and/or platforms).
 
-    A mutant is a real survivor iff it was MISSED somewhere and CAUGHT NOWHERE.
-    Within a platform the shards partition the mutant set (union). Across
-    platforms this reconciles cargo-mutants' cfg blindness: a mutant killed by
-    ANY platform's tests is not a gap, even if another platform (where the code
-    is cfg'd out) reported it missed.
+    A mutant is a real survivor iff it was MISSED somewhere and neither CAUGHT
+    nor UNVIABLE anywhere. Within a platform the shards partition the mutant
+    set (union). Across platforms this reconciles cargo-mutants' cfg
+    blindness: a mutant killed by ANY platform's tests — or impossible to
+    build on the platform that compiles it — is not a gap, even if another
+    platform (where the code is cfg'd out) reported it missed.
     """
     caught_ids = set()
     for d in dirs:
         caught_ids |= read_caught(d)
+        caught_ids |= read_unviable(d)
     seen = {}
     for d in dirs:
         for m in read_missed(d):

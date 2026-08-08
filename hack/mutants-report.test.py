@@ -5,7 +5,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("mr", os.path.join(HERE, "mutants-report.py"))
 mr = importlib.util.module_from_spec(spec); spec.loader.exec_module(mr)
 
-def _outdir(tmp, name, missed_lines, total_mutants=None, caught_lines=None):
+def _outdir(tmp, name, missed_lines, total_mutants=None, caught_lines=None, unviable_lines=None):
     d = os.path.join(tmp, name, "mutants.out")
     os.makedirs(d)
     with open(os.path.join(d, "missed.txt"), "w") as f:
@@ -13,6 +13,9 @@ def _outdir(tmp, name, missed_lines, total_mutants=None, caught_lines=None):
     if caught_lines is not None:
         with open(os.path.join(d, "caught.txt"), "w") as f:
             f.write("\n".join(caught_lines) + ("\n" if caught_lines else ""))
+    if unviable_lines is not None:
+        with open(os.path.join(d, "unviable.txt"), "w") as f:
+            f.write("\n".join(unviable_lines) + ("\n" if unviable_lines else ""))
     if total_mutants is not None:
         with open(os.path.join(d, "outcomes.json"), "w") as f:
             json.dump({"total_mutants": total_mutants}, f)
@@ -102,6 +105,23 @@ def test_caught_on_other_platform_suppresses_survivor():
         assert "crates/izba-core/src/procmgr/jail_windows.rs" not in paths  # suppressed
         assert "crates/izba-core/src/sandbox.rs" in paths                    # genuine gap kept
         assert len(survivors) == 1
+
+def test_unviable_on_compiling_platform_suppresses_phantom_miss():
+    # cfg(target_os = "linux") mutant whose generated replacement doesn't even
+    # compile: UNVIABLE on Linux (the only platform that builds the code) and
+    # phantom-MISSED on Windows (cfg'd out there, so the mutated tree builds
+    # trivially). Not a coverage gap — must be suppressed (issue #208).
+    cfg_lin = "crates/izba-core/src/daemon/server.rs:880:5: replace host_resources -> Option<HostResources> with Some(Default::default())"
+    real_gap = "crates/izba-core/src/sandbox.rs:20:5: replace go -> Result<()> with Ok(())"
+    with tempfile.TemporaryDirectory() as t:
+        linux = _outdir(t, "lin", [real_gap], caught_lines=[], unviable_lines=[cfg_lin])
+        windows = _outdir(t, "win", [cfg_lin, real_gap], caught_lines=[])
+        survivors = mr.merge([linux, windows])
+        paths = [m.path for m in survivors]
+        assert "crates/izba-core/src/daemon/server.rs" not in paths  # unviable ⇒ suppressed
+        assert "crates/izba-core/src/sandbox.rs" in paths            # genuine gap kept
+        assert len(survivors) == 1
+
 
 def test_missed_on_both_platforms_is_a_real_gap():
     line = "crates/izba-core/src/sandbox.rs:20:5: replace go -> Result<()> with Ok(())"
