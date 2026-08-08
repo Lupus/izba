@@ -4151,6 +4151,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn probe_guest_stats_folds_a_real_guest_reply() {
+        // The fake guest connector answers Request::Stats with a real
+        // Response::Stats(GuestStats) (see testutil::fake_guest_stats). This
+        // kills both `probe_guest_stats -> None` (the function must actually
+        // return the guest's reply, not degrade unconditionally) and the
+        // `delete match arm Response::Stats(g)` mutant (deleting that arm
+        // routes a genuine Stats reply through the `_ => None` catch-all).
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        write_state(&d.paths, "web", live_identity()); // running per pid probe
+
+        let guest = probe_guest_stats(&d, "web", STATS_PROBE_TIMEOUT);
+        let g = guest.expect("fake guest answers Request::Stats");
+        assert_eq!(g.process_count, 7, "the marker field must survive intact");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_resources_reports_the_live_test_process() {
+        // Uses the test process itself as the "vmm": a PidIdentity built with
+        // the correct starttime (procmgr::proc_starttime, same helper used at
+        // real spawn time) is unambiguously alive, so host_resources must
+        // return Some with real /proc-derived fields — kills `host_resources
+        // -> None`.
+        let (_dir, d) = test_daemon();
+        let config = SandboxConfig {
+            image_digest: "sha256:abc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem_mb: 512,
+            workspace: "/ws".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+            rw_size_gb: 1,
+            usb: Default::default(),
+            docker: false,
+        };
+        let id = live_identity();
+        let res = host_resources(&d, "web", &config, &id).expect("live pid must report resources");
+        assert!(res.rss_kb > 0, "expected a real VmRSS reading, got 0");
+        assert_eq!(res.cpus_limit, 2);
+        assert_eq!(res.mem_limit_mb, 512);
+
+        // Same pid, wrong starttime (simulates a recycled pid): the identity
+        // re-check must refuse it, never read the wrong process. This kills
+        // `delete !` on the pid_alive gate (which would flip the guard to
+        // "refuse the live identity, accept the dead one").
+        let wrong = crate::testutil::dead_identity();
+        assert!(
+            host_resources(&d, "web", &config, &wrong).is_none(),
+            "a recycled pid must never be read as the live vmm"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn host_resources_stub_is_always_none() {
+        // The non-Linux host tier is out of scope (spec §9): host_resources
+        // must always degrade to None here, never fabricate a Default
+        // reading. Kills `host_resources -> Some(Default::default())`.
+        let (_dir, d) = test_daemon();
+        let config = SandboxConfig {
+            image_digest: "sha256:abc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 1,
+            mem_mb: 256,
+            workspace: "/ws".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+            rw_size_gb: 1,
+            usb: Default::default(),
+            docker: false,
+        };
+        let id = live_identity();
+        assert!(host_resources(&d, "web", &config, &id).is_none());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn cpu_permille_from_tick_delta() {
@@ -4159,6 +4245,21 @@ mod tests {
         // Non-monotonic (VMM restarted / cache stale): honest None, never junk.
         assert_eq!(cpu_permille(2000, 1000, 1000, 100), None);
         assert_eq!(cpu_permille(0, 0, 0, 100), None); // zero elapsed
+                                                      // Equal ticks (no CPU consumed this interval) is a valid 0% sample,
+                                                      // NOT a gap: `ticks < prev_ticks` must stay strict (`<`), never `<=`.
+        assert_eq!(cpu_permille(1000, 1000, 1000, 100), Some(0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_clk_tck_is_a_sane_user_hz() {
+        // USER_HZ is >= 24 on any real kernel (100 is the typical value); an
+        // upper bound of 10_000 guards against a nonsense sysconf() result.
+        // This kills both `host_clk_tck -> 0` and `host_clk_tck -> 1` mutants
+        // (0 is below the floor; 1 would also make cpu_permille observably
+        // wrong, but the direct range assertion is the precise kill).
+        let t = host_clk_tck();
+        assert!((24..=10_000).contains(&t), "implausible CLK_TCK: {t}");
     }
 
     #[cfg(target_os = "linux")]

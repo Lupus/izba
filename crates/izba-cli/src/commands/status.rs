@@ -7,6 +7,14 @@ use izba_core::daemon::DaemonClient;
 use izba_core::jail_account::orchestrate::lockdown_state;
 use izba_core::paths::Paths;
 
+/// Whether `run()` should fetch guest stats at all (#203): only worth the
+/// extra RPC for a running docker-mode sandbox, since that's the only case
+/// `engine_line` renders anything from `stats`.
+fn wants_engine_stats(det: &SandboxDetail) -> bool {
+    det.docker && det.status == "running"
+}
+
+#[mutants::skip] // reason: drives a live daemon (Inspect + best-effort Stats RPCs); orchestration exercised by daemon_e2e (docker_publish_reaches_inner_container asserts the engine line end-to-end). The pure pieces (wants_engine_stats, engine_line, render) are unit-tested separately.
 pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     let mut client = DaemonClient::connect(paths)?;
     match client.request(&DaemonRequest::Inspect { name: name.into() }, &mut |_| {})? {
@@ -15,7 +23,7 @@ pub fn run(paths: &Paths, name: &str) -> anyhow::Result<i32> {
             // surface nested-Docker-Engine liveness. Best-effort: any
             // transport error or non-Stats reply degrades to `None`
             // ("unknown") rather than failing `status` outright.
-            let stats = if det.docker && det.status == "running" {
+            let stats = if wants_engine_stats(&det) {
                 match client.request(&DaemonRequest::Stats { name: name.into() }, &mut |_| {}) {
                     Ok(DaemonResponse::Stats(s)) => Some(s),
                     _ => None,
@@ -168,6 +176,26 @@ mod tests {
             user_fallback: None,
             docker: false,
         }
+    }
+
+    #[test]
+    fn wants_engine_stats_is_docker_and_running() {
+        // All four docker×status combinations pin the exact `docker &&
+        // status == "running"` truth table, so a flipped `&&`/`||` or a
+        // flipped `==`/`!=` cannot survive.
+        let mut det = detail(None);
+        det.docker = false;
+        det.status = "stopped".into();
+        assert!(!wants_engine_stats(&det), "neither ⇒ off");
+        det.docker = true;
+        det.status = "stopped".into();
+        assert!(!wants_engine_stats(&det), "docker but not running ⇒ off");
+        det.docker = false;
+        det.status = "running".into();
+        assert!(!wants_engine_stats(&det), "running but not docker ⇒ off");
+        det.docker = true;
+        det.status = "running".into();
+        assert!(wants_engine_stats(&det), "docker and running ⇒ on");
     }
 
     #[test]
