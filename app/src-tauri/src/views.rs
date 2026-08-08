@@ -797,6 +797,7 @@ mod tests {
             confinement: None,
             container: Some(izba_proto::ContainerState::Stopped),
             user_fallback: None,
+            docker: false,
         };
         let v = SandboxDetailView::from(detail);
         assert_eq!(v.name, "web");
@@ -827,6 +828,7 @@ mod tests {
             confinement: None,
             container: None,
             user_fallback: None,
+            docker: false,
         };
         let v = SandboxDetailView::from(detail);
         assert_eq!(v.workspace, r"C:\Users\u\proj");

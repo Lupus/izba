@@ -258,6 +258,13 @@ pub struct SandboxDetail {
     /// the CLI prints nothing.
     #[serde(default)]
     pub user_fallback: Option<String>,
+    /// Whether this sandbox runs in docker mode (#198): own netns + veth,
+    /// userns-scoped admin caps, an auto `/var/lib/docker` volume, and an
+    /// auto-started Docker Engine. Surfaced by `izba status`/`inspect` per
+    /// spec §1. Additive + serde(default) → no DAEMON_PROTO_VERSION bump;
+    /// `false` for an older daemon's frames and for non-docker sandboxes.
+    #[serde(default)]
+    pub docker: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +569,7 @@ mod tests {
                 confinement: Some("confined: restricted(limited)+low-il+job".into()),
                 container: Some(izba_proto::ContainerState::Running),
                 user_fallback: Some("node".into()),
+                docker: false,
             }),
             DaemonResponse::Ports { rules: vec![] },
             DaemonResponse::Pruned {
@@ -681,13 +689,52 @@ mod tests {
             confinement: None,
             container: Some(izba_proto::ContainerState::Stopped),
             user_fallback: None,
+            docker: true,
         });
         let json = serde_json::to_string(&resp).unwrap();
         let back: DaemonResponse = serde_json::from_str(&json).unwrap();
         match back {
             DaemonResponse::Inspect(det) => {
                 assert_eq!(det.container, Some(izba_proto::ContainerState::Stopped));
+                // #198: docker mode surfaces over the Inspect wire.
+                assert!(det.docker, "docker flag must round-trip");
             }
+            other => panic!("expected Inspect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_docker_field_defaults_false_for_older_daemon_frames() {
+        // A pre-#198 daemon's Inspect frame has no `docker` key; serde(default)
+        // must deserialize it to `false` (no DAEMON_PROTO_VERSION bump). Build
+        // the frame from a real SandboxDetail and drop the key, so this stays
+        // faithful to the derived wire shape rather than a hand-typed guess.
+        let resp = DaemonResponse::Inspect(SandboxDetail {
+            name: "web".into(),
+            image_ref: "i".into(),
+            image_digest: "d".into(),
+            cpus: 1,
+            mem_mb: 512,
+            workspace: "/ws".into(),
+            status: "running".into(),
+            ports: vec![],
+            volumes: vec![],
+            confinement: None,
+            container: None,
+            user_fallback: None,
+            docker: true,
+        });
+        // DaemonResponse is internally tagged (`#[serde(tag = "type")]`), so a
+        // newtype variant flattens its struct's fields alongside `type` at the
+        // top level — the `docker` key lives there, not under an "Inspect" key.
+        let mut v = serde_json::to_value(&resp).unwrap();
+        assert!(
+            v.as_object_mut().unwrap().remove("docker").is_some(),
+            "the serialized frame must have carried a docker key to remove"
+        );
+        let back: DaemonResponse = serde_json::from_value(v).unwrap();
+        match back {
+            DaemonResponse::Inspect(det) => assert!(!det.docker),
             other => panic!("expected Inspect, got {other:?}"),
         }
     }
