@@ -90,6 +90,9 @@ pub trait DaemonApi: Send {
     fn policy_set_enforce(&mut self, name: &str, on: bool) -> anyhow::Result<()>;
     /// Full sandbox detail (ports + volumes included).
     fn inspect(&mut self, name: &str) -> anyhow::Result<izba_core::daemon::proto::SandboxDetail>;
+    /// Resource stats for one sandbox: host CPU/RSS/disk plus a sanitized
+    /// guest-reported mini-top/mounts/docker-engine snapshot (#203).
+    fn stats(&mut self, name: &str) -> anyhow::Result<izba_core::daemon::proto::SandboxStats>;
     /// List active port-publish rules for `name`.
     fn port_list(&mut self, name: &str) -> anyhow::Result<Vec<izba_core::state::PortRule>>;
     /// Publish a port rule for `name`.
@@ -452,6 +455,17 @@ impl DaemonApi for RealDaemon {
                 DaemonResponse::Inspect(d) => Ok(d),
                 DaemonResponse::Error { message } => anyhow::bail!("{message}"),
                 other => anyhow::bail!("unexpected Inspect reply: {other:?}"),
+            },
+        )
+    }
+
+    fn stats(&mut self, name: &str) -> anyhow::Result<izba_core::daemon::proto::SandboxStats> {
+        let name = name.to_string();
+        self.with_client(
+            |c| match c.request(&DaemonRequest::Stats { name }, &mut |_| {})? {
+                DaemonResponse::Stats(s) => Ok(s),
+                DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected Stats reply: {other:?}"),
             },
         )
     }
