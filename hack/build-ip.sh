@@ -44,7 +44,22 @@ docker run --rm \
   # on glibc but not on musl (musl declares the htobe64 family in <endian.h>
   # only). Forcing the include fixes the "implicit declaration of function
   # htobe64" build failure without patching upstream source.
-  make -j"$(nproc)" SUBDIRS="lib ip" LDFLAGS="-static" CCOPTS="-O2 -pipe -include endian.h"
+  #
+  # SHARED_LIBS=n is LOAD-BEARING, not a size tweak. iproute2 resolves a link
+  # KIND (`ip link add ... type veth`) through get_link_kind(), which by
+  # default looks the handler up with dlsym() against dlopen(NULL) — a lookup
+  # that always fails in a fully static binary (no dynamic symbol table). The
+  # symptom is not an honest "unknown type" but iproute2 falling through to
+  # generic argument parsing and dying with
+  #   Garbage instead of arguments "peer ...". Try "ip link help".
+  # so `ip link add veth0 type veth peer name veth1` — the first command of
+  # the docker-mode veth datapath — is simply impossible with a default
+  # static build (confirmed on a real guest boot, Task 7). SHARED_LIBS=n makes
+  # iproute2 compile ip/static-syms.c instead, resolving link kinds from a
+  # generated static symbol table. Keep this flag whenever ip is built static.
+  # (No apostrophes in this comment block: it lives inside a single-quoted
+  # `sh -euc` string, and one would terminate it.)
+  make -j"$(nproc)" SUBDIRS="lib ip" SHARED_LIBS=n LDFLAGS="-static" CCOPTS="-O2 -pipe -include endian.h"
   strip ip/ip && cp ip/ip /out/ip
 '
 file "$OUT" | grep -q "statically linked" || { echo "error: $OUT is not static" >&2; exit 1; }
