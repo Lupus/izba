@@ -325,6 +325,75 @@ impl DaemonApi for FakeDaemon {
         })
     }
 
+    fn stats(&mut self, name: &str) -> anyhow::Result<izba_core::daemon::proto::SandboxStats> {
+        use izba_core::daemon::proto::{HostDisk, HostResources, SandboxStats, VolumeDisk};
+        if !self.sandboxes.iter().any(|s| s.name == name) {
+            anyhow::bail!("sandbox '{name}' not found");
+        }
+        Ok(SandboxStats {
+            name: name.to_string(),
+            running: true,
+            uptime_ms: Some(1234),
+            host: Some(HostResources {
+                cpu_permille: Some(340),
+                rss_kb: 2_621_440,
+                cpus_limit: 2,
+                mem_limit_mb: 4096,
+            }),
+            disk: HostDisk {
+                rw_img_bytes: 1_288_490_189,
+                volumes: vec![VolumeDisk {
+                    guest_path: "/var/lib/docker".into(),
+                    allocated_bytes: 2_254_857_830,
+                    docker: true,
+                }],
+                logs_bytes: 12_582_912,
+                image_bytes: 933_232_640,
+            },
+            guest: Some(izba_proto::GuestStats {
+                processes: vec![
+                    izba_proto::ProcSample {
+                        pid: 1,
+                        comm: "init".into(),
+                        state: 'S',
+                        cpu_permille: 5,
+                        rss_kb: 4_096,
+                    },
+                    izba_proto::ProcSample {
+                        pid: 42,
+                        comm: "node".into(),
+                        state: 'R',
+                        cpu_permille: 210,
+                        rss_kb: 65_536,
+                    },
+                    izba_proto::ProcSample {
+                        pid: 77,
+                        comm: "dockerd".into(),
+                        state: 'S',
+                        cpu_permille: 12,
+                        rss_kb: 32_768,
+                    },
+                ],
+                process_count: 61,
+                load1_centi: 42,
+                load5_centi: 30,
+                load15_centi: 19,
+                mem_total_kb: 4 * 1024 * 1024,
+                mem_available_kb: 2 * 1024 * 1024,
+                mounts: vec![izba_proto::MountUsage {
+                    path: "/var/lib/docker".into(),
+                    total_bytes: 10 * 1024 * 1024 * 1024,
+                    avail_bytes: 8 * 1024 * 1024 * 1024,
+                }],
+                docker: Some(izba_proto::DockerEngine {
+                    running: true,
+                    detail: None,
+                }),
+                container: Some(izba_proto::ContainerState::Running),
+            }),
+        })
+    }
+
     fn port_list(&mut self, _name: &str) -> anyhow::Result<Vec<izba_core::state::PortRule>> {
         Ok(self.ports.clone())
     }

@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use crate::daemon::DaemonApi;
 use crate::views::{
     app_build_info, CreateOpts, DaemonStatusView, DiffView, PolicyView, PortRuleView, PromoteView,
-    SandboxDetailView, SandboxView, SeedEntry, UsbDeviceView, UsbStatusView, UsbUpstreamView,
-    VersionView, VolumeInfoView,
+    SandboxDetailView, SandboxStatsView, SandboxView, SeedEntry, UsbDeviceView, UsbStatusView,
+    UsbUpstreamView, VersionView, VolumeInfoView,
 };
 use izba_core::daemon::egress::audit::EndpointSummary;
 use izba_core::daemon::egress::config::{AllowEntry, GitRule};
@@ -269,6 +269,13 @@ pub fn policy_set_enforce_core(d: &mut dyn DaemonApi, name: &str, on: bool) -> R
 pub fn inspect_core(d: &mut dyn DaemonApi, name: &str) -> Result<SandboxDetailView, String> {
     d.inspect(name)
         .map(SandboxDetailView::from)
+        .map_err(|e| e.to_string())
+}
+
+/// Core of `stats`: resource stats for one sandbox mapped to a view.
+pub fn stats_core(d: &mut dyn DaemonApi, name: &str) -> Result<SandboxStatsView, String> {
+    d.stats(name)
+        .map(SandboxStatsView::from)
         .map_err(|e| e.to_string())
 }
 
@@ -922,6 +929,20 @@ mod tests {
         assert!(v.ports.is_empty());
         assert!(v.volumes.is_empty());
         assert_eq!(v.container.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn stats_core_returns_mapped_view() {
+        let mut d = FakeDaemon::default();
+        let v = stats_core(&mut d, "web").unwrap();
+        assert_eq!(v.name, "web");
+        assert!(v.disk.rw_img_bytes > 0);
+    }
+
+    #[test]
+    fn stats_core_maps_daemon_error() {
+        let mut d = FakeDaemon::default();
+        assert!(stats_core(&mut d, "missing").is_err());
     }
 
     #[test]
