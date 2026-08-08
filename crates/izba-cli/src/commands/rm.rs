@@ -97,6 +97,7 @@ mod tests {
             confinement: None,
             container: None,
             user_fallback: None,
+            docker: false,
         }
     }
 

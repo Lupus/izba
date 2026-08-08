@@ -321,6 +321,7 @@ impl DaemonApi for FakeDaemon {
             confinement: None,
             container: Some(izba_proto::ContainerState::Running),
             user_fallback: None,
+            docker: false,
         })
     }
 

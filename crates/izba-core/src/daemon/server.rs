@@ -697,6 +697,7 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
         confinement,
         container,
         user_fallback,
+        docker: config.docker,
     }))
 }
 

@@ -48,6 +48,14 @@ fn render(paths: &Paths, det: &SandboxDetail) -> String {
         confinement,
         lockdown,
     );
+    if det.docker {
+        // #198, spec §1: docker mode is a materially different security +
+        // network profile (own netns + veth, userns-scoped admin caps, an
+        // auto /var/lib/docker volume, an auto-started Docker Engine), so it
+        // must be visible in `status`/`inspect`. Only shown when on — a normal
+        // sandbox stays lean.
+        out.push_str("mode:        docker (nested Docker Engine)\n");
+    }
     if let Some(declared) = det.user_fallback.as_deref() {
         // Loud-on-degradation (#114): the workload runs as root because the
         // image's symbolic USER could not be resolved host-side — this line
@@ -111,6 +119,7 @@ mod tests {
             confinement: confinement.map(String::from),
             container,
             user_fallback: None,
+            docker: false,
         }
     }
 
@@ -224,6 +233,25 @@ mod tests {
         let paths = test_paths(&tmp);
         let out = render(&paths, &detail(None));
         assert!(!out.contains("USER"), "got: {out}");
+    }
+
+    #[test]
+    fn renders_docker_mode_when_on() {
+        // #198 / spec §1: a docker-mode sandbox must surface it in `status`.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.docker = true;
+        let out = render(&paths, &det);
+        assert!(out.contains("mode:        docker"), "got: {out}");
+    }
+
+    #[test]
+    fn no_docker_line_for_a_normal_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let out = render(&paths, &detail(None));
+        assert!(!out.contains("mode:"), "got: {out}");
     }
 
     #[test]
