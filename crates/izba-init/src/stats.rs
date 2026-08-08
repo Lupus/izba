@@ -292,6 +292,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_stat_line_accepts_the_minimal_22_field_tail() {
+        // rss is rest[21], so a tail of EXACTLY 22 fields is the shortest
+        // valid line and must parse (the length guard is `< 22`, not `<= 22`).
+        let line = "7 (x) S 1 1 1 0 -1 0 0 0 0 0 4 6 0 0 20 0 1 0 300 77";
+        assert!(parse_stat_line(line).is_none(), "21 fields is one short");
+        let line = "7 (x) S 1 1 1 0 -1 0 0 0 0 0 4 6 0 0 20 0 1 0 300 1000 77";
+        let p = parse_stat_line(line).unwrap();
+        assert_eq!(p.ticks, 10); // utime 4 + stime 6
+        assert_eq!(p.rss_pages, 77); // rest[21] — the 22nd (last) field
+    }
+
+    #[test]
+    fn statfs_real_reports_a_real_filesystem() {
+        // The production statvfs path (everything else injects a fake probe):
+        // "/" always exists, is at least a few MiB, and avail can never
+        // exceed total — which pins the (total, avail) tuple order and kills
+        // the constant-replacement mutants. A missing path must be None.
+        let (total, avail) = statfs_real(Path::new("/")).expect("statvfs on / must succeed");
+        assert!(total > 1024 * 1024, "implausibly small root fs: {total}");
+        assert!(avail <= total, "avail {avail} cannot exceed total {total}");
+        assert!(statfs_real(Path::new("/definitely-not-a-real-path-izba")).is_none());
+    }
+
+    #[test]
     fn parse_stat_line_rejects_garbage() {
         assert!(parse_stat_line("").is_none());
         assert!(parse_stat_line("1 (x").is_none());
