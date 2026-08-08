@@ -24,13 +24,15 @@ export function OverviewCard({
   );
 }
 
-/** One label/value line. The value is right-aligned against a muted label so
- *  the cards line up without a table. */
+/** One label/value line: a fixed-width muted label column with the value
+ *  LEFT-aligned beside it (the approved wireframe's shape). A left value
+ *  column is scannable — right-aligning ragged-length values like a path or
+ *  "engine not running — see logs" gives the card a jagged edge. */
 export function Row({ label, children }: Readonly<{ label: string; children: ReactNode }>) {
   return (
-    <div className="flex items-baseline justify-between gap-3 py-0.5">
-      <span className="shrink-0 text-muted-foreground-2">{label}</span>
-      <span className="min-w-0 text-right">{children}</span>
+    <div className="flex items-baseline gap-3 py-0.5">
+      <span className="w-24 shrink-0 text-muted-foreground-2">{label}</span>
+      <span className="min-w-0 flex-1">{children}</span>
     </div>
   );
 }

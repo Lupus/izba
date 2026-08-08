@@ -36,14 +36,20 @@ export function SandboxCard({
   state,
   detail,
   stats,
+  stale = false,
 }: Readonly<{
   name: string;
   state: SbxState;
   detail: SandboxDetail | null;
   stats: SandboxStats | null;
+  /** The poller is failing and `stats` is the last good snapshot. Every
+   *  live-implying reading (uptime, container state, docker engine) degrades
+   *  to its unknown form: a stale byte must never keep claiming health. */
+  stale?: boolean;
 }>) {
-  const uptime = stats?.uptime_ms != null ? ` · ${formatUptime(stats.uptime_ms)}` : "";
-  const docker = dockerRow(stats);
+  const fresh = stale ? null : stats;
+  const uptime = fresh?.uptime_ms != null ? ` · ${formatUptime(fresh.uptime_ms)}` : "";
+  const docker = dockerRow(fresh);
   const workspace = detail?.workspace ?? "";
 
   return (
@@ -55,9 +61,13 @@ export function SandboxCard({
         </span>
       </Row>
 
-      {stats?.running && <Row label="container">{containerLabel(stats.guest?.container ?? null)}</Row>}
+      {stats?.running && <Row label="container">{containerLabel(fresh?.guest?.container ?? null)}</Row>}
 
       <Row label="confinement">{detail === null ? "…" : (detail.confinement ?? "unknown")}</Row>
+
+      <Row label="firewall">
+        <FirewallStatus name={name} compact />
+      </Row>
 
       {detail?.docker && (
         <Row label="docker">
@@ -68,20 +78,19 @@ export function SandboxCard({
         </Row>
       )}
       {detail?.docker && docker.detail && (
-        <div className="truncate text-right text-xs text-muted-foreground-2" title={docker.detail}>
+        <div className="truncate pl-24 text-xs text-muted-foreground-2" title={docker.detail}>
           {docker.detail}
         </div>
       )}
 
       <Row label="workspace">
-        <span className="block truncate font-mono" title={workspace}>
+        {/* `select-all` restores one-click copy (the retired WorkspacePath's
+            affordance); `break-all` wraps instead of truncating, so the tail —
+            the part a user recognizes the project by — stays visible. */}
+        <span className="block select-all break-all font-mono text-xs" title={workspace}>
           {workspace || "…"}
         </span>
       </Row>
-
-      <div className="pt-2">
-        <FirewallStatus name={name} />
-      </div>
     </OverviewCard>
   );
 }

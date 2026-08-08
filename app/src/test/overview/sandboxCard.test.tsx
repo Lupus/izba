@@ -67,7 +67,7 @@ describe("SandboxCard", () => {
     expect(screen.getByText("/home/u/git/web")).toBeInTheDocument();
   });
 
-  it("renders the firewall badge inside the card", () => {
+  it("renders the firewall badge as a labeled row inside the card", () => {
     render(
       <SandboxCard
         name="web"
@@ -76,7 +76,26 @@ describe("SandboxCard", () => {
         stats={runningStats()}
       />,
     );
+    expect(screen.getByText("firewall")).toBeInTheDocument();
     expect(screen.getByText("firewall-for-web")).toBeInTheDocument();
+  });
+
+  it("stops claiming uptime, container and engine state once the stats are stale", () => {
+    // The poller kept its last good snapshot but the daemon stopped answering:
+    // the card must not keep asserting a live workload from stale bytes.
+    render(
+      <SandboxCard
+        name="web"
+        state={{ kind: "running" }}
+        detail={detailFixture()}
+        stats={runningStats()}
+        stale
+      />,
+    );
+    expect(screen.getByText("running")).toBeInTheDocument();
+    expect(screen.queryByText(/2h 14m/)).not.toBeInTheDocument();
+    expect(screen.getByText("unknown")).toBeInTheDocument(); // container
+    expect(screen.getByText("engine unknown")).toBeInTheDocument();
   });
 
   it("reports a live nested docker engine", () => {

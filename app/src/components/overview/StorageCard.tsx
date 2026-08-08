@@ -51,7 +51,9 @@ export function StorageCard({ stats }: Readonly<{ stats: SandboxStats | null }>)
     },
     { key: "rw", label: "writable layer", bytes: disk.rw_img_bytes, cls: "bg-success", note: null },
     { key: "vol", label: "volumes", bytes: otherVolBytes, cls: "bg-muted-foreground-2", note: null },
-    { key: "logs", label: "logs", bytes: disk.logs_bytes, cls: "bg-muted", note: null },
+    // NOT `bg-muted`: that is the bar's own track color, which made the logs
+    // segment and its swatch invisible.
+    { key: "logs", label: "logs", bytes: disk.logs_bytes, cls: "bg-muted-foreground", note: null },
   ].filter((s) => s.bytes > 0);
 
   return (
