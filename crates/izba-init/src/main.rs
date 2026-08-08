@@ -16,6 +16,7 @@ mod rwdisk;
 mod server;
 mod ssh;
 mod trust;
+mod veth;
 
 use anyhow::Context;
 use exec::ExecEngine;
@@ -222,12 +223,20 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     let usb = Arc::new(izba_init::usb::UsbState::new(usb_enabled));
 
-    // Static guest networking: lo + dummy0 with the izba subnet. Log and
-    // continue on error — exec/cp/vsock still work without IP networking.
-    if let Err(e) = net::configure() {
+    // Docker mode, decided by the host: same host-authoritative cmdline
+    // channel as izba.usb (see sandbox.rs). Drives the network topology
+    // (net::configure), the resolv.conf nameserver (write_resolv_conf), the
+    // nft chain (bring_up_egress/apply_nft), and — once the container is
+    // running — the veth datapath wired up below.
+    let docker = params.get("izba.docker").map(|v| v == "1").unwrap_or(false);
+
+    // Guest networking: shared-netns dummy0, or (docker mode) just loopback
+    // — see net::configure's doc for the split. Log and continue on error —
+    // exec/cp/vsock still work without IP networking.
+    if let Err(e) = net::configure(docker) {
         eprintln!("izba-init: network configure: {e}");
     }
-    write_resolv_conf();
+    write_resolv_conf(docker);
     write_etc_hosts(
         params
             .get("izba.hostname")
@@ -248,7 +257,7 @@ fn run_pid1() -> anyhow::Result<()> {
         vsock::VsockListener::bind_with_cid_port(libc::VMADDR_CID_ANY, STREAM_PORT)
             .context("binding vsock stream port")?,
     );
-    bring_up_egress();
+    bring_up_egress(docker);
 
     // Start the OCI workload container via crun BEFORE the vsock control/stream
     // servers begin answering.  Placement rationale:
@@ -266,6 +275,31 @@ fn run_pid1() -> anyhow::Result<()> {
     // this window queue in the kernel backlog rather than being refused.
     // Fail-honest: launch_container() logs errors but never panics or exits PID 1.
     oci::launch_container();
+
+    // Docker mode only: the workload runs in its OWN netns (image/
+    // runtime_config.rs's docker-mode OCI profile), so — unlike the shared-
+    // netns default, where the container just inherits init's dummy0 — it
+    // needs the veth pair wired up now that crun has actually created that
+    // netns (launch_container() blocked until `running`, so container_pid
+    // should be available; a race would mean the container died between
+    // "running" and here, which container_pid's None branch reports
+    // honestly rather than wiring a stale/wrong pid). Placed before serving
+    // control/streams, mirroring launch_container's own placement rationale
+    // above: a sandbox should not be usable before its network is.
+    if docker {
+        match oci::container_pid(oci::CONTAINER_ID) {
+            Some(pid) => {
+                if let Err(e) = veth::apply(pid) {
+                    eprintln!(
+                        "izba-init: *** DOCKER-MODE VETH SETUP FAILED *** {e}; the container has no network"
+                    );
+                }
+            }
+            None => eprintln!(
+                "izba-init: *** DOCKER-MODE VETH SETUP SKIPPED *** container pid unavailable (container not running?)"
+            ),
+        }
+    }
 
     {
         let (e, u, s) = (Arc::clone(&engine), Arc::clone(&usb), Arc::clone(&shutdown));
@@ -308,8 +342,18 @@ fn setup_user_volumes(vols: &[&str]) -> anyhow::Result<()> {
 /// REDIRECT is in, every guest TCP connect lands on the stub. The binds happen
 /// HERE on the main thread (not inside the spawned serve loops) so they
 /// strictly happen-before apply_nft; the accept/recv loops then move into
-/// threads.
-fn bring_up_egress() {
+/// threads. `docker` selects the nft ruleset variant (`egress::ruleset`): the
+/// same output chain always applies (init's own outbound egress dial), plus
+/// the prerouting chain in docker mode (the workload's own-netns traffic,
+/// delivered over the veth — see `egress::NFT_DOCKER_PREROUTING`).
+///
+/// `#[mutants::skip]`: orchestrates real socket binds, thread spawns, and the
+/// nft apply against a live guest; none of that is reachable from a host unit
+/// test. Its constituent pieces (`egress::bind_dns_udp`/`bind_dns_tcp`/
+/// `bind_tcp_redirect`, `spawn_serve`, `egress::ruleset`) are unit-tested
+/// directly.
+#[mutants::skip]
+fn bring_up_egress(docker: bool) {
     let dns_sock = match egress::bind_dns_udp() {
         Ok(s) => Some(s),
         Err(e) => {
@@ -349,7 +393,7 @@ fn bring_up_egress() {
         "tcp redirect stub",
         egress::serve_tcp_redirect,
     );
-    if let Err(e) = egress::apply_nft() {
+    if let Err(e) = egress::apply_nft(docker) {
         // Loud but not fatal: DNS still works via resolv.conf; TCP
         // egress is dead until fixed. The console log is captured.
         eprintln!("izba-init: applying nft ruleset: {e}");
@@ -375,22 +419,46 @@ fn spawn_serve<T: Send + 'static>(
     });
 }
 
-/// The resolver MUST be a loopback address (127.0.0.1) because 127.0.0.0/8
-/// hits the `return` rule in the nft REDIRECT chain and is never redirected.
-/// Any query sent to a non-loopback address IS redirected to :53, but the
-/// stub answers from an unconnected wildcard socket — the reply's source
-/// address does not match the address the client queried, so conntrack's
-/// reverse-NAT never finds the tuple and the reply never reaches the client
-/// (the transparent-UDP-proxy reply problem; see NFT_RULESET's doc in
-/// egress.rs). Apps that hardcode an external UDP resolver (e.g. 8.8.8.8)
-/// currently get no DNS — a known M1 gap, pending an IP_ORIGDSTADDR
-/// transparent-reply fix in the stub. There is no NIC and no DHCP, so there
-/// is nothing to discover from /proc/net/pnp.
-fn write_resolv_conf() {
+/// The resolver MUST be a loopback address (127.0.0.1) in shared-netns mode
+/// because 127.0.0.0/8 hits the `return` rule in the nft output-hook REDIRECT
+/// chain and is never redirected. Any query sent to a non-loopback address IS
+/// redirected to :53, but the stub answers from an unconnected wildcard
+/// socket — the reply's source address does not match the address the client
+/// queried, so conntrack's reverse-NAT never finds the tuple and the reply
+/// never reaches the client (the transparent-UDP-proxy reply problem; see
+/// NFT_RULESET's doc in egress.rs). Apps that hardcode an external UDP
+/// resolver (e.g. 8.8.8.8) currently get no DNS — a known M1 gap, pending an
+/// IP_ORIGDSTADDR transparent-reply fix in the stub. There is no NIC and no
+/// DHCP, so there is nothing to discover from /proc/net/pnp.
+///
+/// **Docker-mode exception:** the workload runs in its OWN netns, reached
+/// only over the veth pair — 127.0.0.1 there is the CONTAINER's own
+/// loopback, not init's, so it can't reach the stub at all. RESOLVER_IP (the
+/// veth gateway address, intercepted by the docker-mode prerouting chain
+/// instead of the output chain) is used as the nameserver there, exactly as
+/// non-loopback DNS servers are handled in shared-netns mode, but for
+/// prerouting REDIRECT rather than output REDIRECT — see
+/// `egress::NFT_DOCKER_PREROUTING`.
+///
+/// `#[mutants::skip]`: writes a real file under `/rootfs/etc`, only
+/// meaningful inside a booted guest with the overlay assembled; the unit
+/// suite has no `/rootfs`. The content it writes (`resolv_conf_content`) is
+/// the pure, unit-tested part.
+#[mutants::skip]
+fn write_resolv_conf(docker: bool) {
     let _ = std::fs::create_dir_all("/rootfs/etc");
-    let conf = format!("nameserver {}\n", net::DNS_LOOPBACK);
-    if let Err(e) = std::fs::write("/rootfs/etc/resolv.conf", conf) {
+    if let Err(e) = std::fs::write("/rootfs/etc/resolv.conf", resolv_conf_content(docker)) {
         eprintln!("izba-init: writing resolv.conf: {e}");
+    }
+}
+
+/// Pure: the resolv.conf content for either mode (nameserver line only). See
+/// [`write_resolv_conf`]'s doc for why the nameserver differs by mode.
+fn resolv_conf_content(docker: bool) -> String {
+    if docker {
+        format!("nameserver {}\n", net::RESOLVER_IP)
+    } else {
+        format!("nameserver {}\n", net::DNS_LOOPBACK)
     }
 }
 
@@ -484,7 +552,8 @@ fn power_off() -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_interactive_login_shell, is_pause_invocation, login_shell_command, spawn_serve,
+        is_interactive_login_shell, is_pause_invocation, login_shell_command, resolv_conf_content,
+        spawn_serve,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -585,5 +654,17 @@ mod tests {
         // A serve loop returning Err is logged inside the thread, not propagated.
         spawn_serve(Some(()), "err", err_serve);
         assert_eq!(spin_until_nonzero(&ERR_CALLS), 1);
+    }
+
+    #[test]
+    fn resolv_conf_content_selects_nameserver_by_mode() {
+        assert_eq!(
+            resolv_conf_content(false),
+            format!("nameserver {}\n", crate::net::DNS_LOOPBACK)
+        );
+        assert_eq!(
+            resolv_conf_content(true),
+            format!("nameserver {}\n", crate::net::RESOLVER_IP)
+        );
     }
 }

@@ -633,6 +633,65 @@ fn read_log_tail(path: &str, max_bytes: usize) -> String {
     String::from_utf8_lossy(&data[start..]).into_owned()
 }
 
+/// Extract the `"pid"` field's value out of `crun state` JSON.
+///
+/// `crun state` emits an unquoted integer `"pid"` field (unlike `"status"`,
+/// which is a quoted string) — the pid of the container's init process, or
+/// `0` when the container is not running (crun's convention for a stopped
+/// container). Returns `None` for an absent field, an unparseable value, or
+/// `0` — a caller never receives a pid it could mistake for a live process.
+///
+/// Mirrors [`extract_status_field`]'s substring-scan technique (no full JSON
+/// parser needed) but reads a bare integer rather than a quoted string.
+pub fn parse_container_pid(json: &str) -> Option<u32> {
+    match extract_pid_field(json)? {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+/// Extracts the value of the `"pid"` key from a JSON object without a full
+/// JSON parser. Returns `None` when the key is absent or its value is not a
+/// bare non-negative integer. See [`extract_status_field`] for the same
+/// technique applied to a quoted-string field.
+fn extract_pid_field(json: &str) -> Option<u32> {
+    let key_pos = json.find("\"pid\"")?;
+    let after_key = &json[key_pos + 5..]; // len("\"pid\"") = 5
+    let colon_pos = after_key.find(':')?;
+    let after_colon = after_key[colon_pos + 1..].trim_start();
+    let end = after_colon
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after_colon.len());
+    if end == 0 {
+        return None;
+    }
+    after_colon[..end].parse::<u32>().ok()
+}
+
+/// Query the workload container's pid by invoking `crun state <id>` and
+/// parsing the OCI state JSON's `"pid"` field.
+///
+/// Returns `None` when crun cannot be run, exits non-zero, or emits output
+/// without a usable (present, non-zero, parseable) pid — mirroring
+/// [`container_state`]'s honesty contract: a missing/errored/not-running
+/// container is never mistaken for a live one.
+///
+/// `#[mutants::skip]`: shells out to a real `/sbin/crun state <id>` against a
+/// live container, which exists only inside a booted microVM — same
+/// unreachable-from-unit-tests situation as `container_state`. The JSON
+/// parsing it delegates to (`parse_container_pid`) is unit-tested directly.
+#[mutants::skip]
+pub fn container_pid(id: &str) -> Option<u32> {
+    let out = std::process::Command::new(CRUN_PATH)
+        .args(["state", id])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_container_pid(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// Query the workload container's live state by invoking `crun state <id>` and
 /// parsing the OCI state JSON.
 ///
@@ -1031,6 +1090,32 @@ mod tests {
     fn parse_container_state_missing_status_is_none() {
         assert_eq!(parse_container_state(r#"{"id":"izba"}"#), None);
         assert_eq!(parse_container_state(""), None);
+    }
+
+    // ── crun state → pid parse ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_container_pid_extracts_integer_field() {
+        let json = r#"{"ociVersion":"1.0.2","id":"izba","pid":423,"status":"running"}"#;
+        assert_eq!(parse_container_pid(json), Some(423));
+    }
+
+    #[test]
+    fn parse_container_pid_absent_or_zero_is_none() {
+        assert_eq!(
+            parse_container_pid(r#"{"id":"izba","status":"stopped"}"#),
+            None
+        );
+        // crun reports pid 0 for a stopped container — not a usable PID.
+        assert_eq!(parse_container_pid(r#"{"pid":0,"status":"stopped"}"#), None);
+        assert_eq!(parse_container_pid(""), None);
+    }
+
+    #[test]
+    fn parse_container_pid_whitespace_and_unparseable_value() {
+        assert_eq!(parse_container_pid(r#"{ "pid" : 7 }"#), Some(7));
+        assert_eq!(parse_container_pid(r#"{"pid":"not-a-number"}"#), None);
+        assert_eq!(parse_container_pid(r#"{"pid":}"#), None);
     }
 
     // ── OCI mount op shape (mirrors mounts.rs test convention) ──────────────
