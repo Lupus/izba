@@ -818,12 +818,8 @@ const STATS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 fn handle_stats(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> {
     let config: SandboxConfig = load_json(&d.paths.sandbox_dir(&name).join(CONFIG_FILE))?
         .with_context(|| format!("no such sandbox '{name}'"))?;
-    let status = d
-        .registry
-        .liveness(&name)
-        .unwrap_or(Liveness::Stopped)
-        .describe();
-    let running = status != "stopped";
+    let liveness = d.registry.liveness(&name).unwrap_or(Liveness::Stopped);
+    let running = liveness != Liveness::Stopped;
     let run_state = load_json::<crate::state::RunState>(
         &d.paths.sandbox_dir(&name).join(crate::state::STATE_FILE),
     )?;
@@ -954,6 +950,15 @@ fn handle_guest_rpc(
     name: String,
     req: izba_proto::Request,
 ) -> anyhow::Result<DaemonResponse> {
+    // Stats must never cross the daemon boundary raw: GuestStats carries
+    // hostile-guest-controlled strings/lists that only `sanitize_guest_stats`
+    // (crate::daemon::stats) is allowed to touch, and that sanitizer has
+    // exactly one call site — the dedicated Stats handler. Refuse here rather
+    // than proxy, so a client can never bypass sanitization by wrapping
+    // Request::Stats in a GuestRpc.
+    if matches!(req, izba_proto::Request::Stats) {
+        bail!("use DaemonRequest::Stats, not GuestRpc, to fetch sandbox stats (sanitized path)");
+    }
     let mut conn = sandbox::control(&d.paths, &name, d.connector())?;
     write_frame(&mut conn, &req)?;
     let resp: Response = read_frame(&mut conn)?;
@@ -3183,6 +3188,38 @@ mod tests {
                 assert!(message.contains("not running"), "{message}")
             }
             other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guest_rpc_refuses_stats_request() {
+        // A GuestRpc carrying Request::Stats must be refused, never proxied:
+        // the raw guest Response::Stats(GuestStats) would bypass
+        // sanitize_guest_stats (crate::daemon::stats), which is only ever
+        // called from the dedicated Stats handler. Even on a live sandbox
+        // (where the guest would happily answer), the daemon must reject the
+        // request before it ever dials the guest.
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        write_state(&d.paths, "web", live_identity()); // running per pid probe
+        match rpc(
+            &mut c,
+            &DaemonRequest::GuestRpc {
+                name: "web".into(),
+                req: Request::Stats,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(
+                    message.contains("DaemonRequest::Stats"),
+                    "expected the error to point at the dedicated Stats RPC: {message}"
+                );
+            }
+            other => panic!("expected a refusal, got a raw guest proxy: {other:?}"),
         }
     }
 

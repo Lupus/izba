@@ -94,12 +94,16 @@ fn render(paths: &Paths, det: &SandboxDetail, stats: Option<&SandboxStats>) -> S
 
 /// The `engine:` line for a docker-mode sandbox (#203): a dead/absent
 /// nested Docker Engine must be visible, not a silent "running" sandbox.
-/// `stats` is None when the daemon Stats call itself failed.
+/// `stats` is None when the daemon Stats call itself failed, and
+/// `stats.guest` is None when the sandbox is running but the in-guest probe
+/// couldn't reach it (unresponsive/wedged guest) — both are honestly
+/// "unknown". A THIRD case is distinct from either: the guest DID respond
+/// (`stats.guest` is `Some`) but reported no docker engine state at all
+/// (`guest.docker` is `None`) — that's not a communication failure, so it
+/// gets its own wording rather than falsely implying the guest is silent.
 fn engine_line(stats: Option<&SandboxStats>) -> String {
-    let engine = stats
-        .and_then(|s| s.guest.as_ref())
-        .and_then(|g| g.docker.as_ref());
-    match engine {
+    let guest = stats.and_then(|s| s.guest.as_ref());
+    match guest.and_then(|g| g.docker.as_ref()) {
         Some(e) if e.running => "engine:      running".to_string(),
         Some(e) => match &e.detail {
             // Daemon-sanitized (control chars stripped), safe to print.
@@ -108,6 +112,9 @@ fn engine_line(stats: Option<&SandboxStats>) -> String {
                 "engine:      not running (see /var/log/izba-dockerd.log in the guest)".to_string()
             }
         },
+        None if guest.is_some() => {
+            "engine:      unknown (guest reported no engine state)".to_string()
+        }
         None => "engine:      unknown (guest not responding)".to_string(),
     }
 }
@@ -340,7 +347,7 @@ mod tests {
     #[test]
     fn engine_line_renders_all_states() {
         use izba_core::daemon::proto::SandboxStats;
-        fn stats_with(docker: Option<izba_proto::DockerEngine>) -> SandboxStats {
+        fn stats_with_guest(guest: Option<izba_proto::GuestStats>) -> SandboxStats {
             SandboxStats {
                 name: "web".into(),
                 running: true,
@@ -352,19 +359,24 @@ mod tests {
                     logs_bytes: 0,
                     image_bytes: 0,
                 },
-                guest: docker.map(|d| izba_proto::GuestStats {
-                    processes: vec![],
-                    process_count: 0,
-                    load1_centi: 0,
-                    load5_centi: 0,
-                    load15_centi: 0,
-                    mem_total_kb: 0,
-                    mem_available_kb: 0,
-                    mounts: vec![],
-                    docker: Some(d),
-                    container: None,
-                }),
+                guest,
             }
+        }
+        // The guest DID respond (guest: Some), just with no docker field set
+        // (docker: None) — distinct from an unreachable guest.
+        fn stats_with(docker: Option<izba_proto::DockerEngine>) -> SandboxStats {
+            stats_with_guest(Some(izba_proto::GuestStats {
+                processes: vec![],
+                process_count: 0,
+                load1_centi: 0,
+                load5_centi: 0,
+                load15_centi: 0,
+                mem_total_kb: 0,
+                mem_available_kb: 0,
+                mounts: vec![],
+                docker,
+                container: None,
+            }))
         }
         assert_eq!(
             engine_line(Some(&stats_with(Some(izba_proto::DockerEngine {
@@ -387,14 +399,24 @@ mod tests {
             })))),
             "engine:      not running (see /var/log/izba-dockerd.log in the guest)"
         );
-        // Guest unreachable, or a pre-stats guest: honest unknown.
+        // Stats call itself failed (daemon unreachable / RPC error): honest
+        // unknown, "guest not responding".
         assert_eq!(
             engine_line(None),
             "engine:      unknown (guest not responding)"
         );
+        // Sandbox running, but the in-guest stats probe couldn't reach it
+        // (guest: None despite a successful Stats RPC): same wording — from
+        // the caller's perspective the guest is silent either way.
+        assert_eq!(
+            engine_line(Some(&stats_with_guest(None))),
+            "engine:      unknown (guest not responding)"
+        );
+        // Guest DID respond but reported no docker engine state at all: a
+        // different flavor of "unknown" — not a communication failure.
         assert_eq!(
             engine_line(Some(&stats_with(None))),
-            "engine:      unknown (guest not responding)"
+            "engine:      unknown (guest reported no engine state)"
         );
     }
 

@@ -26,8 +26,11 @@ export function ProcessesCard({ stats }: Readonly<{ stats: SandboxStats | null }
             </tr>
           </thead>
           <tbody>
-            {guest.processes.slice(0, MAX_ROWS).map((p) => (
-              <tr key={p.pid}>
+            {guest.processes.slice(0, MAX_ROWS).map((p, i) => (
+              // A hostile guest can report duplicate pids (see comment above:
+              // everything here is guest-reported), which would collide as a
+              // React key on `p.pid` alone. Fold in the row index too.
+              <tr key={`${p.pid}-${i}`}>
                 <td className="pr-3">{p.pid}</td>
                 <td className="truncate pr-3">{p.comm}</td>
                 <td className="text-right">{(p.cpu_permille / 10).toFixed(1)}</td>
