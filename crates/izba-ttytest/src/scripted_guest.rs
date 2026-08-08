@@ -339,6 +339,13 @@ fn handle_control_request(req: Request, shared: &Arc<Shared>) -> ControlOutcome 
             kind: ErrorKind::UsbUnavailable,
             message: "ttytest: no USB support".to_string(),
         },
+        // The scripted guest doesn't simulate stats collection (no ttytest
+        // journey exercises `Request::Stats` yet); keep the match exhaustive
+        // with an honest "unsupported" answer rather than a stubbed payload.
+        Request::Stats => Response::Error {
+            kind: ErrorKind::Internal,
+            message: "ttytest: stats not simulated".to_string(),
+        },
         Request::Shutdown => return ControlOutcome::Shutdown,
     };
     ControlOutcome::Reply(resp)

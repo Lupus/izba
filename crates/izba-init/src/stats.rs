@@ -11,9 +11,6 @@ use izba_proto::{DockerEngine, GuestStats, MountUsage, ProcSample};
 use std::path::{Path, PathBuf};
 
 /// Everything `collect` needs, wired once at boot by `main.rs`.
-// Not yet constructed: task 3 threads this through the control server's
-// `Request::Stats` dispatch.
-#[allow(dead_code)]
 pub struct StatsContext {
     pub procfs: PathBuf,
     pub rootfs: PathBuf,
@@ -38,7 +35,6 @@ pub struct ProcRaw {
 }
 
 /// How long `collect` waits between its two `/proc` samples.
-#[allow(dead_code)] // only read by `collect`, not yet called (task 3 wires it)
 const SAMPLE_INTERVAL_MS: u64 = 250;
 /// How many processes the guest reports (the daemon re-truncates anyway).
 const TOP_N: usize = 15;
@@ -218,7 +214,6 @@ pub fn engine_status(procs: &[ProcRaw], engine_log: &Path) -> DockerEngine {
 }
 
 /// statfs via statvfs; `(total, avail)` in bytes.
-#[allow(dead_code)] // only reachable through `collect`, not yet called (task 3)
 fn statfs_real(p: &Path) -> Option<(u64, u64)> {
     let s = nix::sys::statvfs::statvfs(p).ok()?;
     let frag = s.fragment_size() as u64;
@@ -230,8 +225,6 @@ fn statfs_real(p: &Path) -> Option<(u64, u64)> {
 
 /// Full guest collection. Blocks ~[`SAMPLE_INTERVAL_MS`]. `container` is left
 /// `None` — the control-server dispatch fills it (it owns the crun query).
-// Not yet called from `dispatch_control_request`: task 3 wires this in.
-#[allow(dead_code)]
 pub fn collect(ctx: &StatsContext) -> GuestStats {
     let before = scan_procs(&ctx.procfs);
     std::thread::sleep(std::time::Duration::from_millis(SAMPLE_INTERVAL_MS));

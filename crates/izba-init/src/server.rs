@@ -36,6 +36,7 @@ pub fn serve_control<L: Listener>(
     l: L,
     engine: Arc<ExecEngine>,
     usb: Arc<izba_init::usb::UsbState>,
+    stats: Arc<crate::stats::StatsContext>,
     shutdown: Arc<AtomicBool>,
 ) {
     loop {
@@ -56,8 +57,9 @@ pub fn serve_control<L: Listener>(
         };
         let engine = Arc::clone(&engine);
         let usb = Arc::clone(&usb);
+        let stats = Arc::clone(&stats);
         let shutdown = Arc::clone(&shutdown);
-        std::thread::spawn(move || control_conn(conn, engine, usb, shutdown));
+        std::thread::spawn(move || control_conn(conn, engine, usb, stats, shutdown));
     }
 }
 
@@ -65,6 +67,7 @@ fn control_conn<C: Read + Write>(
     mut conn: C,
     engine: Arc<ExecEngine>,
     usb: Arc<izba_init::usb::UsbState>,
+    stats: Arc<crate::stats::StatsContext>,
     shutdown: Arc<AtomicBool>,
 ) {
     loop {
@@ -82,7 +85,7 @@ fn control_conn<C: Read + Write>(
             let _ = write_frame(&mut conn, &Response::Ok);
             return;
         }
-        let resp = dispatch_control_request(&engine, &usb, req);
+        let resp = dispatch_control_request(&engine, &usb, &stats, req);
         if write_frame(&mut conn, &resp).is_err() {
             return;
         }
@@ -94,6 +97,7 @@ fn control_conn<C: Read + Write>(
 fn dispatch_control_request(
     engine: &ExecEngine,
     usb: &izba_init::usb::UsbState,
+    stats: &crate::stats::StatsContext,
     req: Request,
 ) -> Response {
     let from_unit = |r: Result<(), (ErrorKind, String)>| match r {
@@ -135,14 +139,13 @@ fn dispatch_control_request(
             from_unit(usb.attach_with(&device, izba_init::usb::dial_host))
         }
         Request::UsbDetach { device } => from_unit(usb.detach(&device)),
-        // TODO(sandbox-stats task 3): wire `StatsContext` + `crate::stats::collect`
-        // here and fill `container` from `crate::oci::container_state`. Placeholder
-        // keeps this match exhaustive (izba-proto's `Request::Stats` landed in
-        // task 1, ahead of the dispatch wiring in task 3).
-        Request::Stats => Response::Error {
-            kind: ErrorKind::Internal,
-            message: "stats: not yet implemented".to_string(),
-        },
+        Request::Stats => {
+            let mut g = crate::stats::collect(stats);
+            // Same honest container source as Health: queried fresh, Unknown
+            // when crun can't answer — never a stale claim.
+            g.container = Some(crate::oci::container_state(crate::oci::CONTAINER_ID));
+            Response::Stats(g)
+        }
         // Handled by control_conn (acks then closes the connection).
         Request::Shutdown => unreachable!("Shutdown handled by control_conn"),
     }
@@ -461,6 +464,25 @@ mod tests {
         }
     }
 
+    /// A minimal `StatsContext` for tests that don't care about `Request::Stats`
+    /// itself, just that the control server is wired with SOME context: an
+    /// empty (but real, so `collect`'s reads don't error mid-scan) tempdir
+    /// procfs. The dir is leaked (never cleaned up) so its path stays valid
+    /// for the lifetime of the harness thread it's handed to.
+    fn test_stats_ctx() -> Arc<crate::stats::StatsContext> {
+        let root = tempfile::tempdir().unwrap().keep();
+        std::fs::create_dir_all(root.join("proc")).unwrap();
+        Arc::new(crate::stats::StatsContext {
+            procfs: root.join("proc"),
+            rootfs: root.join("rootfs"),
+            volume_paths: vec![],
+            docker: false,
+            engine_log: root.join("no.log"),
+            clk_tck: 100,
+            page_kb: 4,
+        })
+    }
+
     struct Harness {
         control_tx: mpsc::Sender<UnixStream>,
         stream_tx: mpsc::Sender<UnixStream>,
@@ -469,6 +491,10 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            Self::with_stats(test_stats_ctx())
+        }
+
+        fn with_stats(stats: Arc<crate::stats::StatsContext>) -> Self {
             // Direct-spawn engine: the server RPC-wiring tests exec real
             // binaries (sh/sleep) and assert exec/kill/resize/stream framing.
             // Production wraps execs in `crun exec`, which is absent on the test
@@ -482,7 +508,9 @@ mod tests {
             // harness proves the RPCs are wired, not that a vhci exists.
             let usb = Arc::new(izba_init::usb::UsbState::new(false));
             let (e, s) = (Arc::clone(&engine), Arc::clone(&shutdown));
-            std::thread::spawn(move || serve_control(PairListener(Mutex::new(rx)), e, usb, s));
+            std::thread::spawn(move || {
+                serve_control(PairListener(Mutex::new(rx)), e, usb, stats, s)
+            });
 
             let (stream_tx, rx) = mpsc::channel();
             std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), engine, false));
@@ -525,6 +553,51 @@ mod tests {
                 assert_eq!(info.container, Some(izba_proto::ContainerState::Unknown));
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_request_returns_guest_stats_with_container_state() {
+        // Fake procfs with one process; StatsContext pointing at it.
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("proc").join("1");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("stat"),
+            "1 (init) S 0 1 1 0 -1 0 0 0 0 0 2 1 0 0 20 0 1 0 3 1000 50 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.path().join("proc").join("meminfo"),
+            "MemTotal: 500 kB\nMemAvailable: 250 kB\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.path().join("proc").join("loadavg"),
+            "0.10 0.20 0.30 1/1 1\n",
+        )
+        .unwrap();
+        let ctx = Arc::new(crate::stats::StatsContext {
+            procfs: t.path().join("proc"),
+            rootfs: t.path().join("rootfs"), // absent: mounts just come back empty
+            volume_paths: vec![],
+            docker: false,
+            engine_log: t.path().join("no.log"),
+            clk_tck: 100,
+            page_kb: 4,
+        });
+        let h = Harness::with_stats(ctx);
+        let mut c = h.control_conn();
+        match rpc(&mut c, &Request::Stats) {
+            Response::Stats(g) => {
+                assert_eq!(g.process_count, 1);
+                assert_eq!(g.mem_total_kb, 500);
+                assert_eq!(g.load5_centi, 20);
+                assert!(g.docker.is_none());
+                // On a crun-less unit host container state is Unknown — but SET.
+                assert!(g.container.is_some());
+            }
+            other => panic!("expected Stats, got {other:?}"),
         }
     }
 
