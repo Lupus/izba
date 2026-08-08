@@ -575,6 +575,21 @@ fn exit_codes() {
         err.contains("not found"),
         "stderr should carry crun's not-found diagnostic, got {err:?}"
     );
+
+    // Non-docker sandboxes report no engine at all (the field is `Some` only
+    // when the guest booted with `izba.docker=1` — see docker_mode_engine_
+    // runs_containers for the docker-mode counterpart).
+    let connector = sandbox::default_connector();
+    let mut stats_conn = connector(&tb.paths, "exit").expect("stats control connection");
+    write_frame(&mut stats_conn, &Request::Stats).expect("sending stats request");
+    match read_frame::<_, Response>(&mut stats_conn).expect("stats reply") {
+        Response::Stats(g) => assert!(
+            g.docker.is_none(),
+            "non-docker sandbox must report no engine status, got {:?}",
+            g.docker
+        ),
+        other => panic!("expected Stats, got {other:?}"),
+    }
 }
 
 #[test]
@@ -2628,6 +2643,36 @@ fn docker_mode_engine_runs_containers() {
         !engine_log.contains("ships no dockerd"),
         "the dind image must ship dockerd; engine log said: {engine_log:?}"
     );
+
+    // --- [5a] Stats: Request::Stats round-trip, guest-reported and sane -----
+    // The engine is known up (phase [5] just confirmed `docker info`), so
+    // this is the honest real-VM proof that izba-init's stats collector sees
+    // a live process tree, real meminfo, the overlay statfs, AND detects the
+    // running dockerd by comm scan (Task 2/3).
+    let connector = sandbox::default_connector();
+    let mut stats_conn = connector(&tb.paths, name).expect("stats control connection");
+    write_frame(&mut stats_conn, &Request::Stats).expect("sending stats request");
+    match read_frame::<_, Response>(&mut stats_conn).expect("stats reply") {
+        Response::Stats(g) => {
+            assert!(
+                g.process_count >= 3,
+                "at least init+crun+dockerd: {}",
+                g.process_count
+            );
+            assert!(
+                g.mem_total_kb > 100_000,
+                "meminfo parsed: {}",
+                g.mem_total_kb
+            );
+            assert!(!g.mounts.is_empty(), "overlay statfs reported");
+            let e = g
+                .docker
+                .expect("docker engine status present in docker mode");
+            assert!(e.running, "dockerd detected by comm scan: {:?}", e.detail);
+            assert!(g.container.is_some());
+        }
+        other => panic!("expected Stats, got {other:?}"),
+    }
 
     // --- [5b] The /proc/sys narrowing (defense-in-depth) is real ------------
     // Docker mode unlocks the `net` sysctl subtree (dockerd needs

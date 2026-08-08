@@ -5,14 +5,12 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { LogsView } from "./LogsView";
 import { NetlogView } from "./NetlogView";
 import { PolicyEditor } from "./PolicyEditor";
-import { FirewallStatus } from "./FirewallStatus";
 import { ShellPanel } from "./ShellPanel";
 import { PortsTab } from "./PortsTab";
 import { VolumesTab } from "./VolumesTab";
 import { ManifestTab } from "./ManifestTab";
 import { UsbTab } from "./UsbTab";
-import { WorkspacePath } from "./WorkspacePath";
-import { ContainerStatus } from "./ContainerStatus";
+import { OverviewTab } from "./overview/OverviewTab";
 import { Spinner } from "./Spinner";
 import { Button } from "@/components/ui/button";
 import { api } from "../lib/ipc";
@@ -101,10 +99,54 @@ export function Detail({ sandbox, onChanged }: Props) {
 
   return (
     <section className="flex flex-1 flex-col p-5">
-      <div className="flex items-center gap-3 text-lg font-semibold">
-        <StatusDot state={sandbox.state} /> {name}
+      {/* Header row: identity on the left, lifecycle actions on the right —
+          the actions apply to the whole sandbox, not to the Overview tab. */}
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="flex items-center gap-3 text-lg font-semibold">
+            <StatusDot state={sandbox.state} /> {name}
+          </div>
+          <div className="mt-1 text-muted-foreground">{sandbox.image}</div>
+        </div>
+        <div className="flex flex-wrap justify-end gap-2">
+          {running ? (
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={busy}
+              onClick={() => setPending({ kind: "stop", name })}
+            >
+              {label("stop", "Stop")}
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="default"
+              disabled={busy}
+              onClick={() => void act("start", () => api.start(name))}
+            >
+              {label("start", "Start")}
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="secondary"
+            disabled={busy}
+            onClick={() => void act("restart", () => api.restart(name))}
+          >
+            {label("restart", "Restart")}
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            disabled={busy}
+            onClick={() => setPending({ kind: "remove", name })}
+          >
+            {label("remove", "Remove")}
+          </Button>
+        </div>
       </div>
-      <div className="mt-1 text-muted-foreground">{sandbox.image}</div>
+      {error && <div className="mt-2 text-right text-sm text-destructive">{error}</div>}
       {sandbox.state.kind === "degraded" && (
         <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           {sandbox.state.reason}
@@ -133,51 +175,7 @@ export function Detail({ sandbox, onChanged }: Props) {
       </div>
 
       <div className="mt-4 flex min-h-0 flex-1 flex-col">
-        {tab === "overview" && (
-          <div className="flex flex-col gap-3">
-            <WorkspacePath name={name} />
-            <ContainerStatus name={name} />
-            <FirewallStatus name={name} />
-            <div className="flex flex-wrap gap-2">
-              {running ? (
-                <Button
-                  type="button"
-                  variant="secondary"
-                  disabled={busy}
-                  onClick={() => setPending({ kind: "stop", name })}
-                >
-                  {label("stop", "Stop")}
-                </Button>
-              ) : (
-                <Button
-                  type="button"
-                  variant="default"
-                  disabled={busy}
-                  onClick={() => void act("start", () => api.start(name))}
-                >
-                  {label("start", "Start")}
-                </Button>
-              )}
-              <Button
-                type="button"
-                variant="secondary"
-                disabled={busy}
-                onClick={() => void act("restart", () => api.restart(name))}
-              >
-                {label("restart", "Restart")}
-              </Button>
-              <Button
-                type="button"
-                variant="destructive"
-                disabled={busy}
-                onClick={() => setPending({ kind: "remove", name })}
-              >
-                {label("remove", "Remove")}
-              </Button>
-            </div>
-            {error && <div className="mt-3 text-sm text-destructive">{error}</div>}
-          </div>
-        )}
+        {tab === "overview" && <OverviewTab sandbox={sandbox} />}
 
         {tab === "ports" && <PortsTab sandbox={sandbox} />}
 

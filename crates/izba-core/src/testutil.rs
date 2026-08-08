@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use izba_proto::{read_frame, write_frame, HealthInfo, Request, Response};
+use izba_proto::{read_frame, write_frame, GuestStats, HealthInfo, Request, Response};
 
 use crate::paths::Paths;
 use crate::procmgr;
@@ -260,6 +260,11 @@ pub(crate) fn fake_connector(
                         }
                         Response::Ok
                     }
+                    // A reachable fake guest answers Stats too, so
+                    // `probe_guest_stats`/`handle_stats` tests can assert the
+                    // host actually folds a real Response::Stats(GuestStats)
+                    // reply (not just the None-on-failure path).
+                    Request::Stats => Response::Stats(fake_guest_stats()),
                     _ => Response::Ok,
                 };
                 log.lock().unwrap().push(req);
@@ -282,6 +287,24 @@ pub(crate) fn hanging_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box
             std::thread::sleep(Duration::from_secs(10));
         });
         Ok(Box::new(client) as Box<dyn IoStream>)
+    }
+}
+
+/// Minimal but non-degenerate `GuestStats` fixture for `fake_connector`'s
+/// `Request::Stats` reply. `process_count` is a distinguishable marker field
+/// so tests can assert it survives the probe→sanitize→wire round trip.
+pub(crate) fn fake_guest_stats() -> GuestStats {
+    GuestStats {
+        processes: vec![],
+        process_count: 7,
+        load1_centi: 0,
+        load5_centi: 0,
+        load15_centi: 0,
+        mem_total_kb: 0,
+        mem_available_kb: 0,
+        mounts: vec![],
+        docker: None,
+        container: None,
     }
 }
 

@@ -1,6 +1,8 @@
 use izba_core::build_info::BuildInfoOwned;
 use izba_core::daemon::egress::config::{Access, AllowEntry, GitRule};
-use izba_core::daemon::proto::{DaemonCreate, SandboxDetail};
+use izba_core::daemon::proto::{
+    DaemonCreate, HostDisk, HostResources, SandboxDetail, SandboxStats, VolumeDisk,
+};
 use izba_core::state::PortRule;
 use izba_core::volume::{VolumeInfo, VolumeSpec};
 use serde::{Deserialize, Serialize};
@@ -448,6 +450,14 @@ pub struct SandboxDetailView {
     /// daemon predates container-state reporting. The frontend renders `None`
     /// and `unknown` identically — never as a healthy status.
     pub container: Option<String>,
+    /// Whether this sandbox runs in docker mode (#198).
+    pub docker: bool,
+    pub cpus: u32,
+    pub mem_mb: u32,
+    /// Host-side VMM confinement summary, or `None` when the sandbox is
+    /// stopped / its state predates the field — the UI renders `None` as
+    /// "unknown".
+    pub confinement: Option<String>,
 }
 
 impl From<SandboxDetail> for SandboxDetailView {
@@ -460,6 +470,200 @@ impl From<SandboxDetail> for SandboxDetailView {
             ports: d.ports.into_iter().map(PortRuleView::from).collect(),
             volumes: d.volumes.into_iter().map(VolumeSpecView::from).collect(),
             container: d.container.map(|c| c.as_str().to_string()),
+            docker: d.docker,
+            cpus: d.cpus,
+            mem_mb: d.mem_mb,
+            confinement: d.confinement,
+        }
+    }
+}
+
+/// One declared volume's disk footprint, as the UI sees it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VolumeDiskView {
+    pub guest_path: String,
+    pub allocated_bytes: u64,
+    /// Whether this is the auto-provisioned docker-mode volume, so the UI can
+    /// label it distinctly.
+    pub docker: bool,
+}
+
+impl From<VolumeDisk> for VolumeDiskView {
+    fn from(v: VolumeDisk) -> Self {
+        VolumeDiskView {
+            guest_path: v.guest_path,
+            allocated_bytes: v.allocated_bytes,
+            docker: v.docker,
+        }
+    }
+}
+
+/// Host-observed process resource usage for a running sandbox's VMM.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HostResourcesView {
+    /// CPU share over the sampling interval, in permille of one host CPU.
+    /// `None` when a single sample can't yet yield a rate (first read).
+    pub cpu_permille: Option<u32>,
+    pub rss_kb: u64,
+    pub cpus_limit: u32,
+    pub mem_limit_mb: u32,
+}
+
+impl From<HostResources> for HostResourcesView {
+    fn from(h: HostResources) -> Self {
+        HostResourcesView {
+            cpu_permille: h.cpu_permille,
+            rss_kb: h.rss_kb,
+            cpus_limit: h.cpus_limit,
+            mem_limit_mb: h.mem_limit_mb,
+        }
+    }
+}
+
+/// Host-computed on-disk footprint for a sandbox.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HostDiskView {
+    pub rw_img_bytes: u64,
+    pub volumes: Vec<VolumeDiskView>,
+    pub logs_bytes: u64,
+    /// The rootfs image's on-disk size. Shared by every sandbox created from
+    /// the same image — do NOT sum across sandboxes.
+    pub image_bytes: u64,
+}
+
+impl From<HostDisk> for HostDiskView {
+    fn from(d: HostDisk) -> Self {
+        HostDiskView {
+            rw_img_bytes: d.rw_img_bytes,
+            volumes: d.volumes.into_iter().map(VolumeDiskView::from).collect(),
+            logs_bytes: d.logs_bytes,
+            image_bytes: d.image_bytes,
+        }
+    }
+}
+
+/// One process in the guest's mini-top, as the UI sees it. `state` is the
+/// kernel state char rendered as a JSON-friendly string ("R", "S", …).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProcessView {
+    pub pid: u32,
+    pub comm: String,
+    pub state: String,
+    pub cpu_permille: u32,
+    pub rss_kb: u64,
+}
+
+impl From<izba_proto::ProcSample> for ProcessView {
+    fn from(p: izba_proto::ProcSample) -> Self {
+        ProcessView {
+            pid: p.pid,
+            comm: p.comm,
+            state: p.state.to_string(),
+            cpu_permille: p.cpu_permille,
+            rss_kb: p.rss_kb,
+        }
+    }
+}
+
+/// Filesystem-level fullness of one guest mount, as the UI sees it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MountView {
+    pub path: String,
+    pub total_bytes: u64,
+    pub avail_bytes: u64,
+}
+
+impl From<izba_proto::MountUsage> for MountView {
+    fn from(m: izba_proto::MountUsage) -> Self {
+        MountView {
+            path: m.path,
+            total_bytes: m.total_bytes,
+            avail_bytes: m.avail_bytes,
+        }
+    }
+}
+
+/// Nested Docker Engine liveness, as the UI sees it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DockerEngineView {
+    pub running: bool,
+    /// When `!running`: a bounded tail of the engine log.
+    pub detail: Option<String>,
+}
+
+impl From<izba_proto::DockerEngine> for DockerEngineView {
+    fn from(e: izba_proto::DockerEngine) -> Self {
+        DockerEngineView {
+            running: e.running,
+            detail: e.detail,
+        }
+    }
+}
+
+/// Guest-side stats payload, as the UI sees it. Everything here is
+/// guest-reported and already sanitized by the daemon before it reaches this
+/// struct.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GuestStatsView {
+    /// Top processes by CPU over the sampling interval, descending.
+    pub processes: Vec<ProcessView>,
+    /// Total live processes in the guest.
+    pub process_count: u32,
+    /// Load averages × 100.
+    pub load1_centi: u32,
+    pub load5_centi: u32,
+    pub load15_centi: u32,
+    pub mem_total_kb: u64,
+    pub mem_available_kb: u64,
+    pub mounts: Vec<MountView>,
+    /// `Some` only when the guest booted with `izba.docker=1`.
+    pub docker: Option<DockerEngineView>,
+    /// In-guest workload container state token, or `None`.
+    pub container: Option<String>,
+}
+
+impl From<izba_proto::GuestStats> for GuestStatsView {
+    fn from(g: izba_proto::GuestStats) -> Self {
+        GuestStatsView {
+            processes: g.processes.into_iter().map(ProcessView::from).collect(),
+            process_count: g.process_count,
+            load1_centi: g.load1_centi,
+            load5_centi: g.load5_centi,
+            load15_centi: g.load15_centi,
+            mem_total_kb: g.mem_total_kb,
+            mem_available_kb: g.mem_available_kb,
+            mounts: g.mounts.into_iter().map(MountView::from).collect(),
+            docker: g.docker.map(DockerEngineView::from),
+            container: g.container.map(|c| c.as_str().to_string()),
+        }
+    }
+}
+
+/// Resource stats for one sandbox (#203), as the UI sees it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SandboxStatsView {
+    pub name: String,
+    pub running: bool,
+    /// Wall time since the VM process started, when running.
+    pub uptime_ms: Option<u64>,
+    /// Host-observed CPU/RSS + the sandbox's configured limits. `None` when
+    /// not running.
+    pub host: Option<HostResourcesView>,
+    pub disk: HostDiskView,
+    /// Sanitized guest-reported mini-top/mounts/docker-engine snapshot.
+    /// `None` when the sandbox is stopped or the guest could not be reached.
+    pub guest: Option<GuestStatsView>,
+}
+
+impl From<SandboxStats> for SandboxStatsView {
+    fn from(s: SandboxStats) -> Self {
+        SandboxStatsView {
+            name: s.name,
+            running: s.running,
+            uptime_ms: s.uptime_ms,
+            host: s.host.map(HostResourcesView::from),
+            disk: HostDiskView::from(s.disk),
+            guest: s.guest.map(GuestStatsView::from),
         }
     }
 }
@@ -833,5 +1037,101 @@ mod tests {
         let v = SandboxDetailView::from(detail);
         assert_eq!(v.workspace, r"C:\Users\u\proj");
         assert_eq!(v.container, None);
+    }
+
+    /// `SandboxDetailView` must carry the docker/cpus/mem/confinement fields
+    /// through unchanged — the Overview facelift's four-card dashboard reads
+    /// them directly off this view.
+    #[test]
+    fn sandbox_detail_view_carries_docker_cpus_mem_confinement() {
+        let detail = izba_core::daemon::proto::SandboxDetail {
+            name: "web".into(),
+            image_ref: "ubuntu:24.04".into(),
+            image_digest: "sha256:x".into(),
+            cpus: 4,
+            mem_mb: 4096,
+            workspace: "/ws".into(),
+            status: "running".into(),
+            ports: vec![],
+            volumes: vec![],
+            confinement: Some("confined".into()),
+            container: Some(izba_proto::ContainerState::Running),
+            user_fallback: None,
+            docker: true,
+        };
+        let v = SandboxDetailView::from(detail);
+        assert!(v.docker);
+        assert_eq!(v.cpus, 4);
+        assert_eq!(v.mem_mb, 4096);
+        assert_eq!(v.confinement.as_deref(), Some("confined"));
+    }
+
+    /// Full round trip of `SandboxStats` → `SandboxStatsView`, mirroring Task
+    /// 4's wire fixture plus a populated `guest` half (one process, one
+    /// mount, docker engine running, container running).
+    #[test]
+    fn sandbox_stats_view_maps_wire_type() {
+        let s = SandboxStats {
+            name: "web".into(),
+            running: true,
+            uptime_ms: Some(1234),
+            host: Some(HostResources {
+                cpu_permille: Some(340),
+                rss_kb: 2_621_440,
+                cpus_limit: 4,
+                mem_limit_mb: 4096,
+            }),
+            disk: HostDisk {
+                rw_img_bytes: 1_288_490_189,
+                volumes: vec![VolumeDisk {
+                    guest_path: "/var/lib/docker".into(),
+                    allocated_bytes: 2_254_857_830,
+                    docker: true,
+                }],
+                logs_bytes: 12_582_912,
+                image_bytes: 933_232_640,
+            },
+            guest: Some(izba_proto::GuestStats {
+                processes: vec![izba_proto::ProcSample {
+                    pid: 42,
+                    comm: "node".into(),
+                    state: 'R',
+                    cpu_permille: 210,
+                    rss_kb: 65_536,
+                }],
+                process_count: 61,
+                load1_centi: 42,
+                load5_centi: 30,
+                load15_centi: 19,
+                mem_total_kb: 4 * 1024 * 1024,
+                mem_available_kb: 2 * 1024 * 1024,
+                mounts: vec![izba_proto::MountUsage {
+                    path: "/var/lib/docker".into(),
+                    total_bytes: 10 * 1024 * 1024 * 1024,
+                    avail_bytes: 8 * 1024 * 1024 * 1024,
+                }],
+                docker: Some(izba_proto::DockerEngine {
+                    running: true,
+                    detail: None,
+                }),
+                container: Some(izba_proto::ContainerState::Running),
+            }),
+        };
+        let v = SandboxStatsView::from(s);
+        assert_eq!(v.name, "web");
+        assert!(v.running);
+        assert_eq!(v.uptime_ms, Some(1234));
+        assert_eq!(v.host.as_ref().unwrap().cpu_permille, Some(340));
+        assert_eq!(v.host.as_ref().unwrap().rss_kb, 2_621_440);
+        assert_eq!(v.disk.rw_img_bytes, 1_288_490_189);
+        assert!(v.disk.volumes[0].docker);
+        assert_eq!(v.disk.volumes[0].guest_path, "/var/lib/docker");
+        let g = v.guest.unwrap();
+        assert_eq!(g.processes[0].comm, "node");
+        assert_eq!(g.processes[0].state, "R");
+        assert_eq!(g.process_count, 61);
+        assert_eq!(g.mounts[0].path, "/var/lib/docker");
+        assert!(g.docker.as_ref().unwrap().running);
+        assert_eq!(g.container.as_deref(), Some("running"));
     }
 }

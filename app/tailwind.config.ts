@@ -42,6 +42,7 @@ export default {
           foreground: "hsl(var(--popover-foreground))",
         },
         success: "hsl(var(--success))",
+        warning: "hsl(var(--warning))",
         sidebar: "hsl(var(--sidebar))",
       },
       borderRadius: {

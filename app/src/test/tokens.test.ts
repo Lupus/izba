@@ -6,7 +6,7 @@ describe("tailwind tokens", () => {
   it.each([
     "primary", "secondary", "destructive", "muted", "accent",
     "background", "foreground", "card", "popover", "border", "input", "ring",
-    "success", "sidebar", "muted-foreground-2",
+    "success", "warning", "sidebar", "muted-foreground-2",
   ])("exposes the %s token", (name) => {
     expect(colors[name]).toBeDefined();
   });

@@ -11,6 +11,7 @@ pub mod proto;
 pub mod registry;
 pub mod relays;
 pub mod server;
+pub mod stats;
 pub mod supervisor;
 pub mod transport;
 

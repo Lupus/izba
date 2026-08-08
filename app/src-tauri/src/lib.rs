@@ -11,8 +11,8 @@ use base64::Engine as _;
 use daemon::{DaemonApi, RealDaemon, ShellSession};
 use tauri::{Emitter, State};
 use views::{
-    CreateOpts, DaemonStatusView, DiffView, PortRuleView, SandboxDetailView, SandboxView,
-    SeedEntry, VersionView, VolumeInfoView,
+    CreateOpts, DaemonStatusView, DiffView, PortRuleView, SandboxDetailView, SandboxStatsView,
+    SandboxView, SeedEntry, VersionView, VolumeInfoView,
 };
 
 /// A live interactive shell, wrapped so the `shells` map lock is only held for
@@ -242,6 +242,11 @@ async fn policy_set_enforce(
 #[tauri::command]
 async fn inspect(state: State<'_, AppState>, name: String) -> Result<SandboxDetailView, String> {
     run_action(&state, move |d| commands::inspect_core(d, &name)).await
+}
+
+#[tauri::command]
+async fn stats(state: State<'_, AppState>, name: String) -> Result<SandboxStatsView, String> {
+    run_action(&state, move |d| commands::stats_core(d, &name)).await
 }
 
 #[tauri::command]
@@ -569,6 +574,7 @@ pub fn dispatch(
             to_json(commands::remove_core(d, &arg_str(&args, "name")?, force)?)
         }
         "inspect" => to_json(commands::inspect_core(d, &arg_str(&args, "name")?)?),
+        "stats" => to_json(commands::stats_core(d, &arg_str(&args, "name")?)?),
         "read_netlog" => to_json(commands::read_netlog_core(d, &arg_str(&args, "name")?)?),
         "port_list" => to_json(commands::port_list_core(d, &arg_str(&args, "name")?)?),
         // NOTE on arg names: Tauri camelCases Rust snake_case command args in
@@ -806,6 +812,7 @@ pub fn run() {
             policy_git_block,
             policy_set_enforce,
             inspect,
+            stats,
             port_list,
             port_publish,
             port_unpublish,

@@ -5,5 +5,6 @@ pub mod dns;
 
 pub mod messages;
 pub use messages::*;
+pub use messages::{DockerEngine, GuestStats, MountUsage, ProcSample};
 
 pub mod usbip;

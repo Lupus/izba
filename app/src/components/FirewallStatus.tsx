@@ -4,8 +4,13 @@ import { api } from "../lib/ipc";
 import { Badge } from "@/components/ui/badge";
 
 /** A compact badge for the Overview tab: is this sandbox bare (all egress
- *  allowed) or enforcing a firewall, and how many allow rules does it have. */
-export function FirewallStatus({ name }: { name: string }) {
+ *  allowed) or enforcing a firewall, and how many allow rules does it have.
+ *
+ *  `compact` renders it as a value inside the Sandbox card's labeled-row
+ *  rhythm: no "Firewall" prefix (the row label says it), small badge, and an
+ *  explicit "…" while the policy is still unknown — an empty labeled row
+ *  would read as broken, whereas standalone the badge simply stays away. */
+export function FirewallStatus({ name, compact = false }: Readonly<{ name: string; compact?: boolean }>) {
   const [policy, setPolicy] = useState<PolicyView | null>(null);
 
   useEffect(() => {
@@ -23,7 +28,19 @@ export function FirewallStatus({ name }: { name: string }) {
     };
   }, [name]);
 
-  if (!policy) return null;
+  if (!policy) return compact ? <span className="text-muted-foreground-2">…</span> : null;
+
+  if (compact) {
+    const n = policy.allow.length;
+    return (
+      <Badge
+        variant={policy.enforcing ? "success" : "secondary"}
+        className="px-2 py-0 text-xs font-normal"
+      >
+        {policy.enforcing ? `enforcing · ${n} allow rule${n === 1 ? "" : "s"}` : "off · all egress allowed"}
+      </Badge>
+    );
+  }
 
   if (!policy.enforcing) {
     return (
