@@ -290,7 +290,11 @@ fn relay_tcp_query<S: Read + Write>(host: &mut S, query: &[u8]) -> io::Result<Ve
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no dns response from izbad"))
 }
 
-/// Loopback port the nat-output REDIRECT delivers all outbound TCP to.
+/// Loopback port all outbound TCP is delivered to: the nat-output REDIRECT
+/// (shared-netns mode) or, in docker mode, the nat-prerouting REDIRECT that
+/// intercepts traffic arriving over the veth from the workload's own netns
+/// (see [`NFT_DOCKER_PREROUTING`]) — same relay stub, two different nft
+/// hooks depending on which netns topology this boot is running.
 pub const REDIRECT_PORT: u16 = 15001;
 
 /// The fixed transparent-redirect ruleset. Loopback destinations (`return`)
@@ -331,9 +335,45 @@ table ip izba {
 }
 ";
 
+/// Docker-mode prerouting chain (spec §3): traffic from the workload's own
+/// netns arrives over the veth and traverses prerouting, never output. Same
+/// interception surface; REDIRECT rewrites the destination to the ingress
+/// interface's address, which is why bind_tcp_redirect binds wildcard.
+const NFT_DOCKER_PREROUTING: &str = "\
+table ip izba {
+  chain prerouting {
+    type nat hook prerouting priority -100; policy accept;
+    tcp dport 53 redirect to :53
+    udp dport 53 redirect to :53
+    tcp dport != 53 redirect to :15001
+  }
+}
+";
+
+/// The nft ruleset for this boot: base output chain, plus the prerouting
+/// chain when docker mode is on. In docker mode the workload runs in its
+/// OWN netns (reached over the veth pair set up by `veth::apply`), so its
+/// traffic never traverses init's `output` hook at all — the `prerouting`
+/// chain is what actually intercepts it; the `output` chain stays in place
+/// too because init's own netns processes (e.g. the DNS/TCP stub dialing
+/// out to izbad) still traverse it.
+pub fn ruleset(docker: bool) -> String {
+    if docker {
+        format!("{NFT_RULESET}{NFT_DOCKER_PREROUTING}")
+    } else {
+        NFT_RULESET.to_string()
+    }
+}
+
 /// Apply the ruleset via the vendored static nft.
-pub fn apply_nft() -> io::Result<()> {
-    std::fs::write("/tmp/izba-egress.nft", NFT_RULESET)?;
+///
+/// `#[mutants::skip]`: shells out to a real `/sbin/nft -f` against a real
+/// file path, only meaningful inside a booted guest with nft present; the
+/// unit suite has neither. The branching logic it delegates to (`ruleset`) is
+/// the pure, unit-tested part.
+#[mutants::skip]
+pub fn apply_nft(docker: bool) -> io::Result<()> {
+    std::fs::write("/tmp/izba-egress.nft", ruleset(docker))?;
     let status = std::process::Command::new("/sbin/nft")
         .args(["-f", "/tmp/izba-egress.nft"])
         .status()?;
@@ -709,6 +749,34 @@ mod tests {
             dns_tcp < relay,
             "tcp:53 DNS rule must precede the relay rule"
         );
+    }
+
+    #[test]
+    fn ruleset_without_docker_is_the_base_const() {
+        assert_eq!(ruleset(false), NFT_RULESET);
+    }
+
+    #[test]
+    fn ruleset_with_docker_adds_prerouting_chain() {
+        let r = ruleset(true);
+        assert!(
+            r.starts_with(NFT_RULESET.trim_end_matches('\n')) || r.contains("chain output"),
+            "base output chain must remain"
+        );
+        assert!(r.contains("type nat hook prerouting"));
+        // Same interception surface as the output chain, veth-delivered.
+        assert!(r.contains("tcp dport 53 redirect to :53"));
+        assert!(r.contains("udp dport 53 redirect to :53"));
+        assert!(r.contains(&format!("tcp dport != 53 redirect to :{REDIRECT_PORT}")));
+    }
+
+    #[test]
+    fn ruleset_with_docker_keeps_output_chain_too() {
+        // init's own outbound traffic (the DNS/TCP stub dialing izbad) still
+        // needs the output-hook chain even when the workload uses prerouting.
+        let r = ruleset(true);
+        assert!(r.contains("type nat hook output priority -100"));
+        assert!(r.contains(NFT_RULESET));
     }
 
     #[test]

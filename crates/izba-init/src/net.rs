@@ -1,8 +1,17 @@
-//! Guest network bring-up for the NIC-less end state: loopback up, dummy0
-//! with the static izba subnet (192.168.127.2/24 + the resolver address
-//! 192.168.127.1 as an alias), default route via the dummy. Everything the
-//! stub does not intercept therefore has nowhere to go — that IS the
-//! non-TCP deny posture.
+//! Guest network bring-up. Two variants, both NIC-less:
+//!
+//! - **Shared-netns (default, `docker=false`):** loopback up, dummy0 with the
+//!   static izba subnet (192.168.127.2/24 + the resolver address
+//!   192.168.127.1 as an alias), default route via the dummy. Everything the
+//!   stub does not intercept therefore has nowhere to go — that IS the
+//!   non-TCP deny posture.
+//! - **Docker mode (`docker=true`):** just loopback + `route_localnet`. There
+//!   is no dummy0 and no init-side default route here — the veth pair
+//!   `veth::apply` sets up once the workload container is running carries
+//!   RESOLVER_IP/GUEST_IP instead, and until that happens anything
+//!   non-loopback simply has no route. The structural deny is the SAME
+//!   property (no route out except through the intercepted path), just
+//!   expressed via a missing veth instead of a missing dummy0.
 //!
 //! All configuration is ioctl-based (SIOCSIFADDR/SIOCSIFNETMASK/
 //! SIOCSIFFLAGS/SIOCADDRT) — no netlink dependency in static musl PID 1.
@@ -21,14 +30,26 @@ pub(crate) const RESOLVER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);
 pub(crate) const DNS_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
-/// Bring up lo + dummy0 and install the default route. Errors are
-/// reported per step so a console log names the exact failure.
+/// Bring up loopback plus, in shared-netns mode, dummy0 and the default
+/// route. Errors are reported per step so a console log names the exact
+/// failure.
+///
+/// `docker=false` (shared-netns, the default): dummy0 + its resolver alias +
+/// default route, exactly as before docker mode existed.
+/// `docker=true`: lo + `route_localnet` only — no dummy0, no init-side
+/// default route. The workload's own netns gets its addressing later from
+/// the veth pair (`veth::apply`, run once the container is up); nothing here
+/// gives init's own netns a route to anywhere but loopback, which is the
+/// structural deny for this topology (see the module doc).
 // reason: ioctl-based network bring-up (SIOCSIFADDR/SIOCADDRT/...) plus the
 // route_localnet sysctl; needs a real guest netns, so it is exercised only by
 // the KVM integration suite (egress_dns_* / net boot), never host unit tests.
 #[mutants::skip]
-pub fn configure() -> io::Result<()> {
+pub fn configure(docker: bool) -> io::Result<()> {
     if_up("lo")?;
+    if docker {
+        return enable_route_localnet();
+    }
     set_addr("dummy0", GUEST_IP, NETMASK)?;
     if_up("dummy0")?;
     // The resolver address rides an ioctl alias interface.
