@@ -528,6 +528,50 @@ pub fn compute_userns_mappings(
     )
 }
 
+/// True iff `mappings` map container id 0 to guest (host) id 0 — i.e. the
+/// container's root IS the guest's real root. Because a userns map's extents
+/// are non-overlapping and 0 is the minimum id, the extent covering container
+/// id 0 always starts at `container_id == 0` and maps it linearly to its
+/// `host_id`; so this is exactly "some extent has container_id 0 and host_id 0".
+fn maps_root_to_host_root(mappings: &[oci_spec::runtime::LinuxIdMapping]) -> bool {
+    mappings
+        .iter()
+        .any(|m| m.container_id() == 0 && m.host_id() == 0)
+}
+
+/// Docker mode's **durable** container→guest-root barrier (spec §3, the
+/// rootless-container invariant). Returns `true` when the container user
+/// namespace maps container-root to a **non-zero** guest id for BOTH uid and
+/// gid — the property that actually contains a `CAP_SYS_ADMIN`-holding
+/// workload, exactly as rootless Docker/Podman rely on.
+///
+/// Why this, and not the `/proc/sys` read-only binds: those binds are
+/// defense-in-depth only. A docker-mode workload holds userns `CAP_SYS_ADMIN`
+/// (dockerd needs it) and seccomp is off, so it can `mount -o remount,rw` any
+/// bind izba installed in its own mount namespace — crun creates them after the
+/// userns, so they are not `MNT_LOCKED` (verified on a real VM, Task 7).
+/// What it CANNOT change is the id map: the kernel's file-write permission
+/// check (`capable_wrt_inode_uidgid`, torvalds/linux `23adbe12`) requires the
+/// target file's owner uid to be MAPPED into the acting userns, and root-owned
+/// sysctls (`/proc/sys/kernel/*`) are owned by guest-uid-0. When container-root
+/// maps to a non-zero guest id, guest-uid-0-as-container-0 is false, so the
+/// DAC/`CAP_DAC_OVERRIDE` check fails and the write is denied **regardless of
+/// any remount**. This is the same design as rootless containers
+/// (rootlesscontaine.rs, docker.com/engine/security/rootless).
+///
+/// `transpose_identity_map` breaks the invariant (container-0 → guest-0)
+/// whenever `workload == owner` OR `min(workload, owner) > 0` — i.e. a
+/// root-owned workspace running a root image, a same-uid workspace/USER, or a
+/// non-root image `USER` on a non-root workspace. It HOLDS iff exactly one of
+/// `{workload, owner}` is zero (the common flow: a root docker image on a
+/// non-root-owned workspace ⇒ container-0 → guest-owner). The caller
+/// ([`generate_spec`]) fails a docker-mode start closed when this returns
+/// `false`.
+pub fn docker_userns_isolates_root(owner: (u32, u32), workload: (u32, u32)) -> bool {
+    let (uid_maps, gid_maps) = compute_userns_mappings(owner, workload);
+    !maps_root_to_host_root(&uid_maps) && !maps_root_to_host_root(&gid_maps)
+}
+
 /// Render the 6 canonical CA-bundle env pairs as `"KEY=VALUE"` strings for
 /// the OCI spec's process environment.
 ///
@@ -665,6 +709,27 @@ const SERIAL_MAJORS: [i64; 2] = [166, 188];
 /// load-bearing decision **D1** — drops the network namespace so the container
 /// shares izba-init's netns (egress/port-relay/ssh all live there).
 pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
+    // Docker mode's durable security barrier (spec §3): fail the start CLOSED
+    // unless the container user namespace isolates container-root from
+    // guest-root. See [`docker_userns_isolates_root`] for why this — not the
+    // `/proc/sys` read-only binds — is what actually contains a
+    // `CAP_SYS_ADMIN`-holding docker-mode workload. `privileged` never sets a
+    // userns (builders own the whole guest), and docker+privileged is mutually
+    // exclusive, so this only gates the docker-mode userns path.
+    if params.docker && !docker_userns_isolates_root(params.host_owner, params.user) {
+        let (o_uid, o_gid) = params.host_owner;
+        let (w_uid, w_gid) = params.user;
+        anyhow::bail!(
+            "docker mode requires the container's root to map to a NON-root guest \
+             user — the rootless-container invariant (as in rootless Docker/Podman) \
+             that keeps /proc/sys, cgroup and mount-based escapes contained inside \
+             the user namespace. With this workspace owned by uid {o_uid}/gid {o_gid} \
+             and the image USER uid {w_uid}/gid {w_gid}, izba's id transposition would \
+             map container-root to guest-root, so the sandbox is refused. Re-create \
+             the sandbox on a workspace owned by your (non-root) user — do not run izba \
+             as root or on a root-owned workspace."
+        );
+    }
     let cfg = params.image;
     let image_ep: Vec<String> = cfg.and_then(|c| c.entrypoint.clone()).unwrap_or_default();
     let image_cmd: Vec<String> = cfg.and_then(|c| c.cmd.clone()).unwrap_or_default();
@@ -848,21 +913,26 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     // maskedPaths AND all capability limits; izba unlocks exactly one sysctl
     // subtree, and only for docker-mode sandboxes.
     //
-    // **Why the whole subtree is NOT unlocked.** `net.*` writes are gated by
-    // the kernel on the owning user namespace (`net_ctl_permissions` ⇒
-    // `ns_capable(net->user_ns, CAP_NET_ADMIN)`), and this netns belongs to the
-    // container's userns (spec §3) — so those writes are legitimately the
-    // container's own and the userns really is the boundary there. Every OTHER
-    // sysctl goes through `sysctl_perm`/`test_perm`, which is a plain
-    // `current_euid() == GLOBAL_ROOT_UID` check against the 0644 file mode —
-    // NO namespace check at all. Container-uid-0 maps to guest-uid-0 in common
-    // id maps (`transpose_identity_map` emits `extent(0, 0, …)` both when
-    // workload == owner and whenever `min(workload, owner) > 0`), so unlocking
-    // all of `/proc/sys` would hand container root real write access to
-    // `kernel.core_pattern`, `kernel.modprobe`, `vm.*` … — i.e. guest-init-root
-    // code execution outside the container overlay. Keeping the non-`net`
-    // children explicitly read-only makes the guarantee unconditional instead
-    // of id-map-dependent.
+    // **Why the whole subtree is NOT unlocked, and what actually enforces it.**
+    // `net.*` writes are gated by the kernel on the owning user namespace
+    // (`net_ctl_permissions` ⇒ `ns_capable(net->user_ns, CAP_NET_ADMIN)`), and
+    // this netns belongs to the container's userns (spec §3) — so those writes
+    // are legitimately the container's own. Keeping the OTHER `/proc/sys`
+    // children read-only is **defense-in-depth, NOT the durable barrier**: a
+    // docker-mode workload holds userns `CAP_SYS_ADMIN` (dockerd needs it) with
+    // seccomp off, and these binds live in the container's own mount namespace,
+    // so it can `mount -o remount,rw` them (crun does not `MNT_LOCK` mounts it
+    // creates after the userns — proven on a real VM, Task 7 [5c]). Narrowing
+    // the list therefore only shrinks the attack surface; it does not close it.
+    //
+    // The DURABLE barrier is the container-0 ≠ guest-0 uid invariant enforced at
+    // the top of this function ([`docker_userns_isolates_root`]): non-`net`
+    // sysctls (owned by guest-uid-0) go through `capable_wrt_inode_uidgid`,
+    // which requires the file-owner uid to be mapped into the acting userns, so
+    // a workload whose container-root maps to a NON-zero guest id is denied the
+    // write even after it remounts the path rw — exactly as in rootless
+    // Docker/Podman. That is why generate_spec fails a violating docker-mode
+    // start closed rather than relying on these binds.
     //
     // The other default read-only paths (`/proc/bus`, `/proc/fs`, `/proc/irq`,
     // `/proc/sysrq-trigger`) and ALL `maskedPaths` stay untouched.
@@ -1940,6 +2010,92 @@ mod tests {
                 "non-docker spec must not carry {child}, got {ro:?}"
             );
         }
+    }
+
+    // ---- docker-mode rootless container-0 ≠ guest-0 invariant ----
+
+    #[test]
+    fn docker_userns_isolates_root_predicate_matches_the_rootless_rule() {
+        // SAFE — exactly one of {workload, owner} is zero. The common flow: a
+        // root docker image (USER 0) on a workspace owned by a non-root user.
+        // container-0 → guest-owner (non-zero).
+        assert!(docker_userns_isolates_root((1000, 1000), (0, 0)));
+        assert!(docker_userns_isolates_root((501, 501), (0, 0)));
+        // A root-owned workspace running a non-root image USER also isolates
+        // (owner 0, workload non-zero ⇒ container-0 → guest-workload).
+        assert!(docker_userns_isolates_root((0, 0), (101, 101)));
+
+        // VIOLATING — container-0 → guest-0. All three transpose shapes:
+        // (a) root-owned workspace + root image (the realistic `sudo izba` trap).
+        assert!(!docker_userns_isolates_root((0, 0), (0, 0)));
+        // (b) workload == owner, both non-zero (identity map).
+        assert!(!docker_userns_isolates_root((1000, 1000), (1000, 1000)));
+        // (c) both non-zero and distinct (min > 0 ⇒ leading identity extent).
+        assert!(!docker_userns_isolates_root((1000, 1000), (101, 101)));
+
+        // The gid leg is checked independently: a safe uid but a root-mapping
+        // gid must still be caught.
+        assert!(!docker_userns_isolates_root((1000, 0), (0, 0)));
+        assert!(!docker_userns_isolates_root((0, 1000), (0, 0)));
+    }
+
+    #[test]
+    fn docker_start_fails_closed_when_container_root_would_be_guest_root() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        // Root-owned workspace (owner 0/0) + a root image (user 0/0): the
+        // realistic `sudo izba` / root-workspace case. generate_spec must
+        // refuse, with an actionable, rootless-citing message.
+        let mut p = base_params(&img);
+        p.docker = true;
+        p.host_owner = (0, 0);
+        p.user = (0, 0);
+        let err = generate_spec(&p).expect_err("docker start must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rootless") && msg.contains("root-owned workspace"),
+            "message must be actionable + name the fix, got: {msg}"
+        );
+
+        // The SAME violating id map is accepted when docker mode is OFF — the
+        // invariant is a docker-mode gate, not a general one (Option A already
+        // maps container-0 → guest-0 for ordinary sandboxes by design).
+        let mut ok = base_params(&img);
+        ok.docker = false;
+        ok.host_owner = (0, 0);
+        ok.user = (0, 0);
+        assert!(
+            generate_spec(&ok).is_ok(),
+            "non-docker mode must not be gated by the docker rootless invariant"
+        );
+    }
+
+    #[test]
+    fn docker_start_succeeds_on_the_common_non_root_workspace_flow() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut p = base_params(&img);
+        p.docker = true;
+        // base_params already models it: workspace owned by 1000/1000, image
+        // USER root. Assert the produced map really isolates container-root.
+        assert_eq!(p.host_owner, (1000, 1000));
+        assert_eq!(p.user, (0, 0));
+        let spec = generate_spec(&p).expect("common docker flow must start");
+        let uid_maps = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .uid_mappings()
+            .clone()
+            .expect("uid mappings present");
+        // container id 0 maps to a non-zero guest uid.
+        let root_ext = uid_maps
+            .iter()
+            .find(|m| m.container_id() == 0)
+            .expect("an extent covering container id 0");
+        assert_ne!(
+            root_ext.host_id(),
+            0,
+            "container-root must map to a non-zero guest uid, got {root_ext:?}"
+        );
     }
 
     #[test]

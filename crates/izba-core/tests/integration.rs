@@ -2357,6 +2357,54 @@ const DIND_IMAGE: &str =
 const HELLO_WORLD_IMAGE: &str =
     "hello-world@sha256:7f4da0fc94bcece205a8c0b6f4d11c8196924654ffe5c4d1aa439b7f632048b2";
 
+/// Adversarial escape probe run AS CONTAINER ROOT inside a docker-mode sandbox.
+/// It first UNDOES the read-only `/proc/sys` binds every way a workload holding
+/// userns `CAP_SYS_ADMIN` (which docker mode grants, seccomp off) can — plain
+/// `remount,rw`, the `remount,rw,bind` spelling, a fresh bind elsewhere, and a
+/// brand-new `procfs` — then attempts to write `/proc/sys/kernel/core_pattern`
+/// through each. `core_pattern` is the classic container→host-root escalation
+/// primitive (a `|/path` value makes the kernel run that program as real root
+/// on the next crash), so a landed write here would be guest-init-root code
+/// execution — able to flush izba's nft egress rules.
+///
+/// The point of the probe is to prove the remounts SUCCEED (they do — the binds
+/// are defeatable) yet the WRITE is still denied, because the durable barrier is
+/// the container-0 ≠ guest-0 uid map, not the bind. `core_pattern`'s original
+/// value is restored-by-identity (we only ever try to write the value already
+/// there), and the escape payload is only attempted against the copies, so a
+/// success would be observable without actually arming a real host `core_pattern`.
+///
+/// Machine-readable lines the assertions parse: `remount_rc`, `bindremount_rc`,
+/// `write_after_remount_rc` (the load-bearing one — MUST be non-zero) with its
+/// `write_after_remount_err`, plus `core_before`/`core_after` (MUST be equal)
+/// and the `uid_map` that explains why (container-0 maps to a non-zero guest id).
+const PROC_SYS_ESCAPE_PROBE: &str = r#"
+CORE=/proc/sys/kernel/core_pattern
+BEFORE=$(cat "$CORE" 2>/dev/null)
+echo "core_before=$BEFORE"
+mount -o remount,rw /proc/sys/kernel 2>&1; echo "remount_rc=$?"
+mount -o remount,rw,bind /proc/sys/kernel 2>&1; echo "bindremount_rc=$?"
+printf '%s' "$BEFORE" > "$CORE" 2>/tmp/e1; echo "write_after_remount_rc=$?"
+echo "write_after_remount_err=$(cat /tmp/e1)"
+mkdir -p /tmp/k && mount --bind /proc/sys/kernel /tmp/k 2>&1; echo "rebind_rc=$?"
+printf '%s' "$BEFORE" > /tmp/k/core_pattern 2>/tmp/e2; echo "rebind_write_rc=$?"
+echo "rebind_write_err=$(cat /tmp/e2)"
+mkdir -p /tmp/p && mount -t proc proc /tmp/p 2>&1; echo "freshproc_rc=$?"
+printf '%s' "$BEFORE" > /tmp/p/sys/kernel/core_pattern 2>/tmp/e3; echo "freshproc_write_rc=$?"
+echo "freshproc_write_err=$(cat /tmp/e3)"
+echo "core_after=$(cat "$CORE" 2>/dev/null)"
+echo "euid=$(id -u)"
+echo "uid_map=$(cat /proc/self/uid_map | tr '\n' ';')"
+exit 0
+"#;
+
+/// Pull `key=<value>` out of the [`PROC_SYS_ESCAPE_PROBE`] output.
+fn probe_field<'a>(out: &'a str, key: &str) -> Option<&'a str> {
+    out.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+        .map(str::trim)
+}
+
 /// `create` a docker-mode sandbox on the dind fixture, sized for a real engine
 /// (dockerd + containerd + a nested container are hungry compared to the 1
 /// cpu / 1 GiB the alpine tests use). Registers the name for cleanup.
@@ -2581,20 +2629,19 @@ fn docker_mode_engine_runs_containers() {
         "the dind image must ship dockerd; engine log said: {engine_log:?}"
     );
 
-    // --- [5b] The /proc/sys narrowing is real, and complete -----------------
+    // --- [5b] The /proc/sys narrowing (defense-in-depth) is real ------------
     // Docker mode unlocks the `net` sysctl subtree (dockerd needs
-    // net.ipv4.ip_forward) and NOTHING else. This matters because non-net
-    // sysctls are gated by a plain euid check with no namespace component, and
-    // container-uid-0 maps to guest-uid-0 in common id maps — so an unlocked
-    // /proc/sys/kernel would be a genuine container→guest-root escape hatch
-    // (kernel.core_pattern, kernel.modprobe).
+    // net.ipv4.ip_forward) and read-only-remounts every OTHER child. These
+    // binds are defense-in-depth, NOT the durable barrier — phase [5c] proves a
+    // CAP_SYS_ADMIN workload can remove them — but they still narrow the attack
+    // surface, so pin that they are actually installed.
     //
     // Enumerating the REAL /proc/sys is the point: the host-side list in
     // runtime_config.rs could miss a subtree this kernel registers, and that
-    // subtree would then be silently writable. crun bind-remounts every
-    // readonlyPath, so a protected child has its own /proc/mounts line and an
-    // unprotected one does not. Any output at all is a failure, and it names
-    // the offender.
+    // subtree would then lack even the defense-in-depth bind. crun bind-remounts
+    // every readonlyPath, so a protected child has its own /proc/mounts line and
+    // an unprotected one does not. Any output at all is a failure, and it names
+    // the offender (this is what caught /proc/sys/sunrpc, CONFIG_SUNRPC).
     let unprotected = exec_ok(
         &tb.paths,
         name,
@@ -2612,32 +2659,69 @@ fn docker_mode_engine_runs_containers() {
          these are NOT: {unprotected:?}\n{}",
         docker_diag(&tb.paths, name)
     );
-    // Concrete companion: container root really cannot write a kernel sysctl
-    // (`pid_max` exists on every CONFIG_SYSCTL kernel).
-    let (write_status, _, write_err) = exec_collect(
-        &tb.paths,
-        name,
-        &["sh", "-c", "echo 4194304 > /proc/sys/kernel/pid_max"],
-        None,
-    )
-    .expect("exec sysctl write attempt");
-    assert_ne!(
-        write_status,
-        ExitStatus::Code(0),
-        "container root must NOT be able to write /proc/sys/kernel/* in docker mode"
-    );
-    assert!(
-        write_err.to_lowercase().contains("read-only"),
-        "the refusal must come from the read-only remount, got: {write_err:?}"
-    );
-    // ...while the subtree dockerd needs really is writable — proven by the
-    // value dockerd itself wrote during the startup that phase [5] just
-    // confirmed.
+    // The subtree dockerd needs really is writable — proven by the value dockerd
+    // itself wrote during the startup that phase [5] just confirmed.
     let forwarding = exec_ok(&tb.paths, name, &["cat", "/proc/sys/net/ipv4/ip_forward"]);
     assert_eq!(
         forwarding.trim(),
         "1",
         "dockerd must have been able to set net.ipv4.ip_forward"
+    );
+
+    // --- [5c] ADVERSARIAL: the DURABLE barrier holds under CAP_SYS_ADMIN ----
+    // Run as container root, remove the read-only /proc/sys/kernel bind (which a
+    // CAP_SYS_ADMIN workload CAN do — the bind is not MNT_LOCKED), then try to
+    // write kernel.core_pattern (the classic container→host-root escalation).
+    // The remount is ALLOWED; the WRITE must be DENIED — not by the bind, but by
+    // the rootless container-0 ≠ guest-0 uid invariant + the kernel DAC check
+    // (capable_wrt_inode_uidgid). This is the property PART 1 enforces at start.
+    let probe = exec_ok(&tb.paths, name, &["sh", "-c", PROC_SYS_ESCAPE_PROBE]);
+    eprintln!("---- [5c] escape probe ----\n{probe}\n---- end probe ----");
+    let write_rc = probe_field(&probe, "write_after_remount_rc")
+        .unwrap_or_else(|| panic!("probe missing write_after_remount_rc:\n{probe}"));
+    assert_ne!(
+        write_rc, "0",
+        "SECURITY: kernel.core_pattern write LANDED after remount — the durable \
+         container-0 ≠ guest-0 barrier failed. Probe:\n{probe}"
+    );
+    let core_before = probe_field(&probe, "core_before").unwrap_or("");
+    let core_after = probe_field(&probe, "core_after").unwrap_or("");
+    assert_eq!(
+        core_before, core_after,
+        "SECURITY: kernel.core_pattern CHANGED — a container→guest-root escape \
+         landed. Probe:\n{probe}"
+    );
+    // And the same for every alternative vector the probe tried.
+    for rc in ["rebind_write_rc", "freshproc_write_rc"] {
+        assert_ne!(
+            probe_field(&probe, rc),
+            Some("0"),
+            "SECURITY: {rc} write LANDED — an alternative escape vector worked. \
+             Probe:\n{probe}"
+        );
+    }
+    // Sanity on WHY it held: the uid map must isolate container-root.
+    let uid_map = probe_field(&probe, "uid_map").unwrap_or("");
+    assert!(
+        !uid_map.is_empty() && uid_map.starts_with('0'),
+        "expected a container-root uid_map line, got: {uid_map:?}"
+    );
+
+    // --- [5d] The common flow still WORKS: a user-owned /workspace is writable
+    // by the container root (the transposition maps the host workspace owner to
+    // container-0), so the rootless invariant does not break the product.
+    let ws_probe = exec_ok(
+        &tb.paths,
+        name,
+        &[
+            "sh",
+            "-c",
+            "touch /workspace/izba-docker-probe && echo ok && rm -f /workspace/izba-docker-probe",
+        ],
+    );
+    assert!(
+        ws_probe.contains("ok"),
+        "container root must be able to write the user-owned /workspace, got: {ws_probe:?}"
     );
 
     // --- [6] A nested container, pulled through izba's egress plane ---------
