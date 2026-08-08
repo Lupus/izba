@@ -47,22 +47,56 @@ pub fn delegation_plan(container_cgroup: &str) -> Vec<(PathBuf, String)> {
 }
 
 /// Execute the plan against `cgroup_root` (`/sys/fs/cgroup` in the guest; a
-/// tempdir in tests). Every target file is expected to already exist — a real
-/// cgroupfs never needs one created (`cgroup.subtree_control` is always
-/// present in an existing cgroup directory) — so a missing file is reported
-/// as an error rather than silently created. Controllers a kernel lacks make
-/// the write fail too — the caller treats delegation failure as
-/// loud-but-nonfatal (dockerd still starts; nested limits degrade honestly).
+/// tempdir in tests) with **per-controller, best-effort writes**: each
+/// controller token in a plan entry (e.g. `"+cpu"`, `"+io"`) is written to
+/// its `cgroup.subtree_control` file as an INDEPENDENT write, opening the
+/// file fresh each time. This matters because cgroup v2 rejects an entire
+/// multi-token write (`EINVAL`) the instant ANY one controller in it is
+/// unavailable — so a single missing controller must never take the others
+/// down with it. A missing `cgroup.subtree_control` file (no such cgroup
+/// directory) or a kernel-refused controller both fail only THAT write; they
+/// are logged and the loop continues to the next controller/level. Returns
+/// `Ok` as long as at least one controller write across the whole plan
+/// succeeded; `Err` (the last observed error) only when every single write —
+/// every controller, every ancestor level — failed. The caller treats even an
+/// `Err` as loud-but-nonfatal (dockerd still starts; nested limits degrade
+/// honestly).
 pub fn apply_delegation(cgroup_root: &Path, container_cgroup: &str) -> std::io::Result<()> {
-    for (rel, value) in delegation_plan(container_cgroup) {
-        let path = cgroup_root.join(rel);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&path)?;
-        f.write_all(value.as_bytes())?;
+    let plan = delegation_plan(container_cgroup);
+    if plan.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let mut any_written = false;
+    let mut last_err: Option<std::io::Error> = None;
+    for (rel, controllers) in plan {
+        let path = cgroup_root.join(rel);
+        for controller in controllers.split_whitespace() {
+            match write_controller(&path, controller) {
+                Ok(()) => any_written = true,
+                Err(e) => {
+                    eprintln!(
+                        "izba-init: docker-mode cgroup delegation: writing {controller} to {}: {e}",
+                        path.display()
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+    }
+    if any_written {
+        Ok(())
+    } else {
+        Err(last_err.expect("non-empty plan always attempts at least one controller write"))
+    }
+}
+
+/// Write a single controller token (e.g. `"+cpu"`) to `path`, opening it
+/// fresh for this one write — the unit of failure cgroup v2 actually uses
+/// (one `write(2)` per control message), so one controller's `EINVAL` can
+/// never poison a sibling controller's write.
+fn write_controller(path: &Path, controller: &str) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+    writeln!(f, "{controller}")
 }
 
 /// Extract the container's cgroup path out of `/proc/<pid>/cgroup` content.
@@ -140,19 +174,43 @@ mod tests {
     #[test]
     fn apply_delegation_writes_fake_cgroupfs() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("izba")).unwrap();
         std::fs::write(root.path().join("cgroup.subtree_control"), "").unwrap();
         apply_delegation(root.path(), "/izba").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("cgroup.subtree_control")).unwrap(),
-            "+cpu +memory +pids +io"
-        );
+        // Each controller is its own independent write (opened fresh, not one
+        // joined write) — assert all four landed, proving each was actually
+        // attempted rather than only the last one surviving a truncate.
+        let content = std::fs::read_to_string(root.path().join("cgroup.subtree_control")).unwrap();
+        for token in ["+cpu", "+memory", "+pids", "+io"] {
+            assert!(content.contains(token), "missing {token} in {content:?}");
+        }
     }
 
     #[test]
     fn apply_delegation_missing_file_is_reported() {
         let root = tempfile::tempdir().unwrap();
         assert!(apply_delegation(root.path(), "/izba").is_err());
+    }
+
+    #[test]
+    fn apply_delegation_one_ancestor_level_failing_does_not_block_others() {
+        // Faithfully injecting a SINGLE CONTROLLER's failure needs real
+        // cgroup2 content validation (a plain tempdir file accepts any bytes
+        // — there is no "+bogus-controller is EINVAL but +cpu is fine" to
+        // fake short of a real kernel). What IS cheap and meaningful here:
+        // proving the write LOOP doesn't `?`-abort the whole delegation the
+        // moment one PLAN ENTRY fails — i.e. a missing ancestor level must
+        // not prevent a level that does exist from still getting delegated.
+        // The true per-controller EINVAL-degrades-only-itself path is left
+        // to Task 7's real-VM boot (see the report's Task 7 concerns).
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("cgroup.subtree_control"), "").unwrap();
+        // Deliberately do NOT create "a/cgroup.subtree_control" — container
+        // cgroup "/a/b" needs both the root and "a" delegated.
+        apply_delegation(root.path(), "/a/b").unwrap(); // Ok: the root level succeeded.
+        let content = std::fs::read_to_string(root.path().join("cgroup.subtree_control")).unwrap();
+        for token in ["+cpu", "+memory", "+pids", "+io"] {
+            assert!(content.contains(token), "missing {token} in {content:?}");
+        }
     }
 
     #[test]

@@ -301,21 +301,29 @@ fn run_pid1() -> anyhow::Result<()> {
                 // Best-effort (loud, non-fatal) — a kernel/controller gap
                 // degrades nested resource limits but must not block the
                 // engine from starting at all.
-                let cgroup_path = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-                    .ok()
-                    .and_then(|s| docker::parse_cgroup_path(&s));
-                match cgroup_path {
-                    Some(cg) => {
-                        if let Err(e) =
-                            docker::apply_delegation(std::path::Path::new("/sys/fs/cgroup"), &cg)
-                        {
-                            eprintln!(
-                                "izba-init: docker-mode cgroup delegation incomplete: {e} (nested container limits degraded)"
-                            );
+                match std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+                    Ok(s) => match docker::parse_cgroup_path(&s) {
+                        Some(cg) => {
+                            if let Err(e) = docker::apply_delegation(
+                                std::path::Path::new("/sys/fs/cgroup"),
+                                &cg,
+                            ) {
+                                eprintln!(
+                                    "izba-init: docker-mode cgroup delegation incomplete: {e} (nested container limits degraded)"
+                                );
+                            }
                         }
-                    }
-                    None => eprintln!(
-                        "izba-init: docker-mode cgroup delegation skipped: container cgroup unknown"
+                        // Distinct from the read failure below: the file was
+                        // read fine, but had no `0::<path>` unified-hierarchy
+                        // line (unexpected content, not a raced-away pid).
+                        None => eprintln!(
+                            "izba-init: docker-mode cgroup delegation skipped: /proc/{pid}/cgroup had no parseable unified-hierarchy line"
+                        ),
+                    },
+                    // The pid raced away (container died between container_pid()
+                    // returning it and this read) or /proc is otherwise unreadable.
+                    Err(e) => eprintln!(
+                        "izba-init: docker-mode cgroup delegation skipped: reading /proc/{pid}/cgroup: {e}"
                     ),
                 }
                 // Auto-start the engine regardless of delegation outcome —
