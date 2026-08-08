@@ -2349,6 +2349,14 @@ fn git_read_only_repo_allows_clone_denies_push() {
 const DIND_IMAGE: &str =
     "docker@sha256:2a232a42256f70d78e3cc5d2b5d6b3276710a0de0596c145f627ecfae90282ac";
 
+/// The image the NESTED engine pulls — pinned by DIGEST for the same reason as
+/// [`DIND_IMAGE`] (resolved 2026-08-08 from the floating tag
+/// `hello-world:latest`). The journey greps this container's stdout, so a
+/// re-push of the tag would change both what the test runs AND whether it
+/// passes, and the failure would read as a docker-mode product regression.
+const HELLO_WORLD_IMAGE: &str =
+    "hello-world@sha256:7f4da0fc94bcece205a8c0b6f4d11c8196924654ffe5c4d1aa439b7f632048b2";
+
 /// `create` a docker-mode sandbox on the dind fixture, sized for a real engine
 /// (dockerd + containerd + a nested container are hungry compared to the 1
 /// cpu / 1 GiB the alpine tests use). Registers the name for cleanup.
@@ -2639,7 +2647,7 @@ fn docker_mode_engine_runs_containers() {
     let (status, stdout, stderr) = exec_collect(
         &tb.paths,
         name,
-        &["docker", "run", "--rm", "hello-world"],
+        &["docker", "run", "--rm", HELLO_WORLD_IMAGE],
         None,
     )
     .expect("exec docker run");
