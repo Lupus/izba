@@ -1220,6 +1220,21 @@ fn docker_publish_reaches_inner_container() {
         docker_diag(&data, name)
     );
 
+    // [2b] Task 10: `izba status` must show docker mode plus a running
+    // engine line, sourced from the same guest Stats round-trip the port
+    // reach-through below exercises transitively.
+    let o = izba(&data, no_env, &["status", name]);
+    assert_ok(&o, "status");
+    let status_out = stdout_of(&o);
+    assert!(
+        status_out.contains("mode:        docker"),
+        "status must show docker mode, got:\n{status_out}"
+    );
+    assert!(
+        status_out.contains("engine:      running"),
+        "status must show a running engine, got:\n{status_out}"
+    );
+
     // [3] Run nginx in the nested engine with a published port. `-p 8080:80`
     // makes docker-proxy listen on 8080 in the WORKLOAD's netns.
     let o = izba(

@@ -163,6 +163,11 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   izbad dials out + replies `Ok`/`Error`, then raw byte pipe) or
   `StreamOpen::Dns` (RFC 1035 2-byte-BE length framing per `izba_proto::dns`,
   request/response alternating). TCP `:53` routes to the same resolver.
+  Control port 1025 also serves `Request::Stats` (`izba-init`'s process/mem/
+  mount/docker-engine snapshot — guest-reported, daemon-sanitized before it
+  reaches the CLI/GUI; ~250 ms in-call CPU sampling via two `/proc` reads
+  makes the RPC stateless). `DAEMON_PROTO_VERSION = 5` is this: v5 added
+  `DaemonRequest::Stats`.
 - **Disk order:** `sandbox::start()` builds
   `[rootfs.erofs (RO)=vda, rw.img (RW)=vdb, vol₀=vdc, vol₁=vdd, …]`
   (`build_vm_disks`) → CH enumerates `--disk` in that order, OpenVMM gives each
