@@ -2573,6 +2573,65 @@ fn docker_mode_engine_runs_containers() {
         "the dind image must ship dockerd; engine log said: {engine_log:?}"
     );
 
+    // --- [5b] The /proc/sys narrowing is real, and complete -----------------
+    // Docker mode unlocks the `net` sysctl subtree (dockerd needs
+    // net.ipv4.ip_forward) and NOTHING else. This matters because non-net
+    // sysctls are gated by a plain euid check with no namespace component, and
+    // container-uid-0 maps to guest-uid-0 in common id maps — so an unlocked
+    // /proc/sys/kernel would be a genuine container→guest-root escape hatch
+    // (kernel.core_pattern, kernel.modprobe).
+    //
+    // Enumerating the REAL /proc/sys is the point: the host-side list in
+    // runtime_config.rs could miss a subtree this kernel registers, and that
+    // subtree would then be silently writable. crun bind-remounts every
+    // readonlyPath, so a protected child has its own /proc/mounts line and an
+    // unprotected one does not. Any output at all is a failure, and it names
+    // the offender.
+    let unprotected = exec_ok(
+        &tb.paths,
+        name,
+        &[
+            "sh",
+            "-c",
+            "for d in /proc/sys/*; do [ -d \"$d\" ] || continue; \
+             [ \"$d\" = /proc/sys/net ] && continue; \
+             grep -q \" $d \" /proc/mounts || echo \"$d\"; done",
+        ],
+    );
+    assert!(
+        unprotected.trim().is_empty(),
+        "every non-net /proc/sys subtree must be remounted read-only; \
+         these are NOT: {unprotected:?}\n{}",
+        docker_diag(&tb.paths, name)
+    );
+    // Concrete companion: container root really cannot write a kernel sysctl
+    // (`pid_max` exists on every CONFIG_SYSCTL kernel).
+    let (write_status, _, write_err) = exec_collect(
+        &tb.paths,
+        name,
+        &["sh", "-c", "echo 4194304 > /proc/sys/kernel/pid_max"],
+        None,
+    )
+    .expect("exec sysctl write attempt");
+    assert_ne!(
+        write_status,
+        ExitStatus::Code(0),
+        "container root must NOT be able to write /proc/sys/kernel/* in docker mode"
+    );
+    assert!(
+        write_err.to_lowercase().contains("read-only"),
+        "the refusal must come from the read-only remount, got: {write_err:?}"
+    );
+    // ...while the subtree dockerd needs really is writable — proven by the
+    // value dockerd itself wrote during the startup that phase [5] just
+    // confirmed.
+    let forwarding = exec_ok(&tb.paths, name, &["cat", "/proc/sys/net/ipv4/ip_forward"]);
+    assert_eq!(
+        forwarding.trim(),
+        "1",
+        "dockerd must have been able to set net.ipv4.ip_forward"
+    );
+
     // --- [6] A nested container, pulled through izba's egress plane ---------
     // Proves: inner pull over the veth + prerouting REDIRECT, nested runc
     // under the delegated cgroups, and that the userns-scoped admin caps are

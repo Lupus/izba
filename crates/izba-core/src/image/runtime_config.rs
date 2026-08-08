@@ -833,7 +833,8 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
         }
     }
 
-    // Docker mode only: drop `/proc/sys` from the OCI default `readonlyPaths`.
+    // Docker mode only: narrow the OCI default `/proc/sys` read-only remount
+    // down to its non-`net` children (see [`DOCKER_READONLY_PROC_SYS`]).
     //
     // dockerd cannot create its default `bridge` network without writing
     // `/proc/sys/net/ipv4/ip_forward` (plus a handful of per-interface
@@ -844,22 +845,36 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     //   open ...: read-only file system
     // (observed in Task 7's first green-veth boot). Docker's own dind image
     // solves this with `--privileged`, which clears readonlyPaths AND
-    // maskedPaths AND all capability limits; izba does strictly less — only
-    // this one path, and only for docker-mode sandboxes.
+    // maskedPaths AND all capability limits; izba unlocks exactly one sysctl
+    // subtree, and only for docker-mode sandboxes.
     //
-    // Why this is not a trust-boundary widening: the workload runs in a user
-    // namespace, and the kernel gates every `/proc/sys` write on the OWNING
-    // user namespace. `net.*` is per-netns and this netns belongs to the
-    // container's userns (spec §3), so those writes are legitimately the
-    // container's own. Host-owned sysctls (`kernel.*`, `vm.*`, …) remain
-    // refused by the kernel itself with EPERM regardless of this remount —
-    // the userns is the boundary, `readonlyPaths` was only defence in depth.
-    // The other default read-only paths (`/proc/bus`, `/proc/fs`,
-    // `/proc/irq`, `/proc/sysrq-trigger`) and ALL `maskedPaths` stay.
+    // **Why the whole subtree is NOT unlocked.** `net.*` writes are gated by
+    // the kernel on the owning user namespace (`net_ctl_permissions` ⇒
+    // `ns_capable(net->user_ns, CAP_NET_ADMIN)`), and this netns belongs to the
+    // container's userns (spec §3) — so those writes are legitimately the
+    // container's own and the userns really is the boundary there. Every OTHER
+    // sysctl goes through `sysctl_perm`/`test_perm`, which is a plain
+    // `current_euid() == GLOBAL_ROOT_UID` check against the 0644 file mode —
+    // NO namespace check at all. Container-uid-0 maps to guest-uid-0 in common
+    // id maps (`transpose_identity_map` emits `extent(0, 0, …)` both when
+    // workload == owner and whenever `min(workload, owner) > 0`), so unlocking
+    // all of `/proc/sys` would hand container root real write access to
+    // `kernel.core_pattern`, `kernel.modprobe`, `vm.*` … — i.e. guest-init-root
+    // code execution outside the container overlay. Keeping the non-`net`
+    // children explicitly read-only makes the guarantee unconditional instead
+    // of id-map-dependent.
+    //
+    // The other default read-only paths (`/proc/bus`, `/proc/fs`, `/proc/irq`,
+    // `/proc/sysrq-trigger`) and ALL `maskedPaths` stay untouched.
     if params.docker {
         if let Some(linux) = spec.linux_mut().as_mut() {
             if let Some(mut ro) = linux.readonly_paths().clone() {
                 ro.retain(|p| p != "/proc/sys");
+                for child in DOCKER_READONLY_PROC_SYS {
+                    if !ro.iter().any(|p| p == child) {
+                        ro.push((*child).to_string());
+                    }
+                }
                 linux.set_readonly_paths(Some(ro));
             }
         }
@@ -867,6 +882,37 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
 
     Ok(spec)
 }
+
+/// The `/proc/sys` children that stay read-only in docker mode: every top-level
+/// sysctl subtree izba's guest kernel registers EXCEPT `net`, which dockerd
+/// must write (see the `params.docker` block in [`generate_spec`]).
+///
+/// A path that does not exist in the guest kernel is harmless: per the OCI
+/// runtime spec a runtime ignores a `readonlyPaths` entry it cannot resolve
+/// (crun releases the `ENOENT` and continues), so over-listing is free while
+/// UNDER-listing silently leaves a subtree writable. Erring towards
+/// over-listing is therefore deliberate.
+///
+/// The authority is the guest kernel, not this list, and the enforcement is
+/// real: `docker_mode_engine_runs_containers` phase [5b] enumerates the ACTUAL
+/// `/proc/sys` in a booted docker-mode guest and fails naming any non-`net`
+/// child that is not remounted read-only. That oracle is not theoretical — it
+/// is what caught `sunrpc` (registered by `CONFIG_SUNRPC` in izba's kernel and
+/// absent from the canonical "abi/debug/dev/fs/kernel/net/user/vm" set) on the
+/// first real boot after this narrowing landed. A future kernel option adding
+/// another subtree fails that test rather than slipping through.
+const DOCKER_READONLY_PROC_SYS: &[&str] = &[
+    "/proc/sys/abi",
+    "/proc/sys/debug",
+    "/proc/sys/dev",
+    "/proc/sys/fs",
+    "/proc/sys/kernel",
+    // CONFIG_SUNRPC (the guest kernel carries NFS/SUNRPC); not part of the
+    // canonical set, found by the phase-[5b] guest enumeration.
+    "/proc/sys/sunrpc",
+    "/proc/sys/user",
+    "/proc/sys/vm",
+];
 
 /// Bind the shared device directory into the container and authorise the serial
 /// char majors.
@@ -1817,10 +1863,14 @@ mod tests {
     }
 
     #[test]
-    fn docker_mode_unlocks_proc_sys_but_keeps_every_other_readonly_path() {
+    fn docker_mode_unlocks_only_proc_sys_net_and_keeps_every_other_readonly_path() {
         // dockerd cannot bring up its default bridge without writing
-        // /proc/sys/net/ipv4/ip_forward (real-boot failure, Task 7). Only that
-        // one path is unlocked; the rest of readonlyPaths stays.
+        // /proc/sys/net/ipv4/ip_forward (real-boot failure, Task 7). ONLY the
+        // net subtree is unlocked: the blanket /proc/sys entry is replaced by
+        // its non-net children, because non-net sysctls are gated by a plain
+        // euid check with no namespace component — container root maps to
+        // guest root in common id maps, so an unlocked /proc/sys/kernel would
+        // be a real escape hatch.
         let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
         let mut params = base_params(&img);
         params.docker = true;
@@ -1834,8 +1884,26 @@ mod tests {
             .expect("readonlyPaths present");
         assert!(
             !ro.iter().any(|p| p == "/proc/sys"),
-            "docker mode must unlock /proc/sys, got {ro:?}"
+            "the blanket /proc/sys entry must be gone (it would keep net RO), got {ro:?}"
         );
+        // Every non-net sysctl subtree is pinned read-only, one entry each.
+        for keep in DOCKER_READONLY_PROC_SYS {
+            assert!(
+                ro.iter().any(|p| p == keep),
+                "{keep} must stay read-only in docker mode, got {ro:?}"
+            );
+        }
+        // The escape-hatch subtrees specifically (belt and braces: this list is
+        // what a future edit of DOCKER_READONLY_PROC_SYS must not lose).
+        for critical in ["/proc/sys/kernel", "/proc/sys/vm", "/proc/sys/fs"] {
+            assert!(ro.iter().any(|p| p == critical), "{critical} must be RO");
+        }
+        // ...and net is NOT read-only, under any prefix spelling.
+        assert!(
+            !ro.iter().any(|p| p.starts_with("/proc/sys/net")),
+            "/proc/sys/net must stay writable for dockerd, got {ro:?}"
+        );
+        // The non-/proc/sys defaults survive.
         for keep in ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sysrq-trigger"] {
             assert!(
                 ro.iter().any(|p| p == keep),
@@ -1851,6 +1919,27 @@ mod tests {
             .clone()
             .expect("maskedPaths present");
         assert!(masked.iter().any(|p| p == "/proc/kcore"));
+    }
+
+    #[test]
+    fn non_docker_spec_gets_no_proc_sys_children() {
+        // The narrowing is docker-mode-only: a normal sandbox keeps the single
+        // blanket entry and gains none of the per-child ones.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let spec = generate_spec(&base_params(&img)).unwrap();
+        let ro = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .readonly_paths()
+            .clone()
+            .expect("readonlyPaths present");
+        for child in DOCKER_READONLY_PROC_SYS {
+            assert!(
+                !ro.iter().any(|p| p == child),
+                "non-docker spec must not carry {child}, got {ro:?}"
+            );
+        }
     }
 
     #[test]
