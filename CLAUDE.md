@@ -176,7 +176,7 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   Named volumes are persistent (`<data>/volumes/<name>.img`, survive `rm`,
   single-writer); anonymous are ephemeral (in the sandbox dir).
 - **Cmdline chain:** `console=ttyS0 izba.hostname=<name>
-  [izba.volumes=<p0>,<p1>,…] [izba.buildout=1] [izba.usb=1]` ↔
+  [izba.volumes=<p0>,<p1>,…] [izba.buildout=1] [izba.usb=1] [izba.docker=1]` ↔
   `hack/kernel.config` (`SERIAL_8250_CONSOLE`; netfilter/nftables —
   `NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK` — + `CONFIG_DUMMY`) ↔ init
   reads `izba.hostname` for sethostname and `izba.volumes` (ordered,
@@ -227,6 +227,63 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   Live attachments are host-observed, not asked of the guest: the broker holds
   one registry entry per splice (`usb/broker/attachments.rs`), which is what
   `UsbDeviceInfo.attached_to` and `UsbStatus.attached` report.
+- **Docker mode (#198, `izba.docker=1`):** a sandbox created with `--docker`
+  (or an image carrying the `com.docker.sandboxes.start-docker` label, unless
+  `--no-docker`) runs a full nested Docker Engine. Host-authoritative like USB:
+  `config.docker` rides `izba.docker=1` on the cmdline; **mutually exclusive
+  with `--builder`** (`docker: config.docker && !config.builder`, re-asserted at
+  both the OCI-spec and cmdline sites). Load-bearing pieces, change all ends or
+  none:
+  - **Own netns + veth (spec §3):** unlike every other sandbox (which shares
+    init's netns), the workload gets a FRESH network namespace in its OCI spec
+    so a nested dockerd owns its own bridge/NAT. `net.rs` in docker mode brings
+    up only `lo` + `route_localnet` (NO dummy0). After `crun` reports the
+    container `running`, init runs `veth::apply(container_pid)`: a `veth0`↔`veth1`
+    pair, init side `192.168.127.1` (= `RESOLVER_IP`, the gateway), container
+    side `192.168.127.2` (= `net::GUEST_IP`) with a default route back through
+    `.1`. The named-handle form is `ip netns attach izba <pid>` then `ip -n izba
+    …` (iproute2's `-n` needs a `/var/run/netns/<name>` handle, so
+    `veth::apply` `create_dir_all`s it first). resolv.conf points at
+    `192.168.127.1`, NOT loopback (the container's own netns has no 127.0.0.1
+    stub).
+  - **nft interception moves to prerouting:** the workload's egress arrives over
+    the veth and traverses the nat **prerouting** chain (`NFT_DOCKER_PREROUTING`),
+    never init's `output` hook — same REDIRECT surface (`:53`→DNS stub,
+    everything else→`:15001` relay), so every inner-container byte is still
+    izbad-governed and netlog-visible. The **output** chain gains ONE docker-only
+    rule, `ip daddr 192.168.127.2 return`, exempting init's OWN veth-fallback
+    dial (see below) from its relay REDIRECT — without it a published-port dial
+    would be swallowed and izbad would try to reach `.2` from the host and time
+    out. `egress::output_chain(false)` is byte-equal to the non-docker
+    `NFT_RULESET` (guard test) so the default datapath is untouched.
+  - **Port reach-through:** `server::tcp_dial` tries `127.0.0.1:port` first, then
+    (docker mode only) falls back to `net::GUEST_IP` — that is what makes a
+    docker-published port (docker-proxy in the workload netns) reachable from the
+    host relay. FOOTGUN: `izba port publish N:22|53|15001` hits init's own
+    sshd/DNS/relay on loopback, not the container (deferred).
+  - **cgroup delegation + engine auto-start:** init writes `+cpu +memory +pids
+    +io` into every ancestor `cgroup.subtree_control` (per-controller, best-
+    effort) so the container cgroup can create controller-bearing children, then
+    fire-and-forgets `crun exec --user 0:0` of `dockerd` (logged to
+    `/var/log/izba-dockerd.log`; no auto-restart — a dead engine stays dead). The
+    OCI spec mounts `/sys/fs/cgroup` **rw** for docker mode (a nested runc needs
+    to `mkdir` its own subtree).
+  - **`/proc/sys/net`-only unlock:** the OCI default read-only-remounts all of
+    `/proc/sys`, but dockerd must write `net.ipv4.ip_forward`. Docker mode keeps
+    every NON-`net` `/proc/sys` child read-only (`DOCKER_READONLY_PROC_SYS`) and
+    unlocks only `net`. These binds are **defense-in-depth, not the durable
+    barrier** — a userns-`CAP_SYS_ADMIN` workload (seccomp is off) can
+    `remount,rw` them (proven on a real VM).
+  - **Container-0 ≠ guest-0 rootless uid invariant (THE durable barrier):**
+    dockerd runs as container root, so the non-`net` sysctl protection reduces to
+    the kernel DAC check (`capable_wrt_inode_uidgid`), which denies the write
+    only when container-root maps to a NON-zero guest uid — exactly the rootless
+    Docker/Podman invariant. `generate_spec` **fails a docker-mode start CLOSED**
+    (`docker_userns_isolates_root`) whenever `transpose_identity_map` would map
+    container-0 to guest-0 (a root-owned workspace / `sudo izba`, a `workload ==
+    owner`, or a non-root image `USER` on a non-root workspace). The common flow
+    (root docker image on a non-root-owned workspace ⇒ container-0 → guest-owner)
+    is allowed. See `docs/security/` finding F-32.
 - **virtiofs tag** `workspace` (driver `FsShare` ↔ init mount plan) →
   `/workspace` inside the guest, which is also exec's default cwd.
 - **SSH access (`ssh izba-<name>`):** a vendored static OpenSSH `sshd`
