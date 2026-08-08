@@ -16,6 +16,7 @@ mod pause;
 mod rwdisk;
 mod server;
 mod ssh;
+mod stats;
 mod trust;
 mod veth;
 

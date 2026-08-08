@@ -135,6 +135,14 @@ fn dispatch_control_request(
             from_unit(usb.attach_with(&device, izba_init::usb::dial_host))
         }
         Request::UsbDetach { device } => from_unit(usb.detach(&device)),
+        // TODO(sandbox-stats task 3): wire `StatsContext` + `crate::stats::collect`
+        // here and fill `container` from `crate::oci::container_state`. Placeholder
+        // keeps this match exhaustive (izba-proto's `Request::Stats` landed in
+        // task 1, ahead of the dispatch wiring in task 3).
+        Request::Stats => Response::Error {
+            kind: ErrorKind::Internal,
+            message: "stats: not yet implemented".to_string(),
+        },
         // Handled by control_conn (acks then closes the connection).
         Request::Shutdown => unreachable!("Shutdown handled by control_conn"),
     }
