@@ -64,6 +64,19 @@ pub struct SandboxConfig {
     pub docker: bool,
 }
 
+impl SandboxConfig {
+    /// Whether this sandbox actually runs in docker mode. Docker and builder
+    /// are mutually exclusive OCI profiles (a fresh userns-scoped cap set vs.
+    /// no userns at all), so a sandbox that is BOTH `docker` and `builder`
+    /// resolves to `builder` and docker mode is off. This single predicate is
+    /// the authority; every consumer (the OCI `SpecParams.docker`, the guest
+    /// `izba.docker=1` cmdline token) must route through it so the guest and
+    /// the host spec can never disagree.
+    pub fn docker_effective(&self) -> bool {
+        self.docker && !self.builder
+    }
+}
+
 /// A single host→guest TCP publish rule. Its identity (uniqueness key) is
 /// `(bind, host_port)`. `bind` serializes as a string, e.g. `"127.0.0.1"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +203,28 @@ mod tests {
             rw_size_gb: 8,
             docker: false,
         }
+    }
+
+    #[test]
+    fn docker_effective_is_docker_and_not_builder() {
+        let mut c = sample_config();
+        // All four combinations pin the exact `docker && !builder` truth table,
+        // so a flipped operator or a dropped negation cannot survive.
+        c.docker = false;
+        c.builder = false;
+        assert!(!c.docker_effective(), "neither ⇒ off");
+        c.docker = true;
+        c.builder = false;
+        assert!(c.docker_effective(), "docker only ⇒ on");
+        c.docker = false;
+        c.builder = true;
+        assert!(!c.docker_effective(), "builder only ⇒ off");
+        c.docker = true;
+        c.builder = true;
+        assert!(
+            !c.docker_effective(),
+            "builder wins: docker+builder ⇒ off (mutually exclusive OCI profiles)"
+        );
     }
 
     #[test]
