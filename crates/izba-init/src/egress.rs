@@ -350,16 +350,54 @@ table ip izba {
 }
 ";
 
-/// The nft ruleset for this boot: base output chain, plus the prerouting
-/// chain when docker mode is on. In docker mode the workload runs in its
-/// OWN netns (reached over the veth pair set up by `veth::apply`), so its
-/// traffic never traverses init's `output` hook at all — the `prerouting`
-/// chain is what actually intercepts it; the `output` chain stays in place
-/// too because init's own netns processes (e.g. the DNS/TCP stub dialing
-/// out to izbad) still traverse it.
+/// The output chain for this boot. Identical to [`NFT_RULESET`] except that
+/// docker mode adds ONE rule: `ip daddr <GUEST_IP> return`.
+///
+/// That rule is load-bearing for published ports. In docker mode
+/// `server::tcp_dial` falls back to `net::GUEST_IP` (the container side of the
+/// veth) after loopback misses — that dial is INIT-originated, so unlike the
+/// workload's own traffic it DOES traverse this `output` hook, where
+/// `tcp dport != 53 redirect to :15001` would swallow it into the egress relay.
+/// The relay then asks izbad — on the HOST — to connect to `192.168.127.2`,
+/// which exists nowhere on the host, and the port relay dies with
+/// `izba-init: egress 192.168.127.2:8080: ConnectFailed: connection timed out`
+/// (observed on a real boot, Task 7). Exempting the veth peer keeps that dial
+/// on the wire it belongs on.
+///
+/// This is NOT a policy hole: only init's own netns traverses `output`, and
+/// the only thing at `GUEST_IP` is the workload container izba itself just
+/// dialed on the user's behalf. The workload's egress still arrives via
+/// `prerouting` and is intercepted exactly as before.
+fn output_chain(docker: bool) -> String {
+    let veth_return = if docker {
+        format!("    ip daddr {} return\n", crate::net::GUEST_IP)
+    } else {
+        String::new()
+    };
+    format!(
+        "table ip izba {{
+  chain output {{
+    type nat hook output priority -100; policy accept;
+    ip daddr 127.0.0.0/8 return
+{veth_return}    tcp dport 53 redirect to :53
+    udp dport 53 redirect to :53
+    tcp dport != 53 redirect to :15001
+  }}
+}}
+"
+    )
+}
+
+/// The nft ruleset for this boot: the output chain ([`output_chain`]), plus
+/// the prerouting chain when docker mode is on. In docker mode the workload
+/// runs in its OWN netns (reached over the veth pair set up by `veth::apply`),
+/// so its traffic never traverses init's `output` hook at all — the
+/// `prerouting` chain is what actually intercepts it; the `output` chain stays
+/// in place too because init's own netns processes still traverse it (and, in
+/// docker mode, gains the veth-peer exemption `output_chain` documents).
 pub fn ruleset(docker: bool) -> String {
     if docker {
-        format!("{NFT_RULESET}{NFT_DOCKER_PREROUTING}")
+        format!("{}{NFT_DOCKER_PREROUTING}", output_chain(true))
     } else {
         NFT_RULESET.to_string()
     }
@@ -776,7 +814,44 @@ mod tests {
         // needs the output-hook chain even when the workload uses prerouting.
         let r = ruleset(true);
         assert!(r.contains("type nat hook output priority -100"));
-        assert!(r.contains(NFT_RULESET));
+        // Everything the base output chain does is still there (the docker
+        // variant ADDS the veth-peer exemption, it removes nothing).
+        for rule in [
+            "ip daddr 127.0.0.0/8 return",
+            "tcp dport 53 redirect to :53",
+            "udp dport 53 redirect to :53",
+        ] {
+            assert!(r.contains(rule), "docker output chain lost {rule:?}");
+        }
+        assert!(r.contains(&format!("tcp dport != 53 redirect to :{REDIRECT_PORT}")));
+    }
+
+    #[test]
+    fn output_chain_without_docker_is_exactly_the_documented_const() {
+        // Guards against the generated chain drifting from NFT_RULESET, whose
+        // doc comment is the reference explanation of every rule.
+        assert_eq!(output_chain(false), NFT_RULESET);
+    }
+
+    #[test]
+    fn docker_output_chain_exempts_the_veth_peer_before_the_relay_rule() {
+        // The init-side dial to the container (server::tcp_dial's docker
+        // fallback) must NOT be swallowed by `tcp dport != 53 redirect`, or
+        // izbad tries to reach 192.168.127.2 from the HOST and the port relay
+        // times out (real-boot failure, Task 7).
+        let r = output_chain(true);
+        let exempt = format!("ip daddr {} return", crate::net::GUEST_IP);
+        let at = r
+            .find(&exempt)
+            .unwrap_or_else(|| panic!("docker output chain must exempt the veth peer:\n{r}"));
+        let relay = r.find("tcp dport != 53 redirect").expect("relay rule");
+        assert!(
+            at < relay,
+            "the exemption must precede the relay rule:\n{r}"
+        );
+        // ...and it must NOT leak into the shared-netns ruleset, where the same
+        // address is the guest's own dummy0 and nothing dials it from init.
+        assert!(!output_chain(false).contains(&exempt));
     }
 
     #[test]
