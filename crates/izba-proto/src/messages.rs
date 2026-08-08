@@ -44,6 +44,11 @@ pub enum Request {
     UsbDetach {
         device: String,
     },
+    /// Guest resource stats for the host's status surfaces: mini-top,
+    /// memory, load, mount fullness, docker-engine liveness. Read-only,
+    /// side-effect-free; the reply is UNTRUSTED guest data which izbad
+    /// sanitizes before display. Takes ~250 ms (in-call CPU sampling).
+    Stats,
 }
 
 /// State of the in-guest OCI workload container, as reported by `crun state`.
@@ -110,6 +115,69 @@ pub struct HealthInfo {
     pub container: Option<ContainerState>,
 }
 
+/// One process in the guest's mini-top, reported by init's `/proc` scan.
+/// All fields are guest-reported and therefore UNTRUSTED: the daemon
+/// sanitizes `comm` and truncates the containing list before anything
+/// host-side renders it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcSample {
+    pub pid: u32,
+    /// `/proc/<pid>/comm` — guest-controlled bytes.
+    pub comm: String,
+    /// Kernel state char (R/S/D/Z/T/…).
+    pub state: char,
+    /// CPU share over the sampling interval, in permille of ONE cpu
+    /// (a multi-threaded process can exceed 1000).
+    pub cpu_permille: u32,
+    pub rss_kb: u64,
+}
+
+/// Filesystem-level fullness of one guest mount (statfs), under its guest
+/// path (`/`, `/var/lib/docker`, …). Guest-reported, untrusted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MountUsage {
+    pub path: String,
+    pub total_bytes: u64,
+    pub avail_bytes: u64,
+}
+
+/// Nested Docker Engine liveness as observed by init (a live `dockerd`
+/// process in the guest's pid namespace tree). Present only when the
+/// sandbox booted with `izba.docker=1`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DockerEngine {
+    pub running: bool,
+    /// When `!running`: a bounded tail of the engine log, so the host can
+    /// say WHY (crashed vs "image ships no dockerd"). Guest-controlled.
+    pub detail: Option<String>,
+}
+
+/// Guest-side stats payload for [`Request::Stats`]. Everything here is
+/// guest-reported: the host treats it as display data, never as authority.
+/// CPU percentages are computed inside the call (two `/proc` samples
+/// ~250 ms apart), so the RPC is stateless.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GuestStats {
+    /// Top processes by CPU over the sampling interval, descending.
+    pub processes: Vec<ProcSample>,
+    /// Total live processes in the guest (all pid namespaces — init's
+    /// `/proc` sees the workload container's tree too).
+    pub process_count: u32,
+    /// Load averages × 100 (`/proc/loadavg`).
+    pub load1_centi: u32,
+    pub load5_centi: u32,
+    pub load15_centi: u32,
+    /// `/proc/meminfo` MemTotal / MemAvailable.
+    pub mem_total_kb: u64,
+    pub mem_available_kb: u64,
+    pub mounts: Vec<MountUsage>,
+    /// `Some` only when the guest booted with `izba.docker=1`.
+    pub docker: Option<DockerEngine>,
+    /// Same container state `Health` reports — lets the daemon serve both
+    /// from one guest round-trip.
+    pub container: Option<ContainerState>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitStatus {
@@ -153,6 +221,7 @@ pub enum Response {
         devid: u32,
         speed: u32,
     },
+    Stats(GuestStats),
     Error {
         kind: ErrorKind,
         message: String,
@@ -583,5 +652,62 @@ mod tests {
             let back: Response = crate::read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
             assert_eq!(format!("{resp:?}"), format!("{back:?}"));
         }
+    }
+
+    #[test]
+    fn stats_request_and_response_round_trip() {
+        let req = Request::Stats;
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"stats\""), "snake_case tag: {s}");
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, Request::Stats));
+
+        let resp = Response::Stats(GuestStats {
+            processes: vec![ProcSample {
+                pid: 812,
+                comm: "node".into(),
+                state: 'R',
+                cpu_permille: 421,
+                rss_kb: 319_488,
+            }],
+            process_count: 61,
+            load1_centi: 42,
+            load5_centi: 30,
+            load15_centi: 19,
+            mem_total_kb: 4_046_412,
+            mem_available_kb: 2_012_004,
+            mounts: vec![MountUsage {
+                path: "/var/lib/docker".into(),
+                total_bytes: 10 * 1024 * 1024 * 1024,
+                avail_bytes: 8 * 1024 * 1024 * 1024,
+            }],
+            docker: Some(DockerEngine {
+                running: true,
+                detail: None,
+            }),
+            container: Some(ContainerState::Running),
+        });
+        let s = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&s).unwrap();
+        match back {
+            Response::Stats(g) => {
+                assert_eq!(g.processes.len(), 1);
+                assert_eq!(g.processes[0].comm, "node");
+                assert_eq!(g.process_count, 61);
+                assert!(g.docker.as_ref().unwrap().running);
+                assert_eq!(g.container, Some(ContainerState::Running));
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_guest_rejects_stats_request_as_unknown_variant() {
+        // A pre-stats guest deserializing `{"type":"stats"}` fails at serde —
+        // its control loop replies nothing and drops the conn, which the
+        // daemon maps to `guest: None`. Documented here: the request tag must
+        // stay exactly "stats" so this failure mode is stable.
+        let s = serde_json::to_string(&Request::Stats).unwrap();
+        assert_eq!(s, r#"{"type":"stats"}"#);
     }
 }
