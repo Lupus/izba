@@ -81,6 +81,18 @@ pub fn assign_eph_ids(volumes: &mut [VolumeSpec]) {
     }
 }
 
+/// Component-wise match against [`DOCKER_VOLUME_PATH`] so `/var/lib/docker/.`
+/// and friends don't slip past (shared by volume injection and stats
+/// attribution — keep both call sites on THIS predicate).
+pub fn is_docker_volume_path(p: &std::path::Path) -> bool {
+    let target: Vec<std::path::Component> = std::path::Path::new(DOCKER_VOLUME_PATH)
+        .components()
+        .collect();
+    p.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .eq(target.iter().cloned())
+}
+
 /// Docker mode auto-attaches an anonymous ext4 volume at
 /// [`DOCKER_VOLUME_PATH`] unless the user already declared a volume there
 /// (a named volume then gives persistence across `izba rm`). Component-wise
@@ -90,15 +102,7 @@ pub fn inject_docker_volume(volumes: &mut Vec<VolumeSpec>, docker: bool) {
     if !docker {
         return;
     }
-    let target: Vec<std::path::Component> = std::path::Path::new(DOCKER_VOLUME_PATH)
-        .components()
-        .collect();
-    let declared = volumes.iter().any(|v| {
-        v.guest_path
-            .components()
-            .filter(|c| !matches!(c, std::path::Component::CurDir))
-            .eq(target.iter().cloned())
-    });
+    let declared = volumes.iter().any(|v| is_docker_volume_path(&v.guest_path));
     if !declared {
         volumes.push(VolumeSpec {
             name: None,
@@ -437,6 +441,16 @@ mod tests {
         inject_docker_volume(&mut vols, true);
         assert_eq!(vols.len(), 1);
         assert_eq!(vols[0].name.as_deref(), Some("dockerlib"));
+    }
+
+    #[test]
+    fn is_docker_volume_path_matches_component_wise() {
+        use std::path::Path;
+        assert!(is_docker_volume_path(Path::new("/var/lib/docker")));
+        assert!(is_docker_volume_path(Path::new("/var/lib/docker/.")));
+        assert!(is_docker_volume_path(Path::new("/var/./lib/docker")));
+        assert!(!is_docker_volume_path(Path::new("/var/lib/docker2")));
+        assert!(!is_docker_volume_path(Path::new("/var/lib")));
     }
 
     #[test]

@@ -336,6 +336,10 @@ fn dispatch_inner(
             sandboxes: d.registry.summaries(),
         }),
         DaemonRequest::Inspect { name } => handle_inspect(d, name),
+        // Handler lands in a follow-up task (#203 stats facelift task 5); the
+        // wire types/proto bump land first so the shapes are fixed for the
+        // client/GUI work that consumes them.
+        DaemonRequest::Stats { .. } => bail!("stats RPC not yet implemented"),
         DaemonRequest::GuestRpc { name, req } => handle_guest_rpc(d, name, req),
         DaemonRequest::PortPublish {
             name,

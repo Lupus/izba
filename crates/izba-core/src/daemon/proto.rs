@@ -31,8 +31,9 @@ use izba_proto::{Request, Response};
 /// during v1; the `Unknown` catch-all below turns any future slip into a
 /// clean error instead of a dropped connection. v3 covers the `Usb*`
 /// control-plane requests; v4 covers `UsbAttach`/`UsbDetach` and the guest
-/// `Request` variants they forward.)
-pub const DAEMON_PROTO_VERSION: u32 = 4;
+/// `Request` variants they forward. v5 covers `DaemonRequest::Stats` /
+/// `DaemonResponse::Stats`.)
+pub const DAEMON_PROTO_VERSION: u32 = 5;
 
 /// First frame on every daemon connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +106,12 @@ pub enum DaemonRequest {
     },
     List,
     Inspect {
+        name: String,
+    },
+    /// Host-computed + guest-reported resource stats for one sandbox (#203):
+    /// CPU/RSS/disk from the host side, plus a sanitized `GuestStats` round
+    /// trip when the VM is up. v5.
+    Stats {
         name: String,
     },
     /// Proxy one guest control RPC (vsock 1025). `Wait` may block for the
@@ -267,6 +274,61 @@ pub struct SandboxDetail {
     pub docker: bool,
 }
 
+/// Resource stats for one sandbox (#203), served by `DaemonRequest::Stats`.
+/// `host`/`disk` are host-derived — computed by the daemon from pid/cgroup
+/// and filesystem metadata — and trusted. `guest` is guest-REPORTED (a live
+/// round trip to `izba-init`'s `Request::Stats`) and therefore sanitized by
+/// `daemon::stats::sanitize_guest_stats` before it ever reaches this struct;
+/// never trust it further.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxStats {
+    pub name: String,
+    pub running: bool,
+    /// Wall time since the VM process started, when running.
+    pub uptime_ms: Option<u64>,
+    /// Host-observed CPU/RSS + the sandbox's configured limits. `None` when
+    /// not running (there is no VMM process to sample).
+    pub host: Option<HostResources>,
+    pub disk: HostDisk,
+    /// Sanitized guest-reported mini-top/mounts/docker-engine snapshot.
+    /// `None` when the sandbox is stopped or the guest could not be reached.
+    pub guest: Option<izba_proto::GuestStats>,
+}
+
+/// Host-observed process resource usage for a running sandbox's VMM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostResources {
+    /// CPU share over the sampling interval, in permille of one host CPU.
+    /// `None` when a single sample can't yet yield a rate (first read).
+    pub cpu_permille: Option<u32>,
+    pub rss_kb: u64,
+    pub cpus_limit: u32,
+    pub mem_limit_mb: u32,
+}
+
+/// Host-computed on-disk footprint for a sandbox. Host-derived and trusted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostDisk {
+    pub rw_img_bytes: u64,
+    pub volumes: Vec<VolumeDisk>,
+    pub logs_bytes: u64,
+    /// The rootfs image's on-disk size. Shared by every sandbox created from
+    /// the SAME image (erofs layers are content-addressed) — do NOT sum this
+    /// across sandboxes into a combined footprint, it double-counts shared
+    /// storage.
+    pub image_bytes: u64,
+}
+
+/// One declared volume's disk footprint, keyed by guest mountpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeDisk {
+    pub guest_path: String,
+    pub allocated_bytes: u64,
+    /// Whether this is the auto-provisioned docker-mode volume
+    /// (`volume::is_docker_volume_path`), so the UI can label it distinctly.
+    pub docker: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     /// Display string (`build.short()`); retained for back-compat.
@@ -363,6 +425,8 @@ pub enum DaemonResponse {
         sandboxes: Vec<SandboxSummary>,
     },
     Inspect(SandboxDetail),
+    /// Result of `DaemonRequest::Stats`.
+    Stats(SandboxStats),
     Ports {
         rules: Vec<PortRule>,
     },
@@ -446,6 +510,7 @@ mod tests {
             },
             DaemonRequest::List,
             DaemonRequest::Inspect { name: "web".into() },
+            DaemonRequest::Stats { name: "web".into() },
             DaemonRequest::GuestRpc {
                 name: "web".into(),
                 req: Request::Health,
@@ -862,7 +927,47 @@ mod tests {
         // A same-version daemon predating these variants would fail the frame
         // read instead of self-healing via a restart, so the COMPATIBILITY gate
         // must move with them.
-        assert_eq!(DAEMON_PROTO_VERSION, 4);
+        assert_eq!(DAEMON_PROTO_VERSION, 5);
+    }
+
+    #[test]
+    fn stats_daemon_frames_round_trip() {
+        let req = DaemonRequest::Stats { name: "web".into() };
+        let s = serde_json::to_string(&req).unwrap();
+        let back: DaemonRequest = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, DaemonRequest::Stats { name } if name == "web"));
+
+        let resp = DaemonResponse::Stats(SandboxStats {
+            name: "web".into(),
+            running: true,
+            uptime_ms: Some(1234),
+            host: Some(HostResources {
+                cpu_permille: Some(340),
+                rss_kb: 2_621_440,
+                cpus_limit: 4,
+                mem_limit_mb: 4096,
+            }),
+            disk: HostDisk {
+                rw_img_bytes: 1_288_490_189,
+                volumes: vec![VolumeDisk {
+                    guest_path: "/var/lib/docker".into(),
+                    allocated_bytes: 2_254_857_830,
+                    docker: true,
+                }],
+                logs_bytes: 12_582_912,
+                image_bytes: 933_232_640,
+            },
+            guest: None,
+        });
+        let s = serde_json::to_string(&resp).unwrap();
+        let back: DaemonResponse = serde_json::from_str(&s).unwrap();
+        match back {
+            DaemonResponse::Stats(st) => {
+                assert!(st.disk.volumes[0].docker);
+                assert_eq!(st.host.unwrap().cpu_permille, Some(340));
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
     }
 
     #[test]
