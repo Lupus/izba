@@ -1104,3 +1104,162 @@ fn reconcile_is_clean_right_after_run() {
     let _ = izba(&data, no_env, &["rm", "--force", name]);
     let _ = izba(&data, no_env, &["daemon", "stop"]);
 }
+
+/// Docker mode, pinned by digest (resolved 2026-08-08 from `docker:28-dind`).
+const DIND_IMAGE: &str =
+    "docker@sha256:2a232a42256f70d78e3cc5d2b5d6b3276710a0de0596c145f627ecfae90282ac";
+/// The inner workload the nested engine publishes (resolved 2026-08-08 from
+/// `nginx:alpine`) — a tiny image that serves HTTP on :80 with no config.
+const NGINX_IMAGE: &str =
+    "nginx@sha256:4a73073bd557c65b759505da037898b61f1be6cbcc3c2c3aeac22d2a470c1752";
+
+/// Dump the guest console tail for a docker-mode sandbox, mirroring the
+/// build-in-VM test's dump-on-failure pattern, plus the in-container engine
+/// log (the only place a dockerd that died leaves its reason).
+fn docker_diag(data: &Path, name: &str) -> String {
+    let mut out = String::new();
+    let console = data.join("sandboxes").join(name).join("logs/console.log");
+    out.push_str(&format!("--- console.log ({}) ---\n", console.display()));
+    if let Ok(txt) = std::fs::read_to_string(&console) {
+        let lines: Vec<&str> = txt.lines().collect();
+        let start = lines.len().saturating_sub(60);
+        out.push_str(&lines[start..].join("\n"));
+    }
+    out.push_str("\n--- /var/log/izba-dockerd.log ---\n");
+    let o = izba(
+        data,
+        &[],
+        &["exec", name, "--", "cat", "/var/log/izba-dockerd.log"],
+    );
+    out.push_str(&stdout_of(&o));
+    out.push_str(&String::from_utf8_lossy(&o.stderr));
+    out
+}
+
+/// Tear the sandbox and its daemon down even when an assertion panics.
+///
+/// Every other test in this file cleans up on the happy path only, which is
+/// fine for CI (fresh runner per job) but leaks a live microVM AND a daemon
+/// still holding the published host port on a developer box — the next local
+/// run then fails with a misleading "host port … is unavailable" instead of
+/// the real regression. A docker-mode sandbox is the most expensive thing this
+/// suite boots, so it is the one that earns the guard.
+struct SandboxGuard {
+    data: PathBuf,
+    name: &'static str,
+}
+
+impl Drop for SandboxGuard {
+    fn drop(&mut self) {
+        let _ = izba(&self.data, &[], &["rm", "--force", self.name]);
+        let _ = izba(&self.data, &[], &["daemon", "stop"]);
+    }
+}
+
+/// Docker mode (#198) through the FULL daemon path: a port published against
+/// a container the nested Docker Engine started must be reachable from the
+/// host. Every hop is real — host TcpStream → izbad relay → `StreamOpen::
+/// TcpDial{8080}` over vsock 1026 → izba-init's loopback dial MISS →
+/// docker-mode veth fallback to `192.168.127.2` → docker-proxy in the
+/// workload's own netns → nginx in the nested container.
+///
+/// The veth fallback (Task 6) is the piece this test exists for: in docker
+/// mode the published port lives in the container's netns, never on init's
+/// loopback, so without the fallback this GET can only ever fail.
+#[test]
+fn docker_publish_reaches_inner_container() {
+    if !want() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+    let name = "dind-port";
+    let _guard = SandboxGuard {
+        data: data.clone(),
+        name,
+    };
+
+    // [1] Create + start a docker-mode sandbox via the real CLI flag.
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "create", "--docker", "--image", DIND_IMAGE, "--cpus", "2", "--mem", "2048", "--name",
+            name, &ws_s,
+        ],
+    );
+    assert_ok(&o, "create --docker");
+    let o = izba(&data, no_env, &["start", name]);
+    assert_ok(&o, "start");
+
+    // [2] Wait for the auto-started engine. Generous ceiling: dockerd starts
+    // containerd, its bridge + iptables, and probes storage first.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if izba(
+            &data,
+            no_env,
+            &["exec", name, "--", "docker", "info", "--format", "{{.ID}}"],
+        )
+        .status
+        .success()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    assert!(
+        ready,
+        "dockerd never became ready within 120s\n{}",
+        docker_diag(&data, name)
+    );
+
+    // [3] Run nginx in the nested engine with a published port. `-p 8080:80`
+    // makes docker-proxy listen on 8080 in the WORKLOAD's netns.
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "exec",
+            name,
+            "--",
+            "docker",
+            "run",
+            "-d",
+            "-p",
+            "8080:80",
+            NGINX_IMAGE,
+        ],
+    );
+    assert!(
+        o.status.success(),
+        "nested `docker run -d -p 8080:80 nginx` failed: {}\n{}\n{}",
+        stdout_of(&o),
+        String::from_utf8_lossy(&o.stderr),
+        docker_diag(&data, name)
+    );
+
+    // [4] Publish it host-side and GET through the whole chain.
+    assert_ok(
+        &izba(&data, no_env, &["port", "publish", name, "18080:8080"]),
+        "port publish 18080:8080",
+    );
+    let body = http_get(18080).unwrap_or_else(|e| {
+        panic!(
+            "GET 127.0.0.1:18080 never reached the nested container: {e:#}\n{}",
+            docker_diag(&data, name)
+        )
+    });
+    assert!(
+        body.contains("nginx"),
+        "expected nginx's default page through the relay, got: {body:?}\n{}",
+        docker_diag(&data, name)
+    );
+    // Teardown is the SandboxGuard's job (it also runs on panic).
+}

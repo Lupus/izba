@@ -1239,15 +1239,29 @@ fn start_with_egress(
     ws: &Path,
     policy_yaml: Option<&str>,
 ) -> izba_core::daemon::egress::EgressManager {
-    use izba_core::daemon::egress::{
-        audit::AuditSink, config::EgressPolicyConfig, sys_resolver::SystemResolver, EgressManager,
-    };
+    use izba_core::daemon::egress::config::EgressPolicyConfig;
     create_sandbox(env, tb, name, ws);
     if let Some(yaml) = policy_yaml {
         let cfg = EgressPolicyConfig::from_yaml(yaml).expect("parsing egress policy yaml");
         cfg.write_to(&tb.paths.sandbox_dir(name))
             .expect("writing egress policy.yaml");
     }
+    arm_egress_and_start(env, tb, name)
+}
+
+/// Arm the stand-in izbad egress listener for an ALREADY-CREATED sandbox and
+/// boot it. Split out of [`start_with_egress`] so tests that need a bespoke
+/// `create` (docker mode, a dedicated image, bigger cpu/mem) reuse the exact
+/// same arm-then-boot ordering — the listener MUST exist on
+/// `run/vsock.sock_1027` before the guest boots and dials it.
+fn arm_egress_and_start(
+    env: &TestEnv,
+    tb: &TestBox,
+    name: &str,
+) -> izba_core::daemon::egress::EgressManager {
+    use izba_core::daemon::egress::{
+        audit::AuditSink, sys_resolver::SystemResolver, EgressManager,
+    };
     let mgr = EgressManager::new(
         SystemResolver::new().expect("system resolver"),
         None,
@@ -2322,4 +2336,278 @@ fn git_read_only_repo_allows_clone_denies_push() {
 
     stop_sandbox(&tb, "git-ro");
     mgr.stop("git-ro", &tb.paths.run_dir("git-ro"));
+}
+
+// ---------------------------------------------------------------------------
+// Docker mode (#198): the Docker-in-Docker journey
+// ---------------------------------------------------------------------------
+
+/// The docker-mode fixture: Docker's own `dind` image, which ships a full
+/// Docker Engine (dockerd + containerd + runc + iptables). Pinned by DIGEST —
+/// resolved 2026-08-08 from the floating tag `docker:28-dind` — so a re-push of
+/// that tag can never silently change what this test boots.
+const DIND_IMAGE: &str =
+    "docker@sha256:2a232a42256f70d78e3cc5d2b5d6b3276710a0de0596c145f627ecfae90282ac";
+
+/// `create` a docker-mode sandbox on the dind fixture, sized for a real engine
+/// (dockerd + containerd + a nested container are hungry compared to the 1
+/// cpu / 1 GiB the alpine tests use). Registers the name for cleanup.
+fn create_docker_sandbox(tb: &mut TestBox, name: &str, ws: &Path) {
+    let digest = ensure_image(&tb.paths, DIND_IMAGE).expect("pulling the dind fixture image");
+    sandbox::create(
+        &tb.paths,
+        name,
+        &CreateOpts {
+            image_digest: digest,
+            image_ref: DIND_IMAGE.to_string(),
+            cpus: 2,
+            mem_mb: 2048,
+            workspace: ws.to_path_buf(),
+            rw_size_gb: 4,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            builder: false,
+            // The whole point: own netns + veth, userns-scoped admin caps,
+            // rw cgroupfs, the auto /var/lib/docker volume, izba.docker=1.
+            docker: true,
+        },
+    )
+    .expect("create docker-mode sandbox");
+    tb.names.push(name.to_string());
+}
+
+/// The whole guest serial console (not just [`console_tail`]'s last 2 KiB):
+/// the docker-mode banners this test asserts on are printed during boot and
+/// scroll far out of the tail once dockerd starts logging.
+fn console_full(paths: &Paths, name: &str) -> String {
+    let log = paths.logs_dir(name).join("console.log");
+    fs::read_to_string(&log).unwrap_or_else(|e| format!("<unreadable {}: {e}>", log.display()))
+}
+
+/// Docker-mode failure diagnostics, per the Task 7 brief: the guest console
+/// tail PLUS the in-container engine log — the two places a dockerd that never
+/// came up leaves its reason.
+fn docker_diag(paths: &Paths, name: &str) -> String {
+    let mut out = format!("--- console tail ---\n{}", console_tail(paths, name));
+    out.push_str("\n--- /var/log/izba-dockerd.log (in container) ---\n");
+    match exec_collect(paths, name, &["cat", "/var/log/izba-dockerd.log"], None) {
+        Ok((status, stdout, stderr)) => {
+            out.push_str(&format!("(exit {status:?})\n{stdout}\n{stderr}"))
+        }
+        Err((kind, msg)) => out.push_str(&format!("<exec rejected ({kind:?}): {msg}>")),
+    }
+    out
+}
+
+/// Re-run `argv` in the guest until it exits 0 or `timeout` elapses, returning
+/// the successful stdout (`None` on timeout, so the caller can dump
+/// diagnostics). dockerd needs a generous ceiling: it starts containerd, sets
+/// up its bridge + iptables, and probes storage before it answers `docker info`.
+fn poll_exec_ok(paths: &Paths, name: &str, argv: &[&str], timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok((ExitStatus::Code(0), stdout, _)) = exec_collect(paths, name, argv, None) {
+            return Some(stdout);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// The #198 docker-mode journey against a REAL microVM: engine auto-start,
+/// the veth datapath, cgroup delegation, a nested container pulled through
+/// izba's egress plane, and netlog honesty for that nested pull.
+///
+/// This is the honest gate for Tasks 4-6 — every piece below is something the
+/// host-side unit tests structurally cannot observe (a real netns, a real
+/// cgroup2 hierarchy, a real dockerd):
+///
+/// * **Task 4 (a)** `veth::apply`'s `create_dir_all("/var/run/netns")` +
+///   `ip netns attach izba <pid>` round-trip actually succeeds as root in the
+///   guest — proven by the absence of the loud failure banner AND by (b).
+/// * **Task 4 (b)** the pair carries `.1` (init side) ↔ `.2` (container side)
+///   with the default route back through `.1`.
+/// * **Task 4 (c)** the nat-**prerouting** chain intercepts traffic that
+///   originates in the workload's own netns (it never traverses init's
+///   `output` hook) — proven by inner-container-pull records in the audit log.
+/// * **Task 4 (d)** docker-mode resolv.conf points at `192.168.127.1` (the
+///   veth gateway, NOT loopback) and names actually resolve through it.
+/// * **Task 5 (a)** `cgroup.controllers` inside the container lists the
+///   delegated controllers post-boot.
+/// * **Task 5 (c)** `parse_cgroup_path` matched crun's REAL `0::<path>`
+///   naming — proven by the absence of the "delegation skipped" banner.
+/// * **Task 5 (d)** `start_engine` end-to-end: the engine log exists, dockerd
+///   is really there, and a nested container runs.
+#[test]
+fn docker_mode_engine_runs_containers() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let name = "dind";
+    let ws = tb.workspace(name);
+    create_docker_sandbox(&mut tb, name, &ws);
+    // Stand in for izbad's vsock-1027 listener: the nested image pull below
+    // travels this plane, so it must be armed before the guest boots.
+    let mgr = arm_egress_and_start(&env, &tb, name);
+
+    // --- [1] The veth datapath (Task 4 a/b) ---------------------------------
+    // The container is in its OWN netns; its only link to the world is the
+    // pair veth::apply wired up after crun reported `running`.
+    let (st, addrs, aerr) = exec_collect(
+        &tb.paths,
+        name,
+        &["ip", "-o", "addr", "show", "veth1"],
+        None,
+    )
+    .expect("exec ip addr show veth1");
+    assert_eq!(
+        st,
+        ExitStatus::Code(0),
+        "the container netns must hold the veth1 end: {aerr}\n--- console ---\n{}",
+        console_full(&tb.paths, name)
+    );
+    assert!(
+        addrs.contains("192.168.127.2/24"),
+        "container side of the veth must carry GUEST_IP, got: {addrs:?}\n{}",
+        console_full(&tb.paths, name)
+    );
+    let routes = exec_ok(&tb.paths, name, &["ip", "route"]);
+    assert!(
+        routes.contains("default via 192.168.127.1"),
+        "container's default route must go via the init-side veth address, got: {routes:?}"
+    );
+    // The loud failure banners must be absent: their presence would mean the
+    // netns attach or the cgroup delegation silently degraded this boot.
+    let console = console_full(&tb.paths, name);
+    assert!(
+        !console.contains("DOCKER-MODE VETH SETUP FAILED")
+            && !console.contains("DOCKER-MODE VETH SETUP SKIPPED"),
+        "veth setup reported failure on the console:\n{console}"
+    );
+    assert!(
+        !console.contains("cgroup delegation skipped")
+            && !console.contains("cgroup delegation incomplete"),
+        "cgroup delegation reported a problem on the console:\n{console}"
+    );
+
+    // --- [2] Docker-mode DNS (Task 4 d) -------------------------------------
+    // resolv.conf points at the veth gateway (loopback would be wrong here:
+    // the container's own netns has no DNS stub on 127.0.0.1).
+    let resolv = exec_ok(&tb.paths, name, &["cat", "/etc/resolv.conf"]);
+    assert!(
+        resolv.contains("192.168.127.1"),
+        "docker-mode resolv.conf must name the veth gateway, got: {resolv:?}"
+    );
+    let resolved = exec_ok(
+        &tb.paths,
+        name,
+        &["sh", "-lc", "getent hosts registry-1.docker.io"],
+    );
+    assert!(
+        resolved.contains("registry-1.docker.io"),
+        "a name must resolve through the veth-gateway resolver, got: {resolved:?}"
+    );
+
+    // --- [3] The auto /var/lib/docker volume --------------------------------
+    // The engine's graph root must sit on the dedicated virtio-blk volume, not
+    // on the overlay upper (overlay2-on-overlayfs does not work).
+    let mounts = exec_ok(
+        &tb.paths,
+        name,
+        &["sh", "-lc", "grep ' /var/lib/docker ' /proc/mounts"],
+    );
+    assert!(
+        mounts.contains("/dev/vd"),
+        "/var/lib/docker must be a virtio-blk volume mount, got: {mounts:?}"
+    );
+
+    // --- [4] Cgroup delegation (Task 5 a) -----------------------------------
+    // The container's own cgroup can only create controller-bearing children
+    // if init wrote `+<controller>` into every ancestor's subtree_control.
+    let controllers = exec_ok(
+        &tb.paths,
+        name,
+        &["cat", "/sys/fs/cgroup/cgroup.controllers"],
+    );
+    for want in ["cpu", "memory", "pids", "io"] {
+        assert!(
+            controllers.split_whitespace().any(|c| c == want),
+            "delegated controllers must include {want}, got: {controllers:?}"
+        );
+    }
+
+    // --- [5] Engine auto-start (Task 5 d) -----------------------------------
+    let version = poll_exec_ok(
+        &tb.paths,
+        name,
+        &["docker", "info", "--format", "{{.ServerVersion}}"],
+        Duration::from_secs(120),
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "dockerd never answered `docker info` within 120s\n{}",
+            docker_diag(&tb.paths, name)
+        )
+    });
+    assert!(
+        !version.trim().is_empty(),
+        "docker info reported an empty server version"
+    );
+    let driver = exec_ok(
+        &tb.paths,
+        name,
+        &["docker", "info", "--format", "{{.Driver}}"],
+    );
+    assert_eq!(
+        driver.trim(),
+        "overlay2",
+        "engine must run overlay2 on the dedicated volume (a non-overlay2 \
+         driver means /var/lib/docker landed on the overlay upper)"
+    );
+    // The engine log is the honest record; "ships no dockerd" is what
+    // start_engine writes when the image has no engine at all.
+    let engine_log = exec_ok(&tb.paths, name, &["cat", "/var/log/izba-dockerd.log"]);
+    assert!(
+        !engine_log.contains("ships no dockerd"),
+        "the dind image must ship dockerd; engine log said: {engine_log:?}"
+    );
+
+    // --- [6] A nested container, pulled through izba's egress plane ---------
+    // Proves: inner pull over the veth + prerouting REDIRECT, nested runc
+    // under the delegated cgroups, and that the userns-scoped admin caps are
+    // enough (no --privileged).
+    let (status, stdout, stderr) = exec_collect(
+        &tb.paths,
+        name,
+        &["docker", "run", "--rm", "hello-world"],
+        None,
+    )
+    .expect("exec docker run");
+    assert_eq!(
+        status,
+        ExitStatus::Code(0),
+        "nested `docker run` failed: stdout {stdout:?} stderr {stderr:?}\n{}",
+        docker_diag(&tb.paths, name)
+    );
+    assert!(
+        stdout.contains("Hello from Docker!"),
+        "expected the hello-world greeting from the nested container, got: {stdout:?}"
+    );
+
+    // --- [7] Netlog honesty (Task 4 c) --------------------------------------
+    // The inner pull is POLICY-VISIBLE: it reached the registry through
+    // izbad, so izba's audit log names the registry host. This is the
+    // structural payoff of moving interception to the prerouting hook — the
+    // workload's own netns cannot route anywhere else.
+    let records = read_audit_with_retry(&tb.paths, name);
+    let hosts: Vec<String> = records.iter().filter_map(|r| r.host.clone()).collect();
+    assert!(
+        hosts.iter().any(|h| h.ends_with("docker.io")),
+        "expected an audit record for the nested pull's registry host \
+         (registry-1.docker.io / auth.docker.io); saw hosts: {hosts:?}"
+    );
+
+    stop_sandbox(&tb, name);
+    mgr.stop(name, &tb.paths.run_dir(name));
 }
