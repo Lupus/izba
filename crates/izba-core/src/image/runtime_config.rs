@@ -550,14 +550,16 @@ fn maps_root_to_host_root(mappings: &[oci_spec::runtime::LinuxIdMapping]) -> boo
 /// (dockerd needs it) and seccomp is off, so it can `mount -o remount,rw` any
 /// bind izba installed in its own mount namespace — crun creates them after the
 /// userns, so they are not `MNT_LOCKED` (verified on a real VM, Task 7).
-/// What it CANNOT change is the id map: the kernel's file-write permission
-/// check (`capable_wrt_inode_uidgid`, torvalds/linux `23adbe12`) requires the
-/// target file's owner uid to be MAPPED into the acting userns, and root-owned
-/// sysctls (`/proc/sys/kernel/*`) are owned by guest-uid-0. When container-root
-/// maps to a non-zero guest id, guest-uid-0-as-container-0 is false, so the
-/// DAC/`CAP_DAC_OVERRIDE` check fails and the write is denied **regardless of
-/// any remount**. This is the same design as rootless containers
-/// (rootlesscontaine.rs, docker.com/engine/security/rootless).
+/// What it CANNOT change is the id map. A sysctl write goes through
+/// `sysctl_perm`/`test_perm`, a plain `current_euid() == GLOBAL_ROOT_UID` DAC
+/// check against the 0644 file owned by guest-uid-0: when container-root maps
+/// to a NON-zero guest id, the acting euid is not guest-0 and the write is
+/// denied. `CAP_DAC_OVERRIDE` cannot rescue it either, because
+/// `capable_wrt_inode_uidgid` (torvalds/linux `23adbe12`) additionally requires
+/// the file's owner uid to be MAPPED into the acting userns — and guest-uid-0 is
+/// exactly what a container-0 ≠ guest-0 map leaves unmapped. So the write is
+/// denied **regardless of any remount**. This is the same design as rootless
+/// containers (rootlesscontaine.rs, docker.com/engine/security/rootless).
 ///
 /// `transpose_identity_map` breaks the invariant (container-0 → guest-0)
 /// whenever `workload == owner` OR `min(workload, owner) > 0` — i.e. a
@@ -725,9 +727,11 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
              that keeps /proc/sys, cgroup and mount-based escapes contained inside \
              the user namespace. With this workspace owned by uid {o_uid}/gid {o_gid} \
              and the image USER uid {w_uid}/gid {w_gid}, izba's id transposition would \
-             map container-root to guest-root, so the sandbox is refused. Re-create \
-             the sandbox on a workspace owned by your (non-root) user — do not run izba \
-             as root or on a root-owned workspace."
+             map container-root to guest-root, so the sandbox is refused. The invariant \
+             holds when exactly ONE of {{workspace owner, image USER}} is root — the \
+             standard docker-in-sandbox setup is a root image (`docker:dind`) on a \
+             workspace owned by your non-root user, so re-create the sandbox on such a \
+             workspace and do not run izba as root."
         );
     }
     let cfg = params.image;
@@ -926,10 +930,11 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     // the list therefore only shrinks the attack surface; it does not close it.
     //
     // The DURABLE barrier is the container-0 ≠ guest-0 uid invariant enforced at
-    // the top of this function ([`docker_userns_isolates_root`]): non-`net`
-    // sysctls (owned by guest-uid-0) go through `capable_wrt_inode_uidgid`,
-    // which requires the file-owner uid to be mapped into the acting userns, so
-    // a workload whose container-root maps to a NON-zero guest id is denied the
+    // the top of this function ([`docker_userns_isolates_root`]): a non-`net`
+    // sysctl write (file owned by guest-uid-0) is gated by `test_perm`'s plain
+    // euid==guest-0 check, with `capable_wrt_inode_uidgid` blocking any
+    // `CAP_DAC_OVERRIDE` bypass while the owner uid stays unmapped — so a
+    // workload whose container-root maps to a NON-zero guest id is denied the
     // write even after it remounts the path rw — exactly as in rootless
     // Docker/Podman. That is why generate_spec fails a violating docker-mode
     // start closed rather than relying on these binds.
@@ -2052,7 +2057,9 @@ mod tests {
         let err = generate_spec(&p).expect_err("docker start must fail closed");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("rootless") && msg.contains("root-owned workspace"),
+            msg.contains("rootless")
+                && msg.contains("non-root user")
+                && msg.contains("do not run izba as root"),
             "message must be actionable + name the fix, got: {msg}"
         );
 

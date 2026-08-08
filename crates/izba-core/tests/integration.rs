@@ -2673,10 +2673,25 @@ fn docker_mode_engine_runs_containers() {
     // CAP_SYS_ADMIN workload CAN do — the bind is not MNT_LOCKED), then try to
     // write kernel.core_pattern (the classic container→host-root escalation).
     // The remount is ALLOWED; the WRITE must be DENIED — not by the bind, but by
-    // the rootless container-0 ≠ guest-0 uid invariant + the kernel DAC check
-    // (capable_wrt_inode_uidgid). This is the property PART 1 enforces at start.
+    // the rootless container-0 ≠ guest-0 uid invariant: the sysctl's plain
+    // `test_perm` euid check denies a non-guest-0 writer, and `CAP_DAC_OVERRIDE`
+    // cannot bypass it because the file's guest-0 owner is unmapped
+    // (`capable_wrt_inode_uidgid`). This is the property PART 1 enforces at start.
     let probe = exec_ok(&tb.paths, name, &["sh", "-c", PROC_SYS_ESCAPE_PROBE]);
     eprintln!("---- [5c] escape probe ----\n{probe}\n---- end probe ----");
+    // The remount MUST succeed (rc 0): the whole point is that the read-only
+    // bind is defeatable and the WRITE is nonetheless denied by the uid map. A
+    // silently-failed remount (non-zero rc, bind still in place) would deny the
+    // write for the WRONG reason — the defense-in-depth layer, not the durable
+    // barrier — and mask a uid-invariant regression behind a green test.
+    let remount_rc = probe_field(&probe, "remount_rc")
+        .unwrap_or_else(|| panic!("probe missing remount_rc:\n{probe}"));
+    assert_eq!(
+        remount_rc, "0",
+        "probe premise broken: the CAP_SYS_ADMIN remount of /proc/sys/kernel did \
+         NOT succeed, so a denied write proves nothing about the uid barrier. \
+         Probe:\n{probe}"
+    );
     let write_rc = probe_field(&probe, "write_after_remount_rc")
         .unwrap_or_else(|| panic!("probe missing write_after_remount_rc:\n{probe}"));
     assert_ne!(
