@@ -21,12 +21,14 @@ use std::net::Ipv4Addr;
 
 pub(crate) const GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
 pub(crate) const RESOLVER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 1);
-/// resolv.conf nameserver. Loopback, NOT `RESOLVER_IP`: 127.0.0.0/8 is
-/// exempt from the nft REDIRECT rule, so the reply path stays clean. A
-/// non-loopback address would be REDIRECTed to :53, but the stub's wildcard
-/// socket replies from the wrong source address — conntrack never matches the
-/// reverse-NAT tuple and the reply is dropped. See `main::write_resolv_conf`
-/// and NFT_RULESET's doc in `egress.rs`.
+/// resolv.conf nameserver in shared-netns mode. Loopback, NOT `RESOLVER_IP`:
+/// 127.0.0.0/8 is exempt from the nft REDIRECT rule, so the reply path stays
+/// clean. A non-loopback address would be REDIRECTed to :53, but the stub's
+/// wildcard socket replies from the wrong source address — conntrack never
+/// matches the reverse-NAT tuple and the reply is dropped. See
+/// `main::write_resolv_conf` and NFT_RULESET's doc in `egress.rs`.
+/// **Docker mode uses `RESOLVER_IP` instead** — see `write_resolv_conf`'s doc
+/// for why loopback doesn't work there.
 pub(crate) const DNS_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
