@@ -833,6 +833,38 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
         }
     }
 
+    // Docker mode only: drop `/proc/sys` from the OCI default `readonlyPaths`.
+    //
+    // dockerd cannot create its default `bridge` network without writing
+    // `/proc/sys/net/ipv4/ip_forward` (plus a handful of per-interface
+    // `net.ipv6.*` knobs). The OCI default read-only-remounts ALL of
+    // `/proc/sys`, so on a real boot dockerd died at startup with
+    //   failed to start daemon: Error initializing network controller: ...
+    //   failed to set IP forwarding '/proc/sys/net/ipv4/ip_forward' = '1':
+    //   open ...: read-only file system
+    // (observed in Task 7's first green-veth boot). Docker's own dind image
+    // solves this with `--privileged`, which clears readonlyPaths AND
+    // maskedPaths AND all capability limits; izba does strictly less — only
+    // this one path, and only for docker-mode sandboxes.
+    //
+    // Why this is not a trust-boundary widening: the workload runs in a user
+    // namespace, and the kernel gates every `/proc/sys` write on the OWNING
+    // user namespace. `net.*` is per-netns and this netns belongs to the
+    // container's userns (spec §3), so those writes are legitimately the
+    // container's own. Host-owned sysctls (`kernel.*`, `vm.*`, …) remain
+    // refused by the kernel itself with EPERM regardless of this remount —
+    // the userns is the boundary, `readonlyPaths` was only defence in depth.
+    // The other default read-only paths (`/proc/bus`, `/proc/fs`,
+    // `/proc/irq`, `/proc/sysrq-trigger`) and ALL `maskedPaths` stay.
+    if params.docker {
+        if let Some(linux) = spec.linux_mut().as_mut() {
+            if let Some(mut ro) = linux.readonly_paths().clone() {
+                ro.retain(|p| p != "/proc/sys");
+                linux.set_readonly_paths(Some(ro));
+            }
+        }
+    }
+
     Ok(spec)
 }
 
@@ -1782,6 +1814,60 @@ mod tests {
             .unwrap();
         let opts = m.options().clone().unwrap();
         assert!(opts.iter().any(|o| o == "rw") && !opts.iter().any(|o| o == "ro"));
+    }
+
+    #[test]
+    fn docker_mode_unlocks_proc_sys_but_keeps_every_other_readonly_path() {
+        // dockerd cannot bring up its default bridge without writing
+        // /proc/sys/net/ipv4/ip_forward (real-boot failure, Task 7). Only that
+        // one path is unlocked; the rest of readonlyPaths stays.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut params = base_params(&img);
+        params.docker = true;
+        let spec = generate_spec(&params).unwrap();
+        let ro = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .readonly_paths()
+            .clone()
+            .expect("readonlyPaths present");
+        assert!(
+            !ro.iter().any(|p| p == "/proc/sys"),
+            "docker mode must unlock /proc/sys, got {ro:?}"
+        );
+        for keep in ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sysrq-trigger"] {
+            assert!(
+                ro.iter().any(|p| p == keep),
+                "{keep} must stay read-only in docker mode, got {ro:?}"
+            );
+        }
+        // maskedPaths are untouched — this is NOT `--privileged`.
+        let masked = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .masked_paths()
+            .clone()
+            .expect("maskedPaths present");
+        assert!(masked.iter().any(|p| p == "/proc/kcore"));
+    }
+
+    #[test]
+    fn non_docker_spec_keeps_proc_sys_readonly() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let spec = generate_spec(&base_params(&img)).unwrap();
+        let ro = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .readonly_paths()
+            .clone()
+            .expect("readonlyPaths present");
+        assert!(
+            ro.iter().any(|p| p == "/proc/sys"),
+            "a normal sandbox keeps the OCI default /proc/sys read-only remount"
+        );
     }
 
     // ---- privileged builder spec ----
