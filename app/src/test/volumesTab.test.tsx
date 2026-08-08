@@ -41,6 +41,10 @@ function makeDetail(overrides: Partial<SandboxDetail> = {}): SandboxDetail {
     ports: [],
     volumes: [],
     container: null,
+    docker: false,
+    cpus: 2,
+    mem_mb: 4096,
+    confinement: null,
     ...overrides,
   };
 }
