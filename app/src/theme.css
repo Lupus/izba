@@ -25,6 +25,8 @@
     --input: 220 19% 91%;
     --ring: 220 73% 55%;
     --success: 142 71% 37%;
+    /* Usage-meter warn tone (≥ 80 %); distinct from --destructive's red-orange. */
+    --warning: 48 96% 39%;
     --sidebar: 210 33% 99%;
     --radius: 0.5rem;
   }
@@ -52,6 +54,7 @@
     --input: 222 20% 24%;
     --ring: 220 73% 60%;
     --success: 142 60% 45%;
+    --warning: 48 96% 50%;
     --sidebar: 222 27% 13%;
   }
 }

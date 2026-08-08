@@ -9,7 +9,7 @@ vi.mock("../lib/ipc", () => ({
     stop: vi.fn().mockResolvedValue(undefined),
     restart: vi.fn().mockResolvedValue(undefined),
     remove: vi.fn().mockResolvedValue(undefined),
-    // Consumed by the WorkspacePath line on the Overview tab.
+    // Consumed by the Overview tab's SandboxCard (one non-polling inspect).
     inspect: vi.fn().mockResolvedValue({
       name: "web",
       image: "ubuntu:24.04",
@@ -17,7 +17,22 @@ vi.mock("../lib/ipc", () => ({
       workspace: "C:\\Users\\u\\proj",
       ports: [],
       volumes: [],
+      container: "running",
+      docker: false,
+      cpus: 2,
+      mem_mb: 4096,
+      confinement: "confined",
     }),
+    // The Overview tab's single stats poller.
+    stats: vi.fn().mockResolvedValue({
+      name: "web",
+      running: true,
+      uptime_ms: 1_000,
+      host: null,
+      disk: { rw_img_bytes: 0, volumes: [], logs_bytes: 0, image_bytes: 0 },
+      guest: null,
+    }),
+    policyShow: vi.fn().mockResolvedValue({ enforcing: false, allow: [] }),
   },
 }));
 
