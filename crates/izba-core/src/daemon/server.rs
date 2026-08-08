@@ -893,6 +893,7 @@ fn host_resources(
     })
 }
 #[cfg(not(target_os = "linux"))]
+#[mutants::skip] // reason: constant one-line stub whose only property (always None — the Windows host tier is spec §9 out-of-scope) is pinned by host_resources_stub_is_always_none on the platform that compiles it. The gate cannot kill mutants here: on Linux the body is cfg'd out (phantom miss), and on Windows the generated `Some(Default::default())` doesn't compile (unviable), which the caught-nowhere reconciler counts as a survivor.
 fn host_resources(
     _d: &Arc<Daemon>,
     _name: &str,
