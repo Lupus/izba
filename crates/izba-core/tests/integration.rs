@@ -235,6 +235,7 @@ fn create_sandbox(env: &TestEnv, tb: &mut TestBox, name: &str, ws: &Path) {
             volumes: Vec::new(),
             builder: false,
             docker: false,
+            vnc: false,
         },
     )
     .expect("create");
@@ -264,6 +265,7 @@ fn create_sandbox_with_volumes(
             volumes,
             builder: false,
             docker: false,
+            vnc: false,
         },
     )
     .expect("create");
@@ -827,6 +829,7 @@ fn userns_numeric_user_owns_workspace() {
             volumes: Vec::new(),
             builder: false,
             docker: false,
+            vnc: false,
         },
     )
     .expect("create");
@@ -926,6 +929,7 @@ fn userns_resolves_symbolic_image_user() {
             volumes: Vec::new(),
             builder: false,
             docker: false,
+            vnc: false,
         },
     )
     .expect("create");
@@ -2055,6 +2059,7 @@ fn port_publish_create_time() {
             volumes: Vec::new(),
             builder: false,
             docker: false,
+            vnc: false,
         },
     )
     .expect("create");
@@ -2442,6 +2447,7 @@ fn create_docker_sandbox(tb: &mut TestBox, name: &str, ws: &Path) {
             // The whole point: own netns + veth, userns-scoped admin caps,
             // rw cgroupfs, the auto /var/lib/docker volume, izba.docker=1.
             docker: true,
+            vnc: false,
         },
     )
     .expect("create docker-mode sandbox");

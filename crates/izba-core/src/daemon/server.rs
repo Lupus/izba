@@ -530,6 +530,7 @@ fn handle_create(
             // leave it false.
             builder: c.builder,
             docker,
+            vnc: c.vnc,
         },
     )?;
     d.registry.set(&c.name, &c.image_ref, Liveness::Stopped);
@@ -1722,6 +1723,7 @@ mod tests {
             allow_unconfined: false,
             builder: false,
             docker: None,
+            vnc: false,
         })
     }
 
@@ -2487,6 +2489,7 @@ mod tests {
                 allow_unconfined: false,
                 builder: true,
                 docker: Some(true),
+                vnc: false,
             }),
         ) {
             DaemonResponse::Created { name } => assert_eq!(name, "builder-web"),
@@ -2745,6 +2748,7 @@ mod tests {
                 build: None,
                 rw_size_gb: 1,
                 docker: false,
+                vnc: false,
             },
         )
         .unwrap();
@@ -3351,6 +3355,7 @@ mod tests {
                 volumes,
                 builder: false,
                 docker: false,
+                vnc: false,
             },
         )
         .unwrap();
@@ -3446,6 +3451,7 @@ mod tests {
                 }],
                 builder: false,
                 docker: false,
+                vnc: false,
             },
         )
         .unwrap();
@@ -3604,6 +3610,7 @@ mod tests {
             volumes: Vec::new(),
             builder: false,
             docker: false,
+            vnc: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -3865,6 +3872,7 @@ mod tests {
                 volumes: Vec::new(),
                 builder: false,
                 docker: false,
+                vnc: false,
             },
         )
         .unwrap();
@@ -3918,6 +3926,7 @@ mod tests {
                 volumes: Vec::new(),
                 builder: false,
                 docker: false,
+                vnc: false,
             },
         )
         .unwrap();
@@ -4063,6 +4072,7 @@ mod tests {
             rw_size_gb: 1,
             usb: Default::default(),
             docker: true,
+            vnc: false,
         };
         save_json(&sdir.join(CONFIG_FILE), &config).unwrap();
 
@@ -4203,6 +4213,7 @@ mod tests {
             rw_size_gb: 1,
             usb: Default::default(),
             docker: false,
+            vnc: false,
         };
         let id = live_identity();
         let res = host_resources(&d, "web", &config, &id).expect("live pid must report resources");
@@ -4241,6 +4252,7 @@ mod tests {
             rw_size_gb: 1,
             usb: Default::default(),
             docker: false,
+            vnc: false,
         };
         let id = live_identity();
         assert!(host_resources(&d, "web", &config, &id).is_none());

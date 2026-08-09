@@ -218,6 +218,7 @@ mod tests {
             volumes: Vec::new(),
             builder: false,
             docker: false,
+            vnc: false,
         };
         crate::sandbox::create(&paths, "up", &opts).unwrap();
         crate::sandbox::create(&paths, "down", &opts).unwrap();
@@ -262,6 +263,7 @@ mod tests {
             volumes: Vec::new(),
             builder: false,
             docker: false,
+            vnc: false,
         };
         crate::sandbox::create(&paths, "boot", &opts).unwrap();
 

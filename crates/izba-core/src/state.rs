@@ -62,6 +62,12 @@ pub struct SandboxConfig {
     /// loading (= false).
     #[serde(default)]
     pub docker: bool,
+    /// VNC display (spec 2026-08-09): this sandbox boots with the KasmVNC +
+    /// window-manager erofs bundle mounted and VNC-facing services started.
+    /// Resolved at create from the CLI flag; `#[serde(default)]` keeps
+    /// pre-feature config.json loading (= false).
+    #[serde(default)]
+    pub vnc: bool,
 }
 
 impl SandboxConfig {
@@ -202,6 +208,7 @@ mod tests {
             build: None,
             rw_size_gb: 8,
             docker: false,
+            vnc: false,
         }
     }
 
@@ -242,6 +249,14 @@ mod tests {
         let json = r#"{"image_digest":"sha256:x","image_ref":"alpine","cpus":1,"mem_mb":256,"workspace":"/w"}"#;
         let cfg: SandboxConfig = serde_json::from_str(json).expect("deserialize");
         assert!(!cfg.docker);
+    }
+
+    /// Pre-VNC config.json on disk must load with vnc=false.
+    #[test]
+    fn config_without_vnc_defaults_false() {
+        let json = r#"{"image_digest":"sha256:x","image_ref":"alpine","cpus":1,"mem_mb":256,"workspace":"/w"}"#;
+        let cfg: SandboxConfig = serde_json::from_str(json).expect("deserialize");
+        assert!(!cfg.vnc);
     }
 
     #[test]

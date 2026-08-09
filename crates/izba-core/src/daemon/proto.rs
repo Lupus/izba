@@ -83,6 +83,12 @@ pub struct DaemonCreate {
     /// `DAEMON_PROTO_VERSION` bump.
     #[serde(default)]
     pub docker: Option<bool>,
+    /// VNC display (spec 2026-08-09): plain `izba create --vnc` flag — no
+    /// tri-state, no image-label precedence, nothing auto-enables VNC.
+    /// Additive + serde(default) → no `DAEMON_PROTO_VERSION` bump (a
+    /// pre-feature client's frame deserializes to `false`).
+    #[serde(default)]
+    pub vnc: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,6 +499,7 @@ mod tests {
                 allow_unconfined: false,
                 builder: true,
                 docker: Some(true),
+                vnc: true,
             }),
             DaemonRequest::VolumePrune,
             DaemonRequest::Start {

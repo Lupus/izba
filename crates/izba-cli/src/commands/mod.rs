@@ -145,6 +145,7 @@ pub(crate) fn build_create_request(
         // `create`/`run` never provision a build host; only `izba build` does.
         builder: false,
         docker,
+        vnc: opts.vnc,
     }
 }
 
@@ -315,6 +316,7 @@ mod tests {
             volumes: vec![],
             docker: false,
             no_docker: false,
+            vnc: false,
         }
     }
 
@@ -444,6 +446,35 @@ mod tests {
             Some(false),
         );
         assert_eq!(off.docker, Some(false));
+    }
+
+    /// `SandboxOpts.vnc` threads straight through to `DaemonCreate.vnc` — a
+    /// plain bool, no tri-state, nothing auto-enables it.
+    #[test]
+    fn build_create_request_threads_vnc_flag() {
+        let mut o = opts();
+        let off = build_create_request(
+            "web".into(),
+            &o,
+            PathBuf::from("/ws"),
+            vec![],
+            vec![],
+            false,
+            None,
+        );
+        assert!(!off.vnc);
+
+        o.vnc = true;
+        let on = build_create_request(
+            "web".into(),
+            &o,
+            PathBuf::from("/ws"),
+            vec![],
+            vec![],
+            false,
+            None,
+        );
+        assert!(on.vnc);
     }
 
     /// Fix 4: manifest volumes are adopted into opts when the user passed none.

@@ -306,6 +306,7 @@ spec:
             volumes: vec![],
             builder: false,
             docker: false,
+            vnc: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -343,6 +344,7 @@ spec:
             volumes: vec![],
             builder: false,
             docker: false,
+            vnc: false,
             build: Some(build_spec.clone()),
             rw_size_gb: 8,
         };
@@ -363,6 +365,7 @@ spec:
             volumes: vec![],
             builder: false,
             docker: false,
+            vnc: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -391,6 +394,7 @@ spec:
             volumes: vec![],
             builder: false,
             docker: false,
+            vnc: false,
             build: Some(build_spec.clone()),
             rw_size_gb: 8,
         };

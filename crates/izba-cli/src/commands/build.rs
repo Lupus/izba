@@ -191,6 +191,8 @@ fn builder_create_request(name: String, opts: &BuildOpts, workspace: PathBuf) ->
         // Builder VMs never get docker mode: `handle_create` forces it off
         // whenever `builder` is set, so this is inert either way.
         docker: None,
+        // Builder VMs never get a VNC display.
+        vnc: false,
     }
 }
 

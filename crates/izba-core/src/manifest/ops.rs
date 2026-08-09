@@ -255,6 +255,7 @@ mod tests {
             volumes: vec![],
             builder: false,
             docker: false,
+            vnc: false,
             build: None,
             rw_size_gb: 8,
         };
@@ -299,6 +300,7 @@ mod tests {
             volumes: vec![],
             builder: false,
             docker: false,
+            vnc: false,
             build: None,
             rw_size_gb: 0, // legacy: unknown, must recover from rw.img
         };
@@ -352,6 +354,7 @@ mod tests {
             volumes: vec![],
             builder: false,
             docker: false,
+            vnc: false,
             build: None,
             rw_size_gb: 16, // persisted at create time
         };
@@ -399,6 +402,7 @@ mod tests {
             volumes: vec![],
             builder: false,
             docker: false,
+            vnc: false,
             build: None,
             rw_size_gb: 0, // legacy: unknown, recover from rw.img
         };
