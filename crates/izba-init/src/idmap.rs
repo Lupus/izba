@@ -338,6 +338,15 @@ mod tests {
         // The anchor (disk RANGE → presented 0) must NOT be confused for it.
         let only_anchor = parse_cmdline_map("1048576-0-1").expect("parses");
         assert_eq!(presented_of_disk_zero(&only_anchor), None);
+        // A zero-size disk-0 extent maps nothing and must be ignored (the
+        // cmdline parser rejects size 0, but the fn is public — build the
+        // degenerate extent directly to pin the `size > 0` guard).
+        let degenerate = vec![IdExtent {
+            disk: 0,
+            presented: 42,
+            size: 0,
+        }];
+        assert_eq!(presented_of_disk_zero(&degenerate), None);
     }
 
     #[test]

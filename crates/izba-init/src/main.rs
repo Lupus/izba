@@ -429,6 +429,12 @@ fn with_docker_fs_ids<R>(ids: Option<(u32, u32)>, f: impl FnOnce() -> R) -> R {
     }
 }
 
+// reason: formats/mounts real block devices and applies live idmapped-mount
+// syscalls — guest-only; exercised by the KVM e2e volume journeys and the
+// docker-mode /var/lib/docker fidelity assert ([5e]). Its host-testable
+// constituents (volume_device, volume_mount_plan, apply_layer_idmaps' pure
+// inputs) are unit-tested directly.
+#[mutants::skip]
 fn setup_user_volumes(
     vols: &[&str],
     layer_maps: Option<&(Vec<idmap::IdExtent>, Vec<idmap::IdExtent>)>,
