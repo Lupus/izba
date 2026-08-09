@@ -1354,14 +1354,16 @@ fn restore_confined_workspace(paths: &Paths, name: &str) {
     // config. Best-effort: a failure on one surface must not skip the rest.
     let mut surfaces = vec![cfg.workspace.clone()];
     // No `Artifacts` available post-launch here (only the persisted config), so
-    // vnc_erofs is None. This is a non-issue, not a gap to fill later: this
-    // whole function is a Windows-MIC-only path (the `is_confined()` gate
-    // above), where confinement is a per-file Low-IL *label*, not Landlock —
-    // Linux's Landlock read rules are auto-derived by cloud-hypervisor from
-    // its own `--disk` config at launch, entirely independent of this
-    // restore path. And even on Windows, the loop below only re-labels
-    // *writable* surfaces (Medium IL), so the always-readonly kasmvnc disk
-    // would never appear in `surfaces` regardless of what's passed here.
+    // vnc_erofs is None. This is a non-issue, not a gap to fill later: the
+    // confined branch above (`is_confined()`) runs on BOTH platforms, but this
+    // loop's EFFECT — a per-file Low→Medium MIC relabel — is Windows-only;
+    // `restore_integrity_recursive` no-ops on non-Windows (see
+    // `procmgr::restore_integrity_recursive`), so on Linux this whole loop
+    // does nothing regardless of what disks it enumerates. Linux confinement
+    // needs no disk-path enumeration here at all: cloud-hypervisor
+    // auto-derives its Landlock read rules from its own `--disk` config at
+    // launch, independent of this restore path — which is also why passing
+    // None for the vnc erofs is correct rather than a gap.
     for disk in build_vm_disks(paths, name, &cfg.image_digest, &cfg.volumes, None) {
         if !disk.readonly {
             surfaces.push(disk.path);
