@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Build a self-contained KasmVNC + openbox + xterm bundle and pack it into an
+# erofs image for the izba VNC display feature.
+#
+# Promoted from hack/spike/build-kasmvnc-bundle.sh (spike proven end-to-end
+# across glibc/musl/busybox images — see hack/spike/kasmvnc-bundle-findings.md).
+# Same approach: install the upstream KasmVNC .deb + a minimal WM (openbox) +
+# a test X app (xterm) in a digest-pinned Debian bookworm container, copy the
+# binaries, their full shared-library closure, the dynamic loader itself, and
+# all runtime data (xkb, fonts, fontconfig, openbox config/themes, the
+# KasmVNC web client) into one tree, patchelf every ELF to interpreter+rpath
+# under /opt/izba-vnc (the fixed mount path izba-init will bind the bundle
+# at), assert the result is self-contained, then pack the tree into an erofs
+# image.
+#
+# The guest kernel builds CONFIG_EROFS_FS=y with NO EROFS_FS_ZIP* options
+# (hack/kernel.config), so the image is built UNCOMPRESSED — a compressed
+# erofs would not mount. Expect ~100-110 MB (vs the spike's 42 MB tar.gz).
+#
+# Output: dist/kasmvnc.erofs (override with KASMVNC_OUT).
+set -euo pipefail
+
+KASMVNC_VERSION=1.5.0
+KASMVNC_DEB="kasmvncserver_bookworm_${KASMVNC_VERSION}_amd64.deb"
+KASMVNC_URL="https://github.com/kasmtech/KasmVNC/releases/download/v${KASMVNC_VERSION}/${KASMVNC_DEB}"
+KASMVNC_SHA256=770fd3df51510beecc89666879d82faf411276e68c6e11df612f736b891b5f71
+BUILDER_IMAGE="debian@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241" # bookworm-slim 2026-08
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+OUT_FILE="${KASMVNC_OUT:-$HERE/../dist/kasmvnc.erofs}"
+mkdir -p "$(dirname "$OUT_FILE")"
+
+CACHE_DIR="$HERE/../dist/.kasmvnc-cache"
+mkdir -p "$CACHE_DIR"
+
+command -v docker >/dev/null 2>&1 || {
+  echo "error: docker not found (build-kasmvnc-erofs.sh builds the bundle in a Debian container)" >&2
+  exit 1
+}
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+STAGE_DIR="$WORK/stage"
+mkdir -p "$STAGE_DIR"
+
+if [ ! -f "$CACHE_DIR/$KASMVNC_DEB" ]; then
+  wget -q -O "$CACHE_DIR/$KASMVNC_DEB" "$KASMVNC_URL"
+fi
+echo "$KASMVNC_SHA256  $CACHE_DIR/$KASMVNC_DEB" | sha256sum -c -
+
+docker run --rm \
+  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+  -v "$CACHE_DIR:/cache:ro" \
+  -v "$STAGE_DIR:/bundle" \
+  "$BUILDER_IMAGE" bash -euo pipefail -c '
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends \
+  /cache/'"$KASMVNC_DEB"' \
+  openbox xterm xfonts-base fonts-dejavu-core patchelf file \
+  x11-xkb-utils >/dev/null
+
+B=/bundle
+rm -rf "$B"/{bin,lib,share,etc}
+mkdir -p "$B"/{bin,lib,share,etc}
+
+# --- binaries ---
+BINS="/usr/bin/Xkasmvnc /usr/bin/kasmvncpasswd /usr/bin/xkbcomp /usr/bin/openbox /usr/bin/xterm"
+for b in $BINS; do cp -L "$b" "$B/bin/"; done
+
+# --- shared-library closure (iterate until fixpoint over ldd of bins+libs) ---
+copy_deps() {
+  ldd "$1" 2>/dev/null | awk "/=>/ {print \$3} /^\t\// {print \$1}" | while read -r so; do
+    [ -f "$so" ] || continue
+    base="$(basename "$so")"
+    [ -f "$B/lib/$base" ] || cp -L "$so" "$B/lib/$base"
+  done
+}
+for b in $BINS; do copy_deps "$b"; done
+for _ in 1 2 3; do for so in "$B"/lib/*; do copy_deps "$so"; done; done
+# the loader itself
+cp -L /lib64/ld-linux-x86-64.so.2 "$B/lib/ld-linux-x86-64.so.2"
+
+# libGL dispatch backend is dlopened, not ldd-visible; GLX is disabled at
+# runtime but the server still links libGLX. Copy the mesa pieces if present.
+for so in /usr/lib/x86_64-linux-gnu/libGLX_mesa.so.0 /usr/lib/x86_64-linux-gnu/libglapi.so.0; do
+  [ -f "$so" ] && cp -L "$so" "$B/lib/" || true
+done
+
+# --- data ---
+cp -r /usr/share/kasmvnc "$B/share/kasmvnc"          # web client + defaults
+cp -r /usr/share/X11/xkb "$B/share/xkb"              # keymaps
+mkdir -p "$B/share/fonts/X11"
+cp -r /usr/share/fonts/X11/misc "$B/share/fonts/X11/misc"   # core fonts (xterm, server "fixed")
+cp -r /usr/share/fonts/truetype "$B/share/fonts/truetype"   # dejavu for Xft apps
+cp -r /etc/xdg/openbox "$B/etc/openbox" || true
+mkdir -p "$B/share/themes"
+for t in Clearlooks Onyx; do
+  [ -d "/usr/share/themes/$t" ] && cp -r "/usr/share/themes/$t" "$B/share/themes/" || true
+done
+
+# minimal fontconfig setup pointing exclusively into the bundle
+mkdir -p "$B/etc/fonts"
+cat > "$B/etc/fonts/fonts.conf" <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>/opt/izba-vnc/share/fonts</dir>
+  <cachedir>/tmp/izba-vnc-fontcache</cachedir>
+</fontconfig>
+EOF
+
+# --- make every ELF self-locating: bundle loader + bundle rpath ---
+for f in "$B"/bin/* "$B"/lib/*.so*; do
+  [ "$(basename "$f")" = ld-linux-x86-64.so.2 ] && continue
+  if file "$f" | grep -q "ELF 64-bit"; then
+    patchelf --set-rpath /opt/izba-vnc/lib "$f" 2>/dev/null || true
+    if file "$f" | grep -q "interpreter"; then
+      patchelf --set-interpreter /opt/izba-vnc/lib/ld-linux-x86-64.so.2 "$f"
+    fi
+  fi
+done
+
+# --- self-containment assertion: every bundled binary must resolve through
+# the bundle loader/rpath ONLY, never anything from the builder image ---
+for f in "$B"/bin/*; do
+  file "$f" | grep -q "ELF 64-bit" || continue
+  patchelf --print-interpreter "$f" 2>/dev/null | grep -q "^/opt/izba-vnc/lib/ld-linux-x86-64.so.2$" || {
+    echo "error: $f does not use the bundle loader" >&2; exit 1; }
+  patchelf --print-rpath "$f" | grep -q "^/opt/izba-vnc/lib$" || {
+    echo "error: $f rpath escapes the bundle" >&2; exit 1; }
+done
+echo "self-containment assertion: OK"
+
+du -sh "$B"
+echo "bundle contents ok"
+
+# hand the staged tree (currently root-owned — this whole block ran as
+# root inside the container) back to the host user so the trap below can
+# remove the tempdir.
+chown -R "$HOST_UID:$HOST_GID" "$B"
+'
+
+# --- pack the staged tree into an erofs image (uncompressed — the guest
+# kernel has no EROFS_FS_ZIP* decompression support) ---
+if command -v mkfs.erofs >/dev/null 2>&1; then
+  mkfs.erofs "$OUT_FILE" "$STAGE_DIR"
+else
+  echo "mkfs.erofs not found on PATH — building it inside $BUILDER_IMAGE instead" >&2
+  OUT_DIR="$(cd "$(dirname "$OUT_FILE")" && pwd)"
+  OUT_NAME="$(basename "$OUT_FILE")"
+  docker run --rm \
+    -v "$STAGE_DIR:/stage:ro" \
+    -v "$OUT_DIR:/out" \
+    "$BUILDER_IMAGE" bash -euo pipefail -c '
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends erofs-utils >/dev/null
+mkfs.erofs "/out/'"$OUT_NAME"'" /stage
+'
+fi
+
+echo "wrote $OUT_FILE ($(du -sh "$OUT_FILE" | cut -f1), sha256 $(sha256sum "$OUT_FILE" | cut -d' ' -f1))"
