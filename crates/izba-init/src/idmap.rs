@@ -154,12 +154,16 @@ fn layer_userns_fd(
             drop(r);
             // SAFETY: plain syscalls, no allocation.
             let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
-            if rc == 0 {
-                use std::io::Write as _;
-                let _ = w.write_all(&[1]);
+            if rc != 0 {
+                // Exit so the pipe closes and the parent's read_exact sees
+                // EOF (→ the loud "failed to unshare" error) instead of
+                // blocking forever on a parked child that never wrote.
+                // SAFETY: _exit is async-signal-safe.
+                unsafe { libc::_exit(1) };
             }
-            // Park until the parent harvests the ns and kills us. Exit on any
-            // stray wakeup if the parent died first.
+            use std::io::Write as _;
+            let _ = w.write_all(&[1]);
+            // Park until the parent harvests the ns and kills us.
             loop {
                 // SAFETY: pause has no preconditions.
                 unsafe { libc::pause() };
