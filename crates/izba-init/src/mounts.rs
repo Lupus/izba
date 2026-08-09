@@ -496,10 +496,15 @@ mod tests {
             assert_eq!(op.target, PathBuf::from(crate::vnc::BUNDLE_DIR));
             assert_eq!(op.fstype, "erofs");
             assert!(op.flags.iter().any(|f| f == "ro"), "bundle is read-only");
-            assert!(
-                !op.optional,
-                "an izba.vnc=1 boot with no bundle disk must fail loudly"
-            );
+            // NOT optional: unlike the credential share (which the host only
+            // attaches for a vnc sandbox), an `izba.vnc=1` boot always has a
+            // bundle disk, so a failure here is a real fault and `apply`
+            // must return it rather than logging "skipped". The host side is
+            // what fails CLOSED (artifact locate refuses a vnc start with no
+            // bundle); in the guest, main.rs turns this Err into a loud
+            // console line and boots on — the sandbox stays usable, with a
+            // dead desktop honestly reported, instead of the VM dying.
+            assert!(!op.optional, "a bundle mount failure must be an error");
         }
     }
 
