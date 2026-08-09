@@ -334,6 +334,22 @@ mod tests {
         assert_eq!(workspace_default_name(&ws).unwrap(), "my_proj");
     }
 
+    /// A real `--volume` spec must actually be parsed through, not swallowed
+    /// into an empty vec (the wrapper's only job below `validate_volumes` is
+    /// to collect `parse_volume_flag`'s output — `validate_volumes`'s own
+    /// cap/uniqueness behavior, including the vnc-aware cap, is covered at
+    /// its own definition in `izba_core::volume`).
+    #[test]
+    fn parse_volumes_returns_the_parsed_volume_not_an_empty_vec() {
+        let vols = parse_volumes(&["data:/data:8g".to_string()], false).unwrap();
+        assert_eq!(
+            vols.len(),
+            1,
+            "parse_volumes must return the parsed volume, got {vols:?}"
+        );
+        assert_eq!(vols[0].guest_path, Path::new("/data"));
+    }
+
     /// `Path::new(".")` must resolve to the current directory's basename rather
     /// than erroring out (the real `izba diff` default-arg path).
     #[test]

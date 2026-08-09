@@ -311,6 +311,35 @@ mod tests {
         }
     }
 
+    /// `set_mode_0644` must be observed forcing the mode, not merely relying
+    /// on a permissive process umask to coincidentally already land on 0644
+    /// (a common CI/dev umask of 022 makes a freshly-created file 0644 by
+    /// default, which would make a `replace set_mode_0644 -> Ok(())` mutant
+    /// indistinguishable from the real body). Pre-create the file with an
+    /// explicit restrictive mode — `set_mode_0644` chmods an EXISTING file,
+    /// so creation-time umask plays no part — and assert it actually changes.
+    #[test]
+    #[cfg(unix)]
+    fn set_mode_0644_forces_the_mode_regardless_of_umask() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kasmpasswd");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let before = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(before, 0o600, "precondition: file created restrictively");
+
+        set_mode_0644(&path).unwrap();
+
+        let after = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(after, 0o644, "set_mode_0644 must force the mode to 0644");
+    }
+
     #[test]
     fn plaintext_password_lives_outside_the_share_dir() {
         let (_dir, paths) = test_paths();

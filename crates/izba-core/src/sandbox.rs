@@ -1366,6 +1366,17 @@ fn kill_sidecars_from_state(paths: &Paths, name: &str) {
 /// an orphaned VMM's label is eventually reconciled. MUST run only once the VMM
 /// is dead (every caller ensures this before wiping state.json), so the label is
 /// never pulled out from under a still-running guest.
+/// `#[mutants::skip]`: this function's only externally observable effect — a
+/// per-file Low→Medium MIC relabel — is Windows-only (`procmgr::
+/// restore_integrity_recursive` no-ops on every other platform), and even the
+/// Windows lane has no real MIC assertion today. The control-flow tests below
+/// (`restore_confined_workspace_runs_full_path_for_confined_sandbox`,
+/// `restore_confined_workspace_skips_unconfined_and_tolerates_bad_config`)
+/// only assert "does not panic" across the early-return/Ok/Err arms, so a
+/// `replace restore_confined_workspace with ()` mutant is indistinguishable
+/// from the real body on every gate platform — skip rather than fake an
+/// assertion.
+#[mutants::skip]
 fn restore_confined_workspace(paths: &Paths, name: &str) {
     let dir = paths.sandbox_dir(name);
     let state: Option<RunState> = load_json(&dir.join(STATE_FILE)).ok().flatten();
