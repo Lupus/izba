@@ -770,6 +770,54 @@ mod tests {
         assert!(found, "created archive must contain dst/file.txt");
     }
 
+    /// The docker-mode fs-id guard path: with `fs_ids` set, TarExtract must
+    /// still run the extraction (under `with_fs_ids` — a no-op switch to our
+    /// own euid/egid on an unprivileged host, but the ARM must execute; a
+    /// deleted `Some` arm would silently fall through to the plain path in
+    /// the guest and land cp writes on the fsuid-0 anchor as `nobody`).
+    #[test]
+    fn tar_extract_runs_under_the_docker_fs_id_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(ExecEngine::new(Some(tmp.path().to_path_buf())));
+        let (stream_tx, rx) = mpsc::channel();
+        let own_ids = unsafe { (libc::geteuid(), libc::getegid()) };
+        {
+            let e = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                serve_streams(PairListener(Mutex::new(rx)), e, false, Some(own_ids))
+            });
+        }
+        let (mut ext, theirs) = UnixStream::pair().unwrap();
+        stream_tx.send(theirs).unwrap();
+        std::fs::create_dir_all(tmp.path().join("dst")).unwrap();
+        write_frame(
+            &mut ext,
+            &StreamOpen::TarExtract {
+                dest: "/dst".into(),
+            },
+        )
+        .unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        let data = b"guarded";
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(tar::EntryType::Regular);
+        hdr.set_size(data.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        b.append_data(&mut hdr, "g.txt", &mut &data[..]).unwrap();
+        let archive = b.into_inner().unwrap();
+        ext.write_all(&archive).unwrap();
+        ext.shutdown(std::net::Shutdown::Write).unwrap();
+        match read_frame::<_, Response>(&mut ext).unwrap() {
+            Response::Ok => {}
+            other => panic!("guarded extract expected Ok, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(tmp.path().join("dst/g.txt")).unwrap(),
+            b"guarded"
+        );
+    }
+
     #[test]
     fn tar_create_missing_src_sends_leading_error() {
         let tmp = tempfile::tempdir().unwrap();
