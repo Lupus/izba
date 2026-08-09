@@ -117,7 +117,7 @@ jobs:
   # Build the microVM artifacts the KVM jobs boot real sandboxes with. Mirrors
   # e2e.yml's kernel/mke2fs/nft/ip/initramfs jobs (same pinned versions + caches).
   kernel:
-    name: vmlinux (pinned 6.12.30)
+    name: vmlinux (pinned 6.18.43)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

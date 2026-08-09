@@ -4,8 +4,8 @@
 # Usage:
 #   hack/build-kernel.sh [VERSION [OUTPUT]]
 #
-#   VERSION  Kernel version to build.  Defaults to 6.12.30 — a known-good
-#            6.12 LTS point release.  Any recent stable (6.6+, 6.12+) works.
+#   VERSION  Kernel version to build.  Defaults to 6.18.43 — a known-good
+#            6.18 LTS point release.  Any recent stable (6.12+) works.
 #   OUTPUT   Destination for the built vmlinux.
 #            Defaults to dist/vmlinux (relative to the repo root).
 #
@@ -13,7 +13,7 @@
 # hack/kernel.config, for building a variant image. The USB-passthrough kernel
 # is built this way:
 #   IZBA_KERNEL_EXTRA_CONFIG=hack/kernel-usb.config \
-#     hack/build-kernel.sh 6.12.30 dist/vmlinux-usb
+#     hack/build-kernel.sh 6.18.43 dist/vmlinux-usb
 # The extra fragment wins on any symbol both files mention, which is what lets
 # it re-enable something the base fragment deliberately turns off.
 #
@@ -34,7 +34,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
-VERSION="${1:-6.12.30}"
+VERSION="${1:-6.18.43}"
 OUTPUT="${2:-dist/vmlinux}"
 
 # sha256 pins for known-good tarballs.  Building any other VERSION requires
@@ -42,6 +42,7 @@ OUTPUT="${2:-dist/vmlinux}"
 # sha256 from https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
 declare -A KNOWN_SHA256=(
     ["6.12.30"]="df046a48971e40ce0b2e003e7e55b6b1e7da2912120eb216d5d6c8450c9cf82e"
+    ["6.18.43"]="a1aeb926c7c4a1564368200b1082e45bb958007682d804aff88abbc3a7a47b5d"
 )
 EXPECTED_SHA256="${IZBA_KERNEL_SHA256:-${KNOWN_SHA256[$VERSION]:-}}"
 if [[ -z "$EXPECTED_SHA256" ]]; then
