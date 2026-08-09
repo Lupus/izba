@@ -7,6 +7,7 @@
 //! cargo test -p izba-cli --test daemon_e2e -- --test-threads=1 --nocapture
 //! ```
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -84,6 +85,109 @@ fn http_get(port: u16) -> anyhow::Result<String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     anyhow::bail!("http_get({port}) never connected: {last:?}")
+}
+
+/// Standard base64 (RFC 4648 §4) — hand-rolled so the e2e suite gains no
+/// dev-dependency for the ~30 bytes of `Authorization: Basic` it needs.
+fn base64_encode(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for c in input.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if c.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// One-shot HTTP GET returning `(status_code, body)`, with optional HTTP Basic
+/// credentials — the auth matrix `http_get` (which only ever expected a 200)
+/// cannot express.
+///
+/// Deliberately does NOT retry: callers poll it inside their own deadline loop
+/// so a "connection refused" and a "401 arrived" are distinguishable. The read
+/// tolerates a server that keeps the socket open despite `Connection: close`
+/// (KasmVNC's websockify answers HTTP/1.1) by treating a read timeout as
+/// end-of-response rather than an error.
+fn http_get_status(
+    port: u16,
+    path: &str,
+    basic_auth: Option<(&str, &str)>,
+) -> anyhow::Result<(u16, String)> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_secs(5)))?;
+    s.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    if let Some((user, pass)) = basic_auth {
+        let token = base64_encode(format!("{user}:{pass}").as_bytes());
+        req.push_str(&format!("Authorization: Basic {token}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes())?;
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                // The KasmVNC index page is ~10 KB; a megabyte is plenty and
+                // bounds a server that streams forever.
+                if buf.len() > 1 << 20 {
+                    break;
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let code: u16 = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("no HTTP status line in reply: {text:?}"))?;
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    Ok((code, body))
+}
+
+/// Ports in LISTEN state (`st == 0A`) from a `/proc/net/tcp[6]` dump.
+///
+/// `/proc/net/tcp` is kernel-provided, so this works on ANY workload image —
+/// unlike `netstat`, which needs the image to ship busybox/net-tools.
+fn parse_listening_ports(proc_net_tcp: &str) -> BTreeSet<u16> {
+    proc_net_tcp
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 4 || f[3] != "0A" {
+                return None;
+            }
+            let (_addr, port) = f[1].rsplit_once(':')?;
+            u16::from_str_radix(port, 16).ok()
+        })
+        .collect()
 }
 
 #[test]
@@ -1277,4 +1381,371 @@ fn docker_publish_reaches_inner_container() {
         docker_diag(&data, name)
     );
     // Teardown is the SandboxGuard's job (it also runs on panic).
+}
+
+// ── VNC desktop (spec 2026-08-09) ────────────────────────────────────────────
+
+/// Is the KasmVNC bundle staged where PRODUCTION discovery looks for it?
+///
+/// Deliberately the exe-relative `<exe-dir>/../artifacts/kasmvnc.erofs` path
+/// and NOTHING else: the test never sets `IZBA_KASMVNC_EROFS`, so a green run
+/// proves the shipped discovery path works (the USB post-mortem's lesson —
+/// an e2e that hands itself an env override can pass while every installer
+/// is broken). `CARGO_BIN_EXE_izba` is `<target>/debug/izba`, so the parent
+/// hop lands on `<target>/artifacts`.
+fn vnc_bundle_path() -> Option<PathBuf> {
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_izba"));
+    exe.parent()
+        .and_then(Path::parent)
+        .map(|d| d.join("artifacts/kasmvnc.erofs"))
+}
+
+/// Guest + host diagnostics for a VNC sandbox: the console tail (boot/mount
+/// failures) plus the in-container desktop log, which is the only place a
+/// dead `Xkasmvnc` leaves its reason. Mirrors `docker_diag`.
+fn vnc_diag(data: &Path, name: &str) -> String {
+    let mut out = String::new();
+    let console = data.join("sandboxes").join(name).join("logs/console.log");
+    out.push_str(&format!("--- console.log ({}) ---\n", console.display()));
+    if let Ok(txt) = std::fs::read_to_string(&console) {
+        let lines: Vec<&str> = txt.lines().collect();
+        let start = lines.len().saturating_sub(60);
+        out.push_str(&lines[start..].join("\n"));
+    }
+    out.push_str("\n--- /var/log/izba-vnc.log (in guest) ---\n");
+    let o = izba(
+        data,
+        &[],
+        &["exec", name, "--", "cat", "/var/log/izba-vnc.log"],
+    );
+    out.push_str(&stdout_of(&o));
+    out.push_str(&String::from_utf8_lossy(&o.stderr));
+    out
+}
+
+/// Split `http://izba:<password>@127.0.0.1:<port>/` into its two variable
+/// parts, asserting the whole shape on the way (the URL contract `izba vnc
+/// url` promises: fixed user, loopback host, trailing slash).
+fn parse_vnc_url(url: &str) -> (String, u16) {
+    let rest = url
+        .strip_prefix("http://izba:")
+        .unwrap_or_else(|| panic!("vnc url must carry the izba userinfo, got: {url:?}"));
+    let (password, hostpart) = rest
+        .split_once('@')
+        .unwrap_or_else(|| panic!("vnc url must carry a password, got: {url:?}"));
+    let hostport = hostpart.trim_end_matches('/');
+    let port: u16 = hostport
+        .strip_prefix("127.0.0.1:")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("vnc url must target a loopback port, got: {url:?}"));
+    assert!(!password.is_empty(), "vnc url password must not be empty");
+    (password.to_string(), port)
+}
+
+/// The guest's LISTEN set, read from the kernel inside the workload container
+/// (which shares init's netns for every non-docker sandbox, so this is the
+/// whole guest).
+fn guest_listening_ports(data: &Path, name: &str) -> BTreeSet<u16> {
+    let o = izba(
+        data,
+        &[],
+        &[
+            "exec",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null",
+        ],
+    );
+    assert_ok(&o, "read the guest's /proc/net/tcp");
+    parse_listening_ports(&stdout_of(&o))
+}
+
+/// The full VNC display feature against a real microVM: bundle discovery
+/// through the PRODUCTION path, credentialed web client through the daemon's
+/// ephemeral relay, the desktop actually running inside the container, the
+/// guest's listening surface, and the honest `vnc off`/plain-sandbox
+/// renderings.
+///
+/// Everything here is a real hop: host `TcpStream` → izbad's VNC relay →
+/// `StreamOpen::TcpDial{6901}` over vsock 1026 → izba-init's loopback dial →
+/// `Xkasmvnc`'s websockify inside the crun container, authenticating against
+/// the `kasmpasswd` hash the host generated at `start` and delivered over the
+/// `izba-vnc` virtiofs share.
+///
+/// Assertions, in order:
+/// 1. `izba vnc url` prints `http://izba:<pw>@127.0.0.1:<port>/`.
+/// 2. Auth matrix: no creds → 401; correct creds → 200 + a KasmVNC page;
+///    wrong password → 401 (the hash really is checked, not merely present).
+/// 3. The desktop is functional: the X socket is at `/tmp/.X11-unix/X1` and
+///    both `Xkasmvnc` and `openbox` are live processes inside the container.
+/// 4. The guest listens on NOTHING beyond izba's own set — in particular no
+///    X11 TCP port (`-ac` grants root-on-display to anything in the netns, so
+///    an open 6001 would be a real hole).
+/// 5. `izba vnc off` on a RUNNING sandbox: "restart required" guidance, a
+///    status line that admits the desktop is still up, and a `vnc url` that
+///    still hands back the live URL with the disabled warning on stderr.
+/// 6. A sandbox created WITHOUT `--vnc`: `izba vnc url` fails, pointing at
+///    `vnc on`.
+#[test]
+fn vnc_desktop_e2e() {
+    if !want() {
+        return;
+    }
+    let bundle = vnc_bundle_path();
+    if !bundle.as_deref().map(Path::exists).unwrap_or(false) {
+        eprintln!(
+            "SKIP vnc_desktop_e2e: kasmvnc.erofs not staged at {} — run \
+             hack/build-kasmvnc-erofs.sh and copy dist/kasmvnc.erofs there",
+            bundle
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<exe-relative artifacts dir>".into())
+        );
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+    let name = "vnc-e2e";
+    let _guard = SandboxGuard {
+        data: data.clone(),
+        name,
+    };
+
+    // [1] create --vnc + start. No IZBA_KASMVNC_EROFS: the daemon must find
+    // the bundle by itself or `start` fails closed.
+    let o = izba(
+        &data,
+        no_env,
+        &["create", "--vnc", "--image", IMAGE, "--name", name, &ws_s],
+    );
+    assert_ok(&o, "create --vnc");
+    let o = izba(&data, no_env, &["start", name]);
+    assert_ok(&o, "start (vnc)");
+
+    // [2] The credentialed URL.
+    let o = izba(&data, no_env, &["vnc", "url", name]);
+    assert_ok(&o, "vnc url");
+    let url = stdout_of(&o).trim().to_string();
+    let (password, port) = parse_vnc_url(&url);
+
+    // [3] Poll for the desktop: the relay is up the instant `start` returns,
+    // but Xkasmvnc needs a few seconds to bind :6901 behind it. An
+    // unauthenticated 401 is the first honest proof the whole chain is live.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut first = None;
+    while Instant::now() < deadline {
+        if let Ok((code, _)) = http_get_status(port, "/", None) {
+            first = Some(code);
+            if code == 401 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    assert_eq!(
+        first,
+        Some(401),
+        "the desktop never answered with an auth challenge within 120s \
+         (last status: {first:?})\n{}",
+        vnc_diag(&data, name)
+    );
+
+    // [4] Correct credentials get the KasmVNC web client.
+    let (code, body) = http_get_status(port, "/", Some(("izba", &password)))
+        .unwrap_or_else(|e| panic!("authenticated GET failed: {e:#}\n{}", vnc_diag(&data, name)));
+    assert_eq!(
+        code,
+        200,
+        "correct credentials must be accepted (the host-generated kasmpasswd \
+         hash must match byte-for-byte what KasmVNC recomputes)\n{}",
+        vnc_diag(&data, name)
+    );
+    assert!(
+        body.to_lowercase().contains("kasm"),
+        "expected the KasmVNC client page, got: {:.400}",
+        body
+    );
+
+    // [5] A wrong password is rejected — proves [4] passed because of the
+    // credentials, not because auth is effectively disabled.
+    let (code, _) = http_get_status(port, "/", Some(("izba", "definitely-not-the-password")))
+        .expect("wrong-password GET");
+    assert_eq!(code, 401, "a wrong password must not be accepted");
+
+    // [6] The desktop is really running inside the container: the X server's
+    // socket is where izba-init's window-manager wait expects it, and both
+    // processes are alive.
+    let o = izba(
+        &data,
+        no_env,
+        &["exec", name, "--", "sh", "-c", "ls /tmp/.X11-unix/"],
+    );
+    assert_ok(&o, "ls /tmp/.X11-unix/");
+    assert!(
+        stdout_of(&o).contains("X1"),
+        "the X server must own display :1 at /tmp/.X11-unix/X1, got: {:?}\n{}",
+        stdout_of(&o),
+        vnc_diag(&data, name)
+    );
+    // pgrep is not in busybox-alpine's default applet set; read /proc instead.
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "exec",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "for p in /proc/[0-9]*; do tr '\\0' ' ' < \"$p/cmdline\"; echo; done",
+        ],
+    );
+    assert_ok(&o, "list container processes");
+    let procs = stdout_of(&o);
+    for want in ["Xkasmvnc", "openbox"] {
+        assert!(
+            procs.contains(want),
+            "{want} must be running inside the container, got:\n{procs}\n{}",
+            vnc_diag(&data, name)
+        );
+    }
+
+    // [7] Listening surface. `Xkasmvnc` runs with `-ac` (access control off),
+    // so an X11 TCP listener would hand root-on-display to anything that can
+    // reach the guest netns — the whole point of KasmVNC's unix-socket-only
+    // default. Assert the LISTEN set is exactly izba's own: sshd (22), the
+    // egress DNS/TCP stub (53), the egress relay (15001) and the desktop's
+    // websocket (6901).
+    let listening = guest_listening_ports(&data, name);
+    let expected: BTreeSet<u16> = [22, 53, 6901, 15001].into_iter().collect();
+    assert!(
+        listening.contains(&6901),
+        "the desktop's websocket must be listening, got: {listening:?}"
+    );
+    assert!(
+        !listening.contains(&6001),
+        "an X11 TCP listener (6000+display) must NOT exist — with -ac it would \
+         be root-on-display for anything in the guest netns; got: {listening:?}"
+    );
+    assert!(
+        listening.is_subset(&expected),
+        "the guest must listen on nothing beyond izba's own set {expected:?}, got: {listening:?}"
+    );
+
+    // [8] `vnc off` against a RUNNING sandbox: config flips now, the booted
+    // desktop cannot be unmade, and every surface has to say so honestly.
+    let o = izba(&data, no_env, &["vnc", "off", name]);
+    assert_ok(&o, "vnc off");
+    let off_out = format!("{}{}", stdout_of(&o), String::from_utf8_lossy(&o.stderr));
+    assert!(
+        off_out.contains("restart required"),
+        "vnc off on a running sandbox must ask for a restart, got: {off_out}"
+    );
+    let o = izba(&data, no_env, &["status", name]);
+    assert_ok(&o, "status after vnc off");
+    let status_out = stdout_of(&o);
+    assert!(
+        status_out.contains("vnc:         disabled (desktop still running until restart)"),
+        "status must admit the desktop is still up, got:\n{status_out}"
+    );
+    // The URL still works — the relay and the desktop behind it are live.
+    let o = izba(&data, no_env, &["vnc", "url", name]);
+    assert_ok(&o, "vnc url after vnc off");
+    assert_eq!(
+        stdout_of(&o).trim(),
+        url,
+        "the live relay's URL must be unchanged by a config-only flip"
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("disabled in config"),
+        "vnc url must warn that the desktop is on borrowed time, got stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // [9] A sandbox created WITHOUT --vnc has no URL to give. It never needs
+    // to boot for that answer, so this costs no second microVM.
+    let ws2 = root.path().join("ws-plain");
+    std::fs::create_dir_all(&ws2).unwrap();
+    let ws2_s = ws2.to_string_lossy().into_owned();
+    let plain = "vnc-e2e-plain";
+    let _plain_guard = SandboxGuard {
+        data: data.clone(),
+        name: plain,
+    };
+    assert_ok(
+        &izba(
+            &data,
+            no_env,
+            &["create", "--image", IMAGE, "--name", plain, &ws2_s],
+        ),
+        "create (plain)",
+    );
+    let o = izba(&data, no_env, &["vnc", "url", plain]);
+    assert!(
+        !o.status.success(),
+        "vnc url on a sandbox without --vnc must fail"
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("vnc on"),
+        "the refusal must point at `izba vnc on`, got: {err}"
+    );
+
+    // Teardown is the SandboxGuards' job (they also run on panic).
+}
+
+/// The two hand-rolled parsers `vnc_desktop_e2e` leans on are pure, so they
+/// are gated in EVERY CI run — not only under `IZBA_INTEGRATION=1`. A silent
+/// base64 bug would turn "the password was rejected" into "the header was
+/// malformed", and a `/proc/net/tcp` misparse would turn the listening-surface
+/// assertion into a no-op.
+#[test]
+fn base64_encode_matches_rfc4648_vectors() {
+    assert_eq!(base64_encode(b""), "");
+    assert_eq!(base64_encode(b"f"), "Zg==");
+    assert_eq!(base64_encode(b"fo"), "Zm8=");
+    assert_eq!(base64_encode(b"foo"), "Zm9v");
+    assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+    assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+    assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    // The shape the test actually sends, plus the high-bit/padding edges.
+    assert_eq!(base64_encode(b"izba:pw"), "aXpiYTpwdw==");
+    assert_eq!(base64_encode(&[0xff, 0xef, 0xfe]), "/+/+");
+}
+
+#[test]
+fn parse_listening_ports_reads_only_listeners() {
+    // Verbatim from a real `--vnc` guest (alpine:3.20, 2026-08-09): sshd,
+    // the egress DNS stub, the egress relay, the desktop websocket, and one
+    // ESTABLISHED (st 01) connection that must NOT be counted.
+    let sample = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 538 1
+   1: 0100007F:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 545 1
+   2: 00000000:3A99 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 539 1
+   3: 0100007F:1AF5 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 647 1
+   4: 0100007F:E5CA 0100007F:1AF5 01 00000000:00000000 00:00000000 00000000     0        0 0 3
+";
+    let got = parse_listening_ports(sample);
+    assert_eq!(
+        got,
+        [22u16, 53, 6901, 15001]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+    // An IPv6-shaped row (32-hex address) parses the same way.
+    let v6 = "   0: 00000000000000000000000000000000:1F90 \
+              00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 1\n";
+    assert_eq!(
+        parse_listening_ports(v6),
+        [8080u16].into_iter().collect::<BTreeSet<_>>()
+    );
+    assert!(parse_listening_ports("").is_empty());
 }
