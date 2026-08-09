@@ -20,6 +20,7 @@ mod ssh;
 mod stats;
 mod trust;
 mod veth;
+mod vnc;
 
 use anyhow::Context;
 use exec::ExecEngine;
@@ -125,7 +126,7 @@ fn self_check() {
 
     // ExecEngine constructs without a live container (cgroup detection is
     // best-effort), exercising the boot-time construction path.
-    let _engine = ExecEngine::new(None);
+    let _engine = ExecEngine::new(None, false);
 
     // The crun run/exec argv wiring is the Stance B substitute for the old
     // direct spawn; validate both build the expected, well-formed argv.
@@ -293,6 +294,37 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     let usb = Arc::new(izba_init::usb::UsbState::new(usb_enabled));
 
+    // VNC display, decided by the host on the same cmdline channel as USB and
+    // docker mode. Everything here MUST happen before `launch_container()`:
+    // both the KasmVNC bundle dir and the secrets dir are bind SOURCES in the
+    // OCI config the host authored, and crun fails the whole container start
+    // when a bind source does not exist (the same reason the USB device dir
+    // above is created up front).
+    let vnc_enabled = vnc::enabled_on_cmdline(&params);
+    if vnc_enabled {
+        // The bundle erofs is the disk after the last user volume.
+        if let Err(e) = mounts::apply(&[mounts::vnc_mount_op(vols.len())]) {
+            eprintln!("izba-init: *** VNC BUNDLE MOUNT FAILED *** {e:#}; no desktop this boot");
+        }
+        // Convenience for init-context debugging only: inside the container
+        // the bundle is a real bind at this path (authored host-side), but
+        // init itself sees it at /run/izba/vnc. Best-effort; an existing path
+        // (e.g. a second boot of the same initramfs) is fine.
+        let _ = std::os::unix::fs::symlink(vnc::BUNDLE_DIR, vnc::CONTAINER_BUNDLE_DIR);
+        // Copy the kasmpasswd hash out of the read-only izba-vnc share into
+        // init-root /run/izba/vnc-secrets. Creates the dir even when the
+        // share delivered nothing, so a missing hash degrades to "every VNC
+        // login is refused" instead of "the container never starts".
+        match vnc::materialize(Path::new(vnc::SHARE_MOUNT), Path::new(vnc::SECRETS_DIR)) {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "izba-init: vnc: no {} in the izba-vnc share; the desktop will refuse every login",
+                vnc::KASMPASSWD_FILE
+            ),
+            Err(e) => eprintln!("izba-init: vnc materialize: {e}"),
+        }
+    }
+
     // Guest networking: shared-netns dummy0, or (docker mode) just loopback
     // — see net::configure's doc for the split. Log and continue on error —
     // exec/cp/vsock still work without IP networking. (`docker` itself was
@@ -316,7 +348,7 @@ fn run_pid1() -> anyhow::Result<()> {
     });
     ssh::launch();
 
-    let engine = Arc::new(ExecEngine::new(Some("/rootfs".into())));
+    let engine = Arc::new(ExecEngine::new(Some("/rootfs".into()), vnc_enabled));
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let control = VsockPortListener(
@@ -404,6 +436,16 @@ fn run_pid1() -> anyhow::Result<()> {
                 "izba-init: *** DOCKER-MODE VETH SETUP SKIPPED *** container pid unavailable (container not running?)"
             ),
         }
+    }
+
+    // VNC desktop auto-start. OUTSIDE the `if docker` block above — a display
+    // is orthogonal to docker mode — and placed at the same point in the boot
+    // as `docker::start_engine`: the container is `running`, so `crun exec`
+    // can enter it. Fire-and-forget with no auto-restart, exactly like the
+    // engine; a dead X server is reported honestly by the daemon's liveness
+    // probe rather than silently respawned.
+    if vnc_enabled {
+        vnc::start_desktop();
     }
 
     let stats_ctx = Arc::new(stats::StatsContext {

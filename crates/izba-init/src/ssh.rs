@@ -29,16 +29,23 @@ pub const SSH_SESSION_CWD: &str = "/workspace";
 /// guest; when true, all six CA-bundle env vars from
 /// [`crate::trust::trust_env_pairs`] are forwarded (mirroring the `izba exec`
 /// server path), gated ONLY on bundle presence and NOT on tty — a non-tty
-/// `ssh host git ...` must still trust izbad's MITM leaf certs. Runs the
+/// `ssh host git ...` must still trust izbad's MITM leaf certs. `vnc` is
+/// whether this sandbox booted with a display (`izba.vnc=1`); when true the
+/// session gets `DISPLAY`, mirroring the `izba exec` server path
+/// (`exec.rs build_env_overlay`) so a GUI app started over SSH lands on the
+/// KasmVNC desktop. Like the trust vars and unlike `TERM`, it is NOT gated on
+/// tty — `ssh host xterm &` is exactly the case that needs it. Runs the
 /// container's `/bin/sh` either interactively or as `sh -c <cmd>`, in
 /// `SSH_SESSION_CWD`, as the container's configured user (no `--user`), with
-/// the container image env plus the forwarded `TERM` and CA-bundle vars.
+/// the container image env plus the forwarded `TERM`, CA-bundle and
+/// `DISPLAY` vars.
 pub fn ssh_session_crun_argv(
     cgroup_manager: crate::oci::CgroupManager,
     tty: bool,
     command: Option<&str>,
     term: Option<&str>,
     trust_present: bool,
+    vnc: bool,
 ) -> Vec<String> {
     let shell_argv = match command {
         Some(cmd) => vec!["/bin/sh".to_string(), "-c".to_string(), cmd.to_string()],
@@ -60,6 +67,11 @@ pub fn ssh_session_crun_argv(
         for (k, v) in crate::trust::trust_env_pairs() {
             env.push((k.to_string(), v.to_string()));
         }
+    }
+    // Forward DISPLAY for a VNC sandbox (see the doc comment): not gated on
+    // tty, so `ssh host <gui-app>` reaches the desktop too.
+    if vnc {
+        env.push(("DISPLAY".to_string(), crate::vnc::DISPLAY.to_string()));
     }
     crate::oci::crun_exec_argv(
         cgroup_manager,
@@ -115,10 +127,26 @@ pub fn ssh_session(command: Option<&str>) -> ! {
     // Forward the MITM CA-bundle env vars when the izba CA bundle is present in
     // the guest (mirrors the `izba exec` server path); not gated on tty.
     let trust_present = ssh_trust_bundle_present();
-    let argv = ssh_session_crun_argv(cg, tty, command, term.as_deref(), trust_present);
+    // The SSH login shell is a SEPARATE process from PID 1, so it cannot
+    // inherit the boot-time `izba.vnc` decision — it re-reads the same
+    // host-authoritative kernel cmdline PID 1 read.
+    let vnc = vnc_enabled();
+    let argv = ssh_session_crun_argv(cg, tty, command, term.as_deref(), trust_present, vnc);
     let e = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
     eprintln!("izba-init: ssh-session: {e}");
     std::process::exit(127);
+}
+
+/// Whether this sandbox booted with a VNC display, read from the kernel
+/// command line (the host-authoritative channel PID 1 uses).
+// reason: reads /proc/cmdline, which only carries izba's flags inside a
+// booted guest; the predicate it applies (vnc::enabled_on_cmdline) and the
+// parser (cmdline::parse) are unit-tested directly.
+#[mutants::skip]
+fn vnc_enabled() -> bool {
+    let params =
+        crate::cmdline::parse(&std::fs::read_to_string("/proc/cmdline").unwrap_or_default());
+    crate::vnc::enabled_on_cmdline(&params)
 }
 
 /// virtiofs tag of the read-only SSH share izbad attaches per-sandbox.
@@ -348,8 +376,14 @@ mod tests {
     fn ssh_session_crun_argv_interactive_tty() {
         // tty=true, None (interactive login) → --tty present, ends with
         // ["izba", "/bin/sh"], cwd is SSH_SESSION_CWD.
-        let argv =
-            ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, true, None, None, false);
+        let argv = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            true,
+            None,
+            None,
+            false,
+            false,
+        );
         assert_eq!(
             argv.first().map(String::as_str),
             Some(crate::oci::CRUN_PATH)
@@ -385,6 +419,7 @@ mod tests {
             Some("ls -l"),
             None,
             false,
+            false,
         );
         assert_eq!(
             argv.first().map(String::as_str),
@@ -417,7 +452,7 @@ mod tests {
             crate::oci::CgroupManager::Cgroupfs,
             crate::oci::CgroupManager::Disabled,
         ] {
-            let argv = ssh_session_crun_argv(mgr, false, None, None, false);
+            let argv = ssh_session_crun_argv(mgr, false, None, None, false, false);
             assert_eq!(argv[0], crate::oci::CRUN_PATH);
             assert!(
                 argv[1].starts_with("--cgroup-manager="),
@@ -438,6 +473,7 @@ mod tests {
             true,
             None,
             Some("xterm-256color"),
+            false,
             false,
         );
         assert_eq!(
@@ -466,6 +502,7 @@ mod tests {
             None,
             Some("screen-256color"),
             false,
+            false,
         );
         assert_eq!(env_flag_value(&argv, "TERM"), Some("screen-256color"));
     }
@@ -474,8 +511,14 @@ mod tests {
     fn ssh_session_crun_argv_tty_none_term_omits_env() {
         // tty=true but no resolved TERM → no --env TERM= fabricated here; the
         // caller (`ssh_session`) is responsible for supplying the default.
-        let argv =
-            ssh_session_crun_argv(crate::oci::CgroupManager::Disabled, true, None, None, false);
+        let argv = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            true,
+            None,
+            None,
+            false,
+            false,
+        );
         assert_eq!(
             env_flag_value(&argv, "TERM"),
             None,
@@ -495,6 +538,7 @@ mod tests {
             false,
             Some("ls"),
             Some("xterm"),
+            false,
             false,
         );
         assert_eq!(
@@ -520,6 +564,7 @@ mod tests {
             None,
             Some("xterm-256color"),
             true,
+            false,
         );
         // The two key ones called out by the contract.
         assert_eq!(
@@ -553,6 +598,7 @@ mod tests {
             None,
             Some("xterm-256color"),
             false,
+            false,
         );
         for (key, _) in crate::trust::trust_env_pairs() {
             assert_eq!(
@@ -573,6 +619,7 @@ mod tests {
             Some("git fetch"),
             None,
             true,
+            false,
         );
         // No TERM (non-tty), but all trust vars present.
         assert_eq!(
@@ -587,6 +634,55 @@ mod tests {
                 "trust env {key} must be forwarded even on a non-tty command: {argv:?}"
             );
         }
+    }
+
+    // ── DISPLAY forwarding (mirrors `izba exec` build_env_overlay) ───────────
+
+    #[test]
+    fn ssh_session_crun_argv_forwards_display_only_for_a_vnc_sandbox() {
+        // vnc=false → no DISPLAY at all (a display-less sandbox must never
+        // advertise an X server that isn't running).
+        let plain = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            true,
+            None,
+            Some("xterm-256color"),
+            false,
+            false,
+        );
+        assert_eq!(env_flag_value(&plain, "DISPLAY"), None, "{plain:?}");
+
+        // vnc=true → DISPLAY=:1, alongside TERM.
+        let vnc = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            true,
+            None,
+            Some("xterm-256color"),
+            false,
+            true,
+        );
+        assert_eq!(
+            env_flag_value(&vnc, "DISPLAY"),
+            Some(crate::vnc::DISPLAY),
+            "{vnc:?}"
+        );
+        assert_eq!(env_flag_value(&vnc, "TERM"), Some("xterm-256color"));
+    }
+
+    #[test]
+    fn ssh_session_crun_argv_forwards_display_on_a_non_tty_command() {
+        // `ssh host xterm` (no tty, no TERM) still needs DISPLAY — the
+        // forwarding is gated on the sandbox having a display, not on tty.
+        let argv = ssh_session_crun_argv(
+            crate::oci::CgroupManager::Disabled,
+            false,
+            Some("xterm"),
+            None,
+            false,
+            true,
+        );
+        assert_eq!(env_flag_value(&argv, "TERM"), None);
+        assert_eq!(env_flag_value(&argv, "DISPLAY"), Some(crate::vnc::DISPLAY));
     }
 
     #[test]

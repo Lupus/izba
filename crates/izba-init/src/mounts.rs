@@ -108,6 +108,19 @@ pub fn rootfs_mount_plan() -> Vec<MountOp> {
             "",
         )
         .optional(),
+        // The KasmVNC password hash, delivered read-only for the VNC session.
+        // Optional: the share is only attached for a `vnc: true` sandbox; a
+        // missing tag fails-soft instead of aborting boot. Mirrors izba-ssh —
+        // the target is under /rootfs so the share stays read-only, and
+        // vnc::materialize copies the hash out into init-root /run.
+        MountOp::new(
+            crate::vnc::VNC_TAG,
+            crate::vnc::SHARE_MOUNT,
+            "virtiofs",
+            &["ro"],
+            "",
+        )
+        .optional(),
         // OCI bundle share: the host delivers config.json (and the absolute
         // root.path = /rootfs) over this read-only virtiofs tag.  Optional so
         // a sandbox without a crun OCI config (pre-M2 launch or a bare shell)
@@ -156,6 +169,31 @@ pub const BUILDOUT_TAG: &str = "izba-buildout";
 pub fn buildout_mount_op() -> MountOp {
     // No "ro" flag → writable by the guest (virtiofs passes writes through).
     MountOp::new(BUILDOUT_TAG, "/rootfs/out", "virtiofs", &[], "")
+}
+
+/// Mount op for the vendored KasmVNC erofs bundle, whose disk the host
+/// appends AFTER every user volume (`build_vm_disks`: `[rootfs.erofs=vda,
+/// rw.img=vdb, vol₀=vdc, …, kasmvnc.erofs]`) — so its guest device is
+/// `volume_device(volume_count)`, the slot one past the last volume. Purely
+/// positional, exactly like the volumes themselves.
+///
+/// The target is init-root [`crate::vnc::BUNDLE_DIR`], deliberately OUTSIDE
+/// `/rootfs`: this is izba-owned system material (like the ssh keys and the
+/// USB device dir), never part of the OCI image, and crun bind-mounts it into
+/// the container read-only. Being outside the overlay it also gets **no
+/// idmapped-mount treatment ever** (`idmap::apply_layer_idmaps` covers
+/// `/lower`, `/upper`, the volumes and the workspace share only): its files
+/// are root-owned by construction and are read through their world-readable
+/// mode bits, which is correct under every id map, including docker mode's
+/// shifted one where guest-uid 0 is unmapped entirely.
+pub fn vnc_mount_op(volume_count: usize) -> MountOp {
+    MountOp::new(
+        &volume_device(volume_count),
+        crate::vnc::BUNDLE_DIR,
+        "erofs",
+        &["ro"],
+        "",
+    )
 }
 
 /// Mount ops for user volumes, one per guest path in declaration order.
@@ -332,8 +370,9 @@ mod tests {
         let p = rootfs_mount_plan();
         // Stance B: crun owns the container's proc/sys/dev/tmp/devpts, so the
         // plan is only the overlay stack + the virtiofs shares: vda(lower),
-        // vdb(upper), overlay, workspace, izba-trust, izba-ssh, izba-oci = 7 ops.
-        assert_eq!(p.len(), 7);
+        // vdb(upper), overlay, workspace, izba-trust, izba-ssh, izba-vnc,
+        // izba-oci = 8 ops.
+        assert_eq!(p.len(), 8);
         assert_eq!(op(&p, 0), ("/dev/vda", "/lower", "erofs", vec!["ro"], ""));
         assert_eq!(op(&p, 1), ("/dev/vdb", "/upper", "ext4", vec![], ""));
         assert_eq!(
@@ -366,6 +405,10 @@ mod tests {
         );
         assert_eq!(
             op(&p, 6),
+            ("izba-vnc", "/rootfs/izba-vnc", "virtiofs", vec!["ro"], "")
+        );
+        assert_eq!(
+            op(&p, 7),
             (
                 izba_proto::OCI_TAG,
                 crate::oci::BUNDLE_MOUNT,
@@ -413,8 +456,63 @@ mod tests {
         assert!(trust.optional, "trust share must fail-soft when absent");
         assert!(trust.flags.iter().any(|f| f == "ro"));
         assert_eq!(trust.target, PathBuf::from("/rootfs/izba-trust"));
-        // The trust, izba-ssh and OCI bundle shares are all optional.
-        assert_eq!(p.iter().filter(|o| o.optional).count(), 3);
+        // The trust, izba-ssh, izba-vnc and OCI bundle shares are all optional.
+        assert_eq!(p.iter().filter(|o| o.optional).count(), 4);
+    }
+
+    /// The optional izba-vnc credential share must be present, read-only, and
+    /// optional (only a `vnc: true` sandbox gets the tag attached).
+    #[test]
+    fn vnc_share_is_optional_and_read_only() {
+        let p = rootfs_mount_plan();
+        let vnc = p
+            .iter()
+            .find(|o| o.source == crate::vnc::VNC_TAG)
+            .expect("izba-vnc share must be present in the rootfs plan");
+        assert!(vnc.optional, "izba-vnc share must fail-soft when absent");
+        assert!(
+            vnc.flags.iter().any(|f| f == "ro"),
+            "izba-vnc must be read-only"
+        );
+        assert_eq!(vnc.target, PathBuf::from(crate::vnc::SHARE_MOUNT));
+        assert_eq!(vnc.fstype, "virtiofs");
+        // virtiofs ⇒ it inherits the OpenVMM pre-mount pause like every other
+        // share (asserted plan-wide by `virtiofs_gets_pre_mount_pause`).
+        assert!(pre_mount_pause(vnc).is_some());
+    }
+
+    /// The KasmVNC erofs is the disk immediately AFTER the last user volume.
+    #[test]
+    fn vnc_mount_op_targets_the_disk_after_volumes() {
+        // No volumes → vda(lower), vdb(rw), vdc(vnc).
+        let op0 = vnc_mount_op(0);
+        assert_eq!(op0.source, "/dev/vdc");
+        // Two volumes occupy vdc+vdd, so the bundle lands on vde.
+        let op2 = vnc_mount_op(2);
+        assert_eq!(op2.source, "/dev/vde");
+        assert_eq!(op2.source, volume_device(2), "positional contract");
+        // Same target/fstype/flags regardless of volume count.
+        for op in [&op0, &op2] {
+            assert_eq!(op.target, PathBuf::from(crate::vnc::BUNDLE_DIR));
+            assert_eq!(op.fstype, "erofs");
+            assert!(op.flags.iter().any(|f| f == "ro"), "bundle is read-only");
+            assert!(
+                !op.optional,
+                "an izba.vnc=1 boot with no bundle disk must fail loudly"
+            );
+        }
+    }
+
+    /// The bundle mount lives OUTSIDE the overlay, so no idmapped-mount pass
+    /// (docker mode's `/lower`,`/upper`,volumes,workspace) can ever touch it.
+    #[test]
+    fn vnc_bundle_is_mounted_outside_the_rootfs_overlay() {
+        let target = vnc_mount_op(0).target;
+        assert!(
+            !target.starts_with("/rootfs"),
+            "izba-owned system material must not live in the OCI image tree: {target:?}"
+        );
+        assert!(target.starts_with("/run/izba"));
     }
 
     #[test]
