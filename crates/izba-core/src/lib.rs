@@ -20,5 +20,6 @@ pub mod state;
 pub(crate) mod testutil;
 pub mod usb;
 pub mod vmm;
+pub mod vnc;
 pub mod volume;
 pub mod vsock;
