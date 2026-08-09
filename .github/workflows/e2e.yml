@@ -332,12 +332,25 @@ jobs:
         with:
           name: kasmvnc-erofs
           path: dist/
+      - name: Restore OCI test-image cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /home/runner/.cache/izba-itest
+          key: izba-itest-alpine-3.20
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          prefix-key: e2e-linux
       - name: Stage kasmvnc.erofs at the production exe-relative discovery path
         # vnc_desktop_e2e (crates/izba-cli/tests/daemon_e2e.rs) deliberately
         # never sets IZBA_KASMVNC_EROFS — it proves the SHIPPED discovery path
         # (<exe-dir>/../artifacts/kasmvnc.erofs; CARGO_BIN_EXE_izba here is
         # target/debug/izba, so the sibling dir is target/artifacts). NO env
         # override, on purpose.
+        #
+        # ORDER IS LOAD-BEARING: this must run AFTER Swatinem/rust-cache —
+        # the cache restore replaces target/ wholesale and silently deleted
+        # an earlier-staged bundle (both platforms' VNC proofs then
+        # self-skipped GREEN on the first dispatched run of this workflow).
         run: |
           mkdir -p target/artifacts
           cp dist/kasmvnc.erofs target/artifacts/kasmvnc.erofs
@@ -347,14 +360,6 @@ jobs:
             echo "target/artifacts/kasmvnc.erofs missing — the kasmvnc-erofs artifact job is broken; vnc_desktop_e2e would silently self-skip instead of proving the feature" >&2
             exit 1
           }
-      - name: Restore OCI test-image cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: /home/runner/.cache/izba-itest
-          key: izba-itest-alpine-3.20
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-        with:
-          prefix-key: e2e-linux
       - name: Report host confinement capabilities (Landlock probe)
         run: |
           # Authoritative check via the landlock_create_ruleset ABI probe — NOT
@@ -632,23 +637,6 @@ jobs:
         with:
           name: kasmvnc-erofs
           path: dist/
-      - name: Stage kasmvnc.erofs at the production exe-relative discovery path
-        # Mirrors the linux-kvm staging: the future VNC validation section
-        # drives izba.exe via IZBA_EXE=target\release\izba.exe (same convention
-        # as the other steps in this job), so production discovery walks up to
-        # target\artifacts\kasmvnc.erofs. NO env override, on purpose — same
-        # reasoning as vnc_desktop_e2e on Linux.
-        shell: bash
-        run: |
-          mkdir -p target/artifacts
-          cp dist/kasmvnc.erofs target/artifacts/kasmvnc.erofs
-      - name: Verify kasmvnc.erofs staged (fail loudly, never silently skip VNC)
-        shell: bash
-        run: |
-          test -f target/artifacts/kasmvnc.erofs || {
-            echo "target/artifacts/kasmvnc.erofs missing — the kasmvnc-erofs artifact job is broken; the VNC validation section would silently skip instead of proving the feature" >&2
-            exit 1
-          }
       - name: Restore pinned openvmm.exe
         id: openvmm
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -664,6 +652,27 @@ jobs:
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           prefix-key: e2e-windows
+      - name: Stage kasmvnc.erofs at the production exe-relative discovery path
+        # Mirrors the linux-kvm staging: the VNC validation section drives
+        # izba.exe via IZBA_EXE=target\release\izba.exe, so production
+        # discovery walks up to target\artifacts\kasmvnc.erofs. NO env
+        # override, on purpose — same reasoning as vnc_desktop_e2e on Linux.
+        #
+        # ORDER IS LOAD-BEARING: must run AFTER Swatinem/rust-cache — the
+        # cache restore replaces target/ wholesale and silently deleted an
+        # earlier-staged bundle (section [15] then SKIPPED green on the
+        # first dispatched run of this workflow).
+        shell: bash
+        run: |
+          mkdir -p target/artifacts
+          cp dist/kasmvnc.erofs target/artifacts/kasmvnc.erofs
+      - name: Verify kasmvnc.erofs staged (fail loudly, never silently skip VNC)
+        shell: bash
+        run: |
+          test -f target/artifacts/kasmvnc.erofs || {
+            echo "target/artifacts/kasmvnc.erofs missing — the kasmvnc-erofs artifact job is broken; the VNC validation section would silently skip instead of proving the feature" >&2
+            exit 1
+          }
       # bash, not pwsh: fail-fast between the two builds (pwsh only gates the
       # step on the LAST native command's exit code).
       - name: Build izba.exe + ttystorm.exe + confine_probe.exe (native MSVC)
