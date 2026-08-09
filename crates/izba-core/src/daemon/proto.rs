@@ -32,8 +32,8 @@ use izba_proto::{Request, Response};
 /// clean error instead of a dropped connection. v3 covers the `Usb*`
 /// control-plane requests; v4 covers `UsbAttach`/`UsbDetach` and the guest
 /// `Request` variants they forward. v5 covers `DaemonRequest::Stats` /
-/// `DaemonResponse::Stats`.)
-pub const DAEMON_PROTO_VERSION: u32 = 5;
+/// `DaemonResponse::Stats`. v6 added `DaemonRequest::VncSet`.)
+pub const DAEMON_PROTO_VERSION: u32 = 6;
 
 /// First frame on every daemon connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +218,13 @@ pub enum DaemonRequest {
         name: String,
         device: String,
     },
+    /// Enable or disable VNC display for a sandbox (spec 2026-08-09). Takes
+    /// effect on the next start — there is no hot-toggle; a running VM keeps
+    /// its current desktop (or lack of one) until restarted. v6.
+    VncSet {
+        name: String,
+        enabled: bool,
+    },
     /// Graceful daemon exit. Sandboxes keep running (detached children);
     /// in-daemon port relays pause until the next daemon adopts.
     Shutdown,
@@ -278,6 +285,31 @@ pub struct SandboxDetail {
     /// `false` for an older daemon's frames and for non-docker sandboxes.
     #[serde(default)]
     pub docker: bool,
+    /// VNC display (spec 2026-08-09): whether this sandbox is CONFIGURED to
+    /// boot with a VNC desktop. Additive + serde(default) → no
+    /// DAEMON_PROTO_VERSION bump; `false` for an older daemon's frames and
+    /// for non-VNC sandboxes.
+    #[serde(default)]
+    pub vnc: bool,
+    /// Whether a VNC relay is currently live for this sandbox. Wired in a
+    /// later task (Task 9's relay registry); stays at its serde default
+    /// (`false`) here. Additive + serde(default) → no DAEMON_PROTO_VERSION
+    /// bump.
+    #[serde(default)]
+    pub vnc_running: bool,
+    /// The URL a human can open to reach the live VNC desktop, when one is
+    /// running. Wired in a later task (Task 9); stays at its serde default
+    /// (`None`) here. Additive + serde(default) → no DAEMON_PROTO_VERSION
+    /// bump.
+    #[serde(default)]
+    pub vnc_url: Option<String>,
+    /// The sandbox is running with its VNC display configuration ahead of
+    /// what it actually booted (either direction — enabling OR disabling VNC
+    /// on a live run both need a restart to take effect), so it must be
+    /// restarted for `vnc` to take effect. Additive + serde(default) → no
+    /// DAEMON_PROTO_VERSION bump.
+    #[serde(default)]
+    pub vnc_restart_required: bool,
 }
 
 /// Resource stats for one sandbox (#203), served by `DaemonRequest::Stats`.
@@ -558,6 +590,10 @@ mod tests {
                 name: "web".into(),
                 guest_path: PathBuf::from("/data"),
             },
+            DaemonRequest::VncSet {
+                name: "web".into(),
+                enabled: true,
+            },
         ] {
             let mut buf = Vec::new();
             write_frame(&mut buf, &req).unwrap();
@@ -642,6 +678,10 @@ mod tests {
                 container: Some(izba_proto::ContainerState::Running),
                 user_fallback: Some("node".into()),
                 docker: false,
+                vnc: false,
+                vnc_running: false,
+                vnc_url: None,
+                vnc_restart_required: false,
             }),
             DaemonResponse::Ports { rules: vec![] },
             DaemonResponse::Pruned {
@@ -762,6 +802,10 @@ mod tests {
             container: Some(izba_proto::ContainerState::Stopped),
             user_fallback: None,
             docker: true,
+            vnc: false,
+            vnc_running: false,
+            vnc_url: None,
+            vnc_restart_required: false,
         });
         let json = serde_json::to_string(&resp).unwrap();
         let back: DaemonResponse = serde_json::from_str(&json).unwrap();
@@ -795,6 +839,10 @@ mod tests {
             container: None,
             user_fallback: None,
             docker: true,
+            vnc: false,
+            vnc_running: false,
+            vnc_url: None,
+            vnc_restart_required: false,
         });
         // DaemonResponse is internally tagged (`#[serde(tag = "type")]`), so a
         // newtype variant flattens its struct's fields alongside `type` at the
@@ -934,7 +982,7 @@ mod tests {
         // A same-version daemon predating these variants would fail the frame
         // read instead of self-healing via a restart, so the COMPATIBILITY gate
         // must move with them.
-        assert_eq!(DAEMON_PROTO_VERSION, 5);
+        assert_eq!(DAEMON_PROTO_VERSION, 6);
     }
 
     #[test]
