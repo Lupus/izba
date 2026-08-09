@@ -57,77 +57,165 @@ impl KernelVariant {
 /// 3. `<data>/artifacts/{...}` — per-user data dir, used as a fallback for
 ///    `cargo run` / dev builds that have no sibling bundle (populated by
 ///    `hack/fetch-artifacts.sh`).
-pub fn locate(paths: &Paths, variant: KernelVariant) -> anyhow::Result<Artifacts> {
+///
+/// The optional KasmVNC bundle (`kasmvnc.erofs`) follows the same order, keyed
+/// off `$IZBA_KASMVNC_EROFS` — a standalone override with no pairing rule (see
+/// [`locate_from_with_vnc_env`]) — and is resolved only when `vnc` is true.
+pub fn locate(paths: &Paths, variant: KernelVariant, vnc: bool) -> anyhow::Result<Artifacts> {
     let kernel = std::env::var_os(variant.env()).map(PathBuf::from);
     let initramfs = std::env::var_os("IZBA_INITRAMFS").map(PathBuf::from);
+    let vnc_env = std::env::var_os("IZBA_KASMVNC_EROFS").map(PathBuf::from);
     // current_exe may be unavailable in some sandboxed environments; None just
     // skips the exe-relative fallback below.
     let exe = std::env::current_exe().ok();
     let exe_dir = exe.as_deref().and_then(Path::parent);
-    locate_from(kernel, initramfs, &paths.artifacts_dir(), exe_dir, variant)
+    locate_from_with_vnc_env(
+        kernel,
+        initramfs,
+        vnc_env,
+        &paths.artifacts_dir(),
+        exe_dir,
+        variant,
+        vnc,
+    )
 }
 
 /// Pure core of [`locate`], factored for testing (no process env / current_exe).
+/// Never threads a `$IZBA_KASMVNC_EROFS` override — tests that need one call
+/// [`locate_from_with_vnc_env`] directly. Test-only: production always goes
+/// through `locate` -> `locate_from_with_vnc_env` since it always has a real
+/// (possibly absent) env value to thread.
+#[cfg(test)]
 fn locate_from(
     kernel_env: Option<PathBuf>,
     initramfs_env: Option<PathBuf>,
     data_dir: &Path,
     exe_dir: Option<&Path>,
     variant: KernelVariant,
+    vnc: bool,
 ) -> anyhow::Result<Artifacts> {
-    match (kernel_env, initramfs_env) {
-        (Some(kernel), Some(initramfs)) => {
-            return Ok(Artifacts {
-                variant,
-                kernel,
-                initramfs,
-            })
-        }
+    locate_from_with_vnc_env(
+        kernel_env,
+        initramfs_env,
+        None,
+        data_dir,
+        exe_dir,
+        variant,
+        vnc,
+    )
+}
+
+/// Pure core of [`locate`], with the KasmVNC bundle's env override also
+/// threaded explicitly (same style as the kernel/initramfs overrides above) so
+/// tests stay env-free.
+#[allow(clippy::too_many_arguments)]
+fn locate_from_with_vnc_env(
+    kernel_env: Option<PathBuf>,
+    initramfs_env: Option<PathBuf>,
+    vnc_env: Option<PathBuf>,
+    data_dir: &Path,
+    exe_dir: Option<&Path>,
+    variant: KernelVariant,
+    vnc: bool,
+) -> anyhow::Result<Artifacts> {
+    let (kernel, initramfs) = match (kernel_env, initramfs_env) {
+        (Some(kernel), Some(initramfs)) => (kernel, initramfs),
         (Some(_), None) | (None, Some(_)) => {
             bail!(
                 "{} and IZBA_INITRAMFS must be set together (or neither)",
                 variant.env()
             )
         }
-        (None, None) => {}
+        (None, None) => {
+            // 2. exe-relative `../artifacts` (version-matched bundle), then 3. data dir.
+            let exe_relative = exe_dir
+                .and_then(Path::parent)
+                .map(|root| root.join("artifacts"));
+            let candidates = exe_relative
+                .into_iter()
+                .chain(std::iter::once(data_dir.to_path_buf()));
+            let mut found = None;
+            for dir in candidates {
+                let kernel = dir.join(variant.image());
+                let initramfs = dir.join("initramfs.cpio.gz");
+                if kernel.is_file() && initramfs.is_file() {
+                    found = Some((kernel, initramfs));
+                    break;
+                }
+            }
+            match found {
+                Some(pair) => pair,
+                None => {
+                    if variant == KernelVariant::Usb {
+                        // Never fall back to the base kernel: it has no vhci, so the
+                        // sandbox would boot, accept an attach, and then quietly have
+                        // no device. Say exactly what is missing and how to build it.
+                        bail!(
+                            "this sandbox has USB device grants, so it needs the \
+                             USB-capable kernel ('{}'), which is not installed in {} or \
+                             next to the izba binary — build it with \
+                             `IZBA_KERNEL_EXTRA_CONFIG=hack/kernel-usb.config \
+                             hack/build-kernel.sh 6.18.43 dist/vmlinux-usb`, or set \
+                             IZBA_KERNEL_USB and IZBA_INITRAMFS. Revoke the grants \
+                             (`izba usb revoke`) to start on the default kernel.",
+                            variant.image(),
+                            data_dir.display()
+                        );
+                    }
+                    bail!(
+                        "boot artifacts not found in {} (or next to the izba binary) — \
+                         run hack/fetch-artifacts.sh or set IZBA_KERNEL and IZBA_INITRAMFS",
+                        data_dir.display()
+                    );
+                }
+            }
+        }
+    };
+
+    let kasmvnc_erofs = if vnc {
+        Some(locate_kasmvnc(vnc_env, data_dir, exe_dir)?)
+    } else {
+        None
+    };
+
+    Ok(Artifacts {
+        variant,
+        kernel,
+        initramfs,
+        kasmvnc_erofs,
+    })
+}
+
+/// Resolve the KasmVNC bundle: `$IZBA_KASMVNC_EROFS` override (no pairing
+/// rule — it is a standalone file, not a matched pair like kernel+initramfs),
+/// then exe-relative `../artifacts/kasmvnc.erofs`, then `<data>/artifacts/
+/// kasmvnc.erofs`. Fails closed: a VNC-enabled sandbox with no bundle must
+/// never silently boot without VNC.
+fn locate_kasmvnc(
+    vnc_env: Option<PathBuf>,
+    data_dir: &Path,
+    exe_dir: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(path) = vnc_env {
+        return Ok(path);
     }
 
-    // 2. exe-relative `../artifacts` (version-matched bundle), then 3. data dir.
     let exe_relative = exe_dir
         .and_then(Path::parent)
-        .map(|root| root.join("artifacts"));
+        .map(|root| root.join("artifacts").join("kasmvnc.erofs"));
     let candidates = exe_relative
         .into_iter()
-        .chain(std::iter::once(data_dir.to_path_buf()));
-    for dir in candidates {
-        let kernel = dir.join(variant.image());
-        let initramfs = dir.join("initramfs.cpio.gz");
-        if kernel.is_file() && initramfs.is_file() {
-            return Ok(Artifacts {
-                variant,
-                kernel,
-                initramfs,
-            });
+        .chain(std::iter::once(data_dir.join("kasmvnc.erofs")));
+    for path in candidates {
+        if path.is_file() {
+            return Ok(path);
         }
     }
 
-    if variant == KernelVariant::Usb {
-        // Never fall back to the base kernel: it has no vhci, so the sandbox
-        // would boot, accept an attach, and then quietly have no device. Say
-        // exactly what is missing and how to build it.
-        bail!(
-            "this sandbox has USB device grants, so it needs the USB-capable kernel \
-             ('{}'), which is not installed in {} or next to the izba binary — build \
-             it with `IZBA_KERNEL_EXTRA_CONFIG=hack/kernel-usb.config hack/build-kernel.sh \
-             6.18.43 dist/vmlinux-usb`, or set IZBA_KERNEL_USB and IZBA_INITRAMFS. \
-             Revoke the grants (`izba usb revoke`) to start on the default kernel.",
-            variant.image(),
-            data_dir.display()
-        );
-    }
     bail!(
-        "boot artifacts not found in {} (or next to the izba binary) — run \
-         hack/fetch-artifacts.sh or set IZBA_KERNEL and IZBA_INITRAMFS",
+        "VNC is enabled for this sandbox but kasmvnc.erofs was not found in {} \
+         (or next to the izba binary) — reinstall izba, run hack/build-kasmvnc-erofs.sh, \
+         set IZBA_KASMVNC_EROFS, or disable VNC with `izba vnc off <name>`",
         data_dir.display()
     );
 }
@@ -150,13 +238,13 @@ mod tests {
         touch(&data, "vmlinux-usb");
         touch(&data, "initramfs.cpio.gz");
         assert_eq!(
-            locate_from(None, None, &data, None, KernelVariant::Usb)
+            locate_from(None, None, &data, None, KernelVariant::Usb, false)
                 .unwrap()
                 .kernel,
             data.join("vmlinux-usb")
         );
         assert_eq!(
-            locate_from(None, None, &data, None, KernelVariant::Base)
+            locate_from(None, None, &data, None, KernelVariant::Base, false)
                 .unwrap()
                 .kernel,
             data.join("vmlinux")
@@ -174,7 +262,7 @@ mod tests {
         touch(&data, "initramfs.cpio.gz");
         let err = format!(
             "{:#}",
-            locate_from(None, None, &data, None, KernelVariant::Usb).unwrap_err()
+            locate_from(None, None, &data, None, KernelVariant::Usb, false).unwrap_err()
         );
         assert!(err.contains("vmlinux-usb"), "name what is missing: {err}");
         assert!(
@@ -202,6 +290,7 @@ mod tests {
                 Path::new("/no/data"),
                 None,
                 KernelVariant::Usb,
+                false,
             )
             .unwrap_err()
         );
@@ -216,6 +305,7 @@ mod tests {
             Path::new("/no/data"),
             Some(Path::new("/no/exe/bin")),
             KernelVariant::Base,
+            false,
         )
         .unwrap();
         assert_eq!(got.kernel, PathBuf::from("/k"));
@@ -230,6 +320,7 @@ mod tests {
             Path::new("/no/data"),
             None,
             KernelVariant::Base,
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("must be set together"));
@@ -241,7 +332,7 @@ mod tests {
         let data = tmp.path().join("data");
         touch(&data, "vmlinux");
         touch(&data, "initramfs.cpio.gz");
-        let got = locate_from(None, None, &data, None, KernelVariant::Base).unwrap();
+        let got = locate_from(None, None, &data, None, KernelVariant::Base, false).unwrap();
         assert_eq!(got.kernel, data.join("vmlinux"));
         assert_eq!(got.initramfs, data.join("initramfs.cpio.gz"));
     }
@@ -256,7 +347,15 @@ mod tests {
         touch(&art, "vmlinux");
         touch(&art, "initramfs.cpio.gz");
         let empty_data = tmp.path().join("empty-data");
-        let got = locate_from(None, None, &empty_data, Some(&bin), KernelVariant::Base).unwrap();
+        let got = locate_from(
+            None,
+            None,
+            &empty_data,
+            Some(&bin),
+            KernelVariant::Base,
+            false,
+        )
+        .unwrap();
         assert_eq!(got.kernel, art.join("vmlinux"));
         assert_eq!(got.initramfs, art.join("initramfs.cpio.gz"));
     }
@@ -274,7 +373,7 @@ mod tests {
         touch(&art, "initramfs.cpio.gz");
         // The version-matched bundle next to the binary must win over a
         // potentially stale data dir left behind by an earlier dev build.
-        let got = locate_from(None, None, &data, Some(&bin), KernelVariant::Base).unwrap();
+        let got = locate_from(None, None, &data, Some(&bin), KernelVariant::Base, false).unwrap();
         assert_eq!(got.kernel, art.join("vmlinux"));
         assert_eq!(got.initramfs, art.join("initramfs.cpio.gz"));
     }
@@ -288,9 +387,65 @@ mod tests {
             &tmp.path().join("nope"),
             None,
             KernelVariant::Base,
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("boot artifacts not found"));
+    }
+
+    #[test]
+    fn a_vnc_sandbox_without_the_bundle_fails_with_a_fixable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "vmlinux");
+        touch(dir.path(), "initramfs.cpio.gz");
+        let err = locate_from(None, None, dir.path(), None, KernelVariant::Base, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kasmvnc.erofs"), "names the artifact: {err}");
+        assert!(
+            err.contains("hack/build-kasmvnc-erofs.sh"),
+            "names the remedy: {err}"
+        );
+        assert!(err.contains("izba vnc off"), "names the way out: {err}");
+    }
+
+    #[test]
+    fn the_vnc_bundle_is_found_next_to_the_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "vmlinux");
+        touch(dir.path(), "initramfs.cpio.gz");
+        touch(dir.path(), "kasmvnc.erofs");
+        let art = locate_from(None, None, dir.path(), None, KernelVariant::Base, true).unwrap();
+        assert_eq!(art.kasmvnc_erofs, Some(dir.path().join("kasmvnc.erofs")));
+    }
+
+    #[test]
+    fn a_non_vnc_sandbox_never_looks_for_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "vmlinux");
+        touch(dir.path(), "initramfs.cpio.gz");
+        let art = locate_from(None, None, dir.path(), None, KernelVariant::Base, false).unwrap();
+        assert_eq!(art.kasmvnc_erofs, None);
+    }
+
+    #[test]
+    fn the_vnc_bundle_env_override_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "vmlinux");
+        touch(dir.path(), "initramfs.cpio.gz");
+        let alt = tempfile::tempdir().unwrap();
+        touch(alt.path(), "kasmvnc.erofs");
+        let art = locate_from_with_vnc_env(
+            None,
+            None,
+            Some(alt.path().join("kasmvnc.erofs")),
+            dir.path(),
+            None,
+            KernelVariant::Base,
+            true,
+        )
+        .unwrap();
+        assert_eq!(art.kasmvnc_erofs, Some(alt.path().join("kasmvnc.erofs")));
     }
 
     #[test]
@@ -316,5 +471,10 @@ mod tests {
                 v
             );
         }
+        assert!(
+            script.contains("usr/lib/izba/artifacts/kasmvnc.erofs"),
+            "packaging/build-deb.sh installs no usr/lib/izba/artifacts/kasmvnc.erofs: \
+             a VNC-enabled sandbox cannot start from an installed build"
+        );
     }
 }
