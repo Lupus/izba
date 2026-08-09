@@ -60,6 +60,13 @@ Env knobs (all optional): `IZBA_KERNEL`, `IZBA_CH`, `IZBA_VIRTIOFSD`,
 Exit code: **0** if the floor (Option A) passed (Option B status reported
 separately); **non-zero** if Option A failed.
 
+> **2026-08-09 note:** the June run's "Option B not functional on 6.12.30"
+> verdict was a harness bug — the mount idmap columns were swapped (see the
+> RETRACTION in `docs/superpowers/specs/2026-06-22-crun-userns-virtiofs-spike-findings.md`).
+> The guest init now carries the corrected orientation (`containerID` = the
+> ON-DISK id, `hostID` = the presented id) and Option B passes on the
+> unchanged 6.12.30 + virtiofsd 1.13.3 pins.
+
 ## Pass/fail interpretation (per spec tests 1, 3, 6)
 
 | Spike test | Spec test | PASS means | FAIL means |
