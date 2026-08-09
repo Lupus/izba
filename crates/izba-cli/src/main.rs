@@ -74,7 +74,8 @@ struct SandboxOpts {
     no_docker: bool,
     /// Enable VNC display: boots with the KasmVNC + window-manager erofs
     /// bundle mounted and VNC-facing services started. Nothing auto-enables
-    /// this — it is always an explicit opt-in.
+    /// this — it is always an explicit opt-in. Requires /bin/sh in the image
+    /// (keymap compile + desktop autostart shell out).
     #[arg(long)]
     vnc: bool,
 }

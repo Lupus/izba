@@ -258,7 +258,7 @@ integration test suite.
 ## Commands
 
 ```
-izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [--volume [NAME:]GUEST_PATH:SIZE]... [--policy PATH] [DIR]
+izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [--volume [NAME:]GUEST_PATH:SIZE]... [--policy PATH] [--vnc] [DIR]
 izba run    [--image IMG] [--rm|-d] [NAME_OR_DIR] [-- CMD...]   # create+start+exec; --rm reaps on exit, -d/--detach leaves it running
 izba exec   NAME [-it] [-- CMD...]
 izba ssh    NAME [-- CMD...]            # ssh into a running sandbox (root shell in the workspace)
@@ -289,11 +289,27 @@ izba usb     revoke NAME --device VID:PID # withdraw a grant
 izba usb     attach NAME --device VID:PID  # attach a granted device (appears at /dev/izba/ inside)
 izba usb     detach NAME --device VID:PID  # detach it again
 izba usb     status NAME                  # a sandbox's device grants
+izba vnc     on|off NAME                  # enable/disable the KasmVNC desktop (restart required if running)
+izba vnc     url NAME                     # print the credentialed desktop URL (http://izba:<pw>@127.0.0.1:<port>/)
+izba vnc     open NAME                    # open the desktop URL in your default browser
 izba diff    [NAME_OR_DIR] [--name NAME]  # show drift between izba.yml and managed truth
 izba promote [NAME_OR_DIR] [--name NAME] [--force] [--restart] [--reset-scratch=BOOL]
                                           # apply manifest → managed truth (human-gated)
 izba export  [NAME_OR_DIR] [--name NAME]  # write managed truth → izba.yml
 ```
+
+`izba create --vnc` (or `izba vnc on <name>` on an existing sandbox, restart
+required if it's running) boots with a KasmVNC remote desktop — openbox +
+xterm — reachable via `izba vnc url <name>` (prints a credentialed
+`http://izba:<pw>@127.0.0.1:<port>/`; the only surface that shows the
+password) or `izba vnc open <name>` (opens it in your default browser).
+Some things worth knowing before you turn it on: the workload image needs
+`/bin/sh` (used to compile the X keymap and launch the desktop autostart);
+X runs with access control off (`-ac`) inside the sandbox, so anything in the
+guest can drive the display — the same trust domain as the rest of the
+container; the desktop defaults to display `:1` at 1280x800 and the web
+client can resize it live; the clipboard is bidirectional by default; and VNC
+is not yet supported together with `--docker` (refused at create/start).
 
 ### Referring to sandboxes
 
