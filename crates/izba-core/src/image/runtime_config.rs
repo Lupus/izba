@@ -847,6 +847,14 @@ pub struct SpecParams<'a> {
     /// Supplementary gids for the container process user (the image USER's
     /// /etc/group memberships — e.g. `docker`). Empty when none resolve.
     pub additional_gids: &'a [u32],
+    /// This sandbox has a VNC display enabled: bind the KasmVNC bundle
+    /// ([`VNC_BUNDLE_SHARED_DIR`]) and its `xkbcomp` binary
+    /// (hardcoded server path, see [`add_vnc_mounts`]) and secrets
+    /// ([`VNC_SECRETS_SHARED_DIR`]) into the container, and grow `/dev/shm`
+    /// to [`DEV_SHM_VNC_SIZE`] (the X server + browser client both need real
+    /// shared-memory headroom). False for every sandbox without a display,
+    /// which then gets none of these mounts and the stock 64M `/dev/shm`.
+    pub vnc: bool,
 }
 
 /// Guest path izba-init mirrors attached device nodes into, bind-mounted to
@@ -874,6 +882,37 @@ pub const USB_CONTAINER_DIR: &str = "/dev/izba";
 /// the same restriction the guest applies when it decides which node to mirror,
 /// enforced independently on the other side.
 const SERIAL_MAJORS: [i64; 2] = [166, 188];
+
+/// Host-mirrored guest path holding the vendored KasmVNC bundle (X server,
+/// window manager, VNC/websockify, and the `xkbcomp` binary at
+/// `bin/xkbcomp` — see [`add_vnc_mounts`]), bind-mounted read-only into the
+/// container at [`VNC_BUNDLE_CONTAINER_DIR`].
+///
+/// Lives in init-root `/run`, OUTSIDE the `/rootfs` overlay — mirroring the
+/// USB and ssh material — so the VNC bundle is never part of the OCI image
+/// and can't be shadowed by anything the workload writes.
+pub const VNC_BUNDLE_SHARED_DIR: &str = "/run/izba/vnc";
+
+/// Where the VNC bundle appears inside the container.
+pub const VNC_BUNDLE_CONTAINER_DIR: &str = "/opt/izba-vnc";
+
+/// Host-mirrored guest path holding VNC session secrets (password, TLS
+/// material), bind-mounted read-only into the container. Source and
+/// destination are the same path by convention (mirrors how the guest's own
+/// tooling expects to find it), so container tooling needs no izba-specific
+/// path translation.
+pub const VNC_SECRETS_SHARED_DIR: &str = "/run/izba/vnc-secrets";
+
+/// Container-side mount point for the VNC secrets — identical to
+/// [`VNC_SECRETS_SHARED_DIR`] (see its doc comment).
+pub const VNC_SECRETS_CONTAINER_DIR: &str = "/run/izba/vnc-secrets";
+
+/// `/dev/shm` size for a VNC-enabled sandbox, replacing the OCI default
+/// spec's stock `size=65536k` (64 MiB). The X server and the browser-based
+/// VNC client both keep real shared-memory segments (framebuffer/SHM
+/// extension), and 64 MiB is too tight for a modern desktop session — 512
+/// MiB gives real headroom.
+pub const DEV_SHM_VNC_SIZE: &str = "size=524288k";
 
 /// Generate the OCI runtime [`Spec`] for the guest's single workload container.
 ///
@@ -1036,6 +1075,15 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     // a sandbox without grants — no directory, no device rules.
     if params.usb {
         add_usb_device_access(&mut spec)?;
+    }
+
+    // VNC display: bind in the vendored bundle + secrets, and grow
+    // /dev/shm for the X server and browser VNC client. Both halves are
+    // skipped entirely for a sandbox without a display — no bundle, no
+    // secrets, no bigger /dev/shm.
+    if params.vnc {
+        add_vnc_mounts(&mut spec)?;
+        resize_dev_shm(&mut spec);
     }
 
     // Privileged builders AND docker-mode sandboxes: mount `/sys/fs/cgroup`
@@ -1208,6 +1256,97 @@ fn add_usb_device_access(spec: &mut Spec) -> Result<()> {
         linux.set_resources(Some(resources));
     }
     Ok(())
+}
+
+/// Bind the vendored KasmVNC bundle and its session secrets into the
+/// container.
+///
+/// Three binds:
+/// - **Bundle** ([`VNC_BUNDLE_SHARED_DIR`] → [`VNC_BUNDLE_CONTAINER_DIR`]):
+///   the whole vendored tree (X server, window manager, VNC/websockify),
+///   `rbind,ro` — read-only because the workload never needs to modify its
+///   own display stack, but withOUT `noexec`: the binaries inside it are
+///   what actually runs.
+/// - **`xkbcomp`** (`VNC_BUNDLE_SHARED_DIR/bin/xkbcomp` →
+///   `/usr/bin/xkbcomp`): a single-file bind at the X server's HARDCODED
+///   lookup path. The server shells out to `/usr/bin/xkbcomp` directly and
+///   ignores any environment override for that path (proven in the spike),
+///   so the only way to make our vendored `xkbcomp` reachable is to occupy
+///   that exact guest path — the workload's own `/usr/bin` (if any) is
+///   shadowed at this one file, nothing else.
+/// - **Secrets** ([`VNC_SECRETS_SHARED_DIR`] → [`VNC_SECRETS_CONTAINER_DIR`]):
+///   `rbind,ro,nosuid,noexec` — session password/TLS material, never
+///   executable and never writable from inside the container.
+fn add_vnc_mounts(spec: &mut Spec) -> Result<()> {
+    if let Some(mounts) = spec.mounts_mut().as_mut() {
+        mounts.push(
+            MountBuilder::default()
+                .destination(PathBuf::from(VNC_BUNDLE_CONTAINER_DIR))
+                .typ("bind")
+                .source(PathBuf::from(VNC_BUNDLE_SHARED_DIR))
+                .options(vec![
+                    "rbind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                    // NOT noexec: the bundle's binaries execute from here.
+                ])
+                .build()?,
+        );
+        mounts.push(
+            MountBuilder::default()
+                .destination(PathBuf::from("/usr/bin/xkbcomp"))
+                .typ("bind")
+                .source(PathBuf::from(format!(
+                    "{VNC_BUNDLE_SHARED_DIR}/bin/xkbcomp"
+                )))
+                .options(vec![
+                    "bind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                ])
+                .build()?,
+        );
+        mounts.push(
+            MountBuilder::default()
+                .destination(PathBuf::from(VNC_SECRETS_CONTAINER_DIR))
+                .typ("bind")
+                .source(PathBuf::from(VNC_SECRETS_SHARED_DIR))
+                .options(vec![
+                    "rbind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                ])
+                .build()?,
+        );
+    }
+    Ok(())
+}
+
+/// Grow the spec's `/dev/shm` mount to [`DEV_SHM_VNC_SIZE`], in place —
+/// dropping any existing `size=…` option rather than appending a second one
+/// (tmpfs only honors the last `size=` remount option it sees, so a
+/// duplicate would silently mean "whichever one crun/mount parses last").
+/// Idempotent and a no-op if there is no `/dev/shm` mount.
+fn resize_dev_shm(spec: &mut Spec) {
+    let Some(mounts) = spec.mounts_mut().as_mut() else {
+        return;
+    };
+    let Some(shm) = mounts
+        .iter_mut()
+        .find(|m| m.destination().to_string_lossy() == "/dev/shm")
+    else {
+        return;
+    };
+    let mut opts: Vec<String> = shm
+        .options()
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|o| !o.starts_with("size="))
+        .collect();
+    opts.push(DEV_SHM_VNC_SIZE.to_string());
+    shm.set_options(Some(opts));
 }
 
 /// Rewrite the spec's `/sys` mount from a fresh `sysfs` mount into a recursive
@@ -1809,6 +1948,7 @@ mod tests {
             usb: false,
             docker: false,
             additional_gids: &[],
+            vnc: false,
         }
     }
 
@@ -1964,6 +2104,140 @@ mod tests {
                 .map(|m| format!("{:?}", m.typ()))
         };
         assert_eq!(sys(&with), sys(&without));
+    }
+
+    // ---- VNC ----
+
+    #[test]
+    fn a_vnc_sandbox_gets_bundle_xkbcomp_and_secrets_bound_in() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let spec = generate_spec(&SpecParams {
+            vnc: true,
+            ..base_params(&img)
+        })
+        .unwrap();
+        let m = |dest: &str| {
+            spec.mounts()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|m| m.destination().to_str() == Some(dest))
+                .cloned()
+        };
+        let bundle = m(VNC_BUNDLE_CONTAINER_DIR).expect("bundle bind");
+        assert_eq!(
+            bundle.source().as_ref().unwrap().to_str(),
+            Some(VNC_BUNDLE_SHARED_DIR)
+        );
+        let bundle_opts = bundle.options().clone().unwrap_or_default();
+        assert!(bundle_opts.contains(&"ro".to_string()));
+        assert!(
+            !bundle_opts.iter().any(|o| o == "noexec"),
+            "bundle binaries must stay executable: {bundle_opts:?}"
+        );
+
+        let xkb = m("/usr/bin/xkbcomp").expect("xkbcomp file bind (server path is hardcoded)");
+        assert_eq!(
+            xkb.source().as_ref().unwrap().to_str(),
+            Some("/run/izba/vnc/bin/xkbcomp")
+        );
+
+        let sec = m(VNC_SECRETS_CONTAINER_DIR).expect("secrets bind");
+        assert_eq!(
+            sec.source().as_ref().unwrap().to_str(),
+            Some(VNC_SECRETS_SHARED_DIR)
+        );
+        let sec_opts = sec.options().clone().unwrap_or_default();
+        for want in ["ro", "nosuid", "noexec"] {
+            assert!(
+                sec_opts.iter().any(|o| o == want),
+                "missing {want}: {sec_opts:?}"
+            );
+        }
+
+        let shm = m("/dev/shm").unwrap();
+        let opts = shm.options().clone().unwrap_or_default();
+        assert!(opts.contains(&DEV_SHM_VNC_SIZE.to_string()));
+        assert!(
+            !opts.iter().any(|o| o == "size=65536k"),
+            "old size replaced, not duplicated: {opts:?}"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_without_vnc_has_stock_shm_and_no_vnc_mounts() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let spec = generate_spec(&base_params(&img)).unwrap();
+        let mounts = spec.mounts().as_ref().unwrap();
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.destination().to_str() == Some(VNC_BUNDLE_CONTAINER_DIR)),
+            "no vnc ⇒ no bundle bind"
+        );
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.destination().to_str() == Some("/usr/bin/xkbcomp")),
+            "no vnc ⇒ no xkbcomp bind"
+        );
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.destination().to_str() == Some(VNC_SECRETS_CONTAINER_DIR)),
+            "no vnc ⇒ no secrets bind"
+        );
+        let shm = mounts
+            .iter()
+            .find(|m| m.destination().to_str() == Some("/dev/shm"))
+            .expect("stock /dev/shm mount");
+        let opts = shm.options().clone().unwrap_or_default();
+        // Pin the actual OCI-default stock value so drift in the vendored
+        // spec (e.g. a version bump changing the default size) is caught
+        // here rather than silently changing what "stock" means.
+        assert!(
+            opts.contains(&"size=65536k".to_string()),
+            "stock /dev/shm size must be untouched without vnc: {opts:?}"
+        );
+        assert!(!opts.iter().any(|o| o == DEV_SHM_VNC_SIZE));
+    }
+
+    #[test]
+    fn vnc_does_not_disturb_the_rest_of_the_spec() {
+        // Mirrors usb_does_not_disturb_the_rest_of_the_spec: the VNC
+        // additions are additive — the /sys rebind, the dropped network
+        // namespace, the user namespace, and the readonly paths must all
+        // survive untouched.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let with = generate_spec(&SpecParams {
+            vnc: true,
+            ..base_params(&img)
+        })
+        .unwrap();
+        let without = generate_spec(&base_params(&img)).unwrap();
+        let nss = |s: &Spec| {
+            s.linux()
+                .as_ref()
+                .unwrap()
+                .namespaces()
+                .clone()
+                .unwrap()
+                .iter()
+                .map(|n| format!("{:?}", n.typ()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(nss(&with), nss(&without));
+        let sys = |s: &Spec| {
+            s.mounts()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|m| m.destination() == std::path::Path::new("/sys"))
+                .map(|m| format!("{:?}", m.typ()))
+        };
+        assert_eq!(sys(&with), sys(&without));
+        let ro = |s: &Spec| s.linux().as_ref().unwrap().readonly_paths().clone();
+        assert_eq!(ro(&with), ro(&without));
     }
 
     #[test]
