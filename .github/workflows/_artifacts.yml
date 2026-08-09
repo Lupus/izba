@@ -247,6 +247,33 @@ jobs:
           path: bundle/mkfs.erofs.exe
           if-no-files-found: error
 
+  kasmvnc-erofs:
+    name: kasmvnc.erofs (KasmVNC + WM bundle, VNC display feature)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Restore built kasmvnc.erofs
+        id: kasmvnc-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: dist/kasmvnc.erofs
+          key: kasmvnc-erofs-${{ hashFiles('hack/build-kasmvnc-erofs.sh') }}
+      - name: Build kasmvnc.erofs
+        # docker (preinstalled on ubuntu-latest) is the only host dependency:
+        # the script builds the bundle in a digest-pinned Debian container and,
+        # when mkfs.erofs is not on PATH, falls back to packing the erofs image
+        # inside that same already-pulled container too (no host toolchain
+        # build needed — the image is UNCOMPRESSED, so any reasonably recent
+        # mkfs.erofs, including Debian's packaged one, produces a valid result).
+        if: steps.kasmvnc-cache.outputs.cache-hit != 'true'
+        run: hack/build-kasmvnc-erofs.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kasmvnc-erofs
+          path: dist/kasmvnc.erofs
+          if-no-files-found: error
+
   izba-windows:
     name: izba.exe bundle (native MSVC)
     needs: erofs-parity
@@ -281,7 +308,7 @@ jobs:
 
   manifest:
     name: SHA256SUMS + provenance
-    needs: [kernel, kernel-usb, initramfs, mke2fs, nft, ip, crun, sshd, erofs-parity, izba-windows]
+    needs: [kernel, kernel-usb, initramfs, mke2fs, nft, ip, crun, sshd, erofs-parity, izba-windows, kasmvnc-erofs]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

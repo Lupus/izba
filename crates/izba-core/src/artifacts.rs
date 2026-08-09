@@ -477,4 +477,29 @@ mod tests {
              a VNC-enabled sandbox cannot start from an installed build"
         );
     }
+
+    #[test]
+    fn e2e_ci_builds_and_stages_the_kasmvnc_bundle() {
+        // The defect this pins (Task 13): `crates/izba-cli/tests/daemon_e2e.rs`'s
+        // vnc_desktop_e2e requires kasmvnc.erofs staged at the PRODUCTION
+        // exe-relative discovery path (`target/artifacts/kasmvnc.erofs`) and
+        // never sets IZBA_KASMVNC_EROFS — so unless CI actually builds and
+        // stages the bundle, the e2e silently self-skips forever and never
+        // proves the feature on a real VM (same class as the USB kernel-variant
+        // packaging miss above). A cross-check over the CI YAML, mirroring
+        // `every_kernel_variant_is_installed_by_the_debian_package`'s
+        // file-reading pattern.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let e2e = std::fs::read_to_string(root.join(".github/workflows/e2e.yml"))
+            .expect(".github/workflows/e2e.yml must be readable from the crate");
+        assert!(
+            e2e.contains("kasmvnc-erofs"),
+            "e2e.yml has no kasmvnc-erofs artifact job/staging step: vnc_desktop_e2e \
+             would self-skip on every CI run and never exercise VNC on a real VM"
+        );
+    }
 }

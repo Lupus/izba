@@ -294,6 +294,31 @@ IZBA_NFT=dist/nft IZBA_SSHD=dist/sshd \
   hack/build-initramfs.sh
 ```
 
+### VNC desktop exercise (`vnc_desktop_e2e`)
+
+The suite also includes `vnc_desktop_e2e`, which drives the KasmVNC display
+feature (spec `2026-08-09-vnc-display`) against a real microVM: `izba vnc
+url`, an auth matrix through the daemon's credentialed relay, the desktop
+processes inside the container, and the guest's listening surface. It
+deliberately never sets `IZBA_KASMVNC_EROFS` — it proves the **production**
+exe-relative discovery path (`<exe-dir>/../artifacts/kasmvnc.erofs`), so it
+self-skips with a loud message unless the bundle is staged where that
+resolution looks. For `cargo test -p izba-cli --test daemon_e2e`,
+`CARGO_BIN_EXE_izba` is `target/debug/izba`, so the sibling dir is
+`target/artifacts`:
+
+```sh
+hack/build-kasmvnc-erofs.sh                    # → dist/kasmvnc.erofs (needs Docker; ~100 MB, uncompressed)
+mkdir -p target/artifacts
+cp dist/kasmvnc.erofs target/artifacts/kasmvnc.erofs
+```
+
+CI (`.github/workflows/e2e.yml`'s `kasmvnc-erofs` job) builds and caches the
+bundle and stages it the same way for both the `linux-kvm` and `windows-whp`
+jobs, with an explicit staged-file check before the test steps run — so a
+broken artifact job fails the run loudly instead of the e2e silently
+self-skipping.
+
 ## 5a. Code coverage
 
 `hack/coverage.sh` measures coverage for the Rust workspace with
