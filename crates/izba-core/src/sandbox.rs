@@ -763,6 +763,7 @@ fn write_oci_bundle(
         // rather than trust the caller.
         docker: config.docker_effective(),
         additional_gids: &additional_gids,
+        vnc: config.vnc,
     };
     let spec =
         crate::image::runtime_config::generate_spec(&params).context("generating OCI spec")?;
