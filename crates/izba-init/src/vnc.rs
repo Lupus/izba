@@ -410,6 +410,56 @@ mod tests {
         );
     }
 
+    /// `set_permissions` must be observed FORCING the mode, not merely
+    /// coinciding with it: `materialized_hash_is_0644_in_a_0755_dir` above
+    /// creates its source file/dir the plain way, so under a common CI/dev
+    /// umask of 022 both `create_dir_all` and `std::fs::copy` already land on
+    /// 0755/0644 by default — making a `replace set_permissions -> Ok(())`
+    /// mutant indistinguishable from the real body. Pre-create the path with
+    /// an explicit, DIFFERENT mode and assert `set_permissions` actually
+    /// changes it, independent of umask or `fs::copy`'s permission-preserving
+    /// behavior.
+    #[cfg(unix)]
+    #[test]
+    fn set_permissions_forces_the_mode_regardless_of_prior_state() {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+
+        let dir = tmp.path().join("d");
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "precondition: dir created restrictively"
+        );
+        set_permissions(&dir, 0o755).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "set_permissions must force the dir mode to 0755"
+        );
+
+        let file = tmp.path().join("f");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&file)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "precondition: file created restrictively"
+        );
+        set_permissions(&file, 0o644).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "set_permissions must force the file mode to 0644"
+        );
+    }
+
     // ── desktop_exec_argvs ───────────────────────────────────────────────────
 
     fn scripts() -> (String, String) {

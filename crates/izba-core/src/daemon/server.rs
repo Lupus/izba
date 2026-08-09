@@ -4496,6 +4496,75 @@ mod tests {
         );
     }
 
+    /// The already-running republish check is `booted_with_vnc(...) &&
+    /// vnc_relays.active(...).is_empty()` — both conjuncts matter. A
+    /// non-VNC sandbox trivially satisfies the second (it never had a
+    /// relay), so an `&&`→`||` mutation would still evaluate true on the
+    /// first conjunct's `false` and wrongly attempt `publish_vnc_relay` for
+    /// a sandbox with no VNC endpoint on the other end. Assert the redundant
+    /// Start leaves it relay-less.
+    #[test]
+    fn start_already_running_non_vnc_sandbox_publishes_no_vnc_relay() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let vmm = spawn_sleep(dir.path());
+        let mut deps = test_deps();
+        deps.connector = Box::new(fake_connector(
+            Arc::new(Mutex::new(Vec::new())),
+            Some(vmm.clone()),
+        ));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+
+        // Make it look live, with a non-VNC state.json (write_state_with_run_dir
+        // always records `vnc: false`) and its egress listener already bound —
+        // exactly what a real first Start would have left behind.
+        write_state_with_run_dir(&d.paths, "web", vmm.clone(), Some(d.paths.run_dir("web")));
+        match d
+            .egress
+            .ensure_listening(&d.paths, "web", &d.paths.run_dir("web"))
+        {
+            Ok(()) => {}
+            Err(e)
+                if e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                }) =>
+            {
+                eprintln!(
+                    "SKIP start_already_running_non_vnc_sandbox_publishes_no_vnc_relay: bind denied: {e:#}"
+                );
+                return;
+            }
+            Err(e) => panic!("ensure_listening: {e:#}"),
+        }
+
+        assert!(
+            d.vnc_relays.active("web").is_empty(),
+            "precondition: no VNC relay yet"
+        );
+        match rpc(
+            &mut c,
+            &DaemonRequest::Start {
+                name: "web".into(),
+                allow_unconfined: false,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("already running"), "got: {message}");
+            }
+            other => panic!("expected an already-running error, got: {other:?}"),
+        }
+        assert!(
+            d.vnc_relays.active("web").is_empty(),
+            "a non-VNC sandbox's redundant Start must not publish a VNC relay"
+        );
+    }
+
     #[test]
     fn rm_without_force_keeps_relays() {
         let (dir, d) = test_daemon();
