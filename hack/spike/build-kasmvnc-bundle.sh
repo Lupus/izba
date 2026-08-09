@@ -34,7 +34,9 @@ OUT="${BUNDLE_OUT:-$HERE/../../dist/kasmvnc-bundle}"
 mkdir -p "$OUT" "$OUT.cache"
 
 if [ ! -f "$OUT.cache/$KASMVNC_DEB" ]; then
-  wget -q -O "$OUT.cache/$KASMVNC_DEB" "$KASMVNC_URL"
+  # --https-only: refuse any redirect that downgrades to http (S6506); the
+  # sha256 check below is the integrity gate either way.
+  wget -q --https-only -O "$OUT.cache/$KASMVNC_DEB" "$KASMVNC_URL"
 fi
 echo "$KASMVNC_SHA256  $OUT.cache/$KASMVNC_DEB" | sha256sum -c -
 
