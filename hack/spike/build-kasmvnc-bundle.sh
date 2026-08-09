@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# SPIKE (throwaway): build a fully self-contained KasmVNC bundle that runs
+# SPIKE (throwaway) — SUPERSEDED by hack/build-kasmvnc-erofs.sh, which
+# promotes this to a production erofs artifact (uncompressed, self-
+# containment-asserted). This script + test-kasmvnc-bundle.sh stay as the
+# proof-of-concept record; see hack/spike/kasmvnc-bundle-findings.md.
+#
+# Original goal: build a fully self-contained KasmVNC bundle that runs
 # inside ANY container image (glibc, musl, shell-less), to de-risk the
 # "izba ships a pre-baked VNC erofs" feature.
 #
