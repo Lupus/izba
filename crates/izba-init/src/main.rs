@@ -307,10 +307,28 @@ fn run_pid1() -> anyhow::Result<()> {
             eprintln!("izba-init: *** VNC BUNDLE MOUNT FAILED *** {e:#}; no desktop this boot");
         }
         // Convenience for init-context debugging only: inside the container
-        // the bundle is a real bind at this path (authored host-side), but
-        // init itself sees it at /run/izba/vnc. Best-effort; an existing path
-        // (e.g. a second boot of the same initramfs) is fine.
-        let _ = std::os::unix::fs::symlink(vnc::BUNDLE_DIR, vnc::CONTAINER_BUNDLE_DIR);
+        // the bundle is a real bind at CONTAINER_BUNDLE_DIR (authored
+        // host-side), but init itself only sees it at BUNDLE_DIR — so a
+        // hand-run of a bundle binary from init's own shell would otherwise
+        // fail on the rpath/interpreter, both of which are absolute
+        // /opt/izba-vnc paths baked in at build time.
+        //
+        // The initramfs skeleton (hack/build-initramfs.sh) ships no /opt, and
+        // the initramfs is unpacked fresh on every boot — so without the
+        // create_dir_all the symlink() below would ENOENT every single time
+        // and a discarded error would have read as working. Report failures
+        // for the same reason; this affordance either exists or it does not.
+        if let Err(e) = std::fs::create_dir_all("/opt") {
+            eprintln!("izba-init: vnc: creating /opt for the bundle symlink: {e}");
+        }
+        if let Err(e) = std::os::unix::fs::symlink(vnc::BUNDLE_DIR, vnc::CONTAINER_BUNDLE_DIR) {
+            eprintln!(
+                "izba-init: vnc: symlinking {} -> {}: {e} (init-context debugging only; \
+                 the container's own bind is unaffected)",
+                vnc::CONTAINER_BUNDLE_DIR,
+                vnc::BUNDLE_DIR
+            );
+        }
         // Copy the kasmpasswd hash out of the read-only izba-vnc share into
         // init-root /run/izba/vnc-secrets. Creates the dir even when the
         // share delivered nothing, so a missing hash degrades to "every VNC

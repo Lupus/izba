@@ -105,6 +105,10 @@ const DEPTH: &str = "24";
 /// waits for before connecting (see [`desktop_exec_argvs`]).
 const X_SOCKET: &str = "/tmp/.X11-unix/X1";
 
+/// The conventional system `PATH`, appended after the bundle's `bin` (see
+/// [`vnc_env`]).
+const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// Whether the host declared a VNC display for this sandbox.
 ///
 /// Host-authoritative like `izba.usb` / `izba.docker`: the flag rides the
@@ -158,9 +162,24 @@ pub fn materialize(share_dir: &Path, secrets_dir: &Path) -> std::io::Result<bool
 /// `fonts.conf` (which itself points at the bundle font dirs and a `/tmp`
 /// cache), the XDG dirs for openbox's config/themes, and `HOME=/tmp`
 /// because the image's user may have no writable home at all.
+///
+/// `PATH` puts the bundle's `bin` FIRST, then the standard system dirs. This
+/// is the one env var that exists for the workload's benefit rather than the
+/// server's: openbox's default root menu launches a terminal by NAME
+/// (`x-terminal-emulator`, `xterm`), and the bundle ships `xterm` — so
+/// without this the menu is dead on any image that does not carry its own
+/// terminal, which is most of them. The system dirs stay after it so an
+/// image's own tools still win for everything the bundle does not provide.
+/// (Overriding `PATH` is safe here in a way it is NOT for `izba exec`, where
+/// `build_env_overlay` deliberately leaves `PATH` to the image: these two
+/// processes are izba's own, not the user's command.)
 fn vnc_env() -> Vec<(String, String)> {
     vec![
         ("HOME".to_string(), "/tmp".to_string()),
+        (
+            "PATH".to_string(),
+            format!("{CONTAINER_BUNDLE_DIR}/bin:{SYSTEM_PATH}"),
+        ),
         (
             "FONTCONFIG_PATH".to_string(),
             format!("{CONTAINER_BUNDLE_DIR}/etc/fonts"),
@@ -203,6 +222,10 @@ fn vnc_env() -> Vec<(String, String)> {
 /// same shape as `docker::dockerd_exec_argv`.
 pub fn desktop_exec_argvs(cgroup_manager: crate::oci::CgroupManager) -> Vec<Vec<String>> {
     let env = vnc_env();
+    // INJECTION NOTE (both format! sites below): every substitution here is a
+    // compile-time constant. Anything host- or cmdline-derived must be quoted
+    // or passed as argv instead — this string is handed to a container-root
+    // `sh -c`.
     let server = format!(
         "mkdir -p /var/log; \
          exec {CONTAINER_BUNDLE_DIR}/bin/Xkasmvnc {DISPLAY} \
@@ -518,6 +541,18 @@ mod tests {
         assert_eq!(env_of(&argvs[1], "DISPLAY"), Some(DISPLAY.to_string()));
         for argv in &argvs {
             assert_eq!(env_of(argv, "HOME"), Some("/tmp".to_string()));
+            // Bundle bin FIRST so openbox's default menu (which launches a
+            // terminal by NAME) finds the bundled xterm on an image that
+            // ships none; system dirs still follow it.
+            let path = env_of(argv, "PATH").expect("PATH must be set");
+            assert!(
+                path.starts_with("/opt/izba-vnc/bin:"),
+                "bundle bin must come first: {path}"
+            );
+            assert!(path.ends_with(SYSTEM_PATH), "{path}");
+            for dir in ["/usr/bin", "/bin"] {
+                assert!(path.split(':').any(|p| p == dir), "missing {dir}: {path}");
+            }
             assert_eq!(
                 env_of(argv, "FONTCONFIG_PATH"),
                 Some("/opt/izba-vnc/etc/fonts".to_string())
