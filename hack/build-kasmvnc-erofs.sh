@@ -44,7 +44,9 @@ STAGE_DIR="$WORK/stage"
 mkdir -p "$STAGE_DIR"
 
 if [ ! -f "$CACHE_DIR/$KASMVNC_DEB" ]; then
-  wget -q -O "$CACHE_DIR/$KASMVNC_DEB" "$KASMVNC_URL"
+  # --https-only: refuse any redirect that downgrades to http (S6506); the
+  # sha256 check below is the integrity gate either way.
+  wget -q --https-only -O "$CACHE_DIR/$KASMVNC_DEB" "$KASMVNC_URL"
 fi
 echo "$KASMVNC_SHA256  $CACHE_DIR/$KASMVNC_DEB" | sha256sum -c -
 
