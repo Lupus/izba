@@ -222,9 +222,36 @@ jobs:
           path: dist/mkfs.erofs.exe
           if-no-files-found: error
 
+  kasmvnc-erofs:
+    name: kasmvnc.erofs (KasmVNC + WM bundle, VNC display feature)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - name: Restore built kasmvnc.erofs
+        id: kasmvnc-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: dist/kasmvnc.erofs
+          key: kasmvnc-erofs-${{ hashFiles('hack/build-kasmvnc-erofs.sh') }}
+      - name: Build kasmvnc.erofs
+        # docker (preinstalled on ubuntu-latest) is the only host dependency:
+        # the script builds the bundle in a digest-pinned Debian container and,
+        # when mkfs.erofs is not on PATH, falls back to packing the erofs image
+        # inside that same already-pulled container too (no host toolchain
+        # build needed — the image is UNCOMPRESSED, so any reasonably recent
+        # mkfs.erofs, including Debian's packaged one, produces a valid result).
+        if: steps.kasmvnc-cache.outputs.cache-hit != 'true'
+        run: hack/build-kasmvnc-erofs.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kasmvnc-erofs
+          path: dist/kasmvnc.erofs
+          if-no-files-found: error
+
   linux-kvm:
     name: KVM e2e (integration + daemon + tty + ttystorm)
-    needs: [kernel, kernel-usb, initramfs]
+    needs: [kernel, kernel-usb, initramfs, kasmvnc-erofs]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -301,6 +328,25 @@ jobs:
         with:
           name: initramfs
           path: dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kasmvnc-erofs
+          path: dist/
+      - name: Stage kasmvnc.erofs at the production exe-relative discovery path
+        # vnc_desktop_e2e (crates/izba-cli/tests/daemon_e2e.rs) deliberately
+        # never sets IZBA_KASMVNC_EROFS — it proves the SHIPPED discovery path
+        # (<exe-dir>/../artifacts/kasmvnc.erofs; CARGO_BIN_EXE_izba here is
+        # target/debug/izba, so the sibling dir is target/artifacts). NO env
+        # override, on purpose.
+        run: |
+          mkdir -p target/artifacts
+          cp dist/kasmvnc.erofs target/artifacts/kasmvnc.erofs
+      - name: Verify kasmvnc.erofs staged (fail loudly, never silently skip the VNC e2e)
+        run: |
+          test -f target/artifacts/kasmvnc.erofs || {
+            echo "target/artifacts/kasmvnc.erofs missing — the kasmvnc-erofs artifact job is broken; vnc_desktop_e2e would silently self-skip instead of proving the feature" >&2
+            exit 1
+          }
       - name: Restore OCI test-image cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -559,7 +605,7 @@ jobs:
 
   windows-whp:
     name: WHP e2e (validate + tty + ttystorm)
-    needs: [kernel, initramfs, erofs-exe]
+    needs: [kernel, initramfs, erofs-exe, kasmvnc-erofs]
     runs-on: windows-latest
     timeout-minutes: 60
     env:
@@ -582,6 +628,27 @@ jobs:
         with:
           name: e2e-mkfs-erofs-windows
           path: dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kasmvnc-erofs
+          path: dist/
+      - name: Stage kasmvnc.erofs at the production exe-relative discovery path
+        # Mirrors the linux-kvm staging: the future VNC validation section
+        # drives izba.exe via IZBA_EXE=target\release\izba.exe (same convention
+        # as the other steps in this job), so production discovery walks up to
+        # target\artifacts\kasmvnc.erofs. NO env override, on purpose — same
+        # reasoning as vnc_desktop_e2e on Linux.
+        shell: bash
+        run: |
+          mkdir -p target/artifacts
+          cp dist/kasmvnc.erofs target/artifacts/kasmvnc.erofs
+      - name: Verify kasmvnc.erofs staged (fail loudly, never silently skip VNC)
+        shell: bash
+        run: |
+          test -f target/artifacts/kasmvnc.erofs || {
+            echo "target/artifacts/kasmvnc.erofs missing — the kasmvnc-erofs artifact job is broken; the VNC validation section would silently skip instead of proving the feature" >&2
+            exit 1
+          }
       - name: Restore pinned openvmm.exe
         id: openvmm
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
