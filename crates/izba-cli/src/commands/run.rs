@@ -254,7 +254,7 @@ fn resolve_or_create(
         return Ok((name, false));
     }
     let ports = super::parse_publish(&merged.publish)?;
-    let volumes = super::parse_volumes(&merged.volumes)?;
+    let volumes = super::parse_volumes(&merged.volumes, merged.vnc)?;
     // Validate --policy BEFORE the daemon Create RPC: a missing or invalid
     // file must fail here, leaving no stub sandbox registered (#139).
     let policy_raw = super::read_policy(merged.policy.as_deref())?;

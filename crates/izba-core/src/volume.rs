@@ -15,7 +15,10 @@ use crate::paths::Paths;
 
 /// Max user volumes per sandbox: 26 virtio-blk slots minus vda (erofs) and
 /// vdb (rw). OpenVMM's `disk_port` asserts `< 26`; we validate the friendly
-/// limit at the host boundary so a clear error replaces a driver panic.
+/// limit at the host boundary so a clear error replaces a driver panic. A VNC
+/// sandbox appends one more disk (`kasmvnc.erofs`, after every volume — see
+/// `sandbox::build_vm_disks`), so `validate_volumes` shrinks the effective
+/// cap by one when `vnc` is set, keeping the same `< 26` total headroom.
 pub const MAX_VOLUMES: usize = 24;
 
 /// Guest path of docker's storage root. overlay2 refuses an overlayfs
@@ -185,8 +188,19 @@ pub fn parse_volume_flag(s: &str) -> anyhow::Result<VolumeSpec> {
 }
 
 /// Whole-list invariants: count ceiling, unique guest paths, unique names.
-pub fn validate_volumes(volumes: &[VolumeSpec]) -> anyhow::Result<()> {
-    if volumes.len() > MAX_VOLUMES {
+/// `vnc` shrinks the effective cap by one — a VNC sandbox appends
+/// `kasmvnc.erofs` as one more virtio-blk disk after every volume, and
+/// OpenVMM's `disk_port` asserts a hard `< 26` total.
+pub fn validate_volumes(volumes: &[VolumeSpec], vnc: bool) -> anyhow::Result<()> {
+    let cap = MAX_VOLUMES - (vnc as usize);
+    if volumes.len() > cap {
+        if vnc {
+            bail!(
+                "at most {cap} volumes per sandbox with VNC enabled (got {}); \
+                 VNC's kasmvnc.erofs disk takes the last slot",
+                volumes.len()
+            );
+        }
         bail!(
             "at most {MAX_VOLUMES} volumes per sandbox (got {})",
             volumes.len()
@@ -284,7 +298,7 @@ mod tests {
             parse_volume_flag("/d:1g").unwrap(),
             parse_volume_flag("x:/d:1g").unwrap(),
         ];
-        assert!(validate_volumes(&vs).is_err());
+        assert!(validate_volumes(&vs, false).is_err());
     }
 
     #[test]
@@ -293,7 +307,7 @@ mod tests {
             parse_volume_flag("c:/a:1g").unwrap(),
             parse_volume_flag("c:/b:1g").unwrap(),
         ];
-        assert!(validate_volumes(&vs).is_err());
+        assert!(validate_volumes(&vs, false).is_err());
     }
 
     #[test]
@@ -301,7 +315,7 @@ mod tests {
         let vs: Vec<_> = (0..25)
             .map(|i| parse_volume_flag(&format!("/m{i}:1g")).unwrap())
             .collect();
-        assert!(validate_volumes(&vs).is_err());
+        assert!(validate_volumes(&vs, false).is_err());
     }
 
     #[test]
@@ -309,7 +323,29 @@ mod tests {
         let vs: Vec<_> = (0..24)
             .map(|i| parse_volume_flag(&format!("/m{i}:1g")).unwrap())
             .collect();
-        assert!(validate_volumes(&vs).is_ok());
+        assert!(validate_volumes(&vs, false).is_ok());
+    }
+
+    /// VNC appends `kasmvnc.erofs` as one more disk after every volume, so the
+    /// effective cap drops by one when `vnc` is set: 24 volumes is fine
+    /// without VNC, errors (mentioning VNC) with it, and 23 is fine with it.
+    #[test]
+    fn validate_volumes_vnc_aware_cap() {
+        let vs24: Vec<_> = (0..24)
+            .map(|i| parse_volume_flag(&format!("/m{i}:1g")).unwrap())
+            .collect();
+        assert!(validate_volumes(&vs24, false).is_ok());
+
+        let err = validate_volumes(&vs24, true).unwrap_err();
+        assert!(
+            err.to_string().contains("VNC"),
+            "error must mention VNC, got: {err:#}"
+        );
+
+        let vs23: Vec<_> = (0..23)
+            .map(|i| parse_volume_flag(&format!("/m{i}:1g")).unwrap())
+            .collect();
+        assert!(validate_volumes(&vs23, true).is_ok());
     }
 
     #[test]

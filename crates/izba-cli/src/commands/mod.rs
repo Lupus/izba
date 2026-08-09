@@ -106,13 +106,17 @@ pub fn parse_publish(specs: &[String]) -> anyhow::Result<Vec<PortRule>> {
 }
 
 /// Parse the repeatable `--volume` specs into VolumeSpecs and validate the set
-/// (count ceiling, unique guest paths + names).
-pub fn parse_volumes(specs: &[String]) -> anyhow::Result<Vec<izba_core::volume::VolumeSpec>> {
+/// (count ceiling, unique guest paths + names). `vnc` shrinks the effective
+/// cap by one — a VNC sandbox appends `kasmvnc.erofs` as one more disk.
+pub fn parse_volumes(
+    specs: &[String],
+    vnc: bool,
+) -> anyhow::Result<Vec<izba_core::volume::VolumeSpec>> {
     let volumes = specs
         .iter()
         .map(|s| izba_core::volume::parse_volume_flag(s))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    izba_core::volume::validate_volumes(&volumes)?;
+    izba_core::volume::validate_volumes(&volumes, vnc)?;
     Ok(volumes)
 }
 
