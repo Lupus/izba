@@ -1353,9 +1353,15 @@ fn restore_confined_workspace(paths: &Paths, name: &str) {
     // backing file. Mirrors VmSpec::confined_write_surfaces via the persisted
     // config. Best-effort: a failure on one surface must not skip the rest.
     let mut surfaces = vec![cfg.workspace.clone()];
-    // No `Artifacts` available post-launch here (only the persisted config),
-    // so vnc_erofs is None — harmless: the kasmvnc disk is always readonly
-    // and this loop only collects writable surfaces to restore.
+    // No `Artifacts` available post-launch here (only the persisted config), so
+    // vnc_erofs is None. This is a non-issue, not a gap to fill later: this
+    // whole function is a Windows-MIC-only path (the `is_confined()` gate
+    // above), where confinement is a per-file Low-IL *label*, not Landlock —
+    // Linux's Landlock read rules are auto-derived by cloud-hypervisor from
+    // its own `--disk` config at launch, entirely independent of this
+    // restore path. And even on Windows, the loop below only re-labels
+    // *writable* surfaces (Medium IL), so the always-readonly kasmvnc disk
+    // would never appear in `surfaces` regardless of what's passed here.
     for disk in build_vm_disks(paths, name, &cfg.image_digest, &cfg.volumes, None) {
         if !disk.readonly {
             surfaces.push(disk.path);
@@ -2211,7 +2217,9 @@ mod tests {
 
     /// The kasmvnc erofs, when present, is a fifth disk STRICTLY AFTER every
     /// volume (disk order is positional per the "Disk order" contract), and
-    /// it is always readonly.
+    /// it is always readonly. Also pins that slots 2/3 still hold the two
+    /// volumes in declaration order — the load-bearing half of the
+    /// positional contract, which VNC must never disturb.
     #[test]
     fn vnc_erofs_appends_after_all_volumes_readonly() {
         let (_dir, paths) = test_paths();
@@ -2224,24 +2232,29 @@ mod tests {
             Some(Path::new("/a/kasmvnc.erofs")),
         );
         assert_eq!(disks.len(), 5);
-        assert!(disks[4].readonly);
-        assert!(disks[4].path.ends_with("kasmvnc.erofs"));
-    }
-
-    /// A plain (non-VNC) sandbox gets no extra disk — the volume-only layout
-    /// is unchanged (this is the absence guard for the vnc disk).
-    #[test]
-    fn no_vnc_disk_for_a_plain_sandbox() {
-        let (_dir, paths) = test_paths();
-        let vols = two_vols();
-        let disks = build_vm_disks(&paths, "web", "sha256:x", &vols, None);
-        assert_eq!(disks.len(), 4);
         assert!(disks[0].readonly && !disks[1].readonly);
         assert_eq!(
             disks[2].path,
             paths.sandbox_dir("web").join("volumes/0.img")
         );
         assert_eq!(disks[3].path, paths.volume_image("c"));
+        assert!(disks[4].readonly);
+        assert!(disks[4].path.ends_with("kasmvnc.erofs"));
+    }
+
+    /// A plain (non-VNC) sandbox gets no extra disk at all — not just a
+    /// shorter list, but specifically no disk that could be mistaken for the
+    /// vnc erofs (the absence guard for `vnc_erofs_appends_after_all_volumes_readonly`).
+    #[test]
+    fn no_vnc_disk_for_a_plain_sandbox() {
+        let (_dir, paths) = test_paths();
+        let vols = two_vols();
+        let disks = build_vm_disks(&paths, "web", "sha256:x", &vols, None);
+        assert_eq!(disks.len(), 4);
+        assert!(
+            disks.iter().all(|d| !d.path.ends_with("kasmvnc.erofs")),
+            "a plain sandbox must have no kasmvnc.erofs disk, got: {disks:?}"
+        );
     }
 
     #[test]
@@ -2477,6 +2490,46 @@ mod tests {
         // No image config was cached for this digest, so there is no declared
         // USER to fail resolving — record_run_state must persist None (#114).
         assert!(state.user_fallback.is_none());
+    }
+
+    /// The launch-path call-site companion to `start_builds_correct_spec`:
+    /// `config.vnc` must actually reach `build_cmdline` and
+    /// `art.kasmvnc_erofs` must actually reach `build_vm_disks` through
+    /// `start_with_timeouts`, not just through the unit-tested helpers in
+    /// isolation (design-spec §8: every rule gets its test AND its call site
+    /// gets one).
+    #[test]
+    fn start_threads_vnc_config_and_artifact_into_the_captured_spec() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let mut o = opts(&ws);
+        o.vnc = true;
+        create(&paths, "web", &o).unwrap();
+
+        let mut a = arts();
+        a.kasmvnc_erofs = Some(PathBuf::from("/art/kasmvnc.erofs"));
+
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &a, false).unwrap();
+
+        let spec = driver
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spec captured");
+
+        assert!(
+            spec.cmdline.ends_with(" izba.vnc=1"),
+            "cmdline must end with izba.vnc=1: {}",
+            spec.cmdline
+        );
+
+        // No volumes: [erofs=vda, rw=vdb, kasmvnc=vdc].
+        assert_eq!(spec.disks.len(), 3);
+        assert!(spec.disks[2].readonly);
+        assert!(spec.disks[2].path.ends_with("kasmvnc.erofs"));
     }
 
     /// #114 persist side: an image that declares a symbolic `USER` this host
