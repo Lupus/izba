@@ -97,6 +97,13 @@ export const shellStore = {
       emit();
       throw e;
     }
+    // Explicit initial resize AFTER the backend session exists, mirroring the
+    // CLI exec path (#89). Any resize sent while shellOpen was in flight hit an
+    // unregistered id and was dropped, leaving the guest PTY at its 24x80
+    // pre-size until the next window resize. fit() no-ops if the terminal
+    // isn't attached yet; the viewer's ResizeObserver then owns later changes.
+    fit.fit();
+    void api.shellResize(id, term.cols, term.rows);
     emit();
     return id;
   },

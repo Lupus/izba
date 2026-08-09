@@ -56,6 +56,34 @@ describe("shellStore", () => {
     expect(got[0].id).toBe(id);
   });
 
+  it("sends an initial fitted resize AFTER the backend open resolves (#89)", async () => {
+    // Any resize sent while shellOpen is still in flight hits an unregistered
+    // id in the backend and is dropped — so the store itself must send one
+    // once the session exists, mirroring the CLI exec path's initial Resize.
+    let resolveOpen!: () => void;
+    (api.shellOpen as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise<void>((r) => (resolveOpen = r)),
+    );
+    const opening = shellStore.open("web");
+    // The session (and its FitAddon) exists synchronously; make fit() produce a
+    // non-default measured size, as a real layout pass would.
+    const s = shellStore.forSandbox("web")[0];
+    (s.fit.fit as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      term.cols = 120;
+      term.rows = 40;
+    });
+    // open() awaits its event subscriptions before calling the backend; wait
+    // until the deferred shellOpen is actually in flight.
+    await vi.waitFor(() => expect(api.shellOpen).toHaveBeenCalled());
+    expect(api.shellResize).not.toHaveBeenCalled();
+    resolveOpen();
+    const id = await opening;
+    const resized = (api.shellResize as ReturnType<typeof vi.fn>).mock.calls;
+    term.cols = 80;
+    term.rows = 24;
+    expect(resized).toContainEqual([id, 120, 40]);
+  });
+
   it("forSandbox returns only that sandbox's sessions", async () => {
     await shellStore.open("web");
     await shellStore.open("api");
