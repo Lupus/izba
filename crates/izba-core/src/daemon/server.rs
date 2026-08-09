@@ -479,7 +479,7 @@ fn handle_create(
     c: crate::daemon::proto::DaemonCreate,
     progress: &mut dyn FnMut(String),
 ) -> anyhow::Result<DaemonResponse> {
-    crate::volume::validate_volumes(&c.volumes)?;
+    crate::volume::validate_volumes(&c.volumes, c.vnc)?;
     // Preflight (confined intent only): reject a workspace that cannot be
     // Low-integrity-relabelled for the confined VMM (e.g. a folder at a drive
     // root) BEFORE anything is written to disk, with an actionable message —

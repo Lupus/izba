@@ -2899,6 +2899,7 @@ fn docker_mode_non_root_user_image_boots_with_faithful_ownership() {
             volumes: Vec::new(),
             builder: false,
             docker: true,
+            vnc: false,
         },
     )
     .expect("create non-root docker-mode sandbox");

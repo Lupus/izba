@@ -71,7 +71,9 @@ impl CreateOpts {
             .filter(|s| !s.is_empty())
             .map(izba_core::volume::parse_volume_flag)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        izba_core::volume::validate_volumes(&volumes)?;
+        // The GUI wizard has no VNC control yet (spec 2026-08-09 is CLI-first),
+        // so the cap is never shrunk here — matches the `vnc: false` below.
+        izba_core::volume::validate_volumes(&volumes, false)?;
         Ok(DaemonCreate {
             name: self.name,
             image_ref: self.image,

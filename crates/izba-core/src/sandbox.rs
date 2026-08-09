@@ -215,14 +215,17 @@ fn console_tail(log: &std::path::Path, n: usize) -> String {
     )
 }
 
-/// Disk list for a launch: `[erofs=vda (RO), rw=vdb (RW), vol₀=vdc, …]`.
-/// Volumes append in declaration order (the binding the cmdline + guest mount
-/// plan rely on).
+/// Disk list for a launch: `[erofs=vda (RO), rw=vdb (RW), vol₀=vdc, …,
+/// kasmvnc=vd? (RO, VNC sandboxes only)]`. Volumes append in declaration
+/// order (the binding the cmdline + guest mount plan rely on); the VNC erofs,
+/// when present, is always LAST — strictly after every volume — so the
+/// volume↔slot binding never shifts based on whether VNC is enabled.
 fn build_vm_disks(
     paths: &Paths,
     name: &str,
     image_digest: &str,
     volumes: &[crate::volume::VolumeSpec],
+    vnc_erofs: Option<&Path>,
 ) -> Vec<BlockDisk> {
     let mut disks = vec![
         BlockDisk {
@@ -240,6 +243,12 @@ fn build_vm_disks(
             readonly: false,
         });
     }
+    if let Some(vnc) = vnc_erofs {
+        disks.push(BlockDisk {
+            path: vnc.to_path_buf(),
+            readonly: true,
+        });
+    }
     disks
 }
 
@@ -252,6 +261,7 @@ fn build_cmdline(
     builder: bool,
     usb: bool,
     docker_idmaps: Option<&DockerCmdline>,
+    vnc: bool,
 ) -> String {
     let mut c = format!("console=ttyS0 izba.hostname={name}");
     if !volumes.is_empty() {
@@ -289,6 +299,12 @@ fn build_cmdline(
         if d.ws_idmap {
             c.push_str(" izba.wsidmap=1");
         }
+    }
+    // Host-authoritative like USB/docker: izba-init reads izba.vnc=1 before
+    // the container starts to bring up the kasmvnc share. Appended last so
+    // every earlier flag's position stays stable regardless of VNC.
+    if vnc {
+        c.push_str(" izba.vnc=1");
     }
     c
 }
@@ -383,7 +399,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
         crate::volume::assign_eph_ids(&mut volumes);
 
         // Single-writer guard: persistent volumes may only be referenced by one sandbox.
-        crate::volume::validate_volumes(&volumes)?;
+        crate::volume::validate_volumes(&volumes, opts.vnc)?;
         for v in volumes.iter().filter(|v| v.is_persistent()) {
             let vol_name = v.name.as_deref().unwrap();
             ensure_volume_not_shared(paths, vol_name, name)?;
@@ -997,6 +1013,7 @@ pub fn start_with_timeouts(
         config.builder,
         config.usb.is_enabled(),
         docker_idmaps.as_ref(),
+        config.vnc,
     );
     // Resolve per-sandbox account credentials when the sandbox is locked down
     // (Windows MVP-D).  On non-Windows and for unlocked sandboxes this is None
@@ -1008,7 +1025,13 @@ pub fn start_with_timeouts(
         cmdline,
         cpus: config.cpus,
         mem_mb: config.mem_mb,
-        disks: build_vm_disks(paths, name, &config.image_digest, &config.volumes),
+        disks: build_vm_disks(
+            paths,
+            name,
+            &config.image_digest,
+            &config.volumes,
+            art.kasmvnc_erofs.as_deref(),
+        ),
         shares: vec![
             FsShare {
                 tag: "workspace".to_string(),
@@ -1330,7 +1353,10 @@ fn restore_confined_workspace(paths: &Paths, name: &str) {
     // backing file. Mirrors VmSpec::confined_write_surfaces via the persisted
     // config. Best-effort: a failure on one surface must not skip the rest.
     let mut surfaces = vec![cfg.workspace.clone()];
-    for disk in build_vm_disks(paths, name, &cfg.image_digest, &cfg.volumes) {
+    // No `Artifacts` available post-launch here (only the persisted config),
+    // so vnc_erofs is None — harmless: the kasmvnc disk is always readonly
+    // and this loop only collects writable surfaces to restore.
+    for disk in build_vm_disks(paths, name, &cfg.image_digest, &cfg.volumes, None) {
         if !disk.readonly {
             surfaces.push(disk.path);
         }
@@ -1694,7 +1720,7 @@ pub fn attach_volume(
     let mut cfg: SandboxConfig =
         load_json(&cfg_path)?.with_context(|| format!("no such sandbox '{name}'"))?;
     cfg.volumes.push(spec);
-    crate::volume::validate_volumes(&cfg.volumes)?;
+    crate::volume::validate_volumes(&cfg.volumes, cfg.vnc)?;
     // Single-writer guard: check the last-added spec (the one we just pushed).
     let new_spec = cfg.volumes.last().unwrap();
     if new_spec.is_persistent() {
@@ -2150,10 +2176,10 @@ mod tests {
         assert!(paths.volume_image("kept").exists());
     }
 
-    #[test]
-    fn disks_append_volumes_after_rw() {
-        let (_dir, paths) = test_paths();
-        let vols = vec![
+    /// Two volumes for the disks_* tests below, shared to keep the vnc/no-vnc
+    /// comparison exact.
+    fn two_vols() -> Vec<crate::volume::VolumeSpec> {
+        vec![
             crate::volume::VolumeSpec {
                 name: None,
                 guest_path: "/a".into(),
@@ -2166,8 +2192,49 @@ mod tests {
                 size_bytes: 1 << 20,
                 eph_id: None,
             },
-        ];
-        let disks = build_vm_disks(&paths, "web", "sha256:x", &vols);
+        ]
+    }
+
+    #[test]
+    fn disks_append_volumes_after_rw() {
+        let (_dir, paths) = test_paths();
+        let vols = two_vols();
+        let disks = build_vm_disks(&paths, "web", "sha256:x", &vols, None);
+        assert_eq!(disks.len(), 4);
+        assert!(disks[0].readonly && !disks[1].readonly);
+        assert_eq!(
+            disks[2].path,
+            paths.sandbox_dir("web").join("volumes/0.img")
+        );
+        assert_eq!(disks[3].path, paths.volume_image("c"));
+    }
+
+    /// The kasmvnc erofs, when present, is a fifth disk STRICTLY AFTER every
+    /// volume (disk order is positional per the "Disk order" contract), and
+    /// it is always readonly.
+    #[test]
+    fn vnc_erofs_appends_after_all_volumes_readonly() {
+        let (_dir, paths) = test_paths();
+        let vols = two_vols();
+        let disks = build_vm_disks(
+            &paths,
+            "web",
+            "sha256:x",
+            &vols,
+            Some(Path::new("/a/kasmvnc.erofs")),
+        );
+        assert_eq!(disks.len(), 5);
+        assert!(disks[4].readonly);
+        assert!(disks[4].path.ends_with("kasmvnc.erofs"));
+    }
+
+    /// A plain (non-VNC) sandbox gets no extra disk — the volume-only layout
+    /// is unchanged (this is the absence guard for the vnc disk).
+    #[test]
+    fn no_vnc_disk_for_a_plain_sandbox() {
+        let (_dir, paths) = test_paths();
+        let vols = two_vols();
+        let disks = build_vm_disks(&paths, "web", "sha256:x", &vols, None);
         assert_eq!(disks.len(), 4);
         assert!(disks[0].readonly && !disks[1].readonly);
         assert_eq!(
@@ -2185,8 +2252,27 @@ mod tests {
             size_bytes: 1 << 20,
             eph_id: None,
         }];
-        assert!(build_cmdline("web", &vols, false, false, None).contains("izba.volumes=/a"));
-        assert!(!build_cmdline("web", &[], false, false, None).contains("izba.volumes"));
+        assert!(build_cmdline("web", &vols, false, false, None, false).contains("izba.volumes=/a"));
+        assert!(!build_cmdline("web", &[], false, false, None, false).contains("izba.volumes"));
+    }
+
+    /// `izba.vnc=1` is appended LAST, after every other flag (including the
+    /// docker token set), so the VNC flag never perturbs an earlier token's
+    /// position.
+    #[test]
+    fn cmdline_declares_vnc_only_when_enabled() {
+        assert!(build_cmdline("s", &[], false, false, None, true).ends_with(" izba.vnc=1"));
+        assert!(!build_cmdline("s", &[], false, false, None, false).contains("izba.vnc"));
+        // Also last when the docker token set (izba.docker/uidmap/gidmap/
+        // wsidmap) precedes it.
+        let maps = DockerCmdline {
+            uidmap: "0-2097152-1048576".to_string(),
+            gidmap: "0-2097152-1048576".to_string(),
+            ws_idmap: true,
+        };
+        let c = build_cmdline("s", &[], false, true, Some(&maps), true);
+        assert!(c.ends_with(" izba.vnc=1"), "vnc must stay last, got: {c}");
+        assert!(c.contains(" izba.usb=1") && c.contains(" izba.wsidmap=1"));
     }
 
     fn opts(workspace: &Path) -> CreateOpts {
@@ -3860,14 +3946,14 @@ mod tests {
     /// without grants boots a guest that refuses every USB RPC structurally.
     #[test]
     fn the_cmdline_declares_usb_only_for_a_sandbox_that_has_grants() {
-        assert!(build_cmdline("web", &[], false, true, None).contains("izba.usb=1"));
-        assert!(!build_cmdline("web", &[], false, false, None).contains("izba.usb"));
+        assert!(build_cmdline("web", &[], false, true, None, false).contains("izba.usb=1"));
+        assert!(!build_cmdline("web", &[], false, false, None, false).contains("izba.usb"));
     }
 
     /// build_cmdline with builder=true must contain `izba.buildout=1`.
     #[test]
     fn build_cmdline_builder_flag_appended() {
-        let c = build_cmdline("mybox", &[], true, false, None);
+        let c = build_cmdline("mybox", &[], true, false, None, false);
         assert!(
             c.contains("izba.buildout=1"),
             "builder cmdline must contain izba.buildout=1, got: {c}"
@@ -3877,7 +3963,7 @@ mod tests {
     /// build_cmdline with builder=false must NOT contain `izba.buildout`.
     #[test]
     fn build_cmdline_no_builder_flag_absent() {
-        let c = build_cmdline("mybox", &[], false, false, None);
+        let c = build_cmdline("mybox", &[], false, false, None, false);
         assert!(
             !c.contains("izba.buildout"),
             "non-builder cmdline must not contain izba.buildout, got: {c}"
@@ -3894,7 +3980,7 @@ mod tests {
             gidmap: "0-2097152-1048576".to_string(),
             ws_idmap: false,
         };
-        let on = build_cmdline("s", &[], false, false, Some(&maps));
+        let on = build_cmdline("s", &[], false, false, Some(&maps), false);
         assert!(on.contains(" izba.docker=1"));
         // The layer-idmap extents ride the SAME token set — never apart from
         // the flag (uid-fidelity design §2.3).
@@ -3903,7 +3989,7 @@ mod tests {
         // ws_idmap=false (the common non-zero-owner case) must NOT emit the
         // workspace-idmap token.
         assert!(!on.contains("izba.wsidmap"));
-        let off = build_cmdline("s", &[], false, false, None);
+        let off = build_cmdline("s", &[], false, false, None, false);
         assert!(!off.contains("izba.docker"));
         assert!(!off.contains("izba.uidmap") && !off.contains("izba.gidmap"));
         assert!(!off.contains("izba.wsidmap"));
@@ -3927,7 +4013,7 @@ mod tests {
             vnc: false,
         };
         let guarded_maps = cfg.docker_effective().then(|| maps.clone());
-        let guarded = build_cmdline("s", &[], cfg.builder, false, guarded_maps.as_ref());
+        let guarded = build_cmdline("s", &[], cfg.builder, false, guarded_maps.as_ref(), cfg.vnc);
         assert!(!guarded.contains("izba.docker"));
     }
 
@@ -3941,7 +4027,7 @@ mod tests {
             gidmap: "0-2097152-1048576".to_string(),
             ws_idmap: true,
         };
-        let c = build_cmdline("s", &[], false, false, Some(&maps));
+        let c = build_cmdline("s", &[], false, false, Some(&maps), false);
         assert!(c.contains(" izba.docker=1"));
         assert!(
             c.contains(" izba.wsidmap=1"),
@@ -3976,6 +4062,7 @@ mod tests {
             rw_size_gb: 0,
             usb: Default::default(),
             docker,
+            vnc: false,
         };
         let db = crate::image::runtime_config::UserDb::from_files(None, None);
 
