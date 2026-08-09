@@ -531,10 +531,14 @@ fn handle_create(
     // the host-side loopback relay can never reach. Refuse loudly at create
     // time rather than shipping a VNC URL that can never connect.
     if c.vnc && docker {
+        // The user may never have typed `--docker` themselves — an image's
+        // `com.docker.sandboxes.start-docker` label can turn it on too — so
+        // the escape hatch has to name the flag that actually overrides that
+        // (`--no-docker`), not just the flag that would have opted in.
         bail!(
             "VNC is not yet supported for docker-mode sandboxes (the nested \
-             engine owns the network namespace); create without --vnc or \
-             without --docker"
+             engine owns the network namespace); create without --vnc, or \
+             disable docker mode (--no-docker overrides the image label)"
         );
     }
     sandbox::create(
@@ -1528,10 +1532,17 @@ fn handle_vnc_set(d: &Arc<Daemon>, name: String, enabled: bool) -> anyhow::Resul
         // never reach it. `docker_effective()` (not the raw `docker` field)
         // is the authority — a builder-forced-off docker sandbox is fine.
         if cfg.docker_effective() {
+            // Docker mode is resolved once, at create — there is no RPC that
+            // flips `config.docker` on an existing sandbox — so the escape
+            // hatch here is necessarily "start over", and it must name
+            // `--no-docker` explicitly: the user may never have typed
+            // `--docker` themselves, since an image's
+            // `com.docker.sandboxes.start-docker` label can turn it on too.
             bail!(
                 "VNC is not yet supported for docker-mode sandboxes (the nested \
-                 engine owns the network namespace); create without --vnc or \
-                 without --docker"
+                 engine owns the network namespace); re-create this sandbox \
+                 without --vnc, or disable docker mode at create time \
+                 (--no-docker overrides the image label)"
             );
         }
         crate::volume::validate_volumes(&cfg.volumes, true)?;
@@ -2793,10 +2804,11 @@ mod tests {
         ) {
             DaemonResponse::Error { message } => {
                 assert!(message.contains("docker-mode"), "{message}");
-                assert!(
-                    message.contains("--vnc") || message.contains("--docker"),
-                    "{message}"
-                );
+                assert!(message.contains("--vnc"), "{message}");
+                // I5: the user may never have typed --docker themselves (an
+                // image label can turn docker mode on), so the escape hatch
+                // must name --no-docker, not just the flag that opted in.
+                assert!(message.contains("--no-docker"), "{message}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -3288,11 +3300,57 @@ mod tests {
         ) {
             DaemonResponse::Error { message } => {
                 assert!(message.contains("docker-mode"), "{message}");
+                // I5: the escape hatch must name --no-docker, since docker
+                // mode may have come from an image label the user never typed
+                // a flag for.
+                assert!(message.contains("--no-docker"), "{message}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
         let after = std::fs::read_to_string(&p).unwrap();
         assert_eq!(before, after, "a refused VncSet must not touch config.json");
+    }
+
+    /// Folded minor (b): the refusal keys on `docker_effective()`, not the
+    /// raw `docker` field — a `builder: true` sandbox created with
+    /// `docker: Some(true)` persists `docker: true` but `docker_effective()
+    /// == false` (builder wins, see `docker_effective_is_docker_and_not_builder`),
+    /// so `VncSet{enabled: true}` against it must succeed.
+    #[test]
+    fn vnc_set_allows_enabling_on_a_builder_forced_off_docker_sandbox() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        match rpc(
+            &mut c,
+            &DaemonRequest::Create(DaemonCreate {
+                name: "builder-web".into(),
+                image_ref: "ubuntu:24.04".into(),
+                cpus: 1,
+                mem_mb: 256,
+                workspace: dir.path().join("ws"),
+                rw_size_gb: 1,
+                ports: Vec::new(),
+                volumes: Vec::new(),
+                allow_unconfined: false,
+                builder: true,
+                docker: Some(true),
+                vnc: false,
+            }),
+        ) {
+            DaemonResponse::Created { .. } => {}
+            other => panic!("create: {other:?}"),
+        }
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::VncSet {
+                name: "builder-web".into(),
+                enabled: true,
+            },
+        ));
+        let cfg: SandboxConfig = load_json(&d.paths.sandbox_dir("builder-web").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.vnc, "VncSet must have taken effect");
     }
 
     /// Task 8 carry-over: `VncSet` against a name that does not exist must

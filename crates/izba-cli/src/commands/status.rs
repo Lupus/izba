@@ -84,12 +84,17 @@ fn render(paths: &Paths, det: &SandboxDetail, stats: Option<&SandboxStats>) -> S
             out.push('\n');
         }
     }
-    if det.vnc {
+    if det.vnc || det.vnc_url.is_some() {
         // Credentialed-URL discipline (spec 2026-08-09): `status` shows STATE
         // only, never `det.vnc_url` — that string carries the desktop's
         // plaintext password in its userinfo, and `izba vnc url` is the one
-        // surface allowed to print it.
-        out.push_str(&format!("vnc:         enabled ({})\n", vnc_state(det)));
+        // surface allowed to print it. Gated on EITHER flag because `Inspect`
+        // keys `vnc_url` on the live RELAY, never on `config.vnc` alone — a
+        // `vnc off` against an already-running sandbox flips `det.vnc`
+        // immediately but cannot unmake the desktop it booted with, and that
+        // still-live desktop must stay visible until the restart that
+        // actually drops it (controller ruling, Task 11 review I4).
+        out.push_str(&vnc_line(det));
     }
     if let Some(declared) = det.user_fallback.as_deref() {
         // Loud-on-degradation (#114): the workload runs as root because the
@@ -134,18 +139,35 @@ fn engine_line(stats: Option<&SandboxStats>) -> String {
     }
 }
 
-/// The parenthetical after `vnc:         enabled (…)`. `vnc_restart_required`
-/// wins over `vnc_running` — a run whose booted desktop config disagrees with
-/// `det.vnc` needs a restart regardless of whether whatever it DID boot with
-/// happens to answer right now, and that's the actionable fact to lead with.
-fn vnc_state(det: &SandboxDetail) -> &'static str {
-    if det.vnc_restart_required {
+/// The `vnc:` status line. Three shapes:
+/// - `config.vnc` is off but a relay is still live (`vnc_url.is_some()`) — the
+///   honest disabled-but-still-running case (I4): the desktop keeps working
+///   until the next restart, so say so rather than hiding it or claiming
+///   "enabled".
+/// - `config.vnc` is on but the sandbox isn't running (mirrors
+///   `engine_line`'s stopped-docker precedent 10 lines up: no live state to
+///   report, so no parenthetical — printing "(dead)" next to a merely-STOPPED
+///   sandbox would read as a crash, not an off switch).
+/// - `config.vnc` is on and the sandbox is running: the parenthetical carries
+///   the live state, `vnc_restart_required` winning over `vnc_running` — a run
+///   whose booted desktop config disagrees with `det.vnc` needs a restart
+///   regardless of whether whatever it DID boot with happens to answer right
+///   now, and that's the actionable fact to lead with.
+fn vnc_line(det: &SandboxDetail) -> String {
+    if !det.vnc {
+        return "vnc:         disabled (desktop still running until restart)\n".to_string();
+    }
+    if det.status != "running" {
+        return "vnc:         enabled\n".to_string();
+    }
+    let state = if det.vnc_restart_required {
         "restart required"
     } else if det.vnc_running {
         "running"
     } else {
         "dead"
-    }
+    };
+    format!("vnc:         enabled ({state})\n")
 }
 
 /// Human-readable label for the in-guest container state. `None` (stopped
@@ -443,6 +465,46 @@ mod tests {
         let out = render(&paths, &det, None);
         assert!(!out.contains("s3cr3t"), "got: {out}");
         assert!(!out.contains("vnc url"), "got: {out}");
+    }
+
+    #[test]
+    fn renders_vnc_enabled_without_a_parenthetical_when_stopped() {
+        // Task 11 review I3: `enabled (dead)` on a STOPPED sandbox reads as a
+        // crash, not an off switch — mirrors `no_engine_line_for_stopped_docker_sandbox`
+        // 45 lines up (there's simply nothing live to report).
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.vnc = true;
+        det.status = "stopped".into();
+        det.vnc_running = false; // never true for a stopped sandbox in practice
+        let out = render(&paths, &det, None);
+        assert!(out.contains("vnc:         enabled\n"), "got: {out}");
+        assert!(!out.contains("dead"), "got: {out}");
+        assert!(!out.contains("("), "no parenthetical at all: {out}");
+    }
+
+    #[test]
+    fn renders_vnc_disabled_but_still_running_after_a_live_off() {
+        // Task 11 review I4 (controller ruling): `vnc off` against an
+        // already-running sandbox flips `config.vnc` immediately, but
+        // `Inspect` keys `vnc_url`/the relay on the live RUN, not on config —
+        // so the desktop keeps answering until the next restart. Hiding that
+        // (gating solely on `det.vnc`) or mislabeling it "enabled" would both
+        // be dishonest; this is its own state.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.vnc = false;
+        det.vnc_running = true;
+        det.vnc_url = Some("http://izba:s3cr3t@127.0.0.1:12345/".into());
+        let out = render(&paths, &det, None);
+        assert!(
+            out.contains("vnc:         disabled (desktop still running until restart)"),
+            "got: {out}"
+        );
+        // Still never the credentialed URL itself.
+        assert!(!out.contains("s3cr3t"), "got: {out}");
     }
 
     #[test]
