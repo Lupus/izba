@@ -84,6 +84,13 @@ fn render(paths: &Paths, det: &SandboxDetail, stats: Option<&SandboxStats>) -> S
             out.push('\n');
         }
     }
+    if det.vnc {
+        // Credentialed-URL discipline (spec 2026-08-09): `status` shows STATE
+        // only, never `det.vnc_url` — that string carries the desktop's
+        // plaintext password in its userinfo, and `izba vnc url` is the one
+        // surface allowed to print it.
+        out.push_str(&format!("vnc:         enabled ({})\n", vnc_state(det)));
+    }
     if let Some(declared) = det.user_fallback.as_deref() {
         // Loud-on-degradation (#114): the workload runs as root because the
         // image's symbolic USER could not be resolved host-side — this line
@@ -124,6 +131,20 @@ fn engine_line(stats: Option<&SandboxStats>) -> String {
             "engine:      unknown (guest reported no engine state)".to_string()
         }
         None => "engine:      unknown (guest not responding)".to_string(),
+    }
+}
+
+/// The parenthetical after `vnc:         enabled (…)`. `vnc_restart_required`
+/// wins over `vnc_running` — a run whose booted desktop config disagrees with
+/// `det.vnc` needs a restart regardless of whether whatever it DID boot with
+/// happens to answer right now, and that's the actionable fact to lead with.
+fn vnc_state(det: &SandboxDetail) -> &'static str {
+    if det.vnc_restart_required {
+        "restart required"
+    } else if det.vnc_running {
+        "running"
+    } else {
+        "dead"
     }
 }
 
@@ -358,6 +379,70 @@ mod tests {
         let out = render(&paths, &det, None);
         assert!(out.contains("mode:        docker"), "got: {out}");
         assert!(!out.contains("engine:"), "got: {out}");
+    }
+
+    #[test]
+    fn renders_vnc_running_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.vnc = true;
+        det.vnc_running = true;
+        let out = render(&paths, &det, None);
+        assert!(out.contains("vnc:         enabled (running)"), "got: {out}");
+    }
+
+    #[test]
+    fn renders_vnc_dead_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.vnc = true;
+        det.vnc_running = false;
+        let out = render(&paths, &det, None);
+        assert!(out.contains("vnc:         enabled (dead)"), "got: {out}");
+    }
+
+    #[test]
+    fn renders_vnc_restart_required_over_running() {
+        // `vnc_restart_required` must win even when `vnc_running` happens to
+        // be true (a live relay still answering the desktop it booted with,
+        // while `config.vnc` has since moved ahead of that boot).
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.vnc = true;
+        det.vnc_running = true;
+        det.vnc_restart_required = true;
+        let out = render(&paths, &det, None);
+        assert!(
+            out.contains("vnc:         enabled (restart required)"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn no_vnc_line_for_a_plain_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let out = render(&paths, &detail(None), None);
+        assert!(!out.contains("vnc:"), "got: {out}");
+    }
+
+    #[test]
+    fn status_never_prints_the_credentialed_vnc_url() {
+        // Credentialed-URL discipline (spec 2026-08-09): `det.vnc_url` carries
+        // the desktop's plaintext password in its userinfo. `izba status` is
+        // NOT the surface allowed to print it — `izba vnc url` is.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&tmp);
+        let mut det = detail(None);
+        det.vnc = true;
+        det.vnc_running = true;
+        det.vnc_url = Some("http://izba:s3cr3t@127.0.0.1:12345/".into());
+        let out = render(&paths, &det, None);
+        assert!(!out.contains("s3cr3t"), "got: {out}");
+        assert!(!out.contains("vnc url"), "got: {out}");
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub mod status;
 pub mod stop;
 pub mod usb;
 pub mod version;
+pub mod vnc;
 pub mod volume;
 
 use crate::name;
