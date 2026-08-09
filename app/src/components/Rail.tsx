@@ -63,9 +63,16 @@ export function Rail({ sandboxes, selected, onSelect, onNew, view, onView }: Pro
           }`}
         >
           <StatusDot state={s.state} />
-          <span className="leading-tight">
-            {s.name}
-            <small className="block text-muted-foreground-2 font-normal text-xs">{s.image}</small>
+          <span className="min-w-0 leading-tight">
+            <span className="block truncate" title={s.name}>
+              {s.name}
+            </span>
+            <small
+              className="block truncate text-muted-foreground-2 font-normal text-xs"
+              title={s.image}
+            >
+              {s.image}
+            </small>
           </span>
         </Button>
       ))}
