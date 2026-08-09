@@ -49,6 +49,9 @@ pub fn run(paths: &Paths, cmd: &VncCmd) -> Result<i32> {
             let det = inspect(paths, name)?;
             match url_or_reason(&det) {
                 Ok(url) => {
+                    if let Some(w) = disabled_but_still_running_warning(&det) {
+                        eprintln!("{w}");
+                    }
                     if let Some(w) = dead_desktop_warning(&det) {
                         eprintln!("{w}");
                     }
@@ -62,10 +65,28 @@ pub fn run(paths: &Paths, cmd: &VncCmd) -> Result<i32> {
             let det = inspect(paths, name)?;
             match url_or_reason(&det) {
                 Ok(url) => {
+                    if let Some(w) = disabled_but_still_running_warning(&det) {
+                        eprintln!("{w}");
+                    }
                     if let Some(w) = dead_desktop_warning(&det) {
                         eprintln!("{w}");
                     }
-                    platform_open(&url)
+                    match platform_open(&url) {
+                        Ok(code) => Ok(code),
+                        Err(e) => {
+                            // Folded minor (c): a missing/failing platform
+                            // opener (headless host, no `xdg-open` installed)
+                            // must not swallow the URL — fall back to
+                            // printing it, same as `vnc url`, rather than
+                            // failing with nothing actionable to copy.
+                            eprintln!(
+                                "note: could not launch the platform URL opener ({e}); \
+                                 open this URL yourself:"
+                            );
+                            println!("{url}");
+                            Ok(0)
+                        }
+                    }
                 }
                 Err(reason) => bail!(reason),
             }
@@ -105,6 +126,20 @@ fn inspect(paths: &Paths, name: &str) -> Result<SandboxDetail> {
     }
 }
 
+/// Hand the credentialed URL to the platform's default browser.
+///
+/// Folded minor (d): this puts the plaintext VNC password (in the URL's
+/// userinfo) into the opener's argv — visible in `/proc/<pid>/cmdline` for
+/// the process's short lifetime — and into the browser's history/address
+/// bar, same as any other credentialed URL a human opens by hand. Accepted
+/// as a single-user-desktop tradeoff: izba's threat model is a hostile
+/// GUEST, not a hostile co-tenant on the operator's own desktop session.
+///
+/// Folded minor (e): on Windows, `cmd /C start "" <url>` is safe against
+/// argument-injection specifically BECAUSE the URL's only variable part is
+/// the password, which is drawn from `vnc::PASSWORD_ALPHABET`
+/// (`[A-Za-z0-9]`, no shell metacharacters) and the URL carries no query
+/// string — if either of those ever changes, this call needs revisiting.
 // reason: spawns the OS's URL opener (a real subprocess/browser) — nothing
 // about a successful launch is assertable from a unit test.
 #[mutants::skip]
@@ -134,17 +169,26 @@ fn restart_required_line(name: &str) -> String {
 }
 
 /// The URL to print for `vnc url`/`vnc open`, or the reason one can't be
-/// printed yet. The three cases:
+/// printed yet.
+///
+/// `det.vnc_url` is checked FIRST, ahead of `det.vnc` (Task 11 review I4,
+/// controller ruling): `Inspect` keys `vnc_url` on the live RELAY, never on
+/// `config.vnc` alone, so a `vnc off` against an already-running sandbox
+/// flips `det.vnc` to `false` immediately while the desktop it booted with —
+/// and its relay — are still live. That desktop is real and reachable; the
+/// honest answer is to hand back its URL (the caller pairs this with
+/// `disabled_but_still_running_warning`), not to claim VNC is "not enabled".
+///
+/// Once `vnc_url` is ruled out, the remaining cases:
 /// - not configured at all → tell the user how to turn it on;
 /// - configured but the sandbox isn't running → tell them how to start it;
 /// - configured and running but the live run booted without it (a `vnc on`
 ///   since the last boot, `vnc_restart_required`) → no relay exists yet, so
 ///   there's no URL to give; tell them to restart.
-///
-/// Only the fourth case — configured, running, and the run booted with it —
-/// has a URL, which is exactly when `det.vnc_url` is `Some` (`Inspect` keys
-/// it on the relay, never on `config.vnc` alone).
 pub(crate) fn url_or_reason(det: &SandboxDetail) -> std::result::Result<String, String> {
+    if let Some(url) = &det.vnc_url {
+        return Ok(url.clone());
+    }
     if !det.vnc {
         return Err(format!(
             "vnc not enabled — run `izba vnc on {}` (restart required if running)",
@@ -154,10 +198,7 @@ pub(crate) fn url_or_reason(det: &SandboxDetail) -> std::result::Result<String, 
     if det.status != "running" {
         return Err(format!("sandbox not running — `izba start {}`", det.name));
     }
-    match &det.vnc_url {
-        Some(url) => Ok(url.clone()),
-        None => Err(restart_required_line(&det.name)),
-    }
+    Err(restart_required_line(&det.name))
 }
 
 /// The stderr warning `vnc url`/`vnc open` print alongside a working relay
@@ -169,9 +210,22 @@ fn dead_desktop_warning(det: &SandboxDetail) -> Option<String> {
     if det.vnc_url.is_some() && !det.vnc_running {
         Some(format!(
             "warning: the desktop is not answering (guest log: /var/log/izba-vnc.log \
-             inside the sandbox — `izba exec {} cat /var/log/izba-vnc.log`)",
+             inside the sandbox — `izba exec {} -- cat /var/log/izba-vnc.log`)",
             det.name
         ))
+    } else {
+        None
+    }
+}
+
+/// The stderr warning `vnc url`/`vnc open` print alongside a working relay
+/// URL when `config.vnc` has since moved AHEAD of the live run — `vnc off`
+/// against an already-running sandbox flips `det.vnc` immediately, but the
+/// booted desktop (and its relay) are still up, so `url_or_reason` still
+/// hands back the URL. Pure so the wording is unit-tested without a daemon.
+fn disabled_but_still_running_warning(det: &SandboxDetail) -> Option<String> {
+    if !det.vnc && det.vnc_url.is_some() {
+        Some("warning: vnc is disabled in config; this desktop stops at the next restart".into())
     } else {
         None
     }
@@ -244,6 +298,54 @@ mod tests {
     }
 
     #[test]
+    fn url_or_reason_still_returns_the_url_after_a_live_off() {
+        // Task 11 review I4: `vnc off` against an already-running sandbox
+        // flips `det.vnc` to false immediately, but `vnc_url` is keyed on the
+        // live relay, not on config — so the desktop is still real and
+        // reachable, and the honest answer is its URL, not "not enabled".
+        let det = detail(
+            false,
+            "running",
+            true,
+            Some("http://izba:s3cr3t@127.0.0.1:4444/"),
+        );
+        assert_eq!(
+            url_or_reason(&det).unwrap(),
+            "http://izba:s3cr3t@127.0.0.1:4444/"
+        );
+    }
+
+    #[test]
+    fn disabled_but_still_running_warning_fires_after_a_live_off() {
+        let det = detail(
+            false,
+            "running",
+            true,
+            Some("http://izba:s3cr3t@127.0.0.1:4444/"),
+        );
+        let w = disabled_but_still_running_warning(&det).expect("must warn");
+        assert!(w.contains("disabled in config"), "{w}");
+        assert!(w.contains("next restart"), "{w}");
+    }
+
+    #[test]
+    fn disabled_but_still_running_warning_silent_when_enabled() {
+        let det = detail(
+            true,
+            "running",
+            true,
+            Some("http://izba:s3cr3t@127.0.0.1:4444/"),
+        );
+        assert!(disabled_but_still_running_warning(&det).is_none());
+    }
+
+    #[test]
+    fn disabled_but_still_running_warning_silent_when_no_relay_at_all() {
+        let det = detail(false, "stopped", false, None);
+        assert!(disabled_but_still_running_warning(&det).is_none());
+    }
+
+    #[test]
     fn dead_desktop_warning_fires_when_relayed_but_not_answering() {
         let det = detail(
             true,
@@ -253,7 +355,10 @@ mod tests {
         );
         let w = dead_desktop_warning(&det).expect("must warn");
         assert!(w.contains("/var/log/izba-vnc.log"), "{w}");
-        assert!(w.contains("izba exec web cat /var/log/izba-vnc.log"), "{w}");
+        assert!(
+            w.contains("izba exec web -- cat /var/log/izba-vnc.log"),
+            "{w}"
+        );
     }
 
     #[test]
