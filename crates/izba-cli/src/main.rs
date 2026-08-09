@@ -243,6 +243,11 @@ enum Cmd {
         /// directory's sandbox)
         #[arg(value_name = "NAME_OR_DIR")]
         target: Option<String>,
+        /// Stop every sandbox with live processes (running or degraded).
+        /// Used by installers/updaters to quiesce izba before replacing
+        /// binaries; follow with `izba daemon stop` for a full shutdown.
+        #[arg(long, conflicts_with = "target")]
+        all: bool,
     },
     /// Remove a sandbox
     Rm {
@@ -454,9 +459,13 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
             let name = commands::sandbox_ref::resolve(paths, target.as_deref())?.name;
             commands::start::run(paths, &name, allow_unconfined)
         }
-        Cmd::Stop { target } => {
-            let name = commands::sandbox_ref::resolve(paths, target.as_deref())?.name;
-            commands::stop::run(paths, &name)
+        Cmd::Stop { target, all } => {
+            if all {
+                commands::stop::run_all(paths)
+            } else {
+                let name = commands::sandbox_ref::resolve(paths, target.as_deref())?.name;
+                commands::stop::run(paths, &name)
+            }
         }
         Cmd::Rm { target, force } => {
             let omitted = target.is_none();
@@ -736,7 +745,7 @@ mod tests {
         // Bare word stays a name; omitted means "the current workspace".
         let c = Cli::try_parse_from(["izba", "stop", "myapp"]).unwrap();
         match c.cmd {
-            Cmd::Stop { target } => assert_eq!(target.as_deref(), Some("myapp")),
+            Cmd::Stop { target, .. } => assert_eq!(target.as_deref(), Some("myapp")),
             other => panic!("expected Stop, got {other:?}"),
         }
         let c = Cli::try_parse_from(["izba", "status"]).unwrap();
@@ -752,6 +761,29 @@ mod tests {
             }
             other => panic!("expected Rm, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_stop_all() {
+        let c = Cli::try_parse_from(["izba", "stop", "--all"]).unwrap();
+        match c.cmd {
+            Cmd::Stop { target, all } => {
+                assert!(target.is_none());
+                assert!(all);
+            }
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        // A plain `izba stop <name>` keeps `all` off.
+        let c = Cli::try_parse_from(["izba", "stop", "myapp"]).unwrap();
+        match c.cmd {
+            Cmd::Stop { target, all } => {
+                assert_eq!(target.as_deref(), Some("myapp"));
+                assert!(!all);
+            }
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        // --all and an explicit target are mutually exclusive.
+        assert!(Cli::try_parse_from(["izba", "stop", "--all", "myapp"]).is_err());
     }
 
     #[test]
