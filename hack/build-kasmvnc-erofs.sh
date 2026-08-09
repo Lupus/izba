@@ -121,14 +121,21 @@ for f in "$B"/bin/* "$B"/lib/*.so*; do
   fi
 done
 
-# --- self-containment assertion: every bundled binary must resolve through
-# the bundle loader/rpath ONLY, never anything from the builder image ---
-for f in "$B"/bin/*; do
+# --- self-containment assertion: every bundled ELF (binaries AND libs) must
+# resolve through the bundle rpath ONLY (loader too, for the ones that have
+# one), never anything from the builder image. Covers lib/*.so* as well as
+# bin/* because the patchelf pass above swallows per-file rpath failures
+# (`2>/dev/null || true`) — a lib whose rpath-patch silently failed would
+# otherwise ship undetected and only fail at runtime in the guest. ---
+for f in "$B"/bin/* "$B"/lib/*.so*; do
+  [ "$(basename "$f")" = ld-linux-x86-64.so.2 ] && continue
   file "$f" | grep -q "ELF 64-bit" || continue
-  patchelf --print-interpreter "$f" 2>/dev/null | grep -q "^/opt/izba-vnc/lib/ld-linux-x86-64.so.2$" || {
-    echo "error: $f does not use the bundle loader" >&2; exit 1; }
   patchelf --print-rpath "$f" | grep -q "^/opt/izba-vnc/lib$" || {
     echo "error: $f rpath escapes the bundle" >&2; exit 1; }
+  if file "$f" | grep -q "interpreter"; then
+    patchelf --print-interpreter "$f" 2>/dev/null | grep -q "^/opt/izba-vnc/lib/ld-linux-x86-64.so.2$" || {
+      echo "error: $f does not use the bundle loader" >&2; exit 1; }
+  fi
 done
 echo "self-containment assertion: OK"
 
@@ -150,6 +157,7 @@ else
   OUT_DIR="$(cd "$(dirname "$OUT_FILE")" && pwd)"
   OUT_NAME="$(basename "$OUT_FILE")"
   docker run --rm \
+    -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     -v "$STAGE_DIR:/stage:ro" \
     -v "$OUT_DIR:/out" \
     "$BUILDER_IMAGE" bash -euo pipefail -c '
@@ -157,6 +165,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends erofs-utils >/dev/null
 mkfs.erofs "/out/'"$OUT_NAME"'" /stage
+# this container runs as root by default, so the file it just wrote into
+# the /out bind is root-owned; hand it back to the host user so a later
+# re-run does not hit Permission denied overwriting dist/kasmvnc.erofs.
+chown "$HOST_UID:$HOST_GID" "/out/'"$OUT_NAME"'"
 '
 fi
 
