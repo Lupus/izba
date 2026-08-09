@@ -172,11 +172,17 @@ fn http_get_status(
     Ok((code, body))
 }
 
-/// Ports in LISTEN state (`st == 0A`) from a `/proc/net/tcp[6]` dump.
+/// Listeners (`st == 0A`) from a `/proc/net/tcp[6]` dump, as
+/// `(port, local-address-in-the-kernel's-hex-form)`.
+///
+/// The ADDRESS is kept, not discarded: `00000000` (wildcard) and `0100007F`
+/// (loopback, little-endian 127.0.0.1) are very different security postures,
+/// and the VNC listener's `-interface 127.0.0.1` is only actually pinned if a
+/// test looks at it.
 ///
 /// `/proc/net/tcp` is kernel-provided, so this works on ANY workload image —
 /// unlike `netstat`, which needs the image to ship busybox/net-tools.
-fn parse_listening_ports(proc_net_tcp: &str) -> BTreeSet<u16> {
+fn parse_listeners(proc_net_tcp: &str) -> BTreeSet<(u16, String)> {
     proc_net_tcp
         .lines()
         .filter_map(|line| {
@@ -184,8 +190,8 @@ fn parse_listening_ports(proc_net_tcp: &str) -> BTreeSet<u16> {
             if f.len() < 4 || f[3] != "0A" {
                 return None;
             }
-            let (_addr, port) = f[1].rsplit_once(':')?;
-            u16::from_str_radix(port, 16).ok()
+            let (addr, port) = f[1].rsplit_once(':')?;
+            Some((u16::from_str_radix(port, 16).ok()?, addr.to_string()))
         })
         .collect()
 }
@@ -1442,10 +1448,16 @@ fn parse_vnc_url(url: &str) -> (String, u16) {
     (password.to_string(), port)
 }
 
-/// The guest's LISTEN set, read from the kernel inside the workload container
+/// The guest's listeners, read from the kernel inside the workload container
 /// (which shares init's netns for every non-docker sandbox, so this is the
 /// whole guest).
-fn guest_listening_ports(data: &Path, name: &str) -> BTreeSet<u16> {
+///
+/// Each file is `cat`'d separately and its absence tolerated (`; true`): a
+/// kernel built without IPv6 has no `/proc/net/tcp6`, and a single `cat a b`
+/// would fail the whole read — turning "the guest listens on nothing extra"
+/// into an unrelated exec failure. The exec ITSELF is still asserted, so a
+/// broken `izba exec` cannot masquerade as an empty listener set.
+fn guest_listeners(data: &Path, name: &str) -> BTreeSet<(u16, String)> {
     let o = izba(
         data,
         &[],
@@ -1455,11 +1467,11 @@ fn guest_listening_ports(data: &Path, name: &str) -> BTreeSet<u16> {
             "--",
             "sh",
             "-c",
-            "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null",
+            "cat /proc/net/tcp 2>/dev/null; cat /proc/net/tcp6 2>/dev/null; true",
         ],
     );
     assert_ok(&o, "read the guest's /proc/net/tcp");
-    parse_listening_ports(&stdout_of(&o))
+    parse_listeners(&stdout_of(&o))
 }
 
 /// The full VNC display feature against a real microVM: bundle discovery
@@ -1493,6 +1505,16 @@ fn vnc_desktop_e2e() {
     if !want() {
         return;
     }
+    // The whole point of this test is that PRODUCTION discovery finds the
+    // bundle. `izba()` inherits the parent environment, so an ambient
+    // IZBA_KASMVNC_EROFS exported in the shell (or by a CI step) would hand
+    // the daemon an override and the test would silently prove the wrong
+    // path — the exact mode the USB post-mortem calls out. Refuse to run
+    // rather than run a lie.
+    assert!(
+        std::env::var_os("IZBA_KASMVNC_EROFS").is_none(),
+        "this e2e must prove production discovery — unset IZBA_KASMVNC_EROFS"
+    );
     let bundle = vnc_bundle_path();
     if !bundle.as_deref().map(Path::exists).unwrap_or(false) {
         eprintln!(
@@ -1513,6 +1535,20 @@ fn vnc_desktop_e2e() {
     let ws_s = ws.to_string_lossy().into_owned();
     let no_env: &[(&str, &str)] = &[];
     let name = "vnc-e2e";
+    let plain = "vnc-e2e-plain";
+    // Guards drop in REVERSE declaration order, so the plain sandbox's guard
+    // is declared FIRST to make the VNC sandbox's guard run first: the live
+    // microVM is then torn down while the daemon this test has been using is
+    // still up, and only the cheap `rm` of a never-started sandbox lands
+    // after it. (Each guard also stops the daemon, so the second one
+    // re-spawns it for its `rm` — harmless, and not worth changing the
+    // shared `SandboxGuard` the docker e2e also relies on.) The plain
+    // sandbox does not exist until step [9]; `rm --force` on a missing
+    // sandbox is a no-op the guard already ignores.
+    let _plain_guard = SandboxGuard {
+        data: data.clone(),
+        name: plain,
+    };
     let _guard = SandboxGuard {
         data: data.clone(),
         name,
@@ -1539,21 +1575,28 @@ fn vnc_desktop_e2e() {
     // but Xkasmvnc needs a few seconds to bind :6901 behind it. An
     // unauthenticated 401 is the first honest proof the whole chain is live.
     let deadline = Instant::now() + Duration::from_secs(120);
-    let mut first = None;
+    let mut last_status = None;
+    let mut last_err = None;
     while Instant::now() < deadline {
-        if let Ok((code, _)) = http_get_status(port, "/", None) {
-            first = Some(code);
-            if code == 401 {
-                break;
+        match http_get_status(port, "/", None) {
+            Ok((code, _)) => {
+                last_status = Some(code);
+                if code == 401 {
+                    break;
+                }
             }
+            // Keep the reason: "relay refused the connection" and "the guest
+            // answered 500" are different failures, and `last_status: None`
+            // alone says nothing about which one happened.
+            Err(e) => last_err = Some(format!("{e:#}")),
         }
         std::thread::sleep(Duration::from_secs(2));
     }
     assert_eq!(
-        first,
+        last_status,
         Some(401),
         "the desktop never answered with an auth challenge within 120s \
-         (last status: {first:?})\n{}",
+         (last status: {last_status:?}, last error: {last_err:?})\n{}",
         vnc_diag(&data, name)
     );
 
@@ -1569,15 +1612,26 @@ fn vnc_desktop_e2e() {
     );
     assert!(
         body.to_lowercase().contains("kasm"),
-        "expected the KasmVNC client page, got: {:.400}",
-        body
+        "expected the KasmVNC client page, got: {:.400}\n{}",
+        body,
+        vnc_diag(&data, name)
     );
 
     // [5] A wrong password is rejected — proves [4] passed because of the
     // credentials, not because auth is effectively disabled.
     let (code, _) = http_get_status(port, "/", Some(("izba", "definitely-not-the-password")))
-        .expect("wrong-password GET");
-    assert_eq!(code, 401, "a wrong password must not be accepted");
+        .unwrap_or_else(|e| {
+            panic!(
+                "wrong-password GET never completed: {e:#}\n{}",
+                vnc_diag(&data, name)
+            )
+        });
+    assert_eq!(
+        code,
+        401,
+        "a wrong password must not be accepted\n{}",
+        vnc_diag(&data, name)
+    );
 
     // [6] The desktop is really running inside the container: the X server's
     // socket is where izba-init's window-manager wait expects it, and both
@@ -1623,20 +1677,26 @@ fn vnc_desktop_e2e() {
     // default. Assert the LISTEN set is exactly izba's own: sshd (22), the
     // egress DNS/TCP stub (53), the egress relay (15001) and the desktop's
     // websocket (6901).
-    let listening = guest_listening_ports(&data, name);
+    let listeners = guest_listeners(&data, name);
+    let ports: BTreeSet<u16> = listeners.iter().map(|(p, _)| *p).collect();
     let expected: BTreeSet<u16> = [22, 53, 6901, 15001].into_iter().collect();
+    // The desktop must be listening AND on loopback specifically: `0100007F`
+    // is the kernel's little-endian hex for 127.0.0.1, so this pins
+    // `-interface 127.0.0.1` end to end. A regression to a wildcard bind
+    // would satisfy a port-only assertion while exposing the display to
+    // anything that reaches the guest's netns.
     assert!(
-        listening.contains(&6901),
-        "the desktop's websocket must be listening, got: {listening:?}"
+        listeners.contains(&(6901, "0100007F".to_string())),
+        "the desktop's websocket must be listening on loopback (0100007F), got: {listeners:?}"
     );
     assert!(
-        !listening.contains(&6001),
+        !ports.contains(&6001),
         "an X11 TCP listener (6000+display) must NOT exist — with -ac it would \
-         be root-on-display for anything in the guest netns; got: {listening:?}"
+         be root-on-display for anything in the guest netns; got: {listeners:?}"
     );
     assert!(
-        listening.is_subset(&expected),
-        "the guest must listen on nothing beyond izba's own set {expected:?}, got: {listening:?}"
+        ports.is_subset(&expected),
+        "the guest must listen on nothing beyond izba's own set {expected:?}, got: {listeners:?}"
     );
 
     // [8] `vnc off` against a RUNNING sandbox: config flips now, the booted
@@ -1674,11 +1734,6 @@ fn vnc_desktop_e2e() {
     let ws2 = root.path().join("ws-plain");
     std::fs::create_dir_all(&ws2).unwrap();
     let ws2_s = ws2.to_string_lossy().into_owned();
-    let plain = "vnc-e2e-plain";
-    let _plain_guard = SandboxGuard {
-        data: data.clone(),
-        name: plain,
-    };
     assert_ok(
         &izba(
             &data,
@@ -1721,7 +1776,7 @@ fn base64_encode_matches_rfc4648_vectors() {
 }
 
 #[test]
-fn parse_listening_ports_reads_only_listeners() {
+fn parse_listeners_reads_only_listeners_and_keeps_the_address() {
     // Verbatim from a real `--vnc` guest (alpine:3.20, 2026-08-09): sshd,
     // the egress DNS stub, the egress relay, the desktop websocket, and one
     // ESTABLISHED (st 01) connection that must NOT be counted.
@@ -1733,19 +1788,28 @@ fn parse_listening_ports_reads_only_listeners() {
    3: 0100007F:1AF5 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 647 1
    4: 0100007F:E5CA 0100007F:1AF5 01 00000000:00000000 00:00000000 00000000     0        0 0 3
 ";
-    let got = parse_listening_ports(sample);
+    let got = parse_listeners(sample);
     assert_eq!(
         got,
-        [22u16, 53, 6901, 15001]
-            .into_iter()
-            .collect::<BTreeSet<_>>()
+        [
+            // Loopback-bound (0100007F) vs wildcard (00000000) is preserved:
+            // it is the difference the VNC assertion turns on.
+            (22u16, "0100007F".to_string()),
+            (53, "00000000".to_string()),
+            (6901, "0100007F".to_string()),
+            (15001, "00000000".to_string()),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
     );
     // An IPv6-shaped row (32-hex address) parses the same way.
     let v6 = "   0: 00000000000000000000000000000000:1F90 \
               00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 1\n";
     assert_eq!(
-        parse_listening_ports(v6),
-        [8080u16].into_iter().collect::<BTreeSet<_>>()
+        parse_listeners(v6),
+        [(8080u16, "00000000000000000000000000000000".to_string())]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
     );
-    assert!(parse_listening_ports("").is_empty());
+    assert!(parse_listeners("").is_empty());
 }
