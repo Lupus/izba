@@ -584,6 +584,7 @@ mod tests {
             allow_unconfined: false,
             builder: false,
             docker: None,
+            vnc: false,
         }
     }
 

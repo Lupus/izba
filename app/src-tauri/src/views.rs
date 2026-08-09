@@ -87,6 +87,9 @@ impl CreateOpts {
             // None defers to the image's start-docker label, same as an
             // unset CLI flag.
             docker: None,
+            // The GUI wizard has no VNC control yet (spec 2026-08-09 is
+            // CLI-first); false matches an unset `--vnc` flag.
+            vnc: false,
         })
     }
 }

@@ -102,6 +102,7 @@ impl ScriptedGuest {
                 volumes: Vec::new(),
                 builder: false,
                 docker: false,
+                vnc: false,
                 build: None,
                 rw_size_gb: 0,
                 usb: Default::default(),

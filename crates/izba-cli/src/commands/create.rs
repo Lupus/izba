@@ -77,6 +77,7 @@ mod tests {
             volumes: vec![],
             docker: false,
             no_docker: false,
+            vnc: false,
         }
     }
 

@@ -645,6 +645,7 @@ mod tests {
             build: None,
             rw_size_gb: 0,
             usb,
+            vnc: false,
         };
         crate::state::save_json(&dir.join(crate::state::CONFIG_FILE), &cfg).unwrap();
         if configured {

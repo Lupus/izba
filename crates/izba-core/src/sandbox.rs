@@ -68,6 +68,10 @@ pub struct CreateOpts {
     /// `create` is called (CLI flag / image label precedence) — `create`
     /// itself just folds it into `SandboxConfig`.
     pub docker: bool,
+    /// VNC display (spec 2026-08-09): resolved by the daemon before `create`
+    /// is called (plain CLI flag, no image-label precedence) — `create`
+    /// itself just folds it into `SandboxConfig`.
+    pub vnc: bool,
 }
 
 /// Boot artifacts shared by all sandboxes (kernel + initramfs with izba-init).
@@ -395,6 +399,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             volumes: volumes.clone(),
             builder: opts.builder,
             docker: opts.docker,
+            vnc: opts.vnc,
             build: None,
             // Persist the requested scratch size so `izba export` can emit a
             // valid `rootDisk.size` without reading the physical rw.img length
@@ -1908,6 +1913,7 @@ mod tests {
             rw_size_gb: 0,
             usb: Default::default(),
             docker: false,
+            vnc: false,
         };
         save_json(&paths.sandbox_dir(name).join(CONFIG_FILE), &cfg).unwrap();
     }
@@ -2195,6 +2201,7 @@ mod tests {
             volumes: Vec::new(),
             builder: false,
             docker: false,
+            vnc: false,
         }
     }
 
@@ -2244,6 +2251,41 @@ mod tests {
 
         let err = create(&paths, "web", &o).unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {err:#}");
+    }
+
+    /// `CreateOpts.vnc: true` must round-trip through `config.json` (spec
+    /// 2026-08-09 Task 3): reload the persisted `SandboxConfig` and assert
+    /// `vnc` survived.
+    #[test]
+    fn create_persists_vnc_flag() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let mut o = opts(&ws);
+        o.vnc = true;
+
+        create(&paths, "web", &o).unwrap();
+
+        let sdir = paths.sandbox_dir("web");
+        let config: SandboxConfig = load_json(&sdir.join(CONFIG_FILE)).unwrap().unwrap();
+        assert!(config.vnc, "vnc: true must persist through create()");
+    }
+
+    /// A create without `--vnc` (the default `CreateOpts.vnc: false`) must
+    /// persist `vnc: false` — nothing auto-enables VNC.
+    #[test]
+    fn create_defaults_vnc_false() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let o = opts(&ws);
+        assert!(!o.vnc, "opts() helper must default to vnc: false");
+
+        create(&paths, "web", &o).unwrap();
+
+        let sdir = paths.sandbox_dir("web");
+        let config: SandboxConfig = load_json(&sdir.join(CONFIG_FILE)).unwrap().unwrap();
+        assert!(!config.vnc);
     }
 
     #[test]
@@ -3882,6 +3924,7 @@ mod tests {
             rw_size_gb: 0,
             usb: Default::default(),
             docker: true,
+            vnc: false,
         };
         let guarded_maps = cfg.docker_effective().then(|| maps.clone());
         let guarded = build_cmdline("s", &[], cfg.builder, false, guarded_maps.as_ref());

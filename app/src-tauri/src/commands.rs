@@ -1044,6 +1044,7 @@ mod tests {
             volumes: vec![],
             builder: false,
             docker: false,
+            vnc: false,
             build: None,
             rw_size_gb: 1,
         };

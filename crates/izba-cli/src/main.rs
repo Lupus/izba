@@ -72,6 +72,11 @@ struct SandboxOpts {
     /// com.docker.sandboxes.start-docker label.
     #[arg(long, overrides_with = "docker")]
     no_docker: bool,
+    /// Enable VNC display: boots with the KasmVNC + window-manager erofs
+    /// bundle mounted and VNC-facing services started. Nothing auto-enables
+    /// this — it is always an explicit opt-in.
+    #[arg(long)]
+    vnc: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -940,6 +945,23 @@ mod tests {
         };
         assert!(opts.docker);
         assert!(!opts.no_docker, "the later --docker must clear --no-docker");
+    }
+
+    /// `izba create --vnc` is a plain bool — no `--no-vnc` pair, no tri-state,
+    /// nothing auto-enables VNC (unlike `--docker`/`--no-docker`).
+    #[test]
+    fn parse_create_vnc_flag() {
+        let bare = Cli::try_parse_from(["izba", "create"]).unwrap();
+        let Cmd::Create { opts, .. } = bare.cmd else {
+            panic!("expected create");
+        };
+        assert!(!opts.vnc, "absence of --vnc must leave it false");
+
+        let on = Cli::try_parse_from(["izba", "create", "--vnc"]).unwrap();
+        let Cmd::Create { opts, .. } = on.cmd else {
+            panic!("expected create");
+        };
+        assert!(opts.vnc);
     }
 
     #[test]
