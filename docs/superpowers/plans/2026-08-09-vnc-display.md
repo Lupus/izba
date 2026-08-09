@@ -317,7 +317,9 @@ Also in `sandbox.rs`: `start_includes_vnc_share` (mirror `start_includes_ssh_sha
 
 - [ ] **Step 5: Commit** — `git commit -m "feat(core): record booted vnc in RunState + start-window re-verify"`
 
----### Task 8: daemon proto v6 — `VncSet`, Inspect surface
+---
+
+### Task 8: daemon proto v6 — `VncSet`, Inspect surface
 
 **Files:**
 - Modify: `crates/izba-core/src/daemon/proto.rs` — `DAEMON_PROTO_VERSION` :35 (5→6 + history line "v6 added DaemonRequest::VncSet"), `DaemonRequest` (add `VncSet { name: String, enabled: bool }` after `UsbDetach`), `SandboxDetail` (add `#[serde(default)] pub vnc: bool, #[serde(default)] pub vnc_running: bool, #[serde(default)] pub vnc_url: Option<String>, #[serde(default)] pub vnc_restart_required: bool` — each with the standard additive comment), `request_roundtrip` array
