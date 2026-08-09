@@ -999,8 +999,9 @@ pub fn start_with_timeouts(
     }
 
     // For VNC sandboxes: rotate the VNC credentials and deliver the
-    // guest-facing kasmpasswd hash over the read-only izba-vnc share. The
-    // host-only plaintext lives outside the share (see write_vnc_material).
+    // guest-facing kasmpasswd hash over the izba-vnc share, mounted read-only
+    // by izba-init (Task 10). The host-only plaintext lives outside the
+    // share (see write_vnc_material).
     if config.vnc {
         let vnc_share =
             crate::vnc::write_vnc_material(paths, name).context("preparing izba-vnc share")?;
