@@ -112,6 +112,14 @@ impl Paths {
         self.sandbox_dir(name).join("ssh")
     }
 
+    /// Per-sandbox dir whose contents are delivered to the guest as the
+    /// `izba-vnc` virtiofs share (the `kasmpasswd` hash file only — the
+    /// plaintext password is host-only and deliberately lives OUTSIDE this
+    /// dir, at `<sandbox>/vnc.password`, so it never crosses into the guest).
+    pub fn vnc_share_dir(&self, name: &str) -> PathBuf {
+        self.sandbox_dir(name).join("vnc")
+    }
+
     /// Daemon-level USB passthrough settings (`settings.json`). Host-only: the
     /// upstream address never reaches a guest.
     pub fn usb_dir(&self) -> PathBuf {

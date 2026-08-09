@@ -998,6 +998,18 @@ pub fn start_with_timeouts(
         });
     }
 
+    // For VNC sandboxes: rotate the VNC credentials and deliver the
+    // guest-facing kasmpasswd hash over the read-only izba-vnc share. The
+    // host-only plaintext lives outside the share (see write_vnc_material).
+    if config.vnc {
+        let vnc_share =
+            crate::vnc::write_vnc_material(paths, name).context("preparing izba-vnc share")?;
+        extra_shares.push(FsShare {
+            tag: crate::vnc::VNC_SHARE_TAG.to_string(),
+            host_path: vnc_share,
+        });
+    }
+
     // The guest is a pure vsock island: no NIC, no DHCP. Guest egress always
     // rides the izbad-owned vsock 1027 plane (init's stub is unconditional —
     // no cmdline flag gates it).
@@ -2481,6 +2493,12 @@ mod tests {
                 .exists(),
             "oci/config.json written for the izba-oci share"
         );
+        assert!(
+            spec.shares
+                .iter()
+                .all(|s| s.tag != crate::vnc::VNC_SHARE_TAG),
+            "a non-vnc sandbox must not have an izba-vnc share"
+        );
 
         assert_eq!(spec.console_log, paths.logs_dir("web").join("console.log"));
         assert_eq!(spec.run_dir, paths.run_dir("web"));
@@ -3907,6 +3925,66 @@ mod tests {
         assert_eq!(ssh_share.host_path, paths.ssh_share_dir("web"));
         assert!(ssh_share.host_path.join("ssh_host_ed25519_key").exists());
         assert!(ssh_share.host_path.join("authorized_keys").exists());
+    }
+
+    /// start delivers the izba-vnc share in the VmSpec shares vec for a
+    /// vnc-enabled sandbox, carrying the freshly written kasmpasswd hash.
+    #[test]
+    fn start_includes_vnc_share() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let mut o = opts(&ws);
+        o.vnc = true;
+        create(&paths, "web", &o).unwrap();
+
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
+
+        let spec = driver
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spec captured");
+
+        let vnc_share = spec
+            .shares
+            .iter()
+            .find(|s| s.tag == crate::vnc::VNC_SHARE_TAG)
+            .expect("izba-vnc share must be present for a vnc sandbox");
+        assert_eq!(vnc_share.host_path, paths.vnc_share_dir("web"));
+        assert!(vnc_share.host_path.join("kasmpasswd").exists());
+        assert!(
+            paths.sandbox_dir("web").join("vnc.password").exists(),
+            "plaintext password must be written host-only"
+        );
+    }
+
+    /// A non-vnc sandbox must NOT have an izba-vnc share (the absence guard
+    /// for `start_includes_vnc_share`).
+    #[test]
+    fn start_without_vnc_has_no_vnc_share() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
+
+        let spec = driver
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spec captured");
+        assert!(
+            spec.shares
+                .iter()
+                .all(|s| s.tag != crate::vnc::VNC_SHARE_TAG),
+            "normal sandbox must not have an izba-vnc share"
+        );
     }
 
     /// Ephemeral volumes (no name) are not subject to the single-writer guard;
