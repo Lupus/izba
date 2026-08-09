@@ -82,6 +82,11 @@ pub struct Artifacts {
     pub variant: crate::artifacts::KernelVariant,
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
+    /// The self-contained KasmVNC + WM erofs bundle, mounted into the guest
+    /// when the sandbox has VNC enabled. `Some` iff VNC was requested at
+    /// locate-time (fail-closed: `artifacts::locate` bails rather than
+    /// returning `None` for a VNC-enabled sandbox that lacks the bundle).
+    pub kasmvnc_erofs: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -2198,6 +2203,7 @@ mod tests {
             variant: crate::artifacts::KernelVariant::Base,
             kernel: PathBuf::from("/art/vmlinux"),
             initramfs: PathBuf::from("/art/initramfs.img"),
+            kasmvnc_erofs: None,
         }
     }
 
@@ -2390,6 +2396,7 @@ mod tests {
             variant: crate::artifacts::KernelVariant::Usb,
             kernel: PathBuf::from("/art/vmlinux-usb"),
             initramfs: PathBuf::from("/art/initramfs.img"),
+            kasmvnc_erofs: None,
         }
     }
 

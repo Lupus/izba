@@ -80,9 +80,14 @@ pub type SharedStreamConnector =
     Box<dyn Fn(&Paths, &str) -> anyhow::Result<UdsStream> + Send + Sync>;
 
 /// Seam over `artifacts::locate`. Takes the variant because a sandbox holding
-/// USB grants needs a different kernel image than one that does not.
-pub type ArtifactsFn =
-    Box<dyn Fn(&Paths, crate::artifacts::KernelVariant) -> anyhow::Result<Artifacts> + Send + Sync>;
+/// USB grants needs a different kernel image than one that does not, and
+/// `vnc` because a VNC-enabled sandbox additionally requires the KasmVNC
+/// bundle (fail-closed: locate bails when `vnc` is true and it is missing).
+pub type ArtifactsFn = Box<
+    dyn Fn(&Paths, crate::artifacts::KernelVariant, bool) -> anyhow::Result<Artifacts>
+        + Send
+        + Sync,
+>;
 
 /// Seam over `image::ensure_image`: image ref → digest (pulling if needed).
 pub type ResolveImageFn = Box<dyn Fn(&Paths, &str) -> anyhow::Result<String> + Send + Sync>;
@@ -553,7 +558,9 @@ fn handle_start(
     } else {
         crate::artifacts::KernelVariant::Base
     };
-    let art = (d.deps.artifacts)(&d.paths, variant)?;
+    // VNC is not yet wired into SandboxConfig — Task 7 threads the real
+    // per-sandbox flag through here; every start resolves without it for now.
+    let art = (d.deps.artifacts)(&d.paths, variant, false)?;
     // Held across the whole listener-bind → boot → relay-republish window
     // (dropped on return, success or error): tells the supervisor tick to
     // spare this sandbox's egress/relays while state.json doesn't exist yet
@@ -1607,11 +1614,12 @@ mod tests {
                 });
                 Ok(host)
             }),
-            artifacts: Box::new(|_, variant| {
+            artifacts: Box::new(|_, variant, _| {
                 Ok(crate::sandbox::Artifacts {
                     variant,
                     kernel: "/art/vmlinux".into(),
                     initramfs: "/art/initramfs.img".into(),
+                    kasmvnc_erofs: None,
                 })
             }),
             resolve_image: Box::new(|_, _| Ok("sha256:abc".into())),

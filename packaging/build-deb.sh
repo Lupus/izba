@@ -8,6 +8,8 @@
 #   IZBA_VMLINUX    kernel image
 #   IZBA_VMLINUX_USB  USB-capable kernel image (vmlinux-usb)
 #   IZBA_INITRAMFS  initramfs.cpio.gz
+#   IZBA_KASMVNC_EROFS  KasmVNC + WM erofs bundle (kasmvnc.erofs, from
+#                   hack/build-kasmvnc-erofs.sh)
 #   VERSION         debian package version (e.g. 0.1.0 or 0.1.0~git<sha>)
 # Optional:
 #   OUT_DIR         where to write the .deb (default: dist/)
@@ -15,10 +17,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 : "${IZBA_BIN:?}" "${IZBA_CH:?}" "${IZBA_VIRTIOFSD:?}"
-: "${IZBA_VMLINUX:?}" "${IZBA_VMLINUX_USB:?}" "${IZBA_INITRAMFS:?}" "${VERSION:?}"
+: "${IZBA_VMLINUX:?}" "${IZBA_VMLINUX_USB:?}" "${IZBA_INITRAMFS:?}"
+: "${IZBA_KASMVNC_EROFS:?}" "${VERSION:?}"
 OUT_DIR="${OUT_DIR:-dist}"
 
-for f in "$IZBA_BIN" "$IZBA_CH" "$IZBA_VIRTIOFSD" "$IZBA_VMLINUX" "$IZBA_VMLINUX_USB" "$IZBA_INITRAMFS"; do
+for f in "$IZBA_BIN" "$IZBA_CH" "$IZBA_VIRTIOFSD" "$IZBA_VMLINUX" "$IZBA_VMLINUX_USB" "$IZBA_INITRAMFS" "$IZBA_KASMVNC_EROFS"; do
     [[ -f "$f" ]] || { echo "error: missing input $f" >&2; exit 1; }
 done
 
@@ -28,7 +31,7 @@ trap 'rm -rf "$STAGE"' EXIT
 # Layout (symmetric with the Windows install — see the design doc):
 #   /usr/lib/izba/bin/izba
 #   /usr/lib/izba/bin/libexec/{cloud-hypervisor,virtiofsd}
-#   /usr/lib/izba/artifacts/{vmlinux,vmlinux-usb,initramfs.cpio.gz}
+#   /usr/lib/izba/artifacts/{vmlinux,vmlinux-usb,initramfs.cpio.gz,kasmvnc.erofs}
 #   /usr/bin/izba -> ../lib/izba/bin/izba
 install -D -m 0755 "$IZBA_BIN"        "$STAGE/usr/lib/izba/bin/izba"
 install -D -m 0755 "$IZBA_CH"         "$STAGE/usr/lib/izba/bin/libexec/cloud-hypervisor"
@@ -36,6 +39,7 @@ install -D -m 0755 "$IZBA_VIRTIOFSD"  "$STAGE/usr/lib/izba/bin/libexec/virtiofsd
 install -D -m 0644 "$IZBA_VMLINUX"    "$STAGE/usr/lib/izba/artifacts/vmlinux"
 install -D -m 0644 "$IZBA_VMLINUX_USB" "$STAGE/usr/lib/izba/artifacts/vmlinux-usb"
 install -D -m 0644 "$IZBA_INITRAMFS"  "$STAGE/usr/lib/izba/artifacts/initramfs.cpio.gz"
+install -D -m 0644 "$IZBA_KASMVNC_EROFS" "$STAGE/usr/lib/izba/artifacts/kasmvnc.erofs"
 
 mkdir -p "$STAGE/usr/bin"
 ln -s ../lib/izba/bin/izba "$STAGE/usr/bin/izba"

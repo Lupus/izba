@@ -287,6 +287,7 @@ fn start_sandbox(env: &TestEnv, tb: &TestBox, name: &str) -> anyhow::Result<()> 
             variant: izba_core::artifacts::KernelVariant::Base,
             kernel: env.kernel.clone(),
             initramfs: env.initramfs.clone(),
+            kasmvnc_erofs: None,
         },
         allow_unconfined,
         BOOT_TIMEOUT,
