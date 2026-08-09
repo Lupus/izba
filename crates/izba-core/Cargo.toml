@@ -91,13 +91,20 @@ bytes = "1"
 mutants = "0.0.4"
 
 # --- VNC display credentials (spec 2026-08-09 Task 6) ---
-# Pure-Rust SHA-256-crypt: reproduces the `$5$...` glibc crypt(3) format
-# upstream `kasmvncpasswd` emits into `kasmpasswd`, verified empirically
-# (crates/izba-core/src/vnc.rs module docs) against a captured golden line
-# from kasmvncserver 1.5.0. Cross-compiles to x86_64-pc-windows-gnu (no C deps).
-sha-crypt = "0.6.0"
-# Per-start VNC password rotation (24-char alphanumeric) + random salt bytes
-# for the hash above. Pure-Rust, cross-compiles cleanly.
+# Pure-Rust SHA-256-crypt: reproduces the `$5$kasm$...` glibc crypt(3) format
+# upstream `kasmvncpasswd` emits into `kasmpasswd`, verified byte-for-byte
+# against both a captured golden line AND a live KasmVNC 1.5.0 auth probe
+# (crates/izba-core/src/vnc.rs module docs). We use only the crate's
+# low-level, feature-independent `sha256_crypt` + `Params` (default-features
+# = false drops its `password-hash`/MCF-encoding machinery — ctutils, mcf,
+# password-hash — which we deliberately bypass; see module docs for why).
+# Cross-compiles to x86_64-pc-windows-gnu (no C deps).
+sha-crypt = { version = "0.6.0", default-features = false }
+# base64ct's crypt(3)-alphabet encoder (`Base64ShaCrypt`), used directly to
+# encode the transposed sha256-crypt digest into the MCF hash field.
+base64ct = { version = "1", default-features = false, features = ["alloc"] }
+# Per-start VNC password rotation (24-char alphanumeric). Pure-Rust,
+# cross-compiles cleanly.
 rand = "0.10.2"
 
 [dev-dependencies]
