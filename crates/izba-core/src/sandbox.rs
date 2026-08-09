@@ -3858,6 +3858,10 @@ mod tests {
     /// `write_oci_bundle` must hand back the layer-idmap cmdline values in
     /// docker mode — extracted from the very mappings it wrote into the spec
     /// (the single-generation-site contract) — and `None` otherwise.
+    /// Unix-only: the owner-anchor expectation is recomputed from the real
+    /// euid/egid via `nix`, and on Windows `workspace_owner` is the (0,0)
+    /// stub anyway.
+    #[cfg(unix)]
     #[test]
     fn write_oci_bundle_returns_docker_idmaps_only_in_docker_mode() {
         let dir = tempfile::tempdir().unwrap();
