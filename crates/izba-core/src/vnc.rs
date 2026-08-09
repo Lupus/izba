@@ -261,6 +261,18 @@ mod tests {
         );
     }
 
+    /// Drift pin against izba-init, which cannot import these (no izba-core
+    /// dependency) and therefore repeats the literals in its own
+    /// `vnc::{WEBSOCKET_PORT, VNC_TAG}` with a mirror-image test. The port is
+    /// the guest side of the daemon's relay + liveness probe: init's
+    /// `Xkasmvnc -websocketPort` must be this number or both silently target
+    /// a port nothing listens on.
+    #[test]
+    fn wire_constants_match_the_izba_init_literals() {
+        assert_eq!(WEBSOCKET_PORT, 6901);
+        assert_eq!(VNC_SHARE_TAG, "izba-vnc");
+    }
+
     #[test]
     fn write_vnc_material_creates_password_and_hash() {
         let (_dir, paths) = test_paths();

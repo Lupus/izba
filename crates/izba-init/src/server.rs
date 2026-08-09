@@ -701,7 +701,7 @@ mod tests {
         // guest->host create, over socketpairs.
         use std::io::Cursor;
         let tmp = tempfile::tempdir().unwrap();
-        let engine = Arc::new(ExecEngine::new(Some(tmp.path().to_path_buf())));
+        let engine = Arc::new(ExecEngine::new(Some(tmp.path().to_path_buf()), false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (stream_tx, rx) = mpsc::channel();
         {
@@ -778,7 +778,7 @@ mod tests {
     #[test]
     fn tar_extract_runs_under_the_docker_fs_id_guard() {
         let tmp = tempfile::tempdir().unwrap();
-        let engine = Arc::new(ExecEngine::new(Some(tmp.path().to_path_buf())));
+        let engine = Arc::new(ExecEngine::new(Some(tmp.path().to_path_buf()), false));
         let (stream_tx, rx) = mpsc::channel();
         let own_ids = unsafe { (libc::geteuid(), libc::getegid()) };
         {
@@ -821,7 +821,7 @@ mod tests {
     #[test]
     fn tar_create_missing_src_sends_leading_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let engine = Arc::new(ExecEngine::new(Some(tmp.path().to_path_buf())));
+        let engine = Arc::new(ExecEngine::new(Some(tmp.path().to_path_buf()), false));
         let (stream_tx, rx) = mpsc::channel();
         {
             let e = Arc::clone(&engine);

@@ -2164,6 +2164,21 @@ mod tests {
         );
     }
 
+    /// The VNC bind SOURCES are guest paths izba-init creates/mounts, agreed
+    /// by convention rather than a shared constant (izba-core does not depend
+    /// on izba-init). izba-init pins the same literals in its `vnc` module. A
+    /// drift here would fail the container start outright — crun refuses a
+    /// bind whose source does not exist.
+    #[test]
+    fn the_vnc_guest_paths_match_the_ones_izba_init_provides() {
+        assert_eq!(VNC_BUNDLE_SHARED_DIR, "/run/izba/vnc");
+        assert_eq!(VNC_BUNDLE_CONTAINER_DIR, "/opt/izba-vnc");
+        assert_eq!(VNC_SECRETS_SHARED_DIR, "/run/izba/vnc-secrets");
+        // Source and destination are deliberately the same path so
+        // `-KasmPasswordFile` reads identically on both sides.
+        assert_eq!(VNC_SECRETS_CONTAINER_DIR, VNC_SECRETS_SHARED_DIR);
+    }
+
     #[test]
     fn a_sandbox_without_vnc_has_stock_shm_and_no_vnc_mounts() {
         let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));

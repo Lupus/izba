@@ -66,6 +66,10 @@ pub struct ExecEngine {
     /// cp tar arms' path resolution. Exec no longer chroots here — `crun exec`
     /// enters the container's namespaces instead (Stance B).
     root: Option<PathBuf>,
+    /// Whether this sandbox booted with a VNC display (`izba.vnc=1`). When
+    /// set, every exec gets `DISPLAY` defaulted so GUI apps land on the
+    /// desktop session (see [`ExecEngine::build_env_overlay`]).
+    vnc: bool,
     /// The cgroup manager crun should use, detected ONCE at construction.
     /// Detection probes `/sys/fs/cgroup` (a mount + path check), so doing it per
     /// exec would be wasteful and could race the boot-time cgroup setup; the
@@ -84,9 +88,12 @@ pub struct ExecEngine {
 }
 
 impl ExecEngine {
-    pub fn new(root: Option<PathBuf>) -> Self {
+    /// `vnc` is whether the sandbox booted with a display (`izba.vnc=1`); it
+    /// only affects the per-exec `DISPLAY` default.
+    pub fn new(root: Option<PathBuf>, vnc: bool) -> Self {
         Self {
             root,
+            vnc,
             cgroup_manager: crate::oci::detect_cgroup_manager(),
             #[cfg(test)]
             direct: false,
@@ -102,7 +109,7 @@ impl ExecEngine {
     pub fn new_direct(root: Option<PathBuf>) -> Self {
         Self {
             direct: true,
-            ..Self::new(root)
+            ..Self::new(root, false)
         }
     }
 
@@ -263,6 +270,11 @@ impl ExecEngine {
     /// Starts from the caller's `req.env`, then appends izba's defaults for any
     /// key the caller did not set:
     /// - `TERM` (tty execs only) — the container image rarely sets it;
+    /// - `DISPLAY` (VNC sandboxes only) — so a GUI app launched through
+    ///   `izba exec` lands on the KasmVNC desktop instead of failing with
+    ///   "cannot open display". Gated on the sandbox actually having booted
+    ///   with `izba.vnc=1`, so a display-less sandbox never advertises an X
+    ///   server that isn't there;
     /// - the MITM CA-bundle vars, but ONLY when the combined bundle exists in
     ///   the guest (`write_trust_anchor` wrote it), so non-MITM sandboxes don't
     ///   point tools at a missing file. The values are guest paths valid inside
@@ -277,6 +289,9 @@ impl ExecEngine {
         let has = |env: &[(String, String)], key: &str| env.iter().any(|(k, _)| k == key);
         if req.tty && !has(&env, "TERM") {
             env.push(("TERM".to_string(), DEFAULT_TERM.to_string()));
+        }
+        if self.vnc && !has(&env, "DISPLAY") {
+            env.push(("DISPLAY".to_string(), crate::vnc::DISPLAY.to_string()));
         }
         if self.trust_bundle_present() {
             for (k, v) in crate::trust::trust_env_pairs() {
@@ -539,7 +554,7 @@ mod tests {
     }
 
     fn engine() -> ExecEngine {
-        ExecEngine::new(None)
+        ExecEngine::new(None, false)
     }
 
     /// Resolve a real binary in the test host for the lifecycle tests.
@@ -823,6 +838,50 @@ mod tests {
     }
 
     #[test]
+    fn display_env_injected_only_for_vnc_and_not_overridden() {
+        // No display on this sandbox → never inject DISPLAY, tty or not.
+        let plain = ExecEngine::new(None, false);
+        let mut r = req(&["x"]);
+        assert!(!plain
+            .build_env_overlay(&r)
+            .iter()
+            .any(|(k, _)| k == "DISPLAY"));
+        r.tty = true;
+        assert!(
+            !plain
+                .build_env_overlay(&r)
+                .iter()
+                .any(|(k, _)| k == "DISPLAY"),
+            "a display-less sandbox must never advertise an X server"
+        );
+
+        // VNC sandbox → DISPLAY defaulted, for pipe execs too (a GUI app is
+        // just as likely to be launched non-interactively).
+        let vnc = ExecEngine::new(None, true);
+        let mut r = req(&["x"]);
+        r.tty = false;
+        let env = vnc.build_env_overlay(&r);
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "DISPLAY")
+                .map(|(_, v)| v.as_str()),
+            Some(crate::vnc::DISPLAY)
+        );
+
+        // A caller-supplied DISPLAY wins and is not duplicated (same guard
+        // as TERM).
+        r.env = vec![("DISPLAY".into(), ":7".into())];
+        let env = vnc.build_env_overlay(&r);
+        assert_eq!(env.iter().filter(|(k, _)| k == "DISPLAY").count(), 1);
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "DISPLAY")
+                .map(|(_, v)| v.as_str()),
+            Some(":7")
+        );
+    }
+
+    #[test]
     fn build_env_overlay_no_path_default() {
         // PATH is left to the container image; izba must NOT inject a default
         // (that would mask the image's bin dirs).
@@ -834,7 +893,7 @@ mod tests {
     #[test]
     fn trust_bundle_present_tracks_the_guest_file() {
         let dir = tempfile::tempdir().unwrap();
-        let e = ExecEngine::new(Some(dir.path().to_path_buf()));
+        let e = ExecEngine::new(Some(dir.path().to_path_buf()), false);
         // No bundle yet → not present → trust env defaulting is suppressed.
         assert!(!e.trust_bundle_present());
         // Materialize <root>/etc/izba/ca-bundle.pem.
@@ -847,7 +906,7 @@ mod tests {
     #[test]
     fn build_env_overlay_injects_trust_vars_when_bundle_present() {
         let dir = tempfile::tempdir().unwrap();
-        let e = ExecEngine::new(Some(dir.path().to_path_buf()));
+        let e = ExecEngine::new(Some(dir.path().to_path_buf()), false);
         let bundle = dir.path().join("etc/izba/ca-bundle.pem");
         std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
         std::fs::write(&bundle, "CA\n").unwrap();
