@@ -9,6 +9,7 @@ mod docker;
 mod egress;
 mod exec;
 mod hosts;
+mod idmap;
 mod mounts;
 mod net;
 mod oci;
@@ -181,12 +182,53 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     rwdisk::ensure_formatted(Path::new("/dev/vdb")).context("rw disk")?;
 
+    // Docker mode, decided by the host: the flag rides the kernel cmdline,
+    // which only izbad writes (same host-authoritative channel as izba.usb).
+    // Parsed BEFORE the rootfs assembly because docker mode changes how the
+    // overlay layers are mounted (idmapped — uid-fidelity design §2.2): the
+    // izba.uidmap=/izba.gidmap= extents MUST be present and valid, or the
+    // boot fails loudly — proceeding with plain layers would scramble every
+    // uid the container sees.
+    let docker = params.get("izba.docker").map(|v| v == "1").unwrap_or(false);
+    let layer_maps = if docker {
+        let parse = |key: &str| -> anyhow::Result<Vec<idmap::IdExtent>> {
+            let v = params
+                .get(key)
+                .with_context(|| format!("docker mode requires {key}= on the cmdline"))?;
+            idmap::parse_cmdline_map(v).map_err(|e| anyhow::anyhow!("parsing {key}: {e}"))
+        };
+        Some((parse("izba.uidmap")?, parse("izba.gidmap")?))
+    } else {
+        None
+    };
+    // The fs ids init's own /rootfs writes must adopt in docker mode so they
+    // land as disk-0 (container-root-owned) through the idmapped layers; see
+    // idmap.rs module docs. None outside docker mode (plain writes).
+    let docker_fs_ids = layer_maps.as_ref().and_then(|(u, g)| {
+        Some((
+            idmap::presented_of_disk_zero(u)?,
+            idmap::presented_of_disk_zero(g)?,
+        ))
+    });
+
     // The overlay (op 2) needs upperdir/workdir to exist on the freshly
     // mounted rw disk, so the plan is applied in two halves.
     let rootfs_plan = mounts::rootfs_mount_plan();
     mounts::apply(&rootfs_plan[..2]).context("lower/upper mounts")?;
     for dir in mounts::upper_prep_dirs() {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    // Docker mode: replace /lower and /upper with idmapped clones BEFORE the
+    // overlay references them, so the assembled /rootfs presents image uids
+    // shifted per the layer map (and the container userns shifts them back —
+    // verbatim in-container ownership, guest-0 unmapped).
+    if let Some((uid_map, gid_map)) = &layer_maps {
+        idmap::apply_layer_idmaps(
+            &[Path::new("/lower"), Path::new("/upper")],
+            uid_map,
+            gid_map,
+        )
+        .context("idmapping overlay layers (docker mode)")?;
     }
     mounts::apply(&rootfs_plan[2..]).context("rootfs mounts")?;
 
@@ -196,7 +238,7 @@ fn run_pid1() -> anyhow::Result<()> {
         .get("izba.volumes")
         .map(|s| s.split(',').filter(|p| !p.is_empty()).collect())
         .unwrap_or_default();
-    setup_user_volumes(&vols)?;
+    setup_user_volumes(&vols, layer_maps.as_ref())?;
 
     // Builder output share: when the host attached the `izba-buildout` virtiofs
     // share (signalled by `izba.buildout=1` on the cmdline), mount it at
@@ -225,27 +267,27 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     let usb = Arc::new(izba_init::usb::UsbState::new(usb_enabled));
 
-    // Docker mode, decided by the host: same host-authoritative cmdline
-    // channel as izba.usb (see sandbox.rs). Drives the network topology
-    // (net::configure), the resolv.conf nameserver (write_resolv_conf), the
-    // nft chain (bring_up_egress/apply_nft), and — once the container is
-    // running — the veth datapath wired up below.
-    let docker = params.get("izba.docker").map(|v| v == "1").unwrap_or(false);
-
     // Guest networking: shared-netns dummy0, or (docker mode) just loopback
     // — see net::configure's doc for the split. Log and continue on error —
-    // exec/cp/vsock still work without IP networking.
+    // exec/cp/vsock still work without IP networking. (`docker` itself was
+    // parsed before the rootfs assembly, which its layer idmaps reshape.)
     if let Err(e) = net::configure(docker) {
         eprintln!("izba-init: network configure: {e}");
     }
-    write_resolv_conf(docker);
-    write_etc_hosts(
-        params
-            .get("izba.hostname")
-            .map(String::as_str)
-            .filter(|h| !h.is_empty()),
-    );
-    write_trust_anchor();
+    // The /rootfs writers run under the docker-mode fs-id guard so their
+    // files land as disk-0 = container-root-owned through the idmapped
+    // layers (a plain fsuid-0 write would land on the fsuid-0 anchor id and
+    // present as `nobody`). Outside docker mode the guard is a no-op.
+    with_docker_fs_ids(docker_fs_ids, || {
+        write_resolv_conf(docker);
+        write_etc_hosts(
+            params
+                .get("izba.hostname")
+                .map(String::as_str)
+                .filter(|h| !h.is_empty()),
+        );
+        write_trust_anchor();
+    });
     ssh::launch();
 
     let engine = Arc::new(ExecEngine::new(Some("/rootfs".into())));
@@ -358,7 +400,7 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     {
         let e = Arc::clone(&engine);
-        std::thread::spawn(move || server::serve_streams(streams, e, docker));
+        std::thread::spawn(move || server::serve_streams(streams, e, docker, docker_fs_ids));
     }
 
     // Zombie policy (v1): every engine exec is reaped by its dedicated
@@ -377,13 +419,36 @@ fn run_pid1() -> anyhow::Result<()> {
 
 /// Format-if-blank then mount each user volume (vdc, vdd, …) under /rootfs,
 /// in the host-declared `izba.volumes` order.
-fn setup_user_volumes(vols: &[&str]) -> anyhow::Result<()> {
+/// Run `f` under [`idmap::with_fs_ids`] when docker mode computed fs ids,
+/// plain otherwise. The seam every init write into `/rootfs` must pass
+/// through in docker mode (idmap.rs module invariant).
+fn with_docker_fs_ids<R>(ids: Option<(u32, u32)>, f: impl FnOnce() -> R) -> R {
+    match ids {
+        Some(ids) => idmap::with_fs_ids(ids, f),
+        None => f(),
+    }
+}
+
+fn setup_user_volumes(
+    vols: &[&str],
+    layer_maps: Option<&(Vec<idmap::IdExtent>, Vec<idmap::IdExtent>)>,
+) -> anyhow::Result<()> {
     for i in 0..vols.len() {
         let dev = mounts::volume_device(i);
         rwdisk::ensure_formatted(Path::new(&dev))
             .with_context(|| format!("formatting volume {dev}"))?;
     }
-    mounts::apply(&mounts::volume_mount_plan(vols)).context("volume mounts")
+    let plan = mounts::volume_mount_plan(vols);
+    mounts::apply(&plan).context("volume mounts")?;
+    // Docker mode: volumes present through the same idmap as the overlay
+    // layers, so e.g. the fresh /var/lib/docker ext4 root (disk-uid 0)
+    // appears container-root-owned — dockerd owns it with no chown pass.
+    if let Some((uid_map, gid_map)) = layer_maps {
+        let targets: Vec<&Path> = plan.iter().map(|op| op.target.as_path()).collect();
+        idmap::apply_layer_idmaps(&targets, uid_map, gid_map)
+            .context("idmapping user volumes (docker mode)")?;
+    }
+    Ok(())
 }
 
 /// Bring up the always-on egress stub.

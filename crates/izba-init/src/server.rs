@@ -160,7 +160,18 @@ fn dispatch_control_request(
 /// nothing on `127.0.0.1` needs a second try there. Computed once here
 /// rather than per-connection since it never changes for the process's
 /// lifetime.
-pub fn serve_streams<L: Listener>(l: L, engine: Arc<ExecEngine>, docker: bool) {
+/// `fs_ids`, when set (docker mode), are the fs uid/gid `TarExtract` writes
+/// adopt so extracted files land as disk-0 = container-root-owned through the
+/// idmapped rootfs (see idmap.rs; a plain fsuid-0 write would land on the
+/// fsuid-0 anchor and present as `nobody`). `setfsuid` is per-thread, and
+/// each stream runs on its own thread, so the guard cannot leak across
+/// connections.
+pub fn serve_streams<L: Listener>(
+    l: L,
+    engine: Arc<ExecEngine>,
+    docker: bool,
+    fs_ids: Option<(u32, u32)>,
+) {
     let fallback = docker.then_some(crate::net::GUEST_IP);
     loop {
         let conn = match l.accept() {
@@ -173,7 +184,7 @@ pub fn serve_streams<L: Listener>(l: L, engine: Arc<ExecEngine>, docker: bool) {
             }
         };
         let engine = Arc::clone(&engine);
-        std::thread::spawn(move || stream_conn(conn, engine, fallback));
+        std::thread::spawn(move || stream_conn(conn, engine, fallback, fs_ids));
     }
 }
 
@@ -181,6 +192,7 @@ fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(
     mut conn: C,
     engine: Arc<ExecEngine>,
     fallback: Option<Ipv4Addr>,
+    fs_ids: Option<(u32, u32)>,
 ) {
     let open: StreamOpen = match read_frame(&mut conn) {
         Ok(o) => o,
@@ -189,7 +201,12 @@ fn stream_conn<C: Read + Write + AsRawFd + Send + 'static>(
     let attach = match open {
         StreamOpen::Attach(a) => a,
         StreamOpen::TarExtract { dest } => {
-            tar_extract(&mut conn, &engine, &dest);
+            match fs_ids {
+                Some(ids) => {
+                    crate::idmap::with_fs_ids(ids, || tar_extract(&mut conn, &engine, &dest))
+                }
+                None => tar_extract(&mut conn, &engine, &dest),
+            }
             return;
         }
         StreamOpen::TarCreate { src } => {
@@ -513,7 +530,9 @@ mod tests {
             });
 
             let (stream_tx, rx) = mpsc::channel();
-            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), engine, false));
+            std::thread::spawn(move || {
+                serve_streams(PairListener(Mutex::new(rx)), engine, false, None)
+            });
 
             Self {
                 control_tx,
@@ -688,7 +707,7 @@ mod tests {
         {
             let e = Arc::clone(&engine);
             let _ = &shutdown;
-            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), e, false));
+            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), e, false, None));
         }
         let stream_conn = || {
             let (mine, theirs) = UnixStream::pair().unwrap();
@@ -758,7 +777,7 @@ mod tests {
         let (stream_tx, rx) = mpsc::channel();
         {
             let e = Arc::clone(&engine);
-            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), e, false));
+            std::thread::spawn(move || serve_streams(PairListener(Mutex::new(rx)), e, false, None));
         }
         let (mut mine, theirs) = UnixStream::pair().unwrap();
         stream_tx.send(theirs).unwrap();
@@ -829,7 +848,7 @@ mod tests {
         fallback: Option<Ipv4Addr>,
     ) {
         let engine = Arc::new(ExecEngine::new_direct(None));
-        stream_conn(conn, engine, fallback);
+        stream_conn(conn, engine, fallback, None);
     }
 
     /// A `TcpDial` whose loopback attempt refuses must fall back to the
