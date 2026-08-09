@@ -245,7 +245,9 @@ pub struct SandboxSummary {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// NOTE: `Debug` is implemented BY HAND below (not derived) because
+/// `vnc_url` embeds a plaintext password. Keep it that way.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SandboxDetail {
     pub name: String,
     pub image_ref: String,
@@ -310,6 +312,37 @@ pub struct SandboxDetail {
     /// DAEMON_PROTO_VERSION bump.
     #[serde(default)]
     pub vnc_restart_required: bool,
+}
+
+/// Hand-written so `vnc_url` — which carries the sandbox's plaintext VNC
+/// password in its userinfo — is REDACTED. `SandboxDetail` travels inside
+/// `DaemonResponse`, which is `Debug`-formatted freely in daemon/CLI error
+/// paths and test panics (`{other:?}`), any one of which would otherwise
+/// print the live credential into a log the user never meant to share.
+/// Serde is untouched: the real URL still reaches the client that asked for
+/// it. Every other field is printed verbatim.
+impl std::fmt::Debug for SandboxDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxDetail")
+            .field("name", &self.name)
+            .field("image_ref", &self.image_ref)
+            .field("image_digest", &self.image_digest)
+            .field("cpus", &self.cpus)
+            .field("mem_mb", &self.mem_mb)
+            .field("workspace", &self.workspace)
+            .field("status", &self.status)
+            .field("ports", &self.ports)
+            .field("volumes", &self.volumes)
+            .field("confinement", &self.confinement)
+            .field("container", &self.container)
+            .field("user_fallback", &self.user_fallback)
+            .field("docker", &self.docker)
+            .field("vnc", &self.vnc)
+            .field("vnc_running", &self.vnc_running)
+            .field("vnc_url", &self.vnc_url.as_ref().map(|_| "<redacted>"))
+            .field("vnc_restart_required", &self.vnc_restart_required)
+            .finish()
+    }
 }
 
 /// Resource stats for one sandbox (#203), served by `DaemonRequest::Stats`.
@@ -784,6 +817,54 @@ mod tests {
             }
             other => panic!("expected Inspect, got {other:?}"),
         }
+    }
+
+    /// `vnc_url` carries the sandbox's plaintext VNC password, and
+    /// `SandboxDetail` is `Debug`-formatted freely (daemon/CLI error paths,
+    /// test panics). The hand-written `Debug` must redact it — while serde
+    /// still carries the real URL to the client that asked for it.
+    #[test]
+    fn debug_redacts_the_vnc_url_password() {
+        let det = SandboxDetail {
+            name: "desk".into(),
+            image_ref: "ubuntu:24.04".into(),
+            image_digest: "sha256:abc".into(),
+            cpus: 1,
+            mem_mb: 512,
+            workspace: "/ws".into(),
+            status: "running".into(),
+            ports: vec![],
+            volumes: vec![],
+            confinement: None,
+            container: None,
+            user_fallback: None,
+            docker: false,
+            vnc: true,
+            vnc_running: true,
+            vnc_url: Some("http://izba:sup3rs3cr3tpassw0rd@127.0.0.1:41234/".into()),
+            vnc_restart_required: false,
+        };
+        let rendered = format!("{det:?}");
+        assert!(
+            !rendered.contains("sup3rs3cr3tpassw0rd"),
+            "Debug leaked the VNC password: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // Other fields still print, and the WIRE form is untouched.
+        assert!(rendered.contains("desk"), "{rendered}");
+        assert!(
+            serde_json::to_string(&det)
+                .unwrap()
+                .contains("sup3rs3cr3tpassw0rd"),
+            "serde must still carry the real URL"
+        );
+        // A detail without a URL prints None, not a redaction marker.
+        let plain = SandboxDetail {
+            vnc_url: None,
+            ..det
+        };
+        let rendered = format!("{plain:?}");
+        assert!(rendered.contains("vnc_url: None"), "{rendered}");
     }
 
     #[test]

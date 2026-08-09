@@ -595,15 +595,31 @@ fn handle_start(
     // `ensure_socket_budget` precheck (`create.rs`/`run.rs`) — give it the
     // same actionable "IZBA_DATA_DIR too deep" message instead of a raw
     // SUN_LEN bind error surfacing from `ensure_listening` below (#71).
-    crate::paths::ensure_socket_budget(&d.paths, &name)?;
-    d.egress
-        .ensure_listening(&d.paths, &name, &d.paths.run_dir(&name))?;
+    // Every bail-out below leaves NO plane of this sandbox armed, the VNC
+    // relay included: each of these failures means the sandbox is not (and is
+    // not becoming) live — `ensure_socket_budget` fails on a static property
+    // of the data root, and `ensure_listening` is idempotent, so it can only
+    // fail for a sandbox that has no listener, i.e. no live run. A relay still
+    // held for this name is therefore a previous run's leftover, and leaving
+    // it would keep a host port open onto a dead guest.
+    if let Err(e) = crate::paths::ensure_socket_budget(&d.paths, &name) {
+        d.vnc_relays.stop_all(&name);
+        return Err(e);
+    }
+    if let Err(e) = d
+        .egress
+        .ensure_listening(&d.paths, &name, &d.paths.run_dir(&name))
+    {
+        d.vnc_relays.stop_all(&name);
+        return Err(e);
+    }
     // Same dir, same moment: a granted sandbox must have its USB plane up
     // before the guest boots and dials it. On failure the egress listener bound
     // just above is torn down too, so the two planes are armed and disarmed
     // together rather than leaving one behind for the supervisor to reap.
     if let Err(e) = d.usb.refresh(&d.paths, &name, &d.paths.run_dir(&name)) {
         d.egress.stop(&name, &d.paths.run_dir(&name));
+        d.vnc_relays.stop_all(&name);
         return Err(e);
     }
     if let Err(e) = sandbox::start(
@@ -621,6 +637,19 @@ fn handle_start(
             // success while the daemon keeps reporting "stopped" (#67).
             if let Ok(live) = sandbox::liveness_of(&d.paths, &name, d.connector()) {
                 d.registry.set(&name, &config.image_ref, live);
+            }
+            // …and re-publish a MISSING VNC relay for a run that booted with
+            // one. This is the documented recovery path: when the publish
+            // below fails, the start errors out with "re-run `izba start`",
+            // and a repeat start on a live sandbox lands exactly here. Keyed
+            // on the BOOTED fact (state.json), never on `config.vnc`: a `vnc
+            // on` since boot has no desktop to reach yet (that is what
+            // `vnc_restart_required` reports).
+            if booted_with_vnc(&d.paths, &name) && d.vnc_relays.active(&name).is_empty() {
+                match publish_vnc_relay(d, &name) {
+                    Ok(port) => progress(format!("vnc: http://127.0.0.1:{port}/")),
+                    Err(pe) => progress(format!("warning: VNC relay still unavailable: {pe:#}")),
+                }
             }
             return Err(e);
         }
@@ -653,12 +682,18 @@ fn handle_start(
     // KasmVNC endpoint, created per start and never persisted (it lives in
     // the separate `vnc_relays` manager, so the `save_rules` call above
     // cannot see it). Unlike a user's published port, a failure here is not
-    // a warning: a `--vnc` sandbox whose desktop is unreachable from the
-    // host is a silently useless sandbox, so fail the start loudly rather
-    // than degrade (the sandbox itself is up — `izba start` again once the
-    // host port pressure clears).
+    // a warning: a `--vnc` sandbox whose desktop is unreachable from the host
+    // is a silently useless sandbox, so fail the start loudly rather than
+    // degrade. The VM itself IS up at this point, which is why the message
+    // names the retry: a repeat `izba start` hits the already-running branch
+    // above, which re-publishes a missing relay.
     if config.vnc {
-        let port = publish_vnc_relay(d, &name).context("publishing the VNC display relay")?;
+        let port = publish_vnc_relay(d, &name).with_context(|| {
+            format!(
+                "publishing the VNC display relay (the sandbox is running; \
+                 re-run `izba start {name}` to retry just the relay)"
+            )
+        })?;
         progress(format!("vnc: http://127.0.0.1:{port}/"));
     }
     d.registry.set(&name, &config.image_ref, Liveness::Running);
@@ -743,17 +778,26 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
         probe_container_state(d, &name, CONTAINER_PROBE_TIMEOUT)
     };
     // The VNC display: the ephemeral relay this run published (host port), and
-    // whether the guest's KasmVNC endpoint behind it actually answers.
-    // `vnc_url` follows the RELAY (+ the host-only password) — a URL is still
-    // the right thing to hand a user whose desktop is merely still booting;
-    // `vnc_running` is the honest liveness answer and costs one bounded dial,
-    // only for a running VNC sandbox with a relay (same budget/degrade posture
-    // as the container probe above: any failure ⇒ `false`, never an error).
-    let vnc_port = d.vnc_relays.active(&name).first().map(|r| r.host_port);
-    let vnc_running = config.vnc
-        && running
-        && vnc_port.is_some()
-        && probe_vnc_endpoint(d, &name, CONTAINER_PROBE_TIMEOUT);
+    // whether the guest's KasmVNC endpoint behind it actually answers. Both
+    // are keyed on the RELAY (and the run being live), NEVER on `config.vnc`:
+    // `vnc off` on a live sandbox flips config immediately but cannot unmake
+    // the desktop it booted with (that is what `vnc_restart_required` says),
+    // so a config-keyed answer would report "not running" next to a URL that
+    // still works — the reachability question is about the RUN, not the
+    // config. `vnc_port.is_some()` short-circuits a plain sandbox at zero
+    // cost, so no dial is spent on one.
+    //
+    // `vnc_url` follows the relay + the host-only password: a URL is the right
+    // thing to hand a user whose desktop is merely still coming up, but a
+    // STOPPED sandbox's lingering relay must not advertise one. `vnc_running`
+    // costs one bounded dial with the same budget/degrade posture as the
+    // container probe above (any failure ⇒ `false`, never an error).
+    let vnc_port = if running {
+        d.vnc_relays.active(&name).first().map(|r| r.host_port)
+    } else {
+        None
+    };
+    let vnc_running = vnc_port.is_some() && probe_vnc_endpoint(d, &name, CONTAINER_PROBE_TIMEOUT);
     let vnc_url = vnc_port.and_then(|port| {
         crate::vnc::read_password(&d.paths, &name)
             .ok()
@@ -3561,16 +3605,202 @@ mod tests {
                 name: "desk".into(),
             },
         ) {
-            DaemonResponse::Inspect(det) => assert!(
-                !det.vnc_running,
-                "a stopped sandbox can never have a running desktop"
-            ),
+            DaemonResponse::Inspect(det) => {
+                assert!(
+                    !det.vnc_running,
+                    "a stopped sandbox can never have a running desktop"
+                );
+                assert!(
+                    det.vnc_url.is_none(),
+                    "a stopped sandbox must not advertise a URL for a lingering relay: {:?}",
+                    det.vnc_url
+                );
+            }
             other => panic!("expected Inspect, got {other:?}"),
         }
         assert!(
             seen.lock().unwrap().is_empty(),
             "a stopped sandbox must cost no VNC probe dial"
         );
+        d.vnc_relays.stop_all("desk");
+    }
+
+    /// Reachability is a property of the RUN, not of `config.vnc`: `izba vnc
+    /// off` on a live sandbox flips the config immediately but cannot unmake
+    /// the desktop that booted — so inspect must keep reporting
+    /// `vnc_running: true` (alongside `vnc_restart_required: true`) instead of
+    /// contradicting itself with "not running" next to a URL that still works.
+    #[test]
+    fn vnc_off_on_a_live_sandbox_keeps_reporting_the_running_desktop() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let seen: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut deps = vnc_deps();
+        deps.stream_connector = Box::new(dial_answering_stream_connector(Arc::clone(&seen), true));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        if !start_or_skip(
+            &mut c,
+            "desk",
+            "vnc_off_on_a_live_sandbox_keeps_reporting_the_running_desktop",
+        ) {
+            return;
+        }
+
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::VncSet {
+                name: "desk".into(),
+                enabled: false,
+            },
+        ));
+        match rpc(
+            &mut c,
+            &DaemonRequest::Inspect {
+                name: "desk".into(),
+            },
+        ) {
+            DaemonResponse::Inspect(det) => {
+                assert!(!det.vnc, "config now says VNC is off");
+                assert!(
+                    det.vnc_restart_required,
+                    "the live run is ahead of its config"
+                );
+                assert!(
+                    det.vnc_running,
+                    "the booted desktop is still up and reachable — config cannot unmake it"
+                );
+                assert!(det.vnc_url.is_some(), "and its URL still works");
+            }
+            other => panic!("expected Inspect, got {other:?}"),
+        }
+    }
+
+    /// The probe's budget, not just its verdict (the rule-with-a-test /
+    /// call-site-without-one defect class): a guest that accepts the stream
+    /// connection and reads the `TcpDial` but never replies must not pin
+    /// `handle_inspect` — and transitively a polling GUI — forever.
+    #[test]
+    fn vnc_probe_times_out_on_wedged_guest() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let mut deps = vnc_deps();
+        // Accepts, reads, never answers, holds the socket open for 10 s.
+        deps.stream_connector = Box::new(|_paths: &Paths, _name: &str| {
+            let (host, guest) = UdsStream::pair()?;
+            std::thread::spawn(move || {
+                let mut g = guest;
+                let _ = read_frame::<_, izba_proto::StreamOpen>(&mut g);
+                std::thread::sleep(Duration::from_secs(10));
+            });
+            Ok(host)
+        });
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+
+        let t0 = Instant::now();
+        let answered = probe_vnc_endpoint(&d, "desk", Duration::from_millis(200));
+        assert!(!answered, "a wedged guest is not a running desktop");
+        // Well under the hanging fake's 10 s hold: proves the timeout fired,
+        // not the peer's eventual exit.
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "probe blocked {:?} instead of timing out",
+            t0.elapsed()
+        );
+    }
+
+    /// Fail-loud, not degrade: a `--vnc` start whose relay cannot be published
+    /// must FAIL (a sandbox with an unreachable desktop is silently useless),
+    /// with a message that names the retry.
+    #[test]
+    fn start_fails_loudly_when_the_vnc_relay_cannot_be_published() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let d = Arc::new(Daemon::new(paths, vnc_deps()));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        d.vnc_relays.fail_next_publish_bound();
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::Start {
+                name: "desk".into(),
+                allow_unconfined: false,
+            },
+        ) {
+            DaemonResponse::Error { message } if message.contains("unavailable") => {
+                assert!(
+                    message.contains("izba start desk"),
+                    "the failure must name the retry: {message}"
+                );
+            }
+            // This environment could not even bind the egress listener.
+            DaemonResponse::Error { message }
+                if message.contains("denied")
+                    || message.contains("Permission")
+                    || message.contains("not permitted") =>
+            {
+                eprintln!(
+                    "SKIP start_fails_loudly_when_the_vnc_relay_cannot_be_published: {message}"
+                );
+                return;
+            }
+            other => panic!("expected the relay failure to fail the start, got {other:?}"),
+        }
+        assert!(d.vnc_relays.active("desk").is_empty());
+    }
+
+    /// …and the recovery the message promises: a repeat `izba start` on the
+    /// still-running sandbox re-publishes the missing relay (it lands in the
+    /// already-running branch, which still returns the honest error).
+    #[test]
+    fn repeat_start_republishes_a_missing_vnc_relay() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let d = Arc::new(Daemon::new(paths, vnc_deps()));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        if !start_or_skip(
+            &mut c,
+            "desk",
+            "repeat_start_republishes_a_missing_vnc_relay",
+        ) {
+            return;
+        }
+        // Lose the relay exactly as a failed publish would have left it.
+        d.vnc_relays.stop_all("desk");
+        assert!(d.vnc_relays.active("desk").is_empty());
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::Start {
+                name: "desk".into(),
+                allow_unconfined: false,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("already running"), "{message}")
+            }
+            other => panic!("expected an already-running error, got {other:?}"),
+        }
+        let rules = d.vnc_relays.active("desk");
+        assert_eq!(rules.len(), 1, "the repeat start must republish the relay");
+        assert_eq!(rules[0].guest_port, crate::vnc::WEBSOCKET_PORT);
         d.vnc_relays.stop_all("desk");
     }
 
@@ -3789,6 +4019,12 @@ mod tests {
         )
         .unwrap();
         let d = Arc::new(Daemon::new(paths, test_deps()));
+        // A relay left by a previous run of this name: an early bail-out must
+        // leave NO plane armed, the VNC relay included (the sandbox is not,
+        // and is not becoming, live).
+        let planted =
+            plant_vnc_relay_or_skip(&d, "web", "handle_start_rejects_deep_root").is_some();
+
         let mut progress_log = Vec::new();
         let err = handle_start(&d, "web".into(), false, &mut |s| progress_log.push(s))
             .expect_err("deep root must be rejected before binding the listener");
@@ -3798,6 +4034,12 @@ mod tests {
             !d.egress.listening("web"),
             "listener must not have been bound"
         );
+        if planted {
+            assert!(
+                d.vnc_relays.active("web").is_empty(),
+                "a refused start must not leave a stale VNC relay listening"
+            );
+        }
     }
 
     /// A pre-upgrade ("legacy") sandbox — adopted with `RunState.run_dir:
