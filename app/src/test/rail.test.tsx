@@ -137,4 +137,28 @@ describe("Rail", () => {
     fireEvent.click(screen.getByText("web"));
     expect(onView).toHaveBeenCalledWith("sandboxes");
   });
+
+  it("ellipsis-truncates a long image name instead of widening the rail", () => {
+    const longImage = "ghcr.io/some-org/sandbox-templates:claude-code-docker";
+    render(
+      <Rail
+        sandboxes={[{ name: "docker-claude-test", image: longImage, state: { kind: "running" } }]}
+        selected={null}
+        onSelect={noop}
+        onNew={noop}
+        view={defaultView}
+        onView={noop}
+      />,
+    );
+    const image = screen.getByText(longImage);
+    // `truncate` (overflow-hidden + ellipsis + nowrap) is what stops a long
+    // image ref from forcing a horizontal scrollbar on the w-56 rail...
+    expect(image.className).toMatch(/\btruncate\b/);
+    // ...and the flex item holding the two text lines must allow shrinking
+    // below its content width, or the truncation above never engages.
+    expect(image.parentElement!.className).toMatch(/\bmin-w-0\b/);
+    expect(image).toHaveAttribute("title", longImage);
+    const name = screen.getByText("docker-claude-test");
+    expect(name.className).toMatch(/\btruncate\b/);
+  });
 });
