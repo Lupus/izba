@@ -1361,6 +1361,7 @@ mod tests {
             run_dir: None,
             user_fallback: None,
             usb_kernel: false,
+            vnc: false,
         };
         save_json(&sandbox_dir.join(STATE_FILE), &run_state).unwrap();
 

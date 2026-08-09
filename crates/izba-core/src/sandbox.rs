@@ -925,6 +925,17 @@ pub fn start_with_timeouts(
         );
     }
 
+    // Same reasoning, mirrored for VNC: the artifact set (with or without the
+    // KasmVNC disk) was resolved from ONE read of config.json by the caller;
+    // this is the SECOND read. A VNC toggle landing in between would boot a
+    // guest whose cmdline (built from `config` below) disagrees with the
+    // disks actually attached (built from `art`).
+    let wants_vnc = config.vnc;
+    let has_vnc = art.kasmvnc_erofs.is_some();
+    if wants_vnc != has_vnc {
+        bail!("sandbox {name}: its VNC setting changed while it was starting; start it again");
+    }
+
     let conn = default_connector();
     if liveness_of(paths, name, &conn)? != Liveness::Stopped {
         return Err(AlreadyRunning {
@@ -1080,7 +1091,14 @@ pub fn start_with_timeouts(
     // would be orphaned with no state.json pointing at it.
     let booted = (|| -> anyhow::Result<()> {
         wait_for_boot(handle.as_ref(), name, &console_log, boot_timeout, poll)?;
-        record_run_state(paths, name, handle.as_ref(), user_fallback, has_usb_kernel)
+        record_run_state(
+            paths,
+            name,
+            handle.as_ref(),
+            user_fallback,
+            has_usb_kernel,
+            has_vnc,
+        )
     })();
 
     if let Err(e) = booted {
@@ -1151,14 +1169,17 @@ fn control_is_healthy(handle: &dyn VmHandle, attempt_timeout: Duration) -> bool 
 /// Persist the post-boot `state.json`: the VMM pid (split out of the driver's
 /// pid list) plus the remaining sidecar pids, the start timestamp, the
 /// host-side confinement actually achieved for the VMM (so status can report it
-/// honestly — and loudly when unconfined), and which kernel variant booted (so
-/// a grant added later can be told apart from one the running kernel supports).
+/// honestly — and loudly when unconfined), which kernel variant booted (so
+/// a grant added later can be told apart from one the running kernel supports),
+/// and whether this run booted with the VNC desktop disk+cmdline (so a VNC
+/// toggle on a running sandbox can be told apart the same way).
 fn record_run_state(
     paths: &Paths,
     name: &str,
     handle: &dyn VmHandle,
     user_fallback: Option<crate::state::UserFallback>,
     usb_kernel: bool,
+    vnc: bool,
 ) -> anyhow::Result<()> {
     let mut pids = handle.pids();
     let vmm_idx = pids
@@ -1177,6 +1198,7 @@ fn record_run_state(
         run_dir: Some(paths.run_dir(name)),
         user_fallback,
         usb_kernel,
+        vnc,
     };
     save_json(&paths.sandbox_dir(name).join(STATE_FILE), &state)
 }
@@ -1929,6 +1951,7 @@ mod tests {
             run_dir: None,
             user_fallback: None,
             usb_kernel: false,
+            vnc: false,
         };
         save_json(&paths.sandbox_dir("web").join(STATE_FILE), &legacy).unwrap();
         assert_eq!(live_run_dir(&paths, "web"), paths.legacy_run_dir("web"));
@@ -2672,6 +2695,77 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no USB device grants"), "got: {err}");
+    }
+
+    fn arts_vnc() -> Artifacts {
+        Artifacts {
+            variant: crate::artifacts::KernelVariant::Base,
+            kernel: PathBuf::from("/art/vmlinux"),
+            initramfs: PathBuf::from("/art/initramfs.img"),
+            kasmvnc_erofs: Some(PathBuf::from("/art/kasmvnc.erofs")),
+        }
+    }
+
+    /// Mirrors `start_records_which_kernel_variant_it_booted` for the VNC
+    /// desktop disk: `RunState.vnc` records whether THIS run actually
+    /// booted with the KasmVNC disk + `izba.vnc=1` cmdline, not merely
+    /// whether `config.vnc` is set — both directions, against the same
+    /// writer, so a field that is always `false` cannot pass.
+    #[test]
+    fn start_records_booted_vnc() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        create(&paths, "plain", &opts(&ws)).unwrap();
+        start(&paths, "plain", &MockDriver::new(), &arts(), false).unwrap();
+        assert!(!started_run_state(&paths, "plain").vnc);
+
+        let mut o = opts(&ws);
+        o.vnc = true;
+        create(&paths, "withvnc", &o).unwrap();
+        start(&paths, "withvnc", &MockDriver::new(), &arts_vnc(), false).unwrap();
+        assert!(started_run_state(&paths, "withvnc").vnc);
+    }
+
+    /// Mirrors `start_refuses_a_kernel_that_disagrees_with_the_grants`: the
+    /// VNC artifact set is resolved from ONE read of config.json by the
+    /// caller and `start` re-reads it as a SECOND read; a VNC toggle
+    /// landing in the window between the two must fail the start rather
+    /// than boot a guest whose cmdline (built from the fresh read)
+    /// disagrees with the disks actually attached (built from `art`).
+    #[test]
+    fn start_refuses_when_vnc_setting_disagrees_with_the_located_artifacts() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        // Located with the VNC bundle, but vnc got turned off on disk
+        // before start's second config.json read.
+        let mut o = opts(&ws);
+        o.vnc = true;
+        create(&paths, "was_vnc", &o).unwrap();
+        let cfg_path = paths.sandbox_dir("was_vnc").join(CONFIG_FILE);
+        let mut cfg: SandboxConfig = load_json(&cfg_path).unwrap().unwrap();
+        cfg.vnc = false;
+        save_json(&cfg_path, &cfg).unwrap();
+        let err = start(&paths, "was_vnc", &MockDriver::new(), &arts_vnc(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VNC setting changed"), "got: {err}");
+
+        // And the mirror: located without the VNC bundle, but vnc got
+        // turned on before start's second read — which would boot a
+        // desktop-less guest the config now claims has one.
+        create(&paths, "was_plain", &opts(&ws)).unwrap();
+        let cfg_path = paths.sandbox_dir("was_plain").join(CONFIG_FILE);
+        let mut cfg: SandboxConfig = load_json(&cfg_path).unwrap().unwrap();
+        cfg.vnc = true;
+        save_json(&cfg_path, &cfg).unwrap();
+        let err = start(&paths, "was_plain", &MockDriver::new(), &arts(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VNC setting changed"), "got: {err}");
     }
 
     #[test]
@@ -3570,6 +3664,7 @@ mod tests {
                 run_dir: None,
                 user_fallback: None,
                 usb_kernel: false,
+                vnc: false,
             },
         )
         .unwrap();
@@ -3600,6 +3695,7 @@ mod tests {
             run_dir: None,
             user_fallback: None,
             usb_kernel: false,
+            vnc: false,
         };
         save_json(&sdir.join(STATE_FILE), &confined).unwrap();
         restore_confined_workspace(&paths, "box"); // Ok(None) arm
@@ -3939,8 +4035,11 @@ mod tests {
         o.vnc = true;
         create(&paths, "web", &o).unwrap();
 
+        let mut a = arts();
+        a.kasmvnc_erofs = Some(PathBuf::from("/art/kasmvnc.erofs"));
+
         let driver = MockDriver::new();
-        start(&paths, "web", &driver, &arts(), false).unwrap();
+        start(&paths, "web", &driver, &a, false).unwrap();
 
         let spec = driver
             .captured

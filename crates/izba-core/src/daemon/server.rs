@@ -559,9 +559,10 @@ fn handle_start(
     } else {
         crate::artifacts::KernelVariant::Base
     };
-    // VNC is not yet wired into SandboxConfig — Task 7 threads the real
-    // per-sandbox flag through here; every start resolves without it for now.
-    let art = (d.deps.artifacts)(&d.paths, variant, false)?;
+    // A VNC-enabled sandbox additionally needs the KasmVNC erofs bundle;
+    // `artifacts::locate` fails closed when it's requested but missing.
+    let vnc = config.vnc;
+    let art = (d.deps.artifacts)(&d.paths, variant, vnc)?;
     // Held across the whole listener-bind → boot → relay-republish window
     // (dropped on return, success or error): tells the supervisor tick to
     // spare this sandbox's egress/relays while state.json doesn't exist yet
@@ -2296,6 +2297,7 @@ mod tests {
                 run_dir: None,
                 user_fallback: None,
                 usb_kernel: true,
+                vnc: false,
             },
         )
         .unwrap();
@@ -2529,6 +2531,7 @@ mod tests {
                 run_dir: None,
                 user_fallback: Some(UserFallback::new("node")),
                 usb_kernel: false,
+                vnc: false,
             },
         )
         .unwrap();
@@ -2716,6 +2719,89 @@ mod tests {
         ));
         assert!(!d.egress.listening("web"));
         assert!(!egress::listener_path(&d.paths.run_dir("web")).exists());
+    }
+
+    /// The call-site companion to `ArtifactsFn`'s `vnc` parameter: before
+    /// this test `handle_start` hardcoded `false` regardless of the
+    /// sandbox's actual `config.vnc` (a stub left by an earlier task,
+    /// call-site-tested here per the USB-restart-required post-mortem —
+    /// "a rule with a test and a call site without one" is this feature's
+    /// recurring defect class). Two sandboxes, both directions, against the
+    /// same fake, so a hardcoded value on either side cannot pass.
+    #[test]
+    fn handle_start_passes_the_sandboxs_real_vnc_flag_to_artifacts() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let seen_vnc: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let seen = seen_vnc.clone();
+        let mut deps = test_deps();
+        deps.artifacts = Box::new(move |_, variant, vnc| {
+            *seen.lock().unwrap() = Some(vnc);
+            Ok(crate::sandbox::Artifacts {
+                variant,
+                kernel: "/art/vmlinux".into(),
+                initramfs: "/art/initramfs.img".into(),
+                kasmvnc_erofs: if vnc {
+                    Some("/art/kasmvnc.erofs".into())
+                } else {
+                    None
+                },
+            })
+        });
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+
+        let vnc_req = DaemonRequest::Create(DaemonCreate {
+            name: "withvnc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 1,
+            mem_mb: 256,
+            workspace: dir.path().join("ws"),
+            rw_size_gb: 1,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            allow_unconfined: false,
+            builder: false,
+            docker: None,
+            vnc: true,
+        });
+        assert!(matches!(
+            rpc(&mut c, &vnc_req),
+            DaemonResponse::Created { .. }
+        ));
+        // Start's ultimate outcome doesn't matter here (a sandboxed test env
+        // may deny the egress listener bind, same as the sibling tests
+        // above) — the artifacts fn runs before that bind, so the recorded
+        // value is what matters.
+        let _ = rpc(
+            &mut c,
+            &DaemonRequest::Start {
+                name: "withvnc".into(),
+                allow_unconfined: false,
+            },
+        );
+        assert_eq!(
+            *seen_vnc.lock().unwrap(),
+            Some(true),
+            "handle_start must pass config.vnc=true through to the artifacts fn"
+        );
+
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "plain")),
+            DaemonResponse::Created { .. }
+        ));
+        let _ = rpc(
+            &mut c,
+            &DaemonRequest::Start {
+                name: "plain".into(),
+                allow_unconfined: false,
+            },
+        );
+        assert_eq!(
+            *seen_vnc.lock().unwrap(),
+            Some(false),
+            "handle_start must pass config.vnc=false through to the artifacts fn"
+        );
     }
 
     /// A non-CLI client (e.g. the GUI) can call `Start` directly for a

@@ -122,6 +122,7 @@ impl ScriptedGuest {
                 run_dir: Some(run.clone()),
                 user_fallback: None,
                 usb_kernel: false,
+                vnc: false,
             },
         )
         .context("write state.json")?;

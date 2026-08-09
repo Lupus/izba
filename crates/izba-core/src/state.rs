@@ -158,6 +158,19 @@ pub struct RunState {
     /// true of it and the safe direction (never claims support it lacks).
     #[serde(default)]
     pub usb_kernel: bool,
+    /// Whether this run booted with the KasmVNC disk + `izba.vnc=1` cmdline
+    /// (i.e. `art.kasmvnc_erofs.is_some()` at boot time).
+    ///
+    /// Mirrors `usb_kernel`'s reasoning: `config.vnc` answers "should this
+    /// sandbox have a desktop"; only this answers "does the kernel currently
+    /// running actually have one" — they diverge exactly when VNC is toggled
+    /// on a running sandbox, which is the case a UI has to flag as
+    /// restart-required rather than silently doing nothing (or, unlike USB,
+    /// pretending a desktop is still there after VNC was turned off).
+    /// `serde(default)`: a pre-VNC `state.json` reads as `false`, the safe
+    /// direction (never claims a desktop it doesn't have).
+    #[serde(default)]
+    pub vnc: bool,
 }
 
 /// Crash-safe write: serialise to a sibling `.tmp` file in the same directory,
@@ -300,6 +313,7 @@ mod tests {
             run_dir: None,
             user_fallback: None,
             usb_kernel: false,
+            vnc: false,
         }
     }
 
@@ -324,6 +338,28 @@ mod tests {
         save_json(&path, &state).unwrap();
         let loaded: RunState = load_json(&path).unwrap().unwrap();
         assert!(loaded.usb_kernel);
+    }
+
+    #[test]
+    fn a_state_json_written_before_vnc_reads_as_no_vnc() {
+        // Same safe direction as usb_kernel above: an old record must not
+        // claim a desktop the run does not have.
+        let legacy = r#"{"vmm_pid":{"pid":1,"starttime":2},"sidecar_pids":[],"started_unix_ms":0}"#;
+        let s: RunState = serde_json::from_str(legacy).unwrap();
+        assert!(!s.vnc);
+    }
+
+    #[test]
+    fn the_booted_vnc_flag_survives_a_disk_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let state = RunState {
+            vnc: true,
+            ..sample_run_state()
+        };
+        save_json(&path, &state).unwrap();
+        let loaded: RunState = load_json(&path).unwrap().unwrap();
+        assert!(loaded.vnc);
     }
 
     #[test]

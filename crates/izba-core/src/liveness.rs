@@ -117,6 +117,7 @@ mod tests {
             run_dir: None,
             user_fallback: None,
             usb_kernel: false,
+            vnc: false,
         }
     }
 
