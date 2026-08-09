@@ -181,7 +181,8 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   Named volumes are persistent (`<data>/volumes/<name>.img`, survive `rm`,
   single-writer); anonymous are ephemeral (in the sandbox dir).
 - **Cmdline chain:** `console=ttyS0 izba.hostname=<name>
-  [izba.volumes=<p0>,<p1>,…] [izba.buildout=1] [izba.usb=1] [izba.docker=1]` ↔
+  [izba.volumes=<p0>,<p1>,…] [izba.buildout=1] [izba.usb=1]
+  [izba.docker=1 izba.uidmap=<d-p-n>,… izba.gidmap=<d-p-n>,…]` ↔
   `hack/kernel.config` (`SERIAL_8250_CONSOLE`; netfilter/nftables —
   `NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK` — + `CONFIG_DUMMY`) ↔ init
   reads `izba.hostname` for sethostname and `izba.volumes` (ordered,
@@ -283,12 +284,31 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
     dockerd runs as container root, so the non-`net` sysctl protection reduces to
     the kernel DAC check (`capable_wrt_inode_uidgid`), which denies the write
     only when container-root maps to a NON-zero guest uid — exactly the rootless
-    Docker/Podman invariant. `generate_spec` **fails a docker-mode start CLOSED**
-    (`docker_userns_isolates_root`) whenever `transpose_identity_map` would map
-    container-0 to guest-0 (a root-owned workspace / `sudo izba`, a `workload ==
-    owner`, or a non-root image `USER` on a non-root workspace). The common flow
-    (root docker image on a non-root-owned workspace ⇒ container-0 → guest-owner)
-    is allowed. See `docs/security/` finding F-32.
+    Docker/Podman invariant. Since the uid-fidelity redesign
+    (`docs/superpowers/specs/2026-08-09-docker-uid-fidelity-design.md`) the
+    invariant holds **by construction** for every (owner, USER) shape — no
+    fail-closed refusal — via `docker_shifted_map`: container `c` → guest
+    `BASE+c` (`BASE=1<<21`, `RANGE=1<<20`) with one carve-out
+    `container-USER → guest-owner` iff owner ≠ 0; guest-0 is entirely UNMAPPED.
+    See `docs/security/` finding F-32.
+  - **Idmapped layers (uid fidelity, change all ends or none):** the SAME
+    mapping is applied by init as an idmapped mount over `/lower` (erofs) +
+    `/upper` (ext4) before overlay assembly, and over each user volume — so
+    image uids present verbatim in-container (root files as container-0 ⇒
+    setuid `sudo` works; `USER`-owned `$HOME` as the USER). The extents ride
+    the cmdline as `izba.uidmap=`/`izba.gidmap=` (`disk-presented-n` triples —
+    the OCI extents VERBATIM, since an idmapped mount treats the on-disk id as
+    the userns-INNER id; emitted by `layer_idmap_cmdline_value` from the
+    just-written OCI spec — single generation site, never emitted apart from
+    `izba.docker=1`), closed by the fsuid-0 anchor `<RANGE>-0-1` (guest-root
+    writers — overlay whiteouts, crun mkdirs — land on disk-id `RANGE`,
+    presenting as `nobody`).
+    Init's own `/rootfs` writes (resolv.conf, trust CA, `izba cp` extract) run
+    under `idmap::with_fs_ids` so they land as disk-0 = container-root-owned;
+    **any future init write under `/rootfs` must use that guard in docker
+    mode.** Non-docker sandboxes keep the Option-A transpose, except
+    `owner == 0` (the Windows anchor / `sudo izba`) is now IDENTITY — the old
+    0↔USER swap scrambled every root-owned image file on Windows.
 - **virtiofs tag** `workspace` (driver `FsShare` ↔ init mount plan) →
   `/workspace` inside the guest, which is also exec's default cwd.
 - **SSH access (`ssh izba-<name>`):** a vendored static OpenSSH `sshd`
