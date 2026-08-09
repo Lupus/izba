@@ -98,6 +98,10 @@ mod tests {
             container: None,
             user_fallback: None,
             docker: false,
+            vnc: false,
+            vnc_running: false,
+            vnc_url: None,
+            vnc_restart_required: false,
         }
     }
 

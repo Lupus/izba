@@ -428,6 +428,7 @@ fn dispatch_inner(
         DaemonRequest::UsbStatus { name } => handle_usb_status(d, name),
         DaemonRequest::UsbAttach { name, device } => handle_usb_attach(d, name, device, true),
         DaemonRequest::UsbDetach { name, device } => handle_usb_attach(d, name, device, false),
+        DaemonRequest::VncSet { name, enabled } => handle_vnc_set(d, name, enabled),
         DaemonRequest::VolumeList => handle_volume_list(d),
         DaemonRequest::VolumeRemove { name } => handle_volume_remove(d, name),
         DaemonRequest::VolumeAttach { name, spec } => handle_volume_attach(d, name, spec),
@@ -695,6 +696,10 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
         .as_ref()
         .and_then(|s| s.user_fallback.as_ref())
         .map(|f| f.declared.clone());
+    // Same "is this run actually live" predicate `handle_usb_status` uses, so
+    // the two answers can never disagree about the same sandbox.
+    let running = d.registry.liveness(&name).unwrap_or(Liveness::Stopped) != Liveness::Stopped;
+    let booted_vnc = run_state.as_ref().map(|s| s.vnc).unwrap_or(false);
     // Honesty: the VM (liveness) being up does not mean the workload container
     // inside it is. Probe the guest's container state best-effort; any failure
     // (unreachable/wedged guest, or a guest that doesn't report it) maps to
@@ -719,6 +724,10 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
         container,
         user_fallback,
         docker: config.docker,
+        vnc: config.vnc,
+        vnc_running: false,
+        vnc_url: None,
+        vnc_restart_required: needs_vnc_restart(config.vnc, running, booted_vnc),
     }))
 }
 
@@ -1352,6 +1361,47 @@ fn handle_usb_attach(
         }
     };
     handle_guest_rpc(d, name, req)
+}
+
+/// Enable or disable VNC on a sandbox's config (spec 2026-08-09).
+///
+/// Idempotent: a request that matches the current setting is a no-op `Ok`,
+/// same as `persist_port_rule`'s sibling handlers. There is no artifact check
+/// here — enabling only records intent; `handle_start`'s `artifacts` call is
+/// the fail-closed gate (a missing KasmVNC bundle fails the START, not this
+/// RPC), and `vnc_restart_required` on `Inspect` is what tells a user whose
+/// sandbox is already running that the change hasn't taken effect yet.
+///
+/// The volume cap DOES matter here, though: VNC's `kasmvnc.erofs` takes the
+/// last of the 26 virtio-blk slots (`disk_port` asserts < 26), so a sandbox
+/// already at the plain 24-volume cap must be refused BEFORE `config.vnc` is
+/// flipped to true — otherwise its next start would try to build 27 disks and
+/// panic the VMM driver instead of failing with an actionable error.
+fn handle_vnc_set(d: &Arc<Daemon>, name: String, enabled: bool) -> anyhow::Result<DaemonResponse> {
+    sandbox_must_exist(&d.paths, &name)?;
+    let p = d.paths.sandbox_dir(&name).join(CONFIG_FILE);
+    let mut cfg: SandboxConfig =
+        load_json(&p)?.with_context(|| format!("no config for '{name}'"))?;
+    if cfg.vnc == enabled {
+        return Ok(DaemonResponse::Ok);
+    }
+    if enabled {
+        crate::volume::validate_volumes(&cfg.volumes, true)?;
+    }
+    cfg.vnc = enabled;
+    crate::state::save_json(&p, &cfg)?;
+    Ok(DaemonResponse::Ok)
+}
+
+/// Whether a sandbox's live run is behind its configured VNC setting.
+///
+/// Unlike `needs_usb_restart`, this is BIDIRECTIONAL: turning VNC OFF on a
+/// running sandbox needs a restart just as much as turning it ON does — the
+/// booted desktop (or lack of one) doesn't change until the VM reboots either
+/// way. A stopped sandbox never needs one: its next start just picks up
+/// whatever `config.vnc` says.
+fn needs_vnc_restart(enabled: bool, running: bool, booted_vnc: bool) -> bool {
+    running && enabled != booted_vnc
 }
 
 fn sandbox_must_exist(paths: &Paths, name: &str) -> anyhow::Result<()> {
@@ -2229,6 +2279,17 @@ mod tests {
         assert!(!needs_usb_restart(true, true, true));
     }
 
+    /// Unlike `needs_usb_restart`, this predicate is BIDIRECTIONAL: disabling
+    /// VNC on a live run needs a restart just as much as enabling it does.
+    #[test]
+    fn needs_vnc_restart_truth_table() {
+        assert!(!needs_vnc_restart(false, false, false));
+        assert!(!needs_vnc_restart(true, false, false)); // stopped: next start picks it up
+        assert!(needs_vnc_restart(true, true, false)); // enable while running
+        assert!(needs_vnc_restart(false, true, true)); // disable while running
+        assert!(!needs_vnc_restart(true, true, true));
+    }
+
     #[test]
     fn a_stopped_sandbox_with_a_fresh_grant_is_not_told_to_restart() {
         let (dir, d) = test_daemon();
@@ -2802,6 +2863,123 @@ mod tests {
             Some(false),
             "handle_start must pass config.vnc=false through to the artifacts fn"
         );
+    }
+
+    /// `VncSet` persists `config.vnc`, is idempotent, and `restart_required`
+    /// on `Inspect` follows `needs_vnc_restart`'s bidirectional truth table
+    /// against the real handler (not just the predicate alone).
+    #[test]
+    fn vnc_set_persists_and_restart_required_is_bidirectional() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+
+        // "Boot" the sandbox with VNC off — a live run whose config is about
+        // to move ahead of what it actually booted.
+        d.registry.set_liveness("web", Liveness::Running);
+        save_json(
+            &d.paths.sandbox_dir("web").join(STATE_FILE),
+            &RunState {
+                vmm_pid: live_identity(),
+                sidecar_pids: vec![],
+                started_unix_ms: 0,
+                confinement: None,
+                run_dir: None,
+                user_fallback: None,
+                usb_kernel: false,
+                vnc: false,
+            },
+        )
+        .unwrap();
+
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::VncSet {
+                name: "web".into(),
+                enabled: true,
+            },
+        ));
+        match rpc(&mut c, &DaemonRequest::Inspect { name: "web".into() }) {
+            DaemonResponse::Inspect(det) => {
+                assert!(det.vnc, "VncSet must persist the enable");
+                assert!(
+                    det.vnc_restart_required,
+                    "a live run booted without VNC needs a restart to pick up the new setting"
+                );
+            }
+            other => panic!("expected Inspect, got {other:?}"),
+        }
+
+        // Idempotent: the same request again is Ok, and config.json is
+        // untouched (still just the one flip from above).
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::VncSet {
+                name: "web".into(),
+                enabled: true,
+            },
+        ));
+        let cfg: SandboxConfig = load_json(&d.paths.sandbox_dir("web").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.vnc, "config unchanged means still enabled");
+
+        // Stopped: the next start already picks up the new setting by
+        // itself, so telling the user to restart it would be noise.
+        d.registry.set_liveness("web", Liveness::Stopped);
+        match rpc(&mut c, &DaemonRequest::Inspect { name: "web".into() }) {
+            DaemonResponse::Inspect(det) => assert!(!det.vnc_restart_required),
+            other => panic!("expected Inspect, got {other:?}"),
+        }
+    }
+
+    /// The guard Task 4's reviewer flagged: enabling VNC on a sandbox already
+    /// at the plain 24-volume cap must be refused BEFORE `config.vnc` flips —
+    /// otherwise its next start would try to build 27 disks (rootfs + rw +
+    /// 24 volumes + kasmvnc.erofs) and panic the VMM driver's `disk_port`
+    /// assert (< 26 slots), instead of failing with an actionable error here.
+    #[test]
+    fn vnc_set_refuses_to_enable_over_the_volume_cap() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+
+        // Config-level fixture: write 24 volumes directly, bypassing
+        // create's own volume-count validation (which would refuse a 24-
+        // volume Create alongside vnc:true, but not a plain 24-volume one).
+        let p = d.paths.sandbox_dir("web").join(CONFIG_FILE);
+        let mut cfg: SandboxConfig = load_json(&p).unwrap().unwrap();
+        cfg.volumes = (0..24)
+            .map(|i| crate::volume::VolumeSpec {
+                name: Some(format!("v{i}")),
+                guest_path: format!("/data{i}").into(),
+                size_bytes: 1 << 20,
+                eph_id: None,
+            })
+            .collect();
+        save_json(&p, &cfg).unwrap();
+        let before = std::fs::read_to_string(&p).unwrap();
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::VncSet {
+                name: "web".into(),
+                enabled: true,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("volume"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(before, after, "a refused VncSet must not touch config.json");
     }
 
     /// A non-CLI client (e.g. the GUI) can call `Start` directly for a

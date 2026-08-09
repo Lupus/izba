@@ -463,6 +463,17 @@ pub struct SandboxDetailView {
     /// stopped / its state predates the field — the UI renders `None` as
     /// "unknown".
     pub confinement: Option<String>,
+    /// Whether this sandbox is configured to boot with a VNC desktop.
+    pub vnc: bool,
+    /// Whether a VNC relay is currently live for this sandbox.
+    pub vnc_running: bool,
+    /// The URL a human can open to reach the live VNC desktop, when one is
+    /// running.
+    pub vnc_url: Option<String>,
+    /// The sandbox is running with its VNC display configuration ahead of
+    /// what it actually booted (either direction) — it must be restarted for
+    /// `vnc` to take effect.
+    pub vnc_restart_required: bool,
 }
 
 impl From<SandboxDetail> for SandboxDetailView {
@@ -479,6 +490,10 @@ impl From<SandboxDetail> for SandboxDetailView {
             cpus: d.cpus,
             mem_mb: d.mem_mb,
             confinement: d.confinement,
+            vnc: d.vnc,
+            vnc_running: d.vnc_running,
+            vnc_url: d.vnc_url,
+            vnc_restart_required: d.vnc_restart_required,
         }
     }
 }
@@ -1007,6 +1022,10 @@ mod tests {
             container: Some(izba_proto::ContainerState::Stopped),
             user_fallback: None,
             docker: false,
+            vnc: true,
+            vnc_running: true,
+            vnc_url: Some("vnc://127.0.0.1:5901".into()),
+            vnc_restart_required: true,
         };
         let v = SandboxDetailView::from(detail);
         assert_eq!(v.name, "web");
@@ -1017,6 +1036,10 @@ mod tests {
         assert_eq!(v.ports[0].host_port, 8080);
         assert!(v.volumes.is_empty());
         assert_eq!(v.container.as_deref(), Some("stopped"));
+        assert!(v.vnc);
+        assert!(v.vnc_running);
+        assert_eq!(v.vnc_url.as_deref(), Some("vnc://127.0.0.1:5901"));
+        assert!(v.vnc_restart_required);
     }
 
     /// A Windows workspace recorded canonicalized (`\\?\C:\...`) surfaces to
@@ -1038,6 +1061,10 @@ mod tests {
             container: None,
             user_fallback: None,
             docker: false,
+            vnc: false,
+            vnc_running: false,
+            vnc_url: None,
+            vnc_restart_required: false,
         };
         let v = SandboxDetailView::from(detail);
         assert_eq!(v.workspace, r"C:\Users\u\proj");
@@ -1063,6 +1090,10 @@ mod tests {
             container: Some(izba_proto::ContainerState::Running),
             user_fallback: None,
             docker: true,
+            vnc: false,
+            vnc_running: false,
+            vnc_url: None,
+            vnc_restart_required: false,
         };
         let v = SandboxDetailView::from(detail);
         assert!(v.docker);
