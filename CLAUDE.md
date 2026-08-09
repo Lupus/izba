@@ -21,7 +21,7 @@ OpenVMM driver (M0 done).
 | [docs/egress-firewall-building-blocks.md](docs/egress-firewall-building-blocks.md) | OSS building-block survey + decisions for the **egress firewall** (M2 allow-list + MITM, M5 credential vault): regorus, DNS-snoop, NVIDIA OpenShell salvage map. Read before M2/M5 work. |
 | [docs/dogfooding-value.md](docs/dogfooding-value.md) | **LLM-dogfooding value model** — what the swarm harness measures vs e2e tests, the fair-test boundary, graduation/freshness principles, and the instrument-honesty guarantees. Read before changing `hack/dogfood/` or the `llm-dogfooding` skill. |
 | [docs/testing.md](docs/testing.md) | KVM integration-suite runbook (WSL2 setup, deps, troubleshooting) |
-| [hack/README.md](hack/README.md) | Artifact tooling: kernel config/build, initramfs, binary fetching |
+| [hack/README.md](hack/README.md) | Artifact tooling: kernel config/build, initramfs, binary fetching, KasmVNC bundle (`kasmvnc.erofs`) |
 
 ## Build & test
 
@@ -166,10 +166,11 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   Control port 1025 also serves `Request::Stats` (`izba-init`'s process/mem/
   mount/docker-engine snapshot — guest-reported, daemon-sanitized before it
   reaches the CLI/GUI; ~250 ms in-call CPU sampling via two `/proc` reads
-  makes the RPC stateless). `DAEMON_PROTO_VERSION = 5` is this: v5 added
-  `DaemonRequest::Stats`.
+  makes the RPC stateless). `DAEMON_PROTO_VERSION = 6` is this: v6 added
+  `DaemonRequest::VncSet`.
 - **Disk order:** `sandbox::start()` builds
-  `[rootfs.erofs (RO)=vda, rw.img (RW)=vdb, vol₀=vdc, vol₁=vdd, …]`
+  `[rootfs.erofs (RO)=vda, rw.img (RW)=vdb, vol₀=vdc, vol₁=vdd, …, kasmvnc.erofs
+  (RO, VNC sandboxes only)]`
   (`build_vm_disks`) → CH enumerates `--disk` in that order, OpenVMM gives each
   disk its own PCIe root port via `disk_port(i)` (vda, vdb, vdc, …) → init
   mounts `/dev/vda` erofs lower + `/dev/vdb` ext4 upper into an overlay at
@@ -177,12 +178,16 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   its declared guest path under `/rootfs` (after the overlay + virtiofs).
   User volumes append after `rw.img` in declaration order; the binding between
   a volume and its `vd{c…}` slot is purely positional, carried on `izba.volumes`
-  (see Cmdline chain). Max 24 volumes (26 virtio-blk slots − vda − vdb).
+  (see Cmdline chain). The VNC erofs, when present, is always LAST — strictly
+  after every volume — so the volume↔slot binding never shifts based on
+  whether VNC is enabled. Max 24 volumes (26 virtio-blk slots − vda − vdb),
+  dropping to 23 when VNC is enabled (the kasmvnc disk claims the last slot).
   Named volumes are persistent (`<data>/volumes/<name>.img`, survive `rm`,
   single-writer); anonymous are ephemeral (in the sandbox dir).
 - **Cmdline chain:** `console=ttyS0 izba.hostname=<name>
   [izba.volumes=<p0>,<p1>,…] [izba.buildout=1] [izba.usb=1]
-  [izba.docker=1 izba.uidmap=<d-p-n>,… izba.gidmap=<d-p-n>,… [izba.wsidmap=1]]` ↔
+  [izba.docker=1 izba.uidmap=<d-p-n>,… izba.gidmap=<d-p-n>,… [izba.wsidmap=1]]
+  [izba.vnc=1]` ↔
   `hack/kernel.config` (`SERIAL_8250_CONSOLE`; netfilter/nftables —
   `NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK` — + `CONFIG_DUMMY`) ↔ init
   reads `izba.hostname` for sethostname and `izba.volumes` (ordered,

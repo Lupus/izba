@@ -156,6 +156,25 @@ Pass the result to `build-initramfs.sh` via `IZBA_MKE2FS` so the guest can
 format a blank `rw.img` on first boot.  The source tarball is cached in
 `${XDG_CACHE_HOME:-$HOME/.cache}/izba/e2fsprogs/`.
 
+### `build-kasmvnc-erofs.sh`
+
+Builds the self-contained KasmVNC + openbox + xterm bundle for the `izba vnc`
+display feature and packs it into an **uncompressed** erofs image (the guest
+kernel's `EROFS_FS` has no `EROFS_FS_ZIP*`, so a compressed image would not
+mount). Installs the upstream KasmVNC `.deb` (sha256-pinned) + a minimal WM
+in a digest-pinned Debian bookworm container, copies the binaries and their
+full shared-library closure, and patchelf's every ELF to the fixed in-guest
+mount path `/opt/izba-vnc`. Requires Docker.
+
+```sh
+hack/build-kasmvnc-erofs.sh   # → dist/kasmvnc.erofs (override with KASMVNC_OUT; ~100 MB, uncompressed)
+```
+
+`izba create --vnc` / `izba run --vnc` fail closed at start if the bundle
+cannot be located — see `artifacts::locate_kasmvnc` (`$IZBA_KASMVNC_EROFS`
+override, then exe-relative `../artifacts/kasmvnc.erofs`, then
+`<data>/artifacts/kasmvnc.erofs`).
+
 ### `ci/ttystorm-gate.sh` / `ci/ttystorm-gate.ps1`
 
 The scripted M0 vsock-churn gate used by `.github/workflows/e2e.yml`: boots a
