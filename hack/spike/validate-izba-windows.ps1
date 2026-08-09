@@ -13,7 +13,9 @@
 #           [11] lock-down: per-sandbox account + read-deny + net-block,
 #           [12] ssh round-trip + chroot isolation,
 #           [13] container userns uid-mapping (OpenVMM/WHP leg),
-#           [14] build-in-VM: Dockerfile -> OCI ingest -> tag -> run -> marker.
+#           [14] build-in-VM: Dockerfile -> OCI ingest -> tag -> run -> marker,
+#           [15] VNC display: izba vnc url + auth matrix over the real relay
+#                (skips loudly when kasmvnc.erofs is not staged).
 $ErrorActionPreference = 'Continue'
 $exe   = if ($env:IZBA_EXE)   { $env:IZBA_EXE }   else { 'C:\izba\bin\izba.exe' }
 $image = if ($env:IZBA_IMAGE) { $env:IZBA_IMAGE } else { 'alpine:3.20' }
@@ -669,6 +671,136 @@ if (-not (Test-Path (Join-Path $fixtureDir 'Dockerfile'))) {
 $buildSectionFails = $fails - $buildFails0
 if ($buildSectionFails -gt 0) {
     [Console]::Error.WriteLine("  [14] build-in-VM section: $buildSectionFails check(s) failed")
+}
+
+# [15] VNC display (spec 2026-08-09): `izba vnc url` -> credentialed URL ->
+# HTTP auth matrix over the REAL relay path -- host TcpStream -> izbad's VNC
+# relay -> StreamOpen::TcpDial{6901} over vsock 1026 -> izba-init's loopback
+# dial -> Xkasmvnc's websockify inside the crun container, authenticating
+# against the kasmpasswd hash the host generated at `start` and delivered
+# over the `izba-vnc` virtiofs share. This is the WHP analogue of the KVM
+# `vnc_desktop_e2e` daemon_e2e test -- same auth-matrix ORDERING lesson
+# applies: KasmVNC blacklists an IP after 5 failed login attempts (a dropped
+# connection thereafter, not a clean 401), so the good-credentials probe MUST
+# land before the wrong-password probe and the whole matrix stays within a
+# few bounded requests. The poll-until-401 loop breaks on the FIRST 401 for
+# the same reason -- it must not itself burn through the attempt budget.
+#
+# Guarded on the kasmvnc.erofs artifact actually being staged at the SAME
+# production exe-relative discovery path production code uses
+# (<exe-dir>\..\artifacts\kasmvnc.erofs -- mirrors vnc_bundle_path() in
+# daemon_e2e.rs); a local run without the artifact stays usable via a loud
+# SKIP rather than a silent no-op or a hard failure.
+$vncBundle = Join-Path (Split-Path -Parent (Split-Path -Parent $exe)) 'artifacts\kasmvnc.erofs'
+if (-not (Test-Path $vncBundle)) {
+    Write-Warning "SKIP vnc: kasmvnc.erofs not staged at $vncBundle"
+} else {
+    $vncName   = 'vnc-validate'
+    $vncWs     = "$env:TEMP\izba-vnc-validate-ws"
+    $vncFails0 = $fails
+    & $exe stop $vncName 2>$null | Out-Null
+    & $exe rm --force $vncName 2>$null | Out-Null
+    if (Test-Path $vncWs) { Remove-Item -Recurse -Force $vncWs -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $vncWs | Out-Null
+
+    try {
+        # Step 1: create --vnc + boot. Single `run` call (create-on-first-use
+        # + start), same idiom as every other from-scratch boot in this
+        # script; retry-guarded against the nested-WHP boot stall.
+        $vncBootOk = Invoke-BootWithRetry $vncName @('--image', $image, '--vnc', $vncWs, '--', '/bin/true')
+        Check 'vnc: sandbox boots (run exits 0)' $vncBootOk
+        if (-not $vncBootOk) { Dump-BootLogs $vncName }
+
+        if ($vncBootOk) {
+            # Step 2: the credentialed URL.
+            $vncUrlOut = (& $exe vnc url $vncName | Out-String).Trim()
+            Check 'vnc: url exits 0' ($LASTEXITCODE -eq 0)
+            $vncMatch = [regex]::Match($vncUrlOut, 'http://izba:([^@]+)@127\.0\.0\.1:(\d+)/')
+            Check 'vnc: url matches http://izba:<pw>@127.0.0.1:<port>/' $vncMatch.Success
+            if (-not $vncMatch.Success) {
+                [Console]::Error.WriteLine("  vnc url output: '$vncUrlOut'")
+            }
+
+            if ($vncMatch.Success) {
+                $vncPw   = $vncMatch.Groups[1].Value
+                $vncPort = $vncMatch.Groups[2].Value
+                $vncBase = "http://127.0.0.1:$vncPort/"
+
+                # Step 3: poll for the desktop. The relay is up as soon as
+                # `run` returns, but Xkasmvnc needs a few seconds to bind
+                # :6901 behind it. An unauthenticated 401 is the first honest
+                # proof the whole chain is live -- break on the first 401.
+                $vncDeadline = (Get-Date).AddSeconds(120)
+                $vncLastCode = $null
+                while ((Get-Date) -lt $vncDeadline) {
+                    try {
+                        $vncR = Invoke-WebRequest -Uri $vncBase -SkipHttpErrorCheck -TimeoutSec 10
+                        $vncLastCode = $vncR.StatusCode
+                        if ($vncLastCode -eq 401) { break }
+                    } catch {
+                        $vncLastCode = "err: $($_.Exception.Message)"
+                    }
+                    Start-Sleep -Seconds 2
+                }
+                Check 'vnc: unauthenticated GET -> 401' ($vncLastCode -eq 401)
+                if ($vncLastCode -ne 401) {
+                    [Console]::Error.WriteLine("  vnc: last status/error = $vncLastCode")
+                    Dump-BootLogs $vncName
+                }
+
+                # Step 4: correct credentials -- deliberately BEFORE the
+                # wrong-password probe (see the blacklist note above).
+                $vncGoodHeader = @{ Authorization = ('Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("izba:$vncPw"))) }
+                $vncGoodCode = $null
+                $vncGoodBody = ''
+                try {
+                    $vncRGood    = Invoke-WebRequest -Uri $vncBase -Headers $vncGoodHeader -SkipHttpErrorCheck -TimeoutSec 15
+                    $vncGoodCode = $vncRGood.StatusCode
+                    $vncGoodBody = "$($vncRGood.Content)"
+                } catch {
+                    [Console]::Error.WriteLine("  vnc: authenticated GET failed: $($_.Exception.Message)")
+                }
+                Check 'vnc: correct credentials -> 200' ($vncGoodCode -eq 200)
+                Check 'vnc: correct-credentials body contains kasm' ($vncGoodBody.ToLower().Contains('kasm'))
+                if ($vncGoodCode -ne 200) { Dump-BootLogs $vncName }
+
+                # Step 5: a wrong password is rejected -- proves step 4
+                # passed because of the credentials, not because auth is
+                # effectively disabled. ONE bad-credential attempt total,
+                # well inside KasmVNC's 5-attempt blacklist threshold.
+                $vncBadHeader = @{ Authorization = ('Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('izba:definitely-not-the-password'))) }
+                $vncBadCode = $null
+                try {
+                    $vncRBad    = Invoke-WebRequest -Uri $vncBase -Headers $vncBadHeader -SkipHttpErrorCheck -TimeoutSec 15
+                    $vncBadCode = $vncRBad.StatusCode
+                } catch {
+                    [Console]::Error.WriteLine("  vnc: wrong-password GET failed: $($_.Exception.Message)")
+                }
+                Check 'vnc: wrong password -> 401' ($vncBadCode -eq 401)
+            } else {
+                Check 'vnc: unauthenticated GET -> 401' $false
+                Check 'vnc: correct credentials -> 200' $false
+                Check 'vnc: correct-credentials body contains kasm' $false
+                Check 'vnc: wrong password -> 401' $false
+            }
+        } else {
+            Check 'vnc: url exits 0' $false
+            Check 'vnc: url matches http://izba:<pw>@127.0.0.1:<port>/' $false
+            Check 'vnc: unauthenticated GET -> 401' $false
+            Check 'vnc: correct credentials -> 200' $false
+            Check 'vnc: correct-credentials body contains kasm' $false
+            Check 'vnc: wrong password -> 401' $false
+        }
+    } finally {
+        & $exe stop $vncName 2>$null | Out-Null
+        & $exe rm --force $vncName 2>$null | Out-Null
+        if (Test-Path $vncWs) { Remove-Item -Recurse -Force $vncWs -ErrorAction SilentlyContinue }
+    }
+
+    $vncSectionFails = $fails - $vncFails0
+    if ($vncSectionFails -gt 0) {
+        [Console]::Error.WriteLine("  [15] vnc section: $vncSectionFails check(s) failed")
+    }
 }
 
 # Best-effort daemon cleanup so the validation run leaves no daemon behind.
