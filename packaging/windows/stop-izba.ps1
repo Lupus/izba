@@ -47,6 +47,7 @@ function Invoke-WithTimeout {
     } catch {
         # Best-effort: a missing/old binary (e.g. pre-`stop --all` izba) or a
         # wedged daemon must never block the installer.
+        Write-Warning "izba shutdown step '$File $CmdArgs' failed: $_"
     }
 }
 
@@ -62,12 +63,14 @@ if (Test-Path -LiteralPath $izba) {
 # daemon, orphaned openvmm.exe VMMs, the GUI app, the jail helper. Path
 # prefix match with a trailing separator so 'izba' never matches 'izba2'.
 $prefix = $InstallDir.TrimEnd('\') + '\'
-Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.Path -and
-    $_.Path.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) -and
-    $_.ProcessName -notlike 'unins*'   # never kill the Inno uninstaller
-} | ForEach-Object {
-    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+$leftovers = Get-Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Path -and
+        $_.Path.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) -and
+        $_.ProcessName -notlike 'unins*'   # never kill the Inno uninstaller
+    }
+foreach ($p in $leftovers) {
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
 }
 
 exit 0
