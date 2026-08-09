@@ -182,7 +182,7 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   single-writer); anonymous are ephemeral (in the sandbox dir).
 - **Cmdline chain:** `console=ttyS0 izba.hostname=<name>
   [izba.volumes=<p0>,<p1>,…] [izba.buildout=1] [izba.usb=1]
-  [izba.docker=1 izba.uidmap=<d-p-n>,… izba.gidmap=<d-p-n>,…]` ↔
+  [izba.docker=1 izba.uidmap=<d-p-n>,… izba.gidmap=<d-p-n>,… [izba.wsidmap=1]]` ↔
   `hack/kernel.config` (`SERIAL_8250_CONSOLE`; netfilter/nftables —
   `NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK` — + `CONFIG_DUMMY`) ↔ init
   reads `izba.hostname` for sethostname and `izba.volumes` (ordered,
@@ -306,7 +306,12 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
     Init's own `/rootfs` writes (resolv.conf, trust CA, `izba cp` extract) run
     under `idmap::with_fs_ids` so they land as disk-0 = container-root-owned;
     **any future init write under `/rootfs` must use that guard in docker
-    mode.** Non-docker sandboxes keep the Option-A transpose, except
+    mode.** `izba.wsidmap=1` (emitted iff an owner leg is 0 —
+    `workspace_idmap_needed`) asks init to stack the SAME layer idmap over the
+    workspace virtiofs share, FAIL-SOFT: a backend without `FUSE_ALLOW_IDMAP`
+    (OpenVMM today) refuses mount_setattr and init keeps the raw share
+    (0777/`nobody` presentation) instead of failing boot — cosmetic
+    presentation, not a trust boundary. Non-docker sandboxes keep the Option-A transpose, except
     `owner == 0` (the Windows anchor / `sudo izba`) is now IDENTITY — the old
     0↔USER swap scrambled every root-owned image file on Windows.
 - **virtiofs tag** `workspace` (driver `FsShare` ↔ init mount plan) →

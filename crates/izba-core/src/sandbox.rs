@@ -242,7 +242,7 @@ fn build_cmdline(
     volumes: &[crate::volume::VolumeSpec],
     builder: bool,
     usb: bool,
-    docker_idmaps: Option<&(String, String)>,
+    docker_idmaps: Option<&DockerCmdline>,
 ) -> String {
     let mut c = format!("console=ttyS0 izba.hostname={name}");
     if !volumes.is_empty() {
@@ -267,10 +267,19 @@ fn build_cmdline(
     // The idmap values ride the same token set — `Some` IS docker mode, so the
     // flag and the layer-idmap extents (uid-fidelity design §2.3, extracted
     // from the just-written OCI spec) can never be emitted apart.
-    if let Some((uidmap, gidmap)) = docker_idmaps {
+    if let Some(d) = docker_idmaps {
         c.push_str(&format!(
-            " izba.docker=1 izba.uidmap={uidmap} izba.gidmap={gidmap}"
+            " izba.docker=1 izba.uidmap={} izba.gidmap={}",
+            d.uidmap, d.gidmap
         ));
+        // Workspace-share idmap (uid-fidelity design §4 follow-up): emitted
+        // only when an owner leg is 0, i.e. exactly when the share would
+        // present as nobody through the shifted map (guest-0 unmapped). Rides
+        // the docker token set — init applies it with the SAME layer extents,
+        // fail-soft on backends without FUSE_ALLOW_IDMAP (OpenVMM).
+        if d.ws_idmap {
+            c.push_str(" izba.wsidmap=1");
+        }
     }
     c
 }
@@ -748,10 +757,11 @@ fn write_oci_bundle(
             .gid_mappings()
             .as_ref()
             .context("docker-mode spec must carry gid mappings")?;
-        Some((
-            crate::image::runtime_config::layer_idmap_cmdline_value(uid),
-            crate::image::runtime_config::layer_idmap_cmdline_value(gid),
-        ))
+        Some(DockerCmdline {
+            uidmap: crate::image::runtime_config::layer_idmap_cmdline_value(uid),
+            gidmap: crate::image::runtime_config::layer_idmap_cmdline_value(gid),
+            ws_idmap: crate::image::runtime_config::workspace_idmap_needed(params.host_owner),
+        })
     } else {
         None
     };
@@ -786,7 +796,18 @@ fn write_oci_bundle(
 /// cmdline values extracted from the spec it just wrote.
 struct OciBundleOut {
     user_fallback: Option<crate::state::UserFallback>,
-    docker_idmaps: Option<(String, String)>,
+    docker_idmaps: Option<DockerCmdline>,
+}
+
+/// The docker-mode kernel-cmdline payload extracted from the just-written OCI
+/// spec: the layer-idmap extents (`izba.uidmap=`/`izba.gidmap=`) plus whether
+/// the workspace share needs an in-guest idmapped mount (`izba.wsidmap=1` —
+/// see [`crate::image::runtime_config::workspace_idmap_needed`]).
+#[derive(Clone)]
+struct DockerCmdline {
+    uidmap: String,
+    gidmap: String,
+    ws_idmap: bool,
 }
 
 /// Writes the SSH host key and authorized_keys into the per-sandbox ssh share
@@ -3819,19 +3840,24 @@ mod tests {
     /// the host actually put the sandbox in docker mode.
     #[test]
     fn cmdline_includes_docker_flag_only_when_enabled() {
-        let maps = (
-            "0-2097152-1048576".to_string(),
-            "0-2097152-1048576".to_string(),
-        );
+        let maps = DockerCmdline {
+            uidmap: "0-2097152-1048576".to_string(),
+            gidmap: "0-2097152-1048576".to_string(),
+            ws_idmap: false,
+        };
         let on = build_cmdline("s", &[], false, false, Some(&maps));
         assert!(on.contains(" izba.docker=1"));
         // The layer-idmap extents ride the SAME token set — never apart from
         // the flag (uid-fidelity design §2.3).
         assert!(on.contains(" izba.uidmap=0-2097152-1048576"));
         assert!(on.contains(" izba.gidmap=0-2097152-1048576"));
+        // ws_idmap=false (the common non-zero-owner case) must NOT emit the
+        // workspace-idmap token.
+        assert!(!on.contains("izba.wsidmap"));
         let off = build_cmdline("s", &[], false, false, None);
         assert!(!off.contains("izba.docker"));
         assert!(!off.contains("izba.uidmap") && !off.contains("izba.gidmap"));
+        assert!(!off.contains("izba.wsidmap"));
         // Exercises the REAL guard (`SandboxConfig::docker_effective`): a
         // builder sandbox that also requested docker mode must be computed down
         // to `docker=false` BEFORE reaching build_cmdline, so the emitted
@@ -3853,6 +3879,24 @@ mod tests {
         let guarded_maps = cfg.docker_effective().then(|| maps.clone());
         let guarded = build_cmdline("s", &[], cfg.builder, false, guarded_maps.as_ref());
         assert!(!guarded.contains("izba.docker"));
+    }
+
+    /// `izba.wsidmap=1` is emitted exactly when the docker payload says the
+    /// workspace share needs the in-guest idmapped mount, and always INSIDE
+    /// the docker token set (it can never appear without `izba.docker=1`).
+    #[test]
+    fn cmdline_includes_wsidmap_only_when_flagged() {
+        let maps = DockerCmdline {
+            uidmap: "0-2097152-1048576".to_string(),
+            gidmap: "0-2097152-1048576".to_string(),
+            ws_idmap: true,
+        };
+        let c = build_cmdline("s", &[], false, false, Some(&maps));
+        assert!(c.contains(" izba.docker=1"));
+        assert!(
+            c.contains(" izba.wsidmap=1"),
+            "ws_idmap=true must emit the workspace-idmap token, got: {c}"
+        );
     }
 
     /// `write_oci_bundle` must hand back the layer-idmap cmdline values in
@@ -3886,7 +3930,7 @@ mod tests {
         let db = crate::image::runtime_config::UserDb::from_files(None, None);
 
         let out = write_oci_bundle(&oci, "t", None, &db, false, &mk_cfg(true)).unwrap();
-        let (uidmap, gidmap) = out.docker_idmaps.expect("docker mode must return idmaps");
+        let d = out.docker_idmaps.expect("docker mode must return idmaps");
         // The expectation is recomputed through the same public functions with
         // the same inputs (owner = this process's euid/egid via the workspace
         // dir it just created; workload = root, no image USER) — equality here
@@ -3898,8 +3942,14 @@ mod tests {
         let (u, g) = crate::image::runtime_config::compute_docker_userns_mappings(owner, (0, 0))
             .expect("maps build");
         use crate::image::runtime_config::layer_idmap_cmdline_value;
-        assert_eq!(uidmap, layer_idmap_cmdline_value(&u));
-        assert_eq!(gidmap, layer_idmap_cmdline_value(&g));
+        assert_eq!(d.uidmap, layer_idmap_cmdline_value(&u));
+        assert_eq!(d.gidmap, layer_idmap_cmdline_value(&g));
+        // Same recompute-through-the-public-fn pinning for the workspace-idmap
+        // decision (true only when an owner leg is 0 — root test runs).
+        assert_eq!(
+            d.ws_idmap,
+            crate::image::runtime_config::workspace_idmap_needed(owner)
+        );
         // And the written spec really is the docker-mode one.
         let spec: serde_json::Value =
             serde_json::from_slice(&std::fs::read(oci.join("config.json")).unwrap()).unwrap();

@@ -725,6 +725,27 @@ pub fn layer_idmap_cmdline_value(userns_map: &[oci_spec::runtime::LinuxIdMapping
         .join(",")
 }
 
+/// Whether the workspace virtiofs share needs a guest-side idmapped mount in
+/// docker mode (`izba.wsidmap=1`).
+///
+/// The share presents its files with the HOST owner's ids (virtiofsd
+/// passthrough on Linux; guest-0 on OpenVMM, whose stub `workspace_owner()`
+/// reports `(0, 0)`). When an owner leg is non-zero the shifted map's owner
+/// carve-out already presents `/workspace` as the workload USER in-container
+/// — the common Linux case, no idmap needed. When a leg is 0, guest-0 is
+/// deliberately UNMAPPED (F-32: the rootless invariant), so the share would
+/// list as `nobody`/`nogroup` and be writable only through the 0777 mode
+/// bits. For exactly that case izba-init stacks an idmapped mount over the
+/// share using the SAME layer extents as `/lower`/`/upper`, which presents
+/// disk-0 as container-root and gives every mapped container id a write-through
+/// reverse mapping. Fail-soft in the guest: a virtiofs backend that does not
+/// advertise `FUSE_ALLOW_IDMAP` (OpenVMM today) rejects the idmap and init
+/// keeps the un-idmapped share (the documented §6 cosmetic) rather than
+/// failing the boot.
+pub fn workspace_idmap_needed(host_owner: (u32, u32)) -> bool {
+    host_owner.0 == 0 || host_owner.1 == 0
+}
+
 /// Render the 6 canonical CA-bundle env pairs as `"KEY=VALUE"` strings for
 /// the OCI spec's process environment.
 ///
@@ -1652,6 +1673,19 @@ mod tests {
                 r - 1001
             )
         );
+    }
+
+    #[test]
+    fn workspace_idmap_needed_exactly_when_an_owner_leg_is_zero() {
+        // Zero leg(s) ⇒ the share would present through the shifted map as
+        // nobody/nogroup (guest-0 unmapped, F-32) ⇒ idmap it. Non-zero owner
+        // (the common Linux case) ⇒ the owner carve-out already presents the
+        // share as the workload USER ⇒ leave it alone.
+        assert!(workspace_idmap_needed((0, 0)));
+        assert!(workspace_idmap_needed((0, 1000)));
+        assert!(workspace_idmap_needed((1000, 0)));
+        assert!(!workspace_idmap_needed((1000, 1000)));
+        assert!(!workspace_idmap_needed((1, 1)));
     }
 
     #[test]
