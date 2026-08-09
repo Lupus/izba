@@ -61,6 +61,9 @@ struct RelaySlot {
 #[derive(Default)]
 pub struct RelayManager {
     inner: Mutex<HashMap<String, Vec<RelaySlot>>>,
+    /// Test hook — see [`RelayManager::fail_next_publish_bound`].
+    #[cfg(test)]
+    fail_next_publish: AtomicBool,
 }
 
 impl RelayManager {
@@ -71,6 +74,14 @@ impl RelayManager {
     /// Bind `(rule.bind, rule.host_port)` and start the relay thread.
     /// Synchronous error on duplicate key or bind failure.
     pub fn publish(&self, paths: &Paths, name: &str, rule: PortRule) -> anyhow::Result<()> {
+        // Port 0 belongs to `publish_bound` alone: `spawn_slot` rewrites a
+        // zero host port from the listener, which would silently defeat the
+        // duplicate-key check below (every `0` rule looks distinct, and the
+        // stored rule is not the one the caller asked for). The CLI already
+        // rejects `:0` in a rule spec, so this seals the library seam.
+        if rule.host_port == 0 {
+            bail!("host port 0 is not publishable — use publish_bound for an ephemeral relay");
+        }
         let mut inner = self.inner.lock().unwrap();
         let slots = inner.entry(name.to_string()).or_default();
         if slots
@@ -99,6 +110,8 @@ impl RelayManager {
     /// it is derived per-start state, not a published port (spec
     /// 2026-08-09 §5).
     pub fn publish_bound(&self, paths: &Paths, name: &str, rule: PortRule) -> anyhow::Result<u16> {
+        #[cfg(test)]
+        self.take_forced_failure()?;
         let mut inner = self.inner.lock().unwrap();
         let slot = spawn_slot(paths, name, rule)?;
         let port = slot.rule.host_port;
@@ -172,6 +185,24 @@ impl RelayManager {
                 }
             }
         }
+    }
+
+    /// Test hook: make the NEXT `publish_bound` fail the way an unbindable
+    /// host port would. There is no portable way to make an EPHEMERAL
+    /// loopback bind fail on demand, and the fail-loud posture of the call
+    /// site (`handle_start` propagates the error rather than degrading to a
+    /// VNC-less sandbox) is exactly the behaviour that needs a test.
+    #[cfg(test)]
+    pub(crate) fn fail_next_publish_bound(&self) {
+        self.fail_next_publish.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn take_forced_failure(&self) -> anyhow::Result<()> {
+        if self.fail_next_publish.swap(false, Ordering::SeqCst) {
+            bail!("host port 127.0.0.1:0 is unavailable (forced test failure)");
+        }
+        Ok(())
     }
 
     /// Test hook: a slot whose thread is already finished (simulated crash).
@@ -409,6 +440,19 @@ mod tests {
         assert_eq!(mgr.active("web").first().map(|r| r.host_port), Some(port));
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
         mgr.stop_all("web");
+    }
+
+    /// `publish` is the FIXED-port path: port 0 must be refused outright.
+    /// `spawn_slot`'s rewrite would otherwise hand `publish` a stored rule the
+    /// caller never asked for and make its duplicate-key check blind (every
+    /// `0` rule looks distinct). No bind happens, so this needs no skip.
+    #[test]
+    fn publish_refuses_port_zero() {
+        let (_d, paths) = test_paths();
+        let mgr = RelayManager::new();
+        let err = mgr.publish(&paths, "web", rule(0)).unwrap_err();
+        assert!(err.to_string().contains("not publishable"), "{err:#}");
+        assert!(mgr.active("web").is_empty());
     }
 
     /// `publish` (the fixed-port path) must keep reporting exactly the rule
