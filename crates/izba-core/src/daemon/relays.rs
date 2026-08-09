@@ -83,6 +83,29 @@ impl RelayManager {
         Ok(())
     }
 
+    /// Like [`publish`](Self::publish), but for a relay whose host port the
+    /// KERNEL picks: pass `rule.host_port: 0` and the actually-bound port is
+    /// returned AND stored (the slot keeps the REWRITTEN rule, so `active()`,
+    /// the URL the daemon prints and a later `respawn_dead` rebind all agree
+    /// on one real port).
+    ///
+    /// No duplicate-key check, unlike `publish`: an ephemeral bind can never
+    /// collide with a port this manager already holds (the kernel does not
+    /// hand out a bound port), and a caller passing a fixed port that IS
+    /// taken gets the same synchronous "unavailable" bind error anyway.
+    ///
+    /// Used for the VNC relay, which lives in the daemon's SEPARATE
+    /// `vnc_relays` manager precisely so it can never reach `save_rules` —
+    /// it is derived per-start state, not a published port (spec
+    /// 2026-08-09 §5).
+    pub fn publish_bound(&self, paths: &Paths, name: &str, rule: PortRule) -> anyhow::Result<u16> {
+        let mut inner = self.inner.lock().unwrap();
+        let slot = spawn_slot(paths, name, rule)?;
+        let port = slot.rule.host_port;
+        inner.entry(name.to_string()).or_default().push(slot);
+        Ok(port)
+    }
+
     pub fn unpublish(&self, name: &str, bind: Ipv4Addr, host_port: u16) -> anyhow::Result<()> {
         let slot = {
             let mut inner = self.inner.lock().unwrap();
@@ -153,7 +176,7 @@ impl RelayManager {
 
     /// Test hook: a slot whose thread is already finished (simulated crash).
     #[cfg(test)]
-    fn insert_for_test(&self, name: &str, rule: PortRule) {
+    pub(crate) fn insert_for_test(&self, name: &str, rule: PortRule) {
         let thread = std::thread::spawn(|| {});
         while !thread.is_finished() {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -171,9 +194,19 @@ impl RelayManager {
     }
 }
 
-fn spawn_slot(paths: &Paths, name: &str, rule: PortRule) -> anyhow::Result<RelaySlot> {
+fn spawn_slot(paths: &Paths, name: &str, mut rule: PortRule) -> anyhow::Result<RelaySlot> {
     let listener = TcpListener::bind((rule.bind, rule.host_port))
         .with_context(|| format!("host port {}:{} is unavailable", rule.bind, rule.host_port))?;
+    // Ephemeral publish (`publish_bound`): the bind above is what decides the
+    // port, so rewrite the rule with the kernel's choice BEFORE it is stored
+    // — a slot left holding `0` would report a useless rule and rebind onto a
+    // different port on respawn.
+    if rule.host_port == 0 {
+        rule.host_port = listener
+            .local_addr()
+            .context("reading the ephemeral relay port")?
+            .port();
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let vsock = crate::sandbox::live_run_dir(paths, name).join("vsock.sock");
     let stop2 = Arc::clone(&stop);
@@ -302,6 +335,95 @@ mod tests {
             err.to_string().contains("no such published port"),
             "{err:#}"
         );
+    }
+
+    /// `publish_bound` with `host_port: 0` must report the port the KERNEL
+    /// chose, and store that REWRITTEN rule — `active()` (and therefore the
+    /// URL the daemon prints, and a later `respawn_dead`) must all agree on
+    /// the real port, never on the `0` the caller asked for.
+    #[test]
+    fn publish_bound_reports_the_ephemeral_port() {
+        if !bind_works() {
+            return;
+        }
+        let (_d, paths) = test_paths();
+        let mgr = RelayManager::new();
+        let port = mgr
+            .publish_bound(
+                &paths,
+                "web",
+                PortRule {
+                    bind: "127.0.0.1".parse().unwrap(),
+                    host_port: 0,
+                    guest_port: 6901,
+                },
+            )
+            .unwrap();
+        assert_ne!(port, 0, "an ephemeral publish must report a real port");
+        assert_eq!(
+            mgr.active("web"),
+            vec![PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: port,
+                guest_port: 6901,
+            }],
+            "the stored rule must carry the bound port, not the requested 0"
+        );
+        // The reported port is genuinely bound.
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+        mgr.stop_all("web");
+    }
+
+    /// A crashed ephemeral relay must come back on the SAME port — the URL
+    /// handed to the user has to stay valid across a respawn, which only
+    /// works because the slot stores the rewritten rule.
+    #[test]
+    fn respawn_dead_reuses_the_ephemeral_port() {
+        if !bind_works() {
+            return;
+        }
+        let (_d, paths) = test_paths();
+        let mgr = RelayManager::new();
+        let port = mgr
+            .publish_bound(
+                &paths,
+                "web",
+                PortRule {
+                    bind: "127.0.0.1".parse().unwrap(),
+                    host_port: 0,
+                    guest_port: 6901,
+                },
+            )
+            .unwrap();
+        mgr.stop_all("web");
+        // Re-insert as a "crashed" slot carrying the rewritten rule.
+        mgr.insert_for_test(
+            "web",
+            PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: port,
+                guest_port: 6901,
+            },
+        );
+        mgr.respawn_dead(&paths, "web");
+        assert_eq!(mgr.active("web").first().map(|r| r.host_port), Some(port));
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+        mgr.stop_all("web");
+    }
+
+    /// `publish` (the fixed-port path) must keep reporting exactly the rule
+    /// it was given — the rewrite is ephemeral-only.
+    #[test]
+    fn publish_keeps_the_requested_fixed_port() {
+        if !bind_works() {
+            return;
+        }
+        let (_d, paths) = test_paths();
+        let mgr = RelayManager::new();
+        let r = rule(free_port());
+        mgr.publish(&paths, "web", r.clone()).unwrap();
+        assert_eq!(mgr.active("web"), vec![r]);
+        mgr.stop_all("web");
     }
 
     #[test]
