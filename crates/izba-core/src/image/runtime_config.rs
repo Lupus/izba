@@ -462,6 +462,10 @@ pub const USERNS_RANGE_END: u32 = u32::MAX; // 4294967295, exclusive
 ///   are world-rx and the workload is already root, so nothing breaks.
 /// - When `workload_id == owner_id` (e.g. host uid 1000 running an image whose
 ///   USER is uid 1000) the map degenerates to pure identity.
+/// - When `owner_id == 0` (the Windows OpenVMM anchor — shares present as
+///   guest-0 mode 0777 — or a root-owned Linux workspace) the map is ALSO
+///   identity: transposing 0↔workload would scramble every root-owned image
+///   file for nothing (see the in-function comment).
 ///
 /// The returned extents are a bijection over `0..USERNS_RANGE_END` with no
 /// overlapping host ranges (the kernel rejects overlaps), using at most five
@@ -484,7 +488,18 @@ pub fn transpose_identity_map(
     };
 
     // workload == owner ⇒ the swap is a no-op ⇒ a single full-range identity map.
-    if workload_id == owner_id {
+    //
+    // owner == 0 (workload non-root) ⇒ ALSO identity. A zero owner anchor means
+    // the guest-visible workspace owner is root: the Windows OpenVMM virtiofs
+    // backend (which presents every share as guest-0 with mode 0777), or a
+    // root-owned Linux workspace (`sudo izba`). Transposing 0↔workload there
+    // scrambles every root-owned image file — setuid `sudo` becomes owned by
+    // the workload uid and the workload's own $HOME becomes root's (the
+    // claude-code-on-Windows breakage) — while buying nothing: on Windows the
+    // 0777 share mode already grants the workload write access, and on a
+    // root-owned Linux workspace the honest answer is that root's files are
+    // not the workload's to own.
+    if workload_id == owner_id || owner_id == 0 {
         return vec![extent(0, 0, USERNS_RANGE_END)];
     }
 
@@ -556,22 +571,158 @@ fn maps_root_to_host_root(mappings: &[oci_spec::runtime::LinuxIdMapping]) -> boo
 /// to a NON-zero guest id, the acting euid is not guest-0 and the write is
 /// denied. `CAP_DAC_OVERRIDE` cannot rescue it either, because
 /// `capable_wrt_inode_uidgid` (torvalds/linux `23adbe12`) additionally requires
-/// the file's owner uid to be MAPPED into the acting userns — and guest-uid-0 is
-/// exactly what a container-0 ≠ guest-0 map leaves unmapped. So the write is
+/// the file's owner uid to be MAPPED into the acting userns. The
+/// [`docker_shifted_map`] leaves guest-uid-0 entirely unmapped, so the write is
 /// denied **regardless of any remount**. This is the same design as rootless
 /// containers (rootlesscontaine.rs, docker.com/engine/security/rootless).
 ///
-/// `transpose_identity_map` breaks the invariant (container-0 → guest-0)
-/// whenever `workload == owner` OR `min(workload, owner) > 0` — i.e. a
-/// root-owned workspace running a root image, a same-uid workspace/USER, or a
-/// non-root image `USER` on a non-root workspace. It HOLDS iff exactly one of
-/// `{workload, owner}` is zero (the common flow: a root docker image on a
-/// non-root-owned workspace ⇒ container-0 → guest-owner). The caller
-/// ([`generate_spec`]) fails a docker-mode start closed when this returns
-/// `false`.
-pub fn docker_userns_isolates_root(owner: (u32, u32), workload: (u32, u32)) -> bool {
-    let (uid_maps, gid_maps) = compute_userns_mappings(owner, workload);
-    !maps_root_to_host_root(&uid_maps) && !maps_root_to_host_root(&gid_maps)
+/// The shifted map satisfies this **by construction** (container-0 → `BASE` or
+/// → the non-zero owner), so since the shifted-map change this is a regression
+/// TRIPWIRE over the actual mappings — asserted by [`generate_spec`] — rather
+/// than a user-facing fail-closed gate. (The old transpose could violate it,
+/// which is why non-root-`USER` images used to be refused in docker mode.)
+pub fn docker_userns_isolates_root(
+    uid_maps: &[oci_spec::runtime::LinuxIdMapping],
+    gid_maps: &[oci_spec::runtime::LinuxIdMapping],
+) -> bool {
+    !maps_root_to_host_root(uid_maps) && !maps_root_to_host_root(gid_maps)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Docker mode — shifted userns map + idmapped layers (uid-fidelity design)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Number of ids the docker-mode map covers, starting at container id 0.
+/// 2^20 comfortably covers real-world image uids (system accounts, `nobody`,
+/// the occasional 100000-range rpm ghost) while keeping the guest window far
+/// below any plausible collision.
+pub const DOCKER_IDMAP_RANGE: u32 = 1 << 20;
+
+/// Default first guest id of the shifted window (`container 0 → guest BASE`).
+/// Bumped by one RANGE when the workspace-owner id happens to fall inside the
+/// window (see [`docker_shifted_map`]).
+pub const DOCKER_IDMAP_BASE: u32 = 1 << 21;
+
+/// Build the docker-mode container id map — the rootless-container playbook
+/// (uid-fidelity design §2.1). One function `guest_of(c)` shapes BOTH this
+/// userns map and the layer idmap izba-init applies to the erofs/ext4 layers
+/// (delivered via `izba.uidmap=`/`izba.gidmap=`, same extents):
+///
+/// - `guest_of(c) = BASE + c` for `c ∈ [0, RANGE)`, **except**
+/// - `guest_of(workload) = owner` iff `owner != 0` — the workspace carve-out
+///   that keeps the image `USER` owning the virtiofs `/workspace` (whose
+///   guest-visible owner is `owner`, and whose FUSE driver forces
+///   `default_permissions`, so ownership is what grants the write).
+///
+/// With the layers idmapped by the same function, a file stored with image
+/// uid `D` presents in-container as `D` again — verbatim image ownership —
+/// while guest-0 stays **unmapped** (the F-32 barrier, strictly stronger than
+/// the old transpose which mapped guest-0 to the workload id).
+///
+/// `owner == 0` (the Windows anchor, or a root-owned workspace) ⇒ **no
+/// carve-out**: mapping any container id to guest-0 would hand the workload
+/// guest-root's euid for the sysctl DAC check. The Windows share is 0777, so
+/// writability survives without ownership.
+pub fn docker_shifted_map(
+    workload_id: u32,
+    owner_id: u32,
+) -> Result<Vec<oci_spec::runtime::LinuxIdMapping>> {
+    use oci_spec::runtime::LinuxIdMappingBuilder;
+    anyhow::ensure!(
+        workload_id < DOCKER_IDMAP_RANGE,
+        "docker mode: the image USER id {workload_id} is outside the mapped id range \
+         (0..{DOCKER_IDMAP_RANGE}); such an image cannot run in docker mode"
+    );
+    let extent = |container: u32, host: u32, size: u32| {
+        LinuxIdMappingBuilder::default()
+            .container_id(container)
+            .host_id(host)
+            .size(size)
+            .build()
+            .expect("LinuxIdMapping build is infallible for u32 fields")
+    };
+    // Keep the guest window clear of the owner id so the carve-out extent can
+    // never overlap the shift extents (the kernel rejects overlapping maps).
+    // The two candidate windows are disjoint, so the owner is inside at most
+    // one of them.
+    let base = if (DOCKER_IDMAP_BASE..DOCKER_IDMAP_BASE + DOCKER_IDMAP_RANGE).contains(&owner_id) {
+        DOCKER_IDMAP_BASE + DOCKER_IDMAP_RANGE
+    } else {
+        DOCKER_IDMAP_BASE
+    };
+    if owner_id == 0 {
+        return Ok(vec![extent(0, base, DOCKER_IDMAP_RANGE)]);
+    }
+    let mut maps = Vec::with_capacity(3);
+    if workload_id > 0 {
+        maps.push(extent(0, base, workload_id));
+    }
+    maps.push(extent(workload_id, owner_id, 1));
+    if workload_id < DOCKER_IDMAP_RANGE - 1 {
+        maps.push(extent(
+            workload_id + 1,
+            base + workload_id + 1,
+            DOCKER_IDMAP_RANGE - workload_id - 1,
+        ));
+    }
+    Ok(maps)
+}
+
+/// Docker-mode `(uidMappings, gidMappings)` — [`docker_shifted_map`] applied
+/// to the uid and gid dimensions independently (same shape as
+/// [`compute_userns_mappings`] for the transpose).
+pub fn compute_docker_userns_mappings(
+    owner: (u32, u32),
+    workload: (u32, u32),
+) -> Result<(
+    Vec<oci_spec::runtime::LinuxIdMapping>,
+    Vec<oci_spec::runtime::LinuxIdMapping>,
+)> {
+    Ok((
+        docker_shifted_map(workload.0, owner.0)?,
+        docker_shifted_map(workload.1, owner.1)?,
+    ))
+}
+
+/// Disk id that fsuid-0 writers land on through the idmapped layers — the
+/// [`layer_idmap_cmdline_value`] anchor extent (`disk RANGE → presented 0`).
+///
+/// Kernel background: a write through an idmapped mount reverse-maps the
+/// writer's fsuid; a fsuid with NO reverse mapping fails `EOVERFLOW`. Guest
+/// fsuid-0 writers are unavoidable — overlayfs creates whiteouts/copy-ups
+/// with the MOUNTER's creds (izba-init, fsuid 0), and crun mkdirs missing
+/// mount targets — so the layer map must give presented-0 a disk id. It is
+/// `DOCKER_IDMAP_RANGE` itself: one past every image uid the map covers, so
+/// it collides with nothing and such files present in-container as `nobody`
+/// (guest-0 is unmapped in the container userns — F-32). izba-init's OWN
+/// writes (resolv.conf, trust CA, `izba cp`) instead run under
+/// `setfsuid(presented-of-disk-0)` so they land as disk-0 = container-root.
+pub const DOCKER_IDMAP_FSUID0_DISK_ID: u32 = DOCKER_IDMAP_RANGE;
+
+/// Serialize a container userns map as the **layer idmap** `izba.uidmap=`/
+/// `izba.gidmap=` kernel-cmdline value: comma-separated `disk-presented-size`
+/// triples, plus the fsuid-0 anchor extent
+/// (see [`DOCKER_IDMAP_FSUID0_DISK_ID`]).
+///
+/// Orientation (VERIFIED on a real VM — an inverted first cut presented
+/// every image-root file as `nobody`): an idmapped mount computes
+/// `presented = make_kuid(mnt_userns, disk_uid)`, i.e. the DISK uid is the
+/// namespace-INNER id and the presented uid is the OUTER id, so a userns
+/// `uid_map` line reads `<disk> <presented> <n>`. The OCI userns extent
+/// `(container, guest, n)` has disk==container==image-uid and
+/// presented==guest, which makes the layer triples the OCI extents
+/// **verbatim** — same columns, no swap. Host-authoritative, same
+/// channel-shape as `izba.volumes`; parsed by izba-init's `idmap.rs` and
+/// written verbatim as the layer-idmap userns map lines.
+pub fn layer_idmap_cmdline_value(userns_map: &[oci_spec::runtime::LinuxIdMapping]) -> String {
+    userns_map
+        .iter()
+        .map(|m| format!("{}-{}-{}", m.container_id(), m.host_id(), m.size()))
+        .chain(std::iter::once(format!(
+            "{DOCKER_IDMAP_FSUID0_DISK_ID}-0-1"
+        )))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Render the 6 canonical CA-bundle env pairs as `"KEY=VALUE"` strings for
@@ -711,29 +862,6 @@ const SERIAL_MAJORS: [i64; 2] = [166, 188];
 /// load-bearing decision **D1** — drops the network namespace so the container
 /// shares izba-init's netns (egress/port-relay/ssh all live there).
 pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
-    // Docker mode's durable security barrier (spec §3): fail the start CLOSED
-    // unless the container user namespace isolates container-root from
-    // guest-root. See [`docker_userns_isolates_root`] for why this — not the
-    // `/proc/sys` read-only binds — is what actually contains a
-    // `CAP_SYS_ADMIN`-holding docker-mode workload. `privileged` never sets a
-    // userns (builders own the whole guest), and docker+privileged is mutually
-    // exclusive, so this only gates the docker-mode userns path.
-    if params.docker && !docker_userns_isolates_root(params.host_owner, params.user) {
-        let (o_uid, o_gid) = params.host_owner;
-        let (w_uid, w_gid) = params.user;
-        anyhow::bail!(
-            "docker mode requires the container's root to map to a NON-root guest \
-             user — the rootless-container invariant (as in rootless Docker/Podman) \
-             that keeps /proc/sys, cgroup and mount-based escapes contained inside \
-             the user namespace. With this workspace owned by uid {o_uid}/gid {o_gid} \
-             and the image USER uid {w_uid}/gid {w_gid}, izba's id transposition would \
-             map container-root to guest-root, so the sandbox is refused. The invariant \
-             holds when exactly ONE of {{workspace owner, image USER}} is root — the \
-             standard docker-in-sandbox setup is a root image (`docker:dind`) on a \
-             workspace owned by your non-root user, so re-create the sandbox on such a \
-             workspace and do not run izba as root."
-        );
-    }
     let cfg = params.image;
     let image_ep: Vec<String> = cfg.and_then(|c| c.entrypoint.clone()).unwrap_or_default();
     let image_cmd: Vec<String> = cfg.and_then(|c| c.cmd.clone()).unwrap_or_default();
@@ -840,7 +968,25 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
             linux.set_namespaces(Some(nss));
         }
         if !params.privileged {
-            let (uid_maps, gid_maps) = compute_userns_mappings(params.host_owner, params.user);
+            let (uid_maps, gid_maps) = if params.docker {
+                // Docker mode (uid-fidelity design §2): the shifted map. The
+                // matching layer idmap (same extents, applied by izba-init to
+                // the erofs/ext4 layers via izba.uidmap=/izba.gidmap=) is what
+                // makes image uids present verbatim in-container; this userns
+                // half is what keeps guest-root unmapped — the F-32 barrier,
+                // now satisfied for EVERY (owner, USER) shape, so the old
+                // fail-closed refusal of non-root-USER images is gone.
+                let (u, g) = compute_docker_userns_mappings(params.host_owner, params.user)?;
+                // Regression tripwire, never a user-facing gate: the shifted
+                // map isolates container-root by construction.
+                debug_assert!(
+                    docker_userns_isolates_root(&u, &g),
+                    "docker_shifted_map must never map container-root to guest-root"
+                );
+                (u, g)
+            } else {
+                compute_userns_mappings(params.host_owner, params.user)
+            };
             linux.set_uid_mappings(Some(uid_maps));
             linux.set_gid_mappings(Some(gid_maps));
         }
@@ -1320,6 +1466,164 @@ mod tests {
         let m = transpose_identity_map(0, 0);
         assert_eq!(m.len(), 1);
         assert_eq!(map_c2h(&m, 0), Some(0));
+    }
+
+    #[test]
+    fn userns_owner_zero_nonroot_workload_is_identity() {
+        // owner 0 with a non-root workload = the Windows anchor stub (OpenVMM
+        // virtiofs presents guest-0 0777) or a root-owned Linux workspace
+        // (`sudo izba`). Transposing 0↔workload scrambles EVERY root-owned
+        // image file (setuid sudo → uid workload, workload's $HOME → root) —
+        // the claude-code-on-Windows breakage. Identity keeps the image
+        // faithful; workspace writability comes from the share's own mode
+        // (0777 on Windows), not from ownership games.
+        let m = transpose_identity_map(1000, 0);
+        assert_eq!(m.len(), 1);
+        assert_eq!(map_c2h(&m, 0), Some(0));
+        assert_eq!(map_c2h(&m, 1000), Some(1000));
+        assert_eq!(map_c2h(&m, 65534), Some(65534));
+    }
+
+    // ---- docker-mode shifted map (docker_shifted_map) ----
+
+    /// Sum of extent sizes == the mapped id count; extents must not overlap on
+    /// either side.
+    fn assert_shifted_invariants(m: &[oci_spec::runtime::LinuxIdMapping]) {
+        assert_no_host_overlap(m);
+        let mut cranges: Vec<(u64, u64)> = m
+            .iter()
+            .map(|e| {
+                (
+                    e.container_id() as u64,
+                    e.container_id() as u64 + e.size() as u64,
+                )
+            })
+            .collect();
+        cranges.sort();
+        for w in cranges.windows(2) {
+            assert!(w[0].1 <= w[1].0, "container ranges overlap: {cranges:?}");
+        }
+    }
+
+    #[test]
+    fn docker_shifted_map_common_linux_flow_owner_equals_workload() {
+        // THE claude-code-docker case that used to fail closed: image USER
+        // agent (1000) on a workspace owned by host uid 1000.
+        let m = docker_shifted_map(1000, 1000).expect("map builds");
+        // container-root → BASE, never guest-0 (F-32, by construction).
+        assert_eq!(map_c2h(&m, 0), Some(DOCKER_IDMAP_BASE));
+        // the workload owns the workspace (carve-out to guest-owner).
+        assert_eq!(map_c2h(&m, 1000), Some(1000));
+        // linear shift around the carve-out.
+        assert_eq!(map_c2h(&m, 999), Some(DOCKER_IDMAP_BASE + 999));
+        assert_eq!(map_c2h(&m, 1001), Some(DOCKER_IDMAP_BASE + 1001));
+        // guest-0 is entirely unmapped (strictly stronger than the transpose):
+        // a host range contains 0 iff it STARTS at 0 (ranges are ascending).
+        assert!(!m.iter().any(|e| e.host_id() == 0 && e.size() > 0));
+        assert_shifted_invariants(&m);
+    }
+
+    #[test]
+    fn docker_shifted_map_root_image_on_user_workspace() {
+        // docker:dind (USER root) on a uid-1000 workspace: container-root gets
+        // the carve-out → owns /workspace, exactly like the shipped dind e2e.
+        let m = docker_shifted_map(0, 1000).expect("map builds");
+        assert_eq!(map_c2h(&m, 0), Some(1000));
+        assert_eq!(map_c2h(&m, 1), Some(DOCKER_IDMAP_BASE + 1));
+        assert_eq!(
+            map_c2h(&m, DOCKER_IDMAP_RANGE - 1),
+            Some(DOCKER_IDMAP_BASE + DOCKER_IDMAP_RANGE - 1)
+        );
+        assert_shifted_invariants(&m);
+    }
+
+    #[test]
+    fn docker_shifted_map_owner_zero_is_pure_shift() {
+        // Windows (owner anchor 0): NO carve-out — mapping any container id to
+        // guest-0 would hand the workload guest-root's euid for sysctl DAC.
+        for workload in [0u32, 1000] {
+            let m = docker_shifted_map(workload, 0).expect("map builds");
+            assert_eq!(m.len(), 1);
+            assert_eq!(map_c2h(&m, 0), Some(DOCKER_IDMAP_BASE));
+            assert_eq!(map_c2h(&m, 1000), Some(DOCKER_IDMAP_BASE + 1000));
+            assert_shifted_invariants(&m);
+        }
+    }
+
+    #[test]
+    fn docker_shifted_map_owner_inside_window_bumps_base() {
+        // An owner uid that lands inside the default guest window would
+        // overlap the shift extents; the window moves up by one RANGE.
+        let owner = DOCKER_IDMAP_BASE + 5;
+        let m = docker_shifted_map(1000, owner).expect("map builds");
+        let base = DOCKER_IDMAP_BASE + DOCKER_IDMAP_RANGE;
+        assert_eq!(map_c2h(&m, 0), Some(base));
+        assert_eq!(map_c2h(&m, 1000), Some(owner));
+        assert_shifted_invariants(&m);
+    }
+
+    #[test]
+    fn docker_shifted_map_huge_owner_outside_window_is_fine() {
+        // A big (LDAP-style) owner uid far above the window: no bump needed,
+        // carve-out points straight at it.
+        let owner = 10_000_000;
+        let m = docker_shifted_map(1000, owner).expect("map builds");
+        assert_eq!(map_c2h(&m, 0), Some(DOCKER_IDMAP_BASE));
+        assert_eq!(map_c2h(&m, 1000), Some(owner));
+        assert_shifted_invariants(&m);
+    }
+
+    #[test]
+    fn docker_shifted_map_workload_above_range_is_refused() {
+        let err = docker_shifted_map(DOCKER_IDMAP_RANGE, 1000)
+            .expect_err("workload beyond the mapped range must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("USER"), "actionable message, got: {msg}");
+    }
+
+    #[test]
+    fn docker_shifted_map_workload_zero_boundary_extents() {
+        // workload 0 with non-zero owner: the carve-out IS container-0; no
+        // leading extent, and the tail covers [1, RANGE).
+        let m = docker_shifted_map(0, 7).expect("map builds");
+        assert_eq!(map_c2h(&m, 0), Some(7));
+        assert_eq!(map_c2h(&m, 1), Some(DOCKER_IDMAP_BASE + 1));
+        let total: u64 = m.iter().map(|e| e.size() as u64).sum();
+        assert_eq!(total, DOCKER_IDMAP_RANGE as u64);
+        assert_shifted_invariants(&m);
+    }
+
+    #[test]
+    fn compute_docker_userns_mappings_maps_uid_and_gid_independently() {
+        let (uid_maps, gid_maps) =
+            compute_docker_userns_mappings((1000, 2000), (10, 20)).expect("maps build");
+        assert_eq!(map_c2h(&uid_maps, 10), Some(1000));
+        assert_eq!(map_c2h(&gid_maps, 20), Some(2000));
+        // the OTHER dimension's ids follow the shift, not the carve-out.
+        assert_eq!(map_c2h(&uid_maps, 20), Some(DOCKER_IDMAP_BASE + 20));
+        assert_eq!(map_c2h(&gid_maps, 10), Some(DOCKER_IDMAP_BASE + 10));
+    }
+
+    #[test]
+    fn layer_idmap_cmdline_value_keeps_oci_columns_and_appends_fsuid0_anchor() {
+        // The cmdline fragment mirrors izba.volumes: comma-separated
+        // `disk-presented-n` triples — the OCI extents VERBATIM (disk uid is
+        // the mount userns's inner id; see layer_idmap_cmdline_value's
+        // orientation doc, verified on a real VM) — closed by the fsuid-0
+        // anchor so guest-root writers (overlay whiteouts, crun mkdirs)
+        // never EOVERFLOW.
+        let m = docker_shifted_map(1000, 1000).expect("map builds");
+        let s = layer_idmap_cmdline_value(&m);
+        let b = DOCKER_IDMAP_BASE;
+        let r = DOCKER_IDMAP_RANGE;
+        assert_eq!(
+            s,
+            format!(
+                "0-{b}-1000,1000-1000-1,1001-{}-{},{r}-0-1",
+                b + 1001,
+                r - 1001
+            )
+        );
     }
 
     #[test]
@@ -2020,60 +2324,65 @@ mod tests {
     // ---- docker-mode rootless container-0 ≠ guest-0 invariant ----
 
     #[test]
-    fn docker_userns_isolates_root_predicate_matches_the_rootless_rule() {
-        // SAFE — exactly one of {workload, owner} is zero. The common flow: a
-        // root docker image (USER 0) on a workspace owned by a non-root user.
-        // container-0 → guest-owner (non-zero).
-        assert!(docker_userns_isolates_root((1000, 1000), (0, 0)));
-        assert!(docker_userns_isolates_root((501, 501), (0, 0)));
-        // A root-owned workspace running a non-root image USER also isolates
-        // (owner 0, workload non-zero ⇒ container-0 → guest-workload).
-        assert!(docker_userns_isolates_root((0, 0), (101, 101)));
-
-        // VIOLATING — container-0 → guest-0. All three transpose shapes:
-        // (a) root-owned workspace + root image (the realistic `sudo izba` trap).
-        assert!(!docker_userns_isolates_root((0, 0), (0, 0)));
-        // (b) workload == owner, both non-zero (identity map).
-        assert!(!docker_userns_isolates_root((1000, 1000), (1000, 1000)));
-        // (c) both non-zero and distinct (min > 0 ⇒ leading identity extent).
-        assert!(!docker_userns_isolates_root((1000, 1000), (101, 101)));
-
-        // The gid leg is checked independently: a safe uid but a root-mapping
-        // gid must still be caught.
-        assert!(!docker_userns_isolates_root((1000, 0), (0, 0)));
-        assert!(!docker_userns_isolates_root((0, 1000), (0, 0)));
+    fn docker_userns_isolates_root_holds_for_every_shifted_shape() {
+        // F-32 holds BY CONSTRUCTION for the shifted map: container-root maps
+        // to BASE (owner 0 / workload≠0 shapes) or to the non-zero owner
+        // (workload 0). The predicate stays as a regression tripwire over the
+        // actual mappings, exercised across every shape — including the ones
+        // the old transpose could not satisfy (owner==workload, both-zero).
+        for (owner, workload) in [
+            ((1000, 1000), (0, 0)),
+            ((0, 0), (101, 101)),
+            ((0, 0), (0, 0)),
+            ((1000, 1000), (1000, 1000)),
+            ((1000, 1000), (101, 101)),
+            ((1000, 0), (0, 0)),
+            ((0, 1000), (0, 0)),
+        ] {
+            let (uid_maps, gid_maps) =
+                compute_docker_userns_mappings(owner, workload).expect("maps build");
+            assert!(
+                docker_userns_isolates_root(&uid_maps, &gid_maps),
+                "shifted map must isolate container-root for owner={owner:?} workload={workload:?}"
+            );
+        }
+        // And the tripwire still bites on a genuinely violating map (the old
+        // transpose identity shape).
+        let (u, g) = compute_userns_mappings((1000, 1000), (1000, 1000));
+        assert!(!docker_userns_isolates_root(&u, &g));
     }
 
     #[test]
-    fn docker_start_fails_closed_when_container_root_would_be_guest_root() {
-        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
-        // Root-owned workspace (owner 0/0) + a root image (user 0/0): the
-        // realistic `sudo izba` / root-workspace case. generate_spec must
-        // refuse, with an actionable, rootless-citing message.
+    fn docker_start_succeeds_for_non_root_user_image_on_same_uid_workspace() {
+        // THE claude-code-docker regression gate: image USER 1000 on a
+        // uid-1000-owned workspace USED to fail closed; the shifted map makes
+        // it start, with container-root isolated and the USER owning the
+        // workspace-owner id.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"], "User": "1000:1000" }));
         let mut p = base_params(&img);
         p.docker = true;
-        p.host_owner = (0, 0);
-        p.user = (0, 0);
-        let err = generate_spec(&p).expect_err("docker start must fail closed");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("rootless")
-                && msg.contains("non-root user")
-                && msg.contains("do not run izba as root"),
-            "message must be actionable + name the fix, got: {msg}"
-        );
+        p.host_owner = (1000, 1000);
+        p.user = (1000, 1000);
+        let spec = generate_spec(&p).expect("non-root USER docker sandbox must start");
+        let linux = spec.linux().as_ref().unwrap();
+        let uid_maps = linux.uid_mappings().clone().expect("uid mappings present");
+        assert_eq!(map_c2h(&uid_maps, 0), Some(DOCKER_IDMAP_BASE));
+        assert_eq!(map_c2h(&uid_maps, 1000), Some(1000));
 
-        // The SAME violating id map is accepted when docker mode is OFF — the
-        // invariant is a docker-mode gate, not a general one (Option A already
-        // maps container-0 → guest-0 for ordinary sandboxes by design).
+        // Non-docker mode keeps the transpose (identity here) untouched.
         let mut ok = base_params(&img);
         ok.docker = false;
-        ok.host_owner = (0, 0);
-        ok.user = (0, 0);
-        assert!(
-            generate_spec(&ok).is_ok(),
-            "non-docker mode must not be gated by the docker rootless invariant"
-        );
+        ok.host_owner = (1000, 1000);
+        ok.user = (1000, 1000);
+        let spec = generate_spec(&ok).expect("non-docker flow unchanged");
+        let uid_maps = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .uid_mappings()
+            .clone()
+            .expect("uid mappings present");
+        assert_eq!(map_c2h(&uid_maps, 0), Some(0));
     }
 
     #[test]
@@ -2093,16 +2402,22 @@ mod tests {
             .uid_mappings()
             .clone()
             .expect("uid mappings present");
-        // container id 0 maps to a non-zero guest uid.
-        let root_ext = uid_maps
-            .iter()
-            .find(|m| m.container_id() == 0)
-            .expect("an extent covering container id 0");
-        assert_ne!(
-            root_ext.host_id(),
-            0,
-            "container-root must map to a non-zero guest uid, got {root_ext:?}"
-        );
+        // container-root gets the carve-out: it owns the workspace (guest
+        // 1000), and is never guest-root.
+        assert_eq!(map_c2h(&uid_maps, 0), Some(1000));
+        // image system uids follow the shift (fidelity comes from the layer
+        // idmap presenting disk uids shifted the same way).
+        assert_eq!(map_c2h(&uid_maps, 33), Some(DOCKER_IDMAP_BASE + 33));
+    }
+
+    #[test]
+    fn docker_start_refuses_workload_beyond_mapped_range() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut p = base_params(&img);
+        p.docker = true;
+        p.user = (DOCKER_IDMAP_RANGE + 1, 0);
+        let err = generate_spec(&p).expect_err("out-of-range USER must be refused");
+        assert!(format!("{err:#}").contains("USER"));
     }
 
     #[test]

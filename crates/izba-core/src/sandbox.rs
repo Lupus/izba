@@ -242,7 +242,7 @@ fn build_cmdline(
     volumes: &[crate::volume::VolumeSpec],
     builder: bool,
     usb: bool,
-    docker: bool,
+    docker_idmaps: Option<&(String, String)>,
 ) -> String {
     let mut c = format!("console=ttyS0 izba.hostname={name}");
     if !volumes.is_empty() {
@@ -264,8 +264,13 @@ fn build_cmdline(
     // Same host-authoritative channel as USB: izba-init reads izba.docker=1
     // before the container starts, to bring up the extra plumbing docker mode
     // needs (fresh netns bring-up, rw cgroup already baked into the OCI spec).
-    if docker {
-        c.push_str(" izba.docker=1");
+    // The idmap values ride the same token set — `Some` IS docker mode, so the
+    // flag and the layer-idmap extents (uid-fidelity design §2.3, extracted
+    // from the just-written OCI spec) can never be emitted apart.
+    if let Some((uidmap, gidmap)) = docker_idmaps {
+        c.push_str(&format!(
+            " izba.docker=1 izba.uidmap={uidmap} izba.gidmap={gidmap}"
+        ));
     }
     c
 }
@@ -669,7 +674,7 @@ fn write_oci_bundle(
     user_db: &crate::image::runtime_config::UserDb,
     ca_present: bool,
     config: &SandboxConfig,
-) -> anyhow::Result<Option<crate::state::UserFallback>> {
+) -> anyhow::Result<OciBundleOut> {
     // Gate the CA trust-env defaults on the bundle actually being present —
     // same gate the guest applies in `build_env_overlay` (trust_bundle_present).
     // Today the host always writes ca.pem so this is always-open, but encoding
@@ -726,6 +731,30 @@ fn write_oci_bundle(
     };
     let spec =
         crate::image::runtime_config::generate_spec(&params).context("generating OCI spec")?;
+    // Docker mode: extract the very mappings just written into the spec as the
+    // izba.uidmap=/izba.gidmap= cmdline values — one generation site, so the
+    // layer idmap izba-init applies can never drift from the container userns
+    // map (the uid-fidelity design's change-all-ends-or-none contract).
+    let docker_idmaps = if params.docker {
+        let linux = spec
+            .linux()
+            .as_ref()
+            .context("docker-mode spec must carry a linux section")?;
+        let uid = linux
+            .uid_mappings()
+            .as_ref()
+            .context("docker-mode spec must carry uid mappings")?;
+        let gid = linux
+            .gid_mappings()
+            .as_ref()
+            .context("docker-mode spec must carry gid mappings")?;
+        Some((
+            crate::image::runtime_config::layer_idmap_cmdline_value(uid),
+            crate::image::runtime_config::layer_idmap_cmdline_value(gid),
+        ))
+    } else {
+        None
+    };
     let json = serde_json::to_vec_pretty(&spec).context("serializing OCI spec")?;
 
     // Atomic write: tempfile in the same dir, then rename into place.
@@ -746,7 +775,18 @@ fn write_oci_bundle(
     }
     tmp.persist(oci_dir.join("config.json"))
         .context("persisting oci/config.json")?;
-    Ok(user_fallback)
+    Ok(OciBundleOut {
+        user_fallback,
+        docker_idmaps,
+    })
+}
+
+/// What [`write_oci_bundle`] hands back to `start`: the loud USER-fallback
+/// warning (if any) and, in docker mode, the `izba.uidmap=`/`izba.gidmap=`
+/// cmdline values extracted from the spec it just wrote.
+struct OciBundleOut {
+    user_fallback: Option<crate::state::UserFallback>,
+    docker_idmaps: Option<(String, String)>,
 }
 
 /// Writes the SSH host key and authorized_keys into the per-sandbox ssh share
@@ -885,7 +925,10 @@ pub fn start_with_timeouts(
     let (passwd, group) = store.load_user_dbs(&config.image_digest)?;
     let user_db =
         crate::image::runtime_config::UserDb::from_files(passwd.as_deref(), group.as_deref());
-    let user_fallback = write_oci_bundle(
+    let OciBundleOut {
+        user_fallback,
+        docker_idmaps,
+    } = write_oci_bundle(
         &oci_dir,
         name,
         image_config,
@@ -912,17 +955,17 @@ pub fn start_with_timeouts(
     // no cmdline flag gates it).
     // izba.volumes (when present) carries the ordered guest mountpoints.
     // izba.buildout=1 (when present) signals the guest to mount the buildout share.
-    // Mirrors the `SpecParams.docker` guard above: the guest must never be
-    // told to bring up docker-mode plumbing (izba.docker=1 — veth datapath +
-    // auto-started dockerd) for a sandbox whose OCI spec was built with
-    // `docker: false` (dropped netns, no docker-mode caps) — that combination
-    // would be a self-contradictory guest state.
+    // izba.docker=1 + izba.uidmap/izba.gidmap travel as ONE token set, sourced
+    // from the OCI bundle just written (`docker_idmaps` is Some exactly when
+    // the spec was generated with `docker: true`) — the guest can never be
+    // told to bring up docker-mode plumbing for a non-docker spec, nor apply a
+    // layer idmap that drifts from the container userns map.
     let cmdline = build_cmdline(
         name,
         &config.volumes,
         config.builder,
         config.usb.is_enabled(),
-        config.docker_effective(),
+        docker_idmaps.as_ref(),
     );
     // Resolve per-sandbox account credentials when the sandbox is locked down
     // (Windows MVP-D).  On non-Windows and for unlocked sandboxes this is None
@@ -2110,8 +2153,8 @@ mod tests {
             size_bytes: 1 << 20,
             eph_id: None,
         }];
-        assert!(build_cmdline("web", &vols, false, false, false).contains("izba.volumes=/a"));
-        assert!(!build_cmdline("web", &[], false, false, false).contains("izba.volumes"));
+        assert!(build_cmdline("web", &vols, false, false, None).contains("izba.volumes=/a"));
+        assert!(!build_cmdline("web", &[], false, false, None).contains("izba.volumes"));
     }
 
     fn opts(workspace: &Path) -> CreateOpts {
@@ -3747,14 +3790,14 @@ mod tests {
     /// without grants boots a guest that refuses every USB RPC structurally.
     #[test]
     fn the_cmdline_declares_usb_only_for_a_sandbox_that_has_grants() {
-        assert!(build_cmdline("web", &[], false, true, false).contains("izba.usb=1"));
-        assert!(!build_cmdline("web", &[], false, false, false).contains("izba.usb"));
+        assert!(build_cmdline("web", &[], false, true, None).contains("izba.usb=1"));
+        assert!(!build_cmdline("web", &[], false, false, None).contains("izba.usb"));
     }
 
     /// build_cmdline with builder=true must contain `izba.buildout=1`.
     #[test]
     fn build_cmdline_builder_flag_appended() {
-        let c = build_cmdline("mybox", &[], true, false, false);
+        let c = build_cmdline("mybox", &[], true, false, None);
         assert!(
             c.contains("izba.buildout=1"),
             "builder cmdline must contain izba.buildout=1, got: {c}"
@@ -3764,7 +3807,7 @@ mod tests {
     /// build_cmdline with builder=false must NOT contain `izba.buildout`.
     #[test]
     fn build_cmdline_no_builder_flag_absent() {
-        let c = build_cmdline("mybox", &[], false, false, false);
+        let c = build_cmdline("mybox", &[], false, false, None);
         assert!(
             !c.contains("izba.buildout"),
             "non-builder cmdline must not contain izba.buildout, got: {c}"
@@ -3776,10 +3819,19 @@ mod tests {
     /// the host actually put the sandbox in docker mode.
     #[test]
     fn cmdline_includes_docker_flag_only_when_enabled() {
-        let on = build_cmdline("s", &[], false, false, true);
+        let maps = (
+            "0-2097152-1048576".to_string(),
+            "0-2097152-1048576".to_string(),
+        );
+        let on = build_cmdline("s", &[], false, false, Some(&maps));
         assert!(on.contains(" izba.docker=1"));
-        let off = build_cmdline("s", &[], false, false, false);
+        // The layer-idmap extents ride the SAME token set — never apart from
+        // the flag (uid-fidelity design §2.3).
+        assert!(on.contains(" izba.uidmap=0-2097152-1048576"));
+        assert!(on.contains(" izba.gidmap=0-2097152-1048576"));
+        let off = build_cmdline("s", &[], false, false, None);
         assert!(!off.contains("izba.docker"));
+        assert!(!off.contains("izba.uidmap") && !off.contains("izba.gidmap"));
         // Exercises the REAL guard (`SandboxConfig::docker_effective`): a
         // builder sandbox that also requested docker mode must be computed down
         // to `docker=false` BEFORE reaching build_cmdline, so the emitted
@@ -3798,7 +3850,8 @@ mod tests {
             usb: Default::default(),
             docker: true,
         };
-        let guarded = build_cmdline("s", &[], cfg.builder, false, cfg.docker_effective());
+        let guarded_maps = cfg.docker_effective().then(|| maps.clone());
+        let guarded = build_cmdline("s", &[], cfg.builder, false, guarded_maps.as_ref());
         assert!(!guarded.contains("izba.docker"));
     }
 
