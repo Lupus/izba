@@ -2784,6 +2784,40 @@ fn docker_mode_engine_runs_containers() {
         "container root must be able to write the user-owned /workspace, got: {ws_probe:?}"
     );
 
+    // --- [5e] uid FIDELITY through the idmapped layers ----------------------
+    // The shifted userns map (container-0 → guest-BASE) composed with the
+    // layer idmap (disk-0 → guest-BASE) must present image files with their
+    // ORIGINAL image uids inside the container. Under the old transpose,
+    // /etc/passwd (image uid 0) presented as uid 1000 here — the exact
+    // scrambling that broke sudo/settings in the claude-code-docker template.
+    let fid = exec_ok(&tb.paths, name, &["stat", "-c", "%u:%g", "/etc/passwd"]);
+    assert_eq!(
+        fid.trim(),
+        "0:0",
+        "image-root files must present as container-root (idmap fidelity)"
+    );
+    // The auto /var/lib/docker volume rides the same idmap: its freshly
+    // formatted ext4 root (disk-uid 0) must be container-root-owned — that is
+    // what lets dockerd own its graph root with no chown pass.
+    let vld = exec_ok(&tb.paths, name, &["stat", "-c", "%u:%g", "/var/lib/docker"]);
+    assert_eq!(
+        vld.trim(),
+        "0:0",
+        "the /var/lib/docker volume root must present as container-root"
+    );
+    // init's own writes through the idmapped rootfs (the setfsuid guard) must
+    // land as container-root-owned too, not on the fsuid-0 anchor (`nobody`).
+    let resolv_owner = exec_ok(
+        &tb.paths,
+        name,
+        &["stat", "-c", "%u:%g", "/etc/resolv.conf"],
+    );
+    assert_eq!(
+        resolv_owner.trim(),
+        "0:0",
+        "init-written files (resolv.conf) must present as container-root"
+    );
+
     // --- [6] A nested container, pulled through izba's egress plane ---------
     // Proves: inner pull over the veth + prerouting REDIRECT, nested runc
     // under the delegated cgroups, and that the userns-scoped admin caps are
@@ -2817,6 +2851,119 @@ fn docker_mode_engine_runs_containers() {
         hosts.iter().any(|h| h.ends_with("docker.io")),
         "expected an audit record for the nested pull's registry host \
          (registry-1.docker.io / auth.docker.io); saw hosts: {hosts:?}"
+    );
+
+    stop_sandbox(&tb, name);
+    mgr.stop(name, &tb.paths.run_dir(name));
+}
+
+/// A NON-ROOT-`USER` image, pinned by digest (resolved 2026-08-09 from
+/// `nginxinc/nginx-unprivileged:alpine`; `USER 101`, chowns /var/cache/nginx
+/// to 101). The uid-shape of `docker/sandbox-templates:claude-code-docker`
+/// (`USER agent`=1000 on a uid-1000 workspace) in a CI-sized image.
+const NON_ROOT_USER_IMAGE: &str = "nginxinc/nginx-unprivileged@sha256:a6c3ec0c0d249d68b0682df854d4a9e222b90fb607dc3fcf2f1d2fcbc85d347e";
+
+/// REGRESSION GATE for the claude-code-docker breakage (uid-fidelity design):
+/// a docker-mode sandbox from a non-root-`USER` image must (a) START — the
+/// old transpose map degenerated to identity for owner==USER and the F-32
+/// gate then failed the boot closed — and (b) present FAITHFUL ownership:
+/// image-root files as container-root (the old Windows scramble showed them
+/// as the USER's uid, breaking sudo and $HOME), image-USER files as the USER,
+/// and /workspace owned + writable by the USER.
+#[test]
+fn docker_mode_non_root_user_image_boots_with_faithful_ownership() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let name = "nonroot-docker";
+    let ws = tb.workspace(name);
+    let digest =
+        ensure_image(&tb.paths, NON_ROOT_USER_IMAGE).expect("pulling the non-root fixture image");
+    sandbox::create(
+        &tb.paths,
+        name,
+        &CreateOpts {
+            image_digest: digest,
+            image_ref: NON_ROOT_USER_IMAGE.to_string(),
+            cpus: 1,
+            mem_mb: 1024,
+            workspace: ws.to_path_buf(),
+            rw_size_gb: 4,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            builder: false,
+            docker: true,
+        },
+    )
+    .expect("create non-root docker-mode sandbox");
+    tb.names.push(name.to_string());
+    // (a) The boot itself is the first assertion: the pre-fix code refused
+    // this shape at generate_spec time ("use a non-root-owned workspace").
+    let mgr = arm_egress_and_start(&env, &tb, name);
+
+    // Default exec runs as the image USER (ExecRequest uid==gid==0 ⇒ crun
+    // applies the configured USER) — the identity the claude template's shell
+    // lands on.
+    let uid = exec_ok(&tb.paths, name, &["id", "-u"]);
+    assert_eq!(uid.trim(), "101", "exec must run as the image USER");
+
+    // (b) Ownership fidelity, all three directions of the old scramble:
+    // image-root files present as container-root…
+    let passwd = exec_ok(&tb.paths, name, &["stat", "-c", "%u:%g", "/etc/passwd"]);
+    assert_eq!(
+        passwd.trim(),
+        "0:0",
+        "image-root files must present as container-root, not the USER's uid"
+    );
+    // …image-USER-owned files keep the USER's uid (the claude analogue was
+    // /home/agent presenting as root, EACCES on its own settings)…
+    let cache = exec_ok(&tb.paths, name, &["stat", "-c", "%u", "/var/cache/nginx"]);
+    assert_eq!(
+        cache.trim(),
+        "101",
+        "image files chowned to the USER must present as the USER"
+    );
+    // …and init-written files land as container-root (the setfsuid guard),
+    // readable by the USER.
+    let resolv = exec_ok(
+        &tb.paths,
+        name,
+        &["stat", "-c", "%u:%g", "/etc/resolv.conf"],
+    );
+    assert_eq!(
+        resolv.trim(),
+        "0:0",
+        "resolv.conf must be container-root-owned"
+    );
+    let trust = exec_ok(
+        &tb.paths,
+        name,
+        &["stat", "-c", "%u:%g", "/etc/izba/ca.pem"],
+    );
+    assert_eq!(
+        trust.trim(),
+        "0:0",
+        "trust anchor must be container-root-owned"
+    );
+
+    // The workspace carve-out: the USER owns and can write /workspace.
+    let ws_owner = exec_ok(&tb.paths, name, &["stat", "-c", "%u", "/workspace"]);
+    assert_eq!(
+        ws_owner.trim(),
+        "101",
+        "the image USER must own the virtiofs /workspace"
+    );
+    let ws_probe = exec_ok(
+        &tb.paths,
+        name,
+        &[
+            "sh",
+            "-c",
+            "touch /workspace/izba-nonroot-probe && echo ok && rm -f /workspace/izba-nonroot-probe",
+        ],
+    );
+    assert!(
+        ws_probe.contains("ok"),
+        "the image USER must be able to write /workspace, got: {ws_probe:?}"
     );
 
     stop_sandbox(&tb, name);
