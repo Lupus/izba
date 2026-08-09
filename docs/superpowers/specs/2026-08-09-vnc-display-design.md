@@ -124,11 +124,14 @@ layout during implementation):
 ## 6. Credentials
 
 Per-start generated password (rotating): host generates a random secret,
-stores it under `<sandbox>/vnc/` (0600, host-only authority like
-`config.json`), and delivers it via a tiny `izba-vnc` virtiofs share
-mirroring the proven `izba-ssh` channel; init copies to init-root
-`/run/izba/vnc-secrets` (0600, outside the overlay) and the container gets a
-RO bind for `-KasmPasswordFile`.
+stores the plaintext at `<sandbox>/vnc.password` (0600, host-only, a SIBLING
+of the share dir so it never enters the guest), and delivers only the hash
+via a tiny `izba-vnc` virtiofs share mirroring the proven `izba-ssh`
+channel; init copies it to init-root `/run/izba/vnc-secrets` (0755 dir /
+0644 file — NOT 0600: the container user's uid differs from init's, and
+under docker's shifted map init-root presents as `nobody`, so world-read
+bits are the delivery mechanism; the file is a crypt hash, not a secret
+plaintext) and the container gets a RO bind for `-KasmPasswordFile`.
 
 `.kasmpasswd` hash: generate host-side in Rust if the format is
 implementable with available crates (verify format first — kasmvncpasswd
