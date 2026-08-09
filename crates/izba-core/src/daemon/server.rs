@@ -135,6 +135,16 @@ pub struct Daemon {
     pub deps: DaemonDeps,
     pub registry: Registry,
     pub relays: RelayManager,
+    /// The VNC display relay plane, DELIBERATELY a second `RelayManager`
+    /// rather than more entries in `relays` (spec 2026-08-09 §5). The VNC
+    /// relay is derived per-start state on an ephemeral port: it must never
+    /// reach `ports.json`, and `handle_port_publish`/`handle_port_unpublish`
+    /// persist `relays.active(name)` WHOLESALE. Sharing one map would leak a
+    /// `guest_port: 6901` rule into a user's persisted ports the first time
+    /// they published anything — the separation IS the firewall, so keep
+    /// these two managers apart (guard test:
+    /// `vnc_relay_never_persists_into_ports_json`).
+    pub vnc_relays: RelayManager,
     pub egress: EgressManager,
     /// The guest-facing USB plane. Bound per sandbox only while that sandbox
     /// holds a grant, so a sandbox without USB has no 1028 socket at all.
@@ -171,6 +181,7 @@ impl Daemon {
             deps,
             registry: Registry::new(),
             relays: RelayManager::new(),
+            vnc_relays: RelayManager::new(),
             egress,
             usb,
             starting: StartsInFlight::new(),
@@ -620,10 +631,15 @@ fn handle_start(
         // bound in `paths.run_dir`.
         d.egress.stop(&name, &d.paths.run_dir(&name));
         d.usb.stop(&name, &d.paths.run_dir(&name));
+        // The VNC relay of a previous run of this name (if the daemon still
+        // holds one) dies with the same failure, so a failed start leaves no
+        // plane of this sandbox half-armed.
+        d.vnc_relays.stop_all(&name);
         return Err(e);
     }
     // (Re-)apply the persisted publish rules afresh, as threads.
     d.relays.stop_all(&name);
+    d.vnc_relays.stop_all(&name);
     for rule in &config.ports {
         if let Err(e) = d.relays.publish(&d.paths, &name, rule.clone()) {
             progress(format!(
@@ -633,6 +649,18 @@ fn handle_start(
         }
     }
     relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+    // The VNC display relay: an EPHEMERAL loopback port onto the guest's
+    // KasmVNC endpoint, created per start and never persisted (it lives in
+    // the separate `vnc_relays` manager, so the `save_rules` call above
+    // cannot see it). Unlike a user's published port, a failure here is not
+    // a warning: a `--vnc` sandbox whose desktop is unreachable from the
+    // host is a silently useless sandbox, so fail the start loudly rather
+    // than degrade (the sandbox itself is up — `izba start` again once the
+    // host port pressure clears).
+    if config.vnc {
+        let port = publish_vnc_relay(d, &name).context("publishing the VNC display relay")?;
+        progress(format!("vnc: http://127.0.0.1:{port}/"));
+    }
     d.registry.set(&name, &config.image_ref, Liveness::Running);
     regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
@@ -652,6 +680,9 @@ fn handle_stop(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> 
     let run_dir = crate::sandbox::live_run_dir(&d.paths, &name);
     sandbox::stop(&d.paths, &name, d.connector(), STOP_TIMEOUT)?;
     d.relays.stop_all(&name);
+    // The VNC relay is per-run derived state: it dies with the run that
+    // created it (a fresh ephemeral port is allocated by the next start).
+    d.vnc_relays.stop_all(&name);
     d.egress.stop(&name, &run_dir);
     d.usb.stop(&name, &run_dir);
     let _ = std::fs::remove_file(relays::rules_path(&d.paths, &name));
@@ -665,6 +696,7 @@ fn handle_rm(d: &Arc<Daemon>, name: String, force: bool) -> anyhow::Result<Daemo
     let run_dir = crate::sandbox::live_run_dir(&d.paths, &name);
     sandbox::remove(&d.paths, &name, d.connector(), force)?;
     d.relays.stop_all(&name);
+    d.vnc_relays.stop_all(&name);
     d.egress.stop(&name, &run_dir);
     d.usb.stop(&name, &run_dir);
     d.registry.remove(&name);
@@ -710,6 +742,23 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
     } else {
         probe_container_state(d, &name, CONTAINER_PROBE_TIMEOUT)
     };
+    // The VNC display: the ephemeral relay this run published (host port), and
+    // whether the guest's KasmVNC endpoint behind it actually answers.
+    // `vnc_url` follows the RELAY (+ the host-only password) — a URL is still
+    // the right thing to hand a user whose desktop is merely still booting;
+    // `vnc_running` is the honest liveness answer and costs one bounded dial,
+    // only for a running VNC sandbox with a relay (same budget/degrade posture
+    // as the container probe above: any failure ⇒ `false`, never an error).
+    let vnc_port = d.vnc_relays.active(&name).first().map(|r| r.host_port);
+    let vnc_running = config.vnc
+        && running
+        && vnc_port.is_some()
+        && probe_vnc_endpoint(d, &name, CONTAINER_PROBE_TIMEOUT);
+    let vnc_url = vnc_port.and_then(|port| {
+        crate::vnc::read_password(&d.paths, &name)
+            .ok()
+            .map(|pw| format!("http://izba:{pw}@127.0.0.1:{port}/"))
+    });
     Ok(DaemonResponse::Inspect(SandboxDetail {
         name,
         image_ref: config.image_ref,
@@ -725,8 +774,8 @@ fn handle_inspect(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonRespons
         user_fallback,
         docker: config.docker,
         vnc: config.vnc,
-        vnc_running: false,
-        vnc_url: None,
+        vnc_running,
+        vnc_url,
         vnc_restart_required: needs_vnc_restart(config.vnc, running, booted_vnc),
     }))
 }
@@ -755,6 +804,38 @@ fn probe_container_state(
         Response::Health(h) => h.container,
         _ => None,
     }
+}
+
+/// Best-effort liveness probe of the guest's KasmVNC endpoint: one bounded
+/// `StreamOpen::TcpDial{6901}` through the sandbox's stream port, closed
+/// immediately. `true` only when the guest answers `Response::Ok`, i.e. it
+/// really did connect to a listening `127.0.0.1:6901` inside the guest — a
+/// dead desktop stays dead and is reported as such (no auto-restart, same
+/// posture as a dead dockerd). Every failure mode (stream port unreachable,
+/// wedged guest, `Error{ConnectFailed}`, junk reply) maps to `false`.
+///
+/// Uses the SAME `StreamOpen::TcpDial` contract as `portfwd::relay_one`, so
+/// what this probes is exactly what the relay in front of it does.
+fn probe_vnc_endpoint(d: &Arc<Daemon>, name: &str, timeout: Duration) -> bool {
+    let Ok(mut s) = (d.deps.stream_connector)(&d.paths, name) else {
+        return false;
+    };
+    if s.set_io_timeout(Some(timeout)).is_err() {
+        return false;
+    }
+    let answered = write_frame(
+        &mut s,
+        &izba_proto::StreamOpen::TcpDial {
+            port: crate::vnc::WEBSOCKET_PORT,
+        },
+    )
+    .is_ok()
+        && matches!(read_frame::<_, Response>(&mut s), Ok(Response::Ok));
+    // Full teardown once we're done talking: CH does not propagate a vsock
+    // half-close guest→host (the load-bearing contract), so never leave this
+    // probe's connection half-open.
+    let _ = s.shutdown(std::net::Shutdown::Both);
+    answered
 }
 
 /// Ephemeral per-sandbox CPU sample cache. NOT authoritative state (the
@@ -1393,6 +1474,35 @@ fn handle_vnc_set(d: &Arc<Daemon>, name: String, enabled: bool) -> anyhow::Resul
     Ok(DaemonResponse::Ok)
 }
 
+/// Publish this run's VNC display relay: an EPHEMERAL loopback host port
+/// (kernel-chosen, `host_port: 0`) onto the guest's KasmVNC endpoint, in the
+/// daemon's separate `vnc_relays` manager so it can never be persisted into
+/// `ports.json`. Returns the bound host port. One helper, two call sites
+/// (`handle_start` and `adopt`), so the two can never disagree about which
+/// manager/port/guest-port a VNC relay uses.
+fn publish_vnc_relay(d: &Arc<Daemon>, name: &str) -> anyhow::Result<u16> {
+    d.vnc_relays.publish_bound(
+        &d.paths,
+        name,
+        crate::state::PortRule {
+            bind: std::net::Ipv4Addr::LOCALHOST,
+            host_port: 0,
+            guest_port: crate::vnc::WEBSOCKET_PORT,
+        },
+    )
+}
+
+/// Whether a sandbox's CURRENT run actually BOOTED with VNC (`state.json`'s
+/// recorded fact — the same one `vnc_restart_required` is derived from), as
+/// opposed to merely being configured for it now.
+fn booted_with_vnc(paths: &Paths, name: &str) -> bool {
+    load_json::<crate::state::RunState>(&paths.sandbox_dir(name).join(crate::state::STATE_FILE))
+        .ok()
+        .flatten()
+        .map(|s| s.vnc)
+        .unwrap_or(false)
+}
+
 /// Whether a sandbox's live run is behind its configured VNC setting.
 ///
 /// Unlike `needs_usb_restart`, this is BIDIRECTIONAL: turning VNC OFF on a
@@ -1479,6 +1589,22 @@ pub fn adopt(d: &Arc<Daemon>) {
             if let Err(e) = d.usb.refresh(&d.paths, &info.name, &run_dir) {
                 eprintln!("izbad: USB listener for '{}': {e:#}", info.name);
             }
+            // The VNC relay is in-memory only, so a restarted/upgraded izbad
+            // would otherwise leave a live desktop unreachable until the
+            // sandbox itself is restarted — exactly what the "izbad holds no
+            // authoritative state, adoption never harms sandboxes" contract
+            // forbids. Keyed on what the run actually BOOTED (`state.json`),
+            // not on `config.vnc`: a `vnc on` since boot has no desktop to
+            // reach yet (that's what `vnc_restart_required` says).
+            if booted_with_vnc(&d.paths, &info.name) {
+                match publish_vnc_relay(d, &info.name) {
+                    Ok(port) => eprintln!(
+                        "izbad: re-published VNC relay for '{}' on 127.0.0.1:{port}",
+                        info.name
+                    ),
+                    Err(e) => eprintln!("izbad: VNC relay for '{}': {e:#}", info.name),
+                }
+            }
         }
     }
     d.registry.replace_all(snap, infos);
@@ -1560,6 +1686,7 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
                 &d.paths,
                 &d.registry,
                 &d.relays,
+                &d.vnc_relays,
                 &d.egress,
                 &d.usb,
                 d.connector(),
@@ -2980,6 +3107,651 @@ mod tests {
         }
         let after = std::fs::read_to_string(&p).unwrap();
         assert_eq!(before, after, "a refused VncSet must not touch config.json");
+    }
+
+    /// Task 8 carry-over: `VncSet` against a name that does not exist must
+    /// fail with the house "no such sandbox" wording (the `sandbox_must_exist`
+    /// gate), not with a raw config-read error — the CLI/GUI key their
+    /// messaging off it, same as every other per-sandbox RPC.
+    #[test]
+    fn vnc_set_on_unknown_sandbox_errors() {
+        let (_dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        match rpc(
+            &mut c,
+            &DaemonRequest::VncSet {
+                name: "ghost".into(),
+                enabled: true,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("no such sandbox"), "{message}")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // VNC display relay (spec 2026-08-09 §5)
+    // -----------------------------------------------------------------
+
+    /// Deps for a daemon that can start a `--vnc` sandbox: the artifacts fn
+    /// hands back the KasmVNC bundle such a start fails closed without.
+    fn vnc_deps() -> DaemonDeps {
+        let mut deps = test_deps();
+        deps.artifacts = Box::new(|_, variant, vnc| {
+            Ok(crate::sandbox::Artifacts {
+                variant,
+                kernel: "/art/vmlinux".into(),
+                initramfs: "/art/initramfs.img".into(),
+                kasmvnc_erofs: if vnc {
+                    Some("/art/kasmvnc.erofs".into())
+                } else {
+                    None
+                },
+            })
+        });
+        deps
+    }
+
+    fn create_vnc_req(dir: &tempfile::TempDir, name: &str) -> DaemonRequest {
+        match create_req(dir, name) {
+            DaemonRequest::Create(mut c) => {
+                c.vnc = true;
+                DaemonRequest::Create(c)
+            }
+            other => panic!("create_req built {other:?}"),
+        }
+    }
+
+    /// A fake guest stream port that answers ONE `StreamOpen` frame the way
+    /// izba-init does: `Ok` when `reachable` (something IS listening on the
+    /// dialed guest port), `Error{ConnectFailed}` otherwise. Records every
+    /// dialed port so a test can prove WHICH port was probed.
+    fn dial_answering_stream_connector(
+        seen: Arc<Mutex<Vec<u16>>>,
+        reachable: bool,
+    ) -> impl Fn(&Paths, &str) -> anyhow::Result<UdsStream> + Send + Sync + 'static {
+        move |_paths: &Paths, _name: &str| {
+            let (host, guest) = UdsStream::pair()?;
+            let seen = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                let mut g = guest;
+                let Ok(open) = read_frame::<_, izba_proto::StreamOpen>(&mut g) else {
+                    return;
+                };
+                if let izba_proto::StreamOpen::TcpDial { port } = open {
+                    seen.lock().unwrap().push(port);
+                }
+                let resp = if reachable {
+                    Response::Ok
+                } else {
+                    Response::Error {
+                        kind: izba_proto::ErrorKind::ConnectFailed,
+                        message: "connection refused".into(),
+                    }
+                };
+                let _ = write_frame(&mut g, &resp);
+            });
+            Ok(host)
+        }
+    }
+
+    /// Start `name`, or report `false` (having logged) where this environment
+    /// denies the binds a start needs — the house runtime-skip pattern.
+    fn start_or_skip(c: &mut UdsStream, name: &str, test: &str) -> bool {
+        match rpc(
+            c,
+            &DaemonRequest::Start {
+                name: name.into(),
+                allow_unconfined: false,
+            },
+        ) {
+            DaemonResponse::Ok => true,
+            DaemonResponse::Error { message }
+                if message.contains("denied")
+                    || message.contains("Permission")
+                    || message.contains("not permitted") =>
+            {
+                eprintln!("SKIP {test}: bind denied: {message}");
+                false
+            }
+            other => panic!("start: {other:?}"),
+        }
+    }
+
+    /// THE persistence firewall (spec 2026-08-09 §5): the VNC relay lives in
+    /// `d.vnc_relays`, never in `d.relays`, because both port handlers persist
+    /// `relays.active(name)` WHOLESALE into `ports.json`. Publishing an
+    /// unrelated port afterwards is exactly the moment a shared map would leak
+    /// a `guest_port: 6901` rule into the user's persisted ports — and it
+    /// would then be re-published (on a FIXED port) by every later start and
+    /// by adoption.
+    #[test]
+    fn vnc_relay_never_persists_into_ports_json() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let d = Arc::new(Daemon::new(paths, vnc_deps()));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        if !start_or_skip(&mut c, "desk", "vnc_relay_never_persists_into_ports_json") {
+            return;
+        }
+
+        // The relay exists, on an ephemeral port, in the VNC map ONLY.
+        let vnc_rules = d.vnc_relays.active("desk");
+        assert_eq!(vnc_rules.len(), 1, "one VNC relay per start: {vnc_rules:?}");
+        assert_eq!(vnc_rules[0].guest_port, crate::vnc::WEBSOCKET_PORT);
+        assert_ne!(vnc_rules[0].host_port, 0, "an ephemeral host port");
+        assert!(
+            d.relays.active("desk").is_empty(),
+            "the VNC relay must never enter the published-ports manager"
+        );
+
+        // Now publish a real port — the operation that rewrites ports.json.
+        let user_port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let rule = crate::state::PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: user_port,
+            guest_port: 8080,
+        };
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::PortPublish {
+                name: "desk".into(),
+                rule: rule.clone(),
+                persist: false,
+            },
+        ));
+
+        let (persisted, _) = relays::load_rules_migrating(&d.paths, "desk").unwrap();
+        assert_eq!(
+            persisted,
+            vec![rule],
+            "ports.json must hold the user's rule and nothing else"
+        );
+        assert!(
+            persisted
+                .iter()
+                .all(|r| r.guest_port != crate::vnc::WEBSOCKET_PORT),
+            "a VNC relay rule must never reach ports.json: {persisted:?}"
+        );
+    }
+
+    /// A plain sandbox gets no VNC relay at all (the absence guard for the
+    /// test above — a start that published one unconditionally would open a
+    /// host port onto a guest with nothing listening).
+    #[test]
+    fn plain_sandbox_start_publishes_no_vnc_relay() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let d = Arc::new(Daemon::new(paths, vnc_deps()));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "plain")),
+            DaemonResponse::Created { .. }
+        ));
+        if !start_or_skip(
+            &mut c,
+            "plain",
+            "plain_sandbox_start_publishes_no_vnc_relay",
+        ) {
+            return;
+        }
+        assert!(
+            d.vnc_relays.active("plain").is_empty(),
+            "a sandbox without --vnc must have no VNC relay"
+        );
+    }
+
+    /// Stop tears the relay down AND releases its host port — the relay is
+    /// per-run derived state, and a stopped sandbox must not leave a listening
+    /// socket onto a dead guest.
+    #[test]
+    fn stop_tears_down_the_vnc_relay() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let vmm = spawn_sleep(dir.path());
+        let mut deps = vnc_deps();
+        deps.connector = Box::new(fake_connector(
+            Arc::new(Mutex::new(Vec::new())),
+            Some(vmm.clone()),
+        ));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        if !start_or_skip(&mut c, "desk", "stop_tears_down_the_vnc_relay") {
+            return;
+        }
+        let port = d.vnc_relays.active("desk")[0].host_port;
+
+        // Swap the MockDriver-recorded vmm identity for the disposable child
+        // (as the sibling start/stop tests do), keeping this start's real
+        // run_dir so Stop resolves the same sockets.
+        write_state_with_run_dir(&d.paths, "desk", vmm.clone(), Some(d.paths.run_dir("desk")));
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::Stop {
+                name: "desk".into(),
+            },
+        ));
+
+        assert!(
+            d.vnc_relays.active("desk").is_empty(),
+            "stop must tear the VNC relay down"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "VNC relay port never released");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The same teardown at the OTHER call site: `rm`. (A rule with a test
+    /// and a call site without one is this project's recurring defect class.)
+    #[test]
+    fn rm_tears_down_the_vnc_relay() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let vmm = spawn_sleep(dir.path());
+        let mut deps = vnc_deps();
+        deps.connector = Box::new(fake_connector(
+            Arc::new(Mutex::new(Vec::new())),
+            Some(vmm.clone()),
+        ));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        if !start_or_skip(&mut c, "desk", "rm_tears_down_the_vnc_relay") {
+            return;
+        }
+        assert_eq!(d.vnc_relays.active("desk").len(), 1);
+
+        write_state_with_run_dir(&d.paths, "desk", vmm.clone(), Some(d.paths.run_dir("desk")));
+        expect_ok_resp(rpc(
+            &mut c,
+            &DaemonRequest::Rm {
+                name: "desk".into(),
+                force: true,
+            },
+        ));
+        assert!(
+            d.vnc_relays.active("desk").is_empty(),
+            "rm must tear the VNC relay down"
+        );
+    }
+
+    /// `Inspect` on a live VNC sandbox: the credentialed URL points at the
+    /// relay's real ephemeral port and carries the host-only per-start
+    /// password, and `vnc_running` is the guest's own answer — proved by the
+    /// dialed port being 6901, not merely by the relay existing.
+    #[test]
+    fn inspect_reports_vnc_url_and_running_from_the_relay() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let seen: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut deps = vnc_deps();
+        deps.stream_connector = Box::new(dial_answering_stream_connector(Arc::clone(&seen), true));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        if !start_or_skip(
+            &mut c,
+            "desk",
+            "inspect_reports_vnc_url_and_running_from_the_relay",
+        ) {
+            return;
+        }
+        let port = d.vnc_relays.active("desk")[0].host_port;
+        let pw = crate::vnc::read_password(&d.paths, "desk").unwrap();
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::Inspect {
+                name: "desk".into(),
+            },
+        ) {
+            DaemonResponse::Inspect(det) => {
+                assert!(det.vnc);
+                assert_eq!(
+                    det.vnc_url,
+                    Some(format!("http://izba:{pw}@127.0.0.1:{port}/")),
+                    "the URL must carry this start's password and the relay's real port"
+                );
+                assert!(det.vnc_running, "the guest answered the dial");
+            }
+            other => panic!("expected Inspect, got {other:?}"),
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![crate::vnc::WEBSOCKET_PORT],
+            "the liveness probe must dial the guest's KasmVNC port"
+        );
+    }
+
+    /// Honesty: a relay in front of a dead desktop is NOT "running". The URL
+    /// still surfaces (the relay and the password are real — the desktop may
+    /// simply still be coming up), but `vnc_running` follows the guest.
+    #[test]
+    fn inspect_reports_vnc_not_running_when_the_guest_port_is_dead() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let seen: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut deps = vnc_deps();
+        deps.stream_connector = Box::new(dial_answering_stream_connector(Arc::clone(&seen), false));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        if !start_or_skip(
+            &mut c,
+            "desk",
+            "inspect_reports_vnc_not_running_when_the_guest_port_is_dead",
+        ) {
+            return;
+        }
+        match rpc(
+            &mut c,
+            &DaemonRequest::Inspect {
+                name: "desk".into(),
+            },
+        ) {
+            DaemonResponse::Inspect(det) => {
+                assert!(
+                    !det.vnc_running,
+                    "a refused guest dial must not report a running desktop"
+                );
+                assert!(det.vnc_url.is_some(), "the relay URL still surfaces");
+            }
+            other => panic!("expected Inspect, got {other:?}"),
+        }
+    }
+
+    /// A plain (non-VNC) sandbox reports no URL and no running desktop, and
+    /// costs no guest dial at all.
+    #[test]
+    fn inspect_reports_no_vnc_for_a_plain_sandbox() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let seen: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut deps = vnc_deps();
+        deps.stream_connector = Box::new(dial_answering_stream_connector(Arc::clone(&seen), true));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "plain")),
+            DaemonResponse::Created { .. }
+        ));
+        if !start_or_skip(
+            &mut c,
+            "plain",
+            "inspect_reports_no_vnc_for_a_plain_sandbox",
+        ) {
+            return;
+        }
+        match rpc(
+            &mut c,
+            &DaemonRequest::Inspect {
+                name: "plain".into(),
+            },
+        ) {
+            DaemonResponse::Inspect(det) => {
+                assert!(!det.vnc && !det.vnc_running && det.vnc_url.is_none());
+            }
+            other => panic!("expected Inspect, got {other:?}"),
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a plain sandbox must cost no VNC probe dial"
+        );
+    }
+
+    /// A STOPPED sandbox is never probed, even if the daemon still holds a
+    /// relay for it (e.g. one that outlived its run): a dead VM cannot answer,
+    /// so the dial would only burn the inspect budget. Same posture as the
+    /// container probe's `status == "stopped"` short-circuit.
+    #[test]
+    fn inspect_does_not_probe_vnc_on_a_stopped_sandbox() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let seen: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut deps = vnc_deps();
+        deps.stream_connector = Box::new(dial_answering_stream_connector(Arc::clone(&seen), true));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        // Never started: the registry reports it stopped. Plant a relay
+        // anyway, so only the liveness gate can keep the probe from running.
+        let Some(()) = plant_vnc_relay_or_skip(
+            &d,
+            "desk",
+            "inspect_does_not_probe_vnc_on_a_stopped_sandbox",
+        ) else {
+            return;
+        };
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::Inspect {
+                name: "desk".into(),
+            },
+        ) {
+            DaemonResponse::Inspect(det) => assert!(
+                !det.vnc_running,
+                "a stopped sandbox can never have a running desktop"
+            ),
+            other => panic!("expected Inspect, got {other:?}"),
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a stopped sandbox must cost no VNC probe dial"
+        );
+        d.vnc_relays.stop_all("desk");
+    }
+
+    /// Plant a VNC relay for `name` the way a previous run would have left
+    /// one. `None` (having logged) where the environment denies the bind.
+    fn plant_vnc_relay_or_skip(d: &Arc<Daemon>, name: &str, test: &str) -> Option<()> {
+        match publish_vnc_relay(d, name) {
+            Ok(_) => Some(()),
+            Err(e) => {
+                eprintln!("SKIP {test}: VNC relay bind denied: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// A VMM driver that cannot launch — the fastest way to a `handle_start`
+    /// failure AFTER its listener/relay teardown responsibilities begin (an
+    /// unhealthy-guest failure would burn the whole 30 s boot budget).
+    struct FailingDriver;
+
+    impl VmmDriver for FailingDriver {
+        fn launch(
+            &self,
+            _spec: &crate::vmm::VmSpec,
+        ) -> anyhow::Result<Box<dyn crate::vmm::VmHandle>> {
+            anyhow::bail!("mock launch failure")
+        }
+    }
+
+    /// A start that never booted must leave NO plane of the sandbox armed —
+    /// including a VNC relay left over from an earlier run of the same name
+    /// (the error path already stops egress + USB; the VNC relay is the third
+    /// plane and must go with them).
+    #[test]
+    fn failed_start_tears_down_a_stale_vnc_relay() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let mut deps = vnc_deps();
+        deps.driver = Box::new(FailingDriver);
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        let Some(()) =
+            plant_vnc_relay_or_skip(&d, "desk", "failed_start_tears_down_a_stale_vnc_relay")
+        else {
+            return;
+        };
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::Start {
+                name: "desk".into(),
+                allow_unconfined: false,
+            },
+        ) {
+            // A start that never reached the driver (this environment denies
+            // the egress listener bind) proves nothing about the teardown.
+            DaemonResponse::Error { message }
+                if message.contains("denied")
+                    || message.contains("Permission")
+                    || message.contains("not permitted") =>
+            {
+                eprintln!("SKIP failed_start_tears_down_a_stale_vnc_relay: bind denied: {message}");
+                return;
+            }
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("mock launch failure"), "{message}")
+            }
+            other => panic!("expected the start to fail, got {other:?}"),
+        }
+        assert!(
+            d.vnc_relays.active("desk").is_empty(),
+            "a failed start must not leave a VNC relay behind"
+        );
+    }
+
+    /// A successful start REPLACES any relay of a previous run rather than
+    /// stacking a second one: the sandbox has exactly one desktop, so it must
+    /// have exactly one URL.
+    #[test]
+    fn start_replaces_a_stale_vnc_relay() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let d = Arc::new(Daemon::new(paths, vnc_deps()));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        let Some(()) = plant_vnc_relay_or_skip(&d, "desk", "start_replaces_a_stale_vnc_relay")
+        else {
+            return;
+        };
+        let stale_port = d.vnc_relays.active("desk")[0].host_port;
+
+        if !start_or_skip(&mut c, "desk", "start_replaces_a_stale_vnc_relay") {
+            return;
+        }
+        let rules = d.vnc_relays.active("desk");
+        assert_eq!(rules.len(), 1, "exactly one VNC relay per run: {rules:?}");
+        // The stale relay was genuinely stopped, not merely dropped from the
+        // map — its port comes back (unless the kernel happened to hand the
+        // fresh relay the very same ephemeral port, which is equally proof it
+        // was released first).
+        if rules[0].host_port != stale_port {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if std::net::TcpListener::bind(("127.0.0.1", stale_port)).is_ok() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "stale relay port never released");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// The VNC relay is in-memory only, so a restarted/upgraded izbad must
+    /// re-publish it during adoption — otherwise a running desktop stays
+    /// unreachable until the sandbox itself is restarted, breaking the
+    /// "killing/upgrading izbad never harms sandboxes" contract. Keyed on
+    /// what the run BOOTED (`state.json`), not on `config.vnc`.
+    #[test]
+    fn adopt_republishes_the_vnc_relay_of_a_booted_vnc_sandbox() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let d = Arc::new(Daemon::new(paths, vnc_deps()));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_vnc_req(&dir, "desk")),
+            DaemonResponse::Created { .. }
+        ));
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "plain")),
+            DaemonResponse::Created { .. }
+        ));
+        // Both look alive on disk; only "desk" recorded a VNC boot.
+        save_json(
+            &d.paths.sandbox_dir("desk").join(STATE_FILE),
+            &RunState {
+                vmm_pid: live_identity(),
+                sidecar_pids: vec![],
+                started_unix_ms: 0,
+                confinement: None,
+                run_dir: Some(d.paths.run_dir("desk")),
+                user_fallback: None,
+                usb_kernel: false,
+                vnc: true,
+            },
+        )
+        .unwrap();
+        write_state_with_run_dir(
+            &d.paths,
+            "plain",
+            live_identity(),
+            Some(d.paths.run_dir("plain")),
+        );
+
+        // A fresh daemon over the same data root = the post-restart adoption.
+        let fresh = Arc::new(Daemon::new(d.paths.clone(), vnc_deps()));
+        adopt(&fresh);
+
+        let rules = fresh.vnc_relays.active("desk");
+        if rules.is_empty() {
+            eprintln!("SKIP adopt_republishes_the_vnc_relay: no relay bound (bind denied?)");
+            return;
+        }
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].guest_port, crate::vnc::WEBSOCKET_PORT);
+        assert_ne!(rules[0].host_port, 0);
+        assert!(
+            fresh.vnc_relays.active("plain").is_empty(),
+            "a sandbox that did not boot with VNC must get no relay"
+        );
+        assert!(
+            fresh.relays.active("desk").is_empty(),
+            "adoption must not put the VNC relay in the published-ports manager"
+        );
+        fresh.vnc_relays.stop_all("desk");
     }
 
     /// A non-CLI client (e.g. the GUI) can call `Start` directly for a

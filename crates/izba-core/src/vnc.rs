@@ -49,6 +49,13 @@ use crate::paths::Paths;
 /// virtiofs share tag for the guest-facing `kasmpasswd` hash file.
 pub const VNC_SHARE_TAG: &str = "izba-vnc";
 
+/// The guest-loopback port KasmVNC's websocket/HTTP endpoint listens on
+/// (`-websocketPort`, spec 2026-08-09 §4/§7). The host never binds this — it
+/// is the `StreamOpen::TcpDial` target of the daemon's ephemeral VNC relay
+/// and of the inspect liveness probe. Both ends of the number must move
+/// together: the guest side is izba-init's `Xkasmvnc` invocation.
+pub const WEBSOCKET_PORT: u16 = 6901;
+
 /// Length of the generated plaintext VNC password.
 const PASSWORD_LEN: usize = 24;
 

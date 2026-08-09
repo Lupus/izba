@@ -94,10 +94,20 @@ impl Drop for StartGuard<'_> {
     }
 }
 
+// Every argument is one of the daemon's planes, passed explicitly (rather
+// than as `&Daemon`) precisely so the tick stays unit-testable against
+// hand-built managers — bundling them into a struct would buy nothing but a
+// second name for `Daemon`. House precedent for the allow: `sandbox::start`,
+// `egress::router`.
+#[allow(clippy::too_many_arguments)]
 pub fn tick(
     paths: &Paths,
     registry: &Registry,
     relays: &RelayManager,
+    // The daemon's SEPARATE VNC relay manager (`Daemon.vnc_relays`) — same
+    // respawn/teardown semantics as `relays`, kept in its own map so it can
+    // never be persisted into `ports.json` (see the field's doc).
+    vnc_relays: &RelayManager,
     egress: &EgressManager,
     usb: &crate::usb::broker::UsbBroker,
     connector: Connector,
@@ -130,12 +140,21 @@ pub fn tick(
             // (Greptile P1, PR #135).
             starting.teardown_unless_starting(&info.name, || {
                 relays.stop_all(&info.name);
+                // The VNC relay is per-run derived state: a stopped sandbox
+                // must not keep an open host port onto a dead guest. Inside
+                // the SAME guard as the rest — a tick landing mid-boot must
+                // not kill the relay a `Start` just published (#133/#134).
+                vnc_relays.stop_all(&info.name);
                 let run_dir = sandbox::live_run_dir(paths, &info.name);
                 egress.stop(&info.name, &run_dir);
                 usb.stop(&info.name, &run_dir);
             });
         } else {
             relays.respawn_dead(paths, &info.name);
+            // Same crash-respawn for the VNC relay, and it rebinds the SAME
+            // ephemeral port (the slot stores the rewritten rule), so a URL
+            // already handed to a user survives a relay-thread crash.
+            vnc_relays.respawn_dead(paths, &info.name);
             // Idempotent: a no-op if the listener is alive, a crash-respawn
             // otherwise. Every running sandbox owns a vsock_1027 plane. This
             // tick serves already-running VMs, so it must rebind in the LIVE
@@ -233,7 +252,17 @@ mod tests {
         let usb = crate::usb::broker::UsbBroker::new(crate::daemon::egress::audit::AuditSink::new(
             paths.clone(),
         ));
-        tick(&paths, &registry, &relays, &egress, &usb, &conn, &starting);
+        let vnc_relays = RelayManager::new();
+        tick(
+            &paths,
+            &registry,
+            &relays,
+            &vnc_relays,
+            &egress,
+            &usb,
+            &conn,
+            &starting,
+        );
 
         assert_eq!(registry.liveness("up"), Some(Liveness::Running));
         assert_eq!(registry.liveness("down"), Some(Liveness::Stopped));
@@ -248,7 +277,13 @@ mod tests {
     /// early return.
     fn setup_booting_sandbox(
         test_name: &str,
-    ) -> Option<(tempfile::TempDir, Paths, EgressManager, RelayManager)> {
+    ) -> Option<(
+        tempfile::TempDir,
+        Paths,
+        EgressManager,
+        RelayManager,
+        RelayManager,
+    )> {
         let (dir, paths) = test_paths();
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -289,7 +324,25 @@ mod tests {
             }
             panic!("publish: {e:#}");
         }
-        Some((dir, paths, egress, relays))
+        // …and the VNC display relay, in its own manager exactly as the
+        // daemon holds it, on an ephemeral port.
+        let vnc_relays = RelayManager::new();
+        if let Err(e) = vnc_relays.publish_bound(
+            &paths,
+            "boot",
+            PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: 0,
+                guest_port: crate::vnc::WEBSOCKET_PORT,
+            },
+        ) {
+            if is_permission_denied(&e) {
+                eprintln!("SKIP {test_name}: vnc publish denied: {e:#}");
+                return None;
+            }
+            panic!("vnc publish: {e:#}");
+        }
+        Some((dir, paths, egress, relays, vnc_relays))
     }
 
     /// #134: a `Start` mid-boot has no state.json yet, so the disk scan
@@ -298,7 +351,7 @@ mod tests {
     /// the guest is mid-boot-dial against them.
     #[test]
     fn tick_spares_egress_and_relays_of_starting_sandbox() {
-        let Some((_dir, paths, egress, relays)) =
+        let Some((_dir, paths, egress, relays, vnc_relays)) =
             setup_booting_sandbox("tick_spares_egress_and_relays_of_starting_sandbox")
         else {
             return;
@@ -312,7 +365,16 @@ mod tests {
         let usb = crate::usb::broker::UsbBroker::new(crate::daemon::egress::audit::AuditSink::new(
             paths.clone(),
         ));
-        tick(&paths, &registry, &relays, &egress, &usb, &conn, &starting);
+        tick(
+            &paths,
+            &registry,
+            &relays,
+            &vnc_relays,
+            &egress,
+            &usb,
+            &conn,
+            &starting,
+        );
 
         assert!(
             egress.listening("boot"),
@@ -322,6 +384,12 @@ mod tests {
             !relays.active("boot").is_empty(),
             "guard spares the mid-boot relays"
         );
+        assert!(
+            !vnc_relays.active("boot").is_empty(),
+            "guard spares the mid-boot VNC relay too (the registry tick-clobber \
+             lesson, PR #133: a supervisor pass must not resurrect/kill a plane \
+             a Start is mid-way through publishing)"
+        );
     }
 
     /// Negative control for the above: same setup, but no guard is held —
@@ -329,7 +397,7 @@ mod tests {
     /// down. Kills the condition-negation mutant on the guard check.
     #[test]
     fn tick_stops_egress_and_relays_of_genuinely_stopped_sandbox() {
-        let Some((_dir, paths, egress, relays)) =
+        let Some((_dir, paths, egress, relays, vnc_relays)) =
             setup_booting_sandbox("tick_stops_egress_and_relays_of_genuinely_stopped_sandbox")
         else {
             return;
@@ -342,7 +410,16 @@ mod tests {
         let usb = crate::usb::broker::UsbBroker::new(crate::daemon::egress::audit::AuditSink::new(
             paths.clone(),
         ));
-        tick(&paths, &registry, &relays, &egress, &usb, &conn, &starting);
+        tick(
+            &paths,
+            &registry,
+            &relays,
+            &vnc_relays,
+            &egress,
+            &usb,
+            &conn,
+            &starting,
+        );
 
         assert!(
             !egress.listening("boot"),
@@ -352,6 +429,87 @@ mod tests {
             relays.active("boot").is_empty(),
             "unmarked stopped sandbox loses its relays"
         );
+        assert!(
+            vnc_relays.active("boot").is_empty(),
+            "a stopped sandbox must not keep a host port open onto a dead desktop"
+        );
+    }
+
+    /// Call-site companion to `RelayManager::respawn_dead`: the tick must
+    /// revive a crashed VNC relay thread of a RUNNING sandbox, on the same
+    /// ephemeral port (so a URL already handed to a user stays valid).
+    #[test]
+    fn tick_respawns_crashed_vnc_relay_of_running_sandbox() {
+        match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP tick_respawns_crashed_vnc_relay: bind denied: {e}");
+                return;
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        }
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let opts = CreateOpts {
+            image_digest: "sha256:abc".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 1,
+            mem_mb: 256,
+            workspace: ws,
+            rw_size_gb: 1,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            builder: false,
+            docker: false,
+            vnc: true,
+        };
+        crate::sandbox::create(&paths, "desk", &opts).unwrap();
+        write_state(&paths, "desk", live_identity()); // it looks alive
+
+        let port = free_port();
+        let vnc_relays = RelayManager::new();
+        // A slot whose relay thread already died (simulated crash), carrying
+        // the rewritten (real) rule a `publish_bound` would have stored.
+        vnc_relays.insert_for_test(
+            "desk",
+            PortRule {
+                bind: "127.0.0.1".parse().unwrap(),
+                host_port: port,
+                guest_port: crate::vnc::WEBSOCKET_PORT,
+            },
+        );
+
+        let registry = Registry::new();
+        let relays = RelayManager::new();
+        let egress = test_egress();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let conn = fake_connector(log, None);
+        let starting = StartsInFlight::new();
+        let usb = crate::usb::broker::UsbBroker::new(crate::daemon::egress::audit::AuditSink::new(
+            paths.clone(),
+        ));
+        tick(
+            &paths,
+            &registry,
+            &relays,
+            &vnc_relays,
+            &egress,
+            &usb,
+            &conn,
+            &starting,
+        );
+
+        assert_eq!(
+            vnc_relays.active("desk").first().map(|r| r.host_port),
+            Some(port),
+            "the respawned VNC relay must keep the same host port"
+        );
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "the tick must genuinely rebind the crashed VNC relay's port"
+        );
+        vnc_relays.stop_all("desk");
     }
 
     #[test]
