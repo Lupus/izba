@@ -43,15 +43,20 @@ fn stop_all_with(
     }
 }
 
-/// `izba stop --all`: best-effort stop of every running/degraded sandbox.
-#[mutants::skip] // reason: drives a live daemon (List + Stop RPCs); the sweep logic is stop_all_with, unit-tested with an injected stop fn.
-pub fn run_all(paths: &Paths) -> anyhow::Result<i32> {
-    let mut client = DaemonClient::connect(paths)?;
-    let sandboxes = match client.request(&DaemonRequest::List, &mut |_| {})? {
-        DaemonResponse::List { sandboxes } => sandboxes,
+/// Unwrap the daemon's `List` reply.
+fn expect_list(resp: DaemonResponse) -> anyhow::Result<Vec<SandboxSummary>> {
+    match resp {
+        DaemonResponse::List { sandboxes } => Ok(sandboxes),
         DaemonResponse::Error { message } => bail!(message),
         other => bail!("unexpected daemon reply: {other:?}"),
-    };
+    }
+}
+
+/// `izba stop --all`: best-effort stop of every running/degraded sandbox.
+#[mutants::skip] // reason: drives a live daemon (List + Stop RPCs); the sweep logic is stop_all_with and expect_list, unit-tested with an injected stop fn.
+pub fn run_all(paths: &Paths) -> anyhow::Result<i32> {
+    let mut client = DaemonClient::connect(paths)?;
+    let sandboxes = expect_list(client.request(&DaemonRequest::List, &mut |_| {})?)?;
     stop_all_with(sandboxes, |name| {
         client
             .request(
@@ -121,14 +126,37 @@ mod tests {
 
     #[test]
     fn stop_all_with_empty_is_success_without_stops() {
-        let mut calls = 0;
-        let rc = stop_all_with(vec![sb("a", "stopped")], |_| {
-            calls += 1;
-            Ok(())
+        // The closure must never run: a stopped sandbox is not stopped again.
+        let rc = stop_all_with(vec![sb("a", "stopped")], |name| {
+            panic!("tried to stop {name} but nothing should be stopped")
         })
         .unwrap();
         assert_eq!(rc, 0);
-        assert_eq!(calls, 0, "a stopped sandbox must not be stopped again");
+    }
+
+    #[test]
+    fn expect_list_unwraps_sandboxes() {
+        let resp = DaemonResponse::List {
+            sandboxes: vec![sb("a", "running")],
+        };
+        let list = expect_list(resp).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "a");
+    }
+
+    #[test]
+    fn expect_list_propagates_daemon_error() {
+        let err = expect_list(DaemonResponse::Error {
+            message: "boom".into(),
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "boom");
+    }
+
+    #[test]
+    fn expect_list_rejects_wrong_variant() {
+        let err = expect_list(DaemonResponse::Ok).unwrap_err();
+        assert!(err.to_string().contains("unexpected daemon reply"));
     }
 
     /// A failure on one sandbox must not abort the sweep — the rest still get
