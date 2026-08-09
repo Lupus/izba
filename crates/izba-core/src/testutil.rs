@@ -90,6 +90,7 @@ pub(crate) fn write_state_with_run_dir(
             run_dir,
             user_fallback: None,
             usb_kernel: false,
+            vnc: false,
         },
     )
     .unwrap();
@@ -111,6 +112,7 @@ pub(crate) fn write_state_with_sidecars(
             run_dir: None,
             user_fallback: None,
             usb_kernel: false,
+            vnc: false,
         },
     )
     .unwrap();
