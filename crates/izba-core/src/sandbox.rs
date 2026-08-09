@@ -3855,6 +3855,59 @@ mod tests {
         assert!(!guarded.contains("izba.docker"));
     }
 
+    /// `write_oci_bundle` must hand back the layer-idmap cmdline values in
+    /// docker mode — extracted from the very mappings it wrote into the spec
+    /// (the single-generation-site contract) — and `None` otherwise.
+    #[test]
+    fn write_oci_bundle_returns_docker_idmaps_only_in_docker_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let oci = dir.path().join("oci");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&oci).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let mk_cfg = |docker: bool| SandboxConfig {
+            image_digest: "sha256:x".into(),
+            image_ref: "img".into(),
+            cpus: 1,
+            mem_mb: 512,
+            workspace: ws.clone(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            build: None,
+            rw_size_gb: 0,
+            usb: Default::default(),
+            docker,
+        };
+        let db = crate::image::runtime_config::UserDb::from_files(None, None);
+
+        let out = write_oci_bundle(&oci, "t", None, &db, false, &mk_cfg(true)).unwrap();
+        let (uidmap, gidmap) = out.docker_idmaps.expect("docker mode must return idmaps");
+        // The expectation is recomputed through the same public functions with
+        // the same inputs (owner = this process's euid/egid via the workspace
+        // dir it just created; workload = root, no image USER) — equality here
+        // pins that the cmdline values come from the spec's own mappings.
+        let owner = (
+            nix::unistd::Uid::effective().as_raw(),
+            nix::unistd::Gid::effective().as_raw(),
+        );
+        let (u, g) = crate::image::runtime_config::compute_docker_userns_mappings(owner, (0, 0))
+            .expect("maps build");
+        use crate::image::runtime_config::layer_idmap_cmdline_value;
+        assert_eq!(uidmap, layer_idmap_cmdline_value(&u));
+        assert_eq!(gidmap, layer_idmap_cmdline_value(&g));
+        // And the written spec really is the docker-mode one.
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(oci.join("config.json")).unwrap()).unwrap();
+        assert!(spec["linux"]["uidMappings"].is_array());
+
+        let out = write_oci_bundle(&oci, "t", None, &db, false, &mk_cfg(false)).unwrap();
+        assert!(
+            out.docker_idmaps.is_none(),
+            "non-docker mode must not emit layer idmaps"
+        );
+    }
+
     /// `SandboxConfig` without a `builder` field in JSON deserializes to `builder == false`.
     #[test]
     fn sandbox_config_builder_defaults_to_false() {
