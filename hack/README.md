@@ -125,7 +125,7 @@ Pinned: iproute2 6.x, kernel.org tarball sha256-verified in-container.
 
 ### `build-kernel.sh`
 
-Downloads a Linux kernel source tarball (default: **6.12.30 LTS**), applies
+Downloads a Linux kernel source tarball (default: **6.18.43 LTS**), applies
 the `kernel.config` fragment, and builds `vmlinux`.
 
 Requires a C toolchain:
@@ -138,7 +138,8 @@ subsequent runs skip the download.
 
 Output defaults to `dist/vmlinux`.
 
-**Tarball integrity:** known versions have a pinned sha256 (currently `6.12.30`).
+**Tarball integrity:** known versions have a pinned sha256 (currently `6.12.30`
+and `6.18.43`).
 Building an unlisted version requires `IZBA_KERNEL_SHA256=<hash>` — there is no
 unverified path.  Set `IZBA_KERNEL_VERIFY_ONLY=1` to hash-check the cached
 tarball and exit without building (useful for CI preflight).

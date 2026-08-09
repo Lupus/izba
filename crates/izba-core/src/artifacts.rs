@@ -119,7 +119,7 @@ fn locate_from(
             "this sandbox has USB device grants, so it needs the USB-capable kernel \
              ('{}'), which is not installed in {} or next to the izba binary — build \
              it with `IZBA_KERNEL_EXTRA_CONFIG=hack/kernel-usb.config hack/build-kernel.sh \
-             6.12.30 dist/vmlinux-usb`, or set IZBA_KERNEL_USB and IZBA_INITRAMFS. \
+             6.18.43 dist/vmlinux-usb`, or set IZBA_KERNEL_USB and IZBA_INITRAMFS. \
              Revoke the grants (`izba usb revoke`) to start on the default kernel.",
             variant.image(),
             data_dir.display()
