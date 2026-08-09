@@ -1582,6 +1582,34 @@ mod tests {
     }
 
     #[test]
+    fn docker_shifted_map_workload_at_top_of_range_omits_zero_size_tail() {
+        // workload == RANGE-1: the tail extent would be zero-size and must be
+        // omitted (the kernel rejects zero-size extents; a relaxed `<`→`<=`
+        // or broken `RANGE - 1` arithmetic in the guard would emit it).
+        let m = docker_shifted_map(DOCKER_IDMAP_RANGE - 1, 1000).expect("map builds");
+        assert!(
+            m.iter().all(|e| e.size() > 0),
+            "no zero-size extents allowed: {m:?}"
+        );
+        assert_eq!(map_c2h(&m, DOCKER_IDMAP_RANGE - 1), Some(1000));
+        let total: u64 = m.iter().map(|e| e.size() as u64).sum();
+        assert_eq!(total, DOCKER_IDMAP_RANGE as u64);
+        assert_shifted_invariants(&m);
+    }
+
+    #[test]
+    fn docker_userns_isolates_root_checks_both_legs_independently() {
+        // A safe uid map with a gid map that puts container-0 on guest-0 (and
+        // vice versa) must fail the predicate — `&&` of the two negated legs,
+        // not `||`.
+        let safe = docker_shifted_map(0, 1000).expect("map builds");
+        let violating = transpose_identity_map(1000, 1000); // identity: 0 → 0
+        assert!(!docker_userns_isolates_root(&safe, &violating));
+        assert!(!docker_userns_isolates_root(&violating, &safe));
+        assert!(docker_userns_isolates_root(&safe, &safe));
+    }
+
+    #[test]
     fn docker_shifted_map_workload_zero_boundary_extents() {
         // workload 0 with non-zero owner: the carve-out IS container-0; no
         // leading extent, and the tail covers [1, RANGE).
