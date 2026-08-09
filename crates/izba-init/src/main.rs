@@ -232,6 +232,32 @@ fn run_pid1() -> anyhow::Result<()> {
     }
     mounts::apply(&rootfs_plan[2..]).context("rootfs mounts")?;
 
+    // Workspace-share idmap (izba.wsidmap=1, docker mode only): the host asks
+    // for it exactly when an owner leg is 0 — the share would present as
+    // nobody through the shifted map (guest-0 unmapped). Same layer extents,
+    // same mechanism as /lower and /upper above, but FAIL-SOFT by contract:
+    // a virtiofs backend that does not advertise FUSE_ALLOW_IDMAP (OpenVMM
+    // today) rejects mount_setattr, and the un-idmapped share (0777, listed
+    // as nobody — the uid-fidelity design's §6 cosmetic) is strictly better
+    // than a failed boot. Cosmetic presentation, not a trust boundary.
+    if docker
+        && params
+            .get("izba.wsidmap")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        if let Some((uid_map, gid_map)) = &layer_maps {
+            if let Err(e) =
+                idmap::apply_layer_idmaps(&[Path::new("/rootfs/workspace")], uid_map, gid_map)
+            {
+                eprintln!(
+                    "izba-init: workspace idmap unavailable (share keeps its raw \
+                     ids; virtiofs backend without FUSE_ALLOW_IDMAP?): {e:#}"
+                );
+            }
+        }
+    }
+
     // User volumes (vdc, vdd, …): format-if-blank then mount under /rootfs,
     // in the order the host declared them on the izba.volumes cmdline list.
     let vols: Vec<&str> = params

@@ -138,8 +138,20 @@ non-root owner are byte-for-byte unchanged.
 
 - Nested userns remap inside the workload (dockerd `--userns-remap`,
   rootless-in-rootless): ids beyond `RANGE` stay unmapped; revisit on demand.
-- Idmapped virtiofs (kernel ≥ 6.15) would let Windows `/workspace` present a
-  real owner; revisit when the pinned kernel moves.
+- ~~Idmapped virtiofs (kernel ≥ 6.15) would let Windows `/workspace` present a
+  real owner; revisit when the pinned kernel moves.~~ **Re-diagnosed
+  2026-08-09:** the "≥ 6.15" premise was wrong — virtiofs has carried
+  `FS_ALLOW_IDMAP` + implicit `default_permissions` since 6.12, and virtiofsd
+  has advertised `FUSE_ALLOW_IDMAP` since v1.13.0 (izba pins 1.13.3). The June
+  spike failed on an inverted mount-map orientation (the same bug class §2.3
+  documents), not missing kernel plumbing; re-run with the corrected columns
+  it passes on the 6.12.30 pins. The guest side now stacks an idmapped mount
+  over the workspace share when the host asks (`izba.wsidmap=1`, emitted for
+  docker sandboxes whose owner leg is 0), fail-soft on backends without
+  `FUSE_ALLOW_IDMAP`. **The remaining Windows blocker is OpenVMM**: its
+  bundled virtiofs server does not advertise `FUSE_ALLOW_IDMAP` (verified
+  upstream, zero hits), so the idmap degrades to the §6 cosmetic there until
+  upstream gains the flag.
 - Unifying non-docker mode onto the shifted+idmap scheme (#200 territory).
 
 ## 5. Testing
@@ -165,4 +177,13 @@ On Windows (owner=0), `/workspace` lists as `nobody` (docker mode) or root
 (non-docker) inside the container; writable either way via 0777. Git may need
 `safe.directory` there — the templates already run in `/workspace` as the
 repo user on Linux, and the Windows share never had a real owner to begin
-with. Revisit with idmapped virtiofs (§4).
+with.
+
+**Update 2026-08-09:** the guest-side fix ships (`izba.wsidmap=1` → init
+stacks an idmapped mount over the share with the same layer extents, so
+disk-0 presents as container-root and every mapped container id writes
+through). On Linux it takes effect for root-owned workspaces (`sudo izba`
+docker sandboxes). On Windows the residue REMAINS for now: OpenVMM's virtiofs
+does not advertise `FUSE_ALLOW_IDMAP`, init's mount_setattr is refused, and
+the share keeps the 0777/`nobody` presentation — it lights up automatically
+once OpenVMM gains the flag (§4).
