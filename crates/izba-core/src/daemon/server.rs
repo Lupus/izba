@@ -525,6 +525,18 @@ fn handle_create(
                 .and_then(|cc| cc.labels.as_ref()),
         )
     };
+    // VNC + docker mode is a broken combination, not merely an unsupported
+    // one: docker mode gives the workload its own network namespace (spec
+    // §3), so the KasmVNC endpoint the relay would publish lives in a netns
+    // the host-side loopback relay can never reach. Refuse loudly at create
+    // time rather than shipping a VNC URL that can never connect.
+    if c.vnc && docker {
+        bail!(
+            "VNC is not yet supported for docker-mode sandboxes (the nested \
+             engine owns the network namespace); create without --vnc or \
+             without --docker"
+        );
+    }
     sandbox::create(
         &d.paths,
         &c.name,
@@ -1511,6 +1523,17 @@ fn handle_vnc_set(d: &Arc<Daemon>, name: String, enabled: bool) -> anyhow::Resul
         return Ok(DaemonResponse::Ok);
     }
     if enabled {
+        // Same-flavor refusal as `handle_create`: a docker-mode sandbox's
+        // workload lives in its own netns (spec §3), so a VNC relay can
+        // never reach it. `docker_effective()` (not the raw `docker` field)
+        // is the authority — a builder-forced-off docker sandbox is fine.
+        if cfg.docker_effective() {
+            bail!(
+                "VNC is not yet supported for docker-mode sandboxes (the nested \
+                 engine owns the network namespace); create without --vnc or \
+                 without --docker"
+            );
+        }
         crate::volume::validate_volumes(&cfg.volumes, true)?;
     }
     cfg.vnc = enabled;
@@ -2741,6 +2764,78 @@ mod tests {
         );
     }
 
+    /// Task 11 controller addition: `vnc: true` + effective docker mode is a
+    /// broken combination (docker mode's own netns, spec §3, makes the VNC
+    /// relay unreachable), so `handle_create` must refuse it loudly rather
+    /// than creating a sandbox whose VNC URL can never connect. Nothing is
+    /// left on disk from the refused attempt.
+    #[test]
+    fn handle_create_refuses_vnc_plus_docker() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::Create(DaemonCreate {
+                name: "web".into(),
+                image_ref: "ubuntu:24.04".into(),
+                cpus: 1,
+                mem_mb: 256,
+                workspace: dir.path().join("ws"),
+                rw_size_gb: 1,
+                ports: Vec::new(),
+                volumes: Vec::new(),
+                allow_unconfined: false,
+                builder: false,
+                docker: Some(true),
+                vnc: true,
+            }),
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("docker-mode"), "{message}");
+                assert!(
+                    message.contains("--vnc") || message.contains("--docker"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(
+            !d.paths.sandbox_dir("web").join(CONFIG_FILE).is_file(),
+            "a refused create must leave no config.json behind"
+        );
+    }
+
+    /// A `builder` create forces docker off (see the test above), so `vnc:
+    /// true` alongside `builder: true, docker: Some(true)` must succeed —
+    /// the refusal keys on the EFFECTIVE docker flag, not the raw request.
+    #[test]
+    fn handle_create_allows_vnc_plus_docker_when_builder_forces_docker_off() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::Create(DaemonCreate {
+                name: "builder-web".into(),
+                image_ref: "ubuntu:24.04".into(),
+                cpus: 1,
+                mem_mb: 256,
+                workspace: dir.path().join("ws"),
+                rw_size_gb: 1,
+                ports: Vec::new(),
+                volumes: Vec::new(),
+                allow_unconfined: false,
+                builder: true,
+                docker: Some(true),
+                vnc: true,
+            }),
+        ) {
+            DaemonResponse::Created { name } => assert_eq!(name, "builder-web"),
+            other => panic!("expected Created, got {other:?}"),
+        }
+    }
+
     /// #114 surface acceptance: a persisted symbolic-USER→root fallback in
     /// state.json is read back through `Inspect` unchanged.
     #[test]
@@ -3146,6 +3241,53 @@ mod tests {
         ) {
             DaemonResponse::Error { message } => {
                 assert!(message.contains("volume"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(before, after, "a refused VncSet must not touch config.json");
+    }
+
+    /// Task 11 controller addition: enabling VNC on an already-existing
+    /// docker-mode sandbox must be refused the same way `handle_create` is —
+    /// the netns split doesn't care whether docker mode was chosen before or
+    /// after the sandbox existed.
+    #[test]
+    fn vnc_set_refuses_to_enable_on_a_docker_mode_sandbox() {
+        let (dir, d) = test_daemon();
+        let mut c = client_conn(&d);
+        match rpc(
+            &mut c,
+            &DaemonRequest::Create(DaemonCreate {
+                name: "web".into(),
+                image_ref: "ubuntu:24.04".into(),
+                cpus: 1,
+                mem_mb: 256,
+                workspace: dir.path().join("ws"),
+                rw_size_gb: 1,
+                ports: Vec::new(),
+                volumes: Vec::new(),
+                allow_unconfined: false,
+                builder: false,
+                docker: Some(true),
+                vnc: false,
+            }),
+        ) {
+            DaemonResponse::Created { .. } => {}
+            other => panic!("create: {other:?}"),
+        }
+        let p = d.paths.sandbox_dir("web").join(CONFIG_FILE);
+        let before = std::fs::read_to_string(&p).unwrap();
+
+        match rpc(
+            &mut c,
+            &DaemonRequest::VncSet {
+                name: "web".into(),
+                enabled: true,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("docker-mode"), "{message}");
             }
             other => panic!("expected Error, got {other:?}"),
         }

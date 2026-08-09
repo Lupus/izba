@@ -288,6 +288,9 @@ enum Cmd {
     /// Pass a USB device through to a sandbox (usbip)
     #[command(subcommand)]
     Usb(commands::usb::UsbCmd),
+    /// Manage a sandbox's VNC desktop
+    #[command(subcommand)]
+    Vnc(commands::vnc::VncCmd),
     /// Manage the izba daemon (auto-started by other commands)
     #[command(subcommand)]
     Daemon(DaemonCmd),
@@ -497,6 +500,7 @@ fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
         Cmd::Volume(vc) => commands::volume::run(paths, &vc),
         Cmd::Policy(pc) => commands::policy::run(paths, &pc),
         Cmd::Usb(uc) => commands::usb::run(paths, &uc),
+        Cmd::Vnc(vc) => commands::vnc::run(paths, &vc),
         Cmd::Version { json } => commands::version::run(paths, json),
         Cmd::Daemon(dc) => match dc {
             DaemonCmd::Run => commands::daemon::run_foreground(paths),
@@ -1127,6 +1131,31 @@ mod tests {
         assert_eq!(name, "web");
         // name is required
         assert!(Cli::try_parse_from(["izba", "lockdown"]).is_err());
+    }
+
+    #[test]
+    fn parse_vnc_subcommands() {
+        use commands::vnc::VncCmd;
+        for (args, expect_name) in [
+            (vec!["izba", "vnc", "on", "web"], "web"),
+            (vec!["izba", "vnc", "off", "web"], "web"),
+            (vec!["izba", "vnc", "url", "web"], "web"),
+            (vec!["izba", "vnc", "open", "web"], "web"),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Cmd::Vnc(vc) = cli.cmd else {
+                panic!("expected vnc subcommand");
+            };
+            let name = match vc {
+                VncCmd::On { name } => name,
+                VncCmd::Off { name } => name,
+                VncCmd::Url { name } => name,
+                VncCmd::Open { name } => name,
+            };
+            assert_eq!(name, expect_name);
+        }
+        // Bare `izba vnc` requires a subcommand.
+        assert!(Cli::try_parse_from(["izba", "vnc"]).is_err());
     }
 
     #[test]
