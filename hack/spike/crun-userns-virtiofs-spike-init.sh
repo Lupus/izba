@@ -91,21 +91,21 @@ parse_cmdline() {
 # ---------------------------------------------------------------------------
 mount_workspace() {
     mkdir -p "$WS"
-    if mount -t virtiofs -o default_permissions "$TAG" "$WS" 2>/tmp/ws.err; then
-        result "virtiofs-mount PASS mounted $TAG at $WS with default_permissions"
+    # NOTE (2026-08-09 re-diagnosis): virtio_fs REJECTS an explicit
+    # `-o default_permissions` mount param (its parse_param only knows dax) but
+    # SETS default_permissions unconditionally in virtio_fs_ctx_set_defaults()
+    # — on every kernel since virtiofs existed. A plain mount is therefore
+    # already idmap-capable (fc->default_permissions=1 satisfies the
+    # FUSE_ALLOW_IDMAP handshake in fuse's process_init_reply). The June 2026
+    # run misread the param rejection as "idmap plumbing missing".
+    if mount -t virtiofs "$TAG" "$WS" 2>/tmp/ws.err; then
+        result "virtiofs-mount PASS mounted $TAG at $WS (default_permissions is implicit for virtiofs)"
         log "pre-userns ls -lan of $WS (numeric owners; host uid=$HOST_UID):"
         ls -lan "$WS" 2>&1 | sed 's/^/SPIKE:   /'
         return 0
     fi
-    log "mount -o default_permissions failed err=$(cat /tmp/ws.err); dmesg tail:"
+    log "mount failed err=$(cat /tmp/ws.err); dmesg tail:"
     dmesg 2>/dev/null | tail -8 | sed 's/^/SPIKE:   dmesg: /'
-    # Retry without default_permissions purely to learn whether the option is
-    # what the backend rejects (diagnostic only; idmap tests still need it).
-    if mount -t virtiofs "$TAG" "$WS" 2>>/tmp/ws.err; then
-        result "virtiofs-mount DEGRADED mounted only WITHOUT default_permissions \
-(backend rejected the option; Option B idmap needs it) err=$(cat /tmp/ws.err)"
-        return 0
-    fi
     result "virtiofs-mount FAIL could not mount $TAG err=$(cat /tmp/ws.err)"
     return 1
 }
@@ -277,14 +277,21 @@ write_config_option_b() {
     # see PID1 uid_map in the probe).
     uidmap='[{"containerID":0,"hostID":0,"size":1}]'
     gidmap='[{"containerID":0,"hostID":0,"size":1}]'
-    # Mount-level idmap: containerID 0 <- hostID HOST_UID. Per the OCI
-    # runtime-spec, a mount with "idmap" in options and its own uid/gidMappings
-    # gets an idmapped mount; the mappings here are the MOUNT's, independent of
-    # the process userns. (crun >= 1.9 understands "idmap".)
+    # Mount-level idmap. ORIENTATION (verified on a real VM, 2026-08-09, and
+    # the root cause of the June FAIL): the kernel computes
+    # presented = make_kuid(mnt_userns, disk_uid) — the ON-DISK id is the
+    # userns-INNER id. crun writes each mapping as a uid_map line
+    # `<containerID> <hostID> <size>`, so containerID = DISK id and
+    # hostID = PRESENTED id. The virtiofs files' disk id (as the guest sees
+    # them) is HOST_UID and we want them PRESENTED as 0, hence
+    # containerID=HOST_UID, hostID=0 — the June run had the two columns
+    # swapped, which presents the files as 65534/nobody and EOVERFLOWs
+    # container writes (presented-0 had no reverse mapping).
+    # (crun >= 1.9 understands "idmap".)
     ws_mount="    { \"destination\": \"/workspace\", \"type\": \"bind\", \"source\": \"${WS}\",
       \"options\": [\"rbind\",\"rw\",\"idmap\"],
-      \"uidMappings\": [{\"containerID\":0,\"hostID\":${HOST_UID},\"size\":1}],
-      \"gidMappings\": [{\"containerID\":0,\"hostID\":${HOST_GID},\"size\":1}] }"
+      \"uidMappings\": [{\"containerID\":${HOST_UID},\"hostID\":0,\"size\":1}],
+      \"gidMappings\": [{\"containerID\":${HOST_GID},\"hostID\":0,\"size\":1}] }"
     # Process is identity-root, so a root-owned rootfs is fine here.
     rfs="$BUNDLE_B/rootfs"
     build_rootfs "$rfs"

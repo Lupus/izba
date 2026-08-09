@@ -4,6 +4,25 @@
 still TODO. · **Companion:** the gating spike defined in
 `2026-06-22-crun-oci-runtime-design.LOCAL-DRAFT.md` §5.
 
+> **RETRACTION (2026-08-09): the Option B verdict below is WRONG.** The June
+> run's mount idmap had its two columns swapped — the OCI mount mapping said
+> `containerID:0, hostID:<host_uid>`, but an idmapped mount treats the ON-DISK
+> id as the userns-INNER id (`presented = make_kuid(mnt_userns, disk_uid)`), so
+> presenting a disk-`<host_uid>` file as 0 needs `containerID:<host_uid>,
+> hostID:0`. The inverted map presents the files as `65534/nobody` and
+> EOVERFLOWs container writes — exactly the symptoms recorded below, and the
+> same bug class later hit and documented in the 2026-08-09 uid-fidelity
+> design §2.3. The supporting evidence was also misread: virtio_fs REJECTS an
+> explicit `default_permissions` mount param (its parser only knows `dax`) but
+> sets it UNCONDITIONALLY in `virtio_fs_ctx_set_defaults()`, and it has carried
+> `FS_ALLOW_IDMAP` since v6.12; virtiofsd has advertised `FUSE_ALLOW_IDMAP`
+> since v1.13.0. With the orientation corrected the same harness passes Option
+> B end-to-end **on the unchanged 6.12.30 + virtiofsd 1.13.3 pins** (host file
+> presents 0:0 in-container; container write round-trips to the host owner).
+> No kernel version was ever the blocker on the CH leg. The OpenVMM leg IS
+> still blocked: its bundled virtiofs server does not advertise
+> `FUSE_ALLOW_IDMAP`.
+
 **Harness:** `hack/spike/crun-userns-virtiofs-spike.sh` (+ guest `-init.sh`).
 Boots a real ≥6.12 microVM under Cloud Hypervisor v42.0 with vhost-user
 virtiofsd 1.13.3 (`--memory shared=on`, mirroring izba's launch), a throwaway
