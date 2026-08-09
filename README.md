@@ -267,7 +267,7 @@ izba port   publish|unpublish|ls NAME [RULE]   # TCP, runtime or create-time -p
 izba volume prune [-f]                  # remove persistent volumes no sandbox uses
 izba ls
 izba start  [NAME_OR_DIR]               # boot a stopped sandbox (no exec; symmetric with stop)
-izba stop   [NAME_OR_DIR]
+izba stop   [NAME_OR_DIR] [--all]       # --all stops every running sandbox (installers/updaters)
 izba rm     [--force] [NAME_OR_DIR]
 izba daemon run                         # run the daemon in the foreground (auto-started on demand otherwise)
 izba daemon status                      # daemon health + supervised sandboxes

@@ -34,6 +34,12 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 ChangesEnvironment=yes
+; Backstop only: PrepareToInstall below quiesces izba gracefully (sandboxes,
+; daemon, leftovers). Restart Manager cannot close console processes like
+; `izba daemon run` / openvmm.exe, so anything it still finds is terminated
+; rather than surfacing "unable to automatically close all applications".
+CloseApplications=force
+RestartApplications=no
 
 [Components]
 Name: "cli"; Description: "izba CLI + microVM runtime"; Types: full custom; Flags: fixed
@@ -45,6 +51,10 @@ Source: "{#StageDir}\bin\izba-jail-helper.exe"; DestDir: "{app}\bin";         Fl
 Source: "{#StageDir}\bin\libexec\*";     DestDir: "{app}\bin\libexec"; Flags: ignoreversion recursesubdirs;  Components: cli
 Source: "{#StageDir}\artifacts\*";       DestDir: "{app}\artifacts";   Flags: ignoreversion recursesubdirs;  Components: cli
 Source: "{#StageDir}\bin\izba-app.exe";  DestDir: "{app}\bin";         Flags: ignoreversion;                 Components: gui
+; Shutdown helper: extracted to {tmp} for PrepareToInstall, and installed so
+; the uninstaller can quiesce izba before removing files.
+Source: "stop-izba.ps1"; Flags: dontcopy
+Source: "stop-izba.ps1"; DestDir: "{app}"; Flags: ignoreversion; Components: cli
 
 [Icons]
 Name: "{group}\izba"; Filename: "{app}\bin\izba-app.exe"; Components: gui
@@ -56,6 +66,35 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
     Check: NeedsAddPath(ExpandConstant('{app}\bin'))
 
 [Code]
+// Quiesce izba so file replacement never hits in-use binaries: gracefully
+// stop all sandboxes (`izba stop --all`) and the daemon (`izba daemon stop`),
+// then force-kill anything still running from the install dir. All
+// best-effort with timeouts inside the script; CloseApplications=force above
+// is the final backstop.
+procedure RunStopIzba(const ScriptPath: string);
+var
+  ResultCode: Integer;
+begin
+  Exec('powershell.exe',
+    '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '"' +
+    ' -InstallDir "' + ExpandConstant('{app}') + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  ExtractTemporaryFile('stop-izba.ps1');
+  RunStopIzba(ExpandConstant('{tmp}\stop-izba.ps1'));
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  // Right before file removal — the installed copy still exists here.
+  if CurUninstallStep = usUninstall then
+    RunStopIzba(ExpandConstant('{app}\stop-izba.ps1'));
+end;
+
 function NeedsAddPath(Param: string): Boolean;
 var
   OrigPath: string;
