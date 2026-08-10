@@ -150,6 +150,9 @@ pub trait DaemonApi: Send {
     fn usb_attach(&mut self, name: &str, device: &str) -> anyhow::Result<()>;
     /// Detach a device the sandbox currently holds.
     fn usb_detach(&mut self, name: &str, device: &str) -> anyhow::Result<()>;
+    /// Turn the KasmVNC desktop on/off for a sandbox (may need a restart to
+    /// take effect — see `SandboxDetail::vnc_restart_required`).
+    fn vnc_set(&mut self, name: &str, enabled: bool) -> anyhow::Result<()>;
 }
 
 /// Production `DaemonApi`: a lazily-connected `DaemonClient`. Connects via
@@ -675,6 +678,18 @@ impl DaemonApi for RealDaemon {
             interpret_attach_reply(
                 c.request(&DaemonRequest::UsbDetach { name, device }, &mut |_| {})?,
             )
+        })
+    }
+
+    fn vnc_set(&mut self, name: &str, enabled: bool) -> anyhow::Result<()> {
+        self.with_client(|c| {
+            expect_ok(c.request(
+                &DaemonRequest::VncSet {
+                    name: name.to_string(),
+                    enabled,
+                },
+                &mut |_| {},
+            )?)
         })
     }
 }

@@ -66,6 +66,11 @@ pub struct FakeDaemon {
     /// `vid:pid` of devices the sandbox is holding.
     pub usb_attached: Vec<String>,
     pub usb_restart_required: bool,
+    /// KasmVNC desktop toggle echoed by `inspect`, flipped by `vnc_set`.
+    pub vnc: bool,
+    pub vnc_running: bool,
+    pub vnc_url: Option<String>,
+    pub vnc_restart_required: bool,
 }
 
 impl Default for FakeDaemon {
@@ -114,6 +119,10 @@ impl Default for FakeDaemon {
             usb_grants: vec![],
             usb_attached: vec![],
             usb_restart_required: false,
+            vnc: false,
+            vnc_running: false,
+            vnc_url: None,
+            vnc_restart_required: false,
         }
     }
 }
@@ -322,10 +331,10 @@ impl DaemonApi for FakeDaemon {
             container: Some(izba_proto::ContainerState::Running),
             user_fallback: None,
             docker: false,
-            vnc: false,
-            vnc_running: false,
-            vnc_url: None,
-            vnc_restart_required: false,
+            vnc: self.vnc,
+            vnc_running: self.vnc_running,
+            vnc_url: self.vnc_url.clone(),
+            vnc_restart_required: self.vnc_restart_required,
         })
     }
 
@@ -567,6 +576,15 @@ impl DaemonApi for FakeDaemon {
             anyhow::bail!("the guest refused the detach");
         }
         self.usb_attached.retain(|d| d != device);
+        Ok(())
+    }
+
+    fn vnc_set(&mut self, name: &str, enabled: bool) -> anyhow::Result<()> {
+        self.calls.push(format!("vnc_set:{name}:{enabled}"));
+        if self.fail_action {
+            anyhow::bail!("daemon unreachable");
+        }
+        self.vnc = enabled;
         Ok(())
     }
 }
