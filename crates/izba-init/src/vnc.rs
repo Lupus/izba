@@ -208,7 +208,36 @@ fn vnc_env() -> Vec<(String, String)> {
 ///    which otherwise makes a real egress request; `-interface` keeps the
 ///    listener on loopback (the host reaches it only through init's vsock
 ///    relay); every data path (`-httpd`/`-fp`/`-xkbdir`) points into the
-///    bundle bind.
+///    bundle bind. Two further flags are what make the *session* — not just
+///    the static page — actually work in a browser; both were missing in
+///    the first cut and produced the "page loads, desktop never appears,
+///    endless spinner, credential re-prompt" bug:
+///    - `-SecurityTypes None`. The X server's default is `VncAuth`, which
+///      authenticates the RFB stream against a **separate** legacy
+///      `-rfbauth`/`PasswordFile` DES-obfuscated file. izba never writes one
+///      (its credential is the `kasmpasswd` BasicAuth hash), so the server
+///      offered security type 2 with no password configured: the HTTP GETs
+///      all succeeded, the websocket upgraded, and the RFB handshake then
+///      dead-ended — the web client sat spinning and re-prompted. Upstream's
+///      `kasmvncserver` wrapper avoids this by generating an `-rfbauth` file
+///      too; izba instead drops the RFB-level type, because the ONLY gate
+///      that means anything here is the HTTP BasicAuth in front of the
+///      websocket (which stays on — see `-KasmPasswordFile` below). It is
+///      not a weakening: the listener is guest-loopback-only, the host
+///      reaches it exclusively through the daemon's authenticated relay, and
+///      an in-guest process already owns the display outright via `-ac`.
+///    - `-BlacklistThreshold 0` (disable KasmVNC's brute-force lockout).
+///      The default blacklists a source IP after 5 unauthenticated requests
+///      for `BlacklistTimeout` minutes — and a browser loading this page
+///      *always* trips it: HTTP basic auth is a 401-then-retry protocol, and
+///      the client page fires ~30 parallel subresource requests, ~10 of
+///      which reach the server before the credentials are cached. The
+///      counter then locks out **everything**, since every byte arrives from
+///      the same guest loopback address (the relay), and the half-loaded
+///      page spins forever. Rate-limiting cannot discriminate between
+///      attacker and user when all traffic shares one source IP, and there
+///      is nothing to rate-limit: the password is a fresh 24-char random
+///      string per `start` (`izba_core::vnc::generate_password`).
 /// 2. `openbox` — decorations/focus, with `DISPLAY` set. It **waits for the
 ///    X server's socket** before exec'ing: these are two fire-and-forget
 ///    spawns issued back-to-back, and openbox exits immediately ("cannot
@@ -232,6 +261,7 @@ pub fn desktop_exec_argvs(cgroup_manager: crate::oci::CgroupManager) -> Vec<Vec<
          -geometry {GEOMETRY} -depth {DEPTH} \
          -interface {LISTEN_ADDR} -websocketPort {WEBSOCKET_PORT} -publicIP {LISTEN_ADDR} \
          -KasmPasswordFile {SECRETS_DIR}/{KASMPASSWD_FILE} \
+         -SecurityTypes None -BlacklistThreshold 0 \
          -httpd {CONTAINER_BUNDLE_DIR}/share/kasmvnc/www \
          -fp {CONTAINER_BUNDLE_DIR}/share/fonts/X11/misc \
          -xkbdir {CONTAINER_BUNDLE_DIR}/share/xkb \
@@ -525,6 +555,37 @@ mod tests {
             server.contains("-KasmPasswordFile /run/izba/vnc-secrets/kasmpasswd"),
             "the hash file materialize() wrote is what the server authenticates against: {server}"
         );
+    }
+
+    /// Regression pin for the "page loads, desktop never appears" bug: the
+    /// browser session only completes when the RFB-level security type is
+    /// `None` (the default `VncAuth` needs an `-rfbauth` file izba never
+    /// writes, so the handshake dead-ends after a successful websocket
+    /// upgrade) AND KasmVNC's brute-force lockout is off (basic auth's
+    /// 401-then-retry across ~30 parallel subresource fetches trips the
+    /// 5-attempt default, and every request shares one source IP — the
+    /// relay's loopback). Both were absent in the first cut, and every probe
+    /// at the time stopped at a plain HTTP GET, which passes either way.
+    #[test]
+    fn server_argv_completes_a_browser_session_without_disabling_basic_auth() {
+        let (server, _) = scripts();
+        assert!(
+            server.contains("-SecurityTypes None"),
+            "the RFB handshake must not offer VncAuth — izba configures no \
+             -rfbauth password file, so the web client would spin: {server}"
+        );
+        assert!(
+            server.contains("-BlacklistThreshold 0"),
+            "KasmVNC's brute-force lockout must be off — a single page load \
+             trips it and locks out the loopback the relay dials: {server}"
+        );
+        // The websocket's BasicAuth gate is what replaces both, so it must
+        // never be turned off in the same breath.
+        assert!(
+            !server.contains("-DisableBasicAuth"),
+            "BasicAuth is the ONLY remaining gate in front of the desktop: {server}"
+        );
+        assert!(server.contains("-KasmPasswordFile"), "{server}");
     }
 
     #[test]
