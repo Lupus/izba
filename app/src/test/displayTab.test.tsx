@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
 import type { SandboxDetail } from "../lib/types";
 
@@ -136,6 +136,52 @@ describe("DisplayTab", () => {
     m.inspect.mockResolvedValue({ ...live, name: "api" });
     rerender(<DisplayTab name="api" running onChanged={() => {}} />);
     await waitFor(() => expect(m.vncProxyStart).toHaveBeenCalledWith("api"));
+  });
+
+  it("blanks the tab until the sandbox it switched to has answered", async () => {
+    // The previous sandbox's detail is still in state for that stretch, and it
+    // carries that sandbox's password-bearing URL. It is not this tab's to offer.
+    m.inspect.mockImplementation((n: string) =>
+      n === "web" ? Promise.resolve(live) : new Promise<SandboxDetail>(() => {}),
+    );
+    const { rerender } = render(<DisplayTab name="web" running onChanged={() => {}} />);
+    await screen.findByRole("button", { name: /open in browser/i });
+
+    rerender(<DisplayTab name="api" running onChanged={() => {}} />);
+    expect(screen.queryByRole("button", { name: /open in browser/i })).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Sandbox desktop")).not.toBeInTheDocument();
+  });
+
+  it("never paints a slow answer for the sandbox the tab already left", async () => {
+    // "web" answers late; "api" answers at once. The late answer describes a
+    // sandbox we are no longer looking at — painting it would put web's
+    // password-bearing URL behind api's Open in browser button.
+    const apiUrl = "http://izba:0th3rpw@127.0.0.1:6081/vnc.html";
+    let answerWeb!: (d: SandboxDetail) => void;
+    m.inspect.mockImplementation((n: string) =>
+      n === "web"
+        ? new Promise<SandboxDetail>((resolve) => {
+            answerWeb = resolve;
+          })
+        : Promise.resolve(detail({ ...live, name: "api", vnc_url: apiUrl })),
+    );
+
+    const { rerender, container } = render(
+      <DisplayTab name="web" running onChanged={() => {}} />,
+    );
+    rerender(<DisplayTab name="api" running onChanged={() => {}} />);
+    await screen.findByTitle("Sandbox desktop");
+
+    await act(async () => {
+      answerWeb(deadDesktop);
+    });
+
+    expect(screen.queryByText(/not answering/i)).not.toBeInTheDocument();
+    expect(container.innerHTML).not.toContain("s3cr3t");
+    expect(container.innerHTML).not.toContain("0th3rpw");
+    fireEvent.click(screen.getByRole("button", { name: /open in browser/i }));
+    expect(openUrl).toHaveBeenCalledWith(apiUrl);
+    expect(openUrl).not.toHaveBeenCalledWith(CREDENTIALED);
   });
 
   it("opens and copies the credentialed URL without showing it", async () => {
