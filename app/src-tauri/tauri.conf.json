@@ -14,7 +14,7 @@
       { "title": "izba", "width": 1100, "height": 720, "minWidth": 880, "minHeight": 560 }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'self' http://127.0.0.1:*"
     }
   },
   "bundle": {
