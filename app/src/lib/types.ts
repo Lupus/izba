@@ -78,6 +78,17 @@ export interface SandboxDetail {
    *  stopped / its state predates the field — the UI renders `null` as
    *  "unknown". */
   confinement: string | null;
+  /** Whether this sandbox is configured to boot with a VNC desktop. */
+  vnc: boolean;
+  /** Whether a VNC relay is currently live for this sandbox. */
+  vnc_running: boolean;
+  /** The URL a human can open to reach the live VNC desktop, when one is
+   *  running. */
+  vnc_url: string | null;
+  /** The sandbox is running with its VNC display configuration ahead of
+   *  what it actually booted (either direction) — it must be restarted for
+   *  `vnc` to take effect. */
+  vnc_restart_required: boolean;
 }
 
 /** One process in the guest's mini-top (mirrors `ProcessView`). `state` is
@@ -178,6 +189,8 @@ export interface CreateOpts {
   rw_size_gb: number;
   ports: string[];
   volumes: string[];
+  /** Boot with the KasmVNC desktop (--vnc). */
+  vnc: boolean;
 }
 
 /** Payload of the `shell-output` event (raw PTY bytes, base64-encoded). */

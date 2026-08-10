@@ -22,6 +22,10 @@ vi.mock("../lib/ipc", () => ({
       cpus: 2,
       mem_mb: 4096,
       confinement: "confined",
+      vnc: false,
+      vnc_running: false,
+      vnc_url: null,
+      vnc_restart_required: false,
     }),
     // The Overview tab's single stats poller.
     stats: vi.fn().mockResolvedValue({

@@ -119,6 +119,7 @@ export function NewSandbox({ onClose, onCreated }: Readonly<Props>) {
             `${r.bind.trim() ? `${r.bind.trim()}:` : ""}${r.host.trim()}:${r.guest.trim()}`,
         ),
       volumes: volumeRows.filter((r) => !isBlankVolRow(r)).map((r) => buildVolSpec(r, allVolumes)),
+      vnc: false, // wizard control lands in the create-wizard task
     };
     try {
       const created = await api.create(opts);

@@ -37,6 +37,7 @@ describe("ipc action wrappers", () => {
       rw_size_gb: 8,
       ports: [],
       volumes: [],
+      vnc: false,
     };
     await api.create(opts);
     expect(invoke).toHaveBeenCalledWith("create", { opts });
@@ -219,5 +220,23 @@ describe("ipc action wrappers", () => {
     invoke.mockResolvedValue(promoted);
     await expect(api.manifestPromote("web", true)).resolves.toEqual(promoted);
     expect(invoke).toHaveBeenCalledWith("manifest_promote", { name: "web", restart: true });
+  });
+
+  // ── vnc ──────────────────────────────────────────────────────────────────
+
+  it("vncSet invokes vnc_set with name + enabled", async () => {
+    await api.vncSet("web", true);
+    expect(invoke).toHaveBeenCalledWith("vnc_set", { name: "web", enabled: true });
+  });
+
+  it("vncProxyStart invokes vnc_proxy_start with the name and returns the url", async () => {
+    invoke.mockResolvedValue("http://izba:s3cr3t@127.0.0.1:4444/");
+    await expect(api.vncProxyStart("web")).resolves.toBe("http://izba:s3cr3t@127.0.0.1:4444/");
+    expect(invoke).toHaveBeenCalledWith("vnc_proxy_start", { name: "web" });
+  });
+
+  it("vncProxyStop invokes vnc_proxy_stop with the name", async () => {
+    await api.vncProxyStop("web");
+    expect(invoke).toHaveBeenCalledWith("vnc_proxy_stop", { name: "web" });
   });
 });

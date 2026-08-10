@@ -76,6 +76,10 @@ export function detailFixture(overrides: Partial<SandboxDetail> = {}): SandboxDe
     cpus: 4,
     mem_mb: 4096,
     confinement: "confined",
+    vnc: false,
+    vnc_running: false,
+    vnc_url: null,
+    vnc_restart_required: false,
     ...overrides,
   };
 }

@@ -87,6 +87,9 @@ export const api = {
   manifestExport: (name: string) => invoke<string>("manifest_export", { name }),
   manifestPromote: (name: string, restart: boolean) =>
     invoke<PromoteView>("manifest_promote", { name, restart }),
+  vncSet: (name: string, enabled: boolean) => invoke<void>("vnc_set", { name, enabled }),
+  vncProxyStart: (name: string) => invoke<string>("vnc_proxy_start", { name }),
+  vncProxyStop: (name: string) => invoke<void>("vnc_proxy_stop", { name }),
 };
 
 /** Decode a base64 string to raw bytes (xterm.write accepts Uint8Array). */

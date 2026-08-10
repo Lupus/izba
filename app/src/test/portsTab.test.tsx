@@ -40,6 +40,10 @@ function detail(ports: PortRule[] = []): SandboxDetail {
     cpus: 2,
     mem_mb: 4096,
     confinement: null,
+    vnc: false,
+    vnc_running: false,
+    vnc_url: null,
+    vnc_restart_required: false,
   };
 }
 
