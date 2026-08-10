@@ -679,18 +679,73 @@ if ($buildSectionFails -gt 0) {
 # dial -> Xkasmvnc's websockify inside the crun container, authenticating
 # against the kasmpasswd hash the host generated at `start` and delivered
 # over the `izba-vnc` virtiofs share. This is the WHP analogue of the KVM
-# `vnc_desktop_e2e` daemon_e2e test -- same auth-matrix ORDERING lesson
-# applies: KasmVNC blacklists an IP after 5 failed login attempts (a dropped
-# connection thereafter, not a clean 401), so the good-credentials probe MUST
-# land before the wrong-password probe and the whole matrix stays within a
-# few bounded requests. The poll-until-401 loop breaks on the FIRST 401 for
-# the same reason -- it must not itself burn through the attempt budget.
+# `vnc_desktop_e2e` daemon_e2e test.
+#
+# The HTTP matrix alone is NOT proof the display works: static content served
+# perfectly in the first cut while the desktop never appeared. So the section
+# also drives a real WebSocket upgrade and the first two RFB steps through it
+# (Invoke-VncWsProbe below), which is where both shipped bugs actually lived
+# -- the RFB security type and KasmVNC's brute-force lockout.
+#
+# The lockout is now disabled server-side (`-BlacklistThreshold 0` in
+# izba-init's Xkasmvnc argv), because a browser trips the 5-attempt default
+# by itself: basic auth is 401-then-retry and every request reaches the guest
+# from the same loopback address, so the counter can only ever lock out the
+# legitimate user. The probe ordering below therefore no longer has to ration
+# failed attempts -- and it deliberately spends MORE than the old budget
+# before the credentialed websocket probe, so a regression that restores the
+# lockout fails this section instead of only failing in a real browser.
 #
 # Guarded on the kasmvnc.erofs artifact actually being staged at the SAME
 # production exe-relative discovery path production code uses
 # (<exe-dir>\..\artifacts\kasmvnc.erofs -- mirrors vnc_bundle_path() in
 # daemon_e2e.rs); a local run without the artifact stays usable via a loud
 # SKIP rather than a silent no-op or a hard failure.
+# What a real VNC client does and Invoke-WebRequest cannot: upgrade the port
+# to a WebSocket and run the first two RFB steps through it. Returns a
+# hashtable @{ Greeting = 'RFB 003.00x'; SecTypes = @(1); Error = $null } --
+# on a refused upgrade only Error is set (.NET Framework's ClientWebSocket
+# collapses the 401 into a generic "Unable to connect to the remote server",
+# so the caller asserts "no RFB stream", not a status code).
+function Invoke-VncWsProbe {
+    param([int]$Port, [string]$AuthHeader)
+    $out = @{ Greeting = ''; SecTypes = @(); Error = $null }
+    $ws  = New-Object System.Net.WebSockets.ClientWebSocket
+    $cts = New-Object System.Threading.CancellationTokenSource 20000
+    try {
+        if ($AuthHeader) { $ws.Options.SetRequestHeader('Authorization', $AuthHeader) }
+        # NOT optional: without an Origin the server answers 404 ("request
+        # failed websocket checks") and a broken probe would look like a
+        # broken server. `binary` is the subprotocol the shipped client asks
+        # for, and `/websockify` the path it dials.
+        $ws.Options.SetRequestHeader('Origin', "http://127.0.0.1:$Port")
+        $ws.Options.AddSubProtocol('binary')
+        $ws.ConnectAsync([Uri]"ws://127.0.0.1:$Port/websockify", $cts.Token).GetAwaiter().GetResult() | Out-Null
+        $buf = New-Object byte[] 64
+        $seg = New-Object System.ArraySegment[byte] (,$buf)
+        $r   = $ws.ReceiveAsync($seg, $cts.Token).GetAwaiter().GetResult()
+        $out.Greeting = [Text.Encoding]::ASCII.GetString($buf, 0, $r.Count)
+        if ($r.Count -ge 12) {
+            # Echo the server's version back (RFB 3.x step 2) so it proceeds
+            # to the security-type list: <count> <type>...
+            $send = New-Object System.ArraySegment[byte] (,$buf[0..11])
+            $ws.SendAsync($send, [System.Net.WebSockets.WebSocketMessageType]::Binary, $true, $cts.Token).GetAwaiter().GetResult() | Out-Null
+            $buf2 = New-Object byte[] 64
+            $seg2 = New-Object System.ArraySegment[byte] (,$buf2)
+            $r2   = $ws.ReceiveAsync($seg2, $cts.Token).GetAwaiter().GetResult()
+            if ($r2.Count -ge 1) {
+                $n = [int]$buf2[0]
+                if ($n -gt 0 -and $n -le ($r2.Count - 1)) { $out.SecTypes = @($buf2[1..$n]) }
+            }
+        }
+    } catch {
+        $out.Error = $_.Exception.Message
+    } finally {
+        $ws.Dispose()
+    }
+    return $out
+}
+
 $vncBundle = Join-Path (Split-Path -Parent (Split-Path -Parent $exe)) 'artifacts\kasmvnc.erofs'
 if (-not (Test-Path $vncBundle)) {
     Write-Warning "SKIP vnc: kasmvnc.erofs not staged at $vncBundle"
@@ -766,8 +821,7 @@ if (-not (Test-Path $vncBundle)) {
 
                 # Step 5: a wrong password is rejected -- proves step 4
                 # passed because of the credentials, not because auth is
-                # effectively disabled. ONE bad-credential attempt total,
-                # well inside KasmVNC's 5-attempt blacklist threshold.
+                # effectively disabled.
                 $vncBadHeader = @{ Authorization = ('Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('izba:definitely-not-the-password'))) }
                 $vncBadCode = $null
                 try {
@@ -777,11 +831,41 @@ if (-not (Test-Path $vncBundle)) {
                     [Console]::Error.WriteLine("  vnc: wrong-password GET failed: $($_.Exception.Message)")
                 }
                 Check 'vnc: wrong password -> 401' ($vncBadCode -eq 401)
+
+                # Step 6: the session itself. The auth gate must hold on the
+                # websocket path too...
+                $vncWsAnon = Invoke-VncWsProbe -Port ([int]$vncPort) -AuthHeader $null
+                Check 'vnc: unauthenticated websocket upgrade refused' (-not $vncWsAnon.Greeting.StartsWith('RFB '))
+
+                # ...and then, AFTER spending more unauthenticated requests
+                # than KasmVNC's default 5-attempt lockout would allow (the
+                # pattern any browser generates on its own), a credentialed
+                # client must still reach a live RFB stream.
+                for ($i = 0; $i -lt 6; $i++) {
+                    try { Invoke-WebRequest -Uri $vncBase -SkipHttpErrorCheck -TimeoutSec 10 | Out-Null } catch { }
+                }
+                $vncWs = Invoke-VncWsProbe -Port ([int]$vncPort) -AuthHeader $vncGoodHeader.Authorization
+                Check 'vnc: credentialed websocket carries the RFB stream' ($vncWs.Greeting.StartsWith('RFB '))
+                if (-not $vncWs.Greeting.StartsWith('RFB ')) {
+                    [Console]::Error.WriteLine("  vnc: websocket probe error = $($vncWs.Error)")
+                    Dump-BootLogs $vncName
+                }
+                # 1 = None, 2 = VncAuth. VncAuth authenticates against a
+                # separate legacy -rfbauth file izba never writes, so
+                # offering it strands the web client at a password prompt it
+                # can never satisfy -- the BasicAuth proven above is the gate.
+                Check 'vnc: RFB security type is None, not VncAuth' (($vncWs.SecTypes -contains 1) -and -not ($vncWs.SecTypes -contains 2))
+                if ($vncWs.SecTypes -contains 2) {
+                    [Console]::Error.WriteLine("  vnc: offered security types = $($vncWs.SecTypes -join ',')")
+                }
             } else {
                 Check 'vnc: unauthenticated GET -> 401' $false
                 Check 'vnc: correct credentials -> 200' $false
                 Check 'vnc: correct-credentials body contains kasm' $false
                 Check 'vnc: wrong password -> 401' $false
+                Check 'vnc: unauthenticated websocket upgrade refused' $false
+                Check 'vnc: credentialed websocket carries the RFB stream' $false
+                Check 'vnc: RFB security type is None, not VncAuth' $false
             }
         } else {
             Check 'vnc: url exits 0' $false
@@ -790,6 +874,9 @@ if (-not (Test-Path $vncBundle)) {
             Check 'vnc: correct credentials -> 200' $false
             Check 'vnc: correct-credentials body contains kasm' $false
             Check 'vnc: wrong password -> 401' $false
+            Check 'vnc: unauthenticated websocket upgrade refused' $false
+            Check 'vnc: credentialed websocket carries the RFB stream' $false
+            Check 'vnc: RFB security type is None, not VncAuth' $false
         }
     } finally {
         & $exe stop $vncName 2>$null | Out-Null
