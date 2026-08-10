@@ -98,7 +98,7 @@ end;
 // CloseApplications=force above is the final backstop.
 procedure RunStopIzba(const ScriptPath: string);
 var
-  StatusFile, DoneFile, Status, LastStatus, KillCmd: String;
+  StatusFile, DoneFile, Status, LastStatus, KillCmd, Marker: String;
   S: AnsiString;
   ResultCode, Polls: Integer;
 begin
@@ -136,11 +136,17 @@ begin
   // unique done-file path on its own command line - guaranteed present
   // (it IS how the helper was launched), unlike a pid file the helper
   // might have failed to write. The killer excludes itself by $PID.
+  // Literal .Contains (not -like: * and [ are wildcards there) with
+  // apostrophes doubled for the single-quoted PowerShell literal - {tmp}
+  // contains the user name, which may legally contain an apostrophe.
   if not FileExists(DoneFile) then
   begin
+    Marker := DoneFile;
+    StringChangeEx(Marker, '''', '''''', True);
     KillCmd :=
       'Get-CimInstance Win32_Process | Where-Object {' +
-      ' $_.CommandLine -like ''*' + DoneFile + '*'' -and $_.ProcessId -ne $PID' +
+      ' $_.CommandLine -and $_.CommandLine.Contains(''' + Marker + ''')' +
+      ' -and $_.ProcessId -ne $PID' +
       ' } | ForEach-Object { taskkill.exe /f /t /pid $_.ProcessId }';
     Exec('powershell.exe', '-NoProfile -Command "' + KillCmd + '"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
