@@ -1,5 +1,6 @@
 import type {
   SandboxView,
+  SandboxDetail,
   DaemonStatusView,
   VersionView,
   BuildInfo,
@@ -15,6 +16,9 @@ export interface Scenario {
   logs?: string;
   netlog?: EndpointSummary[];
   policy?: Record<string, PolicyView>;
+  /** `inspect` responses keyed by sandbox name (OverviewTab, DisplayTab, …
+   *  all fetch it). Mutated in place by the mock's `vnc_set` arm. */
+  details?: Record<string, SandboxDetail>;
   failList?: boolean;
   failStatus?: boolean;
   failAction?: boolean;
@@ -40,6 +44,30 @@ function buildInfo(over: Partial<BuildInfo> = {}): BuildInfo {
   };
 }
 
+/** Mirrors the Rust daemon's `SandboxDetail` shape; every field the GUI reads
+ *  (OverviewTab, PortsTab, VolumesTab, DisplayTab, WorkspacePath) gets an
+ *  inert default so a spec need only override what it cares about. */
+function sandboxDetail(over: Partial<SandboxDetail> = {}): SandboxDetail {
+  return {
+    name: "web",
+    image: "ubuntu:24.04",
+    status: "running",
+    workspace: "/ws",
+    ports: [],
+    volumes: [],
+    container: null,
+    docker: false,
+    cpus: 2,
+    mem_mb: 2048,
+    confinement: null,
+    vnc: false,
+    vnc_running: false,
+    vnc_url: null,
+    vnc_restart_required: false,
+    ...over,
+  };
+}
+
 /** Mirrors the Rust FakeDaemon::default seed. */
 export function defaultScenario(): Scenario {
   return {
@@ -58,6 +86,35 @@ export function defaultScenario(): Scenario {
     logs: "boot ok\nlogin:\n",
     netlog: [],
     policy: {},
+    details: {
+      web: sandboxDetail({ name: "web", image: "ubuntu:24.04", status: "running", workspace: "/ws/web" }),
+      db: sandboxDetail({ name: "db", image: "postgres:16", status: "stopped", workspace: "/ws/db" }),
+    },
+  };
+}
+
+/** A running sandbox with a live, credentialed desktop — the Display tab's
+ *  "url" presentation (`vncPresentation` in src/lib/vnc.ts). `vnc_url`
+ *  carries the desktop password in its userinfo exactly like the real
+ *  backend, so display.spec.ts's credential-leak assertion is genuine: a
+ *  regression that rendered this URL (instead of the proxy URL) would trip
+ *  it. */
+export function vncEnabledScenario(): Scenario {
+  const base = defaultScenario();
+  return {
+    ...base,
+    details: {
+      ...base.details,
+      web: sandboxDetail({
+        name: "web",
+        image: "ubuntu:24.04",
+        status: "running",
+        workspace: "/ws/web",
+        vnc: true,
+        vnc_running: true,
+        vnc_url: "http://izba:pw@127.0.0.1:4444/",
+      }),
+    },
   };
 }
 

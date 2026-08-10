@@ -115,6 +115,12 @@
       case "version_info":
         return Promise.resolve(scenario.version);
 
+      case "inspect": {
+        calls.push("inspect:" + args.name);
+        const d = scenario.details && scenario.details[args.name];
+        return d ? Promise.resolve(d) : err("no detail for " + args.name);
+      }
+
       case "start":
         calls.push("start:" + args.name);
         return action();
@@ -182,6 +188,37 @@
       case "shell_close":
         calls.push("shell_close:" + args.id);
         return action();
+
+      // vnc_set mutates the scenario's inspect() record in place: enabling/
+      // disabling flips `vnc`, and — mirroring the real daemon — flags
+      // vnc_restart_required whenever the sandbox is currently running (a
+      // stopped sandbox picks up the new config on its next start, no
+      // restart needed).
+      case "vnc_set": {
+        calls.push("vnc_set:" + args.name + ":" + args.enabled);
+        const d = scenario.details && scenario.details[args.name];
+        if (d) {
+          d.vnc = !!args.enabled;
+          const sbx = (scenario.sandboxes || []).find(function (s) {
+            return s.name === args.name;
+          });
+          if (sbx && sbx.state && sbx.state.kind === "running") {
+            d.vnc_restart_required = true;
+          }
+        }
+        return action();
+      }
+      // Deliberately a loopback URL the iframe cannot actually load
+      // (credential-less, unlike detail.vnc_url) — specs assert UI chrome
+      // around the embed, never iframe content.
+      case "vnc_proxy_start":
+        calls.push("vnc_proxy_start:" + args.name);
+        return scenario.failAction
+          ? err(scenario.errorMessage || "action failed")
+          : Promise.resolve("http://127.0.0.1:1/");
+      case "vnc_proxy_stop":
+        calls.push("vnc_proxy_stop:" + args.name);
+        return Promise.resolve(null);
 
       // Manifest diff/export/promote. Canned defaults below; specs override
       // per-call via window.__MOCK_MANIFEST__ = { diff, export, promote }
