@@ -438,13 +438,17 @@ async fn vnc_set(state: State<'_, AppState>, name: String, enabled: bool) -> Res
 /// replace it (inserting over an existing key drops the old proxy, which
 /// stops it) with a freshly started one. Returns the credential-less loopback
 /// URL the webview should embed.
+///
+/// "Live" is two conditions, not one: a proxy whose accept loop has ended
+/// still matches its target but its port is closed, so reusing it would hand
+/// the webview a dead port for as long as the sandbox entry survives.
 fn vnc_proxy_url(
     proxies: &mut HashMap<String, vncproxy::VncProxy>,
     name: String,
     target: vncproxy::ProxyTarget,
 ) -> Result<String, String> {
     if let Some(existing) = proxies.get(&name) {
-        if existing.target_matches(&target) {
+        if existing.target_matches(&target) && existing.is_live() {
             return Ok(format!("http://127.0.0.1:{}/", existing.port()));
         }
     }
@@ -1253,6 +1257,62 @@ mod dispatch_tests {
             &mut emit,
         );
         assert!(stopped.is_ok(), "{stopped:?}");
+    }
+
+    #[test]
+    fn vnc_proxy_url_reuses_rekeys_and_replaces_a_dead_proxy() {
+        let mut proxies: HashMap<String, vncproxy::VncProxy> = HashMap::new();
+        let target = vncproxy::ProxyTarget {
+            port: 4444,
+            authorization: "Basic aXpiYTphYWE=".into(),
+        };
+
+        // Some sandboxes deny TCP bind with EPERM (see vncproxy's try_listener).
+        let first = match vnc_proxy_url(&mut proxies, "web".into(), target.clone()) {
+            Ok(u) => u,
+            Err(e) if e.contains("bind loopback proxy port") => {
+                eprintln!("SKIP: sandbox denies TCP bind: {e}");
+                return;
+            }
+            Err(e) => panic!("vnc_proxy_url: {e}"),
+        };
+        assert!(
+            !first.contains('@'),
+            "url must carry no credentials: {first}"
+        );
+
+        // Same target: the same port comes back, so a re-mounting tab does not
+        // leak a proxy per mount.
+        let again = vnc_proxy_url(&mut proxies, "web".into(), target).unwrap();
+        assert_eq!(first, again);
+        assert_eq!(proxies.len(), 1);
+
+        // Changed target (the desktop was restarted ⇒ new relay port + new
+        // password): reusing the old proxy would point the webview at a relay
+        // it was never authenticated for.
+        let rotated = vncproxy::ProxyTarget {
+            port: 4445,
+            authorization: "Basic aXpiYTpiYmI=".into(),
+        };
+        let rekeyed = vnc_proxy_url(&mut proxies, "web".into(), rotated.clone()).unwrap();
+        // The old proxy is only dropped after the new one binds, so the ports
+        // cannot collide.
+        assert_ne!(rekeyed, again);
+        assert_eq!(proxies.len(), 1);
+
+        // Dead proxy, matching target: the reuse branch must NOT serve it.
+        proxies.get_mut("web").unwrap().stop_for_test();
+        assert!(!proxies["web"].is_live());
+        let revived = vnc_proxy_url(&mut proxies, "web".into(), rotated).unwrap();
+        assert!(
+            proxies["web"].is_live(),
+            "a dead proxy must be replaced, not handed back"
+        );
+        assert_eq!(
+            revived,
+            format!("http://127.0.0.1:{}/", proxies["web"].port()),
+            "the url must name the freshly started proxy"
+        );
     }
 
     #[test]
