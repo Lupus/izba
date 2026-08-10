@@ -148,13 +148,35 @@ At the docker-engine auto-start site (workload container `running`), when
 `izba.vnc=1`:
 1. `crun exec` `Xkasmvnc :1 -geometry 1280x800 -depth 24 -interface
    127.0.0.1 -websocketPort 6901 -publicIP 127.0.0.1 -KasmPasswordFile
-   <bind> -httpd /opt/izba-vnc/share/kasmvnc/www -fp
+   <bind> -SecurityTypes None -BlacklistThreshold 0 -httpd
+   /opt/izba-vnc/share/kasmvnc/www -fp
    /opt/izba-vnc/share/fonts/X11/misc -xkbdir /opt/izba-vnc/share/xkb -ac
    -noreset` (+ `FONTCONFIG_PATH`, `HOME`, XDG dirs into the bundle).
    `-publicIP` pins off the WebRTC public-IP lookup (spike finding: it makes
    a real egress request otherwise). Clipboard: KasmVNC defaults are
    bidirectional-on, matching the locked decision — no flags needed; the DLP
    config path stays available.
+   **`-SecurityTypes None` + `-BlacklistThreshold 0` are load-bearing** (both
+   were missing in the first cut, which produced a working HTTP surface and a
+   desktop that never appeared — endless spinner + credential re-prompt):
+   - The X server's default `SecurityTypes=VncAuth` authenticates the RFB
+     stream against a *separate* legacy `-rfbauth` DES password file. izba's
+     credential is the `kasmpasswd` BasicAuth hash and it writes no rfbauth
+     file (upstream's `kasmvncserver` wrapper generates one; izba invokes the
+     X server directly), so the websocket upgraded and the RFB handshake then
+     dead-ended. Dropping the RFB-level type is not a weakening: HTTP
+     BasicAuth in front of the websocket stays the gate, the listener is
+     guest-loopback-only behind the daemon relay, and an in-guest process
+     already owns the display outright via `-ac`.
+   - KasmVNC's brute-force lockout blacklists a source IP after 5
+     unauthenticated requests. A browser trips it unaided — basic auth is
+     401-then-retry and the client page fetches ~30 subresources in parallel
+     — and since every byte reaches the guest from the same loopback address
+     (the relay), the counter can only ever lock out the legitimate user. The
+     password is a fresh 24-char random string per `start`, so there is
+     nothing for a rate limiter to protect.
+   Neither is observable through an HTTP GET, which is why §8's probes must
+   include a websocket upgrade + RFB handshake, not just status codes.
 2. `crun exec openbox` (decorations/focus; Anthropic computer-use precedent).
 3. Both logged to `/var/log/izba-vnc.log`; fire-and-forget; a dead VNC
    server stays dead and is reported honestly (§5 probe).
