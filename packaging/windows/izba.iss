@@ -98,22 +98,19 @@ end;
 // CloseApplications=force above is the final backstop.
 procedure RunStopIzba(const ScriptPath: string);
 var
-  StatusFile, DoneFile, PidFile, Status, LastStatus, PidStr: String;
+  StatusFile, DoneFile, Status, LastStatus, KillCmd: String;
   S: AnsiString;
-  ResultCode, Polls, HelperPid: Integer;
+  ResultCode, Polls: Integer;
 begin
   StatusFile := ExpandConstant('{tmp}\izba-quiesce-status.txt');
   DoneFile := ExpandConstant('{tmp}\izba-quiesce-done.txt');
-  PidFile := ExpandConstant('{tmp}\izba-quiesce-pid.txt');
   DeleteFile(StatusFile);
   DeleteFile(DoneFile);
-  DeleteFile(PidFile);
   QuiesceStatus('Stopping izba sandboxes and daemon - this can take a few minutes...');
   if not Exec('powershell.exe',
     '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '"' +
     ' -InstallDir "' + ExpandConstant('{app}') + '"' +
-    ' -StatusFile "' + StatusFile + '" -DoneFile "' + DoneFile + '"' +
-    ' -PidFile "' + PidFile + '"',
+    ' -StatusFile "' + StatusFile + '" -DoneFile "' + DoneFile + '"',
     '', SW_HIDE, ewNoWait, ResultCode) then
     exit;
   LastStatus := '';
@@ -134,19 +131,19 @@ begin
       end;
     end;
   end;
-  // Ceiling overrun with the helper still alive: kill its whole process
-  // tree so file replacement never races a live quiesce.
+  // Ceiling overrun with the helper still alive: tree-kill it so file
+  // replacement never races a live quiesce. The helper is found by the
+  // unique done-file path on its own command line - guaranteed present
+  // (it IS how the helper was launched), unlike a pid file the helper
+  // might have failed to write. The killer excludes itself by $PID.
   if not FileExists(DoneFile) then
   begin
-    HelperPid := 0;
-    if LoadStringFromFile(PidFile, S) then
-    begin
-      PidStr := S;
-      HelperPid := StrToIntDef(Trim(PidStr), 0);
-    end;
-    if HelperPid > 0 then
-      Exec('taskkill.exe', '/f /t /pid ' + IntToStr(HelperPid),
-        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    KillCmd :=
+      'Get-CimInstance Win32_Process | Where-Object {' +
+      ' $_.CommandLine -like ''*' + DoneFile + '*'' -and $_.ProcessId -ne $PID' +
+      ' } | ForEach-Object { taskkill.exe /f /t /pid $_.ProcessId }';
+    Exec('powershell.exe', '-NoProfile -Command "' + KillCmd + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
 
