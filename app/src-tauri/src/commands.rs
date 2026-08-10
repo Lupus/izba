@@ -504,6 +504,11 @@ pub fn usb_detach_core(d: &mut dyn DaemonApi, name: &str, device: &str) -> Resul
     d.usb_detach(name, device).map_err(|e| e.to_string())
 }
 
+/// Core of `vnc_set`: turn the KasmVNC desktop on/off for a sandbox.
+pub fn vnc_set_core(d: &mut dyn DaemonApi, name: &str, enabled: bool) -> Result<(), String> {
+    d.vnc_set(name, enabled).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,6 +976,25 @@ mod tests {
         let bind: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
         port_unpublish_core(&mut d, "web", bind, 8080).unwrap();
         assert!(d.calls.iter().any(|c| c == "unpublish:web:127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn vnc_set_core_records_call_and_flips_inspect() {
+        let mut d = crate::fake::FakeDaemon::default();
+        vnc_set_core(&mut d, "web", true).unwrap();
+        assert_eq!(d.calls, vec!["vnc_set:web:true".to_string()]);
+        let det = inspect_core(&mut d, "web").unwrap();
+        assert!(det.vnc);
+    }
+
+    #[test]
+    fn vnc_set_core_maps_daemon_error() {
+        let mut d = crate::fake::FakeDaemon {
+            fail_action: true,
+            ..Default::default()
+        };
+        let err = vnc_set_core(&mut d, "web", true).unwrap_err();
+        assert!(err.contains("daemon unreachable"), "{err}");
     }
 
     #[test]

@@ -424,6 +424,11 @@ async fn usb_detach(
     .await
 }
 
+#[tauri::command]
+async fn vnc_set(state: State<'_, AppState>, name: String, enabled: bool) -> Result<(), String> {
+    run_action(&state, move |d| commands::vnc_set_core(d, &name, enabled)).await
+}
+
 #[derive(Clone, serde::Serialize)]
 struct ShellOutput {
     id: String,
@@ -772,6 +777,17 @@ pub fn dispatch(
             &arg_str(&args, "name")?,
             &arg_str(&args, "device")?,
         )?),
+        "vnc_set" => {
+            let enabled = args
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            to_json(commands::vnc_set_core(
+                d,
+                &arg_str(&args, "name")?,
+                enabled,
+            )?)
+        }
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -835,7 +851,8 @@ pub fn run() {
             usb_allow,
             usb_revoke,
             usb_attach,
-            usb_detach
+            usb_detach,
+            vnc_set
         ])
         .run(tauri::generate_context!())
         .expect("error while running izba app");
@@ -1099,6 +1116,29 @@ mod dispatch_tests {
         )
         .unwrap();
         assert_eq!(listed.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn dispatch_vnc_set_round_trips_through_inspect() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(
+            &st,
+            "vnc_set",
+            serde_json::json!({"name": "web", "enabled": true}),
+            &mut emit,
+        )
+        .unwrap();
+        assert!(out.is_null());
+
+        let shown = dispatch(
+            &st,
+            "inspect",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(shown["vnc"], serde_json::json!(true));
     }
 
     #[test]
