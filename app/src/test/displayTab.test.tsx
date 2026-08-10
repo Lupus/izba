@@ -120,6 +120,24 @@ describe("DisplayTab", () => {
     expect(m.vncProxyStop).not.toHaveBeenCalledWith("api");
   });
 
+  it("keeps embedding while asking for a restart the running desktop still needs", async () => {
+    m.inspect.mockResolvedValue(detail({ ...live, vnc_restart_required: true }));
+    render(<DisplayTab name="web" running onChanged={() => {}} />);
+    // Both truths at once: this desktop works, and it is not the configured one.
+    await screen.findByText(/restart the sandbox to apply the desktop change/i);
+    expect(await screen.findByTitle("Sandbox desktop")).toBeInTheDocument();
+  });
+
+  it("starts the new sandbox's proxy even when stopping the old one fails", async () => {
+    m.inspect.mockResolvedValue(live);
+    m.vncProxyStop.mockRejectedValue(new Error("state poisoned"));
+    const { rerender } = render(<DisplayTab name="web" running onChanged={() => {}} />);
+    await screen.findByTitle("Sandbox desktop");
+    m.inspect.mockResolvedValue({ ...live, name: "api" });
+    rerender(<DisplayTab name="api" running onChanged={() => {}} />);
+    await waitFor(() => expect(m.vncProxyStart).toHaveBeenCalledWith("api"));
+  });
+
   it("opens and copies the credentialed URL without showing it", async () => {
     m.inspect.mockResolvedValue(live);
     render(<DisplayTab name="web" running onChanged={() => {}} />);
