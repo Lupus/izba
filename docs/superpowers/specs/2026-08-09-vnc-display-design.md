@@ -248,7 +248,9 @@ revisited — no per-session toggle shipped; it remains open for a future PR.
   through it (pixels, web client) is untrusted guest output.
 - Clipboard bidirectional-on is a **documented accepted risk** (user
   decision): a hostile guest can write the host clipboard while a VNC tab is
-  connected. Revisit as a per-session toggle in PR2.
+  connected. Revisit as a per-session toggle in PR2. (Not done — PR2 shipped
+  no per-session toggle; see the "PR2 as built" note in §9. The risk stands
+  as accepted, and the toggle remains open for a future PR.)
 - No egress-policy interaction: the VNC plane is host-initiated inbound over
   vsock; the only outbound temptation (public-IP lookup) is pinned off and
   asserted in e2e via netlog absence if cheap.
@@ -263,6 +265,17 @@ revisited — no per-session toggle shipped; it remains open for a future PR.
   same class of accepted risk as `izba vnc open`'s credentialed URL on the
   process argv. It binds `127.0.0.1` only and its lifetime is bound to the
   Display tab's: started when the tab mounts, stopped when it unmounts.
+- **PR2 webview CSP (accepted risk):** embedding that proxy needs a
+  `frame-src` the app's static CSP (`app/src-tauri/tauri.conf.json`) cannot
+  narrow, because the proxy port is ephemeral — it is minted per proxy start
+  and unknown at build time. The policy therefore reads `frame-src 'self'
+  http://127.0.0.1:*`, which permits framing **any** loopback HTTP service,
+  not just ours. Accepted because `script-src 'self'` is intact (framed
+  loopback content cannot execute script in the app's own origin) and the only
+  URL ever put in an iframe is the one the Rust side just minted
+  (`vnc_proxy_start`'s return value) — never a value from the guest or the
+  daemon. Narrowing it would need a runtime-generated per-port CSP or a fixed
+  proxy port; both deferred.
 
 ## 11. Risks & mitigations
 
