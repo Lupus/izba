@@ -3,6 +3,10 @@ mod daemon;
 #[cfg(test)]
 mod fake;
 mod views;
+// `pub` so the lib build sees the proxy's interface as reachable before the
+// Display-tab commands call it — the alternative, a blanket `allow(dead_code)`,
+// would also mask genuinely-dead internals.
+pub mod vncproxy;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
