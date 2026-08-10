@@ -6,6 +6,7 @@ use crate::views::{
     SandboxDetailView, SandboxStatsView, SandboxView, SeedEntry, UsbDeviceView, UsbStatusView,
     UsbUpstreamView, VersionView, VolumeInfoView,
 };
+use crate::vncproxy;
 use izba_core::daemon::egress::audit::EndpointSummary;
 use izba_core::daemon::egress::config::{AllowEntry, GitRule};
 use izba_core::manifest::store;
@@ -509,6 +510,20 @@ pub fn vnc_set_core(d: &mut dyn DaemonApi, name: &str, enabled: bool) -> Result<
     d.vnc_set(name, enabled).map_err(|e| e.to_string())
 }
 
+/// Core of `vnc_proxy_start`'s target resolution: the sandbox's live desktop
+/// relay URL, parsed into a proxy target. Errors when there is nothing to
+/// embed — a guard for the frontend's url state, not user-facing UX copy.
+pub fn vnc_embed_target(
+    d: &mut dyn DaemonApi,
+    name: &str,
+) -> Result<vncproxy::ProxyTarget, String> {
+    let det = inspect_core(d, name)?;
+    let url = det
+        .vnc_url
+        .ok_or_else(|| "no live VNC desktop to embed".to_string())?;
+    vncproxy::parse_vnc_url(&url).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,6 +1010,23 @@ mod tests {
         };
         let err = vnc_set_core(&mut d, "web", true).unwrap_err();
         assert!(err.contains("daemon unreachable"), "{err}");
+    }
+
+    #[test]
+    fn vnc_embed_target_requires_a_live_url() {
+        let mut d = crate::fake::FakeDaemon::default(); // vnc_url: None
+        let err = vnc_embed_target(&mut d, "web").unwrap_err();
+        assert_eq!(err, "no live VNC desktop to embed");
+    }
+
+    #[test]
+    fn vnc_embed_target_parses_the_relay_url() {
+        let mut d = crate::fake::FakeDaemon {
+            vnc_url: Some("http://izba:s3cr3t@127.0.0.1:4444/".into()),
+            ..Default::default()
+        };
+        let t = vnc_embed_target(&mut d, "web").unwrap();
+        assert_eq!(t.port, 4444);
     }
 
     #[test]

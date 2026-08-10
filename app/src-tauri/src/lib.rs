@@ -3,10 +3,7 @@ mod daemon;
 #[cfg(test)]
 mod fake;
 mod views;
-// `pub` so the lib build sees the proxy's interface as reachable before the
-// Display-tab commands call it — the alternative, a blanket `allow(dead_code)`,
-// would also mask genuinely-dead internals.
-pub mod vncproxy;
+mod vncproxy;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -32,6 +29,10 @@ pub struct AppState {
     pub make_daemon: Arc<dyn Fn() -> Box<dyn DaemonApi> + Send + Sync>,
     /// Live interactive shells, keyed by session id now.
     pub shells: Mutex<HashMap<String, ShellHandle>>,
+    /// Live VNC embed proxies, keyed by sandbox name. A sandbox restart mints
+    /// a new relay port and password, so the proxy is rekeyed (dropped +
+    /// restarted) on `vnc_proxy_start` whenever the target no longer matches.
+    pub vnc_proxies: Mutex<HashMap<String, vncproxy::VncProxy>>,
 }
 
 /// Look up a live shell, cloning the per-session handle so the map lock is
@@ -433,6 +434,47 @@ async fn vnc_set(state: State<'_, AppState>, name: String, enabled: bool) -> Res
     run_action(&state, move |d| commands::vnc_set_core(d, &name, enabled)).await
 }
 
+/// Reuse the sandbox's live proxy if it already talks to `target`; otherwise
+/// replace it (inserting over an existing key drops the old proxy, which
+/// stops it) with a freshly started one. Returns the credential-less loopback
+/// URL the webview should embed.
+fn vnc_proxy_url(
+    proxies: &mut HashMap<String, vncproxy::VncProxy>,
+    name: String,
+    target: vncproxy::ProxyTarget,
+) -> Result<String, String> {
+    if let Some(existing) = proxies.get(&name) {
+        if existing.target_matches(&target) {
+            return Ok(format!("http://127.0.0.1:{}/", existing.port()));
+        }
+    }
+    let proxy = vncproxy::VncProxy::start(target).map_err(|e| e.to_string())?;
+    let url = format!("http://127.0.0.1:{}/", proxy.port());
+    proxies.insert(name, proxy);
+    Ok(url)
+}
+
+#[tauri::command]
+async fn vnc_proxy_start(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    let key = name.clone();
+    let target = run_action(&state, move |d| commands::vnc_embed_target(d, &name)).await?;
+    let mut proxies = state
+        .vnc_proxies
+        .lock()
+        .map_err(|e| format!("state poisoned: {e}"))?;
+    vnc_proxy_url(&mut proxies, key, target)
+}
+
+#[tauri::command]
+async fn vnc_proxy_stop(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    state
+        .vnc_proxies
+        .lock()
+        .map_err(|e| format!("state poisoned: {e}"))?
+        .remove(&name);
+    Ok(())
+}
+
 #[derive(Clone, serde::Serialize)]
 struct ShellOutput {
     id: String,
@@ -792,6 +834,24 @@ pub fn dispatch(
                 enabled,
             )?)
         }
+        "vnc_proxy_start" => {
+            let name = arg_str(&args, "name")?;
+            let target = commands::vnc_embed_target(d, &name)?;
+            let mut proxies = state
+                .vnc_proxies
+                .lock()
+                .map_err(|e| format!("state poisoned: {e}"))?;
+            to_json(vnc_proxy_url(&mut proxies, name, target)?)
+        }
+        "vnc_proxy_stop" => {
+            let name = arg_str(&args, "name")?;
+            state
+                .vnc_proxies
+                .lock()
+                .map_err(|e| format!("state poisoned: {e}"))?
+                .remove(&name);
+            to_json(())
+        }
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -806,6 +866,7 @@ pub fn run() {
         daemon: Mutex::new(Box::new(RealDaemon::new())),
         make_daemon: Arc::new(|| Box::new(RealDaemon::new())),
         shells: Mutex::new(HashMap::new()),
+        vnc_proxies: Mutex::new(HashMap::new()),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -856,7 +917,9 @@ pub fn run() {
             usb_revoke,
             usb_attach,
             usb_detach,
-            vnc_set
+            vnc_set,
+            vnc_proxy_start,
+            vnc_proxy_stop
         ])
         .run(tauri::generate_context!())
         .expect("error while running izba app");
@@ -873,6 +936,7 @@ mod dispatch_tests {
             daemon: Mutex::new(Box::new(d)),
             make_daemon: Arc::new(|| Box::new(FakeDaemon::default())),
             shells: Mutex::new(std::collections::HashMap::new()),
+            vnc_proxies: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1143,6 +1207,52 @@ mod dispatch_tests {
         )
         .unwrap();
         assert_eq!(shown["vnc"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn dispatch_vnc_proxy_start_stop_round_trip() {
+        let st = state_with(FakeDaemon {
+            vnc_url: Some("http://izba:s3cr3t@127.0.0.1:4444/".into()),
+            ..Default::default()
+        });
+        let mut emit = |_: &str, _: serde_json::Value| {};
+
+        let out = dispatch(
+            &st,
+            "vnc_proxy_start",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        );
+        // Some sandboxes deny TCP bind with EPERM (see vncproxy's try_listener).
+        let out = match out {
+            Ok(v) => v,
+            Err(e) if e.contains("bind loopback proxy port") => {
+                eprintln!("SKIP: sandbox denies TCP bind: {e}");
+                return;
+            }
+            Err(e) => panic!("dispatch vnc_proxy_start: {e}"),
+        };
+        let url = out.as_str().expect("vnc_proxy_start returns a url string");
+        assert!(
+            url.starts_with("http://127.0.0.1:") && url.ends_with('/'),
+            "{url}"
+        );
+        let port = url
+            .trim_start_matches("http://127.0.0.1:")
+            .trim_end_matches('/');
+        assert!(
+            !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()),
+            "{url}"
+        );
+        assert!(!url.contains('@'), "url must carry no credentials: {url}");
+
+        let stopped = dispatch(
+            &st,
+            "vnc_proxy_stop",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        );
+        assert!(stopped.is_ok(), "{stopped:?}");
     }
 
     #[test]

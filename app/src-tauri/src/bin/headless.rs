@@ -28,6 +28,7 @@ fn main() {
         daemon: Mutex::new(app_lib::new_real_daemon()),
         make_daemon: Arc::new(|| app_lib::new_real_daemon()),
         shells: Mutex::new(HashMap::new()),
+        vnc_proxies: Mutex::new(HashMap::new()),
     };
     // Single client (one browser). Re-accept on disconnect so a page reload
     // re-attaches.
