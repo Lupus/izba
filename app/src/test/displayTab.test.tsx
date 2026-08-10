@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
-import { vi, describe, it, expect, beforeEach } from "vitest";
+import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { SandboxDetail } from "../lib/types";
 
 // ── hoisted mocks ────────────────────────────────────────────────────────────
@@ -242,5 +242,82 @@ describe("DisplayTab", () => {
     render(<DisplayTab name="web" running onChanged={() => {}} />);
     fireEvent.click(await screen.findByRole("button", { name: /disable desktop/i }));
     await screen.findByText(/daemon says no/i);
+  });
+});
+
+describe("DisplayTab polling", () => {
+  // The tab is a live view of a desktop that takes seconds to boot, so it must
+  // re-inspect on its own — a user who "waits for the desktop to come up" gets
+  // nothing from a tab that only reads once.
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Advance the poll clock and let the chained promises (inspect → proxy
+   *  start) settle. */
+  async function tickBy(ms: number) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+  }
+
+  it("picks up a desktop that comes up — and one that goes away — without user action", async () => {
+    m.inspect.mockResolvedValue(restartRequired);
+    render(<DisplayTab name="web" running onChanged={() => {}} />);
+    await tickBy(0);
+    expect(screen.queryByTitle("Sandbox desktop")).not.toBeInTheDocument();
+
+    // The desktop comes up between ticks.
+    m.inspect.mockResolvedValue(live);
+    await tickBy(3000);
+    expect(screen.getByTitle("Sandbox desktop")).toHaveAttribute("src", PROXY);
+
+    // ...and dies again.
+    m.inspect.mockResolvedValue(restartRequired);
+    await tickBy(3000);
+    expect(screen.queryByTitle("Sandbox desktop")).not.toBeInTheDocument();
+  });
+
+  it("stops polling once the tab unmounts", async () => {
+    m.inspect.mockResolvedValue(notEnabled);
+    const { unmount } = render(<DisplayTab name="web" running onChanged={() => {}} />);
+    await tickBy(0);
+    expect(m.inspect).toHaveBeenCalledTimes(1);
+    await tickBy(3000);
+    expect(m.inspect).toHaveBeenCalledTimes(2);
+
+    unmount();
+    await tickBy(30_000);
+    // A tab nobody is looking at must not keep asking the daemon.
+    expect(m.inspect).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips a tick while the previous inspect is still in flight", async () => {
+    let answer!: (d: SandboxDetail) => void;
+    m.inspect.mockImplementation(
+      () =>
+        new Promise<SandboxDetail>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    render(<DisplayTab name="web" running onChanged={() => {}} />);
+    await tickBy(0);
+    expect(m.inspect).toHaveBeenCalledTimes(1);
+
+    // Several intervals elapse against a hung daemon: the overlap guard must
+    // not stack requests behind it.
+    await tickBy(12_000);
+    expect(m.inspect).toHaveBeenCalledTimes(1);
+
+    answer(notEnabled);
+    await tickBy(0);
+    await tickBy(3000);
+    expect(m.inspect).toHaveBeenCalledTimes(2);
   });
 });

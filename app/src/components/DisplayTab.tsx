@@ -17,6 +17,11 @@ const BANNER =
   "flex flex-wrap items-center gap-3 rounded-lg border border-destructive/30 " +
   "bg-destructive/10 px-3 py-2 text-sm text-destructive";
 
+/** A desktop takes seconds to come up (and can die) while the tab is open, so
+ *  the tab re-inspects on a timer rather than only on mount — same cadence and
+ *  in-flight-guard shape as `useStats`. Ticks stop with the effect. */
+const POLL_MS = 3000;
+
 /**
  * CREDENTIAL DISCIPLINE: `detail.vnc_url` carries the desktop's password in its
  * userinfo. It is only ever passed to `openUrl` or the clipboard — never
@@ -50,8 +55,23 @@ export function DisplayTab({ name, running, onChanged }: Props) {
 
   useEffect(() => {
     const mine = ++generation.current;
-    void load(mine);
+    // Overlap guard: a slow inspect must not stack ticks behind it.
+    let inFlight = false;
+    const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        // `load` is generation-guarded, so a tick that lands after the tab
+        // moved on (or unmounted) still cannot paint.
+        await load(mine);
+      } finally {
+        inFlight = false;
+      }
+    };
+    void tick();
+    const timer = setInterval(() => void tick(), POLL_MS);
     return () => {
+      clearInterval(timer);
       // Not a DOM ref: bumping the counter IS the cleanup, and reading its
       // latest value at teardown is exactly the intent the rule warns about.
       // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -155,7 +175,9 @@ export function DisplayTab({ name, running, onChanged }: Props) {
       {presentation.kind === "restart-required" && (
         <div className="flex flex-col items-start gap-3">
           <RestartBanner name={name} busy={busy} act={act} />
-          {current.vnc && <DisableButton name={name} busy={busy} act={act} />}
+          {/* `restart-required` is only reachable with `vnc: true` (see
+              `vncPresentation`), so there is nothing to guard on here. */}
+          <DisableButton name={name} busy={busy} act={act} />
         </div>
       )}
 

@@ -230,8 +230,12 @@ describe("ipc action wrappers", () => {
   });
 
   it("vncProxyStart invokes vnc_proxy_start with the name and returns the url", async () => {
-    invoke.mockResolvedValue("http://izba:s3cr3t@127.0.0.1:4444/");
-    await expect(api.vncProxyStart("web")).resolves.toBe("http://izba:s3cr3t@127.0.0.1:4444/");
+    // Credential-less by construction: the proxy exists precisely so the
+    // webview never sees the password, so the command can only ever return
+    // this shape — a credentialed fixture would assert a value that cannot
+    // occur.
+    invoke.mockResolvedValue("http://127.0.0.1:9999/");
+    await expect(api.vncProxyStart("web")).resolves.toBe("http://127.0.0.1:9999/");
     expect(invoke).toHaveBeenCalledWith("vnc_proxy_start", { name: "web" });
   });
 
