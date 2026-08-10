@@ -105,6 +105,11 @@ const DEPTH: &str = "24";
 /// waits for before connecting (see [`desktop_exec_argvs`]).
 const X_SOCKET: &str = "/tmp/.X11-unix/X1";
 
+/// The X server's lock file for [`DISPLAY`] (`/tmp/.X<n>-lock`), holding the
+/// pid that owns the display. Removed together with [`X_SOCKET`] before every
+/// start — see [`stale_display_cleanup_argv`].
+const X_LOCK: &str = "/tmp/.X1-lock";
+
 /// The conventional system `PATH`, appended after the bundle's `bin` (see
 /// [`vnc_env`]).
 const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -193,6 +198,55 @@ fn vnc_env() -> Vec<(String, String)> {
             format!("{CONTAINER_BUNDLE_DIR}/share"),
         ),
     ]
+}
+
+/// The `crun exec` argv that clears a PREVIOUS boot's X11 leftovers, run to
+/// completion before either desktop process is spawned ([`start_desktop`]).
+///
+/// **This is what made a restarted sandbox's desktop dead on arrival.** The
+/// container's `/tmp` is not a tmpfs — it lives in the sandbox's persistent
+/// overlay (`rw.img`), so `/tmp/.X1-lock` and `/tmp/.X11-unix/X1` written by
+/// the X server of one boot are still there on the next one. `Xkasmvnc` then
+/// finds the lock, decides the display is taken and dies with
+///
+/// ```text
+/// Fatal server error:
+/// (EE) Server is already active for display 1
+/// ```
+///
+/// X's own staleness check does not save us: it keeps the lock when the pid
+/// recorded in it is still alive, and the recorded pid is a LOW one (the
+/// display comes up moments after the container does), which the fresh boot's
+/// pid namespace has almost certainly handed out again. The failure is
+/// therefore reliable, not racy — and invisible to a fresh sandbox, which is
+/// all CI ever booted.
+///
+/// The stale socket is the second half of the same bug: the window manager's
+/// wait loop in [`desktop_exec_argvs`] treats the socket's existence as "the
+/// server is up", so it would exec against a dead socket and exit with
+/// "Failed to open the display".
+///
+/// Removing both is unconditionally safe here: init calls this exactly once,
+/// right after the workload container reaches `running`, and izba's desktop
+/// is the only thing that ever owns [`DISPLAY`] in that container. Running it
+/// to completion (rather than folding the `rm` into the server script) is
+/// what makes the ordering deterministic against the window manager's wait.
+pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> Vec<String> {
+    crate::oci::crun_exec_argv(
+        cgroup_manager,
+        false,
+        "/",
+        &[],
+        Some("0:0"),
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            // `rm -f` never fails on an absent path, so a first boot is a
+            // clean no-op; `mkdir -p` re-creates the socket dir the X server
+            // expects when the image ships none.
+            format!("rm -f {X_LOCK} {X_SOCKET}; mkdir -p /tmp/.X11-unix; true"),
+        ],
+    )
 }
 
 /// The two `crun exec` argvs that bring up the desktop, in start order:
@@ -305,6 +359,20 @@ pub fn desktop_exec_argvs(cgroup_manager: crate::oci::CgroupManager) -> Vec<Vec<
 #[mutants::skip]
 pub fn start_desktop() {
     let cgmgr = crate::oci::detect_cgroup_manager();
+    // AWAITED, unlike the two spawns below: the window manager's wait loop
+    // keys on the X socket's existence, so a leftover socket must be gone
+    // BEFORE it starts looking. See `stale_display_cleanup_argv`.
+    let cleanup = stale_display_cleanup_argv(cgmgr);
+    match std::process::Command::new(&cleanup[0])
+        .args(&cleanup[1..])
+        .status()
+    {
+        Ok(st) if !st.success() => {
+            eprintln!("izba-init: vnc stale-display cleanup exited {st}");
+        }
+        Err(e) => eprintln!("izba-init: vnc stale-display cleanup failed: {e}"),
+        Ok(_) => {}
+    }
     for argv in desktop_exec_argvs(cgmgr) {
         if let Err(e) = std::process::Command::new(&argv[0])
             .args(&argv[1..])
@@ -499,6 +567,59 @@ mod tests {
             argvs[0].last().unwrap().clone(),
             argvs[1].last().unwrap().clone(),
         )
+    }
+
+    // ── stale_display_cleanup_argv ───────────────────────────────────────────
+
+    #[test]
+    fn stale_display_cleanup_removes_the_previous_boots_lock_and_socket() {
+        // The regression this pins: the container's /tmp is in the sandbox's
+        // PERSISTENT overlay, so a second `start` finds the first boot's
+        // /tmp/.X1-lock and Xkasmvnc dies with "Server is already active for
+        // display 1" — a dead desktop on every restarted sandbox.
+        let argv = stale_display_cleanup_argv(crate::oci::CgroupManager::Cgroupfs);
+        let script = argv.last().unwrap();
+        assert!(
+            script.contains(&format!("rm -f {X_LOCK} {X_SOCKET}")),
+            "both the lock and the socket must go: {script}"
+        );
+        assert!(
+            script.contains("rm -f"),
+            "an absent path on a first boot must not fail: {script}"
+        );
+        assert!(
+            script.contains("mkdir -p /tmp/.X11-unix"),
+            "the X socket dir must exist for the server: {script}"
+        );
+        assert_eq!(argv[0], crate::oci::CRUN_PATH);
+        assert!(argv.iter().any(|a| a == "exec"), "{argv:?}");
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--user" && w[1] == "0:0"),
+            "cleanup runs as the same container root that owns the files: {argv:?}"
+        );
+        let id_pos = argv
+            .iter()
+            .position(|a| a == crate::oci::CONTAINER_ID)
+            .expect("container id");
+        assert!(argv.iter().position(|a| a == "--user").unwrap() < id_pos);
+    }
+
+    #[test]
+    fn stale_display_cleanup_targets_exactly_the_display_the_server_claims() {
+        // X derives both paths from the display number, so a change to
+        // DISPLAY that misses either constant silently re-opens the bug.
+        let n = DISPLAY.trim_start_matches(':');
+        assert_eq!(X_LOCK, format!("/tmp/.X{n}-lock"));
+        assert_eq!(X_SOCKET, format!("/tmp/.X11-unix/X{n}"));
+        let script = stale_display_cleanup_argv(crate::oci::CgroupManager::Disabled)
+            .last()
+            .unwrap()
+            .clone();
+        let (_server, wm) = scripts();
+        assert!(
+            wm.contains(X_SOCKET) && script.contains(X_SOCKET),
+            "the wm waits on the very socket the cleanup removes: {wm} / {script}"
+        );
     }
 
     #[test]

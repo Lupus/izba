@@ -14,8 +14,9 @@
 #           [12] ssh round-trip + chroot isolation,
 #           [13] container userns uid-mapping (OpenVMM/WHP leg),
 #           [14] build-in-VM: Dockerfile -> OCI ingest -> tag -> run -> marker,
-#           [15] VNC display: izba vnc url + auth matrix over the real relay
-#                (skips loudly when kasmvnc.erofs is not staged).
+#           [15] VNC display: izba vnc url + auth matrix over the real relay,
+#                a real websocket/RFB session, and the same again after a
+#                stop/start (skips loudly when kasmvnc.erofs is not staged).
 $ErrorActionPreference = 'Continue'
 $exe   = if ($env:IZBA_EXE)   { $env:IZBA_EXE }   else { 'C:\izba\bin\izba.exe' }
 $image = if ($env:IZBA_IMAGE) { $env:IZBA_IMAGE } else { 'alpine:3.20' }
@@ -844,19 +845,100 @@ if (-not (Test-Path $vncBundle)) {
                 for ($i = 0; $i -lt 6; $i++) {
                     try { Invoke-WebRequest -Uri $vncBase -SkipHttpErrorCheck -TimeoutSec 10 | Out-Null } catch { }
                 }
-                $vncWs = Invoke-VncWsProbe -Port ([int]$vncPort) -AuthHeader $vncGoodHeader.Authorization
-                Check 'vnc: credentialed websocket carries the RFB stream' ($vncWs.Greeting.StartsWith('RFB '))
-                if (-not $vncWs.Greeting.StartsWith('RFB ')) {
-                    [Console]::Error.WriteLine("  vnc: websocket probe error = $($vncWs.Error)")
+                # NOTE: a distinct variable from $vncWs (the workspace dir the
+                # `finally` block still has to delete) -- reusing that name
+                # here left the cleanup calling Test-Path on a hashtable.
+                $vncWsProbe = Invoke-VncWsProbe -Port ([int]$vncPort) -AuthHeader $vncGoodHeader.Authorization
+                Check 'vnc: credentialed websocket carries the RFB stream' ($vncWsProbe.Greeting.StartsWith('RFB '))
+                if (-not $vncWsProbe.Greeting.StartsWith('RFB ')) {
+                    [Console]::Error.WriteLine("  vnc: websocket probe error = $($vncWsProbe.Error)")
                     Dump-BootLogs $vncName
                 }
                 # 1 = None, 2 = VncAuth. VncAuth authenticates against a
                 # separate legacy -rfbauth file izba never writes, so
                 # offering it strands the web client at a password prompt it
                 # can never satisfy -- the BasicAuth proven above is the gate.
-                Check 'vnc: RFB security type is None, not VncAuth' (($vncWs.SecTypes -contains 1) -and -not ($vncWs.SecTypes -contains 2))
-                if ($vncWs.SecTypes -contains 2) {
-                    [Console]::Error.WriteLine("  vnc: offered security types = $($vncWs.SecTypes -join ',')")
+                Check 'vnc: RFB security type is None, not VncAuth' (($vncWsProbe.SecTypes -contains 1) -and -not ($vncWsProbe.SecTypes -contains 2))
+                if ($vncWsProbe.SecTypes -contains 2) {
+                    [Console]::Error.WriteLine("  vnc: offered security types = $($vncWsProbe.SecTypes -join ',')")
+                }
+
+                # Step 7: RESTART. Everything above only ever exercised the
+                # FIRST boot of a fresh sandbox -- which is all this script
+                # and the KVM e2e ever booted, and why a desktop that is dead
+                # on every SECOND boot shipped. The container's /tmp is not a
+                # tmpfs: it lives in the sandbox's persistent overlay, so the
+                # X server's /tmp/.X1-lock survives `stop` and Xkasmvnc then
+                # dies with "Server is already active for display 1" while
+                # `izba vnc url` still hands out a URL that serves nothing.
+                # Every installer upgrade (which quiesces sandboxes) and every
+                # plain stop/start hits it.
+                & $exe stop $vncName 2>$null | Out-Null
+                & $exe start $vncName | Out-Null
+                $vncRestartOk = ($LASTEXITCODE -eq 0)
+                if (-not $vncRestartOk) {
+                    # Same nested-WHP boot stall Invoke-BootWithRetry guards.
+                    & $exe stop $vncName 2>$null | Out-Null
+                    & $exe start $vncName | Out-Null
+                    $vncRestartOk = ($LASTEXITCODE -eq 0)
+                }
+                Check 'vnc: restart -> start exits 0' $vncRestartOk
+
+                # The password is minted fresh per `start` and the relay port
+                # is ephemeral, so the URL must be re-read -- reusing the old
+                # one would prove nothing.
+                $vncUrlOut2 = (& $exe vnc url $vncName | Out-String).Trim()
+                $vncMatch2  = [regex]::Match($vncUrlOut2, 'http://izba:([^@]+)@127\.0\.0\.1:(\d+)/')
+                if ($vncMatch2.Success) {
+                    $vncPw2   = $vncMatch2.Groups[1].Value
+                    $vncBase2 = "http://127.0.0.1:$($vncMatch2.Groups[2].Value)/"
+                    $vncHdr2  = @{ Authorization = ('Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("izba:$vncPw2"))) }
+
+                    $vncDeadline2 = (Get-Date).AddSeconds(120)
+                    $vncLastCode2 = $null
+                    while ((Get-Date) -lt $vncDeadline2) {
+                        try {
+                            $vncR2 = Invoke-WebRequest -Uri $vncBase2 -SkipHttpErrorCheck -TimeoutSec 10
+                            $vncLastCode2 = $vncR2.StatusCode
+                            if ($vncLastCode2 -eq 401) { break }
+                        } catch {
+                            $vncLastCode2 = "err: $($_.Exception.Message)"
+                        }
+                        Start-Sleep -Seconds 2
+                    }
+                    Check 'vnc: after restart, unauthenticated GET -> 401' ($vncLastCode2 -eq 401)
+                    if ($vncLastCode2 -ne 401) {
+                        [Console]::Error.WriteLine("  vnc: restart last status/error = $vncLastCode2")
+                    }
+
+                    $vncGoodCode2 = $null
+                    try {
+                        $vncRGood2    = Invoke-WebRequest -Uri $vncBase2 -Headers $vncHdr2 -SkipHttpErrorCheck -TimeoutSec 15
+                        $vncGoodCode2 = $vncRGood2.StatusCode
+                    } catch {
+                        [Console]::Error.WriteLine("  vnc: restart authenticated GET failed: $($_.Exception.Message)")
+                    }
+                    Check 'vnc: after restart, correct credentials -> 200' ($vncGoodCode2 -eq 200)
+
+                    $vncWsProbe2 = Invoke-VncWsProbe -Port ([int]$vncMatch2.Groups[2].Value) -AuthHeader $vncHdr2.Authorization
+                    Check 'vnc: after restart, credentialed websocket carries the RFB stream' ($vncWsProbe2.Greeting.StartsWith('RFB '))
+                    if (-not $vncWsProbe2.Greeting.StartsWith('RFB ')) {
+                        [Console]::Error.WriteLine("  vnc: restart websocket probe error = $($vncWsProbe2.Error)")
+                    }
+
+                    # The precise failure mode, named.
+                    $vncLog2 = (& $exe exec $vncName -- sh -c 'cat /var/log/izba-vnc.log' 2>&1 | Out-String)
+                    Check 'vnc: after restart, no stale X display lock in the guest log' (-not $vncLog2.Contains('already active for display'))
+                    if ($vncLog2.Contains('already active for display')) {
+                        [Console]::Error.WriteLine("  vnc: restarted guest tripped X's stale display lock")
+                        Dump-BootLogs $vncName
+                    }
+                } else {
+                    [Console]::Error.WriteLine("  vnc: restart url output: '$vncUrlOut2'")
+                    Check 'vnc: after restart, unauthenticated GET -> 401' $false
+                    Check 'vnc: after restart, correct credentials -> 200' $false
+                    Check 'vnc: after restart, credentialed websocket carries the RFB stream' $false
+                    Check 'vnc: after restart, no stale X display lock in the guest log' $false
                 }
             } else {
                 Check 'vnc: unauthenticated GET -> 401' $false
@@ -866,6 +948,11 @@ if (-not (Test-Path $vncBundle)) {
                 Check 'vnc: unauthenticated websocket upgrade refused' $false
                 Check 'vnc: credentialed websocket carries the RFB stream' $false
                 Check 'vnc: RFB security type is None, not VncAuth' $false
+                Check 'vnc: restart -> start exits 0' $false
+                Check 'vnc: after restart, unauthenticated GET -> 401' $false
+                Check 'vnc: after restart, correct credentials -> 200' $false
+                Check 'vnc: after restart, credentialed websocket carries the RFB stream' $false
+                Check 'vnc: after restart, no stale X display lock in the guest log' $false
             }
         } else {
             Check 'vnc: url exits 0' $false
@@ -877,6 +964,11 @@ if (-not (Test-Path $vncBundle)) {
             Check 'vnc: unauthenticated websocket upgrade refused' $false
             Check 'vnc: credentialed websocket carries the RFB stream' $false
             Check 'vnc: RFB security type is None, not VncAuth' $false
+            Check 'vnc: restart -> start exits 0' $false
+            Check 'vnc: after restart, unauthenticated GET -> 401' $false
+            Check 'vnc: after restart, correct credentials -> 200' $false
+            Check 'vnc: after restart, credentialed websocket carries the RFB stream' $false
+            Check 'vnc: after restart, no stale X display lock in the guest log' $false
         }
     } finally {
         & $exe stop $vncName 2>$null | Out-Null
