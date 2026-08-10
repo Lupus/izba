@@ -1579,6 +1579,83 @@ fn parse_vnc_url(url: &str) -> (String, u16) {
     (password.to_string(), port)
 }
 
+/// Prove a REAL browser-equivalent session against the desktop on `port`:
+/// wait for the server to bind behind the relay, authenticate, and carry an
+/// RFB stream over the websocket whose offered security type is `None`.
+///
+/// Factored out because the second `start` of a sandbox has to be held to the
+/// exact same bar as the first (see the restart step of [`vnc_desktop_e2e`]);
+/// the first pass keeps its extra negative probes inline.
+fn prove_desktop_session(data: &Path, name: &str, port: u16, password: &str, phase: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut last_status = None;
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match http_get_status(port, "/", None) {
+            Ok((code, _)) => {
+                last_status = Some(code);
+                if code == 401 {
+                    break;
+                }
+            }
+            Err(e) => last_err = Some(format!("{e:#}")),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    assert_eq!(
+        last_status,
+        Some(401),
+        "[{phase}] the desktop never answered with an auth challenge within \
+         120s (last status: {last_status:?}, last error: {last_err:?})\n{}",
+        vnc_diag(data, name)
+    );
+
+    let (code, body) = http_get_status(port, "/", Some(("izba", password))).unwrap_or_else(|e| {
+        panic!(
+            "[{phase}] authenticated GET failed: {e:#}\n{}",
+            vnc_diag(data, name)
+        )
+    });
+    assert_eq!(
+        code,
+        200,
+        "[{phase}] correct credentials must be accepted\n{}",
+        vnc_diag(data, name)
+    );
+    assert!(
+        body.to_lowercase().contains("kasm"),
+        "[{phase}] expected the KasmVNC client page, got: {:.400}\n{}",
+        body,
+        vnc_diag(data, name)
+    );
+
+    let (code, greeting, types) =
+        ws_rfb_probe(port, Some(("izba", password))).unwrap_or_else(|e| {
+            panic!(
+                "[{phase}] websocket upgrade failed: {e:#}\n{}",
+                vnc_diag(data, name)
+            )
+        });
+    assert_eq!(
+        code,
+        101,
+        "[{phase}] the credentialed websocket upgrade must succeed\n{}",
+        vnc_diag(data, name)
+    );
+    assert!(
+        greeting.starts_with(b"RFB "),
+        "[{phase}] the websocket must carry the RFB stream, got: {:?}\n{}",
+        String::from_utf8_lossy(&greeting),
+        vnc_diag(data, name)
+    );
+    assert!(
+        types.contains(&1) && !types.contains(&2),
+        "[{phase}] the server must offer RFB security type None (1) and not \
+         VncAuth (2), got: {types:?}\n{}",
+        vnc_diag(data, name)
+    );
+}
+
 /// The guest's listeners, read from the kernel inside the workload container
 /// (which shares init's netns for every non-docker sandbox, so this is the
 /// whole guest).
@@ -1633,10 +1710,14 @@ fn guest_listeners(data: &Path, name: &str) -> BTreeSet<(u16, String)> {
 /// 5. The guest listens on NOTHING beyond izba's own set — in particular no
 ///    X11 TCP port (`-ac` grants root-on-display to anything in the netns, so
 ///    an open 6001 would be a real hole).
-/// 6. `izba vnc off` on a RUNNING sandbox: "restart required" guidance, a
+/// 6. A RESTARTED sandbox serves a working desktop too — `stop`/`start`,
+///    then the whole real-client proof again against the new URL. The first
+///    cut only ever booted a fresh sandbox, and the X server's lock file
+///    lives in the persistent overlay, so every second boot was dead.
+/// 7. `izba vnc off` on a RUNNING sandbox: "restart required" guidance, a
 ///    status line that admits the desktop is still up, and a `vnc url` that
 ///    still hands back the live URL with the disabled warning on stderr.
-/// 7. A sandbox created WITHOUT `--vnc`: `izba vnc url` fails, pointing at
+/// 8. A sandbox created WITHOUT `--vnc`: `izba vnc url` fails, pointing at
 ///    `vnc on`.
 #[test]
 fn vnc_desktop_e2e() {
@@ -1895,6 +1976,72 @@ fn vnc_desktop_e2e() {
         "the guest must listen on nothing beyond izba's own set {expected:?}, got: {listeners:?}"
     );
 
+    // [7b] RESTART — the class every assertion above is blind to, and the one
+    // that reached a user: everything so far only ever exercised the FIRST
+    // boot of a fresh sandbox, which is also all CI ever booted.
+    //
+    // The container's `/tmp` is not a tmpfs; it lives in the sandbox's
+    // persistent overlay. So the X server's `/tmp/.X1-lock` and
+    // `/tmp/.X11-unix/X1` survive `stop`, and on the next `start` `Xkasmvnc`
+    // finds the lock, concludes the display is taken and dies with "Server is
+    // already active for display 1" — while `izba vnc url` still cheerfully
+    // prints a URL that now serves nothing. Every upgrade (the installer
+    // quiesces sandboxes) and every plain `izba stop`/`izba start` hits it.
+    let o = izba(&data, no_env, &["stop", name]);
+    assert_ok(&o, "stop (vnc restart)");
+    let o = izba(&data, no_env, &["start", name]);
+    assert_ok(&o, "start (vnc restart)");
+
+    // The password is regenerated per `start` and the relay port is
+    // ephemeral, so the URL must be re-read — using the stale one would
+    // prove nothing.
+    let o = izba(&data, no_env, &["vnc", "url", name]);
+    assert_ok(&o, "vnc url (after restart)");
+    let url2 = stdout_of(&o).trim().to_string();
+    let (password2, port2) = parse_vnc_url(&url2);
+    assert_ne!(
+        password2, password,
+        "each start must mint a fresh VNC password"
+    );
+    prove_desktop_session(&data, name, port2, &password2, "after restart");
+
+    // …and the desktop processes really came back, not just the websocket.
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "exec",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "for p in /proc/[0-9]*; do tr '\\0' ' ' < \"$p/cmdline\"; echo; done",
+        ],
+    );
+    assert_ok(&o, "list container processes (after restart)");
+    let procs = stdout_of(&o);
+    for want in ["Xkasmvnc", "openbox"] {
+        assert!(
+            procs.contains(want),
+            "{want} must be running after a restart, got:\n{procs}\n{}",
+            vnc_diag(&data, name)
+        );
+    }
+
+    // The precise failure mode, named: even if some future change made the
+    // probes above pass by luck, a stale lock leaves this in the log.
+    let o = izba(
+        &data,
+        no_env,
+        &["exec", name, "--", "cat", "/var/log/izba-vnc.log"],
+    );
+    assert_ok(&o, "read the guest vnc log after restart");
+    assert!(
+        !stdout_of(&o).contains("already active for display"),
+        "a restarted sandbox must not trip X's stale display lock:\n{}",
+        stdout_of(&o)
+    );
+
     // [8] `vnc off` against a RUNNING sandbox: config flips now, the booted
     // desktop cannot be unmade, and every surface has to say so honestly.
     let o = izba(&data, no_env, &["vnc", "off", name]);
@@ -1916,7 +2063,9 @@ fn vnc_desktop_e2e() {
     assert_ok(&o, "vnc url after vnc off");
     assert_eq!(
         stdout_of(&o).trim(),
-        url,
+        // The URL of the CURRENT run — the restart in [7b] minted a new
+        // password and relay port, and `vnc off` must not disturb either.
+        url2,
         "the live relay's URL must be unchanged by a config-only flip"
     );
     assert!(
