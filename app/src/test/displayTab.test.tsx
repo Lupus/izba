@@ -94,7 +94,11 @@ describe("DisplayTab", () => {
     m.inspect.mockResolvedValue(live);
     const { container } = render(<DisplayTab name="web" running onChanged={() => {}} />);
     const frame = await screen.findByTitle("Sandbox desktop");
-    expect(frame).toHaveAttribute("src", PROXY);
+    // The #show_control_bar=1 fragment is load-bearing: without it the
+    // KasmVNC client detects it is inside an iframe and enters Kasm
+    // Workspaces' embedded mode (webp/resize/clipboard off, no initial
+    // keyframe paint) — a black desktop with working input.
+    expect(frame).toHaveAttribute("src", `${PROXY}#show_control_bar=1`);
     await waitFor(() => expect(m.vncProxyStart).toHaveBeenCalledWith("web"));
     expect(container.innerHTML).not.toContain("s3cr3t");
     expect(container.innerHTML).not.toContain(CREDENTIALED);
@@ -276,7 +280,7 @@ describe("DisplayTab polling", () => {
     // The desktop comes up between ticks.
     m.inspect.mockResolvedValue(live);
     await tickBy(3000);
-    expect(screen.getByTitle("Sandbox desktop")).toHaveAttribute("src", PROXY);
+    expect(screen.getByTitle("Sandbox desktop")).toHaveAttribute("src", `${PROXY}#show_control_bar=1`);
 
     // ...and dies again.
     m.inspect.mockResolvedValue(restartRequired);

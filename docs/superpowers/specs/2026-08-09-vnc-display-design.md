@@ -238,6 +238,18 @@ the proxy), a copy-URL action, and the create-wizard "Desktop (VNC)"
 toggle. The §10 clipboard bidirectional-on accepted risk was **not**
 revisited — no per-session toggle shipped; it remains open for a future PR.
 
+**Iframe embedded-mode trap (2026-08-10, found in live testing):** the
+KasmVNC web client checks `window.self !== window.top` and, unless the URL
+carries a `show_control_bar` fragment parameter, switches into Kasm
+Workspaces' embedded mode — webp/resize/clipboard defaults off, its UI
+hidden, expecting Kasm's own parent frame to drive it over `postMessage`.
+In that mode the session's initial keyframe is never painted: the embed
+shows a black desktop whose mouse/keyboard input still works (damage rects
+that arrive *after* connect do paint, which is what made this hard to
+diagnose). The Display tab therefore appends `#show_control_bar=1` to the
+proxy URL — load-bearing, fenced by component and e2e assertions on the
+exact iframe `src`.
+
 ## 10. Security posture
 
 - Bundle: izba-owned, sha-pinned, RO at block layer; guest tampering is

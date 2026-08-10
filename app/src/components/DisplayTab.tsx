@@ -233,7 +233,15 @@ export function DisplayTab({ name, running, onChanged }: Props) {
           ) : (
             proxyUrl && (
               <iframe
-                src={proxyUrl}
+                // #show_control_bar=1 is load-bearing, not cosmetic: the
+                // KasmVNC client checks `window.self !== window.top` and,
+                // without this fragment param, enters Kasm Workspaces'
+                // embedded mode (webp/resize/clipboard defaults off, UI
+                // hidden, driven by parent postMessage) — in which the
+                // session's initial keyframe is never painted: a black
+                // desktop whose input still works. The param keeps the
+                // client in its standalone mode inside our iframe.
+                src={`${proxyUrl}#show_control_bar=1`}
                 title="Sandbox desktop"
                 // min-h-96 (384px), not an arbitrary 480px: the lint gate bans
                 // arbitrary values, and the frame grows to fill the tab anyway.

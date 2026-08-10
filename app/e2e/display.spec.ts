@@ -63,8 +63,10 @@ test.describe("display tab", () => {
       // The embed src is the credential-less loopback proxy the mock's
       // vnc_proxy_start returns — NOT the scenario's password-bearing
       // vnc_url. A regression that wired the raw vnc_url into the iframe
-      // would fail this exact assertion.
-      await expect(iframe).toHaveAttribute("src", "http://127.0.0.1:1/");
+      // would fail this exact assertion. The #show_control_bar=1 fragment
+      // keeps the KasmVNC client out of its iframe-embedded mode (which
+      // never paints the initial keyframe — black desktop, working input).
+      await expect(iframe).toHaveAttribute("src", "http://127.0.0.1:1/#show_control_bar=1");
 
       await expect(page.getByRole("button", { name: "Open in browser" })).toBeVisible();
       await expect(page.getByRole("button", { name: "Copy URL" })).toBeVisible();
