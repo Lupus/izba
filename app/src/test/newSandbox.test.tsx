@@ -32,6 +32,17 @@ describe("NewSandbox", () => {
     );
   });
 
+  it("submits create with vnc: true when the Desktop (VNC) checkbox is checked", async () => {
+    render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });
+    fireEvent.change(screen.getByLabelText(/workspace/i), { target: { value: "/ws" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: /desktop \(vnc\)/i }));
+    fireEvent.click(screen.getByRole("button", { name: /create/i }));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({ vnc: true })),
+    );
+  });
+
   it("assembles a host:guest port from an added row", async () => {
     render(<NewSandbox onClose={() => {}} onCreated={() => {}} />);
     fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "web" } });

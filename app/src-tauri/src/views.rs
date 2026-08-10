@@ -49,6 +49,9 @@ pub struct CreateOpts {
     /// Repeatable `[NAME:]GUEST_PATH:SIZE` volume specs (blank entries ignored).
     #[serde(default)]
     pub volumes: Vec<String>,
+    /// Boot with a browser-accessible VNC desktop (`--vnc`).
+    #[serde(default)]
+    pub vnc: bool,
 }
 
 impl CreateOpts {
@@ -71,9 +74,7 @@ impl CreateOpts {
             .filter(|s| !s.is_empty())
             .map(izba_core::volume::parse_volume_flag)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        // The GUI wizard has no VNC control yet (spec 2026-08-09 is CLI-first),
-        // so the cap is never shrunk here — matches the `vnc: false` below.
-        izba_core::volume::validate_volumes(&volumes, false)?;
+        izba_core::volume::validate_volumes(&volumes, self.vnc)?;
         Ok(DaemonCreate {
             name: self.name,
             image_ref: self.image,
@@ -89,9 +90,7 @@ impl CreateOpts {
             // None defers to the image's start-docker label, same as an
             // unset CLI flag.
             docker: None,
-            // The GUI wizard has no VNC control yet (spec 2026-08-09 is
-            // CLI-first); false matches an unset `--vnc` flag.
-            vnc: false,
+            vnc: self.vnc,
         })
     }
 }
@@ -870,17 +869,28 @@ mod tests {
         assert_eq!(parse_state(""), SbxState::Stopped);
     }
 
-    #[test]
-    fn create_opts_maps_to_daemon_create() {
-        let opts = CreateOpts {
+    /// Minimal `CreateOpts` literal shared by tests that only care about a
+    /// couple of fields — mirrors `create_opts_maps_to_daemon_create`'s
+    /// original literal.
+    fn minimal_create_opts() -> CreateOpts {
+        CreateOpts {
             name: "web".into(),
             image: "ubuntu:24.04".into(),
             cpus: 2,
             mem_mb: 4096,
             workspace: "/ws".into(),
             rw_size_gb: 8,
-            ports: vec!["127.0.0.1:8080:80".into(), "  ".into()],
+            ports: vec![],
             volumes: vec![],
+            vnc: false,
+        }
+    }
+
+    #[test]
+    fn create_opts_maps_to_daemon_create() {
+        let opts = CreateOpts {
+            ports: vec!["127.0.0.1:8080:80".into(), "  ".into()],
+            ..minimal_create_opts()
         };
         let dc = opts.into_daemon_create().unwrap();
         assert_eq!(dc.name, "web");
@@ -898,16 +908,28 @@ mod tests {
     fn create_opts_rejects_bad_name() {
         let opts = CreateOpts {
             name: "Bad Name".into(),
-            image: "ubuntu:24.04".into(),
-            cpus: 2,
-            mem_mb: 4096,
-            workspace: "/ws".into(),
-            rw_size_gb: 8,
-            ports: vec![],
-            volumes: vec![],
+            ..minimal_create_opts()
         };
         let err = opts.into_daemon_create().unwrap_err().to_string();
         assert!(err.contains("invalid sandbox name"), "got: {err}");
+    }
+
+    /// `CreateOpts.vnc` must flow through to `DaemonCreate.vnc` AND into the
+    /// volume-cap check: 24 volumes is fine without VNC but over the
+    /// VNC-shrunk 23-volume cap.
+    #[test]
+    fn create_spec_vnc_flows_to_daemon_create_and_shrinks_the_volume_cap() {
+        let mut opts = minimal_create_opts();
+        opts.vnc = true;
+        assert!(opts.clone().into_daemon_create().unwrap().vnc);
+
+        // 24 volumes is fine without vnc but over the cap with it.
+        opts.volumes = (0..24).map(|i| format!("/data{i}:1g")).collect();
+        let err = opts.into_daemon_create().unwrap_err().to_string();
+        assert!(
+            err.contains("23"),
+            "cap error should name the vnc cap: {err}"
+        );
     }
 
     #[test]
@@ -945,14 +967,8 @@ mod tests {
     #[test]
     fn create_opts_parses_volumes() {
         let opts = CreateOpts {
-            name: "web".into(),
-            image: "ubuntu:24.04".into(),
-            cpus: 2,
-            mem_mb: 4096,
-            workspace: "/ws".into(),
-            rw_size_gb: 8,
-            ports: vec![],
             volumes: vec!["cache:/data:1g".into(), "  ".into()],
+            ..minimal_create_opts()
         };
         let dc = opts.into_daemon_create().unwrap();
         assert_eq!(dc.volumes.len(), 1);

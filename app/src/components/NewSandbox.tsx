@@ -18,6 +18,7 @@ import {
 } from "../lib/volumevalidate";
 import { VolumeRowEditor } from "./VolumeRowEditor";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -51,6 +52,7 @@ export function NewSandbox({ onClose, onCreated }: Readonly<Props>) {
   const [memMb, setMemMb] = useState(4096);
   const [rwSizeGb, setRwSizeGb] = useState(8);
   const [workspace, setWorkspace] = useState("");
+  const [vnc, setVnc] = useState(false);
   const [ports, setPorts] = useState<PortRow[]>([]);
   const [volumeRows, setVolumeRowsState] = useState<VolumeRow[]>([]);
   const [allVolumes, setAllVolumes] = useState<VolumeInfo[]>([]);
@@ -119,7 +121,7 @@ export function NewSandbox({ onClose, onCreated }: Readonly<Props>) {
             `${r.bind.trim() ? `${r.bind.trim()}:` : ""}${r.host.trim()}:${r.guest.trim()}`,
         ),
       volumes: volumeRows.filter((r) => !isBlankVolRow(r)).map((r) => buildVolSpec(r, allVolumes)),
-      vnc: false, // wizard control lands in the create-wizard task
+      vnc,
     };
     try {
       const created = await api.create(opts);
@@ -246,6 +248,19 @@ export function NewSandbox({ onClose, onCreated }: Readonly<Props>) {
                 onChange={(e) => setRwSizeGb(+e.target.value)}
               />
             </div>
+          </div>
+          <div className="grid gap-1">
+            <label className="flex items-center gap-2 text-sm">
+              <Checkbox
+                aria-label="Desktop (VNC)"
+                checked={vnc}
+                onCheckedChange={(v) => setVnc(v === true)}
+              />
+              Desktop (VNC)
+            </label>
+            <span className="text-xs text-muted-foreground-2">
+              Boots a browser-accessible Linux desktop in the sandbox.
+            </span>
           </div>
           <div className="grid gap-1">
             <span className="text-muted-foreground">Ports</span>
