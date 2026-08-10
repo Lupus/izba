@@ -1,0 +1,61 @@
+{
+  "feature": "izba desktop app — Display tab (VNC desktop)",
+  "journeys": [
+    {
+      "journey_id": "vnc-enable-existing-sandbox-restart-banner",
+      "modality": "gui",
+      "tier": "smoke",
+      "rationale": "The Display tab's cheapest, most common path: a sandbox created without a desktop shows the not-enabled explainer and an Enable affordance, and flipping it on for an ALREADY-RUNNING sandbox must be honest that the change is not live yet — the guest needs the kasmvnc.erofs disk + izba.vnc=1 cmdline that only a fresh boot attaches, so the tab must show the restart banner (not silently pretend the desktop is reachable, and not embed a stale iframe).",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-08-09-vnc-display-design.md §9 PR2 sketch (GUI); DisplayTab.tsx not-enabled/restart-required rendering; vnc.ts vncPresentation restart-required precedence"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'vnc-enable-demo' into the Name field, and 'alpine:3.20' into the Image field, leaving the 'Desktop (VNC)' checkbox unchecked, then click Create to create a new sandbox from this workspace",
+          "expect": "a sandbox named vnc-enable-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the vnc-enable-demo sandbox's detail view and click its Display tab",
+          "expect": "the Display tab shows 'Run a full Linux desktop in this sandbox, streamed to your browser.' and an 'Enable desktop' button, with no desktop iframe and no restart banner"
+        },
+        {
+          "intent": "on the sandbox's Overview, click Start to boot it; wait until its status shows running",
+          "expect": "the vnc-enable-demo sandbox is running"
+        },
+        {
+          "intent": "click the Display tab and click 'Enable desktop'",
+          "expect": "the Display tab shows 'Restart the sandbox to apply the desktop change.' alongside a Restart button, and still no desktop iframe appears — the desktop is enabled in config but not yet live on the running guest",
+          "core": true,
+          "expect_text": "Restart the sandbox to apply the desktop change."
+        }
+      ]
+    },
+    {
+      "journey_id": "vnc-live-desktop-embed-no-password",
+      "modality": "gui",
+      "tier": "core",
+      "rationale": "The flagship promise: a sandbox created and started WITH the desktop already enabled must, once the guest is up, show a live embedded desktop and an Open-in-browser escape hatch — and it must do so without ever putting the desktop's credential (carried in `vnc_url`'s userinfo, per DisplayTab.tsx's CREDENTIAL DISCIPLINE comment) anywhere a screen or the DOM could leak it: the iframe embeds the credential-less loopback proxy (`api.vncProxyStart`), never the raw `vnc_url`, and neither Open in browser nor Copy URL render the URL as text. This journey does NOT assert anything about the desktop's rendered pixels (KasmVNC content) — only the UI's own truthful state: the iframe exists, the controls exist, and no plaintext secret is visible.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/specs/2026-08-09-vnc-display-design.md §6 Credentials + §9 PR2 sketch (GUI); DisplayTab.tsx CREDENTIAL DISCIPLINE comment + iframe embed (title=\"Sandbox desktop\"); vnc.ts CREDENTIAL DISCIPLINE comment"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'vnc-live-demo' into the Name field, and 'alpine:3.20' into the Image field, check the 'Desktop (VNC)' checkbox, then click Create to create a new sandbox from this workspace with the desktop enabled",
+          "expect": "a sandbox named vnc-live-demo appears in the sandbox list"
+        },
+        {
+          "intent": "open the vnc-live-demo sandbox's detail view and, on its Overview, click Start to boot the sandbox; wait until its status shows running",
+          "expect": "the vnc-live-demo sandbox is running"
+        },
+        {
+          "intent": "click the Display tab and wait for the desktop to come up",
+          "expect": "the Display tab shows an embedded desktop iframe (titled 'Sandbox desktop'), an 'Open in browser' button, and a 'Copy URL' button — and no plaintext password or credential string appears anywhere on the page, in the visible text, the iframe's src, or any other attribute",
+          "core": true,
+          "expect_text": "Open in browser"
+        }
+      ]
+    }
+  ]
+}
