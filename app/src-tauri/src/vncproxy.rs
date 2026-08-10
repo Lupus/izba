@@ -137,6 +137,24 @@ fn rewrite_request_head(head: &str, authorization: &str) -> anyhow::Result<(Stri
     Ok((out, is_upgrade))
 }
 
+/// Whether an `accept` error means the LISTENER is gone, or just one queued
+/// connection.
+///
+/// A client that queues a connection and then resets it before we accept is
+/// routine — Chromium preconnects and cancels — and the OS reports it against
+/// `accept`: `ECONNABORTED` on unix, `WSAECONNRESET` (→ `ConnectionReset`) on
+/// Windows. `Interrupted` is a signal. Breaking the loop on any of those would
+/// close the port while `vnc_proxy_url`'s registry still hands it out, so the
+/// tab would embed a dead port until the app restarts.
+fn accept_error_is_fatal(kind: std::io::ErrorKind) -> bool {
+    !matches!(
+        kind,
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
 /// A running proxy. Dropping it stops accepting.
 pub struct VncProxy {
     port: u16,
@@ -169,15 +187,11 @@ impl VncProxy {
                             let _ = serve_connection(client, &t);
                         });
                     }
-                    // A per-connection abort is not the listener's death; any
-                    // other accept error is, and ending the loop beats
+                    // A per-connection failure is not the listener's death;
+                    // any other accept error is, and ending the loop beats
                     // spinning on it.
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(_) => break,
+                    Err(e) if accept_error_is_fatal(e.kind()) => break,
+                    Err(_) => {}
                 }
             }
         });
@@ -199,6 +213,24 @@ impl VncProxy {
     /// be pointed at a relay it was not started for.
     pub fn target_matches(&self, t: &ProxyTarget) -> bool {
         &self.target == t
+    }
+
+    /// Whether the accept loop is still running. A proxy whose loop has ended
+    /// holds a closed port: it can never serve again, so a matching target is
+    /// NOT enough to reuse it — the registry must rekey.
+    pub fn is_live(&self) -> bool {
+        self.accept.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// Test-only: end the accept loop and join it, leaving a bound-but-dead
+    /// proxy — exactly the state a fatal accept error produces in the field.
+    #[cfg(test)]
+    pub fn stop_for_test(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.accept.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -352,6 +384,27 @@ mod tests {
         assert!(err.to_string().contains("exceeds"), "{err}");
     }
 
+    #[test]
+    fn a_reset_connection_does_not_kill_the_accept_loop() {
+        // Chromium preconnects then cancels; the OS reports that against
+        // `accept` as ECONNABORTED (unix) or WSAECONNRESET (Windows). Treating
+        // either as fatal closes the port while the registry still serves it.
+        for benign in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            assert!(!accept_error_is_fatal(benign), "{benign:?}");
+        }
+        // A listener that is genuinely gone still ends the loop.
+        for fatal in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(accept_error_is_fatal(fatal), "{fatal:?}");
+        }
+    }
+
     /// Some sandboxes deny `bind` with EPERM; those runs SKIP rather than fail.
     fn try_listener() -> Option<std::net::TcpListener> {
         match std::net::TcpListener::bind("127.0.0.1:0") {
@@ -454,6 +507,21 @@ mod tests {
             "response: {resp}"
         );
         assert!(resp.contains("ok:ping"), "response: {resp}");
+    }
+
+    #[test]
+    fn is_live_follows_the_accept_loop() {
+        let Some(upstream) = try_listener() else {
+            return;
+        };
+        let mut proxy = VncProxy::start(ProxyTarget {
+            port: upstream.local_addr().unwrap().port(),
+            authorization: "Basic good".into(),
+        })
+        .unwrap();
+        assert!(proxy.is_live(), "a just-started proxy is live");
+        proxy.stop_for_test();
+        assert!(!proxy.is_live(), "a proxy whose accept loop ended is dead");
     }
 
     #[test]
