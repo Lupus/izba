@@ -91,7 +91,9 @@ export function DisplayTab({ name, running, onChanged }: Props) {
       // late-arriving start must not paint the previous sandbox's frame.
       dropped = true;
       setProxyUrl(null);
-      void api.vncProxyStop(name);
+      // Teardown has nowhere to report to — and a stop that fails must not
+      // stop the next sandbox's embed from starting.
+      void api.vncProxyStop(name).catch(() => {});
     };
   }, [name, liveUrl]);
 
