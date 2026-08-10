@@ -172,6 +172,137 @@ fn http_get_status(
     Ok((code, body))
 }
 
+/// What a real VNC client does that a plain HTTP GET never does: upgrade the
+/// same port to a WebSocket and run the first two RFB steps through it.
+///
+/// Returns `(upgrade_status, rfb_greeting, security_types)`. The greeting is
+/// the server's `RFB 003.00x\n`; the types are the bytes of the
+/// `SecurityTypes` list it offers after the client echoes the version back
+/// (`1 = None`, `2 = VncAuth`). Everything before this — bind, relay, HTTP,
+/// BasicAuth, even the websocket upgrade itself — can be perfectly healthy
+/// while the session still dead-ends here, which is exactly the bug this
+/// probe exists to catch, so the types are returned rather than merely
+/// counted.
+///
+/// Hand-rolled over `TcpStream`: masking a couple of ≤125-byte client frames
+/// and reading two server frames is less code than a websocket dependency,
+/// and it keeps the probe honest about the wire.
+fn ws_rfb_probe(
+    port: u16,
+    basic_auth: Option<(&str, &str)>,
+) -> anyhow::Result<(u16, Vec<u8>, Vec<u8>)> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    s.set_write_timeout(Some(Duration::from_secs(10)))?;
+
+    // `/websockify` is the path the shipped KasmVNC web client dials, and
+    // `Origin` is NOT optional: without it the server answers 404 ("request
+    // failed websocket checks"), which would make a broken probe look like a
+    // broken server.
+    let mut req = format!(
+        "GET /websockify HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Upgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\n\
+         Sec-WebSocket-Protocol: binary\r\nOrigin: http://127.0.0.1:{port}\r\n",
+        base64_encode(b"izba-e2e-probe16"),
+    );
+    if let Some((user, pass)) = basic_auth {
+        req.push_str(&format!(
+            "Authorization: Basic {}\r\n",
+            base64_encode(format!("{user}:{pass}").as_bytes())
+        ));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes())?;
+
+    // Read just past the response headers; anything after them is already
+    // websocket framing and must not be consumed by the header parse.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        match s.read(&mut chunk) {
+            Ok(0) => anyhow::bail!(
+                "connection closed before the websocket response completed: {:?}",
+                String::from_utf8_lossy(&buf)
+            ),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(e.into()),
+        }
+        anyhow::ensure!(buf.len() < 1 << 16, "websocket response headers too large");
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let code: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("no HTTP status line in the upgrade reply: {head:?}"))?;
+    if code != 101 {
+        return Ok((code, Vec::new(), Vec::new()));
+    }
+
+    let mut pending: Vec<u8> = buf[head_end..].to_vec();
+    let greeting = ws_read_frame(&mut s, &mut pending)?;
+    // Echo the server's version back (RFB 3.x step 2) so it proceeds to the
+    // security-type list.
+    anyhow::ensure!(
+        greeting.len() >= 12,
+        "short RFB greeting: {:?}",
+        String::from_utf8_lossy(&greeting)
+    );
+    ws_write_frame(&mut s, &greeting[..12])?;
+    let security = ws_read_frame(&mut s, &mut pending)?;
+    // `<count> <type>…`, or a `0` count meaning the handshake failed outright.
+    let types = match security.split_first() {
+        Some((&n, rest)) if n as usize <= rest.len() => rest[..n as usize].to_vec(),
+        _ => Vec::new(),
+    };
+    Ok((code, greeting, types))
+}
+
+/// One masked client→server binary frame (payload ≤ 125 bytes — every frame
+/// this probe sends is a handshake token).
+fn ws_write_frame(s: &mut TcpStream, payload: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(payload.len() <= 125, "probe frames stay short");
+    let mask = [0x37u8, 0xfa, 0x21, 0x3d];
+    let mut frame = vec![0x82, 0x80 | payload.len() as u8];
+    frame.extend_from_slice(&mask);
+    frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    s.write_all(&frame)?;
+    Ok(())
+}
+
+/// One server→client frame's payload (server frames are never masked; the
+/// 7-bit and 16-bit length forms both appear in an RFB stream).
+fn ws_read_frame(s: &mut TcpStream, pending: &mut Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    let mut fill = |pending: &mut Vec<u8>, want: usize| -> anyhow::Result<()> {
+        let mut chunk = [0u8; 4096];
+        while pending.len() < want {
+            match s.read(&mut chunk) {
+                Ok(0) => anyhow::bail!("connection closed mid-frame"),
+                Ok(n) => pending.extend_from_slice(&chunk[..n]),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    };
+    fill(pending, 2)?;
+    let (mut len, mut off) = ((pending[1] & 0x7f) as usize, 2usize);
+    if len == 126 {
+        fill(pending, 4)?;
+        len = u16::from_be_bytes([pending[2], pending[3]]) as usize;
+        off = 4;
+    }
+    anyhow::ensure!(len < 1 << 20, "unexpectedly large websocket frame: {len}");
+    fill(pending, off + len)?;
+    let payload = pending[off..off + len].to_vec();
+    pending.drain(..off + len);
+    Ok(payload)
+}
+
 /// Listeners (`st == 0A`) from a `/proc/net/tcp[6]` dump, as
 /// `(port, local-address-in-the-kernel's-hex-form)`.
 ///
@@ -1490,15 +1621,22 @@ fn guest_listeners(data: &Path, name: &str) -> BTreeSet<(u16, String)> {
 /// 1. `izba vnc url` prints `http://izba:<pw>@127.0.0.1:<port>/`.
 /// 2. Auth matrix: no creds → 401; correct creds → 200 + a KasmVNC page;
 ///    wrong password → 401 (the hash really is checked, not merely present).
-/// 3. The desktop is functional: the X socket is at `/tmp/.X11-unix/X1` and
+/// 3. A REAL client session, not just static content: the websocket upgrade
+///    on the same port (401 unauthenticated, 101 with credentials — even
+///    after more unauthenticated requests than KasmVNC's default brute-force
+///    threshold) carrying an RFB stream whose offered security type is
+///    `None`, not `VncAuth`. Every probe in the first cut stopped at an HTTP
+///    GET, and static content served perfectly while the desktop never
+///    appeared.
+/// 4. The desktop is functional: the X socket is at `/tmp/.X11-unix/X1` and
 ///    both `Xkasmvnc` and `openbox` are live processes inside the container.
-/// 4. The guest listens on NOTHING beyond izba's own set — in particular no
+/// 5. The guest listens on NOTHING beyond izba's own set — in particular no
 ///    X11 TCP port (`-ac` grants root-on-display to anything in the netns, so
 ///    an open 6001 would be a real hole).
-/// 5. `izba vnc off` on a RUNNING sandbox: "restart required" guidance, a
+/// 6. `izba vnc off` on a RUNNING sandbox: "restart required" guidance, a
 ///    status line that admits the desktop is still up, and a `vnc url` that
 ///    still hands back the live URL with the disabled warning on stderr.
-/// 6. A sandbox created WITHOUT `--vnc`: `izba vnc url` fails, pointing at
+/// 7. A sandbox created WITHOUT `--vnc`: `izba vnc url` fails, pointing at
 ///    `vnc on`.
 #[test]
 fn vnc_desktop_e2e() {
@@ -1630,6 +1768,64 @@ fn vnc_desktop_e2e() {
         code,
         401,
         "a wrong password must not be accepted\n{}",
+        vnc_diag(&data, name)
+    );
+
+    // [5b] The step every earlier probe skipped: what a REAL client does.
+    // Static GETs can all succeed while the session is dead, which is
+    // precisely how the "page loads, desktop never appears, endless spinner"
+    // bug shipped. Upgrade the same port to a websocket and run the first two
+    // RFB steps through it.
+    //
+    // First unauthenticated — the auth gate has to hold on the websocket
+    // path, not merely on `/`.
+    let (code, _, _) = ws_rfb_probe(port, None).unwrap_or_else(|e| {
+        panic!(
+            "unauthenticated websocket upgrade never completed: {e:#}\n{}",
+            vnc_diag(&data, name)
+        )
+    });
+    assert_eq!(
+        code,
+        401,
+        "the websocket must demand BasicAuth too\n{}",
+        vnc_diag(&data, name)
+    );
+
+    // Then hammer the server with MORE unauthenticated requests than
+    // KasmVNC's default brute-force threshold (5) before the real attempt.
+    // A browser generates exactly this pattern by itself — basic auth is
+    // 401-then-retry and the client page fetches ~30 subresources in
+    // parallel — and every request arrives from the same guest-loopback
+    // address, so the default lockout blacklists the only client there is.
+    // With the lockout left on, the authenticated probe below fails.
+    for _ in 0..6 {
+        let _ = http_get_status(port, "/", None);
+    }
+
+    let (code, greeting, types) = ws_rfb_probe(port, Some(("izba", &password)))
+        .unwrap_or_else(|e| panic!("websocket upgrade failed: {e:#}\n{}", vnc_diag(&data, name)));
+    assert_eq!(
+        code,
+        101,
+        "the credentialed websocket upgrade must succeed (a blacklisted \
+         loopback answers 401 forever)\n{}",
+        vnc_diag(&data, name)
+    );
+    assert!(
+        greeting.starts_with(b"RFB "),
+        "the websocket must carry the RFB stream, got: {:?}\n{}",
+        String::from_utf8_lossy(&greeting),
+        vnc_diag(&data, name)
+    );
+    // `1 = None`, `2 = VncAuth`. VncAuth authenticates against a separate
+    // legacy `-rfbauth` file that izba never writes, so offering it strands
+    // the web client at a password prompt it can never satisfy — the RFB
+    // stream must be gated by the BasicAuth already proven above instead.
+    assert!(
+        types.contains(&1) && !types.contains(&2),
+        "the server must offer RFB security type None (1) and not VncAuth \
+         (2), got: {types:?}\n{}",
         vnc_diag(&data, name)
     );
 
