@@ -222,6 +222,22 @@ credentialed relay URL; restart-required banner mirroring the USB tab;
 `--vnc` toggle in the create dialog; `vnc` fields ride the existing inspect
 payload; GUI dogfood journey. No daemon changes beyond PR1's.
 
+**PR2 as built (2026-08-10):** the sketch above assumed a direct iframe at
+the credentialed relay URL; that does not work under WebView2, which refuses
+credentials embedded in a subresource URL. The Display tab instead embeds
+through an **in-app auth-injecting loopback proxy**
+(`app/src-tauri/src/vncproxy.rs`): the proxy accepts credential-less HTTP
+from the webview on an ephemeral loopback port, injects the `Authorization:
+Basic` header server-side (including on the websocket upgrade, since
+KasmVNC gates both HTTP and ws behind Basic auth), and splices to the
+daemon's VNC relay. Its lifetime is the Display tab's — started when the tab
+mounts, stopped when it unmounts. Shipped as sketched: enable/disable
+(`izba vnc on|off` parity in the GUI), the restart-required banner, an
+open-in-browser action (using the daemon's credentialed URL directly, not
+the proxy), a copy-URL action, and the create-wizard "Desktop (VNC)"
+toggle. The §10 clipboard bidirectional-on accepted risk was **not**
+revisited — no per-session toggle shipped; it remains open for a future PR.
+
 ## 10. Security posture
 
 - Bundle: izba-owned, sha-pinned, RO at block layer; guest tampering is
@@ -239,6 +255,14 @@ payload; GUI dogfood journey. No daemon changes beyond PR1's.
 - Manifest (`izba.yml`) does NOT get a `vnc:` field in PR1 — enabling a
   desktop stays a human action (CLI/GUI), not an agent-writable proposal;
   revisit with the promote flow if demand appears.
+- **PR2 embed proxy (accepted risk):** WebView2 refuses credentials embedded
+  in a subresource URL, so the Display tab embeds through an in-app
+  auth-injecting loopback proxy (`app/src-tauri/src/vncproxy.rs`) rather than
+  iframing the credentialed relay URL directly. While it runs, any local
+  process can reach the desktop through that port without credentials — the
+  same class of accepted risk as `izba vnc open`'s credentialed URL on the
+  process argv. It binds `127.0.0.1` only and its lifetime is bound to the
+  Display tab's: started when the tab mounts, stopped when it unmounts.
 
 ## 11. Risks & mitigations
 
