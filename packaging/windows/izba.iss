@@ -66,19 +66,71 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
     Check: NeedsAddPath(ExpandConstant('{app}\bin'))
 
 [Code]
-// Quiesce izba so file replacement never hits in-use binaries: gracefully
-// stop all sandboxes (`izba stop --all`) and the daemon (`izba daemon stop`),
-// then force-kill anything still running from the install dir. All
-// best-effort with timeouts inside the script; CloseApplications=force above
-// is the final backstop.
+const
+  // Ceiling over stop-izba.ps1's own internal timeouts (~160 s worst case);
+  // the script's done marker normally ends the wait much earlier.
+  QuiescePollMs = 200;
+  QuiesceMaxPolls = 900;   // 900 * 200 ms = 180 s
+
+// Paint a quiesce progress line on whichever surface exists: the wizard's
+// "Preparing to Install" page (install) or the uninstall progress form.
+procedure QuiesceStatus(const Msg: String);
+begin
+  if IsUninstaller then
+  begin
+    UninstallProgressForm.StatusLabel.Caption := Msg;
+    UninstallProgressForm.Refresh;
+  end else
+  begin
+    WizardForm.PreparingLabel.Visible := True;
+    WizardForm.PreparingLabel.Caption := Msg;
+    WizardForm.Refresh;
+  end;
+end;
+
+// Quiesce izba so file replacement never hits in-use binaries: close the
+// desktop app, gracefully stop all sandboxes (`izba stop --all`) and the
+// daemon (`izba daemon stop`), then force-kill anything still running from
+// the install dir. The script runs detached and reports through two files:
+// a status file we poll onto the UI (a blocking Exec would leave the page
+// blank for the whole multi-minute quiesce) and a done marker that ends the
+// wait. All best-effort with timeouts inside the script;
+// CloseApplications=force above is the final backstop.
 procedure RunStopIzba(const ScriptPath: string);
 var
-  ResultCode: Integer;
+  StatusFile, DoneFile, Status, LastStatus: String;
+  S: AnsiString;
+  ResultCode, Polls: Integer;
 begin
-  Exec('powershell.exe',
+  StatusFile := ExpandConstant('{tmp}\izba-quiesce-status.txt');
+  DoneFile := ExpandConstant('{tmp}\izba-quiesce-done.txt');
+  DeleteFile(StatusFile);
+  DeleteFile(DoneFile);
+  QuiesceStatus('Stopping izba sandboxes and daemon - this can take a few minutes...');
+  if not Exec('powershell.exe',
     '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '"' +
-    ' -InstallDir "' + ExpandConstant('{app}') + '"',
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    ' -InstallDir "' + ExpandConstant('{app}') + '"' +
+    ' -StatusFile "' + StatusFile + '" -DoneFile "' + DoneFile + '"',
+    '', SW_HIDE, ewNoWait, ResultCode) then
+    exit;
+  LastStatus := '';
+  for Polls := 1 to QuiesceMaxPolls do
+  begin
+    if FileExists(DoneFile) then
+      break;
+    Sleep(QuiescePollMs);
+    // A failed read (script mid-write) just keeps the last painted status.
+    if LoadStringFromFile(StatusFile, S) then
+    begin
+      Status := S;
+      Status := Trim(Status);
+      if (Status <> '') and (Status <> LastStatus) then
+      begin
+        LastStatus := Status;
+        QuiesceStatus(Status);
+      end;
+    end;
+  end;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
