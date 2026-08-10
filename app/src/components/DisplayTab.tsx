@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "../lib/ipc";
 import type { SandboxDetail } from "../lib/types";
@@ -30,29 +30,49 @@ export function DisplayTab({ name, running, onChanged }: Props) {
   const [proxyUrl, setProxyUrl] = useState<string | null>(null);
   const [proxyError, setProxyError] = useState<string | null>(null);
 
-  async function load() {
+  // Bumped whenever the tab moves to another sandbox (or unmounts). An answer
+  // that started under an older generation describes a DIFFERENT sandbox and
+  // must never paint: in this tab a wrong `detail` means the toolbar hands out
+  // another sandbox's password-bearing URL.
+  const generation = useRef(0);
+
+  async function load(mine: number) {
     try {
-      setDetail(await api.inspect(name));
+      const d = await api.inspect(name);
+      if (mine !== generation.current) return;
+      setDetail(d);
       setError(null);
     } catch (e) {
+      if (mine !== generation.current) return;
       setError(e instanceof Error ? e.message : String(e));
     }
   }
 
   useEffect(() => {
-    void load();
+    const mine = ++generation.current;
+    void load(mine);
+    return () => {
+      // Not a DOM ref: bumping the counter IS the cleanup, and reading its
+      // latest value at teardown is exactly the intent the rule warns about.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      generation.current++;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name, running]);
 
   async function act(fn: () => Promise<unknown>) {
+    // Captured before the call: a mutation for the sandbox we have since left
+    // must not paint its result either — `load` here is this render's, bound
+    // to this render's `name`.
+    const mine = generation.current;
     setBusy(true);
     setError(null);
     try {
       await fn();
-      await load();
-      onChanged();
+      await load(mine);
+      if (mine === generation.current) onChanged();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (mine === generation.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -68,7 +88,12 @@ export function DisplayTab({ name, running, onChanged }: Props) {
     }
   }
 
-  const presentation = detail === null ? null : vncPresentation(detail);
+  // A detail belongs to a sandbox, so it is only this tab's while the names
+  // agree: for the one commit between a switch and its answer, `detail` still
+  // describes the sandbox we left, and rendering it there would hand out that
+  // sandbox's password-bearing URL.
+  const current = detail !== null && detail.name === name ? detail : null;
+  const presentation = current === null ? null : vncPresentation(current);
   // The embed follows the LIVE desktop, not the config: a proxy is only worth
   // running while there is a URL to proxy.
   const liveUrl = presentation?.kind === "url" ? presentation.url : null;
@@ -97,7 +122,7 @@ export function DisplayTab({ name, running, onChanged }: Props) {
     };
   }, [name, liveUrl]);
 
-  if (detail === null || presentation === null) {
+  if (current === null || presentation === null) {
     return <div className="flex flex-col gap-4">{error && <ErrorLine text={error} />}</div>;
   }
 
@@ -130,7 +155,7 @@ export function DisplayTab({ name, running, onChanged }: Props) {
       {presentation.kind === "restart-required" && (
         <div className="flex flex-col items-start gap-3">
           <RestartBanner name={name} busy={busy} act={act} />
-          {detail.vnc && <DisableButton name={name} busy={busy} act={act} />}
+          {current.vnc && <DisableButton name={name} busy={busy} act={act} />}
         </div>
       )}
 
@@ -143,7 +168,7 @@ export function DisplayTab({ name, running, onChanged }: Props) {
           ))}
           {/* Enabled, running, but booted with a different display config: the
               desktop on screen is not the one the config describes. */}
-          {detail.vnc_restart_required && detail.vnc && (
+          {current.vnc_restart_required && current.vnc && (
             <RestartBanner name={name} busy={busy} act={act} />
           )}
 
@@ -164,7 +189,7 @@ export function DisplayTab({ name, running, onChanged }: Props) {
             >
               Copy URL
             </Button>
-            {detail.vnc ? (
+            {current.vnc ? (
               <DisableButton name={name} busy={busy} act={act} />
             ) : (
               <Button
