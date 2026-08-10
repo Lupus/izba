@@ -10,6 +10,7 @@ import { PortsTab } from "./PortsTab";
 import { VolumesTab } from "./VolumesTab";
 import { ManifestTab } from "./ManifestTab";
 import { UsbTab } from "./UsbTab";
+import { DisplayTab } from "./DisplayTab";
 import { OverviewTab } from "./overview/OverviewTab";
 import { Spinner } from "./Spinner";
 import { Button } from "@/components/ui/button";
@@ -30,6 +31,7 @@ type Tab =
   | "netlog"
   | "policy"
   | "manifest"
+  | "display"
   | "shell";
 type Action = "start" | "stop" | "restart" | "remove";
 
@@ -94,6 +96,7 @@ export function Detail({ sandbox, onChanged }: Props) {
     { id: "netlog", label: "Netlog" },
     { id: "policy", label: "Policy" },
     { id: "manifest", label: "Manifest" },
+    { id: "display", label: "Display" },
     { id: "shell", label: "Shell" },
   ];
 
@@ -190,6 +193,8 @@ export function Detail({ sandbox, onChanged }: Props) {
         {tab === "policy" && <PolicyEditor name={name} />}
 
         {tab === "manifest" && <ManifestTab name={name} running={running} />}
+
+        {tab === "display" && <DisplayTab name={name} running={running} onChanged={onChanged} />}
 
         {tab === "shell" &&
           (running ? (

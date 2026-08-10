@@ -178,6 +178,18 @@ describe("Detail tabs", () => {
     expect(screen.getByText("usb-for-web")).toBeInTheDocument();
   });
 
+  it("has a Display tab, present even with vnc off, that renders DisplayTab content", async () => {
+    // Present even with VNC unconfigured — never conditionally hidden, same
+    // convention as the USB tab above: it's where a user finds out the
+    // feature exists at all.
+    const sbx: SandboxView = { name: "web", image: "u", state: { kind: "running" } };
+    render(<Detail sandbox={sbx} onChanged={noop} />);
+    fireEvent.click(screen.getByRole("tab", { name: /^display$/i }));
+    expect(
+      await screen.findByText(/run a full linux desktop in this sandbox/i),
+    ).toBeInTheDocument();
+  });
+
   it("has a Manifest tab that switches to the ManifestTab", () => {
     const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
     render(<Detail sandbox={sbx} onChanged={noop} />);
