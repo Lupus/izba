@@ -98,19 +98,22 @@ end;
 // CloseApplications=force above is the final backstop.
 procedure RunStopIzba(const ScriptPath: string);
 var
-  StatusFile, DoneFile, Status, LastStatus: String;
+  StatusFile, DoneFile, PidFile, Status, LastStatus, PidStr: String;
   S: AnsiString;
-  ResultCode, Polls: Integer;
+  ResultCode, Polls, HelperPid: Integer;
 begin
   StatusFile := ExpandConstant('{tmp}\izba-quiesce-status.txt');
   DoneFile := ExpandConstant('{tmp}\izba-quiesce-done.txt');
+  PidFile := ExpandConstant('{tmp}\izba-quiesce-pid.txt');
   DeleteFile(StatusFile);
   DeleteFile(DoneFile);
+  DeleteFile(PidFile);
   QuiesceStatus('Stopping izba sandboxes and daemon - this can take a few minutes...');
   if not Exec('powershell.exe',
     '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '"' +
     ' -InstallDir "' + ExpandConstant('{app}') + '"' +
-    ' -StatusFile "' + StatusFile + '" -DoneFile "' + DoneFile + '"',
+    ' -StatusFile "' + StatusFile + '" -DoneFile "' + DoneFile + '"' +
+    ' -PidFile "' + PidFile + '"',
     '', SW_HIDE, ewNoWait, ResultCode) then
     exit;
   LastStatus := '';
@@ -130,6 +133,20 @@ begin
         QuiesceStatus(Status);
       end;
     end;
+  end;
+  // Ceiling overrun with the helper still alive: kill its whole process
+  // tree so file replacement never races a live quiesce.
+  if not FileExists(DoneFile) then
+  begin
+    HelperPid := 0;
+    if LoadStringFromFile(PidFile, S) then
+    begin
+      PidStr := S;
+      HelperPid := StrToIntDef(Trim(PidStr), 0);
+    end;
+    if HelperPid > 0 then
+      Exec('taskkill.exe', '/f /t /pid ' + IntToStr(HelperPid),
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
 

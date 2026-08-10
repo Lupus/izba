@@ -40,6 +40,12 @@
     Optional: a file created when the quiesce is finished (success or not).
     The installer polls for its existence instead of blocking on this
     process, which keeps its UI updatable while we work.
+
+.PARAMETER PidFile
+    Optional: a file this script writes its own PID to at startup. If the
+    installer's polling ceiling expires before the done marker appears, it
+    taskkills this PID's tree rather than letting file replacement race a
+    still-running quiesce.
 #>
 [CmdletBinding()]
 param(
@@ -48,10 +54,20 @@ param(
 
     [string] $StatusFile,
 
-    [string] $DoneFile
+    [string] $DoneFile,
+
+    [string] $PidFile
 )
 
 $ErrorActionPreference = 'Continue'
+
+if ($PidFile) {
+    try {
+        [System.IO.File]::WriteAllText($PidFile, "$PID")
+    } catch {
+        Write-Warning "pid-file write failed: $_"
+    }
+}
 
 function Write-Status {
     param([string] $Message)
