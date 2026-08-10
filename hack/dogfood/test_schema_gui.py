@@ -602,9 +602,9 @@ def test_gui_bundle_with_initial_observation_validates():
 
 
 def test_committed_journeys_corpora_validate_against_schema():
-    # The two committed corpora must stay valid under the extended schema.
+    # The committed corpora must stay valid under the extended schema.
     jsonschema = pytest.importorskip("jsonschema")
     schema = _load("journeys.schema.json")
-    for name in ("manifest-gui.json", "smoke-core-cli.json"):
+    for name in ("manifest-gui.json", "smoke-core-cli.json", "vnc-gui.json"):
         with open(os.path.join(HERE, "journeys", name)) as f:
             jsonschema.validate(json.load(f), schema)
