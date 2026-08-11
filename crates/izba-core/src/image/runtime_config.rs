@@ -1261,7 +1261,7 @@ fn add_usb_device_access(spec: &mut Spec) -> Result<()> {
 /// Bind the vendored KasmVNC bundle and its session secrets into the
 /// container.
 ///
-/// Seven binds:
+/// Ten binds:
 /// - **Bundle** ([`VNC_BUNDLE_SHARED_DIR`] → [`VNC_BUNDLE_CONTAINER_DIR`]):
 ///   the whole vendored tree (X server, window manager, VNC/websockify),
 ///   `rbind,ro` — read-only because the workload never needs to modify its
@@ -1288,7 +1288,7 @@ fn add_usb_device_access(spec: &mut Spec) -> Result<()> {
 ///   is permanently EMPTY, with nothing logged anywhere. Both were found
 ///   only by booting a real VM and looking.
 /// - **Module + data trees** — the same hardcoded-path class once more, for
-///   `dlopen` and `open` rather than `exec`. Three directories, none of them
+///   `dlopen` and `open` rather than `exec`. Five directories, none of them
 ///   overridable by any environment variable:
 ///   - `lib/lxpanel/plugins` → `/usr/lib/x86_64-linux-gnu/lxpanel/plugins`
 ///     and `lib/libfm` → `/usr/lib/x86_64-linux-gnu/libfm/modules`:
@@ -1296,13 +1296,26 @@ fn add_usb_device_access(spec: &mut Spec) -> Result<()> {
 ///     directory, so without these binds every panel plugin (the
 ///     Applications menu, taskbar, pager, clock) and every libfm module is
 ///     simply absent — the panel process lives but is empty.
-///   - `share/lxpanel` → `/usr/share/lxpanel`: lxpanel's compiled-in
-///     `PACKAGE_DATA_DIR`, where it opens its images (the Applications
-///     button's `images/my-computer.png`) and its GtkBuilder `ui/` files.
-///     Without it the panel comes up with a broken-image button.
+///   - `share/lxpanel` → `/usr/share/lxpanel`, `share/libfm` →
+///     `/usr/share/libfm`, and `share/pcmanfm` → `/usr/share/pcmanfm`: the
+///     compiled-in `PACKAGE_DATA_DIR` of each app, holding its images and
+///     its GtkBuilder `.ui` files. Without lxpanel's, the panel comes up
+///     with a broken-image Applications button. Without libfm's and
+///     pcmanfm's, the desktop right-click menu still renders but the
+///     dialogs behind its entries — Desktop Preferences
+///     (`pcmanfm/ui/desktop-pref.ui`), Create New, Properties, Rename
+///     (`libfm/ui/*.ui`) — cannot be built, and libfm's terminal database
+///     (`libfm/terminals.list`) is missing.
 ///
 ///   `ro` but never `noexec`: the module trees are shared objects that must
 ///   be mappable executable.
+///
+///   NOTE the literal `x86_64-linux-gnu` in the two module paths. Debian's
+///   multiarch directory name is part of the compiled-in path, so these
+///   binds are correct only for an x86_64 bundle — which is what
+///   `hack/build-kasmvnc-erofs.sh` builds (it copies from
+///   `/usr/lib/x86_64-linux-gnu` and vendors an x86_64 dynamic loader).
+///   Porting the bundle to another architecture must change both ends.
 /// - **Secrets** ([`VNC_SECRETS_SHARED_DIR`] → [`VNC_SECRETS_CONTAINER_DIR`]):
 ///   `rbind,ro,nosuid,noexec` — session password/TLS material, never
 ///   executable and never writable from inside the container.
@@ -1361,6 +1374,14 @@ fn add_vnc_mounts(spec: &mut Spec) -> Result<()> {
             (
                 "/usr/share/lxpanel",
                 format!("{VNC_BUNDLE_SHARED_DIR}/share/lxpanel"),
+            ),
+            (
+                "/usr/share/libfm",
+                format!("{VNC_BUNDLE_SHARED_DIR}/share/libfm"),
+            ),
+            (
+                "/usr/share/pcmanfm",
+                format!("{VNC_BUNDLE_SHARED_DIR}/share/pcmanfm"),
             ),
         ] {
             mounts.push(
@@ -2251,6 +2272,12 @@ mod tests {
                 "/run/izba/vnc/lib/libfm",
             ),
             ("/usr/share/lxpanel", "/run/izba/vnc/share/lxpanel"),
+            // libfm's and pcmanfm's PACKAGE_DATA_DIRs carry the GtkBuilder
+            // .ui files behind the desktop right-click menu's entries
+            // (Desktop Preferences, Create New, Properties, Rename); an
+            // image that does not ship pcmanfm has none of them.
+            ("/usr/share/libfm", "/run/izba/vnc/share/libfm"),
+            ("/usr/share/pcmanfm", "/run/izba/vnc/share/pcmanfm"),
         ] {
             let md = m(dest).unwrap_or_else(|| panic!("module-dir bind for {dest}"));
             assert_eq!(md.source().as_ref().and_then(|p| p.to_str()), Some(src));
@@ -2317,6 +2344,8 @@ mod tests {
             "/usr/lib/x86_64-linux-gnu/lxpanel/plugins",
             "/usr/lib/x86_64-linux-gnu/libfm/modules",
             "/usr/share/lxpanel",
+            "/usr/share/libfm",
+            "/usr/share/pcmanfm",
         ] {
             assert!(
                 !mounts
