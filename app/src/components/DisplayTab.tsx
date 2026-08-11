@@ -118,11 +118,23 @@ export function DisplayTab({ name, running, onChanged }: Props) {
   // running while there is a URL to proxy.
   const liveUrl = presentation?.kind === "url" ? presentation.url : null;
 
+  // Proxy start/stop operations run strictly serialized through this chain.
+  // Two orderings must both be impossible: a cleanup's stop overtaking its
+  // own still-resolving start (the backend inserts into its registry only
+  // after a daemon round-trip — an overtaken stop removes nothing and the
+  // late insert orphans an unauthenticated listener with no tab left to stop
+  // it), and a stale cleanup's stop landing AFTER a replacement effect's
+  // start for the same sandbox (the registry keys by name alone, so the late
+  // stop would drop the replacement and strand the iframe on a dead port).
+  const proxyOps = useRef<Promise<void>>(Promise.resolve());
+
   useEffect(() => {
     if (liveUrl === null) return;
     let dropped = false;
     setProxyError(null);
-    const started = (async () => {
+    proxyOps.current = proxyOps.current.then(async () => {
+      // Superseded before it began (rapid switch): start nothing.
+      if (dropped) return;
       try {
         const url = await api.vncProxyStart(name);
         if (!dropped) setProxyUrl(url);
@@ -130,20 +142,18 @@ export function DisplayTab({ name, running, onChanged }: Props) {
         // The embed is the loss; open-in-browser still reaches the desktop.
         if (!dropped) setProxyError(e instanceof Error ? e.message : String(e));
       }
-    })();
+    });
     return () => {
       // Switching sandbox (or unmounting) must not leave a proxy behind, and a
       // late-arriving start must not paint the previous sandbox's frame.
       dropped = true;
       setProxyUrl(null);
-      // The stop is chained behind the start's settlement: vnc_proxy_start
-      // inserts into the backend registry only after a daemon round-trip, so
-      // a stop that overtook a still-resolving start would remove nothing and
-      // the late insert would orphan an unauthenticated listener with no tab
-      // left to stop it. (`started` never rejects — errors land in
-      // setProxyError above.) Teardown has nowhere to report to — and a stop
-      // that fails must not stop the next sandbox's embed from starting.
-      void started.then(() => api.vncProxyStop(name)).catch(() => {});
+      // Queue the stop behind everything already in flight. Teardown has
+      // nowhere to report to — and a stop that fails must not poison the
+      // chain for the next embed.
+      proxyOps.current = proxyOps.current
+        .then(() => api.vncProxyStop(name))
+        .catch(() => {});
     };
   }, [name, liveUrl]);
 
