@@ -1656,6 +1656,47 @@ fn prove_desktop_session(data: &Path, name: &str, port: u16, password: &str, pha
     );
 }
 
+/// Assert every desktop component is a live process inside the container,
+/// polling briefly: pcmanfm/lxpanel start alongside openbox, and
+/// menu-cached is spawned lazily by lxpanel's menu plugin, so a single
+/// snapshot right after the RFB proof can race their startup.
+fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
+    let wants = ["Xkasmvnc", "openbox", "lxpanel", "pcmanfm", "menu-cached"];
+    let no_env: &[(&str, &str)] = &[];
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let procs = loop {
+        let o = izba(
+            data,
+            no_env,
+            &[
+                "exec",
+                name,
+                "--",
+                "sh",
+                "-c",
+                // pgrep is not in busybox-alpine's default applet set.
+                "for p in /proc/[0-9]*; do tr '\\0' ' ' < \"$p/cmdline\"; echo; done",
+            ],
+        );
+        assert_ok(&o, "list container processes");
+        let procs = stdout_of(&o);
+        if wants.iter().all(|w| procs.contains(w)) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            break procs;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
+    for want in wants {
+        assert!(
+            procs.contains(want),
+            "[{phase}] {want} must be running inside the container, got:\n{procs}\n{}",
+            vnc_diag(data, name)
+        );
+    }
+}
+
 /// The guest's listeners, read from the kernel inside the workload container
 /// (which shares init's netns for every non-docker sandbox, so this is the
 /// whole guest).
@@ -1706,14 +1747,16 @@ fn guest_listeners(data: &Path, name: &str) -> BTreeSet<(u16, String)> {
 ///    GET, and static content served perfectly while the desktop never
 ///    appeared.
 /// 4. The desktop is functional: the X socket is at `/tmp/.X11-unix/X1` and
-///    both `Xkasmvnc` and `openbox` are live processes inside the container.
+///    `Xkasmvnc`, `openbox`, `lxpanel`, `pcmanfm`, and `menu-cached` are all
+///    live processes inside the container.
 /// 5. The guest listens on NOTHING beyond izba's own set — in particular no
 ///    X11 TCP port (`-ac` grants root-on-display to anything in the netns, so
 ///    an open 6001 would be a real hole).
 /// 6. A RESTARTED sandbox serves a working desktop too — `stop`/`start`,
-///    then the whole real-client proof again against the new URL. The first
-///    cut only ever booted a fresh sandbox, and the X server's lock file
-///    lives in the persistent overlay, so every second boot was dead.
+///    then the whole real-client proof again against the new URL, plus the
+///    full component set from item 4 alive again. The first cut only ever
+///    booted a fresh sandbox, and the X server's lock file lives in the
+///    persistent overlay, so every second boot was dead.
 /// 7. `izba vnc off` on a RUNNING sandbox: "restart required" guidance, a
 ///    status line that admits the desktop is still up, and a `vnc url` that
 ///    still hands back the live URL with the disabled warning on stderr.
@@ -1925,28 +1968,7 @@ fn vnc_desktop_e2e() {
         stdout_of(&o),
         vnc_diag(&data, name)
     );
-    // pgrep is not in busybox-alpine's default applet set; read /proc instead.
-    let o = izba(
-        &data,
-        no_env,
-        &[
-            "exec",
-            name,
-            "--",
-            "sh",
-            "-c",
-            "for p in /proc/[0-9]*; do tr '\\0' ' ' < \"$p/cmdline\"; echo; done",
-        ],
-    );
-    assert_ok(&o, "list container processes");
-    let procs = stdout_of(&o);
-    for want in ["Xkasmvnc", "openbox"] {
-        assert!(
-            procs.contains(want),
-            "{want} must be running inside the container, got:\n{procs}\n{}",
-            vnc_diag(&data, name)
-        );
-    }
+    assert_desktop_procs(&data, name, "first boot");
 
     // [7] Listening surface. `Xkasmvnc` runs with `-ac` (access control off),
     // so an X11 TCP listener would hand root-on-display to anything that can
@@ -2006,27 +2028,7 @@ fn vnc_desktop_e2e() {
     prove_desktop_session(&data, name, port2, &password2, "after restart");
 
     // …and the desktop processes really came back, not just the websocket.
-    let o = izba(
-        &data,
-        no_env,
-        &[
-            "exec",
-            name,
-            "--",
-            "sh",
-            "-c",
-            "for p in /proc/[0-9]*; do tr '\\0' ' ' < \"$p/cmdline\"; echo; done",
-        ],
-    );
-    assert_ok(&o, "list container processes (after restart)");
-    let procs = stdout_of(&o);
-    for want in ["Xkasmvnc", "openbox"] {
-        assert!(
-            procs.contains(want),
-            "{want} must be running after a restart, got:\n{procs}\n{}",
-            vnc_diag(&data, name)
-        );
-    }
+    assert_desktop_procs(&data, name, "after restart");
 
     // The precise failure mode, named: even if some future change made the
     // probes above pass by luck, a stale lock leaves this in the log.
