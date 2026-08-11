@@ -195,8 +195,13 @@ fn vnc_env() -> Vec<(String, String)> {
         ),
         (
             "XDG_DATA_DIRS".to_string(),
-            format!("{CONTAINER_BUNDLE_DIR}/share"),
+            format!("{CONTAINER_BUNDLE_DIR}/share:/usr/share:/usr/local/share"),
         ),
+        (
+            "GDK_PIXBUF_MODULE_FILE".to_string(),
+            format!("{CONTAINER_BUNDLE_DIR}/lib/gdk-pixbuf/loaders.cache"),
+        ),
+        ("XDG_MENU_PREFIX".to_string(), "lxde-".to_string()),
     ]
 }
 
@@ -292,14 +297,21 @@ pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> 
 ///      attacker and user when all traffic shares one source IP, and there
 ///      is nothing to rate-limit: the password is a fresh 24-char random
 ///      string per `start` (`izba_core::vnc::generate_password`).
-/// 2. `openbox` — decorations/focus, with `DISPLAY` set. It **waits for the
-///    X server's socket** before exec'ing: these are two fire-and-forget
-///    spawns issued back-to-back, and openbox exits immediately ("cannot
-///    open display") if it wins that race, leaving the session with no
-///    window manager and no retry (a dead process stays dead). The wait is
-///    bounded, uses whole-second `sleep` (busybox `sleep` may not accept
-///    fractions), and falls through to the exec on timeout so the failure is
-///    still logged honestly.
+/// 2. `izba-session` (the bundled script, spec 2026-08-11) — decorations,
+///    focus, taskbar and a file-manager desktop, with `DISPLAY` set. It
+///    **waits for the X server's socket** before exec'ing: these are two
+///    fire-and-forget spawns issued back-to-back, and the script's own
+///    `openbox` exits immediately ("cannot open display") if it wins that
+///    race, leaving the session with no window manager and no retry (a dead
+///    process stays dead). The wait is bounded, uses whole-second `sleep`
+///    (busybox `sleep` may not accept fractions), and falls through to the
+///    exec on timeout so the failure is still logged honestly. Once the wait
+///    clears, `izba-session` backgrounds `pcmanfm --desktop` (desktop icons +
+///    file manager) and `lxpanel` (taskbar + Applications menu), then `exec`s
+///    `openbox` last so it becomes THIS spawn's session leader — matching the
+///    single fire-and-forget, no-auto-restart contract the rest of this
+///    module documents: only openbox's death is observed here, pcmanfm/
+///    lxpanel are launched and forgotten exactly like their parent.
 ///
 /// Both are wrapped in `sh -c` with output appended to [`VNC_LOG`] — the
 /// same shape as `docker::dockerd_exec_argv`.
@@ -324,7 +336,7 @@ pub fn desktop_exec_argvs(cgroup_manager: crate::oci::CgroupManager) -> Vec<Vec<
     let wm = format!(
         "mkdir -p /var/log; \
          i=0; while [ ! -e {X_SOCKET} ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; \
-         exec {CONTAINER_BUNDLE_DIR}/bin/openbox >>{VNC_LOG} 2>&1"
+         exec {CONTAINER_BUNDLE_DIR}/bin/izba-session >>{VNC_LOG} 2>&1"
     );
 
     let mut wm_env = env.clone();
@@ -648,7 +660,11 @@ mod tests {
             server.contains("exec /opt/izba-vnc/bin/Xkasmvnc"),
             "{server}"
         );
-        assert!(wm.contains("exec /opt/izba-vnc/bin/openbox"), "{wm}");
+        assert!(
+            wm.contains("exec /opt/izba-vnc/bin/izba-session"),
+            "spawn 2 must exec the bundled session script (pcmanfm + lxpanel \
+             + openbox), not bare openbox: {wm}"
+        );
     }
 
     #[test]
@@ -793,11 +809,39 @@ mod tests {
                 env_of(argv, "XDG_CONFIG_DIRS"),
                 Some("/opt/izba-vnc/etc".to_string())
             );
+            // Bundle share FIRST (its menus/icons/mime win), then the
+            // image's own share dirs so GUI apps the image ships appear in
+            // the Applications menu (spec 2026-08-11 §7).
             assert_eq!(
                 env_of(argv, "XDG_DATA_DIRS"),
-                Some("/opt/izba-vnc/share".to_string())
+                Some("/opt/izba-vnc/share:/usr/share:/usr/local/share".to_string())
             );
+            // gdk-pixbuf resolves image loaders through this cache; without
+            // it GTK2 falls back to builder-image paths that don't exist.
+            assert_eq!(
+                env_of(argv, "GDK_PIXBUF_MODULE_FILE"),
+                Some("/opt/izba-vnc/lib/gdk-pixbuf/loaders.cache".to_string())
+            );
+            // lxpanel's Applications menu reads lxde-applications.menu via
+            // the XDG menu spec prefix.
+            assert_eq!(env_of(argv, "XDG_MENU_PREFIX"), Some("lxde-".to_string()));
         }
+    }
+
+    /// The wm spawn's wait loop and the session script are two halves of one
+    /// contract: the script assumes the X server is already up (it starts
+    /// pcmanfm/lxpanel immediately), which is only true because the argv in
+    /// front of it waits on the socket.
+    #[test]
+    fn wm_spawn_waits_for_the_socket_then_execs_the_session_script() {
+        let (_server, wm) = scripts();
+        assert!(
+            wm.contains(X_SOCKET),
+            "socket wait must precede the session: {wm}"
+        );
+        let wait = wm.find(X_SOCKET).unwrap();
+        let exec = wm.find("exec /opt/izba-vnc/bin/izba-session").unwrap();
+        assert!(wait < exec, "wait must come BEFORE the exec: {wm}");
     }
 
     #[test]
