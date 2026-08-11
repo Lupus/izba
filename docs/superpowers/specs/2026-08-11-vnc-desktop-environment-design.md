@@ -145,24 +145,66 @@ exec openbox
 - The bundle path of `izba-session` joins the existing init⇄bundle drift
   test (the constants that pin `/opt/izba-vnc` layout).
 
-## 6. `menu-cached` reachability (`crates/izba-core/src/image/runtime_config.rs`)
+## 6. Hardcoded-path binds (`crates/izba-core/src/image/runtime_config.rs`)
 
-libmenu-cache spawns its cache daemon from a **compiled-in** libexec path
-(`/usr/libexec/menu-cached` on Debian) — inside the container that path
-belongs to the user's image and won't exist. Resolution order for
-implementation:
+libmenu-cache spawns its cache daemon from a **compiled-in** path — inside
+the container that path belongs to the user's image and won't exist. No env
+override exists (checked against the shipped objects), so the resolution is
+a **file-bind** at the exact path, exactly like the existing `xkbcomp`
+file-bind (the X server hardcodes `/usr/bin/xkbcomp`) — authored only for
+`vnc: true` sandboxes, same as every other VNC bind.
 
-1. If libmenu-cache honors an env override or falls back to `PATH` lookup
-   (verify in the builder), use that — zero host-side change.
-2. Otherwise, author a **file-bind** of container
-   `/usr/libexec/menu-cached` → bundle `bin/menu-cached` in
-   `runtime_config.rs`, exactly like the existing `xkbcomp` file-bind (the X
-   server hardcodes `/usr/bin/xkbcomp`) — authored only for `vnc: true`
-   sandboxes, same as every other VNC bind.
+**As-built correction.** Implementation found this pattern to be much wider
+than the one binary this section originally anticipated, and the exact
+literals matter — a wrong one is not a degraded menu but a dead desktop.
+The compiled-in path is **`/usr/lib/menu-cache/menu-cached`**, *not*
+`/usr/libexec/menu-cached` as drafted above; and `libmenu-cache-bin` ships
+**two** binaries, the daemon and the `menu-cache-gen` generator the daemon
+spawns from its own hardcoded path. Beyond those, three data/module trees
+are read from absolute compiled-in directories.
 
-If neither works, the panel's fallback is a menu-less taskbar — the
-implementation must **not** ship that silently: the e2e (§8) asserts the
-Applications menu backend is alive.
+The full set of container paths a `--vnc` sandbox occupies, all `ro`, all
+sourced from the bundle at `/run/izba/vnc`:
+
+| Container path | Bundle source | Consequence if absent |
+| --- | --- | --- |
+| `/opt/izba-vnc` | `/` | nothing runs |
+| `/usr/bin/xkbcomp` | `bin/xkbcomp` | X server cannot compile a keymap |
+| `/usr/lib/menu-cache/menu-cached` | `bin/menu-cached` | lxpanel `g_error`s and aborts — **no panel at all** |
+| `/usr/lib/menu-cache/menu-cache-gen` | `bin/menu-cache-gen` | Applications menu is **silently empty** — nothing logged |
+| `/usr/lib/x86_64-linux-gnu/lxpanel/plugins` | `lib/lxpanel/plugins` | every panel plugin missing (menu, taskbar, pager, clock) |
+| `/usr/lib/x86_64-linux-gnu/libfm/modules` | `lib/libfm` | every libfm module missing |
+| `/usr/share/lxpanel` | `share/lxpanel` | broken-image Applications button; popup does not open |
+| `/usr/share/libfm` | `share/libfm` | Create New / Properties / Rename dialogs cannot be built; no terminal DB |
+| `/usr/share/pcmanfm` | `share/pcmanfm` | Desktop Preferences dialog cannot be built |
+| `/run/izba/vnc-secrets` | (sibling share) | no password material |
+
+The `x86_64-linux-gnu` literal pins the two module binds to the bundle's
+x86_64-only build; porting the bundle to another architecture must change
+both ends.
+
+**Skew hazard.** Every row above is a bind whose SOURCE must exist in the
+bundle, and crun fails a container start outright when a bind source is
+missing. So a `--vnc` sandbox booted against a **stale bundle** — an
+`izba` binary newer than the `kasmvnc.erofs` beside it — is a hard
+container-start failure, not a degraded desktop. This is deliberate: the
+alternative (skipping absent binds) reintroduces exactly the silent-partial-
+desktop class this section exists to prevent. **The guard is the bundle
+build script's content manifest**, which asserts one concrete file from each
+of these trees and fails the *build* rather than the boot; an init-side
+pre-flight was considered and rejected as redundant with it. Any new bind
+added here must gain a matching manifest entry in the same commit.
+
+### Shadowing (user-visible)
+
+These binds occupy paths inside the user's image, so for `--vnc` sandboxes
+an image that ships its **own** lxpanel, pcmanfm or libmenu-cache has those
+directories shadowed by izba's copies for as long as the sandbox runs. This
+is intentional — the desktop must be image-independent, and a half-izba/
+half-image desktop is the worst of both — but it is a real behavior
+difference from a non-VNC sandbox, where izba never shadows image paths
+except the single `xkbcomp` file. Shadowing is confined to the paths in the
+table; everything else in `/usr` is the image's own.
 
 ## 7. Environment additions (`vnc_env()`)
 
@@ -205,6 +247,22 @@ Applications menu backend is alive.
   module manifests as broken icons or a dead plugin, not a crash; the e2e
   liveness checks (§8) plus one manual visual pass on the devbuild are the
   net.
+  **As-built:** this risk landed, four times, and it is worse than
+  "broken icons" — see the §6 table. It generalizes beyond `dlopen` to any
+  absolute compiled-in path (`exec`, `dlopen`, and plain `open` of `.ui`
+  data files), and **liveness checks did not catch any of them**: three
+  were found by a human looking at the desktop in a browser. The durable
+  lesson for the next component added to this bundle: `strings` the
+  binary for absolute `/usr/...` literals *before* trusting that
+  environment variables place it, and give every one of them a bind plus a
+  manifest entry.
+- **Oracle honesty:** liveness is not evidence of function here. A panel
+  process can be alive with no plugins; `menu-cached` can be alive with an
+  empty menu. §8's checks must assert produced ARTIFACTS (the generated
+  menu cache) and must read them in a probe that cannot satisfy itself —
+  the first version of that check grepped a combined process listing for a
+  marker string that its own `/proc/self/cmdline` contained, and so could
+  never fail.
 - **Size:** ~+60–80 MB in every installer. Accepted in §2; if the measured
   result lands materially above 180 MB, prune (icon sizes, locales,
   unused libfm modules) before merging rather than re-litigating the design.
