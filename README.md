@@ -299,8 +299,10 @@ izba export  [NAME_OR_DIR] [--name NAME]  # write managed truth → izba.yml
 ```
 
 `izba create --vnc` (or `izba vnc on <name>` on an existing sandbox, restart
-required if it's running) boots with a KasmVNC remote desktop — openbox +
-xterm — reachable via `izba vnc url <name>` (prints a credentialed
+required if it's running) boots with a KasmVNC remote desktop — a lightweight
+LXDE-style session (openbox window manager, lxpanel taskbar with an
+Applications menu and clock, pcmanfm desktop, xterm) — reachable via
+`izba vnc url <name>` (prints a credentialed
 `http://izba:<pw>@127.0.0.1:<port>/`; the only surface that shows the
 password) or `izba vnc open <name>` (opens it in your default browser).
 Some things worth knowing before you turn it on: the workload image needs
