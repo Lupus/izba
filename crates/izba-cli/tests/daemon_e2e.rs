@@ -1656,12 +1656,32 @@ fn prove_desktop_session(data: &Path, name: &str, port: u16, password: &str, pha
     );
 }
 
-/// Assert every desktop component is a live process inside the container,
-/// polling briefly: pcmanfm/lxpanel start alongside openbox, and
-/// menu-cached is spawned lazily by lxpanel's menu plugin, so a single
-/// snapshot right after the RFB proof can race their startup.
+/// Assert every desktop component is a live process inside the container
+/// **and** that the Applications menu actually has content, polling
+/// briefly: pcmanfm/lxpanel start alongside openbox, and menu-cached is
+/// spawned lazily by lxpanel's menu plugin, so a single snapshot right
+/// after the RFB proof can race their startup.
+///
+/// The `MENU_CACHE_MARKER` line is not decoration. Liveness alone is a
+/// LYING oracle for the Applications menu: `menu-cached` (the daemon) can
+/// be running and answering while `menu-cache-gen` (the generator it
+/// spawns from a second hardcoded path) is missing, in which case the menu
+/// opens with nothing in it — no cache file, no warning, no error, nothing
+/// in `/var/log/izba-vnc.log`. That shipped once and was caught only by a
+/// human opening the menu in a browser. The generated cache under
+/// `$HOME/.cache/menus/` is the one host-visible artifact that proves the
+/// generator ran, and lxpanel triggers it at startup, so no interaction is
+/// needed to observe it.
 fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
-    let wants = ["Xkasmvnc", "openbox", "lxpanel", "pcmanfm", "menu-cached"];
+    const MENU_CACHE_MARKER: &str = "izba-menu-cache-entry:";
+    let wants = [
+        "Xkasmvnc",
+        "openbox",
+        "lxpanel",
+        "pcmanfm",
+        "menu-cached",
+        MENU_CACHE_MARKER,
+    ];
     let no_env: &[(&str, &str)] = &[];
     let deadline = Instant::now() + Duration::from_secs(60);
     let procs = loop {
@@ -1675,7 +1695,10 @@ fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
                 "sh",
                 "-c",
                 // pgrep is not in busybox-alpine's default applet set.
-                "for p in /proc/[0-9]*; do tr '\\0' ' ' < \"$p/cmdline\"; echo; done",
+                // HOME is /tmp for the desktop (izba-init's vnc_env), so
+                // menu-cache writes its cache to /tmp/.cache/menus.
+                "for p in /proc/[0-9]*; do tr '\\0' ' ' < \"$p/cmdline\"; echo; done; \
+                 ls /tmp/.cache/menus 2>/dev/null | sed 's/^/izba-menu-cache-entry:/'",
             ],
         );
         assert_ok(&o, "list container processes");
@@ -1689,9 +1712,14 @@ fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
         std::thread::sleep(Duration::from_secs(2));
     };
     for want in wants {
+        let what = if want == MENU_CACHE_MARKER {
+            "the Applications menu cache (menu-cache-gen must have run)"
+        } else {
+            want
+        };
         assert!(
             procs.contains(want),
-            "[{phase}] {want} must be running inside the container, got:\n{procs}\n{}",
+            "[{phase}] {what} must be present inside the container, got:\n{procs}\n{}",
             vnc_diag(data, name)
         );
     }
