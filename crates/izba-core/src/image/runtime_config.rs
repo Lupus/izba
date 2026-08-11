@@ -1261,7 +1261,7 @@ fn add_usb_device_access(spec: &mut Spec) -> Result<()> {
 /// Bind the vendored KasmVNC bundle and its session secrets into the
 /// container.
 ///
-/// Four binds:
+/// Six binds:
 /// - **Bundle** ([`VNC_BUNDLE_SHARED_DIR`] → [`VNC_BUNDLE_CONTAINER_DIR`]):
 ///   the whole vendored tree (X server, window manager, VNC/websockify),
 ///   `rbind,ro` — read-only because the workload never needs to modify its
@@ -1275,10 +1275,24 @@ fn add_usb_device_access(spec: &mut Spec) -> Result<()> {
 ///   that exact guest path — the workload's own `/usr/bin` (if any) is
 ///   shadowed at this one file, nothing else.
 /// - **`menu-cached`** (`VNC_BUNDLE_SHARED_DIR/bin/menu-cached` →
-///   `/usr/libexec/menu-cached`): same class as `xkbcomp` — libmenu-cache
-///   spawns its Applications-menu cache daemon from a COMPILED-IN libexec
-///   path with no environment override, so the vendored `menu-cached` must
-///   occupy that exact guest path instead.
+///   `/usr/lib/menu-cache/menu-cached`): same class as `xkbcomp` —
+///   libmenu-cache spawns its Applications-menu cache daemon from a
+///   COMPILED-IN path with no environment override, so the vendored
+///   `menu-cached` must occupy that exact guest path instead. The literal
+///   is the one baked into `libmenu-cache.so.3` (Debian's
+///   `libmenu-cache-bin` layout) — **not** a `libexec` path. Getting it
+///   wrong is not a degraded menu: `lxpanel` treats the missing daemon as
+///   a fatal `g_error` and aborts, so the desktop comes up with no panel.
+/// - **Module trees** (`VNC_BUNDLE_SHARED_DIR/lib/lxpanel/plugins` →
+///   `/usr/lib/x86_64-linux-gnu/lxpanel/plugins`, and
+///   `VNC_BUNDLE_SHARED_DIR/lib/libfm` →
+///   `/usr/lib/x86_64-linux-gnu/libfm/modules`): the same hardcoded-path
+///   class once more, for `dlopen` rather than `exec`. `liblxpanel.so.0`
+///   and `libfm.so.4` each scan a compiled-in multiarch directory with no
+///   environment override, so without these binds every panel plugin (the
+///   Applications menu, taskbar, pager, clock) and every libfm module is
+///   simply absent — the panel process lives but is empty. `ro` but never
+///   `noexec`: these are shared objects that must be mappable executable.
 /// - **Secrets** ([`VNC_SECRETS_SHARED_DIR`] → [`VNC_SECRETS_CONTAINER_DIR`]):
 ///   `rbind,ro,nosuid,noexec` — session password/TLS material, never
 ///   executable and never writable from inside the container.
@@ -1313,7 +1327,7 @@ fn add_vnc_mounts(spec: &mut Spec) -> Result<()> {
         );
         mounts.push(
             MountBuilder::default()
-                .destination(PathBuf::from("/usr/libexec/menu-cached"))
+                .destination(PathBuf::from("/usr/lib/menu-cache/menu-cached"))
                 .typ("bind")
                 .source(PathBuf::from(format!(
                     "{VNC_BUNDLE_SHARED_DIR}/bin/menu-cached"
@@ -1325,6 +1339,30 @@ fn add_vnc_mounts(spec: &mut Spec) -> Result<()> {
                 ])
                 .build()?,
         );
+        for (dest, src) in [
+            (
+                "/usr/lib/x86_64-linux-gnu/lxpanel/plugins",
+                format!("{VNC_BUNDLE_SHARED_DIR}/lib/lxpanel/plugins"),
+            ),
+            (
+                "/usr/lib/x86_64-linux-gnu/libfm/modules",
+                format!("{VNC_BUNDLE_SHARED_DIR}/lib/libfm"),
+            ),
+        ] {
+            mounts.push(
+                MountBuilder::default()
+                    .destination(PathBuf::from(dest))
+                    .typ("bind")
+                    .source(PathBuf::from(src))
+                    .options(vec![
+                        "rbind".to_string(),
+                        "ro".to_string(),
+                        "nosuid".to_string(),
+                        // NOT noexec: these trees are dlopened.
+                    ])
+                    .build()?,
+            );
+        }
         mounts.push(
             MountBuilder::default()
                 .destination(PathBuf::from(VNC_SECRETS_CONTAINER_DIR))
@@ -2162,14 +2200,44 @@ mod tests {
         );
 
         // libmenu-cache (lxpanel's Applications menu backend) spawns its
-        // daemon from a COMPILED-IN libexec path — same class as xkbcomp:
-        // occupy the hardcoded path with a bundle file-bind.
-        let mc = m("/usr/libexec/menu-cached").expect("menu-cached file bind");
+        // daemon from a COMPILED-IN path — same class as xkbcomp: occupy
+        // the hardcoded path with a bundle file-bind. The literal is
+        // `/usr/lib/menu-cache/menu-cached` (Debian's `libmenu-cache-bin`
+        // layout, and the string compiled into `libmenu-cache.so.3`); a
+        // bind anywhere else leaves lxpanel to `g_error`/abort at startup
+        // with "failed to find menu-cached" — the desktop then has no
+        // panel at all, which a real-VM boot proved.
+        let mc = m("/usr/lib/menu-cache/menu-cached").expect("menu-cached file bind");
         assert_eq!(
             mc.source().as_ref().and_then(|p| p.to_str()),
             Some("/run/izba/vnc/bin/menu-cached")
         );
         assert!(mc.options().as_ref().unwrap().iter().any(|o| o == "ro"));
+
+        // The two dlopened MODULE TREES, same class again: `liblxpanel.so.0`
+        // and `libfm.so.4` each dlopen from a compiled-in multiarch dir with
+        // no environment override, so the bundle's copies must occupy those
+        // exact guest paths or every panel plugin (taskbar, clock, menu) and
+        // every libfm module is silently missing.
+        for (dest, src) in [
+            (
+                "/usr/lib/x86_64-linux-gnu/lxpanel/plugins",
+                "/run/izba/vnc/lib/lxpanel/plugins",
+            ),
+            (
+                "/usr/lib/x86_64-linux-gnu/libfm/modules",
+                "/run/izba/vnc/lib/libfm",
+            ),
+        ] {
+            let md = m(dest).unwrap_or_else(|| panic!("module-dir bind for {dest}"));
+            assert_eq!(md.source().as_ref().and_then(|p| p.to_str()), Some(src));
+            let opts = md.options().clone().unwrap_or_default();
+            assert!(opts.iter().any(|o| o == "ro"), "{dest}: {opts:?}");
+            assert!(
+                !opts.iter().any(|o| o == "noexec"),
+                "module trees are dlopened — noexec would defeat the bind: {opts:?}"
+            );
+        }
 
         let sec = m(VNC_SECRETS_CONTAINER_DIR).expect("secrets bind");
         assert_eq!(
@@ -2219,12 +2287,19 @@ mod tests {
                 .any(|m| m.destination().to_str() == Some(VNC_BUNDLE_CONTAINER_DIR)),
             "no vnc ⇒ no bundle bind"
         );
-        assert!(
-            !mounts
-                .iter()
-                .any(|m| m.destination().to_str() == Some("/usr/bin/xkbcomp")),
-            "no vnc ⇒ no xkbcomp bind"
-        );
+        for dest in [
+            "/usr/bin/xkbcomp",
+            "/usr/lib/menu-cache/menu-cached",
+            "/usr/lib/x86_64-linux-gnu/lxpanel/plugins",
+            "/usr/lib/x86_64-linux-gnu/libfm/modules",
+        ] {
+            assert!(
+                !mounts
+                    .iter()
+                    .any(|m| m.destination().to_str() == Some(dest)),
+                "no vnc ⇒ no {dest} bind"
+            );
+        }
         assert!(
             !mounts
                 .iter()
