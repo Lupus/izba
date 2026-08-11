@@ -1261,7 +1261,7 @@ fn add_usb_device_access(spec: &mut Spec) -> Result<()> {
 /// Bind the vendored KasmVNC bundle and its session secrets into the
 /// container.
 ///
-/// Three binds:
+/// Four binds:
 /// - **Bundle** ([`VNC_BUNDLE_SHARED_DIR`] → [`VNC_BUNDLE_CONTAINER_DIR`]):
 ///   the whole vendored tree (X server, window manager, VNC/websockify),
 ///   `rbind,ro` — read-only because the workload never needs to modify its
@@ -1274,6 +1274,11 @@ fn add_usb_device_access(spec: &mut Spec) -> Result<()> {
 ///   so the only way to make our vendored `xkbcomp` reachable is to occupy
 ///   that exact guest path — the workload's own `/usr/bin` (if any) is
 ///   shadowed at this one file, nothing else.
+/// - **`menu-cached`** (`VNC_BUNDLE_SHARED_DIR/bin/menu-cached` →
+///   `/usr/libexec/menu-cached`): same class as `xkbcomp` — libmenu-cache
+///   spawns its Applications-menu cache daemon from a COMPILED-IN libexec
+///   path with no environment override, so the vendored `menu-cached` must
+///   occupy that exact guest path instead.
 /// - **Secrets** ([`VNC_SECRETS_SHARED_DIR`] → [`VNC_SECRETS_CONTAINER_DIR`]):
 ///   `rbind,ro,nosuid,noexec` — session password/TLS material, never
 ///   executable and never writable from inside the container.
@@ -1298,6 +1303,20 @@ fn add_vnc_mounts(spec: &mut Spec) -> Result<()> {
                 .typ("bind")
                 .source(PathBuf::from(format!(
                     "{VNC_BUNDLE_SHARED_DIR}/bin/xkbcomp"
+                )))
+                .options(vec![
+                    "bind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                ])
+                .build()?,
+        );
+        mounts.push(
+            MountBuilder::default()
+                .destination(PathBuf::from("/usr/libexec/menu-cached"))
+                .typ("bind")
+                .source(PathBuf::from(format!(
+                    "{VNC_BUNDLE_SHARED_DIR}/bin/menu-cached"
                 )))
                 .options(vec![
                     "bind".to_string(),
@@ -2141,6 +2160,16 @@ mod tests {
             xkb.source().as_ref().unwrap().to_str(),
             Some("/run/izba/vnc/bin/xkbcomp")
         );
+
+        // libmenu-cache (lxpanel's Applications menu backend) spawns its
+        // daemon from a COMPILED-IN libexec path — same class as xkbcomp:
+        // occupy the hardcoded path with a bundle file-bind.
+        let mc = m("/usr/libexec/menu-cached").expect("menu-cached file bind");
+        assert_eq!(
+            mc.source().as_ref().and_then(|p| p.to_str()),
+            Some("/run/izba/vnc/bin/menu-cached")
+        );
+        assert!(mc.options().as_ref().unwrap().iter().any(|o| o == "ro"));
 
         let sec = m(VNC_SECRETS_CONTAINER_DIR).expect("secrets bind");
         assert_eq!(
