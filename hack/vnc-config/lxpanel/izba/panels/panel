@@ -1,0 +1,56 @@
+# izba lxpanel profile: bottom panel with Applications menu, window
+# taskbar, pager, clock. Field names follow lxpanel 0.10's config format.
+Global {
+  edge=bottom
+  align=left
+  margin=0
+  widthtype=percent
+  width=100
+  height=28
+  transparent=0
+  autohide=0
+  setdocktype=1
+  setpartialstrut=1
+  usefontcolor=0
+  background=0
+  iconsize=24
+}
+Plugin {
+  type=menu
+  Config {
+    system {
+    }
+    separator {
+    }
+    item {
+      command=run
+    }
+  }
+}
+Plugin {
+  type=taskbar
+  expand=1
+  Config {
+    tooltips=1
+    IconsOnly=0
+    ShowAllDesks=0
+    UseMouseWheel=1
+    UseUrgencyHint=1
+    FlatButton=0
+    MaxTaskWidth=200
+    spacing=1
+    GroupedTasks=0
+  }
+}
+Plugin {
+  type=pager
+}
+Plugin {
+  type=dclock
+  Config {
+    ClockFmt=%H:%M
+    BoldFont=0
+    IconOnly=0
+    CenterText=0
+  }
+}
