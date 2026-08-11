@@ -260,13 +260,39 @@ impl Drop for VncProxy {
 }
 
 /// One client connection: read its head, rewrite it, then be a raw byte pipe.
-fn serve_connection(mut client: TcpStream, target: &ProxyTarget) -> anyhow::Result<()> {
-    // Bounded head phase (see HEAD_READ_TIMEOUT); a timed-out read surfaces
-    // as an error here and the connection is dropped.
-    client
-        .set_read_timeout(Some(HEAD_READ_TIMEOUT))
-        .context("set head deadline")?;
-    let (head, body) = read_request_head(&mut client)?;
+/// `Read` adapter enforcing an ABSOLUTE deadline across every read of the
+/// head phase. A per-read timeout alone restarts on each byte, so a client
+/// dripping one header byte per interval would hold its handler thread
+/// forever; this adapter re-arms the socket timeout with the REMAINING time
+/// before each read and fails once the deadline has passed.
+struct DeadlineReader<'a> {
+    stream: &'a TcpStream,
+    deadline: std::time::Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "head deadline exceeded",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        (&mut &*self.stream).read(buf)
+    }
+}
+
+fn serve_connection(client: TcpStream, target: &ProxyTarget) -> anyhow::Result<()> {
+    // Bounded head phase (see HEAD_READ_TIMEOUT); a timed-out or overdue
+    // read surfaces as an error here and the connection is dropped.
+    let (head, body) = read_request_head(&mut DeadlineReader {
+        stream: &client,
+        deadline: std::time::Instant::now() + HEAD_READ_TIMEOUT,
+    })?;
     // Head is in — from here on the connection is a live session whose reads
     // legitimately block for as long as the desktop is idle.
     client
@@ -577,6 +603,48 @@ mod tests {
             "proxy did not enforce the head deadline (waited {:?})",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn proxy_drops_a_drip_feeding_client_at_the_absolute_deadline() {
+        let Some(upstream) = try_listener() else {
+            return;
+        };
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let proxy = VncProxy::start(ProxyTarget {
+            port: upstream_port,
+            authorization: "Basic good".into(),
+        })
+        .unwrap();
+        // Drip one header byte per interval, faster than any per-read
+        // timeout: only an ABSOLUTE deadline across the whole head phase can
+        // end this connection. (A per-read timeout restarts on every byte.)
+        let mut writer = TcpStream::connect(("127.0.0.1", proxy.port())).unwrap();
+        let mut reader = writer.try_clone().unwrap();
+        let feeder = std::thread::spawn(move || {
+            for _ in 0..60 {
+                if writer.write_all(b"G").is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let start = std::time::Instant::now();
+        let n = reader.read(&mut buf);
+        assert!(
+            matches!(n, Ok(0) | Err(_)),
+            "expected the proxy to close the drip-fed connection, got {n:?}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "proxy did not enforce the absolute head deadline (waited {:?})",
+            start.elapsed()
+        );
+        let _ = feeder.join();
     }
 
     #[test]
