@@ -29,6 +29,19 @@ use base64::Engine as _;
 /// head is a few KiB, so anything past this is not a client we serve.
 const MAX_HEAD: usize = 64 * 1024;
 
+/// Deadline for a client to deliver its complete request head. A local
+/// process that connects and never finishes its header would otherwise park
+/// a handler thread and its socket for the app's lifetime — the accepted-risk
+/// model bounds WHO can connect (loopback), not how long they may stall.
+/// The deadline is lifted once the head is in: a live desktop session's
+/// splice must block indefinitely.
+#[cfg(not(test))]
+const HEAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Test builds shorten the deadline so the stalled-client test observes the
+/// drop in milliseconds instead of ten seconds.
+#[cfg(test)]
+const HEAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// Where a proxy sends its traffic, and what it authenticates with.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProxyTarget {
@@ -248,7 +261,17 @@ impl Drop for VncProxy {
 
 /// One client connection: read its head, rewrite it, then be a raw byte pipe.
 fn serve_connection(mut client: TcpStream, target: &ProxyTarget) -> anyhow::Result<()> {
+    // Bounded head phase (see HEAD_READ_TIMEOUT); a timed-out read surfaces
+    // as an error here and the connection is dropped.
+    client
+        .set_read_timeout(Some(HEAD_READ_TIMEOUT))
+        .context("set head deadline")?;
     let (head, body) = read_request_head(&mut client)?;
+    // Head is in — from here on the connection is a live session whose reads
+    // legitimately block for as long as the desktop is idle.
+    client
+        .set_read_timeout(None)
+        .context("clear head deadline")?;
     // The upgrade answer does not change what we do: past the head, a plain
     // response and a websocket are both just bytes to splice.
     let (rewritten, _is_upgrade) = rewrite_request_head(&head, &target.authorization)?;
@@ -522,6 +545,38 @@ mod tests {
         assert!(proxy.is_live(), "a just-started proxy is live");
         proxy.stop_for_test();
         assert!(!proxy.is_live(), "a proxy whose accept loop ended is dead");
+    }
+
+    #[test]
+    fn proxy_drops_a_client_that_never_finishes_its_head() {
+        let Some(upstream) = try_listener() else {
+            return;
+        };
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let proxy = VncProxy::start(ProxyTarget {
+            port: upstream_port,
+            authorization: "Basic good".into(),
+        })
+        .unwrap();
+        // Connect and send NOTHING: the head deadline (shortened under
+        // cfg(test)) must expire and the handler must drop the socket —
+        // observed as EOF/error on our end — instead of parking forever.
+        let mut stalled = TcpStream::connect(("127.0.0.1", proxy.port())).unwrap();
+        stalled
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let start = std::time::Instant::now();
+        let n = stalled.read(&mut buf);
+        assert!(
+            matches!(n, Ok(0) | Err(_)),
+            "expected the proxy to close the stalled connection, got {n:?}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "proxy did not enforce the head deadline (waited {:?})",
+            start.elapsed()
+        );
     }
 
     #[test]

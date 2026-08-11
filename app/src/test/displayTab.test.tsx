@@ -112,6 +112,23 @@ describe("DisplayTab", () => {
     await waitFor(() => expect(m.vncProxyStop).toHaveBeenCalledWith("web"));
   });
 
+  it("never lets the unmount stop overtake a still-resolving start", async () => {
+    // The backend inserts the proxy into its registry only after a daemon
+    // round-trip; a stop that lands before that insert removes nothing and
+    // the late insert would orphan an unauthenticated listener. The cleanup
+    // must therefore chain its stop behind the start's settlement.
+    m.inspect.mockResolvedValue(live);
+    let resolveStart!: (u: string) => void;
+    m.vncProxyStart.mockReturnValue(new Promise<string>((r) => (resolveStart = r)));
+    const { unmount } = render(<DisplayTab name="web" running onChanged={() => {}} />);
+    await waitFor(() => expect(m.vncProxyStart).toHaveBeenCalledWith("web"));
+    unmount();
+    // Start still in flight: the stop must NOT have been issued yet.
+    expect(m.vncProxyStop).not.toHaveBeenCalled();
+    resolveStart(PROXY);
+    await waitFor(() => expect(m.vncProxyStop).toHaveBeenCalledWith("web"));
+  });
+
   it("stops the old sandbox's proxy when the tab switches sandbox", async () => {
     m.inspect.mockResolvedValue(live);
     const { rerender } = render(<DisplayTab name="web" running onChanged={() => {}} />);
