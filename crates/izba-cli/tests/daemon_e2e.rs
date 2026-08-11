@@ -2063,6 +2063,21 @@ fn vnc_desktop_e2e() {
     // already active for display 1" — while `izba vnc url` still cheerfully
     // prints a URL that now serves nothing. Every upgrade (the installer
     // quiesces sandboxes) and every plain `izba stop`/`izba start` hits it.
+    //
+    // Same class as the lock lesson above applies to the menu-cache oracle
+    // below: `/tmp/.cache/menus` from boot 1 would ALSO survive this
+    // stop/start in the persistent overlay, so the "after restart"
+    // `assert_desktop_procs` menu check could pass on a leftover artifact
+    // without menu-cache-gen ever running again. Clear it now, before the
+    // restart, so phase 2 has to prove REGENERATION. `izba-session` does not
+    // recreate this directory itself — menu-cache-gen does — so removing it
+    // here is safe.
+    let o = izba(
+        &data,
+        no_env,
+        &["exec", name, "--", "rm", "-rf", "/tmp/.cache/menus"],
+    );
+    assert_ok(&o, "clear stale menu cache before restart");
     let o = izba(&data, no_env, &["stop", name]);
     assert_ok(&o, "stop (vnc restart)");
     let o = izba(&data, no_env, &["start", name]);
