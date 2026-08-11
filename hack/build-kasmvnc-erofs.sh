@@ -148,7 +148,16 @@ gtk-update-icon-cache -f -t "$B/share/icons/Adwaita" || true
 gtk-update-icon-cache -f -t "$B/share/icons/hicolor" || true
 
 cp -r /usr/share/mime "$B/share/mime"                      # shared-mime-info db
-cp -r /usr/share/lxpanel "$B/share/lxpanel"                # panel images/data
+# The three compiled-in PACKAGE_DATA_DIRs of the desktop apps. Each is an
+# ABSOLUTE path baked into the binary with no environment override, so the
+# OCI spec binds each one over the corresponding /usr/share path
+# (image/runtime_config.rs). They hold GtkBuilder .ui files, so the dialogs
+# behind menu entries -- Desktop Preferences, Create New, Properties,
+# Rename -- simply fail to open when they are absent, on any image that
+# does not happen to ship pcmanfm itself.
+cp -r /usr/share/lxpanel "$B/share/lxpanel"                # panel images + ui
+cp -r /usr/share/libfm "$B/share/libfm"                    # libfm ui + terminals.list
+cp -r /usr/share/pcmanfm "$B/share/pcmanfm"                # pcmanfm ui (desktop-pref)
 cp -r /usr/share/desktop-directories "$B/share/desktop-directories"
 mkdir -p "$B/etc/menus"
 cp -r /etc/xdg/menus/. "$B/etc/menus/"                     # lxde-applications.menu
@@ -214,7 +223,9 @@ for req in bin/pcmanfm bin/lxpanel bin/menu-cached bin/menu-cache-gen bin/izba-s
            lib/gdk-pixbuf/loaders.cache etc/openbox/menu.xml \
            etc/lxpanel/izba/panels/panel etc/pcmanfm/izba/desktop-items-0.conf \
            etc/libfm/libfm.conf share/applications/xterm.desktop \
-           share/icons/Adwaita/index.theme share/mime/mime.cache; do
+           share/icons/Adwaita/index.theme share/mime/mime.cache \
+           share/lxpanel/images/my-computer.png share/libfm/terminals.list \
+           share/libfm/ui/ask-rename.ui share/pcmanfm/ui/desktop-pref.ui; do
   [ -e "$B/$req" ] || { echo "error: bundle missing $req" >&2; exit 1; }
 done
 # The two dlopened module trees the OCI spec binds over the compiled-in
