@@ -69,8 +69,13 @@ rm -rf "$B"/{bin,lib,share,etc}
 mkdir -p "$B"/{bin,lib,share,etc}
 
 # --- binaries ---
-MENU_CACHED="$(dpkg -L libmenu-cache-bin | grep "/menu-cached\$")"
-BINS="/usr/bin/Xkasmvnc /usr/bin/kasmvncpasswd /usr/bin/xkbcomp /usr/bin/openbox /usr/bin/xterm /usr/bin/pcmanfm /usr/bin/lxpanel $MENU_CACHED"
+# libmenu-cache-bin ships TWO binaries and lxpanel needs both: menu-cached
+# is the daemon lxpanel talks to, and menu-cache-gen is the generator that
+# daemon spawns (from its own hardcoded /usr/lib/menu-cache path) to build
+# the Applications menu. Shipping only the daemon yields a menu that opens
+# but is permanently EMPTY, with nothing logged anywhere -- vendor both.
+MENU_CACHE_BINS="$(dpkg -L libmenu-cache-bin | grep -E "/menu-cache(d|-gen)\$")"
+BINS="/usr/bin/Xkasmvnc /usr/bin/kasmvncpasswd /usr/bin/xkbcomp /usr/bin/openbox /usr/bin/xterm /usr/bin/pcmanfm /usr/bin/lxpanel $MENU_CACHE_BINS"
 for b in $BINS; do cp -L "$b" "$B/bin/"; done
 
 # --- shared-library closure (iterate until fixpoint over ldd of bins+libs) ---
@@ -205,7 +210,7 @@ done
 echo "self-containment assertion: OK"
 
 # --- content manifest: every path a later task depends on ---
-for req in bin/pcmanfm bin/lxpanel bin/menu-cached bin/izba-session \
+for req in bin/pcmanfm bin/lxpanel bin/menu-cached bin/menu-cache-gen bin/izba-session \
            lib/gdk-pixbuf/loaders.cache etc/openbox/menu.xml \
            etc/lxpanel/izba/panels/panel etc/pcmanfm/izba/desktop-items-0.conf \
            etc/libfm/libfm.conf share/applications/xterm.desktop \
