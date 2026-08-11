@@ -122,7 +122,7 @@ export function DisplayTab({ name, running, onChanged }: Props) {
     if (liveUrl === null) return;
     let dropped = false;
     setProxyError(null);
-    void (async () => {
+    const started = (async () => {
       try {
         const url = await api.vncProxyStart(name);
         if (!dropped) setProxyUrl(url);
@@ -136,9 +136,14 @@ export function DisplayTab({ name, running, onChanged }: Props) {
       // late-arriving start must not paint the previous sandbox's frame.
       dropped = true;
       setProxyUrl(null);
-      // Teardown has nowhere to report to — and a stop that fails must not
-      // stop the next sandbox's embed from starting.
-      void api.vncProxyStop(name).catch(() => {});
+      // The stop is chained behind the start's settlement: vnc_proxy_start
+      // inserts into the backend registry only after a daemon round-trip, so
+      // a stop that overtook a still-resolving start would remove nothing and
+      // the late insert would orphan an unauthenticated listener with no tab
+      // left to stop it. (`started` never rejects — errors land in
+      // setProxyError above.) Teardown has nowhere to report to — and a stop
+      // that fails must not stop the next sandbox's embed from starting.
+      void started.then(() => api.vncProxyStop(name)).catch(() => {});
     };
   }, [name, liveUrl]);
 
