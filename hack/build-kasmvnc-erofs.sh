@@ -54,20 +54,23 @@ docker run --rm \
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   -v "$CACHE_DIR:/cache:ro" \
   -v "$STAGE_DIR:/bundle" \
+  -v "$HERE/vnc-config:/vnc-config:ro" \
   "$BUILDER_IMAGE" bash -euo pipefail -c '
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   /cache/'"$KASMVNC_DEB"' \
   openbox xterm xfonts-base fonts-dejavu-core patchelf file \
-  x11-xkb-utils >/dev/null
+  x11-xkb-utils \
+  pcmanfm lxpanel lxmenu-data shared-mime-info adwaita-icon-theme >/dev/null
 
 B=/bundle
 rm -rf "$B"/{bin,lib,share,etc}
 mkdir -p "$B"/{bin,lib,share,etc}
 
 # --- binaries ---
-BINS="/usr/bin/Xkasmvnc /usr/bin/kasmvncpasswd /usr/bin/xkbcomp /usr/bin/openbox /usr/bin/xterm"
+MENU_CACHED="$(dpkg -L libmenu-cache-bin | grep "/menu-cached\$")"
+BINS="/usr/bin/Xkasmvnc /usr/bin/kasmvncpasswd /usr/bin/xkbcomp /usr/bin/openbox /usr/bin/xterm /usr/bin/pcmanfm /usr/bin/lxpanel $MENU_CACHED"
 for b in $BINS; do cp -L "$b" "$B/bin/"; done
 
 # --- shared-library closure (iterate until fixpoint over ldd of bins+libs) ---
@@ -80,6 +83,30 @@ copy_deps() {
 }
 for b in $BINS; do copy_deps "$b"; done
 for _ in 1 2 3; do for so in "$B"/lib/*; do copy_deps "$so"; done; done
+
+# --- dlopened GTK2/libfm/lxpanel modules: invisible to ldd, copied
+# explicitly, then fed BACK through copy_deps for their own closures ---
+ARCH_LIB=/usr/lib/x86_64-linux-gnu
+mkdir -p "$B"/lib/gdk-pixbuf/loaders "$B"/lib/libfm "$B"/lib/lxpanel/plugins
+cp -L "$ARCH_LIB"/gdk-pixbuf-2.0/2.10.0/loaders/*.so "$B/lib/gdk-pixbuf/loaders/"
+cp -L "$ARCH_LIB"/libfm/modules/*.so "$B/lib/libfm/"
+cp -L "$ARCH_LIB"/lxpanel/plugins/*.so "$B/lib/lxpanel/plugins/" 2>/dev/null || true
+for so in "$B"/lib/gdk-pixbuf/loaders/*.so "$B"/lib/libfm/*.so "$B"/lib/lxpanel/plugins/*.so; do
+  [ -f "$so" ] && copy_deps "$so"
+done
+for _ in 1 2; do for so in "$B"/lib/*.so*; do copy_deps "$so"; done; done
+
+# gdk-pixbuf loaders cache: paths in the cache are absolute; rewrite them
+# to the bundle mount before shipping. Loaded via GDK_PIXBUF_MODULE_FILE.
+# (query-loaders is a libexec-style binary, not on PATH in bookworm; it
+# ships inside libgdk-pixbuf-2.0-0 itself at a fixed private path.)
+GDK_PIXBUF_QUERY_LOADERS=/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders
+"$GDK_PIXBUF_QUERY_LOADERS" "$B"/lib/gdk-pixbuf/loaders/*.so \
+  | sed "s|$B/lib/gdk-pixbuf/loaders|/opt/izba-vnc/lib/gdk-pixbuf/loaders|" \
+  > "$B/lib/gdk-pixbuf/loaders.cache"
+grep -q "/opt/izba-vnc/lib/gdk-pixbuf/loaders/" "$B/lib/gdk-pixbuf/loaders.cache" || {
+  echo "error: loaders.cache does not point into the bundle" >&2; exit 1; }
+
 # the loader itself
 cp -L /lib64/ld-linux-x86-64.so.2 "$B/lib/ld-linux-x86-64.so.2"
 
@@ -101,6 +128,35 @@ for t in Clearlooks Onyx; do
   [ -d "/usr/share/themes/$t" ] && cp -r "/usr/share/themes/$t" "$B/share/themes/" || true
 done
 
+# --- desktop data ---
+mkdir -p "$B"/share/icons
+cp -r /usr/share/icons/hicolor "$B/share/icons/hicolor"
+# Adwaita pruned to the small sizes GTK2 apps actually use (spec: <=12 MB)
+mkdir -p "$B"/share/icons/Adwaita
+cp /usr/share/icons/Adwaita/index.theme "$B/share/icons/Adwaita/"
+for sz in 16x16 22x22 24x24 32x32 48x48; do
+  [ -d "/usr/share/icons/Adwaita/$sz" ] && cp -r "/usr/share/icons/Adwaita/$sz" "$B/share/icons/Adwaita/"
+done
+# index.theme still lists the pruned sizes; GTK skips missing dirs, but the
+# caches must be rebuilt AFTER pruning so lookups do not chase ghosts.
+gtk-update-icon-cache -f -t "$B/share/icons/Adwaita" || true
+gtk-update-icon-cache -f -t "$B/share/icons/hicolor" || true
+
+cp -r /usr/share/mime "$B/share/mime"                      # shared-mime-info db
+cp -r /usr/share/lxpanel "$B/share/lxpanel"                # panel images/data
+cp -r /usr/share/desktop-directories "$B/share/desktop-directories"
+mkdir -p "$B/etc/menus"
+cp -r /etc/xdg/menus/. "$B/etc/menus/"                     # lxde-applications.menu
+
+# --- izba-authored desktop configuration (hack/vnc-config) ---
+cp /vnc-config/openbox/menu.xml "$B/etc/openbox/menu.xml"   # replaces the Debian default
+mkdir -p "$B/etc/lxpanel" "$B/etc/pcmanfm" "$B/etc/libfm" "$B/share/applications"
+cp -r /vnc-config/lxpanel/izba "$B/etc/lxpanel/izba"
+cp -r /vnc-config/pcmanfm/izba "$B/etc/pcmanfm/izba"
+cp /vnc-config/libfm/libfm.conf "$B/etc/libfm/libfm.conf"
+cp /vnc-config/applications/xterm.desktop "$B/share/applications/xterm.desktop"
+install -m 0755 /vnc-config/izba-session "$B/bin/izba-session"
+
 # minimal fontconfig setup pointing exclusively into the bundle
 mkdir -p "$B/etc/fonts"
 cat > "$B/etc/fonts/fonts.conf" <<EOF
@@ -112,8 +168,15 @@ cat > "$B/etc/fonts/fonts.conf" <<EOF
 </fontconfig>
 EOF
 
+# --- ELF file list: bin/* (all binaries, including izba-session which is a
+# shell script and gets skipped by the ELF-magic checks below) plus every
+# nested .so under lib/, so dlopened module trees (gdk-pixbuf loaders,
+# libfm, lxpanel plugins) are covered by both the patchelf pass and the
+# self-containment assertion, not just the top-level lib/*.so* glob. ---
+ELFS="$(find "$B"/bin "$B"/lib -type f \( -name "*.so*" -o -path "$B/bin/*" \))"
+
 # --- make every ELF self-locating: bundle loader + bundle rpath ---
-for f in "$B"/bin/* "$B"/lib/*.so*; do
+for f in $ELFS; do
   [ "$(basename "$f")" = ld-linux-x86-64.so.2 ] && continue
   if file "$f" | grep -q "ELF 64-bit"; then
     patchelf --set-rpath /opt/izba-vnc/lib "$f" 2>/dev/null || true
@@ -129,7 +192,7 @@ done
 # bin/* because the patchelf pass above swallows per-file rpath failures
 # (`2>/dev/null || true`) — a lib whose rpath-patch silently failed would
 # otherwise ship undetected and only fail at runtime in the guest. ---
-for f in "$B"/bin/* "$B"/lib/*.so*; do
+for f in $ELFS; do
   [ "$(basename "$f")" = ld-linux-x86-64.so.2 ] && continue
   file "$f" | grep -q "ELF 64-bit" || continue
   patchelf --print-rpath "$f" | grep -q "^/opt/izba-vnc/lib$" || {
@@ -140,6 +203,17 @@ for f in "$B"/bin/* "$B"/lib/*.so*; do
   fi
 done
 echo "self-containment assertion: OK"
+
+# --- content manifest: every path a later task depends on ---
+for req in bin/pcmanfm bin/lxpanel bin/menu-cached bin/izba-session \
+           lib/gdk-pixbuf/loaders.cache etc/openbox/menu.xml \
+           etc/lxpanel/izba/panels/panel etc/pcmanfm/izba/desktop-items-0.conf \
+           etc/libfm/libfm.conf share/applications/xterm.desktop \
+           share/icons/Adwaita/index.theme share/mime/mime.cache; do
+  [ -e "$B/$req" ] || { echo "error: bundle missing $req" >&2; exit 1; }
+done
+grep -q obamenu "$B/etc/openbox/menu.xml" && { echo "error: stock Debian menu.xml shipped" >&2; exit 1; }
+echo "bundle manifest: OK"
 
 du -sh "$B"
 echo "bundle contents ok"
