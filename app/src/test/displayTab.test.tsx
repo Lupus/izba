@@ -288,6 +288,49 @@ describe("DisplayTab polling", () => {
     });
   }
 
+  it("serializes a same-sandbox URL change so the stale stop cannot drop the replacement proxy", async () => {
+    // Restarting a sandbox changes its relay URL. If that happens while the
+    // previous effect's start is still resolving, the old cleanup's stop must
+    // not land AFTER the replacement's start — the backend keys proxies by
+    // sandbox name alone, so a late stop would remove the replacement and
+    // leave the iframe on a dead port. Operations must run strictly in order:
+    // start#1 → stop → start#2.
+    const PROXY2 = "http://127.0.0.1:9998/";
+    const liveB = detail({
+      vnc: true,
+      vnc_running: true,
+      vnc_url: "http://izba:o7her@127.0.0.1:6081/",
+    });
+    m.inspect.mockResolvedValue(live);
+    let resolveStart!: (u: string) => void;
+    m.vncProxyStart.mockReturnValueOnce(new Promise<string>((r) => (resolveStart = r)));
+    render(<DisplayTab name="web" running onChanged={() => {}} />);
+    await tickBy(0);
+    expect(m.vncProxyStart).toHaveBeenCalledTimes(1);
+
+    // The relay URL changes while start #1 is still in flight.
+    m.inspect.mockResolvedValue(liveB);
+    m.vncProxyStart.mockResolvedValue(PROXY2);
+    await tickBy(3000);
+    // Nothing may overtake the in-flight start: no stop, no second start yet.
+    expect(m.vncProxyStop).not.toHaveBeenCalled();
+    expect(m.vncProxyStart).toHaveBeenCalledTimes(1);
+
+    resolveStart(PROXY);
+    await tickBy(0);
+    await tickBy(0);
+    // The chain drains in order: the era-A stop, THEN the replacement start.
+    expect(m.vncProxyStop).toHaveBeenCalledWith("web");
+    expect(m.vncProxyStart).toHaveBeenCalledTimes(2);
+    expect(m.vncProxyStop.mock.invocationCallOrder[0]).toBeLessThan(
+      m.vncProxyStart.mock.invocationCallOrder[1],
+    );
+    expect(screen.getByTitle("Sandbox desktop")).toHaveAttribute(
+      "src",
+      `${PROXY2}#show_control_bar=1`,
+    );
+  });
+
   it("picks up a desktop that comes up — and one that goes away — without user action", async () => {
     m.inspect.mockResolvedValue(restartRequired);
     render(<DisplayTab name="web" running onChanged={() => {}} />);
