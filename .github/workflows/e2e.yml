@@ -233,7 +233,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: dist/kasmvnc.erofs
-          key: kasmvnc-erofs-${{ hashFiles('hack/build-kasmvnc-erofs.sh') }}
+          key: kasmvnc-erofs-${{ hashFiles('hack/build-kasmvnc-erofs.sh', 'hack/vnc-config/**') }}
       - name: Build kasmvnc.erofs
         # docker (preinstalled on ubuntu-latest) is the only host dependency:
         # the script builds the bundle in a digest-pinned Debian container and,
