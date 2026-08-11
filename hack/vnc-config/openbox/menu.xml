@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<openbox_menu xmlns="http://openbox.org/3.4/menu">
+  <menu id="root-menu" label="izba">
+    <item label="Terminal">
+      <action name="Execute"><command>xterm</command></action>
+    </item>
+    <!-- built-in window list: switching even if the panel is dead -->
+    <menu id="client-list-combined-menu" />
+    <separator />
+    <item label="Reconfigure">
+      <action name="Reconfigure" />
+    </item>
+    <item label="Restart window manager">
+      <action name="Restart" />
+    </item>
+  </menu>
+</openbox_menu>

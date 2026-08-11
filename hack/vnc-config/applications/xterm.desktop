@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal (xterm)
+Comment=X terminal emulator
+Exec=xterm
+Icon=utilities-terminal
+Categories=System;TerminalEmulator;

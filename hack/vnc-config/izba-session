@@ -1,0 +1,20 @@
+#!/bin/sh
+# izba VNC session: desktop + panel + window manager. Fire-and-forget with
+# no restarts -- a dead component stays dead and is visible in
+# /var/log/izba-vnc.log (the docker-engine precedent, see izba-init vnc.rs).
+#
+# lxpanel and pcmanfm resolve "--profile izba" against XDG_CONFIG_HOME
+# (default $HOME/.config; HOME=/tmp per vnc_env). Their fallback search for
+# a default profile uses COMPILED-IN /etc/xdg + /usr/share paths that belong
+# to the user's image inside the container, so relying on it would make the
+# desktop image-dependent. Seed the profile deterministically instead; /tmp
+# is the persistent overlay, so cp -r would keep a stale copy forever --
+# refresh with rm -rf first (the profile is izba-owned, never user state).
+rm -rf /tmp/.config/lxpanel/izba /tmp/.config/pcmanfm/izba
+mkdir -p /tmp/.config/lxpanel /tmp/.config/pcmanfm
+cp -r /opt/izba-vnc/etc/lxpanel/izba /tmp/.config/lxpanel/izba
+cp -r /opt/izba-vnc/etc/pcmanfm/izba /tmp/.config/pcmanfm/izba
+
+pcmanfm --desktop --profile izba &
+lxpanel --profile izba &
+exec openbox
