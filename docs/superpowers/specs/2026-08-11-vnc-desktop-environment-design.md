@@ -216,6 +216,8 @@ table; everything else in `/usr` is the image's own.
   image ships appear in the Applications menu automatically.
 - Existing `HOME=/tmp`, `PATH` (bundle first), `FONTCONFIG_PATH`,
   `XDG_CONFIG_DIRS` are unchanged and already correct for GTK2.
+- `XDG_MENU_PREFIX=lxde-`: resolves `${XDG_CONFIG_DIRS}/menus/lxde-applications.menu`,
+  the file lxpanel's Applications menu plugin actually reads.
 
 ## 8. Testing
 

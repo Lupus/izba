@@ -225,7 +225,9 @@ for req in bin/pcmanfm bin/lxpanel bin/menu-cached bin/menu-cache-gen bin/izba-s
            etc/libfm/libfm.conf share/applications/xterm.desktop \
            share/icons/Adwaita/index.theme share/mime/mime.cache \
            share/lxpanel/images/my-computer.png share/libfm/terminals.list \
-           share/libfm/ui/ask-rename.ui share/pcmanfm/ui/desktop-pref.ui; do
+           share/libfm/ui/ask-rename.ui share/pcmanfm/ui/desktop-pref.ui \
+           etc/menus/lxde-applications.menu \
+           share/desktop-directories/lxde-menu-applications.directory; do
   [ -e "$B/$req" ] || { echo "error: bundle missing $req" >&2; exit 1; }
 done
 # The two dlopened module trees the OCI spec binds over the compiled-in
