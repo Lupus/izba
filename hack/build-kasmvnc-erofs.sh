@@ -212,6 +212,17 @@ for req in bin/pcmanfm bin/lxpanel bin/menu-cached bin/izba-session \
            share/icons/Adwaita/index.theme share/mime/mime.cache; do
   [ -e "$B/$req" ] || { echo "error: bundle missing $req" >&2; exit 1; }
 done
+# The two dlopened module trees the OCI spec binds over the compiled-in
+# multiarch dirs of liblxpanel and libfm (image/runtime_config.rs). They are
+# copied by globs that tolerate an empty match, so assert they are NON-EMPTY
+# here: an empty tree still binds cleanly and the failure would only show up
+# as a panel with no plugins on a real boot.
+# (NOTE: this whole block lives inside a single-quoted "sh -c" string --
+# never use an apostrophe in a comment here, it closes the quote.)
+for req in lib/lxpanel/plugins lib/libfm; do
+  ls "$B/$req"/*.so >/dev/null 2>&1 || {
+    echo "error: bundle module tree $req has no .so files" >&2; exit 1; }
+done
 grep -q obamenu "$B/etc/openbox/menu.xml" && { echo "error: stock Debian menu.xml shipped" >&2; exit 1; }
 echo "bundle manifest: OK"
 
