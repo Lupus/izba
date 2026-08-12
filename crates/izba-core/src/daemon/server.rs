@@ -857,6 +857,9 @@ fn probe_container_state(
 /// dead desktop stays dead and is reported as such (no auto-restart, same
 /// posture as a dead dockerd). Every failure mode (stream port unreachable,
 /// wedged guest, `Error{ConnectFailed}`, junk reply) maps to `false`.
+/// (In docker mode the guest-side dial reaches the container's wildcard
+/// listener via the `192.168.127.2` veth fallback instead of loopback — same
+/// TcpDial contract either way.)
 ///
 /// Uses the SAME `StreamOpen::TcpDial` contract as `portfwd::relay_one`, so
 /// what this probes is exactly what the relay in front of it does.
