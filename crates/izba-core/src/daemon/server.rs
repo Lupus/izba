@@ -1524,16 +1524,39 @@ fn handle_vnc_set(d: &Arc<Daemon>, name: String, enabled: bool) -> anyhow::Resul
 /// `ports.json`. Returns the bound host port. One helper, two call sites
 /// (`handle_start` and `adopt`), so the two can never disagree about which
 /// manager/port/guest-port a VNC relay uses.
+///
+/// The kernel-chosen port additionally avoids every persisted fixed rule
+/// across sandboxes (#221) via `relays::allocate_avoiding`.
 fn publish_vnc_relay(d: &Arc<Daemon>, name: &str) -> anyhow::Result<u16> {
-    d.vnc_relays.publish_bound(
-        &d.paths,
-        name,
-        crate::state::PortRule {
-            bind: std::net::Ipv4Addr::LOCALHOST,
-            host_port: 0,
-            guest_port: crate::vnc::WEBSOCKET_PORT,
+    let avoid = relays::persisted_host_ports(&d.paths);
+    let (port, collided) = relays::allocate_avoiding(
+        &avoid,
+        10,
+        || {
+            d.vnc_relays.publish_bound(
+                &d.paths,
+                name,
+                crate::state::PortRule {
+                    bind: std::net::Ipv4Addr::LOCALHOST,
+                    host_port: 0,
+                    guest_port: crate::vnc::WEBSOCKET_PORT,
+                },
+            )
         },
-    )
+        |p| {
+            let _ = d
+                .vnc_relays
+                .unpublish(name, std::net::Ipv4Addr::LOCALHOST, p);
+        },
+    )?;
+    if collided {
+        eprintln!(
+            "izbad: VNC relay for '{name}' kept port {port}, which a sandbox's \
+             ports.json persists as a fixed rule — that sandbox's next start may \
+             fail its publish (rebind attempts exhausted)"
+        );
+    }
+    Ok(port)
 }
 
 /// Whether a sandbox's CURRENT run actually BOOTED with VNC (`state.json`'s
