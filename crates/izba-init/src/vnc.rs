@@ -76,24 +76,29 @@ pub const DISPLAY: &str = ":1";
 /// in izba-core.
 pub const WEBSOCKET_PORT: u16 = 6901;
 
-/// Address the X server's VNC/websocket endpoint binds to. Loopback only:
-/// the guest has no NIC, and the host reaches the port exclusively through
-/// init's vsock `TcpDial` relay, which dials `127.0.0.1`.
-///
-/// **KNOWN GAP — docker mode + VNC is not reachable (not fixed here).** Every
-/// other sandbox shares init's network namespace, so the container's
-/// `127.0.0.1` IS init's and `server::tcp_dial`'s first attempt lands on this
-/// listener. A docker-mode sandbox instead gives the workload its OWN netns
-/// (`image/runtime_config.rs` §3), reached only over the veth pair: this
-/// listener then sits on the CONTAINER's private loopback, which init cannot
-/// dial, and `tcp_dial`'s docker-mode fallback to [`crate::net::GUEST_IP`]
-/// finds nothing because the server is not bound there. The relay and the
-/// daemon's liveness probe therefore both fail for `--docker --vnc`, which
-/// izba-core does not currently refuse. Fixing it means binding the wildcard
-/// address in docker mode (the container's netns is not shared with anything
-/// else, so the exposure is contained) — a deliberate follow-up, since it
-/// changes the listener's exposure and belongs with a docker+vnc e2e.
+/// Address the X server's VNC/websocket endpoint binds to in the DEFAULT
+/// (shared-netns) case. Loopback only: the guest has no NIC, and the host
+/// reaches the port exclusively through init's vsock `TcpDial` relay, which
+/// dials `127.0.0.1` first.
 const LISTEN_ADDR: &str = "127.0.0.1";
+
+/// Bind address in docker mode (#216, spec 2026-08-12). A docker-mode
+/// sandbox gives the workload its OWN netns (`image/runtime_config.rs` §3),
+/// so a loopback listener would sit on the CONTAINER's private loopback,
+/// which init cannot dial. The wildcard bind makes the endpoint reachable at
+/// `crate::net::GUEST_IP` over the veth pair — exactly where
+/// `server::tcp_dial`'s docker-mode fallback dials after loopback refuses
+/// (and init's nft output chain already exempts that address from the
+/// egress REDIRECT). Binding `GUEST_IP` itself would race `veth::apply`:
+/// the address exists only after crun reports `running`, the same window
+/// this exec is issued in. Exposure is contained to the container netns
+/// (the workload already owns the display outright via `-ac`; nested
+/// containers are the same trust zone) and HTTP/ws stays behind BasicAuth.
+/// The listening surface is pinned end-to-end by `vnc_docker_e2e`: `:6901`
+/// is the ONLY wildcard listener (Xkasmvnc 1.5.0 opens no raw-RFB or
+/// X11-TCP port — a real-VM observation, also asserted by
+/// `vnc_desktop_e2e`'s listener check).
+const LISTEN_ADDR_DOCKER: &str = "0.0.0.0";
 
 /// Initial framebuffer geometry/depth. KasmVNC's dynamic resize is
 /// client-driven and stays enabled, so the browser window size wins over
@@ -266,11 +271,12 @@ pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> 
 ///    is pinned to loopback to suppress KasmVNC's WebRTC public-IP lookup,
 ///    which otherwise makes a real egress request; `-interface` keeps the
 ///    listener on loopback (the host reaches it only through init's vsock
-///    relay); every data path (`-httpd`/`-fp`/`-xkbdir`) points into the
-///    bundle bind. Two further flags are what make the *session* — not just
-///    the static page — actually work in a browser; both were missing in
-///    the first cut and produced the "page loads, desktop never appears,
-///    endless spinner, credential re-prompt" bug:
+///    relay). In docker mode the interface is the wildcard instead — see
+///    [`LISTEN_ADDR_DOCKER`]. Every data path (`-httpd`/`-fp`/`-xkbdir`)
+///    points into the bundle bind. Two further flags are what make the
+///    *session* — not just the static page — actually work in a browser;
+///    both were missing in the first cut and produced the "page loads,
+///    desktop never appears, endless spinner, credential re-prompt" bug:
 ///    - `-SecurityTypes None`. The X server's default is `VncAuth`, which
 ///      authenticates the RFB stream against a **separate** legacy
 ///      `-rfbauth`/`PasswordFile` DES-obfuscated file. izba never writes one
@@ -315,8 +321,16 @@ pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> 
 ///
 /// Both are wrapped in `sh -c` with output appended to [`VNC_LOG`] — the
 /// same shape as `docker::dockerd_exec_argv`.
-pub fn desktop_exec_argvs(cgroup_manager: crate::oci::CgroupManager) -> Vec<Vec<String>> {
+pub fn desktop_exec_argvs(
+    cgroup_manager: crate::oci::CgroupManager,
+    docker: bool,
+) -> Vec<Vec<String>> {
     let env = vnc_env();
+    let listen = if docker {
+        LISTEN_ADDR_DOCKER
+    } else {
+        LISTEN_ADDR
+    };
     // INJECTION NOTE (both format! sites below): every substitution here is a
     // compile-time constant. Anything host- or cmdline-derived must be quoted
     // or passed as argv instead — this string is handed to a container-root
@@ -325,7 +339,7 @@ pub fn desktop_exec_argvs(cgroup_manager: crate::oci::CgroupManager) -> Vec<Vec<
         "mkdir -p /var/log; \
          exec {CONTAINER_BUNDLE_DIR}/bin/Xkasmvnc {DISPLAY} \
          -geometry {GEOMETRY} -depth {DEPTH} \
-         -interface {LISTEN_ADDR} -websocketPort {WEBSOCKET_PORT} -publicIP {LISTEN_ADDR} \
+         -interface {listen} -websocketPort {WEBSOCKET_PORT} -publicIP {LISTEN_ADDR} \
          -KasmPasswordFile {SECRETS_DIR}/{KASMPASSWD_FILE} \
          -SecurityTypes None -BlacklistThreshold 0 \
          -httpd {CONTAINER_BUNDLE_DIR}/share/kasmvnc/www \
@@ -369,7 +383,7 @@ pub fn desktop_exec_argvs(cgroup_manager: crate::oci::CgroupManager) -> Vec<Vec<
 // reason: forks a live /sbin/crun against the running container — guest-only;
 // the argvs it spawns are unit-tested via desktop_exec_argvs.
 #[mutants::skip]
-pub fn start_desktop() {
+pub fn start_desktop(docker: bool) {
     let cgmgr = crate::oci::detect_cgroup_manager();
     // AWAITED, unlike the two spawns below: the window manager's wait loop
     // keys on the X socket's existence, so a leftover socket must be gone
@@ -385,7 +399,7 @@ pub fn start_desktop() {
         Err(e) => eprintln!("izba-init: vnc stale-display cleanup failed: {e}"),
         Ok(_) => {}
     }
-    for argv in desktop_exec_argvs(cgmgr) {
+    for argv in desktop_exec_argvs(cgmgr, docker) {
         if let Err(e) = std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .spawn()
@@ -573,7 +587,7 @@ mod tests {
     // ── desktop_exec_argvs ───────────────────────────────────────────────────
 
     fn scripts() -> (String, String) {
-        let argvs = desktop_exec_argvs(crate::oci::CgroupManager::Cgroupfs);
+        let argvs = desktop_exec_argvs(crate::oci::CgroupManager::Cgroupfs, false);
         assert_eq!(argvs.len(), 2, "server then window manager");
         (
             argvs[0].last().unwrap().clone(),
@@ -636,7 +650,7 @@ mod tests {
 
     #[test]
     fn desktop_exec_argvs_runs_server_then_wm_as_root_with_honest_logging() {
-        let argvs = desktop_exec_argvs(crate::oci::CgroupManager::Cgroupfs);
+        let argvs = desktop_exec_argvs(crate::oci::CgroupManager::Cgroupfs, false);
         for argv in &argvs {
             assert_eq!(argv[0], crate::oci::CRUN_PATH);
             assert!(argv.iter().any(|a| a == "exec"), "{argv:?}");
@@ -750,7 +764,7 @@ mod tests {
 
     #[test]
     fn window_manager_gets_display_and_waits_for_the_x_socket() {
-        let argvs = desktop_exec_argvs(crate::oci::CgroupManager::Disabled);
+        let argvs = desktop_exec_argvs(crate::oci::CgroupManager::Disabled, false);
         let wm = &argvs[1];
         assert!(
             wm.windows(2)
@@ -772,7 +786,7 @@ mod tests {
 
     #[test]
     fn the_server_does_not_get_display_but_both_get_the_bundle_env() {
-        let argvs = desktop_exec_argvs(crate::oci::CgroupManager::Disabled);
+        let argvs = desktop_exec_argvs(crate::oci::CgroupManager::Disabled, false);
         let env_of = |argv: &Vec<String>, key: &str| -> Option<String> {
             let prefix = format!("{key}=");
             argv.iter().enumerate().find_map(|(i, a)| {
@@ -850,8 +864,52 @@ mod tests {
             crate::oci::CgroupManager::Cgroupfs,
             crate::oci::CgroupManager::Disabled,
         ] {
-            for argv in desktop_exec_argvs(mgr) {
+            for argv in desktop_exec_argvs(mgr, false) {
                 assert_eq!(argv[1], format!("--cgroup-manager={}", mgr.as_str()));
+            }
+        }
+    }
+
+    // ── docker mode (#216, spec 2026-08-12) ─────────────────────────────────
+
+    #[test]
+    fn docker_mode_binds_the_wildcard_for_the_veth_fallback() {
+        let argvs = desktop_exec_argvs(crate::oci::CgroupManager::Cgroupfs, true);
+        let server = argvs[0].last().unwrap();
+        // The container owns its netns: loopback is unreachable from init,
+        // and the veth address does not exist yet when this exec is issued
+        // (veth::apply runs after `running`), so wildcard is the only bind
+        // that cannot race. Reachability rides tcp_dial's GUEST_IP fallback.
+        assert!(
+            server.contains("-interface 0.0.0.0"),
+            "docker mode must bind the wildcard address: {server}"
+        );
+        // -publicIP is NOT a bind address — it only suppresses KasmVNC's
+        // WebRTC public-IP lookup — so it stays pinned to loopback.
+        assert!(server.contains("-publicIP 127.0.0.1"), "{server}");
+    }
+
+    /// The docker argv must differ from the default argv ONLY in the
+    /// `-interface` value (the `egress::output_chain(false)` guard pattern):
+    /// any other divergence is silent drift between the two modes.
+    #[test]
+    fn docker_mode_differs_from_the_default_argv_only_in_the_interface_bind() {
+        for mgr in [
+            crate::oci::CgroupManager::Cgroupfs,
+            crate::oci::CgroupManager::Disabled,
+        ] {
+            let plain = desktop_exec_argvs(mgr, false);
+            let docker = desktop_exec_argvs(mgr, true);
+            assert_eq!(plain.len(), docker.len());
+            for (p, d) in plain.iter().zip(docker.iter()) {
+                let rewritten: Vec<String> = p
+                    .iter()
+                    .map(|a| a.replace("-interface 127.0.0.1", "-interface 0.0.0.0"))
+                    .collect();
+                assert_eq!(
+                    &rewritten, d,
+                    "docker argv must differ from the default only in -interface"
+                );
             }
         }
     }
