@@ -272,6 +272,13 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
     docker-published port (docker-proxy in the workload netns) reachable from the
     host relay. FOOTGUN: `izba port publish N:22|53|15001` hits init's own
     sshd/DNS/relay on loopback, not the container (deferred).
+  - **VNC in docker mode (#216, spec 2026-08-12):** the desktop binds the
+    WILDCARD address (`-interface 0.0.0.0` vs loopback in the shared-netns
+    default) so the relay reaches it via `tcp_dial`'s veth fallback to
+    `192.168.127.2`; the container netns is the exposure boundary and
+    BasicAuth stays in front of HTTP/ws. The two `desktop_exec_argvs` modes
+    differ ONLY in `-interface` (guard test); `vnc_docker_e2e` pins `:6901`
+    as the container's only wildcard listener.
   - **cgroup delegation + engine auto-start:** init writes `+cpu +memory +pids
     +io` into every ancestor `cgroup.subtree_control` (per-controller, best-
     effort) so the container cgroup can create controller-bearing children, then
