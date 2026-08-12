@@ -61,8 +61,9 @@ a sha-pinned, read-only, loopback-only vendored bundle (see §9 maintenance).
   config, no binary asset shipped.
 - Localization; everything is English/C locale.
 - Any change to the KasmVNC/auth/relay plumbing, the `docker+vnc` refusal
-  (#216), or the `DAEMON_PROTO_VERSION`. This is a guest-bundle + init-argv
-  change only.
+  (#216 — since LIFTED by `2026-08-12-vnc-docker-mode-design.md`, which owns
+  the docker-mode listener posture), or the `DAEMON_PROTO_VERSION`. This is
+  a guest-bundle + init-argv change only.
 
 ## 4. Bundle changes (`hack/build-kasmvnc-erofs.sh`)
 
