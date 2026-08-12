@@ -32,18 +32,6 @@ pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32>
     } else {
         None
     };
-    // Fast client-side fail for the explicit-flag case (Task 11 review, folded
-    // minor a): the daemon refuses this combination too (its check is the
-    // authority — an image-label-derived docker mode can't be known here), but
-    // catching an explicit `--vnc --docker` before even connecting to the
-    // daemon skips a wasted image pull.
-    if merged.vnc && merged.docker {
-        bail!(
-            "VNC is not yet supported for docker-mode sandboxes (the nested \
-             engine owns the network namespace); create without --vnc, or \
-             disable docker mode (--no-docker overrides the image label)"
-        );
-    }
     let mut client = DaemonClient::connect(paths)?;
     // `izba create` has no unconfined opt-out (that is a run/start flag), so it
     // always creates with confined intent: the daemon runs the workspace

@@ -2311,6 +2311,44 @@ mod tests {
         );
     }
 
+    /// #216 (spec 2026-08-12): docker mode and VNC compose in ONE spec — the
+    /// fresh container-owned network namespace (docker, spec §3) and the VNC
+    /// binds must both be present; neither feature may mask the other. The
+    /// refusal that used to make this combination unrepresentable is gone.
+    #[test]
+    fn a_docker_vnc_sandbox_gets_both_the_fresh_netns_and_the_vnc_binds() {
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let spec = generate_spec(&SpecParams {
+            docker: true,
+            vnc: true,
+            ..base_params(&img)
+        })
+        .unwrap();
+        // docker half: the `network` namespace entry is KEPT (pathless) so
+        // crun creates a fresh netns — the D1 default drops it.
+        let nss = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .namespaces()
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            nss.iter().any(|n| n.typ() == LinuxNamespaceType::Network),
+            "docker mode must keep the fresh network namespace: {nss:?}"
+        );
+        // vnc half: bundle + secrets binds present.
+        let has = |dest: &str| {
+            spec.mounts()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|m| m.destination().to_str() == Some(dest))
+        };
+        assert!(has(VNC_BUNDLE_CONTAINER_DIR), "vnc bundle bind missing");
+        assert!(has(VNC_SECRETS_CONTAINER_DIR), "vnc secrets bind missing");
+    }
+
     /// The VNC bind SOURCES are guest paths izba-init creates/mounts, agreed
     /// by convention rather than a shared constant (izba-core does not depend
     /// on izba-init). izba-init pins the same literals in its `vnc` module. A
