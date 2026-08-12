@@ -975,39 +975,58 @@ mod tests {
         h.join().unwrap();
     }
 
-    /// A `TcpDial` to a refused loopback port with no fallback configured
-    /// must reply Error{ConnectFailed} and close. Port 1 is privileged/closed
-    /// for an unprivileged dial; if the dial unexpectedly succeeds the assert
-    /// fails loudly.
+    /// The no-fallback dial must surface `ConnectFailed`. The free port is
+    /// obtained by bind-and-drop, which is inherently racy under parallel
+    /// execution: another test can bind the dropped port before our dial
+    /// (observed twice in PR #215 review runs — #220), making the dial
+    /// SUCCEED. A success is therefore treated as a raced port and retried
+    /// with a fresh one, never asserted against.
     #[test]
     fn tcp_dial_without_fallback_reports_connect_failed() {
-        // Bind-and-drop to obtain a definitely-free port, then dial it.
         use std::net::TcpListener;
-        let port = match TcpListener::bind(("127.0.0.1", 0)) {
-            Ok(l) => {
-                let p = l.local_addr().unwrap().port();
-                drop(l); // nothing is listening on p now
-                p
+        for attempt in 0..5 {
+            let port = match TcpListener::bind(("127.0.0.1", 0)) {
+                Ok(l) => {
+                    let p = l.local_addr().unwrap().port();
+                    drop(l); // nothing is listening on p now — usually
+                    p
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    eprintln!(
+                        "SKIP tcp_dial_without_fallback_reports_connect_failed: sandbox denies bind: {e}"
+                    );
+                    return;
+                }
+                Err(e) => panic!("unexpected bind failure: {e}"),
+            };
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let h = std::thread::spawn(move || tcp_dial(server, port, None));
+            match read_frame::<_, Response>(&mut client).unwrap() {
+                Response::Error { kind, .. } => {
+                    assert_eq!(kind, ErrorKind::ConnectFailed);
+                    // Conn is closed after the error frame.
+                    let mut rest = Vec::new();
+                    client.read_to_end(&mut rest).unwrap();
+                    assert!(rest.is_empty());
+                    h.join().unwrap();
+                    return;
+                }
+                Response::Ok => {
+                    // Raced: something bound the port between drop and dial.
+                    // Drop our end — tcp_dial tears down on EOF — and retry.
+                    eprintln!(
+                        "tcp_dial deflake: port {port} was re-bound mid-test (attempt {attempt}), retrying"
+                    );
+                    drop(client);
+                    h.join().unwrap();
+                }
+                other => panic!("expected ConnectFailed (or a raced Ok), got {other:?}"),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!(
-                    "SKIP tcp_dial_without_fallback_reports_connect_failed: sandbox denies bind: {e}"
-                );
-                return;
-            }
-            Err(e) => panic!("unexpected bind failure: {e}"),
-        };
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let h = std::thread::spawn(move || tcp_dial(server, port, None));
-        match read_frame::<_, Response>(&mut client).unwrap() {
-            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::ConnectFailed),
-            other => panic!("expected ConnectFailed, got {other:?}"),
         }
-        // Conn is closed after the error frame.
-        let mut rest = Vec::new();
-        client.read_to_end(&mut rest).unwrap();
-        assert!(rest.is_empty());
-        h.join().unwrap();
+        panic!(
+            "5 consecutive bind-and-drop ports were all re-bound by parallel \
+             tests — something is systematically grabbing freed ports"
+        );
     }
 
     #[test]
