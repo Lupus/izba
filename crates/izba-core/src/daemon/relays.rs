@@ -81,7 +81,8 @@ pub fn persisted_host_ports(paths: &Paths) -> std::collections::HashSet<u16> {
 /// collided the LAST bind is KEPT and `collided` is `true` (the caller warns
 /// loudly): a colliding relay beats no display at all. Only the host-port
 /// number matters, not the bind address: overlapping addresses on one port
-/// conflict at bind time regardless.
+/// conflict at bind time regardless. `attempts` is effectively clamped to at
+/// least 1: the initial bind always happens.
 pub fn allocate_avoiding(
     avoid: &std::collections::HashSet<u16>,
     attempts: usize,
