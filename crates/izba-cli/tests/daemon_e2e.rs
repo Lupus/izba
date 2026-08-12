@@ -2172,6 +2172,169 @@ fn vnc_desktop_e2e() {
     // Teardown is the SandboxGuards' job (they also run on panic).
 }
 
+/// Docker mode + VNC (#216, spec 2026-08-12-vnc-docker-mode): a docker-mode
+/// sandbox gives the workload its OWN netns, so the desktop binds the
+/// WILDCARD address and the relay reaches it through init's `TcpDial` veth
+/// fallback (`192.168.127.2`) instead of shared loopback. The full session
+/// contract must hold exactly as in `vnc_desktop_e2e` — auth, ws+RFB,
+/// restart survival — with the nested docker engine alive alongside.
+#[test]
+fn vnc_docker_e2e() {
+    if !want() {
+        return;
+    }
+    // Production discovery only — same rule as vnc_desktop_e2e.
+    assert!(
+        std::env::var_os("IZBA_KASMVNC_EROFS").is_none(),
+        "this e2e must prove production discovery — unset IZBA_KASMVNC_EROFS"
+    );
+    let bundle = vnc_bundle_path();
+    if !bundle.as_deref().map(Path::exists).unwrap_or(false) {
+        eprintln!(
+            "SKIP vnc_docker_e2e: kasmvnc.erofs not staged — see vnc_desktop_e2e's \
+             skip message for the staging recipe"
+        );
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+    let name = "vnc-docker-e2e";
+    let _guard = SandboxGuard {
+        data: data.clone(),
+        name,
+    };
+
+    // [1] create --docker --vnc: the exact combination PR #215 refused.
+    // Same sizing as docker_publish_reaches_inner_container — dockerd plus
+    // an X session need more than the 1-cpu default.
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "create", "--docker", "--vnc", "--image", DIND_IMAGE, "--cpus", "2", "--mem", "2048",
+            "--name", name, &ws_s,
+        ],
+    );
+    assert_ok(&o, "create --docker --vnc");
+    let o = izba(&data, no_env, &["start", name]);
+    assert_ok(&o, "start (docker+vnc)");
+
+    // [2] Full session proof through the relay: 401 challenge, credentialed
+    // 200, real websocket upgrade + RFB greeting. Every byte crosses the
+    // veth — init's loopback dial finds nothing (the container owns :6901
+    // in its own netns), so the TcpDial fallback to 192.168.127.2 is the
+    // hop this test exists to prove.
+    let o = izba(&data, no_env, &["vnc", "url", name]);
+    assert_ok(&o, "vnc url (docker)");
+    let url = stdout_of(&o).trim().to_string();
+    let (password, port) = parse_vnc_url(&url);
+    prove_desktop_session(&data, name, port, &password, "docker first boot");
+
+    // [3] Listener posture: `izba exec` enters the CONTAINER netns in
+    // docker mode, so this reads the container's own table. With
+    // `-SecurityTypes None` and `-ac`, any OTHER wildcard listener from the
+    // X server (raw RFB 5901, X11-TCP 6001) would be an unauthenticated
+    // desktop for everything in the netns — :6901 (BasicAuth-gated) must be
+    // the only one.
+    let listeners = guest_listeners(&data, name);
+    assert!(
+        listeners.contains(&(6901, "00000000".to_string())),
+        "the desktop must bind the wildcard address in docker mode \
+         (loopback is unreachable across the netns split), got: {listeners:?}\n{}",
+        vnc_diag(&data, name)
+    );
+    for (p, addr) in &listeners {
+        if addr.chars().all(|c| c == '0') {
+            assert_eq!(
+                *p, 6901,
+                "the desktop websocket must be the ONLY wildcard listener, got: {listeners:?}"
+            );
+        }
+    }
+    let ports: BTreeSet<u16> = listeners.iter().map(|(p, _)| *p).collect();
+    assert!(
+        !ports.contains(&6001) && !ports.contains(&5901),
+        "no X11-TCP (6001) or raw-RFB (5901) listener may exist: {listeners:?}"
+    );
+    // init's own services (sshd 22, egress relay 15001) live in the OTHER
+    // netns; seeing them here would mean exec did not enter the container
+    // netns and [2] proved nothing about the veth path.
+    assert!(
+        !ports.contains(&22) && !ports.contains(&15001),
+        "init-netns services must not be visible from the container: {listeners:?}"
+    );
+
+    // [3b] The X server really owns display :1 in the container.
+    let o = izba(
+        &data,
+        no_env,
+        &["exec", name, "--", "sh", "-c", "ls /tmp/.X11-unix/"],
+    );
+    assert_ok(&o, "ls /tmp/.X11-unix/ (docker)");
+    assert!(
+        stdout_of(&o).contains("X1"),
+        "the X server must own display :1, got: {:?}\n{}",
+        stdout_of(&o),
+        vnc_diag(&data, name)
+    );
+
+    // [4] Coexistence: the nested engine still comes up beside the desktop
+    // (same 120 s ceiling as docker_publish_reaches_inner_container).
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut engine_up = false;
+    while Instant::now() < deadline {
+        let o = izba(
+            &data,
+            no_env,
+            &["exec", name, "--", "docker", "info", "--format", "{{.ID}}"],
+        );
+        if o.status.success() {
+            engine_up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    assert!(
+        engine_up,
+        "dockerd never became ready beside the desktop within 120s\n{}\n{}",
+        docker_diag(&data, name),
+        vnc_diag(&data, name)
+    );
+
+    // [5] RESTART: the stale-X-lock class (persistent /tmp overlay) does
+    // not care about docker mode, and neither may the fix. Fresh password,
+    // full session re-proof, and the log must not show X's stale-lock death.
+    let o = izba(&data, no_env, &["stop", name]);
+    assert_ok(&o, "stop (docker+vnc restart)");
+    let o = izba(&data, no_env, &["start", name]);
+    assert_ok(&o, "start (docker+vnc restart)");
+    let o = izba(&data, no_env, &["vnc", "url", name]);
+    assert_ok(&o, "vnc url (docker, after restart)");
+    let url2 = stdout_of(&o).trim().to_string();
+    let (password2, port2) = parse_vnc_url(&url2);
+    assert_ne!(
+        password2, password,
+        "each start must mint a fresh VNC password"
+    );
+    prove_desktop_session(&data, name, port2, &password2, "docker after restart");
+    let o = izba(
+        &data,
+        no_env,
+        &["exec", name, "--", "cat", "/var/log/izba-vnc.log"],
+    );
+    assert_ok(&o, "read the guest vnc log after restart");
+    assert!(
+        !stdout_of(&o).contains("already active for display"),
+        "a restarted docker+vnc sandbox must not trip X's stale display lock:\n{}",
+        stdout_of(&o)
+    );
+}
+
 /// The two hand-rolled parsers `vnc_desktop_e2e` leans on are pure, so they
 /// are gated in EVERY CI run — not only under `IZBA_INTEGRATION=1`. A silent
 /// base64 bug would turn "the password was rejected" into "the header was
