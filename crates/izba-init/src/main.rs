@@ -456,14 +456,15 @@ fn run_pid1() -> anyhow::Result<()> {
         }
     }
 
-    // VNC desktop auto-start. OUTSIDE the `if docker` block above — a display
-    // is orthogonal to docker mode — and placed at the same point in the boot
-    // as `docker::start_engine`: the container is `running`, so `crun exec`
-    // can enter it. Fire-and-forget with no auto-restart, exactly like the
-    // engine; a dead X server is reported honestly by the daemon's liveness
-    // probe rather than silently respawned.
+    // VNC desktop auto-start. OUTSIDE the `if docker` block above — a
+    // display starts the same way in both modes; only the bind address
+    // follows the netns split (`vnc.rs`) — and placed at the same point in
+    // the boot as `docker::start_engine`: the container is `running`, so
+    // `crun exec` can enter it. Fire-and-forget with no auto-restart, exactly
+    // like the engine; a dead X server is reported honestly by the daemon's
+    // liveness probe rather than silently respawned.
     if vnc_enabled {
-        vnc::start_desktop();
+        vnc::start_desktop(docker);
     }
 
     let stats_ctx = Arc::new(stats::StatsContext {
