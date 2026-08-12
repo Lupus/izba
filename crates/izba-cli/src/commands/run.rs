@@ -272,18 +272,6 @@ fn resolve_or_create(
     } else {
         None
     };
-    // Fast client-side fail for the explicit-flag case (Task 11 review, folded
-    // minor a): the daemon refuses this combination too (its check is the
-    // authority — an image-label-derived docker mode can't be known here), but
-    // catching an explicit `--vnc --docker` before the Create RPC skips a
-    // wasted image pull.
-    if merged.vnc && merged.docker {
-        bail!(
-            "VNC is not yet supported for docker-mode sandboxes (the nested \
-             engine owns the network namespace); create without --vnc, or \
-             disable docker mode (--no-docker overrides the image label)"
-        );
-    }
     // Carry the run's confinement intent into create: `run --allow-unconfined`
     // on a workspace that can't be relabelled must still create (the VMM will run
     // unconfined and never relabel it), so skip the create-time preflight.
