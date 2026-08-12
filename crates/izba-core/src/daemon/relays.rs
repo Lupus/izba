@@ -50,6 +50,55 @@ pub fn load_rules_migrating(
     Ok((rules, pids))
 }
 
+/// Every host port persisted as a fixed rule in ANY sandbox's `ports.json`.
+///
+/// The VNC relay's ephemeral allocation avoids these (#221): a kernel-chosen
+/// port that matches a persisted rule would make that sandbox's next `start`
+/// fail its publish and DROP the rule (pre-existing conflict behavior) — a
+/// user-visible loss from a cosmetic collision. Best-effort: an unreadable
+/// `ports.json` contributes nothing rather than failing the relay.
+pub fn persisted_host_ports(paths: &Paths) -> std::collections::HashSet<u16> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir(paths.sandboxes_dir()) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Ok((rules, _)) = load_rules_migrating(paths, name) {
+            out.extend(rules.iter().map(|r| r.host_port));
+        }
+    }
+    out
+}
+
+/// Bind-with-avoidance (#221): call `bind` (kernel-chosen ephemeral port);
+/// when the result lands in `avoid`, undo it via `unbind` and try again, up
+/// to `attempts` total binds. Returns `(port, collided)` — if every attempt
+/// collided the LAST bind is KEPT and `collided` is `true` (the caller warns
+/// loudly): a colliding relay beats no display at all. Only the host-port
+/// number matters, not the bind address: overlapping addresses on one port
+/// conflict at bind time regardless.
+pub fn allocate_avoiding(
+    avoid: &std::collections::HashSet<u16>,
+    attempts: usize,
+    mut bind: impl FnMut() -> anyhow::Result<u16>,
+    mut unbind: impl FnMut(u16),
+) -> anyhow::Result<(u16, bool)> {
+    let mut port = bind()?;
+    for _ in 1..attempts {
+        if !avoid.contains(&port) {
+            return Ok((port, false));
+        }
+        unbind(port);
+        port = bind()?;
+    }
+    Ok((port, avoid.contains(&port)))
+}
+
 struct RelaySlot {
     rule: PortRule,
     stop: Arc<AtomicBool>,
@@ -514,5 +563,104 @@ mod tests {
         assert!(std::net::TcpListener::bind((r.bind, r.host_port)).is_err());
         assert_eq!(mgr.active("web"), vec![r]);
         mgr.stop_all("web");
+    }
+
+    // ── #221: ephemeral VNC-relay allocation vs persisted fixed ports ───────
+
+    #[test]
+    fn persisted_host_ports_collects_every_sandboxs_fixed_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().join("izba"));
+        for s in ["a", "b", "empty"] {
+            std::fs::create_dir_all(paths.sandbox_dir(s)).unwrap();
+        }
+        save_rules(&paths, "a", &[rule(8080), rule(8081)]).unwrap();
+        save_rules(&paths, "b", &[rule(9090)]).unwrap();
+        assert_eq!(
+            persisted_host_ports(&paths),
+            [8080, 8081, 9090].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn persisted_host_ports_is_empty_without_sandboxes_or_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().join("izba"));
+        assert!(persisted_host_ports(&paths).is_empty());
+        std::fs::create_dir_all(paths.sandbox_dir("bare")).unwrap();
+        assert!(persisted_host_ports(&paths).is_empty());
+    }
+
+    #[test]
+    fn allocate_avoiding_rebinds_off_a_persisted_port() {
+        let avoid: std::collections::HashSet<u16> = [40001].into_iter().collect();
+        let ports = std::cell::RefCell::new(vec![40002u16, 40001]); // popped back-first
+        let unbound = std::cell::RefCell::new(Vec::new());
+        let (port, collided) = allocate_avoiding(
+            &avoid,
+            10,
+            || Ok(ports.borrow_mut().pop().expect("bind called too often")),
+            |p| unbound.borrow_mut().push(p),
+        )
+        .unwrap();
+        assert_eq!((port, collided), (40002, false));
+        assert_eq!(
+            *unbound.borrow(),
+            vec![40001],
+            "the colliding bind must be undone before the retry"
+        );
+    }
+
+    #[test]
+    fn allocate_avoiding_keeps_the_last_port_when_every_attempt_collides() {
+        let avoid: std::collections::HashSet<u16> = [40001].into_iter().collect();
+        let binds = std::cell::RefCell::new(0usize);
+        let unbound = std::cell::RefCell::new(Vec::new());
+        let (port, collided) = allocate_avoiding(
+            &avoid,
+            3,
+            || {
+                *binds.borrow_mut() += 1;
+                Ok(40001)
+            },
+            |p| unbound.borrow_mut().push(p),
+        )
+        .unwrap();
+        assert_eq!(
+            (port, collided),
+            (40001, true),
+            "a colliding relay beats no display at all"
+        );
+        assert_eq!(*binds.borrow(), 3, "exactly `attempts` binds");
+        assert_eq!(
+            unbound.borrow().len(),
+            2,
+            "every abandoned bind is undone; the kept one is not"
+        );
+    }
+
+    #[test]
+    fn allocate_avoiding_binds_once_when_clear_of_the_avoid_set() {
+        let unbound = std::cell::RefCell::new(Vec::new());
+        let (port, collided) = allocate_avoiding(
+            &std::collections::HashSet::new(),
+            10,
+            || Ok(50000),
+            |p| unbound.borrow_mut().push(p),
+        )
+        .unwrap();
+        assert_eq!((port, collided), (50000, false));
+        assert!(unbound.borrow().is_empty());
+    }
+
+    #[test]
+    fn allocate_avoiding_propagates_a_bind_error() {
+        let r = allocate_avoiding(
+            &std::collections::HashSet::new(),
+            10,
+            || anyhow::bail!("forced"),
+            |_p| {},
+        );
+        assert!(r.is_err());
     }
 }
