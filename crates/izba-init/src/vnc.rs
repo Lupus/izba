@@ -115,6 +115,17 @@ const X_SOCKET: &str = "/tmp/.X11-unix/X1";
 /// start — see [`stale_display_cleanup_argv`].
 const X_LOCK: &str = "/tmp/.X1-lock";
 
+/// Space-separated izba-owned desktop state a pre-change (root-desktop)
+/// boot may have left root-owned in the persistent overlay's `/tmp`,
+/// removed by the cleanup exec on every start so the image user can
+/// recreate it: the seeded lxpanel/pcmanfm profile parents
+/// (`izba-session` re-seeds them from the bundle), the generated
+/// Applications-menu cache, and the fontconfig cache (path pinned against
+/// `hack/build-kasmvnc-erofs.sh`'s fonts.conf by a drift test). Never
+/// user state — all four are regenerated on every desktop start.
+const LEGACY_ROOT_STATE: &str =
+    "/tmp/.config/lxpanel /tmp/.config/pcmanfm /tmp/.cache/menus /tmp/izba-vnc-fontcache";
+
 /// The conventional system `PATH`, appended after the bundle's `bin` (see
 /// [`vnc_env`]).
 const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -241,6 +252,15 @@ fn vnc_env() -> Vec<(String, String)> {
 /// is the only thing that ever owns [`DISPLAY`] in that container. Running it
 /// to completion (rather than folding the `rm` into the server script) is
 /// what makes the ordering deterministic against the window manager's wait.
+///
+/// Since the desktop dropped container root (spec 2026-08-13), this exec is
+/// also the GROUND PREPARATION for an unprivileged desktop: it makes the X
+/// socket dir and the `/tmp` XDG parents any-uid-writable, pre-creates the
+/// log file mode 666 (an image uid cannot create files under `/var/log`),
+/// and removes the root-owned desktop state a pre-change boot left in the
+/// persistent overlay — without which an upgraded sandbox's desktop is dead
+/// on arrival. It stays `--user 0:0` deliberately: root is what can delete
+/// those legacy files.
 pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> Vec<String> {
     crate::oci::crun_exec_argv(
         cgroup_manager,
@@ -251,10 +271,18 @@ pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> 
         &[
             "/bin/sh".into(),
             "-c".into(),
-            // `rm -f` never fails on an absent path, so a first boot is a
-            // clean no-op; `mkdir -p` re-creates the socket dir the X server
-            // expects when the image ships none.
-            format!("rm -f {X_LOCK} {X_SOCKET}; mkdir -p /tmp/.X11-unix; true"),
+            // `rm -f`/`rm -rf` never fail on an absent path, so a first boot is
+            // a clean no-op. Removal goes FIRST: mkdir/chmod then rebuild the
+            // parents any-uid-writable (1777 under an already-1777 /tmp). The log
+            // is created empty iff absent (`: >` would truncate an existing one)
+            // and opened up to 666 so the unprivileged desktop can append.
+            format!(
+                "rm -f {X_LOCK} {X_SOCKET}; \
+                 rm -rf {LEGACY_ROOT_STATE}; \
+                 mkdir -p /tmp/.X11-unix /tmp/.config /tmp/.cache /var/log; \
+                 chmod 1777 /tmp/.X11-unix /tmp/.config /tmp/.cache; \
+                 [ -e {VNC_LOG} ] || : > {VNC_LOG}; chmod 666 {VNC_LOG}; true"
+            ),
         ],
     )
 }
@@ -895,6 +923,65 @@ mod tests {
         // -publicIP is NOT a bind address — it only suppresses KasmVNC's
         // WebRTC public-IP lookup — so it stays pinned to loopback.
         assert!(server.contains("-publicIP 127.0.0.1"), "{server}");
+    }
+
+    /// The desktop now runs unprivileged (see `desktop_exec_argvs`), so the
+    /// root-run cleanup is the only thing that can make its ground writable:
+    /// the X socket dir, the append-only log, and the XDG parents under
+    /// HOME=/tmp — plus removal of the root-owned state a pre-change (root
+    /// desktop) boot left in the persistent overlay, which would otherwise be
+    /// unwritable by the image user forever (dead desktop after an upgrade).
+    #[test]
+    fn stale_display_cleanup_prepares_nonroot_ground() {
+        let argv = stale_display_cleanup_argv(crate::oci::CgroupManager::Cgroupfs);
+        let script = argv.last().unwrap();
+        assert!(
+            script.contains("chmod 1777 /tmp/.X11-unix /tmp/.config /tmp/.cache"),
+            "a non-root X server/session must be able to create the socket and \
+             its XDG subdirs: {script}"
+        );
+        assert!(
+            script.contains(&format!("[ -e {VNC_LOG} ] || : > {VNC_LOG}")),
+            "the log must exist before an unprivileged writer appends — and an \
+             existing log must NOT be truncated: {script}"
+        );
+        assert!(
+            script.contains(&format!("chmod 666 {VNC_LOG}")),
+            "any image uid must be able to append to the honest log: {script}"
+        );
+        assert!(
+            script.contains(&format!("rm -rf {LEGACY_ROOT_STATE}")),
+            "root-owned desktop state from pre-change boots must go: {script}"
+        );
+        // The removal must precede the mkdir/chmod that rebuilds the parents.
+        let rm = script.find("rm -rf").unwrap();
+        let chmod = script.find("chmod 1777").unwrap();
+        assert!(rm < chmod, "legacy removal must come first: {script}");
+        // Still container root: it is what deletes root-owned legacy files.
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--user" && w[1] == "0:0"),
+            "cleanup must stay root — it removes root-owned leftovers: {argv:?}"
+        );
+    }
+
+    /// The font cache the cleanup clears must be the path the bundle's
+    /// generated fonts.conf actually uses — pinned against
+    /// hack/build-kasmvnc-erofs.sh, the single place that writes it.
+    #[test]
+    fn legacy_font_cache_path_matches_the_bundle_fonts_conf() {
+        let sh = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../hack/build-kasmvnc-erofs.sh"
+        ))
+        .expect("hack/build-kasmvnc-erofs.sh readable from the workspace");
+        assert!(
+            sh.contains("<cachedir>/tmp/izba-vnc-fontcache</cachedir>"),
+            "bundle fonts.conf cachedir moved — update LEGACY_ROOT_STATE too"
+        );
+        assert!(
+            LEGACY_ROOT_STATE.contains("/tmp/izba-vnc-fontcache"),
+            "cleanup must clear the bundle's font cache: {LEGACY_ROOT_STATE}"
+        );
     }
 
     /// The docker argv must differ from the default argv ONLY in the
