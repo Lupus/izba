@@ -10,9 +10,9 @@
 //!    the container at the same path. The plaintext password never leaves
 //!    the host.
 //! 2. **Auto-start.** Once the workload container is `running`, init
-//!    `crun exec`s the KasmVNC X server and a window manager inside it
-//!    ([`desktop_exec_argvs`] / [`start_desktop`]) — the same
-//!    fire-and-forget, no-auto-restart contract as docker mode's engine.
+//!    `crun exec`s the KasmVNC X server and a window manager inside it,
+//!    as the image's configured user ([`desktop_exec_argvs`] / [`start_desktop`])
+//!    — the same fire-and-forget, no-auto-restart contract as docker mode's engine.
 //! 3. **Discovery.** [`enabled_on_cmdline`] is the single predicate for
 //!    "this sandbox booted with a display", used both by PID 1 and by the
 //!    (separate-process) SSH login shell, which re-reads `/proc/cmdline`.
@@ -262,10 +262,16 @@ pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> 
 /// The two `crun exec` argvs that bring up the desktop, in start order:
 /// the KasmVNC X server, then the window manager.
 ///
-/// Both run as **container root** (`--user 0:0`, the dockerd precedent):
-/// container-0 is a mapped, unprivileged guest uid, and running as a single
-/// known user sidesteps ownership questions around the X socket, the
-/// `/tmp` cache dirs and the password file.
+/// Both run as the **container's configured user** — the OCI spec's
+/// `process.user`, which izba-core's `resolve_process_user` filled from the
+/// image `USER` (uid, primary gid, supplementary groups). Passing no `--user`
+/// is what selects it: crun then applies the container's own process user,
+/// exactly like a default `izba exec`. An image with no `USER` (alpine) keeps
+/// a root desktop; a `USER agent` image gets its desktop — and everything
+/// launched from it — as `agent`, matching exec/ssh (spec 2026-08-13).
+/// Ground the desktop needs but cannot create unprivileged (the X socket
+/// dir, the log file, the `/tmp` XDG parents) is prepared by the root-run
+/// cleanup exec ([`stale_display_cleanup_argv`]), which is awaited first.
 ///
 /// 1. `Xkasmvnc` — flags per the design (spec 2026-08-09 §7). `-publicIP`
 ///    is pinned to loopback to suppress KasmVNC's WebRTC public-IP lookup,
@@ -362,7 +368,7 @@ pub fn desktop_exec_argvs(
             false,
             "/",
             &env,
-            Some("0:0"),
+            None,
             &["/bin/sh".into(), "-c".into(), server],
         ),
         crate::oci::crun_exec_argv(
@@ -370,7 +376,7 @@ pub fn desktop_exec_argvs(
             false,
             "/",
             &wm_env,
-            Some("0:0"),
+            None,
             &["/bin/sh".into(), "-c".into(), wm],
         ),
     ]
@@ -649,21 +655,23 @@ mod tests {
     }
 
     #[test]
-    fn desktop_exec_argvs_runs_server_then_wm_as_root_with_honest_logging() {
+    fn desktop_exec_argvs_runs_server_then_wm_as_the_image_user_with_honest_logging() {
         let argvs = desktop_exec_argvs(crate::oci::CgroupManager::Cgroupfs, false);
         for argv in &argvs {
             assert_eq!(argv[0], crate::oci::CRUN_PATH);
             assert!(argv.iter().any(|a| a == "exec"), "{argv:?}");
             assert!(
-                argv.windows(2).any(|w| w[0] == "--user" && w[1] == "0:0"),
-                "desktop runs as container root: {argv:?}"
+                !argv.iter().any(|a| a == "--user"),
+                "desktop must inherit the container's configured user (the image \
+                 USER, like a default `izba exec`), never a pinned uid: {argv:?}"
             );
-            // Options must precede the positional container id (crun's parser).
+            // Container id positional presence assertion.
             let id_pos = argv
                 .iter()
                 .position(|a| a == crate::oci::CONTAINER_ID)
                 .expect("container id");
-            assert!(argv.iter().position(|a| a == "--user").unwrap() < id_pos);
+            // Verify id_pos exists as a sanity check (no ordering assertion needed without --user).
+            assert!(id_pos > 0);
             assert!(
                 argv.last().unwrap().contains(VNC_LOG),
                 "output must land in the honest log: {argv:?}"
