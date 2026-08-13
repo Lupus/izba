@@ -305,7 +305,9 @@ Applications menu and clock, pcmanfm desktop, xterm) — reachable via
 `izba vnc url <name>` (prints a credentialed
 `http://izba:<pw>@127.0.0.1:<port>/`; the only surface that shows the
 password) or `izba vnc open <name>` (opens it in your default browser).
-Some things worth knowing before you turn it on: the workload image needs
+Some things worth knowing before you turn it on: the desktop runs as the
+image's configured `USER` — the same identity `izba exec` gets — so files you
+create from it land `USER`-owned in `/workspace`; the workload image needs
 `/bin/sh` (used to compile the X keymap and launch the desktop autostart);
 X runs with access control off (`-ac`) inside the sandbox, so anything in the
 guest can drive the display — the same trust domain as the rest of the
