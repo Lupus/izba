@@ -50,28 +50,31 @@ Rejected alternatives:
 
 Dropping `--user 0:0` alone leaves the desktop unable to start on most
 images, and dead-on-arrival on sandboxes upgraded from the root-desktop era.
-The **existing stale-display cleanup exec** (`stale_display_cleanup_argv`,
-already `--user 0:0`, already awaited before the desktop spawns) becomes the
-single ground-preparation step. In addition to its current
-`rm -f /tmp/.X1-lock /tmp/.X11-unix/X1; mkdir -p /tmp/.X11-unix` it must:
+Ground preparation is **two awaited execs** before the desktop spawns —
+split so that root only ever *removes* and the image user *creates*:
 
-1. `chmod 1777 /tmp/.X11-unix` — a non-root X server must create the `X1`
-   socket inside it (and a pre-change boot left it root-owned `0755`).
-2. `mkdir -p /var/log`, create `/var/log/izba-vnc.log` if absent, and
-   `chmod 666` it — both desktop spawns append to it from a uid that cannot
-   create files under `/var/log`. The log **path contract is unchanged**
-   (e2e diagnostics and docs keep pointing at `/var/log/izba-vnc.log`).
-3. Remove izba-owned desktop state a pre-change (root) boot left behind,
-   which would otherwise be unwritable/unremovable by the image user:
-   `rm -rf /tmp/.config/lxpanel /tmp/.config/pcmanfm /tmp/.cache/menus
-   /tmp/izba-vnc-fontcache`. All four are izba-owned by construction
-   (profiles are re-seeded from the bundle by `izba-session` on every start;
-   the caches are regenerated) — never user state.
-4. `mkdir -p /tmp/.config /tmp/.cache` + `chmod 1777` both — `izba-session`
-   and `menu-cached` (XDG dirs under `HOME=/tmp`) must create subdirs there,
-   and a pre-change boot may have left them root-owned `0755`. `1777` under
-   an already-`1777` `/tmp` introduces no new exposure class in a
-   single-workload container.
+1. **Remove (root — `stale_display_cleanup_argv`, `--user 0:0`).** In
+   addition to its `rm -f /tmp/.X1-lock /tmp/.X11-unix/X1` it removes the
+   izba-owned desktop state a pre-change (root) boot left behind, which
+   would otherwise be unwritable/unremovable by the image user
+   (`/tmp/.config/{lxpanel,pcmanfm,libfm}`, `/tmp/.cache/{menus,openbox}`,
+   `/tmp/izba-vnc-fontcache` — all re-seeded/regenerated on every start,
+   never user state), de-links any workload-planted symlink at the paths
+   the next exec will create (`rm` never dereferences), and prepares the
+   log: create `/var/log/izba-vnc.log` iff absent, `chmod 666`. The log
+   **path contract is unchanged**. `/var/log` is root-owned and non-sticky
+   in any conventional image, so the workload cannot plant anything there;
+   root deliberately runs **no `chmod`/`mkdir` under `/tmp` at all** — an
+   earlier `chmod 1777` cut handed the workload a root-chmod primitive it
+   could aim by racing a symlink swap (Greptile P1), and creating the dirs
+   as the image user eliminates that primitive instead of narrowing it.
+2. **Create (image user — `desktop_dirs_prep_argv`, no `--user`).**
+   `mkdir -p /tmp/.X11-unix /tmp/.config /tmp/.cache` as the container's
+   configured user: the desktop owns its ground outright, so no
+   world-writable modes exist anywhere. A workload racing a symlink into
+   place can at worst redirect its OWN uid's `mkdir -p` — no privilege
+   crosses. On a no-`USER` image the configured user is root, recreating
+   today's root-owned dirs byte-for-byte.
 
 The cleanup stays `--user 0:0` deliberately: it is what deletes root-owned
 legacy files, and container-0 is a mapped unprivileged guest uid.
