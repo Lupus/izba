@@ -125,17 +125,17 @@ const X_LOCK: &str = "/tmp/.X1-lock";
 /// user state — every entry is regenerated on every desktop start.
 ///
 /// This is a hand-enumerated KNOWN-FATAL-PLUS-KNOWN-DEGRADING set, not an
-/// exhaustive inventory of everything a root desktop ever wrote: the
-/// `mkdir -p` and `chmod 1777` above rebuild `/tmp/.X11-unix`,
-/// `/tmp/.config`, and `/tmp/.cache` as world-writable parents, so an
-/// UNLISTED root-owned
-/// leftover under one of them degrades SOFTLY — the owning app warns or
-/// falls back (e.g. skips its cache, logs a permission error) on that one
-/// unwritable subdir — rather than killing the whole desktop the way the X
-/// lock or a root `/tmp/.config/lxpanel` does. Only entries whose
-/// root-ownership is fatal (X's own lock/socket, handled separately) or
-/// reliably breaks a specific component on every upgraded sandbox belong
-/// here; anything merely cosmetic is left for the 1777 parents to shrug off.
+/// exhaustive inventory of everything a root desktop ever wrote: after the
+/// removal pass, [`desktop_dirs_prep_argv`] recreates `/tmp/.X11-unix`,
+/// `/tmp/.config`, and `/tmp/.cache` as the image user's OWN directories,
+/// so an UNLISTED root-owned leftover under one of them degrades SOFTLY —
+/// the owning app warns or falls back (e.g. skips its cache, logs a
+/// permission error) on that one unwritable subdir — rather than killing
+/// the whole desktop the way the X lock or a root `/tmp/.config/lxpanel`
+/// does. Only entries whose root-ownership is fatal (X's own lock/socket,
+/// handled separately) or reliably breaks a specific component on every
+/// upgraded sandbox belong here; anything merely cosmetic is left for the
+/// user-owned parents to shrug off.
 const LEGACY_ROOT_STATE: &str = "/tmp/.config/lxpanel /tmp/.config/pcmanfm /tmp/.config/libfm \
      /tmp/.cache/menus /tmp/.cache/openbox /tmp/izba-vnc-fontcache";
 
@@ -267,30 +267,33 @@ fn vnc_env() -> Vec<(String, String)> {
 /// what makes the ordering deterministic against the window manager's wait.
 ///
 /// Since the desktop dropped container root (spec 2026-08-13), this exec is
-/// also the GROUND PREPARATION for an unprivileged desktop: it makes the X
-/// socket dir and the `/tmp` XDG parents any-uid-writable, pre-creates the
-/// log file mode 666 (an image uid cannot create files under `/var/log`),
-/// and removes the root-owned desktop state a pre-change boot left in the
-/// persistent overlay — without which an upgraded sandbox's desktop is dead
-/// on arrival. It stays `--user 0:0` deliberately: root is what can delete
-/// those legacy files.
+/// also half of the GROUND PREPARATION for an unprivileged desktop — the
+/// **remove-only** half. Root's job here is strictly deletion plus the log
+/// file: it clears the root-owned desktop state a pre-change boot left in
+/// the persistent overlay (without which an upgraded sandbox's desktop is
+/// dead on arrival) and pre-creates [`VNC_LOG`] mode 666 (an image uid
+/// cannot create files under `/var/log`). It stays `--user 0:0`
+/// deliberately: root is what can delete those legacy files. The
+/// **create** half — the X socket dir and `/tmp` XDG parents — runs as the
+/// image user itself in [`desktop_dirs_prep_argv`], so the desktop OWNS
+/// its ground and no world-writable modes are needed.
 ///
-/// Symlink hardening: `chmod`/`: >` dereference symlinks, and every path
-/// they touch is under the container's own `/tmp`, which the workload can
-/// freely populate — so a planted `/tmp/.config → /etc` would otherwise
-/// aim root's `chmod 1777` at an arbitrary in-container target. The script
-/// therefore removes any of its targets that is a symlink (the LINK, never
-/// what it points at — `rm -f` does not dereference) before the
-/// `mkdir`/`chmod`/log steps run. What remains accepted: the workload runs
-/// CONCURRENTLY with this exec, so a hostile process can still race a swap
-/// into the check-to-chmod window — full atomicity is not expressible in
-/// portable `sh`. That residue is in-container, single-trust-zone
-/// tampering (the workload gains nothing over the code it already runs)
-/// and no wider than the pre-change ROOT desktop's exposure, which ran
-/// every one of these paths as root already. The same reasoning covers
-/// docker+VNC (supported, spec 2026-08-12): everything this exec touches
-/// stays inside the workload container itself, never init's root or the
-/// nested engine's state.
+/// Symlink discipline: everything root does by path under the
+/// workload-writable `/tmp` is `rm` — and `rm` never dereferences, so a
+/// workload-planted `/tmp/.config → /etc` loses the LINK, not the target.
+/// Root deliberately runs **no `chmod`/`mkdir` under `/tmp` at all**
+/// (the earlier `chmod 1777` design handed the workload a root-run chmod
+/// primitive it could aim by racing a symlink swap; creating the dirs as
+/// the image user eliminates the primitive instead of narrowing it). The
+/// one root write outside `/tmp` is the log under `/var/log`, a
+/// root-owned, non-sticky directory in any conventional image, so the
+/// workload user cannot plant anything there for `: >`/`chmod 666` to
+/// dereference; the `[ ! -L ]` guard covers the unconventional
+/// world-writable-`/var/log` image, where the residual check-to-use race
+/// is accepted — in-container, single-trust-zone, and no wider than the
+/// pre-change ROOT desktop. The same reasoning covers docker+VNC
+/// (supported, spec 2026-08-12): everything this exec touches stays
+/// inside the workload container itself.
 pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> Vec<String> {
     crate::oci::crun_exec_argv(
         cgroup_manager,
@@ -301,30 +304,60 @@ pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> 
         &[
             "/bin/sh".into(),
             "-c".into(),
-            // `rm -f`/`rm -rf` never fail on an absent path, so a first boot is
-            // a clean no-op — those two legs stay `;`-joined so a first-boot
-            // no-op can never fail the script. Everything after them is
-            // load-bearing ground prep (the mkdir/chmod that makes the X
-            // socket dir and XDG parents any-uid-writable, and the log
-            // file's mode), so it is `&&`-chained instead: a failed mkdir or
-            // chmod now propagates as a non-zero exit, which `start_desktop`
-            // reports via its "cleanup exited {st}" diagnostic, rather than
-            // being swallowed the way a trailing `true` would. The log is
-            // created empty iff absent (`: >` would truncate an existing
-            // one) — grouped in `{ ...; }` so the `||` binds only to the
-            // create-if-absent check, not to the `&&` chain around it — then
-            // opened up to 666 so the unprivileged desktop can append.
+            // `rm -f`/`rm -rf` never fail on an absent path, so a first boot
+            // is a clean no-op — the removal legs stay `;`-joined so a
+            // first-boot no-op can never fail the script. Only the LOG leg
+            // is load-bearing creation, so it alone is `&&`-chained: a
+            // failed mkdir/create/chmod propagates as a non-zero exit, which
+            // `start_desktop` reports via its "cleanup exited {st}"
+            // diagnostic, rather than being swallowed the way a trailing
+            // `true` would. The log is created empty iff absent (`: >` would
+            // truncate an existing one) — grouped in `{ ...; }` so the `||`
+            // binds only to the create-if-absent check, not to the `&&`
+            // chain around it — then opened up to 666 so the unprivileged
+            // desktop can append. The symlink de-linking loop keeps a
+            // pre-planted link from surviving into the image user's
+            // `mkdir -p` (which would silently follow it); `rm` itself never
+            // dereferences, so every root-by-path step under /tmp is safe.
             format!(
                 "rm -f {X_LOCK} {X_SOCKET}; \
                  rm -rf {LEGACY_ROOT_STATE}; \
                  for d in /tmp/.X11-unix /tmp/.config /tmp/.cache; do \
-                 [ ! -L \"$d\" ] || rm -f \"$d\"; done && \
-                 mkdir -p /tmp/.X11-unix /tmp/.config /tmp/.cache /var/log && \
-                 chmod 1777 /tmp/.X11-unix /tmp/.config /tmp/.cache && \
+                 [ ! -L \"$d\" ] || rm -f \"$d\"; done; \
                  {{ [ ! -L {VNC_LOG} ] || rm -f {VNC_LOG}; }} && \
+                 mkdir -p /var/log && \
                  {{ [ -e {VNC_LOG} ] || : > {VNC_LOG}; }} && \
                  chmod 666 {VNC_LOG}"
             ),
+        ],
+    )
+}
+
+/// The `crun exec` argv for the **create** half of the ground preparation:
+/// `mkdir -p` of the X socket dir and the `/tmp` XDG parents, run as the
+/// **image user** (no `--user`, same selection as [`desktop_exec_argvs`])
+/// after [`stale_display_cleanup_argv`] has removed the root-owned
+/// leftovers. Creating these as the desktop's own uid is what lets the
+/// earlier root-run `chmod 1777` disappear: the user owns its ground
+/// outright, nothing under the workload-writable `/tmp` is ever the target
+/// of a root `chmod`/`mkdir`, and a workload racing a symlink into place
+/// can at worst redirect ITS OWN uid's `mkdir -p` — a no-op privilege-wise,
+/// since `mkdir -p` treats any existing directory (followed or not) as
+/// success and creates nothing through it that the user could not create
+/// directly. On an alpine-style no-`USER` image the configured user is
+/// root, which simply recreates today's root-owned dirs. Awaited by
+/// [`start_desktop`] before the desktop spawns, like the cleanup.
+pub fn desktop_dirs_prep_argv(cgroup_manager: crate::oci::CgroupManager) -> Vec<String> {
+    crate::oci::crun_exec_argv(
+        cgroup_manager,
+        false,
+        "/",
+        &[],
+        None,
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "mkdir -p /tmp/.X11-unix /tmp/.config /tmp/.cache".into(),
         ],
     )
 }
@@ -464,16 +497,23 @@ pub fn start_desktop(docker: bool) {
     // AWAITED, unlike the two spawns below: the window manager's wait loop
     // keys on the X socket's existence, so a leftover socket must be gone
     // BEFORE it starts looking. See `stale_display_cleanup_argv`.
-    let cleanup = stale_display_cleanup_argv(cgmgr);
-    match std::process::Command::new(&cleanup[0])
-        .args(&cleanup[1..])
-        .status()
-    {
-        Ok(st) if !st.success() => {
-            eprintln!("izba-init: vnc stale-display cleanup exited {st}");
+    // Removal (root) first, then creation (image user): the dirs prep must
+    // not run until root has cleared the legacy root-owned parents it is
+    // about to recreate as its own uid.
+    for (what, argv) in [
+        ("stale-display cleanup", stale_display_cleanup_argv(cgmgr)),
+        ("dirs prep", desktop_dirs_prep_argv(cgmgr)),
+    ] {
+        match std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .status()
+        {
+            Ok(st) if !st.success() => {
+                eprintln!("izba-init: vnc {what} exited {st}");
+            }
+            Err(e) => eprintln!("izba-init: vnc {what} failed: {e}"),
+            Ok(_) => {}
         }
-        Err(e) => eprintln!("izba-init: vnc stale-display cleanup failed: {e}"),
-        Ok(_) => {}
     }
     for argv in desktop_exec_argvs(cgmgr, docker) {
         if let Err(e) = std::process::Command::new(&argv[0])
@@ -689,9 +729,11 @@ mod tests {
             script.contains("rm -f"),
             "an absent path on a first boot must not fail: {script}"
         );
+        // The X socket dir is (re)created by the image user's dirs prep,
+        // never by this root exec — see desktop_dirs_prep_creates_the_ground.
         assert!(
-            script.contains("mkdir -p /tmp/.X11-unix"),
-            "the X socket dir must exist for the server: {script}"
+            !script.contains("mkdir -p /tmp/"),
+            "root must not mkdir under the workload-writable /tmp: {script}"
         );
         assert_eq!(argv[0], crate::oci::CRUN_PATH);
         assert!(argv.iter().any(|a| a == "exec"), "{argv:?}");
@@ -964,20 +1006,30 @@ mod tests {
         assert!(server.contains("-publicIP 127.0.0.1"), "{server}");
     }
 
-    /// The desktop now runs unprivileged (see `desktop_exec_argvs`), so the
-    /// root-run cleanup is the only thing that can make its ground writable:
-    /// the X socket dir, the append-only log, and the XDG parents under
-    /// HOME=/tmp — plus removal of the root-owned state a pre-change (root
-    /// desktop) boot left in the persistent overlay, which would otherwise be
-    /// unwritable by the image user forever (dead desktop after an upgrade).
+    /// The desktop runs unprivileged (see `desktop_exec_argvs`), and the
+    /// ground preparation is split in two: this ROOT exec removes (legacy
+    /// root-owned state from pre-change boots, workload-planted symlinks)
+    /// and prepares only the log under root-owned `/var/log`; the CREATE
+    /// half under the workload-writable `/tmp` belongs to the image user
+    /// (`desktop_dirs_prep_creates_the_ground_as_the_image_user`). Root
+    /// must never `chmod`/`mkdir` by path under `/tmp` — `chmod`
+    /// dereferences, so a workload racing a symlink swap would get a
+    /// root-run chmod aimed at an arbitrary in-container target (the
+    /// Greptile P1 on this branch's first cut).
     #[test]
     fn stale_display_cleanup_prepares_nonroot_ground() {
         let argv = stale_display_cleanup_argv(crate::oci::CgroupManager::Cgroupfs);
         let script = argv.last().unwrap();
+        // Root's only footprint under /tmp is removal — `rm` never
+        // dereferences a symlink, `chmod`/`mkdir` do.
         assert!(
-            script.contains("chmod 1777 /tmp/.X11-unix /tmp/.config /tmp/.cache"),
-            "a non-root X server/session must be able to create the socket and \
-             its XDG subdirs: {script}"
+            !script.contains("chmod 1777"),
+            "no world-writable modes anywhere — the image user owns its \
+             ground instead: {script}"
+        );
+        assert!(
+            !script.contains("mkdir -p /tmp/"),
+            "root must not mkdir under the workload-writable /tmp: {script}"
         );
         assert!(
             script.contains(&format!("[ -e {VNC_LOG} ] || : > {VNC_LOG}")),
@@ -992,27 +1044,17 @@ mod tests {
             script.contains(&format!("rm -rf {LEGACY_ROOT_STATE}")),
             "root-owned desktop state from pre-change boots must go: {script}"
         );
-        // The load-bearing ground-prep tail must propagate a failure (a
-        // trailing `true` would silently swallow a failed mkdir/chmod, and
-        // start_desktop's "cleanup exited {st}" diagnostic would never
-        // fire). Pin both the absence of the old masking idiom and the
-        // presence of the `&&` chain that replaced it — substring checks on
-        // individual commands alone would still pass if someone reverted
-        // the `&&`s to `;` or re-added `; true` at the end.
+        // The load-bearing log leg must propagate a failure (a trailing
+        // `true` would silently swallow it and start_desktop's "cleanup
+        // exited {st}" diagnostic would never fire).
         assert!(
             !script.trim_end().ends_with("true"),
             "the cleanup script must not end with a masking `true` — a \
              failed ground-prep step must exit non-zero: {script}"
         );
         assert!(
-            script.contains("chmod 1777 /tmp/.X11-unix /tmp/.config /tmp/.cache && "),
-            "the ground-prep steps after the mkdir must be &&-chained so a \
-             failure propagates: {script}"
-        );
-        assert!(
             script.contains(&format!("&& chmod 666 {VNC_LOG}")),
-            "the log-mode step must be &&-chained onto the rest of the \
-             load-bearing tail: {script}"
+            "the log-mode step must be &&-chained so a failure propagates: {script}"
         );
         // Pin the individual known-fatal-plus-known-degrading entries, not
         // just the joined constant, so a future trim silently dropping one
@@ -1031,25 +1073,14 @@ mod tests {
                 "LEGACY_ROOT_STATE must enumerate {path}: {LEGACY_ROOT_STATE}"
             );
         }
-        // The removal must precede the mkdir/chmod that rebuilds the parents.
-        let rm = script.find("rm -rf").unwrap();
-        let chmod = script.find("chmod 1777").unwrap();
-        assert!(rm < chmod, "legacy removal must come first: {script}");
-        // Symlink hardening: the workload can plant any of the chmod'd
-        // paths as a symlink before a restart, and `chmod` dereferences —
-        // a root-run `chmod 1777` aimed at an arbitrary in-container
-        // target. Each target that is a symlink must be removed (the link,
-        // never what it points at) BEFORE the mkdir/chmod rebuilds it, and
-        // the log gets the same guard before its create/chmod steps.
+        // A workload-planted symlink at any dir the image user is about to
+        // `mkdir -p` must be removed here (the LINK — `rm` does not
+        // dereference), or the user's mkdir would silently follow it.
         let guard = "for d in /tmp/.X11-unix /tmp/.config /tmp/.cache; do \
                      [ ! -L \"$d\" ] || rm -f \"$d\"; done";
         assert!(
             script.contains(guard),
-            "the chmod targets must be de-symlinked first: {script}"
-        );
-        assert!(
-            script.find(guard).unwrap() < script.find("mkdir -p").unwrap(),
-            "the symlink guard must run before the parents are rebuilt: {script}"
+            "the dirs the image user recreates must be de-symlinked first: {script}"
         );
         assert!(
             script.contains(&format!("[ ! -L {VNC_LOG} ] || rm -f {VNC_LOG}")),
@@ -1060,6 +1091,40 @@ mod tests {
             argv.windows(2).any(|w| w[0] == "--user" && w[1] == "0:0"),
             "cleanup must stay root — it removes root-owned leftovers: {argv:?}"
         );
+    }
+
+    /// The CREATE half of the ground prep: the X socket dir and the /tmp
+    /// XDG parents are made by the image user itself — user-owned ground
+    /// instead of root-chmod'd 1777 dirs, which is what eliminates the
+    /// root-chmod-follows-symlink primitive outright. No `--user` = crun
+    /// applies the container's configured user, exactly like the desktop
+    /// spawns.
+    #[test]
+    fn desktop_dirs_prep_creates_the_ground_as_the_image_user() {
+        let argv = desktop_dirs_prep_argv(crate::oci::CgroupManager::Cgroupfs);
+        assert_eq!(argv[0], crate::oci::CRUN_PATH);
+        assert!(argv.iter().any(|a| a == "exec"), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--user"),
+            "dirs prep must run as the container's configured user — the \
+             same identity that will write into them: {argv:?}"
+        );
+        let script = argv.last().unwrap();
+        assert!(
+            script.contains("mkdir -p /tmp/.X11-unix /tmp/.config /tmp/.cache"),
+            "the X socket dir and XDG parents must be created: {script}"
+        );
+        assert!(
+            !script.contains("chmod"),
+            "user-owned dirs need no mode games: {script}"
+        );
+        for mgr in [
+            crate::oci::CgroupManager::Cgroupfs,
+            crate::oci::CgroupManager::Disabled,
+        ] {
+            let argv = desktop_dirs_prep_argv(mgr);
+            assert_eq!(argv[1], format!("--cgroup-manager={}", mgr.as_str()));
+        }
     }
 
     /// The font cache the cleanup clears must be the path the bundle's
