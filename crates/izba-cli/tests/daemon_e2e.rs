@@ -2048,12 +2048,14 @@ fn vnc_desktop_e2e() {
     // alpine declares no USER, so the configured user is root: the desktop
     // must still run as uid 0 — a no-USER image keeps its exact behavior
     // (the image-user change is proven by vnc_desktop_runs_as_image_user_e2e).
-    let uids = desktop_proc_uids(&data, name, "Xkasmvnc");
-    assert!(
-        !uids.is_empty() && uids.iter().all(|u| *u == 0),
-        "no-USER image must keep a root desktop, got uids {uids:?}\n{}",
-        vnc_diag(&data, name)
-    );
+    for comm in ["Xkasmvnc", "openbox"] {
+        let uids = desktop_proc_uids(&data, name, comm);
+        assert!(
+            !uids.is_empty() && uids.iter().all(|u| *u == 0),
+            "no-USER image must keep a root {comm}, got uids {uids:?}\n{}",
+            vnc_diag(&data, name)
+        );
+    }
 
     // [7] Listening surface. `Xkasmvnc` runs with `-ac` (access control off),
     // so an X11 TCP listener would hand root-on-display to anything that can

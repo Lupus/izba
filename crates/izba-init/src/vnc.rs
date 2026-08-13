@@ -118,13 +118,26 @@ const X_LOCK: &str = "/tmp/.X1-lock";
 /// Space-separated izba-owned desktop state a pre-change (root-desktop)
 /// boot may have left root-owned in the persistent overlay's `/tmp`,
 /// removed by the cleanup exec on every start so the image user can
-/// recreate it: the seeded lxpanel/pcmanfm profile parents
+/// recreate it: the seeded lxpanel/pcmanfm/openbox/libfm profile parents
 /// (`izba-session` re-seeds them from the bundle), the generated
 /// Applications-menu cache, and the fontconfig cache (path pinned against
 /// `hack/build-kasmvnc-erofs.sh`'s fonts.conf by a drift test). Never
-/// user state — all four are regenerated on every desktop start.
-const LEGACY_ROOT_STATE: &str =
-    "/tmp/.config/lxpanel /tmp/.config/pcmanfm /tmp/.cache/menus /tmp/izba-vnc-fontcache";
+/// user state — every entry is regenerated on every desktop start.
+///
+/// This is a hand-enumerated KNOWN-FATAL-PLUS-KNOWN-DEGRADING set, not an
+/// exhaustive inventory of everything a root desktop ever wrote: the
+/// `mkdir -p` and `chmod 1777` above rebuild `/tmp/.X11-unix`,
+/// `/tmp/.config`, and `/tmp/.cache` as world-writable parents, so an
+/// UNLISTED root-owned
+/// leftover under one of them degrades SOFTLY — the owning app warns or
+/// falls back (e.g. skips its cache, logs a permission error) on that one
+/// unwritable subdir — rather than killing the whole desktop the way the X
+/// lock or a root `/tmp/.config/lxpanel` does. Only entries whose
+/// root-ownership is fatal (X's own lock/socket, handled separately) or
+/// reliably breaks a specific component on every upgraded sandbox belong
+/// here; anything merely cosmetic is left for the 1777 parents to shrug off.
+const LEGACY_ROOT_STATE: &str = "/tmp/.config/lxpanel /tmp/.config/pcmanfm /tmp/.config/libfm \
+     /tmp/.cache/menus /tmp/.cache/openbox /tmp/izba-vnc-fontcache";
 
 /// The conventional system `PATH`, appended after the bundle's `bin` (see
 /// [`vnc_env`]).
@@ -261,6 +274,17 @@ fn vnc_env() -> Vec<(String, String)> {
 /// persistent overlay — without which an upgraded sandbox's desktop is dead
 /// on arrival. It stays `--user 0:0` deliberately: root is what can delete
 /// those legacy files.
+///
+/// Accepted primitive: the root-run `chmod`/`: >` here dereference symlinks,
+/// and every path they touch is under the container's own `/tmp`, which the
+/// workload can freely populate (e.g. plant `/tmp/.cache` as a symlink to
+/// some other in-container path before a restart). That is in-container,
+/// single-trust-zone tampering — the workload already runs as itself, so it
+/// gains nothing by redirecting root's `chmod` elsewhere inside its own
+/// container — and no wider than the pre-change ROOT desktop's exposure,
+/// which ran every one of these paths as root already. Revisit this if
+/// docker+VNC (#216) is ever un-refused: a nested workload container is a
+/// weaker trust boundary than this exec's caller, izba-init itself.
 pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> Vec<String> {
     crate::oci::crun_exec_argv(
         cgroup_manager,
@@ -272,16 +296,25 @@ pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> 
             "/bin/sh".into(),
             "-c".into(),
             // `rm -f`/`rm -rf` never fail on an absent path, so a first boot is
-            // a clean no-op. Removal goes FIRST: mkdir/chmod then rebuild the
-            // parents any-uid-writable (1777 under an already-1777 /tmp). The log
-            // is created empty iff absent (`: >` would truncate an existing one)
-            // and opened up to 666 so the unprivileged desktop can append.
+            // a clean no-op — those two legs stay `;`-joined so a first-boot
+            // no-op can never fail the script. Everything after them is
+            // load-bearing ground prep (the mkdir/chmod that makes the X
+            // socket dir and XDG parents any-uid-writable, and the log
+            // file's mode), so it is `&&`-chained instead: a failed mkdir or
+            // chmod now propagates as a non-zero exit, which `start_desktop`
+            // reports via its "cleanup exited {st}" diagnostic, rather than
+            // being swallowed the way a trailing `true` would. The log is
+            // created empty iff absent (`: >` would truncate an existing
+            // one) — grouped in `{ ...; }` so the `||` binds only to the
+            // create-if-absent check, not to the `&&` chain around it — then
+            // opened up to 666 so the unprivileged desktop can append.
             format!(
                 "rm -f {X_LOCK} {X_SOCKET}; \
                  rm -rf {LEGACY_ROOT_STATE}; \
-                 mkdir -p /tmp/.X11-unix /tmp/.config /tmp/.cache /var/log; \
-                 chmod 1777 /tmp/.X11-unix /tmp/.config /tmp/.cache; \
-                 [ -e {VNC_LOG} ] || : > {VNC_LOG}; chmod 666 {VNC_LOG}; true"
+                 mkdir -p /tmp/.X11-unix /tmp/.config /tmp/.cache /var/log && \
+                 chmod 1777 /tmp/.X11-unix /tmp/.config /tmp/.cache && \
+                 {{ [ -e {VNC_LOG} ] || : > {VNC_LOG}; }} && \
+                 chmod 666 {VNC_LOG}"
             ),
         ],
     )
@@ -693,13 +726,10 @@ mod tests {
                 "desktop must inherit the container's configured user (the image \
                  USER, like a default `izba exec`), never a pinned uid: {argv:?}"
             );
-            // Container id positional presence assertion.
-            let id_pos = argv
+            let _id_pos = argv
                 .iter()
                 .position(|a| a == crate::oci::CONTAINER_ID)
                 .expect("container id");
-            // Verify id_pos exists as a sanity check (no ordering assertion needed without --user).
-            assert!(id_pos > 0);
             assert!(
                 argv.last().unwrap().contains(VNC_LOG),
                 "output must land in the honest log: {argv:?}"
@@ -953,6 +983,23 @@ mod tests {
             script.contains(&format!("rm -rf {LEGACY_ROOT_STATE}")),
             "root-owned desktop state from pre-change boots must go: {script}"
         );
+        // Pin the individual known-fatal-plus-known-degrading entries, not
+        // just the joined constant, so a future trim silently dropping one
+        // of them (rather than the constant changing shape entirely) is
+        // still caught here.
+        for path in [
+            "/tmp/.config/lxpanel",
+            "/tmp/.config/pcmanfm",
+            "/tmp/.config/libfm",
+            "/tmp/.cache/menus",
+            "/tmp/.cache/openbox",
+            "/tmp/izba-vnc-fontcache",
+        ] {
+            assert!(
+                LEGACY_ROOT_STATE.contains(path),
+                "LEGACY_ROOT_STATE must enumerate {path}: {LEGACY_ROOT_STATE}"
+            );
+        }
         // The removal must precede the mkdir/chmod that rebuilds the parents.
         let rm = script.find("rm -rf").unwrap();
         let chmod = script.find("chmod 1777").unwrap();
