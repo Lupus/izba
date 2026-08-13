@@ -275,16 +275,22 @@ fn vnc_env() -> Vec<(String, String)> {
 /// on arrival. It stays `--user 0:0` deliberately: root is what can delete
 /// those legacy files.
 ///
-/// Accepted primitive: the root-run `chmod`/`: >` here dereference symlinks,
-/// and every path they touch is under the container's own `/tmp`, which the
-/// workload can freely populate (e.g. plant `/tmp/.cache` as a symlink to
-/// some other in-container path before a restart). That is in-container,
-/// single-trust-zone tampering — the workload already runs as itself, so it
-/// gains nothing by redirecting root's `chmod` elsewhere inside its own
-/// container — and no wider than the pre-change ROOT desktop's exposure,
-/// which ran every one of these paths as root already. Revisit this if
-/// docker+VNC (#216) is ever un-refused: a nested workload container is a
-/// weaker trust boundary than this exec's caller, izba-init itself.
+/// Symlink hardening: `chmod`/`: >` dereference symlinks, and every path
+/// they touch is under the container's own `/tmp`, which the workload can
+/// freely populate — so a planted `/tmp/.config → /etc` would otherwise
+/// aim root's `chmod 1777` at an arbitrary in-container target. The script
+/// therefore removes any of its targets that is a symlink (the LINK, never
+/// what it points at — `rm -f` does not dereference) before the
+/// `mkdir`/`chmod`/log steps run. What remains accepted: the workload runs
+/// CONCURRENTLY with this exec, so a hostile process can still race a swap
+/// into the check-to-chmod window — full atomicity is not expressible in
+/// portable `sh`. That residue is in-container, single-trust-zone
+/// tampering (the workload gains nothing over the code it already runs)
+/// and no wider than the pre-change ROOT desktop's exposure, which ran
+/// every one of these paths as root already. The same reasoning covers
+/// docker+VNC (supported, spec 2026-08-12): everything this exec touches
+/// stays inside the workload container itself, never init's root or the
+/// nested engine's state.
 pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> Vec<String> {
     crate::oci::crun_exec_argv(
         cgroup_manager,
@@ -311,8 +317,11 @@ pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> 
             format!(
                 "rm -f {X_LOCK} {X_SOCKET}; \
                  rm -rf {LEGACY_ROOT_STATE}; \
+                 for d in /tmp/.X11-unix /tmp/.config /tmp/.cache; do \
+                 [ ! -L \"$d\" ] || rm -f \"$d\"; done && \
                  mkdir -p /tmp/.X11-unix /tmp/.config /tmp/.cache /var/log && \
                  chmod 1777 /tmp/.X11-unix /tmp/.config /tmp/.cache && \
+                 {{ [ ! -L {VNC_LOG} ] || rm -f {VNC_LOG}; }} && \
                  {{ [ -e {VNC_LOG} ] || : > {VNC_LOG}; }} && \
                  chmod 666 {VNC_LOG}"
             ),
@@ -1026,6 +1035,26 @@ mod tests {
         let rm = script.find("rm -rf").unwrap();
         let chmod = script.find("chmod 1777").unwrap();
         assert!(rm < chmod, "legacy removal must come first: {script}");
+        // Symlink hardening: the workload can plant any of the chmod'd
+        // paths as a symlink before a restart, and `chmod` dereferences —
+        // a root-run `chmod 1777` aimed at an arbitrary in-container
+        // target. Each target that is a symlink must be removed (the link,
+        // never what it points at) BEFORE the mkdir/chmod rebuilds it, and
+        // the log gets the same guard before its create/chmod steps.
+        let guard = "for d in /tmp/.X11-unix /tmp/.config /tmp/.cache; do \
+                     [ ! -L \"$d\" ] || rm -f \"$d\"; done";
+        assert!(
+            script.contains(guard),
+            "the chmod targets must be de-symlinked first: {script}"
+        );
+        assert!(
+            script.find(guard).unwrap() < script.find("mkdir -p").unwrap(),
+            "the symlink guard must run before the parents are rebuilt: {script}"
+        );
+        assert!(
+            script.contains(&format!("[ ! -L {VNC_LOG} ] || rm -f {VNC_LOG}")),
+            "the log path must be de-symlinked before it is created/chmod'd: {script}"
+        );
         // Still container root: it is what deletes root-owned legacy files.
         assert!(
             argv.windows(2).any(|w| w[0] == "--user" && w[1] == "0:0"),
