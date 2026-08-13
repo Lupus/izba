@@ -89,7 +89,12 @@ the files it creates are owned by the image user.
   unchanged.
 - **Fire-and-forget contract:** no auto-restart; a dead desktop stays dead
   and is visible in the (path-unchanged) log.
-- **docker mode:** `--docker --vnc` is refused (#216); no interaction.
+- **docker mode:** docker+VNC is supported (#216, spec 2026-08-12) and the
+  same `desktop_exec_argvs` serves it — a docker-mode sandbox's desktop
+  likewise runs as the image's configured `USER` (only the bind address
+  differs, `LISTEN_ADDR_DOCKER`). Everything the ground-prep exec touches
+  stays inside the workload container, so the reasoning above carries over
+  unchanged; `vnc_docker_e2e` re-verifies the mode.
 - **Windows/OpenVMM:** izba-init is the only changed binary and is shared;
   no driver-specific behavior.
 
