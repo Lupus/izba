@@ -983,6 +983,28 @@ mod tests {
             script.contains(&format!("rm -rf {LEGACY_ROOT_STATE}")),
             "root-owned desktop state from pre-change boots must go: {script}"
         );
+        // The load-bearing ground-prep tail must propagate a failure (a
+        // trailing `true` would silently swallow a failed mkdir/chmod, and
+        // start_desktop's "cleanup exited {st}" diagnostic would never
+        // fire). Pin both the absence of the old masking idiom and the
+        // presence of the `&&` chain that replaced it — substring checks on
+        // individual commands alone would still pass if someone reverted
+        // the `&&`s to `;` or re-added `; true` at the end.
+        assert!(
+            !script.trim_end().ends_with("true"),
+            "the cleanup script must not end with a masking `true` — a \
+             failed ground-prep step must exit non-zero: {script}"
+        );
+        assert!(
+            script.contains("chmod 1777 /tmp/.X11-unix /tmp/.config /tmp/.cache && "),
+            "the ground-prep steps after the mkdir must be &&-chained so a \
+             failure propagates: {script}"
+        );
+        assert!(
+            script.contains(&format!("&& chmod 666 {VNC_LOG}")),
+            "the log-mode step must be &&-chained onto the rest of the \
+             load-bearing tail: {script}"
+        );
         // Pin the individual known-fatal-plus-known-degrading entries, not
         // just the joined constant, so a future trim silently dropping one
         // of them (rather than the constant changing shape entirely) is
