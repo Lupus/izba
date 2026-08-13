@@ -441,7 +441,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 **Files:** none new (fixes only if something is red).
 
-- [ ] **Step 1: All six workspace gates**
+- [x] **Step 1: All six workspace gates**
 
 Run (from the worktree root, `source .cargo-env` first):
 1. `cargo test --workspace`
@@ -452,16 +452,38 @@ Run (from the worktree root, `source .cargo-env` first):
 6. `cargo clippy --target x86_64-pc-windows-gnu --all-targets -p izba-proto -p izba-core -p izba-cli -- -D warnings`
 Expected: all green. (izba-core/izba-proto public types untouched, so the app gate is not required — verify with `git diff main --stat -- crates/izba-core crates/izba-proto` showing no hits.)
 
-- [ ] **Step 2: Stage artifacts for the KVM run**
+All six green (2026-08-13). Note: the worktree's local `main` ref was stale
+(behind the already-merged docker+VNC work on `origin/main`); the
+untouched-public-types check was re-verified against `origin/main` and came
+back empty, as expected.
+
+- [x] **Step 2: Stage artifacts for the KVM run**
 
 The e2e needs kernel/initramfs/CH artifacts plus `kasmvnc.erofs` at the exe-relative `target/debug/../artifacts/` (i.e. `target/artifacts/`). Check the main checkout first: `ls /home/kolkhovskiy/git/izba/target/artifacts/` — if populated, copy (or symlink) into the worktree's `target/artifacts/`. Otherwise run `hack/fetch-artifacts.sh` (see `hack/README.md`) and `hack/build-kasmvnc-erofs.sh`. The initramfs must carry Task 1/2's izba-init: rebuild it after the musl build (`hack/build-initramfs.sh` — check `hack/README.md` for the exact invocation and env).
 
-- [ ] **Step 3: Run the VNC e2e tests on real KVM (sandbox disabled)**
+Staged: `nft`/`sshd`+`sshd-session`+`sftp-server`/`ip`/`crun`/`mke2fs` built
+locally via the `hack/build-*.sh` scripts (needed a `DOCKER_CONFIG` override
+to work around a broken `docker-credential-secretservice` helper on this
+host — see report), `kasmvnc.erofs` built via `hack/build-kasmvnc-erofs.sh`
+and copied to `target/artifacts/kasmvnc.erofs`, initramfs rebuilt with all
+five embedded (this branch's musl izba-init), and — beyond what this step
+anticipated — the guest kernel itself rebuilt (`hack/build-kernel.sh`,
+6.18.43) because the pre-staged `~/.local/share/izba/artifacts/vmlinux` was
+a stale June-12 build that predated several `hack/kernel.config` commits and
+made every `crun run` fail with `clone: Invalid argument` — an environment
+staleness issue, not a bug in this branch's diff. See the report for detail.
+
+- [x] **Step 3: Run the VNC e2e tests on real KVM (sandbox disabled)**
 
 Run: `IZBA_INTEGRATION=1 cargo test -p izba-cli --test daemon_e2e vnc_desktop -- --test-threads=1 --nocapture`
 Expected: `vnc_desktop_e2e` AND `vnc_desktop_runs_as_image_user_e2e` both PASS (not SKIP — watch stderr for the skip lines; a skip is a failed verification, fix the staging).
 This is the load-bearing proof (USB post-mortem rule: a green static board is not proof for a feature that only manifests in a real VM).
 
-- [ ] **Step 4: Commit any fixes; update the plan checkboxes**
+Both PASS, no SKIP lines, once the kernel was rebuilt (see Step 2):
+`test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 50.75s`
+
+- [x] **Step 4: Commit any fixes; update the plan checkboxes**
 
 If the e2e surfaced product bugs, fix them TDD-style (failing unit test first where expressible) and re-run Step 3 until green.
+
+No product-code fix was needed — the branch's own changes (`crates/izba-init/src/vnc.rs`, `crates/izba-cli/tests/daemon_e2e.rs`) were correct as written; the only failure was the stale local kernel artifact, fixed by rebuilding it (an environment/staging fix, nothing to commit to the branch). Plan checkboxes for this task updated above.
