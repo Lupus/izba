@@ -1751,6 +1751,28 @@ fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
     );
 }
 
+/// Real uids of every container process whose `/proc/<pid>/comm` equals
+/// `comm`, via `izba exec`. Matching on comm (exact file content) rather
+/// than cmdline is what keeps the probe from matching ITSELF: the probe's
+/// own argv carries the target name as literal script text, but its comm
+/// is `sh` — the same self-satisfaction trap `menu_cache_entries`
+/// documents. Every substitution is a test-literal process name; nothing
+/// host-derived reaches the `sh -c`.
+fn desktop_proc_uids(data: &Path, name: &str, comm: &str) -> Vec<u32> {
+    let script = format!(
+        "for p in /proc/[0-9]*; do \
+           [ \"$(cat \"$p/comm\" 2>/dev/null)\" = \"{comm}\" ] || continue; \
+           awk '/^Uid:/{{print $2}}' \"$p/status\"; \
+         done; true"
+    );
+    let o = izba(data, &[], &["exec", name, "--", "sh", "-c", &script]);
+    assert_ok(&o, "read desktop process uids");
+    stdout_of(&o)
+        .split_whitespace()
+        .map(|s| s.parse().expect("uid must be numeric"))
+        .collect()
+}
+
 /// The guest's listeners, read from the kernel inside the workload container
 /// (which shares init's netns for every non-docker sandbox, so this is the
 /// whole guest).
@@ -2023,6 +2045,15 @@ fn vnc_desktop_e2e() {
         vnc_diag(&data, name)
     );
     assert_desktop_procs(&data, name, "first boot");
+    // alpine declares no USER, so the configured user is root: the desktop
+    // must still run as uid 0 — a no-USER image keeps its exact behavior
+    // (the image-user change is proven by vnc_desktop_runs_as_image_user_e2e).
+    let uids = desktop_proc_uids(&data, name, "Xkasmvnc");
+    assert!(
+        !uids.is_empty() && uids.iter().all(|u| *u == 0),
+        "no-USER image must keep a root desktop, got uids {uids:?}\n{}",
+        vnc_diag(&data, name)
+    );
 
     // [7] Listening surface. `Xkasmvnc` runs with `-ac` (access control off),
     // so an X11 TCP listener would hand root-on-display to anything that can
@@ -2170,6 +2201,92 @@ fn vnc_desktop_e2e() {
     );
 
     // Teardown is the SandboxGuards' job (they also run on panic).
+}
+
+/// The desktop runs as the image's configured USER, not container root —
+/// the user-visible promise: in a `USER agent`-style image, the X server,
+/// window manager, and everything launched from the desktop are the same
+/// identity `izba exec`/ssh already get. Boots the digest-pinned
+/// `nginxinc/nginx-unprivileged` (`USER 101`, the repo's standing non-root
+/// fixture — see izba-core's userns_numeric_user_owns_workspace) with
+/// `--vnc`, holds the desktop to the same working-session bar as the
+/// alpine flow (a session that WORKS as uid 101, not merely processes that
+/// exist), then reads each component's uid off /proc.
+#[test]
+fn vnc_desktop_runs_as_image_user_e2e() {
+    if !want() {
+        return;
+    }
+    assert!(
+        std::env::var_os("IZBA_KASMVNC_EROFS").is_none(),
+        "this e2e must prove production discovery — unset IZBA_KASMVNC_EROFS"
+    );
+    let bundle = vnc_bundle_path();
+    if !bundle.as_deref().map(Path::exists).unwrap_or(false) {
+        eprintln!(
+            "SKIP vnc_desktop_runs_as_image_user_e2e: kasmvnc.erofs not staged — \
+             run hack/build-kasmvnc-erofs.sh and copy dist/kasmvnc.erofs to the \
+             exe-relative artifacts dir"
+        );
+        return;
+    }
+    // Pinned digest of nginxinc/nginx-unprivileged:alpine (USER 101) — the
+    // same fixture izba-core's integration suite pins; digest-pinning keeps
+    // the test reproducible if the floating tag is re-pushed.
+    const UNPRIV_IMAGE: &str = "nginxinc/nginx-unprivileged@sha256:054e14f543eb688809d59ec2ad1644d1a61678e247c87a318ad605977eb37eaf";
+
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+    let name = "vnc-unpriv";
+    let _guard = SandboxGuard {
+        data: data.clone(),
+        name,
+    };
+
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "create",
+            "--vnc",
+            "--image",
+            UNPRIV_IMAGE,
+            "--name",
+            name,
+            &ws_s,
+        ],
+    );
+    assert_ok(&o, "create --vnc (USER 101 image)");
+    let o = izba(&data, no_env, &["start", name]);
+    assert_ok(&o, "start (vnc, USER 101 image)");
+
+    let o = izba(&data, no_env, &["vnc", "url", name]);
+    assert_ok(&o, "vnc url");
+    let url = stdout_of(&o).trim().to_string();
+    let (password, port) = parse_vnc_url(&url);
+
+    // Same bar as the alpine flow: a real credentialed websocket/RFB
+    // session, then the full component set live.
+    prove_desktop_session(&data, name, port, &password, "unpriv");
+    assert_desktop_procs(&data, name, "unpriv");
+
+    for comm in ["Xkasmvnc", "openbox"] {
+        let uids = desktop_proc_uids(&data, name, comm);
+        assert!(
+            !uids.is_empty(),
+            "[unpriv] no live {comm} process found\n{}",
+            vnc_diag(&data, name)
+        );
+        assert!(
+            uids.iter().all(|u| *u == 101),
+            "[unpriv] {comm} must run as the image USER 101, got {uids:?}\n{}",
+            vnc_diag(&data, name)
+        );
+    }
 }
 
 /// Docker mode + VNC (#216, spec 2026-08-12-vnc-docker-mode): a docker-mode
