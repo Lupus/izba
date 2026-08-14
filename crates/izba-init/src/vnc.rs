@@ -231,6 +231,19 @@ fn vnc_env() -> Vec<(String, String)> {
             format!("{CONTAINER_BUNDLE_DIR}/lib/gdk-pixbuf/loaders.cache"),
         ),
         ("XDG_MENU_PREFIX".to_string(), "lxde-".to_string()),
+        // GLib execs every GAppInfo launch (lxpanel's Run dialog, menu
+        // items, pcmanfm open-with) through its `gio-launch-desktop`
+        // helper. The helper's default location is a COMPILED-IN multiarch
+        // path (`/usr/lib/x86_64-linux-gnu/glib-2.0/…` in the bookworm
+        // builder) that belongs to the user's image — which need not ship
+        // GLib at all — so without this override the Run dialog dies with
+        // `Failed to execute child process "gio-launch-desktop"`. GLib
+        // consults this env var before the compiled-in path; the bundle
+        // vendors the helper (hack/build-kasmvnc-erofs.sh, drift-pinned).
+        (
+            "GIO_LAUNCH_DESKTOP".to_string(),
+            format!("{CONTAINER_BUNDLE_DIR}/libexec/gio-launch-desktop"),
+        ),
     ]
 }
 
@@ -956,6 +969,18 @@ mod tests {
             // lxpanel's Applications menu reads lxde-applications.menu via
             // the XDG menu spec prefix.
             assert_eq!(env_of(argv, "XDG_MENU_PREFIX"), Some("lxde-".to_string()));
+            // GLib launches EVERY GAppInfo command (lxpanel's Run dialog,
+            // menu items, pcmanfm open-with) through its gio-launch-desktop
+            // helper, resolved from a compiled-in multiarch path that
+            // belongs to the user's IMAGE — which need not ship GLib at all
+            // (claude-code-docker does not). Without this override the Run
+            // dialog dies with `Failed to execute child process
+            // "gio-launch-desktop" (No such file or directory)` on any such
+            // image; GLib checks the env var before the compiled-in path.
+            assert_eq!(
+                env_of(argv, "GIO_LAUNCH_DESKTOP"),
+                Some("/opt/izba-vnc/libexec/gio-launch-desktop".to_string())
+            );
         }
     }
 
@@ -1144,6 +1169,29 @@ mod tests {
         assert!(
             LEGACY_ROOT_STATE.contains("/tmp/izba-vnc-fontcache"),
             "cleanup must clear the bundle's font cache: {LEGACY_ROOT_STATE}"
+        );
+    }
+
+    /// The GIO_LAUNCH_DESKTOP override in `vnc_env` names a helper the
+    /// bundle build must actually stage — both ends pinned, like the font
+    /// cache above. Without the helper the env var points at nothing and
+    /// the Run dialog fails exactly as it did unfixed.
+    #[test]
+    fn gio_launch_helper_is_staged_where_vnc_env_points() {
+        let sh = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../hack/build-kasmvnc-erofs.sh"
+        ))
+        .expect("hack/build-kasmvnc-erofs.sh readable from the workspace");
+        assert!(
+            sh.contains("libexec/gio-launch-desktop"),
+            "bundle build must stage the gio-launch-desktop helper at \
+             libexec/ — vnc_env's GIO_LAUNCH_DESKTOP points there"
+        );
+        assert!(
+            vnc_env().iter().any(|(k, v)| k == "GIO_LAUNCH_DESKTOP"
+                && v == "/opt/izba-vnc/libexec/gio-launch-desktop"),
+            "vnc_env must select the bundled helper"
         );
     }
 
