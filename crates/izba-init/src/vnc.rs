@@ -111,33 +111,35 @@ const DEPTH: &str = "24";
 const X_SOCKET: &str = "/tmp/.X11-unix/X1";
 
 /// The X server's lock file for [`DISPLAY`] (`/tmp/.X<n>-lock`), holding the
-/// pid that owns the display. Removed together with [`X_SOCKET`] before every
-/// start — see [`stale_display_cleanup_argv`].
+/// pid that owns the display. Removed before every start (the socket goes
+/// with its whole directory, [`DESKTOP_TMP_STATE`]) — see
+/// [`stale_display_cleanup_argv`].
 const X_LOCK: &str = "/tmp/.X1-lock";
 
-/// Space-separated izba-owned desktop state a pre-change (root-desktop)
-/// boot may have left root-owned in the persistent overlay's `/tmp`,
-/// removed by the cleanup exec on every start so the image user can
-/// recreate it: the seeded lxpanel/pcmanfm/openbox/libfm profile parents
-/// (`izba-session` re-seeds them from the bundle), the generated
-/// Applications-menu cache, and the fontconfig cache (path pinned against
-/// `hack/build-kasmvnc-erofs.sh`'s fonts.conf by a drift test). Never
-/// user state — every entry is regenerated on every desktop start.
+/// Space-separated desktop state under `/tmp` removed WHOLESALE by the
+/// root cleanup exec on every start, then recreated as the image user's
+/// own directories by [`desktop_dirs_prep_argv`]: the X socket dir, the
+/// XDG config/cache parents of the desktop's `HOME=/tmp`, and the
+/// fontconfig cache (path pinned against `hack/build-kasmvnc-erofs.sh`'s
+/// fonts.conf by a drift test). Everything izba puts there is re-seeded or
+/// regenerated per start (`izba-session` profiles, the Applications-menu
+/// cache, font caches), so the desktop's dot-dirs are deliberately
+/// EPHEMERAL across restarts — the price of the symlink-safe shape below,
+/// and also what makes a root-desktop-era sandbox upgrade cleanly (its
+/// root-owned leftovers go with the parent).
 ///
-/// This is a hand-enumerated KNOWN-FATAL-PLUS-KNOWN-DEGRADING set, not an
-/// exhaustive inventory of everything a root desktop ever wrote: after the
-/// removal pass, [`desktop_dirs_prep_argv`] recreates `/tmp/.X11-unix`,
-/// `/tmp/.config`, and `/tmp/.cache` as the image user's OWN directories,
-/// so an UNLISTED root-owned leftover under one of them degrades SOFTLY —
-/// the owning app warns or falls back (e.g. skips its cache, logs a
-/// permission error) on that one unwritable subdir — rather than killing
-/// the whole desktop the way the X lock or a root `/tmp/.config/lxpanel`
-/// does. Only entries whose root-ownership is fatal (X's own lock/socket,
-/// handled separately) or reliably breaks a specific component on every
-/// upgraded sandbox belong here; anything merely cosmetic is left for the
-/// user-owned parents to shrug off.
-const LEGACY_ROOT_STATE: &str = "/tmp/.config/lxpanel /tmp/.config/pcmanfm /tmp/.config/libfm \
-     /tmp/.cache/menus /tmp/.cache/openbox /tmp/izba-vnc-fontcache";
+/// **Symlink-safe removal shape — every entry is a FINAL path component
+/// directly under `/tmp`.** `rm -rf` never dereferences the final
+/// component (a planted symlink loses the LINK, not its target), and the
+/// only intermediate, `/tmp` itself, is not workload-replaceable (root-
+/// owned `/` refuses the rename). Naming anything DEEPER — say
+/// `/tmp/.config/lxpanel` — would let a workload-planted `/tmp/.config →
+/// /some/target` aim root's recursive delete at fixed-name children of an
+/// attacker-chosen directory, since path resolution follows INTERMEDIATE
+/// symlinks even when the final component is not followed. The unit tests
+/// pin this shape: no path in the cleanup script may sit beneath a
+/// workload-controlled directory.
+const DESKTOP_TMP_STATE: &str = "/tmp/.X11-unix /tmp/.config /tmp/.cache /tmp/izba-vnc-fontcache";
 
 /// The conventional system `PATH`, appended after the bundle's `bin` (see
 /// [`vnc_env`]).
@@ -291,22 +293,32 @@ fn vnc_env() -> Vec<(String, String)> {
 /// image user itself in [`desktop_dirs_prep_argv`], so the desktop OWNS
 /// its ground and no world-writable modes are needed.
 ///
-/// Symlink discipline: everything root does by path under the
-/// workload-writable `/tmp` is `rm` — and `rm` never dereferences, so a
-/// workload-planted `/tmp/.config → /etc` loses the LINK, not the target.
-/// Root deliberately runs **no `chmod`/`mkdir` under `/tmp` at all**
-/// (the earlier `chmod 1777` design handed the workload a root-run chmod
-/// primitive it could aim by racing a symlink swap; creating the dirs as
-/// the image user eliminates the primitive instead of narrowing it). The
-/// one root write outside `/tmp` is the log under `/var/log`, a
-/// root-owned, non-sticky directory in any conventional image, so the
-/// workload user cannot plant anything there for `: >`/`chmod 666` to
-/// dereference; the `[ ! -L ]` guard covers the unconventional
-/// world-writable-`/var/log` image, where the residual check-to-use race
-/// is accepted — in-container, single-trust-zone, and no wider than the
-/// pre-change ROOT desktop. The same reasoning covers docker+VNC
-/// (supported, spec 2026-08-12): everything this exec touches stays
-/// inside the workload container itself.
+/// Symlink discipline — two rules, both pinned by unit tests:
+///
+/// 1. Everything root does by path under the workload-writable `/tmp` is
+///    `rm` of a **final path component directly under `/tmp`** (see
+///    [`DESKTOP_TMP_STATE`]). `rm -rf` never dereferences the final
+///    component, and `/tmp` — the only intermediate — is not
+///    workload-replaceable, so there is no symlink for root to follow at
+///    all: not at the target (a planted link loses the LINK), and not on
+///    the way there (naming a DEEPER path like `/tmp/.config/lxpanel`
+///    would resolve a planted `/tmp/.config` intermediate and aim the
+///    delete inside an attacker-chosen directory). Root runs **no
+///    `chmod`/`mkdir` under `/tmp` at all** — the earlier `chmod 1777`
+///    design handed the workload a root-run chmod primitive; creating the
+///    dirs as the image user ([`desktop_dirs_prep_argv`]) eliminates the
+///    primitive instead of narrowing it.
+/// 2. The one root write outside `/tmp` is the log under `/var/log`, a
+///    root-owned, non-sticky directory in any conventional image, so the
+///    workload user cannot plant anything there for `: >`/`chmod 666` to
+///    dereference; the `[ ! -L ]` guard covers the unconventional
+///    world-writable-`/var/log` image, where the residual check-to-use
+///    race is accepted — in-container, single-trust-zone, and no wider
+///    than the pre-change ROOT desktop.
+///
+/// The same reasoning covers docker+VNC (supported, spec 2026-08-12):
+/// everything this exec touches stays inside the workload container
+/// itself.
 pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> Vec<String> {
     crate::oci::crun_exec_argv(
         cgroup_manager,
@@ -318,25 +330,23 @@ pub fn stale_display_cleanup_argv(cgroup_manager: crate::oci::CgroupManager) -> 
             "/bin/sh".into(),
             "-c".into(),
             // `rm -f`/`rm -rf` never fail on an absent path, so a first boot
-            // is a clean no-op — the removal legs stay `;`-joined so a
-            // first-boot no-op can never fail the script. Only the LOG leg
-            // is load-bearing creation, so it alone is `&&`-chained: a
-            // failed mkdir/create/chmod propagates as a non-zero exit, which
+            // is a clean no-op — the removal leg stays `;`-joined so a
+            // first-boot no-op can never fail the script. Every removed
+            // path is a FINAL component directly under /tmp (the
+            // DESKTOP_TMP_STATE shape — the X lock and socket dir go with
+            // their parents, so no deeper path is ever named; see the
+            // symlink-discipline doc above). Only the LOG leg is
+            // load-bearing creation, so it alone is `&&`-chained: a failed
+            // mkdir/create/chmod propagates as a non-zero exit, which
             // `start_desktop` reports via its "cleanup exited {st}"
             // diagnostic, rather than being swallowed the way a trailing
-            // `true` would. The log is created empty iff absent (`: >` would
-            // truncate an existing one) — grouped in `{ ...; }` so the `||`
-            // binds only to the create-if-absent check, not to the `&&`
-            // chain around it — then opened up to 666 so the unprivileged
-            // desktop can append. The symlink de-linking loop keeps a
-            // pre-planted link from surviving into the image user's
-            // `mkdir -p` (which would silently follow it); `rm` itself never
-            // dereferences, so every root-by-path step under /tmp is safe.
+            // `true` would. The log is created empty iff absent (`: >`
+            // would truncate an existing one) — grouped in `{ ...; }` so
+            // the `||` binds only to the create-if-absent check, not to
+            // the `&&` chain around it — then opened up to 666 so the
+            // unprivileged desktop can append.
             format!(
-                "rm -f {X_LOCK} {X_SOCKET}; \
-                 rm -rf {LEGACY_ROOT_STATE}; \
-                 for d in /tmp/.X11-unix /tmp/.config /tmp/.cache; do \
-                 [ ! -L \"$d\" ] || rm -f \"$d\"; done; \
+                "rm -rf {X_LOCK} {DESKTOP_TMP_STATE}; \
                  {{ [ ! -L {VNC_LOG} ] || rm -f {VNC_LOG}; }} && \
                  mkdir -p /var/log && \
                  {{ [ -e {VNC_LOG} ] || : > {VNC_LOG}; }} && \
@@ -735,12 +745,20 @@ mod tests {
         let argv = stale_display_cleanup_argv(crate::oci::CgroupManager::Cgroupfs);
         let script = argv.last().unwrap();
         assert!(
-            script.contains(&format!("rm -f {X_LOCK} {X_SOCKET}")),
-            "both the lock and the socket must go: {script}"
+            script.contains(&format!("rm -rf {X_LOCK} {DESKTOP_TMP_STATE}")),
+            "the lock and the desktop /tmp state must go: {script}"
+        );
+        // The SOCKET is removed with its parent dir, never named directly:
+        // /tmp/.X11-unix/X1 has a workload-controlled intermediate.
+        assert!(
+            X_SOCKET.starts_with("/tmp/.X11-unix/"),
+            "the socket must live in the dir the cleanup removes: {X_SOCKET}"
         );
         assert!(
-            script.contains("rm -f"),
-            "an absent path on a first boot must not fail: {script}"
+            DESKTOP_TMP_STATE
+                .split_whitespace()
+                .any(|p| p == "/tmp/.X11-unix"),
+            "the socket dir must be in the wipe list: {DESKTOP_TMP_STATE}"
         );
         // The X socket dir is (re)created by the image user's dirs prep,
         // never by this root exec — see desktop_dirs_prep_creates_the_ground.
@@ -773,9 +791,13 @@ mod tests {
             .unwrap()
             .clone();
         let (_server, wm) = scripts();
+        // The wm waits on the socket; the cleanup removes the DIRECTORY the
+        // socket lives in (never the socket path itself — its intermediate
+        // is workload-controlled), and the lock directly.
+        let socket_dir = X_SOCKET.rsplit_once('/').unwrap().0;
         assert!(
-            wm.contains(X_SOCKET) && script.contains(X_SOCKET),
-            "the wm waits on the very socket the cleanup removes: {wm} / {script}"
+            wm.contains(X_SOCKET) && script.contains(socket_dir) && script.contains(X_LOCK),
+            "the wm waits on a socket inside the dir the cleanup removes: {wm} / {script}"
         );
     }
 
@@ -1066,8 +1088,8 @@ mod tests {
             "any image uid must be able to append to the honest log: {script}"
         );
         assert!(
-            script.contains(&format!("rm -rf {LEGACY_ROOT_STATE}")),
-            "root-owned desktop state from pre-change boots must go: {script}"
+            script.contains(&format!("rm -rf {X_LOCK} {DESKTOP_TMP_STATE}")),
+            "the desktop /tmp state must go wholesale: {script}"
         );
         // The load-bearing log leg must propagate a failure (a trailing
         // `true` would silently swallow it and start_desktop's "cleanup
@@ -1081,32 +1103,42 @@ mod tests {
             script.contains(&format!("&& chmod 666 {VNC_LOG}")),
             "the log-mode step must be &&-chained so a failure propagates: {script}"
         );
-        // Pin the individual known-fatal-plus-known-degrading entries, not
-        // just the joined constant, so a future trim silently dropping one
-        // of them (rather than the constant changing shape entirely) is
-        // still caught here.
+        // THE symlink-safety shape pin (Greptile P1 ×2 on this branch):
+        // root's recursive delete follows INTERMEDIATE symlinks even
+        // though it never dereferences the final component, so every
+        // /tmp path this script names must sit DIRECTLY under /tmp — the
+        // only intermediate the workload cannot replace. A deeper path
+        // (e.g. /tmp/.config/lxpanel) would let a planted /tmp/.config →
+        // <target> aim the delete inside an attacker-chosen directory.
+        for entry in DESKTOP_TMP_STATE.split_whitespace().chain([X_LOCK]) {
+            let p = std::path::Path::new(entry);
+            assert_eq!(
+                p.parent(),
+                Some(std::path::Path::new("/tmp")),
+                "every removed path must be a final component directly \
+                 under /tmp: {entry}"
+            );
+        }
+        for deep in ["/tmp/.config/", "/tmp/.cache/", "/tmp/.X11-unix/"] {
+            assert!(
+                !script.contains(deep),
+                "the cleanup script must never name a path beneath a \
+                 workload-controlled directory: {deep} in {script}"
+            );
+        }
+        // The wipe list must cover the dirs the image user recreates and
+        // the fontconfig cache (fontcache path drift-pinned separately).
         for path in [
-            "/tmp/.config/lxpanel",
-            "/tmp/.config/pcmanfm",
-            "/tmp/.config/libfm",
-            "/tmp/.cache/menus",
-            "/tmp/.cache/openbox",
+            "/tmp/.X11-unix",
+            "/tmp/.config",
+            "/tmp/.cache",
             "/tmp/izba-vnc-fontcache",
         ] {
             assert!(
-                LEGACY_ROOT_STATE.contains(path),
-                "LEGACY_ROOT_STATE must enumerate {path}: {LEGACY_ROOT_STATE}"
+                DESKTOP_TMP_STATE.split_whitespace().any(|p| p == path),
+                "DESKTOP_TMP_STATE must enumerate {path}: {DESKTOP_TMP_STATE}"
             );
         }
-        // A workload-planted symlink at any dir the image user is about to
-        // `mkdir -p` must be removed here (the LINK — `rm` does not
-        // dereference), or the user's mkdir would silently follow it.
-        let guard = "for d in /tmp/.X11-unix /tmp/.config /tmp/.cache; do \
-                     [ ! -L \"$d\" ] || rm -f \"$d\"; done";
-        assert!(
-            script.contains(guard),
-            "the dirs the image user recreates must be de-symlinked first: {script}"
-        );
         assert!(
             script.contains(&format!("[ ! -L {VNC_LOG} ] || rm -f {VNC_LOG}")),
             "the log path must be de-symlinked before it is created/chmod'd: {script}"
@@ -1164,11 +1196,13 @@ mod tests {
         .expect("hack/build-kasmvnc-erofs.sh readable from the workspace");
         assert!(
             sh.contains("<cachedir>/tmp/izba-vnc-fontcache</cachedir>"),
-            "bundle fonts.conf cachedir moved — update LEGACY_ROOT_STATE too"
+            "bundle fonts.conf cachedir moved — update DESKTOP_TMP_STATE too"
         );
         assert!(
-            LEGACY_ROOT_STATE.contains("/tmp/izba-vnc-fontcache"),
-            "cleanup must clear the bundle's font cache: {LEGACY_ROOT_STATE}"
+            DESKTOP_TMP_STATE
+                .split_whitespace()
+                .any(|p| p == "/tmp/izba-vnc-fontcache"),
+            "cleanup must clear the bundle's font cache: {DESKTOP_TMP_STATE}"
         );
     }
 

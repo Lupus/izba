@@ -53,21 +53,25 @@ images, and dead-on-arrival on sandboxes upgraded from the root-desktop era.
 Ground preparation is **two awaited execs** before the desktop spawns —
 split so that root only ever *removes* and the image user *creates*:
 
-1. **Remove (root — `stale_display_cleanup_argv`, `--user 0:0`).** In
-   addition to its `rm -f /tmp/.X1-lock /tmp/.X11-unix/X1` it removes the
-   izba-owned desktop state a pre-change (root) boot left behind, which
-   would otherwise be unwritable/unremovable by the image user
-   (`/tmp/.config/{lxpanel,pcmanfm,libfm}`, `/tmp/.cache/{menus,openbox}`,
-   `/tmp/izba-vnc-fontcache` — all re-seeded/regenerated on every start,
-   never user state), de-links any workload-planted symlink at the paths
-   the next exec will create (`rm` never dereferences), and prepares the
-   log: create `/var/log/izba-vnc.log` iff absent, `chmod 666`. The log
-   **path contract is unchanged**. `/var/log` is root-owned and non-sticky
-   in any conventional image, so the workload cannot plant anything there;
-   root deliberately runs **no `chmod`/`mkdir` under `/tmp` at all** — an
-   earlier `chmod 1777` cut handed the workload a root-chmod primitive it
-   could aim by racing a symlink swap (Greptile P1), and creating the dirs
-   as the image user eliminates that primitive instead of narrowing it.
+1. **Remove (root — `stale_display_cleanup_argv`, `--user 0:0`).** Wipes
+   the desktop's `/tmp` state wholesale — `rm -rf /tmp/.X1-lock
+   /tmp/.X11-unix /tmp/.config /tmp/.cache /tmp/izba-vnc-fontcache` — and
+   prepares the log: create `/var/log/izba-vnc.log` iff absent,
+   `chmod 666`. The log **path contract is unchanged**. Every removed path
+   is a FINAL component directly under `/tmp`: `rm` never dereferences the
+   final component, and `/tmp` (the only intermediate) is not
+   workload-replaceable, so root follows no symlink at the target OR on
+   the way to it. Two earlier cuts each handed the workload a primitive
+   (Greptile P1 ×2): a root `chmod 1777` it could aim by racing a symlink
+   swap, then a leaf-path `rm -rf /tmp/.config/<name>` whose INTERMEDIATE
+   a planted `/tmp/.config → <target>` would redirect. Wholesale
+   final-component removal eliminates both instead of narrowing them; the
+   cost is that the desktop's `HOME=/tmp` dot-dirs are ephemeral across
+   restarts (izba re-seeds/regenerates everything it puts there), and the
+   upgrade path degenerates to the same wipe. Root deliberately runs **no
+   `chmod`/`mkdir` under `/tmp` at all**; `/var/log` is root-owned and
+   non-sticky in any conventional image, so the workload cannot plant
+   anything there.
 2. **Create (image user — `desktop_dirs_prep_argv`, no `--user`).**
    `mkdir -p /tmp/.X11-unix /tmp/.config /tmp/.cache` as the container's
    configured user: the desktop owns its ground outright, so no
