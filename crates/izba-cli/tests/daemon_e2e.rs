@@ -1749,6 +1749,47 @@ fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
          menu-cached can both look healthy in this state.\n{}",
         vnc_diag(data, name)
     );
+    // The desktop's launch path: GLib execs every GAppInfo command
+    // (lxpanel's Run dialog, menu items) through gio-launch-desktop,
+    // resolved via the GIO_LAUNCH_DESKTOP env var izba-init sets — its
+    // compiled-in fallback path belongs to the image, which need not ship
+    // GLib at all (claude-code-docker does not; user-reported `Failed to
+    // execute child process "gio-launch-desktop"`). Two halves, both live:
+    // the bundled helper is executable in-container, and a REAL desktop
+    // process carries the override in its environ (readable because
+    // `izba exec` runs as the same image user the desktop does).
+    let o = izba(
+        data,
+        &[],
+        &[
+            "exec",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "test -x /opt/izba-vnc/libexec/gio-launch-desktop && echo helper-ok; \
+             for p in /proc/[0-9]*; do \
+               [ \"$(cat \"$p/comm\" 2>/dev/null)\" = \"lxpanel\" ] || continue; \
+               tr '\\0' '\\n' < \"$p/environ\" | grep '^GIO_LAUNCH_DESKTOP='; \
+               break; \
+             done",
+        ],
+    );
+    assert_ok(&o, "probe the desktop's GAppInfo launch path");
+    let out = stdout_of(&o);
+    assert!(
+        out.contains("helper-ok"),
+        "[{phase}] the bundle must ship an executable \
+         libexec/gio-launch-desktop: {out}\n{}",
+        vnc_diag(data, name)
+    );
+    assert!(
+        out.contains("GIO_LAUNCH_DESKTOP=/opt/izba-vnc/libexec/gio-launch-desktop"),
+        "[{phase}] the live panel must carry the GIO_LAUNCH_DESKTOP \
+         override — without it the Run dialog dies on images without \
+         GLib: {out}\n{}",
+        vnc_diag(data, name)
+    );
 }
 
 /// Real uids of every container process whose `/proc/<pid>/comm` equals

@@ -78,6 +78,18 @@ MENU_CACHE_BINS="$(dpkg -L libmenu-cache-bin | grep -E "/menu-cache(d|-gen)\$")"
 BINS="/usr/bin/Xkasmvnc /usr/bin/kasmvncpasswd /usr/bin/xkbcomp /usr/bin/openbox /usr/bin/xterm /usr/bin/pcmanfm /usr/bin/lxpanel $MENU_CACHE_BINS"
 for b in $BINS; do cp -L "$b" "$B/bin/"; done
 
+# GLib execs every GAppInfo launch (lxpanel Run dialog, menu items, pcmanfm
+# open-with) through its gio-launch-desktop helper, whose default location
+# is a COMPILED-IN private glib-2.0 path that belongs to the image, not the
+# bundle -- on an image without GLib the Run dialog dies with Failed to
+# execute child process. Vendor the helper (libglib2.0-0 ships it; dpkg -L
+# locates the private path) at libexec/ and select it via the
+# GIO_LAUNCH_DESKTOP env var, which GLib consults before the compiled-in
+# path (set in izba-init vnc_env, drift-pinned by a unit test there).
+GIO_LAUNCH_HELPER="$(dpkg -L libglib2.0-0 | grep "/gio-launch-desktop\$")"
+mkdir -p "$B/libexec"
+cp -L "$GIO_LAUNCH_HELPER" "$B/libexec/gio-launch-desktop"
+
 # --- shared-library closure (iterate until fixpoint over ldd of bins+libs) ---
 copy_deps() {
   ldd "$1" 2>/dev/null | awk "/=>/ {print \$3} /^\t\// {print \$1}" | while read -r so; do
@@ -87,6 +99,7 @@ copy_deps() {
   done
 }
 for b in $BINS; do copy_deps "$b"; done
+copy_deps "$B/libexec/gio-launch-desktop"
 for _ in 1 2 3; do for so in "$B"/lib/*; do copy_deps "$so"; done; done
 
 # --- dlopened GTK2/libfm/lxpanel modules: invisible to ldd, copied
@@ -187,7 +200,7 @@ EOF
 # nested .so under lib/, so dlopened module trees (gdk-pixbuf loaders,
 # libfm, lxpanel plugins) are covered by both the patchelf pass and the
 # self-containment assertion, not just the top-level lib/*.so* glob. ---
-ELFS="$(find "$B"/bin "$B"/lib -type f \( -name "*.so*" -o -path "$B/bin/*" \))"
+ELFS="$(find "$B"/bin "$B"/lib "$B"/libexec -type f \( -name "*.so*" -o -path "$B/bin/*" -o -path "$B/libexec/*" \))"
 
 # --- make every ELF self-locating: bundle loader + bundle rpath ---
 for f in $ELFS; do
@@ -220,6 +233,7 @@ echo "self-containment assertion: OK"
 
 # --- content manifest: every path a later task depends on ---
 for req in bin/pcmanfm bin/lxpanel bin/menu-cached bin/menu-cache-gen bin/izba-session \
+           libexec/gio-launch-desktop \
            lib/gdk-pixbuf/loaders.cache etc/openbox/menu.xml \
            etc/lxpanel/izba/panels/panel etc/pcmanfm/izba/desktop-items-0.conf \
            etc/libfm/libfm.conf share/applications/xterm.desktop \
