@@ -3,17 +3,27 @@
 # no restarts -- a dead component stays dead and is visible in
 # /var/log/izba-vnc.log (the docker-engine precedent, see izba-init vnc.rs).
 #
+# HOME is the runtime-resolved desktop home (the image user's real home,
+# or /tmp for homeless images -- izba-init's desktop_env_preamble; a drift
+# test in vnc.rs pins this script to "$HOME", never a hardcoded /tmp).
+#
 # lxpanel and pcmanfm resolve "--profile izba" against XDG_CONFIG_HOME
-# (default $HOME/.config; HOME=/tmp per vnc_env). Their fallback search for
-# a default profile uses COMPILED-IN /etc/xdg + /usr/share paths that belong
-# to the user's image inside the container, so relying on it would make the
-# desktop image-dependent. Seed the profile deterministically instead; /tmp
-# is the persistent overlay, so cp -r would keep a stale copy forever --
-# refresh with rm -rf first (the profile is izba-owned, never user state).
-rm -rf /tmp/.config/lxpanel/izba /tmp/.config/pcmanfm/izba
-mkdir -p /tmp/.config/lxpanel /tmp/.config/pcmanfm
-cp -r /opt/izba-vnc/etc/lxpanel/izba /tmp/.config/lxpanel/izba
-cp -r /opt/izba-vnc/etc/pcmanfm/izba /tmp/.config/pcmanfm/izba
+# (default $HOME/.config). Their fallback search for a default profile uses
+# COMPILED-IN /etc/xdg + /usr/share paths that belong to the user's image
+# inside the container, so relying on it would make the desktop
+# image-dependent. Seed the profile deterministically instead; the home may
+# persist across restarts, so cp -r would keep a stale copy forever --
+# refresh with rm -rf first (the izba profile subtree is izba-owned, never
+# user state).
+rm -rf "$HOME/.config/lxpanel/izba" "$HOME/.config/pcmanfm/izba"
+mkdir -p "$HOME/.config/lxpanel" "$HOME/.config/pcmanfm"
+cp -r /opt/izba-vnc/etc/lxpanel/izba "$HOME/.config/lxpanel/izba"
+cp -r /opt/izba-vnc/etc/pcmanfm/izba "$HOME/.config/pcmanfm/izba"
+
+# pcmanfm --desktop opens $HOME/Desktop (or the XDG desktop dir) and throws
+# an error DIALOG on every start when it is missing; make sure it exists,
+# as the desktop's own uid.
+mkdir -p "$HOME/Desktop"
 
 pcmanfm --desktop --profile izba &
 lxpanel --profile izba &

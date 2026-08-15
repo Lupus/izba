@@ -139,7 +139,8 @@ const X_LOCK: &str = "/tmp/.X1-lock";
 /// symlinks even when the final component is not followed. The unit tests
 /// pin this shape: no path in the cleanup script may sit beneath a
 /// workload-controlled directory.
-const DESKTOP_TMP_STATE: &str = "/tmp/.X11-unix /tmp/.config /tmp/.cache /tmp/izba-vnc-fontcache";
+const DESKTOP_TMP_STATE: &str =
+    "/tmp/.X11-unix /tmp/.config /tmp/.cache /tmp/Desktop /tmp/izba-vnc-fontcache";
 
 /// The conventional system `PATH`, appended after the bundle's `bin` (see
 /// [`vnc_env`]).
@@ -196,26 +197,17 @@ pub fn materialize(share_dir: &Path, secrets_dir: &Path) -> std::io::Result<bool
 /// Everything points into the bundle so the session never depends on the
 /// image shipping X11 data of its own: `FONTCONFIG_PATH` for the bundle's
 /// `fonts.conf` (which itself points at the bundle font dirs and a `/tmp`
-/// cache), the XDG dirs for openbox's config/themes, and `HOME=/tmp`
-/// because the image's user may have no writable home at all.
+/// cache), and the XDG dirs for openbox's config/themes.
 ///
-/// `PATH` puts the bundle's `bin` FIRST, then the standard system dirs. This
-/// is the one env var that exists for the workload's benefit rather than the
-/// server's: openbox's default root menu launches a terminal by NAME
-/// (`x-terminal-emulator`, `xterm`), and the bundle ships `xterm` — so
-/// without this the menu is dead on any image that does not carry its own
-/// terminal, which is most of them. The system dirs stay after it so an
-/// image's own tools still win for everything the bundle does not provide.
-/// (Overriding `PATH` is safe here in a way it is NOT for `izba exec`, where
-/// `build_env_overlay` deliberately leaves `PATH` to the image: these two
-/// processes are izba's own, not the user's command.)
+/// `HOME` and `PATH` are deliberately ABSENT here — both are resolved at
+/// runtime by [`desktop_env_preamble`], because their right values depend
+/// on the image: a static `HOME=/tmp` (the root-desktop-era choice) made
+/// the desktop terminal useless in any image whose user has a real home
+/// (no dotfiles, no `~/.local/bin` — the claude image's `claude` was
+/// unreachable, user-reported), and a static `PATH` clobbered the image's
+/// own PATH additions.
 fn vnc_env() -> Vec<(String, String)> {
     vec![
-        ("HOME".to_string(), "/tmp".to_string()),
-        (
-            "PATH".to_string(),
-            format!("{CONTAINER_BUNDLE_DIR}/bin:{SYSTEM_PATH}"),
-        ),
         (
             "FONTCONFIG_PATH".to_string(),
             format!("{CONTAINER_BUNDLE_DIR}/etc/fonts"),
@@ -385,6 +377,40 @@ pub fn desktop_dirs_prep_argv(cgroup_manager: crate::oci::CgroupManager) -> Vec<
     )
 }
 
+/// The shell preamble both desktop spawns start with: runtime `PATH` and
+/// `HOME` resolution, in that order (the resolver's `awk`/`id` must be
+/// findable even on an image with no PATH of its own).
+///
+/// - `PATH`: bundle `bin` FIRST — openbox's default menu launches a
+///   terminal by NAME (`x-terminal-emulator`, `xterm`) and the bundle
+///   ships `xterm`, so without this the menu is dead on any image that
+///   carries no terminal. The IMAGE's own `PATH` follows (a static
+///   override used to clobber e.g. a baked-in `~/.local/bin`), with the
+///   conventional system dirs as the fallback for an image whose env
+///   carries no PATH at all.
+/// - `HOME`: the image user's passwd home when it exists and the desktop's
+///   uid can write it, `/tmp` otherwise. The desktop runs as the image
+///   user (spec 2026-08-13), so its terminal should behave like `izba
+///   exec`/ssh for that user — dotfiles, `~/.local/bin`, the lot; the old
+///   static `HOME=/tmp` hid all of it (user-reported: `claude` not found,
+///   `$HOME` = `/tmp`). Homeless or read-only-home images degrade to the
+///   old behavior instead of a dead session. A numeric USER with no passwd
+///   row resolves to an empty string and falls back the same way.
+///
+/// Everything the session writes under `$HOME` follows automatically: the
+/// izba profiles and menu cache (XDG defaults `$HOME/.config`/`.cache`)
+/// and `pcmanfm --desktop`'s `$HOME/Desktop` (created by `izba-session`;
+/// its absence throws an error dialog on every start — user-reported with
+/// a root-era `/tmp/Desktop` leftover). The fontconfig cache alone stays
+/// pinned to `/tmp/izba-vnc-fontcache` by the bundle's fonts.conf.
+fn desktop_env_preamble() -> String {
+    format!(
+        "PATH=\"{CONTAINER_BUNDLE_DIR}/bin:${{PATH:-{SYSTEM_PATH}}}\"; export PATH; \
+         HOME=\"$(awk -F: -v u=\"$(id -u)\" '$3==u{{print $6}}' /etc/passwd 2>/dev/null)\"; \
+         {{ [ -n \"$HOME\" ] && [ -d \"$HOME\" ] && [ -w \"$HOME\" ]; }} || HOME=/tmp; export HOME;"
+    )
+}
+
 /// The two `crun exec` argvs that bring up the desktop, in start order:
 /// the KasmVNC X server, then the window manager.
 ///
@@ -463,12 +489,14 @@ pub fn desktop_exec_argvs(
     } else {
         LISTEN_ADDR
     };
+    let preamble = desktop_env_preamble();
     // INJECTION NOTE (both format! sites below): every substitution here is a
     // compile-time constant. Anything host- or cmdline-derived must be quoted
-    // or passed as argv instead — this string is handed to a container-root
+    // or passed as argv instead — this string is handed to an image-user
     // `sh -c`.
     let server = format!(
-        "mkdir -p /var/log; \
+        "{preamble} \
+         mkdir -p /var/log; \
          exec {CONTAINER_BUNDLE_DIR}/bin/Xkasmvnc {DISPLAY} \
          -geometry {GEOMETRY} -depth {DEPTH} \
          -interface {listen} -websocketPort {WEBSOCKET_PORT} -publicIP {LISTEN_ADDR} \
@@ -480,7 +508,8 @@ pub fn desktop_exec_argvs(
          -ac -noreset >>{VNC_LOG} 2>&1"
     );
     let wm = format!(
-        "mkdir -p /var/log; \
+        "{preamble} \
+         mkdir -p /var/log; \
          i=0; while [ ! -e {X_SOCKET} ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; \
          exec {CONTAINER_BUNDLE_DIR}/bin/izba-session >>{VNC_LOG} 2>&1"
     );
@@ -954,19 +983,52 @@ mod tests {
         assert_eq!(env_of(&argvs[0], "DISPLAY"), None);
         assert_eq!(env_of(&argvs[1], "DISPLAY"), Some(DISPLAY.to_string()));
         for argv in &argvs {
-            assert_eq!(env_of(argv, "HOME"), Some("/tmp".to_string()));
+            // HOME and PATH are resolved at RUNTIME inside the container
+            // (see the script preamble pins below), never pinned as static
+            // --env pairs: a static HOME=/tmp made the desktop terminal
+            // useless in any image whose user has a real home (no dotfiles,
+            // no ~/.local/bin — the claude image's `claude` was
+            // unreachable), and a static PATH CLOBBERED the image's own
+            // PATH additions.
+            assert_eq!(
+                env_of(argv, "HOME"),
+                None,
+                "HOME must be runtime-resolved, not statically pinned"
+            );
+            assert_eq!(
+                env_of(argv, "PATH"),
+                None,
+                "PATH must extend the image's own PATH at runtime"
+            );
+            let script = argv.last().unwrap();
             // Bundle bin FIRST so openbox's default menu (which launches a
             // terminal by NAME) finds the bundled xterm on an image that
-            // ships none; system dirs still follow it.
-            let path = env_of(argv, "PATH").expect("PATH must be set");
+            // ships none; the IMAGE's PATH follows so its own tools (e.g.
+            // ~/.local/bin entries baked into ENV PATH) stay reachable,
+            // with the conventional system dirs as the no-PATH fallback.
             assert!(
-                path.starts_with("/opt/izba-vnc/bin:"),
-                "bundle bin must come first: {path}"
+                script.contains(&format!(
+                    "PATH=\"/opt/izba-vnc/bin:${{PATH:-{SYSTEM_PATH}}}\"; export PATH"
+                )),
+                "bundle bin first, image PATH preserved, system fallback: {script}"
             );
-            assert!(path.ends_with(SYSTEM_PATH), "{path}");
-            for dir in ["/usr/bin", "/bin"] {
-                assert!(path.split(':').any(|p| p == dir), "missing {dir}: {path}");
-            }
+            // HOME = the image user's real passwd home when it exists and
+            // is writable by the desktop's uid; /tmp only as the fallback
+            // for homeless images. This is what makes the desktop terminal
+            // behave like `izba exec`/ssh for the same user.
+            assert!(
+                script.contains("'$3==u{print $6}' /etc/passwd"),
+                "HOME must come from the image user's passwd entry: {script}"
+            );
+            assert!(
+                script.contains("|| HOME=/tmp; export HOME"),
+                "homeless/unwritable-home images must fall back to /tmp: {script}"
+            );
+            // The preamble must run before the payload exec.
+            assert!(
+                script.find("export HOME").unwrap() < script.find("exec ").unwrap(),
+                "env preamble must precede the exec: {script}"
+            );
             assert_eq!(
                 env_of(argv, "FONTCONFIG_PATH"),
                 Some("/opt/izba-vnc/etc/fonts".to_string())
@@ -1132,6 +1194,7 @@ mod tests {
             "/tmp/.X11-unix",
             "/tmp/.config",
             "/tmp/.cache",
+            "/tmp/Desktop",
             "/tmp/izba-vnc-fontcache",
         ] {
             assert!(
@@ -1204,6 +1267,34 @@ mod tests {
                 .any(|p| p == "/tmp/izba-vnc-fontcache"),
             "cleanup must clear the bundle's font cache: {DESKTOP_TMP_STATE}"
         );
+    }
+
+    /// The session script seeds profiles and the desktop folder under the
+    /// RUNTIME-resolved `$HOME` (never a hardcoded `/tmp`), matching the
+    /// preamble in `desktop_exec_argvs`: a hardcoded `/tmp/.config` seeded
+    /// profiles into a dir the desktop no longer uses when the image user
+    /// has a real home, and a missing `$HOME/Desktop` makes
+    /// `pcmanfm --desktop` throw a "Permission denied"/"not found" error
+    /// dialog on every start (user-reported with a root-era /tmp/Desktop
+    /// leftover). Cross-file pin, like the fontcache one.
+    #[test]
+    fn izba_session_seeds_under_runtime_home() {
+        let sh = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../hack/vnc-config/izba-session"
+        ))
+        .expect("hack/vnc-config/izba-session readable from the workspace");
+        assert!(
+            !sh.contains("/tmp/.config"),
+            "izba-session must seed under \"$HOME\", not a hardcoded /tmp: {sh}"
+        );
+        for want in [
+            "\"$HOME/.config/lxpanel\"",
+            "\"$HOME/.config/pcmanfm\"",
+            "mkdir -p \"$HOME/Desktop\"",
+        ] {
+            assert!(sh.contains(want), "izba-session must contain {want}: {sh}");
+        }
     }
 
     /// The GIO_LAUNCH_DESKTOP override in `vnc_env` names a helper the
