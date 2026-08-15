@@ -1680,21 +1680,32 @@ fn prove_desktop_session(data: &Path, name: &str, port: u16, password: &str, pha
 ///    that exec's stdout alone, is what makes it real. Any future "just fold
 ///    it into the other command" must not be taken.
 fn menu_cache_entries(data: &Path, name: &str) -> String {
+    // The desktop's HOME is runtime-resolved (the image user's real home,
+    // or /tmp for homeless images — izba-init's desktop_env_preamble), so
+    // the cache location follows it. Read the TRUTH — the live desktop's
+    // own environ — rather than re-deriving the resolver's logic here,
+    // which would let a resolver bug and its re-derivation agree with each
+    // other. Comm-matched (not cmdline) for the usual self-satisfaction
+    // reason; environ is readable because `izba exec` runs as the same
+    // image user the desktop does. `ls` of a missing directory is an
+    // error, hence the tolerant `2>/dev/null; true` — the exec ITSELF is
+    // still asserted, so a broken `izba exec` cannot masquerade as an
+    // empty cache.
     let o = izba(
         data,
         &[],
-        // HOME is /tmp for the desktop (izba-init's vnc_env), so menu-cache
-        // writes its generated cache to /tmp/.cache/menus. `ls` of a missing
-        // directory is an error, hence the tolerant `2>/dev/null; true` —
-        // the exec ITSELF is still asserted, so a broken `izba exec` cannot
-        // masquerade as an empty cache.
         &[
             "exec",
             name,
             "--",
             "sh",
             "-c",
-            "ls /tmp/.cache/menus 2>/dev/null; true",
+            "H=; for p in /proc/[0-9]*; do \
+               [ \"$(cat \"$p/comm\" 2>/dev/null)\" = \"lxpanel\" ] || continue; \
+               H=$(tr '\\0' '\\n' < \"$p/environ\" | sed -n 's/^HOME=//p'); \
+               break; \
+             done; \
+             [ -n \"$H\" ] && ls \"$H/.cache/menus\" 2>/dev/null; true",
         ],
     );
     assert_ok(&o, "read the generated Applications-menu cache");
@@ -1744,9 +1755,9 @@ fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
     }
     assert!(
         !menu.trim().is_empty(),
-        "[{phase}] the Applications menu is EMPTY: nothing under \
-         /tmp/.cache/menus, so menu-cache-gen never ran. The panel and \
-         menu-cached can both look healthy in this state.\n{}",
+        "[{phase}] the Applications menu is EMPTY: nothing under the \
+         desktop HOME's .cache/menus, so menu-cache-gen never ran. The \
+         panel and menu-cached can both look healthy in this state.\n{}",
         vnc_diag(data, name)
     );
     // The desktop's launch path: GLib execs every GAppInfo command
@@ -2139,17 +2150,32 @@ fn vnc_desktop_e2e() {
     // quiesces sandboxes) and every plain `izba stop`/`izba start` hits it.
     //
     // Same class as the lock lesson above applies to the menu-cache oracle
-    // below: `/tmp/.cache/menus` from boot 1 would ALSO survive this
-    // stop/start in the persistent overlay, so the "after restart"
-    // `assert_desktop_procs` menu check could pass on a leftover artifact
-    // without menu-cache-gen ever running again. Clear it now, before the
-    // restart, so phase 2 has to prove REGENERATION. `izba-session` does not
-    // recreate this directory itself — menu-cache-gen does — so removing it
-    // here is safe.
+    // below: the cache from boot 1 would ALSO survive this stop/start when
+    // the desktop's home persists (a real image home always does; even the
+    // /tmp fallback lives in the persistent overlay), so the "after
+    // restart" `assert_desktop_procs` menu check could pass on a leftover
+    // artifact without menu-cache-gen ever running again. Clear it now,
+    // before the restart, so phase 2 has to prove REGENERATION. The cache
+    // lives under the LIVE desktop's runtime-resolved HOME — read it from
+    // lxpanel's environ (comm-matched), same as `menu_cache_entries`.
+    // `izba-session` does not recreate this directory itself —
+    // menu-cache-gen does — so removing it here is safe.
     let o = izba(
         &data,
         no_env,
-        &["exec", name, "--", "rm", "-rf", "/tmp/.cache/menus"],
+        &[
+            "exec",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "for p in /proc/[0-9]*; do \
+               [ \"$(cat \"$p/comm\" 2>/dev/null)\" = \"lxpanel\" ] || continue; \
+               H=$(tr '\\0' '\\n' < \"$p/environ\" | sed -n 's/^HOME=//p'); \
+               [ -n \"$H\" ] && rm -rf \"$H/.cache/menus\"; \
+               break; \
+             done",
+        ],
     );
     assert_ok(&o, "clear stale menu cache before restart");
     let o = izba(&data, no_env, &["stop", name]);

@@ -83,6 +83,21 @@ split so that root only ever *removes* and the image user *creates*:
 The cleanup stays `--user 0:0` deliberately: it is what deletes root-owned
 legacy files, and container-0 is a mapped unprivileged guest uid.
 
+**Amendment (2026-08-15) — runtime HOME/PATH.** With the desktop running
+as the image user, the root-desktop-era `HOME=/tmp` and static `PATH`
+overrides became wrong: they hid the user's real dotfiles and
+`~/.local/bin` (user-reported: `claude` unreachable, `$HOME` = `/tmp`) and
+clobbered the image's `PATH`. Both are now resolved at runtime in a shell
+preamble shared by the two desktop spawns (`desktop_env_preamble`): `PATH`
+prepends the bundle `bin` to the image's own PATH (system-dirs fallback),
+and `HOME` is the image user's passwd home when present and writable,
+`/tmp` otherwise. `izba-session` seeds profiles and creates
+`$HOME/Desktop` under the resolved home (its absence made
+`pcmanfm --desktop` throw an error dialog every start), and
+`/tmp/Desktop` joined the wipe list. The e2e menu-cache oracle reads the
+LIVE desktop's `HOME` from lxpanel's environ rather than re-deriving the
+resolver.
+
 `hack/vnc-config/izba-session` itself is unchanged — its `rm -rf`/`cp -r`
 profile refresh now operates on ground the cleanup guaranteed writable, and
 the files it creates are owned by the image user.
