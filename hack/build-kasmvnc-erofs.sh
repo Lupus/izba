@@ -182,6 +182,7 @@ cp -r /vnc-config/lxpanel/izba "$B/etc/lxpanel/izba"
 cp -r /vnc-config/pcmanfm/izba "$B/etc/pcmanfm/izba"
 cp /vnc-config/libfm/libfm.conf "$B/etc/libfm/libfm.conf"
 cp /vnc-config/applications/xterm.desktop "$B/share/applications/xterm.desktop"
+cp /vnc-config/applications/pcmanfm.desktop "$B/share/applications/pcmanfm.desktop"
 install -m 0755 /vnc-config/izba-session "$B/bin/izba-session"
 
 # minimal fontconfig setup pointing exclusively into the bundle
@@ -237,6 +238,7 @@ for req in bin/pcmanfm bin/lxpanel bin/menu-cached bin/menu-cache-gen bin/izba-s
            lib/gdk-pixbuf/loaders.cache etc/openbox/menu.xml \
            etc/lxpanel/izba/panels/panel etc/pcmanfm/izba/desktop-items-0.conf \
            etc/libfm/libfm.conf share/applications/xterm.desktop \
+           share/applications/pcmanfm.desktop \
            share/icons/Adwaita/index.theme share/mime/mime.cache \
            share/lxpanel/images/my-computer.png share/libfm/terminals.list \
            share/libfm/ui/ask-rename.ui share/pcmanfm/ui/desktop-pref.ui \

@@ -4,6 +4,9 @@
     <item label="Terminal">
       <action name="Execute"><command>xterm</command></action>
     </item>
+    <item label="File Manager">
+      <action name="Execute"><command>pcmanfm /workspace</command></action>
+    </item>
     <!-- built-in window list: switching even if the panel is dead -->
     <menu id="client-list-combined-menu" />
     <separator />

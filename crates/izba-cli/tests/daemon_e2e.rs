@@ -1779,6 +1779,7 @@ fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
             "sh",
             "-c",
             "test -x /opt/izba-vnc/libexec/gio-launch-desktop && echo helper-ok; \
+             test -f /opt/izba-vnc/share/applications/pcmanfm.desktop && echo fm-entry-ok; \
              for p in /proc/[0-9]*; do \
                [ \"$(cat \"$p/comm\" 2>/dev/null)\" = \"lxpanel\" ] || continue; \
                tr '\\0' '\\n' < \"$p/environ\" | grep '^GIO_LAUNCH_DESKTOP='; \
@@ -1792,6 +1793,14 @@ fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
         out.contains("helper-ok"),
         "[{phase}] the bundle must ship an executable \
          libexec/gio-launch-desktop: {out}\n{}",
+        vnc_diag(data, name)
+    );
+    assert!(
+        out.contains("fm-entry-ok"),
+        "[{phase}] the bundle must ship share/applications/pcmanfm.desktop — \
+         without it the file manager is installed but absent from the \
+         Applications menu (only reachable by typing `pcmanfm` into the Run \
+         dialog): {out}\n{}",
         vnc_diag(data, name)
     );
     assert!(

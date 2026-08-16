@@ -301,7 +301,8 @@ izba export  [NAME_OR_DIR] [--name NAME]  # write managed truth → izba.yml
 `izba create --vnc` (or `izba vnc on <name>` on an existing sandbox, restart
 required if it's running) boots with a KasmVNC remote desktop — a lightweight
 LXDE-style session (openbox window manager, lxpanel taskbar with an
-Applications menu and clock, pcmanfm desktop, xterm) — reachable via
+Applications menu and clock, the PCManFM file manager — launchable from the
+menu, opening `/workspace` — and xterm) — reachable via
 `izba vnc url <name>` (prints a credentialed
 `http://izba:<pw>@127.0.0.1:<port>/`; the only surface that shows the
 password) or `izba vnc open <name>` (opens it in your default browser).
@@ -312,8 +313,10 @@ create from it land `USER`-owned in `/workspace`; the workload image needs
 X runs with access control off (`-ac`) inside the sandbox, so anything in the
 guest can drive the display — the same trust domain as the rest of the
 container; the desktop defaults to display `:1` at 1280x800 and the web
-client can resize it live; the clipboard is bidirectional by default; and VNC
-is not yet supported together with `--docker` (refused at create/start).
+client can resize it live; and the clipboard is bidirectional by default.
+VNC works together with `--docker` too: the desktop lives inside the
+container's own network namespace, reached through the same credentialed
+relay.
 
 ### Referring to sandboxes
 

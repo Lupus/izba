@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=File Manager (PCManFM)
+Comment=Browse the sandbox filesystem
+Exec=pcmanfm /workspace
+Icon=system-file-manager
+Categories=System;FileTools;FileManager;Utility;
