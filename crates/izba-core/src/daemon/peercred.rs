@@ -57,6 +57,7 @@ pub fn peer_uid(stream: &UdsStream) -> std::io::Result<Option<u32>> {
 /// Non-Linux unix: no supported peer-credential path (izba hosts are Linux
 /// and Windows). Reported as unavailable rather than guessed.
 #[cfg(all(unix, not(target_os = "linux")))]
+#[mutants::skip] // reason: compiled on no CI platform (CI is Linux + Windows only), so no test on either shard can ever exercise or kill a mutant here. Kept as its own cfg arm (not merged with the Windows stub below) because the two carry different rationale and merging would silently widen the cfg to future targets.
 pub fn peer_uid(_stream: &UdsStream) -> std::io::Result<Option<u32>> {
     Ok(None)
 }
@@ -64,6 +65,7 @@ pub fn peer_uid(_stream: &UdsStream) -> std::io::Result<Option<u32>> {
 /// Windows AF_UNIX has no peer-credential API. The control socket's gate
 /// there is the containing directory's ACL.
 #[cfg(windows)]
+#[mutants::skip] // reason: compiles on Windows CI, but killing a mutant here needs a live UdsStream to call it with, and uds_windows::UnixStream has no pair() — constructing one requires binding a listener, which this project's unit tests forbid. owner_uid()/enforcement_mode() Windows behaviour is covered directly below instead.
 pub fn peer_uid(_stream: &UdsStream) -> std::io::Result<Option<u32>> {
     Ok(None)
 }
@@ -89,7 +91,15 @@ pub fn owner_uid() -> Option<u32> {
 /// "enforced" while every connection actually resolved to `Unavailable`.
 /// Both call sites must go through this function so they cannot disagree.
 pub fn enforcement_mode() -> PeerAuth {
-    if cfg!(target_os = "linux") && owner_uid().is_some() {
+    enforcement_mode_for(cfg!(target_os = "linux"), owner_uid())
+}
+
+/// Pure core of [`enforcement_mode`], with the platform predicate injected so
+/// every (platform, owner) combination is testable — including the non-Linux
+/// unix case, which no CI platform can exercise natively and which is exactly
+/// where a `&&`/`||` slip would falsely claim enforcement.
+fn enforcement_mode_for(is_linux: bool, owner: Option<u32>) -> PeerAuth {
+    if is_linux && owner.is_some() {
         PeerAuth::Enforced
     } else {
         PeerAuth::Unavailable
@@ -279,5 +289,59 @@ mod tests {
                 "enforcement_mode() claims Unavailable but authorize_stream() disagreed: {verdict:?}"
             ),
         }
+    }
+
+    // enforcement_mode_for covers all four (is_linux, owner) combinations
+    // directly, including the non-Linux-unix case that no CI platform can
+    // produce natively (CI is Linux + Windows only) — that is exactly the
+    // combination a `&&`/`||` slip in the real predicate would get wrong.
+
+    #[test]
+    fn enforcement_mode_for_linux_with_owner_is_enforced() {
+        assert_eq!(enforcement_mode_for(true, Some(1000)), PeerAuth::Enforced);
+    }
+
+    /// The mutant-killing case: simulates a non-Linux unix (no `SO_PEERCRED`
+    /// path, `is_linux = false`) that nonetheless has a uid concept
+    /// (`owner = Some`, e.g. macOS/BSD's `geteuid()`). Such a platform must
+    /// NEVER report `Enforced` merely because it has a uid — enforcement
+    /// requires BOTH the Linux syscall path and a uid. `&&` gives
+    /// `Unavailable` here; the mutant's `||` would flip this to `Enforced`,
+    /// falsely claiming a peer-credential guarantee the platform cannot back.
+    #[test]
+    fn enforcement_mode_for_non_linux_unix_with_owner_is_unavailable_not_enforced() {
+        assert_eq!(
+            enforcement_mode_for(false, Some(1000)),
+            PeerAuth::Unavailable
+        );
+    }
+
+    #[test]
+    fn enforcement_mode_for_linux_without_owner_is_unavailable() {
+        assert_eq!(enforcement_mode_for(true, None), PeerAuth::Unavailable);
+    }
+
+    #[test]
+    fn enforcement_mode_for_non_linux_without_owner_is_unavailable() {
+        assert_eq!(enforcement_mode_for(false, None), PeerAuth::Unavailable);
+    }
+
+    /// Windows has no uid concept at all: `owner_uid()` must report `None`,
+    /// which is the fact the whole "Windows residual" (directory-ACL-only
+    /// gating) rests on.
+    #[cfg(windows)]
+    #[test]
+    fn owner_uid_is_none_on_windows() {
+        assert_eq!(owner_uid(), None);
+    }
+
+    /// End-to-end on the real Windows platform predicate: with no uid
+    /// concept, `enforcement_mode()` must resolve to `Unavailable`, never
+    /// `Enforced` — pinning the same contract `owner_uid_is_none_on_windows`
+    /// checks, but through the actual public entry point.
+    #[cfg(windows)]
+    #[test]
+    fn enforcement_mode_is_unavailable_on_windows() {
+        assert_eq!(enforcement_mode(), PeerAuth::Unavailable);
     }
 }
