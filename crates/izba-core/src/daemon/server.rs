@@ -244,6 +244,78 @@ fn peer_denial_log(verdict: peercred::PeerVerdict) -> Option<String> {
     }
 }
 
+/// The startup report line for control-socket peer authentication mode, or
+/// `None` when there is nothing to report. Derived from `enforcement_mode()`,
+/// the SAME predicate the accept loop's `authorize_stream` call uses, so this
+/// line can never claim "enforced" on a platform where the accept loop
+/// actually can't (F-09). Pure like `peer_denial_log`, so the startup report
+/// is testable without binding a listener.
+fn peer_auth_mode_line() -> Option<String> {
+    match peercred::enforcement_mode() {
+        peercred::PeerAuth::Enforced => {
+            // `owner_uid()` is `Some` whenever `enforcement_mode()` is
+            // `Enforced` (see its doc comment).
+            peercred::owner_uid().map(|uid| {
+                format!("izbad: control socket peer authentication enforced (uid {uid})")
+            })
+        }
+        peercred::PeerAuth::Unavailable => Some(
+            "izbad: control socket peer authentication UNAVAILABLE on this platform \
+             — the socket is gated by directory permissions only"
+                .to_string(),
+        ),
+    }
+}
+
+/// Report the control-socket authentication mode once, at startup. An
+/// unavailable peer-credential API is a platform fact, not a silent
+/// downgrade — so it is stated rather than assumed (F-09).
+fn report_peer_auth_mode() {
+    if let Some(line) = peer_auth_mode_line() {
+        eprintln!("{line}");
+    }
+}
+
+/// One accept-loop iteration: accept a connection, authenticate its peer,
+/// and hand it to a fresh handler thread — or log/sleep on a transient
+/// accept error. Split out of `run_daemon_with` purely for readability;
+/// every `continue` in the original loop body becomes a `return` here, which
+/// has the same effect (the caller's loop immediately re-evaluates
+/// `should_exit` and calls this again).
+///
+/// ORDERING IS LOAD-BEARING (F-09): the peer check runs AFTER
+/// `set_nonblocking` succeeds and BEFORE `ConnGuard::new` is constructed.
+/// Rejecting after the guard exists would corrupt the daemon's idle-exit
+/// connection accounting; rejecting before the nonblocking guard would let
+/// an unauthorized connection cost a blocking `accept`-thread turn. An
+/// unauthorized connection must cost no thread and read no frame — dropping
+/// `stream` closes it and the client sees EOF.
+fn accept_and_dispatch(listener: &transport::UdsListener, d: &Arc<Daemon>) {
+    match listener.accept() {
+        Ok((stream, _peer)) => {
+            if stream.set_nonblocking(false).is_err() {
+                return;
+            }
+            if let Some(line) = peer_denial_log(peercred::authorize_stream(&stream)) {
+                eprintln!("{line}");
+                return;
+            }
+            // Count the connection NOW (see ConnGuard) so the next
+            // should_exit() already observes it.
+            let guard = ConnGuard::new(Arc::clone(d));
+            let d = Arc::clone(d);
+            std::thread::spawn(move || handle_connection(&d, stream, guard));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err(e) => {
+            eprintln!("izbad: accept error: {e}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 /// Serve one client connection: hello, then request/response frames until
 /// EOF — or until an `OpenStream` converts the connection into a raw splice.
 /// `_guard` is the accept-time connection count; dropped when we return.
@@ -1783,57 +1855,14 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
         });
     }
 
-    // Report the control-socket authentication mode once, at startup. An
-    // unavailable peer-credential API is a platform fact, not a silent
-    // downgrade — so it is stated rather than assumed (F-09). Derived from
-    // `enforcement_mode()`, the SAME predicate the accept loop's
-    // `authorize_stream` call below uses, so this report can never claim
-    // "enforced" on a platform where the accept loop actually can't.
-    match peercred::enforcement_mode() {
-        peercred::PeerAuth::Enforced => {
-            // `owner_uid()` is `Some` whenever `enforcement_mode()` is
-            // `Enforced` (see its doc comment).
-            if let Some(uid) = peercred::owner_uid() {
-                eprintln!("izbad: control socket peer authentication enforced (uid {uid})");
-            }
-        }
-        peercred::PeerAuth::Unavailable => eprintln!(
-            "izbad: control socket peer authentication UNAVAILABLE on this platform \
-             — the socket is gated by directory permissions only"
-        ),
-    }
+    report_peer_auth_mode();
 
     let idle_limit = idle_limit_from(&|k| std::env::var(k).ok());
     loop {
         if should_exit(&d, idle_limit) {
             break;
         }
-        match listener.accept() {
-            Ok((stream, _peer)) => {
-                if stream.set_nonblocking(false).is_err() {
-                    continue;
-                }
-                // F-09: authenticate the peer BEFORE spawning a handler, so an
-                // unauthorized connection costs no thread and reads no frame.
-                // Dropping `stream` closes it; the client sees EOF.
-                if let Some(line) = peer_denial_log(peercred::authorize_stream(&stream)) {
-                    eprintln!("{line}");
-                    continue;
-                }
-                // Count the connection NOW (see ConnGuard) so the next
-                // should_exit() already observes it.
-                let guard = ConnGuard::new(Arc::clone(&d));
-                let d = Arc::clone(&d);
-                std::thread::spawn(move || handle_connection(&d, stream, guard));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => {
-                eprintln!("izbad: accept error: {e}");
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
+        accept_and_dispatch(&listener, &d);
     }
     d.request_shutdown(); // stops the supervisor thread for library embedders
     let _ = std::fs::remove_file(paths.daemon_socket());
@@ -5915,5 +5944,29 @@ mod tests {
             super::peercred::PeerAuth::Unavailable
         ))
         .is_none());
+    }
+
+    /// The startup report line must always agree with what this platform's
+    /// `enforcement_mode()` actually reports — same guarantee as
+    /// `peercred::enforcement_mode_agrees_with_authorize_stream_on_our_own_pair`,
+    /// but for the human-facing startup line rather than the accept-time
+    /// verdict. Run on whatever CI shard this lands on (Linux or Windows),
+    /// so both real `enforcement_mode()` outcomes get covered somewhere.
+    #[test]
+    fn peer_auth_mode_line_matches_this_platforms_enforcement_mode() {
+        let line = super::peer_auth_mode_line();
+        match super::peercred::enforcement_mode() {
+            super::peercred::PeerAuth::Enforced => {
+                let line = line.expect("Enforced must produce a startup line");
+                assert!(line.contains("enforced"), "got: {line}");
+                let uid = super::peercred::owner_uid()
+                    .expect("enforcement_mode() == Enforced implies owner_uid().is_some()");
+                assert!(line.contains(&format!("uid {uid}")), "got: {line}");
+            }
+            super::peercred::PeerAuth::Unavailable => {
+                let line = line.expect("Unavailable must still produce a startup line");
+                assert!(line.contains("UNAVAILABLE"), "got: {line}");
+            }
+        }
     }
 }
