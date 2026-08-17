@@ -201,12 +201,23 @@ is removed first, so a credential the guest obtained by some other route cannot
 ride along. OpenShell does exactly this on its inference path, explicitly to prevent
 an agent smuggling its own key to a provider.
 
-**Substitute only in declared locations.** Docker matches the placeholder *anywhere
-in the request*, which is convenient and is a **credential-smuggling primitive**: an
-agent can get the real secret injected into an arbitrary field of an otherwise-legal
-request — e.g. into a gist body POSTed to `api.github.com`. OpenShell and iron both
-restrict substitution to a declared header name / query param. **izba should follow
-OpenShell here.**
+**Constrain *where* substitution may happen.** Docker matches the placeholder
+*anywhere in the request*, which is convenient and is a **credential-smuggling
+primitive**: an agent can get the real secret injected into an arbitrary field of an
+otherwise-legal request — e.g. into a gist body POSTed to `api.github.com`.
+
+*Corrected 2026-08-17 after reading the schema:* OpenShell is **not** as strict as
+this doc first claimed. For static credentials its `auth_style` metadata is
+"stored and validated" but is **not** the injection mechanism — the proxy resolves a
+placeholder wherever it appears among a supported location set (header value,
+`Bearer ` prefix, Basic `base64(user:ph)`, query parameter, path segment). What it
+*does* do is put the genuinely dangerous locations behind per-endpoint opt-ins
+(`request_body_credential_rewrite` and `websocket_credential_rewrite`, both default
+`false`) and refuse cookies, response bodies and WebSocket binary frames outright.
+So the real control in both systems is the **binding** (host + port + path), not the
+location. izba's opportunity is to be stricter for free: honor `auth_style` as the
+authoritative location when it is declared, keep the same opt-ins for body and
+WebSocket, and record the resolved location in the audit record.
 
 ### 2.B OAuth logins — three interception points
 
@@ -547,15 +558,22 @@ is a real credential sitting in the guest.
 Three existing findings stop being merely open and become **blocking** once real
 credentials are brokered:
 
-- **F-09 — izbad's control socket has no `SO_PEERCRED` check.** Any local process
-  can drive izbad. With a vault that is local privilege escalation into *use of the
-  user's credentials*: an unprivileged local process could create a sandbox and ask
-  for a credential-bearing flow. **This must close first.**
-- **F-05 — DNS is an unenforced QNAME exfiltration channel** (escalated P1, issue
-  #148). Note the asymmetry: the vault design is **robust to F-05 for credentials
-  specifically**, because the credential is never in the guest to exfiltrate. That
-  is a genuine argument *for* the vault — it is the one control that survives an
-  open side channel. It does nothing for other data.
+- **F-09 — izbad's control socket has no `SO_PEERCRED` check**, paired with **F-10**
+  (`OpenStream` splices a client-chosen, daemon-unparsed `StreamOpen`). Verified
+  still open: nothing in `crates/izba-core/src/daemon/` reads peer credentials. The
+  sole gate is the 0700 daemon dir, so any local process can `Create`/`Start` a
+  sandbox and `GuestRpc`-exec inside it. With a vault attached that is a local
+  privilege escalation into **spending the user's credentials** — an unprivileged
+  process could stand up a sandbox bound to a provider and drive credential-bearing
+  requests through izbad. **This must close first.**
+- **F-05 — the DNS QNAME exfiltration channel is CLOSED** (issue #148 closed; the
+  `resolvable` rule at `egress.rego:104-127` now denies any QNAME absent from every
+  rule, for enforcing sandboxes). The findings register's 2026-07-21 status line is
+  stale on this point. Worth recording the asymmetry anyway, because it generalises:
+  the vault design is **robust to side channels for credentials specifically**,
+  since the credential is never in the guest to exfiltrate. That is a genuine
+  argument *for* the vault — it is the one control that survives an exfil channel
+  reopening. It does nothing for other data.
 - **F-30 / Option C — vault material must never enter any virtiofs export.** In-guest
   read-only is null under A1 (virtiofsd serves raw FUSE writes as the host user;
   guest `MS_RDONLY` is advisory). The `secretRef` design satisfies this by
