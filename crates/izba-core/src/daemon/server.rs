@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use izba_proto::{read_frame, write_frame, Response};
 
 use crate::daemon::egress::EgressManager;
+use crate::daemon::peercred;
 use crate::daemon::proto::{
     DaemonHello, DaemonRequest, DaemonResponse, DaemonStatus, HostDisk, HostResources,
     SandboxDetail, SandboxStats, VolumeDisk,
@@ -224,6 +225,22 @@ impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.0.active_conns.fetch_sub(1, Ordering::SeqCst);
         *self.0.idle_since.lock().unwrap() = Instant::now();
+    }
+}
+
+/// The daemon-log line for a rejected control connection, or `None` when the
+/// peer was allowed. Pure so the accept loop's decision is testable without
+/// binding a listener.
+fn peer_denial_log(verdict: peercred::PeerVerdict) -> Option<String> {
+    match verdict {
+        peercred::PeerVerdict::Allow(_) => None,
+        peercred::PeerVerdict::Deny {
+            peer_uid,
+            owner_uid,
+        } => Some(format!(
+            "izbad: control connection from uid {peer_uid} rejected \
+             (daemon runs as uid {owner_uid}); izba must run as the daemon's owner"
+        )),
     }
 }
 
@@ -1766,6 +1783,17 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
         });
     }
 
+    // Report the control-socket authentication mode once, at startup. An
+    // unavailable peer-credential API is a platform fact, not a silent
+    // downgrade — so it is stated rather than assumed (F-09).
+    match crate::daemon::peercred::owner_uid() {
+        Some(uid) => eprintln!("izbad: control socket peer authentication enforced (uid {uid})"),
+        None => eprintln!(
+            "izbad: control socket peer authentication UNAVAILABLE on this platform \
+             — the socket is gated by directory permissions only"
+        ),
+    }
+
     let idle_limit = idle_limit_from(&|k| std::env::var(k).ok());
     loop {
         if should_exit(&d, idle_limit) {
@@ -1774,6 +1802,13 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
         match listener.accept() {
             Ok((stream, _peer)) => {
                 if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
+                // F-09: authenticate the peer BEFORE spawning a handler, so an
+                // unauthorized connection costs no thread and reads no frame.
+                // Dropping `stream` closes it; the client sees EOF.
+                if let Some(line) = peer_denial_log(peercred::authorize_stream(&stream)) {
+                    eprintln!("{line}");
                     continue;
                 }
                 // Count the connection NOW (see ConnGuard) so the next
@@ -5841,5 +5876,32 @@ mod tests {
         assert!(cache.observe("web", &id_a, 1100, ms(1000)).is_some());
         // Same pid, NEW process: must reset, never splice tick counters.
         assert_eq!(cache.observe("web", &id_b, 50, ms(2000)), None);
+    }
+
+    #[test]
+    fn peer_denial_renders_an_actionable_log_line() {
+        let line = super::peer_denial_log(super::peercred::PeerVerdict::Deny {
+            peer_uid: 0,
+            owner_uid: 1000,
+        });
+        let line = line.expect("a Deny verdict must produce a log line");
+        assert!(line.contains("uid 0"), "got: {line}");
+        assert!(line.contains("uid 1000"), "got: {line}");
+        assert!(
+            line.contains("rejected"),
+            "the line must say the connection was rejected; got: {line}"
+        );
+    }
+
+    #[test]
+    fn allowed_peer_produces_no_log_line() {
+        assert!(super::peer_denial_log(super::peercred::PeerVerdict::Allow(
+            super::peercred::PeerAuth::Enforced
+        ))
+        .is_none());
+        assert!(super::peer_denial_log(super::peercred::PeerVerdict::Allow(
+            super::peercred::PeerAuth::Unavailable
+        ))
+        .is_none());
     }
 }
