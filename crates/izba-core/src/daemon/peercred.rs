@@ -26,7 +26,14 @@ pub enum PeerAuth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerVerdict {
     Allow(PeerAuth),
-    Deny { peer_uid: u32, owner_uid: u32 },
+    Deny {
+        /// The connecting peer's uid, or `u32::MAX` as a sentinel meaning
+        /// "the peer-credential syscall itself failed" — it can never equal
+        /// a real uid, so a log/audit consumer must not print it as one; see
+        /// [`verdict_for_peer_result`].
+        peer_uid: u32,
+        owner_uid: u32,
+    },
 }
 
 use crate::vmm::UdsStream;
@@ -73,6 +80,22 @@ pub fn owner_uid() -> Option<u32> {
     None
 }
 
+/// The enforcement this platform can actually achieve — the SINGLE source of
+/// truth for both the startup report (`server.rs`) and the accept-time
+/// verdict ([`authorize_stream`]). Before this existed, the two derived
+/// availability from different predicates (`owner_uid().is_some()` vs the
+/// real `#[cfg(target_os = "linux")]` gate on [`peer_uid`]), so a non-Linux
+/// unix host — an arm this module deliberately defines — would print
+/// "enforced" while every connection actually resolved to `Unavailable`.
+/// Both call sites must go through this function so they cannot disagree.
+pub fn enforcement_mode() -> PeerAuth {
+    if cfg!(target_os = "linux") && owner_uid().is_some() {
+        PeerAuth::Enforced
+    } else {
+        PeerAuth::Unavailable
+    }
+}
+
 /// Map a [`peer_uid`] outcome to a verdict. Pure and platform-independent,
 /// so the syscall-failure path is directly unit-testable without depending
 /// on any real kernel error behaviour.
@@ -93,13 +116,17 @@ fn verdict_for_peer_result(peer: std::io::Result<Option<u32>>, owner: u32) -> Pe
 
 /// Accept-time gate for one control connection.
 ///
-/// `owner_uid() == None` (Windows) short-circuits to
-/// [`PeerAuth::Unavailable`] without consulting the socket; otherwise the
-/// syscall result is handed to [`verdict_for_peer_result`].
+/// Gated on [`enforcement_mode`] — the same predicate the startup report
+/// uses — so an "Unavailable" platform short-circuits to
+/// [`PeerAuth::Unavailable`] without consulting the socket, and an "Enforced"
+/// platform always has `owner_uid()` available (the `expect` below can never
+/// fire: `enforcement_mode()` only returns `Enforced` when `owner_uid()` is
+/// `Some`).
 pub fn authorize_stream(stream: &UdsStream) -> PeerVerdict {
-    let Some(owner) = owner_uid() else {
+    if enforcement_mode() == PeerAuth::Unavailable {
         return PeerVerdict::Allow(PeerAuth::Unavailable);
-    };
+    }
+    let owner = owner_uid().expect("enforcement_mode() == Enforced implies owner_uid().is_some()");
     verdict_for_peer_result(peer_uid(stream), owner)
 }
 
@@ -228,5 +255,29 @@ mod tests {
                 owner_uid: 1000,
             }
         );
+    }
+
+    /// IMPORTANT 1's guard: `enforcement_mode()` — what the startup report
+    /// prints — must agree with what `authorize_stream` can ACTUALLY produce
+    /// on this platform, for a peer that is legitimately us (a `UdsStream`
+    /// pair, never a bound listener). If a future edit reintroduces two
+    /// separate availability predicates, this fails on whichever platform
+    /// they disagree on.
+    #[test]
+    fn enforcement_mode_agrees_with_authorize_stream_on_our_own_pair() {
+        let (a, _b) = UdsStream::pair().expect("UdsStream::pair() must succeed");
+        let verdict = authorize_stream(&a);
+        match enforcement_mode() {
+            PeerAuth::Enforced => assert_eq!(
+                verdict,
+                PeerVerdict::Allow(PeerAuth::Enforced),
+                "enforcement_mode() claims Enforced but authorize_stream() disagreed: {verdict:?}"
+            ),
+            PeerAuth::Unavailable => assert_eq!(
+                verdict,
+                PeerVerdict::Allow(PeerAuth::Unavailable),
+                "enforcement_mode() claims Unavailable but authorize_stream() disagreed: {verdict:?}"
+            ),
+        }
     }
 }

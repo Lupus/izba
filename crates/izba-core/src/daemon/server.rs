@@ -1785,10 +1785,19 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
 
     // Report the control-socket authentication mode once, at startup. An
     // unavailable peer-credential API is a platform fact, not a silent
-    // downgrade — so it is stated rather than assumed (F-09).
-    match crate::daemon::peercred::owner_uid() {
-        Some(uid) => eprintln!("izbad: control socket peer authentication enforced (uid {uid})"),
-        None => eprintln!(
+    // downgrade — so it is stated rather than assumed (F-09). Derived from
+    // `enforcement_mode()`, the SAME predicate the accept loop's
+    // `authorize_stream` call below uses, so this report can never claim
+    // "enforced" on a platform where the accept loop actually can't.
+    match peercred::enforcement_mode() {
+        peercred::PeerAuth::Enforced => {
+            // `owner_uid()` is `Some` whenever `enforcement_mode()` is
+            // `Enforced` (see its doc comment).
+            if let Some(uid) = peercred::owner_uid() {
+                eprintln!("izbad: control socket peer authentication enforced (uid {uid})");
+            }
+        }
+        peercred::PeerAuth::Unavailable => eprintln!(
             "izbad: control socket peer authentication UNAVAILABLE on this platform \
              — the socket is gated by directory permissions only"
         ),
@@ -5885,8 +5894,11 @@ mod tests {
             owner_uid: 1000,
         });
         let line = line.expect("a Deny verdict must produce a log line");
-        assert!(line.contains("uid 0"), "got: {line}");
-        assert!(line.contains("uid 1000"), "got: {line}");
+        // Pin the SEMANTIC SLOTS, not just presence of both uids — a
+        // transposed `format!(peer_uid, owner_uid)` swap would still pass a
+        // bare `contains("uid 0")`/`contains("uid 1000")` pair.
+        assert!(line.contains("from uid 0"), "got: {line}");
+        assert!(line.contains("runs as uid 1000"), "got: {line}");
         assert!(
             line.contains("rejected"),
             "the line must say the connection was rejected; got: {line}"
