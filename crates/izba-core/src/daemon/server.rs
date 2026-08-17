@@ -267,15 +267,6 @@ fn peer_auth_mode_line() -> Option<String> {
     }
 }
 
-/// Report the control-socket authentication mode once, at startup. An
-/// unavailable peer-credential API is a platform fact, not a silent
-/// downgrade — so it is stated rather than assumed (F-09).
-fn report_peer_auth_mode() {
-    if let Some(line) = peer_auth_mode_line() {
-        eprintln!("{line}");
-    }
-}
-
 /// One accept-loop iteration: accept a connection, authenticate its peer,
 /// and hand it to a fresh handler thread — or log/sleep on a transient
 /// accept error. Split out of `run_daemon_with` purely for readability;
@@ -306,14 +297,20 @@ fn accept_and_dispatch(listener: &transport::UdsListener, d: &Arc<Daemon>) {
             let d = Arc::clone(d);
             std::thread::spawn(move || handle_connection(&d, stream, guard));
         }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            std::thread::sleep(Duration::from_millis(100));
-        }
         Err(e) => {
-            eprintln!("izbad: accept error: {e}");
+            if let Some(line) = accept_error_message(&e) {
+                eprintln!("{line}");
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// The diagnostic for an `accept()` error, or `None` when the error is the
+/// benign non-blocking retry. Pure so the classification is testable without
+/// binding a listener.
+fn accept_error_message(e: &std::io::Error) -> Option<String> {
+    (e.kind() != std::io::ErrorKind::WouldBlock).then(|| format!("izbad: accept error: {e}"))
 }
 
 /// Serve one client connection: hello, then request/response frames until
@@ -1855,7 +1852,9 @@ pub fn run_daemon_with(paths: &Paths, deps: DaemonDeps) -> anyhow::Result<()> {
         });
     }
 
-    report_peer_auth_mode();
+    if let Some(line) = peer_auth_mode_line() {
+        eprintln!("{line}");
+    }
 
     let idle_limit = idle_limit_from(&|k| std::env::var(k).ok());
     loop {
@@ -5968,5 +5967,18 @@ mod tests {
                 assert!(line.contains("UNAVAILABLE"), "got: {line}");
             }
         }
+    }
+
+    #[test]
+    fn would_block_accept_error_produces_no_log_line() {
+        let e = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert!(super::accept_error_message(&e).is_none());
+    }
+
+    #[test]
+    fn other_accept_errors_produce_a_diagnostic() {
+        let e = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        let line = super::accept_error_message(&e).expect("a non-WouldBlock error must log");
+        assert!(line.contains("accept error"), "got: {line}");
     }
 }
