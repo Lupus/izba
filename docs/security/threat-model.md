@@ -111,7 +111,7 @@ the elements a serious audit must cover. Ordered by escape value.
 | **B5** | T1 izbad MITM → T5 upstream | Guest-chosen SNI / Host / OrigDst IP | L7 allow-list is only as strong as SNI/Host reconciliation + per-request re-check (F-02, F-03). |
 | **B-IMG** | T5 registry → T1 host image parser (OCI tar → erofs) | Malicious layer tars | Path traversal, symlink escape, decompression bombs, special files (cf. **node-tar CVE-2026-31802**, **Boxlite CVE-2026-46703 CVSS 10**). |
 | **B-CP** | T4 guest → T0 host FS via `izba cp NAME:/src host_dst` | Guest-built tar unpacked on the host | Symlink/`..` escape writing onto the host FS. Host-side unpack lacks the guest-side's openat2 hardening (F-08). |
-| **B2** | T3 local user → T1 izbad control socket | Framed `DaemonRequest` | Full sandbox authority (create/exec/splice/publish/shutdown) with **no peer-cred check** — only 0700 dir perms (F-09). |
+| **B2** | T3 local user → T1 izbad control socket | Framed `DaemonRequest` | Full sandbox authority (create/exec/splice/publish/shutdown), gated by a **peer-uid check on Linux** (F-09 closed) — Windows AF_UNIX has no uid-equivalent peer credential, so there it remains only 0700 dir perms (F-09 residual). |
 | **B1** | T4 guest → T1 host (hybrid-vsock CONNECT replies) | `Response`/`StreamOpen` JSON frames | Where the host *starts trusting* guest-authored frames; feeds the serde/codec surface (F-10). |
 | **B6** | T5 registry → T1 image identity | Manifest/digest | No signature/provenance (cosign/notation); anonymous-only auth (F-11). |
 
@@ -132,9 +132,11 @@ the elements a serious audit must cover. Ordered by escape value.
 
 Threats that survived the first pass map to entries in the findings register.
 
-- **Spoofing** — T3 spoofing a legitimate CLI client over B2 (no peer-cred →
-  F-09). Guest spoofing an allow-listed destination via SNI≠Host over B5 (F-02)
-  or via DNS-snoop poisoning over B3 (F-05).
+- **Spoofing** — T3 spoofing a legitimate CLI client over B2: closed on Linux
+  via a peer-uid check (F-09); Windows AF_UNIX has no uid-equivalent peer
+  credential, so there any local process that can reach the socket is still
+  trusted (F-09 residual). Guest spoofing an allow-listed destination via
+  SNI≠Host over B5 (F-02) or via DNS-snoop poisoning over B3 (F-05).
 - **Tampering** — Guest tampering with the host FS via B-CP symlink escape
   (F-08) or B4 virtiofs escape (F-07). Local user tampering with `state.json`
   to repoint `workspace`/`image` (F-14, gated by the umask finding F-15).
@@ -177,8 +179,13 @@ violated invariant is a failing test, not a judgment call.
 5. **The CA private key never leaves the host and never enters a guest.**
    Today: **holds** (only `ca.pem` is shared, read-only) — a strength;
    residual same-user-process exposure (F-16).
-6. **Control-plane authority requires authenticating the caller.** Today: only
-   filesystem perms (F-09).
+6. **Control-plane authority requires authenticating the caller.** Today:
+   **holds on Linux** — the accept loop authenticates the peer's uid via
+   `SO_PEERCRED` before spawning a handler and rejects any uid but the daemon
+   owner's (F-09 closed on Linux, M5 P0). Residual: Windows AF_UNIX exposes
+   no uid-equivalent peer credential, so there the control socket remains
+   gated by directory ACLs alone, and izbad reports that mode at startup
+   rather than implying enforcement (F-09 residual).
 7. **A VMM/virtiofsd compromise is contained below host-user privilege** (A2).
    Today: **largely met** — Windows runs a restricted-token + Low-IL + job
    confinement (F-06-Windows, PR #37) and Linux a fail-closed seccomp +

@@ -74,10 +74,12 @@ What does **not** exist yet:
   vault (M4/M5). The *single-sandbox* manifest + review loop exists (above).
 - Security findings still open: **F-05** (DNS is monitor-only even for
   enforcing sandboxes — escalated 2026-07-21 to P1 backlog issue
-  [#148](https://github.com/Lupus/izba/issues/148)) and F-09 (no izbad
-  peer-cred), plus the deferred F-28 (cgroup bounding) / F-29 (per-sandbox
-  uid). The former open HIGHs — F-06 (Linux half) and F-07 — were closed by
-  MVP-C. See Track S.
+  [#148](https://github.com/Lupus/izba/issues/148)), plus the deferred F-28
+  (cgroup bounding) / F-29 (per-sandbox uid). The former open HIGHs — F-06
+  (Linux half) and F-07 — were closed by MVP-C; **F-09** (izbad peer-cred) is
+  now closed on Linux (M5 P0) — Windows AF_UNIX exposes no uid-equivalent
+  peer credential, so there the control socket remains gated by directory
+  ACLs alone. See Track S.
 
 The **OpenVMM vsock-assert crash** under stream churn (the declared hard gate
 for putting all traffic on vsock) is **fixed** as of 2026-06-12 — see M0 below.
@@ -390,9 +392,12 @@ path-comma reject). **Still open — the near-term floor:**
   token + Low IL + job + mitigations). The dedicated-identity model (MVP-D) is a
   *hardening enhancement* beyond the finding — the next confinement tier, not a
   new gap.
-- **F-09 (MED):** izbad's AF_UNIX control socket has no `SO_PEERCRED` check —
-  any local process gets full sandbox control. Cheap, high-value; good to land
-  alongside the MVP confinement work.
+- **F-09 — ✅ closed on Linux (M5 P0).** izbad's accept loop now authenticates
+  the peer's uid via `SO_PEERCRED` before spawning a handler and rejects any
+  uid but the daemon owner's. **Residual:** Windows AF_UNIX exposes no
+  uid-equivalent peer-credential API, so there the control socket remains
+  gated by directory ACLs alone; izbad reports that mode at startup rather
+  than implying enforcement.
 - **F-05 (MED → P1 backlog):** DNS has **no enforcement tier at all** — even
   an enforcing sandbox forwards every QNAME to the host resolver before any
   policy check (QNAME exfil/C2 channel). Escalated 2026-07-21 to backlog issue
@@ -444,8 +449,10 @@ hard gates:
    early. **MVP-A** (L7 git policy) is the headline — start with the rego/UX
    research and the vendor-neutral (not github-married) grammar. **MVP-C/D** are
    the security floor; build once their spikes clear. Coordinate MVP-A and MVP-B
-   on the shared app surface (both touch the desktop app). Land **F-09**
-   (izbad peer-cred) alongside the confinement work.
+   on the shared app surface (both touch the desktop app). (**F-09**, izbad
+   peer-cred, was originally planned to land alongside the confinement work
+   here; it actually landed later, at M5 P0 — closed on Linux, Windows
+   residual — see Track S.)
 3. **Cut the first release tag** once the bundle lands — the installer/artifact
    pipeline already exists.
 4. **M4 — Projects: `izba.yaml` + lifecycle + mesh (L) — the next headline build
