@@ -73,23 +73,34 @@ pub fn owner_uid() -> Option<u32> {
     None
 }
 
-/// Accept-time gate for one control connection.
+/// Map a [`peer_uid`] outcome to a verdict. Pure and platform-independent,
+/// so the syscall-failure path is directly unit-testable without depending
+/// on any real kernel error behaviour.
 ///
 /// A syscall failure on a platform that supports peer credentials is a
 /// DENIAL, not an "unavailable" — otherwise an induced failure would be a
-/// bypass. `owner_uid() == None` (Windows) short-circuits to
-/// [`PeerAuth::Unavailable`] without consulting the socket.
-pub fn authorize_stream(stream: &UdsStream) -> PeerVerdict {
-    let Some(owner) = owner_uid() else {
-        return PeerVerdict::Allow(PeerAuth::Unavailable);
-    };
-    match peer_uid(stream) {
+/// bypass. `peer_uid: u32::MAX` on that arm is deliberate: it can never
+/// equal a real uid, so it can never accidentally match `owner`.
+fn verdict_for_peer_result(peer: std::io::Result<Option<u32>>, owner: u32) -> PeerVerdict {
+    match peer {
         Ok(peer) => authorize_peer(peer, owner),
         Err(_) => PeerVerdict::Deny {
             peer_uid: u32::MAX,
             owner_uid: owner,
         },
     }
+}
+
+/// Accept-time gate for one control connection.
+///
+/// `owner_uid() == None` (Windows) short-circuits to
+/// [`PeerAuth::Unavailable`] without consulting the socket; otherwise the
+/// syscall result is handed to [`verdict_for_peer_result`].
+pub fn authorize_stream(stream: &UdsStream) -> PeerVerdict {
+    let Some(owner) = owner_uid() else {
+        return PeerVerdict::Allow(PeerAuth::Unavailable);
+    };
+    verdict_for_peer_result(peer_uid(stream), owner)
 }
 
 /// Decide whether a peer may drive the control plane.
@@ -183,5 +194,39 @@ mod tests {
     #[test]
     fn owner_uid_is_reported_on_unix() {
         assert_eq!(owner_uid(), Some(nix::unistd::geteuid().as_raw()));
+    }
+
+    #[test]
+    fn verdict_for_peer_result_allows_matching_uid_with_enforcement() {
+        assert_eq!(
+            verdict_for_peer_result(Ok(Some(1000)), 1000),
+            PeerVerdict::Allow(PeerAuth::Enforced)
+        );
+    }
+
+    #[test]
+    fn verdict_for_peer_result_reports_unavailable_when_platform_cannot_tell() {
+        assert_eq!(
+            verdict_for_peer_result(Ok(None), 1000),
+            PeerVerdict::Allow(PeerAuth::Unavailable)
+        );
+    }
+
+    /// The safety-critical arm: a syscall failure must be a DENIAL, never an
+    /// "unavailable" — an induced failure (e.g. an attacker triggering an
+    /// error on the accept path) must not become a bypass. This is the one
+    /// property the whole shim exists to guarantee, so it gets a direct,
+    /// kernel-independent test rather than resting on unverified `errno`
+    /// behaviour from a contrived socket state.
+    #[test]
+    fn verdict_for_peer_result_denies_on_syscall_failure_with_sentinel_uid() {
+        let err = std::io::Error::from(std::io::ErrorKind::NotConnected);
+        assert_eq!(
+            verdict_for_peer_result(Err(err), 1000),
+            PeerVerdict::Deny {
+                peer_uid: u32::MAX,
+                owner_uid: 1000,
+            }
+        );
     }
 }
