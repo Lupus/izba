@@ -7,6 +7,7 @@
 
 pub mod client;
 pub mod egress;
+pub mod peercred;
 pub mod proto;
 pub mod registry;
 pub mod relays;
