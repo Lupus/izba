@@ -237,7 +237,9 @@ One `DAEMON_PROTO_VERSION` bump to **7** covering the whole `Provider*`/`Credent
 
 ### 7.11 `crates/izba-core/src/daemon/{transport,server}.rs` — F-09
 
-`SO_PEERCRED` (`getpeereid` on the BSDs, `GetNamedPipeClientProcessId` equivalent on Windows) on accept; reject any peer whose uid is not the daemon owner's. Defence in depth alongside the existing 0700 directory, and a hard precondition for grant attachment (D14).
+`SO_PEERCRED` on accept, before a handler thread is spawned; reject any peer whose uid is not the daemon owner's. Defence in depth alongside the existing 0700 directory, and a hard precondition for grant attachment (D14).
+
+**Platform reality, corrected during planning:** izbad uses **AF_UNIX on both OSes** (`transport.rs:1-3` — std on Unix, `uds_windows` on Windows), not named pipes, and **Windows AF_UNIX exposes no peer-credential API**. There is therefore no Windows enforcement path; the socket is gated there by the containing directory's ACL, and `bind_socket` chmods 0700 only under `cfg(unix)` — so F-09's "the sole gate is the 0700 dir" does not even hold on Windows today. izbad reports the achieved mode at startup rather than implying enforcement, mirroring how VMM confinement records its achieved level. Non-Linux unix is likewise reported unavailable: izba's supported hosts are Linux and Windows, so a `getpeereid` path would be untested code on an unsupported target.
 
 ---
 
