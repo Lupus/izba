@@ -72,7 +72,7 @@ It should be decomposed into four sequenced plans, in the shape the USB feature 
 
 | Phase | Content | Independently valuable? |
 | --- | --- | --- |
-| **P0** | F-09 `SO_PEERCRED` (D14) | Yes — closes an open MED finding on its own |
+| **P0** | F-09 `SO_PEERCRED` (D14) | **Delivered** — closed an open MED finding on its own |
 | **P1** | The inspectability axis: `protocol` field, `Policy::inspects`, the router gate, the SNI pre-peek and passthrough hatch (D2, D3, D12) | **Yes — pays off M2 debt**; L7 rules and the pinning hatch land with no credential code at all |
 | **P2** | Provider ingestion, lint, store, binding + specificity, and family-A injection (D4–D11, D13, D16) | Yes — the bulk of the daily value |
 | **P3** | Family B: `izba login`, then in-band harvest (D15) | Yes |
