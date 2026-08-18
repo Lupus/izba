@@ -26,6 +26,7 @@ use super::mitm::{
     self, server_config_with_resolver, CertCache, L7Request, L7Verdict, MitmPolicy, MitmState,
 };
 use super::policy::{FlowDesc, Policy, Verdict};
+use super::router::DIAL_TIMEOUT;
 
 /// How long an unclaimed `DstMap` entry lives before the sweep reclaims it
 /// (a connection that registered but never reached the accept handler).
@@ -255,10 +256,14 @@ impl MitmRuntime {
     }
 }
 
-/// How much of a ClientHello we are willing to peek. A TLS record caps at
-/// 16 KiB and a post-quantum key share pushes a real hello past 2 KiB, so this
-/// is generous rather than tight.
-const SNI_PEEK_MAX: usize = 16 * 1024;
+/// How much of a ClientHello we are willing to peek. A TLSPlaintext record
+/// caps its fragment at `2^14` bytes (RFC 8446 §5.1) and carries a 5-byte
+/// header ahead of it, so a maximal single-record ClientHello is `5 + 2^14`
+/// = 16389 bytes — the exact boundary a post-quantum key share can reach.
+/// `16 * 1024` alone is 5 bytes short of that and would silently fail such a
+/// hello closed (never a bug, since short reads already fail closed — but a
+/// needless one), so the header is added explicitly rather than rounded away.
+const SNI_PEEK_MAX: usize = 5 + 16 * 1024;
 /// A ClientHello can span several TCP segments, so one `peek` may return a
 /// short buffer. Retry to this bound and then FAIL CLOSED to termination.
 const SNI_PEEK_TRIES: usize = 16;
@@ -311,15 +316,35 @@ async fn passthrough_splice(
 ) {
     let mut flow = FlowDesc::l3(&dst.sandbox, dst.ip.to_string(), dst.port);
     flow.host = Some(sni.to_string());
-    let mut upstream = match tokio::net::TcpStream::connect((dst.ip, dst.port)).await {
-        Ok(s) => s,
-        Err(_) => {
+    // Same budget as the tier-2 blocking dial (`router::DIAL_TIMEOUT`,
+    // `router.rs:309`) — a wedged pinned upstream must not hold this task (or,
+    // via `copy_bidirectional` never starting, the client's connection) for
+    // the kernel's multi-minute SYN timeout, and every window still gets an
+    // audit line so a blackholed dial is never silent.
+    let mut upstream = match tokio::time::timeout(
+        DIAL_TIMEOUT,
+        tokio::net::TcpStream::connect((dst.ip, dst.port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(_)) => {
             audit.record(AuditRecord::from_flow(
                 Verdict::Deny,
                 &flow,
                 dst.ip,
                 Tier::L3,
                 "passthrough (protocol: tcp) — upstream dial failed",
+            ));
+            return;
+        }
+        Err(_) => {
+            audit.record(AuditRecord::from_flow(
+                Verdict::Deny,
+                &flow,
+                dst.ip,
+                Tier::L3,
+                "passthrough (protocol: tcp) — upstream dial timed out",
             ));
             return;
         }
@@ -356,18 +381,7 @@ async fn accept_loop(
         let policy = Arc::clone(&policy);
         let audit = audit.clone();
         tokio::spawn(async move {
-            // Taken before `audit` moves into the `PolicyAdapter` below — the
-            // passthrough splice records its own L3 audit line and never runs
-            // through the L7 `PolicyAdapter`.
-            let audit_pt = audit.clone();
             let state = MitmState { acceptor, upstream };
-            let adapter: Arc<dyn MitmPolicy> = Arc::new(PolicyAdapter {
-                policy,
-                audit,
-                sandbox: dst.sandbox.clone(),
-                ip: dst.ip,
-                port: dst.port,
-            });
             // Classify TLS vs cleartext by PEEKING the first wire bytes
             // (`TcpStream::peek` — does not consume them), not by the destination
             // port. This is robust regardless of port: HTTPS may arrive on a
@@ -384,25 +398,45 @@ async fn accept_loop(
                 // router derived from DNS-snoop — never from the SNI alone
                 // (router::passthrough_names explains why). The list is empty
                 // for every policy that declares no `protocol: tcp`, so the
-                // common path does not even take the larger peek.
+                // common path does not even take the larger peek, nor does it
+                // clone `audit` (below, `&audit` — not a clone — is all the
+                // splice needs, since this branch returns before `audit`
+                // moves into the `PolicyAdapter`).
                 if !passthrough.is_empty() {
                     let sni = peek_client_hello(&tcp).await;
                     if let Some(host) = should_passthrough(&sni, &passthrough) {
-                        passthrough_splice(tcp, &dst, &audit_pt, host).await;
+                        passthrough_splice(tcp, &dst, &audit, host).await;
                         return;
                     }
                 }
+                let adapter: Arc<dyn MitmPolicy> = Arc::new(PolicyAdapter {
+                    policy,
+                    audit,
+                    sandbox: dst.sandbox.clone(),
+                    ip: dst.ip,
+                    port: dst.port,
+                });
                 match state.acceptor.accept(tcp).await {
                     Ok(tls) => {
                         let sni = tls.get_ref().1.server_name().map(str::to_string);
                         let _ = mitm::serve_mitm(tls, sni, &state, adapter, dst.clone()).await;
                     }
                     Err(_) => {
-                        // Audited fail-closed: a TLS-looking handshake that fails
-                        // (e.g. no SNI ⇒ no leaf) never reaches an upstream.
+                        // Fails closed without a distinct audit record: a
+                        // TLS-looking connection whose handshake fails (e.g.
+                        // no SNI ⇒ no leaf) never reaches an upstream, but
+                        // this arm does not itself write an audit line —
+                        // see the M5 plan's diagnosability follow-up.
                     }
                 }
             } else {
+                let adapter: Arc<dyn MitmPolicy> = Arc::new(PolicyAdapter {
+                    policy,
+                    audit,
+                    sandbox: dst.sandbox.clone(),
+                    ip: dst.ip,
+                    port: dst.port,
+                });
                 // DP-4: a cleartext leg has no pinning to protect, so it always
                 // terminates — izba enforcing more than the declaration asks
                 // for, which is the direction D12 sanctions.
