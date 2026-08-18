@@ -2104,6 +2104,18 @@ Append to §13 (out-of-scope follow-ups, named not built):
   landed the reporting in `izba policy show`. Adding an egress summary to
   `status` — inspected ports, passthrough hosts, enforce posture — is a small
   standalone improvement.
+- **`protocol` is stored per-entry, but the pinning hatch is per-port.** An
+  allow entry carries ONE `Option<Protocol>` covering all of its ports, so
+  `izba policy allow pinned.vendor.com:8080` on a host that declares
+  `protocol: tcp` extends the hatch to a port the operator never named. P1
+  chose to preserve the declaration across that mutation rather than drop it —
+  dropping it silently performs an unflagged `http → tcp` weakening, which is
+  worse — and pinned the behaviour in a test. Note the mitigation is narrower
+  than it first appears: `izba policy allow` mutates `policy.yaml` directly and
+  never passes the `izba diff`/`promote` weakening gate, so `izba policy show`
+  is the only surface that reveals the widened hatch. Moving the declaration to
+  a per-port representation, or refusing the mutation on a hatch-carrying host,
+  would close it properly.
 - **Reassembling a ClientHello fragmented across TLS records.** P1's extractor
   reads the first record only; a hello split across records reports
   `Incomplete` and therefore fails closed to termination, which breaks
