@@ -805,19 +805,31 @@ mod tests {
 
     #[test]
     fn tcp_connect_denied_by_policy() {
+        // M5 P1 review, task 3, fix round 2, NEW-1: port 443 is now (correctly)
+        // gated into tier-1 for ANY enforcing policy — including `DenyAll`,
+        // which does not override `inspects` and so gets the trait's baseline
+        // (fix round 2, item 1). This test's NAME claims tier-2 ("denied by
+        // policy"), so it must dial a port `DenyAll.inspects` answers `false`
+        // for, and it must pin the EXACT tier-2 message — a substring match on
+        // "denied" is satisfied by BOTH branches and had already silently let
+        // this test flip tiers twice across this plan (tier-1 -> tier-2 at
+        // task 3's first commit, back to tier-1 at task 3's fix round 1) with
+        // nobody noticing. Tier-1's own fail-closed path is already covered by
+        // `enforcing_https_fails_closed_when_mitm_unavailable` below, so no
+        // separate test is added for that branch here.
         let mut c = spawn_handler(Arc::new(DenyAll), &FakeResolver);
         write_frame(
             &mut c,
             &StreamOpen::TcpConnect {
                 addr: "1.2.3.4".into(),
-                port: 443,
+                port: 8000,
             },
         )
         .unwrap();
         match read_frame::<_, Response>(&mut c).unwrap() {
             Response::Error { kind, message } => {
                 assert_eq!(kind, ErrorKind::ConnectFailed);
-                assert!(message.contains("denied"), "{message}");
+                assert_eq!(message, "egress to 1.2.3.4:8000 denied by policy");
             }
             other => panic!("expected deny error, got {other:?}"),
         }

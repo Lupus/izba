@@ -127,9 +127,14 @@ impl InspectionTable {
             .contains(&(normalize_policy_host(host), port))
     }
 
-    /// Whether any passthrough is declared at all. The datapath uses this to
-    /// skip the ClientHello peek entirely for the overwhelmingly common policy
-    /// that never opens the hatch, keeping that path byte-identical.
+    /// Whether any passthrough is declared at all. `router::passthrough_names`
+    /// consults this (via `Policy::has_passthrough`) to short-circuit its
+    /// candidate computation BEFORE any Rego evaluation (`decide_tier2`) for
+    /// the overwhelmingly common policy that never writes `protocol: tcp`
+    /// anywhere — keeping that path zero-cost. (There is no ClientHello peek
+    /// yet to skip — that lands in a later task, at a different layer: it will
+    /// test the CANDIDATE LIST `passthrough_names` already computed, not this
+    /// table method.)
     pub fn has_passthrough(&self) -> bool {
         !self.passthrough.is_empty()
     }
