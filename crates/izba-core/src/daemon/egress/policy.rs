@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::config::AllowEntry;
+use super::inspect::InspectionTable;
 
 /// One egress connection attempt, as seen at the policy check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
@@ -76,6 +77,27 @@ pub trait Policy: Send + Sync {
     fn allows_name(&self, _sandbox: &str, _name: &str) -> bool {
         !self.enforces()
     }
+
+    /// **Inspectability** (M5 D2): whether a connection to `port` is terminated
+    /// and policed at L7 rather than spliced opaquely. Consulted by the egress
+    /// router's tier-1 gate, and only when `enforces()` is true.
+    ///
+    /// Defaults to `false` so a non-enforcing policy is never MITM'd (M1
+    /// behaviour). `RegoPolicy` answers from its compiled `InspectionTable`.
+    fn inspects(&self, _port: u16) -> bool {
+        false
+    }
+
+    /// The TLS-pinning passthrough (§5.2): whether the operator explicitly
+    /// declared `protocol: tcp` for this exact host and port.
+    ///
+    /// `host` is the ClientHello SNI, which the guest controls — so a `true`
+    /// here is NEVER sufficient on its own. The router additionally requires
+    /// the destination address to be DNS-snoop-bound to this name and to pass
+    /// `decide_tier2` (DP-2); see `router::passthrough_names`.
+    fn passthrough_host(&self, _host: &str, _port: u16) -> bool {
+        false
+    }
 }
 
 /// Default policy for a bare sandbox (no declared `--policy`): everything
@@ -106,6 +128,8 @@ pub struct RegoPolicy {
     template: regorus::Engine,
     /// The boolean query the Rego exposes: `data.egress.allow`.
     query: String,
+    /// The inspectability axis, decided in Rust rather than by the engine (D6).
+    inspection: InspectionTable,
 }
 
 /// Hosts any sandbox may reach with FULL method access (POST-based APIs).
@@ -165,6 +189,18 @@ impl RegoPolicy {
         Self::new(Self::REGO, data_json)
     }
 
+    /// Build from a data document plus the inspectability axis compiled from
+    /// the same config. The two travel together so a policy can never answer
+    /// `check` from one revision and `inspects` from another.
+    pub fn with_data_and_inspection(
+        data_json: &str,
+        inspection: InspectionTable,
+    ) -> anyhow::Result<Self> {
+        let mut p = Self::new(Self::REGO, data_json)?;
+        p.inspection = inspection;
+        Ok(p)
+    }
+
     /// Build from an explicit Rego module + JSON data document (the per-sandbox
     /// data doc is supplied here at egress start; tests vary the tier).
     pub fn new(rego: &str, data_json: &str) -> anyhow::Result<Self> {
@@ -178,6 +214,7 @@ impl RegoPolicy {
         Ok(Self {
             template: engine,
             query: "data.egress.allow".to_string(),
+            inspection: InspectionTable::default(),
         })
     }
 
@@ -258,6 +295,14 @@ impl Policy for RegoPolicy {
                 .map_err(|e| anyhow::anyhow!("eval_bool_query: {e}"))
         })();
         matches!(verdict, Ok(true))
+    }
+
+    fn inspects(&self, port: u16) -> bool {
+        self.inspection.inspects(port)
+    }
+
+    fn passthrough_host(&self, host: &str, port: u16) -> bool {
+        self.inspection.passthrough_host(host, port)
     }
 }
 
@@ -982,5 +1027,27 @@ mod tests {
              what the pattern's author intended — proof that config.rs's \
              validate_host_pattern MUST reject this pattern"
         );
+    }
+
+    #[test]
+    fn allow_all_never_inspects_and_never_passes_through() {
+        // M1 behaviour: a bare sandbox is not MITM'd at all, so it has no axis.
+        assert!(!AllowAll.inspects(443));
+        assert!(!AllowAll.passthrough_host("pinned.vendor.com", 443));
+    }
+
+    #[test]
+    fn rego_policy_answers_the_axis_from_its_compiled_table() {
+        let cfg = crate::daemon::egress::config::EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: internal.example.com\n    ports: [8000]\n    protocol: http\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        )
+        .unwrap();
+        let p = cfg.into_policy("web").unwrap();
+        assert!(p.enforces());
+        assert!(p.inspects(443), "baseline");
+        assert!(p.inspects(8000), "declared http");
+        assert!(!p.inspects(5432));
+        assert!(p.passthrough_host("pinned.vendor.com", 443));
+        assert!(!p.passthrough_host("internal.example.com", 8000));
     }
 }
