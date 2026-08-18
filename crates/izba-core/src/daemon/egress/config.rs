@@ -102,14 +102,21 @@ impl<'de> Deserialize<'de> for AllowEntry {
         // same strict walk `EgressPolicyConfig::from_value` uses for a whole
         // `allow:` list, so DP-3's wildcard/`protocol: tcp` refusal and the
         // unknown-key rejection hold on every ingestion path, not just YAML
-        // files (#138). `parse_allow_entry` takes a list index for its error
-        // messages (`allow[{i}].protocol: ...`); a bare `AllowEntry` has no
-        // list position of its own, so it is always `0` here. Callers that
-        // DO parse a whole list — `EgressPolicyConfig::from_value` — call
-        // `parse_allow_entry` directly with the real index instead of going
-        // through this impl, so their error messages are unaffected.
+        // files (#138). `parse_allow_entry` prefixes every error with a
+        // caller-supplied context label; a bare `AllowEntry` (this impl) has
+        // no list position of its own, so it uses the honest synthetic label
+        // `"allow entry"` rather than a fabricated `allow[0]` that would
+        // misreport WHICH element of a caller's list was bad — e.g. the GUI
+        // deserializing a whole `Vec<AllowEntry>` calls this impl once per
+        // element, and a synthetic `allow[0]` would have named the wrong one
+        // for every element but the first (#NEW-3). Callers that DO parse a
+        // whole list — `EgressPolicyConfig::from_value` — call
+        // `parse_allow_entry` directly with the real `"allow[{i}]"` label
+        // instead of going through this impl, so their error messages are
+        // unaffected.
         let doc = serde_yaml::Value::deserialize(deserializer)?;
-        parse_allow_entry(0, &doc).map_err(|e| serde::de::Error::custom(format!("{e:#}")))
+        parse_allow_entry("allow entry", &doc)
+            .map_err(|e| serde::de::Error::custom(format!("{e:#}")))
     }
 }
 
@@ -331,7 +338,7 @@ impl EgressPolicyConfig {
                     allow = items
                         .iter()
                         .enumerate()
-                        .map(|(i, e)| parse_allow_entry(i, e))
+                        .map(|(i, e)| parse_allow_entry(&format!("allow[{i}]"), e))
                         .collect::<Result<_>>()?;
                 }
                 "git" => {
@@ -366,6 +373,25 @@ impl EgressPolicyConfig {
             self.enforce = on;
             true
         }
+    }
+
+    /// The union-direction fold for a wildcard-hosted group's declared
+    /// `protocol`, shared by `collapse_duplicate_hosts`'s wildcard-union
+    /// collapse and `set_host_access`'s mixed-access wildcard merge (review
+    /// NEW-1: the two must agree, since both fold the SAME kind of group).
+    /// `Some(Http)` if ANY entry named by `idxs` declares it, else `None`.
+    ///
+    /// Written so it is STRUCTURALLY incapable of producing `Some(Tcp)`
+    /// (review NEW-2) rather than merely relying on DP-3 having refused
+    /// `tcp` on a wildcard host at parse time: `AllowEntry::Scoped`'s fields
+    /// are public, so a wildcard-hosted `Some(Tcp)` is constructible in Rust
+    /// regardless of what any parser enforces, and this fold can only ever
+    /// answer `Some(Http)` or `None` — never propagate a `Some(Tcp)` it
+    /// happened to see on an input entry.
+    fn union_wildcard_protocol(&self, idxs: &[usize]) -> Option<Protocol> {
+        idxs.iter()
+            .any(|&i| self.allow[i].declared_protocol() == Some(Protocol::Http))
+            .then_some(Protocol::Http)
     }
 
     /// Collapse normalize-equal duplicate entries in `self.allow`. A legacy
@@ -436,14 +462,11 @@ impl EgressPolicyConfig {
                 ports.sort_unstable();
                 ports.dedup();
                 // Union direction, mirroring how ports/access already union
-                // rather than pick an arbitrary single duplicate: a wildcard
-                // entry can never declare `protocol: tcp` (DP-3 refuses that
-                // at parse time), so the only possible declared value here is
-                // `Http` — take it if ANY duplicate declares it. Silently
+                // rather than pick an arbitrary single duplicate: silently
                 // dropping a declared `Http` here would be exactly the
                 // `⚠ weakens egress` transition the spec calls out, performed
                 // with no flag by a routine collapse.
-                let protocol = idxs.iter().find_map(|&i| self.allow[i].declared_protocol());
+                let protocol = self.union_wildcard_protocol(idxs);
                 winners.push((
                     idxs[0],
                     AllowEntry::Scoped {
@@ -573,13 +596,28 @@ impl EgressPolicyConfig {
             p => Some(p),
         };
 
-        // Mirrors `to_rego_data_json`'s JSON-map overwrite semantics for
-        // exact hosts (a later entry's whole record wins under the same
-        // key): take the LAST normalize-equal entry's declaration, whatever
-        // it is — including `None` even if an earlier duplicate declared
-        // something — rather than silently dropping it to `None`.
-        let protocol =
-            self.allow[*idxs.last().expect("idxs is non-empty here")].declared_protocol();
+        // This rewrite serves TWO shapes through one path (review NEW-1),
+        // and each needs its own fold to agree with how
+        // `collapse_duplicate_hosts` already treats the SAME situation:
+        //  - An exact host always has exactly one entry in `idxs` after the
+        //    `collapse_duplicate_hosts()` call above, so "last" and "only"
+        //    coincide; this mirrors `to_rego_data_json`'s map-overwrite
+        //    semantics for exact hosts — take the LAST normalize-equal
+        //    entry's declaration, whatever it is (including `None` even if
+        //    an earlier duplicate declared something).
+        //  - A wildcard host can still carry MULTIPLE mixed-access
+        //    duplicates here — `collapse_duplicate_hosts` deliberately
+        //    leaves those separate (see its doc), and unifying the access
+        //    verb below removes that reason, so this call merges them.
+        //    Last-wins would silently drop a `protocol` declared on any
+        //    duplicate but the last one, exactly the finding-1 defect this
+        //    round exists to close; use the same union fold
+        //    `collapse_duplicate_hosts`'s wildcard branch uses instead.
+        let protocol = if is_wildcard_host(&normalized) {
+            self.union_wildcard_protocol(&idxs)
+        } else {
+            self.allow[*idxs.last().expect("idxs is non-empty here")].declared_protocol()
+        };
         let first = idxs[0];
         self.allow[first] = AllowEntry::Scoped {
             host: normalized,
@@ -756,9 +794,13 @@ impl EgressPolicyConfig {
     /// pin to the newly-added port too, even though the operator only named
     /// it for the ports that existed when they wrote it. Resolving that
     /// needs a per-port declaration shape, which is its own change (out of
-    /// scope here). This is the lesser evil: the hatch stays LOUD (`izba
-    /// policy show`, `manifest::diff`'s `⚠ weakens egress`), whereas silent
-    /// deletion of a declaration is invisible everywhere.
+    /// scope here; tracked in the plan's spec §13 follow-up list, not only
+    /// here). This is the lesser evil: silent deletion of a declaration is
+    /// invisible everywhere, whereas this call mutates `policy.yaml`
+    /// directly and never passes the `izba.yml` diff/promote weakening gate
+    /// — `izba policy show` (once it lands) is the only surface that reveals
+    /// the widened hatch, so "lesser evil" is a narrower claim than "loud
+    /// everywhere that matters".
     pub fn allow(&mut self, host: &str, port: u16) -> bool {
         self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
@@ -965,12 +1007,19 @@ fn parse_protocol(field: &str, v: &serde_yaml::Value) -> Result<Protocol> {
     anyhow::bail!("{field}: expected 'http' or 'tcp', got {}", yaml_kind(v))
 }
 
-fn parse_allow_entry(i: usize, v: &serde_yaml::Value) -> Result<AllowEntry> {
+/// `ctx` is the field-path label used to prefix every error message this
+/// parses raises (`"allow[3]"` from a real `allow:` list position, or an
+/// honest synthetic label like `"allow entry"` when there is no list
+/// position to report — see the `AllowEntry::Deserialize` impl above). The
+/// YAML walk (`EgressPolicyConfig::from_value`) always passes the real
+/// `"allow[{i}]"`, so its error strings are byte-identical to before this was
+/// a label instead of an index (#NEW-3).
+fn parse_allow_entry(ctx: &str, v: &serde_yaml::Value) -> Result<AllowEntry> {
     use serde_yaml::Value;
     match v {
         // Bare host string → default web ports, read-write.
         Value::String(s) => {
-            validate_host_pattern(s).with_context(|| format!("allow[{i}]"))?;
+            validate_host_pattern(s).with_context(|| ctx.to_string())?;
             Ok(AllowEntry::Host(s.clone()))
         }
         Value::Mapping(m) => {
@@ -979,22 +1028,19 @@ fn parse_allow_entry(i: usize, v: &serde_yaml::Value) -> Result<AllowEntry> {
             let mut access = Access::default();
             let mut protocol = None;
             for (k, val) in m {
-                match key_str(&format!("allow[{i}]"), k)?.as_str() {
-                    "host" => host = Some(as_str(&format!("allow[{i}].host"), val)?),
-                    "ports" => ports = Some(parse_ports(&format!("allow[{i}].ports"), val)?),
-                    "access" => access = parse_access(&format!("allow[{i}].access"), val)?,
-                    "protocol" => {
-                        protocol = Some(parse_protocol(&format!("allow[{i}].protocol"), val)?)
-                    }
+                match key_str(ctx, k)?.as_str() {
+                    "host" => host = Some(as_str(&format!("{ctx}.host"), val)?),
+                    "ports" => ports = Some(parse_ports(&format!("{ctx}.ports"), val)?),
+                    "access" => access = parse_access(&format!("{ctx}.access"), val)?,
+                    "protocol" => protocol = Some(parse_protocol(&format!("{ctx}.protocol"), val)?),
                     other => anyhow::bail!(
-                        "allow[{i}]: unknown key '{other}' \
+                        "{ctx}: unknown key '{other}' \
                          (valid keys: host, ports, access, protocol)"
                     ),
                 }
             }
-            let host =
-                host.ok_or_else(|| anyhow::anyhow!("allow[{i}]: missing required key 'host'"))?;
-            validate_host_pattern(&host).with_context(|| format!("allow[{i}]"))?;
+            let host = host.ok_or_else(|| anyhow::anyhow!("{ctx}: missing required key 'host'"))?;
+            validate_host_pattern(&host).with_context(|| ctx.to_string())?;
             // DP-3: the pinning hatch is keyed on the observed SNI, matched
             // EXACTLY. Honouring it for a wildcard would mean a second
             // implementation of the wildcard semantics that live in
@@ -1002,7 +1048,7 @@ fn parse_allow_entry(i: usize, v: &serde_yaml::Value) -> Result<AllowEntry> {
             // shape of a security bug. Refuse, and name the fix.
             if protocol == Some(Protocol::Tcp) && is_wildcard_host(&normalize_policy_host(&host)) {
                 anyhow::bail!(
-                    "allow[{i}]: 'protocol: tcp' (the TLS-pinning passthrough) needs an exact \
+                    "{ctx}: 'protocol: tcp' (the TLS-pinning passthrough) needs an exact \
                      host, but '{host}' is a wildcard pattern — the hatch is matched against the \
                      observed ClientHello SNI. Name each pinned host explicitly."
                 );
@@ -1015,7 +1061,7 @@ fn parse_allow_entry(i: usize, v: &serde_yaml::Value) -> Result<AllowEntry> {
             })
         }
         other => anyhow::bail!(
-            "allow[{i}]: expected a host string or a mapping with keys host, ports, access, \
+            "{ctx}: expected a host string or a mapping with keys host, ports, access, \
              protocol; got {}",
             yaml_kind(other)
         ),
@@ -3394,11 +3440,13 @@ mod tests {
     // the declaration (the fix above) also extends an existing `Some(Tcp)`
     // pin to a brand-new port the operator never named for it. This is an
     // ACCEPTED, KNOWN sharp edge, not a bug: resolving it needs a per-port
-    // declaration shape, which is its own change and out of scope here.
-    // Preserving is still the lesser evil, because the hatch stays LOUD
-    // everywhere that matters (`izba policy show`, `manifest::diff`'s
-    // `⚠ weakens egress`), whereas silently dropping the declaration (the
-    // alternative) is invisible everywhere.
+    // declaration shape, which is its own change and out of scope here
+    // (tracked in the plan's spec §13 follow-up list). Preserving is still
+    // the lesser evil: silently dropping the declaration (the alternative)
+    // is invisible everywhere, whereas this call mutates `policy.yaml`
+    // directly and never passes the `izba.yml` diff/promote weakening gate —
+    // `izba policy show` (once it lands) is the only surface that reveals
+    // the widened hatch.
     #[test]
     fn allow_extends_an_existing_tcp_pin_to_a_newly_added_port_known_sharp_edge() {
         let mut cfg = EgressPolicyConfig {
@@ -3527,6 +3575,86 @@ mod tests {
         );
     }
 
+    // --- Review round 2, NEW-1: `set_host_access`'s wildcard-merge branch
+    // must fold `protocol` the same union direction as
+    // `collapse_duplicate_hosts`'s wildcard-union collapse ---
+    #[test]
+    fn set_host_access_wildcard_merge_preserves_a_declared_protocol_on_the_first_duplicate() {
+        // Taking only the LAST duplicate's declaration here (last-wins, the
+        // rule that is correct for EXACT hosts) would silently drop a
+        // `protocol` declared on the FIRST of a mixed-access wildcard pair —
+        // exactly the finding-1 defect, in the one branch round 1's fix
+        // missed.
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![
+                AllowEntry::Scoped {
+                    host: "*.x".into(),
+                    ports: Some(vec![8000]),
+                    access: Access::ReadWrite,
+                    protocol: Some(Protocol::Http),
+                },
+                AllowEntry::Scoped {
+                    host: "*.X".into(),
+                    ports: Some(vec![9000]),
+                    access: Access::Read,
+                    protocol: None,
+                },
+            ],
+            git: vec![],
+        };
+        assert!(cfg.set_host_access("*.x", Access::Read));
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "the mixed-access wildcard pair must merge: {:?}",
+            cfg.allow
+        );
+        assert_eq!(
+            cfg.allow[0].declared_protocol(),
+            Some(Protocol::Http),
+            "the declaration on the FIRST duplicate must survive the merge, matching \
+             collapse_duplicate_hosts's union direction for the same situation"
+        );
+    }
+
+    // --- Review round 2, NEW-2: the union fold must be structurally
+    // incapable of yielding `Some(Tcp)`, not merely rely on DP-3 having
+    // refused it at parse time ---
+    #[test]
+    fn wildcard_collapse_never_propagates_a_hand_constructed_tcp_declaration() {
+        // `AllowEntry::Scoped`'s fields are public, so a hand-constructed
+        // wildcard entry CAN carry `Some(Tcp)` even though the parser would
+        // refuse it (DP-3). The union fold must still never let it through.
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.replace_allow(vec![
+            AllowEntry::Scoped {
+                host: "*.x".into(),
+                ports: Some(vec![8000]),
+                access: Access::ReadWrite,
+                protocol: Some(Protocol::Tcp),
+            },
+            AllowEntry::Scoped {
+                host: "*.X".into(),
+                ports: Some(vec![9000]),
+                access: Access::ReadWrite,
+                protocol: None,
+            },
+        ]);
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "uniform-access wildcard duplicates merge to one: {:?}",
+            cfg.allow
+        );
+        assert_eq!(
+            cfg.allow[0].declared_protocol(),
+            None,
+            "the fold must never propagate a hand-constructed Some(Tcp) — only Some(Http) \
+             or None are reachable outputs"
+        );
+    }
+
     // --- Review round 1, finding 2: DP-3 must hold as a TYPE invariant,
     // not just on the `from_yaml`/`from_value` walk ---
 
@@ -3553,6 +3681,33 @@ mod tests {
             .expect_err("an unknown key must be refused on the JSON ingestion path too");
         let msg = err.to_string();
         assert!(msg.contains("unknown key 'protokol'"), "{msg}");
+        // Review round 2, NEW-3: a bare `AllowEntry` has no list position of
+        // its own, so it must use the honest synthetic label "allow entry",
+        // NEVER a fabricated "allow[0]" that would misreport which element
+        // of a caller's list was bad.
+        assert!(msg.contains("allow entry"), "{msg}");
+        assert!(!msg.contains("allow[0]"), "{msg}");
+    }
+
+    // Review round 2, NEW-3: the GUI deserializes a whole `Vec<AllowEntry>`
+    // in one call, so serde calls `AllowEntry::deserialize` once per
+    // element. Before the fix, EVERY element reported itself as `allow[0]`
+    // regardless of its real position — a bad key on the SECOND (or eighth)
+    // entry named the first. Pin that the false index is gone.
+    #[test]
+    fn allow_entry_deserialize_in_a_list_does_not_claim_a_false_index() {
+        let json = serde_json::json!([
+            {"host": "good.example.com"},
+            {"host": "bad.example.com", "protokol": "http"},
+        ]);
+        let err = serde_json::from_value::<Vec<AllowEntry>>(json)
+            .expect_err("the unknown key on the second entry must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown key 'protokol'"), "{msg}");
+        assert!(
+            !msg.contains("allow[0]"),
+            "must not claim the FIRST entry is the bad one: {msg}"
+        );
     }
 
     #[test]
