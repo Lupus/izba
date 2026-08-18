@@ -82,10 +82,21 @@ pub trait Policy: Send + Sync {
     /// and policed at L7 rather than spliced opaquely. Consulted by the egress
     /// router's tier-1 gate, and only when `enforces()` is true.
     ///
-    /// Defaults to `false` so a non-enforcing policy is never MITM'd (M1
-    /// behaviour). `RegoPolicy` answers from its compiled `InspectionTable`.
-    fn inspects(&self, _port: u16) -> bool {
-        false
+    /// The default IS the pre-M5 baseline (`enforces() &&
+    /// matches!(port, 80 | 443)`) — guarded the same way `allows_name` already
+    /// guards its own fail-open trap: gating on `enforces()` so a non-enforcing
+    /// policy is never MITM'd (M1 behaviour), while an enforcing policy that
+    /// does not override this still gets tier-1 on the web ports, never zero
+    /// tier-1 at all. Getting this backwards (defaulting to `false`
+    /// unconditionally) would be a SILENT narrowing the moment tier-1's gate
+    /// moved from a hard-coded port check into this trait method (DP-1
+    /// forbids narrowing) — any future enforcing `Policy` impl that forgets to
+    /// override `inspects` would fall through to a raw tier-2 splice on :443
+    /// instead of being denied outright, which is a much easier mistake to
+    /// ship than to notice. `RegoPolicy` overrides this with its compiled
+    /// `InspectionTable`, which may only ever WIDEN this baseline.
+    fn inspects(&self, port: u16) -> bool {
+        self.enforces() && matches!(port, 80 | 443)
     }
 
     /// The TLS-pinning passthrough (§5.2): whether the operator explicitly
@@ -96,6 +107,16 @@ pub trait Policy: Send + Sync {
     /// the destination address to be DNS-snoop-bound to this name and to pass
     /// `decide_tier2` (DP-2); see `router::passthrough_names`.
     fn passthrough_host(&self, _host: &str, _port: u16) -> bool {
+        false
+    }
+
+    /// Whether this policy declares ANY passthrough at all. Lets the router
+    /// skip the ClientHello-SNI peek (and the `decide_tier2` ceiling call
+    /// behind it — see `router::passthrough_names`) entirely for the
+    /// overwhelmingly common case: a policy that never writes
+    /// `protocol: tcp` anywhere. Defaults to `false`; `RegoPolicy` answers
+    /// from its compiled `InspectionTable::has_passthrough`.
+    fn has_passthrough(&self) -> bool {
         false
     }
 }
@@ -303,6 +324,10 @@ impl Policy for RegoPolicy {
 
     fn passthrough_host(&self, host: &str, port: u16) -> bool {
         self.inspection.passthrough_host(host, port)
+    }
+
+    fn has_passthrough(&self) -> bool {
+        self.inspection.has_passthrough()
     }
 }
 
