@@ -93,7 +93,7 @@ impl InspectionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::egress::config::EgressPolicyConfig;
+    use crate::daemon::egress::config::{Access, EgressPolicyConfig};
 
     fn table(yaml: &str) -> InspectionTable {
         InspectionTable::from_config(&EgressPolicyConfig::from_yaml(yaml).expect("parses"))
@@ -164,8 +164,9 @@ mod tests {
     }
 
     // The trap this catches: a derived Default would be an EMPTY port set, and
-    // `RegoPolicy::embedded()` / `with_data()` (used by the whole existing test
-    // suite and by the global-host default policy) would stop inspecting.
+    // `RegoPolicy::embedded()` / `with_data()` — both test-only constructors,
+    // used by the whole existing test suite, but also the shape any future
+    // production caller of `with_data` would inherit — would stop inspecting.
     #[test]
     fn the_default_table_is_the_pre_m5_baseline_not_an_empty_set() {
         let t = InspectionTable::default();
@@ -180,5 +181,40 @@ mod tests {
             "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
         );
         assert!(!t.passthrough_host("evil.example.com", 443));
+    }
+
+    // Review round 1, finding 1: `from_config`'s `&& !is_wildcard_host(&host)`
+    // guard has no test that can actually reach it through `table(...)`, since
+    // every YAML-driven wildcard-plus-`protocol: tcp` entry is refused at
+    // parse time by DP-3 (`parse_allow_entry`) before `from_config` ever sees
+    // it. `AllowEntry::Scoped`'s fields are public, so the only way to reach
+    // the guard is to hand-construct the config in Rust — the same necessity
+    // that produced Task 1's
+    // `wildcard_collapse_never_propagates_a_hand_constructed_tcp_declaration`
+    // (`config.rs`). Do NOT "simplify" this into a `from_yaml`/`table(...)`
+    // test: that would silently drop the coverage, since the parser refuses
+    // the input before this code path is ever exercised.
+    #[test]
+    fn a_hand_constructed_wildcard_tcp_declaration_never_opens_the_hatch() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "*.vendor.com".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+                protocol: Some(Protocol::Tcp),
+            }],
+            git: vec![],
+        };
+        let t = InspectionTable::from_config(&cfg);
+        assert!(
+            !t.passthrough_host("anything.vendor.com", 443),
+            "a wildcard host must never register a passthrough key, even hand-constructed"
+        );
+        assert!(
+            !t.has_passthrough(),
+            "no passthrough key at all should have been registered — pins the absence \
+             of the key, not just one lookup missing it"
+        );
     }
 }
