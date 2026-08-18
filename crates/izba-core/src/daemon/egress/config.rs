@@ -63,10 +63,16 @@ pub enum Protocol {
 /// One entry in a sandbox's egress allow-list: either a bare host (which
 /// authorizes the default web ports) or a host scoped to explicit ports/access.
 ///
-/// `#[serde(untagged)]` keeps every existing `allow: [<string>...]` file parsing
-/// unchanged — a YAML string deserializes to `Host`, a `{host, ...}` map to
-/// `Scoped`. Variant order matters: `Host` is tried first.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+/// `#[serde(untagged)]` keeps every existing `allow: [<string>...]` file
+/// WRITING unchanged — `Host` serializes as a bare YAML string, `Scoped` as a
+/// `{host, ...}` map. Deserialize is NOT derived (see the manual `impl`
+/// below): it funnels through `parse_allow_entry` instead, for the same
+/// reason `EgressPolicyConfig`'s own `Deserialize` does (#138) — a derived
+/// untagged deserialize would accept `protocol: tcp` on a wildcard host (DP-3
+/// forbids it) and any unknown key, on ANY ingestion path that deserializes a
+/// bare `AllowEntry`/`Vec<AllowEntry>` directly (e.g. the GUI's
+/// `serde_json::from_value::<Vec<AllowEntry>>`), not just the YAML walk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum AllowEntry {
     /// Bare host → web ports [80, 443], access read-write.
@@ -85,6 +91,26 @@ pub enum AllowEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         protocol: Option<Protocol>,
     },
+}
+
+impl<'de> Deserialize<'de> for AllowEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Every deserialization of a bare `AllowEntry` funnels through the
+        // same strict walk `EgressPolicyConfig::from_value` uses for a whole
+        // `allow:` list, so DP-3's wildcard/`protocol: tcp` refusal and the
+        // unknown-key rejection hold on every ingestion path, not just YAML
+        // files (#138). `parse_allow_entry` takes a list index for its error
+        // messages (`allow[{i}].protocol: ...`); a bare `AllowEntry` has no
+        // list position of its own, so it is always `0` here. Callers that
+        // DO parse a whole list — `EgressPolicyConfig::from_value` — call
+        // `parse_allow_entry` directly with the real index instead of going
+        // through this impl, so their error messages are unaffected.
+        let doc = serde_yaml::Value::deserialize(deserializer)?;
+        parse_allow_entry(0, &doc).map_err(|e| serde::de::Error::custom(format!("{e:#}")))
+    }
 }
 
 impl AllowEntry {
@@ -127,9 +153,15 @@ impl AllowEntry {
         }
     }
 
-    /// Effective inspectability for one of this entry's ports: the declared
-    /// value when there is one, else `http` on the default web ports and `tcp`
-    /// anywhere else.
+    /// Effective inspectability for `port`: the declared value when there is
+    /// one, else `http` on the default web ports and `tcp` anywhere else.
+    ///
+    /// Takes any `u16` with NO membership check against `self.ports()` —
+    /// reachability is a separate axis, decided by Rego (D1), not by this
+    /// method. The caller is responsible for having already established that
+    /// `port` is one this entry actually authorizes; calling this on a port
+    /// the entry does not list still answers (derived `tcp` off the default
+    /// web ports), it just answers a question nobody should be asking yet.
     ///
     /// Derivation is per-PORT, not per-entry, so `ports: [443, 5432]` is
     /// inspected on 443 and spliced on 5432 with nothing declared — the entry
@@ -403,13 +435,22 @@ impl EgressPolicyConfig {
                     idxs.iter().flat_map(|&i| self.allow[i].ports()).collect();
                 ports.sort_unstable();
                 ports.dedup();
+                // Union direction, mirroring how ports/access already union
+                // rather than pick an arbitrary single duplicate: a wildcard
+                // entry can never declare `protocol: tcp` (DP-3 refuses that
+                // at parse time), so the only possible declared value here is
+                // `Http` — take it if ANY duplicate declares it. Silently
+                // dropping a declared `Http` here would be exactly the
+                // `⚠ weakens egress` transition the spec calls out, performed
+                // with no flag by a routine collapse.
+                let protocol = idxs.iter().find_map(|&i| self.allow[i].declared_protocol());
                 winners.push((
                     idxs[0],
                     AllowEntry::Scoped {
                         host: key.clone(),
                         ports: Some(ports),
                         access: first_access,
-                        protocol: None,
+                        protocol,
                     },
                 ));
                 drop.extend(idxs.iter().skip(1).copied());
@@ -419,11 +460,16 @@ impl EgressPolicyConfig {
             let last = *idxs.last().expect("idxs.len() > 1");
             let winner = match &self.allow[last] {
                 AllowEntry::Host(_) => AllowEntry::Host(key.clone()),
-                AllowEntry::Scoped { ports, access, .. } => AllowEntry::Scoped {
+                AllowEntry::Scoped {
+                    ports,
+                    access,
+                    protocol,
+                    ..
+                } => AllowEntry::Scoped {
                     host: key.clone(),
                     ports: ports.clone(),
                     access: *access,
-                    protocol: None,
+                    protocol: *protocol,
                 },
             };
             winners.push((first, winner));
@@ -527,12 +573,19 @@ impl EgressPolicyConfig {
             p => Some(p),
         };
 
+        // Mirrors `to_rego_data_json`'s JSON-map overwrite semantics for
+        // exact hosts (a later entry's whole record wins under the same
+        // key): take the LAST normalize-equal entry's declaration, whatever
+        // it is — including `None` even if an earlier duplicate declared
+        // something — rather than silently dropping it to `None`.
+        let protocol =
+            self.allow[*idxs.last().expect("idxs is non-empty here")].declared_protocol();
         let first = idxs[0];
         self.allow[first] = AllowEntry::Scoped {
             host: normalized,
             ports,
             access,
-            protocol: None,
+            protocol,
         };
         let drop: std::collections::HashSet<usize> = idxs[1..].iter().copied().collect();
         let mut i = 0;
@@ -694,6 +747,18 @@ impl EgressPolicyConfig {
     /// ANY equivalent entry lists it, regardless of that entry's access
     /// verb — an exact host always has at most one matching entry after the
     /// collapse, so this reduces to the prior single-entry check there.
+    ///
+    /// KNOWN SHARP EDGE: a declared `protocol` is stored per-ENTRY while the
+    /// `protocol: tcp` pinning hatch is semantically per-PORT
+    /// (`protocol_for`), so preserving the entry's declaration here (rather
+    /// than dropping it — see the sibling `block`/`set_host_access` fix for
+    /// why dropping is the worse failure) extends an existing `Some(Tcp)`
+    /// pin to the newly-added port too, even though the operator only named
+    /// it for the ports that existed when they wrote it. Resolving that
+    /// needs a per-port declaration shape, which is its own change (out of
+    /// scope here). This is the lesser evil: the hatch stays LOUD (`izba
+    /// policy show`, `manifest::diff`'s `⚠ weakens egress`), whereas silent
+    /// deletion of a declaration is invisible everywhere.
     pub fn allow(&mut self, host: &str, port: u16) -> bool {
         self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
@@ -714,11 +779,12 @@ impl EgressPolicyConfig {
             ports.push(port);
             ports.sort_unstable();
             let access = entry.access();
+            let protocol = entry.declared_protocol();
             *entry = AllowEntry::Scoped {
                 host: normalized,
                 ports: Some(ports),
                 access,
-                protocol: None,
+                protocol,
             };
             true
         } else {
@@ -763,11 +829,12 @@ impl EgressPolicyConfig {
             ports.retain(|p| *p != port);
             changed = true;
             let access = e.access();
+            let protocol = e.declared_protocol();
             *e = AllowEntry::Scoped {
                 host: normalized.clone(),
                 ports: Some(ports),
                 access,
-                protocol: None,
+                protocol,
             };
         }
         if changed {
@@ -3272,5 +3339,256 @@ mod tests {
         let yaml = cfg.to_yaml();
         assert!(yaml.contains("protocol: tcp"), "{yaml}");
         assert_eq!(EgressPolicyConfig::from_yaml(&yaml).unwrap(), cfg);
+    }
+
+    // --- Review round 1, finding 3: the pinning hatch's OWN direction ---
+    //
+    // `parses_protocol_http_on_a_nonweb_port` (above) pins the WIDENING
+    // override (8000 + `protocol: http` -> Http instead of the derived Tcp).
+    // This pins the NARROWING one — the hatch itself (spec 5.2): an explicit
+    // `protocol: tcp` must beat the derived Http on a default web port. A
+    // mutant that made `protocol_for` prefer the derived value on
+    // `DEFAULT_PORTS` would silently disable the hatch while every other
+    // test in this file still passed.
+    #[test]
+    fn explicit_tcp_beats_the_derived_http_on_a_default_web_port() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.allow[0].protocol_for(443), Protocol::Tcp);
+    }
+
+    // --- Review round 1, finding 1: mutation paths must PRESERVE a
+    // declared `protocol`, not silently erase it ---
+    //
+    // Each of these rewrites `access`/`ports` in place while carrying the
+    // OTHER field forward already; before this fix, `protocol` was the one
+    // field a rewrite silently dropped to `None` — which, for a declared
+    // `Http` on a non-web port, performs the exact `http -> tcp` "weakens
+    // egress" transition the spec requires be flagged, with no flag at all.
+
+    #[test]
+    fn allow_preserves_a_declared_protocol_when_adding_a_port() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "internal.example.com".into(),
+                ports: Some(vec![8000]),
+                access: Access::ReadWrite,
+                protocol: Some(Protocol::Http),
+            }],
+            git: vec![],
+        };
+        assert!(cfg.allow("internal.example.com", 9000));
+        let entries = cfg.entries_for_host("internal.example.com");
+        assert_eq!(
+            entries[0].declared_protocol(),
+            Some(Protocol::Http),
+            "allow() must not silently erase a declared protocol"
+        );
+    }
+
+    // Finding 1b: `protocol` is stored per-ENTRY while the `protocol: tcp`
+    // pinning hatch is semantically per-PORT (`protocol_for`), so preserving
+    // the declaration (the fix above) also extends an existing `Some(Tcp)`
+    // pin to a brand-new port the operator never named for it. This is an
+    // ACCEPTED, KNOWN sharp edge, not a bug: resolving it needs a per-port
+    // declaration shape, which is its own change and out of scope here.
+    // Preserving is still the lesser evil, because the hatch stays LOUD
+    // everywhere that matters (`izba policy show`, `manifest::diff`'s
+    // `⚠ weakens egress`), whereas silently dropping the declaration (the
+    // alternative) is invisible everywhere.
+    #[test]
+    fn allow_extends_an_existing_tcp_pin_to_a_newly_added_port_known_sharp_edge() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "pinned.vendor.com".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+                protocol: Some(Protocol::Tcp),
+            }],
+            git: vec![],
+        };
+        assert!(cfg.allow("pinned.vendor.com", 8443));
+        let entries = cfg.entries_for_host("pinned.vendor.com");
+        assert_eq!(entries[0].ports(), vec![443, 8443]);
+        assert_eq!(
+            entries[0].protocol_for(8443),
+            Protocol::Tcp,
+            "known sharp edge: the pin extends to the newly added port too"
+        );
+    }
+
+    #[test]
+    fn block_preserves_a_declared_protocol_on_the_remaining_ports() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "internal.example.com".into(),
+                ports: Some(vec![8000, 9000]),
+                access: Access::ReadWrite,
+                protocol: Some(Protocol::Http),
+            }],
+            git: vec![],
+        };
+        assert!(cfg.block("internal.example.com", 9000));
+        let entries = cfg.entries_for_host("internal.example.com");
+        assert_eq!(entries[0].ports(), vec![8000]);
+        assert_eq!(
+            entries[0].declared_protocol(),
+            Some(Protocol::Http),
+            "block() must not silently erase a declared protocol"
+        );
+    }
+
+    #[test]
+    fn set_host_access_preserves_a_declared_protocol() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "internal.example.com".into(),
+                ports: Some(vec![8000]),
+                access: Access::Read,
+                protocol: Some(Protocol::Http),
+            }],
+            git: vec![],
+        };
+        assert!(cfg.set_host_access("internal.example.com", Access::ReadWrite));
+        let entries = cfg.entries_for_host("internal.example.com");
+        assert_eq!(entries[0].access(), Access::ReadWrite);
+        assert_eq!(
+            entries[0].declared_protocol(),
+            Some(Protocol::Http),
+            "set_host_access() must not silently erase a declared protocol"
+        );
+    }
+
+    #[test]
+    fn replace_allow_collapse_of_duplicate_exact_hosts_keeps_the_last_entrys_declaration() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.replace_allow(vec![
+            AllowEntry::Scoped {
+                host: "h.example.com".into(),
+                ports: Some(vec![8000]),
+                access: Access::ReadWrite,
+                protocol: Some(Protocol::Http),
+            },
+            AllowEntry::Scoped {
+                host: "h.example.com".into(),
+                ports: Some(vec![9000]),
+                access: Access::ReadWrite,
+                protocol: None,
+            },
+        ]);
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "exact-host duplicates collapse to one: {:?}",
+            cfg.allow
+        );
+        assert_eq!(
+            cfg.allow[0].declared_protocol(),
+            None,
+            "the LAST duplicate wins, mirroring to_rego_data_json's map-overwrite \
+             semantics — even though it declares nothing and an earlier duplicate did"
+        );
+    }
+
+    #[test]
+    fn wildcard_collapse_keeps_a_declared_protocol_if_any_duplicate_declares_it() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.replace_allow(vec![
+            AllowEntry::Scoped {
+                host: "*.x".into(),
+                ports: Some(vec![8000]),
+                access: Access::ReadWrite,
+                protocol: Some(Protocol::Http),
+            },
+            AllowEntry::Scoped {
+                host: "*.X".into(),
+                ports: Some(vec![9000]),
+                access: Access::ReadWrite,
+                protocol: None,
+            },
+        ]);
+        assert_eq!(
+            cfg.allow.len(),
+            1,
+            "uniform-access wildcard duplicates merge to one: {:?}",
+            cfg.allow
+        );
+        assert_eq!(
+            cfg.allow[0].declared_protocol(),
+            Some(Protocol::Http),
+            "union direction: the merged entry keeps a declaration ANY duplicate carried \
+             (a wildcard can never declare tcp — DP-3 refuses that at parse time)"
+        );
+    }
+
+    // --- Review round 1, finding 2: DP-3 must hold as a TYPE invariant,
+    // not just on the `from_yaml`/`from_value` walk ---
+
+    #[test]
+    fn allow_entry_deserialize_refuses_tcp_on_a_wildcard_via_json_too() {
+        let json = serde_json::json!({
+            "host": "*.vendor.com",
+            "ports": [443],
+            "protocol": "tcp",
+        });
+        let err = serde_json::from_value::<AllowEntry>(json)
+            .expect_err("DP-3 must be enforced on the JSON ingestion path too");
+        let msg = err.to_string();
+        assert!(msg.contains("wildcard"), "{msg}");
+    }
+
+    #[test]
+    fn allow_entry_deserialize_refuses_an_unknown_key_via_json_too() {
+        let json = serde_json::json!({
+            "host": "h.example.com",
+            "protokol": "http",
+        });
+        let err = serde_json::from_value::<AllowEntry>(json)
+            .expect_err("an unknown key must be refused on the JSON ingestion path too");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown key 'protokol'"), "{msg}");
+    }
+
+    #[test]
+    fn allow_entry_round_trips_through_json_with_a_declared_protocol() {
+        let entry = AllowEntry::Scoped {
+            host: "pinned.vendor.com".into(),
+            ports: Some(vec![443]),
+            access: Access::ReadWrite,
+            protocol: Some(Protocol::Tcp),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        let round_tripped: AllowEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, entry);
+    }
+
+    #[test]
+    fn allow_entry_deserialize_still_accepts_the_untagged_shapes_via_json() {
+        // A bare-string host and a `{host, ...}` map must both still parse
+        // the way the derived `#[serde(untagged)]` used to — now routed
+        // through `parse_allow_entry` instead of the derive.
+        let host: AllowEntry = serde_json::from_value(serde_json::json!("github.com")).unwrap();
+        assert_eq!(host, AllowEntry::Host("github.com".into()));
+
+        let scoped: AllowEntry = serde_json::from_value(serde_json::json!({
+            "host": "api.x.com",
+            "ports": [443],
+        }))
+        .unwrap();
+        assert_eq!(
+            scoped,
+            AllowEntry::Scoped {
+                host: "api.x.com".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+                protocol: None,
+            }
+        );
     }
 }
