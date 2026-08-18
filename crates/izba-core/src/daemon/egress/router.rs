@@ -385,7 +385,10 @@ fn mitm_hop(
 
 /// The DNS-snoop-bound names for `ip` that the operator declared as the TLS
 /// pinning passthrough on `port` (§5.2). Empty — the case for every policy that
-/// never writes `protocol: tcp` — means "inspect", so the datapath is unchanged.
+/// never writes `protocol: tcp` — means "inspect", so the datapath is unchanged,
+/// AND costs nothing: `policy.has_passthrough()` short-circuits before the
+/// `decide_tier2` ceiling call below, so a policy with no `protocol: tcp`
+/// anywhere pays zero extra regorus evaluations on the common tier-1 path.
 ///
 /// **Why this is not just `policy.passthrough_host(sni, port)`.** The SNI is a
 /// string the guest chooses, and a passthrough has no upstream certificate
@@ -408,6 +411,13 @@ pub fn passthrough_names(
     if !policy.enforces() {
         return Vec::new();
     }
+    // The zero-cost short-circuit for the overwhelmingly common policy: no
+    // `protocol: tcp` anywhere means no candidate can ever pass the
+    // `passthrough_host` filter below, so skip the `decide_tier2` ceiling
+    // call (a regorus evaluation per DNS-snoop'd name) entirely.
+    if !policy.has_passthrough() {
+        return Vec::new();
+    }
     // Tier-2 is the ceiling: if this flow would not be permitted as an opaque
     // splice, it is not permitted as a passthrough either.
     let (verdict, _, _) = decide_tier2(policy, snoop, sandbox, ip, port, usb);
@@ -419,8 +429,21 @@ pub fn passthrough_names(
         .into_iter()
         .filter(|name| policy.passthrough_host(name, port))
         .filter(|name| {
-            // decide_tier2 may have allowed on an explicit-IP rule; require the
-            // NAME itself to be reachable before we honour its hatch.
+            // SECOND layer, load-bearing, not defence-in-depth, for (at least)
+            // two independent reasons a future edit could reopen:
+            // 1. `InspectionTable::from_config`'s `passthrough` set and
+            //    `to_rego_data_json`'s `sandbox_host_rules` map are two
+            //    separate folds over the same unmerged `EgressPolicyConfig
+            //    ::allow` — kept in lockstep today (both last-wins per exact
+            //    host), but a future edit to either could let them diverge.
+            // 2. `InspectionTable` never consults `AllowEntry::access()` at
+            //    all — an `access: read` + `protocol: tcp` host answers
+            //    `passthrough_host == true` unconditionally, while
+            //    `RegoPolicy::check` denies it for any methodless (tier-2)
+            //    flow (`egress.rego`'s `host_access_ok("read")` requires
+            //    GET/HEAD, and `FlowDesc::l3` never carries a method).
+            // Do not delete this as "redundant with decide_tier2" — it is the
+            // only thing that closes both gaps.
             let mut f = FlowDesc::l3(sandbox, name.clone(), port);
             f.host = Some(name.clone());
             policy.check(&f) == Verdict::Allow
@@ -1739,6 +1762,63 @@ mod tests {
         assert!(
             passthrough_names(&AllowAll, &snoop, "web", ip, 443, UsbGuard::default()).is_empty(),
             "a bare sandbox is never MITM'd, so it has nothing to pass through"
+        );
+    }
+
+    // M5 P1 review, task 3, finding 1 (fix round 1), part 2: `has_passthrough`
+    // / `InspectionTable::from_config` fixed the LAST-WINS divergence, but the
+    // per-name `policy.check` filter in `passthrough_names` is load-bearing
+    // for a SECOND, independent reason: `InspectionTable::from_config` only
+    // reads `e.declared_protocol()` — it never consults `e.access()` at all.
+    // `RegoPolicy::check`, by contrast, evaluates the real `egress.rego`
+    // `host_access_ok` predicate, which for `access: read` REQUIRES the
+    // request to carry an HTTP GET/HEAD method (`read_method`) — and a
+    // tier-2/passthrough `FlowDesc` (`FlowDesc::l3`) never carries one
+    // (`method: None`). So a `protocol: tcp` declaration paired with
+    // `access: read` makes `passthrough_host` answer `true` (it never looks
+    // at `access`) for a (host, port) that `policy.check` ALWAYS denies (no
+    // method ⇒ `read_method` fails ⇒ `host_access_ok("read")` fails). Without
+    // the filter, `passthrough_names` would splice a read-only-declared host
+    // straight through with no upstream certificate verification at all.
+    #[test]
+    fn passthrough_candidates_exclude_a_read_only_declared_host() {
+        // A SECOND, unrelated raw-IP rule is required so `decide_tier2` can
+        // still ALLOW the flow (via the explicit-IP rule) even though the
+        // name-based check on `pinned.vendor.com` denies (read + no method) —
+        // otherwise `decide_tier2` itself would deny first and this could
+        // never reach the per-name filter the test means to exercise.
+        let p = inspect_policy(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    \
+             protocol: tcp\n    access: read\n  - host: 1.2.3.12\n    ports: [443]\n",
+        );
+        // `InspectionTable` alone (ignorant of `access`) says this hatch is open.
+        assert!(
+            p.passthrough_host("pinned.vendor.com", 443),
+            "setup: the table itself does not consult access"
+        );
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "1.2.3.12".parse().unwrap();
+        snoop.record("web", &[("pinned.vendor.com".to_string(), ip, 300)]);
+        assert!(
+            passthrough_names(&*p, &snoop, "web", ip, 443, UsbGuard::default()).is_empty(),
+            "a read-only-declared host must never open the no-cert-verification hatch \
+             for a methodless (tier-2) flow — the policy.check filter must catch this"
+        );
+    }
+
+    // M5 P1 review, task 3, finding 3: the empty-candidate-list path must be
+    // free even when NO snoop record exists at all — `has_passthrough()`
+    // short-circuits `passthrough_names` before it ever calls `decide_tier2`.
+    #[test]
+    fn passthrough_candidates_are_empty_without_any_tcp_declaration_or_snoop_record() {
+        let p = inspect_policy("enforce: true\nallow:\n  - github.com\n");
+        assert!(!p.has_passthrough());
+        let snoop = SnoopStore::new(); // deliberately empty — no record at all
+        let ip: IpAddr = "1.2.3.13".parse().unwrap();
+        assert!(
+            passthrough_names(&*p, &snoop, "web", ip, 443, UsbGuard::default()).is_empty(),
+            "no protocol: tcp anywhere in the policy ⇒ empty, without ever needing a \
+             snoop binding to decide that"
         );
     }
 
