@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::Subcommand;
 use izba_core::daemon::egress::config::{
     edit_policy_file, usbip_exposure_warning, Access, AllowEntry, EgressPolicyConfig, GitRule,
-    GitTarget,
+    GitTarget, Protocol,
 };
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
@@ -284,7 +284,23 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                         Access::Read => "read",
                         Access::ReadWrite => "read-write",
                     };
-                    let _ = writeln!(out, "    {}  [{ports}] ({access_str})", e.host());
+                    // The inspectability axis (M5 §5). Silent when the entry
+                    // declares nothing, so an existing policy renders exactly
+                    // as it did; loud for the pinning hatch, which is the one
+                    // value that gives enforcement up. `izba policy show` is
+                    // the ONLY surface that reveals a pinning passthrough —
+                    // `izba status` renders no egress posture at all, and
+                    // `izba policy allow` writes policy.yaml directly without
+                    // passing the diff/promote weakening gate — so the
+                    // wording here carries its own weight.
+                    let proto_str = match e.declared_protocol() {
+                        None => String::new(),
+                        Some(Protocol::Http) => "  protocol: http (inspected)".to_string(),
+                        Some(Protocol::Tcp) => {
+                            "  protocol: tcp (passthrough: opaque splice, no L7 rules)".to_string()
+                        }
+                    };
+                    let _ = writeln!(out, "    {}  [{ports}] ({access_str}){proto_str}", e.host());
                 }
             }
             if !cfg.git.is_empty() {
@@ -843,6 +859,41 @@ mod tests {
         };
         let out = render_policy("web", Some(&cfg));
         assert!(out.contains("http: deny all (empty allow-list)"));
+    }
+
+    #[test]
+    fn show_marks_a_declared_http_port_as_inspected() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: internal.example.com\n    ports: [8000]\n    protocol: http\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert!(out.contains("internal.example.com"), "{out}");
+        assert!(out.contains("http (inspected)"), "{out}");
+    }
+
+    #[test]
+    fn show_is_loud_about_a_pinning_passthrough() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert!(out.contains("passthrough"), "{out}");
+        assert!(
+            out.contains("no L7 rules"),
+            "the operator must see what they gave up:\n{out}"
+        );
+    }
+
+    #[test]
+    fn show_is_unchanged_for_a_policy_that_declares_nothing() {
+        let cfg = EgressPolicyConfig::from_yaml("enforce: true\nallow:\n  - github.com\n").unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert!(
+            !out.contains("passthrough") && !out.contains("inspected"),
+            "the default rendering must not grow noise:\n{out}"
+        );
     }
 
     #[test]
