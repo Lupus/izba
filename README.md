@@ -77,6 +77,13 @@ Key properties:
       ports: [5432]              # exactly 5432 — explicit ports replace the default
     - host: docs.internal
       access: read               # HTTP GET/HEAD only; writes (POST/PUT/…) blocked
+    - host: internal.example.com
+      ports: [8000]
+      protocol: http             # police this port at L7 too (80/443 already are)
+    - host: pinned.vendor.com
+      ports: [443]
+      protocol: tcp              # ⚠ escape hatch for a TLS-pinning client:
+                                 # spliced opaquely — no L7 rules, no request audit
   git:
     - repo: github.com/myorg/myrepo    # clone/fetch; read-only (no push) by default
     - repo: github.com/myorg/deploy
