@@ -296,9 +296,10 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                     let proto_str = match e.declared_protocol() {
                         None => String::new(),
                         Some(Protocol::Http) => "  protocol: http (inspected)".to_string(),
-                        Some(Protocol::Tcp) => {
-                            "  protocol: tcp (passthrough: opaque splice, no L7 rules)".to_string()
-                        }
+                        Some(Protocol::Tcp) => "  \u{26A0} protocol: tcp — pinning passthrough: \
+                            spliced opaquely; no L7 rules, no request audit, \
+                            no credential injection"
+                            .to_string(),
                     };
                     let _ = writeln!(out, "    {}  [{ports}] ({access_str}){proto_str}", e.host());
                 }
@@ -881,8 +882,21 @@ mod tests {
         let out = render_policy("web", Some(&cfg));
         assert!(out.contains("passthrough"), "{out}");
         assert!(
+            out.contains('\u{26A0}'),
+            "the passthrough line must carry a warning glyph like every other \
+             loud signal in this product (e.g. `izba diff`'s ⚠ weakens egress):\n{out}"
+        );
+        assert!(
             out.contains("no L7 rules"),
             "the operator must see what they gave up:\n{out}"
+        );
+        assert!(
+            out.contains("no request audit"),
+            "netlog/audit visibility is a separate loss from L7 rules — name it:\n{out}"
+        );
+        assert!(
+            out.contains("no credential injection"),
+            "credential injection is a separate loss (per Protocol's own doc) — name it:\n{out}"
         );
     }
 
