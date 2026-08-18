@@ -264,17 +264,16 @@ impl MitmRuntime {
 /// hello closed (never a bug, since short reads already fail closed — but a
 /// needless one), so the header is added explicitly rather than rounded away.
 ///
-/// `mutants::skip` reason: this is a capacity bound, not a decision. Both
-/// arithmetic mutants (`+`→`*`, `*`→`+`) only move WHERE a hello stops fitting
-/// the peek buffer, and a hello that does not fit returns `Incomplete`, which
-/// after the retry budget fails closed to termination — the same outcome the
-/// datapath already gives every other short read. Killing them would need a
-/// test asserting a passthrough for a hello sized between 1045 and 16389
-/// bytes, whose size is chosen by rustls rather than by us; that test would
-/// assert the constant's value through six layers of TLS rather than assert a
-/// behaviour. The value itself is pinned by the doc comment's arithmetic.
-#[mutants::skip]
-const SNI_PEEK_MAX: usize = 5 + 16 * 1024;
+/// Written as a literal rather than `5 + 16 * 1024` on purpose. The arithmetic
+/// form carries two mutants (`+`→`*`, `*`→`+`) that no test can kill: both only
+/// move WHERE a hello stops fitting the buffer, and a hello that does not fit
+/// returns `Incomplete`, which after the retry budget fails closed to
+/// termination — the same outcome every other short read already produces.
+/// `#[mutants::skip]` does not help here; this repo's cargo-mutants honours it
+/// on functions, not on a `const`. So the expression is removed instead of
+/// suppressed, exactly as the u24 length decode in `clienthello.rs` was:
+/// arithmetic that cannot be observably wrong should not be arithmetic.
+const SNI_PEEK_MAX: usize = 16_389; // 5-byte record header + 2^14 fragment
 /// A ClientHello can span several TCP segments, so one `peek` may return a
 /// short buffer. Retry to this bound and then FAIL CLOSED to termination.
 const SNI_PEEK_TRIES: usize = 16;
