@@ -237,14 +237,29 @@ fn tcp_connect(
         return;
     }
 
-    // Tier 1 — HTTP(S) under an ENFORCING policy MUST be terminated by the MITM,
-    // so the allow-list is judged on the decrypted Host (an IP is never on a
-    // domain allow-list, so we do NOT pre-check on the IP here). A bare
-    // (non-enforcing) sandbox skips this entirely and keeps the transparent
-    // direct dial — no CA trust, no http/1.1 downgrade, M1 behavior preserved.
-    if matches!(port, 80 | 443) && policy.enforces() {
+    // Tier 1 — an INSPECTED port under an ENFORCING policy MUST be terminated by
+    // the MITM, so the allow-list is judged on the decrypted Host (an IP is never
+    // on a domain allow-list, so we do NOT pre-check on the IP here). Which ports
+    // are inspected is now declared by the policy (`protocol:`, M5 D2) rather than
+    // hard-coded to 80/443 — but the web ports are always in that set, so this
+    // gate only ever widens (DP-1). A bare (non-enforcing) sandbox skips this
+    // entirely and keeps the transparent direct dial — no CA trust, no http/1.1
+    // downgrade, M1 behavior preserved.
+    if policy.enforces() && policy.inspects(port) {
         match mitm {
-            Some(mitm) => mitm_hop(conn, mitm, Arc::clone(&policy), ip, port, sandbox),
+            Some(mitm) => {
+                let passthrough: Arc<[String]> =
+                    passthrough_names(&*policy, snoop, sandbox, ip, port, usb).into();
+                mitm_hop(
+                    conn,
+                    mitm,
+                    Arc::clone(&policy),
+                    ip,
+                    port,
+                    sandbox,
+                    passthrough,
+                )
+            }
             // FAIL CLOSED: a firewall was declared but the MITM runtime is
             // unavailable (CA/runtime init failed at daemon start). Deny rather
             // than fall through to a tier-2 direct dial — silently downgrading
@@ -322,6 +337,7 @@ fn mitm_hop(
     ip: IpAddr,
     port: u16,
     sandbox: &str,
+    passthrough: Arc<[String]>,
 ) {
     use socket2::{Domain, Socket, Type};
     let listen = mitm.listen_addr();
@@ -343,6 +359,7 @@ fn mitm_hop(
                 sandbox: sandbox.to_string(),
             },
             Arc::clone(&policy),
+            Arc::clone(&passthrough),
         );
         sock.connect(&listen.into())?;
         Ok(sock.into())
@@ -364,6 +381,51 @@ fn mitm_hop(
             );
         }
     }
+}
+
+/// The DNS-snoop-bound names for `ip` that the operator declared as the TLS
+/// pinning passthrough on `port` (§5.2). Empty — the case for every policy that
+/// never writes `protocol: tcp` — means "inspect", so the datapath is unchanged.
+///
+/// **Why this is not just `policy.passthrough_host(sni, port)`.** The SNI is a
+/// string the guest chooses, and a passthrough has no upstream certificate
+/// verification by construction — that is the whole point of the hatch. Deciding
+/// on the SNI alone would therefore splice a guest-chosen ADDRESS on the
+/// strength of a guest-chosen NAME: an unrestricted exfiltration channel. So the
+/// candidate set is derived from what izbad's OWN resolver answered for this
+/// address, and is filtered through `decide_tier2` — a passthrough flow is
+/// exactly a tier-2 flow that additionally proves its SNI, and it inherits the
+/// rebinding guard (`is_lan` ⇒ no name-authorized reach) unchanged.
+pub fn passthrough_names(
+    policy: &dyn Policy,
+    snoop: &SnoopStore,
+    sandbox: &str,
+    ip: IpAddr,
+    port: u16,
+    usb: UsbGuard,
+) -> Vec<String> {
+    // A bare sandbox is never terminated, so it has nothing to pass through.
+    if !policy.enforces() {
+        return Vec::new();
+    }
+    // Tier-2 is the ceiling: if this flow would not be permitted as an opaque
+    // splice, it is not permitted as a passthrough either.
+    let (verdict, _, _) = decide_tier2(policy, snoop, sandbox, ip, port, usb);
+    if verdict != Verdict::Allow {
+        return Vec::new();
+    }
+    snoop
+        .fqdns_for(sandbox, ip)
+        .into_iter()
+        .filter(|name| policy.passthrough_host(name, port))
+        .filter(|name| {
+            // decide_tier2 may have allowed on an explicit-IP rule; require the
+            // NAME itself to be reachable before we honour its hatch.
+            let mut f = FlowDesc::l3(sandbox, name.clone(), port);
+            f.host = Some(name.clone());
+            policy.check(&f) == Verdict::Allow
+        })
+        .collect()
 }
 
 /// Tier-2 (non-HTTP TCP) decision: recover the FQDN(s) izbad resolved for `ip`
@@ -1584,6 +1646,151 @@ mod tests {
                 "address {} is both hard_denied and lan",
                 ip
             );
+        }
+    }
+
+    // --- Task 3: the inspectability-driven tier-1 gate + passthrough candidates. ---
+
+    fn inspect_policy(yaml: &str) -> Arc<dyn Policy> {
+        crate::daemon::egress::config::EgressPolicyConfig::from_yaml(yaml)
+            .expect("parses")
+            .into_policy("web")
+            .expect("compiles")
+    }
+
+    // The guard test for the global constraint: a policy that declares no
+    // protocol anywhere gates exactly where it gates today.
+    #[test]
+    fn a_policy_without_protocol_gates_on_the_web_ports_only() {
+        let p = inspect_policy("enforce: true\nallow:\n  - github.com\n");
+        for port in [80u16, 443] {
+            assert!(p.inspects(port), "port {port} must still be tier-1");
+        }
+        for port in [22u16, 8000, 5432, 15001] {
+            assert!(!p.inspects(port), "port {port} must still be tier-2");
+        }
+    }
+
+    #[test]
+    fn a_declared_http_port_is_gated_into_tier_one() {
+        let p = inspect_policy(
+            "enforce: true\nallow:\n  - host: internal.example.com\n    ports: [8000]\n    protocol: http\n",
+        );
+        assert!(p.enforces() && p.inspects(8000));
+    }
+
+    // DP-2: the hatch is bound to the address by DNS-snoop, not by the SNI.
+    #[test]
+    fn passthrough_candidates_require_a_snoop_binding() {
+        let p = inspect_policy(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        );
+        let snoop = SnoopStore::new();
+        // NOTE: not 203.0.113.0/24 (RFC 5737 TEST-NET-3) — this codebase's
+        // `is_hard_denied` treats that whole range as "documentation" and
+        // blocks it unconditionally (F-01), which would make this test pass
+        // vacuously (deny-by-hard-floor, not deny-by-no-snoop-binding). Use an
+        // ordinary public address instead, consistent with the rest of this
+        // file's decide_tier2 tests (e.g. "1.2.3.4").
+        let ip: IpAddr = "1.2.3.9".parse().unwrap();
+        assert!(
+            passthrough_names(&*p, &snoop, "web", ip, 443, UsbGuard::default()).is_empty(),
+            "no snoop record ⇒ no passthrough, so a raw-IP dial can never splice"
+        );
+        snoop.record("web", &[("pinned.vendor.com".to_string(), ip, 300)]);
+        assert_eq!(
+            passthrough_names(&*p, &snoop, "web", ip, 443, UsbGuard::default()),
+            vec!["pinned.vendor.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn passthrough_candidates_exclude_a_host_without_the_declaration() {
+        let p = inspect_policy("enforce: true\nallow:\n  - api.anthropic.com\n");
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "1.2.3.10".parse().unwrap(); // see the TEST-NET-3 note above
+        snoop.record("web", &[("api.anthropic.com".to_string(), ip, 300)]);
+        assert!(
+            passthrough_names(&*p, &snoop, "web", ip, 443, UsbGuard::default()).is_empty(),
+            "an ordinary allowed host must still be inspected"
+        );
+    }
+
+    // The hatch inherits tier-2's DNS-rebinding guard for free.
+    #[test]
+    fn passthrough_candidates_are_empty_for_a_lan_address() {
+        let p = inspect_policy(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        );
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "192.168.1.50".parse().unwrap();
+        snoop.record("web", &[("pinned.vendor.com".to_string(), ip, 300)]);
+        assert!(
+            passthrough_names(&*p, &snoop, "web", ip, 443, UsbGuard::default()).is_empty(),
+            "a name must never authorize a LAN target (rebinding)"
+        );
+    }
+
+    #[test]
+    fn a_non_enforcing_policy_has_no_passthrough_candidates() {
+        let snoop = SnoopStore::new();
+        let ip: IpAddr = "1.2.3.11".parse().unwrap(); // see the TEST-NET-3 note above
+        snoop.record("web", &[("pinned.vendor.com".to_string(), ip, 300)]);
+        assert!(
+            passthrough_names(&AllowAll, &snoop, "web", ip, 443, UsbGuard::default()).is_empty(),
+            "a bare sandbox is never MITM'd, so it has nothing to pass through"
+        );
+    }
+
+    // End-to-end through the real `handle_conn`. `spawn_handler` passes
+    // `mitm: None`, so an INSPECTED port answers with the fail-closed
+    // "firewall unavailable" error while a spliced port takes tier-2 — which
+    // makes the gate's branch directly observable without a MITM runtime.
+    #[test]
+    fn the_router_gate_follows_the_declaration_end_to_end() {
+        let p = inspect_policy(
+            "enforce: true\nallow:\n  - host: internal.example.com\n    ports: [8000]\n    protocol: http\n",
+        );
+        let mut c = spawn_handler(p, &FakeResolver);
+        write_frame(
+            &mut c,
+            &StreamOpen::TcpConnect {
+                addr: "1.2.3.20".into(), // see the TEST-NET-3 note above
+                port: 8000,
+            },
+        )
+        .unwrap();
+        let resp: Response = read_frame(&mut c).unwrap();
+        match resp {
+            Response::Error { message, .. } => assert!(
+                message.contains("HTTP(S) firewall unavailable"),
+                ":8000 was declared http, so it must take the tier-1 branch: {message}"
+            ),
+            other => panic!("expected the fail-closed tier-1 error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_undeclared_port_still_takes_tier_two() {
+        let p = inspect_policy(
+            "enforce: true\nallow:\n  - host: internal.example.com\n    ports: [8000]\n    protocol: http\n",
+        );
+        let mut c = spawn_handler(p, &FakeResolver);
+        write_frame(
+            &mut c,
+            &StreamOpen::TcpConnect {
+                addr: "1.2.3.21".into(), // see the TEST-NET-3 note above
+                port: 5432,
+            },
+        )
+        .unwrap();
+        let resp: Response = read_frame(&mut c).unwrap();
+        match resp {
+            Response::Error { message, .. } => assert!(
+                message.contains("denied by policy"),
+                "5432 was never declared, so it stays tier-2: {message}"
+            ),
+            other => panic!("expected a tier-2 policy denial, got {other:?}"),
         }
     }
 }
