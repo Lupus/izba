@@ -17,10 +17,13 @@ use super::policy::{FlowDesc, Policy, Verdict};
 use crate::vmm::UdsStream;
 
 /// Same cap as the guest-side TcpDial: a wedged dial must not pin a thread.
-/// `pub(crate)` so `mitm_runtime`'s pinning-passthrough splice (the async
-/// sibling of this blocking tier-2 dial) can stay on the same budget —
-/// see `mitm_runtime.rs`'s `passthrough_splice`.
-pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// `pub` (not just `pub(crate)`) so `mitm_runtime`'s pinning-passthrough
+/// splice (the async sibling of this blocking tier-2 dial) can stay on the
+/// same budget — see `mitm_runtime.rs`'s `passthrough_splice` — AND so an
+/// external integration test (`egress_inspect.rs`) can derive its own poll
+/// deadline from this value instead of hard-coding a copy that silently goes
+/// stale if this budget ever changes.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The IANA-registered USB/IP port. `usbipd-win` and Linux `usbipd` both listen
 /// here by default, and neither offers any authentication or authorization.

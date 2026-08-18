@@ -40,7 +40,7 @@ use izba_core::daemon::egress::mitm::{
 };
 use izba_core::daemon::egress::mitm_runtime::{MitmRuntime, OrigDst};
 use izba_core::daemon::egress::policy::{AllowAll, Policy};
-use izba_core::daemon::egress::router::{self, UsbGuard};
+use izba_core::daemon::egress::router::{self, UsbGuard, DIAL_TIMEOUT};
 use izba_core::vmm::UdsStream;
 use izba_proto::{read_frame, write_frame, Response, StreamOpen};
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -60,14 +60,12 @@ fn can_bind() -> bool {
     std::net::TcpListener::bind(("127.0.0.1", 0)).is_ok()
 }
 
-/// A TLS upstream under `cache`'s CA that answers every connection with
-/// `body` after reading one line. Deliberately NOT an HTTP server: a
-/// passthrough is an opaque pipe, and asserting on a non-HTTP exchange proves
-/// nothing parsed it.
-async fn spawn_pinned_upstream(cache: Arc<CertCache>, body: &'static str) -> u16 {
+/// Serve `cache`'s CA-signed TLS on an already-bound `listener`, answering
+/// every connection with `body` after reading one line. Deliberately NOT an
+/// HTTP server: a passthrough is an opaque pipe, and asserting on a non-HTTP
+/// exchange proves nothing parsed it.
+fn serve_pinned_upstream(listener: TcpListener, cache: Arc<CertCache>, body: &'static str) {
     let acceptor = TlsAcceptor::from(Arc::new(server_config_with_resolver(cache)));
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
@@ -87,7 +85,46 @@ async fn spawn_pinned_upstream(cache: Arc<CertCache>, body: &'static str) -> u16
             });
         }
     });
+}
+
+/// A TLS upstream on an OS-assigned ephemeral port. Returns the bound port.
+async fn spawn_pinned_upstream(cache: Arc<CertCache>, body: &'static str) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    serve_pinned_upstream(listener, cache, body);
     port
+}
+
+/// A TLS upstream on an EXACT port (`None` if that port is already in use).
+async fn try_spawn_pinned_upstream_at(
+    cache: Arc<CertCache>,
+    body: &'static str,
+    port: u16,
+) -> Option<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.ok()?;
+    serve_pinned_upstream(listener, cache, body);
+    Some(port)
+}
+
+/// Bind two upstreams on ADJACENT ports (`correct`, `correct + 1`) so O2's
+/// mutation-testing probe — dialing `dst.port + 1` — reaches a live,
+/// distinguishable decoy rather than an unbound port (fix round 1, finding
+/// 3: two independently OS-assigned ephemeral ports have no defined
+/// relationship, so a `port + 1` probe against them almost always hits
+/// nothing, and "connection reset" is a much weaker kill than "wrong body").
+/// Retries a handful of times since the second bind names an EXACT port (no
+/// `:0`) and could in principle race something else on the machine.
+async fn spawn_adjacent_pinned_upstreams(cache: Arc<CertCache>) -> (u16, u16) {
+    for _ in 0..8 {
+        let correct_port = spawn_pinned_upstream(Arc::clone(&cache), "SPLICE-HIT-CORRECT").await;
+        if let Some(decoy_port) =
+            try_spawn_pinned_upstream_at(Arc::clone(&cache), "SPLICE-HIT-DECOY", correct_port + 1)
+                .await
+        {
+            return (correct_port, decoy_port);
+        }
+    }
+    panic!("could not bind two adjacent loopback ports after 8 attempts");
 }
 
 /// Bounds every `pinned_flow` call below so a mutation that turns "terminate"
@@ -171,9 +208,16 @@ fn harness() -> (MitmRuntime, Arc<rustls::ClientConfig>, Arc<CertCache>) {
     let izba_ca = IzbaCa::generate().unwrap();
     let izba_certs = Arc::new(CertCache::new(izba_ca));
 
-    let audit = AuditSink::new(izba_core::paths::Paths::with_root(
-        std::env::temp_dir().join("izba-egress-inspect-test-audit"),
+    // Pid-unique, like `egress_mitm.rs`'s CLI-shaped test — a fixed shared
+    // path would let two parallel test binaries clobber each other's audit
+    // trail (harmless today since nothing here reads it back, but a future
+    // reader would inherit a flake).
+    let audit_root = std::env::temp_dir().join(format!(
+        "izba-egress-inspect-test-audit-{}",
+        std::process::id()
     ));
+    let _ = std::fs::remove_dir_all(&audit_root);
+    let audit = AuditSink::new(izba_core::paths::Paths::with_root(audit_root));
     let mitm = MitmRuntime::start(izba_certs, upstream_cfg, audit).expect("start MITM runtime");
 
     // The pinned client: trusts the UPSTREAM's CA and NOT izba's.
@@ -224,6 +268,19 @@ fn a_candidate_sni_is_spliced_untouched() {
     });
 }
 
+/// The certificate-verification error string a pinned client (trusting ONLY
+/// the upstream's CA) gets from izbad's OWN CA-signed leaf. Asserting on this
+/// EXACT phrase — not merely "some error" — is load-bearing: a reset, an EOF,
+/// or a hung-then-timed-out connection all produce a NON-EMPTY error string
+/// too, so `!err.is_empty()` cannot tell "izbad terminated under its own CA"
+/// apart from "izbad dropped the connection" or "izbad hung" (fix round 1,
+/// finding 1 — confirmed both `drop(tcp); return;` and an unbounded pending
+/// future in the terminate branch passed against the old, weaker assertion).
+/// `contains` (not an exact match) survives an incidental
+/// `BadSignature` <-> `UnknownIssuer` rustls wording change while still
+/// rejecting every one of those non-termination outcomes.
+const CERT_REJECTION_MARKER: &str = "invalid peer certificate";
+
 #[test]
 fn an_sni_off_the_candidate_list_is_terminated() {
     install_ring();
@@ -254,19 +311,68 @@ fn an_sni_off_the_candidate_list_is_terminated() {
         .await
         .expect_err("an empty candidate list must terminate, not splice");
         assert!(
-            !err.is_empty(),
-            "the pinned client must reject the izba-CA leaf"
+            err.contains(CERT_REJECTION_MARKER),
+            "the pinned client must reject izbad's OWN CA-signed leaf specifically \
+             (not a reset, an EOF, or a timed-out hang): {err}"
+        );
+    });
+}
+
+/// Fix round 1, finding 2: the test above uses an EMPTY candidate list, which
+/// short-circuits `accept_loop`'s `if !passthrough.is_empty()` guard before
+/// the ClientHello-SNI peek ever runs — so it never actually exercises
+/// `should_passthrough`'s "found, but not on the list" arm at the integration
+/// level (only unit-tested in `mitm_runtime.rs`). This flow carries a
+/// NON-EMPTY candidate list naming a DIFFERENT host, so the peek runs for
+/// real and must still decide to terminate.
+#[test]
+fn a_non_empty_candidate_list_with_a_mismatching_sni_is_terminated() {
+    install_ring();
+    if !can_bind() {
+        eprintln!(
+            "SKIP a_non_empty_candidate_list_with_a_mismatching_sni_is_terminated: bind denied"
+        );
+        return;
+    }
+    let (mitm, gcfg, up_cache) = harness();
+    let policy: Arc<dyn Policy> = Arc::new(AllowAll);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let up_port = spawn_pinned_upstream(up_cache, "PINNED-PONG").await;
+        // The candidate list is non-empty (so the peek runs), but it names a
+        // DIFFERENT host than the one the guest's ClientHello actually asks
+        // for — `should_passthrough` must still terminate.
+        let err = pinned_flow(
+            &mitm,
+            &policy,
+            &gcfg,
+            "pinned.vendor.com",
+            up_port,
+            vec!["other-host.example.com".to_string()],
+        )
+        .await
+        .expect_err("a non-empty but mismatching candidate list must terminate, not splice");
+        assert!(
+            err.contains(CERT_REJECTION_MARKER),
+            "the pinned client must reject izbad's OWN CA-signed leaf specifically \
+             (not a reset, an EOF, or a timed-out hang): {err}"
         );
     });
 }
 
 /// O2: the splice must dial the flow's OWN `dst.ip:dst.port` — not merely
 /// "some" upstream. Two upstreams share the same CA (so cert trust alone
-/// cannot distinguish them) but answer with distinct bodies; the registered
-/// `OrigDst.port` names the CORRECT one, and the DECOY sits one port over —
-/// exactly the `port + 1` mutation this obligation names. A splice that
-/// dialed the decoy (or anything else) would surface as the wrong body, or as
-/// a handshake failure if nothing is listening where it dialed instead.
+/// cannot distinguish them) but answer with distinct bodies, bound on
+/// ADJACENT ports (see `spawn_adjacent_pinned_upstreams`) so the `port + 1`
+/// mutation this obligation names reaches a live, distinguishable decoy
+/// rather than an unbound port; the registered `OrigDst.port` names the
+/// CORRECT one. A splice that dialed the decoy (or anything else) would
+/// surface as the wrong body, or as a handshake failure if nothing is
+/// listening where it dialed instead.
 #[test]
 fn a_splice_dials_the_flows_own_upstream_not_a_decoy() {
     install_ring();
@@ -282,8 +388,7 @@ fn a_splice_dials_the_flows_own_upstream_not_a_decoy() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let correct_port = spawn_pinned_upstream(Arc::clone(&up_cache), "SPLICE-HIT-CORRECT").await;
-        let _decoy_port = spawn_pinned_upstream(Arc::clone(&up_cache), "SPLICE-HIT-DECOY").await;
+        let (correct_port, _decoy_port) = spawn_adjacent_pinned_upstreams(up_cache).await;
 
         let got = pinned_flow(
             &mitm,
@@ -347,16 +452,30 @@ fn client_hello_bytes(sni: &'static str) -> Vec<u8> {
 /// this test could bind a real fake upstream on AND legally hand to
 /// `handle_conn`. The oracle is therefore the audit trail `passthrough_splice`
 /// unconditionally writes the moment it is entered, regardless of whether its
-/// own dial to `dst.ip:dst.port` (a real, unreachable "public" address) ever
-/// succeeds: a Tier::L3 record whose rule names the passthrough. That record
-/// can only appear if the router handed a non-empty, SNI-matching candidate
-/// list all the way through to the runtime — which is exactly the wiring O1
-/// says is unverified. If the router instead passed `Vec::new()`, the flow
-/// would fall straight to ordinary MITM termination, which (since our probe
-/// never completes a real handshake) never produces ANY audit record for this
-/// flow (see `mitm_runtime.rs`'s accept_loop: a TLS accept failure writes no
-/// audit line — the M5 diagnosability follow-up) — so this test would instead
-/// time out with no record found.
+/// own dial to `dst.ip:dst.port` ever succeeds: a Tier::L3 record whose rule
+/// names the passthrough. That record can only appear if the router handed a
+/// non-empty, SNI-matching candidate list all the way through to the runtime
+/// — which is exactly the wiring O1 says is unverified. If the router instead
+/// passed `Vec::new()`, the flow would fall straight to ordinary MITM
+/// termination, which (since our probe never completes a real handshake)
+/// never produces ANY audit record for this flow (see `mitm_runtime.rs`'s
+/// accept_loop: a TLS accept failure writes no audit line — the M5
+/// diagnosability follow-up) — so this test would instead time out with no
+/// record found.
+///
+/// The destination is `233.252.0.1` (RFC 5771 MCAST-TEST-NET), NOT an
+/// ordinary "public but unreachable" address like `1.2.3.4`: fix round 1,
+/// finding 4 measured `1.2.3.4` as a real internet blackhole off this
+/// sandbox (~14s to a TCP client timeout unsandboxed — the near-instant
+/// refusal seen inside the agent sandbox is an artifact of ITS network
+/// policy, not something this test can rely on in an ordinary CI runner). A
+/// multicast destination is structurally different: the kernel refuses a
+/// `SOCK_STREAM` `connect()` to it immediately (no SYN ever goes out — TCP
+/// has no multicast destinations), and it is neither loopback/link-local/
+/// documentation/broadcast/unspecified (so `is_hard_denied` still passes it)
+/// nor RFC1918/unique-local (so it is not treated as LAN either) — the same
+/// non-hard-denied, non-RFC5737 shape `1.2.3.4` had, but with a deterministic
+/// instant local refusal instead of a real network round trip.
 #[test]
 fn o1_router_wires_real_passthrough_candidates_into_the_runtime() {
     install_ring();
@@ -366,9 +485,10 @@ fn o1_router_wires_real_passthrough_candidates_into_the_runtime() {
     }
 
     // A real MitmRuntime, built exactly as izbad's `server::build_mitm_runtime`
-    // does. The upstream trust store is irrelevant here — `1.2.3.4` is never
-    // actually reached by a live server this test controls, so an empty root
-    // store is fine (any real upstream dial fails before any cert is checked).
+    // does. The upstream trust store is irrelevant here — the destination
+    // below is never actually reached by a live server this test controls,
+    // so an empty root store is fine (the dial itself fails before any cert
+    // is ever checked).
     let upstream_cfg = upstream_client_config(rustls::RootCertStore::empty());
     let izba_ca = IzbaCa::generate().unwrap();
     let izba_certs = Arc::new(CertCache::new(izba_ca));
@@ -393,11 +513,11 @@ fn o1_router_wires_real_passthrough_candidates_into_the_runtime() {
     let policy: Arc<dyn Policy> = cfg.into_policy("web").unwrap();
 
     // DNS-snoop binding: izbad's OWN resolver "answered" pinned.vendor.com ->
-    // 1.2.3.4 for this sandbox — the candidate list is bound to the address,
-    // never trusted from the SNI alone (see `router::passthrough_names`'s
-    // doc).
+    // 233.252.0.1 for this sandbox — the candidate list is bound to the
+    // address, never trusted from the SNI alone (see
+    // `router::passthrough_names`'s doc).
     let snoop = SnoopStore::new();
-    let dst_ip: IpAddr = "1.2.3.4".parse().unwrap();
+    let dst_ip: IpAddr = "233.252.0.1".parse().unwrap();
     snoop.record("web", &[("pinned.vendor.com".to_string(), dst_ip, 300)]);
 
     let (mut client, server) = UdsStream::pair().unwrap();
@@ -419,7 +539,7 @@ fn o1_router_wires_real_passthrough_candidates_into_the_runtime() {
     write_frame(
         &mut client,
         &StreamOpen::TcpConnect {
-            addr: "1.2.3.4".to_string(),
+            addr: "233.252.0.1".to_string(),
             port: 443,
         },
     )
@@ -427,7 +547,7 @@ fn o1_router_wires_real_passthrough_candidates_into_the_runtime() {
     let resp: Response = read_frame(&mut client).expect("read tier-1 response");
     assert!(
         matches!(resp, Response::Ok),
-        "mitm_hop must accept the loopback dial: {resp:?}"
+        "mitm_hop must accept the guest's tier-1 hop onto the MITM runtime: {resp:?}"
     );
 
     let hello = client_hello_bytes("pinned.vendor.com");
@@ -435,11 +555,15 @@ fn o1_router_wires_real_passthrough_candidates_into_the_runtime() {
         .write_all(&hello)
         .expect("write the ClientHello onto the spliced pipe");
 
-    // Poll the audit trail: bounded by `router::DIAL_TIMEOUT` (10s) plus
-    // margin, since a correctly-wired flow only writes its record after the
-    // (doomed) dial to 1.2.3.4 resolves one way or the other.
+    // Poll the audit trail: bounded by the product's OWN `router::DIAL_TIMEOUT`
+    // plus margin (not a hard-coded copy, per fix round 1 finding 4 — a
+    // future bump to that budget must widen this deadline automatically
+    // rather than silently making this test read as "not wired" when it is),
+    // since a correctly-wired flow only writes its record after the (doomed)
+    // dial to `233.252.0.1` resolves.
     let audit_file = audit_paths.logs_dir("web").join("egress-audit.jsonl");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let poll_budget = DIAL_TIMEOUT + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + poll_budget;
     let mut found = None;
     while std::time::Instant::now() < deadline {
         if let Ok(text) = std::fs::read_to_string(&audit_file) {
