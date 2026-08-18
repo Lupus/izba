@@ -2122,6 +2122,17 @@ Append to §13 (out-of-scope follow-ups, named not built):
   is the only surface that reveals the widened hatch. Moving the declaration to
   a per-port representation, or refusing the mutation on a hatch-carrying host,
   would close it properly.
+- **A superseded `protocol: tcp` disappears silently.** `InspectionTable`'s
+  passthrough set folds last-wins per exact host, mirroring
+  `to_rego_data_json`'s map overwrite — so a later duplicate entry for the same
+  host drops an earlier entry's explicit `protocol: tcp` with no warning. That
+  is the safe direction (the flow gets inspected rather than spliced) and the
+  fold must keep matching the Rego one, but the operator's declaration vanishes
+  and a genuinely pinning client then breaks with nothing pointing at the
+  duplicate entry. A `policy lint`-style warning on a superseded declaration
+  would close the diagnosability gap without touching the fold. Note the
+  deliberate asymmetry: `inspect_ports` still UNIONs, which is also the safe
+  direction for that set.
 - **Reassembling a ClientHello fragmented across TLS records.** P1's extractor
   reads the first record only; a hello split across records reports
   `Incomplete` and therefore fails closed to termination, which breaks
