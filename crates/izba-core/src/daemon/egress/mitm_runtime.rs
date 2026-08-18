@@ -317,7 +317,7 @@ async fn passthrough_splice(
     let mut flow = FlowDesc::l3(&dst.sandbox, dst.ip.to_string(), dst.port);
     flow.host = Some(sni.to_string());
     // Same budget as the tier-2 blocking dial (`router::DIAL_TIMEOUT`,
-    // `router.rs:309`) — a wedged pinned upstream must not hold this task (or,
+    // `router.rs:315`) — a wedged pinned upstream must not hold this task (or,
     // via `copy_bidirectional` never starting, the client's connection) for
     // the kernel's multi-minute SYN timeout, and every window still gets an
     // audit line so a blackholed dial is never silent.

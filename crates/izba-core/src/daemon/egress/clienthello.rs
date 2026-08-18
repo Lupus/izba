@@ -380,7 +380,7 @@ mod tests {
 
     /// A `ServerNameList` entry whose `NameType` is not `host_name` (`0x00`)
     /// is not a name a real TLS server would ever see as SNI — the filter at
-    /// `:101` must skip it rather than treat its payload as a hostname. This
+    /// `:103` must skip it rather than treat its payload as a hostname. This
     /// is the false-`Found` bypass guard: without it, an attacker-chosen
     /// undefined-NameType entry could smuggle a pinned host's name past the
     /// parser and win an unterminated splice for a name no server honours.

@@ -1120,6 +1120,83 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn dispatch_policy_set_full_preserves_protocol() {
+        // Regression (F-1/F-2): the GUI's JSON -> Vec<AllowEntry> ingestion
+        // for `policy_set_full` had zero test coverage before this, even
+        // though an earlier commit in this branch rewired exactly this path
+        // (`AllowEntry`'s hand-written `Deserialize` funnels through
+        // `parse_allow_entry`). A future edit to that parse path could break
+        // desktop policy Save with all workspace gates green and nothing
+        // catching it. This pins the M5 inspectability axis surviving the
+        // exact JSON shape the (fixed) PolicyEditor emits: an explicit `http`
+        // declaration on a non-web port, and an explicit `tcp`
+        // (TLS-pinning-passthrough) declaration on 443.
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(
+            &st,
+            "policy_set_full",
+            serde_json::json!({
+                "name": "web",
+                "allow": [
+                    {"host": "internal.example.com", "ports": [8000], "access": "read", "protocol": "http"},
+                    {"host": "pinned.vendor.com", "ports": [443], "protocol": "tcp"},
+                ],
+                "git": [],
+            }),
+            &mut emit,
+        )
+        .unwrap();
+        assert!(out.is_null());
+
+        let shown = dispatch(
+            &st,
+            "policy_show",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        let allow = shown["allow"].as_array().unwrap();
+        let internal = allow
+            .iter()
+            .find(|e| e["host"] == "internal.example.com")
+            .expect("internal.example.com entry survives the round trip");
+        assert_eq!(
+            internal["protocol"], "http",
+            "an explicit http declaration on a non-web port must round-trip: {shown}"
+        );
+        let pinned = allow
+            .iter()
+            .find(|e| e["host"] == "pinned.vendor.com")
+            .expect("pinned.vendor.com entry survives the round trip");
+        assert_eq!(
+            pinned["protocol"], "tcp",
+            "an explicit tcp (pinning passthrough) declaration on 443 must round-trip: {shown}"
+        );
+
+        // Reconstruct the InspectionTable from what actually round-tripped,
+        // to pin the exact security-relevant answers F-1 flipped silently:
+        // an unflagged http -> tcp weakening on an inspectability-bearing
+        // entry.
+        let round_tripped: Vec<izba_core::daemon::egress::config::AllowEntry> =
+            serde_json::from_value(shown["allow"].clone()).unwrap();
+        let cfg = izba_core::daemon::egress::config::EgressPolicyConfig {
+            enforce: true,
+            allow: round_tripped,
+            git: vec![],
+        };
+        let table = izba_core::daemon::egress::inspect::InspectionTable::from_config(&cfg);
+        assert!(
+            table.inspects(8000),
+            "protocol: http on a non-web port must be inspected after the round trip"
+        );
+        assert!(
+            table.passthrough_host("pinned.vendor.com", 443),
+            "protocol: tcp on 443 must remain the pinning passthrough after the round trip"
+        );
+    }
+
+    #[test]
     fn dispatch_manifest_diff_unknown_sandbox() {
         let st = state_with(FakeDaemon::default());
         let mut emit = |_: &str, _: serde_json::Value| {};
