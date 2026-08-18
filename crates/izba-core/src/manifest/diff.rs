@@ -155,6 +155,15 @@ fn allow_index(eg: &EgressPolicyConfig) -> BTreeMap<(String, u16), Access> {
 /// (`InspectionTable::from_config` and `to_rego_data_json`) disagreeing. So
 /// this asks `InspectionTable`'s own public methods instead — the same ones
 /// the datapath calls. Do not "simplify" this back into `allow_index`.
+///
+/// Both inspection checks deliberately OVER-approximate in the safe
+/// direction (a brute-force audit over ~865k config pairs found ~2.2%
+/// flagging where nothing currently weakens: an explicit `tcp` on a port
+/// nothing yet inspects, and check 2 counting a superseded duplicate entry as
+/// reachable) — do not "tighten" check 1 with an `inspects(p)` guard, since a
+/// standing `tcp` declaration becomes a live hatch the instant ANY other
+/// entry starts inspecting that port, and a guard would turn this into a
+/// missed weakening instead of a merely conservative one.
 fn egress_weakens(from: &EgressPolicyConfig, to: &EgressPolicyConfig) -> bool {
     if from.enforce && !to.enforce {
         return true;
@@ -411,9 +420,11 @@ mod tests {
 
     // DP-7: the manifest reuses EgressPolicyConfig verbatim, so `protocol`
     // rides `spec.egress` with no mirroring — pin that so a future refactor
-    // that forks the type is caught here.
+    // that forks the type is caught here. Read direction only (deserializing
+    // a manifest into a SandboxSpec); the write direction is already covered
+    // by config.rs's own serialization tests, not duplicated here.
     #[test]
-    fn protocol_round_trips_through_a_manifest_spec_egress_block() {
+    fn protocol_deserializes_through_a_manifest_spec_egress_block() {
         let spec: crate::manifest::schema::SandboxSpec = serde_yaml::from_str(
             "image: alpine\negress:\n  enforce: true\n  allow:\n    - host: pinned.vendor.com\n      ports: [443]\n      protocol: tcp\n",
         )
