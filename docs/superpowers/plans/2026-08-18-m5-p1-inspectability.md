@@ -1724,7 +1724,10 @@ git commit -m "feat(manifest): flag protocol: http -> tcp as a weakens-egress tr
         .unwrap();
         let out = render_policy("web", Some(&cfg));
         assert!(out.contains("passthrough"), "{out}");
-        assert!(out.contains("no L7 rules"), "the operator must see what they gave up:\n{out}");
+        assert!(out.contains("\u{26a0}"), "the only surface revealing a hatch must be loud:\n{out}");
+        for loss in ["no L7 rules", "no request audit", "no credential injection"] {
+            assert!(out.contains(loss), "the operator must see what they gave up ({loss}):\n{out}");
+        }
     }
 
     #[test]
@@ -1740,7 +1743,7 @@ git commit -m "feat(manifest): flag protocol: http -> tcp as a weakens-egress tr
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p izba-cli --lib policy`
+Run: `cargo test -p izba-cli --bins policy`  # izba-cli has no lib target
 Expected: FAIL — the rendering carries no protocol.
 
 - [ ] **Step 3: Render the axis**
@@ -1756,7 +1759,9 @@ In `render_policy`'s allow-list loop, after the access string:
                         None => String::new(),
                         Some(Protocol::Http) => "  protocol: http (inspected)".to_string(),
                         Some(Protocol::Tcp) => {
-                            "  protocol: tcp (passthrough: opaque splice, no L7 rules)".to_string()
+                            "  \u{26a0} protocol: tcp \u{2014} pinning passthrough: spliced \
+                             opaquely; no L7 rules, no request audit, no credential injection"
+                                .to_string()
                         }
                     };
                     let _ = writeln!(
