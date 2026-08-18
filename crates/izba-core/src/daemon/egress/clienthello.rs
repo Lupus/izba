@@ -52,8 +52,14 @@ pub fn peek_sni(buf: &[u8]) -> Sni {
     let Some(len_bytes) = fragment.get(1..4) else {
         return Sni::None;
     };
-    let hs_len =
-        ((len_bytes[0] as usize) << 16) | ((len_bytes[1] as usize) << 8) | len_bytes[2] as usize;
+    // A big-endian u24. Decoded through `u32::from_be_bytes` with a leading
+    // zero rather than hand-rolled shifts and ors: the hand-rolled form spells
+    // out an arithmetic identity that a mutation cannot always change
+    // observably (the three shifted bytes occupy disjoint bit ranges, so `|`
+    // and `^` are indistinguishable there), which leaves un-killable mutants
+    // sitting on a length field that guest bytes control. This form has no
+    // arithmetic to mutate.
+    let hs_len = u32::from_be_bytes([0, len_bytes[0], len_bytes[1], len_bytes[2]]) as usize;
     let Some(body) = fragment.get(4..4 + hs_len) else {
         // The record is complete but the handshake message is not: the
         // ClientHello is fragmented across records. We do not reassemble —
@@ -210,6 +216,13 @@ mod tests {
     /// only extension is `server_name` carrying `host` (or no extensions when
     /// `host` is `None`).
     fn client_hello(host: Option<&str>) -> Vec<u8> {
+        client_hello_padded(host, 0)
+    }
+
+    /// As [`client_hello`], plus a trailing filler extension of `pad` bytes so
+    /// the handshake body can be pushed past a single length byte. The filler
+    /// uses an unassigned extension type, which the walk must skip.
+    fn client_hello_padded(host: Option<&str>, pad: usize) -> Vec<u8> {
         let mut ext = Vec::new();
         if let Some(h) = host {
             let mut sni = vec![0x00]; // NameType: host_name
@@ -220,6 +233,11 @@ mod tests {
             ext.extend_from_slice(&0x0000u16.to_be_bytes()); // ext type server_name
             ext.extend_from_slice(&(list.len() as u16).to_be_bytes());
             ext.extend_from_slice(&list);
+        }
+        if pad > 0 {
+            ext.extend_from_slice(&0x5a5au16.to_be_bytes()); // unassigned ext type
+            ext.extend_from_slice(&(pad as u16).to_be_bytes());
+            ext.extend(std::iter::repeat_n(0x00u8, pad));
         }
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // client_version
@@ -376,6 +394,66 @@ mod tests {
         let pos = buf.len() - 3;
         buf[pos] = 0xff; // not ASCII
         assert_eq!(peek_sni(&buf), Sni::None);
+    }
+
+    /// The length bound is `> MAX_SNI_LEN`, so a name of EXACTLY 253 bytes —
+    /// the longest legal hostname — must still be accepted. Pins the boundary
+    /// in both directions: an off-by-one to `>=` would silently refuse the
+    /// longest names a real client can present, and refusing is invisible
+    /// (it just means that host can never take the hatch).
+    #[test]
+    fn a_name_of_exactly_the_maximum_length_is_accepted() {
+        let suffix = ".example.com";
+        let at_limit = format!("{}{suffix}", "a".repeat(MAX_SNI_LEN - suffix.len()));
+        assert_eq!(at_limit.len(), MAX_SNI_LEN);
+        assert_eq!(
+            peek_sni(&client_hello(Some(&at_limit))),
+            Sni::Found(at_limit.clone())
+        );
+
+        let over_limit = format!("a{at_limit}");
+        assert_eq!(over_limit.len(), MAX_SNI_LEN + 1);
+        assert_eq!(peek_sni(&client_hello(Some(&over_limit))), Sni::None);
+    }
+
+    /// An ASCII character outside the hostname whitelist is refused. The
+    /// pre-existing coverage only used a non-ASCII byte, which the `is_ascii`
+    /// check rejects first — so the whitelist itself was never exercised, and
+    /// inverting any of its comparisons went unnoticed. Underscore is the
+    /// realistic case: legal in DNS, not in a hostname izba can match against
+    /// an allow-list entry.
+    #[test]
+    fn an_ascii_character_outside_the_hostname_whitelist_is_refused() {
+        for bad in [
+            "under_score.example.com",
+            "sla/sh.example.com",
+            "co:lon.example.com",
+        ] {
+            assert_eq!(
+                peek_sni(&client_hello(Some(bad))),
+                Sni::None,
+                "{bad} is not a hostname the allow-list can express"
+            );
+        }
+        // The characters the whitelist DOES admit — hyphen and dot included —
+        // so the test above cannot pass by refusing everything.
+        assert_eq!(
+            peek_sni(&client_hello(Some("a-b.c9.example.com"))),
+            Sni::Found("a-b.c9.example.com".into())
+        );
+    }
+
+    /// A handshake body longer than 255 bytes puts a non-zero value in the
+    /// MIDDLE byte of the u24 length, which is the only way to exercise the
+    /// multi-byte decode — every other test's hello is short enough that the
+    /// two high bytes are zero and any decode would agree.
+    #[test]
+    fn a_handshake_longer_than_one_length_byte_decodes_correctly() {
+        let host = "long.example.com";
+        let padded = client_hello_padded(Some(host), 400);
+        assert_eq!(padded[6], 0, "high length byte");
+        assert_ne!(padded[7], 0, "middle length byte must be exercised");
+        assert_eq!(peek_sni(&padded), Sni::Found(host.into()));
     }
 
     /// A `ServerNameList` entry whose `NameType` is not `host_name` (`0x00`)
