@@ -32,6 +32,12 @@ Every task's requirements implicitly include this section.
 - **TDD**: write the failing test, run it, watch it fail for the right reason, then implement. Conventional commits (`feat(egress): …`). Commit at the end of every task.
 - **Mutation gate**: izba runs an incremental `cargo-mutants` gate that fails when a mutant survives on every CI platform. Prefer testing pure functions directly over asserting only through end-to-end paths.
 - **No `git add -A`.** Stage named paths, verify with `git diff --cached --stat`, then commit.
+- **Never use an RFC 5737 documentation address in an egress test.** `192.0.2.0/24`,
+  `198.51.100.0/24` and `203.0.113.0/24` are inside `is_hard_denied`'s SSRF floor,
+  so a flow to one is refused before any policy, gate, or tier decision runs — a
+  test using one silently exercises the floor instead of the thing under test.
+  Use `1.2.3.x`, which is this file's existing convention. (Caught in Task 3:
+  the first draft of this plan used `203.0.113.x` throughout.)
 
 ---
 
@@ -783,7 +789,7 @@ In `router.rs`'s test module. The existing helpers (`RegoPolicy::with_data`, `sp
             "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
         );
         let snoop = SnoopStore::new();
-        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let ip: IpAddr = "1.2.3.9".parse().unwrap();
         assert!(
             passthrough_names(&*p, &snoop, "web", ip, 443, UsbGuard::default()).is_empty(),
             "no snoop record ⇒ no passthrough, so a raw-IP dial can never splice"
@@ -799,7 +805,7 @@ In `router.rs`'s test module. The existing helpers (`RegoPolicy::with_data`, `sp
     fn passthrough_candidates_exclude_a_host_without_the_declaration() {
         let p = inspect_policy("enforce: true\nallow:\n  - api.anthropic.com\n");
         let snoop = SnoopStore::new();
-        let ip: IpAddr = "203.0.113.10".parse().unwrap();
+        let ip: IpAddr = "1.2.3.10".parse().unwrap();
         snoop.record("web", &[("api.anthropic.com".to_string(), ip, 300)]);
         assert!(
             passthrough_names(&*p, &snoop, "web", ip, 443, UsbGuard::default()).is_empty(),
@@ -825,7 +831,7 @@ In `router.rs`'s test module. The existing helpers (`RegoPolicy::with_data`, `sp
     #[test]
     fn a_non_enforcing_policy_has_no_passthrough_candidates() {
         let snoop = SnoopStore::new();
-        let ip: IpAddr = "203.0.113.11".parse().unwrap();
+        let ip: IpAddr = "1.2.3.11".parse().unwrap();
         snoop.record("web", &[("pinned.vendor.com".to_string(), ip, 300)]);
         assert!(
             passthrough_names(&AllowAll, &snoop, "web", ip, 443, UsbGuard::default()).is_empty(),
@@ -846,7 +852,7 @@ In `router.rs`'s test module. The existing helpers (`RegoPolicy::with_data`, `sp
         write_frame(
             &mut c,
             &StreamOpen::TcpConnect {
-                addr: "203.0.113.20".into(),
+                addr: "1.2.3.20".into(),
                 port: 8000,
             },
         )
@@ -870,7 +876,7 @@ In `router.rs`'s test module. The existing helpers (`RegoPolicy::with_data`, `sp
         write_frame(
             &mut c,
             &StreamOpen::TcpConnect {
-                addr: "203.0.113.21".into(),
+                addr: "1.2.3.21".into(),
                 port: 5432,
             },
         )
