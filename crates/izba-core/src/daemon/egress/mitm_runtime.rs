@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use super::audit::{AuditRecord, AuditSink, Tier};
+use super::clienthello;
 use super::mitm::{
     self, server_config_with_resolver, CertCache, L7Request, L7Verdict, MitmPolicy, MitmState,
 };
@@ -52,8 +53,8 @@ struct DstEntry {
 }
 
 /// `DstMap::claim`'s return shape: the destination, its per-sandbox policy,
-/// and its DNS-snoop-bound passthrough name candidates (Task 3's `_passthrough`
-/// in `accept_loop`, consumed starting Task 5).
+/// and its DNS-snoop-bound passthrough name candidates (`accept_loop`'s
+/// `passthrough`, consumed by the pre-termination ClientHello-SNI peek).
 type ClaimedDst = (OrigDst, Arc<dyn Policy>, Arc<[String]>);
 
 /// Rendezvous between the blocking router and the MITM runtime, keyed by the
@@ -254,6 +255,85 @@ impl MitmRuntime {
     }
 }
 
+/// How much of a ClientHello we are willing to peek. A TLS record caps at
+/// 16 KiB and a post-quantum key share pushes a real hello past 2 KiB, so this
+/// is generous rather than tight.
+const SNI_PEEK_MAX: usize = 16 * 1024;
+/// A ClientHello can span several TCP segments, so one `peek` may return a
+/// short buffer. Retry to this bound and then FAIL CLOSED to termination.
+const SNI_PEEK_TRIES: usize = 16;
+const SNI_PEEK_DELAY: Duration = Duration::from_millis(20);
+
+/// Whether this flow takes the pinning passthrough, and if so, the exact name
+/// it matched. Pure, so the fail-closed direction is testable without a
+/// socket: anything other than a complete ClientHello whose SNI is on the
+/// router's pre-computed candidate list terminates and is policed. Returning
+/// the matched `&str` (borrowed from `sni`, never from `candidates`) instead
+/// of a bool keeps the hostname recovery to this one match — no second match
+/// at the call site that could diverge from this decision, and nothing that
+/// can panic on guest-controlled bytes.
+fn should_passthrough<'a>(sni: &'a clienthello::Sni, candidates: &[String]) -> Option<&'a str> {
+    match sni {
+        clienthello::Sni::Found(name) if candidates.iter().any(|c| c == name) => {
+            Some(name.as_str())
+        }
+        // A short read, a fragmented hello, a missing or unusable SNI, or an
+        // SNI not on the candidate list: inspect.
+        _ => None,
+    }
+}
+
+/// Peek (never consume) up to a full ClientHello, retrying while the buffer
+/// holds only a valid prefix. Returns the best answer within the budget; the
+/// bytes stay in the socket for whichever path runs next.
+async fn peek_client_hello(tcp: &tokio::net::TcpStream) -> clienthello::Sni {
+    let mut buf = vec![0u8; SNI_PEEK_MAX];
+    for _ in 0..SNI_PEEK_TRIES {
+        let n = tcp.peek(&mut buf).await.unwrap_or(0);
+        match clienthello::peek_sni(&buf[..n]) {
+            clienthello::Sni::Incomplete => tokio::time::sleep(SNI_PEEK_DELAY).await,
+            decided => return decided,
+        }
+    }
+    clienthello::Sni::Incomplete
+}
+
+/// Splice a pinned flow straight through, unterminated. Audited as what it
+/// actually is — a tier-3/L3 opaque pipe — so `izba netlog` shows the operator
+/// exactly which flows their hatch exempted from L7 (§7.7). The SNI is
+/// recorded as the flow host and nothing else — never the bytes that flow
+/// through the splice.
+async fn passthrough_splice(
+    mut client: tokio::net::TcpStream,
+    dst: &OrigDst,
+    audit: &AuditSink,
+    sni: &str,
+) {
+    let mut flow = FlowDesc::l3(&dst.sandbox, dst.ip.to_string(), dst.port);
+    flow.host = Some(sni.to_string());
+    let mut upstream = match tokio::net::TcpStream::connect((dst.ip, dst.port)).await {
+        Ok(s) => s,
+        Err(_) => {
+            audit.record(AuditRecord::from_flow(
+                Verdict::Deny,
+                &flow,
+                dst.ip,
+                Tier::L3,
+                "passthrough (protocol: tcp) — upstream dial failed",
+            ));
+            return;
+        }
+    };
+    audit.record(AuditRecord::from_flow(
+        Verdict::Allow,
+        &flow,
+        dst.ip,
+        Tier::L3,
+        "passthrough (protocol: tcp)",
+    ));
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+}
+
 async fn accept_loop(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -267,9 +347,7 @@ async fn accept_loop(
             Err(_) => continue,
         };
         // Recover what izbad knew about this flow by the loopback source port.
-        // `_passthrough` is unread until Task 5's ClientHello-SNI peek consumes
-        // it (renamed there); not read here in Task 3.
-        let Some((dst, policy, _passthrough)) = dsts.claim(peer.port()) else {
+        let Some((dst, policy, passthrough)) = dsts.claim(peer.port()) else {
             // Unknown source port: not a flow we registered — drop it.
             continue;
         };
@@ -278,6 +356,10 @@ async fn accept_loop(
         let policy = Arc::clone(&policy);
         let audit = audit.clone();
         tokio::spawn(async move {
+            // Taken before `audit` moves into the `PolicyAdapter` below — the
+            // passthrough splice records its own L3 audit line and never runs
+            // through the L7 `PolicyAdapter`.
+            let audit_pt = audit.clone();
             let state = MitmState { acceptor, upstream };
             let adapter: Arc<dyn MitmPolicy> = Arc::new(PolicyAdapter {
                 policy,
@@ -297,6 +379,19 @@ async fn accept_loop(
             let mut hdr = [0u8; 5];
             let n = tcp.peek(&mut hdr).await.unwrap_or(0);
             if mitm::looks_like_tls(&hdr[..n]) {
+                // The pinning hatch (§5.2, D3) is decided from the ClientHello
+                // SNI BEFORE termination, and only over the candidate list the
+                // router derived from DNS-snoop — never from the SNI alone
+                // (router::passthrough_names explains why). The list is empty
+                // for every policy that declares no `protocol: tcp`, so the
+                // common path does not even take the larger peek.
+                if !passthrough.is_empty() {
+                    let sni = peek_client_hello(&tcp).await;
+                    if let Some(host) = should_passthrough(&sni, &passthrough) {
+                        passthrough_splice(tcp, &dst, &audit_pt, host).await;
+                        return;
+                    }
+                }
                 match state.acceptor.accept(tcp).await {
                     Ok(tls) => {
                         let sni = tls.get_ref().1.server_name().map(str::to_string);
@@ -308,6 +403,9 @@ async fn accept_loop(
                     }
                 }
             } else {
+                // DP-4: a cleartext leg has no pinning to protect, so it always
+                // terminates — izba enforcing more than the declaration asks
+                // for, which is the direction D12 sanctions.
                 let _ = mitm::serve_mitm(tcp, None, &state, adapter, dst.clone()).await;
             }
         });
@@ -374,5 +472,44 @@ mod tests {
         let flow = adapter.flow_for(&req);
         assert_eq!(flow.query.as_deref(), Some("service=git-receive-pack"));
         assert_eq!(flow.host.as_deref(), Some("github.com"));
+    }
+
+    // The decision the peek loop makes once it has (or fails to get) bytes.
+    #[test]
+    fn a_matching_sni_on_the_candidate_list_passes_through() {
+        let cands: Vec<String> = vec!["pinned.vendor.com".into()];
+        assert_eq!(
+            should_passthrough(&clienthello::Sni::Found("pinned.vendor.com".into()), &cands),
+            Some("pinned.vendor.com")
+        );
+    }
+
+    #[test]
+    fn an_sni_off_the_candidate_list_is_terminated() {
+        let cands: Vec<String> = vec!["pinned.vendor.com".into()];
+        assert_eq!(
+            should_passthrough(&clienthello::Sni::Found("evil.example.com".into()), &cands),
+            None
+        );
+    }
+
+    // Fail closed in the inspect direction, on every ambiguity.
+    #[test]
+    fn incomplete_and_absent_snis_are_terminated() {
+        let cands: Vec<String> = vec!["pinned.vendor.com".into()];
+        assert_eq!(
+            should_passthrough(&clienthello::Sni::Incomplete, &cands),
+            None,
+            "a short read must not escape inspection"
+        );
+        assert_eq!(should_passthrough(&clienthello::Sni::None, &cands), None);
+    }
+
+    #[test]
+    fn an_empty_candidate_list_never_passes_through() {
+        assert_eq!(
+            should_passthrough(&clienthello::Sni::Found("pinned.vendor.com".into()), &[]),
+            None
+        );
     }
 }
