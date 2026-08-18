@@ -2133,6 +2133,15 @@ Append to §13 (out-of-scope follow-ups, named not built):
   would close the diagnosability gap without touching the fold. Note the
   deliberate asymmetry: `inspect_ports` still UNIONs, which is also the safe
   direction for that set.
+- **A declined passthrough explains nothing.** When a flow the operator
+  declared `protocol: tcp` fails to take the hatch — a record-fragmented
+  ClientHello exhausting the 320 ms peek budget, an SNI absent from the
+  DNS-snoop candidate set, a `decide_tier2` refusal — izbad silently terminates
+  it instead, which is the correct and safe outcome but leaves a genuinely
+  pinning client failing with nothing in `izba netlog` pointing at why. An
+  audit record for the declined case (reason, observed SNI, candidate count)
+  would close it. Same diagnosability class as the silently-superseded
+  declaration above.
 - **Reassembling a ClientHello fragmented across TLS records.** P1's extractor
   reads the first record only; a hello split across records reports
   `Incomplete` and therefore fails closed to termination, which breaks
