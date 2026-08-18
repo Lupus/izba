@@ -437,6 +437,7 @@ mod tests {
             host: "h".into(),
             ports: None,
             access: Access::Read,
+            protocol: None,
         }];
         let mut to = from.clone();
         if let AllowEntry::Scoped { access, .. } = &mut to.egress.allow[0] {
@@ -486,11 +487,13 @@ mod tests {
                 host: "h".into(),
                 ports: Some(vec![443]),
                 access: Access::Read,
+                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "h".into(),
                 ports: Some(vec![80]),
                 access: Access::Read,
+                protocol: None,
             },
         ];
         let mut to = from.clone();
@@ -589,11 +592,13 @@ mod tests {
                 host: "h".into(),
                 ports: Some(vec![443]),
                 access: Access::ReadWrite,
+                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "h".into(),
                 ports: Some(vec![80]),
                 access: Access::ReadWrite,
+                protocol: None,
             },
         ];
         let mut to = from.clone();
@@ -651,6 +656,7 @@ mod tests {
             host: "api.example.com".into(),
             ports: Some(vec![443]),
             access: Access::Read,
+            protocol: None,
         }];
         let mut to = from.clone();
         if let AllowEntry::Scoped { host, .. } = &mut to.egress.allow[0] {
@@ -687,11 +693,13 @@ mod tests {
                 host: "host.com".into(),
                 ports: Some(vec![443]),
                 access: Access::ReadWrite,
+                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "Host.com".into(),
                 ports: Some(vec![443]),
                 access: Access::Read,
+                protocol: None,
             },
         ];
         let mut to = base();
@@ -699,6 +707,7 @@ mod tests {
             host: "host.com".into(),
             ports: Some(vec![443]),
             access: Access::ReadWrite,
+            protocol: None,
         }];
         assert!(
             egress_weakens(&from.egress, &to.egress),
@@ -716,12 +725,14 @@ mod tests {
             host: "Host.com".into(),
             ports: Some(vec![443]),
             access: Access::Read,
+            protocol: None,
         }];
         let mut to = base();
         to.egress.allow = vec![AllowEntry::Scoped {
             host: "host.com".into(),
             ports: Some(vec![443]),
             access: Access::ReadWrite,
+            protocol: None,
         }];
         assert!(egress_weakens(&from.egress, &to.egress));
     }
@@ -737,6 +748,7 @@ mod tests {
                 host: "host.com".into(),
                 ports: Some(vec![443]),
                 access: Access::Read,
+                protocol: None,
             }];
             f
         };
@@ -746,6 +758,7 @@ mod tests {
             host: "HOST.com".into(),
             ports: Some(vec![8080]),
             access: Access::Read,
+            protocol: None,
         }];
         assert!(
             egress_weakens(&from_single.egress, &widened_port.egress),
@@ -757,6 +770,7 @@ mod tests {
             host: "HOST.com".into(),
             ports: Some(vec![443]),
             access: Access::Read,
+            protocol: None,
         }];
         assert!(
             !egress_weakens(&from_single.egress, &same_port.egress),
@@ -778,6 +792,7 @@ mod tests {
             host: "host.com".into(),
             ports: Some(vec![443]),
             access: Access::ReadWrite,
+            protocol: None,
         }];
         let mut with_dup = base();
         with_dup.egress.allow = vec![
@@ -785,11 +800,13 @@ mod tests {
                 host: "host.com".into(),
                 ports: Some(vec![443]),
                 access: Access::ReadWrite,
+                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "host.com".into(),
                 ports: Some(vec![443]),
                 access: Access::Read,
+                protocol: None,
             },
         ];
         assert!(
@@ -815,11 +832,13 @@ mod tests {
                 host: "host.com".into(),
                 ports: Some(vec![443]),
                 access: Access::Read,
+                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "host.com".into(),
                 ports: Some(vec![8080]),
                 access: Access::ReadWrite,
+                protocol: None,
             },
         ];
         let mut to = base();
@@ -827,6 +846,7 @@ mod tests {
             host: "host.com".into(),
             ports: Some(vec![443]),
             access: Access::Read,
+            protocol: None,
         }];
         assert!(
             egress_weakens(&from.egress, &to.egress),
@@ -848,11 +868,13 @@ mod tests {
                 host: "*.example.com".into(),
                 ports: Some(vec![443]),
                 access: Access::ReadWrite,
+                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "*.example.com".into(),
                 ports: Some(vec![443]),
                 access: Access::Read,
+                protocol: None,
             },
         ];
         let mut single = base();
@@ -860,6 +882,7 @@ mod tests {
             host: "*.example.com".into(),
             ports: Some(vec![443]),
             access: Access::ReadWrite,
+            protocol: None,
         }];
         assert!(
             !egress_weakens(&dup.egress, &single.egress),
@@ -885,12 +908,14 @@ mod tests {
             host: "*.example.com".into(),
             ports: Some(vec![443]),
             access: Access::Read,
+            protocol: None,
         }];
         let mut to = base();
         to.egress.allow = vec![AllowEntry::Scoped {
             host: "*.example.com".into(),
             ports: Some(vec![443]),
             access: Access::ReadWrite,
+            protocol: None,
         }];
         assert!(
             egress_weakens(&from.egress, &to.egress),
