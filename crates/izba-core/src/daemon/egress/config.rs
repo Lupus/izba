@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::audit::EndpointSummary;
+use super::inspect::InspectionTable;
 use super::policy::{AllowAll, Policy, RegoPolicy, Verdict};
 
 /// On-disk policy file name under the sandbox directory.
@@ -717,7 +718,7 @@ impl EgressPolicyConfig {
         }
         Ok(Arc::new(RegoPolicy::with_data_and_inspection(
             &self.to_rego_data_json(sandbox),
-            super::inspect::InspectionTable::from_config(self),
+            InspectionTable::from_config(self),
         )?))
     }
 
