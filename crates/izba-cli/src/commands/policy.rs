@@ -462,6 +462,7 @@ mod tests {
             host: "api.x.com".into(),
             ports: Some(vec![80, 443]),
             access: Access::ReadWrite,
+            protocol: None,
         };
         let out = render_allow_grant(std::slice::from_ref(&rw));
         assert!(out.contains("api.x.com"), "must name the host: {out}");
@@ -479,6 +480,7 @@ mod tests {
             host: "api.x.com".into(),
             ports: Some(vec![443]),
             access: Access::Read,
+            protocol: None,
         };
         let out = render_allow_grant(&[ro]);
         assert!(
@@ -496,11 +498,13 @@ mod tests {
                 host: "*.x.com".into(),
                 ports: Some(vec![443]),
                 access: Access::Read,
+                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "*.x.com".into(),
                 ports: Some(vec![8443]),
                 access: Access::ReadWrite,
+                protocol: None,
             },
         ];
         let out = render_allow_grant(&entries);
@@ -613,6 +617,7 @@ mod tests {
                 host: "api.x.com".to_string(),
                 ports: Some(vec![80, 443]),
                 access: Access::ReadWrite,
+                protocol: None,
             }
         );
         apply_block_edit(dir.path(), "api.x.com", &[80, 443]).unwrap();
@@ -643,6 +648,7 @@ mod tests {
                 host: "*.example.com".into(),
                 ports: Some(vec![443]),
                 access: Access::ReadWrite,
+                protocol: None,
             }]
         );
     }
@@ -848,11 +854,13 @@ mod tests {
                     host: "pypi.org".into(),
                     ports: None,
                     access: Access::Read,
+                    protocol: None,
                 },
                 AllowEntry::Scoped {
                     host: "api.x.com".into(),
                     ports: None,
                     access: Access::ReadWrite,
+                    protocol: None,
                 },
             ],
             git: vec![],
@@ -884,6 +892,7 @@ mod tests {
                 host: "api.x.com".into(),
                 ports: None,
                 access: Access::ReadWrite,
+                protocol: None,
             }],
             git: vec![GitRule {
                 target: GitTarget::Repo("github.com/o/a".into()),
@@ -906,6 +915,7 @@ mod tests {
                 host: "api.x.com".into(),
                 ports: None,
                 access: Access::ReadWrite,
+                protocol: None,
             }],
             git: vec![],
         };
