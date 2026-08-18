@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use crate::daemon::egress::config::{
     is_wildcard_host, normalize_policy_host, Access, EgressPolicyConfig,
 };
+use crate::daemon::egress::inspect::InspectionTable;
 use crate::manifest::normalize::{ImageSource, Normalized};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,8 +137,24 @@ fn allow_index(eg: &EgressPolicyConfig) -> BTreeMap<(String, u16), Access> {
 
 /// True if turning `from` egress into `to` egress LOOSENS the firewall:
 /// disabling enforce, adding a (host, port) pair, widening access
-/// (read -> read-write) on any (host, port), or adding/loosening a git rule.
-/// An unenforced `from` allowed everything, so nothing weakens from it (#124).
+/// (read -> read-write) on any (host, port), opening a new pinning
+/// passthrough, losing L7 inspection on a still-reachable port, or
+/// adding/loosening a git rule. An unenforced `from` allowed everything, so
+/// nothing weakens from it (#124).
+///
+/// The inspectability axis (M5 §5.2) is deliberately NOT folded into
+/// `allow_index`. `allow_index` is host+port-keyed, compile-faithful to
+/// `to_rego_data_json`'s per-host JSON structures (#172) — but
+/// `InspectionTable::from_config`'s `inspect_ports` is a policy-GLOBAL union
+/// keyed on port ALONE: the router's tier-1 gate decides whether to
+/// terminate before the TLS handshake, with only an (ip, port) and no host
+/// yet, so there is no host-keyed answer available at that point (see that
+/// type's doc). A host+port-keyed fold cannot represent that shape, and
+/// reimplementing it here would be a THIRD independent computation of this
+/// axis — Task 3 already spent a day on a live security bypass caused by two
+/// (`InspectionTable::from_config` and `to_rego_data_json`) disagreeing. So
+/// this asks `InspectionTable`'s own public methods instead — the same ones
+/// the datapath calls. Do not "simplify" this back into `allow_index`.
 fn egress_weakens(from: &EgressPolicyConfig, to: &EgressPolicyConfig) -> bool {
     if from.enforce && !to.enforce {
         return true;
@@ -157,6 +174,49 @@ fn egress_weakens(from: &EgressPolicyConfig, to: &EgressPolicyConfig) -> bool {
             }
         }
     }
+
+    let (from_insp, to_insp) = (
+        InspectionTable::from_config(from),
+        InspectionTable::from_config(to),
+    );
+
+    // 1. A NEW pinning passthrough on an exact (host, port) removes L7
+    //    enforcement for that host even though its port stays in the global
+    //    inspected set — an explicit `tcp` entry never removes its own port
+    //    from `inspects` (see `InspectionTable`'s
+    //    `an_explicit_tcp_entry_does_not_uninspect_its_port`). This is the
+    //    titled `http -> tcp` transition, caught directly rather than
+    //    inferred from a protocol pair.
+    for e in &to.allow {
+        for p in e.ports() {
+            if to_insp.passthrough_host(e.host(), p) && !from_insp.passthrough_host(e.host(), p) {
+                return true;
+            }
+        }
+    }
+
+    // 2. Losing GLOBAL inspection on a port some `to` entry can still reach
+    //    is a weakening even when no entry declares an explicit passthrough
+    //    — e.g. removing the one entry that pulled a shared port into the
+    //    inspected set silently un-inspects every OTHER host still on that
+    //    port. Vacuous (not flagged) when nothing in `to` reaches the port
+    //    any more — that is a pure reachability tightening, already handled
+    //    by the (host, port) loop above never seeing a removed cell.
+    let candidate_ports: std::collections::BTreeSet<u16> = from
+        .allow
+        .iter()
+        .flat_map(|e| e.ports())
+        .chain(to.allow.iter().flat_map(|e| e.ports()))
+        .collect();
+    for p in candidate_ports {
+        if from_insp.inspects(p)
+            && !to_insp.inspects(p)
+            && to.allow.iter().any(|e| e.ports().contains(&p))
+        {
+            return true;
+        }
+    }
+
     // git: a new rule, or any rule whose access widened read -> read-write.
     let fg: BTreeMap<String, Access> = from
         .git
@@ -250,9 +310,119 @@ pub fn classify(base: &Normalized, repo: &Normalized, managed: &Normalized) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::egress::config::{Access, AllowEntry, EgressPolicyConfig};
+    use crate::daemon::egress::config::{Access, AllowEntry, EgressPolicyConfig, Protocol};
     use crate::manifest::normalize::{ImageSource, Normalized};
     use crate::state::PortRule;
+
+    fn eg(yaml: &str) -> EgressPolicyConfig {
+        EgressPolicyConfig::from_yaml(yaml).expect("parses")
+    }
+
+    #[test]
+    fn dropping_inspection_from_http_to_tcp_weakens_egress() {
+        let from = eg("enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n");
+        let to = eg(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        );
+        assert!(
+            egress_weakens(&from, &to),
+            "the hatch drops L7 enforcement for this host — it must be flagged"
+        );
+    }
+
+    #[test]
+    fn adding_inspection_from_tcp_to_http_does_not_weaken() {
+        let from = eg(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        );
+        let to = eg("enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n");
+        assert!(!egress_weakens(&from, &to), "restoring inspection tightens");
+    }
+
+    #[test]
+    fn declaring_the_implied_protocol_is_not_a_change() {
+        let from = eg("enforce: true\nallow:\n  - host: h.example.com\n    ports: [443]\n");
+        let to = eg(
+            "enforce: true\nallow:\n  - host: h.example.com\n    ports: [443]\n    protocol: http\n",
+        );
+        assert!(
+            !egress_weakens(&from, &to),
+            "writing down what was already true"
+        );
+        assert!(!egress_weakens(&to, &from));
+    }
+
+    #[test]
+    fn opening_a_new_inspected_port_still_weakens_as_new_reachability() {
+        let from = eg("enforce: true\nallow:\n  - host: h.example.com\n    ports: [443]\n");
+        let to = eg(
+            "enforce: true\nallow:\n  - host: h.example.com\n    ports: [443, 8000]\n    protocol: http\n",
+        );
+        assert!(
+            egress_weakens(&from, &to),
+            "a new (host, port) is new reach"
+        );
+    }
+
+    /// The counter-example that stopped this task mid-flight (M5 P1 review,
+    /// task 6): `inspect_ports` is a policy-GLOBAL union keyed on port alone
+    /// (the router decides termination before the TLS handshake, with only an
+    /// (ip, port) and no host yet — see `InspectionTable::from_config`'s doc).
+    /// h1 never declares a protocol at all, but h2's `protocol: http` on the
+    /// SAME port globally pulls port 8000 into the inspected set, so h1 is
+    /// actually inspected in `from`. Removing h2's entry entirely (not
+    /// touching h1's) drops 8000 out of the global set, so h1 loses L7
+    /// enforcement in `to` even though h1's own entry never changed and is
+    /// still reachable. No host+port-keyed fold (i.e. `allow_index`) can see
+    /// this, because the change that causes it — h2's removal — isn't a cell
+    /// `egress_weakens` ever inspects (removing a host must not itself flag,
+    /// per `removing_an_allow_host_does_not_weaken`). This is why the check
+    /// below asks `InspectionTable` directly instead of folding protocol into
+    /// `allow_index`. Verified directly against `InspectionTable::from_config`
+    /// before this test was written.
+    #[test]
+    fn losing_global_inspection_on_a_still_reachable_port_weakens_egress() {
+        let from = eg(
+            "enforce: true\nallow:\n  - host: h1.example.com\n    ports: [8000]\n  - host: h2.example.com\n    ports: [8000]\n    protocol: http\n",
+        );
+        let to = eg("enforce: true\nallow:\n  - host: h1.example.com\n    ports: [8000]\n");
+        assert!(
+            egress_weakens(&from, &to),
+            "h1 was inspected on 8000 only because h2's entry pulled the port into the \
+             global inspected set; removing h2 silently un-inspects h1's still-reachable port"
+        );
+    }
+
+    /// The complement of the test above: if NOTHING in `to` can reach the
+    /// port any more, losing its global inspection is vacuous — flagging it
+    /// would fire the review-token gate for a change that is a pure
+    /// reachability tightening.
+    #[test]
+    fn losing_global_inspection_on_a_now_unreachable_port_does_not_weaken() {
+        let from = eg(
+            "enforce: true\nallow:\n  - host: h1.example.com\n    ports: [8000]\n  - host: h2.example.com\n    ports: [8000]\n    protocol: http\n",
+        );
+        let to = eg("enforce: true\nallow: []\n");
+        assert!(
+            !egress_weakens(&from, &to),
+            "nothing reaches 8000 any more in `to`; un-inspecting it is vacuous"
+        );
+    }
+
+    // DP-7: the manifest reuses EgressPolicyConfig verbatim, so `protocol`
+    // rides `spec.egress` with no mirroring — pin that so a future refactor
+    // that forks the type is caught here.
+    #[test]
+    fn protocol_round_trips_through_a_manifest_spec_egress_block() {
+        let spec: crate::manifest::schema::SandboxSpec = serde_yaml::from_str(
+            "image: alpine\negress:\n  enforce: true\n  allow:\n    - host: pinned.vendor.com\n      ports: [443]\n      protocol: tcp\n",
+        )
+        .expect("spec.egress deserializes through EgressPolicyConfig's strict walk");
+        assert_eq!(
+            spec.egress.expect("egress block present").allow[0].declared_protocol(),
+            Some(Protocol::Tcp)
+        );
+    }
 
     fn base() -> Normalized {
         Normalized {
