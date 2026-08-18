@@ -15,6 +15,12 @@ interface Row {
   host: string;
   ports: number[];
   access: Access;
+  /** The declared inspectability, carried through unedited (F-1): the GUI has
+   *  no authoring surface for this field, but a value it read must survive a
+   *  Save that did not touch it. `undefined` for an entry that never
+   *  declared one — that must round-trip WITHOUT the key, not as some
+   *  invented default. */
+  protocol?: "http" | "tcp";
 }
 
 interface GitRow {
@@ -36,7 +42,12 @@ function toGitRow(rule: GitRule): GitRow {
 function toRow(e: AllowEntry): Row {
   return typeof e === "string"
     ? { host: e, ports: [...WEB_DEFAULT_PORTS], access: "read-write" }
-    : { host: e.host, ports: e.ports ?? [...WEB_DEFAULT_PORTS], access: e.access ?? "read-write" };
+    : {
+        host: e.host,
+        ports: e.ports ?? [...WEB_DEFAULT_PORTS],
+        access: e.access ?? "read-write",
+        protocol: e.protocol,
+      };
 }
 
 /** Convert a target string and access into a GitRule. */
@@ -260,7 +271,16 @@ export function PolicyEditor({ name }: { name: string }) {
       }
       const allow: AllowEntry[] = hosts
         .filter((r) => r.host.trim() !== "")
-        .map((r) => ({ host: r.host.trim(), ports: r.ports, access: r.access }));
+        .map((r) => ({
+          host: r.host.trim(),
+          ports: r.ports,
+          access: r.access,
+          // Omit the key entirely for a row that never had one (F-1): the
+          // GUI must not invent a declaration, and the Rust side's
+          // `skip_serializing_if = "Option::is_none"` means the key's
+          // ABSENCE is the canonical "no declaration" shape.
+          ...(r.protocol ? { protocol: r.protocol } : {}),
+        }));
       const git: GitRule[] = gitRows
         .filter((r) => r.target.trim() !== "")
         .map((r) => toGitRule(r.target.trim(), r.access));

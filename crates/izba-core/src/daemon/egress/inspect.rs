@@ -131,10 +131,12 @@ impl InspectionTable {
     /// consults this (via `Policy::has_passthrough`) to short-circuit its
     /// candidate computation BEFORE any Rego evaluation (`decide_tier2`) for
     /// the overwhelmingly common policy that never writes `protocol: tcp`
-    /// anywhere — keeping that path zero-cost. (There is no ClientHello peek
-    /// yet to skip — that lands in a later task, at a different layer: it will
-    /// test the CANDIDATE LIST `passthrough_names` already computed, not this
-    /// table method.)
+    /// anywhere — keeping that path zero-cost. A second, independent
+    /// short-circuit lives at a different layer: `mitm_runtime`'s per-flow
+    /// accept loop only takes the larger `peek_client_hello` read when the
+    /// CANDIDATE LIST `passthrough_names` already computed for this flow is
+    /// non-empty — it does not re-consult this table method, since the
+    /// candidate list is what actually gates the hatch.
     pub fn has_passthrough(&self) -> bool {
         !self.passthrough.is_empty()
     }

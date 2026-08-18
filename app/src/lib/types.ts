@@ -225,8 +225,20 @@ export interface EndpointSummary {
  *  `ports` is OPTIONAL: the backend serializes `ports: Option<Vec<u16>>` with
  *  `skip_serializing_if = "Option::is_none"`, so a scoped entry whose ports
  *  equal the web defaults comes back with NO `ports` field. A missing `ports`
- *  means the web defaults (matching Rust's `AllowEntry::ports()`). */
-export type AllowEntry = string | { host: string; ports?: number[]; access?: Access };
+ *  means the web defaults (matching Rust's `AllowEntry::ports()`).
+ *
+ *  `protocol` is likewise OPTIONAL and likewise `skip_serializing_if =
+ *  "Option::is_none"` on the Rust side (`AllowEntry::Scoped.protocol`, the M5
+ *  inspectability axis — `http` means izbad terminates and polices this entry
+ *  at L7, an explicit `tcp` is the documented TLS-pinning passthrough). The
+ *  GUI has NO authoring surface for this field (that stays in `policy.yaml` /
+ *  `izba.yml` + `izba diff`/`promote`, which is also where a weakening from
+ *  `http` to `tcp` is flagged) — but a value it *read* MUST survive a Save it
+ *  did not intend to change: dropping it here silently disables L7
+ *  enforcement outside the diff/promote gate (F-1). */
+export type AllowEntry =
+  | string
+  | { host: string; ports?: number[]; access?: Access; protocol?: "http" | "tcp" };
 
 export type Access = "read" | "read-write";
 

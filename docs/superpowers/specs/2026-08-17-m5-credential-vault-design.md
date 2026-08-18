@@ -362,7 +362,7 @@ Stated plainly so it is not rediscovered: **the vault's threat model is a hostil
 - **Per-container attribution.** In docker mode the workload's netns was created by init, so "which container" is known from topology init controls rather than workload-influenced data — structurally stronger than binary identity and unavailable to container-based designs.
 - OCSF audit schema; metering and budgets; SigV4 re-signing; SPIFFE identity.
 
-**Surfaced by P1 (2026-08-18), named not built.** All four are diagnosability
+**Surfaced by P1 (2026-08-18), named not built.** All six are diagnosability
 or authoring gaps, not enforcement gaps — the datapath fails closed in every
 case below.
 

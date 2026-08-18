@@ -246,6 +246,78 @@ describe("PolicyEditor", () => {
     expect(pypi?.access).toBe("read");
   });
 
+  it("preserves protocol: http on a non-web port on Save without editing the row", async () => {
+    // Regression (F-1): the GUI's Row shape had no `protocol` field, so a
+    // Save the operator did not intend to touch on protocol silently dropped
+    // an `http` L7-inspection declaration on a non-web port — an unflagged
+    // security weakening that never reaches the diff/promote gate, because
+    // this path writes policy.yaml through the daemon directly.
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "internal.example.com", ports: [8000], access: "read", protocol: "http" }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("internal.example.com");
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [
+          {
+            host: "internal.example.com",
+            ports: [8000],
+            access: "read",
+            protocol: "http",
+          },
+        ],
+        [],
+      ),
+    );
+  });
+
+  it("preserves protocol: tcp (the pinning passthrough) on 443 on Save without editing the row", async () => {
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "pinned.vendor.com", ports: [443], protocol: "tcp" }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [
+          {
+            host: "pinned.vendor.com",
+            ports: [443],
+            access: "read-write",
+            protocol: "tcp",
+          },
+        ],
+        [],
+      ),
+    );
+  });
+
+  it("does not emit a protocol key for an entry that never had one", async () => {
+    // A value the GUI never read must not be invented on Save — canonical
+    // YAML for an entry with no declared protocol must not change.
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "api.x.com", ports: [443] }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("api.x.com");
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(api.policySetFull).toHaveBeenCalled());
+    const calls = (api.policySetFull as ReturnType<typeof vi.fn>).mock.calls;
+    const allow: Array<Record<string, unknown>> = calls[0][1];
+    expect(allow[0]).not.toHaveProperty("protocol");
+  });
+
   it("loads a ports-less allow entry (backend None) without crashing", async () => {
     // Regression: a Scoped entry whose ports == web defaults comes back with no
     // `ports` field. toRow must default to the web ports, not undefined.
