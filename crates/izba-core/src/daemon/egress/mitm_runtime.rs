@@ -41,12 +41,20 @@ pub struct OrigDst {
 
 /// What the router hands the MITM runtime per flow: the original destination
 /// plus the per-sandbox policy to apply (the runtime is shared across sandboxes,
-/// so the policy travels with the flow rather than living on the runtime).
+/// so the policy travels with the flow rather than living on the runtime), and
+/// the DNS-snoop-bound passthrough name candidates (`router::passthrough_names`)
+/// — empty for the common case where the policy never declares `protocol: tcp`.
 struct DstEntry {
     dst: OrigDst,
     policy: Arc<dyn Policy>,
+    passthrough: Arc<[String]>,
     at: Instant,
 }
+
+/// `DstMap::claim`'s return shape: the destination, its per-sandbox policy,
+/// and its DNS-snoop-bound passthrough name candidates (Task 3's `_passthrough`
+/// in `accept_loop`, consumed starting Task 5).
+type ClaimedDst = (OrigDst, Arc<dyn Policy>, Arc<[String]>);
 
 /// Rendezvous between the blocking router and the MITM runtime, keyed by the
 /// loopback source port (unique per live connection). The router inserts before
@@ -61,25 +69,32 @@ impl DstMap {
         Self::default()
     }
 
-    pub fn insert(&self, src_port: u16, dst: OrigDst, policy: Arc<dyn Policy>) {
+    pub fn insert(
+        &self,
+        src_port: u16,
+        dst: OrigDst,
+        policy: Arc<dyn Policy>,
+        passthrough: Arc<[String]>,
+    ) {
         self.inner.lock().expect("DstMap poisoned").insert(
             src_port,
             DstEntry {
                 dst,
                 policy,
+                passthrough,
                 at: Instant::now(),
             },
         );
     }
 
-    /// Claim (remove) the dst + policy for a source port; `None` if unknown or
-    /// swept.
-    pub fn claim(&self, src_port: u16) -> Option<(OrigDst, Arc<dyn Policy>)> {
+    /// Claim (remove) the dst + policy + passthrough candidates for a source
+    /// port; `None` if unknown or swept.
+    pub fn claim(&self, src_port: u16) -> Option<ClaimedDst> {
         self.inner
             .lock()
             .expect("DstMap poisoned")
             .remove(&src_port)
-            .map(|e| (e.dst, e.policy))
+            .map(|e| (e.dst, e.policy, e.passthrough))
     }
 
     /// Drop entries older than `max_age`.
@@ -226,10 +241,16 @@ impl MitmRuntime {
         self.listen
     }
 
-    /// Register the dst + its per-sandbox policy for a loopback source port,
-    /// before the router connects.
-    pub fn register(&self, src_port: u16, dst: OrigDst, policy: Arc<dyn Policy>) {
-        self.dsts.insert(src_port, dst, policy);
+    /// Register the dst + its per-sandbox policy + passthrough candidates for a
+    /// loopback source port, before the router connects.
+    pub fn register(
+        &self,
+        src_port: u16,
+        dst: OrigDst,
+        policy: Arc<dyn Policy>,
+        passthrough: Arc<[String]>,
+    ) {
+        self.dsts.insert(src_port, dst, policy, passthrough);
     }
 }
 
@@ -246,7 +267,9 @@ async fn accept_loop(
             Err(_) => continue,
         };
         // Recover what izbad knew about this flow by the loopback source port.
-        let Some((dst, policy)) = dsts.claim(peer.port()) else {
+        // `_passthrough` is unread until Task 5's ClientHello-SNI peek consumes
+        // it (renamed there); not read here in Task 3.
+        let Some((dst, policy, _passthrough)) = dsts.claim(peer.port()) else {
             // Unknown source port: not a flow we registered — drop it.
             continue;
         };
@@ -311,14 +334,24 @@ mod tests {
     #[test]
     fn dstmap_claims_once_and_expires() {
         let map = DstMap::new();
-        map.insert(40001, dst("1.2.3.4", 443, "web"), pol());
+        map.insert(
+            40001,
+            dst("1.2.3.4", 443, "web"),
+            pol(),
+            Arc::from(Vec::new()),
+        );
         assert_eq!(
-            map.claim(40001).map(|(d, _)| d),
+            map.claim(40001).map(|(d, _, _)| d),
             Some(dst("1.2.3.4", 443, "web"))
         );
         assert!(map.claim(40001).is_none(), "second claim must be empty");
 
-        map.insert(40002, dst("5.6.7.8", 443, "web"), pol());
+        map.insert(
+            40002,
+            dst("5.6.7.8", 443, "web"),
+            pol(),
+            Arc::from(Vec::new()),
+        );
         map.expire_older_than(Duration::ZERO); // everything is stale vs zero age
         assert!(map.claim(40002).is_none(), "expired entry must be gone");
     }

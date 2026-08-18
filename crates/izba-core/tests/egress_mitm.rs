@@ -103,6 +103,9 @@ async fn guest_request(
             sandbox: "web".into(),
         },
         Arc::clone(policy),
+        // Task 3 gate: no passthrough candidates in this end-to-end MITM test —
+        // it exercises the ordinary inspected/terminated path.
+        Arc::from(Vec::new()),
     );
     sock.connect(&mitm.listen_addr().into()).unwrap();
     sock.set_nonblocking(true).unwrap();
