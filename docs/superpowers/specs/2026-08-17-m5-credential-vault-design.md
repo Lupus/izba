@@ -73,7 +73,7 @@ It should be decomposed into four sequenced plans, in the shape the USB feature 
 | Phase | Content | Independently valuable? |
 | --- | --- | --- |
 | **P0** | F-09 `SO_PEERCRED` (D14) | **Delivered** — closed an open MED finding on its own |
-| **P1** | The inspectability axis: `protocol` field, `Policy::inspects`, the router gate, the SNI pre-peek and passthrough hatch (D2, D3, D12) | **Yes — pays off M2 debt**; L7 rules and the pinning hatch land with no credential code at all |
+| **P1** | The inspectability axis: `protocol` field, `Policy::inspects`, the router gate, the SNI pre-peek and passthrough hatch (D2, D3, D12) | **Delivered** — paid off the M2 debt; L7 rules on any declared port and the pinning hatch landed with no credential code at all. Plan: [2026-08-18-m5-p1-inspectability](../plans/2026-08-18-m5-p1-inspectability.md) |
 | **P2** | Provider ingestion, lint, store, binding + specificity, and family-A injection (D4–D11, D13, D16) | Yes — the bulk of the daily value |
 | **P3** | Family B: `izba login`, then in-band harvest (D15) | Yes |
 
@@ -147,9 +147,19 @@ Values: `http` (alias `rest` on import) and `tcp`. `graphql`, `mcp`, `json-rpc`,
 
 ### 5.2 Why `protocol: tcp` on 443 is the pinning hatch
 
-The survey requires a documented passthrough for TLS-pinned clients that no MITM can serve. `protocol: tcp` on a specific host is that hatch: it is operator-authored (D12), it is reported by `izba status` and `provider lint`, and it disables injection for that host by construction. Per D3 the decision is taken on the ClientHello SNI before termination, so it does not rest on DNS-snoop.
+The survey requires a documented passthrough for TLS-pinned clients that no MITM can serve. `protocol: tcp` on a specific host is that hatch: it is operator-authored (D12), it is reported by the CLI, and it disables injection for that host by construction. Per D3 the decision is taken on the ClientHello SNI before termination.
 
 **`protocol: http → tcp` on a host is a `⚠ weakens egress` transition** — it drops L7 enforcement — and must be flagged by `manifest::diff::egress_weakens` alongside its CLI and GUI renderers.
+
+**As delivered (P1, 2026-08-18) — three corrections to the paragraphs above, each of which narrows rather than widens.**
+
+*The hatch does rest on DNS-snoop, and must.* This section originally said the SNI decision "does not rest on DNS-snoop". That is wrong, and the reason is worth recording: the SNI is a string the **guest** chooses, and a passthrough performs no upstream certificate verification by construction — that is the whole point. Deciding on the SNI alone would therefore splice a guest-chosen *address* on the strength of a guest-chosen *name*, i.e. an unrestricted exfiltration channel. Tier-1 does not have this problem because it verifies the upstream certificate against the vetted host. So `router::passthrough_names` derives the candidate set from what izbad's **own resolver** answered for that destination, filtered through `decide_tier2`: **a passthrough flow is exactly a tier-2 flow that additionally proves its SNI**, inheriting the DNS-rebinding guard unchanged. A second, independent `policy.check` per candidate name is retained deliberately — during implementation the axis was briefly computed by two folds that disagreed (`to_rego_data_json` last-wins vs a unioning `InspectionTable`), which produced a live hatch on a host the allow-list denied; that filter was the only thing closing it.
+
+*The hatch is reported by `izba policy show`, not `izba status`.* `status` renders no egress posture at all. Since `izba policy allow` also writes `policy.yaml` directly without passing the `izba diff`/`promote` weakening gate, `policy show` is the **only** surface in the product that reveals a pinning passthrough, and its warning is worded to carry that weight alone. An egress block in `status` is a named follow-up.
+
+*Two weakening transitions, not one.* `manifest::diff::egress_weakens` flags a newly-declared passthrough **and** the loss of inspection on a still-reachable port. The second is not reducible to the first: `inspects(port)` is policy-global and port-keyed — it must be, since the tier-1 gate decides before the handshake and has no host — so removing one host's `protocol: http` entry can drop a *different* host from L7 to opaque, which no per-host fold can see. Both checks consult `InspectionTable` rather than re-folding `protocol`, so the diff cannot drift from the datapath.
+
+Two further rules P1 settled: an explicit `protocol: tcp` on a **wildcard** host is a parse error (matching an SNI against a wildcard would fork the wildcard semantics that live in `egress.rego`, and a divergence there is exactly the shape of a security bug), and the hatch is **TLS-only** — a cleartext leg has no pinning to protect, so it always terminates.
 
 ---
 
@@ -352,6 +362,49 @@ Stated plainly so it is not rediscovered: **the vault's threat model is a hostil
 - **Per-container attribution.** In docker mode the workload's netns was created by init, so "which container" is known from topology init controls rather than workload-influenced data — structurally stronger than binary identity and unavailable to container-based designs.
 - OCSF audit schema; metering and budgets; SigV4 re-signing; SPIFFE identity.
 
+**Surfaced by P1 (2026-08-18), named not built.** All four are diagnosability
+or authoring gaps, not enforcement gaps — the datapath fails closed in every
+case below.
+
+- **`izba policy allow --protocol http|tcp`.** P1 added no policy-mutation CLI
+  surface, because threading the axis through the normalized-mutation contract
+  (#170/#172: `collapse_duplicate_hosts`, `set_host_access`, the
+  compile-faithful diff fold) is separate work from the axis itself. Authoring
+  works today by editing `policy.yaml` or through `izba.yml` + `izba diff` /
+  `izba promote`, which is also where the weakening gate lives.
+- **An egress block in `izba status`.** §5.2 assumed `status` reported the
+  hatch; it renders no egress posture at all, so P1 landed the reporting in
+  `izba policy show`. Inspected ports, passthrough hosts and enforce posture in
+  `status` would be a small standalone improvement.
+- **A superseded `protocol: tcp` disappears silently.** The passthrough set
+  folds last-wins per exact host to match `to_rego_data_json`, so a later
+  duplicate entry for the same host drops an earlier explicit declaration with
+  no warning. Safe direction — the flow is inspected rather than spliced — but
+  the operator's declaration vanishes and a genuinely pinning client then
+  breaks with nothing pointing at the duplicate. A `policy lint` warning would
+  close it without touching the fold. Note the deliberate asymmetry:
+  `inspect_ports` unions, which is also the safe direction for that set.
+- **A declined passthrough explains nothing.** When a flow the operator
+  declared `protocol: tcp` fails to take the hatch — a record-fragmented
+  ClientHello exhausting the peek budget, an SNI absent from the DNS-snoop
+  candidate set, a `decide_tier2` refusal — izbad silently terminates it
+  instead. Correct and safe, but a pinning client fails with nothing in
+  `izba netlog` saying why. An audit record for the declined case (reason,
+  observed SNI, candidate count) would close it.
+- **Reassembling a ClientHello fragmented across TLS records.** `peek_sni`
+  reads the first record only; a hello split across records reports
+  `Incomplete` and so fails closed to termination, which breaks passthrough for
+  a client that fragments. Rare in practice, honest in behaviour, worth fixing
+  if a real client hits it.
+- **`protocol` is stored per-entry, but the hatch is per-port.** An entry
+  carries one `Option<Protocol>` covering all its ports, so
+  `izba policy allow pinned.vendor.com:8080` on a host declaring
+  `protocol: tcp` extends the hatch to a port the operator never named. P1
+  preserves the declaration across that mutation rather than dropping it —
+  dropping silently performs an unflagged `http → tcp` weakening, which is
+  worse — and pins the behaviour in a test. A per-port representation, or
+  refusing the mutation on a hatch-carrying host, would close it properly.
+
 ---
 
 ## 14. New findings (for the register)
@@ -369,4 +422,10 @@ Stated plainly so it is not rediscovered: **the vault's threat model is a hostil
 1. Keyring backend on Linux — `libsecret` couples to a desktop session that a headless workstation lacks; the sealed-file fallback may simply be the default there.
 2. Whether `izba login` should proxy the browser open out to the host (Clawker's `BROWSER` trick) or stay a pure host-side command.
 3. Whether the response-side secret scan (§8 step 10) is per-grant opt-in or always on — it costs response buffering.
-4. Whether `protocol` belongs on the manifest's `spec.egress` as well, or stays operator-only like `spec.usb` (USB spec D8 kept hardware consent out of `izba.yml` deliberately).
+4. ~~Whether `protocol` belongs on the manifest's `spec.egress`~~ — **resolved
+   during P1: it was never a choice.** `izba.yml`'s `spec.egress` deserializes
+   through `EgressPolicyConfig`'s own strict walk, so `protocol` rides the
+   manifest automatically; the `spec.usb` comparison does not apply, because
+   that mirrors a separate consent record while `spec.egress` reuses the policy
+   type verbatim. What P1 owed was therefore a test that it survives the
+   manifest path, plus the weakening flags — both delivered.

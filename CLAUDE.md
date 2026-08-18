@@ -206,6 +206,41 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   the initramfs via `IZBA_NFT` (`hack/build-nft.sh`) and applies the nat-output
   REDIRECT ruleset at boot. (passt/consomme/`izba.ipv4only` are GONE from the
   datapath as of M1 — all egress flows through izbad over vsock 1027.)
+- **Inspectability is DECLARED, not derived from the port (M5 P1):** an allow
+  entry carries `protocol: http | tcp`. The router's tier-1 gate is
+  `policy.enforces() && policy.inspects(port)` (`router.rs`), not the old
+  `matches!(port, 80 | 443)`. **The axis may only widen:** `inspects` always
+  contains 80/443 — `Policy::inspects`'s default is
+  `self.enforces() && matches!(port, 80|443)`, guarded the way `allows_name`
+  guards its own default, so an enforcing impl that forgets to override still
+  gets the baseline. `protocol` is decided in typed Rust and NEVER enters
+  `to_rego_data_json` (guard-tested byte-identity); `egress.rego` is untouched.
+  **Change all ends or none — the axis is computed in `InspectionTable`
+  (`daemon/egress/inspect.rs`) and NOWHERE else.** It is consumed by the router
+  and by `manifest::diff::egress_weakens`, both through its public methods.
+  A third, independent fold is what caused a live no-certificate-verification
+  bypass during P1: `to_rego_data_json` folds duplicate exact hosts last-wins
+  while an early `from_config` unioned them, so `passthrough_host` answered
+  true for a host the allow-list denied. `passthrough` now folds last-wins to
+  match; `inspect_ports` unions (it may only widen, and is keyed on ports, not
+  host rules). `router::passthrough_names`'s per-name `policy.check` filter is
+  a deliberate SECOND layer — do not delete it as redundant.
+  **The TLS-pinning hatch** is an EXPLICIT `protocol: tcp` on an EXACT host
+  (a wildcard is a parse error — matching an SNI against a wildcard would fork
+  the semantics that live in `egress.rego`); a value derived from a port number
+  never opens it. It is decided from the ClientHello SNI by a NON-CONSUMING
+  peek before termination (`clienthello::peek_sni`, total over hostile bytes:
+  no panics, `Incomplete` ≠ `None`), and — because the guest chooses the SNI
+  and a passthrough performs no upstream certificate verification — only over
+  the candidate list `router::passthrough_names` derives from DNS-snoop under a
+  `decide_tier2` ceiling. **A passthrough flow is exactly a tier-2 flow that
+  additionally proves its SNI**, never broader. Every ambiguity (short peek,
+  record-fragmented hello, absent SNI, exhausted budget) fails CLOSED to
+  termination. `manifest::diff` flags two `⚠ weakens egress` transitions: a
+  newly-declared passthrough, and losing inspection on a still-reachable port.
+  `izba policy show` is the ONLY surface that reveals a hatch — `izba status`
+  renders no egress posture, and `izba policy allow` writes `policy.yaml`
+  without passing the diff/promote gate.
 - **Linux VMM confinement (MVP-C):** on Linux, cloud-hypervisor and virtiofsd
   launch **confined by default** — explicit `--seccomp true`, `--landlock`
   (Landlock v5+), virtiofsd `--sandbox namespace` (fallback `--sandbox chroot`),
