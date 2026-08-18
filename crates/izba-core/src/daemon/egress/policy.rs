@@ -1035,6 +1035,38 @@ mod tests {
         assert!(AllowAll.allows_name("web", "anything.example.com"));
     }
 
+    // M5 P1 review, task 3, fix round 2, item 1: the same shape as
+    // `allows_name_default_is_fail_closed_for_enforcing_policy` above, but for
+    // `inspects`. DP-1 forbids the tier-1 gate NARROWING once it moved out of
+    // a hard-coded `matches!(port, 80|443)` and into this trait method — a
+    // `Policy` impl that overrides only `check` (so `enforces()` defaults to
+    // `true`) and forgets to override `inspects` must still get tier-1 on the
+    // web ports, not silently zero tier-1 at all.
+    #[test]
+    fn inspects_default_is_the_web_port_baseline_for_an_enforcing_policy() {
+        struct EnforcingNoOverride;
+        impl Policy for EnforcingNoOverride {
+            fn check(&self, _f: &FlowDesc) -> Verdict {
+                Verdict::Deny
+            }
+        }
+        assert!(EnforcingNoOverride.enforces(), "defaults to enforcing");
+        assert!(
+            EnforcingNoOverride.inspects(80),
+            "an enforcing policy without an inspects override must still inspect :80"
+        );
+        assert!(
+            EnforcingNoOverride.inspects(443),
+            "an enforcing policy without an inspects override must still inspect :443"
+        );
+        assert!(
+            !EnforcingNoOverride.inspects(8000),
+            "the baseline is the web ports only, not every port"
+        );
+        // A non-enforcing policy is never MITM'd (M1 behaviour) — unaffected.
+        assert!(!AllowAll.inspects(443));
+    }
+
     #[test]
     fn glob_metacharacters_widen_scope_hence_validation() {
         let p = wildcard_policy(
