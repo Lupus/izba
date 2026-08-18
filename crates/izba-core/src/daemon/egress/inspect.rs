@@ -227,6 +227,31 @@ mod tests {
         assert!(!t.has_passthrough());
     }
 
+    /// The two statements of "which ports are HTTP by default" must agree:
+    /// this table's unconditional baseline (policy-global, DP-1) and
+    /// `Protocol::implied_for_port` (per-entry, the grammar's implicit
+    /// default). They are different facts over the same constant, and this
+    /// PR's review flagged exactly that pairing as drift-prone — so the
+    /// agreement is asserted rather than assumed. If someone widens the
+    /// baseline without widening the implied rule (or vice versa), this fails.
+    #[test]
+    fn baseline_agrees_with_the_implied_rule() {
+        let t = InspectionTable::default();
+        for port in AllowEntry::DEFAULT_PORTS {
+            assert_eq!(
+                Protocol::implied_for_port(port),
+                Protocol::Http,
+                "port {port} is in the baseline, so an undeclared entry on it must imply http"
+            );
+            assert!(t.inspects(port), "port {port} must be in the baseline");
+        }
+        // And the converse, so the test cannot pass by admitting everything.
+        for port in [22u16, 8000, 5432, 15001] {
+            assert_eq!(Protocol::implied_for_port(port), Protocol::Tcp);
+            assert!(!t.inspects(port));
+        }
+    }
+
     #[test]
     fn an_unknown_host_never_passes_through() {
         let t = table(

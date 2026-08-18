@@ -175,13 +175,33 @@ impl AllowEntry {
     /// inspected on 443 and spliced on 5432 with nothing declared — the entry
     /// never has to carry one answer for two different kinds of port.
     pub fn protocol_for(&self, port: u16) -> Protocol {
-        self.declared_protocol().unwrap_or({
-            if Self::DEFAULT_PORTS.contains(&port) {
-                Protocol::Http
-            } else {
-                Protocol::Tcp
-            }
-        })
+        self.declared_protocol()
+            .unwrap_or_else(|| Protocol::implied_for_port(port))
+    }
+}
+
+impl Protocol {
+    /// **The** rule for a port whose entry declares no `protocol:` — the
+    /// grammar's implicit default, stated exactly once.
+    ///
+    /// It is deliberately expressed over [`AllowEntry::DEFAULT_PORTS`], the
+    /// same constant [`super::inspect::InspectionTable`]'s unconditional
+    /// baseline is seeded from, because the two facts must agree and are NOT
+    /// the same fact: this one is per-entry ("an undeclared web port means
+    /// http"), the baseline is policy-global ("80/443 are inspected no matter
+    /// what any entry says", DP-1). Sharing the constant is what keeps them
+    /// from drifting; `inspect.rs`'s `baseline_agrees_with_the_implied_rule`
+    /// test is what proves they still do.
+    ///
+    /// `InspectionTable` remains the sole answer to *effective* inspectability
+    /// for a policy. This is only the per-entry primitive it composes, and its
+    /// single production caller is `InspectionTable::from_config`.
+    pub(crate) fn implied_for_port(port: u16) -> Protocol {
+        if AllowEntry::DEFAULT_PORTS.contains(&port) {
+            Protocol::Http
+        } else {
+            Protocol::Tcp
+        }
     }
 }
 

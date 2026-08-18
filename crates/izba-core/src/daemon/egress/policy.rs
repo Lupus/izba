@@ -1067,6 +1067,28 @@ mod tests {
         assert!(!AllowAll.inspects(443));
     }
 
+    /// `has_passthrough`'s default must be `false`, and unlike `inspects`'s
+    /// default that is a FAIL-CLOSED choice rather than a baseline: an impl
+    /// that overrides `passthrough_host` but forgets this one never opens its
+    /// hatch, which is the safe direction. Pinned because the default is only
+    /// a performance short-circuit today, so nothing else in the suite would
+    /// notice it flipping to `true` — and a `true` default would let such an
+    /// impl splice on a name it never had to justify to `passthrough_names`.
+    #[test]
+    fn has_passthrough_defaults_closed() {
+        struct EnforcingNoOverride;
+        impl Policy for EnforcingNoOverride {
+            fn check(&self, _f: &FlowDesc) -> Verdict {
+                Verdict::Deny
+            }
+        }
+        assert!(
+            !EnforcingNoOverride.has_passthrough(),
+            "a policy that does not declare a hatch must not claim one"
+        );
+        assert!(!AllowAll.has_passthrough());
+    }
+
     #[test]
     fn glob_metacharacters_widen_scope_hence_validation() {
         let p = wildcard_policy(

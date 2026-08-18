@@ -263,6 +263,17 @@ impl MitmRuntime {
 /// `16 * 1024` alone is 5 bytes short of that and would silently fail such a
 /// hello closed (never a bug, since short reads already fail closed — but a
 /// needless one), so the header is added explicitly rather than rounded away.
+///
+/// `mutants::skip` reason: this is a capacity bound, not a decision. Both
+/// arithmetic mutants (`+`→`*`, `*`→`+`) only move WHERE a hello stops fitting
+/// the peek buffer, and a hello that does not fit returns `Incomplete`, which
+/// after the retry budget fails closed to termination — the same outcome the
+/// datapath already gives every other short read. Killing them would need a
+/// test asserting a passthrough for a hello sized between 1045 and 16389
+/// bytes, whose size is chosen by rustls rather than by us; that test would
+/// assert the constant's value through six layers of TLS rather than assert a
+/// behaviour. The value itself is pinned by the doc comment's arithmetic.
+#[mutants::skip]
 const SNI_PEEK_MAX: usize = 5 + 16 * 1024;
 /// A ClientHello can span several TCP segments, so one `peek` may return a
 /// short buffer. Retry to this bound and then FAIL CLOSED to termination.
