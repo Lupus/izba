@@ -794,8 +794,8 @@ impl EgressPolicyConfig {
     /// pin to the newly-added port too, even though the operator only named
     /// it for the ports that existed when they wrote it. Resolving that
     /// needs a per-port declaration shape, which is its own change (out of
-    /// scope here; tracked in the plan's spec §13 follow-up list, not only
-    /// here). This is the lesser evil: silent deletion of a declaration is
+    /// scope here; carried in the M5 P1 plan's follow-up list, which Task 9
+    /// appends to the spec's §13). This is the lesser evil: silent deletion is
     /// invisible everywhere, whereas this call mutates `policy.yaml`
     /// directly and never passes the `izba.yml` diff/promote weakening gate
     /// — `izba policy show` (once it lands) is the only surface that reveals
@@ -3441,7 +3441,8 @@ mod tests {
     // pin to a brand-new port the operator never named for it. This is an
     // ACCEPTED, KNOWN sharp edge, not a bug: resolving it needs a per-port
     // declaration shape, which is its own change and out of scope here
-    // (tracked in the plan's spec §13 follow-up list). Preserving is still
+    // (carried in the M5 P1 plan's follow-up list, which Task 9 appends to
+    // the spec's §13). Preserving is still
     // the lesser evil: silently dropping the declaration (the alternative)
     // is invisible everywhere, whereas this call mutates `policy.yaml`
     // directly and never passes the `izba.yml` diff/promote weakening gate —
