@@ -6,6 +6,7 @@ pub mod audit;
 pub mod config;
 pub mod dns;
 pub mod dns_snoop;
+pub mod inspect;
 pub mod mitm;
 pub mod mitm_runtime;
 pub mod policy;

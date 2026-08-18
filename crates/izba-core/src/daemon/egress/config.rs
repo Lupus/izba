@@ -715,8 +715,9 @@ impl EgressPolicyConfig {
         if !self.enforce {
             return Ok(Arc::new(AllowAll));
         }
-        Ok(Arc::new(RegoPolicy::with_data(
+        Ok(Arc::new(RegoPolicy::with_data_and_inspection(
             &self.to_rego_data_json(sandbox),
+            super::inspect::InspectionTable::from_config(self),
         )?))
     }
 
