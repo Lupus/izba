@@ -41,7 +41,11 @@ pub enum PolicyCmd {
         /// Sandbox name (or dir)
         name: String,
     },
-    /// Re-read a sandbox's policy.yaml and apply it to new connections (no restart)
+    /// Re-read a sandbox's policy.yaml and apply it to new connections (no
+    /// restart). That file is the managed truth, kept host-side at
+    /// `<izba data dir>/sandboxes/<name>/policy.yaml`; edit it there and reload
+    /// to change settings this CLI has no flag for, such as an entry's
+    /// `protocol:`. `izba policy show` prints its effective contents
     Reload {
         /// Sandbox name (or dir)
         name: String,

@@ -7,7 +7,7 @@
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::manifest::{diff, store, DriftState, Manifest, Normalized};
 use crate::paths::Paths;
@@ -90,8 +90,23 @@ pub fn ensure_within(base: &Path, candidate: &Path) -> Result<PathBuf> {
 /// read.
 pub fn load_repo_manifest(dir: &Path) -> Result<(Manifest, String, Option<String>)> {
     let path = dir.join("izba.yml");
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        // A missing manifest is the ordinary way to arrive here — `izba diff`
+        // and `izba promote` are reached by users who have a sandbox but have
+        // never written one — so it gets an answer instead of a raw ENOENT
+        // naming a path they did not type. Every other read error keeps the
+        // OS's own diagnosis.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "no izba.yml in {} — this command reconciles a sandbox against \
+                 the manifest in its workspace. Run `izba export` there to write \
+                 one from the sandbox's current settings, or create it by hand.",
+                dir.display()
+            )
+        } else {
+            anyhow::Error::new(e).context(format!("reading {}", path.display()))
+        }
+    })?;
     let m = Manifest::load_str(&raw)?;
     let dockerfile = match &m.spec.build {
         Some(b) => {
@@ -224,6 +239,22 @@ mod tests {
     fn load_repo_manifest_missing_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(load_repo_manifest(tmp.path()).is_err());
+    }
+
+    /// A missing manifest is the ordinary way a user arrives here, so the
+    /// error has to answer "what do I do now?" rather than report ENOENT on a
+    /// path the user never typed. Asserted, not merely written: the wording is
+    /// the whole fix.
+    #[test]
+    fn load_repo_manifest_missing_explains_how_to_get_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = load_repo_manifest(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("no izba.yml in"), "unexpected error: {err}");
+        assert!(err.contains("izba export"), "no remedy offered: {err}");
+        assert!(
+            !err.contains("No such file or directory"),
+            "still leaking the raw OS error: {err}"
+        );
     }
 
     #[test]
