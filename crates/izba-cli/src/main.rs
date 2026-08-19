@@ -57,8 +57,10 @@ struct SandboxOpts {
     #[arg(long = "volume", value_name = "[NAME:]GUEST_PATH:SIZE")]
     volumes: Vec<String>,
     /// Egress policy YAML: turns the firewall ON (default-deny) and sets the
-    /// allow-list this sandbox may reach (hosts/ports, plus optional `git:` and
-    /// per-host `access:` rules; `enforce: false` makes it log-only). Without
+    /// allow-list this sandbox may reach (hosts/ports, plus optional `git:`
+    /// rules and per-host `access:` / `protocol:` keys — `protocol: http`
+    /// polices a non-web port at L7, `protocol: tcp` on an exact host is the
+    /// TLS-pinning passthrough; `enforce: false` makes it log-only). Without
     /// this flag the sandbox is unrestricted (firewall off); you can also turn
     /// it on later with `izba policy enforce NAME on`.
     #[arg(long, value_name = "FILE")]

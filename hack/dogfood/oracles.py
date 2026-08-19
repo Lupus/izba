@@ -565,6 +565,29 @@ def masks_exit_status_with_echo(command: str) -> bool:
     return bool(_ECHO_STATUS_TAIL_RE.search(command or ""))
 
 
+#: The HOST shell's own "I could not find that binary", as opposed to any
+#: verdict the product rendered. Anchored on a shell/sudo/env prefix so izba's
+#: OWN exit-127 contract (the `CommandNotFound` frame, when the guest cannot be
+#: reached) is never mistaken for it — that 127 IS a product signal and must
+#: keep grading normally.
+_SHELL_NOT_FOUND_RE = re.compile(
+    r"(?im)^\s*(?:bash|sh|zsh|dash|sudo|env|su)\b[^\n]*:\s*command not found\s*$"
+)
+
+
+def shell_never_ran_the_command(exit_code: int, stderr: str) -> bool:
+    """True when exit 127 came from the shell failing to LOCATE the binary.
+
+    An expected-refusal step grades "did this fail?", so any non-zero exit
+    satisfies it — including one where the command never ran at all. That makes
+    a PATH mistake indistinguishable from the product refusing, which is how a
+    real run scored `sudo -u nobody ... izba ls` -> 127 as "the daemon rejected
+    the foreign user" while izba was never invoked (m5p1 core tier, 2026-08-19).
+    A security control graded by a typo is worse than an ungraded one.
+    """
+    return exit_code == 127 and bool(_SHELL_NOT_FOUND_RE.search(stderr or ""))
+
+
 def functional_oracle(
     command: str,
     exit_code: int,
@@ -573,6 +596,7 @@ def functional_oracle(
     ref: Optional[Dict[str, Any]] = None,
     *,
     expect_exit: Any = None,
+    stderr: str = "",
 ) -> List[Candidate]:
     """Compare a command's exit against the step's expectation (two-sided).
 
@@ -621,6 +645,25 @@ def functional_oracle(
             detail=(f"command {command!r} ends in a trailing '; echo $?' which "
                     f"resets the compound's exit status to 0 — the graded exit no "
                     f"longer reflects the probe, so its verdict is unverifiable"),
+            violated_expectation=(
+                expect or (f"expect_exit: {expect_exit}"
+                           if expect_exit is not None else "")),
+            source=source,
+            trajectory_ref=ref,
+        )]
+    # An expected-REFUSAL verdict is satisfied by any non-zero exit, so a command
+    # the shell never located would score as a refusal the product rendered.
+    # Refuse to draw that verdict at all — same shape as `masked_probe` above:
+    # the assertion is unverifiable, not passed.
+    _expects_refusal = expect_exit == "nonzero" or (
+        expect_exit is None and bool(expect) and expects_failure(expect)
+    )
+    if _expects_refusal and shell_never_ran_the_command(exit_code, stderr):
+        return [Candidate(
+            kind="unverifiable_refusal",
+            detail=(f"command {command!r} exited 127 because the SHELL could not "
+                    f"find the binary, so it never ran — a refusal assertion "
+                    f"graded on this verdict proves nothing about the product"),
             violated_expectation=(
                 expect or (f"expect_exit: {expect_exit}"
                            if expect_exit is not None else "")),
