@@ -44,7 +44,9 @@ The app manages the SSH config entry automatically; no manual setup required.
 ## Policy / egress firewall
 
 Each sandbox enforces an egress policy. In the detail panel, click **Policy**
-to view or edit the active policy YAML. Rules control which hostnames and ports
+to view or edit its rules. This is a form — a row per allowed host, with its
+ports and access level — not a YAML text editor, so anything the form has no
+field for cannot be authored here. Rules control which hostnames and ports
 outbound traffic is allowed to reach. Changes take effect immediately; the app
 saves the policy file without restarting the sandbox.
 

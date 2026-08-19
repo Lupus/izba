@@ -647,6 +647,16 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     # where that step's evidence starts. A step the Actor never entered has
     # no entry (grading then falls back to the final capture alone).
     step_hist_start: Dict[int, int] = {}
+    # How many actions had been taken when each step OPENED. `step_hist_start`
+    # cannot answer "was this step exercised": it is recorded at the top of the
+    # step, before the turn/step-cap checks, so a step the Actor was never
+    # funded to act in still gets an entry. Growth in this count is the honest
+    # signal, and the manifest_truth credit is gated on it.
+    step_action_start: Dict[int, int] = {}
+    # Single-element sink recording the step a cap (turns / step-cap / budget)
+    # cut the journey off in. A run that ENDED EARLY is the only case where a
+    # later step's assertion can be credited without having been attempted.
+    capped_at_step: List[int] = []
     ws_abs = os.path.abspath(workspace) if workspace else ""
     if ws_abs:
         os.makedirs(ws_abs, exist_ok=True)
@@ -707,6 +717,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 _snap_manifest_yml()
             _write_seeds(ws_abs, step.get("seed_files"))
             step_hist_start[step_i] = len(page_text_history)
+            step_action_start[step_i] = len(actions)
             seen: set = set()
             # Seed the Actor with the current screen so its FIRST decision sees
             # the accessibility marks (real refs to act on) rather than an empty
@@ -718,10 +729,13 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                                           "marks": marks_text}]
             while True:
                 if len(actions) >= step_cap:
+                    capped_at_step.append(step_i)
                     log(f"{journey_id}: step-cap reached"); raise StopIteration
                 if turns >= max_turns:
+                    capped_at_step.append(step_i)
                     log(f"{journey_id}: max-turns reached"); raise StopIteration
                 if budget["usd"] >= max_usd:
+                    capped_at_step.append(step_i)
                     raise BudgetExceeded()
                 turns += 1
                 try:
@@ -945,7 +959,27 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
         # "unparseable"/"no_target" leave the decisive step ungraded when
         # there is no explicit core step (unchanged Task-11 behavior) —
         # otherwise they degrade the journey below.
-        if decisive_idx and mt_result == "matched":
+        # The credit's whole claim is that the decisive step WAS exercised, so
+        # it may only be granted for a step the Actor actually entered. Without
+        # this gate ANY earlier manifest_diff satisfies rule 1: a journey whose
+        # decisive step was never reached (turn budget exhausted two steps
+        # before it) is credited on a digest recorded BEFORE the action under
+        # test even ran. That is exactly how the GUI round-trip journey
+        # verifying PR #233's silent-drop fix reported green without its
+        # verification step (m5p1 GUI tier, 2026-08-19). "Reached" means the
+        # Actor actually ACTED in the step: `step_hist_start` is recorded before
+        # the turn/step-cap checks, so a step the run was never funded to reach
+        # has an entry there too.
+        _d = min(decisive_idx) if decisive_idx else None
+        _started = step_action_start.get(_d) if _d is not None else None
+        # Unreached == the run was cut off by a cap AND the decisive step took
+        # no action of its own (or never opened at all). A journey the Actor
+        # finished on its own terms keeps crediting exactly as before, so the
+        # existing precedence tests still hold.
+        decisive_unreached = bool(capped_at_step) and (
+            _started is None or len(actions) == _started
+        )
+        if decisive_idx and mt_result == "matched" and not decisive_unreached:
             # Ground truth matched what the UI showed: the decisive
             # assertion passed. Recorded as an audit-trail credit (schema
             # parity with the CLI runner's decisive_credits) even though
@@ -956,6 +990,24 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 "step_index": min(decisive_idx),
                 "action_index": final_ref["action_index"],
                 "graded_cmd": "manifest_truth: izba diff ground truth (matched)",
+            })
+        elif (decisive_idx and has_core_step and decisive_unreached
+              and mt_result == "matched"):
+            # Reached-nothing is the one thing a positive may never be built
+            # from. Same kind/shape the hook path uses, so collector and
+            # skeptic see one convention.
+            _d_step = steps[_d] if _d is not None and _d < len(steps) else {}
+            candidates.append({
+                "kind": "unreached_decisive",
+                "detail": (
+                    f"the Actor never reached decisive step {_d}; "
+                    f"an earlier manifest_diff would otherwise have credited it "
+                    f"(manifest_truth: {mt_result})"),
+                "violated_expectation": _d_step.get("expect", "")
+                or "the decisive step's assertion was never checked",
+                "source": journey.get("source", {}).get("ref", "journey step"),
+                "trajectory_ref": {"journey_id": journey_id,
+                                   "action_index": final_ref["action_index"]},
             })
         elif has_core_step and mt_result in ("no_target", "unparseable"):
             # The harness attempted to verify the declared decisive

@@ -828,6 +828,45 @@ def test_run_gui_journey_manifest_truth_unparseable_records_no_false_credit(monk
     assert "unparseable" in infra[0]["detail"]
 
 
+def test_run_gui_journey_manifest_truth_credit_requires_reaching_the_step(monkeypatch):
+    """A `matched` ground truth must not credit a decisive step the Actor never
+    reached.
+
+    Rule-1 crediting keys off "the journey drove manifest_diff at some point",
+    so ANY earlier diff satisfies it — including one recorded before the action
+    under test ran. That is how the GUI journey verifying PR #233's
+    silent-`protocol`-drop fix reported green while its verification step never
+    executed (m5p1 GUI tier). The credit claims the step WAS exercised, so it
+    must be gated on the Actor actually entering it.
+    """
+    import gui.run_gui_journeys as rgj
+    # One turn of budget: consumed by step 0, so step 1 is never entered.
+    model = FakeModel([{"action": "click", "target": "@e1"}])
+    invoke_log = [{"cmd": "manifest_diff", "ok": True,
+                  "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}}]
+    driver = FakeDriver(snapshots=['[@e1] button "Save"'] * 6,
+                        invoke_log=invoke_log)
+    monkeypatch.setattr(rgj, "capture_state_evidence", _reconcile)
+    monkeypatch.setattr(rgj, "_reconcile_snapshot", lambda *a, **k: {"violations": []})
+
+    def fake_mt_matched(ctx, **k):
+        ctx["manifest_truth_result"] = "matched"
+        return []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle", fake_mt_matched)
+    journey = {"journey_id": "j-mt-unreached", "modality": "gui",
+               "steps": [{"intent": "save the policy", "expect": "saved"},
+                         {"intent": "refresh and confirm still in sync",
+                          "expect": "in sync", "core": True}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=1, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert res["decisive_credits"] == [], res["decisive_credits"]
+    unreached = [c for c in res["candidates"] if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1, res["candidates"]
+    assert "never reached decisive step" in unreached[0]["detail"]
+
+
 def test_run_gui_journey_core_step_no_target_emits_infra_candidate(monkeypatch):
     """Same class as the unparseable case above: a core: true step whose
     ground truth couldn't even be targeted (missing sandbox/workspace, e.g.
