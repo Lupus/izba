@@ -270,7 +270,17 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
             let enforce_str = if cfg.enforce { "on" } else { "off" };
             let _ = writeln!(out, "'{name}' egress policy (enforce: {enforce_str}):");
             if cfg.allow.is_empty() {
-                let _ = writeln!(out, "  http: deny all (empty allow-list)");
+                // An empty allow-list denies everything only when enforcement
+                // is ON: `EgressPolicyConfig::compile` returns AllowAll for
+                // `enforce: false` whatever the list says. Reporting "deny
+                // all" for a bare sandbox — the most common state anyone runs
+                // `policy show` against — would misstate the posture in the
+                // safe-looking direction, on the one surface that reveals it.
+                if cfg.enforce {
+                    let _ = writeln!(out, "  http: deny all (empty allow-list)");
+                } else {
+                    let _ = writeln!(out, "  http: all egress allowed (enforce off)");
+                }
             } else {
                 let _ = writeln!(out, "  http allow-list:");
                 for e in &cfg.allow {
@@ -860,6 +870,37 @@ mod tests {
         };
         let out = render_policy("web", Some(&cfg));
         assert!(out.contains("http: deny all (empty allow-list)"));
+    }
+
+    /// A non-enforcing sandbox with an empty allow-list allows ALL egress
+    /// (`compile` → `AllowAll`), so the empty-list line must not claim
+    /// deny-all there — `policy show` is the only surface that reveals egress
+    /// posture, and a false "locked down" is its worst failure mode. The
+    /// enforcing wording is pinned byte-for-byte in the same test so the two
+    /// postures can never drift into each other.
+    #[test]
+    fn render_policy_empty_allow_list_is_honest_when_enforcement_is_off() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: false,
+            allow: vec![],
+            git: vec![],
+        };
+        let out = render_policy("web", Some(&cfg));
+        assert!(
+            out.contains("  http: all egress allowed (enforce off)\n"),
+            "a non-enforcing sandbox must be reported as allowing egress:\n{out}"
+        );
+        assert!(
+            !out.contains("deny all"),
+            "nothing is denied here — claiming deny-all is the dangerous direction:\n{out}"
+        );
+
+        cfg.enforce = true;
+        let enforcing = render_policy("web", Some(&cfg));
+        assert!(
+            enforcing.contains("  http: deny all (empty allow-list)\n"),
+            "the enforcing wording must stay byte-identical:\n{enforcing}"
+        );
     }
 
     #[test]
