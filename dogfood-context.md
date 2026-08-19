@@ -41,11 +41,12 @@ not part of what's being tested.
   The part after `--` is the guest command. For a compound/piped guest command,
   wrap it: `izba exec NAME -- sh -c 'cmd1 && cmd2'` (a bare `&&` would otherwise
   be passed as an argument, not run by a shell).
-- To test whether the guest can REACH a host/port **without installing
-  anything**, use bash's built-in TCP:
-  `izba exec NAME -- bash -c 'exec 3<>/dev/tcp/example.com/443 && echo OPEN'`
-  (it fails, or hangs briefly, when the connection is not permitted). To test
-  DNS resolution use `izba exec NAME -- getent hosts example.com`.
+- A bare TCP connect is **not** a reachability test here. Opening
+  `/dev/tcp/HOST/443` (or `nc HOST 443`) prints OPEN even for a host the
+  firewall denies — see the README section on how the verdict is rendered. To
+  learn whether traffic is actually permitted you have to make a real request
+  and see whether the exchange completes. To test DNS resolution use
+  `izba exec NAME -- getent hosts example.com`.
 - Installing tools in the guest (`apt-get update && apt-get install -y curl`)
   needs network to the Ubuntu package mirrors — that works on an unrestricted
   sandbox; on a sandbox with its firewall on it works only if the mirror hosts
