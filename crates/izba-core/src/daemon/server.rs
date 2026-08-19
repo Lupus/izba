@@ -4608,15 +4608,27 @@ mod tests {
         );
         // The typed refusal itself is only reachable where the bind IS
         // permitted; a bind-denied environment fails earlier, which says
-        // nothing about the wording under test.
+        // nothing about the wording under test. Report that leg as SKIPPED
+        // rather than folding it into the assertion — an environment silently
+        // accepting a *different* error as success is exactly how a test stops
+        // covering what it claims to (the sibling bind-denied tests above print
+        // the same kind of notice). CI runs unconfined, so the leg is exercised
+        // there.
         let bind_denied = err.chain().any(|c| {
             c.downcast_ref::<std::io::Error>()
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
         });
-        assert!(
-            bind_denied || err.downcast_ref::<sandbox::AlreadyRunning>().is_some(),
-            "expected AlreadyRunning, got: {err:#}"
-        );
+        if bind_denied {
+            eprintln!(
+                "SKIP (partial) start_already_running_does_not_announce_a_start: bind denied, \
+                 so the typed AlreadyRunning refusal was not reached: {err:#}"
+            );
+        } else {
+            assert!(
+                err.downcast_ref::<sandbox::AlreadyRunning>().is_some(),
+                "expected AlreadyRunning, got: {err:#}"
+            );
+        }
     }
 
     /// The already-running republish check is `booted_with_vnc(...) &&
