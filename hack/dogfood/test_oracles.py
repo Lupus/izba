@@ -126,6 +126,41 @@ class FunctionalOracleTests(unittest.TestCase):
     def test_success_step_zero_exit_is_clean(self):
         self.assertEqual(functional_oracle("izba create x", 0, "create succeeds"), [])
 
+    def test_shell_command_not_found_does_not_satisfy_a_refusal(self):
+        """A refusal assertion is satisfied by ANY non-zero exit, so a command
+        the shell never located would score as "the product refused". Refuse the
+        verdict instead — this is how a cross-uid daemon check once passed on a
+        PATH mistake, with izba never invoked."""
+        c = functional_oracle(
+            "sudo -u nobody bash -c 'izba ls'", 127,
+            "the daemon refuses a peer that is not the owner",
+            expect_exit="nonzero",
+            stderr="bash: line 1: izba: command not found")
+        self.assertEqual(len(c), 1)
+        self.assertEqual(c[0].kind, "unverifiable_refusal")
+
+    def test_izba_own_exit_127_still_grades_normally(self):
+        """izba's OWN CommandNotFound contract also exits 127. That one IS a
+        product verdict, so it must keep satisfying a refusal assertion —
+        otherwise the fix above would blind the oracle to a real signal."""
+        self.assertEqual(
+            functional_oracle(
+                "izba exec box -- nosuchbinary", 127,
+                "the command is reported as not found",
+                expect_exit="nonzero",
+                stderr="izba: error: command not found in guest"),
+            [])
+
+    def test_shell_not_found_on_an_expected_SUCCESS_is_unchanged(self):
+        """Only refusal grading is blinded by a stray 127; an expected-success
+        step already flags it, and must keep doing so under its own kind."""
+        c = functional_oracle(
+            "sudo -u nobody bash -c 'izba ls'", 127,
+            "the sandbox is listed",
+            stderr="bash: line 1: izba: command not found")
+        self.assertEqual(len(c), 1)
+        self.assertEqual(c[0].kind, "functional")
+
     def test_failure_step_nonzero_exit_is_clean(self):
         # The whole point of the step is a refusal; a non-zero exit is the PASS.
         self.assertEqual(

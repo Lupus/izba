@@ -349,7 +349,8 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
     found = functional_oracle(
         target.get("command", ""), target.get("exit_code", 0),
         step.get("expect", ""), source, ref,
-        expect_exit=step.get("expect_exit"))
+        expect_exit=step.get("expect_exit"),
+        stderr=target.get("stderr_tail", ""))
     out = []
     for c in found:
         cd = c.to_dict()
@@ -556,7 +557,8 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id):
         found = functional_oracle(
             a.get("command", ""), a.get("exit_code", 0),
             step.get("expect", ""), source, ref,
-            expect_exit=step.get("expect_exit"))
+            expect_exit=step.get("expect_exit"),
+            stderr=a.get("stderr_tail", ""))
         out = []
         for c in found:
             cd = c.to_dict()

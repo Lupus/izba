@@ -27,7 +27,12 @@ not part of what's being tested.
   environment variable** (it is set in your shell). Everything the docs describe
   as living under `~/.local/share/izba/` lives under that path here instead.
 - You have **passwordless `sudo`** on this machine, so you can run a command as
-  another local user (root) when you want to.
+  another local user when you want to. Note that `izba` is on *your* `PATH`
+  because of an entry added to your own shell — another user's shell does not
+  have it. So expand the path in YOUR shell before switching user (e.g.
+  `sudo -u someone "$(command -v izba)" …`); quoting it so the expansion
+  happens in the other user's shell just yields "command not found", which
+  tells you nothing about izba.
 - The machine has working internet access, so a sandbox can reach public hosts
   when its firewall lets it.
 

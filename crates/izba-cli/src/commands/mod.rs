@@ -44,7 +44,18 @@ pub(crate) fn load_manifest_yaml(dir: &Path) -> anyhow::Result<Manifest> {
     let path = dir.join("izba.yml");
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    Manifest::load_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    // Say WHERE this file came from, not just that it failed to parse. The
+    // user never named it: izba picks up the workspace `izba.yml` on its own,
+    // so an unexplained "parsing …/izba.yml" reads as a complaint about the
+    // file they DID pass (e.g. to `--policy`) and sends them to edit the wrong
+    // one. `load_str` already supplies the "parsing izba.yml" half, so this
+    // adds the provenance instead of repeating it.
+    Manifest::load_str(&raw).with_context(|| {
+        format!(
+            "{} (izba reads a workspace izba.yml automatically)",
+            path.display()
+        )
+    })
 }
 
 /// Clap default values — the single source of truth.  Both the `SandboxOpts`
