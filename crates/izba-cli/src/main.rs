@@ -62,7 +62,10 @@ struct SandboxOpts {
     /// polices a non-web port at L7, `protocol: tcp` on an exact host is the
     /// TLS-pinning passthrough; `enforce: false` makes it log-only). Without
     /// this flag the sandbox is unrestricted (firewall off); you can also turn
-    /// it on later with `izba policy enforce NAME on`.
+    /// it on later with `izba policy enforce NAME on`. Against an
+    /// already-running sandbox `izba run --policy` re-arms the live egress
+    /// plane in place (same as `izba policy allow`) — it does NOT restart the
+    /// sandbox; `create` bakes it in at creation instead.
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
     /// Enable docker mode: the workload gets its own network namespace,

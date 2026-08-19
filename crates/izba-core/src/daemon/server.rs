@@ -641,7 +641,25 @@ fn handle_start(
     allow_unconfined: bool,
     progress: &mut dyn FnMut(String),
 ) -> anyhow::Result<DaemonResponse> {
-    progress(format!("starting '{name}'..."));
+    // #234: this line used to announce a start unconditionally, so a redundant
+    // `izba start`/`izba run` against a sandbox that is already up printed
+    // "starting '<name>'..." for a (re)start that never happened — and
+    // `run --policy` leaned on that false claim to explain when an edited
+    // allow-list would take effect. Probe first and say which of the two is
+    // actually about to occur, mirroring `sandbox::start`'s own refusal
+    // predicate (anything other than `Stopped` is an `AlreadyRunning`).
+    //
+    // The probe is NOT the authority — the flock + re-check inside
+    // `sandbox::start` still is, and a sandbox can die between the two — so a
+    // lost race costs a slightly-stale progress line, never correctness.
+    let live = sandbox::liveness_of(&d.paths, &name, d.connector()).unwrap_or(Liveness::Stopped);
+    progress(match &live {
+        Liveness::Stopped => format!("starting '{name}'..."),
+        Liveness::Running => format!("'{name}' is already running — not restarting it"),
+        Liveness::Degraded(why) => {
+            format!("'{name}' is already up but degraded ({why}) — not restarting it")
+        }
+    });
     // Load config FIRST (reused below for relay republish), then
     // bind the vsock_1027 egress listener BEFORE launch so the
     // guest can dial izbad during boot. Every sandbox owns one —
@@ -4544,6 +4562,60 @@ mod tests {
             d.registry.liveness("web"),
             Some(Liveness::Running),
             "the redundant Start must heal the stale registry entry"
+        );
+    }
+
+    /// #234: a Start against a sandbox that is already up must NOT announce a
+    /// start. The line used to be emitted unconditionally at the top of
+    /// `handle_start`, before `sandbox::start` returned its `AlreadyRunning`
+    /// refusal — so `izba run --policy` against a running sandbox printed
+    /// "starting '<name>'..." for a (re)start that never happened, which was
+    /// half of what made the stale-enforcement window invisible.
+    #[test]
+    fn start_already_running_does_not_announce_a_start() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let vmm = spawn_sleep(dir.path());
+        let mut deps = test_deps();
+        deps.connector = Box::new(fake_connector(
+            Arc::new(Mutex::new(Vec::new())),
+            Some(vmm.clone()),
+        ));
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        // Make it live exactly as its first (real) Start would have left it.
+        write_state_with_run_dir(&d.paths, "web", vmm.clone(), Some(d.paths.run_dir("web")));
+
+        let mut said: Vec<String> = Vec::new();
+        let err = handle_start(&d, "web".into(), false, &mut |m| said.push(m))
+            .expect_err("a live sandbox must refuse the redundant start");
+        // The progress line is emitted BEFORE any listener bind, so both
+        // assertions below hold even in a sandbox that denies `bind` with
+        // EPERM (this crate's test-design constraint) — no runtime skip is
+        // needed for the part this test is actually about.
+        assert!(
+            !said.iter().any(|m| m.starts_with("starting '")),
+            "must not announce a start that does not happen: {said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|m| m.contains("already running") || m.contains("already up but degraded")),
+            "must say the sandbox is already up: {said:?}"
+        );
+        // The typed refusal itself is only reachable where the bind IS
+        // permitted; a bind-denied environment fails earlier, which says
+        // nothing about the wording under test.
+        let bind_denied = err.chain().any(|c| {
+            c.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+        });
+        assert!(
+            bind_denied || err.downcast_ref::<sandbox::AlreadyRunning>().is_some(),
+            "expected AlreadyRunning, got: {err:#}"
         );
     }
 
