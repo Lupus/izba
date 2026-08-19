@@ -819,6 +819,138 @@ fn build_in_vm_dockerfile_to_running_sandbox() {
     let _ = izba(&data, no_env, &["daemon", "stop"]);
 }
 
+/// #234: `izba run --policy <file>` against an ALREADY-RUNNING sandbox must
+/// re-arm the live egress plane, not merely persist the file.
+///
+/// The bug it pins: `reconcile_existing` wrote the narrower `policy.yaml`,
+/// printed "takes effect on (re)start", and `run` then printed "starting
+/// '<name>'..." — but no (re)start happens for a running sandbox, so the guest
+/// went on enforcing the OLD, wider allow-list. `izba policy show` proved the
+/// narrower policy was persisted while `izba netlog` showed traffic to a host
+/// that policy forbids still being ALLOWed.
+///
+/// The discriminating oracle here is `izba netlog`, NOT `policy show` (which
+/// passed even with the bug) and NOT the guest command's exit status (which
+/// fails for want of upstream reachability too, so it cannot tell enforcement
+/// apart from a dead network). A name the enforcing policy does not list is
+/// NXDOMAIN'd by the DNS gate and audited `DENY … DNS: not in allow-list`
+/// (`egress/router.rs`); a name it DOES list is forwarded with no deny record.
+/// So a `DENY` line naming the host appears only if the reload really happened.
+///
+/// Steps:
+/// 1. Boot detached with an enforcing policy whose allow-list contains the
+///    probe host.
+/// 2. Probe it from the guest, and assert netlog holds NO deny for it — the
+///    wide policy is genuinely in force (the baseline the flip is measured
+///    against).
+/// 3. `izba run -d --policy <narrower>` against the running sandbox.
+/// 4. Assert the VM never restarted (vmm pid identical) — this is the
+///    reload-live resolution, not the restart one.
+/// 5. Probe again and assert netlog now holds a DENY naming the probe host.
+/// 6. Assert `policy show` reflects the narrower managed truth.
+#[test]
+fn run_policy_rearms_a_running_sandbox() {
+    if !want() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+    let name = "rearm";
+    // The probe host is only ever RESOLVED, never required to answer: the DNS
+    // gate's verdict is recorded before any upstream is contacted.
+    let probe = "example.com";
+    let probe_cmd = "wget -T 5 -q -O /dev/null http://example.com/";
+
+    // [1] Boot with a WIDE enforcing policy that lists the probe host.
+    let wide = root.path().join("wide.yaml");
+    std::fs::write(&wide, b"enforce: true\nallow:\n  - example.com\n").unwrap();
+    let wide_s = wide.to_string_lossy().into_owned();
+    assert_ok(
+        &izba(
+            &data,
+            no_env,
+            &[
+                "run", "-d", "--image", IMAGE, "--name", name, "--policy", &wide_s, &ws_s,
+            ],
+        ),
+        "run -d (boot with the wide policy)",
+    );
+
+    // [2] Baseline: under the wide policy the name resolves without a deny.
+    let _ = izba(&data, no_env, &["exec", name, "--", "sh", "-c", probe_cmd]);
+    let o = izba(&data, no_env, &["netlog", name]);
+    assert_ok(&o, "netlog (baseline)");
+    let baseline = stdout_of(&o);
+    assert!(
+        !baseline
+            .lines()
+            .any(|l| l.contains("DENY") && l.contains(probe)),
+        "precondition: the wide policy must NOT deny {probe}; got:\n{baseline}"
+    );
+
+    // [3] Narrow the policy through `run --policy` against the RUNNING sandbox.
+    let state_path = data.join("sandboxes").join(name).join(STATE_FILE);
+    let st: RunState = load_json(&state_path)
+        .expect("read state.json")
+        .expect("state.json present while running");
+    let pid_before = st.vmm_pid.clone();
+    let narrow = root.path().join("narrow.yaml");
+    std::fs::write(&narrow, b"enforce: true\nallow:\n  - crates.io\n").unwrap();
+    let narrow_s = narrow.to_string_lossy().into_owned();
+    let o = izba(&data, no_env, &["run", "-d", "--policy", &narrow_s, name]);
+    assert_ok(&o, "run -d --policy against the running sandbox");
+    let said = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(
+        said.contains("reloaded egress policy"),
+        "the command must report the live re-arm it performed; got:\n{said}"
+    );
+    assert!(
+        !said.contains("takes effect on (re)start"),
+        "no message may promise a (re)start that does not happen; got:\n{said}"
+    );
+
+    // [4] Reload-live, not restart: the guest's work survives.
+    let st: RunState = load_json(&state_path)
+        .expect("read state.json after run --policy")
+        .expect("state.json still present");
+    assert_eq!(
+        st.vmm_pid, pid_before,
+        "run --policy must hot-reload, never restart the VM"
+    );
+
+    // [5] The flip, observed from the guest's own traffic.
+    let o = izba(&data, no_env, &["exec", name, "--", "sh", "-c", probe_cmd]);
+    assert!(
+        !o.status.success(),
+        "the guest must no longer reach a host the new policy forbids"
+    );
+    let o = izba(&data, no_env, &["netlog", name]);
+    assert_ok(&o, "netlog (after re-arm)");
+    let after = stdout_of(&o);
+    assert!(
+        after
+            .lines()
+            .any(|l| l.contains("DENY") && l.contains(probe)),
+        "the newly-applied policy must be ENFORCED, not merely persisted — \
+         expected a DENY for {probe}; got:\n{after}"
+    );
+
+    // [6] Managed truth agrees with what is now enforced.
+    let o = izba(&data, no_env, &["policy", "show", name]);
+    assert_ok(&o, "policy show after re-arm");
+    let shown = stdout_of(&o);
+    assert!(
+        shown.contains("crates.io") && !shown.contains(probe),
+        "policy show must reflect the narrowed allow-list; got:\n{shown}"
+    );
+
+    assert_ok(&izba(&data, no_env, &["rm", "--force", name]), "rm");
+}
+
 /// Manifest live-apply path: create → `izba diff` → `izba promote` against a
 /// RUNNING sandbox proves egress policy and port relays change without restart.
 ///

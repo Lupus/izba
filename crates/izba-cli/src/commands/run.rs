@@ -161,19 +161,31 @@ fn run_inner(
              confinement. A VM escape would run with your full user privileges."
         );
     }
-    match client.request(
+    let already_running = match client.request(
         &DaemonRequest::Start {
             name: name.clone(),
             allow_unconfined,
         },
         &mut |m| eprintln!("{m}"),
     )? {
-        DaemonResponse::Ok => {}
+        DaemonResponse::Ok => false,
         // `run` is idempotent: already running is exactly the state we want.
-        DaemonResponse::Error { message } if message.contains("already running") => {}
+        DaemonResponse::Error { message } if message.contains("already running") => true,
         DaemonResponse::Error { message } => bail!(message),
         other => bail!("unexpected daemon reply: {other:?}"),
-    }
+    };
+    // #234: `reconcile_existing` has only PERSISTED an edited `--policy` at
+    // this point. The Start above is what tells us whether that file was
+    // actually armed (a stopped sandbox just booted from it) or whether the
+    // guest is still enforcing the previous one (Start was a no-op) — so the
+    // live re-arm, and every message about it, is settled here rather than
+    // guessed before the fact.
+    settle_policy(
+        &mut client,
+        &name,
+        !was_created && opts.policy.is_some(),
+        already_running,
+    )?;
     if detach {
         // Detached bring-up: the sandbox is now running. Print its name on
         // stdout (script-friendly, mirrors `create`) and return WITHOUT
@@ -306,13 +318,18 @@ fn resolve_or_create(
 
 /// Reconcile run-time opts against an ALREADY-existing sandbox. The stored
 /// config (image/cpus/mem/disk/ports) is immutable, but `--policy` IS honored:
-/// re-persist it so an edited allow-list takes effect on the (re)start this
-/// `run` triggers — the daemon re-reads `policy.yaml` when it arms the egress
-/// plane. Anything baked at create that was passed anyway is reported ignored.
+/// re-persist it as the sandbox's managed truth. Anything baked at create that
+/// was passed anyway is reported ignored.
+///
+/// This half only WRITES the file; it deliberately says nothing about when the
+/// allow-list takes effect. It used to promise "(takes effect on (re)start)",
+/// which is false for the case that matters most — an already-running sandbox,
+/// where `run`'s Start is a no-op and the guest kept enforcing the OLD policy
+/// (#234). Arming is settled by [`settle_policy`] once the Start RPC has
+/// reported which world we are in.
 fn reconcile_existing(paths: &Paths, name: &str, opts: &SandboxOpts) -> anyhow::Result<()> {
     if opts.policy.is_some() {
         super::persist_policy(paths, name, opts.policy.as_deref())?;
-        eprintln!("updated egress policy for '{name}' (takes effect on (re)start)");
     }
     let ignored = ignored_create_opts(opts);
     // Mutation note: the `delete !` mutant on this guard only flips whether the
@@ -327,6 +344,72 @@ fn reconcile_existing(paths: &Paths, name: &str, opts: &SandboxOpts) -> anyhow::
             ignored.join(", ")
         );
     }
+    Ok(())
+}
+
+/// The one daemon capability [`settle_policy`] needs: re-arm a running
+/// sandbox's egress plane from the `policy.yaml` just persisted.
+///
+/// A trait rather than a bare `DaemonClient` call so the decision below is
+/// host-testable without a live daemon — this crate's tests never bind a
+/// socket (some sandboxes deny `bind` with EPERM).
+pub(crate) trait PolicyPlane {
+    fn reload_policy(&mut self, name: &str) -> anyhow::Result<()>;
+}
+
+impl PolicyPlane for DaemonClient {
+    // A one-line delegation to a live daemon RPC, so the `-> Ok(())` mutant is
+    // unkillable by any host test: every unit test drives `settle_policy`
+    // through a fake plane and never reaches this impl. It IS killed by the
+    // KVM-gated `run_policy_rearms_a_running_sandbox` e2e (dropping the reload
+    // lets the guest keep reaching a forbidden host), which the incremental
+    // mutation gate excludes along with the rest of the real-VM suite.
+    #[mutants::skip] // reason: live daemon RPC delegation; e2e-only
+    fn reload_policy(&mut self, name: &str) -> anyhow::Result<()> {
+        DaemonClient::reload_policy(self, name)
+    }
+}
+
+/// Settle `run --policy` against an ALREADY-EXISTING sandbox once `Start` has
+/// reported which world we are in (#234).
+///
+/// `reconcile_existing` has persisted the file; this is the half that makes
+/// the persisted truth actually ENFORCED:
+///
+/// - the sandbox was STOPPED — the Start above armed the egress plane from
+///   that very file, so there is nothing to re-arm;
+/// - the sandbox was ALREADY RUNNING — Start was a no-op, so the guest is
+///   still enforcing the PREVIOUS policy until we reload it. This is exactly
+///   what `izba policy allow` does (`policy::maybe_reload`), reached here so
+///   two commands that edit the same managed truth cannot disagree about
+///   whether the edit takes effect.
+///
+/// A failed reload is FATAL, deliberately: at that moment `policy.yaml` is
+/// narrower than what the guest enforces, which IS the silent posture gap
+/// #234 is about. Fail loudly and non-zero, naming the command that finishes
+/// the job, rather than exec'ing the user into a sandbox that is not confined
+/// the way they just asked for.
+fn settle_policy(
+    plane: &mut dyn PolicyPlane,
+    name: &str,
+    policy_reconciled: bool,
+    already_running: bool,
+) -> anyhow::Result<()> {
+    if !policy_reconciled {
+        return Ok(());
+    }
+    if !already_running {
+        eprintln!("updated egress policy for '{name}' (armed by this start)");
+        return Ok(());
+    }
+    plane.reload_policy(name).map_err(|e| {
+        anyhow::anyhow!(
+            "updated egress policy for '{name}', but re-arming the running sandbox failed \
+             ({e}) — the guest is STILL enforcing the previous policy. Re-apply it with \
+             `izba policy reload {name}`, or stop and start the sandbox."
+        )
+    })?;
+    eprintln!("updated and reloaded egress policy for '{name}' (applies to new connections)");
     Ok(())
 }
 
@@ -509,6 +592,109 @@ mod tests {
     #[test]
     fn foreground_with_cmd_is_ok() {
         assert!(check_detach_no_cmd(false, &["uname".into(), "-s".into()]).is_ok());
+    }
+
+    // ── settle_policy (#234) ──────────────────────────────────────────────────
+
+    /// Records every re-arm `settle_policy` asks for, so a test can assert on
+    /// the live-enforcement half without a daemon or a bound socket.
+    struct RecordingPlane {
+        reloaded: Vec<String>,
+        fail: Option<String>,
+    }
+
+    impl RecordingPlane {
+        fn ok() -> Self {
+            Self {
+                reloaded: Vec::new(),
+                fail: None,
+            }
+        }
+        fn failing(msg: &str) -> Self {
+            Self {
+                reloaded: Vec::new(),
+                fail: Some(msg.to_string()),
+            }
+        }
+    }
+
+    impl PolicyPlane for RecordingPlane {
+        fn reload_policy(&mut self, name: &str) -> anyhow::Result<()> {
+            self.reloaded.push(name.to_string());
+            match &self.fail {
+                Some(m) => anyhow::bail!("{m}"),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// The #234 regression. `izba run --policy <file> <running-sandbox>`
+    /// persisted the narrower allow-list and printed that it had been applied,
+    /// but never re-armed the egress plane — the guest kept enforcing the OLD
+    /// policy until some unrelated later command happened to reload. The
+    /// running path must issue exactly one live re-arm, for this sandbox.
+    #[test]
+    fn settle_policy_rearms_an_already_running_sandbox() {
+        let mut plane = RecordingPlane::ok();
+        settle_policy(&mut plane, "fw", true, true).unwrap();
+        assert_eq!(
+            plane.reloaded,
+            vec!["fw".to_string()],
+            "a running sandbox must be re-armed from the policy just persisted"
+        );
+    }
+
+    /// A STOPPED sandbox needs no re-arm: the Start this `run` performed
+    /// already armed the egress plane from the very file that was persisted.
+    /// Reloading again would be harmless but would misreport what happened.
+    #[test]
+    fn settle_policy_does_not_rearm_when_the_start_armed_it() {
+        let mut plane = RecordingPlane::ok();
+        settle_policy(&mut plane, "fw", false, false).unwrap();
+        settle_policy(&mut plane, "fw", true, false).unwrap();
+        assert!(
+            plane.reloaded.is_empty(),
+            "the start already armed it: {:?}",
+            plane.reloaded
+        );
+    }
+
+    /// No `--policy` on the command line means nothing was persisted, so a
+    /// plain `izba run` against a running sandbox must not touch the live
+    /// policy at all — attaching to a sandbox is not a policy edit.
+    #[test]
+    fn settle_policy_is_inert_without_the_flag() {
+        let mut plane = RecordingPlane::ok();
+        settle_policy(&mut plane, "fw", false, true).unwrap();
+        assert!(
+            plane.reloaded.is_empty(),
+            "no --policy => no reload: {:?}",
+            plane.reloaded
+        );
+    }
+
+    /// A failed re-arm is the exact silent-gap state #234 exists to kill:
+    /// `policy.yaml` is now narrower than what the guest enforces. It must be
+    /// fatal (so `run` never execs into a sandbox confined differently than
+    /// the user just asked), it must SAY the old policy is still in force, and
+    /// it must name the command that finishes the job.
+    #[test]
+    fn settle_policy_fails_loudly_when_the_rearm_fails() {
+        let mut plane = RecordingPlane::failing("daemon went away");
+        let err = settle_policy(&mut plane, "fw", true, true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("STILL enforcing the previous policy"),
+            "must state the enforcement gap: {msg}"
+        );
+        assert!(
+            msg.contains("izba policy reload fw"),
+            "must name the recovery command: {msg}"
+        );
+        assert!(
+            msg.contains("daemon went away"),
+            "must carry the underlying cause: {msg}"
+        );
     }
 
     /// The reported bug: edit the policy, re-run with `--policy` against an
