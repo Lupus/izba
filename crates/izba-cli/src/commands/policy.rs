@@ -310,6 +310,23 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                     let proto_str = match e.declared_protocol() {
                         None => String::new(),
                         Some(Protocol::Http) => "  protocol: http (inspected)".to_string(),
+                        // A narrower access level CANCELS the hatch: the splice
+                        // is decided on a methodless (tier-2) flow, which
+                        // `access: read` never authorizes (`egress.rego`'s
+                        // `host_access_ok("read")` requires GET/HEAD), so
+                        // `router::passthrough_names` drops the host and the
+                        // connection stays terminated. Warning either way —
+                        // announcing an opaque splice that will not happen
+                        // strands a pinning client on izba's certificate with
+                        // no hint why.
+                        Some(Protocol::Tcp) if e.access() != Access::ReadWrite => {
+                            "  \u{26A0} protocol: tcp — pinning passthrough NOT in effect: \
+                            an opaque splice carries no HTTP method, so this entry's access \
+                            level never authorizes one; the connection stays terminated at L7 \
+                            (a pinning client still sees izba's certificate) — widen to \
+                            read-write to pin"
+                                .to_string()
+                        }
                         Some(Protocol::Tcp) => "  \u{26A0} protocol: tcp — pinning passthrough: \
                             spliced opaquely; no L7 rules, no request audit, \
                             no credential injection"
@@ -942,6 +959,63 @@ mod tests {
         assert!(
             out.contains("no credential injection"),
             "credential injection is a separate loss (per Protocol's own doc) — name it:\n{out}"
+        );
+    }
+
+    // Dogfooding, m5p1 run: `policy show` promised an opaque splice that
+    // `access: read` silently cancels — `InspectionTable` never consults
+    // `AllowEntry::access()`, but `router::passthrough_names`'s per-name
+    // `policy.check` filter drops the host, because a methodless (tier-2) flow
+    // fails `egress.rego`'s `host_access_ok("read")`. The datapath is right
+    // (more inspection, not less); the rendering said the opposite. Display
+    // only — this asserts the string, never the decision.
+    #[test]
+    fn show_says_a_narrow_access_level_cancels_the_passthrough() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    access: read\n    protocol: tcp\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert!(
+            out.contains('\u{26A0}'),
+            "still a warning — an operator who wrote `protocol: tcp` for a pinning \
+             client must learn their client will not get an opaque splice:\n{out}"
+        );
+        assert!(
+            out.contains("NOT in effect"),
+            "the cancellation is the headline:\n{out}"
+        );
+        assert!(
+            out.contains("izba's certificate"),
+            "name the consequence a pinning client actually hits:\n{out}"
+        );
+        assert!(
+            !out.contains("spliced opaquely"),
+            "the ordinary passthrough promise must NOT be printed for this entry — \
+             that claim is what the finding was about:\n{out}"
+        );
+    }
+
+    // The other half of the pair: the read-write rendering must not drift when
+    // the combined case above is edited (the string is asserted by
+    // `show_is_loud_about_a_pinning_passthrough` and by the m5p1 corpus).
+    #[test]
+    fn show_keeps_the_read_write_passthrough_wording_unchanged() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert!(
+            out.contains(
+                "\u{26A0} protocol: tcp — pinning passthrough: spliced opaquely; \
+                 no L7 rules, no request audit, no credential injection\n"
+            ),
+            "the read-write passthrough line must stay byte-identical:\n{out}"
+        );
+        assert!(
+            !out.contains("NOT in effect"),
+            "the cancellation wording belongs only to the narrowed-access case:\n{out}"
         );
     }
 
