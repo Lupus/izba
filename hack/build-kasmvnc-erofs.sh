@@ -60,7 +60,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   /cache/'"$KASMVNC_DEB"' \
-  openbox xterm xfonts-base fonts-dejavu-core patchelf file \
+  openbox xterm xfonts-base fonts-dejavu-core fonts-symbola patchelf file \
   x11-xkb-utils \
   pcmanfm lxpanel lxmenu-data shared-mime-info adwaita-icon-theme >/dev/null
 
@@ -139,7 +139,13 @@ cp -r /usr/share/kasmvnc "$B/share/kasmvnc"          # web client + defaults
 cp -r /usr/share/X11/xkb "$B/share/xkb"              # keymaps
 mkdir -p "$B/share/fonts/X11"
 cp -r /usr/share/fonts/X11/misc "$B/share/fonts/X11/misc"   # core fonts (xterm, server "fixed")
-cp -r /usr/share/fonts/truetype "$B/share/fonts/truetype"   # dejavu for Xft apps
+# Xft faces. DejaVu is the terminal face; Symbola is the per-glyph FALLBACK
+# xterm reaches through fontconfig for what DejaVu lacks -- Miscellaneous
+# Technical (U+23BF, U+23F5), Miscellaneous Symbols and Arrows, and
+# monochrome emoji. A TUI drawn with those (Claude Code) otherwise renders
+# them as blank boxes. Neither font covers CJK: that stays tofu, which
+# would cost another ~14 MB of Unifont to close.
+cp -r /usr/share/fonts/truetype "$B/share/fonts/truetype"   # dejavu + symbola for Xft apps
 cp -r /etc/xdg/openbox "$B/etc/openbox" || true
 mkdir -p "$B/share/themes"
 for t in Clearlooks Onyx; do
@@ -181,6 +187,12 @@ mkdir -p "$B/etc/lxpanel" "$B/etc/pcmanfm" "$B/etc/libfm" "$B/share/applications
 cp -r /vnc-config/lxpanel/izba "$B/etc/lxpanel/izba"
 cp -r /vnc-config/pcmanfm/izba "$B/etc/pcmanfm/izba"
 cp /vnc-config/libfm/libfm.conf "$B/etc/libfm/libfm.conf"
+# xterm defaults (UTF-8 decoding/titles, Xft face, erase key, clipboard).
+# izba-init points XENVIRONMENT at this path, which is how it reaches an
+# xterm launched from ANY of the desktop launchers -- see the file itself
+# and the drift test in crates/izba-init/src/vnc.rs.
+mkdir -p "$B/etc/X11"
+cp /vnc-config/X11/Xresources "$B/etc/X11/Xresources"
 cp /vnc-config/applications/xterm.desktop "$B/share/applications/xterm.desktop"
 cp /vnc-config/applications/pcmanfm.desktop "$B/share/applications/pcmanfm.desktop"
 install -m 0755 /vnc-config/izba-session "$B/bin/izba-session"
@@ -236,6 +248,7 @@ echo "self-containment assertion: OK"
 for req in bin/pcmanfm bin/lxpanel bin/menu-cached bin/menu-cache-gen bin/izba-session \
            libexec/gio-launch-desktop \
            lib/gdk-pixbuf/loaders.cache etc/openbox/menu.xml \
+           etc/X11/Xresources share/fonts/truetype/ancient-scripts/Symbola_hint.ttf \
            etc/lxpanel/izba/panels/panel etc/pcmanfm/izba/desktop-items-0.conf \
            etc/libfm/libfm.conf share/applications/xterm.desktop \
            share/applications/pcmanfm.desktop \

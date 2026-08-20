@@ -238,6 +238,21 @@ fn vnc_env() -> Vec<(String, String)> {
             "GIO_LAUNCH_DESKTOP".to_string(),
             format!("{CONTAINER_BUNDLE_DIR}/libexec/gio-launch-desktop"),
         ),
+        // Xt reads this resource file at startup for EVERY Xt application
+        // the session launches, which is what lets the bundle configure its
+        // `xterm` without a wrapper binary or per-launcher argv: the openbox
+        // menu, lxpanel's Run dialog, pcmanfm's "Open Terminal" and a hand-
+        // typed `xterm` all inherit it through the environment. The image
+        // cannot be relied on to carry `app-defaults/XTerm` (it need not
+        // ship X11 at all), so without this the terminal runs on xterm's
+        // compiled-in defaults — latin-1 decoding and titles, `fixed`
+        // bitmap font — and every UTF-8 TUI renders as `â` soup
+        // (user-reported for Claude Code). Contents + rationale:
+        // hack/vnc-config/X11/Xresources, drift-pinned by a test below.
+        (
+            "XENVIRONMENT".to_string(),
+            format!("{CONTAINER_BUNDLE_DIR}/etc/X11/Xresources"),
+        ),
     ]
 }
 
@@ -396,6 +411,14 @@ pub fn desktop_dirs_prep_argv(cgroup_manager: crate::oci::CgroupManager) -> Vec<
 ///   `$HOME` = `/tmp`). Homeless or read-only-home images degrade to the
 ///   old behavior instead of a dead session. A numeric USER with no passwd
 ///   row resolves to an empty string and falls back the same way.
+/// - `LANG`: `C.UTF-8` as a DEFAULT ONLY (`${{LANG:=…}}`), so programs run
+///   from the desktop terminal emit and parse UTF-8 — the guest otherwise
+///   has no locale environment at all, and ncurses/vim/python decide their
+///   line-drawing and I/O encoding from it. An image that pins its own
+///   `LANG` keeps it. This is NOT what makes the terminal itself render
+///   UTF-8 — xterm is forced independently of the locale by the bundle's
+///   `Xresources` (`XENVIRONMENT` in [`vnc_env`]), precisely so a libc
+///   without `C.UTF-8` cannot take the rendering back down with it.
 ///
 /// Everything the session writes under `$HOME` follows automatically: the
 /// izba profiles and menu cache (XDG defaults `$HOME/.config`/`.cache`)
@@ -407,7 +430,8 @@ fn desktop_env_preamble() -> String {
     format!(
         "PATH=\"{CONTAINER_BUNDLE_DIR}/bin:${{PATH:-{SYSTEM_PATH}}}\"; export PATH; \
          HOME=\"$(awk -F: -v u=\"$(id -u)\" '$3==u{{print $6}}' /etc/passwd 2>/dev/null)\"; \
-         {{ [ -n \"$HOME\" ] && [ -d \"$HOME\" ] && [ -w \"$HOME\" ]; }} || HOME=/tmp; export HOME;"
+         {{ [ -n \"$HOME\" ] && [ -d \"$HOME\" ] && [ -w \"$HOME\" ]; }} || HOME=/tmp; export HOME; \
+         : \"${{LANG:=C.UTF-8}}\"; export LANG;"
     )
 }
 
@@ -1065,7 +1089,84 @@ mod tests {
                 env_of(argv, "GIO_LAUNCH_DESKTOP"),
                 Some("/opt/izba-vnc/libexec/gio-launch-desktop".to_string())
             );
+            // Xt reads this file for every Xt app the session starts, which
+            // is how the bundled xterm gets UTF-8 decoding, UTF-8 titles and
+            // an Xft face no matter WHICH launcher started it. The image's
+            // own app-defaults cannot be relied on — it need not ship X11.
+            assert_eq!(
+                env_of(argv, "XENVIRONMENT"),
+                Some("/opt/izba-vnc/etc/X11/Xresources".to_string())
+            );
+            // UTF-8 for the programs INSIDE the terminal, but only as a
+            // default: an image that pins its own locale keeps it.
+            let script = argv.last().unwrap();
+            assert!(
+                script.contains(": \"${LANG:=C.UTF-8}\"; export LANG;"),
+                "LANG must default to C.UTF-8 without clobbering the \
+                 image's own: {script}"
+            );
         }
+    }
+
+    /// `vnc_env`'s `XENVIRONMENT` names a file the bundle build must stage,
+    /// and that file must actually carry the settings it exists for — the
+    /// same both-ends pin as the gio helper and the font cache. Without the
+    /// file the env var points at nothing and xterm silently falls back to
+    /// its compiled-in latin-1 defaults, which is the `â`-soup rendering
+    /// this exists to fix; with the file present but the encoding lines
+    /// dropped, the failure looks identical.
+    #[test]
+    fn xterm_resources_are_staged_where_vnc_env_points() {
+        let sh = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../hack/build-kasmvnc-erofs.sh"
+        ))
+        .expect("hack/build-kasmvnc-erofs.sh readable from the workspace");
+        assert!(
+            sh.contains("cp /vnc-config/X11/Xresources \"$B/etc/X11/Xresources\""),
+            "bundle build must stage the xterm resources at etc/X11/ — \
+             vnc_env's XENVIRONMENT points there"
+        );
+        assert!(
+            sh.contains("etc/X11/Xresources"),
+            "the staged resources must be in the bundle content manifest"
+        );
+        assert!(
+            vnc_env()
+                .iter()
+                .any(|(k, v)| k == "XENVIRONMENT" && v == "/opt/izba-vnc/etc/X11/Xresources"),
+            "vnc_env must select the bundled resources"
+        );
+
+        let res = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../hack/vnc-config/X11/Xresources"
+        ))
+        .expect("hack/vnc-config/X11/Xresources readable from the workspace");
+        for want in [
+            // `utf8: 1` alone is NOT enough — with the default
+            // `locale: medium` the locale overrides it and xterm keeps
+            // decoding latin-1 (verified against a real xterm).
+            "XTerm*locale: false",
+            "XTerm*utf8: 1",
+            // OSC titles carry non-latin-1 bytes too.
+            "XTerm*utf8Title: true",
+            // A scalable face is what makes fontconfig's per-glyph
+            // fallback (to the bundled Symbola) reachable at all.
+            "XTerm*renderFont: true",
+            "XTerm*faceName: DejaVu Sans Mono",
+        ] {
+            assert!(
+                res.contains(want),
+                "the bundled xterm resources must set {want}: {res}"
+            );
+        }
+        // The fallback face is only useful if the bundle ships it.
+        assert!(
+            sh.contains("fonts-symbola"),
+            "bundle build must install the Symbola fallback face the \
+             xterm resources rely on for glyphs DejaVu lacks"
+        );
     }
 
     /// The wm spawn's wait loop and the session script are two halves of one
