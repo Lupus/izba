@@ -244,24 +244,34 @@ fn peer_denial_log(verdict: peercred::PeerVerdict) -> Option<String> {
     }
 }
 
-/// The startup report line for control-socket peer authentication mode, or
+/// The startup report line for unix-socket peer authentication mode, or
 /// `None` when there is nothing to report. Derived from `enforcement_mode()`,
 /// the SAME predicate the accept loop's `authorize_stream` call uses, so this
 /// line can never claim "enforced" on a platform where the accept loop
 /// actually can't (F-09). Pure like `peer_denial_log`, so the startup report
 /// is testable without binding a listener.
+///
+/// It covers BOTH peer-authoritative unix planes — the control socket and the
+/// per-sandbox egress listeners (`daemon::egress`, F-CRED-5) — because the one
+/// `enforcement_mode()` predicate governs both. Naming only the control socket
+/// would leave an operator on an unenforced platform to INFER the egress
+/// posture, which is the reported-vs-implied gap this line exists to close.
 fn peer_auth_mode_line() -> Option<String> {
     match peercred::enforcement_mode() {
         peercred::PeerAuth::Enforced => {
             // `owner_uid()` is `Some` whenever `enforcement_mode()` is
             // `Enforced` (see its doc comment).
             peercred::owner_uid().map(|uid| {
-                format!("izbad: control socket peer authentication enforced (uid {uid})")
+                format!(
+                    "izbad: unix-socket peer authentication enforced (uid {uid}) \
+                     — control + egress planes"
+                )
             })
         }
         peercred::PeerAuth::Unavailable => Some(
-            "izbad: control socket peer authentication UNAVAILABLE on this platform \
-             — the socket is gated by directory permissions only"
+            "izbad: unix-socket peer authentication UNAVAILABLE on this platform \
+             — the control socket and the per-sandbox egress listeners are gated \
+             by directory permissions only"
                 .to_string(),
         ),
     }
@@ -6051,6 +6061,26 @@ mod tests {
                 assert!(line.contains("UNAVAILABLE"), "got: {line}");
             }
         }
+    }
+
+    /// The SAME `enforcement_mode()` predicate now governs two unix planes:
+    /// the control socket and every per-sandbox egress listener (F-CRED-5).
+    /// The startup line is the only place an operator learns the posture, so
+    /// it must name BOTH — otherwise a Windows operator reading "control
+    /// socket ... UNAVAILABLE" is left to INFER the egress plane's posture,
+    /// which is exactly the reported-vs-implied gap F-09 closed for control.
+    #[test]
+    fn peer_auth_mode_line_names_both_peer_authoritative_planes() {
+        let line = super::peer_auth_mode_line().expect("a startup line is always produced");
+        assert!(
+            line.contains("control"),
+            "the line must still name the control socket; got: {line}"
+        );
+        assert!(
+            line.contains("egress"),
+            "the line must also name the egress plane the same predicate now \
+             governs; got: {line}"
+        );
     }
 
     #[test]
