@@ -879,4 +879,48 @@ mod tests {
         );
         mgr.stop_all("web");
     }
+
+    #[test]
+    fn a_live_relay_on_another_port_does_not_veto_the_removal() {
+        // The veto matches on bind AND host_port. A sandbox with one live relay
+        // and a separate stranded entry is the ordinary recovery case, so a
+        // veto keyed on either half alone would refuse to clear the strand —
+        // and the loopback bind is shared by every rule, so the bind half is
+        // exactly the one that would silently match everything.
+        let (_dir, paths) = crate::testutil::test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        let mgr = RelayManager::new();
+        let port = match mgr.publish_bound(&paths, "web", rule(0)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIP a_live_relay_on_another_port_does_not_veto: bind denied ({e})");
+                return;
+            }
+        };
+        let live = PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: port,
+            guest_port: 80,
+        };
+        // Same bind, a host port nothing holds — the stranded one.
+        let stranded = PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: port.wrapping_add(1).max(1024),
+            guest_port: 80,
+        };
+        save_rules(&paths, "web", &[live.clone(), stranded.clone()]).unwrap();
+
+        let removed = mgr
+            .remove_persisted_rule(&paths, "web", stranded.bind, stranded.host_port)
+            .unwrap();
+
+        assert!(
+            removed,
+            "a live relay on a DIFFERENT port must not veto clearing the strand"
+        );
+        let (rules, _) = load_rules_migrating(&paths, "web").unwrap();
+        assert!(!rules.contains(&stranded), "the strand must be gone");
+        assert!(rules.contains(&live), "the live relay's rule must survive");
+        mgr.stop_all("web");
+    }
 }
