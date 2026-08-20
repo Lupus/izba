@@ -1294,6 +1294,20 @@ fn handle_port_publish(
             // are not symmetric: a leaked relay is recoverable with `izba port
             // unpublish`, destroying a sibling's live port is not. Keep the
             // relay and say so.
+            //
+            // Hold the per-sandbox lock across the decision AND the teardown
+            // when it is free: persisting requires that same lock, so holding
+            // it makes "nobody has persisted this" true for the whole window
+            // rather than just at the instant of the read.
+            //
+            // A single `try_lock`, deliberately — no retry, no block. We are on
+            // this path precisely BECAUSE the lock was contended, so waiting
+            // for it would mean the common case (the one that leaves a port
+            // forwarding after a failed publish) stops rolling back at all.
+            // When it is still held we fall back to the unlocked read, which is
+            // the same check a moment earlier: a narrower window than the leak
+            // it replaces, and it fails toward keeping the relay.
+            let _decision_guard = crate::sandbox::lock_sandbox(&d.paths, &name).ok();
             let ours_to_remove = match rule_is_persisted(&d.paths, &name, &rule) {
                 Ok(persisted) => !persisted,
                 Err(read_err) => {
@@ -7000,6 +7014,49 @@ mod tests {
         assert!(
             !d.relays.active("web").contains(&rule),
             "nothing persisted this rule, so the failed request must not leave it forwarding"
+        );
+    }
+
+    #[test]
+    fn a_publish_that_cannot_read_config_keeps_the_relay_and_says_so() {
+        // The "cannot tell who owns it" arm. The two mistakes are not
+        // symmetric: a leaked relay is recoverable with `izba port unpublish`,
+        // tearing down a sibling's live port is not — so an unreadable
+        // config.json must keep the relay and report, never silently roll back.
+        //
+        // Also the one case that exercises the decision guard being TAKEN: the
+        // sandbox lock is free here (the persist fails on I/O, not contention),
+        // so the handler acquires it, hits the read error, and must still
+        // release it — asserted at the end.
+        let (dir, paths) = test_paths();
+        let Some((d, host_port, _vmm)) = publishable_sandbox(
+            &dir,
+            paths,
+            "a_publish_that_cannot_read_config_keeps_the_relay_and_says_so",
+        ) else {
+            return;
+        };
+        let rule = port_rule("127.0.0.1", host_port, 80);
+
+        // Uid-independent I/O failure: a directory where the file goes.
+        let cfg = d.paths.sandbox_dir("web").join(CONFIG_FILE);
+        std::fs::remove_file(&cfg).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let err = handle_port_publish(&d, "web".into(), rule.clone(), true)
+            .expect_err("an unreadable config.json must fail the publish");
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("left the relay") && err.contains("could not read config.json"),
+            "the error must say the relay is still up and why: {err}"
+        );
+        assert!(
+            d.relays.active("web").contains(&rule),
+            "an undecidable ownership check must keep the relay, not tear it down"
+        );
+        assert!(
+            crate::sandbox::lock_sandbox(&d.paths, "web").is_ok(),
+            "the decision guard must be released even on the error path"
         );
     }
 }
