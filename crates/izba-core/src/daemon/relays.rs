@@ -25,14 +25,13 @@ pub fn rules_path(paths: &Paths, name: &str) -> PathBuf {
 
 /// Serializes every `ports.json` mutation in this process (#181).
 ///
-/// Every other writer derives the whole file from `RelayManager::active`, the
-/// in-memory AUTHORITY — an unconditional overwrite, so those never race in a
-/// way that loses data. `remove_persisted_rule` is the one writer that must
-/// READ the file to decide what to write, and an unguarded read-modify-write
-/// there would erase whatever an overlapping `save_rules` published in between:
-/// the publish reports success and stays live, but the next daemon adoption no
-/// longer restores its relay. The guard spans read AND write, and `save_rules`
-/// takes it too — guarding only one side would serialize nothing.
+/// The guard must span whatever DECIDES the new contents, not just the write.
+/// Both writers read something first — `save_active` reads the live relay set,
+/// `remove_persisted_rule` reads the file — and a snapshot taken outside the
+/// guard is already stale by the time it is written back, so an overlapping
+/// save is silently erased: that publish reports success and stays live, but
+/// the next daemon adoption no longer restores its relay. That is why the
+/// snapshot happens INSIDE both, and why callers cannot pass one in.
 ///
 /// One global lock, not per-sandbox: these writes are tiny and rare (a port
 /// publish/unpublish, a start, an adopt), so the contention is irrelevant next
@@ -45,12 +44,31 @@ fn ports_io() -> std::sync::MutexGuard<'static, ()> {
     PORTS_IO.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Write an EXPLICIT rule list to `ports.json`.
+///
+/// Production code must not use this to publish the live set — see
+/// [`RelayManager::save_active`], which snapshots the relays inside the guard.
+/// This exists for seeding a file (tests) and for `adopt`'s legacy migration,
+/// where the list genuinely comes from somewhere other than the relay map.
 pub fn save_rules(paths: &Paths, name: &str, rules: &[PortRule]) -> anyhow::Result<()> {
     let _guard = ports_io();
     save_json(&rules_path(paths, name), &rules.to_vec())
 }
 
 impl RelayManager {
+    /// Publish the live relay set of `name` to `ports.json`.
+    ///
+    /// The snapshot is taken INSIDE [`PORTS_IO`] — that is the whole point.
+    /// `save_rules(paths, name, &mgr.active(name))` looks equivalent but is
+    /// not: the argument is evaluated before the call takes the guard, so a
+    /// publish landing in between is already missing from the list this then
+    /// writes, and is erased. Callers therefore cannot supply the list.
+    pub fn save_active(&self, paths: &Paths, name: &str) -> anyhow::Result<()> {
+        let _guard = ports_io();
+        let rules = self.active(name);
+        save_json(&rules_path(paths, name), &rules)
+    }
+
     /// Drop ONE rule from `ports.json`, leaving every other entry intact,
     /// UNLESS a live relay now holds it. Returns whether the file was actually
     /// rewritten.
@@ -459,6 +477,24 @@ mod tests {
         l.local_addr().unwrap().port()
     }
 
+    /// Publish on a free port, RETRYING the port choice.
+    ///
+    /// `free_port` closes its probe socket before the relay binds, so any other
+    /// test that asks the kernel for an ephemeral port in that window can be
+    /// handed the very port just released — including the kernel-chosen
+    /// `publish_bound(rule(0))` binds elsewhere in this file, which draw from
+    /// the same range. Retrying turns that from an `unwrap` panic into a fresh
+    /// attempt, which is what keeps these tests parallel-safe.
+    fn publish_on_a_free_port(mgr: &RelayManager, paths: &Paths, name: &str) -> PortRule {
+        for _ in 0..20 {
+            let r = rule(free_port());
+            if mgr.publish(paths, name, r.clone()).is_ok() {
+                return r;
+            }
+        }
+        panic!("no free port could be bound after 20 attempts");
+    }
+
     #[test]
     fn publish_active_unpublish_lifecycle() {
         if !bind_works() {
@@ -466,8 +502,7 @@ mod tests {
         }
         let (_d, paths) = test_paths();
         let mgr = RelayManager::new();
-        let r = rule(free_port());
-        mgr.publish(&paths, "web", r.clone()).unwrap();
+        let r = publish_on_a_free_port(&mgr, &paths, "web");
         assert_eq!(mgr.active("web"), vec![r.clone()]);
 
         // Duplicate (bind, host_port) key is rejected.
@@ -592,8 +627,7 @@ mod tests {
         }
         let (_d, paths) = test_paths();
         let mgr = RelayManager::new();
-        let r = rule(free_port());
-        mgr.publish(&paths, "web", r.clone()).unwrap();
+        let r = publish_on_a_free_port(&mgr, &paths, "web");
         assert_eq!(mgr.active("web"), vec![r]);
         mgr.stop_all("web");
     }
@@ -619,10 +653,9 @@ mod tests {
         }
         let (_d, paths) = test_paths();
         let mgr = RelayManager::new();
-        let r1 = rule(free_port());
-        let r2 = rule(free_port());
-        mgr.publish(&paths, "web", r1.clone()).unwrap();
-        mgr.publish(&paths, "web", r2.clone()).unwrap();
+        let r1 = publish_on_a_free_port(&mgr, &paths, "web");
+        let r2 = publish_on_a_free_port(&mgr, &paths, "web");
+        let _ = (&r1, &r2);
         mgr.stop_all("web");
         assert!(mgr.active("web").is_empty());
     }
@@ -634,10 +667,19 @@ mod tests {
         }
         let (_d, paths) = test_paths();
         let mgr = RelayManager::new();
-        let r = rule(free_port());
-        // A slot whose thread already finished (simulated crash).
-        mgr.insert_for_test("web", r.clone());
-        mgr.respawn_dead(&paths, "web");
+        // Retry the port choice for the same reason `publish_on_a_free_port`
+        // does: `free_port` releases its probe before `respawn_dead` binds.
+        let mut r = rule(0);
+        for _ in 0..20 {
+            r = rule(free_port());
+            // A slot whose thread already finished (simulated crash).
+            mgr.insert_for_test("web", r.clone());
+            mgr.respawn_dead(&paths, "web");
+            if mgr.active("web") == vec![r.clone()] {
+                break;
+            }
+            mgr.stop_all("web");
+        }
         // After respawn the port is genuinely bound again.
         assert!(std::net::TcpListener::bind((r.bind, r.host_port)).is_err());
         assert_eq!(mgr.active("web"), vec![r]);
