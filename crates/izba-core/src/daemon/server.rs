@@ -1335,13 +1335,6 @@ fn handle_port_unpublish(
     host_port: u16,
 ) -> anyhow::Result<DaemonResponse> {
     sandbox_must_exist(&d.paths, &name)?;
-    // Always drop the persisted rule from config — works even when the sandbox
-    // is stopped (the relay map has no entry), so a persisted-only port can be
-    // removed. (Greptile P1.)
-    let unpersisted = unpersist_port_rule(&d.paths, &name, bind, host_port)?;
-    // Tear down a live relay if one exists; a missing relay (stopped sandbox /
-    // post-restart) is NOT an error.
-    let relay_removed = d.relays.unpublish(&name, bind, host_port).is_ok();
     // ports.json is DERIVED state, so reconcile it to the live relay set
     // whenever it still lists this rule — not only when a relay was just torn
     // down (#181). A failed publish rollback can strand a rule there with no
@@ -1349,13 +1342,26 @@ fn handle_port_unpublish(
     // ports.json rule of a running sandbox — so that entry would resurrect the
     // port on the next daemon restart. This command is what the rollback's
     // error message tells the user to run, so it has to be able to clear it.
-    let stranded_in_rules = relays::load_rules_migrating(&d.paths, &name)
-        .map(|(rules, _)| {
-            rules
-                .iter()
-                .any(|r| r.bind == bind && r.host_port == host_port)
-        })
-        .unwrap_or(false);
+    //
+    // Read it FIRST, and propagate. It is the one fallible step here that has
+    // no side effect of its own, so running it before the config write is what
+    // keeps a failure from stripping config.json and returning Ok. And a read
+    // error is NOT absence: `load_rules_migrating` already maps a missing file
+    // to an empty list, so the only cases reaching the error arm are a file
+    // that cannot be read or matches neither schema — exactly the cases where
+    // reporting "no such published port" would be a lie, since the rule may
+    // still be on disk for `adopt` to republish once the file is readable.
+    let (persisted_rules, _) = relays::load_rules_migrating(&d.paths, &name)?;
+    let stranded_in_rules = persisted_rules
+        .iter()
+        .any(|r| r.bind == bind && r.host_port == host_port);
+    // Always drop the persisted rule from config — works even when the sandbox
+    // is stopped (the relay map has no entry), so a persisted-only port can be
+    // removed. (Greptile P1.)
+    let unpersisted = unpersist_port_rule(&d.paths, &name, bind, host_port)?;
+    // Tear down a live relay if one exists; a missing relay (stopped sandbox /
+    // post-restart) is NOT an error.
+    let relay_removed = d.relays.unpublish(&name, bind, host_port).is_ok();
     if relay_removed {
         relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
     } else if stranded_in_rules {
@@ -1365,7 +1371,7 @@ fn handle_port_unpublish(
         // not inert — `relays::persisted_host_ports` reads every sandbox's
         // ports.json to pick a VNC display port that avoids persisted fixed
         // rules (#221), so discarding them narrows that avoidance set.
-        let (mut rules, _) = relays::load_rules_migrating(&d.paths, &name)?;
+        let mut rules = persisted_rules;
         rules.retain(|r| !(r.bind == bind && r.host_port == host_port));
         relays::save_rules(&d.paths, &name, &rules)?;
     }
@@ -6798,5 +6804,76 @@ mod tests {
             rules.contains(&neighbour),
             "an unrelated rule must survive; got {rules:?}"
         );
+    }
+
+    // ── #181: an unreadable ports.json is not the same as "no such rule" ─────
+    //
+    // The stranded-rule probe used `unwrap_or(false)`, so a read or parse
+    // failure was indistinguishable from absence — the third swallow-an-error
+    // shape on this PR. `load_rules_migrating` already maps a MISSING file to
+    // `Ok(empty)`, so the only things that reach the error arm are a genuinely
+    // unreadable file or one matching neither schema, and in exactly those
+    // cases "no such published port" is a lie: the rule may still be on disk,
+    // and `adopt` republishes it once the file is readable again.
+
+    /// ports.json that parses as neither the current nor the legacy schema.
+    fn corrupt_ports_json(d: &Arc<Daemon>, name: &str) {
+        std::fs::write(relays::rules_path(&d.paths, name), b"{ not ports.json }").unwrap();
+    }
+
+    #[test]
+    fn unpublish_reports_an_unreadable_ports_json_rather_than_absence() {
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+        corrupt_ports_json(&d, "web");
+
+        let err = handle_port_unpublish(&d, "web".into(), "127.0.0.1".parse().unwrap(), 8080)
+            .expect_err("an unreadable ports.json must not be reported as absence");
+        let err = format!("{err:#}");
+        assert!(
+            !err.contains("no such published port"),
+            "a read failure must not masquerade as 'the rule is not there': {err}"
+        );
+        assert!(
+            err.contains("ports.json"),
+            "the error must name the file it could not read: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_ports_json_fails_before_config_json_is_touched() {
+        // The probe is fallible, so it must run BEFORE the config write — the
+        // same fail-before-side-effects rule this PR added to CLAUDE.md.
+        // Otherwise the command strips the rule from config.json, returns Ok
+        // because it "unpersisted something", and leaves the stranded entry.
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+        let rule = port_rule("127.0.0.1", 8080, 80);
+        persist_port_rule(&d.paths, "web", &rule).unwrap();
+        corrupt_ports_json(&d, "web");
+
+        let err = handle_port_unpublish(&d, "web".into(), rule.bind, rule.host_port)
+            .expect_err("an unreadable ports.json must fail the command");
+        assert!(format!("{err:#}").contains("ports.json"), "got: {err:#}");
+        assert!(
+            load_persisted_ports(&d.paths, "web").contains(&rule),
+            "config.json must be untouched when the command fails"
+        );
+    }
+
+    #[test]
+    fn a_missing_ports_json_is_still_absence_not_an_error() {
+        // Guard the other direction: `load_rules_migrating` maps NotFound to an
+        // empty list, and propagating read errors must not turn the ordinary
+        // "no ports.json yet" case into a failure.
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+        let rule = port_rule("127.0.0.1", 8080, 80);
+        persist_port_rule(&d.paths, "web", &rule).unwrap();
+        assert!(!relays::rules_path(&d.paths, "web").exists());
+
+        handle_port_unpublish(&d, "web".into(), rule.bind, rule.host_port)
+            .expect("a persisted-only port unpublishes fine with no ports.json");
+        assert!(load_persisted_ports(&d.paths, "web").is_empty());
     }
 }
