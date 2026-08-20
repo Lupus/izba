@@ -1665,21 +1665,22 @@ fn handle_usb_attach(
 /// panic the VMM driver instead of failing with an actionable error.
 fn handle_vnc_set(d: &Arc<Daemon>, name: String, enabled: bool) -> anyhow::Result<DaemonResponse> {
     sandbox_must_exist(&d.paths, &name)?;
-    // Read-only fast path FIRST, deliberately outside the lock (#181): setting
-    // VNC to the value it already holds writes nothing, so it must stay a
-    // cheap no-op rather than becoming a new way to report "busy" —
-    // `sandbox::start` holds that lock across a whole boot, and the GUI's
-    // Display tab must not error out against a booting sandbox. Racy by
-    // nature, harmlessly so: nothing is written on this path either way.
-    let p = d.paths.sandbox_dir(&name).join(CONFIG_FILE);
-    let cfg: SandboxConfig = load_json(&p)?.with_context(|| format!("no config for '{name}'"))?;
-    if cfg.vnc == enabled {
-        return Ok(DaemonResponse::Ok);
-    }
-    // An actual write, so it goes through the locked helper like every other
-    // config verb — and the volume-cap check moves inside with it, since it
-    // reads the very list a concurrent volume attach is rewriting.
+    // Through the locked helper like every other config verb (#181) — the
+    // equality check included. An earlier revision kept that check outside the
+    // lock as a read-only fast path, so a redundant toggle stayed cheap; it was
+    // dropped because the only caller (the GUI's Display tab) toggles from
+    // explicit state-conditional buttons and never polls, so the carve-out
+    // bought nothing while leaving one verb able to answer Ok without ever
+    // holding the lock.
+    //
+    // The volume-cap check lives in here too: it reads the very list a
+    // concurrent volume attach is rewriting. It stays gated on an ACTUAL
+    // change, so re-affirming an already-enabled desktop cannot start failing
+    // on an over-cap config that predates the check.
     crate::sandbox::edit_sandbox_config(&d.paths, &name, |cfg| {
+        if cfg.vnc == enabled {
+            return Ok(());
+        }
         if enabled {
             crate::volume::validate_volumes(&cfg.volumes, true)?;
         }
@@ -6320,19 +6321,55 @@ mod tests {
     }
 
     #[test]
-    fn a_no_op_vnc_set_does_not_take_the_lock() {
-        // Regression guard for the fix below, not a red test: setting VNC to
-        // the value it already holds writes nothing, so it must stay a cheap
-        // read-only no-op rather than becoming a new way to report "busy" —
-        // `sandbox::start` holds this lock across a whole boot, and the GUI's
-        // Display tab must not error out against a booting sandbox.
+    fn even_a_no_op_vnc_set_is_serialized_like_every_other_config_verb() {
+        // An earlier revision kept the equality check OUTSIDE the lock so a
+        // redundant toggle stayed a cheap read-only no-op. That carve-out was
+        // dropped: the GUI calls `vncSet` only from explicit, state-conditional
+        // buttons, never on a poll, so it bought nothing — and it left one verb
+        // able to answer Ok without ever holding the lock, which is exactly the
+        // exception the contract exists to not have. The equality check now
+        // lives inside the closure, where a redundant toggle rewrites identical
+        // bytes.
         let (_dir, d) = test_daemon();
         write_config_for_persist(&d.paths, "web");
 
         let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
-        handle_vnc_set(&d, "web".to_string(), false)
-            .expect("a no-op toggle must not be refused as busy");
+        let err = handle_vnc_set(&d, "web".to_string(), false)
+            .expect_err("no config verb answers Ok without the lock")
+            .to_string();
+        assert!(err.contains("busy"), "must refuse while locked: {err}");
         drop(held);
+
+        handle_vnc_set(&d, "web".to_string(), false)
+            .expect("the same no-op succeeds once the lock is released");
+        assert!(!load_config_for_persist(&d.paths, "web").vnc);
+    }
+
+    #[test]
+    fn a_redundant_vnc_enable_still_skips_the_volume_cap_check() {
+        // Moving the equality check inside the closure must not start
+        // re-validating a sandbox that is ALREADY vnc-enabled: an over-cap
+        // config that predates the check would otherwise become impossible to
+        // re-affirm. Same carve-out as before, just relocated.
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+
+        let p = d.paths.sandbox_dir("web").join(CONFIG_FILE);
+        let mut cfg: SandboxConfig = load_json(&p).unwrap().unwrap();
+        cfg.vnc = true;
+        cfg.volumes = (0..24)
+            .map(|i| crate::volume::VolumeSpec {
+                name: Some(format!("v{i}")),
+                guest_path: format!("/data{i}").into(),
+                size_bytes: 1 << 20,
+                eph_id: None,
+            })
+            .collect();
+        save_json(&p, &cfg).unwrap();
+
+        handle_vnc_set(&d, "web".to_string(), true)
+            .expect("re-affirming an already-enabled desktop must not re-validate volumes");
+        assert!(load_config_for_persist(&d.paths, "web").vnc);
     }
 
     #[test]
