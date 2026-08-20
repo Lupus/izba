@@ -7004,6 +7004,13 @@ mod tests {
             return;
         };
         let rule = port_rule("127.0.0.1", host_port, 80);
+        // A NEAR-MISS in config.json: same bind, different host port. The
+        // ownership check keys on bind AND port, and loopback is the bind of
+        // essentially every rule — so a check matching on either half alone
+        // would call this rule "already persisted" and skip the rollback,
+        // reinstating the leak. An empty config.json cannot tell the two apart.
+        let neighbour = port_rule("127.0.0.1", host_port.wrapping_add(1).max(1024), 90);
+        persist_port_rule(&d.paths, "web", &neighbour).unwrap();
 
         let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
         let err = handle_port_publish(&d, "web".into(), rule.clone(), true)
@@ -7013,7 +7020,11 @@ mod tests {
 
         assert!(
             !d.relays.active("web").contains(&rule),
-            "nothing persisted this rule, so the failed request must not leave it forwarding"
+            "nothing persisted THIS rule, so the failed request must not leave it forwarding"
+        );
+        assert!(
+            load_persisted_ports(&d.paths, "web").contains(&neighbour),
+            "and the unrelated persisted rule must be untouched"
         );
     }
 
