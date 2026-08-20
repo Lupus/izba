@@ -251,11 +251,32 @@ fn peer_denial_log(verdict: peercred::PeerVerdict) -> Option<String> {
 /// actually can't (F-09). Pure like `peer_denial_log`, so the startup report
 /// is testable without binding a listener.
 ///
-/// It covers BOTH peer-authoritative unix planes — the control socket and the
-/// per-sandbox egress listeners (`daemon::egress`, F-CRED-5) — because the one
-/// `enforcement_mode()` predicate governs both. Naming only the control socket
-/// would leave an operator on an unenforced platform to INFER the egress
-/// posture, which is the reported-vs-implied gap this line exists to close.
+/// It covers the two peer-authoritative unix planes the one
+/// `enforcement_mode()` predicate governs — the control socket and the
+/// per-sandbox egress listeners (`daemon::egress`, F-CRED-5). Naming only the
+/// control socket would leave an operator on an unenforced platform to INFER
+/// the egress posture, which is the reported-vs-implied gap this line closes.
+///
+/// Two things this line must keep being careful about, both of which a
+/// well-meaning tightening of the wording has already got wrong once:
+///
+/// * **It is read as an INVENTORY.** izbad binds a THIRD peer-authoritative
+///   unix listener per sandbox — the USB broker on `vsock.sock_1028`
+///   (`crate::usb::broker`) — with no peer check on either platform. Listing
+///   "control + egress" and stopping there tells an operator that every izbad
+///   unix socket is gated, which is worse than printing nothing. So the line
+///   names the broker as the plane it does NOT cover; `peer_auth_mode_line_
+///   does_not_imply_the_usb_broker_is_covered` pins that. Adding a peer check
+///   there is deliberately out of scope for F-CRED-5 — but if one ever lands,
+///   this line has to move with it.
+/// * **It must not claim a protection izba never applied.** The unenforced
+///   platform is Windows, and there izba sets NO ACL of its own on these
+///   sockets: `paths::create_dir_700` and the egress chmod are both
+///   `#[cfg(unix)]`, and `transport::bind_socket` chmods only under
+///   `cfg(unix)` too (see `peercred`'s module doc). "Gated by directory
+///   permissions only" read as a claim that izba had gated them; the honest
+///   statement is that the sockets inherit whatever their containing directory
+///   happens to grant.
 fn peer_auth_mode_line() -> Option<String> {
     match peercred::enforcement_mode() {
         peercred::PeerAuth::Enforced => {
@@ -264,14 +285,17 @@ fn peer_auth_mode_line() -> Option<String> {
             peercred::owner_uid().map(|uid| {
                 format!(
                     "izbad: unix-socket peer authentication enforced (uid {uid}) \
-                     — control + egress planes"
+                     — control socket + per-sandbox egress listeners; the \
+                     per-sandbox USB broker socket is not covered"
                 )
             })
         }
         peercred::PeerAuth::Unavailable => Some(
             "izbad: unix-socket peer authentication UNAVAILABLE on this platform \
-             — the control socket and the per-sandbox egress listeners are gated \
-             by directory permissions only"
+             — the control socket and the per-sandbox egress listeners accept any \
+             local peer that can open them, and izba applies no permissions of its \
+             own to them here, so they inherit whatever their containing directory \
+             grants; the per-sandbox USB broker socket is not covered on any platform"
                 .to_string(),
         ),
     }
@@ -6080,6 +6104,31 @@ mod tests {
             line.contains("egress"),
             "the line must also name the egress plane the same predicate now \
              governs; got: {line}"
+        );
+    }
+
+    /// A security-posture line is read as an INVENTORY. This daemon binds a
+    /// THIRD peer-authoritative unix listener per sandbox — the USB broker on
+    /// `vsock.sock_1028` (`crate::usb::broker`) — and that one has NO peer
+    /// check, on either platform. A line that names "control + egress" and
+    /// stops there invites an operator to conclude every izbad unix socket is
+    /// gated, which is worse than saying nothing.
+    ///
+    /// So the line must name the broker as UNCOVERED. Kills the mutant that
+    /// drops the exclusion clause while leaving the (still-passing)
+    /// `control`/`egress` assertions above intact.
+    #[test]
+    fn peer_auth_mode_line_does_not_imply_the_usb_broker_is_covered() {
+        let line = super::peer_auth_mode_line().expect("a startup line is always produced");
+        assert!(
+            line.contains("USB broker"),
+            "the line must name the one peer-authoritative unix plane it does \
+             NOT cover; got: {line}"
+        );
+        assert!(
+            line.contains("not"),
+            "naming the USB broker is only honest if the line says it is NOT \
+             covered; got: {line}"
         );
     }
 
