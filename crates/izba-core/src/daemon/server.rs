@@ -1283,13 +1283,49 @@ fn handle_port_publish(
         // path, where the port must keep working).
         if let Err(e) = persist_port_rule(&d.paths, &name, &rule) {
             if bound_here {
-                let _ = d.relays.unpublish(&name, rule.bind, rule.host_port);
-                let _ = relays::save_rules(&d.paths, &name, &d.relays.active(&name));
+                // The compensation can fail too, and swallowing that would be
+                // the same false-success shape #181 is about, one level down:
+                // the caller is told the publish failed while the port is in
+                // fact still forwarding. Say so, and name the recovery.
+                if let Err(note) = rollback_published_relay(d, &name, &rule) {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "rolling back the relay for {bind}:{port} also failed — {note}; \
+                             re-run `izba port unpublish {bind}:{port}` once the sandbox is idle",
+                            bind = rule.bind,
+                            port = rule.host_port,
+                        )
+                    });
+                }
             }
             return Err(e);
         }
     }
     Ok(DaemonResponse::Ok)
+}
+
+/// Undo a relay this request bound, after its config write was refused.
+///
+/// Split out from `handle_port_publish` so BOTH of its failure modes are
+/// directly testable — the branch only reachable when compensation fails is
+/// exactly the one that must not be silent. `Err` carries a human-facing note
+/// describing what is still live, never a swallowed error.
+fn rollback_published_relay(
+    d: &Arc<Daemon>,
+    name: &str,
+    rule: &crate::state::PortRule,
+) -> Result<(), String> {
+    d.relays
+        .unpublish(name, rule.bind, rule.host_port)
+        .map_err(|e| format!("the relay is still forwarding ({e:#})"))?;
+    // Only worth rewriting once the relay is actually gone: while the unpublish
+    // is failing the rule is still in `active`, so a rewrite would put it right
+    // back. A rule left in ports.json outlives the request — `adopt`
+    // re-publishes from that file, so a daemon restart would resurrect a port
+    // the caller was told had failed.
+    relays::save_rules(&d.paths, name, &d.relays.active(name)).map_err(|e| {
+        format!("ports.json still lists it, so a daemon restart would re-adopt it ({e:#})")
+    })
 }
 
 fn handle_port_unpublish(
@@ -6549,6 +6585,84 @@ mod tests {
         assert!(
             d.relays.active("web").contains(&rule),
             "the relay predates this request — a failed persist must not tear it down"
+        );
+    }
+
+    // ── #181: a rollback that ITSELF fails must be loud, never swallowed ─────
+    //
+    // The compensation in `handle_port_publish` can fail too. Discarding those
+    // errors would let the request return failure while the port keeps
+    // forwarding — or while `ports.json` still lists a rule `config.json` never
+    // got, which a daemon restart would re-adopt into a live relay the user was
+    // told had failed.
+
+    #[test]
+    fn rolling_back_a_relay_that_is_not_there_says_it_is_still_forwarding() {
+        let (dir, paths) = test_paths();
+        let Some((d, host_port, _vmm)) = publishable_sandbox(
+            &dir,
+            paths,
+            "rolling_back_a_relay_that_is_not_there_says_it_is_still_forwarding",
+        ) else {
+            return;
+        };
+        // Never published, so the unpublish half of the rollback fails.
+        let rule = port_rule("127.0.0.1", host_port, 80);
+
+        let note = rollback_published_relay(&d, "web", &rule)
+            .expect_err("unpublishing a relay that is not held must report, not swallow");
+        assert!(
+            note.contains("still forwarding"),
+            "the note must say the port may still be live; got: {note}"
+        );
+    }
+
+    #[test]
+    fn a_rollback_that_cannot_rewrite_ports_json_says_it_would_be_re_adopted() {
+        let (dir, paths) = test_paths();
+        let Some((d, host_port, _vmm)) = publishable_sandbox(
+            &dir,
+            paths,
+            "a_rollback_that_cannot_rewrite_ports_json_says_it_would_be_re_adopted",
+        ) else {
+            return;
+        };
+        let rule = port_rule("127.0.0.1", host_port, 80);
+        handle_port_publish(&d, "web".into(), rule.clone(), false).expect("publish must succeed");
+
+        // Fault injection that works regardless of uid: a directory where the
+        // rules file goes makes the write fail with IsADirectory.
+        let rules = relays::rules_path(&d.paths, "web");
+        std::fs::remove_file(&rules).ok();
+        std::fs::create_dir_all(&rules).unwrap();
+
+        let note = rollback_published_relay(&d, "web", &rule)
+            .expect_err("a ports.json rewrite failure must report, not swallow");
+        assert!(
+            note.contains("re-adopt"),
+            "the note must warn the rule would come back on restart; got: {note}"
+        );
+    }
+
+    #[test]
+    fn a_clean_rollback_reports_nothing() {
+        let (dir, paths) = test_paths();
+        let Some((d, host_port, _vmm)) =
+            publishable_sandbox(&dir, paths, "a_clean_rollback_reports_nothing")
+        else {
+            return;
+        };
+        let rule = port_rule("127.0.0.1", host_port, 80);
+        handle_port_publish(&d, "web".into(), rule.clone(), false).expect("publish must succeed");
+
+        rollback_published_relay(&d, "web", &rule).expect("a clean rollback must report nothing");
+        assert!(!d.relays.active("web").contains(&rule));
+        assert!(
+            !relays::load_rules_migrating(&d.paths, "web")
+                .unwrap()
+                .0
+                .contains(&rule),
+            "a clean rollback must also drop the rule from ports.json"
         );
     }
 }
