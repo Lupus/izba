@@ -1356,8 +1356,18 @@ fn handle_port_unpublish(
                 .any(|r| r.bind == bind && r.host_port == host_port)
         })
         .unwrap_or(false);
-    if relay_removed || stranded_in_rules {
+    if relay_removed {
         relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+    } else if stranded_in_rules {
+        // Drop just THIS rule rather than overwriting with the live set: no
+        // relay was torn down, so for a stopped sandbox that set is empty and
+        // an overwrite would take the neighbouring entries with it. They are
+        // not inert — `relays::persisted_host_ports` reads every sandbox's
+        // ports.json to pick a VNC display port that avoids persisted fixed
+        // rules (#221), so discarding them narrows that avoidance set.
+        let (mut rules, _) = relays::load_rules_migrating(&d.paths, &name)?;
+        rules.retain(|r| !(r.bind == bind && r.host_port == host_port));
+        relays::save_rules(&d.paths, &name, &rules)?;
     }
     if !unpersisted && !relay_removed && !stranded_in_rules {
         bail!("no such published port: {bind}:{host_port}");
@@ -6720,6 +6730,34 @@ mod tests {
         assert!(
             err.to_string().contains("no such published port"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn clearing_a_stranded_rule_keeps_the_other_entries() {
+        // The reconcile must remove the TARGET rule, not overwrite ports.json
+        // with the live relay set: for a stopped sandbox that set is empty, so
+        // an overwrite would take the neighbours with it. They are not inert —
+        // `relays::persisted_host_ports` reads every sandbox's ports.json to
+        // pick a VNC display port that avoids persisted fixed rules (#221), so
+        // dropping them narrows that avoidance set into a later collision.
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+        let target = port_rule("127.0.0.1", 8080, 80);
+        let neighbour = port_rule("127.0.0.1", 9090, 90);
+        relays::save_rules(&d.paths, "web", &[target.clone(), neighbour.clone()]).unwrap();
+
+        handle_port_unpublish(&d, "web".into(), target.bind, target.host_port)
+            .expect("clearing a stranded rule must succeed");
+
+        let (rules, _) = relays::load_rules_migrating(&d.paths, "web").unwrap();
+        assert!(
+            !rules.contains(&target),
+            "the target rule must be gone; got {rules:?}"
+        );
+        assert!(
+            rules.contains(&neighbour),
+            "an unrelated rule must survive; got {rules:?}"
         );
     }
 }
