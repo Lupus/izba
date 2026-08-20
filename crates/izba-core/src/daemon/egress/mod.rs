@@ -30,6 +30,7 @@ use self::policy::Policy;
 use crate::daemon::peercred;
 use crate::daemon::transport::UdsListener;
 use crate::paths::Paths;
+use crate::vmm::UdsStream;
 use izba_proto::EGRESS_PORT;
 
 /// Host-side unix path the VMM bridges guest-initiated vsock connections
@@ -41,30 +42,71 @@ pub fn listener_path(run_dir: &Path) -> PathBuf {
     run_dir.join(format!("vsock.sock_{EGRESS_PORT}"))
 }
 
-/// The daemon-log line for a rejected egress connection, or `None` when the
-/// peer was allowed — the egress-plane twin of `server::peer_denial_log`
-/// (F-CRED-5). Pure so the accept loop's decision is testable without binding
-/// a listener.
+/// What the accept loop must do with one egress connection (F-CRED-5).
 ///
-/// The line names the SANDBOX, unlike the control-plane one: a daemon runs one
-/// egress listener per sandbox, so "which sandbox's outbound plane did a
-/// foreign uid just try to drive" is the operator's first question.
+/// This is a NAMED DECISION type on purpose, not an `Option<String>`. The gate
+/// used to read `if let Some(line) = egress_peer_denial_log(..)`, which made
+/// ENFORCEMENT a side effect of whether a LOG MESSAGE happened to be produced:
+/// any later cosmetic edit to the logging — rate-limiting a flood, deduping a
+/// repeat, staying quiet while the daemon is shutting down — would silently
+/// have become an authorization bypass, and would have been reviewed as a
+/// logging change. Here the message rides INSIDE `Reject`, so it can be
+/// reworded, throttled or dropped entirely without the decision moving.
 ///
-/// `Allow(Unavailable)` yields `None`, exactly like `Allow(Enforced)`: a
-/// platform with no peer-credential API (Windows) never performed a rejection,
-/// so it must not report one.
-fn egress_peer_denial_log(verdict: peercred::PeerVerdict, sandbox: &str) -> Option<String> {
-    match verdict {
-        peercred::PeerVerdict::Allow(_) => None,
+/// If you are here to touch the wording: edit the `String`. If you are here to
+/// change who gets served: you are changing a trust boundary, and the register
+/// entry for F-CRED-5 in `docs/security/findings-2026-06-15.md` is the place
+/// that has to change with you.
+enum EgressAdmission {
+    /// Hand the connection to the router.
+    Serve,
+    /// Drop the connection; this is the daemon-log line explaining why.
+    Reject(String),
+}
+
+/// Decide whether one egress connection may be served — the egress-plane twin
+/// of `server::peer_denial_log`, but returning a named decision rather than an
+/// `Option<String>` (see [`EgressAdmission`]). Pure, so the accept loop's
+/// decision is testable without binding a listener.
+///
+/// The rejection line names the SANDBOX, unlike the control-plane one: a daemon
+/// runs one egress listener per sandbox, so "which sandbox's outbound plane did
+/// a foreign uid just try to drive" is the operator's first question.
+///
+/// `Allow(Unavailable)` is `Serve`, exactly like `Allow(Enforced)`: a platform
+/// with no peer-credential API (Windows) never performed a rejection, so it
+/// must not report one.
+///
+/// A `Deny` carrying `peer_uid == u32::MAX` did not identify a peer at all —
+/// that value is `peercred`'s documented sentinel for "the peer-credential
+/// syscall itself failed", and its own doc says a log/audit consumer must not
+/// print it as a uid. Rendering it verbatim would put `uid 4294967295` in the
+/// daemon log and send an operator hunting for a uid that does not exist, so
+/// the line says the peer was unidentifiable instead. The DENIAL is unchanged:
+/// failing closed on an unreadable credential is the entire point of that
+/// sentinel.
+fn egress_admission(verdict: peercred::PeerVerdict, sandbox: &str) -> EgressAdmission {
+    let (peer_uid, owner_uid) = match verdict {
+        peercred::PeerVerdict::Allow(_) => return EgressAdmission::Serve,
         peercred::PeerVerdict::Deny {
             peer_uid,
             owner_uid,
-        } => Some(format!(
-            "izbad: egress connection for '{sandbox}' from uid {peer_uid} rejected \
-             (daemon runs as uid {owner_uid}); only the same-uid VMM process may \
-             drive a sandbox's egress"
-        )),
-    }
+        } => (peer_uid, owner_uid),
+    };
+    let who = if peer_uid == u32::MAX {
+        "an unidentifiable peer (peer-credential lookup failed)".to_string()
+    } else {
+        format!("uid {peer_uid}")
+    };
+    // "as the daemon owner", not "the VMM": that is literally what is checked
+    // (see the FORWARD TRAP on `EgressManager::admit`), and an operator
+    // debugging a denial needs the predicate, not an idealization of it.
+    EgressAdmission::Reject(format!(
+        "izbad: egress connection for '{sandbox}' from {who} rejected \
+         (daemon runs as uid {owner_uid}); only a process running as the daemon \
+         owner — the VMM bridging this sandbox's guest vsock — may drive a \
+         sandbox's egress"
+    ))
 }
 
 /// A swappable holder for a sandbox's live egress policy. The accept loop reads
@@ -181,6 +223,35 @@ pub struct EgressManager {
     /// by sandbox serves every listener; the resolver path fills it and the
     /// `TcpConnect` path reads it.
     snoop: Arc<SnoopStore>,
+    /// The accept loop's peer gate (F-CRED-5). A bare `fn` pointer because
+    /// `fn` is `Copy`: it copies into each accept thread with no `Arc`, no
+    /// lifetime, and no allocation on the per-connection path.
+    ///
+    /// INJECTABLE ONLY so the DENIED leg can be driven through the real accept
+    /// loop by a test (`a_denied_peer_is_refused_by_the_real_accept_loop`): a
+    /// denied peer is by construction a peer this process cannot be, and unit
+    /// tests here may not spawn one under a foreign uid. Production has
+    /// exactly one admitter — [`peercred::authorize_stream`], set in
+    /// [`EgressManager::new`] and pinned by
+    /// `the_production_default_admitter_is_authorize_stream`. Never widen this
+    /// into a constructor argument, a config key, or anything else settable at
+    /// run time: an admitter that can be chosen at run time is an admitter
+    /// that can be chosen to be "allow everyone", which is precisely the state
+    /// F-CRED-5 exists to leave behind.
+    ///
+    /// FORWARD TRAP — this gate authenticates *any process running as the
+    /// daemon owner*, NOT *the VMM*. Today those coincide on Linux, because
+    /// izba spawns no setuid/ambient-cap path and Cloud Hypervisor inherits
+    /// izbad's euid. They do NOT coincide on Windows, where MVP-D already runs
+    /// the VMM under a separate `izba-spk-<name>` principal — harmless only
+    /// because `enforcement_mode()` is `Unavailable` there, so nothing is
+    /// compared. The obvious next Linux hardening step (running
+    /// cloud-hypervisor under a per-sandbox uid, the Linux analogue of what
+    /// Windows already does) would therefore break EVERY sandbox's egress the
+    /// moment it lands, and would surface only as denial lines in
+    /// `daemon.log`. That change needs a peer *allow-set* (owner uid plus the
+    /// sandbox's VMM uid) here, in the same commit.
+    admit: fn(&UdsStream) -> peercred::PeerVerdict,
 }
 
 impl EgressManager {
@@ -195,7 +266,18 @@ impl EgressManager {
             mitm,
             audit,
             snoop: Arc::new(SnoopStore::new()),
+            admit: peercred::authorize_stream,
         }
+    }
+
+    /// Test-only override of the peer gate — see the [`admit`] field's doc for
+    /// why this seam exists and why it must never become reachable in
+    /// production.
+    ///
+    /// [`admit`]: EgressManager::admit
+    #[cfg(test)]
+    fn set_admit(&mut self, f: fn(&UdsStream) -> peercred::PeerVerdict) {
+        self.admit = f;
     }
 
     /// Idempotent: bind the egress listener for `name` unless one is
@@ -231,12 +313,19 @@ impl EgressManager {
         // of `sandbox::start`'s directory setup) — create it first.
         crate::paths::create_dir_700(run_dir, paths.root())
             .with_context(|| format!("creating run dir {}", run_dir.display()))?;
-        // This socket is an unauthenticated outbound proxy (AllowAll until
-        // M2 policy) — keep it reachable only via a 0700 run dir, the same
-        // defense-in-depth the daemon control socket gets (transport.rs).
-        // `create_dir_700` above already hardens a freshly-created dir, but
-        // the dir may pre-exist with looser perms (e.g. Task 5's `create`),
-        // so re-assert the mode unconditionally.
+        // This socket is a full outbound proxy for the sandbox, governed by
+        // that sandbox's M2 egress policy — so whoever can drive it inherits
+        // the sandbox's whole allow-list. It is authenticated per connection
+        // in the accept loop below (`admit`, F-CRED-5), which is the gate that
+        // actually decides who may drive it.
+        //
+        // The 0700 run dir is now DEFENSE IN DEPTH behind that check rather
+        // than the sole gate — and it is unix-only: `create_dir_700` and the
+        // chmod below are both `#[cfg(unix)]`, so on Windows izba applies no
+        // ACL of its own here at all. That is exactly why the peer check had
+        // to stop being optional. `create_dir_700` above already hardens a
+        // freshly-created dir, but the dir may pre-exist with looser perms
+        // (e.g. `create`'s), so re-assert the mode unconditionally.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -271,6 +360,8 @@ impl EgressManager {
         let mitm = self.mitm.clone();
         let audit = self.audit.clone();
         let snoop = Arc::clone(&self.snoop);
+        // `fn` is `Copy`, so the gate travels into the accept thread by value.
+        let admit = self.admit;
         let sandbox = name.to_string();
         let thread = std::thread::spawn(move || {
             while !stop2.load(Ordering::SeqCst) {
@@ -290,8 +381,16 @@ impl EgressManager {
                         // it would inherit the sandbox's entire egress
                         // allow-list (and, once M5 lands, its credentials).
                         // Dropping `conn` closes it, so the peer sees EOF.
-                        if let Some(line) =
-                            egress_peer_denial_log(peercred::authorize_stream(&conn), &sandbox)
+                        //
+                        // `admit` is `peercred::authorize_stream` in every
+                        // production build; it is a field only so a test can
+                        // drive the DENIED leg through this very loop (see the
+                        // field's doc). The decision is `EgressAdmission`, not
+                        // "did we produce a log line" — reword the message
+                        // freely; changing who gets `Serve`d moves a trust
+                        // boundary.
+                        if let EgressAdmission::Reject(line) =
+                            egress_admission((admit)(&conn), &sandbox)
                         {
                             eprintln!("{line}");
                             continue;
@@ -427,7 +526,6 @@ mod tests {
     use super::config::EgressPolicyConfig;
     use super::policy::AllowAll;
     use super::*;
-    use crate::vmm::UdsStream;
     use izba_proto::{dns as pdns, write_frame, StreamOpen};
 
     struct EchoResolver;
@@ -452,19 +550,20 @@ mod tests {
         (dir, paths)
     }
 
+    /// Kills a transposed `format!(peer_uid, owner_uid)` — which a bare
+    /// `contains("uid 0")` / `contains("uid 1000")` pair would NOT — by
+    /// pinning the semantic slots, plus the sandbox name and the verb.
     #[test]
-    fn egress_denial_renders_an_actionable_log_line() {
-        let line = egress_peer_denial_log(
+    fn a_denial_renders_an_actionable_log_line() {
+        let EgressAdmission::Reject(line) = egress_admission(
             peercred::PeerVerdict::Deny {
                 peer_uid: 0,
                 owner_uid: 1000,
             },
             "web",
-        );
-        let line = line.expect("a Deny verdict must produce a log line");
-        // Pin the SEMANTIC SLOTS, not merely the presence of both numbers: a
-        // transposed `format!(peer_uid, owner_uid)` would still satisfy a bare
-        // `contains("uid 0")`/`contains("uid 1000")` pair.
+        ) else {
+            panic!("a Deny verdict must be a Reject");
+        };
         assert!(line.contains("from uid 0"), "got: {line}");
         assert!(line.contains("runs as uid 1000"), "got: {line}");
         assert!(
@@ -477,83 +576,92 @@ mod tests {
         );
     }
 
+    /// `peercred` documents `peer_uid: u32::MAX` as the sentinel for "the
+    /// peer-credential syscall itself failed", and says a log/audit consumer
+    /// must not print it as a uid. Kills the mutant that drops the sentinel
+    /// branch and renders it through the ordinary `uid {peer_uid}` arm, which
+    /// would emit `uid 4294967295` and send an operator hunting a uid that
+    /// cannot exist.
     #[test]
-    fn an_enforced_allow_produces_no_egress_log_line() {
-        assert!(egress_peer_denial_log(
-            peercred::PeerVerdict::Allow(peercred::PeerAuth::Enforced),
-            "web"
-        )
-        .is_none());
+    fn a_failed_credential_lookup_is_not_rendered_as_a_real_uid() {
+        let EgressAdmission::Reject(line) = egress_admission(
+            peercred::PeerVerdict::Deny {
+                peer_uid: u32::MAX,
+                owner_uid: 1000,
+            },
+            "web",
+        ) else {
+            panic!("the sentinel Deny must still be a Reject — fail-closed");
+        };
+        assert!(
+            !line.contains("4294967295"),
+            "the sentinel must never be printed as a uid; got: {line}"
+        );
+        assert!(
+            line.contains("unidentifiable peer"),
+            "the line must say the peer could not be identified; got: {line}"
+        );
+        assert!(
+            line.contains("peer-credential lookup failed"),
+            "the line must say WHY the peer is unidentifiable; got: {line}"
+        );
+        // The owner uid is real and still belongs in the line, and the
+        // connection is still refused: fail-closed is the point of the
+        // sentinel, and only its RENDERING changes.
+        assert!(line.contains("runs as uid 1000"), "got: {line}");
+        assert!(line.contains("rejected"), "got: {line}");
+    }
+
+    #[test]
+    fn an_enforced_allow_is_served() {
+        assert!(matches!(
+            egress_admission(
+                peercred::PeerVerdict::Allow(peercred::PeerAuth::Enforced),
+                "web"
+            ),
+            EgressAdmission::Serve
+        ));
     }
 
     /// A platform with no peer-credential API (Windows) reports
     /// `Allow(Unavailable)`. That is NOT an authentication, but it is also NOT
-    /// a denial: logging it as one would spam a Windows daemon's log with a
-    /// rejection it never performed, and would tempt a future reader into
-    /// making the "denial" real — which would break egress on Windows
-    /// outright. The Windows residual stays "reported, never enforced".
+    /// a denial: rejecting it would break egress on Windows outright, and
+    /// logging it as a rejection would spam the daemon log with one it never
+    /// performed. The Windows residual stays "reported, never enforced".
     #[test]
-    fn an_unavailable_allow_is_not_reported_as_a_denial() {
-        assert!(egress_peer_denial_log(
-            peercred::PeerVerdict::Allow(peercred::PeerAuth::Unavailable),
-            "web"
-        )
-        .is_none());
-    }
-
-    /// The egress plane's copy of `peercred`'s guard: what the daemon REPORTS
-    /// at startup (`enforcement_mode()`, now worded to cover this plane too)
-    /// must agree with what the egress accept path can ACTUALLY produce for a
-    /// peer that is legitimately us — a `UdsStream` pair, never a bound
-    /// listener. Ungated by `cfg(target_os)` on purpose so it runs on both CI
-    /// shards; the branch below is what differs, not the test's existence. If
-    /// a future edit gives this plane its own availability predicate, this
-    /// fails on whichever platform the two disagree on.
-    #[test]
-    fn egress_verdict_agrees_with_this_platforms_enforcement_mode() {
-        let (a, _b) = UdsStream::pair().expect("UdsStream::pair() must succeed");
-        let verdict = peercred::authorize_stream(&a);
-        match peercred::enforcement_mode() {
-            peercred::PeerAuth::Enforced => assert_eq!(
-                verdict,
-                peercred::PeerVerdict::Allow(peercred::PeerAuth::Enforced),
-                "enforcement_mode() claims Enforced but the egress site's \
-                 verdict disagreed: {verdict:?}"
-            ),
-            peercred::PeerAuth::Unavailable => assert_eq!(
-                verdict,
+    fn an_unavailable_allow_is_served_and_not_reported_as_a_denial() {
+        assert!(matches!(
+            egress_admission(
                 peercred::PeerVerdict::Allow(peercred::PeerAuth::Unavailable),
-                "enforcement_mode() claims Unavailable but the egress site's \
-                 verdict disagreed: {verdict:?}"
+                "web"
             ),
-        }
-        // Either way, our own peer is allowed through: the gate must never
-        // close on the VMM process that legitimately drives this listener.
-        assert!(
-            egress_peer_denial_log(verdict, "web").is_none(),
-            "got: {verdict:?}"
-        );
+            EgressAdmission::Serve
+        ));
     }
 
-    /// AC2: the LEGITIMATE peer — the same-uid VMM process bridging the
-    /// guest's vsock 1027 onto our unix listener — must sail straight through
-    /// the new gate. A socketpair carries real `SO_PEERCRED` and both ends
-    /// belong to this test process, so this walks the true kernel path
-    /// WITHOUT binding a listener (house constraint: unit tests never bind).
-    #[cfg(target_os = "linux")]
+    /// The injection seam of FIX 1 is only as good as what it defaults to: an
+    /// `EgressManager::new` that wired `admit` to an always-allow stub would
+    /// leave the entire suite — including the denied-leg accept-loop test,
+    /// which injects its own admitter — green while production authenticated
+    /// nobody. So pin the DEFAULT itself, by address.
+    ///
+    /// Compared as `usize` rather than with `==` on the pointers, which is
+    /// `unpredictable_function_pointer_comparisons` (deny-by-`-D warnings`).
+    /// `authorize_stream` is a plain non-generic `pub fn` in this same crate,
+    /// so it has one address here.
+    ///
+    /// Catches: `admit: peercred::authorize_stream` in `new()` rewritten to any
+    /// other function. (A struct-literal field is not something cargo-mutants
+    /// rewrites, which is exactly why this needs a hand-written guard.)
     #[test]
-    fn our_own_socketpair_peer_is_allowed_and_enforced_at_the_egress_site() {
-        let (a, _b) = UdsStream::pair().expect("UdsStream::pair() must succeed");
-        let verdict = peercred::authorize_stream(&a);
+    fn the_production_default_admitter_is_authorize_stream() {
+        let default_admit = mgr().admit as usize;
+        let expected =
+            peercred::authorize_stream as fn(&UdsStream) -> peercred::PeerVerdict as usize;
         assert_eq!(
-            verdict,
-            peercred::PeerVerdict::Allow(peercred::PeerAuth::Enforced),
-            "our own socketpair peer is us; Allow(Unavailable) here would mean \
-             the platform shim silently gave up on Linux"
-        );
-        assert!(
-            egress_peer_denial_log(verdict, "web").is_none(),
-            "an allowed peer must never be logged — or dropped — as a denial"
+            default_admit, expected,
+            "EgressManager::new must default `admit` to peercred::authorize_stream; \
+             anything else silently unauthenticates every production egress listener"
         );
     }
 
@@ -567,6 +675,14 @@ mod tests {
 
     /// Full lifecycle against a real unix listener — runtime-skip where the
     /// sandbox denies bind (house pattern).
+    ///
+    /// Since F-CRED-5 this is also the peer gate's POSITIVE leg, and the only
+    /// test that runs the real accept loop with the DEFAULT admitter: it uses
+    /// `mgr()` untouched, so `peercred::authorize_stream` judges a peer that
+    /// really is us. A gate that closed on the legitimate same-uid VMM peer —
+    /// or a `Serve`/`Reject` arm swapped in `egress_admission` — would stop
+    /// this echo. `a_denied_peer_is_refused_by_the_real_accept_loop` is its
+    /// matched negative twin.
     #[test]
     fn ensure_listening_accepts_and_routes() {
         let (_d, paths) = test_paths();
@@ -602,6 +718,83 @@ mod tests {
             !listener_path(&run_dir).exists(),
             "socket file removed on stop"
         );
+    }
+
+    /// F-CRED-5's CALL-SITE test: the peer gate must live in the REAL accept
+    /// loop, ABOVE the handler spawn, and must actually stop the connection.
+    ///
+    /// Modelled exactly on `ensure_listening_accepts_and_routes` — same
+    /// manager, same bind-or-skip `PermissionDenied` runtime skip (the house
+    /// pattern for the rare test that genuinely needs a listener), same
+    /// `StreamOpen::Dns` + echo exchange. The ONLY difference is the injected
+    /// always-`Deny` admitter, so the pair is matched and this test's
+    /// assertion is precisely "the echo the positive leg gets must not
+    /// happen".
+    ///
+    /// Two mutations it kills, both of which every *other* test in this crate
+    /// — including the pure `egress_admission` ones — leaves green:
+    ///   * moving the gate BELOW `std::thread::spawn`, so the handler runs and
+    ///     answers before the connection is dropped;
+    ///   * replacing the gate's `continue` with `{}`, so execution falls
+    ///     straight through into the handler.
+    #[test]
+    fn a_denied_peer_is_refused_by_the_real_accept_loop() {
+        let (_d, paths) = test_paths();
+        let run_dir = paths.run_dir("web");
+        let mut m = mgr();
+        // A denied peer is by construction a peer this process cannot BE, and
+        // a unit test may not spawn one under another uid — hence the seam.
+        m.set_admit(|_| peercred::PeerVerdict::Deny {
+            peer_uid: 4242,
+            owner_uid: 0,
+        });
+        match m.ensure_listening(&paths, "web", &run_dir) {
+            Ok(()) => {}
+            Err(e)
+                if e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                }) =>
+            {
+                eprintln!(
+                    "SKIP a_denied_peer_is_refused_by_the_real_accept_loop: bind denied: {e:#}"
+                );
+                return;
+            }
+            Err(e) => panic!("ensure_listening: {e:#}"),
+        }
+
+        let mut c = UdsStream::connect(listener_path(&run_dir)).unwrap();
+        // Backstop only: a working gate closes immediately and a broken one
+        // answers immediately, so this timeout exists purely so a REGRESSION
+        // fails the suite instead of hanging it.
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // The writes may fail with EPIPE once the accept loop has already
+        // dropped its end — that is the gate working, not a test failure.
+        let _ = write_frame(&mut c, &StreamOpen::Dns);
+        let _ = pdns::write_dns_msg(&mut c, b"ping");
+        match pdns::read_dns_msg(&mut c) {
+            // The contract the gate promises: dropping the connection closes
+            // it, and the peer sees EOF without one byte of service.
+            Ok(None) => {}
+            Ok(Some(answer)) => panic!(
+                "a DENIED peer was served: the accept loop answered {answer:?} \
+                 instead of dropping the connection — the gate is missing, sits \
+                 below the handler spawn, or no longer skips the handler"
+            ),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                panic!("a denied peer neither was answered nor saw EOF (hung): {e}")
+            }
+            // A reset/broken pipe is the same refusal seen from the other end.
+            Err(_) => {}
+        }
+
+        m.stop("web", &run_dir);
     }
 
     /// Adoption hands a LEGACY dir for pre-upgrade sandboxes; the bind must
