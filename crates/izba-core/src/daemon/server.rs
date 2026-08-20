@@ -822,7 +822,7 @@ fn handle_start(
             ));
         }
     }
-    relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+    d.relays.save_active(&d.paths, &name)?;
     // The VNC display relay: an EPHEMERAL loopback port onto the guest's
     // KasmVNC endpoint, created per start and never persisted (it lives in
     // the separate `vnc_relays` manager, so the `save_rules` call above
@@ -1271,7 +1271,7 @@ fn handle_port_publish(
     if bound_here {
         d.relays.publish(&d.paths, &name, rule.clone())?;
     }
-    relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+    d.relays.save_active(&d.paths, &name)?;
     if persist {
         // The live effects above land BEFORE this, and taking the per-sandbox
         // lock (#181) turned this step from "fails only on I/O error" into
@@ -1282,7 +1282,33 @@ fn handle_port_publish(
         // already live is not ours to tear down (that is the "Make persistent"
         // path, where the port must keep working).
         if let Err(e) = persist_port_rule(&d.paths, &name, &rule) {
-            if bound_here {
+            // "I bound it" is NOT "I own it". A sibling publish of the same
+            // rule that arrived after our bind saw it already active, adopted
+            // it, and may have persisted it successfully while our own persist
+            // was losing the lock. Tearing the relay down then would hand that
+            // caller a port that is neither forwarding nor recorded — worse
+            // than the leak we are compensating for. So the relay is ours to
+            // remove only while config.json still does NOT list the rule.
+            //
+            // A read failure here means we cannot tell, and the two mistakes
+            // are not symmetric: a leaked relay is recoverable with `izba port
+            // unpublish`, destroying a sibling's live port is not. Keep the
+            // relay and say so.
+            let ours_to_remove = match rule_is_persisted(&d.paths, &name, &rule) {
+                Ok(persisted) => !persisted,
+                Err(read_err) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "left the relay for {bind}:{port} up: could not read config.json to \
+                             tell whether another request had already persisted it ({read_err:#}). \
+                             Re-run `izba port unpublish {bind}:{port}` if it is unwanted",
+                            bind = rule.bind,
+                            port = rule.host_port,
+                        )
+                    });
+                }
+            };
+            if bound_here && ours_to_remove {
                 // The compensation can fail too, and swallowing that would be
                 // the same false-success shape #181 is about, one level down:
                 // the caller is told the publish failed while the port is in
@@ -1304,6 +1330,22 @@ fn handle_port_publish(
     Ok(DaemonResponse::Ok)
 }
 
+/// Does `config.json` currently list this rule? The rollback's ownership test:
+/// a rule some request has already persisted is not ours to tear down, however
+/// it got there.
+fn rule_is_persisted(
+    paths: &Paths,
+    name: &str,
+    rule: &crate::state::PortRule,
+) -> anyhow::Result<bool> {
+    let p = paths.sandbox_dir(name).join(CONFIG_FILE);
+    let cfg: SandboxConfig = load_json(&p)?.with_context(|| format!("no config for '{name}'"))?;
+    Ok(cfg
+        .ports
+        .iter()
+        .any(|r| r.bind == rule.bind && r.host_port == rule.host_port))
+}
+
 /// Undo a relay this request bound, after its config write was refused.
 ///
 /// Split out from `handle_port_publish` so BOTH of its failure modes are
@@ -1323,7 +1365,7 @@ fn rollback_published_relay(
     // back. A rule left in ports.json outlives the request — `adopt`
     // re-publishes from that file, so a daemon restart would resurrect a port
     // the caller was told had failed.
-    relays::save_rules(&d.paths, name, &d.relays.active(name)).map_err(|e| {
+    d.relays.save_active(&d.paths, name).map_err(|e| {
         format!("ports.json still lists it, so a daemon restart would re-adopt it ({e:#})")
     })
 }
@@ -1372,7 +1414,7 @@ fn handle_port_unpublish(
     // post-restart) is NOT an error.
     let relay_removed = d.relays.unpublish(&name, bind, host_port).is_ok();
     if relay_removed {
-        relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
+        d.relays.save_active(&d.paths, &name)?;
     } else if stranded_in_rules {
         // Drop just THIS rule rather than overwriting with the live set: no
         // relay was torn down, so for a stopped sandbox that set is empty and
@@ -1894,7 +1936,7 @@ pub fn adopt(d: &Arc<Daemon>) {
                             );
                         }
                     }
-                    let _ = relays::save_rules(&d.paths, &info.name, &d.relays.active(&info.name));
+                    let _ = d.relays.save_active(&d.paths, &info.name);
                 }
             }
             Err(e) => eprintln!("izbad: ports.json for '{}': {e:#}", info.name),
@@ -6893,5 +6935,71 @@ mod tests {
         handle_port_unpublish(&d, "web".into(), rule.bind, rule.host_port)
             .expect("a persisted-only port unpublishes fine with no ports.json");
         assert!(load_persisted_ports(&d.paths, "web").is_empty());
+    }
+
+    // ── #181: "I bound it" is not "I own it" ────────────────────────────────
+    //
+    // A sibling publish of the same rule that arrives after our bind sees the
+    // relay already active, adopts it, and may persist it successfully while
+    // our own persist is losing the lock. Rolling back then hands that caller a
+    // port that is neither forwarding nor recorded.
+
+    #[test]
+    fn a_failed_publish_does_not_tear_down_a_relay_another_request_persisted() {
+        let (dir, paths) = test_paths();
+        let Some((d, host_port, _vmm)) = publishable_sandbox(
+            &dir,
+            paths,
+            "a_failed_publish_does_not_tear_down_a_relay_another_request_persisted",
+        ) else {
+            return;
+        };
+        let rule = port_rule("127.0.0.1", host_port, 80);
+        // The sibling's work: the rule is already in config.json. Our request
+        // will bind the relay itself (`bound_here`) and then fail to persist.
+        persist_port_rule(&d.paths, "web", &rule).unwrap();
+
+        let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+        let err = handle_port_publish(&d, "web".into(), rule.clone(), true)
+            .expect_err("the persist half must still be refused while the lock is held");
+        drop(held);
+        assert!(err.to_string().contains("busy"), "got: {err:#}");
+
+        assert!(
+            d.relays.active("web").contains(&rule),
+            "config.json already lists this rule, so the relay is not ours to \
+             tear down — a sibling request is relying on it"
+        );
+        assert!(
+            load_persisted_ports(&d.paths, "web").contains(&rule),
+            "and the sibling's persisted rule must survive untouched"
+        );
+    }
+
+    #[test]
+    fn a_failed_publish_still_rolls_back_a_relay_nobody_persisted() {
+        // The control: with config.json NOT listing the rule, the relay really
+        // is this request's own and must still be rolled back. Without this the
+        // ownership test above could be satisfied by never rolling back at all.
+        let (dir, paths) = test_paths();
+        let Some((d, host_port, _vmm)) = publishable_sandbox(
+            &dir,
+            paths,
+            "a_failed_publish_still_rolls_back_a_relay_nobody_persisted",
+        ) else {
+            return;
+        };
+        let rule = port_rule("127.0.0.1", host_port, 80);
+
+        let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+        let err = handle_port_publish(&d, "web".into(), rule.clone(), true)
+            .expect_err("a persisted publish must fail while the lock is held");
+        drop(held);
+        assert!(err.to_string().contains("busy"), "got: {err:#}");
+
+        assert!(
+            !d.relays.active("web").contains(&rule),
+            "nothing persisted this rule, so the failed request must not leave it forwarding"
+        );
     }
 }
