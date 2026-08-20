@@ -46,6 +46,52 @@ pub fn remove_stale_socket(sock: &Path) {
     let _ = std::fs::remove_file(sock);
 }
 
+/// Prepare a sandbox's runtime directory and bind one of its per-sandbox
+/// listeners.
+///
+/// The two guest-facing planes izbad binds per sandbox — egress (vsock 1027,
+/// `daemon::egress`) and the USB broker (vsock 1028, `usb::broker`) — arm
+/// their listeners identically: create the run dir 0700, re-assert that mode
+/// in case the dir pre-existed looser (e.g. `create`'s), unlink a stale socket
+/// file left by a previous run, bind, and go non-blocking so the accept loop
+/// can poll its stop flag instead of parking in `accept`.
+///
+/// It lives here, shared, so the two planes' setup cannot drift apart. The
+/// 0700 re-assert in particular is easy to lose on one side and not the other,
+/// and it is **unix-only**: `paths::create_dir_700` and the chmod below are
+/// both `#[cfg(unix)]`, so on Windows izba applies no ACL of its own to these
+/// sockets and they inherit whatever their containing directory grants. That
+/// is why each plane's own accept-time gate — not this directory mode — is
+/// what actually decides who may drive it.
+///
+/// `what` names the plane in the error messages ("egress", "USB").
+pub fn bind_sandbox_listener(
+    root: &Path,
+    run_dir: &Path,
+    path: &Path,
+    what: &str,
+) -> anyhow::Result<UdsListener> {
+    crate::paths::create_dir_700(run_dir, root)
+        .with_context(|| format!("creating run dir {}", run_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing stale {}", path.display())),
+    }
+    let listener = UdsListener::bind(path)
+        .with_context(|| format!("binding {what} listener {}", path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("{what} listener nonblocking"))?;
+    Ok(listener)
+}
+
 /// Plain connect to the daemon socket (no hello).
 pub fn connect_socket(paths: &Paths) -> std::io::Result<UdsStream> {
     UdsStream::connect(paths.daemon_socket())

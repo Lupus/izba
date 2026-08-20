@@ -30,7 +30,6 @@ use anyhow::{Context, Result};
 use izba_proto::{read_frame, write_frame, ErrorKind, Response, StreamOpen, USB_PORT};
 
 use crate::daemon::egress::audit::{AuditRecord, AuditSink, Tier};
-use crate::daemon::transport::UdsListener;
 use crate::paths::Paths;
 use crate::vmm::{IoStream, UdsStream};
 
@@ -199,24 +198,8 @@ impl UsbBroker {
             inner.remove(name);
         }
         let path = listener_path(run_dir);
-        crate::paths::create_dir_700(run_dir, paths.root())
-            .with_context(|| format!("creating run dir {}", run_dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("removing stale {}", path.display())),
-        }
-        let listener = UdsListener::bind(&path)
-            .with_context(|| format!("binding USB listener {}", path.display()))?;
-        listener
-            .set_nonblocking(true)
-            .context("USB listener nonblocking")?;
+        let listener =
+            crate::daemon::transport::bind_sandbox_listener(paths.root(), run_dir, &path, "USB")?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);
         let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
