@@ -1912,9 +1912,13 @@ fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
             "-c",
             "test -x /opt/izba-vnc/libexec/gio-launch-desktop && echo helper-ok; \
              test -f /opt/izba-vnc/share/applications/pcmanfm.desktop && echo fm-entry-ok; \
+             test -s /opt/izba-vnc/etc/X11/Xresources && echo xresources-ok; \
+             ls /opt/izba-vnc/share/fonts/truetype/ancient-scripts/*.ttf \
+               >/dev/null 2>&1 && echo fallback-font-ok; \
              for p in /proc/[0-9]*; do \
                [ \"$(cat \"$p/comm\" 2>/dev/null)\" = \"lxpanel\" ] || continue; \
-               tr '\\0' '\\n' < \"$p/environ\" | grep '^GIO_LAUNCH_DESKTOP='; \
+               tr '\\0' '\\n' < \"$p/environ\" \
+                 | grep -E '^(GIO_LAUNCH_DESKTOP|XENVIRONMENT)='; \
                break; \
              done",
         ],
@@ -1940,6 +1944,34 @@ fn assert_desktop_procs(data: &Path, name: &str, phase: &str) {
         "[{phase}] the live panel must carry the GIO_LAUNCH_DESKTOP \
          override — without it the Run dialog dies on images without \
          GLib: {out}\n{}",
+        vnc_diag(data, name)
+    );
+    // The terminal's rendering, same two-halves shape as the helper above.
+    // The bundle owns xterm's defaults because the image is not required to
+    // ship `app-defaults/XTerm`, and xterm's COMPILED-IN defaults decode
+    // latin-1 — which rendered every UTF-8 TUI as `â` soup (user-reported
+    // for Claude Code). Both halves must be live: the resources staged
+    // in-container, and a REAL desktop process carrying the XENVIRONMENT
+    // that makes Xt read them.
+    assert!(
+        out.contains("xresources-ok"),
+        "[{phase}] the bundle must ship a non-empty etc/X11/Xresources — \
+         it is what forces xterm's UTF-8 decoding and Xft face: {out}\n{}",
+        vnc_diag(data, name)
+    );
+    assert!(
+        out.contains("fallback-font-ok"),
+        "[{phase}] the bundle must ship the Symbola fallback face — without \
+         it xterm has no glyph for the Miscellaneous Technical/emoji \
+         codepoints a TUI draws with, and they render as blank boxes even \
+         once the encoding is right: {out}\n{}",
+        vnc_diag(data, name)
+    );
+    assert!(
+        out.contains("XENVIRONMENT=/opt/izba-vnc/etc/X11/Xresources"),
+        "[{phase}] the live panel must carry the XENVIRONMENT override — \
+         without it xterm never reads the bundled resources and falls back \
+         to latin-1 decoding: {out}\n{}",
         vnc_diag(data, name)
     );
 }
