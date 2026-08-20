@@ -27,6 +27,7 @@ use self::dns::Resolver;
 use self::dns_snoop::SnoopStore;
 use self::mitm_runtime::MitmRuntime;
 use self::policy::Policy;
+use crate::daemon::peercred;
 use crate::daemon::transport::UdsListener;
 use crate::paths::Paths;
 use izba_proto::EGRESS_PORT;
@@ -38,6 +39,32 @@ use izba_proto::EGRESS_PORT;
 /// recorded in state.json (see `sandbox::live_run_dir`).
 pub fn listener_path(run_dir: &Path) -> PathBuf {
     run_dir.join(format!("vsock.sock_{EGRESS_PORT}"))
+}
+
+/// The daemon-log line for a rejected egress connection, or `None` when the
+/// peer was allowed — the egress-plane twin of `server::peer_denial_log`
+/// (F-CRED-5). Pure so the accept loop's decision is testable without binding
+/// a listener.
+///
+/// The line names the SANDBOX, unlike the control-plane one: a daemon runs one
+/// egress listener per sandbox, so "which sandbox's outbound plane did a
+/// foreign uid just try to drive" is the operator's first question.
+///
+/// `Allow(Unavailable)` yields `None`, exactly like `Allow(Enforced)`: a
+/// platform with no peer-credential API (Windows) never performed a rejection,
+/// so it must not report one.
+fn egress_peer_denial_log(verdict: peercred::PeerVerdict, sandbox: &str) -> Option<String> {
+    match verdict {
+        peercred::PeerVerdict::Allow(_) => None,
+        peercred::PeerVerdict::Deny {
+            peer_uid,
+            owner_uid,
+        } => Some(format!(
+            "izbad: egress connection for '{sandbox}' from uid {peer_uid} rejected \
+             (daemon runs as uid {owner_uid}); only the same-uid VMM process may \
+             drive a sandbox's egress"
+        )),
+    }
 }
 
 /// A swappable holder for a sandbox's live egress policy. The accept loop reads
@@ -252,6 +279,23 @@ impl EgressManager {
                         if conn.set_nonblocking(false).is_err() {
                             continue;
                         }
+                        // ORDERING IS LOAD-BEARING (F-CRED-5): the peer check
+                        // runs AFTER `set_nonblocking` succeeds and BEFORE any
+                        // per-connection work — no policy/USB-guard load, no
+                        // `Arc` clone of the resolver/MITM/audit/snoop, and
+                        // above all no handler thread. A foreign-uid peer must
+                        // cost this daemon nothing and relay not one byte:
+                        // this listener is a full outbound proxy for the
+                        // sandbox, so an unauthorized local peer that got past
+                        // it would inherit the sandbox's entire egress
+                        // allow-list (and, once M5 lands, its credentials).
+                        // Dropping `conn` closes it, so the peer sees EOF.
+                        if let Some(line) =
+                            egress_peer_denial_log(peercred::authorize_stream(&conn), &sandbox)
+                        {
+                            eprintln!("{line}");
+                            continue;
+                        }
                         let policy = cell_for_thread.load();
                         let usb = usb_for_thread.load();
                         let resolver = Arc::clone(&resolver);
@@ -406,6 +450,111 @@ mod tests {
         std::fs::create_dir_all(paths.run_dir("web")).unwrap();
         std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
         (dir, paths)
+    }
+
+    #[test]
+    fn egress_denial_renders_an_actionable_log_line() {
+        let line = egress_peer_denial_log(
+            peercred::PeerVerdict::Deny {
+                peer_uid: 0,
+                owner_uid: 1000,
+            },
+            "web",
+        );
+        let line = line.expect("a Deny verdict must produce a log line");
+        // Pin the SEMANTIC SLOTS, not merely the presence of both numbers: a
+        // transposed `format!(peer_uid, owner_uid)` would still satisfy a bare
+        // `contains("uid 0")`/`contains("uid 1000")` pair.
+        assert!(line.contains("from uid 0"), "got: {line}");
+        assert!(line.contains("runs as uid 1000"), "got: {line}");
+        assert!(
+            line.contains("'web'"),
+            "the line must name the sandbox whose egress was refused; got: {line}"
+        );
+        assert!(
+            line.contains("rejected"),
+            "the line must say the connection was rejected; got: {line}"
+        );
+    }
+
+    #[test]
+    fn an_enforced_allow_produces_no_egress_log_line() {
+        assert!(egress_peer_denial_log(
+            peercred::PeerVerdict::Allow(peercred::PeerAuth::Enforced),
+            "web"
+        )
+        .is_none());
+    }
+
+    /// A platform with no peer-credential API (Windows) reports
+    /// `Allow(Unavailable)`. That is NOT an authentication, but it is also NOT
+    /// a denial: logging it as one would spam a Windows daemon's log with a
+    /// rejection it never performed, and would tempt a future reader into
+    /// making the "denial" real — which would break egress on Windows
+    /// outright. The Windows residual stays "reported, never enforced".
+    #[test]
+    fn an_unavailable_allow_is_not_reported_as_a_denial() {
+        assert!(egress_peer_denial_log(
+            peercred::PeerVerdict::Allow(peercred::PeerAuth::Unavailable),
+            "web"
+        )
+        .is_none());
+    }
+
+    /// The egress plane's copy of `peercred`'s guard: what the daemon REPORTS
+    /// at startup (`enforcement_mode()`, now worded to cover this plane too)
+    /// must agree with what the egress accept path can ACTUALLY produce for a
+    /// peer that is legitimately us — a `UdsStream` pair, never a bound
+    /// listener. Ungated by `cfg(target_os)` on purpose so it runs on both CI
+    /// shards; the branch below is what differs, not the test's existence. If
+    /// a future edit gives this plane its own availability predicate, this
+    /// fails on whichever platform the two disagree on.
+    #[test]
+    fn egress_verdict_agrees_with_this_platforms_enforcement_mode() {
+        let (a, _b) = UdsStream::pair().expect("UdsStream::pair() must succeed");
+        let verdict = peercred::authorize_stream(&a);
+        match peercred::enforcement_mode() {
+            peercred::PeerAuth::Enforced => assert_eq!(
+                verdict,
+                peercred::PeerVerdict::Allow(peercred::PeerAuth::Enforced),
+                "enforcement_mode() claims Enforced but the egress site's \
+                 verdict disagreed: {verdict:?}"
+            ),
+            peercred::PeerAuth::Unavailable => assert_eq!(
+                verdict,
+                peercred::PeerVerdict::Allow(peercred::PeerAuth::Unavailable),
+                "enforcement_mode() claims Unavailable but the egress site's \
+                 verdict disagreed: {verdict:?}"
+            ),
+        }
+        // Either way, our own peer is allowed through: the gate must never
+        // close on the VMM process that legitimately drives this listener.
+        assert!(
+            egress_peer_denial_log(verdict, "web").is_none(),
+            "got: {verdict:?}"
+        );
+    }
+
+    /// AC2: the LEGITIMATE peer — the same-uid VMM process bridging the
+    /// guest's vsock 1027 onto our unix listener — must sail straight through
+    /// the new gate. A socketpair carries real `SO_PEERCRED` and both ends
+    /// belong to this test process, so this walks the true kernel path
+    /// WITHOUT binding a listener (house constraint: unit tests never bind).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn our_own_socketpair_peer_is_allowed_and_enforced_at_the_egress_site() {
+        let (a, _b) = UdsStream::pair().expect("UdsStream::pair() must succeed");
+        let verdict = peercred::authorize_stream(&a);
+        assert_eq!(
+            verdict,
+            peercred::PeerVerdict::Allow(peercred::PeerAuth::Enforced),
+            "our own socketpair peer is us; Allow(Unavailable) here would mean \
+             the platform shim silently gave up on Linux"
+        );
+        assert!(
+            egress_peer_denial_log(verdict, "web").is_none(),
+            "an allowed peer must never be logged — or dropped — as a denial"
+        );
     }
 
     #[test]
