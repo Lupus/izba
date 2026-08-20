@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use crate::manifest::diff;
 use crate::manifest::normalize::Normalized;
 use crate::paths::Paths;
-use crate::state::{load_json, save_json, PortRule, SandboxConfig, CONFIG_FILE};
+use crate::state::PortRule;
 use crate::volume::VolumeSpec;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -88,30 +88,36 @@ pub fn write_managed(
     image_digest: &str,
 ) -> Result<()> {
     let dir = paths.sandbox_dir(name);
-    let mut cfg: SandboxConfig = load_json(&dir.join(CONFIG_FILE))?
-        .with_context(|| format!("no config.json for sandbox {name:?}"))?;
-    cfg.cpus = target.cpus;
-    cfg.mem_mb = target.mem_mb;
-    cfg.image_digest = image_digest.to_string();
-    match &target.image {
-        crate::manifest::normalize::ImageSource::Ref(r) => {
-            cfg.image_ref = r.clone();
-            cfg.build = None;
-        }
-        crate::manifest::normalize::ImageSource::Build(b) => {
-            cfg.build = Some(b.clone());
-            // Store the tag as image_ref for display/legacy purposes;
-            // from_managed uses cfg.build for authoritative reconstruction.
-            if let Some(tag) = &b.tag {
-                cfg.image_ref = tag.clone();
+    // Under the per-sandbox lock (#181): this overwrites cpus/mem/image/ports/
+    // volumes while PRESERVING workspace/builder/usb/docker/vnc from the file
+    // on disk — a whole-file read-modify-write like every other config verb.
+    // Unlocked, a `usb allow` or `vnc on` landing mid-promote was silently
+    // discarded (or discarded the promote) with both requests reporting
+    // success.
+    crate::sandbox::edit_sandbox_config(paths, name, |cfg| {
+        cfg.cpus = target.cpus;
+        cfg.mem_mb = target.mem_mb;
+        cfg.image_digest = image_digest.to_string();
+        match &target.image {
+            crate::manifest::normalize::ImageSource::Ref(r) => {
+                cfg.image_ref = r.clone();
+                cfg.build = None;
+            }
+            crate::manifest::normalize::ImageSource::Build(b) => {
+                cfg.build = Some(b.clone());
+                // Store the tag as image_ref for display/legacy purposes;
+                // from_managed uses cfg.build for authoritative reconstruction.
+                if let Some(tag) = &b.tag {
+                    cfg.image_ref = tag.clone();
+                }
             }
         }
-    }
-    cfg.ports = target.ports.clone();
-    let mut volumes = target.volumes.clone();
-    crate::volume::assign_eph_ids(&mut volumes);
-    cfg.volumes = volumes;
-    save_json(&dir.join(CONFIG_FILE), &cfg)?;
+        cfg.ports = target.ports.clone();
+        let mut volumes = target.volumes.clone();
+        crate::volume::assign_eph_ids(&mut volumes);
+        cfg.volumes = volumes;
+        Ok(())
+    })?;
     write_policy(&dir, &target.egress)?;
     Ok(())
 }
@@ -415,5 +421,77 @@ mod tests {
             cfg.rw_size_gb, 12,
             "write_managed must preserve the existing rw_size_gb (immutable post-create)"
         );
+    }
+
+    // ── #181: `promote` writes config.json too, so it takes the lock ─────────
+    //
+    // `write_managed` overwrites cpus/mem/image/ports/volumes while PRESERVING
+    // workspace/builder/usb/docker/vnc from the existing file — a whole-file
+    // read-modify-write like every other config verb. Unlocked, a `usb allow`
+    // or `vnc on` landing mid-promote is silently discarded (or discards the
+    // promote) with both requests reporting success.
+
+    fn seed_config_for_lock_test(paths: &crate::paths::Paths, name: &str) {
+        std::fs::create_dir_all(paths.sandbox_dir(name)).unwrap();
+        let seed = SandboxConfig {
+            usb: Default::default(),
+            image_digest: "sha256:old".into(),
+            image_ref: "ubuntu:24.04".into(),
+            cpus: 2,
+            mem_mb: 4096,
+            workspace: "/ws".into(),
+            ports: vec![],
+            volumes: vec![],
+            builder: false,
+            docker: false,
+            vnc: false,
+            build: None,
+            rw_size_gb: 8,
+        };
+        crate::state::save_json(&paths.sandbox_dir(name).join(CONFIG_FILE), &seed).unwrap();
+    }
+
+    #[test]
+    fn write_managed_refuses_while_the_sandbox_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().to_path_buf());
+        seed_config_for_lock_test(&paths, "x");
+
+        let held = crate::sandbox::lock_sandbox(&paths, "x").expect("take the lock");
+        let err = write_managed(&paths, "x", &n(8), "sha256:new")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("busy"), "must refuse while locked: {err}");
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir("x").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.cpus, 2,
+            "a refused promote must not have rewritten config.json"
+        );
+
+        drop(held);
+        write_managed(&paths, "x", &n(8), "sha256:new")
+            .expect("the same promote succeeds once the lock is released");
+    }
+
+    #[test]
+    fn a_promote_that_fails_leaves_config_json_untouched() {
+        // policy.yaml is written AFTER config.json, so a promote is not atomic
+        // across the two files — but the config half must still be all-or-
+        // nothing, and it must not be left half-applied by the lock itself.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_root(dir.path().to_path_buf());
+        seed_config_for_lock_test(&paths, "x");
+
+        let held = crate::sandbox::lock_sandbox(&paths, "x").expect("take the lock");
+        assert!(write_managed(&paths, "x", &n(8), "sha256:new").is_err());
+        drop(held);
+
+        let cfg: SandboxConfig = load_json(&paths.sandbox_dir("x").join(CONFIG_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.cpus, 2);
+        assert_eq!(cfg.image_digest, "sha256:old");
     }
 }

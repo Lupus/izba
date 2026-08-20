@@ -136,15 +136,23 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   socket `<data>/daemon/izbad.sock`, framed-JSON `daemon::proto`) holds NO
   authoritative state: it adopts everything from disk at startup, so
   killing/upgrading it never harms sandboxes. **Every mutation of
-  `config.json` goes through `sandbox::edit_sandbox_config` (#181)** — it is
-  rewritten WHOLE, so an unlocked read-modify-write is a lost-update window:
+  `config.json` goes through `sandbox::edit_sandbox_config` (#181)** — the file
+  is rewritten WHOLE, so an unlocked read-modify-write is a lost-update window:
   two overlapping requests land on independent daemon threads, each loads the
   same file, and the later write silently discards the earlier *while both
-  report success*. Adding a new config verb that loads/saves `config.json`
-  itself reopens it. `lock_sandbox` is a `try_lock`, so the deliberate,
-  user-visible cost is that the loser fails with `sandbox '<name>' is busy`
-  (notably: a config edit racing a `start`, which holds the lock across the
-  whole boot) — a loud refusal the caller can retry, never a false success.
+  report success*. The six verbs are `edit_usb_grants`, `attach_volume`,
+  `detach_volume`, `persist_port_rule`/`unpersist_port_rule`, `handle_vnc_set`
+  and `manifest::apply::write_managed` (`promote`); a NEW verb that loads and
+  saves `config.json` itself reopens the window — `create` is the only
+  legitimate direct writer (a first write, not a read-modify-write). Any check
+  that reads config state the edit depends on (the volume cap, the eph_id
+  assignment, the single-writer guard) belongs INSIDE the closure. `lock_sandbox`
+  is a `try_lock`, so the deliberate, user-visible cost is that the loser fails
+  with `sandbox '<name>' is busy` — notably a config edit racing a `start`,
+  which holds the lock across the whole boot. A loud refusal the caller can
+  retry, never a false success. The one sanctioned carve-out is a **read-only**
+  fast path that writes nothing (`handle_vnc_set` returns early when VNC
+  already has the requested value) so a no-op never reports "busy".
   Port relays are daemon
   threads; rules persist in `ports.json` (plain `Vec<PortRule>`).
   VMs/sidecars are never auto-restarted — death ⇒ honest unhealthy reason.
