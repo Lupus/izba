@@ -1387,7 +1387,11 @@ fn handle_port_unpublish(
         // read-modify-write inside `relays`, under the lock that serializes it
         // against those writers; doing it here, unguarded, would erase a
         // publish that landed between the read and the write.
-        relays::remove_persisted_rule(&d.paths, &name, bind, host_port)?;
+        // On the manager, not free-standing: it re-checks liveness inside the
+        // same guard, so a publish of this very rule that raced the probe above
+        // is not deleted out from under its own success report.
+        d.relays
+            .remove_persisted_rule(&d.paths, &name, bind, host_port)?;
     }
     if !unpersisted && !relay_removed && !stranded_in_rules {
         bail!("no such published port: {bind}:{host_port}");

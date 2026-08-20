@@ -50,36 +50,59 @@ pub fn save_rules(paths: &Paths, name: &str, rules: &[PortRule]) -> anyhow::Resu
     save_json(&rules_path(paths, name), &rules.to_vec())
 }
 
-/// Drop ONE rule from `ports.json`, leaving every other entry intact. Returns
-/// whether the file actually listed it.
-///
-/// The read-modify-write runs under [`PORTS_IO`], so an overlapping
-/// `save_rules` either lands entirely before this read or entirely after this
-/// write — never in between, where it would be silently overwritten.
-///
-/// Used by `izba port unpublish` to clear a rule stranded by a failed publish
-/// rollback: no live relay holds it, so the authority-derived
-/// `save_rules(active)` the other call sites use cannot express the removal
-/// without also discarding the neighbouring entries of a stopped sandbox.
-pub fn remove_persisted_rule(
-    paths: &Paths,
-    name: &str,
-    bind: Ipv4Addr,
-    host_port: u16,
-) -> anyhow::Result<bool> {
-    // Held across the read AND the write. `load_rules_migrating` takes no
-    // guard of its own (it only reads, and `save_json` publishes by atomic
-    // rename, so a reader never sees a torn file), which is what lets it be
-    // called from in here without deadlocking.
-    let _guard = ports_io();
-    let (mut rules, _) = load_rules_migrating(paths, name)?;
-    let before = rules.len();
-    rules.retain(|r| !(r.bind == bind && r.host_port == host_port));
-    if rules.len() == before {
-        return Ok(false);
+impl RelayManager {
+    /// Drop ONE rule from `ports.json`, leaving every other entry intact,
+    /// UNLESS a live relay now holds it. Returns whether the file was actually
+    /// rewritten.
+    ///
+    /// Two races, which is why the whole thing runs under [`PORTS_IO`] and
+    /// re-checks liveness inside it:
+    ///
+    /// * An overlapping `save_rules` must not be clobbered — the guard spans
+    ///   the read AND the write, so such a save lands entirely before or
+    ///   entirely after, never in between.
+    /// * The CALLER's "is it stranded?" probe is stale by the time we run. A
+    ///   publish of the same `bind:host_port` that raced it binds its relay
+    ///   BEFORE it saves `ports.json`, so a live relay here means a successful
+    ///   publish either just persisted this rule or is about to — deleting it
+    ///   would strip a port the publish reported as published, leaving it
+    ///   forwarding but unrecorded, and gone after the next daemon restart.
+    ///   Skipping is correct in every interleaving: if the publish has not
+    ///   bound yet we remove, and its own authority-derived
+    ///   `save_rules(active)` puts the rule straight back.
+    ///
+    /// Used by `izba port unpublish` to clear a rule stranded by a failed
+    /// publish rollback: nothing live holds it, so the authority-derived
+    /// `save_rules(active)` the other call sites use cannot express the removal
+    /// without also discarding the neighbouring entries of a stopped sandbox.
+    pub fn remove_persisted_rule(
+        &self,
+        paths: &Paths,
+        name: &str,
+        bind: Ipv4Addr,
+        host_port: u16,
+    ) -> anyhow::Result<bool> {
+        let _guard = ports_io();
+        if self
+            .active(name)
+            .iter()
+            .any(|r| r.bind == bind && r.host_port == host_port)
+        {
+            return Ok(false);
+        }
+        // `load_rules_migrating` takes no guard of its own (it only reads, and
+        // `save_json` publishes by atomic rename, so a reader never sees a torn
+        // file), which is what lets it be called from in here without
+        // deadlocking.
+        let (mut rules, _) = load_rules_migrating(paths, name)?;
+        let before = rules.len();
+        rules.retain(|r| !(r.bind == bind && r.host_port == host_port));
+        if rules.len() == before {
+            return Ok(false);
+        }
+        save_json(&rules_path(paths, name), &rules)?;
+        Ok(true)
     }
-    save_json(&rules_path(paths, name), &rules)?;
-    Ok(true)
 }
 
 /// Load active rules; understands both schemas. Returns
@@ -734,7 +757,9 @@ mod tests {
         std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
         save_rules(&paths, "web", &[rule(8080), rule(9090)]).unwrap();
 
-        assert!(remove_persisted_rule(&paths, "web", "127.0.0.1".parse().unwrap(), 8080).unwrap());
+        assert!(RelayManager::new()
+            .remove_persisted_rule(&paths, "web", "127.0.0.1".parse().unwrap(), 8080)
+            .unwrap());
 
         let (rules, _) = load_rules_migrating(&paths, "web").unwrap();
         assert_eq!(rules, vec![rule(9090)], "only the target may be removed");
@@ -747,7 +772,9 @@ mod tests {
         save_rules(&paths, "web", &[rule(9090)]).unwrap();
 
         assert!(
-            !remove_persisted_rule(&paths, "web", "127.0.0.1".parse().unwrap(), 8080).unwrap(),
+            !RelayManager::new()
+                .remove_persisted_rule(&paths, "web", "127.0.0.1".parse().unwrap(), 8080)
+                .unwrap(),
             "a rule the file never listed is not a removal"
         );
         let (rules, _) = load_rules_migrating(&paths, "web").unwrap();
@@ -776,12 +803,16 @@ mod tests {
             save_rules(&paths, "web", std::slice::from_ref(&stranded)).unwrap();
 
             let start = Arc::new(std::sync::Barrier::new(2));
+            // No relays bound: the removal's liveness check must not veto it.
+            let mgr = Arc::new(RelayManager::new());
 
             let p1 = paths.clone();
             let s1 = Arc::clone(&start);
+            let m1 = Arc::clone(&mgr);
             let remover = std::thread::spawn(move || {
                 s1.wait();
-                remove_persisted_rule(&p1, "web", "127.0.0.1".parse().unwrap(), 8080).unwrap()
+                m1.remove_persisted_rule(&p1, "web", "127.0.0.1".parse().unwrap(), 8080)
+                    .unwrap()
             });
 
             let p2 = paths.clone();
@@ -802,5 +833,50 @@ mod tests {
                  would not restore its relay (file: {rules:?})"
             );
         }
+    }
+
+    #[test]
+    fn a_live_relay_vetoes_the_stranded_rule_removal() {
+        // The caller's "is it stranded?" probe is stale by the time the removal
+        // runs. If a publish of the SAME bind:host_port lands in that window it
+        // binds its relay BEFORE saving ports.json, so a live relay here means
+        // a successful publish just persisted this rule (or is about to).
+        // Deleting it would leave the port forwarding, reported as published,
+        // yet absent from ports.json — gone at the next daemon adoption.
+        //
+        // Deterministic: the relay is bound first, exactly the state the racing
+        // publish leaves behind.
+        let (_dir, paths) = crate::testutil::test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        let mgr = RelayManager::new();
+        let live = rule(0); // kernel-chosen, so this never collides in CI
+        let port = match mgr.publish_bound(&paths, "web", live.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIP a_live_relay_vetoes_the_stranded_rule_removal: bind denied ({e})");
+                return;
+            }
+        };
+        let persisted = PortRule {
+            bind: "127.0.0.1".parse().unwrap(),
+            host_port: port,
+            guest_port: 80,
+        };
+        save_rules(&paths, "web", std::slice::from_ref(&persisted)).unwrap();
+
+        let removed = mgr
+            .remove_persisted_rule(&paths, "web", persisted.bind, persisted.host_port)
+            .unwrap();
+
+        assert!(
+            !removed,
+            "a rule a live relay holds is not stranded — it must not be removed"
+        );
+        let (rules, _) = load_rules_migrating(&paths, "web").unwrap();
+        assert!(
+            rules.contains(&persisted),
+            "the publish's rule must survive the recovery path (file: {rules:?})"
+        );
+        mgr.stop_all("web");
     }
 }
