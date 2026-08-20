@@ -23,8 +23,63 @@ pub fn rules_path(paths: &Paths, name: &str) -> PathBuf {
     paths.sandbox_dir(name).join(PORTS_FILE)
 }
 
+/// Serializes every `ports.json` mutation in this process (#181).
+///
+/// Every other writer derives the whole file from `RelayManager::active`, the
+/// in-memory AUTHORITY — an unconditional overwrite, so those never race in a
+/// way that loses data. `remove_persisted_rule` is the one writer that must
+/// READ the file to decide what to write, and an unguarded read-modify-write
+/// there would erase whatever an overlapping `save_rules` published in between:
+/// the publish reports success and stays live, but the next daemon adoption no
+/// longer restores its relay. The guard spans read AND write, and `save_rules`
+/// takes it too — guarding only one side would serialize nothing.
+///
+/// One global lock, not per-sandbox: these writes are tiny and rare (a port
+/// publish/unpublish, a start, an adopt), so the contention is irrelevant next
+/// to the cost of getting a keyed map right.
+static PORTS_IO: Mutex<()> = Mutex::new(());
+
+/// Take `PORTS_IO`, ignoring poisoning: the data it guards lives on disk, not
+/// in memory, so a panicking holder leaves nothing to corrupt in-process.
+fn ports_io() -> std::sync::MutexGuard<'static, ()> {
+    PORTS_IO.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn save_rules(paths: &Paths, name: &str, rules: &[PortRule]) -> anyhow::Result<()> {
+    let _guard = ports_io();
     save_json(&rules_path(paths, name), &rules.to_vec())
+}
+
+/// Drop ONE rule from `ports.json`, leaving every other entry intact. Returns
+/// whether the file actually listed it.
+///
+/// The read-modify-write runs under [`PORTS_IO`], so an overlapping
+/// `save_rules` either lands entirely before this read or entirely after this
+/// write — never in between, where it would be silently overwritten.
+///
+/// Used by `izba port unpublish` to clear a rule stranded by a failed publish
+/// rollback: no live relay holds it, so the authority-derived
+/// `save_rules(active)` the other call sites use cannot express the removal
+/// without also discarding the neighbouring entries of a stopped sandbox.
+pub fn remove_persisted_rule(
+    paths: &Paths,
+    name: &str,
+    bind: Ipv4Addr,
+    host_port: u16,
+) -> anyhow::Result<bool> {
+    // Held across the read AND the write. `load_rules_migrating` takes no
+    // guard of its own (it only reads, and `save_json` publishes by atomic
+    // rename, so a reader never sees a torn file), which is what lets it be
+    // called from in here without deadlocking.
+    let _guard = ports_io();
+    let (mut rules, _) = load_rules_migrating(paths, name)?;
+    let before = rules.len();
+    rules.retain(|r| !(r.bind == bind && r.host_port == host_port));
+    if rules.len() == before {
+        return Ok(false);
+    }
+    save_json(&rules_path(paths, name), &rules)?;
+    Ok(true)
 }
 
 /// Load active rules; understands both schemas. Returns
@@ -663,5 +718,89 @@ mod tests {
             |_p| {},
         );
         assert!(r.is_err());
+    }
+
+    // ── #181: the one ports.json read-modify-write is serialized ────────────
+    //
+    // Every other writer overwrites the file from `RelayManager::active`, the
+    // in-memory authority, so those cannot lose data. `remove_persisted_rule`
+    // is the only writer that reads the file to decide what to write, and an
+    // unguarded read-modify-write there erases whatever an overlapping
+    // `save_rules` published in between.
+
+    #[test]
+    fn remove_persisted_rule_drops_only_the_target() {
+        let (_dir, paths) = crate::testutil::test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        save_rules(&paths, "web", &[rule(8080), rule(9090)]).unwrap();
+
+        assert!(remove_persisted_rule(&paths, "web", "127.0.0.1".parse().unwrap(), 8080).unwrap());
+
+        let (rules, _) = load_rules_migrating(&paths, "web").unwrap();
+        assert_eq!(rules, vec![rule(9090)], "only the target may be removed");
+    }
+
+    #[test]
+    fn remove_persisted_rule_reports_a_rule_that_was_not_listed() {
+        let (_dir, paths) = crate::testutil::test_paths();
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        save_rules(&paths, "web", &[rule(9090)]).unwrap();
+
+        assert!(
+            !remove_persisted_rule(&paths, "web", "127.0.0.1".parse().unwrap(), 8080).unwrap(),
+            "a rule the file never listed is not a removal"
+        );
+        let (rules, _) = load_rules_migrating(&paths, "web").unwrap();
+        assert_eq!(rules, vec![rule(9090)], "and nothing else may change");
+    }
+
+    #[test]
+    fn a_concurrent_publish_survives_a_stranded_rule_removal() {
+        // The lost-update Greptile described: the removal reads [stranded], a
+        // publish saves its active set [stranded, fresh], and the removal then
+        // writes its stale snapshot minus the target — erasing `fresh`. The
+        // publish reported success and stays live, but the next daemon adoption
+        // no longer restores its relay.
+        //
+        // Under the guard the two orderings are "removal then publish" → the
+        // file ends [stranded, fresh], and "publish then removal" → [fresh].
+        // `fresh` is present either way, which is what this asserts. Rounds,
+        // because a single pair leaves the interleaving to chance.
+        const ROUNDS: usize = 40;
+        let stranded = rule(8080);
+        let fresh = rule(9090);
+
+        for round in 0..ROUNDS {
+            let (_dir, paths) = crate::testutil::test_paths();
+            std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+            save_rules(&paths, "web", std::slice::from_ref(&stranded)).unwrap();
+
+            let start = Arc::new(std::sync::Barrier::new(2));
+
+            let p1 = paths.clone();
+            let s1 = Arc::clone(&start);
+            let remover = std::thread::spawn(move || {
+                s1.wait();
+                remove_persisted_rule(&p1, "web", "127.0.0.1".parse().unwrap(), 8080).unwrap()
+            });
+
+            let p2 = paths.clone();
+            let s2 = Arc::clone(&start);
+            let publisher = std::thread::spawn(move || {
+                s2.wait();
+                save_rules(&p2, "web", &[rule(8080), rule(9090)]).unwrap();
+            });
+
+            remover.join().unwrap();
+            publisher.join().unwrap();
+
+            let (rules, _) = load_rules_migrating(&paths, "web").unwrap();
+            assert!(
+                rules.contains(&fresh),
+                "round {round}: the concurrent publish of :9090 reported success but was \
+                 erased from ports.json by the stranded-rule removal — a daemon restart \
+                 would not restore its relay (file: {rules:?})"
+            );
+        }
     }
 }

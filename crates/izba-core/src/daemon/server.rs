@@ -1381,15 +1381,13 @@ fn handle_port_unpublish(
         // ports.json to pick a VNC display port that avoids persisted fixed
         // rules (#221), so discarding them narrows that avoidance set.
         //
-        // Re-read rather than reuse the probe's list: `unpersist_port_rule` and
-        // the relay teardown both ran in between, and ports.json is not covered
-        // by the per-sandbox lock, so anything written meanwhile must survive
-        // this rewrite. (The residual unlocked read-modify-write on ports.json
-        // itself is pre-existing and explicitly out of scope for #181 — tracked
-        // separately — but this PR must not WIDEN it.)
-        let (mut rules, _) = relays::load_rules_migrating(&d.paths, &name)?;
-        rules.retain(|r| !(r.bind == bind && r.host_port == host_port));
-        relays::save_rules(&d.paths, &name, &rules)?;
+        // This is the ONLY ports.json writer that must read the file to decide
+        // what to write — every other one overwrites it wholesale from
+        // `RelayManager::active`, the in-memory authority. So it does the
+        // read-modify-write inside `relays`, under the lock that serializes it
+        // against those writers; doing it here, unguarded, would erase a
+        // publish that landed between the read and the write.
+        relays::remove_persisted_rule(&d.paths, &name, bind, host_port)?;
     }
     if !unpersisted && !relay_removed && !stranded_in_rules {
         bail!("no such published port: {bind}:{host_port}");
