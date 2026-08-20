@@ -150,9 +150,12 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   is a `try_lock`, so the deliberate, user-visible cost is that the loser fails
   with `sandbox '<name>' is busy` — notably a config edit racing a `start`,
   which holds the lock across the whole boot. A loud refusal the caller can
-  retry, never a false success. The one sanctioned carve-out is a **read-only**
-  fast path that writes nothing (`handle_vnc_set` returns early when VNC
-  already has the requested value) so a no-op never reports "busy".
+  retry, never a false success — and there is **no carve-out**: a no-op edit
+  (`handle_vnc_set` re-affirming the value VNC already has) is refused under
+  contention like any other, rather than answering Ok without ever holding the
+  lock. A verb whose live side effects land BEFORE its config write must undo
+  them when the write is refused, and undo only what THAT request did — see
+  `handle_port_publish`'s `bound_here` rollback.
   Port relays are daemon
   threads; rules persist in `ports.json` (plain `Vec<PortRule>`).
   VMs/sidecars are never auto-restarted — death ⇒ honest unhealthy reason.
