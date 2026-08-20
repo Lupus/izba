@@ -1351,10 +1351,19 @@ fn handle_port_unpublish(
     // that cannot be read or matches neither schema — exactly the cases where
     // reporting "no such published port" would be a lie, since the rule may
     // still be on disk for `adopt` to republish once the file is readable.
-    let (persisted_rules, _) = relays::load_rules_migrating(&d.paths, &name)?;
-    let stranded_in_rules = persisted_rules
-        .iter()
-        .any(|r| r.bind == bind && r.host_port == host_port);
+    //
+    // The list is scoped to this block ON PURPOSE: it is a PROBE, not data to
+    // write back. Carrying it down to the reconcile below would make that a
+    // read-modify-write over a snapshot taken before the two steps in between,
+    // so a concurrent port operation landing in that window would be erased by
+    // the write — the very shape this PR exists to remove, reintroduced one
+    // file over. The reconcile re-reads.
+    let stranded_in_rules = {
+        let (persisted_rules, _) = relays::load_rules_migrating(&d.paths, &name)?;
+        persisted_rules
+            .iter()
+            .any(|r| r.bind == bind && r.host_port == host_port)
+    };
     // Always drop the persisted rule from config — works even when the sandbox
     // is stopped (the relay map has no entry), so a persisted-only port can be
     // removed. (Greptile P1.)
@@ -1371,7 +1380,14 @@ fn handle_port_unpublish(
         // not inert — `relays::persisted_host_ports` reads every sandbox's
         // ports.json to pick a VNC display port that avoids persisted fixed
         // rules (#221), so discarding them narrows that avoidance set.
-        let mut rules = persisted_rules;
+        //
+        // Re-read rather than reuse the probe's list: `unpersist_port_rule` and
+        // the relay teardown both ran in between, and ports.json is not covered
+        // by the per-sandbox lock, so anything written meanwhile must survive
+        // this rewrite. (The residual unlocked read-modify-write on ports.json
+        // itself is pre-existing and explicitly out of scope for #181 — tracked
+        // separately — but this PR must not WIDEN it.)
+        let (mut rules, _) = relays::load_rules_migrating(&d.paths, &name)?;
         rules.retain(|r| !(r.bind == bind && r.host_port == host_port));
         relays::save_rules(&d.paths, &name, &rules)?;
     }
