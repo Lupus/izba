@@ -542,7 +542,7 @@ fn ensure_volume_image(path: &Path, size_bytes: u64, root: &Path) -> anyhow::Res
 /// closes, and forked children (VMM/sidecar spawns, including from other
 /// threads in parallel tests) momentarily inherit the fd until their exec.
 /// An explicit unlock releases the lock immediately regardless.
-struct SandboxLock(File);
+pub(crate) struct SandboxLock(File);
 
 impl Drop for SandboxLock {
     fn drop(&mut self) {
@@ -563,7 +563,7 @@ fn lock_path(paths: &Paths, name: &str) -> PathBuf {
 
 /// Take the per-sandbox exclusive lock (released eagerly when the returned
 /// guard drops).
-fn lock_sandbox(paths: &Paths, name: &str) -> anyhow::Result<SandboxLock> {
+pub(crate) fn lock_sandbox(paths: &Paths, name: &str) -> anyhow::Result<SandboxLock> {
     // The dir check replaces the old open-NotFound mapping (the lock file no
     // longer lives inside the sandbox dir). A concurrent remove between this
     // check and the lock acquisition is caught right after: the winner holds
@@ -1771,23 +1771,26 @@ pub fn attach_volume(
     name: &str,
     spec: crate::volume::VolumeSpec,
 ) -> anyhow::Result<()> {
-    let cfg_path = paths.sandbox_dir(name).join(CONFIG_FILE);
-    let mut cfg: SandboxConfig =
-        load_json(&cfg_path)?.with_context(|| format!("no such sandbox '{name}'"))?;
-    cfg.volumes.push(spec);
-    crate::volume::validate_volumes(&cfg.volumes, cfg.vnc)?;
-    // Single-writer guard: check the last-added spec (the one we just pushed).
-    let new_spec = cfg.volumes.last().unwrap();
-    if new_spec.is_persistent() {
-        let vol_name = new_spec.name.as_deref().unwrap();
-        ensure_volume_not_shared(paths, vol_name, name)?;
-    }
-    crate::volume::assign_eph_ids(&mut cfg.volumes);
-    let v = cfg.volumes.last().unwrap();
-    ensure_volume_image(&v.image_path(paths, name), v.size_bytes, paths.root())
-        .with_context(|| format!("provisioning volume {}", v.guest_path.display()))?;
-    save_json(&cfg_path, &cfg)?;
-    Ok(())
+    // Under the lock (#181): unlocked, two overlapping attaches each loaded
+    // this config, each appended their own volume, and the later write dropped
+    // the earlier one while both callers were told the attach succeeded. The
+    // eph_id assignment and the single-writer guard are inside the critical
+    // section too — both read state a concurrent attach would be changing.
+    edit_sandbox_config(paths, name, |cfg| {
+        cfg.volumes.push(spec);
+        crate::volume::validate_volumes(&cfg.volumes, cfg.vnc)?;
+        // Single-writer guard: check the last-added spec (the one we just pushed).
+        let new_spec = cfg.volumes.last().unwrap();
+        if new_spec.is_persistent() {
+            let vol_name = new_spec.name.as_deref().unwrap();
+            ensure_volume_not_shared(paths, vol_name, name)?;
+        }
+        crate::volume::assign_eph_ids(&mut cfg.volumes);
+        let v = cfg.volumes.last().unwrap();
+        ensure_volume_image(&v.image_path(paths, name), v.size_bytes, paths.root())
+            .with_context(|| format!("provisioning volume {}", v.guest_path.display()))?;
+        Ok(())
+    })
 }
 
 /// Drop the volume mounted at `guest_path` from a sandbox's config (applied on
@@ -1798,41 +1801,64 @@ pub fn detach_volume(
     name: &str,
     guest_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let cfg_path = paths.sandbox_dir(name).join(CONFIG_FILE);
-    let mut cfg: SandboxConfig =
-        load_json(&cfg_path)?.with_context(|| format!("no such sandbox '{name}'"))?;
-    let before = cfg.volumes.len();
-    cfg.volumes.retain(|v| v.guest_path != guest_path);
-    if cfg.volumes.len() == before {
-        bail!(
-            "no volume mounted at {} in sandbox '{name}'",
-            guest_path.display()
-        );
-    }
-    save_json(&cfg_path, &cfg)?;
-    Ok(())
+    // Under the lock (#181): the "not mounted" bail is a read of the very set
+    // a concurrent attach rewrites, and the retain+write-back is the same
+    // whole-file read-modify-write every other config verb performs.
+    edit_sandbox_config(paths, name, |cfg| {
+        let before = cfg.volumes.len();
+        cfg.volumes.retain(|v| v.guest_path != guest_path);
+        if cfg.volumes.len() == before {
+            bail!(
+                "no volume mounted at {} in sandbox '{name}'",
+                guest_path.display()
+            );
+        }
+        Ok(())
+    })
 }
 
-/// Mutate a sandbox's USB device grants under the **per-sandbox lock**.
+/// Read-modify-write a sandbox's `config.json` under the **per-sandbox lock**.
 ///
-/// Grants are a consent record, and the read-modify-write on `config.json` is
-/// otherwise a lost-update window: two overlapping edits each load the same
-/// file and each write the whole thing back. Losing a *grant* is merely
-/// confusing, but losing a *revoke* leaves consent standing after the user was
-/// told it was withdrawn — so this path takes the lock rather than matching the
-/// unlocked convention its volume neighbours still use (tracked separately).
-pub fn edit_usb_grants<T>(
+/// **Every** mutation of `config.json` must go through here (#181). The file is
+/// rewritten WHOLE, so an unlocked read-modify-write is a lost-update window:
+/// two overlapping requests are handled on independent daemon threads, each
+/// loads the same file, and the later write silently discards the earlier —
+/// *while both requests report success*. That is silent loss of user-visible
+/// configuration (a volume attach, a published port, a withdrawn USB consent)
+/// with nothing in any log to explain it.
+///
+/// Closing the window makes contention visible instead: `lock_sandbox` is a
+/// `try_lock`, so the loser now fails with `sandbox '<name>' is busy` rather
+/// than quietly clobbering the winner. That is the deliberate trade — a loud
+/// refusal the caller can retry beats a success message that wasn't true.
+///
+/// `edit` sees the whole `SandboxConfig`; returning `Err` from it aborts before
+/// anything reaches the disk.
+pub fn edit_sandbox_config<T>(
     paths: &Paths,
     name: &str,
-    edit: impl FnOnce(&mut crate::usb::UsbConfig) -> anyhow::Result<T>,
+    edit: impl FnOnce(&mut SandboxConfig) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let _lock = lock_sandbox(paths, name)?;
     let cfg_path = paths.sandbox_dir(name).join(CONFIG_FILE);
     let mut cfg: SandboxConfig =
         load_json(&cfg_path)?.with_context(|| format!("no such sandbox '{name}'"))?;
-    let out = edit(&mut cfg.usb)?;
+    let out = edit(&mut cfg)?;
     save_json(&cfg_path, &cfg)?;
     Ok(out)
+}
+
+/// Mutate a sandbox's USB device grants under the **per-sandbox lock**.
+///
+/// Grants are a consent record: losing a *grant* is merely confusing, but
+/// losing a *revoke* leaves consent standing after the user was told it was
+/// withdrawn. See [`edit_sandbox_config`] for the window this closes.
+pub fn edit_usb_grants<T>(
+    paths: &Paths,
+    name: &str,
+    edit: impl FnOnce(&mut crate::usb::UsbConfig) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    edit_sandbox_config(paths, name, |cfg| edit(&mut cfg.usb))
 }
 
 /// Delete a single persistent volume image. Fails closed if any sandbox config
@@ -4437,5 +4463,226 @@ mod tests {
             after_size, original_size,
             "rw.img size must be unchanged after successful reset"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #181 — every config.json read-modify-write runs under the per-sandbox
+    // lock, so no edit can be silently lost to an overlapping one.
+    // -----------------------------------------------------------------------
+
+    fn sandbox_with_config(paths: &Paths) {
+        let ws = paths.root().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        create(paths, "web", &opts(&ws)).unwrap();
+    }
+
+    fn config_on_disk(paths: &Paths, name: &str) -> SandboxConfig {
+        load_json(&paths.sandbox_dir(name).join(CONFIG_FILE))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn attach_volume_refuses_while_the_sandbox_lock_is_held() {
+        let (_dir, paths) = test_paths();
+        sandbox_with_config(&paths);
+
+        let held = lock_sandbox(&paths, "web").expect("take the lock");
+        let err = attach_volume(
+            &paths,
+            "web",
+            crate::volume::parse_volume_flag("/scratch:1g").unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("busy"), "must refuse while locked: {err}");
+        assert!(
+            config_on_disk(&paths, "web").volumes.is_empty(),
+            "a refused attach must not have rewritten config.json"
+        );
+
+        drop(held);
+        attach_volume(
+            &paths,
+            "web",
+            crate::volume::parse_volume_flag("/scratch:1g").unwrap(),
+        )
+        .expect("the same attach succeeds once the lock is released");
+    }
+
+    #[test]
+    fn detach_volume_refuses_while_the_sandbox_lock_is_held() {
+        let (_dir, paths) = test_paths();
+        sandbox_with_config(&paths);
+        attach_volume(
+            &paths,
+            "web",
+            crate::volume::parse_volume_flag("/data:1g").unwrap(),
+        )
+        .unwrap();
+
+        let held = lock_sandbox(&paths, "web").expect("take the lock");
+        let err = detach_volume(&paths, "web", Path::new("/data"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("busy"), "must refuse while locked: {err}");
+        assert_eq!(
+            config_on_disk(&paths, "web").volumes.len(),
+            1,
+            "a refused detach must not have rewritten config.json"
+        );
+
+        drop(held);
+        detach_volume(&paths, "web", Path::new("/data"))
+            .expect("the same detach succeeds once the lock is released");
+    }
+
+    #[test]
+    fn concurrent_attaches_cannot_lose_one_that_reported_success() {
+        // The lost-update window this closes: unlocked, both threads load the
+        // same config.json, each appends its own volume, and whichever writes
+        // last silently discards the other's edit — while BOTH callers are
+        // told the attach succeeded. Under the lock the only two outcomes are
+        // "both applied" (serialized) or "one refused as busy".
+        //
+        // Rounds, not a single pair: one pair leaves the race to chance, and a
+        // concurrency test that only sometimes enters the window is a test
+        // that passes for the wrong reason. Every round re-checks EVERY attach
+        // that has ever reported success, so a single loss anywhere in the run
+        // trips the assertion.
+        const ROUNDS: usize = 20;
+        let (_dir, paths) = test_paths();
+        sandbox_with_config(&paths);
+
+        let mut reported_attached: Vec<String> = Vec::new();
+        for round in 0..ROUNDS {
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let mut handles = Vec::new();
+            for side in ["a", "b"] {
+                let paths = paths.clone();
+                let start = Arc::clone(&start);
+                let guest_path = format!("/{side}{round}");
+                handles.push(std::thread::spawn(move || {
+                    let spec =
+                        crate::volume::parse_volume_flag(&format!("{guest_path}:1g")).unwrap();
+                    start.wait();
+                    let ok = attach_volume(&paths, "web", spec).is_ok();
+                    (guest_path, ok)
+                }));
+            }
+            for h in handles {
+                let (guest_path, reported_ok) = h.join().unwrap();
+                if reported_ok {
+                    reported_attached.push(guest_path);
+                }
+            }
+
+            let cfg = config_on_disk(&paths, "web");
+            for guest_path in &reported_attached {
+                assert!(
+                    cfg.volumes
+                        .iter()
+                        .any(|v| v.guest_path == Path::new(guest_path)),
+                    "attach of {guest_path} reported success but is absent from \
+                     config.json after round {round} — a concurrent edit silently \
+                     discarded it (volumes on disk: {:?})",
+                    cfg.volumes
+                        .iter()
+                        .map(|v| &v.guest_path)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        assert!(
+            !reported_attached.is_empty(),
+            "at least one concurrent attach must succeed"
+        );
+    }
+
+    #[test]
+    fn back_to_back_config_edits_never_report_busy() {
+        // The lock is taken and released per verb, so ordinary sequential use
+        // must never see the new "busy" refusal.
+        let (_dir, paths) = test_paths();
+        sandbox_with_config(&paths);
+
+        for guest_path in ["/one", "/two", "/three"] {
+            attach_volume(
+                &paths,
+                "web",
+                crate::volume::parse_volume_flag(&format!("{guest_path}:1g")).unwrap(),
+            )
+            .unwrap_or_else(|e| panic!("sequential attach of {guest_path} must not fail: {e:#}"));
+        }
+        for guest_path in ["/one", "/two", "/three"] {
+            detach_volume(&paths, "web", Path::new(guest_path)).unwrap_or_else(|e| {
+                panic!("sequential detach of {guest_path} must not fail: {e:#}")
+            });
+        }
+        assert!(config_on_disk(&paths, "web").volumes.is_empty());
+    }
+
+    #[test]
+    fn edit_sandbox_config_persists_an_arbitrary_field() {
+        // The generalised helper the USB-grant, volume and port verbs now all
+        // share: locked read, mutate the whole config, write back.
+        let (_dir, paths) = test_paths();
+        sandbox_with_config(&paths);
+
+        edit_sandbox_config(&paths, "web", |cfg| {
+            cfg.cpus = 4;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(config_on_disk(&paths, "web").cpus, 4);
+    }
+
+    #[test]
+    fn edit_sandbox_config_refuses_while_the_sandbox_lock_is_held() {
+        let (_dir, paths) = test_paths();
+        sandbox_with_config(&paths);
+        let before = config_on_disk(&paths, "web").cpus;
+
+        let held = lock_sandbox(&paths, "web").expect("take the lock");
+        let err = edit_sandbox_config(&paths, "web", |cfg| {
+            cfg.cpus = 99;
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("busy"), "must refuse while locked: {err}");
+        assert_eq!(
+            config_on_disk(&paths, "web").cpus,
+            before,
+            "a refused edit must not have rewritten config.json"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_failing_edit_sandbox_config_writes_nothing() {
+        let (_dir, paths) = test_paths();
+        sandbox_with_config(&paths);
+        let before = config_on_disk(&paths, "web").cpus;
+
+        let err = edit_sandbox_config(&paths, "web", |cfg| -> anyhow::Result<()> {
+            cfg.cpus = 99;
+            bail!("refused")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("refused"), "{err}");
+        assert_eq!(
+            config_on_disk(&paths, "web").cpus,
+            before,
+            "an edit that returned Err must not reach the disk"
+        );
+    }
+
+    #[test]
+    fn edit_sandbox_config_on_an_unknown_sandbox_is_an_error() {
+        let (_dir, paths) = test_paths();
+        std::fs::create_dir_all(paths.sandboxes_dir()).unwrap();
+        assert!(edit_sandbox_config(&paths, "ghost", |_| Ok(())).is_err());
     }
 }

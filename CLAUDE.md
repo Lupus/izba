@@ -135,7 +135,17 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   failure. `izbad` (auto-started `izba daemon run`,
   socket `<data>/daemon/izbad.sock`, framed-JSON `daemon::proto`) holds NO
   authoritative state: it adopts everything from disk at startup, so
-  killing/upgrading it never harms sandboxes. Port relays are daemon
+  killing/upgrading it never harms sandboxes. **Every mutation of
+  `config.json` goes through `sandbox::edit_sandbox_config` (#181)** — it is
+  rewritten WHOLE, so an unlocked read-modify-write is a lost-update window:
+  two overlapping requests land on independent daemon threads, each loads the
+  same file, and the later write silently discards the earlier *while both
+  report success*. Adding a new config verb that loads/saves `config.json`
+  itself reopens it. `lock_sandbox` is a `try_lock`, so the deliberate,
+  user-visible cost is that the loser fails with `sandbox '<name>' is busy`
+  (notably: a config edit racing a `start`, which holds the lock across the
+  whole boot) — a loud refusal the caller can retry, never a false success.
+  Port relays are daemon
   threads; rules persist in `ports.json` (plain `Vec<PortRule>`).
   VMs/sidecars are never auto-restarted — death ⇒ honest unhealthy reason.
   The CLI↔daemon hello exchanges `DAEMON_PROTO_VERSION` (the COMPATIBILITY gate
