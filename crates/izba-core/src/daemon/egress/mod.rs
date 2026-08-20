@@ -14,7 +14,6 @@ pub mod policy;
 pub mod router;
 pub mod sys_resolver;
 
-use anyhow::Context;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +27,6 @@ use self::dns_snoop::SnoopStore;
 use self::mitm_runtime::MitmRuntime;
 use self::policy::Policy;
 use crate::daemon::peercred;
-use crate::daemon::transport::UdsListener;
 use crate::paths::Paths;
 use crate::vmm::UdsStream;
 use izba_proto::EGRESS_PORT;
@@ -308,40 +306,24 @@ impl EgressManager {
             inner.remove(name);
         }
         let path = listener_path(run_dir);
-        // The hashed run dir may not exist yet on the adoption path (a
-        // pre-upgrade sandbox's legacy dir, or a fresh Start racing the rest
-        // of `sandbox::start`'s directory setup) — create it first.
-        crate::paths::create_dir_700(run_dir, paths.root())
-            .with_context(|| format!("creating run dir {}", run_dir.display()))?;
         // This socket is a full outbound proxy for the sandbox, governed by
         // that sandbox's M2 egress policy — so whoever can drive it inherits
         // the sandbox's whole allow-list. It is authenticated per connection
         // in the accept loop below (`admit`, F-CRED-5), which is the gate that
         // actually decides who may drive it.
         //
-        // The 0700 run dir is now DEFENSE IN DEPTH behind that check rather
-        // than the sole gate — and it is unix-only: `create_dir_700` and the
-        // chmod below are both `#[cfg(unix)]`, so on Windows izba applies no
-        // ACL of its own here at all. That is exactly why the peer check had
-        // to stop being optional. `create_dir_700` above already hardens a
-        // freshly-created dir, but the dir may pre-exist with looser perms
-        // (e.g. `create`'s), so re-assert the mode unconditionally.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("removing stale {}", path.display())),
-        }
-        let listener = UdsListener::bind(&path)
-            .with_context(|| format!("binding egress listener {}", path.display()))?;
-        listener
-            .set_nonblocking(true)
-            .context("egress listener nonblocking")?;
+        // The 0700 run dir that `bind_sandbox_listener` (re-)asserts is now
+        // DEFENSE IN DEPTH behind that check rather than the sole gate — and
+        // it is unix-only, which is exactly why the peer check had to stop
+        // being optional. The helper also creates the dir: it may not exist
+        // yet on the adoption path (a pre-upgrade sandbox's legacy dir, or a
+        // fresh Start racing the rest of `sandbox::start`'s directory setup).
+        let listener = crate::daemon::transport::bind_sandbox_listener(
+            paths.root(),
+            run_dir,
+            &path,
+            "egress",
+        )?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);
         // Resolve THIS sandbox's policy once, when the listener is armed.
