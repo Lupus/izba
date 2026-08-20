@@ -1342,10 +1342,24 @@ fn handle_port_unpublish(
     // Tear down a live relay if one exists; a missing relay (stopped sandbox /
     // post-restart) is NOT an error.
     let relay_removed = d.relays.unpublish(&name, bind, host_port).is_ok();
-    if relay_removed {
+    // ports.json is DERIVED state, so reconcile it to the live relay set
+    // whenever it still lists this rule — not only when a relay was just torn
+    // down (#181). A failed publish rollback can strand a rule there with no
+    // live relay and nothing in config.json, and `adopt` republishes every
+    // ports.json rule of a running sandbox — so that entry would resurrect the
+    // port on the next daemon restart. This command is what the rollback's
+    // error message tells the user to run, so it has to be able to clear it.
+    let stranded_in_rules = relays::load_rules_migrating(&d.paths, &name)
+        .map(|(rules, _)| {
+            rules
+                .iter()
+                .any(|r| r.bind == bind && r.host_port == host_port)
+        })
+        .unwrap_or(false);
+    if relay_removed || stranded_in_rules {
         relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
     }
-    if !unpersisted && !relay_removed {
+    if !unpersisted && !relay_removed && !stranded_in_rules {
         bail!("no such published port: {bind}:{host_port}");
     }
     Ok(DaemonResponse::Ok)
@@ -6663,6 +6677,49 @@ mod tests {
                 .0
                 .contains(&rule),
             "a clean rollback must also drop the rule from ports.json"
+        );
+    }
+
+    // ── #181: the documented recovery must actually recover ─────────────────
+    //
+    // A rollback whose ports.json rewrite failed strands a rule there with no
+    // live relay and nothing in config.json. `adopt` republishes every
+    // ports.json rule of a running sandbox, so that entry resurrects the port
+    // on the next daemon restart — and the error this PR emits points the user
+    // at `izba port unpublish`, so that command has to be able to clear it.
+
+    #[test]
+    fn unpublish_clears_a_rule_stranded_in_ports_json() {
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+        let rule = port_rule("127.0.0.1", 8080, 80);
+        // Exactly the state a failed rollback leaves: ports.json only.
+        relays::save_rules(&d.paths, "web", std::slice::from_ref(&rule)).unwrap();
+
+        handle_port_unpublish(&d, "web".into(), rule.bind, rule.host_port)
+            .expect("the documented recovery command must clear a stranded rule");
+
+        assert!(
+            !relays::load_rules_migrating(&d.paths, "web")
+                .unwrap()
+                .0
+                .contains(&rule),
+            "ports.json must not keep a rule no relay and no config references"
+        );
+    }
+
+    #[test]
+    fn unpublish_of_a_port_that_exists_nowhere_still_errors() {
+        // The reconcile above must not turn the genuine "no such published
+        // port" case into a silent success.
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+
+        let err = handle_port_unpublish(&d, "web".into(), "127.0.0.1".parse().unwrap(), 9999)
+            .expect_err("a port that exists nowhere is still an error");
+        assert!(
+            err.to_string().contains("no such published port"),
+            "got: {err}"
         );
     }
 }
