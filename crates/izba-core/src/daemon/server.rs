@@ -6722,14 +6722,53 @@ mod tests {
     fn unpublish_of_a_port_that_exists_nowhere_still_errors() {
         // The reconcile above must not turn the genuine "no such published
         // port" case into a silent success.
+        //
+        // ports.json deliberately holds a NEIGHBOUR sharing the bind address
+        // but not the port: the stranded-rule probe matches on bind AND port,
+        // and an empty file would let a probe matching on EITHER pass this test
+        // unnoticed (that is the mutant this seeding kills). With a bind-only
+        // match the probe would call the rule stranded, reconcile, and return
+        // Ok for a port that exists nowhere.
         let (_dir, d) = test_daemon();
         write_config_for_persist(&d.paths, "web");
+        let neighbour = port_rule("127.0.0.1", 9090, 90);
+        relays::save_rules(&d.paths, "web", std::slice::from_ref(&neighbour)).unwrap();
 
         let err = handle_port_unpublish(&d, "web".into(), "127.0.0.1".parse().unwrap(), 9999)
             .expect_err("a port that exists nowhere is still an error");
         assert!(
             err.to_string().contains("no such published port"),
             "got: {err}"
+        );
+        assert!(
+            relays::load_rules_migrating(&d.paths, "web")
+                .unwrap()
+                .0
+                .contains(&neighbour),
+            "a failed unpublish must leave ports.json alone"
+        );
+    }
+
+    #[test]
+    fn unpublish_of_a_known_port_on_a_different_bind_still_errors() {
+        // The other half of the same AND: same host port, different bind.
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+        let neighbour = port_rule("127.0.0.1", 9090, 90);
+        relays::save_rules(&d.paths, "web", std::slice::from_ref(&neighbour)).unwrap();
+
+        let err = handle_port_unpublish(&d, "web".into(), "127.0.0.2".parse().unwrap(), 9090)
+            .expect_err("a different bind address is a different rule");
+        assert!(
+            err.to_string().contains("no such published port"),
+            "got: {err}"
+        );
+        assert!(
+            relays::load_rules_migrating(&d.paths, "web")
+                .unwrap()
+                .0
+                .contains(&neighbour),
+            "a failed unpublish must leave ports.json alone"
         );
     }
 
