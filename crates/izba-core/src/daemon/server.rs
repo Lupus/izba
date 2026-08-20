@@ -1267,12 +1267,27 @@ fn handle_port_publish(
     drop(sandbox::control(&d.paths, &name, d.connector())?);
     // Idempotent: re-publishing an identical active rule is a no-op for the
     // relay (this is what the app's "Make persistent" button does).
-    if !d.relays.active(&name).contains(&rule) {
+    let bound_here = !d.relays.active(&name).contains(&rule);
+    if bound_here {
         d.relays.publish(&d.paths, &name, rule.clone())?;
     }
     relays::save_rules(&d.paths, &name, &d.relays.active(&name))?;
     if persist {
-        persist_port_rule(&d.paths, &name, &rule)?;
+        // The live effects above land BEFORE this, and taking the per-sandbox
+        // lock (#181) turned this step from "fails only on I/O error" into
+        // "fails routinely under contention". Without compensation the request
+        // would report failure while the port is actually forwarding — and the
+        // rule would then vanish at the next start, since config.json never
+        // got it. So undo exactly what THIS request did: a relay that was
+        // already live is not ours to tear down (that is the "Make persistent"
+        // path, where the port must keep working).
+        if let Err(e) = persist_port_rule(&d.paths, &name, &rule) {
+            if bound_here {
+                let _ = d.relays.unpublish(&name, rule.bind, rule.host_port);
+                let _ = relays::save_rules(&d.paths, &name, &d.relays.active(&name));
+            }
+            return Err(e);
+        }
     }
     Ok(DaemonResponse::Ok)
 }
@@ -6369,5 +6384,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── #181: a persist that loses the lock must not leave live effects ──────
+    //
+    // `handle_port_publish` binds the relay and saves ports.json BEFORE
+    // persisting into config.json. Making `persist_port_rule` take the lock
+    // turned that last step from "fails only on I/O error" into "fails
+    // routinely under contention", so without compensation the request now
+    // reports failure while the port is actually forwarding — and the rule
+    // would vanish on the next start, since config.json never got it.
+    // Tested at the CALL SITE: a rule with a test and a call site without one
+    // is this project's recurring defect class.
+
+    /// A live-enough sandbox for `handle_port_publish`'s liveness gate, plus a
+    /// free loopback port. Returns `None` when the environment denies `bind`.
+    fn publishable_sandbox(
+        dir: &tempfile::TempDir,
+        paths: Paths,
+        who: &str,
+    ) -> Option<(Arc<Daemon>, u16, crate::state::PidIdentity)> {
+        let probe = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("SKIP {who}: bind denied ({e})");
+                return None;
+            }
+        };
+        let host_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let vmm = spawn_sleep(dir.path());
+        let mut deps = test_deps();
+        deps.connector = Box::new(fake_connector(
+            Arc::new(Mutex::new(Vec::new())),
+            Some(vmm.clone()),
+        ));
+        let d = Arc::new(Daemon::new(paths, deps));
+        write_config_for_persist(&d.paths, "web");
+        write_state(&d.paths, "web", vmm.clone());
+        Some((d, host_port, vmm))
+    }
+
+    #[test]
+    fn a_persist_refused_as_busy_leaves_no_relay_behind() {
+        let (dir, paths) = test_paths();
+        let Some((d, host_port, _vmm)) = publishable_sandbox(
+            &dir,
+            paths,
+            "a_persist_refused_as_busy_leaves_no_relay_behind",
+        ) else {
+            return;
+        };
+        let rule = port_rule("127.0.0.1", host_port, 80);
+
+        let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+        let err = handle_port_publish(&d, "web".into(), rule.clone(), true);
+        drop(held);
+
+        let err = err.expect_err("a persisted publish must fail while the lock is held");
+        let err = err.to_string();
+        assert!(err.contains("busy"), "expected a busy refusal, got: {err}");
+
+        assert!(
+            !d.relays.active("web").contains(&rule),
+            "the request reported failure, so it must not leave the port forwarding"
+        );
+        assert!(
+            !relays::load_rules_migrating(&d.paths, "web")
+                .unwrap()
+                .0
+                .contains(&rule),
+            "ports.json must not keep a rule the request rejected"
+        );
+        assert!(
+            !load_persisted_ports(&d.paths, "web").contains(&rule),
+            "config.json must not keep a rule the request rejected"
+        );
+    }
+
+    #[test]
+    fn an_uncontended_persisted_publish_still_binds_the_relay() {
+        // Control for the rollback above: it must fire only on failure.
+        let (dir, paths) = test_paths();
+        let Some((d, host_port, _vmm)) = publishable_sandbox(
+            &dir,
+            paths,
+            "an_uncontended_persisted_publish_still_binds_the_relay",
+        ) else {
+            return;
+        };
+        let rule = port_rule("127.0.0.1", host_port, 80);
+
+        handle_port_publish(&d, "web".into(), rule.clone(), true)
+            .expect("an uncontended persisted publish must succeed");
+
+        assert!(d.relays.active("web").contains(&rule));
+        assert!(load_persisted_ports(&d.paths, "web").contains(&rule));
+    }
+
+    #[test]
+    fn a_busy_persist_does_not_tear_down_a_pre_existing_relay() {
+        // The rollback must undo only what THIS request did. Re-persisting an
+        // already-live rule is exactly what the app's "Make persistent" button
+        // does, and losing the lock there must not kill the running relay.
+        let (dir, paths) = test_paths();
+        let Some((d, host_port, _vmm)) = publishable_sandbox(
+            &dir,
+            paths,
+            "a_busy_persist_does_not_tear_down_a_pre_existing_relay",
+        ) else {
+            return;
+        };
+        let rule = port_rule("127.0.0.1", host_port, 80);
+
+        // Already forwarding, not yet persisted.
+        handle_port_publish(&d, "web".into(), rule.clone(), false)
+            .expect("the first, unpersisted publish must succeed");
+        assert!(d.relays.active("web").contains(&rule));
+
+        let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+        let err = handle_port_publish(&d, "web".into(), rule.clone(), true)
+            .expect_err("the persist half must be refused while the lock is held");
+        drop(held);
+        assert!(err.to_string().contains("busy"), "got: {err}");
+
+        assert!(
+            d.relays.active("web").contains(&rule),
+            "the relay predates this request — a failed persist must not tear it down"
+        );
     }
 }
