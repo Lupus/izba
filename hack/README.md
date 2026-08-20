@@ -170,6 +170,16 @@ mount path `/opt/izba-vnc`. Requires Docker.
 hack/build-kasmvnc-erofs.sh   # → dist/kasmvnc.erofs (override with KASMVNC_OUT; ~100 MB, uncompressed)
 ```
 
+The bundled `xterm` is configured by `hack/vnc-config/X11/Xresources`, staged
+at `etc/X11/Xresources` and selected through `XENVIRONMENT` (izba-init's
+`vnc_env`) so it applies however the terminal is launched. It forces UTF-8
+decoding and UTF-8 window titles — xterm's compiled-in default is latin-1 and
+`-u8` alone is overridden by the `locale` resource — and selects an Xft face,
+which is what lets fontconfig fall back per glyph to the bundled **Symbola**
+for what DejaVu lacks (Miscellaneous Technical, arrows, monochrome emoji).
+Without it every UTF-8 TUI in the desktop renders as `â` soup. CJK is not
+covered by either face.
+
 `izba create --vnc` / `izba run --vnc` fail closed at start if the bundle
 cannot be located — see `artifacts::locate_kasmvnc` (`$IZBA_KASMVNC_EROFS`
 override, then exe-relative `../artifacts/kasmvnc.erofs`, then

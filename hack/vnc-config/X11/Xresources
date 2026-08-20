@@ -1,0 +1,64 @@
+! izba VNC desktop -- X resource defaults for the bundled xterm.
+!
+! Loaded through XENVIRONMENT (izba-init's `vnc_env`), which every Xt
+! application reads at startup. That is what makes these apply to `xterm`
+! however it is launched -- the openbox root menu, the lxpanel Applications
+! menu / Run dialog, pcmanfm's "Open Terminal", or typed by hand in an
+! already-open terminal -- with no wrapper script and no per-launcher argv.
+! Explicit command-line flags still win over everything here.
+!
+! WHY THIS FILE EXISTS: the bundle deliberately ships no
+! /usr/share/X11/app-defaults/XTerm, and the file inside the container
+! belongs to the user's IMAGE, which need not ship X11 data at all. So the
+! terminal ran on xterm's COMPILED-IN defaults, which are 1980s defaults:
+! latin-1 decoding, the `fixed` bitmap font, latin-1 window titles. Any TUI
+! that draws in UTF-8 -- Claude Code, but equally htop, vim, or git's box
+! art -- came out as strings of `â` (user-reported).
+
+! --- encoding: izba's terminal is UTF-8, unconditionally ---------------
+! `locale: false` + `utf8: 1` forces UTF-8 decoding regardless of the
+! image's locale environment. Two reasons it is forced rather than derived:
+!   * `-u8` ALONE IS IGNORED. With the default `locale: medium` the locale
+!     decides the encoding and the utf8 resource is overridden -- verified:
+!     `xterm -u8` with no UTF-8 locale still renders mojibake.
+!   * The alternative, trusting $LANG, is image-dependent. The desktop
+!     preamble does default LANG to C.UTF-8 (so programs INSIDE the shell
+!     emit UTF-8 too), but an image that pins a non-UTF-8 locale, or a libc
+!     without C.UTF-8, would silently fall back to the broken rendering.
+! `locale: false` also keeps xterm from trying to exec `luit` for a
+! non-UTF-8 locale -- the bundle ships no luit.
+XTerm*locale: false
+XTerm*utf8: 1
+! OSC 0/2 titles are UTF-8 too. Without this, xterm mangles a title
+! containing any non-latin-1 byte down to a single junk character, which is
+! why the window decoration read as garbage for a Claude Code session
+! (its title carries U+273B).
+XTerm*utf8Title: true
+
+! --- font: scalable, wide coverage, DPI-independent --------------------
+! DejaVu Sans Mono (bundled) covers box drawing, block elements, braille
+! and the dingbats a TUI draws with; xterm falls back per glyph through
+! fontconfig to the bundled Symbola for the rest (arrows, Miscellaneous
+! Technical such as U+23BF/U+23F5, and monochrome emoji), so a missing
+! glyph is a blank box only for scripts NEITHER font covers (CJK).
+! The size is given in PIXELS, not points: point sizes depend on the X
+! server's DPI, and the desktop is resized by the browser at will.
+XTerm*renderFont: true
+XTerm*faceName: DejaVu Sans Mono:pixelsize=15
+XTerm*geometry: 100x30
+XTerm*saveLines: 10000
+
+! --- keyboard/clipboard behavior a bare xterm gets wrong ---------------
+! Backspace must send DEL and the tty's erase char must agree with it; the
+! compiled-in default (BS + whatever the pty inherited) is what makes
+! backspace print ^H instead of erasing in a shell or a TUI. This is the
+! same pairing Debian's app-defaults apply -- which the guest does not have.
+XTerm*ttyModes: erase ^?
+XTerm*backarrowKey: false
+! Alt as a prefix (readline word motions, TUI alt-bindings) rather than
+! eight-bit input.
+XTerm*metaSendsEscape: true
+! The session is reached through a BROWSER: KasmVNC syncs the CLIPBOARD
+! selection with the browser, not PRIMARY, so a mouse selection that only
+! landed in PRIMARY could not be pasted out of the desktop at all.
+XTerm*selectToClipboard: true
