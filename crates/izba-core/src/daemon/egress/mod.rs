@@ -238,14 +238,18 @@ pub struct EgressManager {
     /// F-CRED-5 exists to leave behind.
     ///
     /// FORWARD TRAP — this gate authenticates *any process running as the
-    /// daemon owner*, NOT *the VMM*. Today those coincide on Linux, because
-    /// izba spawns no setuid/ambient-cap path and Cloud Hypervisor inherits
-    /// izbad's euid. They do NOT coincide on Windows, where MVP-D already runs
-    /// the VMM under a separate `izba-spk-<name>` principal — harmless only
-    /// because `enforcement_mode()` is `Unavailable` there, so nothing is
-    /// compared. The obvious next Linux hardening step (running
-    /// cloud-hypervisor under a per-sandbox uid, the Linux analogue of what
-    /// Windows already does) would therefore break EVERY sandbox's egress the
+    /// daemon owner*, NOT *the VMM*. Today they coincide on Linux, because izba
+    /// spawns no setuid/ambient-cap path and Cloud Hypervisor inherits izbad's
+    /// euid; they coincide on Windows's DEFAULT path too, where OpenVMM runs as
+    /// izbad's own user under a privilege-stripped Low-IL restricted token
+    /// (`procmgr::jail_windows` calls `CreateRestrictedToken` with no
+    /// restricting and no deny-only SIDs). They stop coinciding under `izba
+    /// lockdown`, which runs the VMM as a separate `izba-sb-<name>` account —
+    /// harmless only because `enforcement_mode()` is `Unavailable` on Windows,
+    /// so nothing is ever compared there.
+    ///
+    /// The Linux analogue of that lockdown — running cloud-hypervisor under a
+    /// per-sandbox uid — would therefore break EVERY sandbox's egress the
     /// moment it lands, and would surface only as denial lines in
     /// `daemon.log`. That change needs a peer *allow-set* (owner uid plus the
     /// sandbox's VMM uid) here, in the same commit.

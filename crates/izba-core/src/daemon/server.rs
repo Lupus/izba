@@ -270,13 +270,20 @@ fn peer_denial_log(verdict: peercred::PeerVerdict) -> Option<String> {
 ///   there is deliberately out of scope for F-CRED-5 — but if one ever lands,
 ///   this line has to move with it.
 /// * **It must not claim a protection izba never applied.** The unenforced
-///   platform is Windows, and there izba sets NO ACL of its own on these
-///   sockets: `paths::create_dir_700` and the egress chmod are both
-///   `#[cfg(unix)]`, and `transport::bind_socket` chmods only under
-///   `cfg(unix)` too (see `peercred`'s module doc). "Gated by directory
-///   permissions only" read as a claim that izba had gated them; the honest
-///   statement is that the sockets inherit whatever their containing directory
-///   happens to grant.
+///   platform is Windows, and there no izba code path *hardens* these sockets:
+///   `paths::create_dir_700`, the egress chmod and `transport::bind_socket`'s
+///   chmod are all `#[cfg(unix)]`. "Gated by directory permissions only" read
+///   as a claim that izba had gated them; in fact they inherit the
+///   `%LOCALAPPDATA%` profile DACL, which izba does not author.
+///
+///   Do not over-correct that into "izba touches no ACL here" — it does, and
+///   in the widening direction, so the line must not imply an izba-applied
+///   restriction either. `VmSpec::confined_write_surfaces` includes the run
+///   dir, so every default Windows start stamps it (and by inheritance the
+///   egress and USB sockets in it) with a **Low** mandatory-integrity label so
+///   the Low-IL VMM can write at all; and `izba lockdown` grants the
+///   per-sandbox `izba-sb-<name>` account an inheritable Modify ACE on that
+///   same dir (`jail_account::orchestrate::compute_grants`). Both widen.
 fn peer_auth_mode_line() -> Option<String> {
     match peercred::enforcement_mode() {
         peercred::PeerAuth::Enforced => {
@@ -293,9 +300,9 @@ fn peer_auth_mode_line() -> Option<String> {
         peercred::PeerAuth::Unavailable => Some(
             "izbad: unix-socket peer authentication UNAVAILABLE on this platform \
              — the control socket and the per-sandbox egress listeners accept any \
-             local peer that can open them, and izba applies no permissions of its \
-             own to them here, so they inherit whatever their containing directory \
-             grants; the per-sandbox USB broker socket is not covered on any platform"
+             local peer that can open them; izba never hardens their permissions \
+             here, so they inherit their containing directory's ACL; the \
+             per-sandbox USB broker socket is not covered on any platform"
                 .to_string(),
         ),
     }

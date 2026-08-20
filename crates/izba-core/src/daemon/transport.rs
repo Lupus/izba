@@ -59,10 +59,21 @@ pub fn remove_stale_socket(sock: &Path) {
 /// It lives here, shared, so the two planes' setup cannot drift apart. The
 /// 0700 re-assert in particular is easy to lose on one side and not the other,
 /// and it is **unix-only**: `paths::create_dir_700` and the chmod below are
-/// both `#[cfg(unix)]`, so on Windows izba applies no ACL of its own to these
-/// sockets and they inherit whatever their containing directory grants. That
-/// is why each plane's own accept-time gate — not this directory mode — is
-/// what actually decides who may drive it.
+/// both `#[cfg(unix)]`, so *this function* sets no permissions at all on
+/// Windows and the sockets inherit their parent directory's DACL.
+///
+/// Be precise about what that does NOT say. izba does touch this directory's
+/// security descriptor on Windows — it just never *hardens* it, only ever
+/// widens it: `VmSpec::confined_write_surfaces` includes the run dir, so every
+/// default start stamps it with an inheritable **Low** mandatory-integrity
+/// label (`procmgr::jail_windows`) that the socket files inherit, without
+/// which the Low-IL VMM could not write here at all; and `izba lockdown` adds
+/// the run dir to `jail_account::orchestrate::compute_grants` so the
+/// per-sandbox `izba-sb-<name>` account gets an inheritable Modify ACE on it.
+/// Confidentiality from other local users on Windows therefore rests on the
+/// inherited `%LOCALAPPDATA%` profile DACL, which izba does not author. That
+/// is why each plane's own accept-time gate — not this directory — is what
+/// actually decides who may drive it.
 ///
 /// `what` names the plane in the error messages ("egress", "USB").
 pub fn bind_sandbox_listener(
