@@ -1650,17 +1650,27 @@ fn handle_usb_attach(
 /// panic the VMM driver instead of failing with an actionable error.
 fn handle_vnc_set(d: &Arc<Daemon>, name: String, enabled: bool) -> anyhow::Result<DaemonResponse> {
     sandbox_must_exist(&d.paths, &name)?;
+    // Read-only fast path FIRST, deliberately outside the lock (#181): setting
+    // VNC to the value it already holds writes nothing, so it must stay a
+    // cheap no-op rather than becoming a new way to report "busy" —
+    // `sandbox::start` holds that lock across a whole boot, and the GUI's
+    // Display tab must not error out against a booting sandbox. Racy by
+    // nature, harmlessly so: nothing is written on this path either way.
     let p = d.paths.sandbox_dir(&name).join(CONFIG_FILE);
-    let mut cfg: SandboxConfig =
-        load_json(&p)?.with_context(|| format!("no config for '{name}'"))?;
+    let cfg: SandboxConfig = load_json(&p)?.with_context(|| format!("no config for '{name}'"))?;
     if cfg.vnc == enabled {
         return Ok(DaemonResponse::Ok);
     }
-    if enabled {
-        crate::volume::validate_volumes(&cfg.volumes, true)?;
-    }
-    cfg.vnc = enabled;
-    crate::state::save_json(&p, &cfg)?;
+    // An actual write, so it goes through the locked helper like every other
+    // config verb — and the volume-cap check moves inside with it, since it
+    // reads the very list a concurrent volume attach is rewriting.
+    crate::sandbox::edit_sandbox_config(&d.paths, &name, |cfg| {
+        if enabled {
+            crate::volume::validate_volumes(&cfg.volumes, true)?;
+        }
+        cfg.vnc = enabled;
+        Ok(())
+    })?;
     Ok(DaemonResponse::Ok)
 }
 
@@ -6259,5 +6269,105 @@ mod tests {
             );
         }
         assert!(load_persisted_ports(&paths, "sb").is_empty());
+    }
+
+    // ── #181: the VNC toggle is a config.json read-modify-write too ──────────
+    //
+    // `VncSet` arrived with proto v6, after #181 was filed, so it was a fifth
+    // whole-file read-modify-write skipping the lock: a `vnc on` overlapping a
+    // port/volume/USB edit could discard it (or be discarded) with both
+    // requests reporting success. Caught by review on the #181 PR.
+
+    fn load_config_for_persist(paths: &Paths, name: &str) -> SandboxConfig {
+        let p = paths.sandbox_dir(name).join(CONFIG_FILE);
+        load_json(&p).unwrap().unwrap()
+    }
+
+    #[test]
+    fn vnc_set_refuses_while_the_sandbox_lock_is_held() {
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+
+        let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+        let err = handle_vnc_set(&d, "web".to_string(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("busy"), "must refuse while locked: {err}");
+        assert!(
+            !load_config_for_persist(&d.paths, "web").vnc,
+            "a refused vnc toggle must not have rewritten config.json"
+        );
+
+        drop(held);
+        handle_vnc_set(&d, "web".to_string(), true)
+            .expect("the same toggle succeeds once the lock is released");
+        assert!(load_config_for_persist(&d.paths, "web").vnc);
+    }
+
+    #[test]
+    fn a_no_op_vnc_set_does_not_take_the_lock() {
+        // Regression guard for the fix below, not a red test: setting VNC to
+        // the value it already holds writes nothing, so it must stay a cheap
+        // read-only no-op rather than becoming a new way to report "busy" —
+        // `sandbox::start` holds this lock across a whole boot, and the GUI's
+        // Display tab must not error out against a booting sandbox.
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+
+        let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+        handle_vnc_set(&d, "web".to_string(), false)
+            .expect("a no-op toggle must not be refused as busy");
+        drop(held);
+    }
+
+    #[test]
+    fn concurrent_vnc_and_port_edits_cannot_lose_one() {
+        // The CROSS-verb window: a `vnc on` and a `port publish --persist` for
+        // one sandbox, on independent threads, each rewriting the whole
+        // config.json. Unlocked, one silently discards the other while both
+        // report success.
+        const ROUNDS: usize = 20;
+        let (_dir, d) = test_daemon();
+        write_config_for_persist(&d.paths, "web");
+
+        for round in 0..ROUNDS {
+            let host_port = 8000 + round as u16;
+            let enabled = round % 2 == 0;
+            let start = Arc::new(std::sync::Barrier::new(2));
+
+            let d2 = Arc::clone(&d);
+            let s2 = Arc::clone(&start);
+            let vnc = std::thread::spawn(move || {
+                s2.wait();
+                handle_vnc_set(&d2, "web".to_string(), enabled).is_ok()
+            });
+
+            let paths = d.paths.clone();
+            let s3 = Arc::clone(&start);
+            let port = std::thread::spawn(move || {
+                let r = port_rule("127.0.0.1", host_port, 80);
+                s3.wait();
+                persist_port_rule(&paths, "web", &r).is_ok()
+            });
+
+            let vnc_ok = vnc.join().unwrap();
+            let port_ok = port.join().unwrap();
+
+            let cfg = load_config_for_persist(&d.paths, "web");
+            if vnc_ok {
+                assert_eq!(
+                    cfg.vnc, enabled,
+                    "vnc set to {enabled} reported success but config.json disagrees \
+                     after round {round} — a concurrent edit discarded it"
+                );
+            }
+            if port_ok {
+                assert!(
+                    cfg.ports.iter().any(|r| r.host_port == host_port),
+                    "publish of :{host_port} reported success but is absent from \
+                     config.json after round {round} — a concurrent edit discarded it"
+                );
+            }
+        }
     }
 }
