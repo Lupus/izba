@@ -1300,23 +1300,26 @@ fn handle_port_unpublish(
     Ok(DaemonResponse::Ok)
 }
 
+/// Both port-rule verbs run through `sandbox::edit_sandbox_config` so the
+/// read-modify-write of the WHOLE `config.json` happens under the per-sandbox
+/// lock (#181). Unlocked, two overlapping publishes on independent daemon
+/// threads each loaded this config and each wrote it back, so a published port
+/// simply vanished while the user held a success message.
 fn persist_port_rule(
     paths: &Paths,
     name: &str,
     rule: &crate::state::PortRule,
 ) -> anyhow::Result<()> {
-    let p = paths.sandbox_dir(name).join(CONFIG_FILE);
-    let mut cfg: SandboxConfig =
-        load_json(&p)?.with_context(|| format!("no config for '{name}'"))?;
-    if !cfg
-        .ports
-        .iter()
-        .any(|r| r.bind == rule.bind && r.host_port == rule.host_port)
-    {
-        cfg.ports.push(rule.clone());
-        crate::state::save_json(&p, &cfg)?;
-    }
-    Ok(())
+    crate::sandbox::edit_sandbox_config(paths, name, |cfg| {
+        if !cfg
+            .ports
+            .iter()
+            .any(|r| r.bind == rule.bind && r.host_port == rule.host_port)
+        {
+            cfg.ports.push(rule.clone());
+        }
+        Ok(())
+    })
 }
 
 fn unpersist_port_rule(
@@ -1325,17 +1328,12 @@ fn unpersist_port_rule(
     bind: std::net::Ipv4Addr,
     host_port: u16,
 ) -> anyhow::Result<bool> {
-    let p = paths.sandbox_dir(name).join(CONFIG_FILE);
-    let mut cfg: SandboxConfig =
-        load_json(&p)?.with_context(|| format!("no config for '{name}'"))?;
-    let before = cfg.ports.len();
-    cfg.ports
-        .retain(|r| !(r.bind == bind && r.host_port == host_port));
-    let removed = cfg.ports.len() != before;
-    if removed {
-        crate::state::save_json(&p, &cfg)?;
-    }
-    Ok(removed)
+    crate::sandbox::edit_sandbox_config(paths, name, |cfg| {
+        let before = cfg.ports.len();
+        cfg.ports
+            .retain(|r| !(r.bind == bind && r.host_port == host_port));
+        Ok(cfg.ports.len() != before)
+    })
 }
 
 fn handle_volume_list(d: &Arc<Daemon>) -> anyhow::Result<DaemonResponse> {
@@ -6150,5 +6148,116 @@ mod tests {
         let e = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
         let line = super::accept_error_message(&e).expect("a non-WouldBlock error must log");
         assert!(line.contains("accept error"), "got: {line}");
+    }
+
+    // ── #181: the port-rule persistence verbs hold the per-sandbox lock ──────
+    //
+    // `persist_port_rule`/`unpersist_port_rule` are read-modify-writes of the
+    // WHOLE config.json. Unlocked, two overlapping requests on independent
+    // daemon threads each load the same file and each write it back, so the
+    // later write silently discards the earlier — a published port simply
+    // vanishes while the user holds a success message.
+
+    #[test]
+    fn persist_port_rule_refuses_while_the_sandbox_lock_is_held() {
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        let held = crate::sandbox::lock_sandbox(&paths, "sb").expect("take the lock");
+        let err = persist_port_rule(&paths, "sb", &port_rule("127.0.0.1", 8080, 80))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("busy"), "must refuse while locked: {err}");
+        assert!(
+            load_persisted_ports(&paths, "sb").is_empty(),
+            "a refused persist must not have rewritten config.json"
+        );
+
+        drop(held);
+        persist_port_rule(&paths, "sb", &port_rule("127.0.0.1", 8080, 80))
+            .expect("the same persist succeeds once the lock is released");
+    }
+
+    #[test]
+    fn unpersist_port_rule_refuses_while_the_sandbox_lock_is_held() {
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+        let r = port_rule("127.0.0.1", 8080, 80);
+        persist_port_rule(&paths, "sb", &r).unwrap();
+
+        let held = crate::sandbox::lock_sandbox(&paths, "sb").expect("take the lock");
+        let err = unpersist_port_rule(&paths, "sb", r.bind, r.host_port)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("busy"), "must refuse while locked: {err}");
+        assert_eq!(
+            load_persisted_ports(&paths, "sb").len(),
+            1,
+            "a refused unpersist must not have rewritten config.json"
+        );
+
+        drop(held);
+        assert!(unpersist_port_rule(&paths, "sb", r.bind, r.host_port).unwrap());
+    }
+
+    #[test]
+    fn concurrent_port_persists_cannot_lose_one_that_reported_success() {
+        // Two `izba port publish --persist` requests for one sandbox, on
+        // independent threads. Under the lock the only two outcomes are "both
+        // persisted" (serialized) or "one refused as busy" — never "both
+        // reported success and one rule is gone".
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for host_port in [8080u16, 9090] {
+            let paths = paths.clone();
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                let r = port_rule("127.0.0.1", host_port, 80);
+                start.wait();
+                (host_port, persist_port_rule(&paths, "sb", &r).is_ok())
+            }));
+        }
+        let outcomes: Vec<(u16, bool)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let ports = load_persisted_ports(&paths, "sb");
+        for (host_port, reported_ok) in &outcomes {
+            if *reported_ok {
+                assert!(
+                    ports.iter().any(|r| r.host_port == *host_port),
+                    "publish of :{host_port} reported success but is absent from \
+                     config.json — a concurrent edit silently discarded it \
+                     (ports on disk: {ports:?})"
+                );
+            }
+        }
+        assert!(
+            outcomes.iter().any(|(_, ok)| *ok),
+            "at least one of two concurrent persists must succeed"
+        );
+    }
+
+    #[test]
+    fn back_to_back_port_persists_never_report_busy() {
+        // The lock is per-verb, so ordinary sequential publishing must never
+        // see the new "busy" refusal.
+        let (_dir, paths) = test_paths();
+        write_config_for_persist(&paths, "sb");
+
+        for host_port in [8080u16, 9090, 7070] {
+            persist_port_rule(&paths, "sb", &port_rule("127.0.0.1", host_port, 80))
+                .unwrap_or_else(|e| panic!("sequential persist of :{host_port} failed: {e:#}"));
+        }
+        for host_port in [8080u16, 9090, 7070] {
+            assert!(
+                unpersist_port_rule(&paths, "sb", "127.0.0.1".parse().unwrap(), host_port)
+                    .unwrap_or_else(|e| panic!(
+                        "sequential unpersist of :{host_port} failed: {e:#}"
+                    ))
+            );
+        }
+        assert!(load_persisted_ports(&paths, "sb").is_empty());
     }
 }
