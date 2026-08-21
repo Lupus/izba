@@ -363,12 +363,35 @@ fn exec_collect(
     argv: &[&str],
     stdin: Option<&[u8]>,
 ) -> Result<(ExitStatus, String, String), (ErrorKind, String)> {
+    exec_collect_env(
+        paths,
+        name,
+        argv,
+        stdin,
+        vec![("PATH".to_string(), STD_PATH.to_string())],
+    )
+}
+
+/// `exec_collect` with caller-controlled environment.
+///
+/// `exec_collect` always supplies `PATH=STD_PATH`, which makes the whole
+/// integration suite blind to #222: it would pass even if the guest delivered
+/// a container with no `PATH` at all. Passing an EMPTY env here is what the
+/// real CLI does (`izba-cli/src/commands/exec.rs` sends `vec![]`), so a test
+/// that wants to observe the container's own `PATH` must use this.
+fn exec_collect_env(
+    paths: &Paths,
+    name: &str,
+    argv: &[&str],
+    stdin: Option<&[u8]>,
+    env: Vec<(String, String)>,
+) -> Result<(ExitStatus, String, String), (ErrorKind, String)> {
     let connector = sandbox::default_connector();
     let mut control = sandbox::control(paths, name, &connector).expect("control connection");
 
     let req = Request::Exec(ExecRequest {
         argv: argv.iter().map(|s| s.to_string()).collect(),
-        env: vec![("PATH".to_string(), STD_PATH.to_string())],
+        env,
         cwd: "/workspace".to_string(),
         tty: false,
         uid: 0,
@@ -945,6 +968,125 @@ fn userns_resolves_symbolic_image_user() {
     assert_userns_workspace_roundtrip(&tb.paths, "uns-sym", &ws, "65534");
 
     stop_sandbox(&tb, "uns-sym");
+}
+
+/// #222, end-to-end on a **glibc, non-Alpine** image.
+///
+/// Every other sandbox this suite boots is Alpine/musl-family or scratch, which
+/// is precisely why a fully green board shipped a bug where bare commands could
+/// not be resolved. This is the capability-not-environment gap again.
+///
+/// Two things are asserted, and neither hardcodes a `PATH`:
+///
+/// 1. **Bare commands resolve.** `cat`/`sh`/`ls` with NO caller-supplied env —
+///    exactly what the real CLI sends (`commands/exec.rs` sends `vec![]`). This
+///    is the literal reproduction from the issue.
+/// 2. **The observed `PATH` is the image's DECLARED `PATH`**, compared against
+///    the image's own OCI config read back from the image store — not against a
+///    constant. If izba ever injected a default, this fails even though (1)
+///    would still pass.
+///
+/// `exec_collect_env` is used rather than `exec_ok`, because the suite's normal
+/// exec helper supplies `PATH=STD_PATH` and would mask the whole bug.
+#[test]
+fn non_alpine_image_bare_commands_resolve_via_the_images_declared_path() {
+    use izba_core::image::ImageStore;
+
+    // The image from the issue itself, so AC1 is asserted literally.
+    const GLIBC_IMAGE: &str = "ubuntu:24.04";
+
+    let Some(env) = want() else { return };
+
+    let mut tb = TestBox::new();
+    let ws = tb.workspace("glibc");
+
+    let digest = ensure_image(&tb.paths, GLIBC_IMAGE).expect("pull the glibc test image");
+
+    // The oracle: what does the image itself declare? Read it from the cached
+    // OCI config, so the assertion tracks the image and not our expectations.
+    let declared_path: String = ImageStore::new(&tb.paths)
+        .load_config(&digest)
+        .expect("load image config")
+        .and_then(|f| f.config)
+        .and_then(|c| c.env)
+        .unwrap_or_default()
+        .iter()
+        .find_map(|e| e.strip_prefix("PATH=").map(str::to_string))
+        .expect("the test image must declare a PATH in its OCI config");
+
+    sandbox::create(
+        &tb.paths,
+        "glibc",
+        &CreateOpts {
+            image_digest: digest,
+            image_ref: GLIBC_IMAGE.to_string(),
+            cpus: 1,
+            mem_mb: 1024,
+            workspace: ws.clone(),
+            rw_size_gb: 2,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            builder: false,
+            docker: false,
+            vnc: false,
+        },
+    )
+    .expect("create");
+    tb.names.push("glibc".to_string());
+    if let Err(e) = start_sandbox(&env, &tb, "glibc") {
+        panic!(
+            "boot failed: {e:#}\nconsole tail:\n{}",
+            boot_diag(&tb.paths, "glibc")
+        );
+    }
+
+    // (1) Bare commands, no caller env — the exact failure from the issue.
+    for argv in [
+        vec!["cat", "/etc/os-release"],
+        vec!["sh", "-c", "exit 0"],
+        vec!["ls", "/"],
+    ] {
+        let (status, stdout, stderr) =
+            exec_collect_env(&tb.paths, "glibc", &argv, None, Vec::new())
+                .unwrap_or_else(|(k, m)| panic!("exec {argv:?} failed to start: {k:?}: {m}"));
+        assert_eq!(
+            status,
+            ExitStatus::Code(0),
+            "bare `{}` must resolve via the image's PATH\nstdout: {stdout}\nstderr: {stderr}",
+            argv.join(" ")
+        );
+    }
+
+    // Sanity: this really is the non-Alpine image we asked for.
+    let (_, os_release, _) = exec_collect_env(
+        &tb.paths,
+        "glibc",
+        &["cat", "/etc/os-release"],
+        None,
+        Vec::new(),
+    )
+    .expect("cat /etc/os-release");
+    assert!(
+        os_release.to_lowercase().contains("ubuntu"),
+        "expected an ubuntu rootfs, got: {os_release}"
+    );
+
+    // (2) The PATH the process sees IS the image's declared PATH.
+    let (status, observed, stderr) =
+        exec_collect_env(&tb.paths, "glibc", &["printenv", "PATH"], None, Vec::new())
+            .expect("printenv PATH");
+    assert_eq!(
+        status,
+        ExitStatus::Code(0),
+        "printenv PATH failed: {stderr}"
+    );
+    assert_eq!(
+        observed.trim(),
+        declared_path,
+        "the process must see the image's DECLARED PATH, not an izba-invented default"
+    );
+
+    stop_sandbox(&tb, "glibc");
 }
 
 #[test]

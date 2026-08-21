@@ -127,8 +127,25 @@ impl<'a> ImageStore<'a> {
     }
 
     /// An image is cached iff its `rootfs.erofs` exists.
+    ///
+    /// This answers "do we already have the layers?" — the expensive half of a
+    /// pull. It deliberately does NOT imply the entry is usable for generating
+    /// an OCI bundle; see [`ImageStore::is_complete`].
     pub fn is_cached(&self, digest: &str) -> bool {
         self.rootfs_path(digest).is_file()
+    }
+
+    /// An entry is COMPLETE iff it has both the rootfs **and** the image's
+    /// runtime `config.json`.
+    ///
+    /// Images cached by a pre-crun izba have the former and not the latter.
+    /// Such an entry is still [`is_cached`](ImageStore::is_cached) (the layers
+    /// are there), but izba cannot learn the image's declared `Env` from it,
+    /// and a bundle generated from it silently carries no `PATH` — which makes
+    /// every bare command fail with crun's `not found in $PATH` (#222). Callers
+    /// that need the config must gate on this, not on `is_cached`.
+    pub fn is_complete(&self, digest: &str) -> bool {
+        self.is_cached(digest) && self.config_path(digest).is_file()
     }
 
     /// Atomically publish an image dir: `build` runs against a staging
@@ -317,6 +334,37 @@ mod tests {
             store.load_config(DIGEST).is_err(),
             "a non-NotFound read error must propagate as Err, not Ok(None)"
         );
+    }
+
+    #[test]
+    fn is_complete_requires_config_not_just_rootfs() {
+        // A cache entry written by a pre-crun izba has the rootfs but no
+        // config.json. `is_cached` (do we have the layers?) is true for it, but
+        // it is NOT a COMPLETE entry: without the config blob izba does not
+        // know the image's declared Env, and generating a bundle from it
+        // silently yields a container with no PATH at all (#222).
+        let (_tmp, paths) = setup();
+        let store = ImageStore::new(&paths);
+        store
+            .publish(DIGEST, |staging| {
+                fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store.is_cached(DIGEST),
+            "the rootfs is present, so the layers are cached"
+        );
+        assert!(
+            !store.is_complete(DIGEST),
+            "an entry with no config.json must NOT count as complete"
+        );
+
+        // Persisting the config (the cheap self-heal) makes it complete.
+        store
+            .persist_config(DIGEST, CONFIG_JSON.as_bytes())
+            .unwrap();
+        assert!(store.is_complete(DIGEST));
     }
 
     #[test]

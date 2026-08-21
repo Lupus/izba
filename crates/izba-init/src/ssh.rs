@@ -589,6 +589,40 @@ mod tests {
         assert_eq!(env_flag_value(&argv, "TERM"), Some("xterm-256color"));
     }
 
+    /// #222 (AC5): the SSH login shell reaches the workload through the SAME
+    /// `crun exec` as `izba exec`, so it inherits `PATH` from the container
+    /// definition's env in exactly the same way — and must therefore inject no
+    /// `PATH` of its own. Mirrors the `izba exec` guard
+    /// (`exec.rs::build_env_overlay_no_path_default`): a guessed default would
+    /// be wrong for any image that declares its own.
+    ///
+    /// The propagation itself is a host-side property (the bundle must carry
+    /// the image's `Env`); this pins that the guest half stays hands-off across
+    /// every session shape.
+    #[test]
+    fn ssh_session_crun_argv_never_injects_a_path() {
+        for (tty, command, trust, vnc) in [
+            (true, None, true, true),
+            (true, None, false, false),
+            (false, Some("git fetch"), true, false),
+            (false, None, false, true),
+        ] {
+            let argv = ssh_session_crun_argv(
+                crate::oci::CgroupManager::Cgroupfs,
+                tty,
+                command,
+                Some("xterm-256color"),
+                trust,
+                vnc,
+            );
+            assert_eq!(
+                env_flag_value(&argv, "PATH"),
+                None,
+                "ssh must not inject PATH (tty={tty}, command={command:?}): {argv:?}"
+            );
+        }
+    }
+
     #[test]
     fn ssh_session_crun_argv_trust_absent_forwards_no_ca_env() {
         // trust_present=false → none of the six CA-bundle env vars are present.
