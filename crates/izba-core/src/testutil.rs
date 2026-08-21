@@ -37,9 +37,18 @@ pub(crate) fn dead_identity() -> PidIdentity {
     }
 }
 
+/// The digest every fixture sandbox is created from (the daemon test harness
+/// stubs `resolve_image` to return it, and `sandbox::tests::opts` names it).
+pub(crate) const FIXTURE_IMAGE_DIGEST: &str = "sha256:abc";
+
 pub(crate) fn test_paths() -> (tempfile::TempDir, Paths) {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::with_root(dir.path().join("izba"));
+    // Every fixture data root holds a COMPLETE cache entry for the canonical
+    // test digest — the shape `ensure_image` guarantees for a real pull. A
+    // rootfs-only entry is the pre-crun shape that silently produced a
+    // container with no `PATH`, and `start` now refuses it outright (#222).
+    publish_fixture_image(&paths, FIXTURE_IMAGE_DIGEST, "ubuntu:22.04");
     (dir, paths)
 }
 

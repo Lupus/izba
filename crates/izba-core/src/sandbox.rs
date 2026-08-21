@@ -1996,8 +1996,8 @@ mod tests {
     use super::*;
     use crate::testutil::{
         count_shutdowns, dead_identity, fake_connector, hanging_connector, live_identity,
-        publish_fixture_image, spawn_sleep, test_paths as bare_test_paths, wait_dead, write_state,
-        write_state_with_sidecars, MockDriver, FIXTURE_IMAGE_PATH,
+        spawn_sleep, test_paths, wait_dead, write_state, write_state_with_sidecars, MockDriver,
+        FIXTURE_IMAGE_PATH,
     };
     use std::path::Path;
     use std::sync::atomic::Ordering;
@@ -2402,15 +2402,6 @@ mod tests {
         let c = build_cmdline("s", &[], false, true, Some(&maps), true);
         assert!(c.ends_with(" izba.vnc=1"), "vnc must stay last, got: {c}");
         assert!(c.contains(" izba.usb=1") && c.contains(" izba.wsidmap=1"));
-    }
-
-    /// Test data root that already holds a COMPLETE cache entry for the image
-    /// [`opts`] creates sandboxes from — the shape `ensure_image` guarantees.
-    /// Without the config blob `start` now refuses (#222), which is the point.
-    fn test_paths() -> (tempfile::TempDir, Paths) {
-        let (dir, paths) = bare_test_paths();
-        publish_fixture_image(&paths, "sha256:abc", "ubuntu:22.04");
-        (dir, paths)
     }
 
     fn opts(workspace: &Path) -> CreateOpts {
