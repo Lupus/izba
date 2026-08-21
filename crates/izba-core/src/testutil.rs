@@ -43,6 +43,38 @@ pub(crate) fn test_paths() -> (tempfile::TempDir, Paths) {
     (dir, paths)
 }
 
+/// The `PATH` the fixture image DECLARES. Deliberately not a plausible default:
+/// if it shows up in a generated bundle, it can only have come from the image
+/// config, never from a guess (#222).
+pub(crate) const FIXTURE_IMAGE_PATH: &str = "/image/declared/bin:/usr/bin:/bin";
+
+/// Publish a COMPLETE image cache entry for `digest`: `rootfs.erofs` **and**
+/// `config.json`.
+///
+/// Real registry images always carry a runtime config, so fixtures must too.
+/// A rootfs-only entry is the pre-crun cache shape that silently produced a
+/// container with no `PATH` (#222) — tests that boot from one are testing a
+/// state `ensure_image` no longer leaves behind.
+pub(crate) fn publish_fixture_image(paths: &Paths, digest: &str, image_ref: &str) {
+    let store = crate::image::ImageStore::new(paths);
+    if store.is_complete(digest) {
+        return;
+    }
+    let config = format!(
+        r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":[]}},
+            "config":{{"Env":["{FIXTURE_IMAGE_PATH}"]}}}}"#,
+        FIXTURE_IMAGE_PATH = format_args!("PATH={FIXTURE_IMAGE_PATH}")
+    );
+    store
+        .publish(digest, |staging| {
+            std::fs::write(staging.join("rootfs.erofs"), b"erofs")?;
+            std::fs::write(staging.join("ref.txt"), image_ref)?;
+            std::fs::write(staging.join("config.json"), &config)?;
+            Ok(())
+        })
+        .unwrap();
+}
+
 /// Spawn a real detached `sleep 30` and return its identity.
 pub(crate) fn spawn_sleep(dir: &Path) -> PidIdentity {
     procmgr::spawn_detached(

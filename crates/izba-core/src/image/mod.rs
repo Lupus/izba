@@ -114,8 +114,13 @@ pub fn ensure_image(paths: &Paths, image_ref: &str) -> Result<String> {
     // Local tag dispatch: a local tag shadows a registry ref only when the
     // tag resolves AND the digest is cached (prevents a stale evicted tag from
     // silently winning over a fresh registry pull).
+    //
+    // The gate is `is_complete`, NOT `is_cached`: an entry with a rootfs but no
+    // config.json cannot tell us the image's declared Env, and returning early
+    // here would skip the self-heal below and hand `start` a config-less entry
+    // (#222). Falling through re-resolves the manifest and heals it cheaply.
     if let Some(digest) = tags::resolve_tag(paths, image_ref)? {
-        if ImageStore::new(paths).is_cached(&digest) {
+        if ImageStore::new(paths).is_complete(&digest) {
             return Ok(digest);
         }
     }
@@ -215,7 +220,20 @@ mod tests {
 
     /// Seed a fake cached entry (just the rootfs.erofs sentinel file) for
     /// `digest` without running mkfs.erofs.
+    /// Seed a COMPLETE entry — rootfs **and** config.json — which is what
+    /// every entry `publish_image` writes looks like.
     fn seed_cached_entry(paths: &Paths, digest: &str) {
+        seed_rootfs_only_entry(paths, digest);
+        fs::write(
+            paths.image_dir(digest).join("config.json"),
+            r#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},
+                "config":{"Env":["PATH=/usr/bin"]}}"#,
+        )
+        .unwrap();
+    }
+
+    /// Seed the PRE-CRUN cache shape: layers present, runtime config missing.
+    fn seed_rootfs_only_entry(paths: &Paths, digest: &str) {
         let dir = paths.image_dir(digest);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("rootfs.erofs"), b"fake erofs").unwrap();
@@ -235,6 +253,32 @@ mod tests {
 
         let got = ensure_image(&paths, "myimg").unwrap();
         assert_eq!(got, digest);
+    }
+
+    /// #222: a tagged entry whose config.json is MISSING must NOT satisfy the
+    /// local-tag fast path. Returning it early skips the self-heal and hands
+    /// `start` an entry it cannot read the image's declared `Env` from, which
+    /// silently produces a container with no `PATH`. It must fall through to
+    /// the registry path instead (where the cheap self-heal lives) — asserted
+    /// the same way as `ensure_image_falls_through_when_tag_not_cached`: the
+    /// registry attempt fails offline, so it must NOT return the digest.
+    #[test]
+    fn ensure_image_falls_through_when_tagged_entry_has_no_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let digest = "sha256:".to_string() + &"d".repeat(64);
+
+        set_tag(&paths, "legacyimg", &digest).unwrap();
+        seed_rootfs_only_entry(&paths, &digest);
+
+        let store = ImageStore::new(&paths);
+        assert!(store.is_cached(&digest), "layers are present");
+        assert!(!store.is_complete(&digest), "but the config blob is not");
+
+        match ensure_image(&paths, "legacyimg") {
+            Ok(got) => panic!("must not short-circuit on a config-less entry, got {got}"),
+            Err(_) => { /* fell through to the registry path, as required */ }
+        }
     }
 
     /// When a local tag exists but its digest is NOT cached, `ensure_image`

@@ -695,6 +695,38 @@ fn workspace_owner(workspace: &Path) -> (u32, u32) {
     }
 }
 
+/// Require that the image's runtime config blob was actually cached, and
+/// return the image's `config` section (which may legitimately be absent).
+///
+/// The distinction this draws is the whole point (#222):
+///
+/// * `config.json` **absent** — izba does not KNOW the image's declared `Env`.
+///   Generating a bundle anyway yields `process.env` with no `PATH`, and since
+///   crun seeds an `exec` from exactly that env and then looks the binary up
+///   via `getenv("PATH")`, every bare command fails with
+///   `executable file ... not found in $PATH`. That is a stale cache entry, so
+///   fail loudly and say how to heal it — never degrade silently.
+/// * `config.json` **present but declaring no `Env`** (e.g. an `oci-archive:`
+///   image, or `FROM scratch`) — that is the honest truth about the image.
+///   Pass it through untouched; izba must not invent a `PATH` (that would be
+///   wrong for any image that declares its own).
+fn require_image_config<'a>(
+    cfg: Option<&'a oci_client::config::ConfigFile>,
+    image_ref: &str,
+    digest: &str,
+) -> anyhow::Result<Option<&'a oci_client::config::Config>> {
+    match cfg {
+        Some(f) => Ok(f.config.as_ref()),
+        None => anyhow::bail!(
+            "image cache entry for '{image_ref}' ({digest}) is incomplete: no config.json. \
+             It was cached by an older izba that did not record the image's runtime config, \
+             so the image's declared PATH/Env cannot be applied and every bare command in the \
+             sandbox would fail with \"not found in $PATH\". \
+             Re-create the sandbox to re-pull the image (`izba rm <name>` then `izba create ...`)."
+        ),
+    }
+}
+
 /// Write `oci/config.json` into `oci_dir` for the interactive (pause) mode.
 ///
 /// Generates an OCI runtime spec via [`crate::image::runtime_config::generate_spec`]
@@ -975,12 +1007,19 @@ pub fn start_with_timeouts(
     let oci_dir = paths.sandbox_dir(name).join("oci");
     std::fs::create_dir_all(&oci_dir)
         .with_context(|| format!("creating oci dir {}", oci_dir.display()))?;
-    // Load the image config (Entrypoint/Cmd/Env/WorkingDir/User). None is fine
-    // for images cached by a pre-crun izba — generate_spec treats it as a bare
-    // image with root user and no default env.
+    // Load the image config (Entrypoint/Cmd/Env/WorkingDir/User). An ABSENT
+    // config blob is NOT acceptable: it is an incomplete cache entry, and
+    // building a bundle from it silently produces a container whose
+    // `process.env` has no PATH, so every bare command fails with crun's
+    // `not found in $PATH` (#222). Fail loudly instead — see
+    // [`require_image_config`].
     let store = ImageStore::new(paths);
     let image_cfg_file = store.load_config(&config.image_digest)?;
-    let image_config = image_cfg_file.as_ref().and_then(|f| f.config.as_ref());
+    let image_config = require_image_config(
+        image_cfg_file.as_ref(),
+        &config.image_ref,
+        &config.image_digest,
+    )?;
     let (passwd, group) = store.load_user_dbs(&config.image_digest)?;
     let user_db =
         crate::image::runtime_config::UserDb::from_files(passwd.as_deref(), group.as_deref());
@@ -1957,7 +1996,8 @@ mod tests {
     use super::*;
     use crate::testutil::{
         count_shutdowns, dead_identity, fake_connector, hanging_connector, live_identity,
-        spawn_sleep, test_paths, wait_dead, write_state, write_state_with_sidecars, MockDriver,
+        publish_fixture_image, spawn_sleep, test_paths as bare_test_paths, wait_dead, write_state,
+        write_state_with_sidecars, MockDriver, FIXTURE_IMAGE_PATH,
     };
     use std::path::Path;
     use std::sync::atomic::Ordering;
@@ -2362,6 +2402,15 @@ mod tests {
         let c = build_cmdline("s", &[], false, true, Some(&maps), true);
         assert!(c.ends_with(" izba.vnc=1"), "vnc must stay last, got: {c}");
         assert!(c.contains(" izba.usb=1") && c.contains(" izba.wsidmap=1"));
+    }
+
+    /// Test data root that already holds a COMPLETE cache entry for the image
+    /// [`opts`] creates sandboxes from — the shape `ensure_image` guarantees.
+    /// Without the config blob `start` now refuses (#222), which is the point.
+    fn test_paths() -> (tempfile::TempDir, Paths) {
+        let (dir, paths) = bare_test_paths();
+        publish_fixture_image(&paths, "sha256:abc", "ubuntu:22.04");
+        (dir, paths)
     }
 
     fn opts(workspace: &Path) -> CreateOpts {
@@ -2803,6 +2852,65 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("VNC setting changed"), "got: {err}");
+    }
+
+    /// #222, the positive half: the image's DECLARED `PATH` must arrive in the
+    /// generated bundle's `process.env`, because that is the only thing crun
+    /// seeds an `exec` from (`clearenv()` + the container def's env, then
+    /// `getenv("PATH")` for the binary lookup). If it is missing, every bare
+    /// command in the sandbox fails with `not found in $PATH`.
+    ///
+    /// The assertion is against what the IMAGE declares — read back out of the
+    /// image store, never a hardcoded string — so it cannot pass by matching a
+    /// default izba invented.
+    #[test]
+    fn start_propagates_the_images_declared_path_into_the_bundle() {
+        use izba_proto::OCI_TAG;
+        use oci_spec::runtime::Spec;
+
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        // What does the image itself declare? (the oracle, not a constant)
+        let declared: Vec<String> = crate::image::ImageStore::new(&paths)
+            .load_config("sha256:abc")
+            .unwrap()
+            .and_then(|f| f.config)
+            .and_then(|c| c.env)
+            .unwrap_or_default();
+        let declared_path = declared
+            .iter()
+            .find_map(|e| e.strip_prefix("PATH="))
+            .expect("fixture image declares a PATH");
+
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
+
+        let captured = driver.captured.lock().unwrap().take().expect("spec");
+        let oci_share = captured
+            .shares
+            .iter()
+            .find(|s| s.tag == OCI_TAG)
+            .expect("izba-oci share");
+        let json = fs::read_to_string(oci_share.host_path.join("config.json")).unwrap();
+        let spec: Spec = serde_json::from_str(&json).unwrap();
+        let env = spec
+            .process()
+            .as_ref()
+            .unwrap()
+            .env()
+            .clone()
+            .expect("process.env present");
+
+        assert!(
+            env.iter().any(|e| e == &format!("PATH={declared_path}")),
+            "the image's declared PATH must reach process.env verbatim; \
+             declared {declared_path:?}, got {env:?}"
+        );
+        // And it is the image's value, not something izba made up.
+        assert_eq!(declared_path, FIXTURE_IMAGE_PATH);
     }
 
     #[test]
@@ -4286,6 +4394,43 @@ mod tests {
         let guarded_maps = cfg.docker_effective().then(|| maps.clone());
         let guarded = build_cmdline("s", &[], cfg.builder, false, guarded_maps.as_ref(), cfg.vnc);
         assert!(!guarded.contains("izba.docker"));
+    }
+
+    /// #222: an image cache entry with no `config.json` must FAIL the start,
+    /// loudly and actionably — never silently degrade to a bundle with no
+    /// `PATH`, which makes every bare command in the sandbox fail with crun's
+    /// `executable file ... not found in $PATH`.
+    #[test]
+    fn missing_image_config_fails_loudly_with_actionable_message() {
+        let err = require_image_config(None, "ubuntu:24.04", "sha256:023f8a75")
+            .expect_err("an absent config blob must be an error, not an empty env");
+        let msg = format!("{err:#}");
+        // Names the image so the user knows WHICH cache entry is stale...
+        assert!(
+            msg.contains("ubuntu:24.04"),
+            "message must name the image: {msg}"
+        );
+        // ...and tells them how to fix it.
+        assert!(
+            msg.contains("izba rm") || msg.contains("re-create"),
+            "message must be actionable: {msg}"
+        );
+    }
+
+    /// The complement: a config blob that IS present but declares no `Env` is
+    /// perfectly legal (e.g. an `oci-archive:` image, or `FROM scratch`). izba
+    /// must pass it through untouched and NOT invent a PATH — the distinction
+    /// is "we don't know the image's env" (a defect) vs "the image declares
+    /// none" (the truth about that image).
+    #[test]
+    fn present_config_without_env_is_accepted_and_no_path_invented() {
+        let cfg_file: oci_client::config::ConfigFile = serde_json::from_str(
+            r#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#,
+        )
+        .unwrap();
+        let got = require_image_config(Some(&cfg_file), "scratch:latest", "sha256:deadbeef")
+            .expect("a present config blob is acceptable even with no Env");
+        assert!(got.is_none(), "no `config` section means no image config");
     }
 
     /// `izba.wsidmap=1` is emitted exactly when the docker payload says the

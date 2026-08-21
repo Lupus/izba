@@ -809,6 +809,15 @@ mod tests {
         let dir = paths.image_dir(&digest);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("rootfs.erofs"), b"fake erofs").unwrap();
+        // The entry must be COMPLETE to stay offline: since #222 the local-tag
+        // fast path gates on `is_complete`, so a rootfs-only entry falls
+        // through to `pull::resolve` (network) instead of short-circuiting.
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},
+                "config":{"Env":["PATH=/usr/bin"]}}"#,
+        )
+        .unwrap();
     }
 
     /// A minimal `spec.image:`-only manifest, with optional extra YAML lines
