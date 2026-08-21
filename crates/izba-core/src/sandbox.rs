@@ -717,12 +717,22 @@ fn require_image_config<'a>(
 ) -> anyhow::Result<Option<&'a oci_client::config::Config>> {
     match cfg {
         Some(f) => Ok(f.config.as_ref()),
+        // The repair is on the IMAGE CACHE, never on the sandbox: `izba rm`
+        // deletes the whole sandbox dir (rw.img + ephemeral volumes), so
+        // recommending it would trade a fixable cache entry for the user's
+        // data. Re-pulling the image repairs the shared entry in place and
+        // leaves every sandbox untouched.
         None => anyhow::bail!(
             "image cache entry for '{image_ref}' ({digest}) is incomplete: no config.json. \
              It was cached by an older izba that did not record the image's runtime config, \
              so the image's declared PATH/Env cannot be applied and every bare command in the \
-             sandbox would fail with \"not found in $PATH\". \
-             Re-create the sandbox to re-pull the image (`izba rm <name>` then `izba create ...`)."
+             sandbox would fail with \"not found in $PATH\".\n\
+             Repair the image cache (this does NOT touch this sandbox or its data): create any \
+             sandbox from the same image — `izba create izba-cache-repair --image {image_ref}` \
+             — which re-pulls and records the missing config, then `izba rm izba-cache-repair` \
+             and start this sandbox again. For a locally built image, rebuild it with \
+             `izba build`. Do NOT `izba rm` this sandbox: that would discard its writable \
+             layer and any ephemeral volumes."
         ),
     }
 }
@@ -4401,10 +4411,16 @@ mod tests {
             msg.contains("ubuntu:24.04"),
             "message must name the image: {msg}"
         );
-        // ...and tells them how to fix it.
+        // ...points the repair at the IMAGE CACHE...
         assert!(
-            msg.contains("izba rm") || msg.contains("re-create"),
-            "message must be actionable: {msg}"
+            msg.contains("izba create") && msg.contains("izba build"),
+            "message must give a cache-repair path for both pulled and built images: {msg}"
+        );
+        // ...and never tells the user to destroy the sandbox to fix an image
+        // cache problem (`izba rm` deletes rw.img + ephemeral volumes).
+        assert!(
+            msg.contains("Do NOT `izba rm` this sandbox"),
+            "message must warn against the destructive recovery: {msg}"
         );
     }
 

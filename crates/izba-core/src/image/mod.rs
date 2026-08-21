@@ -115,12 +115,18 @@ pub fn ensure_image(paths: &Paths, image_ref: &str) -> Result<String> {
     // tag resolves AND the digest is cached (prevents a stale evicted tag from
     // silently winning over a fresh registry pull).
     //
-    // The gate is `is_complete`, NOT `is_cached`: an entry with a rootfs but no
-    // config.json cannot tell us the image's declared Env, and returning early
-    // here would skip the self-heal below and hand `start` a config-less entry
-    // (#222). Falling through re-resolves the manifest and heals it cheaply.
+    // The gate stays `is_cached` and must NOT be tightened to `is_complete`
+    // (#222 review): `image_ref` here is a LOCAL tag, so falling through hands
+    // that bare name to registry resolution. A remote repository of the same
+    // name would then silently substitute a different image for the locally
+    // tagged one, and with no such repository the local image becomes
+    // unusable. Tag precedence is a trust property; it outranks cache repair.
+    //
+    // A config-less tagged entry is instead caught loudly at start (see
+    // `sandbox::require_image_config`) — a locally built/tagged image has no
+    // registry to be healed from anyway, so the honest fix is to rebuild it.
     if let Some(digest) = tags::resolve_tag(paths, image_ref)? {
-        if ImageStore::new(paths).is_complete(&digest) {
+        if ImageStore::new(paths).is_cached(&digest) {
             return Ok(digest);
         }
     }
@@ -255,15 +261,18 @@ mod tests {
         assert_eq!(got, digest);
     }
 
-    /// #222: a tagged entry whose config.json is MISSING must NOT satisfy the
-    /// local-tag fast path. Returning it early skips the self-heal and hands
-    /// `start` an entry it cannot read the image's declared `Env` from, which
-    /// silently produces a container with no `PATH`. It must fall through to
-    /// the registry path instead (where the cheap self-heal lives) — asserted
-    /// the same way as `ensure_image_falls_through_when_tag_not_cached`: the
-    /// registry attempt fails offline, so it must NOT return the digest.
+    /// A local tag keeps precedence even when its entry is INCOMPLETE.
+    ///
+    /// Tempting fix for #222: gate the fast path on `is_complete` so a
+    /// config-less entry falls through and gets healed. That is wrong — the
+    /// bare local tag would be handed to registry resolution, letting a remote
+    /// repository of the same name SUBSTITUTE a different image for the
+    /// locally tagged one (and breaking the local image entirely when no such
+    /// repository exists). A locally built image has no registry to heal from
+    /// in the first place; the config-less case is caught loudly at start
+    /// instead (`sandbox::require_image_config`).
     #[test]
-    fn ensure_image_falls_through_when_tagged_entry_has_no_config() {
+    fn ensure_image_keeps_tag_precedence_even_when_entry_has_no_config() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_root(tmp.path().join("izba"));
         let digest = "sha256:".to_string() + &"d".repeat(64);
@@ -275,10 +284,12 @@ mod tests {
         assert!(store.is_cached(&digest), "layers are present");
         assert!(!store.is_complete(&digest), "but the config blob is not");
 
-        match ensure_image(&paths, "legacyimg") {
-            Ok(got) => panic!("must not short-circuit on a config-less entry, got {got}"),
-            Err(_) => { /* fell through to the registry path, as required */ }
-        }
+        // Offline: reaching the registry at all would fail, so returning the
+        // tagged digest also proves no network substitution was attempted.
+        assert_eq!(
+            ensure_image(&paths, "legacyimg").expect("the local tag must still win"),
+            digest
+        );
     }
 
     /// When a local tag exists but its digest is NOT cached, `ensure_image`
