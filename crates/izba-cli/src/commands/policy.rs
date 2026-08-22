@@ -1,9 +1,10 @@
 use anyhow::Context;
 use clap::Subcommand;
 use izba_core::daemon::egress::config::{
-    edit_policy_file, usbip_exposure_warning, Access, AllowEntry, EgressPolicyConfig, GitRule,
-    GitTarget, Protocol,
+    edit_policy_file, try_edit_policy_file, usbip_exposure_warning, Access, AllowEntry,
+    EgressPolicyConfig, GitRule, GitTarget, Protocol,
 };
+use izba_core::daemon::egress::inspect::InspectionTable;
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
 
@@ -18,6 +19,8 @@ pub enum PolicyCmd {
     /// (NOTE: the opposite default of `policy git allow`, which grants read-only unless --write). Every invocation echoes the effective access level granted.
     /// `*.HOST` matches exactly one subdomain label and `**.HOST` matches any depth; the apex HOST is never matched by a wildcard and needs its own entry.
     /// To actually block anything else, enforcement must be on (see `enforce`).
+    /// A grant that would extend a host's declared `protocol: tcp` pinning passthrough to a
+    /// port it does not already cover is REFUSED unless --passthrough acknowledges it.
     /// Auto-reloads a running sandbox.
     Allow {
         /// Sandbox name (or dir)
@@ -27,6 +30,12 @@ pub enum PolicyCmd {
         /// Restrict to read-only HTTP access (GET/HEAD only); default is read-write
         #[arg(long)]
         read: bool,
+        /// Acknowledge that the new port(s) inherit this host's declared `protocol: tcp`
+        /// pinning passthrough — spliced opaquely, with no L7 rules, no request audit and
+        /// no upstream certificate verification. Without it, such a grant is REFUSED.
+        /// Has no effect on a host that declares no passthrough.
+        #[arg(long)]
+        passthrough: bool,
     },
     /// Remove HOST from the allow-list. A bare HOST removes the web ports (80 + 443); HOST:PORT removes exactly that port; auto-reloads.
     /// `*.HOST` matches exactly one subdomain label and `**.HOST` matches any depth; the apex HOST is never matched by a wildcard and needs its own entry.
@@ -95,27 +104,21 @@ pub enum EnforceState {
 pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
     match cmd {
         PolicyCmd::Show { name } => show(paths, name),
-        PolicyCmd::Allow { name, target, read } => {
+        PolicyCmd::Allow {
+            name,
+            target,
+            read,
+            passthrough,
+        } => {
             let dir = require_sandbox_dir(paths, name)?;
             let (host, ports) = parse_target(target)?;
-            // One write: grant the port(s), then (only when --read) narrow the
-            // access verb, all in the same edit_policy_file closure. Folding
-            // both mutations into a single write matters here — splitting them
-            // across two `edit_policy_file` calls would leave a window where a
-            // crash between the writes persists the host at the WIDER
-            // read-write default, which is the wrong failure direction for a
-            // security-posture flag (#84 fix-wave finding 1).
-            let cfg = edit_policy_file(&dir, |cfg| {
-                for &port in &ports {
-                    cfg.allow(&host, port);
-                }
-                if *read {
-                    cfg.set_host_access(&host, Access::Read);
-                }
-            })?;
+            let (cfg, pinned) = apply_allow_edit(&dir, &host, &ports, *read, *passthrough)?;
             let granted: Vec<AllowEntry> =
                 cfg.entries_for_host(&host).into_iter().cloned().collect();
             print!("{}", render_allow_grant(&granted));
+            if let Some(notice) = pin_widening_notice(&host, &pinned) {
+                eprint!("{notice}");
+            }
             warn_usbip_exposure(paths, &cfg);
             maybe_reload(paths, name);
             Ok(0)
@@ -193,6 +196,130 @@ fn require_sandbox_dir(paths: &Paths, name: &str) -> anyhow::Result<std::path::P
         anyhow::bail!("no such sandbox: {name}");
     }
     Ok(dir)
+}
+
+/// The daemon-free core of `policy allow`: refuse-or-grant, persisted in ONE
+/// write. Returns the new config plus the ports that were added as pinning
+/// passthroughs (empty for every ordinary grant), so the caller can echo them.
+///
+/// One write: grant the port(s), then (only when `read`) narrow the access
+/// verb, all in the same closure. Folding both mutations into a single write
+/// matters here — splitting them across two `edit_policy_file` calls would
+/// leave a window where a crash between the writes persists the host at the
+/// WIDER read-write default, which is the wrong failure direction for a
+/// security-posture flag (#84 fix-wave finding 1).
+///
+/// The pinning-passthrough gate (#235) runs INSIDE that same closure, against
+/// the config the grant is about to mutate, and BEFORE any mutation — so a
+/// refusal leaves `policy.yaml` untouched (`try_edit_policy_file` writes
+/// nothing on `Err`). `protocol` is stored per-ENTRY while the hatch is
+/// semantically per-PORT, so appending a port to an entry declaring
+/// `protocol: tcp` hands that port an opaque splice the operator never named:
+/// no L7 rules, no request audit, no upstream certificate verification. That
+/// transition passes no other gate — `policy allow` deliberately bypasses the
+/// `izba diff`/`promote` weakening check (DP-6), `izba status` renders no
+/// egress posture, and `izba policy show` is not on this command's path — so
+/// this is the only place it can be caught. It therefore FAILS CLOSED: refused
+/// unless `passthrough` explicitly acknowledges it, and loud when it does.
+///
+/// Whether a port would newly become a passthrough is asked of
+/// `InspectionTable` and nothing else, so the answer is the datapath's own
+/// fold (last-wins supersession, wildcard exclusion) rather than a second
+/// reading of `protocol` — see `InspectionTable::widening_ports`. That table
+/// is deliberately blind to the access verb, so a `--read` grant on a
+/// hatch-carrying host is gated too, even though `access: read` cancels the
+/// splice at the router: the narrowing is one `policy allow` away from being
+/// undone, at which point the hatch springs to life on a port nobody named.
+pub(crate) fn apply_allow_edit(
+    sandbox_dir: &std::path::Path,
+    host: &str,
+    ports: &[u16],
+    read: bool,
+    passthrough: bool,
+) -> anyhow::Result<(EgressPolicyConfig, Vec<u16>)> {
+    let mut pinned: Vec<u16> = Vec::new();
+    let cfg = try_edit_policy_file(sandbox_dir, |cfg| {
+        let widened = InspectionTable::widening_ports(cfg, host, ports);
+        if !widened.is_empty() && !passthrough {
+            anyhow::bail!("{}", render_pin_refusal(host, &widened));
+        }
+        for &port in ports {
+            cfg.allow(host, port);
+        }
+        if read {
+            cfg.set_host_access(host, Access::Read);
+        }
+        pinned = widened;
+        Ok(())
+    })?;
+    Ok((cfg, pinned))
+}
+
+/// `port 8080` / `ports 80, 443`, so neither message reads as machine output.
+fn ports_phrase(ports: &[u16]) -> String {
+    let list = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ports.len() == 1 {
+        format!("port {list}")
+    } else {
+        format!("ports {list}")
+    }
+}
+
+/// `it`/`them` for a port list, so the follow-up clauses agree in number.
+fn them(ports: &[u16]) -> &'static str {
+    if ports.len() == 1 {
+        "it"
+    } else {
+        "them"
+    }
+}
+
+/// The refusal for an un-acknowledged hatch widening. Names the host, every
+/// port at stake, what those ports would lose, and both ways forward — the
+/// widening one and the inspected one.
+fn render_pin_refusal(host: &str, ports: &[u16]) -> String {
+    let phrase = ports_phrase(ports);
+    let them = them(ports);
+    format!(
+        "'{host}' declares `protocol: tcp` (a TLS-pinning passthrough), so granting \
+         {phrase} would splice {them} opaquely too: no L7 rules, no request audit, no \
+         upstream certificate verification. You declared that hatch for the ports the \
+         entry already lists, not for {phrase}.\n\
+         \n\
+         \x20 to add {phrase} as a pinning passthrough deliberately, re-run with \
+         --passthrough\n\
+         \x20 to keep {them} inspected, give {them} a separate entry in policy.yaml \
+         (`izba policy show` prints the current one) and `izba policy reload`"
+    )
+}
+
+/// Whether `policy allow` owes the operator a pinning-passthrough warning, and
+/// what it says. Split out of `run()` so the DECISION is unit-testable and not
+/// merely the wording: inverting it would make izba silent in exactly the case
+/// this gate exists for — a port that just became an opaque splice — while
+/// every renderer test still passed. Written to stderr by the caller, so it
+/// stands out from the grant echo without polluting stdout.
+fn pin_widening_notice(host: &str, pinned: &[u16]) -> Option<String> {
+    if pinned.is_empty() {
+        return None;
+    }
+    Some(render_pin_widening_warning(host, pinned))
+}
+
+/// The loud echo when `--passthrough` acknowledges the widening. `izba policy
+/// show` is otherwise the only surface that reveals a hatch, and it is not on
+/// this command's path — so this line carries that weight alone.
+fn render_pin_widening_warning(host: &str, ports: &[u16]) -> String {
+    format!(
+        "\u{26A0} {} added to '{host}' as a pinning passthrough, inherited from its \
+         declared `protocol: tcp`: spliced opaquely — no L7 rules, no request audit, \
+         no upstream certificate verification.\n",
+        ports_phrase(ports),
+    )
 }
 
 /// The daemon-free core of `policy block`: persist the port removal(s) to
@@ -422,6 +549,258 @@ mod tests {
         Ok(())
     }
 
+    // --- #235: `policy allow` must not silently widen a pinning passthrough ---
+
+    fn pinned_policy(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("policy.yaml"),
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        )
+        .unwrap();
+    }
+
+    /// The exact reported sequence. Without the opt-in flag the command
+    /// REFUSES, and the refusal is actionable: it names the host, the port
+    /// that would become an opaque splice, and the flag that declares it
+    /// deliberately.
+    #[test]
+    fn policy_allow_refuses_to_widen_a_pinning_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        pinned_policy(dir.path());
+        let before = std::fs::read(dir.path().join("policy.yaml")).unwrap();
+
+        let err = apply_allow_edit(dir.path(), "pinned.vendor.com", &[8080], false, false)
+            .expect_err("extending a declared hatch to a new port must not be silent");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pinned.vendor.com"),
+            "must name the host: {msg}"
+        );
+        assert!(msg.contains("8080"), "must name the port at stake: {msg}");
+        assert!(
+            msg.contains("--passthrough"),
+            "must name how to declare it deliberately: {msg}"
+        );
+
+        assert_eq!(
+            std::fs::read(dir.path().join("policy.yaml")).unwrap(),
+            before,
+            "a refusal must leave policy.yaml completely untouched — not even reserialized"
+        );
+    }
+
+    /// With the opt-in flag the grant lands AND the operator is told which
+    /// ports became passthroughs, so neither branch of the resolution is
+    /// silent.
+    #[test]
+    fn policy_allow_with_the_flag_widens_and_reports_the_pinned_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        pinned_policy(dir.path());
+
+        let (cfg, pinned) =
+            apply_allow_edit(dir.path(), "pinned.vendor.com", &[8080], false, true).unwrap();
+        assert_eq!(pinned, vec![8080], "the widened port must be reported back");
+        assert_eq!(
+            cfg.entries_for_host("pinned.vendor.com")[0].ports(),
+            vec![443, 8080],
+            "the grant must still land"
+        );
+    }
+
+    /// The end of the reported sequence, asserted where it actually bites:
+    /// the passthrough set the datapath consults. The refusal must leave 8080
+    /// OUT of it; the acknowledged grant puts it in, which is exactly the
+    /// transition `--passthrough` exists to make the operator say out loud.
+    #[test]
+    fn the_resulting_passthrough_set_matches_the_chosen_resolution() {
+        use izba_core::daemon::egress::inspect::InspectionTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        pinned_policy(dir.path());
+
+        apply_allow_edit(dir.path(), "pinned.vendor.com", &[8080], false, false)
+            .expect_err("refused");
+        let stored = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
+        assert!(
+            !InspectionTable::from_config(&stored).passthrough_host("pinned.vendor.com", 8080),
+            "a refused grant must leave 8080 inspected"
+        );
+
+        let (cfg, _) =
+            apply_allow_edit(dir.path(), "pinned.vendor.com", &[8080], false, true).unwrap();
+        assert!(
+            InspectionTable::from_config(&cfg).passthrough_host("pinned.vendor.com", 8080),
+            "the acknowledged grant is what actually pins 8080 — the operator was told so"
+        );
+    }
+
+    /// The flag gates ONLY the hatch. An ordinary host has nothing to
+    /// acknowledge, so the plain command keeps working untouched.
+    #[test]
+    fn policy_allow_on_an_undeclared_host_needs_no_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, pinned) =
+            apply_allow_edit(dir.path(), "plain.example.com", &[8080], false, false).unwrap();
+        assert!(pinned.is_empty(), "nothing was pinned: {pinned:?}");
+        assert_eq!(
+            cfg.entries_for_host("plain.example.com")[0].ports(),
+            vec![8080]
+        );
+    }
+
+    /// Re-running the same acknowledged grant is a no-op that reports nothing
+    /// — the flag must stay idempotent rather than re-warning about a port
+    /// the operator already exempted.
+    #[test]
+    fn policy_allow_with_the_flag_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        pinned_policy(dir.path());
+        apply_allow_edit(dir.path(), "pinned.vendor.com", &[8080], false, true).unwrap();
+
+        let (_, pinned) =
+            apply_allow_edit(dir.path(), "pinned.vendor.com", &[8080], false, true).unwrap();
+        assert!(
+            pinned.is_empty(),
+            "8080 already carried the hatch; nothing new to announce: {pinned:?}"
+        );
+    }
+
+    /// AC 5: this issue changes no stored shape. A policy carrying a
+    /// declaration must survive the refusal path AND the acknowledged path
+    /// with its `protocol:` intact and its parse unchanged.
+    #[test]
+    fn the_stored_policy_shape_is_unchanged_by_the_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        pinned_policy(dir.path());
+        apply_allow_edit(dir.path(), "pinned.vendor.com", &[8080], false, true).unwrap();
+
+        let yaml = std::fs::read_to_string(dir.path().join("policy.yaml")).unwrap();
+        assert!(
+            yaml.contains("protocol: tcp"),
+            "the declaration must survive the edit verbatim: {yaml}"
+        );
+        let reparsed = EgressPolicyConfig::from_yaml(&yaml).unwrap();
+        assert_eq!(
+            reparsed.to_yaml(),
+            yaml,
+            "the written file must round-trip byte-identically"
+        );
+    }
+
+    /// A bare `izba policy allow <pinned-host>` grants BOTH web ports, so the
+    /// refusal must name every one it would pin, not just the first.
+    #[test]
+    fn a_bare_host_refusal_names_every_port_it_would_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("policy.yaml"),
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [8443]\n    protocol: tcp\n",
+        )
+        .unwrap();
+
+        let err = apply_allow_edit(dir.path(), "pinned.vendor.com", &[80, 443], false, false)
+            .expect_err("both web ports would be pinned");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ports 80, 443"),
+            "must name every port it would pin, in the plural: {msg}"
+        );
+        assert!(
+            msg.contains("splice them opaquely"),
+            "the follow-up clauses must agree in number: {msg}"
+        );
+    }
+
+    /// The singular half of the same phrasing. Pinned separately so a
+    /// collapsed plural branch cannot pass by rendering one wording for both.
+    #[test]
+    fn a_single_port_refusal_reads_in_the_singular() {
+        let dir = tempfile::tempdir().unwrap();
+        pinned_policy(dir.path());
+
+        let err = apply_allow_edit(dir.path(), "pinned.vendor.com", &[8080], false, false)
+            .expect_err("8080 would be pinned");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("port 8080") && !msg.contains("ports 8080"),
+            "one port reads as `port 8080`, not `ports 8080`: {msg}"
+        );
+        assert!(
+            msg.contains("splice it opaquely"),
+            "the follow-up clauses must agree in number: {msg}"
+        );
+    }
+
+    /// The acknowledgement echo must state what the port actually loses, not
+    /// merely that something happened — `policy show`'s warning is otherwise
+    /// the only place that says it.
+    /// The call site's OWN decision, not just the wording: a grant that pinned
+    /// nothing must stay silent, and a grant that pinned something must not.
+    /// Inverting this is the whole defect the PR closes — silence exactly when
+    /// a port became an opaque splice — so it needs a test of its own rather
+    /// than riding on the renderer's.
+    #[test]
+    fn the_widening_notice_appears_only_when_a_port_was_pinned() {
+        assert!(
+            pin_widening_notice("pinned.vendor.com", &[]).is_none(),
+            "an ordinary grant pinned nothing and must say nothing"
+        );
+        let notice = pin_widening_notice("pinned.vendor.com", &[8080])
+            .expect("a pinned port must always be announced");
+        assert!(notice.contains("port 8080"), "{notice}");
+    }
+
+    #[test]
+    fn render_pin_widening_warning_names_what_is_lost() {
+        let out = render_pin_widening_warning("pinned.vendor.com", &[8080]);
+        assert!(
+            out.contains("pinned.vendor.com"),
+            "must name the host: {out}"
+        );
+        assert!(
+            out.contains("port 8080") && !out.contains("ports 8080"),
+            "must name the port, in the singular: {out}"
+        );
+        assert!(
+            render_pin_widening_warning("pinned.vendor.com", &[80, 443]).contains("ports 80, 443"),
+            "and in the plural when more than one port was pinned"
+        );
+        assert!(
+            out.contains("protocol: tcp"),
+            "must name the declaration it inherited: {out}"
+        );
+        assert!(
+            out.contains("certificate verification"),
+            "must state that upstream certificate verification is given up: {out}"
+        );
+        assert!(
+            out.contains("audit") || out.contains("L7"),
+            "must state that inspection is given up: {out}"
+        );
+    }
+
+    #[test]
+    fn parse_policy_allow_passthrough() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "izba",
+            "policy",
+            "allow",
+            "web",
+            "pinned.vendor.com:8080",
+            "--passthrough",
+        ])
+        .unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Allow {
+            passthrough, read, ..
+        }) = cli.cmd
+        else {
+            panic!("expected policy allow")
+        };
+        assert!(passthrough, "--passthrough must parse");
+        assert!(!read, "--read is independent of --passthrough");
+    }
+
     #[test]
     fn parse_policy_git_allow_write() {
         use clap::Parser;
@@ -604,7 +983,10 @@ mod tests {
         let cli =
             crate::Cli::try_parse_from(["izba", "policy", "allow", "web", "api.x.com", "--read"])
                 .unwrap();
-        let crate::Cmd::Policy(PolicyCmd::Allow { name, target, read }) = cli.cmd else {
+        let crate::Cmd::Policy(PolicyCmd::Allow {
+            name, target, read, ..
+        }) = cli.cmd
+        else {
             panic!("expected policy allow");
         };
         assert_eq!(name, "web");
@@ -736,6 +1118,7 @@ mod tests {
                 name: "web".into(),
                 target: "api.x.com".into(),
                 read: true,
+                passthrough: false,
             },
         )
         .unwrap();
@@ -754,6 +1137,7 @@ mod tests {
                 name: "web".into(),
                 target: "api.x.com".into(),
                 read: false,
+                passthrough: false,
             },
         )
         .unwrap();
@@ -773,6 +1157,7 @@ mod tests {
                 name: "web".into(),
                 target: "api.x.com:443".into(),
                 read: true,
+                passthrough: false,
             },
         )
         .unwrap();
@@ -782,6 +1167,7 @@ mod tests {
                 name: "web".into(),
                 target: "api.x.com:8443".into(),
                 read: false,
+                passthrough: false,
             },
         )
         .unwrap();
@@ -805,6 +1191,7 @@ mod tests {
                 name: "web".into(),
                 target: "api.x.com".into(),
                 read: false,
+                passthrough: false,
             },
         )
         .unwrap();
@@ -814,6 +1201,7 @@ mod tests {
                 name: "web".into(),
                 target: "api.x.com".into(),
                 read: true,
+                passthrough: false,
             },
         )
         .unwrap();
@@ -844,6 +1232,7 @@ mod tests {
                 name: "web".into(),
                 target: "api.x.com".into(),
                 read: true,
+                passthrough: false,
             },
         )
         .unwrap();
@@ -853,6 +1242,7 @@ mod tests {
                 name: "web".into(),
                 target: "API.X.COM".into(),
                 read: false,
+                passthrough: false,
             },
         )
         .unwrap();
@@ -1122,6 +1512,7 @@ mod tests {
                 name: "ghost".into(),
                 target: "example.com".into(),
                 read: false,
+                passthrough: false,
             },
             PolicyCmd::Block {
                 name: "ghost".into(),
@@ -1149,6 +1540,7 @@ mod tests {
                 name: "ghost".into(),
                 target: "example.com:notaport".into(),
                 read: false,
+                passthrough: false,
             },
             PolicyCmd::Block {
                 name: "ghost".into(),
