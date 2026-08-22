@@ -808,21 +808,27 @@ impl EgressPolicyConfig {
     /// verb — an exact host always has at most one matching entry after the
     /// collapse, so this reduces to the prior single-entry check there.
     ///
-    /// KNOWN SHARP EDGE: a declared `protocol` is stored per-ENTRY while the
-    /// `protocol: tcp` pinning hatch is semantically per-PORT
-    /// (`protocol_for`), so preserving the entry's declaration here (rather
-    /// than dropping it — see the sibling `block`/`set_host_access` fix for
-    /// why dropping is the worse failure) extends an existing `Some(Tcp)`
-    /// pin to the newly-added port too, even though the operator only named
-    /// it for the ports that existed when they wrote it. Resolving that
-    /// needs a per-port declaration shape, which is its own change (out of
-    /// scope here; carried in the M5 P1 plan's follow-up list, which Task 9
-    /// appends to the spec's §13). This is the lesser evil: silent deletion is
-    /// invisible everywhere, whereas this call mutates `policy.yaml`
-    /// directly and never passes the `izba.yml` diff/promote weakening gate
-    /// — `izba policy show` (once it lands) is the only surface that reveals
-    /// the widened hatch, so "lesser evil" is a narrower claim than "loud
-    /// everywhere that matters".
+    /// SHARP EDGE, GATED ONE LAYER UP (#235): a declared `protocol` is stored
+    /// per-ENTRY while the `protocol: tcp` pinning hatch is semantically
+    /// per-PORT (`protocol_for`), so preserving the entry's declaration here
+    /// (rather than dropping it — see the sibling `block`/`set_host_access`
+    /// fix for why dropping is the worse failure) extends an existing
+    /// `Some(Tcp)` pin to the newly-added port too, even though the operator
+    /// only named it for the ports that existed when they wrote it. Resolving
+    /// that IN THE STORED SHAPE needs a per-port declaration, which is still
+    /// its own change (out of scope here; carried in the spec's §13).
+    ///
+    /// What is no longer true is that the widening is silent. This mutator
+    /// keeps the declaration — that part is unchanged, and every caller still
+    /// gets it — but `izba policy allow` now refuses such a grant unless
+    /// `--passthrough` acknowledges it, and says so loudly when it does. The
+    /// gate lives at the CLI (`commands::policy::apply_allow_edit`), not here,
+    /// because it is a decision about an operator's intent, not about the data
+    /// model: a caller with no operator in front of it (policy seeding from
+    /// observed traffic, the GUI's `policy_allow`) must keep the mutator's
+    /// existing behaviour. What "would this grant newly pin a port?" MEANS is
+    /// answered by `InspectionTable::widening_ports` and nowhere else, so the
+    /// gate reads the datapath's own fold rather than re-deriving `protocol`.
     pub fn allow(&mut self, host: &str, port: u16) -> bool {
         self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
@@ -1247,8 +1253,27 @@ pub fn edit_policy_file(
     sandbox_dir: &Path,
     f: impl FnOnce(&mut EgressPolicyConfig),
 ) -> Result<EgressPolicyConfig> {
+    try_edit_policy_file(sandbox_dir, |cfg| {
+        f(cfg);
+        Ok(())
+    })
+}
+
+/// Fallible sibling of [`edit_policy_file`]: when `f` returns `Err`, NOTHING is
+/// written — `policy.yaml` is left exactly as it was found, byte for byte, not
+/// even reserialized.
+///
+/// That is what lets a refusal live INSIDE the edit rather than in front of it
+/// (#235): the check reads the very config the mutation is about to act on —
+/// no load-decide-reload window — and costs zero mutation when it says no.
+/// The plain [`edit_policy_file`] is this function with an infallible closure,
+/// so both paths share one write.
+pub fn try_edit_policy_file(
+    sandbox_dir: &Path,
+    f: impl FnOnce(&mut EgressPolicyConfig) -> Result<()>,
+) -> Result<EgressPolicyConfig> {
     let mut cfg = EgressPolicyConfig::load(sandbox_dir)?.unwrap_or_default();
-    f(&mut cfg);
+    f(&mut cfg)?;
     for (i, e) in cfg.allow.iter().enumerate() {
         validate_host_pattern(e.host()).with_context(|| format!("allow[{i}]"))?;
     }

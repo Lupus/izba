@@ -114,6 +114,39 @@ impl InspectionTable {
         }
     }
 
+    /// Which of `ports` granting `host` would newly turn into pinning
+    /// passthroughs — i.e. the ports that would land in the passthrough set
+    /// only because an EXISTING entry for `host` already declares
+    /// `protocol: tcp` (#235).
+    ///
+    /// Empty means the grant costs no inspection: either the host carries no
+    /// declared hatch, or every named port already had one.
+    ///
+    /// The answer is computed by comparing this table BEFORE and AFTER a
+    /// simulated `EgressPolicyConfig::allow`, so it is the same fold the
+    /// datapath consults — deliberately NOT a second reading of
+    /// `declared_protocol()`. The inspectability axis is computed in
+    /// `InspectionTable` and nowhere else (CLAUDE.md, M5 P1); a caller that
+    /// re-derived "is this host pinned?" for itself would be exactly the
+    /// third, independent fold whose earlier appearance opened a live
+    /// no-certificate-verification bypass. Going through `from_config` also
+    /// inherits last-wins supersession and the wildcard exclusion for free.
+    pub fn widening_ports(cfg: &EgressPolicyConfig, host: &str, ports: &[u16]) -> Vec<u16> {
+        let before = Self::from_config(cfg);
+        let mut after_cfg = cfg.clone();
+        for &port in ports {
+            after_cfg.allow(host, port);
+        }
+        let after = Self::from_config(&after_cfg);
+        ports
+            .iter()
+            .copied()
+            .filter(|&port| {
+                !before.passthrough_host(host, port) && after.passthrough_host(host, port)
+            })
+            .collect()
+    }
+
     /// Whether a connection to `port` is terminated and policed at L7.
     pub fn inspects(&self, port: u16) -> bool {
         self.inspect_ports.contains(&port)
@@ -149,6 +182,113 @@ mod tests {
 
     fn table(yaml: &str) -> InspectionTable {
         InspectionTable::from_config(&EgressPolicyConfig::from_yaml(yaml).expect("parses"))
+    }
+
+    // --- #235: which ports a grant would newly turn into pinning passthroughs ---
+
+    /// The exact reported sequence: an entry declaring `protocol: tcp` for
+    /// [443], then `izba policy allow pinned.vendor.com:8080`. The new port
+    /// lands in the passthrough set even though the operator only named the
+    /// hatch for 443 — `widening_ports` is what lets the caller say so.
+    #[test]
+    fn adding_a_port_to_a_pinned_entry_is_reported_as_widening() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            InspectionTable::widening_ports(&cfg, "pinned.vendor.com", &[8080]),
+            vec![8080],
+        );
+    }
+
+    /// A port whose inspectability is only DERIVED (no `protocol:` anywhere)
+    /// is not the operator's hatch, so granting it costs nothing to announce.
+    /// Guards an implementation that asked `protocol_for` (which derives
+    /// `tcp` off the web ports) instead of the table's declared-only fold.
+    #[test]
+    fn adding_a_port_to_an_undeclared_entry_is_not_widening() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: plain.example.com\n    ports: [443]\n",
+        )
+        .expect("parses");
+        assert!(
+            InspectionTable::widening_ports(&cfg, "plain.example.com", &[8080]).is_empty(),
+            "a derived tcp is a convenience, never a declared passthrough"
+        );
+    }
+
+    /// A port the pinned entry ALREADY names was exempted by the operator, so
+    /// re-granting it announces nothing new. Guards an implementation that
+    /// echoed back every requested port on a pinned host.
+    #[test]
+    fn re_adding_a_port_the_pinned_entry_already_names_is_not_widening() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        )
+        .expect("parses");
+        assert!(
+            InspectionTable::widening_ports(&cfg, "pinned.vendor.com", &[443]).is_empty(),
+            "443 already carried the hatch the operator declared"
+        );
+    }
+
+    /// A bare `izba policy allow <host>` grants BOTH web ports at once, so the
+    /// report must cover every port of the grant, not just the first.
+    #[test]
+    fn a_bare_host_grant_reports_every_newly_pinned_port() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [8443]\n    protocol: tcp\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            InspectionTable::widening_ports(&cfg, "pinned.vendor.com", &AllowEntry::DEFAULT_PORTS),
+            vec![80, 443],
+        );
+    }
+
+    /// A wildcard never registers a passthrough key (DP-3), so a grant against
+    /// one can never widen the hatch. Guards an implementation that peeked at
+    /// `declared_protocol()` directly and so skipped the wildcard exclusion
+    /// `from_config` applies.
+    #[test]
+    fn a_wildcard_host_grant_is_never_widening() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "*.vendor.com".into(),
+                ports: Some(vec![443]),
+                access: Access::ReadWrite,
+                protocol: Some(Protocol::Tcp),
+            }],
+            git: vec![],
+        };
+        assert!(
+            InspectionTable::widening_ports(&cfg, "*.vendor.com", &[8080]).is_empty(),
+            "a wildcard holds no passthrough key to widen"
+        );
+    }
+
+    /// The M5 P1 review's finding-1 shape: an earlier `protocol: tcp` entry
+    /// superseded by a later plain one for the same exact host. The winning
+    /// entry declares nothing, so the grant is not a widening — an
+    /// implementation that scanned for ANY matching entry would report one.
+    #[test]
+    fn a_superseded_tcp_declaration_is_not_a_widening() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443]\n\
+             \x20   protocol: tcp\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [9999]\n",
+        )
+        .expect("parses");
+        assert!(
+            InspectionTable::widening_ports(&cfg, "pinned.vendor.com", &[8080]).is_empty(),
+            "the winning entry for this host declares no hatch to widen"
+        );
     }
 
     // DP-1: the axis may only WIDEN against today's `matches!(port, 80 | 443)`.
