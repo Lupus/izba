@@ -116,8 +116,8 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             let granted: Vec<AllowEntry> =
                 cfg.entries_for_host(&host).into_iter().cloned().collect();
             print!("{}", render_allow_grant(&granted));
-            if !pinned.is_empty() {
-                eprint!("{}", render_pin_widening_warning(&host, &pinned));
+            if let Some(notice) = pin_widening_notice(&host, &pinned) {
+                eprint!("{notice}");
             }
             warn_usbip_exposure(paths, &cfg);
             maybe_reload(paths, name);
@@ -295,6 +295,19 @@ fn render_pin_refusal(host: &str, ports: &[u16]) -> String {
          \x20 to keep {them} inspected, give {them} a separate entry in policy.yaml \
          (`izba policy show` prints the current one) and `izba policy reload`"
     )
+}
+
+/// Whether `policy allow` owes the operator a pinning-passthrough warning, and
+/// what it says. Split out of `run()` so the DECISION is unit-testable and not
+/// merely the wording: inverting it would make izba silent in exactly the case
+/// this gate exists for — a port that just became an opaque splice — while
+/// every renderer test still passed. Written to stderr by the caller, so it
+/// stands out from the grant echo without polluting stdout.
+fn pin_widening_notice(host: &str, pinned: &[u16]) -> Option<String> {
+    if pinned.is_empty() {
+        return None;
+    }
+    Some(render_pin_widening_warning(host, pinned))
 }
 
 /// The loud echo when `--passthrough` acknowledges the widening. `izba policy
@@ -721,6 +734,22 @@ mod tests {
     /// The acknowledgement echo must state what the port actually loses, not
     /// merely that something happened — `policy show`'s warning is otherwise
     /// the only place that says it.
+    /// The call site's OWN decision, not just the wording: a grant that pinned
+    /// nothing must stay silent, and a grant that pinned something must not.
+    /// Inverting this is the whole defect the PR closes — silence exactly when
+    /// a port became an opaque splice — so it needs a test of its own rather
+    /// than riding on the renderer's.
+    #[test]
+    fn the_widening_notice_appears_only_when_a_port_was_pinned() {
+        assert!(
+            pin_widening_notice("pinned.vendor.com", &[]).is_none(),
+            "an ordinary grant pinned nothing and must say nothing"
+        );
+        let notice = pin_widening_notice("pinned.vendor.com", &[8080])
+            .expect("a pinned port must always be announced");
+        assert!(notice.contains("port 8080"), "{notice}");
+    }
+
     #[test]
     fn render_pin_widening_warning_names_what_is_lost() {
         let out = render_pin_widening_warning("pinned.vendor.com", &[8080]);
