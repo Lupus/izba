@@ -402,8 +402,28 @@ case below.
   `protocol: tcp` extends the hatch to a port the operator never named. P1
   preserves the declaration across that mutation rather than dropping it —
   dropping silently performs an unflagged `http → tcp` weakening, which is
-  worse — and pins the behaviour in a test. A per-port representation, or
-  refusing the mutation on a hatch-carrying host, would close it properly.
+  worse — and pins the behaviour in a test.
+
+  **Resolved for the operator-facing path (#235), still open in the stored
+  shape.** `izba policy allow` now REFUSES a grant that would newly pin a port,
+  unless `--passthrough` acknowledges it; the acknowledged path echoes which
+  ports became passthroughs and what they give up. Refuse-by-default beat
+  warn-only because this transition passes no other gate — `policy allow`
+  deliberately bypasses the `izba diff`/`promote` weakening check (DP-6),
+  `izba status` renders no egress posture, and `izba policy show` is not on the
+  command's path — so a warning on a stream the operator may not be reading
+  would be the product's *only* signal that inspection and upstream certificate
+  verification were dropped. It also matches izba's standing rule: never
+  silently downgrade a security control; fail closed, and bypass only via an
+  explicit flag plus a loud warning. Whether a grant widens the hatch is asked
+  of `InspectionTable::widening_ports` — the same fold the datapath consults —
+  so no second reading of `protocol` was introduced. The gate is at the CLI, so
+  non-operator callers (observed-traffic seeding, the GUI) are unchanged; the
+  GUI surfacing the hatch at all is tracked separately.
+
+  A per-port representation would still close the underlying shape mismatch —
+  it is the sibling issue, and landing it would make this gate unnecessary
+  rather than wrong.
 
 ---
 
