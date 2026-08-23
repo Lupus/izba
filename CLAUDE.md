@@ -227,8 +227,20 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   the initramfs via `IZBA_NFT` (`hack/build-nft.sh`) and applies the nat-output
   REDIRECT ruleset at boot. (passt/consomme/`izba.ipv4only` are GONE from the
   datapath as of M1 — all egress flows through izbad over vsock 1027.)
-- **Inspectability is DECLARED, not derived from the port (M5 P1):** an allow
-  entry carries `protocol: http | tcp`. The router's tier-1 gate is
+- **Inspectability is DECLARED per PORT, not derived from the port (M5 P1,
+  #238):** a `ports:` element carries `protocol: http | tcp` — a bare number
+  declares nothing and is inspected by default. The declaration lives on
+  `PortSpec` and NOWHERE else, so `EgressPolicyConfig::allow` (and every other
+  mutator, for every caller — CLI, GUI, observed-traffic seeding) appends a
+  port that structurally cannot inherit a sibling port's hatch. The pre-#238
+  ENTRY-level `protocol:` key is still accepted on input and still means "every
+  port of this entry"; `parse_allow_entry` normalizes it down onto the entry's
+  ports, so a shipped `policy.yaml` keeps its posture and the in-memory model
+  keeps a single representation. **Do not reintroduce an entry-level field:**
+  it was the shape that let a one-port grant silently drop L7 inspection and
+  upstream certificate verification, and the behavioural gate that mitigated it
+  (#235's `policy allow --passthrough`) is gone with it. The router's tier-1
+  gate is
   `policy.enforces() && policy.inspects(port)` (`router.rs`), not the old
   `matches!(port, 80 | 443)`. **The axis may only widen:** `inspects` always
   contains 80/443 — `Policy::inspects`'s default is
@@ -259,9 +271,13 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   record-fragmented hello, absent SNI, exhausted budget) fails CLOSED to
   termination. `manifest::diff` flags two `⚠ weakens egress` transitions: a
   newly-declared passthrough, and losing inspection on a still-reachable port.
-  `izba policy show` is the ONLY surface that reveals a hatch — `izba status`
-  renders no egress posture, and `izba policy allow` writes `policy.yaml`
-  without passing the diff/promote gate.
+  `izba policy show` is the ONLY surface that reveals a hatch, rendered against
+  the specific port carrying it — `izba status` renders no egress posture, and
+  `izba policy allow` writes `policy.yaml` without passing the diff/promote
+  gate (it can no longer open a hatch, so that gap is now only a reporting one).
+  The desktop policy editor marks a declared port but authors nothing; a hatch
+  is written by editing `policy.yaml` or through `izba.yml` + `izba diff`/
+  `izba promote`.
 - **Linux VMM confinement (MVP-C):** on Linux, cloud-hypervisor and virtiofsd
   launch **confined by default** — explicit `--seccomp true`, `--landlock`
   (Landlock v5+), virtiofsd `--sandbox namespace` (fallback `--sandbox chroot`),
