@@ -396,34 +396,42 @@ case below.
   `Incomplete` and so fails closed to termination, which breaks passthrough for
   a client that fragments. Rare in practice, honest in behaviour, worth fixing
   if a real client hits it.
-- **`protocol` is stored per-entry, but the hatch is per-port.** An entry
-  carries one `Option<Protocol>` covering all its ports, so
+- **`protocol` is stored per-entry, but the hatch is per-port. — RESOLVED
+  (#238).** An entry carried one `Option<Protocol>` covering all its ports, so
   `izba policy allow pinned.vendor.com:8080` on a host declaring
-  `protocol: tcp` extends the hatch to a port the operator never named. P1
-  preserves the declaration across that mutation rather than dropping it —
+  `protocol: tcp` extended the hatch to a port the operator never named. P1
+  preserved the declaration across that mutation rather than dropping it —
   dropping silently performs an unflagged `http → tcp` weakening, which is
-  worse — and pins the behaviour in a test.
+  worse — and pinned the behaviour in a test. #235 then closed the
+  operator-facing path behaviourally: `izba policy allow` REFUSED such a grant
+  unless `--passthrough` acknowledged it.
 
-  **Resolved for the operator-facing path (#235), still open in the stored
-  shape.** `izba policy allow` now REFUSES a grant that would newly pin a port,
-  unless `--passthrough` acknowledges it; the acknowledged path echoes which
-  ports became passthroughs and what they give up. Refuse-by-default beat
-  warn-only because this transition passes no other gate — `policy allow`
-  deliberately bypasses the `izba diff`/`promote` weakening check (DP-6),
-  `izba status` renders no egress posture, and `izba policy show` is not on the
-  command's path — so a warning on a stream the operator may not be reading
-  would be the product's *only* signal that inspection and upstream certificate
-  verification were dropped. It also matches izba's standing rule: never
-  silently downgrade a security control; fail closed, and bypass only via an
-  explicit flag plus a loud warning. Whether a grant widens the hatch is asked
-  of `InspectionTable::widening_ports` — the same fold the datapath consults —
-  so no second reading of `protocol` was introduced. The gate is at the CLI, so
-  non-operator callers (observed-traffic seeding, the GUI) are unchanged; the
-  GUI surfacing the hatch at all is tracked separately.
+  **#238 closed it structurally, and the #235 gate is gone with it.** The
+  declaration now lives on `PortSpec` — a `ports:` element is either a bare
+  number (nothing declared, inspected by default) or `{port, protocol}` — so
+  every mutator appends a port that carries no declaration and the widening is
+  **inexpressible** rather than refused. That matters because the behavioural
+  gate lived at ONE call site: the GUI's `policy_allow` (#258) and
+  observed-traffic seeding still widened, and each future mutation site was a
+  place the mitigation had to be remembered. `--passthrough` was removed as
+  dead surface (it shipped after `v0.1.0-rc1` and was never released), and with
+  it `InspectionTable::widening_ports`, whose only job was to report a
+  transition that can no longer occur.
 
-  A per-port representation would still close the underlying shape mismatch —
-  it is the sibling issue, and landing it would make this gate unnecessary
-  rather than wrong.
+  Backward compatibility is a parse-time normalization, not a second
+  representation: the pre-#238 ENTRY-level `protocol:` key is still accepted
+  and still means "every port of this entry", pushed down onto the entry's
+  ports by `parse_allow_entry` (materializing the default web ports when
+  `ports:` is omitted). A shipped `policy.yaml` therefore keeps its posture
+  verbatim, a legacy file and its per-port equivalent compare EQUAL through
+  `izba diff`, and the axis is still computed in `InspectionTable` and nowhere
+  else. `to_rego_data_json` is untouched (D6): `AllowEntry::ports()` still
+  answers in `u16`, and the byte-identity guard still passes.
+
+  Two P1 follow-ups above are narrowed by this, not closed: `izba policy allow
+  --protocol http|tcp` is still the missing AUTHORING surface (the command can
+  no longer open a hatch at all), and the superseded-declaration warning is
+  still a `policy lint` job.
 
 ---
 
