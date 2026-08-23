@@ -104,9 +104,22 @@ impl InspectionTable {
             // declaration was written against that port. There is no
             // entry-level declaration left to project onto the entry's other
             // ports, which is what made `allow`'s widening possible.
-            for spec in cfg.allow[*idx].port_specs() {
-                if spec.protocol == Some(Protocol::Tcp) {
-                    passthrough.insert((host.clone(), spec.port));
+            //
+            // Asks `declared_protocol_for` — the SAME per-entry primitive
+            // `inspect_ports` reaches through `protocol_for` just above, and
+            // the one `izba policy show` reports — rather than scanning the
+            // spec list for any `tcp`. A scan is a second reading of the axis,
+            // and it diverged: for a hand-constructed entry listing one port
+            // twice (`http` then `tcp`), `declared_protocol_for`'s `find`
+            // answers `http` while a scan registers the passthrough, so izbad
+            // spliced a port reported as inspected (PR #260, Greptile P1).
+            // `parse_allow_entry` now refuses that input, but this fold must
+            // not depend on the parser having been the only way in —
+            // `AllowEntry::Scoped`'s fields are public.
+            let e = &cfg.allow[*idx];
+            for port in e.ports() {
+                if e.declared_protocol_for(port) == Some(Protocol::Tcp) {
+                    passthrough.insert((host.clone(), port));
                 }
             }
         }

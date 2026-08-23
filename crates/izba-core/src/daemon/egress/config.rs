@@ -1107,6 +1107,40 @@ fn parse_ports(field: &str, v: &serde_yaml::Value) -> Result<Vec<PortSpec>> {
         .collect()
 }
 
+/// Collapse repeats in a parsed `ports:` list to one spec per port, refusing a
+/// port whose repeats DISAGREE (PR #260, Greptile P1).
+///
+/// Run AFTER the entry-level push-down, so a declaration the legacy shape
+/// supplies is compared too — `ports: [443, {port: 443, protocol: tcp}]` under
+/// an entry-level `protocol: http` is a genuine contradiction, and a check
+/// placed before the push-down would not see it.
+fn dedup_port_specs(field: &str, specs: Vec<PortSpec>) -> Result<Vec<PortSpec>> {
+    let mut out: Vec<PortSpec> = Vec::with_capacity(specs.len());
+    for s in specs {
+        let Some(prev) = out.iter().find(|p| p.port == s.port) else {
+            out.push(s);
+            continue;
+        };
+        if prev.protocol == s.protocol {
+            continue; // redundant, not ambiguous
+        }
+        let name = |p: Option<Protocol>| match p {
+            Some(Protocol::Http) => "protocol: http",
+            Some(Protocol::Tcp) => "protocol: tcp",
+            None => "no protocol",
+        };
+        anyhow::bail!(
+            "{field}: port {} is listed twice with different declarations \
+             ({} and {}) — one port cannot be both inspected at L7 and spliced \
+             opaquely. Name it once, with the declaration you mean.",
+            s.port,
+            name(prev.protocol),
+            name(s.protocol),
+        );
+    }
+    Ok(out)
+}
+
 /// One element of a `ports:` list: a bare number (nothing declared) or a
 /// `{port, protocol}` mapping (#238). Strict about its keys, like every other
 /// level of this walk (#138) — a typo'd `protokol:` silently dropping a
@@ -1206,6 +1240,21 @@ fn parse_allow_entry(ctx: &str, v: &serde_yaml::Value) -> Result<AllowEntry> {
                     }
                     Some(specs)
                 }
+            };
+
+            // One port, one answer. A `ports:` list that names the same port
+            // twice saying DIFFERENT things is a contradiction, and resolving
+            // it silently either way is how the two readings of the axis came
+            // apart: `declared_protocol_for` answers with the first spec while
+            // a fold scanning for any `tcp` would register a passthrough — so
+            // izbad would splice a port `izba policy show` calls inspected.
+            // Refuse instead, and name both declarations. Redundant duplicates
+            // (same answer, or no answer) are collapsed rather than refused,
+            // so a hand-edited `ports: [443, 443]` — and any legacy entry,
+            // whose push-down makes every copy agree — keeps parsing.
+            let ports = match ports {
+                None => None,
+                Some(specs) => Some(dedup_port_specs(&format!("{ctx}.ports"), specs)?),
             };
 
             // DP-3: the pinning hatch is keyed on the observed SNI, matched
@@ -4263,5 +4312,155 @@ mod tests {
             declared.to_rego_data_json("web"),
             "protocol is decided in Rust; the Rego data doc must be byte-identical"
         );
+    }
+
+    // --- Greptile P1 (PR #260): a port declared TWICE, contradictorily ---
+    //
+    // `parse_port_spec` kept every element of a `ports:` list, so one entry
+    // could name the same port twice with different declarations. The two
+    // readings of the axis then disagreed: `declared_protocol_for`'s `find`
+    // answered with the FIRST spec (`http`, reported as inspected) while
+    // `InspectionTable::from_config` registered a passthrough because SOME
+    // spec said `tcp` — the router spliced a port `izba policy show` called
+    // inspected, with no L7 rules, no request audit and no upstream
+    // certificate verification. Exactly the two-folds-disagree shape that
+    // opened the M5 P1 bypass, reintroduced through the new port list.
+
+    /// A contradiction is refused rather than silently resolved. Which of the
+    /// two the operator meant is unknowable, and both answers are wrong to
+    /// pick for them when one of them turns a security control off.
+    #[test]
+    fn a_port_declared_twice_with_conflicting_protocols_is_refused() {
+        let err = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports:\n\
+             \x20     - port: 443\n\
+             \x20       protocol: http\n\
+             \x20     - port: 443\n\
+             \x20       protocol: tcp\n",
+        )
+        .expect_err("a port cannot be both inspected and spliced");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("allow[0].ports"), "{msg}");
+        assert!(msg.contains("443"), "must name the port at stake: {msg}");
+        assert!(
+            msg.contains("http") && msg.contains("tcp"),
+            "must name both declarations so the operator can pick: {msg}"
+        );
+    }
+
+    /// The same contradiction with only ONE of the two spelled out: a bare
+    /// duplicate carries no declaration, but the entry-level push-down gives
+    /// it one, and that one conflicts. Guards a check placed BEFORE the
+    /// push-down, which would miss this.
+    #[test]
+    fn a_duplicate_port_conflicting_via_the_entry_level_push_down_is_refused() {
+        let err = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   protocol: http\n\
+             \x20   ports:\n\
+             \x20     - 443\n\
+             \x20     - port: 443\n\
+             \x20       protocol: tcp\n",
+        )
+        .expect_err("the pushed-down http conflicts with the explicit tcp");
+        assert!(format!("{err:#}").contains("443"));
+    }
+
+    /// A duplicate that says the SAME thing is not a contradiction, just
+    /// redundant — collapse it. This keeps a hand-edited `ports: [443, 443]`
+    /// parsing exactly as it always did: refusing it would turn an
+    /// upgrade into a sandbox that no longer starts, over a file that was
+    /// never ambiguous.
+    #[test]
+    fn a_redundant_duplicate_port_collapses_instead_of_being_refused() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: h.example.com\n    ports: [443, 443]\n",
+        )
+        .expect("a repeated port with no declaration is redundant, not ambiguous");
+        assert_eq!(cfg.allow[0].ports(), vec![443], "collapsed to one");
+    }
+
+    /// The legacy shape can produce a repeated port too, and its push-down
+    /// makes every copy agree — so it must collapse, never be refused. No
+    /// shipped `policy.yaml` may stop parsing on upgrade.
+    #[test]
+    fn a_legacy_entry_with_a_repeated_port_still_parses() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443, 443]\n\
+             \x20   protocol: tcp\n",
+        )
+        .expect("the pre-#238 shape must keep parsing");
+        assert_eq!(cfg.allow[0].ports(), vec![443]);
+        assert_eq!(
+            cfg.allow[0].declared_protocol_for(443),
+            Some(Protocol::Tcp),
+            "and keep its meaning"
+        );
+    }
+
+    /// The end of the reported sequence: whatever survives parse, the two
+    /// readings of the axis must agree. Asserted over the pair that diverged.
+    #[test]
+    fn the_reported_and_effective_inspectability_never_disagree() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports:\n\
+             \x20     - port: 443\n\
+             \x20       protocol: http\n",
+        )
+        .expect("parses");
+        let t = crate::daemon::egress::inspect::InspectionTable::from_config(&cfg);
+        assert_eq!(
+            cfg.allow[0].declared_protocol_for(443),
+            Some(Protocol::Http)
+        );
+        assert!(
+            !t.passthrough_host("pinned.vendor.com", 443),
+            "a port reported as inspected must not be in the passthrough set"
+        );
+    }
+
+    /// `AllowEntry::Scoped`'s fields are public, so a conflicting duplicate
+    /// can be BUILT in Rust even though the parser now refuses it — the same
+    /// necessity behind `wildcard_collapse_never_propagates_a_hand_constructed_tcp_declaration`.
+    /// The fold must not diverge from `declared_protocol_for` there either:
+    /// it reads that one answer rather than scanning for any `tcp`.
+    /// Do NOT "simplify" this into a `from_yaml` test — the parser refuses
+    /// the input before this path is reached.
+    #[test]
+    fn a_hand_constructed_conflicting_duplicate_never_opens_the_hatch() {
+        let cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "pinned.vendor.com".into(),
+                ports: Some(vec![
+                    declared(443, Protocol::Http),
+                    declared(443, Protocol::Tcp),
+                ]),
+                access: Access::ReadWrite,
+            }],
+            git: vec![],
+        };
+        assert_eq!(
+            cfg.allow[0].declared_protocol_for(443),
+            Some(Protocol::Http),
+            "the effective answer is the first spec"
+        );
+        let t = crate::daemon::egress::inspect::InspectionTable::from_config(&cfg);
+        assert!(
+            !t.passthrough_host("pinned.vendor.com", 443),
+            "the passthrough fold must agree with it, not scan for any tcp"
+        );
+        assert!(!t.has_passthrough());
     }
 }
