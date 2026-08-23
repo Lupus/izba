@@ -221,24 +221,30 @@ export interface EndpointSummary {
   last_path: string | null;
 }
 
+/** One authorized port, mirroring Rust's `PortSpec` (#238). A port carrying no
+ *  declaration serializes as a BARE NUMBER on the Rust side, so that is the
+ *  shape the GUI must send back for it — emitting `{port: N}` would rewrite a
+ *  policy file into a shape its author never wrote. */
+export type PortSpec = number | { port: number; protocol?: "http" | "tcp" };
+
 /** Untagged on the Rust side: a bare host is a string, a scoped host an object.
- *  `ports` is OPTIONAL: the backend serializes `ports: Option<Vec<u16>>` with
- *  `skip_serializing_if = "Option::is_none"`, so a scoped entry whose ports
- *  equal the web defaults comes back with NO `ports` field. A missing `ports`
- *  means the web defaults (matching Rust's `AllowEntry::ports()`).
+ *  `ports` is OPTIONAL: the backend serializes `ports: Option<Vec<PortSpec>>`
+ *  with `skip_serializing_if = "Option::is_none"`, so a scoped entry whose
+ *  ports equal the web defaults comes back with NO `ports` field. A missing
+ *  `ports` means the web defaults (matching Rust's `AllowEntry::ports()`).
  *
- *  `protocol` is likewise OPTIONAL and likewise `skip_serializing_if =
- *  "Option::is_none"` on the Rust side (`AllowEntry::Scoped.protocol`, the M5
- *  inspectability axis — `http` means izbad terminates and polices this entry
- *  at L7, an explicit `tcp` is the documented TLS-pinning passthrough). The
- *  GUI has NO authoring surface for this field (that stays in `policy.yaml` /
- *  `izba.yml` + `izba diff`/`promote`, which is also where a weakening from
- *  `http` to `tcp` is flagged) — but a value it *read* MUST survive a Save it
- *  did not intend to change: dropping it here silently disables L7
- *  enforcement outside the diff/promote gate (F-1). */
-export type AllowEntry =
-  | string
-  | { host: string; ports?: number[]; access?: Access; protocol?: "http" | "tcp" };
+ *  `protocol` is the M5 inspectability axis — `http` means izbad terminates
+ *  and polices that port at L7, an explicit `tcp` is the documented
+ *  TLS-pinning passthrough — and since #238 it hangs off the PORT, not the
+ *  entry: a port with no declaration is inspected by default, and no mutation
+ *  can hand it one belonging to a sibling port. The GUI has no authoring
+ *  surface for it (that stays in `policy.yaml` / `izba.yml` + `izba diff`/
+ *  `promote`, which is also where a weakening from `http` to `tcp` is
+ *  flagged) — but a value it *read* MUST survive a Save it did not intend to
+ *  change, against the same port it was read from: dropping it silently
+ *  disables L7 enforcement outside the diff/promote gate (F-1), and moving it
+ *  silently disables L7 enforcement on a port nobody exempted (#238/#258). */
+export type AllowEntry = string | { host: string; ports?: PortSpec[]; access?: Access };
 
 export type Access = "read" | "read-write";
 

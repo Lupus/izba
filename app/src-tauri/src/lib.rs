@@ -1157,12 +1157,18 @@ mod dispatch_tests {
         )
         .unwrap();
         let allow = shown["allow"].as_array().unwrap();
+        // #238: the declaration comes back attached to the PORT, whichever
+        // shape it went in as — the legacy entry-level key above is
+        // normalized down onto the entry's ports at parse. Asserting the
+        // per-port shape here is what pins that a Save cannot move a
+        // declaration onto a port the operator never named.
         let internal = allow
             .iter()
             .find(|e| e["host"] == "internal.example.com")
             .expect("internal.example.com entry survives the round trip");
         assert_eq!(
-            internal["protocol"], "http",
+            internal["ports"],
+            serde_json::json!([{"port": 8000, "protocol": "http"}]),
             "an explicit http declaration on a non-web port must round-trip: {shown}"
         );
         let pinned = allow
@@ -1170,7 +1176,8 @@ mod dispatch_tests {
             .find(|e| e["host"] == "pinned.vendor.com")
             .expect("pinned.vendor.com entry survives the round trip");
         assert_eq!(
-            pinned["protocol"], "tcp",
+            pinned["ports"],
+            serde_json::json!([{"port": 443, "protocol": "tcp"}]),
             "an explicit tcp (pinning passthrough) declaration on 443 must round-trip: {shown}"
         );
 

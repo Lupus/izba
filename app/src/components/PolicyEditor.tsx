@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
-import type { Access, AllowEntry, GitRule } from "../lib/types";
+import type { Access, AllowEntry, GitRule, PortSpec } from "../lib/types";
 import { api } from "../lib/ipc";
 import { WEB_DEFAULT_PORTS } from "../lib/ports";
 import { AccessPicker } from "./AccessPicker";
@@ -11,16 +11,21 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { EditableList } from "@/components/ui/editable-list";
 
+/** One port of a Row, with the inspectability declared FOR THAT PORT (#238).
+ *  `protocol` is carried through unedited (F-1): the GUI has no authoring
+ *  surface for it, but a value it read must survive a Save that did not touch
+ *  it — and must survive against its OWN port, never spread to a sibling.
+ *  `undefined` for a port that never declared one; that must round-trip as a
+ *  bare number, not as some invented default. */
+interface PortRow {
+  port: number;
+  protocol?: "http" | "tcp";
+}
+
 interface Row {
   host: string;
-  ports: number[];
+  ports: PortRow[];
   access: Access;
-  /** The declared inspectability, carried through unedited (F-1): the GUI has
-   *  no authoring surface for this field, but a value it read must survive a
-   *  Save that did not touch it. `undefined` for an entry that never
-   *  declared one — that must round-trip WITHOUT the key, not as some
-   *  invented default. */
-  protocol?: "http" | "tcp";
 }
 
 interface GitRow {
@@ -38,16 +43,44 @@ function toGitRow(rule: GitRule): GitRow {
   return { target: gitRuleTarget(rule), access: rule.access ?? "read" };
 }
 
+/** A wire `PortSpec` (bare number, or `{port, protocol}`) as a `PortRow`. */
+function toPortRow(p: PortSpec): PortRow {
+  return typeof p === "number" ? { port: p } : { port: p.port, protocol: p.protocol };
+}
+
+/** The inverse. A port with no declaration goes back as a BARE NUMBER, which
+ *  is what the Rust `PortSpec` serializes to — so an untouched policy file is
+ *  not rewritten into a shape its author never wrote. */
+function toPortSpec(p: PortRow): PortSpec {
+  return p.protocol ? { port: p.port, protocol: p.protocol } : p.port;
+}
+
+const webDefaultPortRows = (): PortRow[] => WEB_DEFAULT_PORTS.map((port) => ({ port }));
+
 /** Normalize an `AllowEntry` (string = bare host → web default ports) to a Row. */
 function toRow(e: AllowEntry): Row {
   return typeof e === "string"
-    ? { host: e, ports: [...WEB_DEFAULT_PORTS], access: "read-write" }
+    ? { host: e, ports: webDefaultPortRows(), access: "read-write" }
     : {
         host: e.host,
-        ports: e.ports ?? [...WEB_DEFAULT_PORTS],
+        ports: e.ports?.map(toPortRow) ?? webDefaultPortRows(),
         access: e.access ?? "read-write",
-        protocol: e.protocol,
       };
+}
+
+/** How a declared port is announced, for both the chip's accessible name and
+ *  its tooltip. `tcp` is the one value that gives a security control up, so it
+ *  says exactly which controls — `izba policy show` carries the same weight on
+ *  the CLI side and uses the same wording. */
+function portDeclarationLabel(p: PortRow): string | null {
+  switch (p.protocol) {
+    case "tcp":
+      return `Port ${p.port}: TLS-pinning passthrough — spliced opaquely, with no L7 rules, no request audit and no upstream certificate verification`;
+    case "http":
+      return `Port ${p.port}: inspected at L7 (declared protocol: http)`;
+    default:
+      return null;
+  }
 }
 
 /** Convert a target string and access into a GitRule. */
@@ -80,7 +113,7 @@ function PortEditor({
   onAdd,
   onRemove,
 }: {
-  ports: number[];
+  ports: PortRow[];
   onAdd: (port: number) => void;
   onRemove: (port: number) => void;
 }) {
@@ -98,7 +131,7 @@ function PortEditor({
       setErr("Enter a port between 1 and 65535.");
       return;
     }
-    if (ports.includes(p)) {
+    if (ports.some((x) => x.port === p)) {
       setErr(`Port ${p} is already added.`);
       return;
     }
@@ -109,22 +142,37 @@ function PortEditor({
   return (
     <div className="flex flex-1 flex-col gap-1">
       <div className="flex flex-wrap items-center gap-1">
-        {ports.map((p) => (
-          <Badge key={p} variant="secondary" className="gap-1">
-            {p}
-            {/* Intentional in-chip remove button — distinct from row-level RemoveRowButton idiom */}
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label={`Remove port ${p}`}
-              onClick={() => onRemove(p)}
-              className="h-3.5 w-3.5 p-0 text-muted-foreground-2 hover:text-destructive"
+        {ports.map((p) => {
+          const declaration = portDeclarationLabel(p);
+          return (
+            <Badge
+              key={p.port}
+              variant={p.protocol === "tcp" ? "warning" : "secondary"}
+              className="gap-1"
             >
-              <X className="h-3 w-3" />
-            </Button>
-          </Badge>
-        ))}
+              {p.port}
+              {/* #238: the declaration belongs to THIS port, so its marker does
+                  too — a host-level annotation would misreport which port gave
+                  a control up. Undeclared ports render exactly as before. */}
+              {declaration && (
+                <span aria-label={declaration} title={declaration}>
+                  {p.protocol === "tcp" ? "⚠ tcp" : "http"}
+                </span>
+              )}
+              {/* Intentional in-chip remove button — distinct from row-level RemoveRowButton idiom */}
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label={`Remove port ${p.port}`}
+                onClick={() => onRemove(p.port)}
+                className="h-3.5 w-3.5 p-0 text-muted-foreground-2 hover:text-destructive"
+              >
+                <X className="h-3 w-3" />
+              </Button>
+            </Badge>
+          );
+        })}
         <Input
           value={draft}
           onChange={(e) => {
@@ -219,17 +267,21 @@ export function PolicyEditor({ name }: { name: string }) {
   function addPort(i: number, port: number) {
     editHosts((rs) =>
       rs.map((r, j) =>
-        j === i && !r.ports.includes(port)
-          ? { ...r, ports: [...r.ports, port].sort((a, b) => a - b) }
+        // The added port carries NO declaration (#238) — it is inspected by
+        // default and cannot inherit a sibling port's `protocol: tcp`.
+        j === i && !r.ports.some((p) => p.port === port)
+          ? { ...r, ports: [...r.ports, { port }].sort((a, b) => a.port - b.port) }
           : r,
       ),
     );
   }
   function removePort(i: number, port: number) {
-    editHosts((rs) => rs.map((r, j) => (j === i ? { ...r, ports: r.ports.filter((p) => p !== port) } : r)));
+    editHosts((rs) =>
+      rs.map((r, j) => (j === i ? { ...r, ports: r.ports.filter((p) => p.port !== port) } : r)),
+    );
   }
   function addRow() {
-    editHosts((rs) => [...rs, { host: "", ports: [...WEB_DEFAULT_PORTS], access: "read-write" }]);
+    editHosts((rs) => [...rs, { host: "", ports: webDefaultPortRows(), access: "read-write" }]);
   }
   function removeRow(i: number) {
     editHosts((rs) => rs.filter((_, j) => j !== i));
@@ -273,13 +325,13 @@ export function PolicyEditor({ name }: { name: string }) {
         .filter((r) => r.host.trim() !== "")
         .map((r) => ({
           host: r.host.trim(),
-          ports: r.ports,
+          // A port that never declared anything goes back as a bare number
+          // (F-1 / #238): the GUI must not invent a declaration, and on the
+          // Rust side the bare form IS the canonical "no declaration" shape.
+          // A port added here is a `PortRow` with no `protocol`, so it can
+          // never leave carrying a sibling's declaration.
+          ports: r.ports.map(toPortSpec),
           access: r.access,
-          // Omit the key entirely for a row that never had one (F-1): the
-          // GUI must not invent a declaration, and the Rust side's
-          // `skip_serializing_if = "Option::is_none"` means the key's
-          // ABSENCE is the canonical "no declaration" shape.
-          ...(r.protocol ? { protocol: r.protocol } : {}),
         }));
       const git: GitRule[] = gitRows
         .filter((r) => r.target.trim() !== "")
