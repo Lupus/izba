@@ -61,6 +61,67 @@ pub enum Protocol {
     Tcp,
 }
 
+/// One authorized port, carrying the inspectability the operator declared FOR
+/// THAT PORT — or `None` when they declared nothing and the effective value is
+/// derived (`Protocol::implied_for_port`).
+///
+/// **The hatch is per-PORT, and so is its declaration (#238).** It used to be
+/// a property of the whole [`AllowEntry`], which meant every port of that entry
+/// inherited it: granting an entry declaring `protocol: tcp` one more port
+/// handed the new port an opaque splice — no L7 rules, no request audit, no
+/// upstream certificate verification — that the operator never named. Storing
+/// the declaration beside the port it describes makes that widening
+/// **inexpressible**: a port added by any mutator carries no declaration of its
+/// own, so it is inspected by default, and the set of ports carrying a hatch is
+/// exactly the set someone wrote one for.
+///
+/// Serializes as a BARE NUMBER when nothing is declared (see the `Serialize`
+/// impl), so a `policy.yaml` that never mentions `protocol:` round-trips
+/// byte-identically through an izba upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortSpec {
+    pub port: u16,
+    /// Stored as an `Option` on purpose: only an EXPLICIT `Some(Tcp)` opens
+    /// the pinning passthrough, so a value derived from a port number can
+    /// never turn inspection off (D12).
+    pub protocol: Option<Protocol>,
+}
+
+impl PortSpec {
+    /// A port with no declaration — what every mutator appends, and what a
+    /// bare number in a `ports:` list parses to.
+    pub const fn bare(port: u16) -> Self {
+        Self {
+            port,
+            protocol: None,
+        }
+    }
+
+    /// Undeclared specs for a plain list of port numbers.
+    pub fn bare_list(ports: &[u16]) -> Vec<Self> {
+        ports.iter().copied().map(Self::bare).collect()
+    }
+}
+
+/// A bare number when nothing is declared, a `{port, protocol}` mapping when
+/// something is. The bare form is what keeps an existing `ports: [80, 443]`
+/// from being rewritten into a shape its author never wrote (and is why this
+/// impl is hand-written rather than derived).
+impl Serialize for PortSpec {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self.protocol {
+            None => s.serialize_u16(self.port),
+            Some(p) => {
+                let mut m = s.serialize_struct("PortSpec", 2)?;
+                m.serialize_field("port", &self.port)?;
+                m.serialize_field("protocol", &p)?;
+                m.end()
+            }
+        }
+    }
+}
+
 /// One entry in a sandbox's egress allow-list: either a bare host (which
 /// authorizes the default web ports) or a host scoped to explicit ports/access.
 ///
@@ -73,6 +134,16 @@ pub enum Protocol {
 /// forbids it) and any unknown key, on ANY ingestion path that deserializes a
 /// bare `AllowEntry`/`Vec<AllowEntry>` directly (e.g. the GUI's
 /// `serde_json::from_value::<Vec<AllowEntry>>`), not just the YAML walk.
+///
+/// There is NO entry-level `protocol` field: the axis lives on [`PortSpec`]
+/// (#238). The pre-#238 entry-level `protocol:` KEY is still accepted on input
+/// and means exactly what it always did — it is normalized down onto the
+/// entry's ports by `parse_allow_entry`, so a shipped `policy.yaml` keeps its
+/// posture while the in-memory model has a single, per-port representation of
+/// the declaration. One representation is the point: the axis is computed in
+/// `InspectionTable` and nowhere else, and a second place for `protocol` to
+/// live is exactly the shape that opened a live no-certificate-verification
+/// bypass during M5 P1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum AllowEntry {
@@ -82,15 +153,9 @@ pub enum AllowEntry {
     Scoped {
         host: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        ports: Option<Vec<u16>>,
+        ports: Option<Vec<PortSpec>>,
         #[serde(default, skip_serializing_if = "is_default_access")]
         access: Access,
-        /// The declared inspectability, or `None` for "derive from the port".
-        /// Stored as an `Option` on purpose: only an EXPLICIT `Some(Tcp)` opens
-        /// the pinning passthrough, so a value derived from a port number can
-        /// never turn inspection off (D12).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        protocol: Option<Protocol>,
     },
 }
 
@@ -133,15 +198,24 @@ impl AllowEntry {
         }
     }
 
-    /// The ports this entry authorizes: `[80, 443]` for a bare host or when
-    /// ports are omitted, else the explicit set (which REPLACES the default).
-    pub fn ports(&self) -> Vec<u16> {
+    /// The ports this entry authorizes, with each port's declaration attached:
+    /// `[80, 443]` undeclared for a bare host or when ports are omitted, else
+    /// the explicit set (which REPLACES the default).
+    pub fn port_specs(&self) -> Vec<PortSpec> {
         match self {
-            AllowEntry::Host(_) => AllowEntry::DEFAULT_PORTS.to_vec(),
+            AllowEntry::Host(_) => PortSpec::bare_list(&AllowEntry::DEFAULT_PORTS),
             AllowEntry::Scoped { ports, .. } => ports
                 .clone()
-                .unwrap_or_else(|| AllowEntry::DEFAULT_PORTS.to_vec()),
+                .unwrap_or_else(|| PortSpec::bare_list(&AllowEntry::DEFAULT_PORTS)),
         }
+    }
+
+    /// The ports this entry authorizes, declarations dropped. This is the
+    /// REACHABILITY view — what `to_rego_data_json` compiles — and it is
+    /// deliberately unchanged by #238 so the Rego data document stays
+    /// byte-identical (D6).
+    pub fn ports(&self) -> Vec<u16> {
+        self.port_specs().iter().map(|s| s.port).collect()
     }
 
     /// The access verb for this entry.
@@ -152,30 +226,35 @@ impl AllowEntry {
         }
     }
 
-    /// The inspectability the operator wrote, if any. `None` means the entry
-    /// says nothing and the effective value is derived per port.
-    pub fn declared_protocol(&self) -> Option<Protocol> {
-        match self {
-            AllowEntry::Host(_) => None,
-            AllowEntry::Scoped { protocol, .. } => *protocol,
-        }
+    /// The inspectability the operator wrote FOR `port`, if any. `None` means
+    /// nothing was declared for it and the effective value is derived.
+    ///
+    /// A port this entry does not authorize has no declaration to report, so
+    /// the answer is `None` — an entry never speaks for a port outside its own
+    /// list (#238). That is the narrow, safe direction: the only way to get
+    /// `Some(Tcp)` back is for someone to have written it against that exact
+    /// port.
+    pub fn declared_protocol_for(&self, port: u16) -> Option<Protocol> {
+        self.port_specs()
+            .iter()
+            .find(|s| s.port == port)
+            .and_then(|s| s.protocol)
     }
 
     /// Effective inspectability for `port`: the declared value when there is
     /// one, else `http` on the default web ports and `tcp` anywhere else.
     ///
-    /// Takes any `u16` with NO membership check against `self.ports()` —
-    /// reachability is a separate axis, decided by Rego (D1), not by this
-    /// method. The caller is responsible for having already established that
-    /// `port` is one this entry actually authorizes; calling this on a port
-    /// the entry does not list still answers (derived `tcp` off the default
-    /// web ports), it just answers a question nobody should be asking yet.
+    /// Reachability is a separate axis, decided by Rego (D1), not by this
+    /// method — the caller is responsible for having already established that
+    /// `port` is one this entry actually authorizes. Calling this on a port
+    /// the entry does not list still answers, with the derived value, since an
+    /// unlisted port carries no declaration.
     ///
     /// Derivation is per-PORT, not per-entry, so `ports: [443, 5432]` is
     /// inspected on 443 and spliced on 5432 with nothing declared — the entry
     /// never has to carry one answer for two different kinds of port.
     pub fn protocol_for(&self, port: u16) -> Protocol {
-        self.declared_protocol()
+        self.declared_protocol_for(port)
             .unwrap_or_else(|| Protocol::implied_for_port(port))
     }
 }
@@ -409,10 +488,44 @@ impl EgressPolicyConfig {
     /// regardless of what any parser enforces, and this fold can only ever
     /// answer `Some(Http)` or `None` — never propagate a `Some(Tcp)` it
     /// happened to see on an input entry.
-    fn union_wildcard_protocol(&self, idxs: &[usize]) -> Option<Protocol> {
+    fn union_wildcard_protocol(&self, idxs: &[usize], port: u16) -> Option<Protocol> {
         idxs.iter()
-            .any(|&i| self.allow[i].declared_protocol() == Some(Protocol::Http))
+            .any(|&i| self.allow[i].declared_protocol_for(port) == Some(Protocol::Http))
             .then_some(Protocol::Http)
+    }
+
+    /// Merge several normalize-equal entries' port lists into one, unioning
+    /// the ports and, per port, unioning their declarations
+    /// (`union_wildcard_protocol`). Used only on the wildcard branches, where
+    /// duplicates grant independently and last-wins would delete real grants.
+    fn union_wildcard_port_specs(&self, idxs: &[usize]) -> Vec<PortSpec> {
+        let mut ports: Vec<u16> = idxs.iter().flat_map(|&i| self.allow[i].ports()).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+            .into_iter()
+            .map(|port| PortSpec {
+                port,
+                protocol: self.union_wildcard_protocol(idxs, port),
+            })
+            .collect()
+    }
+
+    /// Canonical order for a rewritten `ports:` list: ascending, one entry per
+    /// port. `policy.yaml` is operator-editable, so `[443, 80]` is ordinary
+    /// input and must canonicalize to the same shape `[80, 443]` does —
+    /// otherwise a rewrite would leave `[443, 80]` in place while an
+    /// order-sensitive comparison (the default-ports normalization just below,
+    /// `manifest::diff`'s equality) called it different.
+    ///
+    /// The sort moves whole `PortSpec`s, so a declaration travels with its own
+    /// port rather than with its index. A duplicate port keeps the FIRST
+    /// occurrence's declaration, which is the one `declared_protocol_for`'s
+    /// `find` already answers with — dedup here changes no lookup.
+    fn canonical_port_specs(mut specs: Vec<PortSpec>) -> Vec<PortSpec> {
+        specs.sort_by_key(|s| s.port); // stable: equal ports keep their order
+        specs.dedup_by_key(|s| s.port); // keeps the first of each run
+        specs
     }
 
     /// Collapse normalize-equal duplicate entries in `self.allow`. A legacy
@@ -478,23 +591,20 @@ impl EgressPolicyConfig {
                     // each still enforce their own ports independently.
                     continue;
                 }
-                let mut ports: Vec<u16> =
-                    idxs.iter().flat_map(|&i| self.allow[i].ports()).collect();
-                ports.sort_unstable();
-                ports.dedup();
                 // Union direction, mirroring how ports/access already union
                 // rather than pick an arbitrary single duplicate: silently
                 // dropping a declared `Http` here would be exactly the
                 // `⚠ weakens egress` transition the spec calls out, performed
-                // with no flag by a routine collapse.
-                let protocol = self.union_wildcard_protocol(idxs);
+                // with no flag by a routine collapse. Since #238 the union is
+                // taken PER PORT, so a declaration on one duplicate's port
+                // never lands on a port only another duplicate granted.
+                let ports = self.union_wildcard_port_specs(idxs);
                 winners.push((
                     idxs[0],
                     AllowEntry::Scoped {
                         host: key.clone(),
                         ports: Some(ports),
                         access: first_access,
-                        protocol,
                     },
                 ));
                 drop.extend(idxs.iter().skip(1).copied());
@@ -504,16 +614,10 @@ impl EgressPolicyConfig {
             let last = *idxs.last().expect("idxs.len() > 1");
             let winner = match &self.allow[last] {
                 AllowEntry::Host(_) => AllowEntry::Host(key.clone()),
-                AllowEntry::Scoped {
-                    ports,
-                    access,
-                    protocol,
-                    ..
-                } => AllowEntry::Scoped {
+                AllowEntry::Scoped { ports, access, .. } => AllowEntry::Scoped {
                     host: key.clone(),
                     ports: ports.clone(),
                     access: *access,
-                    protocol: *protocol,
                 },
             };
             winners.push((first, winner));
@@ -601,21 +705,12 @@ impl EgressPolicyConfig {
                 host: normalized,
                 ports: None,
                 access,
-                protocol: None,
             });
             return true;
         }
         if idxs.iter().all(|&i| self.allow[i].access() == access) {
             return false;
         }
-
-        let mut ports: Vec<u16> = idxs.iter().flat_map(|&i| self.allow[i].ports()).collect();
-        ports.sort_unstable();
-        ports.dedup();
-        let ports = match ports {
-            p if p == AllowEntry::DEFAULT_PORTS.to_vec() => None,
-            p => Some(p),
-        };
 
         // This rewrite serves TWO shapes through one path (review NEW-1),
         // and each needs its own fold to agree with how
@@ -634,17 +729,22 @@ impl EgressPolicyConfig {
         //    duplicate but the last one, exactly the finding-1 defect this
         //    round exists to close; use the same union fold
         //    `collapse_duplicate_hosts`'s wildcard branch uses instead.
-        let protocol = if is_wildcard_host(&normalized) {
-            self.union_wildcard_protocol(&idxs)
+        let ports = if is_wildcard_host(&normalized) {
+            self.union_wildcard_port_specs(&idxs)
         } else {
-            self.allow[*idxs.last().expect("idxs is non-empty here")].declared_protocol()
+            Self::canonical_port_specs(
+                self.allow[*idxs.last().expect("idxs is non-empty here")].port_specs(),
+            )
         };
+        // An entry whose ports are exactly the undeclared default set writes
+        // no `ports:` key at all — but only when nothing is declared on them,
+        // since dropping the list would drop the declarations with it.
+        let ports = (ports != PortSpec::bare_list(&AllowEntry::DEFAULT_PORTS)).then_some(ports);
         let first = idxs[0];
         self.allow[first] = AllowEntry::Scoped {
             host: normalized,
             ports,
             access,
-            protocol,
         };
         let drop: std::collections::HashSet<usize> = idxs[1..].iter().copied().collect();
         let mut i = 0;
@@ -808,27 +908,26 @@ impl EgressPolicyConfig {
     /// verb — an exact host always has at most one matching entry after the
     /// collapse, so this reduces to the prior single-entry check there.
     ///
-    /// SHARP EDGE, GATED ONE LAYER UP (#235): a declared `protocol` is stored
-    /// per-ENTRY while the `protocol: tcp` pinning hatch is semantically
-    /// per-PORT (`protocol_for`), so preserving the entry's declaration here
+    /// THE SHARP EDGE THIS USED TO HAVE, AND WHY IT IS GONE (#238): a declared
+    /// `protocol` was stored per-ENTRY while the `protocol: tcp` pinning hatch
+    /// is semantically per-PORT, so preserving the entry's declaration here
     /// (rather than dropping it — see the sibling `block`/`set_host_access`
-    /// fix for why dropping is the worse failure) extends an existing
+    /// fix for why dropping is the worse failure) extended an existing
     /// `Some(Tcp)` pin to the newly-added port too, even though the operator
-    /// only named it for the ports that existed when they wrote it. Resolving
-    /// that IN THE STORED SHAPE needs a per-port declaration, which is still
-    /// its own change (out of scope here; carried in the spec's §13).
+    /// only named it for the ports that existed when they wrote it. #235
+    /// answered that behaviourally, by refusing the grant at the CLI unless
+    /// `--passthrough` acknowledged it; every OTHER mutation site that could
+    /// grow a port list — the GUI's `policy_allow` (#258), observed-traffic
+    /// seeding — was a place the same mitigation had to be re-applied and
+    /// could be forgotten.
     ///
-    /// What is no longer true is that the widening is silent. This mutator
-    /// keeps the declaration — that part is unchanged, and every caller still
-    /// gets it — but `izba policy allow` now refuses such a grant unless
-    /// `--passthrough` acknowledges it, and says so loudly when it does. The
-    /// gate lives at the CLI (`commands::policy::apply_allow_edit`), not here,
-    /// because it is a decision about an operator's intent, not about the data
-    /// model: a caller with no operator in front of it (policy seeding from
-    /// observed traffic, the GUI's `policy_allow`) must keep the mutator's
-    /// existing behaviour. What "would this grant newly pin a port?" MEANS is
-    /// answered by `InspectionTable::widening_ports` and nowhere else, so the
-    /// gate reads the datapath's own fold rather than re-deriving `protocol`.
+    /// The declaration now lives on [`PortSpec`], so the newly-added port
+    /// carries NO declaration of its own and is inspected by default. The
+    /// widening is not warned about, refused or acknowledged — it is
+    /// **inexpressible**, for every caller, with no gate to remember. The set
+    /// of ports carrying a hatch is exactly the set someone wrote one for; a
+    /// hatch is authored by editing `policy.yaml` or through `izba.yml` +
+    /// `izba diff`/`izba promote`, which is also where the weakening gate is.
     pub fn allow(&mut self, host: &str, port: u16) -> bool {
         self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
@@ -845,24 +944,21 @@ impl EgressPolicyConfig {
             .iter_mut()
             .find(|e| normalize_policy_host(e.host()) == normalized)
         {
-            let mut ports = entry.ports();
-            ports.push(port);
-            ports.sort_unstable();
+            let mut ports = entry.port_specs();
+            ports.push(PortSpec::bare(port));
+            let ports = Self::canonical_port_specs(ports);
             let access = entry.access();
-            let protocol = entry.declared_protocol();
             *entry = AllowEntry::Scoped {
                 host: normalized,
                 ports: Some(ports),
                 access,
-                protocol,
             };
             true
         } else {
             self.allow.push(AllowEntry::Scoped {
                 host: normalized,
-                ports: Some(vec![port]),
+                ports: Some(vec![PortSpec::bare(port)]),
                 access: Access::ReadWrite,
-                protocol: None,
             });
             true
         }
@@ -888,23 +984,24 @@ impl EgressPolicyConfig {
             if normalize_policy_host(e.host()) != normalized {
                 continue;
             }
-            let mut ports = e.ports();
-            if !ports.contains(&port) {
+            let mut ports = e.port_specs();
+            if !ports.iter().any(|s| s.port == port) {
                 // This entry never granted `port` -- leave it COMPLETELY
                 // untouched (including its original host spelling). A
                 // no-op `block` must mutate nothing, matching the
                 // changed-bool contract: `false` means zero state change.
                 continue;
             }
-            ports.retain(|p| *p != port);
+            // The removed port takes its own declaration with it; every
+            // surviving port keeps exactly the one it had. Revoking a grant
+            // can never widen the hatch.
+            ports.retain(|s| s.port != port);
             changed = true;
             let access = e.access();
-            let protocol = e.declared_protocol();
             *e = AllowEntry::Scoped {
                 host: normalized.clone(),
                 ports: Some(ports),
                 access,
-                protocol,
             };
         }
         if changed {
@@ -996,7 +1093,7 @@ fn as_port(field: &str, v: &serde_yaml::Value) -> Result<u16> {
     )
 }
 
-fn parse_ports(field: &str, v: &serde_yaml::Value) -> Result<Vec<u16>> {
+fn parse_ports(field: &str, v: &serde_yaml::Value) -> Result<Vec<PortSpec>> {
     let serde_yaml::Value::Sequence(items) = v else {
         anyhow::bail!(
             "{field}: expected a list of port numbers, got {}",
@@ -1006,8 +1103,29 @@ fn parse_ports(field: &str, v: &serde_yaml::Value) -> Result<Vec<u16>> {
     items
         .iter()
         .enumerate()
-        .map(|(j, p)| as_port(&format!("{field}[{j}]"), p))
+        .map(|(j, p)| parse_port_spec(&format!("{field}[{j}]"), p))
         .collect()
+}
+
+/// One element of a `ports:` list: a bare number (nothing declared) or a
+/// `{port, protocol}` mapping (#238). Strict about its keys, like every other
+/// level of this walk (#138) — a typo'd `protokol:` silently dropping a
+/// declaration would be a security footgun in the quiet direction.
+fn parse_port_spec(field: &str, v: &serde_yaml::Value) -> Result<PortSpec> {
+    let serde_yaml::Value::Mapping(m) = v else {
+        return Ok(PortSpec::bare(as_port(field, v)?));
+    };
+    let mut port = None;
+    let mut protocol = None;
+    for (k, val) in m {
+        match key_str(field, k)?.as_str() {
+            "port" => port = Some(as_port(&format!("{field}.port"), val)?),
+            "protocol" => protocol = Some(parse_protocol(&format!("{field}.protocol"), val)?),
+            other => anyhow::bail!("{field}: unknown key '{other}' (valid keys: port, protocol)"),
+        }
+    }
+    let port = port.ok_or_else(|| anyhow::anyhow!("{field}: missing required key 'port'"))?;
+    Ok(PortSpec { port, protocol })
 }
 
 fn parse_access(field: &str, v: &serde_yaml::Value) -> Result<Access> {
@@ -1069,12 +1187,38 @@ fn parse_allow_entry(ctx: &str, v: &serde_yaml::Value) -> Result<AllowEntry> {
             }
             let host = host.ok_or_else(|| anyhow::anyhow!("{ctx}: missing required key 'host'"))?;
             validate_host_pattern(&host).with_context(|| ctx.to_string())?;
+
+            // Normalize the pre-#238 entry-level `protocol:` DOWN onto the
+            // entry's ports, so the in-memory model has exactly one place a
+            // declaration can live. The key keeps meaning what it always
+            // meant — "this applies to every port of this entry" — so a
+            // shipped `policy.yaml` keeps its posture verbatim; a port that
+            // declares something itself keeps its own, narrower answer.
+            // Materializing the default web ports here is what lets
+            // `ports:`-less legacy entry carry the declaration forward.
+            let ports = match protocol {
+                None => ports,
+                Some(declared) => {
+                    let mut specs =
+                        ports.unwrap_or_else(|| PortSpec::bare_list(&AllowEntry::DEFAULT_PORTS));
+                    for s in &mut specs {
+                        s.protocol.get_or_insert(declared);
+                    }
+                    Some(specs)
+                }
+            };
+
             // DP-3: the pinning hatch is keyed on the observed SNI, matched
             // EXACTLY. Honouring it for a wildcard would mean a second
             // implementation of the wildcard semantics that live in
             // egress.rego, and a divergence between the two is exactly the
-            // shape of a security bug. Refuse, and name the fix.
-            if protocol == Some(Protocol::Tcp) && is_wildcard_host(&normalize_policy_host(&host)) {
+            // shape of a security bug. Refuse, and name the fix. Checked AFTER
+            // the push-down above, so the entry-level spelling of the same
+            // declaration is refused by this one guard too.
+            let declares_tcp = ports
+                .as_deref()
+                .is_some_and(|specs| specs.iter().any(|s| s.protocol == Some(Protocol::Tcp)));
+            if declares_tcp && is_wildcard_host(&normalize_policy_host(&host)) {
                 anyhow::bail!(
                     "{ctx}: 'protocol: tcp' (the TLS-pinning passthrough) needs an exact \
                      host, but '{host}' is a wildcard pattern — the hatch is matched against the \
@@ -1085,7 +1229,6 @@ fn parse_allow_entry(ctx: &str, v: &serde_yaml::Value) -> Result<AllowEntry> {
                 host,
                 ports,
                 access,
-                protocol,
             })
         }
         other => anyhow::bail!(
@@ -1263,11 +1406,16 @@ pub fn edit_policy_file(
 /// written — `policy.yaml` is left exactly as it was found, byte for byte, not
 /// even reserialized.
 ///
-/// That is what lets a refusal live INSIDE the edit rather than in front of it
-/// (#235): the check reads the very config the mutation is about to act on —
-/// no load-decide-reload window — and costs zero mutation when it says no.
-/// The plain [`edit_policy_file`] is this function with an infallible closure,
-/// so both paths share one write.
+/// That is what lets a refusal live INSIDE the edit rather than in front of it:
+/// the check reads the very config the mutation is about to act on — no
+/// load-decide-reload window — and costs zero mutation when it says no. The
+/// plain [`edit_policy_file`] is this function with an infallible closure, so
+/// both paths share one write.
+///
+/// Introduced for #235's pinning-passthrough refusal, which #238 removed by
+/// making the widening inexpressible rather than refusable. Kept because the
+/// property is general: any future policy edit that must be able to say no
+/// belongs here rather than in front of the load.
 pub fn try_edit_policy_file(
     sandbox_dir: &Path,
     f: impl FnOnce(&mut EgressPolicyConfig) -> Result<()>,
@@ -1322,9 +1470,8 @@ mod usbip_exposure_tests {
             AllowEntry::Host("github.com".into()),
             AllowEntry::Scoped {
                 host: "10.1.0.124".into(),
-                ports: Some(vec![8080, 443]),
+                ports: Some(PortSpec::bare_list(&[8080, 443])),
                 access: Access::default(),
-                protocol: None,
             },
         ]);
         assert!(usbip_exposure_warning(&cfg, None).is_none());
@@ -1343,9 +1490,8 @@ mod usbip_exposure_tests {
     fn explicit_usbip_port_warns_and_recommends_the_device_allowlist() {
         let cfg = cfg_with(vec![AllowEntry::Scoped {
             host: "10.1.0.124".into(),
-            ports: Some(vec![3240]),
+            ports: Some(PortSpec::bare_list(&[3240])),
             access: Access::default(),
-            protocol: None,
         }]);
         let msg = usbip_exposure_warning(&cfg, None).expect("must warn");
         assert!(msg.contains("10.1.0.124:3240"), "{msg}");
@@ -1363,9 +1509,8 @@ mod usbip_exposure_tests {
     fn configured_upstream_on_a_nonstandard_port_warns() {
         let cfg = cfg_with(vec![AllowEntry::Scoped {
             host: "172.30.96.1".into(),
-            ports: Some(vec![4000]),
+            ports: Some(PortSpec::bare_list(&[4000])),
             access: Access::default(),
-            protocol: None,
         }]);
         let up = Some(("172.30.96.1".parse().unwrap(), 4000));
         let msg = usbip_exposure_warning(&cfg, up).expect("must warn");
@@ -1374,9 +1519,8 @@ mod usbip_exposure_tests {
         // A different host on that port is not the configured upstream.
         let other = cfg_with(vec![AllowEntry::Scoped {
             host: "10.9.9.9".into(),
-            ports: Some(vec![4000]),
+            ports: Some(PortSpec::bare_list(&[4000])),
             access: Access::default(),
-            protocol: None,
         }]);
         assert!(usbip_exposure_warning(&other, up).is_none());
     }
@@ -1386,16 +1530,14 @@ mod usbip_exposure_tests {
         let cfg = cfg_with(vec![
             AllowEntry::Scoped {
                 host: "a.example".into(),
-                ports: Some(vec![3240]),
+                ports: Some(PortSpec::bare_list(&[3240])),
                 access: Access::default(),
-                protocol: None,
             },
             AllowEntry::Host("github.com".into()),
             AllowEntry::Scoped {
                 host: "b.example".into(),
-                ports: Some(vec![443, 3240]),
+                ports: Some(PortSpec::bare_list(&[443, 3240])),
                 access: Access::default(),
-                protocol: None,
             },
         ]);
         let msg = usbip_exposure_warning(&cfg, None).expect("must warn");
@@ -1409,6 +1551,16 @@ mod usbip_exposure_tests {
 mod tests {
     use super::*;
     use crate::daemon::egress::policy::{FlowDesc, Verdict};
+
+    /// A port carrying an explicit declaration, for hand-constructed configs.
+    /// (`PortSpec::bare` is the undeclared counterpart, and is production
+    /// code because every mutator appends one.)
+    fn declared(port: u16, protocol: Protocol) -> PortSpec {
+        PortSpec {
+            port,
+            protocol: Some(protocol),
+        }
+    }
 
     #[test]
     fn parses_bare_host_as_default_web_ports() {
@@ -1432,9 +1584,8 @@ mod tests {
             allow: vec![
                 AllowEntry::Scoped {
                     host: "api.x.com".into(),
-                    ports: Some(vec![443]),
+                    ports: Some(PortSpec::bare_list(&[443])),
                     access: Access::Read,
-                    protocol: None,
                 },
                 AllowEntry::Host("other.com".into()),
             ],
@@ -1457,15 +1608,13 @@ mod tests {
             allow: vec![
                 AllowEntry::Scoped {
                     host: "*.x.com".into(),
-                    ports: Some(vec![443]),
+                    ports: Some(PortSpec::bare_list(&[443])),
                     access: Access::Read,
-                    protocol: None,
                 },
                 AllowEntry::Scoped {
                     host: "*.x.com".into(),
-                    ports: Some(vec![8443]),
+                    ports: Some(PortSpec::bare_list(&[8443])),
                     access: Access::ReadWrite,
-                    protocol: None,
                 },
             ],
             git: vec![],
@@ -1482,9 +1631,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "db.internal".into(),
-                ports: Some(vec![5432]),
+                ports: Some(PortSpec::bare_list(&[5432])),
                 access: Access::ReadWrite,
-                protocol: None,
             }]
         );
         assert_eq!(cfg.allow[0].ports(), vec![5432]);
@@ -1501,9 +1649,8 @@ mod tests {
             cfg.allow[1],
             AllowEntry::Scoped {
                 host: "registry.internal".into(),
-                ports: Some(vec![443, 5000]),
+                ports: Some(PortSpec::bare_list(&[443, 5000])),
                 access: Access::ReadWrite,
-                protocol: None,
             }
         );
     }
@@ -1514,9 +1661,8 @@ mod tests {
             AllowEntry::Host("api.anthropic.com".into()),
             AllowEntry::Scoped {
                 host: "db.internal".into(),
-                ports: Some(vec![5432]),
+                ports: Some(PortSpec::bare_list(&[5432])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
         ];
         let yaml = serde_yaml::to_string(&entries).unwrap();
@@ -1563,9 +1709,8 @@ mod tests {
                 AllowEntry::Host("api.anthropic.com".into()),
                 AllowEntry::Scoped {
                     host: "db.internal".into(),
-                    ports: Some(vec![5432]),
+                    ports: Some(PortSpec::bare_list(&[5432])),
                     access: Access::ReadWrite,
-                    protocol: None,
                 },
             ],
             git: vec![],
@@ -1621,9 +1766,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             }]
         );
         // Idempotent: allowing an already-authorized port is a no-op.
@@ -1642,9 +1786,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: Some(vec![80, 443, 8080]),
+                ports: Some(PortSpec::bare_list(&[80, 443, 8080])),
                 access: Access::ReadWrite,
-                protocol: None,
             }]
         );
     }
@@ -1658,9 +1801,8 @@ mod tests {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::Read,
-                protocol: None,
             }],
             git: vec![],
         };
@@ -1669,9 +1811,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: Some(vec![80, 443]),
+                ports: Some(PortSpec::bare_list(&[80, 443])),
                 access: Access::Read,
-                protocol: None,
             }],
             "adding a port must not clobber the entry's existing access"
         );
@@ -1689,9 +1830,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: Some(vec![80]),
+                ports: Some(PortSpec::bare_list(&[80])),
                 access: Access::ReadWrite,
-                protocol: None,
             }]
         );
         assert!(
@@ -1713,9 +1853,8 @@ mod tests {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: Some(vec![80, 443]),
+                ports: Some(PortSpec::bare_list(&[80, 443])),
                 access: Access::Read,
-                protocol: None,
             }],
             git: vec![],
         };
@@ -1724,9 +1863,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::Read,
-                protocol: None,
             }],
             "removing a port must not clobber the remaining entry's access"
         );
@@ -1740,9 +1878,8 @@ mod tests {
                 AllowEntry::Host("api.x.com".into()),
                 AllowEntry::Scoped {
                     host: "db.internal".into(),
-                    ports: Some(vec![5432]),
+                    ports: Some(PortSpec::bare_list(&[5432])),
                     access: Access::ReadWrite,
-                    protocol: None,
                 },
             ],
             git: vec![],
@@ -1776,9 +1913,8 @@ mod tests {
                 AllowEntry::Host("api.x.com".into()),
                 AllowEntry::Scoped {
                     host: "db.internal".into(),
-                    ports: Some(vec![5432]),
+                    ports: Some(PortSpec::bare_list(&[5432])),
                     access: Access::Read,
-                    protocol: None,
                 },
             ],
             git: vec![],
@@ -1892,7 +2028,6 @@ mod tests {
                 host: "pypi.org".into(),
                 ports: None,
                 access: Access::Read,
-                protocol: None,
             }],
             git: vec![GitRule {
                 target: GitTarget::Repo("github.com/o/a".into()),
@@ -1923,7 +2058,6 @@ mod tests {
                     host: "pypi.org".into(),
                     ports: None,
                     access: Access::Read,
-                    protocol: None,
                 },
             ],
             git: vec![GitRule {
@@ -2051,9 +2185,8 @@ mod tests {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "db.internal".into(),
-                ports: Some(vec![5432]),
+                ports: Some(PortSpec::bare_list(&[5432])),
                 access: Access::ReadWrite,
-                protocol: None,
             }],
             git: vec![],
         };
@@ -2067,9 +2200,8 @@ mod tests {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "db.internal".into(),
-                ports: Some(vec![5432]),
+                ports: Some(PortSpec::bare_list(&[5432])),
                 access: Access::Read,
-                protocol: None,
             }],
             git: vec![],
         };
@@ -2089,9 +2221,8 @@ mod tests {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "ssh.internal".into(),
-                ports: Some(vec![22]),
+                ports: Some(PortSpec::bare_list(&[22])),
                 access: Access::ReadWrite,
-                protocol: None,
             }],
             git: vec![],
         };
@@ -2104,19 +2235,19 @@ mod tests {
         assert_eq!(cfg.allow[0].access(), Access::Read);
     }
 
+    /// The same normalization from a hand-edited file whose ports are out of
+    /// order. `policy.yaml` is operator-editable, so `ports: [443, 80]` is a
+    /// perfectly ordinary input, and it means exactly what `[80, 443]` means —
+    /// the canonical form must not depend on the order someone typed. Pins the
+    /// sort+dedup the per-port rewrite (#238) must keep doing.
     #[test]
-    fn set_host_access_normalizes_default_ports_to_none() {
-        // A host carrying exactly the default web ports must normalize back to
-        // `ports: None` (the canonical default form) on an access change, so the
-        // file never pins [80, 443] explicitly. A guard forced to `false` would
-        // keep `Some([80, 443])`.
+    fn set_host_access_normalizes_out_of_order_default_ports_to_none() {
         let mut cfg = EgressPolicyConfig {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "web.internal".into(),
-                ports: Some(vec![80, 443]),
+                ports: Some(PortSpec::bare_list(&[443, 80])),
                 access: Access::ReadWrite,
-                protocol: None,
             }],
             git: vec![],
         };
@@ -2127,7 +2258,57 @@ mod tests {
                 host: "web.internal".into(),
                 ports: None,
                 access: Access::Read,
-                protocol: None,
+            },
+            "the canonical form must not depend on the order the ports were typed"
+        );
+    }
+
+    /// A declaration must survive the reordering, attached to its own port —
+    /// the sort must move the whole `PortSpec`, not just the numbers.
+    #[test]
+    fn set_host_access_sort_carries_each_ports_declaration_with_it() {
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "pinned.vendor.com".into(),
+                ports: Some(vec![declared(8443, Protocol::Tcp), PortSpec::bare(443)]),
+                access: Access::ReadWrite,
+            }],
+            git: vec![],
+        };
+        assert!(cfg.set_host_access("pinned.vendor.com", Access::Read));
+        let e = &cfg.allow[0];
+        assert_eq!(e.ports(), vec![443, 8443], "sorted");
+        assert_eq!(
+            e.declared_protocol_for(8443),
+            Some(Protocol::Tcp),
+            "the declaration must travel with its port, not with its index"
+        );
+        assert_eq!(e.declared_protocol_for(443), None);
+    }
+
+    #[test]
+    fn set_host_access_normalizes_default_ports_to_none() {
+        // A host carrying exactly the default web ports must normalize back to
+        // `ports: None` (the canonical default form) on an access change, so the
+        // file never pins [80, 443] explicitly. A guard forced to `false` would
+        // keep `Some([80, 443])`.
+        let mut cfg = EgressPolicyConfig {
+            enforce: true,
+            allow: vec![AllowEntry::Scoped {
+                host: "web.internal".into(),
+                ports: Some(PortSpec::bare_list(&[80, 443])),
+                access: Access::ReadWrite,
+            }],
+            git: vec![],
+        };
+        assert!(cfg.set_host_access("web.internal", Access::Read));
+        assert_eq!(
+            cfg.allow[0],
+            AllowEntry::Scoped {
+                host: "web.internal".into(),
+                ports: None,
+                access: Access::Read,
             },
             "default ports must normalize to None on an access change"
         );
@@ -2186,9 +2367,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: Some(vec![443, 8443]),
+                ports: Some(PortSpec::bare_list(&[443, 8443])),
                 access: Access::ReadWrite,
-                protocol: None,
             }],
             "a trailing-dot spelling must merge into the same entry: {:?}",
             cfg.allow
@@ -2210,9 +2390,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: Some(vec![80]),
+                ports: Some(PortSpec::bare_list(&[80])),
                 access: Access::ReadWrite,
-                protocol: None,
             }],
             "block must match a case/trailing-dot variant of the stored host"
         );
@@ -2285,15 +2464,13 @@ mod tests {
             allow: vec![
                 AllowEntry::Scoped {
                     host: "api.x.com".into(),
-                    ports: Some(vec![443]),
+                    ports: Some(PortSpec::bare_list(&[443])),
                     access: Access::Read,
-                    protocol: None,
                 },
                 AllowEntry::Scoped {
                     host: "API.X.COM".into(),
-                    ports: Some(vec![443]),
+                    ports: Some(PortSpec::bare_list(&[443])),
                     access: Access::ReadWrite,
-                    protocol: None,
                 },
             ],
             git: vec![],
@@ -2331,15 +2508,13 @@ mod tests {
             allow: vec![
                 AllowEntry::Scoped {
                     host: "api.x.com".into(),
-                    ports: Some(vec![443]),
+                    ports: Some(PortSpec::bare_list(&[443])),
                     access: Access::Read,
-                    protocol: None,
                 },
                 AllowEntry::Scoped {
                     host: "API.X.COM".into(),
-                    ports: Some(vec![443]),
+                    ports: Some(PortSpec::bare_list(&[443])),
                     access: Access::ReadWrite,
-                    protocol: None,
                 },
             ],
             git: vec![],
@@ -2367,15 +2542,13 @@ mod tests {
             vec![
                 AllowEntry::Scoped {
                     host: "a".into(),
-                    ports: Some(vec![443]),
+                    ports: Some(PortSpec::bare_list(&[443])),
                     access: Access::ReadWrite,
-                    protocol: None,
                 },
                 AllowEntry::Scoped {
                     host: "A.".into(),
-                    ports: Some(vec![8443]),
+                    ports: Some(PortSpec::bare_list(&[8443])),
                     access: Access::ReadWrite,
-                    protocol: None,
                 },
             ]
         };
@@ -2410,9 +2583,8 @@ mod tests {
             cfg2.allow,
             vec![AllowEntry::Scoped {
                 host: "a".into(),
-                ports: Some(vec![8443]),
+                ports: Some(PortSpec::bare_list(&[8443])),
                 access: Access::ReadWrite,
-                protocol: None,
             }],
             "collapse must still have happened even though the block itself no-oped"
         );
@@ -2429,9 +2601,8 @@ mod tests {
             allow: vec![
                 AllowEntry::Scoped {
                     host: "api.x.com".into(),
-                    ports: Some(vec![22]),
+                    ports: Some(PortSpec::bare_list(&[22])),
                     access: Access::Read,
-                    protocol: None,
                 },
                 AllowEntry::Host("API.X.COM".into()),
             ],
@@ -2475,15 +2646,13 @@ mod tests {
         vec![
             AllowEntry::Scoped {
                 host: "*.x".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "*.X".into(),
-                ports: Some(vec![8443]),
+                ports: Some(PortSpec::bare_list(&[8443])),
                 access: Access::Read,
-                protocol: None,
             },
         ]
     }
@@ -2608,9 +2777,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "*.x".into(),
-                ports: Some(vec![443, 8443]),
+                ports: Some(PortSpec::bare_list(&[443, 8443])),
                 access: Access::Read,
-                protocol: None,
             }],
             "setting a uniform access must merge the duplicates into one union-ports entry: {:?}",
             cfg.allow
@@ -2640,15 +2808,13 @@ mod tests {
             allow: vec![
                 AllowEntry::Scoped {
                     host: "*.x".into(),
-                    ports: Some(vec![443]),
+                    ports: Some(PortSpec::bare_list(&[443])),
                     access: Access::Read,
-                    protocol: None,
                 },
                 AllowEntry::Scoped {
                     host: "*.X".into(),
-                    ports: Some(vec![8443]),
+                    ports: Some(PortSpec::bare_list(&[8443])),
                     access: Access::Read,
-                    protocol: None,
                 },
             ],
             git: vec![],
@@ -2659,9 +2825,8 @@ mod tests {
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "*.x".into(),
-                ports: Some(vec![443, 8443]),
+                ports: Some(PortSpec::bare_list(&[443, 8443])),
                 access: Access::Read,
-                protocol: None,
             }],
             "same-access wildcard duplicates must merge to one union-ports entry: {:?}",
             cfg.allow
@@ -2685,9 +2850,8 @@ mod tests {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "API.X.COM".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             }],
             git: vec![],
         };
@@ -3119,17 +3283,15 @@ mod tests {
         let mut cfg = EgressPolicyConfig::default();
         cfg.replace_allow(vec![AllowEntry::Scoped {
             host: "API.Example.com.".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::Read,
-            protocol: None,
         }]);
         assert_eq!(
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "api.example.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::Read,
-                protocol: None,
             }],
             "the persisted host spelling must be canonicalized: {:?}",
             cfg.allow
@@ -3142,24 +3304,21 @@ mod tests {
         cfg.replace_allow(vec![
             AllowEntry::Scoped {
                 host: "Host.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "host.com.".into(),
-                ports: Some(vec![8080]),
+                ports: Some(PortSpec::bare_list(&[8080])),
                 access: Access::Read,
-                protocol: None,
             },
         ]);
         assert_eq!(
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "host.com".into(),
-                ports: Some(vec![8080]),
+                ports: Some(PortSpec::bare_list(&[8080])),
                 access: Access::Read,
-                protocol: None,
             }],
             "normalize-equal exact hosts must collapse to ONE entry carrying the last \
              entry's payload at the first entry's position: {:?}",
@@ -3173,24 +3332,21 @@ mod tests {
         cfg.replace_allow(vec![
             AllowEntry::Scoped {
                 host: "*.x".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::Read,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "*.X".into(),
-                ports: Some(vec![8443]),
+                ports: Some(PortSpec::bare_list(&[8443])),
                 access: Access::Read,
-                protocol: None,
             },
         ]);
         assert_eq!(
             cfg.allow,
             vec![AllowEntry::Scoped {
                 host: "*.x".into(),
-                ports: Some(vec![443, 8443]),
+                ports: Some(PortSpec::bare_list(&[443, 8443])),
                 access: Access::Read,
-                protocol: None,
             }],
             "uniform-access wildcard duplicates must merge into one union-ports entry: {:?}",
             cfg.allow
@@ -3203,15 +3359,13 @@ mod tests {
         cfg.replace_allow(vec![
             AllowEntry::Scoped {
                 host: "*.x".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "*.X".into(),
-                ports: Some(vec![8443]),
+                ports: Some(PortSpec::bare_list(&[8443])),
                 access: Access::Read,
-                protocol: None,
             },
         ]);
         assert_eq!(
@@ -3248,15 +3402,13 @@ mod tests {
         cfg.replace_allow(vec![
             AllowEntry::Scoped {
                 host: "Host.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "*.X".into(),
-                ports: Some(vec![8443]),
+                ports: Some(PortSpec::bare_list(&[8443])),
                 access: Access::Read,
-                protocol: None,
             },
         ]);
         let once = cfg.allow.clone();
@@ -3274,15 +3426,13 @@ mod tests {
         cfg.replace_allow(vec![
             AllowEntry::Scoped {
                 host: "*.x".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "*.X".into(),
-                ports: Some(vec![8443]),
+                ports: Some(PortSpec::bare_list(&[8443])),
                 access: Access::Read,
-                protocol: None,
             },
         ]);
         assert_eq!(
@@ -3313,7 +3463,7 @@ mod tests {
         )
         .expect("parses");
         let e = &cfg.allow[0];
-        assert_eq!(e.declared_protocol(), Some(Protocol::Http));
+        assert_eq!(e.declared_protocol_for(8000), Some(Protocol::Http));
         assert_eq!(e.protocol_for(8000), Protocol::Http);
     }
 
@@ -3324,7 +3474,8 @@ mod tests {
         )
         .expect("parses");
         let e = &cfg.allow[0];
-        assert_eq!(e.declared_protocol(), None, "nothing was declared");
+        assert_eq!(e.declared_protocol_for(443), None, "nothing was declared");
+        assert_eq!(e.declared_protocol_for(5432), None, "nothing was declared");
         assert_eq!(e.protocol_for(443), Protocol::Http, "web port derives http");
         assert_eq!(
             e.protocol_for(5432),
@@ -3336,7 +3487,7 @@ mod tests {
     #[test]
     fn bare_host_derives_http_on_the_web_ports() {
         let e = AllowEntry::Host("github.com".into());
-        assert_eq!(e.declared_protocol(), None);
+        assert_eq!(e.declared_protocol_for(80), None);
         assert_eq!(e.protocol_for(80), Protocol::Http);
         assert_eq!(e.protocol_for(443), Protocol::Http);
         assert_eq!(e.protocol_for(8000), Protocol::Tcp);
@@ -3388,7 +3539,10 @@ mod tests {
             "enforce: true\nallow:\n  - host: '*.vendor.com'\n    ports: [8000]\n    protocol: http\n",
         )
         .expect("widening inspection over a wildcard is fine");
-        assert_eq!(cfg.allow[0].declared_protocol(), Some(Protocol::Http));
+        assert_eq!(
+            cfg.allow[0].declared_protocol_for(8000),
+            Some(Protocol::Http)
+        );
     }
 
     // Global constraint: the Rego data document is untouched by this axis (D6).
@@ -3467,53 +3621,62 @@ mod tests {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "internal.example.com".into(),
-                ports: Some(vec![8000]),
+                ports: Some(vec![declared(8000, Protocol::Http)]),
                 access: Access::ReadWrite,
-                protocol: Some(Protocol::Http),
             }],
             git: vec![],
         };
         assert!(cfg.allow("internal.example.com", 9000));
         let entries = cfg.entries_for_host("internal.example.com");
         assert_eq!(
-            entries[0].declared_protocol(),
+            entries[0].declared_protocol_for(8000),
             Some(Protocol::Http),
             "allow() must not silently erase a declared protocol"
         );
+        assert_eq!(
+            entries[0].declared_protocol_for(9000),
+            None,
+            "and must not spread it to the port it just added"
+        );
     }
 
-    // Finding 1b: `protocol` is stored per-ENTRY while the `protocol: tcp`
-    // pinning hatch is semantically per-PORT (`protocol_for`), so preserving
-    // the declaration (the fix above) also extends an existing `Some(Tcp)`
-    // pin to a brand-new port the operator never named for it. This is an
-    // ACCEPTED, KNOWN sharp edge, not a bug: resolving it needs a per-port
-    // declaration shape, which is its own change and out of scope here
-    // (carried in the M5 P1 plan's follow-up list, which Task 9 appends to
-    // the spec's §13). Preserving is still
-    // the lesser evil: silently dropping the declaration (the alternative)
-    // is invisible everywhere, whereas this call mutates `policy.yaml`
-    // directly and never passes the `izba.yml` diff/promote weakening gate —
-    // `izba policy show` (once it lands) is the only surface that reveals
-    // the widened hatch.
+    // Finding 1b, INVERTED by #238. While `protocol` was stored per-ENTRY,
+    // preserving the declaration (the fix above) also extended an existing
+    // `Some(Tcp)` pin to a brand-new port the operator never named — an
+    // accepted sharp edge, gated behaviourally at the CLI by #235. The
+    // declaration is per-PORT now, so the widening is inexpressible and the
+    // gate is gone. This is the AC that says so, asserted on the passthrough
+    // set the datapath actually consults rather than on `protocol_for`, whose
+    // answer for 8443 is a DERIVED `Tcp` either way (8443 is not a web port)
+    // and so cannot tell the two worlds apart.
     #[test]
-    fn allow_extends_an_existing_tcp_pin_to_a_newly_added_port_known_sharp_edge() {
+    fn allow_never_extends_a_tcp_pin_to_a_newly_added_port() {
         let mut cfg = EgressPolicyConfig {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "pinned.vendor.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(vec![declared(443, Protocol::Tcp)]),
                 access: Access::ReadWrite,
-                protocol: Some(Protocol::Tcp),
             }],
             git: vec![],
         };
         assert!(cfg.allow("pinned.vendor.com", 8443));
         let entries = cfg.entries_for_host("pinned.vendor.com");
-        assert_eq!(entries[0].ports(), vec![443, 8443]);
+        assert_eq!(entries[0].ports(), vec![443, 8443], "the grant still lands");
         assert_eq!(
-            entries[0].protocol_for(8443),
-            Protocol::Tcp,
-            "known sharp edge: the pin extends to the newly added port too"
+            entries[0].declared_protocol_for(8443),
+            None,
+            "the newly added port carries no declaration of its own"
+        );
+
+        let table = crate::daemon::egress::inspect::InspectionTable::from_config(&cfg);
+        assert!(
+            !table.passthrough_host("pinned.vendor.com", 8443),
+            "and so never enters the passthrough set"
+        );
+        assert!(
+            table.passthrough_host("pinned.vendor.com", 443),
+            "while the port the operator DID name keeps its hatch"
         );
     }
 
@@ -3523,9 +3686,11 @@ mod tests {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "internal.example.com".into(),
-                ports: Some(vec![8000, 9000]),
+                ports: Some(vec![
+                    declared(8000, Protocol::Http),
+                    declared(9000, Protocol::Http),
+                ]),
                 access: Access::ReadWrite,
-                protocol: Some(Protocol::Http),
             }],
             git: vec![],
         };
@@ -3533,7 +3698,7 @@ mod tests {
         let entries = cfg.entries_for_host("internal.example.com");
         assert_eq!(entries[0].ports(), vec![8000]);
         assert_eq!(
-            entries[0].declared_protocol(),
+            entries[0].declared_protocol_for(8000),
             Some(Protocol::Http),
             "block() must not silently erase a declared protocol"
         );
@@ -3545,9 +3710,8 @@ mod tests {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
                 host: "internal.example.com".into(),
-                ports: Some(vec![8000]),
+                ports: Some(vec![declared(8000, Protocol::Http)]),
                 access: Access::Read,
-                protocol: Some(Protocol::Http),
             }],
             git: vec![],
         };
@@ -3555,7 +3719,7 @@ mod tests {
         let entries = cfg.entries_for_host("internal.example.com");
         assert_eq!(entries[0].access(), Access::ReadWrite);
         assert_eq!(
-            entries[0].declared_protocol(),
+            entries[0].declared_protocol_for(8000),
             Some(Protocol::Http),
             "set_host_access() must not silently erase a declared protocol"
         );
@@ -3567,15 +3731,13 @@ mod tests {
         cfg.replace_allow(vec![
             AllowEntry::Scoped {
                 host: "h.example.com".into(),
-                ports: Some(vec![8000]),
+                ports: Some(vec![declared(8000, Protocol::Http)]),
                 access: Access::ReadWrite,
-                protocol: Some(Protocol::Http),
             },
             AllowEntry::Scoped {
                 host: "h.example.com".into(),
-                ports: Some(vec![9000]),
+                ports: Some(PortSpec::bare_list(&[9000])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
         ]);
         assert_eq!(
@@ -3585,7 +3747,7 @@ mod tests {
             cfg.allow
         );
         assert_eq!(
-            cfg.allow[0].declared_protocol(),
+            cfg.allow[0].declared_protocol_for(8000),
             None,
             "the LAST duplicate wins, mirroring to_rego_data_json's map-overwrite \
              semantics — even though it declares nothing and an earlier duplicate did"
@@ -3598,15 +3760,13 @@ mod tests {
         cfg.replace_allow(vec![
             AllowEntry::Scoped {
                 host: "*.x".into(),
-                ports: Some(vec![8000]),
+                ports: Some(vec![declared(8000, Protocol::Http)]),
                 access: Access::ReadWrite,
-                protocol: Some(Protocol::Http),
             },
             AllowEntry::Scoped {
                 host: "*.X".into(),
-                ports: Some(vec![9000]),
+                ports: Some(PortSpec::bare_list(&[9000])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
         ]);
         assert_eq!(
@@ -3616,10 +3776,16 @@ mod tests {
             cfg.allow
         );
         assert_eq!(
-            cfg.allow[0].declared_protocol(),
+            cfg.allow[0].declared_protocol_for(8000),
             Some(Protocol::Http),
             "union direction: the merged entry keeps a declaration ANY duplicate carried \
              (a wildcard can never declare tcp — DP-3 refuses that at parse time)"
+        );
+        assert_eq!(
+            cfg.allow[0].declared_protocol_for(9000),
+            None,
+            "and the union is per-PORT: the OTHER duplicate's port declared nothing, so \
+             the merge must not hand it the first one's declaration"
         );
     }
 
@@ -3638,15 +3804,13 @@ mod tests {
             allow: vec![
                 AllowEntry::Scoped {
                     host: "*.x".into(),
-                    ports: Some(vec![8000]),
+                    ports: Some(vec![declared(8000, Protocol::Http)]),
                     access: Access::ReadWrite,
-                    protocol: Some(Protocol::Http),
                 },
                 AllowEntry::Scoped {
                     host: "*.X".into(),
-                    ports: Some(vec![9000]),
+                    ports: Some(PortSpec::bare_list(&[9000])),
                     access: Access::Read,
-                    protocol: None,
                 },
             ],
             git: vec![],
@@ -3659,7 +3823,7 @@ mod tests {
             cfg.allow
         );
         assert_eq!(
-            cfg.allow[0].declared_protocol(),
+            cfg.allow[0].declared_protocol_for(8000),
             Some(Protocol::Http),
             "the declaration on the FIRST duplicate must survive the merge, matching \
              collapse_duplicate_hosts's union direction for the same situation"
@@ -3678,15 +3842,13 @@ mod tests {
         cfg.replace_allow(vec![
             AllowEntry::Scoped {
                 host: "*.x".into(),
-                ports: Some(vec![8000]),
+                ports: Some(vec![declared(8000, Protocol::Tcp)]),
                 access: Access::ReadWrite,
-                protocol: Some(Protocol::Tcp),
             },
             AllowEntry::Scoped {
                 host: "*.X".into(),
-                ports: Some(vec![9000]),
+                ports: Some(PortSpec::bare_list(&[9000])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
         ]);
         assert_eq!(
@@ -3696,7 +3858,7 @@ mod tests {
             cfg.allow
         );
         assert_eq!(
-            cfg.allow[0].declared_protocol(),
+            cfg.allow[0].declared_protocol_for(8000),
             None,
             "the fold must never propagate a hand-constructed Some(Tcp) — only Some(Http) \
              or None are reachable outputs"
@@ -3762,9 +3924,8 @@ mod tests {
     fn allow_entry_round_trips_through_json_with_a_declared_protocol() {
         let entry = AllowEntry::Scoped {
             host: "pinned.vendor.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(vec![declared(443, Protocol::Tcp)]),
             access: Access::ReadWrite,
-            protocol: Some(Protocol::Tcp),
         };
         let json = serde_json::to_value(&entry).unwrap();
         let round_tripped: AllowEntry = serde_json::from_value(json).unwrap();
@@ -3788,10 +3949,319 @@ mod tests {
             scoped,
             AllowEntry::Scoped {
                 host: "api.x.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // #238: the pinning hatch is stored PER-PORT, not per-entry.
+    //
+    // `protocol:` used to be a property of a whole allow entry, so every port
+    // of that entry inherited it and granting one more port silently extended
+    // an opaque splice to a port nobody exempted. A port element may now be a
+    // mapping carrying its own declaration; a bare number carries none.
+    // ---------------------------------------------------------------
+
+    /// The headline shape. A `ports:` element is either a bare number (no
+    /// declaration) or a `{port, protocol}` mapping, and the two mix freely in
+    /// one list.
+    #[test]
+    fn a_port_element_may_carry_its_own_protocol() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports:\n\
+             \x20     - 80\n\
+             \x20     - port: 443\n\
+             \x20       protocol: tcp\n",
+        )
+        .expect("parses");
+        let e = &cfg.allow[0];
+        assert_eq!(e.ports(), vec![80, 443], "both ports stay authorized");
+        assert_eq!(
+            e.declared_protocol_for(80),
+            None,
+            "a bare port element declares nothing"
+        );
+        assert_eq!(
+            e.declared_protocol_for(443),
+            Some(Protocol::Tcp),
+            "the mapping element declares the hatch for its own port only"
+        );
+    }
+
+    /// Backward compatibility, the load-bearing half: an entry-level
+    /// `protocol:` keeps its current meaning — it applies to every port of the
+    /// entry — so no shipped `policy.yaml` changes posture on upgrade.
+    #[test]
+    fn a_legacy_entry_level_protocol_still_covers_every_port_of_its_entry() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443, 8443]\n\
+             \x20   protocol: tcp\n",
+        )
+        .expect("the pre-#238 shape must keep parsing");
+        let e = &cfg.allow[0];
+        assert_eq!(e.declared_protocol_for(443), Some(Protocol::Tcp));
+        assert_eq!(e.declared_protocol_for(8443), Some(Protocol::Tcp));
+    }
+
+    /// Precedence: the narrower declaration wins. An entry-level value is a
+    /// default for the ports that say nothing themselves.
+    #[test]
+    fn a_port_level_protocol_overrides_the_entry_level_one() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: mixed.example.com\n\
+             \x20   protocol: http\n\
+             \x20   ports:\n\
+             \x20     - 8000\n\
+             \x20     - port: 9000\n\
+             \x20       protocol: tcp\n",
+        )
+        .expect("parses");
+        let e = &cfg.allow[0];
+        assert_eq!(
+            e.declared_protocol_for(8000),
+            Some(Protocol::Http),
+            "the entry-level default still covers an undeclared port"
+        );
+        assert_eq!(
+            e.declared_protocol_for(9000),
+            Some(Protocol::Tcp),
+            "the port's own declaration wins over the entry's"
+        );
+    }
+
+    /// A port the entry does not list has no declaration to report, whatever
+    /// the entry says — the accessor answers about a port, not about a list.
+    #[test]
+    fn declared_protocol_for_an_unlisted_port_is_none() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443]\n\
+             \x20   protocol: tcp\n",
+        )
+        .expect("parses");
+        assert_eq!(cfg.allow[0].declared_protocol_for(8080), None);
+    }
+
+    /// A bare host declares nothing on any port.
+    #[test]
+    fn a_bare_host_declares_no_protocol_on_any_port() {
+        let e = AllowEntry::Host("github.com".into());
+        assert_eq!(e.declared_protocol_for(80), None);
+        assert_eq!(e.declared_protocol_for(443), None);
+    }
+
+    /// `protocol_for` composes the declaration with the implied default, per
+    /// port, exactly as before — the derivation rule is untouched.
+    #[test]
+    fn protocol_for_composes_the_port_declaration_with_the_implied_default() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: mixed.example.com\n\
+             \x20   ports:\n\
+             \x20     - 443\n\
+             \x20     - 5432\n\
+             \x20     - port: 8000\n\
+             \x20       protocol: http\n",
+        )
+        .expect("parses");
+        let e = &cfg.allow[0];
+        assert_eq!(e.protocol_for(443), Protocol::Http, "web port implies http");
+        assert_eq!(
+            e.protocol_for(5432),
+            Protocol::Tcp,
+            "other port implies tcp"
+        );
+        assert_eq!(
+            e.protocol_for(8000),
+            Protocol::Http,
+            "the port's declaration wins over the implied default"
+        );
+    }
+
+    // --- parse-error surface for the new shape ---
+
+    /// DP-3 at the port level: the hatch is matched against an observed SNI,
+    /// so it needs an exact host. The refusal must name the same fix as the
+    /// entry-level one.
+    #[test]
+    fn a_per_port_tcp_on_a_wildcard_host_is_refused() {
+        let err = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: '*.vendor.com'\n\
+             \x20   ports:\n\
+             \x20     - port: 443\n\
+             \x20       protocol: tcp\n",
+        )
+        .expect_err("a wildcard passthrough must be refused at the port level too");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("allow[0]"), "{msg}");
+        assert!(msg.contains("protocol: tcp"), "{msg}");
+        assert!(msg.contains("wildcard"), "{msg}");
+    }
+
+    /// Widening inspection over a wildcard is fine at the port level, same as
+    /// at the entry level — only the hatch is restricted to exact hosts.
+    #[test]
+    fn a_per_port_http_on_a_wildcard_host_is_allowed() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: '*.vendor.com'\n\
+             \x20   ports:\n\
+             \x20     - port: 8000\n\
+             \x20       protocol: http\n",
+        )
+        .expect("widening inspection over a wildcard is fine");
+        assert_eq!(
+            cfg.allow[0].declared_protocol_for(8000),
+            Some(Protocol::Http)
+        );
+    }
+
+    /// A port mapping is strict about its keys, like every other level of the
+    /// walk (#138): a typo must never silently drop a declaration.
+    #[test]
+    fn a_port_mapping_rejects_an_unknown_key_naming_the_valid_ones() {
+        let err = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: h.example.com\n\
+             \x20   ports:\n\
+             \x20     - port: 8000\n\
+             \x20       protokol: http\n",
+        )
+        .expect_err("unknown key in a port mapping must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown key 'protokol'"), "{msg}");
+        assert!(msg.contains("valid keys: port, protocol"), "{msg}");
+    }
+
+    /// A port mapping without `port:` names nothing; refuse it rather than
+    /// guessing.
+    #[test]
+    fn a_port_mapping_without_a_port_key_is_refused() {
+        let err = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: h.example.com\n\
+             \x20   ports:\n\
+             \x20     - protocol: tcp\n",
+        )
+        .expect_err("a port mapping must name its port");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("allow[0].ports[0]"), "{msg}");
+        assert!(msg.contains("missing required key 'port'"), "{msg}");
+    }
+
+    /// The unknown-value message is the same one the entry level gives, under
+    /// the port's own field path.
+    #[test]
+    fn a_per_port_protocol_rejects_an_unknown_value() {
+        let err = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: h.example.com\n\
+             \x20   ports:\n\
+             \x20     - port: 8000\n\
+             \x20       protocol: grpc\n",
+        )
+        .expect_err("unknown protocol must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("allow[0].ports[0].protocol"), "{msg}");
+        assert!(msg.contains("'http' or 'tcp'"), "{msg}");
+        assert!(msg.contains("grpc"), "{msg}");
+    }
+
+    /// The list still refuses anything that is neither a port number nor a
+    /// port mapping, and says what it wanted.
+    #[test]
+    fn a_port_element_that_is_neither_a_number_nor_a_mapping_is_refused() {
+        let err = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: h.example.com\n    ports: ['443']\n",
+        )
+        .expect_err("a string is not a port");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("allow[0].ports[0]"), "{msg}");
+    }
+
+    // --- serialization: the old shape must round-trip byte-identically ---
+
+    /// An entry whose ports carry no declaration serializes as a plain list of
+    /// numbers, exactly as before — upgrading izba must not rewrite a policy
+    /// file into a shape its author never wrote.
+    #[test]
+    fn undeclared_ports_still_serialize_as_bare_numbers() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: h.example.com\n    ports: [80, 8000]\n",
+        )
+        .expect("parses");
+        let yaml = cfg.to_yaml();
+        assert!(
+            !yaml.contains("- port:"),
+            "no port element should have grown a mapping: {yaml}"
+        );
+        assert_eq!(
+            EgressPolicyConfig::from_yaml(&yaml).expect("round-trips"),
+            cfg
+        );
+    }
+
+    /// A declared port serializes as a mapping and round-trips.
+    #[test]
+    fn a_declared_port_round_trips_through_yaml() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports:\n\
+             \x20     - 80\n\
+             \x20     - port: 443\n\
+             \x20       protocol: tcp\n",
+        )
+        .expect("parses");
+        let yaml = cfg.to_yaml();
+        assert!(yaml.contains("protocol: tcp"), "{yaml}");
+        assert_eq!(
+            EgressPolicyConfig::from_yaml(&yaml).expect("round-trips"),
+            cfg
+        );
+    }
+
+    /// D6, restated for the new shape: the axis is decided in typed Rust and
+    /// must never reach the Rego data document, whichever shape declares it.
+    #[test]
+    fn a_per_port_protocol_never_reaches_the_rego_data_document() {
+        let plain = EgressPolicyConfig::from_yaml(
+            "enforce: true\nallow:\n  - host: h.example.com\n    ports: [8000]\n",
+        )
+        .unwrap();
+        let declared = EgressPolicyConfig::from_yaml(
+            "enforce: true\n\
+             allow:\n\
+             \x20 - host: h.example.com\n\
+             \x20   ports:\n\
+             \x20     - port: 8000\n\
+             \x20       protocol: http\n",
+        )
+        .unwrap();
+        assert_eq!(
+            plain.to_rego_data_json("web"),
+            declared.to_rego_data_json("web"),
+            "protocol is decided in Rust; the Rego data doc must be byte-identical"
         );
     }
 }
