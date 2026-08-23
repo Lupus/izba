@@ -246,15 +246,25 @@ describe("PolicyEditor", () => {
     expect(pypi?.access).toBe("read");
   });
 
-  it("preserves protocol: http on a non-web port on Save without editing the row", async () => {
-    // Regression (F-1): the GUI's Row shape had no `protocol` field, so a
-    // Save the operator did not intend to touch on protocol silently dropped
-    // an `http` L7-inspection declaration on a non-web port — an unflagged
-    // security weakening that never reaches the diff/promote gate, because
-    // this path writes policy.yaml through the daemon directly.
+  // --- #238: the declaration is per-PORT, so the GUI must carry it per port ---
+  //
+  // F-1 (below, restated) is why preservation is load-bearing: this path
+  // writes policy.yaml through the daemon directly and never passes the
+  // diff/promote weakening gate, so a Save that silently drops a declaration
+  // performs an unflagged security weakening. Since #238 the declaration
+  // rides on the port element rather than the entry, so "preserve" now means
+  // preserve it against the right port.
+
+  it("preserves a per-port protocol: http on Save without editing the row", async () => {
     (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
       enforcing: true,
-      allow: [{ host: "internal.example.com", ports: [8000], access: "read", protocol: "http" }],
+      allow: [
+        {
+          host: "internal.example.com",
+          ports: [{ port: 8000, protocol: "http" }],
+          access: "read",
+        },
+      ],
       git: [],
     });
     render(<PolicyEditor name="web" />);
@@ -266,9 +276,8 @@ describe("PolicyEditor", () => {
         [
           {
             host: "internal.example.com",
-            ports: [8000],
+            ports: [{ port: 8000, protocol: "http" }],
             access: "read",
-            protocol: "http",
           },
         ],
         [],
@@ -276,10 +285,14 @@ describe("PolicyEditor", () => {
     );
   });
 
-  it("preserves protocol: tcp (the pinning passthrough) on 443 on Save without editing the row", async () => {
+  it("preserves a per-port protocol: tcp against its own port, not the whole entry", async () => {
+    // The port the operator pinned keeps its declaration; the port beside it
+    // must come back as a BARE number. Emitting `{port: 80, protocol: "tcp"}`
+    // here would be the widening this issue exists to make inexpressible,
+    // performed by the GUI on a Save nobody asked to change posture.
     (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
       enforcing: true,
-      allow: [{ host: "pinned.vendor.com", ports: [443], protocol: "tcp" }],
+      allow: [{ host: "pinned.vendor.com", ports: [80, { port: 443, protocol: "tcp" }] }],
       git: [],
     });
     render(<PolicyEditor name="web" />);
@@ -291,9 +304,8 @@ describe("PolicyEditor", () => {
         [
           {
             host: "pinned.vendor.com",
-            ports: [443],
+            ports: [80, { port: 443, protocol: "tcp" }],
             access: "read-write",
-            protocol: "tcp",
           },
         ],
         [],
@@ -301,7 +313,24 @@ describe("PolicyEditor", () => {
     );
   });
 
-  it("does not emit a protocol key for an entry that never had one", async () => {
+  it("adds a new port as a bare number, never inheriting a sibling's declaration", async () => {
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "pinned.vendor.com", ports: [{ port: 443, protocol: "tcp" }] }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    fireEvent.change(screen.getByLabelText("add port"), { target: { value: "8080" } });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(api.policySetFull).toHaveBeenCalled());
+    const calls = (api.policySetFull as ReturnType<typeof vi.fn>).mock.calls;
+    const allow: Array<{ ports: Array<number | { port: number }> }> = calls[0][1];
+    expect(allow[0].ports).toEqual([{ port: 443, protocol: "tcp" }, 8080]);
+  });
+
+  it("does not emit a protocol key for a port that never had one", async () => {
     // A value the GUI never read must not be invented on Save — canonical
     // YAML for an entry with no declared protocol must not change.
     (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -314,8 +343,40 @@ describe("PolicyEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() => expect(api.policySetFull).toHaveBeenCalled());
     const calls = (api.policySetFull as ReturnType<typeof vi.fn>).mock.calls;
-    const allow: Array<Record<string, unknown>> = calls[0][1];
-    expect(allow[0]).not.toHaveProperty("protocol");
+    const allow: Array<{ ports: unknown[] }> = calls[0][1];
+    expect(allow[0].ports).toEqual([443]);
+  });
+
+  it("marks the pinned port, and only the pinned port, in the editor", async () => {
+    // #239's display gap, narrowed to what #238 owns: a passthrough port must
+    // not render identically to an ordinary one, and the marker belongs to
+    // the PORT that carries the declaration.
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "pinned.vendor.com", ports: [80, { port: 443, protocol: "tcp" }] }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    expect(
+      screen.getByLabelText(
+        "Port 443: TLS-pinning passthrough — spliced opaquely, with no L7 rules, no request audit and no upstream certificate verification",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Port 80: /)).not.toBeInTheDocument();
+  });
+
+  it("marks a port declared http as inspected", async () => {
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "internal.example.com", ports: [{ port: 8000, protocol: "http" }] }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("internal.example.com");
+    expect(
+      screen.getByLabelText("Port 8000: inspected at L7 (declared protocol: http)"),
+    ).toBeInTheDocument();
   });
 
   it("loads a ports-less allow entry (backend None) without crashing", async () => {
