@@ -319,7 +319,9 @@ pub fn classify(base: &Normalized, repo: &Normalized, managed: &Normalized) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::egress::config::{Access, AllowEntry, EgressPolicyConfig, Protocol};
+    use crate::daemon::egress::config::{
+        Access, AllowEntry, EgressPolicyConfig, PortSpec, Protocol,
+    };
     use crate::manifest::normalize::{ImageSource, Normalized};
     use crate::state::PortRule;
 
@@ -430,9 +432,156 @@ mod tests {
         )
         .expect("spec.egress deserializes through EgressPolicyConfig's strict walk");
         assert_eq!(
-            spec.egress.expect("egress block present").allow[0].declared_protocol(),
+            spec.egress.expect("egress block present").allow[0].declared_protocol_for(443),
             Some(Protocol::Tcp)
         );
+    }
+
+    // --- #238: the same transitions, expressed in the per-port shape ---
+    //
+    // `egress_weakens` asks `InspectionTable`'s public methods rather than
+    // folding `protocol` itself, so the per-port shape flows through it
+    // without a code change. That is a claim worth pinning: a future
+    // "optimization" that reintroduced a local fold would have to keep these
+    // green, and the mixed-shape cases below are exactly where a second fold
+    // would diverge.
+
+    /// A newly-declared per-port passthrough is the `http -> tcp` transition
+    /// the review gate exists for, whichever shape declares it.
+    #[test]
+    fn declaring_a_per_port_passthrough_weakens_egress() {
+        let from = eg("enforce: true\nallow:\n  - host: pinned.vendor.com\n    ports: [80, 443]\n");
+        let to = eg("enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports:\n\
+             \x20     - 80\n\
+             \x20     - port: 443\n\
+             \x20       protocol: tcp\n");
+        assert!(
+            egress_weakens(&from, &to),
+            "443 gave up L7 enforcement and upstream certificate verification"
+        );
+        assert!(
+            !egress_weakens(&to, &from),
+            "and taking the hatch away again tightens"
+        );
+    }
+
+    /// The narrowing this issue is for: a proposal that keeps the hatch on the
+    /// port that had it and adds a plain one alongside must NOT read as a
+    /// hatch widening. It still flags — 8080 is new REACHABILITY — so assert
+    /// the inspection half directly rather than inferring it from the verdict.
+    #[test]
+    fn adding_a_plain_port_beside_a_pinned_one_does_not_extend_the_hatch() {
+        let to = eg("enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports:\n\
+             \x20     - port: 443\n\
+             \x20       protocol: tcp\n\
+             \x20     - 8080\n");
+        let t = InspectionTable::from_config(&to);
+        assert!(t.passthrough_host("pinned.vendor.com", 443));
+        assert!(
+            !t.passthrough_host("pinned.vendor.com", 8080),
+            "the port added beside the hatch carries no declaration of its own"
+        );
+    }
+
+    /// A mixed old/new-shape pair that says THE SAME THING must diff as no
+    /// change: the legacy entry-level `protocol:` is normalized down onto the
+    /// entry's ports at parse, so both sides reach `egress_weakens` in one
+    /// representation. Without that normalization this pair would compare
+    /// unequal in the widening direction and fire the review-token gate on a
+    /// pure re-spelling.
+    #[test]
+    fn a_legacy_shape_and_its_per_port_equivalent_do_not_diff() {
+        let legacy = eg("enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443, 8443]\n\
+             \x20   protocol: tcp\n");
+        let per_port = eg("enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports:\n\
+             \x20     - port: 443\n\
+             \x20       protocol: tcp\n\
+             \x20     - port: 8443\n\
+             \x20       protocol: tcp\n");
+        assert_eq!(
+            legacy, per_port,
+            "the two spellings must normalize to one representation"
+        );
+        assert!(!egress_weakens(&legacy, &per_port));
+        assert!(!egress_weakens(&per_port, &legacy));
+    }
+
+    /// The mixed pair that IS a change: migrating a legacy entry to the
+    /// per-port shape while quietly keeping the hatch on a port the legacy
+    /// entry never named. The legacy `[443] tcp` covered only 443; the
+    /// proposal pins 8443 too, and that must flag.
+    #[test]
+    fn a_migration_that_adds_a_port_to_the_hatch_still_weakens() {
+        let legacy = eg("enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports: [443, 8443]\n\
+             \x20   protocol: http\n");
+        let proposal = eg("enforce: true\n\
+             allow:\n\
+             \x20 - host: pinned.vendor.com\n\
+             \x20   ports:\n\
+             \x20     - port: 443\n\
+             \x20       protocol: http\n\
+             \x20     - port: 8443\n\
+             \x20       protocol: tcp\n");
+        assert!(
+            egress_weakens(&legacy, &proposal),
+            "8443 became an opaque splice; the shape it was written in is irrelevant"
+        );
+    }
+
+    /// The manifest's `spec.egress` block funnels through the same strict
+    /// walk, so `izba.yml` can express the per-port declaration — the read
+    /// direction of AC 6, mirroring
+    /// `protocol_deserializes_through_a_manifest_spec_egress_block`.
+    #[test]
+    fn a_per_port_protocol_deserializes_through_a_manifest_spec_egress_block() {
+        let spec: crate::manifest::schema::SandboxSpec = serde_yaml::from_str(
+            "image: alpine\n\
+             egress:\n\
+             \x20 enforce: true\n\
+             \x20 allow:\n\
+             \x20   - host: pinned.vendor.com\n\
+             \x20     ports:\n\
+             \x20       - 80\n\
+             \x20       - port: 443\n\
+             \x20         protocol: tcp\n",
+        )
+        .expect("spec.egress deserializes through EgressPolicyConfig's strict walk");
+        let entry = &spec.egress.expect("egress block present").allow[0];
+        assert_eq!(entry.declared_protocol_for(443), Some(Protocol::Tcp));
+        assert_eq!(entry.declared_protocol_for(80), None);
+    }
+
+    /// DP-3 holds on the manifest path too: a wildcard host cannot carry the
+    /// hatch, per port or per entry.
+    #[test]
+    fn a_per_port_wildcard_passthrough_is_refused_through_the_manifest() {
+        let err = serde_yaml::from_str::<crate::manifest::schema::SandboxSpec>(
+            "image: alpine\n\
+             egress:\n\
+             \x20 enforce: true\n\
+             \x20 allow:\n\
+             \x20   - host: '*.vendor.com'\n\
+             \x20     ports:\n\
+             \x20       - port: 443\n\
+             \x20         protocol: tcp\n",
+        )
+        .expect_err("a wildcard passthrough must be refused on the manifest path too");
+        assert!(err.to_string().contains("wildcard"), "{err}");
     }
 
     fn base() -> Normalized {
@@ -618,7 +767,6 @@ mod tests {
             host: "h".into(),
             ports: None,
             access: Access::Read,
-            protocol: None,
         }];
         let mut to = from.clone();
         if let AllowEntry::Scoped { access, .. } = &mut to.egress.allow[0] {
@@ -666,15 +814,13 @@ mod tests {
         from.egress.allow = vec![
             AllowEntry::Scoped {
                 host: "h".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::Read,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "h".into(),
-                ports: Some(vec![80]),
+                ports: Some(PortSpec::bare_list(&[80])),
                 access: Access::Read,
-                protocol: None,
             },
         ];
         let mut to = from.clone();
@@ -771,15 +917,13 @@ mod tests {
         from.egress.allow = vec![
             AllowEntry::Scoped {
                 host: "h".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "h".into(),
-                ports: Some(vec![80]),
+                ports: Some(PortSpec::bare_list(&[80])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
         ];
         let mut to = from.clone();
@@ -835,9 +979,8 @@ mod tests {
         let mut from = base();
         from.egress.allow = vec![AllowEntry::Scoped {
             host: "api.example.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::Read,
-            protocol: None,
         }];
         let mut to = from.clone();
         if let AllowEntry::Scoped { host, .. } = &mut to.egress.allow[0] {
@@ -872,23 +1015,20 @@ mod tests {
         from.egress.allow = vec![
             AllowEntry::Scoped {
                 host: "host.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "Host.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::Read,
-                protocol: None,
             },
         ];
         let mut to = base();
         to.egress.allow = vec![AllowEntry::Scoped {
             host: "host.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::ReadWrite,
-            protocol: None,
         }];
         assert!(
             egress_weakens(&from.egress, &to.egress),
@@ -904,16 +1044,14 @@ mod tests {
         let mut from = base();
         from.egress.allow = vec![AllowEntry::Scoped {
             host: "Host.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::Read,
-            protocol: None,
         }];
         let mut to = base();
         to.egress.allow = vec![AllowEntry::Scoped {
             host: "host.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::ReadWrite,
-            protocol: None,
         }];
         assert!(egress_weakens(&from.egress, &to.egress));
     }
@@ -927,9 +1065,8 @@ mod tests {
             let mut f = base();
             f.egress.allow = vec![AllowEntry::Scoped {
                 host: "host.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::Read,
-                protocol: None,
             }];
             f
         };
@@ -937,9 +1074,8 @@ mod tests {
         let mut widened_port = base();
         widened_port.egress.allow = vec![AllowEntry::Scoped {
             host: "HOST.com".into(),
-            ports: Some(vec![8080]),
+            ports: Some(PortSpec::bare_list(&[8080])),
             access: Access::Read,
-            protocol: None,
         }];
         assert!(
             egress_weakens(&from_single.egress, &widened_port.egress),
@@ -949,9 +1085,8 @@ mod tests {
         let mut same_port = base();
         same_port.egress.allow = vec![AllowEntry::Scoped {
             host: "HOST.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::Read,
-            protocol: None,
         }];
         assert!(
             !egress_weakens(&from_single.egress, &same_port.egress),
@@ -971,23 +1106,20 @@ mod tests {
         let mut managed = base();
         managed.egress.allow = vec![AllowEntry::Scoped {
             host: "host.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::ReadWrite,
-            protocol: None,
         }];
         let mut with_dup = base();
         with_dup.egress.allow = vec![
             AllowEntry::Scoped {
                 host: "host.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "host.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::Read,
-                protocol: None,
             },
         ];
         assert!(
@@ -1011,23 +1143,20 @@ mod tests {
         from.egress.allow = vec![
             AllowEntry::Scoped {
                 host: "host.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::Read,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "host.com".into(),
-                ports: Some(vec![8080]),
+                ports: Some(PortSpec::bare_list(&[8080])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
         ];
         let mut to = base();
         to.egress.allow = vec![AllowEntry::Scoped {
             host: "host.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::Read,
-            protocol: None,
         }];
         assert!(
             egress_weakens(&from.egress, &to.egress),
@@ -1047,23 +1176,20 @@ mod tests {
         dup.egress.allow = vec![
             AllowEntry::Scoped {
                 host: "*.example.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::ReadWrite,
-                protocol: None,
             },
             AllowEntry::Scoped {
                 host: "*.example.com".into(),
-                ports: Some(vec![443]),
+                ports: Some(PortSpec::bare_list(&[443])),
                 access: Access::Read,
-                protocol: None,
             },
         ];
         let mut single = base();
         single.egress.allow = vec![AllowEntry::Scoped {
             host: "*.example.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::ReadWrite,
-            protocol: None,
         }];
         assert!(
             !egress_weakens(&dup.egress, &single.egress),
@@ -1087,16 +1213,14 @@ mod tests {
         let mut from = base();
         from.egress.allow = vec![AllowEntry::Scoped {
             host: "*.example.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::Read,
-            protocol: None,
         }];
         let mut to = base();
         to.egress.allow = vec![AllowEntry::Scoped {
             host: "*.example.com".into(),
-            ports: Some(vec![443]),
+            ports: Some(PortSpec::bare_list(&[443])),
             access: Access::ReadWrite,
-            protocol: None,
         }];
         assert!(
             egress_weakens(&from.egress, &to.egress),
