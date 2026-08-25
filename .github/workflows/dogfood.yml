@@ -409,7 +409,8 @@ jobs:
             --readme README.md \
             --context-pack dogfood-context.md \
             --action-timeout-s 120 \
-            --step-cap 25
+            --step-cap 25 \
+            --max-turns 18
       - name: Upload trajectory bundle
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -547,7 +548,7 @@ jobs:
             --artifact-dir "gui-shots-$SHARD" \
             --model "$MODEL" --max-usd "$MAX_USD" \
             --readme README.md --app-guide dogfood-app-guide.md \
-            --action-timeout-s 30 --step-cap 20
+            --action-timeout-s 30 --step-cap 20 --max-turns 18
       - name: Upload GUI trajectory bundle
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
