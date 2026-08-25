@@ -1730,10 +1730,14 @@ def test_expect_text_hit_in_final_settle_capture_counts(monkeypatch):
         "graded_cmd": "expect_text: 'web · running' (matched)"}]
 
 
-def test_manifest_diff_journey_precedence_ignores_hooks(monkeypatch):
-    # A journey that DID drive manifest_diff keeps the manifest_truth path
-    # exactly (its tests pin it): hooks on the core step are not graded — the
-    # only decisive credit is the manifest one.
+def test_manifest_diff_journey_zero_action_failing_hook_is_unreached(monkeypatch):
+    # A journey that DID drive manifest_diff keeps the manifest_truth credit,
+    # but its core step's DECLARED hook is graded too (rung 1 never
+    # substitutes for a declared assertion). Here the Actor performed ZERO
+    # actions, so the failing hook is an ENGAGEMENT failure, not a product
+    # flip: it lands as `unreached_decisive` (the zero-action reclassification
+    # of 606a3bd4), never as a functional candidate — and the journey is still
+    # negative overall, never a silent pass on the discarded assertion.
     import gui.run_gui_journeys as rgj
     model = FakeModel([{"done": True}])
     invoke_log = [{"cmd": "manifest_diff", "ok": True,
@@ -1751,8 +1755,12 @@ def test_manifest_diff_journey_precedence_ignores_hooks(monkeypatch):
                "steps": [{"intent": "view diff", "expect": "", "core": True,
                           "expect_text": "THIS STRING IS NOWHERE"}]}
     res = _run(journey, model, driver, monkeypatch)
-    # expect_text would have flipped functional if graded; precedence says no.
+    # Zero actions ⇒ the failing hook is unreached, not a product finding.
     assert not [c for c in res["candidates"] if c["kind"] == "functional"]
+    unreached = [c for c in res["candidates"]
+                 if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1, res["candidates"]
+    assert "THIS STRING IS NOWHERE" in unreached[0]["detail"]
     assert res["decisive_credits"] == [{
         "step_index": 0, "action_index": -1,
         "graded_cmd": "manifest_truth: izba diff ground truth (matched)"}]
@@ -1956,3 +1964,199 @@ def test_run_gui_journey_ready_page_reaches_actor_and_h_gui_2(monkeypatch):
     # H-GUI-2: the persisted opening capture is the post-gate (READY) page.
     assert "daemon running" in res["initial_observation"]["page_text"]
     assert "Connecting" not in res["initial_observation"]["page_text"]
+
+
+# ---------- a DECLARED hook is never preempted by manifest_truth ----------
+
+_MT_DIGEST_LOG = [{"cmd": "manifest_diff", "ok": True,
+                   "digest": {"state": "in_sync", "deltas": 0, "weakens": 0}}]
+
+
+def _matched_mt(monkeypatch):
+    """Monkeypatch the manifest_truth oracle to a confirmed `matched` ground
+    truth (its real subprocess shells out to `izba diff`)."""
+    import gui.run_gui_journeys as rgj
+
+    def fake_mt(ctx, **k):
+        ctx["manifest_truth_result"] = "matched"
+        return []
+    monkeypatch.setattr(rgj, "manifest_truth_oracle", fake_mt)
+
+
+def test_manifest_journey_grades_a_declared_failing_expect_text(monkeypatch):
+    # Defect 1: rung 1 (manifest_truth) must never SUBSTITUTE for an
+    # assertion the journey explicitly declared. ManifestTab auto-fires
+    # api.manifestDiff on mount, so merely OPENING the Manifest tab re-arms
+    # rung 1 — a wandering Actor could otherwise silently disarm every
+    # declared hook in a journey that never intended manifest grading.
+    _matched_mt(monkeypatch)
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"'] * 3,
+                        page_texts=["Manifest", "Manifest", "Manifest"],
+                        invoke_log=list(_MT_DIGEST_LOG))
+    journey = {"journey_id": "j-mt-declared-text", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "rename the host and save", "expect": "",
+                          "core": True,
+                          "expect_text": "THIS STRING IS NOWHERE"}]}
+    res = _run(journey, model, driver, monkeypatch)
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1, res["candidates"]
+    assert functional[0]["decisive"] is True
+    assert functional[0]["detail"].startswith("expect_text:")
+
+
+def test_manifest_journey_grades_a_declared_failing_expect_state(monkeypatch):
+    # Same defect via the other hook: a digest-carrying manifest_diff must
+    # not swallow a declared expect_state assertion either.
+    _matched_mt(monkeypatch)
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"'] * 3,
+                        page_texts=["Manifest", "Manifest", "Manifest"],
+                        invoke_log=list(_MT_DIGEST_LOG))
+    journey = {"journey_id": "j-mt-declared-state", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "start web", "expect": "", "core": True,
+                          "expect_state": {"sandbox": "web",
+                                           "status": "running"}}]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence(["web"],
+                                  [{"name": "web", "status_disk": "stopped"}]))
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1, res["candidates"]
+    assert functional[0]["decisive"] is True
+    assert functional[0]["detail"].startswith("expect_state:")
+
+
+def test_manifest_journey_credits_both_truths_when_the_hook_holds(monkeypatch):
+    # Both rungs must be ON RECORD when both hold: the manifest credit AND
+    # the declared hook's credit (the skeptic must see every decisive
+    # assertion that was actually checked).
+    _matched_mt(monkeypatch)
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"'] * 3,
+                        page_texts=["Manifest", "in sync", "in sync"],
+                        invoke_log=list(_MT_DIGEST_LOG))
+    journey = {"journey_id": "j-mt-declared-pass", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "view the diff", "expect": "", "core": True,
+                          "expect_text": "in sync"}]}
+    res = _run(journey, model, driver, monkeypatch)
+    assert not [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert res["decisive_credits"] == [
+        {"step_index": 0, "action_index": -1,
+         "graded_cmd": "manifest_truth: izba diff ground truth (matched)"},
+        {"step_index": 0, "action_index": -1,
+         "graded_cmd": "expect_text: 'in sync' (matched)"},
+    ], res["decisive_credits"]
+
+
+def test_manifest_journey_without_declared_hooks_is_unchanged(monkeypatch):
+    # The preserved half of the contract: a core step that declares NO hook
+    # is still governed by manifest_truth alone — exactly one credit, and no
+    # `no gradable hook` unreached_decisive manufactured for it.
+    _matched_mt(monkeypatch)
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"'] * 3,
+                        page_texts=["Manifest", "Manifest", "Manifest"],
+                        invoke_log=list(_MT_DIGEST_LOG))
+    journey = {"journey_id": "j-mt-no-hooks", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "view the diff", "expect": "",
+                          "core": True}]}
+    res = _run(journey, model, driver, monkeypatch)
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "manifest_truth: izba diff ground truth (matched)"}]
+    assert not [c for c in res["candidates"]
+                if c["kind"] in ("functional", "unreached_decisive")]
+
+
+# ---------- expect_state.policy: the managed-policy.yaml vocabulary ----------
+
+def test_step_decisive_hooks_accepts_policy_spec():
+    from gui.run_gui_journeys import _step_decisive_hooks
+    spec = {"sandbox": "web",
+            "policy": {"enforcing": True, "host": "pinned.vendor.com",
+                       "present": True, "access": "read",
+                       "port": {"number": 443, "pinned": True}}}
+    _, state = _step_decisive_hooks({"expect_state": spec})
+    assert state == spec
+    # enforcing alone needs no host (it is a file-level posture).
+    _, state = _step_decisive_hooks(
+        {"expect_state": {"sandbox": "web", "policy": {"enforcing": False}}})
+    assert state == {"sandbox": "web", "policy": {"enforcing": False}}
+
+
+def test_step_decisive_hooks_rejects_malformed_policy_spec():
+    # A declared assertion must never be silently dropped: any half-formed
+    # policy value invalidates the whole hook (⇒ unreached_decisive).
+    from gui.run_gui_journeys import _step_decisive_hooks
+    bad = [
+        {"sandbox": "web", "policy": "pinned.vendor.com"},   # not an object
+        {"sandbox": "web", "policy": {}},                     # nothing declared
+        {"sandbox": "web", "policy": {"host": "h"}},          # host alone
+        {"sandbox": "web", "policy": {"host": "", "present": True}},
+        {"sandbox": "web", "policy": {"present": True}},      # host-less
+        {"sandbox": "web", "policy": {"host": "h", "present": "yes"}},
+        {"sandbox": "web", "policy": {"host": "h", "access": "write"}},
+        {"sandbox": "web", "policy": {"host": "h", "enforcing": "true"}},
+        {"sandbox": "web", "policy": {"host": "h", "port": {"number": 443}}},
+        {"sandbox": "web", "policy": {"host": "h",
+                                      "port": {"pinned": True}}},
+        {"sandbox": "web", "policy": {"host": "h",
+                                      "port": {"number": True,
+                                               "pinned": True}}},
+    ]
+    for spec in bad:
+        _, state = _step_decisive_hooks({"expect_state": spec})
+        assert state is None, spec
+
+
+def test_core_step_failing_policy_assertion_flips_decisive_functional(monkeypatch):
+    # End to end through the runner: the saved policy widened where the GUI
+    # promised a refusal ⇒ one decisive functional candidate, no credit.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "web running"'] * 3,
+                        page_texts=["policy", "policy", "policy"])
+    journey = {"journey_id": "j-policy-fail", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "try to widen access", "expect": "",
+                          "core": True,
+                          "expect_state": {
+                              "sandbox": "web",
+                              "policy": {"host": "pinned.vendor.com",
+                                         "access": "read"}}}]}
+    ev = _evidence(["web"], [{"name": "web", "status_disk": "running"}])
+    ev["per_sandbox"] = {"web": {"policy_yaml": {
+        "enforce": True,
+        "allow": [{"host": "pinned.vendor.com", "access": "read-write"}]}}}
+    res = _run(journey, model, driver, monkeypatch, evidence=ev)
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1, res["candidates"]
+    assert functional[0]["decisive"] is True
+    assert "policy access:" in functional[0]["detail"]
+    assert res["decisive_credits"] == []
+
+
+def test_core_step_unreadable_policy_yaml_degrades_infra(monkeypatch):
+    # PyYAML missing in CI / policy.yaml absent ⇒ null capture ⇒ flipping
+    # infra candidate, never a silent pass.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "web running"'] * 3,
+                        page_texts=["policy", "policy", "policy"])
+    journey = {"journey_id": "j-policy-noev", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "try to widen access", "expect": "",
+                          "core": True,
+                          "expect_state": {
+                              "sandbox": "web",
+                              "policy": {"host": "pinned.vendor.com",
+                                         "access": "read"}}}]}
+    ev = _evidence(["web"], [{"name": "web", "status_disk": "running"}])
+    ev["per_sandbox"] = {"web": {"policy_yaml": None}}
+    res = _run(journey, model, driver, monkeypatch, evidence=ev)
+    infra = [c for c in res["candidates"] if c["kind"] == "infra"]
+    assert len(infra) == 1, res["candidates"]
+    assert "expect_state" in infra[0]["detail"]
+    assert res["decisive_credits"] == []

@@ -30,6 +30,16 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+try:  # PyYAML is the ONLY non-stdlib import in the harness, and it is
+    # OPTIONAL: `.github/workflows/dogfood.yml` installs it (python3-yaml) so
+    # the managed-policy capture works in CI, but a bare python3 must still
+    # run the runner. Absent ⇒ `_read_policy_yaml` returns None ⇒ an
+    # `expect_state.policy` assertion grades `no_evidence` ⇒ the runner's
+    # flipping `infra` candidate. Never a silent pass.
+    import yaml as _yaml
+except ImportError:  # pragma: no cover - exercised by monkeypatching _yaml
+    _yaml = None
+
 # Keep tails small enough to upload cheaply but large enough to carry a panic
 # backtrace head: last 4 KB of each stream.
 TAIL_BYTES = 4096
@@ -290,6 +300,34 @@ def _read_persisted_ports(data_dir: str, name: str) -> Optional[List[Any]]:
     return ports if isinstance(ports, list) else None
 
 
+def _read_policy_yaml(data_dir: str, name: str) -> Optional[Dict[str, Any]]:
+    """The sandbox's MANAGED egress policy: the parsed
+    ``<data_dir>/sandboxes/<name>/policy.yaml`` mapping.
+
+    This file is the host-only authority (CLAUDE.md's manifest trust
+    boundary) — never inside the guest overlay — so it is precisely "the
+    saved policy" an `expect_state.policy` assertion means. It is read here,
+    NOT parsed out of `izba policy show`: that is human-facing rendered text
+    with no `--json`, far too brittle to assert on (the show capture stays
+    alongside, for the skeptic to read).
+
+    ``None`` (never a fabricated ``{}``) whenever the truth was not
+    observed: PyYAML unavailable, the file absent/unreadable, unparseable,
+    or not a mapping — a `policy` assertion must then grade ``no_evidence``.
+    Report-only."""
+    if _yaml is None:
+        return None
+    path = os.path.join(data_dir, "sandboxes", name, "policy.yaml")
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = _yaml.safe_load(f)
+    except OSError:
+        return None
+    except Exception:  # any yaml parse/scan error — report-only, never raise
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
 def capture_state_evidence(
     izba_bin: str, data_dir: str, timeout_s: float,
     env: Optional[Dict[str, str]] = None,
@@ -310,7 +348,11 @@ def capture_state_evidence(
     port-forward truth (behind the GUI ``expect_state.port`` assertion):
     ``port_ls`` (`izba port ls <name>` — the ACTIVE forwards) and
     ``ports_persisted`` (the config.json ``ports`` rules — the persist
-    ground truth `port ls` cannot express; see ``_read_persisted_ports``).
+    ground truth `port ls` cannot express; see ``_read_persisted_ports``),
+    and ``policy_yaml`` (the parsed MANAGED ``policy.yaml`` — "the saved
+    policy" behind the GUI ``expect_state.policy`` assertion; the
+    ``policy_show`` capture beside it is rendered text for humans, never the
+    grading source; see ``_read_policy_yaml``).
     Report-only."""
     run_env = _shell_env(izba_bin, data_dir, env)
     reconcile = _snapshot_reconcile(izba_bin, data_dir, timeout_s, run_env)
@@ -338,6 +380,7 @@ def capture_state_evidence(
             "port_ls": _izba_capture(izba_bin, ["port", "ls", name],
                                      timeout_s, run_env),
             "ports_persisted": _read_persisted_ports(data_dir, name),
+            "policy_yaml": _read_policy_yaml(data_dir, name),
             "console_tail": console_tail,
         }
     return {"sandboxes": names, "reconcile": reconcile,

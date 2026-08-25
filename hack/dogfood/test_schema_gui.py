@@ -608,3 +608,65 @@ def test_committed_journeys_corpora_validate_against_schema():
     for name in ("manifest-gui.json", "smoke-core-cli.json", "vnc-gui.json"):
         with open(os.path.join(HERE, "journeys", name)) as f:
             jsonschema.validate(json.load(f), schema)
+
+
+def test_expect_state_allows_policy_assertion():
+    # PR #262 enabler: "the saved policy is unchanged" is the true oracle of
+    # a refused policy edit, and it is invisible to expect_text (a React
+    # <Input value> contributes nothing to document.body.innerText).
+    schema = _load("journeys.schema.json")
+    es = schema["definitions"]["step"]["properties"]["expect_state"]
+    assert {"required": ["sandbox", "policy"]} in es["anyOf"]
+    assert es["dependencies"]["policy"] == ["sandbox"]
+    pol = es["properties"]["policy"]
+    assert pol["type"] == "object"
+    assert pol["additionalProperties"] is False
+    for k in ("host", "present", "access", "port", "enforcing"):
+        assert k in pol["properties"], k
+    assert pol["properties"]["access"]["enum"] == ["read", "read-write"]
+    port = pol["properties"]["port"]
+    assert port["additionalProperties"] is False
+    assert sorted(port["required"]) == ["number", "pinned"]
+    # The description is the journey compiler's instruction sheet: it must
+    # say WHAT is graded and that the source is the managed policy.yaml.
+    desc = pol["description"].lower()
+    assert "policy.yaml" in desc
+    assert "policy show" in desc  # names the surface it must NOT be graded from
+
+
+def test_expect_state_policy_validation():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_state": {"sandbox": "web",
+                          "policy": {"host": "pinned.vendor.com",
+                                     "present": True, "access": "read",
+                                     "enforcing": True,
+                                     "port": {"number": 443,
+                                              "pinned": True}}}}), schema)
+    # enforcing alone is a valid, host-less assertion.
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_state": {"sandbox": "web",
+                          "policy": {"enforcing": True}}}), schema)
+    # host alone asserts nothing.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web",
+                              "policy": {"host": "h"}}}), schema)
+    # a host-scoped assertion needs the host.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"sandbox": "web",
+                              "policy": {"present": True}}}), schema)
+    # policy without the sandbox target fails.
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc(
+            {"expect_state": {"policy": {"enforcing": True}}}), schema)
+    # unknown access verb / unknown key / half-formed port.
+    for bad in ({"host": "h", "access": "write"},
+                {"host": "h", "protocol": "tcp"},
+                {"host": "h", "port": {"number": 443}},
+                {"host": "h", "port": {"number": 0, "pinned": True}}):
+        with pytest.raises(jsonschema.exceptions.ValidationError):
+            jsonschema.validate(_minimal_journey_doc(
+                {"expect_state": {"sandbox": "web", "policy": bad}}), schema)
