@@ -309,12 +309,39 @@ interface LoadedSnapshot {
   git: GitRow[];
 }
 
+/** What this editor actually KNOWS about the sandbox's policy.
+ *
+ *  The three states are NOT interchangeable, and conflating the first with a
+ *  loaded-and-empty policy is what made this tab able to disarm an egress
+ *  jail with one click: while `policyShow` was in flight (and again when it
+ *  REJECTED) the editor rendered "Firewall off" plus "No allowed hosts — add
+ *  one to permit egress", and `save()` happily shipped that invented empty
+ *  policy to `policySetFull`. That call REPLACES the sandbox's managed
+ *  `policy.yaml` and — unlike the `izba.yml` route — skips the
+ *  `izba diff`/`izba promote` weakening gate entirely, so nothing downstream
+ *  flags it, warns, or asks. An unknown policy is not an empty one, and an
+ *  errored load is not an empty one either. */
+type LoadState = { kind: "loading" } | { kind: "ready" } | { kind: "error"; message: string };
+
+/** Why a Save was refused, given what we know. Returned as text so the refusal
+ *  is VISIBLE (a silently-ignored click teaches the operator nothing) and so
+ *  `save()` has exactly one place that decides "may we write?". */
+function saveRefusal(load: LoadState): string | null {
+  if (load.kind === "ready") return null;
+  const what =
+    load.kind === "loading"
+      ? "This sandbox's policy has not finished loading"
+      : "This sandbox's policy could not be read";
+  return `${what}, so saving is refused: writing now would replace its managed policy.yaml with whatever this half-built form contains — an empty allow-list and no git rules — on a path that skips the izba diff / izba promote weakening gate. Wait for the policy to load, or reopen this tab to retry.`;
+}
+
 export function PolicyEditor({ name }: { name: string }) {
   const [hosts, setHosts] = useState<Row[]>([]);
   const [gitRows, setGitRows] = useState<GitRow[]>([]);
   const [enforcing, setEnforcing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [load, setLoad] = useState<LoadState>({ kind: "loading" });
   const loadedRef = useRef<LoadedSnapshot>({ hosts: [], git: [] });
   // Namespaces the per-row passthrough-notice id so two concurrent
   // PolicyEditor instances can never collide an aria-describedby target.
@@ -327,6 +354,11 @@ export function PolicyEditor({ name }: { name: string }) {
 
   useEffect(() => {
     let alive = true;
+    // A different sandbox is a different policy: go back to "unknown" rather
+    // than leaving the previous sandbox's rows on screen as if they were this
+    // one's — and, with them, a Save that would write them here.
+    setLoad({ kind: "loading" });
+    setError(null);
     void (async () => {
       try {
         const p = await api.policyShow(name);
@@ -337,9 +369,10 @@ export function PolicyEditor({ name }: { name: string }) {
           setEnforcing(p.enforcing);
           setGitRows(loadedGit);
           loadedRef.current = { hosts: loadedHosts, git: loadedGit };
+          setLoad({ kind: "ready" });
         }
       } catch (e) {
-        if (alive) setError(e instanceof Error ? e.message : String(e));
+        if (alive) setLoad({ kind: "error", message: e instanceof Error ? e.message : String(e) });
       }
     })();
     return () => {
@@ -348,6 +381,12 @@ export function PolicyEditor({ name }: { name: string }) {
   }, [name]);
 
   async function toggleEnforce() {
+    // No load guard here on purpose: unlike Save, this control has no
+    // rendered form before `load.kind === "ready"` (see the header below), so
+    // there is no click to refuse — and an unreachable guard would be a
+    // security rule with no test behind it. The invariant that keeps it
+    // unreachable is asserted directly, in "offers no enforce toggle before
+    // the policy has loaded".
     const next = !enforcing;
     setEnforcing(next);
     try {
@@ -429,8 +468,20 @@ export function PolicyEditor({ name }: { name: string }) {
   }
 
   async function save() {
-    setError(null);
     setSaved(false);
+    // THE guard: never write a policy we never read. It lives here, in the
+    // state transition, and not merely in the Save control's rendered state —
+    // the same reasoning that put #262's pinned-row Host lock and
+    // Access-widening refusal in the reducer instead of in `readOnly`: a
+    // scripted click, a stale render or a future markup edit must not be able
+    // to route around it. The control is additionally marked `aria-disabled`
+    // (belt), but that is presentation; this is the barrier.
+    const refusal = saveRefusal(load);
+    if (refusal) {
+      setError(refusal);
+      return;
+    }
+    setError(null);
     try {
       for (const r of hosts) {
         const h = r.host.trim();
@@ -467,122 +518,154 @@ export function PolicyEditor({ name }: { name: string }) {
 
   return (
     <div className="flex h-full flex-col">
-      {/* Enforce toggle — always visible above the scroll area */}
+      {/* Enforce toggle — always visible above the scroll area, but ONLY once
+          the posture is known. `enforcing` initialises to `false`, so
+          rendering the toggle early would announce "Firewall off" for a
+          sandbox that may well be enforcing (the advertised-posture ≠
+          enforced-posture class), and one click would then push that invented
+          posture to the daemon. */}
       <div className="flex shrink-0 items-center gap-3 pb-3">
-        <EnforceToggle enforcing={enforcing} onToggle={() => void toggleEnforce()} />
+        {load.kind === "ready" ? (
+          <EnforceToggle enforcing={enforcing} onToggle={() => void toggleEnforce()} />
+        ) : (
+          <span className="text-xs font-semibold text-muted-foreground">
+            Firewall posture unknown
+          </span>
+        )}
       </div>
       {error && <div className="shrink-0 pb-3 text-sm text-destructive">{error}</div>}
 
       {/* Scrollable sections area — flexes to fill available height */}
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="flex flex-col gap-3 pb-3">
-          <Section title="Hosts">
-            <p className="mb-2 text-sm text-muted-foreground">
-              Hosts this sandbox may reach — exact (api.example.com) or wildcard
-              (*.example.com = one subdomain label, **.example.com = any depth; the
-              apex needs its own entry). Add a port to a host, or remove one with its ✕.
-            </p>
-            <EditableList
-              density="card"
-              items={hosts}
-              renderRow={(r, i) => {
-                const pinned = pinnedPorts(r);
-                const locked = pinned.length > 0;
-                // Namespaced by instanceId (useId) AND per-row by index, so
-                // aria-describedby resolves the right notice even with
-                // several locked rows in this instance, or two mounted
-                // instances of PolicyEditor.
-                const noticeId = `${instanceId}-passthrough-notice-${i}`;
-                return (
-                  <>
-                    <div className="flex w-full items-center gap-2">
-                      <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Host</label>
-                      <Input
-                        value={r.host}
-                        onChange={(e) => setHost(i, e.target.value)}
-                        placeholder="api.example.com or *.example.com"
-                        className="flex-1 font-mono text-sm"
-                        readOnly={locked}
-                        aria-describedby={locked ? noticeId : undefined}
-                        title={
-                          locked
-                            ? `Locked: this row carries a TLS-pinning passthrough port — ${PIN_ESCAPE_HINT}.`
-                            : undefined
-                        }
-                      />
-                    </div>
-                    {locked && (
-                      <p
-                        id={noticeId}
-                        className="w-full rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-xs text-destructive"
-                      >
-                        {passthroughNotice(pinned, r.access, enforcing)}
-                      </p>
-                    )}
-                    <div className="flex w-full items-center gap-2">
-                      <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Ports</label>
-                      <PortEditor
-                        ports={r.ports}
-                        access={r.access}
-                        enforcing={enforcing}
-                        onAdd={(p) => addPort(i, p)}
-                        onRemove={(p) => removePort(i, p)}
-                      />
-                    </div>
-                    <div className="flex w-full items-center gap-2">
-                      <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Access</label>
-                      <AccessPicker
-                        value={r.access}
-                        onChange={(v) => setHostAccess(i, v)}
-                      />
-                    </div>
-                  </>
-                );
-              }}
-              onAdd={addRow}
-              onRemove={(i) => removeRow(i)}
-              addLabel="Add host"
-              emptyHint="No allowed hosts — add one to permit egress."
-              rowAriaLabel={(_,i) => `Remove host ${i + 1}`}
-            />
-          </Section>
+        {load.kind === "ready" ? (
+          <div className="flex flex-col gap-3 pb-3">
+            <Section title="Hosts">
+              <p className="mb-2 text-sm text-muted-foreground">
+                Hosts this sandbox may reach — exact (api.example.com) or wildcard
+                (*.example.com = one subdomain label, **.example.com = any depth; the
+                apex needs its own entry). Add a port to a host, or remove one with its ✕.
+              </p>
+              <EditableList
+                density="card"
+                items={hosts}
+                renderRow={(r, i) => {
+                  const pinned = pinnedPorts(r);
+                  const locked = pinned.length > 0;
+                  // Namespaced by instanceId (useId) AND per-row by index, so
+                  // aria-describedby resolves the right notice even with
+                  // several locked rows in this instance, or two mounted
+                  // instances of PolicyEditor.
+                  const noticeId = `${instanceId}-passthrough-notice-${i}`;
+                  return (
+                    <>
+                      <div className="flex w-full items-center gap-2">
+                        <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Host</label>
+                        <Input
+                          value={r.host}
+                          onChange={(e) => setHost(i, e.target.value)}
+                          placeholder="api.example.com or *.example.com"
+                          className="flex-1 font-mono text-sm"
+                          readOnly={locked}
+                          aria-describedby={locked ? noticeId : undefined}
+                          title={
+                            locked
+                              ? `Locked: this row carries a TLS-pinning passthrough port — ${PIN_ESCAPE_HINT}.`
+                              : undefined
+                          }
+                        />
+                      </div>
+                      {locked && (
+                        <p
+                          id={noticeId}
+                          className="w-full rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-xs text-destructive"
+                        >
+                          {passthroughNotice(pinned, r.access, enforcing)}
+                        </p>
+                      )}
+                      <div className="flex w-full items-center gap-2">
+                        <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Ports</label>
+                        <PortEditor
+                          ports={r.ports}
+                          access={r.access}
+                          enforcing={enforcing}
+                          onAdd={(p) => addPort(i, p)}
+                          onRemove={(p) => removePort(i, p)}
+                        />
+                      </div>
+                      <div className="flex w-full items-center gap-2">
+                        <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Access</label>
+                        <AccessPicker
+                          value={r.access}
+                          onChange={(v) => setHostAccess(i, v)}
+                        />
+                      </div>
+                    </>
+                  );
+                }}
+                onAdd={addRow}
+                onRemove={(i) => removeRow(i)}
+                addLabel="Add host"
+                emptyHint="No allowed hosts — add one to permit egress."
+                rowAriaLabel={(_,i) => `Remove host ${i + 1}`}
+              />
+            </Section>
 
-          <Section title="Git repos">
-            <p className="mb-2 text-sm text-muted-foreground">
-              Git repositories this sandbox may clone or push to. Specify as{" "}
-              <span className="font-mono">host/owner/repo</span> or <span className="font-mono">host</span>.
-            </p>
-            <EditableList
-              density="card"
-              items={gitRows}
-              renderRow={(gr, i) => (
-                <div className="flex w-full items-center gap-2">
-                  <Input
-                    value={gr.target}
-                    onChange={(e) => setGitTarget(i, e.target.value)}
-                    placeholder="github.com/owner/repo"
-                    className="flex-1 font-mono text-sm"
-                  />
-                  <AccessPicker
-                    value={gr.access}
-                    onChange={(v) => setGitAccess(i, v)}
-                  />
-                </div>
-              )}
-              onAdd={addGitRow}
-              onRemove={(i) => removeGitRow(i)}
-              addLabel="Add repo"
-              emptyHint="No git rules — add one to allow a repo."
-              rowAriaLabel={(_,i) => `Remove repo ${i + 1}`}
-            />
-          </Section>
-        </div>
+            <Section title="Git repos">
+              <p className="mb-2 text-sm text-muted-foreground">
+                Git repositories this sandbox may clone or push to. Specify as{" "}
+                <span className="font-mono">host/owner/repo</span> or <span className="font-mono">host</span>.
+              </p>
+              <EditableList
+                density="card"
+                items={gitRows}
+                renderRow={(gr, i) => (
+                  <div className="flex w-full items-center gap-2">
+                    <Input
+                      value={gr.target}
+                      onChange={(e) => setGitTarget(i, e.target.value)}
+                      placeholder="github.com/owner/repo"
+                      className="flex-1 font-mono text-sm"
+                    />
+                    <AccessPicker
+                      value={gr.access}
+                      onChange={(v) => setGitAccess(i, v)}
+                    />
+                  </div>
+                )}
+                onAdd={addGitRow}
+                onRemove={(i) => removeGitRow(i)}
+                addLabel="Add repo"
+                emptyHint="No git rules — add one to allow a repo."
+                rowAriaLabel={(_,i) => `Remove repo ${i + 1}`}
+              />
+            </Section>
+          </div>
+        ) : (
+          /* Distinct from a loaded-and-empty policy on purpose: this pane
+             states what is NOT known instead of rendering "No allowed hosts",
+             whose "add one to permit egress" invitation is exactly what made
+             the destructive click attractive. */
+          <p className="pb-3 text-sm text-muted-foreground">
+            {load.kind === "loading"
+              ? "Loading this sandbox's policy… its allowed hosts, git rules and enforcement posture are not known yet."
+              : `Could not read this sandbox's policy: ${load.message}. Its allowed hosts, git rules and enforcement posture are unknown — an errored load is not an empty policy, so nothing shown here may be written back. Reopen this tab to retry.`}
+          </p>
+        )}
       </div>
 
       {/* Save footer — always visible, never scrolls away */}
       <div className="flex shrink-0 items-center gap-2 border-t border-border pt-3">
+        {/* `aria-disabled`, deliberately NOT the native `disabled` attribute:
+            the click must still reach `save()`, which is where the refusal
+            actually lives and where it produces a VISIBLE reason. A natively
+            disabled button would swallow the click silently and would make
+            any test of the guard vacuous — the guard, not the markup, is what
+            protects managed truth here. */}
         <Button
           type="button"
+          aria-disabled={load.kind !== "ready"}
+          className={load.kind !== "ready" ? "opacity-50" : undefined}
+          title={saveRefusal(load) ?? undefined}
           onClick={() => void save()}
         >
           Save
