@@ -369,6 +369,13 @@ jobs:
           prefix-key: dogfood-linux
       - name: Build izba binary
         run: cargo build --locked --release -p izba-cli
+      # The harness is otherwise pure-stdlib. PyYAML is needed to parse the
+      # sandbox's MANAGED policy.yaml — the ground truth behind the
+      # `expect_state.policy` assertion. Without it that assertion degrades
+      # to an honest `infra` candidate (never a silent pass), so this install
+      # is what keeps policy journeys GRADABLE rather than merely safe.
+      - name: Install PyYAML (managed policy.yaml evidence)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-yaml
       - name: Run dogfood journeys (report-only)
         # workflow_dispatch inputs are user-controlled: pass them through `env:`
         # and reference shell vars in the script (never interpolate `${{ inputs.* }}`
@@ -515,6 +522,10 @@ jobs:
         run: |
           npm i -g agent-browser@0.31.1
           agent-browser install --with-deps
+      # See the CLI job: PyYAML backs the managed-policy.yaml state evidence
+      # the `expect_state.policy` assertion grades against.
+      - name: Install PyYAML (managed policy.yaml evidence)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-yaml
       - name: Run GUI dogfood journeys (report-only)
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}

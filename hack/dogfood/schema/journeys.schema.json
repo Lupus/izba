@@ -123,13 +123,15 @@
             { "required": ["sandbox", "status"] },
             { "required": ["sandbox", "volume"] },
             { "required": ["sandbox", "port"] },
+            { "required": ["sandbox", "policy"] },
             { "required": ["sandboxes_exact"] }
           ],
           "dependencies": {
             "exists": ["sandbox"],
             "status": ["sandbox"],
             "volume": ["sandbox"],
-            "port": ["sandbox"]
+            "port": ["sandbox"],
+            "policy": ["sandbox"]
           },
           "properties": {
             "sandbox": {
@@ -203,9 +205,62 @@
                 }
               },
               "description": "Optional port-forward assertion for the sandbox named by the required sibling `sandbox` key, graded from the end-of-journey per-sandbox port evidence (the `izba port ls` capture for `exists`; the persisted config.json `ports` capture for `persistent`). At least one of exists/persistent must be declared; implies sandbox existence (a port assertion on an absent sandbox fails); composes with the sibling keys (ALL declared assertions must pass). Compiler rule: grade a Make-persistent promise with {persistent: true} — never expect_text over the forward's row copy, which renders the same for both states."
+            },
+            "policy": {
+              "type": "object",
+              "additionalProperties": false,
+              "anyOf": [
+                { "required": ["host", "present"] },
+                { "required": ["host", "access"] },
+                { "required": ["host", "port"] },
+                { "required": ["enforcing"] }
+              ],
+              "dependencies": {
+                "present": ["host"],
+                "access": ["host"],
+                "port": ["host"]
+              },
+              "properties": {
+                "host": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "The allow-list host the assertion is anchored on — an EXACT entry host as written in the policy (e.g. 'pinned.vendor.com'), matched case-insensitively. Required for present/access/port; not needed by a bare `enforcing` assertion. Duplicate exact hosts fold LAST-WINS, matching what the product compiles. No {workspace} substitution."
+                },
+                "present": {
+                  "type": "boolean",
+                  "description": "true ⇒ an allow entry for `host` must exist in the saved policy; false ⇒ it must NOT. This is how a REFUSED host rename is graded: assert {host: <new name>, present: false} on one core step and {host: <old name>, present: true} on another — the GUI renders no text that distinguishes a relocated hatch from a non-relocated one."
+                },
+                "access": {
+                  "enum": ["read", "read-write"],
+                  "description": "The entry's access verb in the saved policy, compared verbatim. An entry that omits `access:` (and a bare-string host entry) IS read-write — the product skips serializing the default. Use this to grade a REFUSED access widening: the file must still say what it said."
+                },
+                "port": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["number", "pinned"],
+                  "properties": {
+                    "number": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 65535,
+                      "description": "The port of the entry whose inspectability declaration is asserted (e.g. 443)."
+                    },
+                    "pinned": {
+                      "type": "boolean",
+                      "description": "true ⇒ that port must carry the explicit `protocol: tcp` TLS-pinning declaration (the passthrough hatch); false ⇒ the port must be authorized and NOT carry it. A port the entry does not authorize at all fails EITHER polarity — neither statement is true of it."
+                    }
+                  },
+                  "description": "Per-PORT inspectability assertion (#238: the axis is declared per port, never per entry). The legacy entry-level `protocol:` key is read as applying to every port of the entry, exactly as the product normalizes it."
+                },
+                "enforcing": {
+                  "type": "boolean",
+                  "description": "The saved policy's enforce posture. An absent (or null) `enforce:` key resolves to TRUE, per izba-core. Needs no `host`."
+                }
+              },
+              "description": "GUI decisive assertion over THE SAVED POLICY: graded from the sandbox's MANAGED `policy.yaml` (<data_dir>/sandboxes/<name>/policy.yaml — the host-only authority, never readable from the guest), not from the UI and NOT by parsing `izba policy show`'s rendered text (human-facing, no --json, far too brittle). This is the only machine-checkable oracle for a REFUSED policy edit — the true assertion behind 'the GUI refused the rename / the access widening' is 'the saved policy is unchanged', and a React <Input value> contributes nothing to document.body.innerText, so expect_text cannot see it. Requires the sibling `sandbox` key. At least one of present/access/port/enforcing must be declared; each host-scoped key needs `host`. ALL declared sub-assertions (and any sibling expect_text/expect_state key) must pass; a failed one flips the journey via a decisive functional candidate; an ungradable one (PyYAML unavailable, policy.yaml absent/unparseable) degrades it via a flipping infra candidate — never a silent pass. Invisible to the Actor (fair-test boundary). Optional."
             }
           },
-          "description": "GUI decisive grading hook — a small daemon-truth assertion graded against the runner's end-of-journey state evidence (the post-settle `izba __reconcile` snapshot + `izba volume ls` capture + per-sandbox `izba port ls`/persisted-ports captures: product ground truth, not what the UI happens to render). Graded on a `core: true` step of a modality:'gui' journey when the journey did NOT drive manifest_diff (manifest_truth then takes precedence); the CLI runner ignores it. Vocabulary: per-sandbox `exists`/`status`/`volume`/`port` (each requires the `sandbox` key), plus the set-level `sandboxes_exact` (which needs no `sandbox`). ALL declared sub-assertions (and any sibling expect_text) must pass for the decisive step to grade positive; a failed assertion flips the journey via a decisive functional candidate; an ungradable one (the reconcile snapshot itself errored, a volume assertion with no usable `izba volume ls` evidence, or a port assertion with no usable port evidence) degrades the journey via a flipping infra candidate — never a silent pass. A failing assertion is first re-sampled across a bounded settle window (--expect-state-settle-s, default 45s): lifecycle teardown and volume-save operations land asynchronously, so only divergence that PERSISTS across the settle flips — both the first and settled samples are recorded in the bundle for the skeptic. Invisible to the Actor (fair-test boundary). Optional."
+          "description": "GUI decisive grading hook — a small daemon-truth assertion graded against the runner's end-of-journey state evidence (the post-settle `izba __reconcile` snapshot + `izba volume ls` capture + per-sandbox `izba port ls`/persisted-ports captures: product ground truth, not what the UI happens to render). Graded on a `core: true` step of a modality:'gui' journey when the journey did NOT drive manifest_diff (manifest_truth then takes precedence); the CLI runner ignores it. Vocabulary: per-sandbox `exists`/`status`/`volume`/`port`/`policy` (each requires the `sandbox` key), plus the set-level `sandboxes_exact` (which needs no `sandbox`). `policy` is graded from the sandbox's managed `policy.yaml` (the saved policy) rather than the reconcile snapshot — the oracle for a REFUSED policy edit. ALL declared sub-assertions (and any sibling expect_text) must pass for the decisive step to grade positive; a failed assertion flips the journey via a decisive functional candidate; an ungradable one (the reconcile snapshot itself errored, a volume assertion with no usable `izba volume ls` evidence, or a port assertion with no usable port evidence) degrades the journey via a flipping infra candidate — never a silent pass. A failing assertion is first re-sampled across a bounded settle window (--expect-state-settle-s, default 45s): lifecycle teardown and volume-save operations land asynchronously, so only divergence that PERSISTS across the settle flips — both the first and settled samples are recorded in the bundle for the skeptic. Invisible to the Actor (fair-test boundary). Optional."
         },
         "seed_files": {
           "type": "object",

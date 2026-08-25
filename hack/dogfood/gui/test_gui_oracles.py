@@ -987,3 +987,229 @@ def test_expect_state_real_failure_beats_unverifiable_port_sibling():
          "port": {"host": 8082, "exists": True}}, ev, REF)
     assert verdict == "mismatch"
     assert "status:" in found[0].detail
+
+
+# ---------- expect_state.policy vocabulary (PR #262 locks enabler) ----------
+# The true oracle of a REFUSED policy edit is "the saved policy is unchanged".
+# The GUI can't express it (a React <Input value> contributes nothing to
+# document.body.innerText, and a RELOCATED hatch renders the same notice as a
+# non-relocated one), so it is graded from the managed policy.yaml — the
+# host-only authority per CLAUDE.md.
+
+_POLICY_DOC = {
+    "enforce": True,
+    "allow": [
+        {"host": "pinned.vendor.com",
+         "ports": [80, {"port": 443, "protocol": "tcp"}],
+         "access": "read"},
+        "plain.example.com",
+    ],
+}
+
+
+def _policy_evidence(doc, name="web"):
+    ev = _state_evidence([name], [{"name": name, "status_disk": "running"}])
+    ev["per_sandbox"] = {name: {"policy_yaml": doc}}
+    return ev
+
+
+def test_expect_state_policy_all_sub_assertions_hold():
+    from gui.gui_oracles import expect_state_oracle
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"enforcing": True, "host": "pinned.vendor.com",
+                    "present": True, "access": "read",
+                    "port": {"number": 443, "pinned": True}}},
+        _policy_evidence(_POLICY_DOC), REF)
+    assert (verdict, found) == ("matched", [])
+
+
+def test_expect_state_policy_access_widening_flips():
+    # The PR #262 assertion: the editor REFUSED to widen access, so the saved
+    # policy must still say `read`. A file that says read-write is the bug.
+    from gui.gui_oracles import expect_state_oracle
+    widened = {"enforce": True,
+               "allow": [{"host": "pinned.vendor.com",
+                          "ports": [80, {"port": 443, "protocol": "tcp"}],
+                          "access": "read-write"}]}
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "pinned.vendor.com", "access": "read"}},
+        _policy_evidence(widened), REF, step_index=3)
+    assert verdict == "mismatch"
+    assert len(found) == 1
+    assert found[0].kind == "functional"
+    assert "policy access:" in found[0].detail
+    assert "core step 3" in found[0].detail
+
+
+def test_expect_state_policy_present_grades_a_refused_rename():
+    # A refused host rename: the NEW name must be absent from the saved
+    # policy (the old name's presence is a sibling core step's assertion).
+    from gui.gui_oracles import expect_state_oracle
+    ev = _policy_evidence(_POLICY_DOC)
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "renamed.vendor.com", "present": False}}, ev, REF)
+    assert (verdict, found) == ("matched", [])
+    # …and the same assertion over a policy that DID get renamed flips.
+    renamed = {"enforce": True,
+               "allow": [{"host": "renamed.vendor.com",
+                          "ports": [{"port": 443, "protocol": "tcp"}]}]}
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "renamed.vendor.com", "present": False}},
+        _policy_evidence(renamed), REF)
+    assert verdict == "mismatch"
+    assert "policy allow:" in found[0].detail
+
+
+def test_expect_state_policy_present_true_flips_on_a_vanished_host():
+    from gui.gui_oracles import expect_state_oracle
+    gone = {"enforce": True, "allow": ["plain.example.com"]}
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "pinned.vendor.com", "present": True}},
+        _policy_evidence(gone), REF)
+    assert verdict == "mismatch"
+    assert "pinned.vendor.com" in found[0].detail
+
+
+def test_expect_state_policy_port_pinned_both_directions():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _policy_evidence(_POLICY_DOC)
+    # 443 carries `protocol: tcp`; 80 is a bare number (declared, NOT pinned).
+    assert expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "pinned.vendor.com",
+                    "port": {"number": 80, "pinned": False}}},
+        ev, REF) == ("matched", [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "pinned.vendor.com",
+                    "port": {"number": 80, "pinned": True}}}, ev, REF)
+    assert verdict == "mismatch"
+    assert "policy port 80:" in found[0].detail
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "pinned.vendor.com",
+                    "port": {"number": 443, "pinned": False}}}, ev, REF)
+    assert verdict == "mismatch"
+    assert "policy port 443:" in found[0].detail
+
+
+def test_expect_state_policy_port_not_authorized_flips_either_way():
+    # A port the entry does not authorize is neither pinned nor
+    # declared-and-unpinned: both polarities must flip, never silently pass.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _policy_evidence(_POLICY_DOC)
+    for pinned in (True, False):
+        verdict, found = expect_state_oracle(
+            {"sandbox": "web",
+             "policy": {"host": "pinned.vendor.com",
+                        "port": {"number": 8443, "pinned": pinned}}}, ev, REF)
+        assert verdict == "mismatch", pinned
+        assert "does not authorize" in found[0].detail
+
+
+def test_expect_state_policy_bare_host_entry_defaults():
+    # A bare string entry = ports [80, 443] undeclared, access read-write.
+    from gui.gui_oracles import expect_state_oracle
+    ev = _policy_evidence(_POLICY_DOC)
+    assert expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "plain.example.com", "present": True,
+                    "access": "read-write",
+                    "port": {"number": 443, "pinned": False}}},
+        ev, REF) == ("matched", [])
+
+
+def test_expect_state_policy_scoped_entry_without_access_is_read_write():
+    from gui.gui_oracles import expect_state_oracle
+    doc = {"enforce": True, "allow": [{"host": "a.example.com",
+                                       "ports": [443]}]}
+    assert expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "a.example.com", "access": "read-write"}},
+        _policy_evidence(doc), REF) == ("matched", [])
+
+
+def test_expect_state_policy_legacy_entry_level_protocol_normalizes_down():
+    # The pre-#238 ENTRY-level `protocol:` key is still accepted on input and
+    # means "every port of this entry" — the harness must read it that way or
+    # it would report a live hatch as absent.
+    from gui.gui_oracles import expect_state_oracle
+    doc = {"enforce": True,
+           "allow": [{"host": "old.vendor.com", "ports": [443],
+                      "protocol": "tcp"}]}
+    assert expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "old.vendor.com",
+                    "port": {"number": 443, "pinned": True}}},
+        _policy_evidence(doc), REF) == ("matched", [])
+
+
+def test_expect_state_policy_duplicate_exact_hosts_fold_last_wins():
+    # `to_rego_data_json` folds duplicate EXACT hosts last-wins (CLAUDE.md);
+    # the harness must read the same entry the product compiles.
+    from gui.gui_oracles import expect_state_oracle
+    doc = {"enforce": True,
+           "allow": [{"host": "dup.example.com", "access": "read"},
+                     {"host": "dup.example.com", "access": "read-write"}]}
+    assert expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "dup.example.com", "access": "read-write"}},
+        _policy_evidence(doc), REF) == ("matched", [])
+
+
+def test_expect_state_policy_enforcing_posture():
+    from gui.gui_oracles import expect_state_oracle
+    # An absent `enforce:` key resolves to TRUE (izba-core config.rs).
+    assert expect_state_oracle(
+        {"sandbox": "web", "policy": {"enforcing": True}},
+        _policy_evidence({"allow": []}), REF) == ("matched", [])
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "policy": {"enforcing": True}},
+        _policy_evidence({"enforce": False, "allow": []}), REF)
+    assert verdict == "mismatch"
+    assert "policy enforce:" in found[0].detail
+
+
+def test_expect_state_policy_absent_entry_fails_access_and_port():
+    # access/port on a host with no entry is a real divergence, not a skip.
+    from gui.gui_oracles import expect_state_oracle
+    doc = {"enforce": True, "allow": ["plain.example.com"]}
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "gone.example.com", "access": "read",
+                    "port": {"number": 443, "pinned": True}}},
+        _policy_evidence(doc), REF)
+    assert verdict == "mismatch"
+    assert "no entry" in found[0].detail
+
+
+def test_expect_state_policy_unreadable_yaml_is_no_evidence():
+    # policy.yaml absent/unparseable, or PyYAML unavailable in CI: the
+    # capture is null and the assertion is UNVERIFIABLE — the runner's
+    # flipping infra candidate, never a silent pass.
+    from gui.gui_oracles import expect_state_oracle
+    spec = {"sandbox": "web",
+            "policy": {"host": "pinned.vendor.com", "present": True}}
+    assert expect_state_oracle(spec, _policy_evidence(None), REF) == (
+        "no_evidence", [])
+    ev = _state_evidence(["web"], [{"name": "web", "status_disk": "running"}])
+    assert expect_state_oracle(spec, ev, REF) == ("no_evidence", [])
+    assert expect_state_oracle(
+        spec, _policy_evidence("not a mapping"), REF) == ("no_evidence", [])
+
+
+def test_expect_state_policy_real_failure_beats_unverifiable_sibling():
+    from gui.gui_oracles import expect_state_oracle
+    ev = _policy_evidence(_POLICY_DOC)
+    ev["reconcile"]["error"] = "izba died"  # status assertion unverifiable
+    verdict, found = expect_state_oracle(
+        {"sandbox": "web", "status": "running",
+         "policy": {"host": "pinned.vendor.com", "access": "read-write"}},
+        ev, REF)
+    assert verdict == "mismatch"
+    assert "policy access:" in found[0].detail

@@ -694,3 +694,92 @@ class TeardownTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PolicyYamlEvidenceTests(unittest.TestCase):
+    """The managed `policy.yaml` capture behind the GUI expect_state.policy
+    assertion (`<data_dir>/sandboxes/<name>/policy.yaml` — the host-only
+    authority per CLAUDE.md, i.e. precisely 'the saved policy'). Never graded
+    from `izba policy show`'s rendered text: that is human-facing output with
+    no --json."""
+
+    _POLICY_YAML = (
+        "enforce: true\n"
+        "allow:\n"
+        "- host: pinned.vendor.com\n"
+        "  ports:\n"
+        "  - 80\n"
+        "  - port: 443\n"
+        "    protocol: tcp\n"
+        "  access: read\n"
+        "- plain.example.com\n"
+    )
+
+    @staticmethod
+    def _stub(d):
+        stub = os.path.join(d, "izba")
+        with open(stub, "w") as f:
+            f.write(
+                "#!/bin/sh\n"
+                'if [ "$1" = "__reconcile" ]; then '
+                "echo '{\"sandboxes\":[{\"name\":\"sb1\"}]}'; exit 0; fi\n"
+                "exit 0\n")
+        os.chmod(stub, 0o755)
+        return stub
+
+    @classmethod
+    def _write_policy(cls, d, text):
+        sbdir = os.path.join(d, "sandboxes", "sb1")
+        os.makedirs(sbdir, exist_ok=True)
+        with open(os.path.join(sbdir, "policy.yaml"), "w") as f:
+            f.write(text)
+
+    def test_capture_state_evidence_parses_policy_yaml(self):
+        import oracles
+        if oracles._yaml is None:
+            self.skipTest("PyYAML unavailable")
+        with tempfile.TemporaryDirectory() as d:
+            stub = self._stub(d)
+            self._write_policy(d, self._POLICY_YAML)
+            ev = oracles.capture_state_evidence(stub, d, timeout_s=10)
+            doc = ev["per_sandbox"]["sb1"]["policy_yaml"]
+            self.assertEqual(doc["enforce"], True)
+            self.assertEqual(doc["allow"][0]["host"], "pinned.vendor.com")
+            self.assertEqual(doc["allow"][0]["ports"],
+                             [80, {"port": 443, "protocol": "tcp"}])
+            self.assertEqual(doc["allow"][1], "plain.example.com")
+
+    def test_capture_state_evidence_policy_yaml_none_when_absent(self):
+        # No policy.yaml on disk ⇒ null, never a fabricated empty policy: a
+        # `policy` assertion must grade no_evidence, never a silent pass.
+        import oracles
+        with tempfile.TemporaryDirectory() as d:
+            stub = self._stub(d)
+            ev = oracles.capture_state_evidence(stub, d, timeout_s=10)
+            self.assertIsNone(ev["per_sandbox"]["sb1"]["policy_yaml"])
+
+    def test_capture_state_evidence_policy_yaml_none_when_unparseable(self):
+        import oracles
+        if oracles._yaml is None:
+            self.skipTest("PyYAML unavailable")
+        with tempfile.TemporaryDirectory() as d:
+            stub = self._stub(d)
+            self._write_policy(d, "allow: [unclosed\n\t- bad: :\n")
+            ev = oracles.capture_state_evidence(stub, d, timeout_s=10)
+            self.assertIsNone(ev["per_sandbox"]["sb1"]["policy_yaml"])
+
+    def test_capture_state_evidence_policy_yaml_none_without_pyyaml(self):
+        # The dogfood CI workflow installs no python deps: PyYAML can simply
+        # be missing. That must degrade to no_evidence (null), never crash
+        # the runner and never silently pass an assertion.
+        import oracles
+        with tempfile.TemporaryDirectory() as d:
+            stub = self._stub(d)
+            self._write_policy(d, self._POLICY_YAML)
+            saved = oracles._yaml
+            oracles._yaml = None
+            try:
+                ev = oracles.capture_state_evidence(stub, d, timeout_s=10)
+            finally:
+                oracles._yaml = saved
+            self.assertIsNone(ev["per_sandbox"]["sb1"]["policy_yaml"])

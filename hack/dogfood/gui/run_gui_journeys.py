@@ -293,6 +293,44 @@ def _valid_port_spec(pspec: Any) -> bool:
             and ("exists" in pspec or "persistent" in pspec))
 
 
+_POLICY_ACCESS_VERBS = ("read", "read-write")
+
+
+def _valid_policy_spec(pspec: Any) -> bool:
+    """True iff ``pspec`` is a schema-shaped ``expect_state.policy`` object:
+    a dict declaring at least one of ``present``/``access``/``port``/
+    ``enforcing``; a non-empty ``host`` anchor whenever a host-scoped key
+    (present/access/port) is declared (``enforcing`` is file-level and needs
+    none); booleans where booleans belong; a known access verb; and a
+    ``port`` carrying BOTH an integer ``number`` (bool rejected — Python
+    bools are ints) and a boolean ``pinned``. A half-formed policy assertion
+    must fall through to the unreached_decisive flip, never grade."""
+    if not isinstance(pspec, dict):
+        return False
+    scoped = [k for k in ("present", "access", "port") if k in pspec]
+    if not scoped and "enforcing" not in pspec:
+        return False
+    host = pspec.get("host")
+    if scoped and not (isinstance(host, str) and host):
+        return False
+    if "enforcing" in pspec and not isinstance(pspec["enforcing"], bool):
+        return False
+    if "present" in pspec and not isinstance(pspec["present"], bool):
+        return False
+    if "access" in pspec and pspec["access"] not in _POLICY_ACCESS_VERBS:
+        return False
+    if "port" in pspec:
+        port = pspec["port"]
+        if not isinstance(port, dict):
+            return False
+        if not isinstance(port.get("number"), int) or isinstance(
+                port.get("number"), bool):
+            return False
+        if not isinstance(port.get("pinned"), bool):
+            return False
+    return True
+
+
 def _valid_sandboxes_exact(v: Any) -> bool:
     """True iff ``v`` is a schema-shaped ``expect_state.sandboxes_exact``
     value: a list — possibly EMPTY (asserts no sandboxes exist at all) — of
@@ -309,15 +347,25 @@ def _state_hook_label(state_hook: Dict[str, Any]) -> str:
             else "the daemon sandbox set (sandboxes_exact)")
 
 
+def _step_declares_hook(step: Dict[str, Any]) -> bool:
+    """True iff the step DECLARES a decisive hook key at all — deliberately
+    keyed on raw presence, not on validity: a malformed hook (which
+    ``_step_decisive_hooks`` normalizes to absent) is still a declared
+    assertion and must reach the grader, where it flips ``unreached_decisive``
+    rather than being silently skipped."""
+    return isinstance(step, dict) and ("expect_text" in step
+                                       or "expect_state" in step)
+
+
 def _step_decisive_hooks(step: Dict[str, Any]) -> tuple:
     """The (expect_text, expect_state) declarative hooks a step carries, with
     malformed values normalized to absent (``None``): a hook the schema would
     reject (non-str/empty expect_text; expect_state carrying a per-sandbox
-    assertion — ``exists``/``status``/``volume``/``port`` — without a
-    ``sandbox`` target, without at least one assertion among those plus
-    ``sandboxes_exact``, or with a half-formed ``volume``/``port``/
-    ``sandboxes_exact`` value — a declared assertion must never be silently
-    dropped) is NOT gradable and must fall through to the
+    assertion — ``exists``/``status``/``volume``/``port``/``policy`` —
+    without a ``sandbox`` target, without at least one assertion among those
+    plus ``sandboxes_exact``, or with a half-formed ``volume``/``port``/
+    ``policy``/``sandboxes_exact`` value — a declared assertion must never be
+    silently dropped) is NOT gradable and must fall through to the
     unreached_decisive flip — never a silent pass on a half-formed
     assertion."""
     text = step.get("expect_text")
@@ -327,7 +375,8 @@ def _step_decisive_hooks(step: Dict[str, Any]) -> tuple:
     if not isinstance(state, dict):
         state = None
     else:
-        per_sandbox = [k for k in ("exists", "status", "volume", "port")
+        per_sandbox = [k for k in ("exists", "status", "volume", "port",
+                                   "policy")
                        if k in state]
         if per_sandbox and not state.get("sandbox"):
             state = None  # per-sandbox assertions need a sandbox target
@@ -336,6 +385,8 @@ def _step_decisive_hooks(step: Dict[str, Any]) -> tuple:
         elif "volume" in state and not _valid_volume_spec(state.get("volume")):
             state = None
         elif "port" in state and not _valid_port_spec(state.get("port")):
+            state = None
+        elif "policy" in state and not _valid_policy_spec(state.get("policy")):
             state = None
         elif ("sandboxes_exact" in state
               and not _valid_sandboxes_exact(state.get("sandboxes_exact"))):
@@ -461,13 +512,25 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
                            resample_state=None,
                            settle_s: float = 0.0,
                            settle_poll_s: float = 3.0,
-                           settle_out: Optional[Dict[str, Any]] = None) -> None:
-    """Grade every declared ``core: true`` step of a NON-manifest GUI journey
-    through its declarative hooks — precedence rung 2 of the decisive wiring
-    (see run_gui_journey's comment block). Mutates ``candidates`` /
-    ``decisive_credits`` in place. Only called when the journey declares a
-    core step and drove no manifest_diff, so ``_decisive_step_indices`` here
-    yields exactly the core steps (never the fallback last step).
+                           settle_out: Optional[Dict[str, Any]] = None,
+                           only_declared_hooks: bool = False) -> None:
+    """Grade every declared ``core: true`` step of a GUI journey through its
+    declarative hooks — precedence rung 2 of the decisive wiring (see
+    run_gui_journey's comment block). Mutates ``candidates`` /
+    ``decisive_credits`` in place. ``_decisive_step_indices`` here yields
+    exactly the core steps (never the fallback last step).
+
+    ``only_declared_hooks`` is the manifest-journey mode: a journey that DID
+    drive a digest-carrying manifest_diff grades rung 1 (manifest_truth) as
+    before AND, additionally, every core step that DECLARED a hook — rung 1
+    may never SUBSTITUTE for an assertion the journey explicitly wrote
+    (ManifestTab auto-fires ``api.manifestDiff`` on mount, so merely opening
+    the tab re-arms rung 1 and would otherwise silently disarm the declared
+    hooks of a journey that never intended manifest grading). In that mode a
+    core step declaring NO hook key at all is SKIPPED — manifest_truth alone
+    governs it, unchanged — while a step whose declared hook is malformed is
+    still graded (and so still flips ``unreached_decisive``): a declared
+    assertion is never silently dropped.
 
     Per core step:
 
@@ -517,6 +580,8 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
     current_evidence = state_evidence
     for step_idx in sorted(_decisive_step_indices(steps)):
         s = steps[step_idx] if step_idx < len(steps) else {}
+        if only_declared_hooks and not _step_declares_hook(s):
+            continue  # manifest_truth governs a hook-less step, unchanged
         ref = {"journey_id": journey_id, "action_index": -1}
         text_hook, state_hook = _step_decisive_hooks(s)
         if text_hook is None and state_hook is None:
@@ -603,9 +668,11 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
                 no_evidence_detail=(
                     "expect_state: daemon state evidence unavailable "
                     "(reconcile snapshot errored/absent, no usable "
-                    "`izba volume ls` capture for a volume assertion, or no "
+                    "`izba volume ls` capture for a volume assertion, no "
                     "usable port_ls/ports_persisted capture for a port "
-                    "assertion), assertion unverifiable"),
+                    "assertion, or no usable managed policy.yaml capture "
+                    "— PyYAML unavailable / file absent / unparseable — for "
+                    "a policy assertion), assertion unverifiable"),
                 journey_id=journey_id, step_idx=step_idx,
                 candidates=candidates, decisive_credits=decisive_credits)
 
@@ -938,7 +1005,12 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     # step_indices, imported unchanged: pure over `steps`, nothing CLI-shaped
     # to fake). Grading PRECEDENCE for a journey with a core step:
     #   1. journey drove manifest_diff ⇒ manifest_truth ground truth
-    #      (unchanged Task-11 behavior, its tests pin it);
+    #      (unchanged Task-11 behavior, its tests pin it) — PLUS, for a core
+    #      step that DECLARED a hook, rung 2 as well: rung 1 never substitutes
+    #      for an assertion the journey explicitly wrote (ManifestTab
+    #      auto-fires api.manifestDiff on mount, so a wandering Actor could
+    #      otherwise disarm every declared hook in the set). ALL of them must
+    #      hold; a hook-less core step is governed by rung 1 alone, unchanged;
     #   2. else, the core step carries declarative hooks (`expect_text` /
     #      `expect_state`, compiler-authored, invisible to the Actor) ⇒
     #      grade those — ALL declared hooks must pass (see
@@ -1061,6 +1133,30 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 journey_id,
                 f"manifest_truth: ground truth could not be verified "
                 f"({mt_result}) for a core decisive step"))
+        if has_core_step and not decisive_unreached:
+            # Rung 1 does not SUBSTITUTE for rung 2 (defect fixed 2026-08-26):
+            # a core step that DECLARED expect_text/expect_state is graded on
+            # top of the manifest-truth result — every declared assertion must
+            # hold. Without this, any digest-carrying manifest_diff (and
+            # ManifestTab auto-fires one on mount, so merely OPENING the tab
+            # arms it) silently threw the journey author's own assertion away
+            # and graded "the UI's diff state equals `izba diff`'s state"
+            # instead. Hook-less core steps are skipped
+            # (``only_declared_hooks``) so manifest-only journeys grade
+            # exactly as before. Gated on the step having been REACHED: an
+            # unreached decisive step already flipped above, and a credit may
+            # never be built from a step the Actor never entered (136a03ea).
+            _grade_core_step_hooks(
+                journey=journey, journey_id=journey_id, steps=steps,
+                page_text_history=page_text_history,
+                step_hist_start=step_hist_start, state_evidence=state_evidence,
+                candidates=candidates, decisive_credits=decisive_credits,
+                zero_actions=not actions,
+                seed_hist_watermarks=seed_hist_watermarks,
+                resample_state=_resample_state,
+                settle_s=expect_state_settle_s,
+                settle_out=settle_out,
+                only_declared_hooks=True)
     elif has_core_step and steps:
         # No manifest_diff to ground-truth: grade each declared core step
         # through its declarative hooks (expect_text/expect_state), or flip

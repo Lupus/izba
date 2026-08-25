@@ -490,6 +490,141 @@ def _grade_volume_assertion(vspec: Dict[str, Any],
     return failures
 
 
+_POLICY_DEFAULT_PORTS = (80, 443)
+
+
+def _policy_entries(doc: Dict[str, Any], host: str) -> List[Dict[str, Any]]:
+    """Every ``allow`` entry naming ``host``, normalized to the Scoped dict
+    shape. A bare STRING entry is izba's ``AllowEntry::Host`` — ports
+    [80, 443] undeclared, access read-write (izba-core
+    ``daemon/egress/config.rs``). Host comparison is case-insensitive
+    (izba normalizes hosts to lowercase; a case-only difference is never the
+    finding a journey means)."""
+    want = host.strip().lower()
+    out: List[Dict[str, Any]] = []
+    for e in (doc.get("allow") or []):
+        if isinstance(e, str):
+            if e.strip().lower() == want:
+                out.append({"host": e})
+        elif isinstance(e, dict) and isinstance(e.get("host"), str):
+            if e["host"].strip().lower() == want:
+                out.append(e)
+    return out
+
+
+def _policy_entry_access(entry: Dict[str, Any]) -> str:
+    """The entry's access verb. Omitted ⇒ ``read-write`` (serde's
+    ``skip_serializing_if = is_default_access`` writes nothing for the
+    default), so an absent key is a POSITIVE fact, not missing evidence."""
+    acc = entry.get("access")
+    return acc if isinstance(acc, str) and acc else "read-write"
+
+
+def _policy_entry_ports(entry: Dict[str, Any]) -> Dict[int, Optional[str]]:
+    """``{port: declared protocol or None}`` for one allow entry.
+
+    ``ports:`` omitted ⇒ the default web ports, UNDECLARED. A list item is
+    either a bare number (nothing declared for that port) or a
+    ``{port, protocol}`` mapping (#238: the inspectability axis is declared
+    per PORT). The pre-#238 ENTRY-level ``protocol:`` key is still accepted
+    on input and means "every port of this entry" — ``parse_allow_entry``
+    normalizes it down onto the ports, so this reader does too: missing that
+    would report a LIVE pinning hatch as absent."""
+    entry_proto = entry.get("protocol")
+    entry_proto = entry_proto if isinstance(entry_proto, str) else None
+    raw = entry.get("ports")
+    if not isinstance(raw, list):
+        return {p: entry_proto for p in _POLICY_DEFAULT_PORTS}
+    out: Dict[int, Optional[str]] = {}
+    for item in raw:
+        if isinstance(item, bool):
+            continue  # a YAML bool is never a port number
+        if isinstance(item, int):
+            out[item] = entry_proto
+        elif isinstance(item, dict) and isinstance(item.get("port"), int):
+            proto = item.get("protocol")
+            out[item["port"]] = proto if isinstance(proto, str) else entry_proto
+    return out
+
+
+def _grade_policy_assertion(pspec: Dict[str, Any],
+                            doc: Dict[str, Any]) -> List[str]:
+    """Failure strings for one ``expect_state.policy`` assertion graded
+    against the parsed MANAGED ``policy.yaml`` (empty = every declared
+    sub-assertion holds).
+
+    ``host`` anchors WHICH allow entry is inspected; ``present`` asserts the
+    entry exists (``false`` = it must not — how a REFUSED rename is graded:
+    the new name absent, the old name present on a sibling step);
+    ``access`` compares the entry's verb verbatim; ``port.pinned`` asserts
+    that port carries the ``protocol: tcp`` pinning declaration (``false`` =
+    the port is authorized and NOT pinned — a port the entry does not
+    authorize at all fails EITHER polarity, since neither statement is true
+    of it); ``enforcing`` compares the file's enforce posture (an absent or
+    null ``enforce:`` key resolves to TRUE — izba-core ``config.rs``).
+
+    Duplicate EXACT hosts fold LAST-WINS, matching what the product
+    compiles (`to_rego_data_json`; the fold that, when it disagreed with an
+    earlier union, opened a live no-certificate-verification bypass — see
+    CLAUDE.md)."""
+    failures: List[str] = []
+    if "enforcing" in pspec:
+        enforce = doc.get("enforce")
+        actual = True if enforce is None else bool(enforce)
+        if actual != bool(pspec["enforcing"]):
+            failures.append(
+                f"policy enforce: expected {bool(pspec['enforcing'])}, the "
+                f"managed policy.yaml says {actual}")
+    host = pspec.get("host")
+    if not isinstance(host, str) or not host:
+        return failures  # host-less spec: only `enforcing` is gradable
+    entries = _policy_entries(doc, host)
+    entry = entries[-1] if entries else None  # last-wins, like the compiler
+    if "present" in pspec:
+        want = bool(pspec["present"])
+        if (entry is not None) != want:
+            failures.append(
+                f"policy allow: expected an entry for {host!r} to be "
+                f"{'present' if want else 'absent'}, the managed policy.yaml "
+                f"has it {'present' if entry is not None else 'absent'}")
+    if "access" in pspec:
+        if entry is None:
+            failures.append(
+                f"policy access: expected {pspec['access']!r} but {host!r} "
+                f"has no entry in the managed policy.yaml")
+        else:
+            actual = _policy_entry_access(entry)
+            if actual != pspec["access"]:
+                failures.append(
+                    f"policy access: expected {pspec['access']!r} for "
+                    f"{host!r}, the managed policy.yaml says {actual!r}")
+    portspec = pspec.get("port")
+    if isinstance(portspec, dict):
+        number = portspec.get("number")
+        want_pinned = bool(portspec.get("pinned"))
+        if entry is None:
+            failures.append(
+                f"policy port {number}: {host!r} has no entry in the managed "
+                f"policy.yaml")
+        else:
+            ports = _policy_entry_ports(entry)
+            if number not in ports:
+                failures.append(
+                    f"policy port {number}: the managed policy.yaml's entry "
+                    f"for {host!r} does not authorize port {number} "
+                    f"(authorized: {sorted(ports)!r})")
+            else:
+                pinned = ports[number] == "tcp"
+                if pinned != want_pinned:
+                    wanted = ("the pinning declaration (protocol: tcp)"
+                              if want_pinned else "NO pinning declaration")
+                    failures.append(
+                        f"policy port {number}: expected {wanted} on "
+                        f"{host!r}, the managed policy.yaml declares "
+                        f"{ports[number]!r}")
+    return failures
+
+
 def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
                         ref: Dict[str, Any], *, step_index: int = 0,
                         expect: str = "", source: str = "journey step"):
@@ -520,7 +655,16 @@ def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
       and ``ports_persisted`` config capture (persist truth — `izba port ls`
       cannot distinguish the two; see ``_grade_port_assertion``). Implies
       sandbox existence: a port assertion on an absent sandbox fails;
-    - ``sandboxes_exact``: the daemon's END-OF-JOURNEY sandbox set equals
+    - ``policy``: the sandbox's MANAGED ``policy.yaml`` (host-only
+      authority — literally "the saved policy") says what the step claims:
+      entry presence/absence for a host, its access verb, whether a port
+      carries the ``protocol: tcp`` pinning declaration, and the file's
+      enforce posture (see ``_grade_policy_assertion``). This is the only
+      machine-checkable oracle for a REFUSED policy edit: a React
+      ``<Input value>`` contributes nothing to ``document.body.innerText``,
+      and a relocated hatch renders an identical notice to a non-relocated
+      one, so ``expect_text`` cannot see either. Graded from the parsed file,
+      never from `izba policy show`'s rendered text;
       EXACTLY the given name set, order-insensitive (an empty list asserts NO
       sandboxes). This is the multi-entity removal differential a single
       ``exists: false`` cannot express (the D-GUI-2 false-green: 'drop-demo
@@ -532,9 +676,10 @@ def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
     declared assertion's evidence is missing — the reconcile snapshot errored
     or is structurally absent (no ``sandboxes`` key and no ``error``) for
     exists/status/port/sandboxes_exact, no usable ``volume_ls`` capture
-    (pre-fix bundle / non-zero exit / unparseable) for volume, or no usable
+    (pre-fix bundle / non-zero exit / unparseable) for volume, no usable
     ``port_ls``/``ports_persisted`` capture for the declared half of a port
-    assertion — the truth was never observed,
+    assertion, or no usable ``policy_yaml`` capture (PyYAML unavailable /
+    file absent / unparseable) for policy — the truth was never observed,
     so neither pass NOR product-bug can honestly be claimed (an errored
     snapshot would otherwise make ``exists: false`` a guaranteed false
     pass); the caller flips via infra. Precedence: a REAL failure on a
@@ -592,6 +737,13 @@ def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
                 pspec, (ev.get("per_sandbox") or {}).get(name) or {})
             failures.extend(pfail)
             unverifiable = unverifiable or punver
+    polspec = spec.get("policy")
+    if isinstance(polspec, dict):
+        doc = ((ev.get("per_sandbox") or {}).get(name) or {}).get("policy_yaml")
+        if not isinstance(doc, dict):
+            unverifiable = True  # PyYAML absent / file absent / unparseable
+        else:
+            failures.extend(_grade_policy_assertion(polspec, doc))
     if "sandboxes_exact" in spec:
         if not reconcile_usable:
             unverifiable = True
