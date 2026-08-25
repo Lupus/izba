@@ -366,8 +366,8 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                             ),
                             Some(Protocol::Tcp) => format!(
                                 "\u{26A0} :{} protocol: tcp — pinning passthrough: spliced \
-                                 opaquely; no L7 rules, no request audit, no credential \
-                                 injection",
+                                 opaquely; no L7 rules, no request audit, no upstream \
+                                 certificate verification",
                                 s.port
                             ),
                         };
@@ -1163,8 +1163,9 @@ mod tests {
             "netlog/audit visibility is a separate loss from L7 rules — name it:\n{out}"
         );
         assert!(
-            out.contains("no credential injection"),
-            "credential injection is a separate loss (per Protocol's own doc) — name it:\n{out}"
+            out.contains("no upstream certificate verification"),
+            "a passthrough verifies no upstream certificate — the most security-relevant \
+             loss, and the one the GUI already names — so name it here too:\n{out}"
         );
     }
 
@@ -1215,7 +1216,7 @@ mod tests {
         assert!(
             out.contains(
                 "\u{26A0} :443 protocol: tcp — pinning passthrough: spliced opaquely; \
-                 no L7 rules, no request audit, no credential injection\n"
+                 no L7 rules, no request audit, no upstream certificate verification\n"
             ),
             "the read-write passthrough line must stay byte-identical:\n{out}"
         );
