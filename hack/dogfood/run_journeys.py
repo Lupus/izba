@@ -416,7 +416,16 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
     step's ``_grade_decisive_from_observed`` scan can refuse to credit any
     action recorded before this boundary (journey-level ``seed_files``,
     written once before step 0, establishes no watermark — nothing precedes
-    it)."""
+    it). The watermark is gated on the step DECLARING ``seed_files`` (any
+    dict, per the schema — ``minProperties`` is not enforced), not on
+    ``_write_seeds`` actually landing a file: an empty dict, or one whose
+    every entry ``_write_seeds`` rejects (traversal/absolute path, escaping
+    symlink, write error — all report-only), still moves the watermark. This
+    is deliberately fail-closed for an oracle: a journey author who declares
+    ``seed_files`` on a step is asserting drift happens there, so a decisive
+    step downstream is held to that assertion even if authoring the fixture
+    itself silently failed — the honest outcome is ``unreached_decisive``,
+    never a stale credit."""
     seen: set = set()
     start = len(actions)  # index of this step's first action; actions[start:] = its own
     seed_files = step.get("seed_files")
@@ -568,8 +577,20 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id,
         return None
     for idx in range(len(actions) - 1, -1, -1):
         if idx < min_action_index:
-            log(f"{journey_id}: expect_cmd_re {pattern!r} only matched pre-drift "
-                f"action(s) before watermark {min_action_index}; refusing credit")
+            # Tell the truth about WHY nothing credited: only claim a
+            # pre-drift match if one actually exists down there — the scan
+            # above the watermark may have found nothing at all, and
+            # unconditionally blaming "pre-drift" would be a false claim a
+            # skeptic could take at face value.
+            if any(rx.search(a.get("command", ""))
+                  for a in actions[:min_action_index]):
+                log(f"{journey_id}: expect_cmd_re {pattern!r} only matched "
+                    f"pre-drift action(s) before watermark {min_action_index}; "
+                    f"refusing credit")
+            else:
+                log(f"{journey_id}: expect_cmd_re {pattern!r} matched no "
+                    f"action at or after watermark {min_action_index}; "
+                    f"refusing to look at pre-drift actions (state boundary)")
             break
         a = actions[idx]
         if not rx.search(a.get("command", "")):

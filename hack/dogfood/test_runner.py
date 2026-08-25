@@ -988,6 +988,114 @@ class DecisiveByObservedCommandTest(unittest.TestCase):
             [{"step_index": 2, "action_index": 0,
               "graded_cmd": "izba policy show"}])
 
+    def test_watermark_refusal_log_is_truthful_when_a_predrift_match_exists(self):
+        # A genuine pre-drift match: action 0 (below the watermark) DOES
+        # match the pattern, action 1 (at/after the watermark) does not. The
+        # refusal log's "only matched pre-drift action(s)" claim is accurate
+        # here.
+        import io
+        import contextlib
+        import run_journeys as rj
+        actions = [{"command": "izba policy show", "exit_code": 0},
+                   {"command": "izba ls", "exit_code": 0}]
+        step = {"expect_cmd_re": r"izba policy show", "expect_exit": 0,
+                "expect": ""}
+        journey = {"journey_id": "j"}
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            graded = rj._grade_decisive_from_observed(
+                step, actions, journey, "j", min_action_index=1)
+        self.assertIsNone(graded)
+        self.assertIn("only matched pre-drift action(s)", buf.getvalue())
+
+    def test_watermark_refusal_log_is_truthful_when_nothing_matched_at_all(self):
+        # Greptile finding: no action anywhere (before OR after the
+        # watermark) matches the pattern — the old log unconditionally
+        # claimed "only matched pre-drift action(s)" the moment the scan
+        # crossed the watermark, which is FALSE here: nothing ever matched.
+        import io
+        import contextlib
+        import run_journeys as rj
+        actions = [{"command": "izba ls", "exit_code": 0},
+                   {"command": "izba diff", "exit_code": 0}]
+        step = {"expect_cmd_re": r"izba policy show", "expect_exit": 0,
+                "expect": ""}
+        journey = {"journey_id": "j"}
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            graded = rj._grade_decisive_from_observed(
+                step, actions, journey, "j", min_action_index=1)
+        self.assertIsNone(graded)
+        self.assertNotIn(
+            "only matched pre-drift action(s)", buf.getvalue(),
+            f"no action anywhere matched; the log must not claim a "
+            f"pre-drift match existed: {buf.getvalue()!r}")
+
+    def test_empty_seed_files_dict_still_moves_the_watermark(self):
+        # Greptile finding: the schema declares no minProperties, so
+        # `seed_files: {}` is legal — an author might write it as a no-op
+        # placeholder. It still establishes the pre-drift boundary: this is
+        # a deliberate fail-closed pin (declaring the key at all is the
+        # signal, not whether _write_seeds actually materialized a file).
+        import run_journeys as rj
+        from model import FakeModel
+        model = FakeModel([
+            {"command": "izba policy show"},  # step 0: pre-boundary baseline
+            {"done": True},
+            {"done": True},                   # step 1: seed_files={}, zero actions
+            {"done": True},                   # step 2 (core): zero actions
+        ])
+        journey = {"journey_id": "empty-seed-dict-watermark",
+                   "steps": [
+                       {"intent": "baseline", "expect": ""},
+                       {"intent": "declare an empty drift boundary", "expect": "",
+                        "seed_files": {}},
+                       {"intent": "verify post-drift state", "expect": "",
+                        "core": True, "expect_exit": 0,
+                        "expect_cmd_re": r"izba policy show"}]}
+        with tempfile.TemporaryDirectory() as td:
+            stub = _write_decisive_stub_izba(td)
+            res = rj.run_journey(
+                model, journey, izba_bin=stub, data_dir=td,
+                max_turns=8, step_cap=8, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
+        kinds = [c.get("kind") for c in res["candidates"]]
+        self.assertIn("unreached_decisive", kinds, res["candidates"])
+        self.assertEqual(res["decisive_credits"], [])
+
+    def test_fully_rejected_seed_files_dict_still_moves_the_watermark(self):
+        # Same pin, but the single entry is one _write_seeds rejects outright
+        # (an absolute path fails the traversal guard) — no file is ever
+        # written to disk, yet declaring the key still moves the watermark.
+        import run_journeys as rj
+        from model import FakeModel
+        model = FakeModel([
+            {"command": "izba policy show"},  # step 0: pre-boundary baseline
+            {"done": True},
+            {"done": True},                   # step 1: seed_files all-rejected
+            {"done": True},                   # step 2 (core): zero actions
+        ])
+        journey = {"journey_id": "rejected-seed-dict-watermark",
+                   "steps": [
+                       {"intent": "baseline", "expect": ""},
+                       {"intent": "declare a rejected drift boundary", "expect": "",
+                        "seed_files": {"/etc/evil": "nope\n"}},
+                       {"intent": "verify post-drift state", "expect": "",
+                        "core": True, "expect_exit": 0,
+                        "expect_cmd_re": r"izba policy show"}]}
+        with tempfile.TemporaryDirectory() as td:
+            stub = _write_decisive_stub_izba(td)
+            res = rj.run_journey(
+                model, journey, izba_bin=stub, data_dir=td,
+                max_turns=8, step_cap=8, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
+        kinds = [c.get("kind") for c in res["candidates"]]
+        self.assertIn("unreached_decisive", kinds, res["candidates"])
+        self.assertEqual(res["decisive_credits"], [])
+        # And confirm the rejected entry really never landed on disk.
+        jdir = run_journeys._journey_data_dir(td, "rejected-seed-dict-watermark")
+        self.assertFalse(os.path.exists(os.path.join(jdir, "proj", "etc", "evil")))
+
     def test_non_product_command_does_not_credit_unreached_decisive(self):
         # Greptile P1: a broad-but-valid expect_cmd_re (e.g. bare `izba`) must
         # NOT be satisfied by a non-product command like `echo izba diff
