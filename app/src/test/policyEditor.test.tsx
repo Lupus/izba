@@ -892,3 +892,85 @@ describe("PolicyEditor", () => {
     );
   });
 });
+
+/** DEEP-1 — the tab must not answer questions it has not yet asked.
+ *
+ *  Before `policyShow` resolves (and again when it REJECTS) this editor used
+ *  to render as though the sandbox had a known, empty, non-enforcing policy:
+ *  "Firewall off" plus "No allowed hosts — add one to permit egress". One
+ *  click on Save in that state called `policySetFull` with an EMPTY allow-list,
+ *  overwriting the sandbox's managed `policy.yaml`. `policySetFull` is the path
+ *  that deliberately SKIPS the `izba diff` / `izba promote` weakening gate, so
+ *  nothing downstream flags or warns: the egress jail is silently disarmed.
+ *
+ *  Every save assertion below is made on the API MOCK, never on the button's
+ *  `disabled` attribute — the guard that matters lives in `save()` itself (the
+ *  same reasoning that put #262's pinned-row guards in the reducer rather than
+ *  in `readOnly`). Each refusal test also asserts the refusal is VISIBLE, which
+ *  is what keeps it from passing vacuously: if the click never reached the
+ *  handler (e.g. because a future edit made the control natively `disabled`),
+ *  no refusal is rendered and the test fails. */
+describe("PolicyEditor load state", () => {
+  /** A `policyShow` that never settles — the "still loading" window. */
+  function pendingPolicyShow() {
+    (api.policyShow as Mock).mockReturnValue(new Promise(() => {}));
+  }
+
+  it("refuses to save while the policy is still loading (policySetFull never called)", async () => {
+    pendingPolicyShow();
+    render(<PolicyEditor name="web" />);
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    // save() runs synchronously up to its first await, so an unguarded save
+    // has already called the mock by now.
+    expect(api.policySetFull).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/refus/i)).toBeInTheDocument());
+    expect(api.policySetFull).not.toHaveBeenCalled();
+  });
+
+  it("refuses to save after a load error (policySetFull never called)", async () => {
+    (api.policyShow as Mock).mockRejectedValue(new Error("daemon unreachable"));
+    render(<PolicyEditor name="web" />);
+    await screen.findByText(/daemon unreachable/i);
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(api.policySetFull).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/refus/i)).toBeInTheDocument());
+    expect(api.policySetFull).not.toHaveBeenCalled();
+    // The load failure stays on screen: an errored load is not an empty policy.
+    expect(screen.getByText(/daemon unreachable/i)).toBeInTheDocument();
+  });
+
+  it("claims no posture and no emptiness while the policy is loading", () => {
+    pendingPolicyShow();
+    render(<PolicyEditor name="web" />);
+    expect(screen.queryByText(/firewall off/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/firewall on/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/no allowed hosts/i)).not.toBeInTheDocument();
+    // ... and says so, rather than rendering a blank that reads as "empty".
+    expect(screen.getByText(/loading/i)).toBeInTheDocument();
+  });
+
+  it("claims no posture and no emptiness after a load error", async () => {
+    (api.policyShow as Mock).mockRejectedValue(new Error("daemon unreachable"));
+    render(<PolicyEditor name="web" />);
+    await screen.findByText(/daemon unreachable/i);
+    expect(screen.queryByText(/firewall off/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/firewall on/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/no allowed hosts/i)).not.toBeInTheDocument();
+  });
+
+  it("offers no enforce toggle before the policy has loaded", () => {
+    pendingPolicyShow();
+    render(<PolicyEditor name="web" />);
+    expect(screen.queryByRole("switch", { name: /enforce firewall/i })).not.toBeInTheDocument();
+    expect(api.policySetEnforce).not.toHaveBeenCalled();
+  });
+
+  it("still renders the empty state, and still saves, for a genuinely empty loaded policy", async () => {
+    (api.policyShow as Mock).mockResolvedValue({ enforcing: false, allow: [], git: [] });
+    render(<PolicyEditor name="web" />);
+    await screen.findByText(/no allowed hosts/i);
+    expect(screen.getByText(/firewall off/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(api.policySetFull).toHaveBeenCalledWith("web", [], []));
+  });
+});
