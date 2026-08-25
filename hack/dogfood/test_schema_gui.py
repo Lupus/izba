@@ -670,3 +670,27 @@ def test_expect_state_policy_validation():
         with pytest.raises(jsonschema.exceptions.ValidationError):
             jsonschema.validate(_minimal_journey_doc(
                 {"expect_state": {"sandbox": "web", "policy": bad}}), schema)
+
+
+def test_step_declares_expect_stdout_re():
+    # Defect 3: the schema is the journey compiler's instruction sheet — a hook
+    # the runner grades but the schema does not declare is unusable (and
+    # `additionalProperties: false` would reject it outright).
+    step = _load("journeys.schema.json")["definitions"]["step"]
+    hook = step["properties"]["expect_stdout_re"]
+    assert hook["type"] == "string"
+    # The runner matches against the recorded stdout TAIL, which is truncated:
+    # an author must not anchor on output that was cut.
+    assert "tail" in hook["description"].lower()
+    assert "expect_stdout_re" not in step.get("required", [])
+
+
+def test_expect_state_is_not_documented_as_gui_only():
+    # Defect 2: expect_state is now graded by BOTH runners. The description
+    # said "the CLI runner ignores it", which was true and is now false —
+    # a journey author reading it would never declare the hook on a CLI
+    # journey (and the corpus that did got no oracle and no warning).
+    desc = (_load("journeys.schema.json")["definitions"]["step"]
+            ["properties"]["expect_state"]["description"])
+    assert "the CLI runner ignores it" not in desc
+    assert "CLI" in desc

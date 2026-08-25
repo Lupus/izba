@@ -1532,3 +1532,272 @@ class CrashedJourneyHonestyTests(unittest.TestCase):
             infra = [c for c in res["candidates"] if c["kind"] == "infra"]
             self.assertTrue(any("journey crashed" in c["detail"] for c in infra),
                             res["candidates"])
+
+
+def _write_echoing_stub_izba(d):
+    """A stub `izba` that ECHOES its arguments, so a test can assert on WHAT a
+    command printed (the expect_stdout_re surface) rather than only on its exit
+    code. `__reconcile` keeps the empty-snapshot contract."""
+    stub = os.path.join(d, "izba")
+    with open(stub, "w") as f:
+        f.write(
+            "#!/bin/sh\n"
+            'if [ "$1" = "__reconcile" ]; then echo \'{"violations":[],"sandboxes":[]}\'; exit 0; fi\n'
+            'if [ "$1" = "bogus-subcommand" ]; then echo "error: unrecognized subcommand" 1>&2; exit 2; fi\n'
+            'echo "izba-said: $*"\n'
+            "exit 0\n"
+        )
+    os.chmod(stub, 0o755)
+    return stub
+
+
+class ExpectStdoutReTests(unittest.TestCase):
+    """Defect 3: `expect_exit` grades the exit code and `expect_cmd_re` selects
+    WHICH action is graded — neither can assert WHAT the command printed. A
+    decisive step meaning "the audit log shows this flow was spliced opaquely,
+    not terminated at L7" was graded purely on `izba netlog` exiting 0, which
+    is true whichever way the flow actually went."""
+
+    def _run(self, d, step, script, journey_extra=None):
+        stub = _write_echoing_stub_izba(d)
+        journey = {"journey_id": "stdout-anchor", "rationale": "r",
+                   "source": {"kind": "spec", "ref": "x"},
+                   "steps": [step]}
+        journey.update(journey_extra or {})
+        jf = _journeys_file(d, [journey])
+        out = os.path.join(d, "traj.json")
+        run_journeys.main([
+            "--journeys", jf, "--shard", "0", "--shards", "1",
+            "--izba-bin", stub, "--data-dir", d, "--out", out,
+            "--fake-model", json.dumps(script),
+            "--step-cap", "25", "--action-timeout-s", "10",
+            "--max-turns", "10", "--max-usd", "5"])
+        with open(out) as f:
+            return json.load(f)["results"][0]
+
+    def test_stdout_mismatch_flips_the_decisive_step(self):
+        step = {"intent": "read the audit log", "expect": "the flow is spliced",
+                "core": True, "expect_stdout_re": r"passthrough"}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [{"command": "izba netlog demo"},
+                                      {"done": True}])
+        func = [c for c in res["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res["candidates"])
+        self.assertTrue(func[0].get("decisive"), func[0])
+        self.assertEqual(func[0].get("graded_cmd"), "izba netlog demo")
+        self.assertIn("passthrough", func[0]["detail"])
+
+    def test_stdout_match_passes(self):
+        step = {"intent": "read the audit log", "expect": "the flow is spliced",
+                "core": True, "expect_stdout_re": r"izba-said: netlog"}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [{"command": "izba netlog demo"},
+                                      {"done": True}])
+        self.assertEqual([c for c in res["candidates"]
+                          if c["kind"] == "functional"], [])
+
+    def test_composes_with_expect_exit(self):
+        # The exit-code half HOLDS (0) and the stdout half does not: the step
+        # must still grade negative — both declared assertions must hold.
+        step = {"intent": "read the audit log", "expect": "the flow is spliced",
+                "core": True, "expect_exit": 0,
+                "expect_stdout_re": r"terminated at L7"}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [{"command": "izba netlog demo"},
+                                      {"done": True}])
+        func = [c for c in res["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res["candidates"])
+        self.assertIn("terminated at L7", func[0]["detail"])
+
+    def test_graded_against_the_expect_cmd_re_selected_action(self):
+        # Same selection rule as expect_exit: the LAST action matching
+        # expect_cmd_re, not the step's trailing verify (whose stdout WOULD
+        # have matched — so a runner grading the wrong action passes here).
+        step = {"intent": "read the audit log then peek", "expect": "spliced",
+                "core": True, "expect_cmd_re": r"izba netlog",
+                "expect_stdout_re": r"izba-said: ls"}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [{"command": "izba netlog demo"},
+                                      {"command": "izba ls"},
+                                      {"done": True}])
+        func = [c for c in res["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res["candidates"])
+        self.assertEqual(func[0].get("graded_cmd"), "izba netlog demo")
+
+    def test_unparseable_regex_degrades_to_infra_never_silent(self):
+        step = {"intent": "read the audit log", "expect": "spliced",
+                "core": True, "expect_stdout_re": "["}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [{"command": "izba netlog demo"},
+                                      {"done": True}])
+        self.assertTrue([c for c in res["candidates"] if c["kind"] == "infra"],
+                        res["candidates"])
+
+    def test_credit_from_an_earlier_action_still_grades_stdout(self):
+        # H3 credit path: a decisive step the Actor never reached may be
+        # credited from an earlier action via expect_cmd_re. That credit must
+        # not skip the stdout assertion — otherwise the very false-green this
+        # hook closes reopens on the credit path.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_echoing_stub_izba(d)
+            jf = _journeys_file(d, [{
+                "journey_id": "stdout-credit", "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"},
+                "steps": [
+                    {"intent": "look at the log", "expect": ""},
+                    {"intent": "assert the splice", "expect": "spliced",
+                     "core": True, "expect_cmd_re": r"izba netlog",
+                     "expect_stdout_re": r"passthrough"}]}])
+            out = os.path.join(d, "traj.json")
+            run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps([{"command": "izba netlog demo"},
+                                            {"done": True}, {"done": True}]),
+                "--step-cap", "25", "--action-timeout-s", "10",
+                "--max-turns", "10", "--max-usd", "5"])
+            with open(out) as f:
+                res = json.load(f)["results"][0]
+        func = [c for c in res["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res["candidates"])
+        self.assertTrue(func[0].get("decisive"), func[0])
+
+
+def _write_reconcile_stub_izba(d, sandboxes="[]", reconcile_exit=0):
+    """A stub `izba` whose `__reconcile` reports a chosen sandbox list (or
+    FAILS, when ``reconcile_exit`` is non-zero — the no-evidence path). Every
+    other subcommand echoes and exits 0, so state grading is what the test is
+    measuring, not the exit code."""
+    stub = os.path.join(d, "izba")
+    with open(stub, "w") as f:
+        f.write(
+            "#!/bin/sh\n"
+            'if [ "$1" = "__reconcile" ]; then\n'
+            f'  if [ {reconcile_exit} -ne 0 ]; then echo "boom" 1>&2; exit {reconcile_exit}; fi\n'
+            f'  echo \'{{"violations":[],"sandboxes":{sandboxes}}}\'; exit 0\n'
+            "fi\n"
+            'echo "izba-said: $*"\n'
+            "exit 0\n"
+        )
+    os.chmod(stub, 0o755)
+    return stub
+
+
+class CliExpectStateTests(unittest.TestCase):
+    """Defect 2: the journey schema puts `expect_state` on `step`
+    unconditionally and the GUI runner grades it, but the CLI runner never
+    read it — declaring it on a CLI journey validated against the schema and
+    was then silently discarded, leaving the decisive step graded on an exit
+    code alone."""
+
+    def _run(self, d, stub, step, script=None):
+        # run_journey directly (not main): the data dir is then exactly ``d``,
+        # so a test can plant the managed policy.yaml the assertion reads.
+        journey = {"journey_id": "state-hook", "rationale": "r",
+                   "source": {"kind": "spec", "ref": "x"},
+                   "steps": [step]}
+        model = FakeModel(script or [{"command": "izba ls"}, {"done": True}])
+        return run_journeys.run_journey(
+            model, journey, izba_bin=stub, data_dir=d,
+            max_turns=10, step_cap=25, action_timeout_s=10,
+            latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=5.0)
+
+    def test_failing_expect_state_flips_the_decisive_step(self):
+        # The command exits 0 (the only thing the old runner graded) but the
+        # asserted daemon truth is false: the journey must grade NEGATIVE.
+        step = {"intent": "create the sandbox", "expect": "it exists",
+                "core": True,
+                "expect_state": {"sandbox": "demo", "exists": True}}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, _write_reconcile_stub_izba(d), step)
+        func = [c for c in res["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res["candidates"])
+        self.assertTrue(func[0].get("decisive"), func[0])
+        self.assertIn("expect_state", func[0]["detail"])
+
+    def test_holding_expect_state_records_an_auditable_credit(self):
+        step = {"intent": "leave nothing behind", "expect": "no sandboxes",
+                "core": True, "expect_state": {"sandboxes_exact": []}}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, _write_reconcile_stub_izba(d), step)
+        self.assertEqual([c for c in res["candidates"]
+                          if c["kind"] in ("functional", "infra",
+                                           "unreached_decisive")], [])
+        credits = [c for c in res["decisive_credits"]
+                   if "expect_state" in (c.get("graded_cmd") or "")]
+        self.assertEqual(len(credits), 1, res["decisive_credits"])
+        self.assertEqual(credits[0]["step_index"], 0)
+
+    def test_unverifiable_expect_state_degrades_to_infra(self):
+        step = {"intent": "create the sandbox", "expect": "it exists",
+                "core": True,
+                "expect_state": {"sandbox": "demo", "exists": False}}
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_reconcile_stub_izba(d, reconcile_exit=1)
+            res = self._run(d, stub, step)
+        infra = [c for c in res["candidates"]
+                 if c["kind"] == "infra" and "expect_state" in c["detail"]]
+        self.assertEqual(len(infra), 1, res["candidates"])
+        self.assertEqual([c for c in res["candidates"]
+                          if c["kind"] == "functional"], [])
+
+    def test_malformed_expect_state_is_never_silently_dropped(self):
+        # A declared-but-ungradable hook (no assertion key at all) must flip,
+        # not pass: silence is the one option that is not acceptable.
+        step = {"intent": "do the thing", "expect": "it worked", "core": True,
+                "expect_state": {"sandbox": "demo"}}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, _write_reconcile_stub_izba(d), step)
+        self.assertTrue([c for c in res["candidates"]
+                         if c["kind"] == "unreached_decisive"],
+                        res["candidates"])
+        self.assertEqual(res["decisive_credits"], [])
+
+    def test_policy_vocabulary_is_graded_from_the_managed_policy_yaml(self):
+        # The `expect_state.policy` sub-assertion (the saved-policy oracle)
+        # must work on a CLI journey too — reusing the ONE implementation,
+        # not a second fold of the inspectability rule.
+        import oracles
+        if oracles._yaml is None:
+            self.skipTest("PyYAML unavailable")  # the capture degrades to infra
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_reconcile_stub_izba(
+                d, sandboxes='[{"name":"pin-demo","status_disk":"running"}]')
+            pol_dir = os.path.join(d, "sandboxes", "pin-demo")
+            os.makedirs(pol_dir, exist_ok=True)
+            with open(os.path.join(pol_dir, "policy.yaml"), "w") as f:
+                f.write("enforce: true\n"
+                        "allow:\n"
+                        "  - host: pinned.vendor.com\n"
+                        "    ports:\n"
+                        "      - port: 443\n"
+                        "        protocol: tcp\n")
+            held = {"intent": "check the hatch", "expect": "still pinned",
+                    "core": True,
+                    "expect_state": {"sandbox": "pin-demo",
+                                     "policy": {"host": "pinned.vendor.com",
+                                                "port": {"number": 443,
+                                                         "pinned": True}}}}
+            res_ok = self._run(d, stub, held)
+            self.assertTrue([c for c in res_ok["decisive_credits"]
+                             if "expect_state" in (c.get("graded_cmd") or "")],
+                            res_ok)
+            self.assertEqual([c for c in res_ok["candidates"]
+                              if c["kind"] == "functional"], [])
+        with tempfile.TemporaryDirectory() as d2:
+            stub = _write_reconcile_stub_izba(
+                d2, sandboxes='[{"name":"pin-demo","status_disk":"running"}]')
+            pol_dir = os.path.join(d2, "sandboxes", "pin-demo")
+            os.makedirs(pol_dir, exist_ok=True)
+            with open(os.path.join(pol_dir, "policy.yaml"), "w") as f:
+                f.write("allow:\n  - host: pinned.vendor.com\n")
+            broken = {"intent": "check the hatch", "expect": "still pinned",
+                      "core": True,
+                      "expect_state": {"sandbox": "pin-demo",
+                                       "policy": {"host": "pinned.vendor.com",
+                                                  "port": {"number": 443,
+                                                           "pinned": True}}}}
+            res_bad = self._run(d2, stub, broken)
+        func = [c for c in res_bad["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res_bad["candidates"])
+        self.assertIn("443", func[0]["detail"])

@@ -52,16 +52,21 @@ def parse_gui_reply(content: str) -> Dict[str, Any]:
     return {"done": True}
 
 
-def build_gui_user_message(journey: Dict[str, Any], step: Dict[str, Any],
+def build_gui_user_message(_journey: Dict[str, Any], step: Dict[str, Any],
                            observations: List[Dict[str, Any]]) -> str:
+    """The GUI Actor's user message. ``_journey`` is part of the
+    ``user_message_fn`` contract and deliberately UNREAD (fair test)."""
     obs_lines = []
     for o in observations[-4:]:  # keep context small + cheap
         obs_lines.append(
             f"- did `{o.get('action', '')}`; screen now:\n{(o.get('marks') or '')[-1500:]}"
         )
     obs = "\n".join(obs_lines) if obs_lines else "(no actions yet)"
+    # Fair-test boundary (mirrors model._build_user_message): no ``journey_id``
+    # — ids like ``gui-cannot-activate-a-dormant-exception`` state the fact
+    # under test, and an Actor told the answer can "satisfy" a step by
+    # asserting it without ever touching the app.
     return (
-        f"Journey: {journey.get('journey_id', '')}\n"
         f"Step intent: {step.get('intent', '')}\n"
         f"Expected outcome: {step.get('expect', '')}\n"
         f"Recent actions + current screen:\n{obs}\n\n"

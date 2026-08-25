@@ -308,6 +308,55 @@ def _decisive_step_indices(steps: List[Dict[str, Any]]) -> set:
     return {len(steps) - 1} if steps else set()
 
 
+def _stdout_candidates(step, action, source, ref, journey_id) -> List[Candidate]:
+    """``expect_stdout_re``: assert WHAT the graded action printed.
+
+    ``expect_exit`` grades the exit code and ``expect_cmd_re`` selects WHICH
+    action is graded — neither can assert on output. So a decisive step meaning
+    "the audit log shows this flow was spliced opaquely, not terminated at L7"
+    was graded purely on `izba netlog` exiting 0, which is true whichever way
+    the flow actually went.
+
+    Graded against the stdout of the SAME action the functional verdict is
+    graded on (``expect_cmd_re``-selected, else the step's last product
+    invocation, else its final action), so the two hooks can never disagree
+    about WHICH command they are talking about. Composes with ``expect_exit``:
+    the candidates simply add, so when both are declared both must hold.
+
+    The matched text is the recorded ``stdout_tail`` — the LAST
+    ``oracles.TAIL_BYTES`` of stdout, which is all the bundle keeps; the schema
+    description says so, so an author does not anchor on output that was cut.
+
+    An UNPARSEABLE pattern is an ungradable assertion, not an absent one: it
+    emits a flipping ``infra`` candidate rather than passing silently (unlike
+    ``expect_cmd_re``, whose invalid-regex path merely falls back to a
+    different — still graded — action)."""
+    pattern = step.get("expect_stdout_re")
+    if not (isinstance(pattern, str) and pattern):
+        return []
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        log(f"{journey_id}: invalid expect_stdout_re {pattern!r}: {e}")
+        return [Candidate(
+            kind="infra",
+            detail=(f"expect_stdout_re {pattern!r} is not a valid regex "
+                    f"({e}); the step's output assertion could not be graded"),
+            violated_expectation="a declared expect_stdout_re must be gradable",
+            source=source, trajectory_ref=dict(ref))]
+    stdout_tail = action.get("stdout_tail") or ""
+    if rx.search(stdout_tail):
+        return []
+    return [Candidate(
+        kind="functional",
+        detail=(f"expect_stdout_re {pattern!r} did not match the stdout of "
+                f"{action.get('command', '')!r} (stdout_tail: "
+                f"{stdout_tail[-300:]!r})"),
+        violated_expectation=step.get("expect", "")
+                             or f"stdout must match {pattern!r}",
+        source=source, trajectory_ref=dict(ref))]
+
+
 def _grade_step_functional(step, produced, journey, journey_id, decisive,
                            action_index) -> List[Dict[str, Any]]:
     """Grade the functional assertion ONCE per step, on its intent-bearing action.
@@ -346,11 +395,12 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
                 break
     ref = {"journey_id": journey_id, "action_index": target_index}
     source = journey.get("source", {}).get("ref", "journey step")
-    found = functional_oracle(
+    found = list(functional_oracle(
         target.get("command", ""), target.get("exit_code", 0),
         step.get("expect", ""), source, ref,
         expect_exit=step.get("expect_exit"),
-        stderr=target.get("stderr_tail", ""))
+        stderr=target.get("stderr_tail", "")))
+    found += _stdout_candidates(step, target, source, ref, journey_id)
     out = []
     for c in found:
         cd = c.to_dict()
@@ -599,11 +649,16 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id,
             continue
         ref = {"journey_id": journey_id, "action_index": idx}
         source = journey.get("source", {}).get("ref", "journey step")
-        found = functional_oracle(
+        found = list(functional_oracle(
             a.get("command", ""), a.get("exit_code", 0),
             step.get("expect", ""), source, ref,
             expect_exit=step.get("expect_exit"),
-            stderr=a.get("stderr_tail", ""))
+            stderr=a.get("stderr_tail", "")))
+        # The credit path grades the SAME assertions as a reached step: an
+        # unreached decisive step credited from an earlier action must still
+        # prove what that action PRINTED, or the false-green expect_stdout_re
+        # closes simply reopens here.
+        found += _stdout_candidates(step, a, source, ref, journey_id)
         out = []
         for c in found:
             cd = c.to_dict()
@@ -618,6 +673,122 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id,
             "candidates": out,
         }
     return None
+
+
+def _load_state_hook_helpers():
+    """The ONE implementation of the ``expect_state`` hook, borrowed from the
+    GUI runner.
+
+    ``expect_state`` is a single rule — the hook's schema vocabulary
+    (``_step_decisive_hooks``'s validity normalization, including the
+    ``policy`` sub-assertion), the oracle that grades it
+    (``expect_state_oracle``), and the instrument-honesty fold that turns a
+    verdict into candidates/credits (``_apply_hook_verdict``). Re-implementing
+    any of it here would be a SECOND FOLD of the same rule, which is how this
+    repo once shipped a live no-certificate-verification bypass (CLAUDE.md,
+    M5 P1): the CLI runner imports the GUI runner's helpers instead.
+
+    The import is LAZY because ``gui.run_gui_journeys`` imports THIS module at
+    its own module scope — a module-scope import here would be circular. By
+    the time a journey is graded this module is fully initialized, so the
+    import is safe from either entry point. A failure to import is reported as
+    a flipping ``infra`` candidate by the caller: a CLI journey that declared
+    ``expect_state`` and could not have it graded degrades LOUDLY, and a
+    rename on the GUI side reddens the CLI runner's own tests rather than
+    silently reverting the hook to the pre-fix silent discard."""
+    from gui.gui_oracles import expect_state_oracle  # noqa: E402
+    from gui.run_gui_journeys import (  # noqa: E402
+        _apply_hook_verdict, _state_hook_label, _step_decisive_hooks,
+        _zero_action_unreached,
+    )
+    return (_step_decisive_hooks, expect_state_oracle, _state_hook_label,
+            _apply_hook_verdict, _zero_action_unreached)
+
+
+_STATE_NO_EVIDENCE_DETAIL = (
+    "expect_state: daemon state evidence unavailable (reconcile snapshot "
+    "errored/absent, no usable `izba volume ls` capture for a volume "
+    "assertion, no usable port_ls/ports_persisted capture for a port "
+    "assertion, or no usable managed policy.yaml capture — PyYAML "
+    "unavailable / file absent / unparseable — for a policy assertion), "
+    "assertion unverifiable")
+
+
+def _grade_decisive_state_hooks(*, journey, journey_id, steps, decisive_idx,
+                                state_evidence, candidates, decisive_credits,
+                                zero_actions=False) -> None:
+    """Grade every DECISIVE step that declares ``expect_state`` against the
+    journey's end-of-journey ``capture_state_evidence`` snapshot.
+
+    The schema puts ``expect_state`` on ``step`` unconditionally and its
+    description talks about daemon ground truth, but only the GUI runner ever
+    read it: declaring it on a CLI journey validated and was then silently
+    DISCARDED, leaving the decisive step graded on an exit code alone — a
+    journey author got no oracle and no warning. The evidence the oracle needs
+    is already captured here (``capture_state_evidence``), so this is plumbing,
+    not a new rule (see ``_load_state_hook_helpers``).
+
+    Instrument honesty, identical to the GUI runner's contract: ``matched`` ⇒
+    an auditable ``decisive_credits`` entry; ``mismatch`` ⇒ the oracle's
+    ``functional`` candidate(s) tagged ``decisive``; evidence unavailable ⇒ a
+    flipping ``infra`` candidate. A step that DECLARES the key but whose value
+    is not gradable (no assertion at all, a half-formed volume/port/policy
+    value) flips ``unreached_decisive`` — a declared assertion is never
+    silently dropped.
+
+    Keyed on RAW key presence, so a malformed hook still reaches the grader.
+    ``zero_actions`` mirrors the GUI runner's Fix-4 reclassification: on a
+    journey whose Actor ran NOTHING, a failing assertion is an engagement
+    failure (the interaction it presupposes was never attempted), not evidence
+    of a product bug."""
+    declaring = [i for i in sorted(decisive_idx)
+                 if isinstance(steps[i], dict) and "expect_state" in steps[i]]
+    if not declaring:
+        return
+    source = journey.get("source", {}).get("ref", "journey step")
+    try:
+        (step_hooks, state_oracle, hook_label, apply_verdict,
+         zero_action_unreached) = _load_state_hook_helpers()
+    except Exception as e:  # never a silent pass: refuse loudly
+        log(f"{journey_id}: expect_state helpers unavailable: {e!r}")
+        candidates.append(_infra_candidate(
+            journey_id,
+            f"expect_state declared on decisive step(s) {declaring} but the "
+            f"shared hook grader could not be loaded ({e!r}); the assertion "
+            f"was not graded"))
+        return
+    for i in declaring:
+        s = steps[i]
+        ref = {"journey_id": journey_id, "action_index": -1}
+        _, state_hook = step_hooks(s)
+        if state_hook is None:
+            candidates.append({
+                "kind": "unreached_decisive",
+                "detail": (f"decisive step {i} ({s.get('intent', '')[:80]!r}) "
+                           f"declares an expect_state the runner cannot grade "
+                           f"({s.get('expect_state')!r}) — its assertion was "
+                           f"never exercised"),
+                "violated_expectation": s.get("expect", "")
+                                        or "expect_state must be gradable",
+                "source": source,
+                "trajectory_ref": dict(ref),
+            })
+            continue
+        verdict, found = state_oracle(
+            state_hook, state_evidence, ref, step_index=i,
+            expect=s.get("expect", ""), source=source)
+        if zero_actions and verdict == "mismatch":
+            candidates.append(zero_action_unreached(
+                journey_id, s, source,
+                f"expect_state for {hook_label(state_hook)} presupposes a "
+                f"command the actor never ran"))
+            continue
+        apply_verdict(
+            verdict, found,
+            hook=f"expect_state: {hook_label(state_hook)}",
+            no_evidence_detail=_STATE_NO_EVIDENCE_DETAIL,
+            journey_id=journey_id, step_idx=i,
+            candidates=candidates, decisive_credits=decisive_credits)
 
 
 def run_journey(
@@ -714,6 +885,14 @@ def run_journey(
     except Exception as e:  # report-only: never let evidence capture fail a run
         log(f"{journey_id}: state-evidence capture error: {e!r}")
         state_evidence = {"sandboxes": [], "reconcile": {}, "per_sandbox": {}}
+    # The declarative daemon-truth hook, graded on the SAME evidence (#defect
+    # 2): a decisive step's `expect_state` is now honoured on CLI journeys too,
+    # not silently discarded.
+    _grade_decisive_state_hooks(
+        journey=journey, journey_id=journey_id, steps=steps,
+        decisive_idx=decisive_idx, state_evidence=state_evidence,
+        candidates=candidates, decisive_credits=decisive_credits,
+        zero_actions=not actions)
     for cd in guest_console_oracle(
             state_evidence, {"journey_id": journey_id, "action_index": -1}):
         d = cd.to_dict()

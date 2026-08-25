@@ -131,5 +131,28 @@ class NextCommandTests(unittest.TestCase):
                                2.0 * model.APPROX_USD_PER_1M_TOKENS)
 
 
+class UserMessageFairTestTests(unittest.TestCase):
+    """The Actor's user message is a FAIR-TEST surface: it may carry the task
+    (intent, expected outcome, observations) and nothing that states the
+    answer. Journey ids are internal (sharding + loop-dedup) but are written
+    in English and routinely name the fact under test
+    (``deep-pinned-host-keeps-the-vendor-certificate``), so an Actor handed one
+    can satisfy a step by asserting the conclusion in prose with zero product
+    actions."""
+
+    JOURNEY = {"journey_id": "deep-pinned-host-keeps-the-vendor-certificate"}
+    STEP = {"intent": "check what the audit log says about the flow",
+            "expect": "the flow is recorded"}
+
+    def test_message_carries_the_task(self):
+        msg = model._build_user_message(self.JOURNEY, self.STEP, [])
+        self.assertIn("check what the audit log says about the flow", msg)
+        self.assertIn("the flow is recorded", msg)
+
+    def test_message_does_not_leak_the_journey_id(self):
+        msg = model._build_user_message(self.JOURNEY, self.STEP, [])
+        self.assertNotIn("deep-pinned-host-keeps-the-vendor-certificate", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

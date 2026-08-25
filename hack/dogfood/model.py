@@ -118,8 +118,11 @@ def _parse_reply(content: str) -> Dict[str, Any]:
     return {"error": f"model reply has wrong shape: {content[:120]!r}"}
 
 
-def _build_user_message(journey: Dict[str, Any], step: Dict[str, Any],
+def _build_user_message(_journey: Dict[str, Any], step: Dict[str, Any],
                         observations: List[Dict[str, Any]]) -> str:
+    """The Actor's user message. ``_journey`` is part of the
+    ``user_message_fn`` contract and deliberately UNREAD — see the fair-test
+    note below."""
     obs_lines = []
     for o in observations[-6:]:  # keep context small + cheap
         obs_lines.append(
@@ -128,8 +131,15 @@ def _build_user_message(journey: Dict[str, Any], step: Dict[str, Any],
             f"stderr: {(o.get('stderr_tail') or '')[-300:]!r}"
         )
     obs = "\n".join(obs_lines) if obs_lines else "(none yet)"
+    # Fair-test boundary: the message carries the TASK (intent, expected
+    # outcome, observations) and nothing that states the answer. The
+    # ``journey_id`` is deliberately NOT rendered: it is internal (sharding +
+    # loop-dedup) but is written in English and routinely names the fact under
+    # test (``deep-pinned-host-keeps-the-vendor-certificate``,
+    # ``deep-dormant-exception-still-intercepts``), so an Actor handed one can
+    # satisfy the step by asserting the conclusion in prose with zero product
+    # actions — the leak first found in `smoke-docs-bare-port-is-inspected`.
     return (
-        f"Journey: {journey.get('journey_id', '')}\n"
         f"Step intent: {step.get('intent', '')}\n"
         f"Expected outcome: {step.get('expect', '')}\n"
         f"Observations so far:\n{obs}\n\n"

@@ -31,3 +31,19 @@ def test_system_prompt_is_ui_actor_and_leaks_nothing_internal():
     # fair-test: the prompt must not name source/spec/testid scaffolding.
     for banned in ("data-testid", "src/components", "spec"):
         assert banned not in GUI_SYSTEM_PROMPT.lower()
+
+
+def test_user_message_does_not_leak_the_journey_id():
+    # Fair-test boundary: a journey id is internal (sharding + loop-dedup) but
+    # is written in English and routinely states the fact under test, e.g.
+    # "gui-cannot-activate-a-dormant-exception" — an Actor handed that can
+    # satisfy the step by asserting the conclusion, with zero UI actions.
+    msg = build_gui_user_message(
+        {"journey_id": "gui-cannot-activate-a-dormant-exception"},
+        {"intent": "widen the access on the pinned row",
+         "expect": "the app refuses"},
+        [{"action": "click @e2", "marks": '[@e9] button "Save"'}],
+    )
+    assert "widen the access on the pinned row" in msg
+    assert "the app refuses" in msg
+    assert "gui-cannot-activate-a-dormant-exception" not in msg
