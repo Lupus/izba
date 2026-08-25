@@ -6,6 +6,18 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 
+/** What this tab actually KNOWS about the sandbox's USB grants.
+ *
+ *  "No devices granted." is an INVENTORY of a host-only consent record
+ *  (`SandboxConfig.usb`), and this tab is where an operator answers "what
+ *  physical hardware can this sandbox reach?". With the daemon unreachable, or
+ *  `usb_status` refused because the sandbox is busy under `lock_sandbox`,
+ *  `status` stays `null` and the tab used to answer "none" right beside its own
+ *  error line. Nothing is written from that window — every write is per-row and
+ *  there are no rows — but this project has already learned that a posture line
+ *  gets read as an inventory. Not knowing is not the same as none. */
+type LoadState = { kind: "loading" } | { kind: "ready" } | { kind: "error" };
+
 interface Props {
   name: string;
   running: boolean;
@@ -21,6 +33,7 @@ export function UsbTab({ name, running, onChanged }: Props) {
   const [granting, setGranting] = useState<UsbDevice | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [loadState, setLoadState] = useState<LoadState>({ kind: "loading" });
 
   async function load() {
     try {
@@ -33,12 +46,22 @@ export function UsbTab({ name, running, onChanged }: Props) {
       setStatus(s);
       setDevices(devs);
       setError(null);
+      setLoadState({ kind: "ready" });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      // A reload failing after a successful read leaves the inventory stale,
+      // not unread — what is on screen is still something izba saw for THIS
+      // sandbox (the effect below resets to `loading` when the sandbox
+      // changes, so it can never be another sandbox's grants).
+      setLoadState((prev) => (prev.kind === "ready" ? prev : { kind: "error" }));
     }
   }
 
   useEffect(() => {
+    // A different sandbox is a different consent record: go back to "unknown"
+    // rather than showing the previous sandbox's grants as this one's.
+    setLoadState({ kind: "loading" });
+    setStatus(null);
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name, running]);
@@ -97,7 +120,14 @@ export function UsbTab({ name, running, onChanged }: Props) {
 
       <div>
         <div className="mb-1 text-xs font-medium text-muted-foreground">Granted devices</div>
-        {(status?.grants ?? []).length === 0 ? (
+        {loadState.kind !== "ready" ? (
+          /* Deliberately distinct from a read-and-empty grant list. */
+          <div className="text-sm text-muted-foreground-2">
+            {loadState.kind === "loading"
+              ? "izba has not read this sandbox's USB grants yet."
+              : "izba could not read this sandbox's USB grants (see the error above) — not knowing which devices are granted is not the same as none being granted."}
+          </div>
+        ) : (status?.grants ?? []).length === 0 ? (
           <div className="text-sm text-muted-foreground-2">No devices granted.</div>
         ) : (
           <table className="w-full text-sm">
@@ -166,7 +196,11 @@ export function UsbTab({ name, running, onChanged }: Props) {
 
       <div>
         <div className="mb-1 text-xs font-medium text-muted-foreground">Available devices</div>
-        {available.length === 0 ? (
+        {loadState.kind !== "ready" ? (
+          <div className="text-sm text-muted-foreground-2">
+            The upstream&apos;s device list is unknown.
+          </div>
+        ) : available.length === 0 ? (
           <div className="text-sm text-muted-foreground-2">
             Nothing else on the upstream to grant.
           </div>
