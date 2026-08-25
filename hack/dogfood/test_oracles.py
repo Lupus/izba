@@ -783,3 +783,31 @@ class PolicyYamlEvidenceTests(unittest.TestCase):
             finally:
                 oracles._yaml = saved
             self.assertIsNone(ev["per_sandbox"]["sb1"]["policy_yaml"])
+
+
+class TailTruncationMarkerTests(unittest.TestCase):
+    """F5: `_tail` truncated silently, so a mismatch CAUSED BY truncation was
+    indistinguishable from a real one — and the schema documented the limit as
+    bytes when it is chars. Journeys are being authored against
+    `expect_stdout_re` right now, matched against exactly this tail."""
+
+    def test_untruncated_text_is_untouched(self):
+        from oracles import _tail
+        self.assertEqual(_tail("short output\n"), "short output\n")
+
+    def test_truncated_text_carries_a_marker_and_the_full_tail(self):
+        from oracles import TAIL_BYTES, TRUNCATION_MARKER, _tail
+        text = "A" * (TAIL_BYTES + 500) + "OUTCOME-TOKEN"
+        out = _tail(text)
+        self.assertTrue(out.startswith(TRUNCATION_MARKER), out[:80])
+        # the marker states what was dropped, in CHARS (not bytes)
+        self.assertIn(str(len(text)), out[:len(TRUNCATION_MARKER) + 40])
+        self.assertIn("char", out[:len(TRUNCATION_MARKER) + 40])
+        # …and the tail itself is intact: the OUTCOME line still matches.
+        self.assertTrue(out.endswith("OUTCOME-TOKEN"))
+        self.assertEqual(len(out) - len(out.split("\n", 1)[0]) - 1, TAIL_BYTES)
+
+    def test_marker_is_detectable_by_a_grader(self):
+        from oracles import TAIL_BYTES, was_truncated, _tail
+        self.assertFalse(was_truncated("plain"))
+        self.assertTrue(was_truncated(_tail("B" * (TAIL_BYTES + 1))))

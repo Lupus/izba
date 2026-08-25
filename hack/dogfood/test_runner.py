@@ -1801,3 +1801,140 @@ class CliExpectStateTests(unittest.TestCase):
         func = [c for c in res_bad["candidates"] if c["kind"] == "functional"]
         self.assertEqual(len(func), 1, res_bad["candidates"])
         self.assertIn("443", func[0]["detail"])
+
+
+class UnreachedDecisiveHookHonestyTests(unittest.TestCase):
+    """F1: a decisive step the Actor NEVER REACHED must not have its
+    `expect_state` graded as a PRODUCT finding.
+
+    `zero_actions` only covers journey-wide inaction. A 2-step journey whose
+    Actor spends its budget on step 0 leaves step 1 (core) unreached — and the
+    hook grader still emitted 'diverges from daemon truth', a fabricated
+    product bug that lands in the Phase-3 skeptic's triage indistinguishable
+    from a real one. Manufacturing false signal in the final report is worse
+    than missing an assertion."""
+
+    def _journey(self, steps):
+        return {"journey_id": "unreached-hook", "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"}, "steps": steps}
+
+    def test_unreached_decisive_step_emits_only_the_unreached_flip(self):
+        steps = [
+            {"intent": "do the setup", "expect": "ok"},
+            {"intent": "then verify", "expect": "the sandbox exists",
+             "core": True,
+             "expect_state": {"sandbox": "demo", "exists": True}},
+        ]
+        # One turn of budget: step 0 consumes it, so step 1 never acts.
+        model = FakeModel([{"command": "izba ls"}])
+        with tempfile.TemporaryDirectory() as d:
+            res = run_journeys.run_journey(
+                model, self._journey(steps),
+                izba_bin=_write_reconcile_stub_izba(d), data_dir=d,
+                max_turns=1, step_cap=25, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=5.0)
+        decisive_cands = [c for c in res["candidates"]
+                          if c["kind"] in ("functional", "unreached_decisive",
+                                           "infra")]
+        self.assertEqual([c["kind"] for c in decisive_cands],
+                         ["unreached_decisive"], res["candidates"])
+        self.assertEqual(res["decisive_credits"], [], res["decisive_credits"])
+
+    def test_reached_and_failing_decisive_step_still_flips_functional(self):
+        # The other half: a step the Actor DID act in keeps grading exactly as
+        # before — this fix narrows fabrication, never the real flip.
+        steps = [{"intent": "create it", "expect": "the sandbox exists",
+                  "core": True,
+                  "expect_state": {"sandbox": "demo", "exists": True}}]
+        model = FakeModel([{"command": "izba create demo"}, {"done": True}])
+        with tempfile.TemporaryDirectory() as d:
+            res = run_journeys.run_journey(
+                model, self._journey(steps),
+                izba_bin=_write_reconcile_stub_izba(d), data_dir=d,
+                max_turns=10, step_cap=25, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=5.0)
+        func = [c for c in res["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res["candidates"])
+        self.assertTrue(func[0].get("decisive"))
+        self.assertIn("expect_state", func[0]["detail"])
+
+
+class NonDecisiveHookHonestyTests(unittest.TestCase):
+    """F4: `expect_state` declared on a NON-decisive step was silently
+    discarded — the journey validated, the author got an oracle they never
+    got. Silence is the thing being eliminated: it degrades LOUDLY instead."""
+
+    def test_expect_state_on_a_non_decisive_step_is_not_silent(self):
+        steps = [
+            {"intent": "check state early", "expect": "ok",
+             "expect_state": {"sandbox": "demo", "exists": True}},
+            {"intent": "the real assertion", "expect": "ok", "core": True,
+             "expect_state": {"sandboxes_exact": []}},
+        ]
+        journey = {"journey_id": "nondecisive-hook", "rationale": "r",
+                   "source": {"kind": "spec", "ref": "x"}, "steps": steps}
+        model = FakeModel([{"command": "izba ls"}, {"done": True},
+                           {"command": "izba ls"}, {"done": True}])
+        with tempfile.TemporaryDirectory() as d:
+            res = run_journeys.run_journey(
+                model, journey, izba_bin=_write_reconcile_stub_izba(d),
+                data_dir=d, max_turns=10, step_cap=25, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=5.0)
+        loud = [c for c in res["candidates"]
+                if c["kind"] == "infra" and "non-decisive" in c["detail"]]
+        self.assertEqual(len(loud), 1, res["candidates"])
+        self.assertIn("0", loud[0]["detail"])  # names the step
+
+
+class JourneyIdPathLeakTests(unittest.TestCase):
+    """F6: the first 16 chars of `journey_id` reached the Actor through its
+    cwd / data-dir path (`deep-dormant-exc` literally carries the answer).
+    The fair-test boundary means NO fragment of the id is Actor-visible."""
+
+    IDS = ("deep-dormant-exception-is-not-live",
+           "gui-cannot-activate-a-dormant-exception",
+           "smoke-docs-bare-port-is-inspected")
+
+    def test_data_dir_component_is_opaque(self):
+        import re as _re
+        for jid in self.IDS:
+            seg = os.path.basename(run_journeys._journey_data_dir("/base", jid))
+            self.assertRegex(seg, r"^j-[0-9a-f]+$", seg)
+            for n in range(4, len(jid) + 1):
+                for i in range(len(jid) - n + 1):
+                    self.assertNotIn(jid[i:i + n], seg,
+                                     f"{jid[i:i+n]!r} leaked into {seg!r}")
+            self.assertLessEqual(len(seg), 25)  # SUN_LEN budget (izba#71)
+
+
+def run_journeys_tail(text):
+    """The recorded tail exactly as `run_action` would store it."""
+    from oracles import _tail
+    return _tail(text)
+
+
+class StdoutReTruncationHonestyTests(unittest.TestCase):
+    """F5 (grader half): when `expect_stdout_re` misses on a TRUNCATED tail,
+    the candidate must say so — otherwise 'the product printed the wrong
+    thing' and 'the harness threw away the line' read identically."""
+
+    def test_detail_names_the_truncation(self):
+        from oracles import TAIL_BYTES
+        step = {"intent": "read the log", "expect": "spliced",
+                "expect_stdout_re": "OPAQUE-SPLICE"}
+        action = {"command": "izba netlog demo",
+                  "stdout_tail": run_journeys_tail("X" * (TAIL_BYTES + 10)),
+                  "exit_code": 0}
+        found = run_journeys._stdout_candidates(
+            step, action, "src", {"journey_id": "j", "action_index": 0}, "j")
+        self.assertEqual(len(found), 1)
+        self.assertIn("truncat", found[0].detail.lower())
+
+    def test_detail_is_unchanged_on_an_untruncated_tail(self):
+        step = {"expect_stdout_re": "OPAQUE-SPLICE", "expect": "spliced"}
+        action = {"command": "izba netlog demo", "stdout_tail": "nope\n",
+                  "exit_code": 0}
+        found = run_journeys._stdout_candidates(
+            step, action, "src", {"journey_id": "j", "action_index": 0}, "j")
+        self.assertEqual(len(found), 1)
+        self.assertNotIn("truncat", found[0].detail.lower())

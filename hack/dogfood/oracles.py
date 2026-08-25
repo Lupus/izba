@@ -79,10 +79,31 @@ class Candidate:
         return asdict(self)
 
 
+# Prefix stamped on a tail that had to drop leading output. Without it a
+# mismatch CAUSED BY truncation ("the matching line was cut") is
+# indistinguishable from a real one ("the product printed the wrong thing") —
+# and `expect_stdout_re` is graded against exactly this string.
+TRUNCATION_MARKER = "[dogfood] truncated: "
+
+
+def was_truncated(tail: str) -> bool:
+    """True iff ``tail`` is a ``_tail`` result that dropped leading output."""
+    return isinstance(tail, str) and tail.startswith(TRUNCATION_MARKER)
+
+
 def _tail(text: str, limit: int = TAIL_BYTES) -> str:
+    """The last ``limit`` CHARACTERS of ``text`` (the name is historical —
+    Python slices str by code point, not byte), with a marker line prepended
+    when anything was dropped, naming how much.
+
+    The kept region is exactly ``limit`` chars, so an author sizing an anchor
+    against the documented budget is unaffected by the marker; a grader
+    detects the truncation with :func:`was_truncated` and says so in its
+    candidate detail."""
     if len(text) <= limit:
         return text
-    return text[-limit:]
+    return (f"{TRUNCATION_MARKER}dropped the first {len(text) - limit} of "
+            f"{len(text)} chars\n") + text[-limit:]
 
 
 def _shell_env(izba_bin: str, data_dir: str,

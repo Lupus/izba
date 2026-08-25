@@ -51,6 +51,7 @@ from oracles import (  # noqa: E402
     run_action,
     step_expects_nonzero,
     teardown_journey,
+    was_truncated,
 )
 # The ONE implementation of the `expect_state` rule, shared with the GUI
 # runner: the hook vocabulary + honesty fold live in `state_hooks` (which
@@ -61,8 +62,12 @@ from oracles import (  # noqa: E402
 # repo once shipped a live no-certificate-verification bypass (CLAUDE.md).
 from gui.gui_oracles import expect_state_oracle  # noqa: E402
 from state_hooks import (  # noqa: E402
+    HOOK_GRADER_EXPECTATION,
+    HOOK_GRADER_SOURCE,
     STATE_NO_EVIDENCE_DETAIL as _STATE_NO_EVIDENCE_DETAIL,
     apply_hook_verdict as _apply_hook_verdict,
+    infra_candidate,
+    infra_candidate as _infra_candidate,
     state_hook_label as _state_hook_label,
     step_decisive_hooks as _step_decisive_hooks,
     zero_action_unreached as _zero_action_unreached,
@@ -89,18 +94,6 @@ def count_degraded(results: List[Dict[str, Any]]) -> int:
         if not r.get("actions")
         or any(c.get("kind") == "infra" for c in r.get("candidates", []))
     )
-
-
-def _infra_candidate(journey_id: str, detail: str) -> Dict[str, Any]:
-    """A flipping `infra` candidate: the harness/model plumbing failed, so the
-    journey verified nothing (and must not tally positive)."""
-    return {
-        "kind": "infra",
-        "detail": detail,
-        "violated_expectation": "model/API must produce a next command",
-        "source": "harness: model transport",
-        "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
-    }
 
 
 def log(msg: str) -> None:
@@ -223,30 +216,31 @@ def gather_cli_help(izba_bin: str, timeout_s: float = 8.0,
     return "\n\n".join(chunks)
 
 
-_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
 def _journey_data_dir(base: str, journey_id: str) -> str:
-    """Per-journey IZBA_DATA_DIR so one journey's leftover state can't contaminate
-    the next (e.g. a stray sandbox breaking a 'clean data dir' journey).
+    """Per-journey IZBA_DATA_DIR so one journey's leftover state can't
+    contaminate the next (e.g. a stray sandbox breaking a 'clean data dir'
+    journey).
 
-    The segment is sanitized AND suffixed with a short hash of the original id:
-    stripping leading/trailing dots prevents ``..`` escaping ``base`` (path
-    traversal), and the hash keeps ids that sanitize identically (e.g.
-    ``"a b"`` vs ``"a-b"``) in distinct dirs rather than silently sharing state.
+    The component is an OPAQUE hash of the id — never a readable prefix of it.
+    The Actor's shell runs with this path as its cwd (``<dir>/proj``) and the
+    GUI Actor is handed ``<dir>/workspace`` outright, so ANY fragment of the
+    journey id in the path crosses the fair-test boundary: ids are written in
+    English and routinely STATE the fact under test
+    (``deep-dormant-exception-is-not-live`` truncated to 16 chars is still
+    ``deep-dormant-exc``), which is the same leak that removing
+    ``Journey: <id>`` from the user message closed on the other channel. The
+    hash is stable per id (the runner, its workspace and teardown all
+    recompute it) and collision-free in practice at 12 hex chars for a corpus
+    of tens of journeys.
 
-    The readable prefix is capped so the per-journey component stays short: the
-    sandbox runtime socket (``<dir>/run/<hex8>/vsock.sock_1027``) must fit the
-    ~108-byte AF_UNIX ``sun_path`` limit, and a long journey id otherwise
-    pushes it over (see izba#71). The product now enforces its own budget at
-    ``create``/``start`` time (an actionable error instead of a raw SUN_LEN
-    bind failure — izba#71/#85); this harness-side cap is belt-and-suspenders,
-    keeping ``IZBA_DATA_DIR`` short so journeys never even approach that
-    limit."""
+    It is also traversal-proof by construction — a hash cannot be ``..`` — and
+    SHORTER than the readable form it replaces: the sandbox runtime socket
+    (``<dir>/run/<hex8>/vsock.sock_1027``) must fit the ~108-byte AF_UNIX
+    ``sun_path`` limit (izba#71/#85), so this component may never grow."""
     journey_id = journey_id or ""  # tolerate None/empty
-    safe = (_SAFE_RE.sub("-", journey_id).strip(".-") or "journey")[:16]
-    short = hashlib.sha256(journey_id.encode("utf-8")).hexdigest()[:8]
-    return os.path.join(base, f"{safe}-{short}")
+    return os.path.join(
+        base,
+        "j-" + hashlib.sha256(journey_id.encode("utf-8")).hexdigest()[:12])
 
 
 class BudgetExceeded(Exception):
@@ -362,11 +356,17 @@ def _stdout_candidates(step, action, source, ref, journey_id) -> List[Candidate]
     stdout_tail = action.get("stdout_tail") or ""
     if rx.search(stdout_tail):
         return []
+    # A miss on a TRUNCATED tail has two possible causes — the product printed
+    # the wrong thing, or the harness dropped the line that would have matched
+    # — and the skeptic cannot tell them apart unless the detail says so.
+    cut = (" — NOTE: this tail was TRUNCATED, so the matching line may have "
+           "been dropped rather than never printed"
+           if was_truncated(stdout_tail) else "")
     return [Candidate(
         kind="functional",
         detail=(f"expect_stdout_re {pattern!r} did not match the stdout of "
                 f"{action.get('command', '')!r} (stdout_tail: "
-                f"{stdout_tail[-300:]!r})"),
+                f"{stdout_tail[-300:]!r}){cut}"),
         violated_expectation=step.get("expect", "")
                              or f"stdout must match {pattern!r}",
         source=source, trajectory_ref=dict(ref))]
@@ -692,7 +692,7 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id,
 
 def _grade_decisive_state_hooks(*, journey, journey_id, steps, decisive_idx,
                                 state_evidence, candidates, decisive_credits,
-                                zero_actions=False) -> None:
+                                zero_actions=False, unreached_steps=None) -> None:
     """Grade every DECISIVE step that declares ``expect_state`` against the
     journey's end-of-journey ``capture_state_evidence`` snapshot.
 
@@ -721,9 +721,47 @@ def _grade_decisive_state_hooks(*, journey, journey_id, steps, decisive_idx,
     ``zero_actions`` mirrors the GUI runner's Fix-4 reclassification: on a
     journey whose Actor ran NOTHING, a failing assertion is an engagement
     failure (the interaction it presupposes was never attempted), not evidence
-    of a product bug."""
+    of a product bug.
+
+    ``unreached_steps`` is the PER-STEP form of that same rule (F1), and it is
+    the more important half: ``zero_actions`` only catches journey-wide
+    inaction, so a 2-step journey that spent its budget on step 0 still had
+    step 1's assertion graded — emitting "diverges from daemon truth" about a
+    step the Actor never entered. That is the harness FABRICATING a product
+    finding: it reaches Phase-3 triage with nothing to distinguish it from a
+    real one, which is worse than a missed assertion. Those steps have already
+    emitted their own ``unreached_decisive`` flip in ``run_journey`` (so the
+    journey still cannot tally positive, and nothing here is silent); this
+    grader simply adds nothing more for them — no fabricated functional flip,
+    and no credit either, since a credit from an unreached step is exactly
+    what the watermark discipline forbids. A step that produced no actions but
+    WAS credited from an observed earlier action is NOT in this set: the
+    harness has judged its assertion exercised, so it is still graded — the
+    alternative would be a credited step whose declared hook was silently
+    dropped.
+
+    A hook declared on a NON-decisive step (F4) is not graded — the decisive
+    step is the one whose assertion defines the journey — but neither is it
+    silently discarded: it degrades LOUDLY via one infra candidate naming the
+    step, so the author moves it or marks the step ``core``."""
+    # F4: a hook on a step that will never be graded is an authoring error the
+    # runner must not swallow. Reported once, naming every offending step.
+    stray = [i for i, s in enumerate(steps)
+             if isinstance(s, dict) and "expect_state" in s
+             and i not in decisive_idx]
+    if stray:
+        candidates.append(infra_candidate(
+            journey_id,
+            f"expect_state declared on non-decisive step(s) {stray}: only a "
+            f"decisive step's assertion is graded, so these were NOT checked "
+            f"— move the assertion onto the decisive step or mark the step "
+            f"`core: true`",
+            source=HOOK_GRADER_SOURCE,
+            violated_expectation=HOOK_GRADER_EXPECTATION))
+    unreached = set(unreached_steps or ())
     declaring = [i for i in sorted(decisive_idx)
-                 if isinstance(steps[i], dict) and "expect_state" in steps[i]]
+                 if isinstance(steps[i], dict) and "expect_state" in steps[i]
+                 and i not in unreached]
     if not declaring:
         return
     source = journey.get("source", {}).get("ref", "journey step")
@@ -820,6 +858,12 @@ def run_journey(
     # can't tally positive on budget exhaustion before its core assertion.
     source = journey.get("source", {}).get("ref", "journey step")
     seed_watermarks = ctx.get("seed_watermarks", [])
+    # Decisive steps that produced no actions AND could not be credited from
+    # an observed earlier action: each flips `unreached_decisive` just below,
+    # and the declarative hook grader must add NOTHING more for them (F1) —
+    # grading an unreached step's expect_state manufactures a product finding
+    # out of a step the Actor never entered.
+    unreached_decisive_steps: set = set()
     for i in sorted(decisive_idx):
         if step_actions.get(i, 0) == 0:
             s = steps[i]
@@ -834,6 +878,7 @@ def run_journey(
                 candidates.extend(graded.pop("candidates"))
                 decisive_credits.append(graded)
                 continue
+            unreached_decisive_steps.add(i)
             candidates.append({
                 "kind": "unreached_decisive",
                 "detail": (f"decisive step {i} ({s.get('intent', '')[:80]!r}) "
@@ -862,7 +907,8 @@ def run_journey(
         journey=journey, journey_id=journey_id, steps=steps,
         decisive_idx=decisive_idx, state_evidence=state_evidence,
         candidates=candidates, decisive_credits=decisive_credits,
-        zero_actions=not actions)
+        zero_actions=not actions,
+        unreached_steps=unreached_decisive_steps)
     for cd in guest_console_oracle(
             state_evidence, {"journey_id": journey_id, "action_index": -1}):
         d = cd.to_dict()
