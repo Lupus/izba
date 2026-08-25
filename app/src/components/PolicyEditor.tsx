@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { X } from "lucide-react";
 import type { Access, AllowEntry, GitRule, PortSpec } from "../lib/types";
 import { api } from "../lib/ipc";
@@ -68,19 +68,100 @@ function toRow(e: AllowEntry): Row {
       };
 }
 
-/** How a declared port is announced, for both the chip's accessible name and
- *  its tooltip. `tcp` is the one value that gives a security control up, so it
- *  says exactly which controls — `izba policy show` carries the same weight on
- *  the CLI side and uses the same wording. */
-function portDeclarationLabel(p: PortRow): string | null {
+/** How an operator gets past a Host rename lock — referenced by the Host
+ *  lock's title, the Access-widening refusal, and the visible notice, so
+ *  there is exactly one sentence to keep in sync (not several near-duplicate
+ *  strings). Removing the pinned port is the escape valve for BOTH the Host
+ *  lock and the Access-widening refusal (#239 1b) — once unpinned, this row
+ *  is an ordinary row again. */
+const PIN_ESCAPE_HINT =
+  "remove the pinned port, or edit policy.yaml, or izba.yml followed by izba diff / izba promote";
+
+/** How to actually make a dormant passthrough pin — NOT by widening Access
+ *  in this editor. That transition is refused on a pinned row (#239 1b), and
+ *  the picker gives no visible feedback when the click is silently ignored,
+ *  so a dormant declaration's wording must never tell the operator to widen
+ *  Access "here" without qualifying where "here" fails — that contradiction
+ *  (Important B, final review) was the exact defect this constant closes. */
+const WIDEN_ESCAPE_HINT =
+  "widen access in policy.yaml, or in izba.yml followed by izba diff / izba promote";
+
+/** How a declared port is announced — for the chip's accessible name/tooltip
+ *  AND the row's visible passthrough notice (`passthroughNotice` below folds
+ *  onto this single source; the final review caught the chip and the notice
+ *  disagreeing about a dormant row's posture when they had separate copies
+ *  of the `tcp` wording). `tcp` is access-aware: an opaque splice carries no
+ *  HTTP method, so `access: read` never authorizes one (`egress.rego`'s
+ *  `host_access_ok("read")` requires GET/HEAD); `router::passthrough_names`
+ *  drops the host and the connection stays terminated at L7 — a pinning
+ *  client still sees izba's certificate. `izba policy show`
+ *  (`crates/izba-cli/src/commands/policy.rs`) renders the exact same
+ *  NOT-in-effect branch, so neither GUI surface may claim the live substance
+ *  for a row that doesn't have it. `http` and the undeclared case do not
+ *  depend on access. */
+function portDeclarationLabel(p: PortRow, access: Access): string | null {
   switch (p.protocol) {
     case "tcp":
-      return `Port ${p.port}: TLS-pinning passthrough — spliced opaquely, with no L7 rules, no request audit and no upstream certificate verification`;
+      return access === "read-write"
+        ? `Port ${p.port}: TLS-pinning passthrough — spliced opaquely, with no L7 rules, no request audit and no upstream certificate verification`
+        : `Port ${p.port}: TLS-pinning passthrough NOT in effect — an opaque splice carries no HTTP method, so this row's "${access}" access never authorizes one; the connection stays terminated at L7 and a pinning client still sees izba's certificate. To pin, ${WIDEN_ESCAPE_HINT}`;
     case "http":
       return `Port ${p.port}: inspected at L7 (declared protocol: http)`;
     default:
       return null;
   }
+}
+
+/** Whether a port carries `protocol: "tcp"` — the boolean "is this a pinned
+ *  port" predicate (#239), used wherever code only needs a yes/no answer:
+ *  `pinnedPorts` below, and both `PortEditor` render sites that pick the
+ *  `warning` Badge variant / `⚠ tcp` marker (a dormant declaration is still
+ *  a declaration worth flagging — only the wording, via
+ *  `portDeclarationLabel`, distinguishes live from not-in-effect).
+ *  `portDeclarationLabel`'s own `switch (p.protocol)` is NOT a second
+ *  derivation of this predicate: it needs the specific declared value
+ *  (`tcp` vs `http` vs undeclared) to choose its wording, a three-way
+ *  dispatch this boolean can't express, so it reads `p.protocol` directly
+ *  rather than calling this. */
+function isPinnedPort(p: PortRow): boolean {
+  return p.protocol === "tcp";
+}
+
+/** Ports on this row that carry `protocol: "tcp"` (#239) — the derived list
+ *  everything downstream (the Host lock, the Access-widening refusal, the
+ *  visible notice) reads to decide whether a row is pinned, built from the
+ *  single `isPinnedPort` predicate. A row carrying at least one locks its
+ *  Host input and refuses widening its Access to `read-write`, because this
+ *  component's Save path (`policySetFull`) skips the `izba diff`/
+ *  `izba promote` weakening gate: renaming the host would relocate the hatch
+ *  onto a host that never declared one, and widening Access would silently
+ *  turn a dormant passthrough live — both unflagged. */
+function pinnedPorts(r: Row): PortRow[] {
+  return r.ports.filter(isPinnedPort);
+}
+
+/** Visible (not just aria-label) text for the notice rendered on a pinned
+ *  row, built from the SAME `portDeclarationLabel` the chip uses. `pinned`
+ *  is always non-empty when this is called (the caller only renders the
+ *  notice for a locked row), and every element carries `protocol: "tcp"` by
+ *  construction of `pinnedPorts`, so `portDeclarationLabel` only ever
+ *  exercises its `tcp` branch here — its `http`/undeclared branches exist
+ *  for the chip's use on an unfiltered port list, not for this call. For a
+ *  `read-write` row the hatch is live and the Host lock is the only
+ *  restriction; for anything narrower the hatch is dormant AND widening
+ *  Access back to `read-write` is refused HERE (in this editor) while the
+ *  row is pinned — silently turning a dormant passthrough live is exactly
+ *  the "activate a hatch" move #239's 1b ruling closes. The route that
+ *  actually pins (editing the file directly) is named in
+ *  `portDeclarationLabel`'s own dormant wording, not repeated here, so this
+ *  sentence only explains why the picker itself won't do it. */
+function passthroughNotice(pinned: PortRow[], access: Access): string {
+  const declared = pinned.map((p) => portDeclarationLabel(p, access)).join(". ");
+  const remediation =
+    access === "read-write"
+      ? `The host is locked so this control cannot be silently relocated — ${PIN_ESCAPE_HINT}.`
+      : `The host is locked, and widening Access to read-write here is refused while this row carries a pinned port (it would silently activate the passthrough) — ${PIN_ESCAPE_HINT}.`;
+  return `${declared}. ${remediation}`;
 }
 
 /** Convert a target string and access into a GitRule. */
@@ -110,10 +191,15 @@ export function hostPatternError(host: string): string | null {
 /** Per-host ports shown as removable chips plus a numeric "add port" field. */
 function PortEditor({
   ports,
+  access,
   onAdd,
   onRemove,
 }: {
   ports: PortRow[];
+  // Needed only to make a `tcp` chip's label access-aware (#239 final
+  // review) — the chip must not claim the live substance for a row whose
+  // access has cancelled the hatch.
+  access: Access;
   onAdd: (port: number) => void;
   onRemove: (port: number) => void;
 }) {
@@ -143,11 +229,11 @@ function PortEditor({
     <div className="flex flex-1 flex-col gap-1">
       <div className="flex flex-wrap items-center gap-1">
         {ports.map((p) => {
-          const declaration = portDeclarationLabel(p);
+          const declaration = portDeclarationLabel(p, access);
           return (
             <Badge
               key={p.port}
-              variant={p.protocol === "tcp" ? "warning" : "secondary"}
+              variant={isPinnedPort(p) ? "warning" : "secondary"}
               className="gap-1"
             >
               {p.port}
@@ -156,7 +242,7 @@ function PortEditor({
                   a control up. Undeclared ports render exactly as before. */}
               {declaration && (
                 <span aria-label={declaration} title={declaration}>
-                  {p.protocol === "tcp" ? "⚠ tcp" : "http"}
+                  {isPinnedPort(p) ? "⚠ tcp" : "http"}
                 </span>
               )}
               {/* Intentional in-chip remove button — distinct from row-level RemoveRowButton idiom */}
@@ -216,6 +302,9 @@ export function PolicyEditor({ name }: { name: string }) {
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const loadedRef = useRef<LoadedSnapshot>({ hosts: [], git: [] });
+  // Namespaces the per-row passthrough-notice id so two concurrent
+  // PolicyEditor instances can never collide an aria-describedby target.
+  const instanceId = useId();
 
   // Derive dirty: current state differs from the last-saved/loaded snapshot.
   const dirty =
@@ -262,7 +351,12 @@ export function PolicyEditor({ name }: { name: string }) {
     setSaved(false);
   }
   function setHost(i: number, host: string) {
-    editHosts((rs) => rs.map((r, j) => (j === i ? { ...r, host } : r)));
+    // A row carrying a pinned port keeps its Host inert — the lock is
+    // behavioural, not merely a `readOnly` attribute a test can bypass with
+    // `fireEvent.change` (#239).
+    editHosts((rs) =>
+      rs.map((r, j) => (j === i && pinnedPorts(r).length === 0 ? { ...r, host } : r)),
+    );
   }
   function addPort(i: number, port: number) {
     editHosts((rs) =>
@@ -287,7 +381,19 @@ export function PolicyEditor({ name }: { name: string }) {
     editHosts((rs) => rs.filter((_, j) => j !== i));
   }
   function setHostAccess(i: number, access: Access) {
-    editHosts((rs) => rs.map((r, j) => (j === i ? { ...r, access } : r)));
+    // Widening a pinned row INTO read-write would silently ACTIVATE a
+    // dormant passthrough (#239 1b, human-ruled) — the reducer is the
+    // barrier, not just the picker's rendered state, so the refusal holds
+    // even against a direct state-setting call. Narrowing (read-write ->
+    // read, or any transition that is not INTO read-write) stays allowed on
+    // a pinned row; only the widening direction is refused.
+    editHosts((rs) =>
+      rs.map((r, j) => {
+        if (j !== i) return r;
+        if (access === "read-write" && pinnedPorts(r).length > 0) return r;
+        return { ...r, access };
+      }),
+    );
   }
 
   // Git row helpers
@@ -365,34 +471,59 @@ export function PolicyEditor({ name }: { name: string }) {
             <EditableList
               density="card"
               items={hosts}
-              renderRow={(r, i) => (
-                <>
-                  <div className="flex w-full items-center gap-2">
-                    <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Host</label>
-                    <Input
-                      value={r.host}
-                      onChange={(e) => setHost(i, e.target.value)}
-                      placeholder="api.example.com or *.example.com"
-                      className="flex-1 font-mono text-sm"
-                    />
-                  </div>
-                  <div className="flex w-full items-center gap-2">
-                    <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Ports</label>
-                    <PortEditor
-                      ports={r.ports}
-                      onAdd={(p) => addPort(i, p)}
-                      onRemove={(p) => removePort(i, p)}
-                    />
-                  </div>
-                  <div className="flex w-full items-center gap-2">
-                    <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Access</label>
-                    <AccessPicker
-                      value={r.access}
-                      onChange={(v) => setHostAccess(i, v)}
-                    />
-                  </div>
-                </>
-              )}
+              renderRow={(r, i) => {
+                const pinned = pinnedPorts(r);
+                const locked = pinned.length > 0;
+                // Namespaced by instanceId (useId) AND per-row by index, so
+                // aria-describedby resolves the right notice even with
+                // several locked rows in this instance, or two mounted
+                // instances of PolicyEditor.
+                const noticeId = `${instanceId}-passthrough-notice-${i}`;
+                return (
+                  <>
+                    <div className="flex w-full items-center gap-2">
+                      <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Host</label>
+                      <Input
+                        value={r.host}
+                        onChange={(e) => setHost(i, e.target.value)}
+                        placeholder="api.example.com or *.example.com"
+                        className="flex-1 font-mono text-sm"
+                        readOnly={locked}
+                        aria-describedby={locked ? noticeId : undefined}
+                        title={
+                          locked
+                            ? `Locked: this row carries a TLS-pinning passthrough port — ${PIN_ESCAPE_HINT}.`
+                            : undefined
+                        }
+                      />
+                    </div>
+                    {locked && (
+                      <p
+                        id={noticeId}
+                        className="w-full rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-xs text-destructive"
+                      >
+                        {passthroughNotice(pinned, r.access)}
+                      </p>
+                    )}
+                    <div className="flex w-full items-center gap-2">
+                      <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Ports</label>
+                      <PortEditor
+                        ports={r.ports}
+                        access={r.access}
+                        onAdd={(p) => addPort(i, p)}
+                        onRemove={(p) => removePort(i, p)}
+                      />
+                    </div>
+                    <div className="flex w-full items-center gap-2">
+                      <label className="w-12 shrink-0 text-xs font-semibold text-muted-foreground">Access</label>
+                      <AccessPicker
+                        value={r.access}
+                        onChange={(v) => setHostAccess(i, v)}
+                      />
+                    </div>
+                  </>
+                );
+              }}
               onAdd={addRow}
               onRemove={(i) => removeRow(i)}
               addLabel="Add host"
