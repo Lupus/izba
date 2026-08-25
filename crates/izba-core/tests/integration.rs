@@ -1912,6 +1912,292 @@ fn read_audit_with_retry(
     Vec::new()
 }
 
+// ---------------------------------------------------------------------------
+// M5 P1 — the pinning-passthrough A/B on a real VM
+// ---------------------------------------------------------------------------
+
+/// The public TLS host both arms of the passthrough A/B fetch. It must be a
+/// name whose certificate chains to a PUBLIC root, because "whose certificate
+/// did the guest see" is the whole assertion. Same real-internet dependency
+/// `mitm_firewall_allows_and_denies_real_vm` already carries.
+const PIN_HOST: &str = "example.com";
+
+/// What one arm of the A/B observed from inside the guest.
+struct PinObservation {
+    /// The guest's own end-to-end proof that this arm's fetch works at all,
+    /// under the trust set izba baked in (izba CA + system roots). Without it
+    /// a hung or unreachable arm would satisfy both "failed" assertions below.
+    warmup_ok: bool,
+    warmup_out: String,
+    /// Handshake validated against the PUBLIC roots ALONE ⇒ the guest saw the
+    /// vendor's own certificate ⇒ izbad spliced the flow untouched.
+    vendor_ca_ok: bool,
+    vendor_ca_out: String,
+    /// Handshake validated against izba's CA ALONE ⇒ the guest saw izba's leaf
+    /// ⇒ izbad terminated and inspected the flow at L7.
+    izba_ca_ok: bool,
+    izba_ca_out: String,
+    /// Everything `izba netlog` would show for this sandbox.
+    records: Vec<izba_core::daemon::egress::audit::AuditRecord>,
+}
+
+impl PinObservation {
+    /// Whether the audit log holds a record matching `tier` + `rule` substring
+    /// for `PIN_HOST:443`.
+    fn has(&self, tier: izba_core::daemon::egress::audit::Tier, rule_contains: &str) -> bool {
+        use izba_core::daemon::egress::policy::Verdict;
+        self.records.iter().any(|r| {
+            r.tier == tier
+                && r.verdict == Verdict::Allow
+                && r.port == 443
+                && r.host.as_deref() == Some(PIN_HOST)
+                && r.rule.contains(rule_contains)
+        })
+    }
+
+    /// Every guest command's output plus the audit log — the failure dump.
+    fn dump(&self, label: &str) -> String {
+        let lines: Vec<String> = self.records.iter().map(|r| r.to_json()).collect();
+        format!(
+            "[{label}] guest observations:\n\
+             warmup (izba CA + system roots) ok={}:\n{}\n\
+             public roots ONLY ok={}:\n{}\n\
+             izba CA ONLY ok={}:\n{}\n\
+             audit records:\n{}",
+            self.warmup_ok,
+            self.warmup_out,
+            self.vendor_ca_ok,
+            self.vendor_ca_out,
+            self.izba_ca_ok,
+            self.izba_ca_out,
+            lines.join("\n")
+        )
+    }
+}
+
+/// The host's public CA bundle: the trust set a browser would use, with NO izba
+/// CA in it. Same candidate paths `izba-init`'s `write_trust_anchor` looks for
+/// in the guest.
+fn host_public_ca_bundle() -> PathBuf {
+    const CANDIDATES: [&str; 2] = [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    ];
+    CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "no system CA bundle at any of {CANDIDATES:?}; install `ca-certificates` \
+                 (see docs/testing.md §2) — the passthrough A/B needs a public-roots-only \
+                 trust set to tell the vendor's certificate from izba's"
+            )
+        })
+}
+
+/// Fetch `https://<PIN_HOST>/` from inside `name`'s guest with a trust store
+/// containing ONLY `bundle`, and report `(handshake validated, guest output)`.
+///
+/// `SSL_CERT_FILE`/`SSL_CERT_DIR` are exactly what OpenSSL's
+/// `SSL_CTX_set_default_verify_paths` honours, and alpine's `ssl_client` — which
+/// busybox `wget` spawns for https, verifying unless `-I` — builds its context
+/// that way. So this pins the guest's trust set to one file and turns "whose
+/// certificate is on the wire" into an exit code. `SSL_CERT_DIR` is aimed at a
+/// non-existent directory so the default hashed-cert dir cannot contribute.
+///
+/// `bundle: None` keeps the environment izba itself baked in (izba CA + system
+/// roots) — the warm-up, which must succeed in BOTH arms.
+fn guest_https_fetch(paths: &Paths, name: &str, bundle: Option<&str>) -> (bool, String) {
+    let trust = match bundle {
+        Some(p) => format!("SSL_CERT_FILE={p} SSL_CERT_DIR=/nonexistent "),
+        None => String::new(),
+    };
+    // `-T 20` bounds a wedged flow, so "the fetch failed" can never be this
+    // harness hanging until the suite times out.
+    let cmd = format!("{trust}wget -T 20 -qO /dev/null https://{PIN_HOST}/");
+    match exec_collect(paths, name, &["sh", "-lc", &cmd], None) {
+        Ok((status, out, err)) => {
+            let ok = matches!(status, ExitStatus::Code(0));
+            (ok, format!("$ {cmd}\n-> {status:?}\n{out}{err}"))
+        }
+        Err((kind, msg)) => (
+            false,
+            format!("$ {cmd}\n-> exec rejected ({kind:?}): {msg}"),
+        ),
+    }
+}
+
+/// Boot one arm of the A/B under `policy_yaml`, observe the certificate the
+/// guest sees three ways, and collect the audit log. The sandbox is stopped
+/// before returning.
+fn observe_pinning_arm(
+    env: &TestEnv,
+    tb: &mut TestBox,
+    name: &str,
+    policy_yaml: &str,
+) -> PinObservation {
+    let ws = tb.workspace(name);
+    // Delivered through the workspace virtiofs share, so the guest can name a
+    // public-roots-only bundle without any package install.
+    fs::copy(host_public_ca_bundle(), ws.join("public-roots.pem"))
+        .expect("staging the public CA bundle into the workspace");
+
+    let (mgr, _audit) = setup_mitm_sandbox(env, tb, name, &ws, policy_yaml);
+
+    // Warm-up: DNS + the first egress dial can settle a beat after boot, and
+    // izbad's DNS-snoop must have answered for this sandbox before a
+    // passthrough candidate can exist at all (`router::passthrough_names`).
+    let (mut warmup_ok, mut warmup_out) = (false, String::new());
+    for _ in 0..5 {
+        let (ok, out) = guest_https_fetch(&tb.paths, name, None);
+        warmup_out = out;
+        if ok {
+            warmup_ok = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    let (vendor_ca_ok, vendor_ca_out) =
+        guest_https_fetch(&tb.paths, name, Some("/workspace/public-roots.pem"));
+    let (izba_ca_ok, izba_ca_out) = guest_https_fetch(&tb.paths, name, Some("/etc/izba/ca.pem"));
+
+    let records = read_audit_with_retry(&tb.paths, name);
+    stop_sandbox(tb, name);
+    mgr.stop(name, &tb.paths.run_dir(name));
+
+    PinObservation {
+        warmup_ok,
+        warmup_out,
+        vendor_ca_ok,
+        vendor_ca_out,
+        izba_ca_ok,
+        izba_ca_out,
+        records,
+    }
+}
+
+/// M5 P1 (#233/#238) exit, graduated from an LLM-dogfooding run that produced
+/// this A/B by accident: the SAME host on the SAME port, once declared
+/// `protocol: tcp` and once not.
+///
+/// The proof is whose certificate the guest sees, decided by which trust store
+/// validates the handshake:
+///
+/// * **declared** `443 protocol: tcp` (access read-write, so the hatch is LIVE
+///   rather than dormant) — validates against the PUBLIC roots alone and FAILS
+///   against izba's CA alone ⇒ the vendor's own certificate reached the guest,
+///   izbad never terminated. `izba netlog` shows the opaque tier-3 splice
+///   (`l3` / `passthrough (protocol: tcp)`) and NO `l7` row.
+/// * **undeclared** — the mirror image: izba's CA alone validates, the public
+///   roots alone do not, and netlog shows `ALLOW l7 … (allow-list)` with no
+///   passthrough row.
+///
+/// The negative arm is the regression that matters: it catches a change that
+/// opens the hatch wider than the declaration (e.g. per-ENTRY inheritance, or
+/// binding the splice to the guest-chosen SNI rather than to izbad's own
+/// DNS-snoop candidates).
+///
+/// Every arm carries a POSITIVE success (the warm-up, plus whichever trust
+/// store is expected to validate) so that a hung or unreachable flow — which
+/// would satisfy both "handshake failed" halves — cannot pass this test.
+///
+/// Real outbound TLS to `PIN_HOST` is required, exactly as in
+/// `mitm_firewall_allows_and_denies_real_vm`.
+#[test]
+fn pinning_passthrough_ab_vendor_cert_vs_izba_ca_real_vm() {
+    use izba_core::daemon::egress::audit::Tier;
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+
+    // Positive arm: 443 declared `protocol: tcp`. Access is left at its
+    // read-write default on purpose — a `read` entry makes the passthrough
+    // DORMANT (`router::passthrough_names`'s per-name `policy.check` filter
+    // denies a methodless flow), and this arm would then quietly test nothing.
+    let pinned = observe_pinning_arm(
+        &env,
+        &mut tb,
+        "pin-declared",
+        &format!(
+            "allow:\n  - host: {PIN_HOST}\n    ports:\n      - port: 443\n        protocol: tcp\n"
+        ),
+    );
+    // Negative arm: the same host on the same port, declared nothing.
+    let inspected = observe_pinning_arm(
+        &env,
+        &mut tb,
+        "pin-undeclared",
+        &format!("allow:\n  - {PIN_HOST}\n"),
+    );
+
+    // --- both arms actually reached the internet -----------------------------
+    for (label, o) in [("declared", &pinned), ("undeclared", &inspected)] {
+        assert!(
+            o.warmup_ok,
+            "the {label} arm never completed an HTTPS fetch under izba's own trust \
+             store, so neither certificate observation below would mean anything.\n{}",
+            o.dump(label)
+        );
+    }
+
+    // --- positive arm: the vendor's certificate, spliced opaquely ------------
+    assert!(
+        pinned.vendor_ca_ok,
+        "a declared `protocol: tcp` port must reach the guest with the VENDOR's \
+         certificate: the handshake had to validate against the public roots alone.\n{}",
+        pinned.dump("declared")
+    );
+    assert!(
+        !pinned.izba_ca_ok && pinned.izba_ca_out.contains("certificate verify failed"),
+        "a declared `protocol: tcp` port must NOT be terminated: validating against \
+         izba's CA alone had to fail certificate verification.\n{}",
+        pinned.dump("declared")
+    );
+    assert!(
+        pinned.has(Tier::L3, "passthrough (protocol: tcp)"),
+        "expected an opaque tier-3 ALLOW for {PIN_HOST}:443 — the netlog row `izba \
+         policy show` promises for a pinned port.\n{}",
+        pinned.dump("declared")
+    );
+    assert!(
+        !pinned.records.iter().any(|r| r.tier == Tier::L7),
+        "a spliced flow carries no HTTP: no l7 row may exist for the declared arm.\n{}",
+        pinned.dump("declared")
+    );
+
+    // --- negative arm: izba's CA, terminated and audited at L7 ---------------
+    // This is the half that catches a hatch opening too widely.
+    assert!(
+        inspected.izba_ca_ok,
+        "an UNDECLARED port must stay inspected: the guest's handshake had to \
+         validate against izba's CA alone.\n{}",
+        inspected.dump("undeclared")
+    );
+    assert!(
+        !inspected.vendor_ca_ok
+            && inspected
+                .vendor_ca_out
+                .contains("certificate verify failed"),
+        "an UNDECLARED port must NOT be spliced: validating against the public roots \
+         alone had to fail — izba's leaf chains to no public root.\n{}",
+        inspected.dump("undeclared")
+    );
+    assert!(
+        inspected.has(Tier::L7, "allow-list"),
+        "expected an L7 ALLOW for {PIN_HOST}:443 on the undeclared arm.\n{}",
+        inspected.dump("undeclared")
+    );
+    assert!(
+        !inspected
+            .records
+            .iter()
+            .any(|r| r.rule.contains("passthrough")),
+        "no passthrough row may exist for a host that declared no `protocol: tcp`.\n{}",
+        inspected.dump("undeclared")
+    );
+}
+
 /// M1 throughput baseline: bulk transfer through the egress stub.
 /// MEASURED, NOT GATED (roadmap decision) — the number is printed for
 /// trend-watching; the only assertion is that the transfer completes.
