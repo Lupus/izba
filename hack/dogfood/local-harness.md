@@ -98,6 +98,15 @@ shape:
   `expect_cmd_re`: besides pinning which action gets graded, it lets the runner
   credit the assertion if the swarm satisfies it under an earlier step instead
   of flagging `unreached_decisive`.
+- An exit code is rarely the assertion you mean. On a decisive step also declare
+  `expect_stdout_re` (a regex over WHAT the graded command printed — `izba
+  netlog` exits 0 whether the flow was spliced or terminated) and/or
+  `expect_state` (a small daemon-truth assertion — sandbox existence/status,
+  volumes, ports, and the saved `policy.yaml`). Both are graded on CLI and GUI
+  journeys, both compose with `expect_exit` (all declared assertions must
+  hold), and both are invisible to the Actor. A declared hook that cannot be
+  graded degrades the journey loudly (`infra` / `unreached_decisive`) — it
+  never passes silently.
 - [ ] Validate the file against the schema before pushing (any JSON-schema
       checker, e.g. `python3 -c "import json,jsonschema,sys; jsonschema.validate(json.load(open('journeys.json')), json.load(open('hack/dogfood/schema/journeys.schema.json')))"`).
 
