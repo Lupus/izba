@@ -510,7 +510,7 @@
     },
     {
       "journey_id": "deep-review-flags-a-new-exception-as-weakening",
-      "rationale": "Declaring a new pinning exception removes L7 enforcement for that host, so the review flow must flag it as a change that weakens the egress firewall — the user must not be able to promote it without seeing that.",
+      "rationale": "Declaring a new pinning exception removes L7 enforcement for that host, so the review flow must flag it as a change that weakens the egress firewall — the user must not be able to promote it without seeing that. GRADING NOTE (skeptic): the seeded baseline and the seeded drift differ ONLY by `protocol: tcp` on an already-allowed port — same hosts, same ports, same access — so `egress_weakens`'s new-(host,port) and widened-access arms are structurally unreachable and the ONLY thing that can produce a marker is the new passthrough. The journey therefore distinguishes the promise from its opposite: if the transition were not flagged, `izba diff` would render the egress delta with NO `⚠ weakens egress` and `izba promote` would print no `WARNING: weakens egress`. Both surfaces must carry it. Creating the sandbox cannot produce the asserted result: the hatch is absent from the file `create` consumed. GRADING NOTE 2 (harness): the marker is now machine-graded, not read out of prose — the diff step asserts the rendered egress delta carries `⚠ weakens egress` on its own field line (so a diff that printed nothing, or printed the delta unflagged, fails), and the promote step asserts both that it applied (`promoted pin18`) and that the SAVED policy.yaml now carries the declaration on port 443. The promote-side `WARNING: weakens egress` is emitted on STDERR (PromoteEvent::Warn → eprintln), which the stdout hook cannot see: its presence remains a skeptic reading of the transcript.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
@@ -520,22 +520,48 @@
         "manifest-egress-review",
         "hatch-via-manifest"
       ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: example.com\n      - host: pinned.vendor.com\n        ports:\n          - 80\n          - 443\n"
+      },
       "steps": [
         {
-          "intent": "create a sandbox named pin18 from a project folder whose manifest declares the firewall on with a vendor host allowed normally, and apply that manifest",
-          "expect": "the sandbox's policy has the vendor host allowed and inspected"
+          "intent": "in the project folder you are already in, create a sandbox named pin18 from the project's own file, then print that sandbox's effective egress policy",
+          "expect": "the sandbox is created, and the printed policy lists the two hosts the project file allows together with the vendor host's ports, exactly as the file spells them"
         },
         {
-          "intent": "edit the manifest so that vendor host's port now carries the certificate-pinning exception, and review the drift",
-          "expect": "the review marks this change as one that weakens the egress firewall, not as an ordinary settings change",
+          "intent": "the project's file has since been changed: the vendor's client accepts only that vendor's own certificate, so the file now asks for one of the vendor host's ports to be handed through untouched instead of being policed. The changed file is already on disk, so edit nothing yourself — ask izba, from this same folder, to review the difference between what the project now asks for and pin18's current settings",
+          "expect": "the review reports pin18 as out of sync with the project and prints the egress settings as a pending change, showing its before and after bodies and any marker izba attaches to a change of this kind",
           "core": true,
-          "expect_cmd_re": "izba diff"
+          "expect_exit": 0,
+          "expect_cmd_re": "izba diff(?!\\s+--help)",
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: example.com\n      - host: pinned.vendor.com\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n"
+          },
+          "expect_stdout_re": "egress:\\s+\\[[^\\]]+\\]\\s+⚠ weakens egress"
+        },
+        {
+          "intent": "apply the reviewed change to pin18, then print pin18's effective egress policy again",
+          "expect": "applying the reviewed change prints what izba did, including anything it says about the kind of change being applied, and the policy printed afterwards shows how that vendor port is now treated",
+          "core": true,
+          "expect_exit": 0,
+          "expect_cmd_re": "izba promote(?!\\s+--help)",
+          "expect_stdout_re": "promoted pin18",
+          "expect_state": {
+            "sandbox": "pin18",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "deep-review-flags-losing-inspection-on-a-shared-port",
-      "rationale": "The subtler weakening: removing the one entry that pulled a non-web port into the inspected set silently un-inspects every other host still allowed on that port. The review flow must flag that too, even though no exception is declared anywhere.",
+      "rationale": "The subtler weakening: removing the one entry that pulled a non-web port into the inspected set silently un-inspects every other host still allowed on that port. The review flow must flag that too, even though no exception is declared anywhere. GRADING NOTE (skeptic): the seeded drift ONLY REMOVES an entry — it adds no host, no port and no access — so every other arm of the weakening check is structurally unreachable and a `⚠ weakens egress` marker can only come from the lost-inspection arm. A removal-only delta is otherwise a pure tightening, so an implementation that missed this class would render the same diff with no marker at all: the oracle separates the promise from its opposite. GRADING NOTE 2 (harness): the diff step now asserts the rendered egress delta carries `⚠ weakens egress` on its own field line, and the promote step asserts it applied (`promoted pin19`) with the removed entry actually gone from the SAVED policy.yaml — so a quiet-but-unapplied review can no longer be credited. The promote-side `WARNING: weakens egress` goes to STDERR and stays a skeptic reading.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
@@ -544,22 +570,45 @@
       "requires": [
         "manifest-egress-review"
       ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: metrics.example.net\n        ports:\n          - port: 8000\n            protocol: http\n      - host: reports.example.net\n        ports:\n          - 8000\n"
+      },
       "steps": [
         {
-          "intent": "create a sandbox named pin19 from a manifest whose firewall is on and where two hosts are allowed on the same non-web port, with one of them asking for that port to be policed at the HTTP layer",
-          "expect": "the sandbox's policy shows that port as inspected"
+          "intent": "in the project folder you are already in, create a sandbox named pin19 from the project's own file, then print that sandbox's effective egress policy",
+          "expect": "the sandbox is created, and the printed policy shows both hosts reachable on the same non-web port, with whatever izba says about how that port is treated"
         },
         {
-          "intent": "edit the manifest to drop the entry that asked for the policing while leaving the other host reachable on the same port, and review the drift",
-          "expect": "the review marks this as a change that weakens the egress firewall, because a port that is still reachable stopped being inspected",
+          "intent": "the project's file has since been changed — the first host is no longer needed and its whole entry has been deleted, while the other host stays reachable on the same port. The changed file is already on disk, so edit nothing yourself: ask izba, from this same folder, to review the difference between what the project now asks for and pin19's current settings",
+          "expect": "the review reports pin19 as out of sync and prints the egress settings as a pending change with its before and after bodies, plus any marker izba attaches to a change of this kind",
           "core": true,
-          "expect_cmd_re": "izba diff"
+          "expect_exit": 0,
+          "expect_cmd_re": "izba diff(?!\\s+--help)",
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: reports.example.net\n        ports:\n          - 8000\n"
+          },
+          "expect_stdout_re": "egress:\\s+\\[[^\\]]+\\]\\s+⚠ weakens egress"
+        },
+        {
+          "intent": "apply the reviewed change to pin19, then print pin19's effective egress policy again",
+          "expect": "applying the reviewed change prints what izba did, including anything it says about the kind of change being applied, and the policy printed afterwards shows the remaining host and how its port is now treated",
+          "core": true,
+          "expect_exit": 0,
+          "expect_cmd_re": "izba promote(?!\\s+--help)",
+          "expect_stdout_re": "promoted pin19",
+          "expect_state": {
+            "sandbox": "pin19",
+            "policy": {
+              "host": "metrics.example.net",
+              "present": false
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "deep-review-is-quiet-when-posture-tightens",
-      "rationale": "The counterweight: removing an exception, or writing down an inspection that was already true, must NOT be flagged as weakening — a gate that cries wolf on tightening edits stops being read.",
+      "rationale": "The counterweight: removing an exception, and writing down an inspection that was already true, must NOT be flagged as weakening — a gate that cries wolf on tightening edits stops being read. Both tightening shapes are folded into ONE seeded drift so the journey needs a single review and a single decisive command. GRADING NOTE (skeptic): a quiet review is only meaningful if the review actually SAW the change, so the step asserts the pending egress delta is printed with its before/after bodies AND carries no weakening marker — a diff that rendered nothing at all (or errored) fails the step rather than passing it silently. The promote step is the second surface: it must print what it applied without a `WARNING: weakens egress` line. GRADING NOTE 2 (harness): the quiet verdict is now graded as a CONJUNCTION on the diff's own stdout — the egress delta must be RENDERED as a field line and the whole output must contain no `weakens egress` anywhere — so silence from a diff that rendered nothing (or was never reached) no longer reads as a correct quiet review. The promote step asserts the tightening actually landed: the saved policy.yaml's port 443 must no longer carry the pinning declaration.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
@@ -569,54 +618,107 @@
         "manifest-egress-review",
         "hatch-via-manifest"
       ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: example.com\n      - host: pinned.vendor.com\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n"
+      },
       "steps": [
         {
-          "intent": "create a sandbox named pin20 from a manifest that declares the firewall on with a vendor host whose port carries the certificate-pinning exception, and apply it",
-          "expect": "the sandbox's policy carries the exception"
+          "intent": "in the project folder you are already in, create a sandbox named pin20 from the project's own file, then print that sandbox's effective egress policy",
+          "expect": "the sandbox is created, and the printed policy lists the vendor host's ports together with whatever izba says about each of them"
         },
         {
-          "intent": "edit the manifest to remove that exception (leaving the host allowed on the same port), and review the drift",
-          "expect": "the change is listed but is NOT flagged as weakening the egress firewall",
+          "intent": "the project's file has since been changed: the vendor no longer needs its port handed through untouched, and the project now also writes down, in full, how the vendor's other port should be policed. The changed file is already on disk, so edit nothing yourself — ask izba, from this same folder, to review the difference between what the project now asks for and pin20's current settings",
+          "expect": "the review reports pin20 as out of sync and prints the egress settings as a pending change, showing its before and after bodies and every marker (if any) izba attaches to this change",
           "core": true,
-          "expect_cmd_re": "izba diff"
+          "expect_exit": 0,
+          "expect_cmd_re": "izba diff(?!\\s+--help)",
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: example.com\n      - host: pinned.vendor.com\n        ports:\n          - port: 80\n            protocol: http\n          - 443\n"
+          },
+          "expect_stdout_re": "(?s)\\A(?!.*weakens egress).*egress:\\s+\\[[^\\]]+\\]"
         },
         {
-          "intent": "edit the manifest again so a web port is explicitly declared as policed at the HTTP layer (which it already was), and review the drift",
-          "expect": "this change is likewise not flagged as weakening"
+          "intent": "apply the reviewed change to pin20, then print pin20's effective egress policy again",
+          "expect": "applying the reviewed change prints every line izba emits while applying it, and the policy printed afterwards shows how each of the vendor host's ports is now treated",
+          "core": true,
+          "expect_exit": 0,
+          "expect_cmd_re": "izba promote(?!\\s+--help)",
+          "expect_stdout_re": "promoted pin20",
+          "expect_state": {
+            "sandbox": "pin20",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 443,
+                "pinned": false
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "deep-command-line-grants-skip-the-review-gate",
-      "rationale": "The same allow-list can be changed two ways with different review properties: the manifest path is gated and flags weakening, while a command-line grant writes the policy immediately with no review. A user should be able to notice that asymmetry rather than assume every change is gated.",
+      "rationale": "The same allow-list can be changed two ways with different review properties: the manifest path is gated (and flags weakening), while a command-line grant writes the policy immediately with no review. A user should be able to notice that asymmetry rather than assume every change is gated. GRADING NOTE (skeptic): the earlier version of this journey could not tell 'there is no gate' from 'a gate exists but this Actor never triggered it' — it only ever exercised the ungated path. This version runs BOTH paths against the SAME sandbox in the same journey: step 1's command-line grant must land in the effective policy with no review command in between, and step 2's manifest-side change of the same shape must be REFUSED when applied without a review (`no reviewed diff — run izba diff first`). Step 2 is what proves the gate is present and reachable here; step 1 is what proves the CLI path skips it. If the Actor reviews first anyway, step 2's refusal will not fire — that is visible in the trajectory as a self-inflicted miss, not as evidence there is no gate. GRADING NOTE 2 (harness): the asymmetry is now graded from the SAVED policy.yaml on both legs — the command-line grant must be PRESENT in it (the ungated path wrote through) while the manifest-side host must be ABSENT (the gated path refused). The host granted from the CLI is prescribed in the intent purely so the assertion has a fixed anchor; it states nothing about the outcome. The refusal wording (`no reviewed diff — run izba diff first`) is an anyhow error on STDERR, so it cannot be anchored with the stdout hook — the non-zero exit plus the absent entry are what carry it.",
       "source": {
         "kind": "spec",
         "ref": "CLAUDE.md — load-bearing contract 'Inspectability is DECLARED per PORT, not derived from the port (M5 P1, #238)'"
       },
       "tier": "deep",
       "requires": [
-        "policy-show-renders"
+        "policy-show-renders",
+        "manifest-egress-review"
       ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: example.com\n"
+      },
       "steps": [
         {
-          "intent": "create a sandbox named pin21 with an enforcing policy allowing one host",
-          "expect": "the sandbox is created"
+          "intent": "in the project folder you are already in, create a sandbox named pin21 from the project's own file, then print that sandbox's effective egress policy",
+          "expect": "the sandbox is created, and the printed policy shows the firewall posture and the one host the project file allows"
         },
         {
-          "intent": "from the command line, grant that sandbox an additional host and port",
-          "expect": "the grant is applied immediately, with no review step and no weakening prompt or warning to acknowledge",
+          "intent": "from the command line, and without touching the project's file, allow pin21 to reach the host api.example.net, which the project file does not mention; then print pin21's effective egress policy again",
+          "expect": "the grant prints what it granted, the policy printed straight afterwards already lists that host, and nothing in between asked you to review, confirm or apply anything",
           "core": true,
-          "expect_cmd_re": "izba policy allow"
+          "expect_exit": 0,
+          "expect_cmd_re": "izba policy allow(?!\\s+--help)",
+          "expect_state": {
+            "sandbox": "pin21",
+            "policy": {
+              "host": "api.example.net",
+              "present": true
+            }
+          }
         },
         {
-          "intent": "print pin21's effective egress policy",
-          "expect": "the new grant is already in effect"
+          "intent": "the project's file has since been changed to ask for a further host as well; that changed file is already on disk. You are in a hurry and do not want to spend time looking at the difference first — just apply the project file's settings to pin21 straight away",
+          "expect": "izba prints its answer to that attempt, and if it will not go ahead it says what you would have to do first",
+          "core": true,
+          "expect_exit": "nonzero",
+          "expect_cmd_re": "izba promote(?!\\s+--help)",
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: example.com\n      - host: docs.example.net\n"
+          },
+          "expect_state": {
+            "sandbox": "pin21",
+            "policy": {
+              "host": "docs.example.net",
+              "present": false
+            }
+          }
+        },
+        {
+          "intent": "print pin21's effective egress policy one last time",
+          "expect": "the listing shows which of the two extra hosts — the one granted from the command line and the one only the project file asks for — is part of pin21's effective policy",
+          "expect_exit": 0,
+          "expect_cmd_re": "izba policy show(?!\\s+--help)"
         }
       ]
     },
     {
       "journey_id": "deep-declare-the-exception-on-a-running-sandbox",
-      "rationale": "The documented way to change a setting the CLI has no flag for: edit the sandbox's managed policy file and reload it. The exception must take effect on a running sandbox without a restart, and be visible afterwards.",
+      "rationale": "The documented way to change a setting the CLI has no flag for: edit the sandbox's managed policy file and reload it. The exception must take effect on a running sandbox without a restart, and be visible afterwards. GRADING NOTE (skeptic): the policy seeded into the working directory is the CREATE-time precondition and carries NO exception, so the asserted end state cannot be produced by `create` — only by finding the managed copy under the izba data dir, editing it there and reloading. Two decisive steps: the reload itself (a verb that cannot appear before this step, so it can never be credited from an earlier action), and the post-reload rendering. Because `izba policy show` may legitimately have run earlier, treat a decisive credit on step 2 that points at an action preceding the reload as UNVERIFIED and grade the exception's presence from the journey-end `policy_show` evidence instead. GRADING NOTE 2 (harness): per-port attribution is now machine-graded from the MANAGED policy.yaml on both ports — 443 must carry the declaration and the sibling 80 must NOT — and the rendering itself is anchored on the LIVE branch of `policy show` (`:443 protocol: tcp … pinning passthrough: spliced opaquely`), which the NOT-in-effect and enforcement-off branches cannot produce. The port is named in the intent only so the two-port assertion has a fixed anchor.",
       "source": {
         "kind": "help",
         "ref": "`izba policy reload --help` — 'edit it there and reload to change settings this CLI has no flag for, such as an entry's `protocol:`'"
@@ -626,180 +728,330 @@
         "policy-file-at-create",
         "hatch-declared"
       ],
+      "seed_files": {
+        "policy.yaml": "enforce: true\nallow:\n  - host: example.com\n  - host: pinned.vendor.com\n    ports:\n      - 80\n      - 443\n"
+      },
       "steps": [
         {
-          "intent": "start a sandbox named pin22 with an enforcing policy allowing a vendor host, and confirm it is running",
-          "expect": "the sandbox is running"
+          "intent": "create and start a sandbox named pin22 on the small alpine image, with its egress firewall configured from the policy file that is already in your working directory, and confirm it is running",
+          "expect": "the sandbox is running",
+          "expect_exit": 0
         },
         {
-          "intent": "find where izba keeps that sandbox's managed policy, add the certificate-pinning exception to one of the vendor host's ports there, and make izba pick it up without restarting the sandbox",
-          "expect": "izba accepts the reload with no error and the sandbox is still running",
-          "expect_cmd_re": "izba policy reload"
+          "intent": "find where izba keeps that sandbox's own managed copy of the policy, add to it — for the vendor host's port 443 — the declaration that hands a TLS-pinning client's connection through untouched, and make izba pick that change up without restarting the sandbox",
+          "expect": "izba accepts the change with no error and pin22 is still running",
+          "core": true,
+          "expect_exit": 0,
+          "expect_cmd_re": "izba policy reload(?!\\s+--help)",
+          "expect_state": {
+            "sandbox": "pin22",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 80,
+                "pinned": false
+              }
+            }
+          }
         },
         {
           "intent": "print pin22's effective egress policy",
-          "expect": "the exception is now reported against that port on the running sandbox",
+          "expect": "the listing shows the vendor host's ports and whatever izba now says about each of them on this running sandbox",
           "core": true,
-          "expect_cmd_re": "izba policy show"
+          "expect_exit": 0,
+          "expect_cmd_re": "izba policy show(?!\\s+--help)",
+          "expect_stdout_re": ":443 protocol: tcp[^\\n]*pinning passthrough: spliced opaquely",
+          "expect_state": {
+            "sandbox": "pin22",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "deep-declaration-survives-a-restart",
-      "rationale": "A declaration that only lived in memory would be a trap: an operator who restarts the sandbox must get the same posture back, not a quietly re-inspected (or quietly still-open) port.",
+      "rationale": "A declaration that only lived in memory would be a trap: an operator who restarts the sandbox must get the same posture back, not a quietly re-inspected (or quietly still-open) port. GRADING NOTE (skeptic): the decisive step is anchored on `izba stop`, a verb that cannot have run in step 0, so a decisive step the Actor never reached can never be credited from an earlier action — it flags unreached instead. The posture itself is graded from the journey-end `policy_show` evidence (captured after the restart), which must attribute the exception to the SAME single port, with the sibling port unmarked. GRADING NOTE 2 (harness): the post-restart posture is now graded from product truth rather than read out of the transcript — the end-of-journey state must show pin23 RUNNING and its managed policy.yaml still attributing the declaration to port 443. The `izba stop` anchor is unchanged, so an unreached decisive step still flags unreached rather than being credited from step 0.",
       "source": {
         "kind": "spec",
         "ref": "CLAUDE.md — load-bearing contract 'Inspectability is DECLARED per PORT, not derived from the port (M5 P1, #238)'"
       },
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ],
+      "seed_files": {
+        "policy.yaml": "enforce: true\nallow:\n  - host: example.com\n  - host: pinned.vendor.com\n    ports:\n      - 80\n      - port: 443\n        protocol: tcp\n"
+      },
       "steps": [
         {
-          "intent": "create and start a sandbox named pin23 whose policy carries the certificate-pinning exception on one port",
-          "expect": "the sandbox is running"
+          "intent": "create and start a sandbox named pin23 on the small alpine image, with its egress firewall configured from the policy file that is already in your working directory, and confirm it is running",
+          "expect": "the sandbox is running",
+          "expect_exit": 0
         },
         {
-          "intent": "stop the sandbox and start it again, then print its effective egress policy",
-          "expect": "the exception is still declared against the same port, unchanged by the restart",
+          "intent": "take pin23 down and bring it back up again, then print its effective egress policy",
+          "expect": "pin23 stops and starts again cleanly, and the policy printed after it is back up lists the vendor host's ports with whatever izba says about each of them",
           "core": true,
-          "expect_cmd_re": "izba policy show"
+          "expect_exit": 0,
+          "expect_cmd_re": "izba stop(?!\\s+--help)",
+          "expect_state": {
+            "sandbox": "pin23",
+            "status": "running",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "deep-pinned-host-keeps-the-vendor-certificate",
-      "rationale": "The functional payoff: from inside an enforcing sandbox, a host with the exception must reach its real upstream with the vendor's own certificate (that is the whole point — a pinning client works), while another allowed host is still intercepted with izba's certificate.",
+      "rationale": "The functional payoff: from inside an enforcing sandbox, a host with the exception must reach its real upstream with the vendor's own certificate (that is the whole point — a pinning client works), while another allowed host is still intercepted with izba's certificate. GRADING NOTE (skeptic): The decisive oracle is izba's OWN per-flow record, not a guest exit code: a spliced flow is audited as tier `l3` with the rule `passthrough (protocol: tcp)` and NO HTTP method, while a terminated flow is audited as tier `l7` carrying the request method and path. The two are textually distinct in `izba netlog`, and the harness captures `netlog --summary` per sandbox at journey end independently of the Actor, so the asserted outcome and its opposite cannot be confused — and a guest client that never ran (a missing binary, a 127) leaves NO row at all, which reads as unverified rather than as a product refusal. Expected truth: `example.org:443` → ALLOW l3 passthrough with no method; `example.com:443` → ALLOW l7 with a method/path. The in-guest certificate observation in step 1 is the user-visible half; if the image's tooling cannot show an issuer at all, that is an observability finding, not a pass. The package mirror is in the seeded policy as a TOOLING precondition only. GRADING NOTE 2 (harness): the l3/l7 distinction is no longer left to a reading of the log — the decisive step asserts an ALLOW row at tier `l3` for `example.org:443` in the netlog output itself (the pattern tolerates both the detailed and the `--summary` rendering, which differ only by the sandbox column and the rule suffix). Port 443 is always in the inspected set, so a terminated flow can only be audited `l7`: an `l3` row for that endpoint IS the splice. The seeded precondition is graded too — the sandbox's managed policy.yaml must actually carry the declaration on 443 — so a fixture that never landed reads as a precondition failure rather than a datapath bug. The sibling `example.com` l7 comparison is machine-graded in deep-two-hosts-one-port-only-one-passes-through.",
       "source": {
         "kind": "spec",
         "ref": "CLAUDE.md — load-bearing contract 'Inspectability is DECLARED per PORT, not derived from the port (M5 P1, #238)'"
       },
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ],
+      "seed_files": {
+        "policy.yaml": "enforce: true\nallow:\n  - host: dl-cdn.alpinelinux.org\n  - host: example.com\n  - host: example.org\n    ports:\n      - port: 443\n        protocol: tcp\n"
+      },
       "steps": [
         {
-          "intent": "create and start a sandbox named pin24 with the firewall on, allowing two real internet hosts on HTTPS, one of which carries the certificate-pinning exception on its HTTPS port",
-          "expect": "the sandbox is running with the policy in effect"
+          "intent": "create and start a sandbox named pin24 on the small alpine image, with its egress firewall configured from the policy file that is already in your working directory, and confirm it is running",
+          "expect": "the sandbox is running",
+          "expect_exit": 0
         },
         {
-          "intent": "from inside the sandbox, look at which certificate authority signs the certificate presented for the ordinary allowed host",
-          "expect": "the ordinary host is presented with izba's own interception certificate"
+          "intent": "the policy allows two ordinary web sites. From inside pin24, fetch each of them over HTTPS in a way that also prints details of the certificate the site presented — the image is minimal, so you may have to install a client first (the policy already allows the package mirror)",
+          "expect": "for each of the two sites the transcript shows what the client got back and what it reported about the certificate it was given"
         },
         {
-          "intent": "from inside the sandbox, look at which certificate authority signs the certificate presented for the host carrying the exception",
-          "expect": "that host presents its real upstream certificate, not izba's — a client that pins the vendor's certificate would succeed",
-          "core": true
+          "intent": "ask izba for its own record of the connections it handled for pin24, in as much detail as it will give you",
+          "expect": "izba prints an entry for each destination the sandbox reached, naming the destination and how izba handled that connection",
+          "core": true,
+          "expect_exit": 0,
+          "expect_cmd_re": "izba netlog(?!\\s+--help)",
+          "expect_stdout_re": "ALLOW\\s+l3\\s+(?:\\S+\\s+)?example\\.org:443",
+          "expect_state": {
+            "sandbox": "pin24",
+            "policy": {
+              "host": "example.org",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "deep-dormant-exception-still-intercepts",
-      "rationale": "The dormant case, checked against reality rather than the printed line: a pinning exception on a read-only entry does not actually pass anything through, so the client still sees izba's certificate. If the printed posture and the wire disagree, an operator has been told the wrong thing about their firewall.",
+      "rationale": "The dormant case, checked against reality rather than the printed line: a pinning exception on a read-only entry does not actually pass anything through, so the client still sees izba's certificate. If the printed posture and the wire disagree, an operator has been told the wrong thing about their firewall. GRADING NOTE (skeptic): The decisive oracle is izba's OWN per-flow record, not a guest exit code: a spliced flow is audited as tier `l3` with the rule `passthrough (protocol: tcp)` and NO HTTP method, while a terminated flow is audited as tier `l7` carrying the request method and path. The two are textually distinct in `izba netlog`, and the harness captures `netlog --summary` per sandbox at journey end independently of the Actor, so the asserted outcome and its opposite cannot be confused — and a guest client that never ran (a missing binary, a 127) leaves NO row at all, which reads as unverified rather than as a product refusal. Expected truth: `example.org:443` → ALLOW l7 carrying a GET (the read-only entry authorizes GET/HEAD), and NO `passthrough (protocol: tcp)` rule anywhere in the log; `izba policy show` must simultaneously report the declaration as NOT in effect. The two surfaces must agree — an l3 passthrough row here, or a show that claims a live hatch, is the finding. GRADING NOTE 2 (harness): the dormant claim is now graded POSITIVELY — the netlog output must carry an ALLOW row at tier `l7` for `example.org:443`, which only a TERMINATED flow can produce; a wrongly-live hatch would render `l3` there and the step flips. The dormant SHAPE is graded from the managed policy.yaml in the same step (`access: read` AND the declaration present on 443), so 'dormant because the fixture lost its declaration' can no longer masquerade as 'dormant because access cancels it'. `policy show`'s NOT-in-effect line remains the skeptic's cross-check.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
       },
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ],
+      "seed_files": {
+        "policy.yaml": "enforce: true\nallow:\n  - host: dl-cdn.alpinelinux.org\n  - host: example.org\n    access: read\n    ports:\n      - port: 443\n        protocol: tcp\n"
+      },
       "steps": [
         {
-          "intent": "create and start a sandbox named pin25 whose firewall is on and where a real internet host is restricted to read-only access while carrying the certificate-pinning exception on its HTTPS port",
-          "expect": "the sandbox is running with the policy in effect"
+          "intent": "create and start a sandbox named pin25 on the small alpine image, with its egress firewall configured from the policy file that is already in your working directory, then print pin25's effective egress policy",
+          "expect": "the sandbox is running and the printed policy shows the allowed host, its access level and whatever izba says about the port it declares",
+          "expect_exit": 0
         },
         {
-          "intent": "from inside the sandbox, look at which certificate is presented for that host, and compare it with what izba's own policy output says about the exception",
-          "expect": "the connection is still intercepted (izba's certificate is presented) and izba's printed posture agrees that the exception is not in effect for this entry",
-          "core": true
+          "intent": "from inside pin25, fetch the allowed web site over HTTPS in a way that also prints details of the certificate it presented — the image is minimal, so you may have to install a client first (the policy already allows the package mirror)",
+          "expect": "the transcript shows what the client got back and what it reported about the certificate it was given"
+        },
+        {
+          "intent": "ask izba for its own record of the connections it handled for pin25, in as much detail as it will give you",
+          "expect": "izba prints an entry for the destination the sandbox reached, naming it and how izba handled that connection",
+          "core": true,
+          "expect_exit": 0,
+          "expect_cmd_re": "izba netlog(?!\\s+--help)",
+          "expect_stdout_re": "ALLOW\\s+l7\\s+(?:\\S+\\s+)?example\\.org:443",
+          "expect_state": {
+            "sandbox": "pin25",
+            "policy": {
+              "host": "example.org",
+              "access": "read",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "deep-exception-does-not-follow-a-raw-address",
-      "rationale": "A pass-through must be bound to the name izba itself resolved, never to whatever the guest claims. Reaching the same destination by raw IP address (bypassing name resolution) must not get the exception.",
+      "rationale": "A pass-through must be bound to the name izba itself resolved, never to whatever the guest claims. Reaching the same destination by raw IP address (bypassing name resolution) must not get the exception. GRADING NOTE (skeptic): The decisive oracle is izba's OWN per-flow record, not a guest exit code: a spliced flow is audited as tier `l3` with the rule `passthrough (protocol: tcp)` and NO HTTP method, while a terminated flow is audited as tier `l7` carrying the request method and path. The two are textually distinct in `izba netlog`, and the harness captures `netlog --summary` per sandbox at journey end independently of the Actor, so the asserted outcome and its opposite cannot be confused — and a guest client that never ran (a missing binary, a 127) leaves NO row at all, which reads as unverified rather than as a product refusal. Expected truth: the by-name attempt produces an ALLOW l3 row with the `passthrough (protocol: tcp)` rule against `example.org:443`; the address-only attempt produces a row keyed on the bare IP that is NOT a passthrough (a DENY, or an l7 termination). Requiring BOTH rows is what stops a guest client that never ran from reading as 'the firewall blocked it'. GRADING NOTE 2 (harness): the by-name half is now machine-graded — the netlog output must carry an ALLOW row at tier `l3` for `example.org:443`, so 'the hatch was live in this sandbox' is established rather than assumed before the address-only half is judged. The address-only half is deliberately NOT anchored, and the earlier expectation that it leaves an IP-keyed row is WRONG for the shape this journey drives: an HTTPS dial to a bare IP sends no SNI, `should_passthrough` refuses it, and the TLS acceptor then fails to select a leaf — an arm that `mitm_runtime.rs` documents as writing NO audit line at all (the M5 plan's diagnosability follow-up). So an ABSENT row for the address attempt is evidence of NOTHING either way: judge that half on the guest transcript, and treat an `l3` `passthrough (protocol: tcp)` row whose target is a bare IP — which the product cannot currently even render, since a splice records the SNI as the host — as the finding.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
       },
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ],
+      "seed_files": {
+        "policy.yaml": "enforce: true\nallow:\n  - host: dl-cdn.alpinelinux.org\n  - host: example.org\n    ports:\n      - port: 443\n        protocol: tcp\n"
+      },
       "steps": [
         {
-          "intent": "create and start a sandbox named pin26 with the firewall on, allowing a real internet host on HTTPS with the certificate-pinning exception declared on that port",
-          "expect": "the sandbox is running with the policy in effect"
+          "intent": "create and start a sandbox named pin26 on the small alpine image, with its egress firewall configured from the policy file that is already in your working directory, and confirm it is running",
+          "expect": "the sandbox is running",
+          "expect_exit": 0
         },
         {
-          "intent": "from inside the sandbox, confirm the exception works when the host is reached by name",
-          "expect": "the host is reached and presents its own upstream certificate"
+          "intent": "from inside pin26, fetch the allowed web site over HTTPS by its name, in a way that also prints details of the certificate it presented — the image is minimal, so you may have to install a client first (the policy already allows the package mirror)",
+          "expect": "the transcript shows what the client got back and what it reported about the certificate it was given"
         },
         {
-          "intent": "from inside the sandbox, try to reach the same destination by its raw IP address instead of by name",
-          "expect": "the raw-address attempt does not get the exception: it is either refused by the firewall or intercepted, never passed through opaquely",
-          "core": true
+          "intent": "from inside pin26, work out the numeric address that name resolves to, then try to reach the very same destination over HTTPS using that numeric address instead of the name",
+          "expect": "the transcript shows the address the name resolved to and what the client got back for the address-only attempt"
+        },
+        {
+          "intent": "ask izba for its own record of the connections it handled for pin26, in as much detail as it will give you",
+          "expect": "izba prints an entry for each destination the sandbox reached — the one reached by name and the one reached by numeric address — with how it handled each",
+          "core": true,
+          "expect_exit": 0,
+          "expect_cmd_re": "izba netlog(?!\\s+--help)",
+          "expect_stdout_re": "ALLOW\\s+l3\\s+(?:\\S+\\s+)?example\\.org:443",
+          "expect_state": {
+            "sandbox": "pin26",
+            "policy": {
+              "host": "example.org",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "deep-two-hosts-one-port-only-one-passes-through",
-      "rationale": "The exception is keyed to one host, not to the port: another host allowed on the same port must stay fully inspected. An operator granting one vendor an exception must not silently lose enforcement for everything else on 443.",
+      "rationale": "The exception is keyed to one host, not to the port: another host allowed on the same port must stay fully inspected. An operator granting one vendor an exception must not silently lose enforcement for everything else on 443. GRADING NOTE (skeptic): The decisive oracle is izba's OWN per-flow record, not a guest exit code: a spliced flow is audited as tier `l3` with the rule `passthrough (protocol: tcp)` and NO HTTP method, while a terminated flow is audited as tier `l7` carrying the request method and path. The two are textually distinct in `izba netlog`, and the harness captures `netlog --summary` per sandbox at journey end independently of the Actor, so the asserted outcome and its opposite cannot be confused — and a guest client that never ran (a missing binary, a 127) leaves NO row at all, which reads as unverified rather than as a product refusal. Expected truth, both on port 443 in the SAME log: `example.org` → ALLOW l3 `passthrough (protocol: tcp)` with no method, `example.com` → ALLOW l7 carrying an actual request method and path. The l7 row's method/path is the positive evidence that the port itself kept request-level inspection — an implementation that keyed the hatch on the port would show both rows as l3 with no method. GRADING NOTE 2 (harness): the comparison is now graded as a CONJUNCTION on the netlog output — an ALLOW `l3` row for `example.org:443` AND an ALLOW `l7` row for `example.com:443` must BOTH be present. An implementation that keyed the hatch on the PORT would render both as `l3` and the step flips; a journey that only fetched one of the two hosts flips as well, which is honest (the comparison this journey exists for was never made). The sibling entry's shape is graded from the managed policy.yaml: `example.com` must authorize 443 WITHOUT the declaration.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
       },
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ],
+      "seed_files": {
+        "policy.yaml": "enforce: true\nallow:\n  - host: dl-cdn.alpinelinux.org\n  - host: example.com\n  - host: example.org\n    ports:\n      - port: 443\n        protocol: tcp\n"
+      },
       "steps": [
         {
-          "intent": "create and start a sandbox named pin27 with the firewall on, allowing two real internet hosts on HTTPS where only one carries the certificate-pinning exception",
-          "expect": "the sandbox is running with the policy in effect"
+          "intent": "create and start a sandbox named pin27 on the small alpine image, with its egress firewall configured from the policy file that is already in your working directory, and confirm it is running",
+          "expect": "the sandbox is running",
+          "expect_exit": 0
         },
         {
-          "intent": "from inside the sandbox, reach both hosts over HTTPS and compare which certificate each presents",
-          "expect": "only the host carrying the exception presents its own upstream certificate; the other is still intercepted by izba, so the port itself did not lose inspection",
-          "core": true
+          "intent": "the policy allows two ordinary web sites on the same port. From inside pin27, fetch a page from each of them over HTTPS — the image is minimal, so you may have to install a client first (the policy already allows the package mirror)",
+          "expect": "the transcript shows what the client got back from each of the two sites"
+        },
+        {
+          "intent": "ask izba for its own record of the connections it handled for pin27, in as much detail as it will give you",
+          "expect": "izba prints an entry for each destination the sandbox reached, naming the destination, the port, and how izba handled that connection",
+          "core": true,
+          "expect_exit": 0,
+          "expect_cmd_re": "izba netlog(?!\\s+--help)",
+          "expect_stdout_re": "(?s)(?=.*ALLOW\\s+l3\\s+(?:\\S+\\s+)?example\\.org:443)(?=.*ALLOW\\s+l7\\s+(?:\\S+\\s+)?example\\.com:443)",
+          "expect_state": {
+            "sandbox": "pin27",
+            "policy": {
+              "host": "example.com",
+              "port": {
+                "number": 443,
+                "pinned": false
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "deep-exception-for-a-host-never-allowed",
-      "rationale": "Reachability and inspectability are separate axes and the exception may only ever narrow what reachability already permits: declaring the exception for a host that the allow-list does not otherwise permit must not make that host reachable.",
+      "rationale": "Reachability and inspectability are separate axes and the exception may only ever narrow what reachability already permits: declaring the exception for a host that the allow-list does not otherwise permit must not make that host reachable. GRADING NOTE (skeptic): The decisive oracle is izba's OWN per-flow record, not a guest exit code: a spliced flow is audited as tier `l3` with the rule `passthrough (protocol: tcp)` and NO HTTP method, while a terminated flow is audited as tier `l7` carrying the request method and path. The two are textually distinct in `izba netlog`, and the harness captures `netlog --summary` per sandbox at journey end independently of the Actor, so the asserted outcome and its opposite cannot be confused — and a guest client that never ran (a missing binary, a 127) leaves NO row at all, which reads as unverified rather than as a product refusal. The unlisted host is `example.com`; the seeded allow-list names only the package mirror (tooling precondition) and `example.org` (the pinned host). Expected truth: a DENY row for `example.com` (on :53 or :443, whichever plane refused it first) and NO `passthrough (protocol: tcp)` rule against it. Do NOT grade this journey on the guest client's exit code: a missing binary, a crun 'executable file not found' rc-1 and a firewall refusal are all non-zero and indistinguishable from each other — only a DENY row in izba's own log is evidence the product refused, and an absent row means the probe never ran. GRADING NOTE 2 (harness): the refusal is now machine-graded from izba's own log — the netlog output must carry a DENY row for `example.com` on the plane that refused it. Under an enforcing policy the DNS gate refuses the unlisted QNAME first (`DNS: not in allow-list`, audited at tier l3 against port 53), so the :53 form is the expected one and the :443 form is accepted for the case where resolution succeeded from cache; either is positive evidence the PRODUCT refused, which no guest exit code can supply. That the host is genuinely unlisted is graded from the managed policy.yaml in the same step.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
       },
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ],
+      "seed_files": {
+        "policy.yaml": "enforce: true\nallow:\n  - host: dl-cdn.alpinelinux.org\n  - host: example.org\n    ports:\n      - port: 443\n        protocol: tcp\n"
+      },
       "steps": [
         {
-          "intent": "create and start a sandbox named pin28 with the firewall on, where the allow-list's only entry is a host declared solely so it can carry the certificate-pinning exception on its HTTPS port — and a second, entirely unlisted host",
-          "expect": "the sandbox is running with the policy in effect"
+          "intent": "create and start a sandbox named pin28 on the small alpine image, with its egress firewall configured from the policy file that is already in your working directory, then print pin28's effective egress policy",
+          "expect": "the sandbox is running and the printed policy shows exactly which hosts it allows and how their ports are treated",
+          "expect_exit": 0
         },
         {
-          "intent": "from inside the sandbox, try to reach the unlisted host over HTTPS",
-          "expect": "the unlisted host is blocked by the firewall — declaring an exception elsewhere did not open anything up",
-          "core": true
+          "intent": "from inside pin28, try to fetch a page over HTTPS from example.com — a site that pin28's policy does not mention at all. The image is minimal, so you may have to install a client first (the policy already allows the package mirror)",
+          "expect": "the transcript shows the attempt and whatever the client reported about it"
+        },
+        {
+          "intent": "ask izba for its own record of the connections it handled for pin28, in as much detail as it will give you",
+          "expect": "izba prints an entry for each destination the sandbox tried to reach, naming the destination and how izba handled it",
+          "core": true,
+          "expect_exit": 0,
+          "expect_cmd_re": "izba netlog(?!\\s+--help)",
+          "expect_stdout_re": "DENY\\s+l\\d\\s+(?:\\S+\\s+)?example\\.com:(?:53|443)",
+          "expect_state": {
+            "sandbox": "pin28",
+            "policy": {
+              "host": "example.com",
+              "present": false
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "gui-pinned-port-is-visible-in-the-policy-tab",
-      "rationale": "An operator who opens the desktop app to answer 'is anything bypassing my firewall?' must get an answer there. The Policy tab must show the pinned port distinctly and state what it gives up, in substance matching what the command line says.",
+      "rationale": "An operator who opens the desktop app to answer 'is anything bypassing my firewall?' must get an answer there. The Policy tab must show the pinned port distinctly and state what it gives up, in substance matching what the command line says. Gating: seven sibling deep journeys require the capability this one establishes, so a false green here would silently validate all of them. GRADING NOTE (harness): the decisive step now also asserts, from the sandbox's MANAGED policy.yaml, that port 443 really does carry the declaration — so 'the Policy tab shows nothing' can no longer be reported against a sandbox whose fixture never landed, which matters doubly on a gating journey.",
       "source": {
         "kind": "pr",
         "ref": "issue #239 Acceptance Criteria 1-3 and 5 (visible marker, substance, absent for http/undeclared, save never drops the declaration)"
       },
       "tier": "deep",
       "modality": "gui",
+      "gating": true,
       "establishes": [
         "gui-pinned-row-visible"
       ],
@@ -812,23 +1064,34 @@
       "steps": [
         {
           "intent": "type {workspace} into the Workspace field, 'pin-gui' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
-          "expect": "a sandbox named pin-gui appears in the sandbox list"
-        },
-        {
-          "intent": "open the pin-gui sandbox's detail view, click its Manifest tab, click Refresh, then Promote the pending changes so the project's declared firewall settings become the sandbox's live settings",
-          "expect": "the promote is confirmed and the Manifest tab reports the sandbox in sync with the project file"
-        },
-        {
-          "intent": "click the Policy tab and read the allowed-hosts list, looking for anything that is exempt from inspection",
-          "expect": "the vendor host's row shows a visible warning naming the exempt port and saying the traffic is passed through opaquely with no L7 rules, no request audit and no upstream certificate verification",
+          "expect": "the create finishes without an error banner and a sandbox named pin-gui is listed in the sandbox rail",
           "core": true,
-          "expect_text": "no upstream certificate verification"
+          "expect_state": {
+            "sandbox": "pin-gui",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open the pin-gui sandbox's detail view, click its Policy tab, and read the allowed-hosts list, looking for anything that is exempt from inspection",
+          "expect": "the allowed-hosts list renders the project's declared hosts with their ports, and one row carries a visible message about one of its individual ports spelling out what that port gives up",
+          "core": true,
+          "expect_text": "no upstream certificate verification",
+          "expect_state": {
+            "sandbox": "pin-gui",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "gui-only-the-declared-port-is-marked",
-      "rationale": "Same per-port attribution promise as the CLI, on the GUI: the warning must name the port that carries the exception, and a port that only asked for extra inspection (or declared nothing) must not be marked as exempt.",
+      "rationale": "Same per-port attribution promise as the CLI, on the GUI: the warning must name the port that carries the exception, and a port that only asked for extra inspection (or declared nothing) must not be marked as exempt. GRADING NOTE (harness): the two NEGATIVE halves of the per-port claim are now graded from the MANAGED policy.yaml rather than inferred from the absence of a marker on screen — the same host's port 80 and the http-declaring host's port 8000 must both be authorized and carry NO pinning declaration. The visible half stays the (narrowed) expect_text needle, which only the enforcing + read-write branch renders.",
       "source": {
         "kind": "pr",
         "ref": "issue #239 Acceptance Criteria 1-3 and 5 (visible marker, substance, absent for http/undeclared, save never drops the declaration)"
@@ -844,23 +1107,41 @@
       "steps": [
         {
           "intent": "type {workspace} into the Workspace field, 'pin-gui2' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
-          "expect": "a sandbox named pin-gui2 appears in the sandbox list"
-        },
-        {
-          "intent": "open pin-gui2's detail view, click its Manifest tab, click Refresh, then Promote the pending changes",
-          "expect": "the promote is confirmed and the tab reports the sandbox in sync"
-        },
-        {
-          "intent": "click the Policy tab and read both host rows, checking which individual port each warning refers to",
-          "expect": "the exemption warning names port 443 specifically; the same host's other port and the host whose port was only asked to be policed carry no exemption warning",
+          "expect": "the create finishes without an error banner and a sandbox named pin-gui2 is listed in the sandbox rail",
           "core": true,
-          "expect_text": "Port 443: TLS-pinning passthrough"
+          "expect_state": {
+            "sandbox": "pin-gui2",
+            "exists": true,
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 80,
+                "pinned": false
+              }
+            }
+          }
+        },
+        {
+          "intent": "open pin-gui2's detail view, click its Policy tab, and read both host rows port by port, noting which individual port each marker and each row message refers to",
+          "expect": "every port renders its own chip and marker, and any row-level message refers to ports by number rather than to the host as a whole, so the two ports of the same host can be compared against each other",
+          "core": true,
+          "expect_text": "Port 443: TLS-pinning passthrough — spliced opaquely",
+          "expect_state": {
+            "sandbox": "pin-gui2",
+            "policy": {
+              "host": "api.example.com",
+              "port": {
+                "number": 8000,
+                "pinned": false
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "gui-dormant-exception-is-not-claimed-as-live",
-      "rationale": "The GUI and the CLI must not disagree about posture: on a read-only entry the exception is dormant, and the app must say so rather than claiming the traffic is passed through when it is still being intercepted.",
+      "rationale": "The GUI and the CLI must not disagree about posture: on a read-only entry the exception is dormant, and the app must say so rather than claiming the traffic is passed through when it is still being intercepted. GRADING NOTE (harness): the row's dormant SHAPE is now graded from the MANAGED policy.yaml (`access: read` AND the declaration present on 443), so the NOT-in-effect wording can only be credited against a policy that actually is dormant-by-access — not against one that lost its declaration on the way in.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/plans/2026-08-25-gui-passthrough-host-lock.md — the AC-4 Decision + its Amendment"
@@ -876,23 +1157,35 @@
       "steps": [
         {
           "intent": "type {workspace} into the Workspace field, 'pin-gui3' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
-          "expect": "a sandbox named pin-gui3 appears in the sandbox list"
-        },
-        {
-          "intent": "open pin-gui3's detail view, click its Manifest tab, click Refresh, then Promote the pending changes",
-          "expect": "the promote is confirmed and the tab reports the sandbox in sync"
-        },
-        {
-          "intent": "click the Policy tab and work out from the row whether that host's exemption is actually in effect",
-          "expect": "the row says the exemption is NOT in effect for this entry — a pinning client would still be presented with izba's certificate — and names where the posture can actually be changed",
+          "expect": "the create finishes without an error banner and a sandbox named pin-gui3 is listed in the sandbox rail",
           "core": true,
-          "expect_text": "TLS-pinning passthrough NOT in effect"
+          "expect_state": {
+            "sandbox": "pin-gui3",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open pin-gui3's detail view, click its Policy tab, and work out from the vendor row — its Access setting and whatever the row says about its declared port — what that port's posture actually is",
+          "expect": "the row shows its Access setting and renders a message about the declared port that states a posture and points somewhere the posture could be changed",
+          "core": true,
+          "expect_text": "access never authorizes one",
+          "expect_state": {
+            "sandbox": "pin-gui3",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "access": "read",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "gui-cannot-move-the-exception-to-another-host",
-      "rationale": "The app's save path has no weakening review in front of it, so renaming a host that carries the exception would move that exemption onto a host nobody ever declared one for. The app must refuse the rename and explain why.",
+      "rationale": "The app's save path has no weakening review in front of it, so renaming a host that carries the exception would move that exemption onto a host nobody ever declared one for. The app must refuse the rename and explain why — and the refusal has to survive a real Save and a re-read from the sandbox, not merely look refused on screen. GRADING NOTE (harness): the true oracle — 'the saved policy is unchanged' — is now machine-graded, which the visible notice cannot express (it renders identically whether or not a rename landed). A refused rename is two assertions over the MANAGED policy.yaml on two core steps: the new name must be ABSENT after the Save, and the old name must still be PRESENT and still carry the declaration on 443 after the re-read. The replacement name is prescribed in the intent only so those assertions have a fixed anchor.",
       "source": {
         "kind": "pr",
         "ref": "PR #262 body — 'The decision (AC 4)': relocation and activation are both refused in the reducer"
@@ -908,23 +1201,52 @@
       "steps": [
         {
           "intent": "type {workspace} into the Workspace field, 'pin-gui4' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
-          "expect": "a sandbox named pin-gui4 appears in the sandbox list"
-        },
-        {
-          "intent": "open pin-gui4's detail view, click its Manifest tab, click Refresh, then Promote the pending changes",
-          "expect": "the promote is confirmed and the tab reports the sandbox in sync"
-        },
-        {
-          "intent": "click the Policy tab and try to change the vendor host's name in its Host field to a different host, then Save",
-          "expect": "the host name cannot be changed while that row carries the exempt port: the app refuses the edit and explains that the exemption cannot be silently moved, naming the ways it can legitimately be changed",
+          "expect": "the create finishes without an error banner and a sandbox named pin-gui4 is listed in the sandbox rail",
           "core": true,
-          "expect_text": "The host is locked"
+          "expect_state": {
+            "sandbox": "pin-gui4",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open pin-gui4's detail view, click its Policy tab, and try to replace the vendor host's name in its Host field with the host name moved.vendor.example",
+          "expect": "what the Host field does with the typing is visible in the field itself, and the row renders a message next to that field"
+        },
+        {
+          "intent": "click Save to write the policy back to the sandbox",
+          "expect": "the save completes and the footer reports the policy was written",
+          "core": true,
+          "expect_text": "saved · reloaded",
+          "expect_state": {
+            "sandbox": "pin-gui4",
+            "policy": {
+              "host": "moved.vendor.example",
+              "present": false
+            }
+          }
+        },
+        {
+          "intent": "switch to the Overview tab and back to the Policy tab so the policy is re-read from the sandbox, then read the vendor row again — its Host field, its ports and its message",
+          "expect": "after the re-read the row renders whatever the sandbox actually has: a host name in the Host field, its port chips, and its message",
+          "core": true,
+          "expect_text": "The host is locked so this control cannot be silently relocated",
+          "expect_state": {
+            "sandbox": "pin-gui4",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "present": true,
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "gui-cannot-activate-a-dormant-exception",
-      "rationale": "One click on the access picker would otherwise turn a dormant exemption live — the same unreviewed weakening the host lock exists to prevent. Widening access on a row carrying an exempt port must be refused, and the row must say so.",
+      "rationale": "One click on the access picker would otherwise turn a dormant exemption live — the same unreviewed weakening the host lock exists to prevent. Widening access on a row carrying an exempt port must be refused, and the refusal must still hold after a Save and a re-read from the sandbox. GRADING NOTE (harness): the refusal is now graded from the MANAGED policy.yaml — after the Save the entry's access verb must still read `read`, and after the re-read the declaration must still be on 443. Had the widening been accepted and persisted the file would say `read-write` and the step flips, independently of what the row rendered.",
       "source": {
         "kind": "pr",
         "ref": "PR #262 body — 'The decision (AC 4)': relocation and activation are both refused in the reducer"
@@ -940,23 +1262,51 @@
       "steps": [
         {
           "intent": "type {workspace} into the Workspace field, 'pin-gui5' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
-          "expect": "a sandbox named pin-gui5 appears in the sandbox list"
-        },
-        {
-          "intent": "open pin-gui5's detail view, click its Manifest tab, click Refresh, then Promote the pending changes",
-          "expect": "the promote is confirmed and the tab reports the sandbox in sync"
-        },
-        {
-          "intent": "click the Policy tab and try to widen that host row's Access from read-only to read-write, then Save",
-          "expect": "the widening is refused while the row carries the exempt port, and the row states that widening here is refused because it would silently activate the exemption",
+          "expect": "the create finishes without an error banner and a sandbox named pin-gui5 is listed in the sandbox rail",
           "core": true,
-          "expect_text": "widening Access to read-write here is refused"
+          "expect_state": {
+            "sandbox": "pin-gui5",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open pin-gui5's detail view, click its Policy tab, and try to move the vendor row's Access from read-only to read-write",
+          "expect": "the Access control's rendered selection after the click is visible on the row, and the row renders a message about that control"
+        },
+        {
+          "intent": "click Save to write the policy back to the sandbox",
+          "expect": "the save completes and the footer reports the policy was written",
+          "core": true,
+          "expect_text": "saved · reloaded",
+          "expect_state": {
+            "sandbox": "pin-gui5",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "access": "read"
+            }
+          }
+        },
+        {
+          "intent": "switch to the Overview tab and back to the Policy tab so the policy is re-read from the sandbox, then read the vendor row's Access setting and its message again",
+          "expect": "after the re-read the row's Access selection and its message describe whichever posture the sandbox actually has now",
+          "core": true,
+          "expect_text": "access never authorizes one",
+          "expect_state": {
+            "sandbox": "pin-gui5",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "gui-saving-an-unrelated-edit-preserves-the-declaration",
-      "rationale": "The editor carries a declaration it has no control for, and this component already shipped one silent-drop defect for exactly that field. Editing something unrelated on the row and saving must leave the exemption on the same port — and any port added here must not pick it up.",
+      "rationale": "The editor carries a declaration it has no control for, and this component already shipped one silent-drop defect for exactly that field. Editing something unrelated on the row and saving must leave the exemption on the same port — and any port added here must not pick it up. GRADING NOTE (harness): both halves of the claim are now graded from the MANAGED policy.yaml — the saved entry must still carry the declaration on 443 (the silent-drop defect this component already shipped once), and the port ADDED here must be authorized and carry NO declaration (a port must not inherit its sibling's hatch, #238). The 8443 assertion doubles as proof the unrelated edit actually reached the file, which `unsaved changes` alone only shows on screen.",
       "source": {
         "kind": "pr",
         "ref": "issue #239 Acceptance Criteria 1-3 and 5 (visible marker, substance, absent for http/undeclared, save never drops the declaration)"
@@ -972,27 +1322,56 @@
       "steps": [
         {
           "intent": "type {workspace} into the Workspace field, 'pin-gui6' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
-          "expect": "a sandbox named pin-gui6 appears in the sandbox list"
-        },
-        {
-          "intent": "open pin-gui6's detail view, click its Manifest tab, click Refresh, then Promote the pending changes",
-          "expect": "the promote is confirmed and the tab reports the sandbox in sync"
-        },
-        {
-          "intent": "click the Policy tab, add one more port to the vendor host's row, and click Save",
-          "expect": "the save is accepted and the app reports the policy saved"
-        },
-        {
-          "intent": "navigate away from the Policy tab and back to it so the policy is re-read from the sandbox, then read the vendor host's row again",
-          "expect": "the exemption is still declared on the original port only — it was neither dropped by the save nor spread onto the port just added",
+          "expect": "the create finishes without an error banner and a sandbox named pin-gui6 is listed in the sandbox rail",
           "core": true,
-          "expect_text": "Port 443: TLS-pinning passthrough"
+          "expect_state": {
+            "sandbox": "pin-gui6",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open pin-gui6's detail view, click its Policy tab, and add one more port — 8443 — to the vendor host's row",
+          "expect": "the new port appears as another chip on that row and the footer shows the editor now has unsaved changes",
+          "core": true,
+          "expect_text": "unsaved changes",
+          "expect_state": {
+            "sandbox": "pin-gui6",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 8443,
+                "pinned": false
+              }
+            }
+          }
+        },
+        {
+          "intent": "click Save to write the policy back to the sandbox",
+          "expect": "the save completes and the footer reports the policy was written",
+          "core": true,
+          "expect_text": "saved · reloaded"
+        },
+        {
+          "intent": "switch to the Overview tab and back to the Policy tab so the policy is re-read from the sandbox, then read the vendor row's ports and its message port by port",
+          "expect": "after the re-read the row renders whichever ports the sandbox actually has, and whichever of them the message refers to, each named by number",
+          "core": true,
+          "expect_text": "Port 443: TLS-pinning passthrough — spliced opaquely",
+          "expect_state": {
+            "sandbox": "pin-gui6",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "gui-removing-the-exempt-port-unlocks-the-row",
-      "rationale": "The escape valve must exist: removing the exempt port is a strictly narrowing edit, after which the row is ordinary again and can be renamed or widened. Without it the app would trap an operator into leaving the GUI for unrelated changes to that host.",
+      "rationale": "The escape valve must exist: removing the exempt port is a strictly narrowing edit, after which the row is ordinary again and can be renamed or widened. Without it the app would trap an operator into leaving the GUI for unrelated changes to that host. GRADING NOTE (harness): the escape valve is now graded from the MANAGED policy.yaml instead of from a `saved · reloaded` footer that any successful Save renders: the original host must be ABSENT and the new name PRESENT, still authorizing the surviving port 80 and carrying no declaration. An Actor who clicks Save on an untouched editor leaves pinned.vendor.com present and flips. The replacement name is prescribed in the intent only so the assertion has a fixed anchor.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/plans/2026-08-25-gui-passthrough-host-lock.md — the AC-4 Decision + its Amendment"
@@ -1008,27 +1387,48 @@
       "steps": [
         {
           "intent": "type {workspace} into the Workspace field, 'pin-gui7' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
-          "expect": "a sandbox named pin-gui7 appears in the sandbox list"
-        },
-        {
-          "intent": "open pin-gui7's detail view, click its Manifest tab, click Refresh, then Promote the pending changes",
-          "expect": "the promote is confirmed and the tab reports the sandbox in sync"
-        },
-        {
-          "intent": "click the Policy tab and remove the exempt port from the vendor host's row",
-          "expect": "the exemption warning disappears from that row"
-        },
-        {
-          "intent": "now change that host's name to a different host and click Save",
-          "expect": "the host name is editable again and the save is accepted, so removing the exempt port is a working way out of the lock",
+          "expect": "the create finishes without an error banner and a sandbox named pin-gui7 is listed in the sandbox rail",
           "core": true,
-          "expect_text": "saved · reloaded"
+          "expect_state": {
+            "sandbox": "pin-gui7",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open pin-gui7's detail view, click its Policy tab, and remove the vendor row's port 443 with its ✕ button",
+          "expect": "the 443 chip is gone from the row and the footer shows the editor now has unsaved changes",
+          "core": true,
+          "expect_text": "unsaved changes",
+          "expect_state": {
+            "sandbox": "pin-gui7",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "present": false
+            }
+          }
+        },
+        {
+          "intent": "now put the host name renamed.vendor.example into that same row's Host field and click Save",
+          "expect": "what the Host field does with the typing is visible in the field, and the footer reports whether the policy was written",
+          "core": true,
+          "expect_text": "saved · reloaded",
+          "expect_state": {
+            "sandbox": "pin-gui7",
+            "policy": {
+              "host": "renamed.vendor.example",
+              "present": true,
+              "port": {
+                "number": 80,
+                "pinned": false
+              }
+            }
+          }
         }
       ]
     },
     {
       "journey_id": "gui-app-cannot-author-a-new-exception",
-      "rationale": "The desktop app is deliberately a place an exemption can be SEEN but never opened. A user who tries to create one there must not find a control that does it, and should be told where it can be declared instead.",
+      "rationale": "The desktop app is deliberately a place an exemption can be SEEN but never opened. A user who tries to create one there must not find a control that does it, must not end up with one after saving, and should be told where it can be declared instead. GRADING NOTE (harness): 'must not end up with one after saving' is now a machine assertion over the MANAGED policy.yaml rather than an inference from the absence of a control: the app-authored row must exist and its port 443 must carry NO pinning declaration, while the project-file row's declaration must survive the same save untouched. The where-to-declare-it copy stays the expect_text needle.",
       "source": {
         "kind": "spec",
         "ref": "docs/superpowers/plans/2026-08-25-gui-passthrough-host-lock.md — the AC-4 Decision + its Amendment"
@@ -1044,21 +1444,48 @@
       "steps": [
         {
           "intent": "type {workspace} into the Workspace field, 'pin-gui8' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
-          "expect": "a sandbox named pin-gui8 appears in the sandbox list"
-        },
-        {
-          "intent": "open pin-gui8's detail view, click its Manifest tab, click Refresh, then Promote the pending changes",
-          "expect": "the promote is confirmed and the tab reports the sandbox in sync"
-        },
-        {
-          "intent": "click the Policy tab, add a NEW host row for a second vendor and look for any control that would exempt one of its ports from inspection the way the existing vendor's port is",
-          "expect": "no such control exists anywhere in the tab — the app can show an exemption but not create one"
-        },
-        {
-          "intent": "read what the existing exempt row says about where that declaration can be changed",
-          "expect": "the row names the places an exemption can legitimately be authored or changed outside the app, so a user is not left guessing",
+          "expect": "the create finishes without an error banner and a sandbox named pin-gui8 is listed in the sandbox rail",
           "core": true,
-          "expect_text": "edit policy.yaml"
+          "expect_state": {
+            "sandbox": "pin-gui8",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open pin-gui8's detail view, click its Policy tab, add a NEW host row for a second vendor (host second.vendor.com, port 443), and look over every control on that new row for one that would exempt its port from inspection the way the existing vendor's port is",
+          "expect": "the new row renders its own Host, Ports and Access controls, and whatever controls they offer are visible for comparison against the existing vendor row's port markers"
+        },
+        {
+          "intent": "click Save to write the policy back to the sandbox",
+          "expect": "the save completes and the footer reports the policy was written",
+          "core": true,
+          "expect_text": "saved · reloaded",
+          "expect_state": {
+            "sandbox": "pin-gui8",
+            "policy": {
+              "host": "pinned.vendor.com",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        },
+        {
+          "intent": "switch to the Overview tab and back to the Policy tab so the policy is re-read from the sandbox, then compare the two vendor rows — the one that came from the project file and the one just added here — and read what any row message says about where its declaration can be changed",
+          "expect": "after the re-read each row renders whichever port markers and messages the sandbox actually has, and any such message names where that declaration can be changed",
+          "core": true,
+          "expect_text": "edit policy.yaml, or izba.yml followed by izba diff / izba promote",
+          "expect_state": {
+            "sandbox": "pin-gui8",
+            "policy": {
+              "host": "second.vendor.com",
+              "port": {
+                "number": 443,
+                "pinned": false
+              }
+            }
+          }
         }
       ]
     }
