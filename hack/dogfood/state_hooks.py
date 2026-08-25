@@ -63,14 +63,30 @@ def is_wildcard_host(host: str) -> bool:
     return host.startswith("*.") or host.startswith("**.")
 
 
-def infra_candidate(journey_id: str, detail: str) -> Dict[str, Any]:
-    """Flipping infra candidate — same shape as the CLI runner's (a broken
-    model/driver plumbing means the journey verified nothing)."""
+# Provenance for a hook-grader degradation. The model transport had nothing to
+# do with it, and both fields are read by the Phase-3 skeptic as provenance —
+# misattributing them sends it looking at the wrong subsystem.
+HOOK_GRADER_SOURCE = "harness: decisive-hook grader"
+HOOK_GRADER_EXPECTATION = "a declared decisive hook must be gradable"
+
+
+def infra_candidate(journey_id: str, detail: str, *,
+                    source: str = "harness: model transport",
+                    violated_expectation: str =
+                    "model/API must produce a next command") -> Dict[str, Any]:
+    """Flipping infra candidate — the harness/driver plumbing failed, so the
+    journey verified nothing (and must not tally positive).
+
+    ``source``/``violated_expectation`` default to the MODEL-TRANSPORT
+    provenance the original callers (model starvation, sidecar/daemon spawn
+    failure) need; every other emitter passes its own. The skeptic reads both
+    fields, so a hook-grader degradation labelled "model/API must produce a
+    next command" points it at the wrong subsystem entirely."""
     return {
         "kind": "infra",
         "detail": detail,
-        "violated_expectation": "model/API must produce a next command",
-        "source": "harness: model transport",
+        "violated_expectation": violated_expectation,
+        "source": source,
         "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
     }
 
@@ -224,7 +240,9 @@ def apply_hook_verdict(verdict: str, found: List[Any], *, hook: str,
         return
     if verdict == "no_evidence":
         candidates.append(infra_candidate(
-            journey_id, f"{no_evidence_detail} (core decisive step {step_idx})"))
+            journey_id, f"{no_evidence_detail} (core decisive step {step_idx})",
+            source=HOOK_GRADER_SOURCE,
+            violated_expectation=HOOK_GRADER_EXPECTATION))
         return
     for c in found:
         cd = c.to_dict()

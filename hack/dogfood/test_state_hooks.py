@@ -58,3 +58,45 @@ def test_valid_policy_spec_rejects_a_pinned_wildcard():
         {"host": "*.v.com", "port": {"number": 443, "pinned": False}})
     assert valid_policy_spec(
         {"host": "exact.v.com", "port": {"number": 443, "pinned": True}})
+
+
+def test_hook_infra_candidates_carry_honest_provenance():
+    # F3: the hook grader's `no_evidence` degradation used
+    # `infra_candidate`'s defaults — `source: harness: model transport`,
+    # `violated_expectation: model/API must produce a next command`. The
+    # model transport had nothing to do with it, and the skeptic reads both
+    # fields as provenance.
+    from state_hooks import apply_hook_verdict
+    candidates, credits = [], []
+    apply_hook_verdict("no_evidence", [], hook="expect_state: sandbox 'web'",
+                       no_evidence_detail="policy.yaml unreadable",
+                       journey_id="j1", step_idx=2,
+                       candidates=candidates, decisive_credits=credits)
+    assert len(candidates) == 1
+    c = candidates[0]
+    assert c["kind"] == "infra"
+    assert "model transport" not in c["source"]
+    assert "next command" not in c["violated_expectation"]
+    assert "hook" in c["source"].lower()
+    assert "gradable" in c["violated_expectation"].lower()
+
+
+def test_infra_candidate_keeps_its_transport_default():
+    # …while the model-transport callers (starvation, spawn failure) are
+    # unchanged: this is provenance, not a rename.
+    from state_hooks import infra_candidate
+    c = infra_candidate("j1", "model starved")
+    assert c["source"] == "harness: model transport"
+    assert c["violated_expectation"] == "model/API must produce a next command"
+
+
+def test_both_runners_share_one_no_evidence_string():
+    # F2: the CLI runner's `_STATE_NO_EVIDENCE_DETAIL` was a verbatim copy of
+    # the GUI's inline literal — one message with two homes.
+    import gui.run_gui_journeys as rgj
+    import run_journeys
+    import state_hooks
+    assert (run_journeys._STATE_NO_EVIDENCE_DETAIL
+            is state_hooks.STATE_NO_EVIDENCE_DETAIL)
+    assert (rgj._STATE_NO_EVIDENCE_DETAIL
+            is state_hooks.STATE_NO_EVIDENCE_DETAIL)

@@ -710,3 +710,25 @@ def test_hook_descriptions_do_not_claim_manifest_truth_preempts():
     # …and expect_text says the true rule positively.
     text_desc = props["expect_text"]["description"]
     assert "never substituted" in text_desc or "on top of" in text_desc.lower()
+
+
+def test_expect_state_policy_warns_off_the_ambiguous_wildcard_shape():
+    # A journey that calls `izba policy allow` twice on ONE wildcard host with
+    # different --access creates mixed-access duplicates the product keeps
+    # independent — the oracle then refuses to certify a posture (no_evidence).
+    # The schema is the compiler's instruction sheet: it must name the trap.
+    schema = _load("journeys.schema.json")
+    desc = (schema["definitions"]["step"]["properties"]["expect_state"]
+            ["properties"]["policy"]["description"].lower())
+    assert "wildcard" in desc
+    assert "no_evidence" in desc or "cannot be graded" in desc
+
+
+def test_expect_stdout_re_description_says_chars_not_bytes():
+    # F5: TAIL_BYTES is a CHAR limit; documenting it as bytes misleads an
+    # author sizing an anchor, and the tail now carries a truncation marker.
+    schema = _load("journeys.schema.json")
+    desc = schema["definitions"]["step"]["properties"]["expect_stdout_re"]["description"]
+    assert "4096 bytes" not in desc
+    assert "4096 char" in desc
+    assert "truncat" in desc.lower()
