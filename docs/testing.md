@@ -245,6 +245,14 @@ Notes:
 - Each test creates its sandboxes under a private tempdir and force-removes
   them on the way out (even on panic), so failed runs do not pollute
   `~/.local/share/izba`.
+- A few egress tests need **real outbound TLS** to a public host
+  (`mitm_firewall_allows_and_denies_real_vm`,
+  `pinning_passthrough_ab_vendor_cert_vs_izba_ca_real_vm` — both fetch
+  `https://example.com/`). The pinning A/B additionally reads the host's own
+  public CA bundle (`/etc/ssl/certs/ca-certificates.crt`, i.e. the
+  `ca-certificates` package) and stages it into the guest workspace: telling
+  the vendor's certificate from izba's needs a trust set with no izba CA in
+  it. Both are satisfied on a stock Ubuntu runner and in `e2e.yml`.
 
 ## 5. Daemon e2e
 
