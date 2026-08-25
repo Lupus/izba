@@ -68,6 +68,8 @@ from state_hooks import (  # noqa: E402
     apply_hook_verdict as _apply_hook_verdict,
     infra_candidate,
     infra_candidate as _infra_candidate,
+    step_was_entered,
+    unentered_step_candidate,
     state_hook_label as _state_hook_label,
     step_decisive_hooks as _step_decisive_hooks,
     zero_action_unreached as _zero_action_unreached,
@@ -317,8 +319,21 @@ def _decisive_step_indices(steps: List[Dict[str, Any]]) -> set:
     return {len(steps) - 1} if steps else set()
 
 
-def _stdout_candidates(step, action, source, ref, journey_id) -> List[Candidate]:
-    """``expect_stdout_re``: assert WHAT the graded action printed.
+# The output-assertion hooks, one row per stream: (hook key, the Action field
+# holding that stream's recorded tail, the human name used in the candidate).
+# ONE grader walks this table — stdout and stderr are the same rule over two
+# streams, and a second copy of a rule is the specific mistake this codebase
+# has paid for (a divergent second fold once shipped a live
+# no-certificate-verification bypass; see CLAUDE.md).
+_STREAM_HOOKS = (
+    ("expect_stdout_re", "stdout_tail", "stdout"),
+    ("expect_stderr_re", "stderr_tail", "stderr"),
+)
+
+
+def _stream_candidates(step, action, source, ref, journey_id) -> List[Candidate]:
+    """``expect_stdout_re`` / ``expect_stderr_re``: assert WHAT the graded
+    action printed, on either stream.
 
     ``expect_exit`` grades the exit code and ``expect_cmd_re`` selects WHICH
     action is graded — neither can assert on output. So a decisive step meaning
@@ -326,50 +341,67 @@ def _stdout_candidates(step, action, source, ref, journey_id) -> List[Candidate]
     was graded purely on `izba netlog` exiting 0, which is true whichever way
     the flow actually went.
 
-    Graded against the stdout of the SAME action the functional verdict is
-    graded on (``expect_cmd_re``-selected, else the step's last product
-    invocation, else its final action), so the two hooks can never disagree
-    about WHICH command they are talking about. Composes with ``expect_exit``:
-    the candidates simply add, so when both are declared both must hold.
+    STDERR is not a nicety: `izba promote`'s ``WARNING: weakens egress``
+    (PromoteEvent::Warn → eprintln!) and its ``no reviewed diff — run izba diff
+    first`` bail are the review gate's own voice, both written to stderr, where
+    a stdout-only hook structurally cannot see them. Without the twin, the
+    security-posture half of "does the review gate flag a weakening?" rests on
+    a human reading prose.
 
-    The matched text is the recorded ``stdout_tail`` — the LAST
-    ``oracles.TAIL_BYTES`` of stdout, which is all the bundle keeps; the schema
+    Both hooks are graded against the SAME action the functional verdict is
+    graded on (``expect_cmd_re``-selected, else the step's last product
+    invocation, else its final action), so no two hooks can disagree about
+    WHICH command they are talking about. They compose with ``expect_exit`` and
+    with each other: the candidates simply add, so when several are declared
+    ALL must hold.
+
+    The matched text is the recorded tail — the LAST ``oracles.TAIL_BYTES``
+    CHARACTERS of that stream, which is all the bundle keeps; the schema
     description says so, so an author does not anchor on output that was cut.
+    When the tail WAS truncated the candidate says so, because "the product
+    printed the wrong thing" and "the harness dropped the line" are otherwise
+    indistinguishable.
 
     An UNPARSEABLE pattern is an ungradable assertion, not an absent one: it
     emits a flipping ``infra`` candidate rather than passing silently (unlike
     ``expect_cmd_re``, whose invalid-regex path merely falls back to a
     different — still graded — action)."""
-    pattern = step.get("expect_stdout_re")
-    if not (isinstance(pattern, str) and pattern):
-        return []
-    try:
-        rx = re.compile(pattern)
-    except re.error as e:
-        log(f"{journey_id}: invalid expect_stdout_re {pattern!r}: {e}")
-        return [Candidate(
-            kind="infra",
-            detail=(f"expect_stdout_re {pattern!r} is not a valid regex "
-                    f"({e}); the step's output assertion could not be graded"),
-            violated_expectation="a declared expect_stdout_re must be gradable",
-            source=source, trajectory_ref=dict(ref))]
-    stdout_tail = action.get("stdout_tail") or ""
-    if rx.search(stdout_tail):
-        return []
-    # A miss on a TRUNCATED tail has two possible causes — the product printed
-    # the wrong thing, or the harness dropped the line that would have matched
-    # — and the skeptic cannot tell them apart unless the detail says so.
-    cut = (" — NOTE: this tail was TRUNCATED, so the matching line may have "
-           "been dropped rather than never printed"
-           if was_truncated(stdout_tail) else "")
-    return [Candidate(
-        kind="functional",
-        detail=(f"expect_stdout_re {pattern!r} did not match the stdout of "
-                f"{action.get('command', '')!r} (stdout_tail: "
-                f"{stdout_tail[-300:]!r}){cut}"),
-        violated_expectation=step.get("expect", "")
-                             or f"stdout must match {pattern!r}",
-        source=source, trajectory_ref=dict(ref))]
+    out: List[Candidate] = []
+    for hook, field, stream in _STREAM_HOOKS:
+        pattern = step.get(hook)
+        if not (isinstance(pattern, str) and pattern):
+            continue
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            log(f"{journey_id}: invalid {hook} {pattern!r}: {e}")
+            out.append(Candidate(
+                kind="infra",
+                detail=(f"{hook} {pattern!r} is not a valid regex "
+                        f"({e}); the step's output assertion could not be "
+                        f"graded"),
+                violated_expectation=f"a declared {hook} must be gradable",
+                source=source, trajectory_ref=dict(ref)))
+            continue
+        tail = action.get(field) or ""
+        if rx.search(tail):
+            continue
+        # A miss on a TRUNCATED tail has two possible causes — the product
+        # printed the wrong thing, or the harness dropped the line that would
+        # have matched — and the skeptic cannot tell them apart unless the
+        # detail says so.
+        cut = (f" — NOTE: this {stream} tail was TRUNCATED, so the matching "
+               f"line may have been dropped rather than never printed"
+               if was_truncated(tail) else "")
+        out.append(Candidate(
+            kind="functional",
+            detail=(f"{hook} {pattern!r} did not match the {stream} of "
+                    f"{action.get('command', '')!r} ({field}: "
+                    f"{tail[-300:]!r}){cut}"),
+            violated_expectation=step.get("expect", "")
+                                 or f"{stream} must match {pattern!r}",
+            source=source, trajectory_ref=dict(ref)))
+    return out
 
 
 def _grade_step_functional(step, produced, journey, journey_id, decisive,
@@ -415,7 +447,7 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
         step.get("expect", ""), source, ref,
         expect_exit=step.get("expect_exit"),
         stderr=target.get("stderr_tail", "")))
-    found += _stdout_candidates(step, target, source, ref, journey_id)
+    found += _stream_candidates(step, target, source, ref, journey_id)
     out = []
     for c in found:
         cd = c.to_dict()
@@ -673,7 +705,7 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id,
         # unreached decisive step credited from an earlier action must still
         # prove what that action PRINTED, or the false-green expect_stdout_re
         # closes simply reopens here.
-        found += _stdout_candidates(step, a, source, ref, journey_id)
+        found += _stream_candidates(step, a, source, ref, journey_id)
         out = []
         for c in found:
             cd = c.to_dict()
@@ -865,7 +897,7 @@ def run_journey(
     # out of a step the Actor never entered.
     unreached_decisive_steps: set = set()
     for i in sorted(decisive_idx):
-        if step_actions.get(i, 0) == 0:
+        if not step_was_entered(i, step_actions):
             s = steps[i]
             # Latest pre-drift watermark established at or before this decisive
             # step (step-level seed_files only; see _run_step's docstring).
@@ -879,16 +911,8 @@ def run_journey(
                 decisive_credits.append(graded)
                 continue
             unreached_decisive_steps.add(i)
-            candidates.append({
-                "kind": "unreached_decisive",
-                "detail": (f"decisive step {i} ({s.get('intent', '')[:80]!r}) "
-                           f"produced no actions — its assertion was never "
-                           f"exercised"),
-                "violated_expectation": s.get("expect", "")
-                                        or "decisive step must be exercised",
-                "source": source,
-                "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
-            })
+            candidates.append(unentered_step_candidate(
+                journey_id, s, i, source))
     # A journey whose EVERY snapshot errored had no reconcile oracle at all.
     if actions and all((a.get("reconcile") or {}).get("error") for a in actions):
         candidates.append(_infra_candidate(

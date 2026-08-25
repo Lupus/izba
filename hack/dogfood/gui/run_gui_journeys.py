@@ -50,6 +50,8 @@ from state_hooks import (  # noqa: E402
     state_hook_label as _state_hook_label,
     step_declares_hook as _step_declares_hook,
     step_decisive_hooks as _step_decisive_hooks,
+    step_was_entered as _step_was_entered,
+    unentered_step_candidate as _unentered_step_candidate,
     valid_policy_spec as _valid_policy_spec,
     valid_port_spec as _valid_port_spec,
     valid_sandboxes_exact as _valid_sandboxes_exact,
@@ -339,6 +341,53 @@ def _settle_expect_state(state_hook: Dict[str, Any], first_verdict: str,
     return verdict, found, evidence
 
 
+def _step_action_counts(step_action_start: Dict[int, int],
+                        total_actions: int) -> Dict[int, int]:
+    """Actions produced INSIDE each step, from the "actions taken when the
+    step opened" marks the loop records.
+
+    `step_action_start` alone cannot answer "was this step exercised": it is
+    written at the top of the step, BEFORE the turn/step-cap checks, so a step
+    the Actor was never funded to act in still has an entry. The DIFFERENCE
+    between consecutive marks is the honest count, and a step the run never
+    opened has no entry at all (⇒ zero). This is the GUI's input to the shared
+    `state_hooks.step_was_entered` predicate, so both runners answer "reached"
+    the same way."""
+    opened = sorted(step_action_start)
+    counts: Dict[int, int] = {}
+    for pos, step_i in enumerate(opened):
+        nxt = (step_action_start[opened[pos + 1]] if pos + 1 < len(opened)
+               else total_actions)
+        counts[step_i] = max(0, nxt - step_action_start[step_i])
+    return counts
+
+
+def _observed_rescue(text_hook: Optional[str], page_text_history: List[str],
+                     journey_id: str, step_idx: int, step: Dict[str, Any],
+                     source: str) -> bool:
+    """Is a NOT-entered decisive step nevertheless satisfied by OBSERVED
+    evidence — its declared ``expect_text`` visibly present in the journey's
+    FINAL capture?
+
+    This is the GUI's counterpart of the CLI's
+    ``_grade_decisive_from_observed`` crediting (an earlier action matching
+    ``expect_cmd_re``), and it is the documented fallback this runner already
+    had: "the outcome being observably present at journey end is still honest
+    evidence". Keeping it is deliberate — dropping a declared hook because the
+    step's own turn was never spent would be a SILENT discard, the failure
+    mode this whole round is removing. When it holds, the caller grades the
+    step normally (so the text hook earns its credit and a sibling
+    ``expect_state`` is still checked); when it does not, the step yields the
+    unentered flip alone."""
+    if text_hook is None or not page_text_history:
+        return False
+    verdict, _ = expect_text_oracle(
+        text_hook, page_text_history[-1:],
+        {"journey_id": journey_id, "action_index": -1},
+        step_index=step_idx, expect=step.get("expect", ""), source=source)
+    return verdict == "matched"
+
+
 def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
                            steps: List[Dict[str, Any]],
                            page_text_history: List[str],
@@ -352,7 +401,8 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
                            settle_s: float = 0.0,
                            settle_poll_s: float = 3.0,
                            settle_out: Optional[Dict[str, Any]] = None,
-                           only_declared_hooks: bool = False) -> None:
+                           only_declared_hooks: bool = False,
+                           step_actions: Optional[Dict[int, int]] = None) -> None:
     """Grade every declared ``core: true`` step of a GUI journey through its
     declarative hooks — precedence rung 2 of the decisive wiring (see
     run_gui_journey's comment block). Mutates ``candidates`` /
@@ -423,6 +473,21 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
             continue  # manifest_truth governs a hook-less step, unchanged
         ref = {"journey_id": journey_id, "action_index": -1}
         text_hook, state_hook = _step_decisive_hooks(s)
+        if (not zero_actions and step_actions is not None
+                and not _step_was_entered(step_idx, step_actions)
+                and not _observed_rescue(text_hook, page_text_history,
+                                         journey_id, step_idx, s, source)):
+            # F1's GUI half: the Actor never ENTERED this decisive step, and
+            # no observed evidence already satisfies its declared assertion.
+            # Grading it would fabricate a product finding about an assertion
+            # nobody exercised — the PR #262 journeys' exact shape ("the
+            # refused edit left the saved policy unchanged" reported as a
+            # FAILURE by a journey that never touched the control). Flip
+            # unreached, alone: no functional candidate, no credit, no infra.
+            # `zero_actions` journeys keep their own (H-GUI-2) treatment.
+            candidates.append(_unentered_step_candidate(
+                journey_id, s, step_idx, source))
+            continue
         if text_hook is None and state_hook is None:
             # Two different truths, two different sentences: on the
             # manifest path this step DID declare a hook (that is why it is
@@ -880,6 +945,10 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     # shells out to `izba diff`, which WRITES the review token, so it is
     # called exactly ONCE here, post-journey (see its docstring).
     decisive_credits: List[Dict[str, Any]] = []
+    # Per-step reach (shared with the CLI runner via state_hooks): which
+    # decisive steps the Actor actually ACTED in. Grading a step it never
+    # entered fabricates a product finding — see _grade_core_step_hooks.
+    step_actions = _step_action_counts(step_action_start, len(actions))
     mt_found: List[Any] = []
     # Fix 1 plumbing: the settle re-sampler + its audit record. The closure
     # resolves capture_state_evidence at call time through module globals so
@@ -997,7 +1066,8 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 resample_state=_resample_state,
                 settle_s=expect_state_settle_s,
                 settle_out=settle_out,
-                only_declared_hooks=True)
+                only_declared_hooks=True,
+                step_actions=step_actions)
     elif has_core_step and steps:
         # No manifest_diff to ground-truth: grade each declared core step
         # through its declarative hooks (expect_text/expect_state), or flip
@@ -1012,7 +1082,8 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
             seed_hist_watermarks=seed_hist_watermarks,
             resample_state=_resample_state,
             settle_s=expect_state_settle_s,
-            settle_out=settle_out)
+            settle_out=settle_out,
+            step_actions=step_actions)
     elif not has_core_step and steps and not _has_product_invoke(invoke_log):
         # H2 (run-4 skeptic): a NON-core journey (no declared `core: true`
         # step, so the branches above never engage) whose Actor bailed

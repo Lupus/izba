@@ -732,3 +732,35 @@ def test_expect_stdout_re_description_says_chars_not_bytes():
     assert "4096 bytes" not in desc
     assert "4096 char" in desc
     assert "truncat" in desc.lower()
+
+
+def test_step_declares_expect_stderr_re():
+    # `additionalProperties: false` would reject the key outright, so the
+    # schema edit is mandatory — and the description is the compiler's
+    # instruction sheet for the stderr-only assertions (`izba promote`'s
+    # `WARNING: weakens egress`, the `no reviewed diff` bail).
+    schema = _load("journeys.schema.json")
+    props = schema["definitions"]["step"]["properties"]
+    assert schema["definitions"]["step"]["additionalProperties"] is False
+    d = props["expect_stderr_re"]
+    assert d["type"] == "string"
+    desc = d["description"]
+    assert "stderr" in desc.lower()
+    assert "weakens egress" in desc          # names the real decisive string
+    assert "expect_cmd_re" in desc           # same action selection
+    assert "credit path" in desc             # same H3 enforcement
+    assert "4096 char" in desc and "truncat" in desc.lower()
+    assert "Invisible to the Actor" in desc  # same fair-test boundary
+
+
+def test_expect_stderr_re_validates():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("journeys.schema.json")
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_stderr_re": "WARNING: weakens egress"}), schema)
+    jsonschema.validate(_minimal_journey_doc(
+        {"expect_stdout_re": "Promoted", "expect_stderr_re": "WARNING",
+         "expect_exit": 0}), schema)
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.validate(_minimal_journey_doc({"expect_stderr_re": 7}),
+                            schema)
