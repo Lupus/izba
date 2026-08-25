@@ -204,10 +204,10 @@ mod tests {
         })
     }
 
-    /// Pick a free TCP port by binding to :0 and dropping the socket.
+    /// A host port the relay will bind LATER, reserved outside the kernel's
+    /// auto-assign range so no other test's `:0` bind can be handed it first.
     fn free_port() -> u16 {
-        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        l.local_addr().unwrap().port()
+        crate::testutil::reserve_port().expect("callers runtime-skip before reaching here")
     }
 
     fn test_egress() -> EgressManager {

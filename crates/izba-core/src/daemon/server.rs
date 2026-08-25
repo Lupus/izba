@@ -3770,12 +3770,7 @@ mod tests {
         );
 
         // Now publish a real port — the operation that rewrites ports.json.
-        let user_port = {
-            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        };
+        let user_port = crate::testutil::reserve_port().expect("bind denied");
         let rule = crate::state::PortRule {
             bind: "127.0.0.1".parse().unwrap(),
             host_port: user_port,
@@ -4915,16 +4910,10 @@ mod tests {
         ));
         write_state(&d.paths, "web", live_identity()); // it looks running
                                                        // Publish a relay thread (skip if this sandbox denies binds).
-        let l = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
-            Ok(l) => l,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("SKIP: bind denied");
-                return;
-            }
-            Err(e) => panic!("bind probe: {e}"),
+        let Some(port) = crate::testutil::reserve_port() else {
+            eprintln!("SKIP: bind denied");
+            return;
         };
-        let port = l.local_addr().unwrap().port();
-        drop(l);
         let rule = crate::state::PortRule {
             bind: "127.0.0.1".parse().unwrap(),
             host_port: port,
@@ -5366,20 +5355,9 @@ mod tests {
         // Make the sandbox look running so PortPublish's liveness gate passes.
         write_state(&d.paths, "web", live_identity());
 
-        // Pick a port we can try to bind (skip if denied by sandbox).
-        let probe = std::net::TcpListener::bind(("127.0.0.1", 0));
-        let (port, _l) = match probe {
-            Ok(l) => {
-                let port = l.local_addr().unwrap().port();
-                // Drop listener so the relay can bind.
-                drop(l);
-                (port, ())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("SKIP port_publish_persist_writes_to_config: bind denied");
-                return;
-            }
-            Err(e) => panic!("bind probe: {e}"),
+        let Some(port) = crate::testutil::reserve_port() else {
+            eprintln!("SKIP port_publish_persist_writes_to_config: bind denied");
+            return;
         };
 
         let rule = crate::state::PortRule {
@@ -5417,18 +5395,9 @@ mod tests {
         let mut c = setup_sandbox_with_client(&dir, &d, "web");
         write_state(&d.paths, "web", live_identity());
 
-        let probe = std::net::TcpListener::bind(("127.0.0.1", 0));
-        let port = match probe {
-            Ok(l) => {
-                let port = l.local_addr().unwrap().port();
-                drop(l);
-                port
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("SKIP port_unpublish_drops_from_config: bind denied");
-                return;
-            }
-            Err(e) => panic!("bind probe: {e}"),
+        let Some(port) = crate::testutil::reserve_port() else {
+            eprintln!("SKIP port_unpublish_drops_from_config: bind denied");
+            return;
         };
 
         let rule = crate::state::PortRule {
@@ -6581,15 +6550,12 @@ mod tests {
         paths: Paths,
         who: &str,
     ) -> Option<(Arc<Daemon>, u16, crate::state::PidIdentity)> {
-        let probe = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("SKIP {who}: bind denied ({e})");
-                return None;
-            }
+        // Reserved, not probed: the relay binds this port much later, so it
+        // must be one no other test's `:0` bind can be handed in the meantime.
+        let Some(host_port) = crate::testutil::reserve_port() else {
+            eprintln!("SKIP {who}: bind denied");
+            return None;
         };
-        let host_port = probe.local_addr().unwrap().port();
-        drop(probe);
 
         let vmm = spawn_sleep(dir.path());
         let mut deps = test_deps();
@@ -6603,92 +6569,224 @@ mod tests {
         Some((d, host_port, vmm))
     }
 
+    /// A scenario attempt that proved nothing: the host port was taken between
+    /// the probe and the relay's bind, so the request failed for a reason that
+    /// has nothing to do with the behaviour under test.
+    struct Stolen;
+
+    /// `handle_port_publish`, with that harness collision told apart from the
+    /// verdict under test.
+    ///
+    /// `publishable_sandbox` closes its probe socket before the relay binds, so
+    /// any other test in this binary that asks the kernel for an ephemeral port
+    /// in that window can be handed the very port just released — the
+    /// `bind(("127.0.0.1", 0))` probes elsewhere in this file and `free_port`
+    /// in `relays.rs`/`supervisor.rs` all draw from the same range. A collision
+    /// is a fact about the harness, never about the request, so it is retried
+    /// rather than asserted on. Keyed on THIS rule's own `bind:port` so the
+    /// forced `host port 127.0.0.1:0 is unavailable` failure injected in
+    /// `relays.rs` can never be mistaken for one.
+    fn publish_unless_stolen(
+        d: &Arc<Daemon>,
+        rule: &crate::state::PortRule,
+        persist: bool,
+    ) -> Result<anyhow::Result<DaemonResponse>, Stolen> {
+        let r = handle_port_publish(d, "web".into(), rule.clone(), persist);
+        if let Err(e) = &r {
+            let taken = format!("host port {}:{} is unavailable", rule.bind, rule.host_port);
+            if format!("{e:#}").contains(&taken) {
+                return Err(Stolen);
+            }
+        }
+        Ok(r)
+    }
+
+    /// Run a port-publish scenario against a fresh sandbox and a freshly probed
+    /// host port, RETRYING the whole scenario — sandbox and port both — when
+    /// `body` reports the port was stolen. Returns without running anything
+    /// where binding is denied outright, matching `publishable_sandbox`.
+    ///
+    /// The retry has to rebuild the sandbox, not just re-probe: the port is
+    /// baked into the rule and into whatever `config.json`/`ports.json` state
+    /// the scenario wrote before the racy publish.
+    fn port_publish_scenario(who: &str, body: impl Fn(&Arc<Daemon>, u16) -> Result<(), Stolen>) {
+        for _ in 0..20 {
+            let (dir, paths) = test_paths();
+            let Some((d, host_port, _vmm)) = publishable_sandbox(&dir, paths, who) else {
+                return;
+            };
+            if body(&d, host_port).is_ok() {
+                return;
+            }
+        }
+        panic!("{who}: no host port survived the probe->bind window in 20 attempts");
+    }
+
+    /// Runtime-skip probe for the two tests below, which bind for real.
+    fn port_bind_works(who: &str) -> bool {
+        match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP {who}: bind denied ({e})");
+                false
+            }
+            Err(e) => panic!("bind probe: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_port_taken_before_the_bind_reads_as_stolen() {
+        // Half one of the seam's contract: an occupied host port is a harness
+        // collision. Without this the retry driver would never fire and the
+        // flake it exists to kill would come straight back.
+        port_publish_scenario(
+            "a_port_taken_before_the_bind_reads_as_stolen",
+            |d, host_port| {
+                let rule = port_rule("127.0.0.1", host_port, 80);
+                // Play the thief ourselves. Losing that race to a real one
+                // proves nothing either way, so it is a retry, not a failure —
+                // this test must not become an instance of the flake it guards.
+                let Ok(_thief) = std::net::TcpListener::bind(("127.0.0.1", host_port)) else {
+                    return Err(Stolen);
+                };
+                assert!(
+                    publish_unless_stolen(d, &rule, true).is_err(),
+                    "a port held by someone else must read as stolen, not as a verdict"
+                );
+                Ok(())
+            },
+        );
+    }
+
+    #[test]
+    fn a_busy_lock_is_a_verdict_not_a_collision() {
+        // Half two, and the one that keeps the seam honest: `busy` is exactly
+        // what the tests below assert on, so it must survive the filter. A
+        // predicate that swallowed it as a collision would never let this
+        // scenario report success, so the driver would panic itself out after
+        // 20 attempts rather than pass.
+        port_publish_scenario(
+            "a_busy_lock_is_a_verdict_not_a_collision",
+            |d, host_port| {
+                let rule = port_rule("127.0.0.1", host_port, 80);
+
+                let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+                let verdict = publish_unless_stolen(d, &rule, true);
+                drop(held);
+
+                let err = format!(
+                    "{:#}",
+                    verdict?.expect_err("the persist half must be refused")
+                );
+                assert!(err.contains("busy"), "got: {err}");
+                Ok(())
+            },
+        );
+    }
+
+    #[test]
+    fn a_stolen_port_retries_the_whole_scenario() {
+        // The driver's contract: `Stolen` buys a fresh sandbox and a fresh
+        // port, and the scenario runs again — it is not a failure, and it is
+        // not silently dropped.
+        if !port_bind_works("a_stolen_port_retries_the_whole_scenario") {
+            return;
+        }
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        port_publish_scenario("a_stolen_port_retries_the_whole_scenario", |_d, _port| {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                Err(Stolen)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the driver must re-run the scenario until it is not a collision"
+        );
+    }
+
     #[test]
     fn a_persist_refused_as_busy_leaves_no_relay_behind() {
-        let (dir, paths) = test_paths();
-        let Some((d, host_port, _vmm)) = publishable_sandbox(
-            &dir,
-            paths,
+        port_publish_scenario(
             "a_persist_refused_as_busy_leaves_no_relay_behind",
-        ) else {
-            return;
-        };
-        let rule = port_rule("127.0.0.1", host_port, 80);
+            |d, host_port| {
+                let rule = port_rule("127.0.0.1", host_port, 80);
 
-        let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
-        let err = handle_port_publish(&d, "web".into(), rule.clone(), true);
-        drop(held);
+                let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+                let err = publish_unless_stolen(d, &rule, true);
+                drop(held);
 
-        let err = err.expect_err("a persisted publish must fail while the lock is held");
-        let err = err.to_string();
-        assert!(err.contains("busy"), "expected a busy refusal, got: {err}");
+                let err = err?.expect_err("a persisted publish must fail while the lock is held");
+                let err = err.to_string();
+                assert!(err.contains("busy"), "expected a busy refusal, got: {err}");
 
-        assert!(
-            !d.relays.active("web").contains(&rule),
-            "the request reported failure, so it must not leave the port forwarding"
-        );
-        assert!(
-            !relays::load_rules_migrating(&d.paths, "web")
-                .unwrap()
-                .0
-                .contains(&rule),
-            "ports.json must not keep a rule the request rejected"
-        );
-        assert!(
-            !load_persisted_ports(&d.paths, "web").contains(&rule),
-            "config.json must not keep a rule the request rejected"
+                assert!(
+                    !d.relays.active("web").contains(&rule),
+                    "the request reported failure, so it must not leave the port forwarding"
+                );
+                assert!(
+                    !relays::load_rules_migrating(&d.paths, "web")
+                        .unwrap()
+                        .0
+                        .contains(&rule),
+                    "ports.json must not keep a rule the request rejected"
+                );
+                assert!(
+                    !load_persisted_ports(&d.paths, "web").contains(&rule),
+                    "config.json must not keep a rule the request rejected"
+                );
+                Ok(())
+            },
         );
     }
 
     #[test]
     fn an_uncontended_persisted_publish_still_binds_the_relay() {
-        // Control for the rollback above: it must fire only on failure.
-        let (dir, paths) = test_paths();
-        let Some((d, host_port, _vmm)) = publishable_sandbox(
-            &dir,
-            paths,
+        port_publish_scenario(
             "an_uncontended_persisted_publish_still_binds_the_relay",
-        ) else {
-            return;
-        };
-        let rule = port_rule("127.0.0.1", host_port, 80);
+            |d, host_port| {
+                // Control for the rollback above: it must fire only on failure.
+                let rule = port_rule("127.0.0.1", host_port, 80);
 
-        handle_port_publish(&d, "web".into(), rule.clone(), true)
-            .expect("an uncontended persisted publish must succeed");
+                publish_unless_stolen(d, &rule, true)?
+                    .expect("an uncontended persisted publish must succeed");
 
-        assert!(d.relays.active("web").contains(&rule));
-        assert!(load_persisted_ports(&d.paths, "web").contains(&rule));
+                assert!(d.relays.active("web").contains(&rule));
+                assert!(load_persisted_ports(&d.paths, "web").contains(&rule));
+                Ok(())
+            },
+        );
     }
 
     #[test]
     fn a_busy_persist_does_not_tear_down_a_pre_existing_relay() {
-        // The rollback must undo only what THIS request did. Re-persisting an
-        // already-live rule is exactly what the app's "Make persistent" button
-        // does, and losing the lock there must not kill the running relay.
-        let (dir, paths) = test_paths();
-        let Some((d, host_port, _vmm)) = publishable_sandbox(
-            &dir,
-            paths,
+        port_publish_scenario(
             "a_busy_persist_does_not_tear_down_a_pre_existing_relay",
-        ) else {
-            return;
-        };
-        let rule = port_rule("127.0.0.1", host_port, 80);
+            |d, host_port| {
+                // The rollback must undo only what THIS request did. Re-persisting an
+                // already-live rule is exactly what the app's "Make persistent" button
+                // does, and losing the lock there must not kill the running relay.
+                let rule = port_rule("127.0.0.1", host_port, 80);
 
-        // Already forwarding, not yet persisted.
-        handle_port_publish(&d, "web".into(), rule.clone(), false)
-            .expect("the first, unpersisted publish must succeed");
-        assert!(d.relays.active("web").contains(&rule));
+                // Already forwarding, not yet persisted.
+                publish_unless_stolen(d, &rule, false)?
+                    .expect("the first, unpersisted publish must succeed");
+                assert!(d.relays.active("web").contains(&rule));
 
-        let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
-        let err = handle_port_publish(&d, "web".into(), rule.clone(), true)
-            .expect_err("the persist half must be refused while the lock is held");
-        drop(held);
-        assert!(err.to_string().contains("busy"), "got: {err}");
+                let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+                let err = handle_port_publish(d, "web".into(), rule.clone(), true)
+                    .expect_err("the persist half must be refused while the lock is held");
+                drop(held);
+                assert!(err.to_string().contains("busy"), "got: {err}");
 
-        assert!(
-            d.relays.active("web").contains(&rule),
-            "the relay predates this request — a failed persist must not tear it down"
+                assert!(
+                    d.relays.active("web").contains(&rule),
+                    "the relay predates this request — a failed persist must not tear it down"
+                );
+                Ok(())
+            },
         );
     }
 
@@ -6723,51 +6821,47 @@ mod tests {
 
     #[test]
     fn a_rollback_that_cannot_rewrite_ports_json_says_it_would_be_re_adopted() {
-        let (dir, paths) = test_paths();
-        let Some((d, host_port, _vmm)) = publishable_sandbox(
-            &dir,
-            paths,
+        port_publish_scenario(
             "a_rollback_that_cannot_rewrite_ports_json_says_it_would_be_re_adopted",
-        ) else {
-            return;
-        };
-        let rule = port_rule("127.0.0.1", host_port, 80);
-        handle_port_publish(&d, "web".into(), rule.clone(), false).expect("publish must succeed");
+            |d, host_port| {
+                let rule = port_rule("127.0.0.1", host_port, 80);
+                publish_unless_stolen(d, &rule, false)?.expect("publish must succeed");
 
-        // Fault injection that works regardless of uid: a directory where the
-        // rules file goes makes the write fail with IsADirectory.
-        let rules = relays::rules_path(&d.paths, "web");
-        std::fs::remove_file(&rules).ok();
-        std::fs::create_dir_all(&rules).unwrap();
+                // Fault injection that works regardless of uid: a directory where the
+                // rules file goes makes the write fail with IsADirectory.
+                let rules = relays::rules_path(&d.paths, "web");
+                std::fs::remove_file(&rules).ok();
+                std::fs::create_dir_all(&rules).unwrap();
 
-        let note = rollback_published_relay(&d, "web", &rule)
-            .expect_err("a ports.json rewrite failure must report, not swallow");
-        assert!(
-            note.contains("re-adopt"),
-            "the note must warn the rule would come back on restart; got: {note}"
+                let note = rollback_published_relay(d, "web", &rule)
+                    .expect_err("a ports.json rewrite failure must report, not swallow");
+                assert!(
+                    note.contains("re-adopt"),
+                    "the note must warn the rule would come back on restart; got: {note}"
+                );
+                Ok(())
+            },
         );
     }
 
     #[test]
     fn a_clean_rollback_reports_nothing() {
-        let (dir, paths) = test_paths();
-        let Some((d, host_port, _vmm)) =
-            publishable_sandbox(&dir, paths, "a_clean_rollback_reports_nothing")
-        else {
-            return;
-        };
-        let rule = port_rule("127.0.0.1", host_port, 80);
-        handle_port_publish(&d, "web".into(), rule.clone(), false).expect("publish must succeed");
+        port_publish_scenario("a_clean_rollback_reports_nothing", |d, host_port| {
+            let rule = port_rule("127.0.0.1", host_port, 80);
+            publish_unless_stolen(d, &rule, false)?.expect("publish must succeed");
 
-        rollback_published_relay(&d, "web", &rule).expect("a clean rollback must report nothing");
-        assert!(!d.relays.active("web").contains(&rule));
-        assert!(
-            !relays::load_rules_migrating(&d.paths, "web")
-                .unwrap()
-                .0
-                .contains(&rule),
-            "a clean rollback must also drop the rule from ports.json"
-        );
+            rollback_published_relay(d, "web", &rule)
+                .expect("a clean rollback must report nothing");
+            assert!(!d.relays.active("web").contains(&rule));
+            assert!(
+                !relays::load_rules_migrating(&d.paths, "web")
+                    .unwrap()
+                    .0
+                    .contains(&rule),
+                "a clean rollback must also drop the rule from ports.json"
+            );
+            Ok(())
+        });
     }
 
     // ── #181: the documented recovery must actually recover ─────────────────
@@ -6960,114 +7054,110 @@ mod tests {
 
     #[test]
     fn a_failed_publish_does_not_tear_down_a_relay_another_request_persisted() {
-        let (dir, paths) = test_paths();
-        let Some((d, host_port, _vmm)) = publishable_sandbox(
-            &dir,
-            paths,
+        port_publish_scenario(
             "a_failed_publish_does_not_tear_down_a_relay_another_request_persisted",
-        ) else {
-            return;
-        };
-        let rule = port_rule("127.0.0.1", host_port, 80);
-        // The sibling's work: the rule is already in config.json. Our request
-        // will bind the relay itself (`bound_here`) and then fail to persist.
-        persist_port_rule(&d.paths, "web", &rule).unwrap();
+            |d, host_port| {
+                let rule = port_rule("127.0.0.1", host_port, 80);
+                // The sibling's work: the rule is already in config.json. Our request
+                // will bind the relay itself (`bound_here`) and then fail to persist.
+                persist_port_rule(&d.paths, "web", &rule).unwrap();
 
-        let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
-        let err = handle_port_publish(&d, "web".into(), rule.clone(), true)
-            .expect_err("the persist half must still be refused while the lock is held");
-        drop(held);
-        assert!(err.to_string().contains("busy"), "got: {err:#}");
+                let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+                let err = publish_unless_stolen(d, &rule, true);
+                drop(held);
+                let err = err?
+                    .expect_err("the persist half must still be refused while the lock is held");
+                assert!(err.to_string().contains("busy"), "got: {err:#}");
 
-        assert!(
-            d.relays.active("web").contains(&rule),
-            "config.json already lists this rule, so the relay is not ours to \
-             tear down — a sibling request is relying on it"
-        );
-        assert!(
-            load_persisted_ports(&d.paths, "web").contains(&rule),
-            "and the sibling's persisted rule must survive untouched"
+                assert!(
+                    d.relays.active("web").contains(&rule),
+                    "config.json already lists this rule, so the relay is not ours to \
+                 tear down — a sibling request is relying on it"
+                );
+                assert!(
+                    load_persisted_ports(&d.paths, "web").contains(&rule),
+                    "and the sibling's persisted rule must survive untouched"
+                );
+                Ok(())
+            },
         );
     }
 
     #[test]
     fn a_failed_publish_still_rolls_back_a_relay_nobody_persisted() {
-        // The control: with config.json NOT listing the rule, the relay really
-        // is this request's own and must still be rolled back. Without this the
-        // ownership test above could be satisfied by never rolling back at all.
-        let (dir, paths) = test_paths();
-        let Some((d, host_port, _vmm)) = publishable_sandbox(
-            &dir,
-            paths,
+        port_publish_scenario(
             "a_failed_publish_still_rolls_back_a_relay_nobody_persisted",
-        ) else {
-            return;
-        };
-        let rule = port_rule("127.0.0.1", host_port, 80);
-        // A NEAR-MISS in config.json: same bind, different host port. The
-        // ownership check keys on bind AND port, and loopback is the bind of
-        // essentially every rule — so a check matching on either half alone
-        // would call this rule "already persisted" and skip the rollback,
-        // reinstating the leak. An empty config.json cannot tell the two apart.
-        let neighbour = port_rule("127.0.0.1", host_port.wrapping_add(1).max(1024), 90);
-        persist_port_rule(&d.paths, "web", &neighbour).unwrap();
+            |d, host_port| {
+                // The control: with config.json NOT listing the rule, the relay really
+                // is this request's own and must still be rolled back. Without this the
+                // ownership test above could be satisfied by never rolling back at all.
+                let rule = port_rule("127.0.0.1", host_port, 80);
+                // A NEAR-MISS in config.json: same bind, different host port. The
+                // ownership check keys on bind AND port, and loopback is the bind of
+                // essentially every rule — so a check matching on either half alone
+                // would call this rule "already persisted" and skip the rollback,
+                // reinstating the leak. An empty config.json cannot tell the two apart.
+                let neighbour = port_rule("127.0.0.1", host_port.wrapping_add(1).max(1024), 90);
+                persist_port_rule(&d.paths, "web", &neighbour).unwrap();
 
-        let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
-        let err = handle_port_publish(&d, "web".into(), rule.clone(), true)
-            .expect_err("a persisted publish must fail while the lock is held");
-        drop(held);
-        assert!(err.to_string().contains("busy"), "got: {err:#}");
+                let held = crate::sandbox::lock_sandbox(&d.paths, "web").expect("take the lock");
+                let err = publish_unless_stolen(d, &rule, true);
+                drop(held);
+                let err = err?.expect_err("a persisted publish must fail while the lock is held");
+                assert!(err.to_string().contains("busy"), "got: {err:#}");
 
-        assert!(
-            !d.relays.active("web").contains(&rule),
-            "nothing persisted THIS rule, so the failed request must not leave it forwarding"
-        );
-        assert!(
-            load_persisted_ports(&d.paths, "web").contains(&neighbour),
-            "and the unrelated persisted rule must be untouched"
+                assert!(
+                    !d.relays.active("web").contains(&rule),
+                    "nothing persisted THIS rule, so the failed request must not \
+                     leave it forwarding"
+                );
+                assert!(
+                    load_persisted_ports(&d.paths, "web").contains(&neighbour),
+                    "and the unrelated persisted rule must be untouched"
+                );
+                Ok(())
+            },
         );
     }
 
     #[test]
     fn a_publish_that_cannot_read_config_keeps_the_relay_and_says_so() {
-        // The "cannot tell who owns it" arm. The two mistakes are not
-        // symmetric: a leaked relay is recoverable with `izba port unpublish`,
-        // tearing down a sibling's live port is not — so an unreadable
-        // config.json must keep the relay and report, never silently roll back.
-        //
-        // Also the one case that exercises the decision guard being TAKEN: the
-        // sandbox lock is free here (the persist fails on I/O, not contention),
-        // so the handler acquires it, hits the read error, and must still
-        // release it — asserted at the end.
-        let (dir, paths) = test_paths();
-        let Some((d, host_port, _vmm)) = publishable_sandbox(
-            &dir,
-            paths,
+        port_publish_scenario(
             "a_publish_that_cannot_read_config_keeps_the_relay_and_says_so",
-        ) else {
-            return;
-        };
-        let rule = port_rule("127.0.0.1", host_port, 80);
+            |d, host_port| {
+                // The "cannot tell who owns it" arm. The two mistakes are not
+                // symmetric: a leaked relay is recoverable with `izba port unpublish`,
+                // tearing down a sibling's live port is not — so an unreadable
+                // config.json must keep the relay and report, never silently roll back.
+                //
+                // Also the one case that exercises the decision guard being TAKEN: the
+                // sandbox lock is free here (the persist fails on I/O, not contention),
+                // so the handler acquires it, hits the read error, and must still
+                // release it — asserted at the end.
+                let rule = port_rule("127.0.0.1", host_port, 80);
 
-        // Uid-independent I/O failure: a directory where the file goes.
-        let cfg = d.paths.sandbox_dir("web").join(CONFIG_FILE);
-        std::fs::remove_file(&cfg).unwrap();
-        std::fs::create_dir_all(&cfg).unwrap();
+                // Uid-independent I/O failure: a directory where the file goes.
+                let cfg = d.paths.sandbox_dir("web").join(CONFIG_FILE);
+                std::fs::remove_file(&cfg).unwrap();
+                std::fs::create_dir_all(&cfg).unwrap();
 
-        let err = handle_port_publish(&d, "web".into(), rule.clone(), true)
-            .expect_err("an unreadable config.json must fail the publish");
-        let err = format!("{err:#}");
-        assert!(
-            err.contains("left the relay") && err.contains("could not read config.json"),
-            "the error must say the relay is still up and why: {err}"
-        );
-        assert!(
-            d.relays.active("web").contains(&rule),
-            "an undecidable ownership check must keep the relay, not tear it down"
-        );
-        assert!(
-            crate::sandbox::lock_sandbox(&d.paths, "web").is_ok(),
-            "the decision guard must be released even on the error path"
+                let err = publish_unless_stolen(d, &rule, true)?
+                    .expect_err("an unreadable config.json must fail the publish");
+                let err = format!("{err:#}");
+                assert!(
+                    err.contains("left the relay") && err.contains("could not read config.json"),
+                    "the error must say the relay is still up and why: {err}"
+                );
+                assert!(
+                    d.relays.active("web").contains(&rule),
+                    "an undecidable ownership check must keep the relay, not tear it down"
+                );
+                assert!(
+                    crate::sandbox::lock_sandbox(&d.paths, "web").is_ok(),
+                    "the decision guard must be released even on the error path"
+                );
+                Ok(())
+            },
         );
     }
 }
