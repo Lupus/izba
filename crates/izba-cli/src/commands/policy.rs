@@ -268,6 +268,27 @@ fn render_allow_grant(entries: &[AllowEntry]) -> String {
             Access::ReadWrite => "read-write (all methods; --read narrows to GET/HEAD)",
         };
         let _ = writeln!(out, "allowed {}  [{ports}]  access: {access}", e.host());
+        // A narrower access level cancels a declared pinning passthrough (an
+        // opaque splice carries no HTTP method, so `access: read` never
+        // authorizes one) — and `--read` narrows the WHOLE entry, so a grant
+        // aimed at one port can switch off a hatch declared on another.
+        // Without this line the only surface that says so is a `policy show`
+        // the user has no reason to run.
+        if e.access() != Access::ReadWrite {
+            for s in e
+                .port_specs()
+                .iter()
+                .filter(|s| matches!(s.protocol, Some(Protocol::Tcp)))
+            {
+                let _ = writeln!(
+                    out,
+                    "  \u{26A0} :{} protocol: tcp — pinning passthrough NOT in effect at \
+                     access: read (an opaque splice carries no HTTP method); re-grant \
+                     without --read to restore it",
+                    s.port
+                );
+            }
+        }
     }
     out
 }
@@ -320,6 +341,19 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                     let _ = writeln!(out, "  http: all egress allowed (enforce off)");
                 }
             } else {
+                // The same honesty as the empty-list branch above, applied to
+                // the case that LOOKS like a firewall: with `enforce: false`
+                // `compile` returns AllowAll, so the list below restricts
+                // nothing and no connection is terminated. Rendering it bare
+                // reads as default-deny-with-holes — the safe-looking
+                // direction, on the one surface that reveals the posture.
+                if !cfg.enforce {
+                    let _ = writeln!(
+                        out,
+                        "  http: all egress allowed (enforce off) — the allow-list below is \
+                         not in force"
+                    );
+                }
                 let _ = writeln!(out, "  http allow-list:");
                 for e in &cfg.allow {
                     let specs = e.port_specs();
@@ -355,6 +389,20 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                             Some(Protocol::Http) => {
                                 format!(":{} protocol: http (inspected)", s.port)
                             }
+                            // Enforcement off ⇒ nothing is terminated, so
+                            // there is nothing to splice:
+                            // `router::passthrough_names` returns empty for a
+                            // non-enforcing sandbox and every destination is
+                            // reachable regardless. The declaration is inert,
+                            // not live, and must not read as the one hole in
+                            // an otherwise-closed firewall.
+                            Some(Protocol::Tcp) if !cfg.enforce => format!(
+                                "\u{26A0} :{} protocol: tcp — pinning passthrough NOT in \
+                                 effect: the firewall is off, so every destination is \
+                                 reachable and no connection is terminated or spliced; this \
+                                 declaration is inert — turn enforcement on to pin",
+                                s.port
+                            ),
                             // A narrower access level CANCELS the hatch: the
                             // splice is decided on a methodless (tier-2) flow,
                             // which `access: read` never authorizes
@@ -771,6 +819,63 @@ mod tests {
         ];
         let out = render_allow_grant(&entries);
         assert_eq!(out.lines().count(), 2, "one line per entry: {out}");
+    }
+
+    /// Dogfooding, passthrough run (CORE-2): `--read` narrows the WHOLE
+    /// entry, so a grant aimed at one port can switch off a `protocol: tcp`
+    /// hatch declared on another — and the echo said only `access: read`.
+    /// `izba policy show` was the sole surface that revealed it, and nothing
+    /// sends the user there. Display only: this asserts the echo, never the
+    /// grant (the access applied is unchanged, and the command still never
+    /// refuses).
+    #[test]
+    fn render_allow_grant_names_the_hatch_a_narrow_access_leaves_dormant() {
+        let narrowed = AllowEntry::Scoped {
+            host: "pinned.vendor.com".into(),
+            ports: Some(vec![
+                PortSpec::bare(80),
+                PortSpec {
+                    port: 443,
+                    protocol: Some(Protocol::Tcp),
+                },
+                PortSpec::bare(8443),
+            ]),
+            access: Access::Read,
+        };
+        let out = render_allow_grant(std::slice::from_ref(&narrowed));
+        assert!(
+            out.contains("access: read (HTTP GET/HEAD only)"),
+            "the existing access echo must stay: {out}"
+        );
+        assert!(
+            out.contains(":443 protocol: tcp"),
+            "name the PORT that lost its passthrough, not just the host: {out}"
+        );
+        assert!(
+            out.contains("NOT in effect"),
+            "the cancellation is the headline, exactly as `policy show` puts it: {out}"
+        );
+        assert!(out.contains("--read"), "say how to restore it: {out}");
+        assert!(
+            !out.contains(":80 protocol") && !out.contains(":8443 protocol"),
+            "only the declared port carries the hatch — do not warn about the others: {out}"
+        );
+
+        // The same entry at read-write pins fine: no dormancy line at all.
+        let live = AllowEntry::Scoped {
+            host: "pinned.vendor.com".into(),
+            ports: Some(vec![PortSpec {
+                port: 443,
+                protocol: Some(Protocol::Tcp),
+            }]),
+            access: Access::ReadWrite,
+        };
+        let out = render_allow_grant(std::slice::from_ref(&live));
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "a grant that leaves the hatch live must not gain a line: {out}"
+        );
     }
 
     /// Every `policy git allow` invocation must loudly state the effective
@@ -1232,6 +1337,42 @@ mod tests {
         assert!(
             !out.contains("NOT in effect"),
             "the cancellation wording belongs only to the narrowed-access case:\n{out}"
+        );
+    }
+
+    /// Dogfooding, passthrough run (CORE-1): with `enforce: false` the
+    /// compiled policy is `AllowAll` and `router::passthrough_names` returns
+    /// nothing, so the allow-list restricts nothing and the declaration
+    /// splices nothing. Rendering the live-hatch line under an `enforce: off`
+    /// header read as a default-deny firewall with exactly one hole — the
+    /// safe-looking direction, on the one surface that reveals posture. Same
+    /// argument `render_policy` already made for the empty allow-list, now
+    /// extended to a non-empty one. Display only: nothing about what is
+    /// stored, compiled or enforced changed.
+    #[test]
+    fn show_says_a_declared_hatch_is_inert_when_enforcement_is_off() {
+        let cfg = EgressPolicyConfig::from_yaml(
+            "enforce: false\nallow:\n  - host: pinned.vendor.com\n    ports: [443]\n    protocol: tcp\n",
+        )
+        .unwrap();
+        let out = render_policy("web", Some(&cfg));
+        assert!(
+            out.contains("  http: all egress allowed (enforce off)"),
+            "a non-enforcing sandbox reaches everything — say so before listing \
+             an allow-list that is not in force:\n{out}"
+        );
+        assert!(
+            out.contains("NOT in effect"),
+            "there is no splice on a sandbox that terminates nothing:\n{out}"
+        );
+        assert!(
+            !out.contains("spliced opaquely"),
+            "claiming a live opaque splice here is the finding:\n{out}"
+        );
+        assert!(
+            out.contains("firewall is off"),
+            "name the reason it is inert, so it is not confused with the \
+             narrowed-access cancellation:\n{out}"
         );
     }
 
