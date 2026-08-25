@@ -457,6 +457,7 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
                            candidates: List[Dict[str, Any]],
                            decisive_credits: List[Dict[str, Any]],
                            zero_actions: bool = False,
+                           seed_hist_watermarks: Optional[Dict[int, int]] = None,
                            resample_state=None,
                            settle_s: float = 0.0,
                            settle_poll_s: float = 3.0,
@@ -498,6 +499,18 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
     attempted either — there is no in-flight operation to settle. The
     ``no_evidence`` ⇒ infra degradation is unchanged.
 
+    A step-level ``seed_files`` injection is a STATE BOUNDARY even on a
+    zero-action journey: the harness writes the drift to disk regardless of
+    whether the Actor ever clicked anything, so the "initial observation"
+    (``page_text_history[0]``) can predate it. ``seed_hist_watermarks`` maps
+    each seed-bearing step's index to the ``page_text_history`` index at the
+    moment its seed landed (the GUI counterpart of the CLI runner's
+    action-count watermark in ``run_journeys._grade_decisive_from_observed``).
+    When the latest watermark established at or before a decisive step is
+    non-zero, the sole zero-action observation is pre-drift and is refused —
+    fail closed to the same ``unreached_decisive`` candidate a failing hook
+    produces, never silently credited.
+
     ALL declared hooks must pass; verdict folding per _apply_hook_verdict."""
     source = journey.get("source", {}).get("ref", "journey step")
     final_hist_idx = max(len(page_text_history) - 1, 0)
@@ -521,28 +534,48 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
             })
             continue
         if text_hook is not None:
+            predrift_refused = False
             if zero_actions:
-                window = page_text_history[:1]
+                predrift_watermark = max(
+                    (v for k, v in (seed_hist_watermarks or {}).items()
+                     if k <= step_idx), default=0)
+                if predrift_watermark > 0:
+                    # Fail closed: a step-level seed_files drift boundary
+                    # landed at or before this decisive step, but the
+                    # zero-action window is the sole initial observation
+                    # (index 0), which predates it. Refuse rather than
+                    # credit stale evidence — same shape as a failing hook,
+                    # never a silent pass.
+                    predrift_refused = True
+                    candidates.append(_zero_action_unreached(
+                        journey_id, s, source,
+                        f"expect_text {text_hook!r}: only a pre-drift "
+                        f"observation is on record (a step-level "
+                        f"seed_files injection precedes this decisive "
+                        f"step)"))
+                else:
+                    window = page_text_history[:1]
             else:
                 start = min(step_hist_start.get(step_idx, final_hist_idx),
                             final_hist_idx)
                 window = page_text_history[start:]
-            verdict, found = expect_text_oracle(
-                text_hook, window, ref,
-                step_index=step_idx, expect=s.get("expect", ""), source=source)
-            if zero_actions and verdict == "mismatch":
-                candidates.append(_zero_action_unreached(
-                    journey_id, s, source,
-                    f"expect_text {text_hook!r} not present in the initial "
-                    f"observation"))
-            else:
-                _apply_hook_verdict(
-                    verdict, found, hook=f"expect_text: {text_hook!r}",
-                    no_evidence_detail=(
-                        "expect_text: no page text was ever captured to grade "
-                        "the assertion against"),
-                    journey_id=journey_id, step_idx=step_idx,
-                    candidates=candidates, decisive_credits=decisive_credits)
+            if not predrift_refused:
+                verdict, found = expect_text_oracle(
+                    text_hook, window, ref,
+                    step_index=step_idx, expect=s.get("expect", ""), source=source)
+                if zero_actions and verdict == "mismatch":
+                    candidates.append(_zero_action_unreached(
+                        journey_id, s, source,
+                        f"expect_text {text_hook!r} not present in the initial "
+                        f"observation"))
+                else:
+                    _apply_hook_verdict(
+                        verdict, found, hook=f"expect_text: {text_hook!r}",
+                        no_evidence_detail=(
+                            "expect_text: no page text was ever captured to grade "
+                            "the assertion against"),
+                        journey_id=journey_id, step_idx=step_idx,
+                        candidates=candidates, decisive_credits=decisive_credits)
         if state_hook is not None:
             verdict, found = expect_state_oracle(
                 state_hook, current_evidence, ref,
@@ -647,6 +680,15 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
     # where that step's evidence starts. A step the Actor never entered has
     # no entry (grading then falls back to the final capture alone).
     step_hist_start: Dict[int, int] = {}
+    # The `page_text_history` index a step-level seed_files injection landed
+    # at, keyed by step index — populated ONLY for steps that declare
+    # seed_files (a journey-level seed, written once before step 0, precedes
+    # every capture and so establishes no watermark). This is the GUI
+    # counterpart of the CLI runner's `ctx["seed_watermarks"]`
+    # (run_journeys._run_step): a zero-action journey's sole "initial
+    # observation" can predate a LATER step's drift, and
+    # `_grade_core_step_hooks` refuses to credit it when it does.
+    seed_hist_watermarks: Dict[int, int] = {}
     # How many actions had been taken when each step OPENED. `step_hist_start`
     # cannot answer "was this step exercised": it is recorded at the top of the
     # step, before the turn/step-cap checks, so a step the Actor was never
@@ -715,6 +757,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
             # snapshotted BEFORE the seed rewrites izba.yml.
             if step.get("seed_files"):
                 _snap_manifest_yml()
+                seed_hist_watermarks[step_i] = len(page_text_history)
             _write_seeds(ws_abs, step.get("seed_files"))
             step_hist_start[step_i] = len(page_text_history)
             step_action_start[step_i] = len(actions)
@@ -1029,6 +1072,7 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
             step_hist_start=step_hist_start, state_evidence=state_evidence,
             candidates=candidates, decisive_credits=decisive_credits,
             zero_actions=not actions,
+            seed_hist_watermarks=seed_hist_watermarks,
             resample_state=_resample_state,
             settle_s=expect_state_settle_s,
             settle_out=settle_out)

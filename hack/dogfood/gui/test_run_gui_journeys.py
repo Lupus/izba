@@ -1421,6 +1421,38 @@ def test_zero_action_expect_text_hit_only_in_later_capture_not_credited(monkeypa
     assert "actor performed no actions" in unreached[0]["detail"]
 
 
+def test_zero_action_predrift_capture_not_credited_across_seed_boundary(monkeypatch):
+    # GUI analog of the CLI runner's watermark fix (run_journeys.py
+    # _grade_decisive_from_observed): a step-level seed_files injection is a
+    # state boundary even in a zero-browser-action journey — the harness
+    # writes the drift to disk regardless of whether the Actor clicked
+    # anything. Step 0's opening capture is genuine PRE-drift evidence; step
+    # 1 (core, decisive) injects seed_files drift and never acts either. The
+    # only text that matches expect_text is step 0's pre-drift capture
+    # (page_text_history[0], what the old `page_text_history[:1]` hard-code
+    # unconditionally graded) — it must NOT credit the decisive step.
+    model = FakeModel([{"done": True}, {"done": True}])
+    driver = FakeDriver(
+        snapshots=['[@e1] heading "Sandboxes"'] * 3,
+        page_texts=["No sandboxes yet", "still empty", "still empty"])
+    journey = {"journey_id": "zero-action-predrift", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [
+                   {"intent": "baseline", "expect": ""},
+                   {"intent": "after drift", "expect": "", "core": True,
+                    "expect_text": "No sandboxes yet",
+                    "seed_files": {"izba.yml": "name: web\n"}},
+               ]}
+    res = _run(journey, model, driver, monkeypatch,
+               evidence=_evidence([], []))
+    assert res["actions"] == []
+    assert res["decisive_credits"] == [], \
+        "step 0's pre-drift capture must not credit the post-drift decisive step"
+    unreached = [c for c in res["candidates"]
+                 if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1, res["candidates"]
+
+
 def test_zero_action_journey_passing_expect_state_credits(monkeypatch):
     # Fix 4: a zero-action expect_state that PASSES (state needing no
     # interaction — rare) is genuine credit, same as the pure-observation
