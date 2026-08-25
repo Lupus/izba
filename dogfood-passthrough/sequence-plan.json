@@ -1,0 +1,448 @@
+{
+  "feature": "per-port protocol inspectability / TLS-pinning passthrough (#233 + #238 + #239/PR #262)",
+  "tiers": [
+    {
+      "tier": "smoke",
+      "file": "tier-smoke.json",
+      "count": 6,
+      "journey_ids": [
+        "smoke-docs-find-pinning-exception",
+        "smoke-docs-find-authoring-surface",
+        "smoke-docs-bare-port-is-inspected",
+        "smoke-create-with-policy-file",
+        "smoke-declare-pinned-port-accepted",
+        "smoke-manifest-egress-review-available"
+      ],
+      "gating": [
+        "smoke-create-with-policy-file",
+        "smoke-declare-pinned-port-accepted"
+      ],
+      "establishes": [
+        "docs-explain-hatch",
+        "docs-name-authoring-path",
+        "docs-explain-non-inheritance",
+        "policy-file-at-create",
+        "policy-show-renders",
+        "hatch-declared",
+        "hatch-visible-in-show",
+        "manifest-egress-review"
+      ]
+    },
+    {
+      "tier": "core",
+      "file": "tier-core.json",
+      "count": 14,
+      "journey_ids": [
+        "core-show-attributes-declaration-to-its-port",
+        "core-police-a-non-web-port",
+        "core-show-stays-quiet-for-a-plain-policy",
+        "core-refuse-pinning-on-a-wildcard-host",
+        "core-refuse-an-unknown-protocol-value",
+        "core-refuse-a-typo-in-the-port-mapping",
+        "core-refuse-one-port-declared-two-ways",
+        "core-inspection-may-be-asked-for-on-a-wildcard",
+        "core-granting-a-port-does-not-inherit-the-exception",
+        "core-declaration-survives-an-unrelated-cli-edit",
+        "core-older-entry-level-declaration-still-works",
+        "core-pinned-port-under-read-only-access",
+        "core-author-the-exception-through-the-review-flow",
+        "core-declared-exception-with-the-firewall-off"
+      ],
+      "gating": [],
+      "establishes": [
+        "hatch-via-manifest"
+      ]
+    },
+    {
+      "tier": "deep",
+      "file": "tier-deep.json",
+      "count": 19,
+      "journey_ids": [
+        "deep-review-flags-a-new-exception-as-weakening",
+        "deep-review-flags-losing-inspection-on-a-shared-port",
+        "deep-review-is-quiet-when-posture-tightens",
+        "deep-command-line-grants-skip-the-review-gate",
+        "deep-declare-the-exception-on-a-running-sandbox",
+        "deep-declaration-survives-a-restart",
+        "deep-pinned-host-keeps-the-vendor-certificate",
+        "deep-dormant-exception-still-intercepts",
+        "deep-exception-does-not-follow-a-raw-address",
+        "deep-two-hosts-one-port-only-one-passes-through",
+        "deep-exception-for-a-host-never-allowed",
+        "gui-pinned-port-is-visible-in-the-policy-tab",
+        "gui-only-the-declared-port-is-marked",
+        "gui-dormant-exception-is-not-claimed-as-live",
+        "gui-cannot-move-the-exception-to-another-host",
+        "gui-cannot-activate-a-dormant-exception",
+        "gui-saving-an-unrelated-edit-preserves-the-declaration",
+        "gui-removing-the-exempt-port-unlocks-the-row",
+        "gui-app-cannot-author-a-new-exception"
+      ],
+      "gating": [],
+      "establishes": [
+        "gui-pinned-row-visible"
+      ]
+    }
+  ],
+  "capabilities": {
+    "docs-explain-hatch": {
+      "established_by": [
+        "smoke-docs-find-pinning-exception"
+      ],
+      "required_by": []
+    },
+    "docs-name-authoring-path": {
+      "established_by": [
+        "smoke-docs-find-authoring-surface"
+      ],
+      "required_by": []
+    },
+    "docs-explain-non-inheritance": {
+      "established_by": [
+        "smoke-docs-bare-port-is-inspected"
+      ],
+      "required_by": []
+    },
+    "policy-file-at-create": {
+      "established_by": [
+        "smoke-create-with-policy-file"
+      ],
+      "required_by": [
+        "smoke-declare-pinned-port-accepted",
+        "smoke-manifest-egress-review-available",
+        "core-police-a-non-web-port",
+        "core-show-stays-quiet-for-a-plain-policy",
+        "deep-declare-the-exception-on-a-running-sandbox"
+      ]
+    },
+    "policy-show-renders": {
+      "established_by": [
+        "smoke-create-with-policy-file"
+      ],
+      "required_by": [
+        "core-granting-a-port-does-not-inherit-the-exception",
+        "core-declared-exception-with-the-firewall-off",
+        "deep-command-line-grants-skip-the-review-gate"
+      ]
+    },
+    "hatch-declared": {
+      "established_by": [
+        "smoke-declare-pinned-port-accepted"
+      ],
+      "required_by": [
+        "core-refuse-pinning-on-a-wildcard-host",
+        "core-refuse-an-unknown-protocol-value",
+        "core-refuse-a-typo-in-the-port-mapping",
+        "core-refuse-one-port-declared-two-ways",
+        "core-inspection-may-be-asked-for-on-a-wildcard",
+        "core-granting-a-port-does-not-inherit-the-exception",
+        "core-declaration-survives-an-unrelated-cli-edit",
+        "core-older-entry-level-declaration-still-works",
+        "core-author-the-exception-through-the-review-flow",
+        "deep-declare-the-exception-on-a-running-sandbox",
+        "deep-declaration-survives-a-restart",
+        "deep-pinned-host-keeps-the-vendor-certificate",
+        "deep-dormant-exception-still-intercepts",
+        "deep-exception-does-not-follow-a-raw-address",
+        "deep-two-hosts-one-port-only-one-passes-through",
+        "deep-exception-for-a-host-never-allowed"
+      ]
+    },
+    "hatch-visible-in-show": {
+      "established_by": [
+        "smoke-declare-pinned-port-accepted"
+      ],
+      "required_by": [
+        "core-show-attributes-declaration-to-its-port",
+        "core-pinned-port-under-read-only-access"
+      ]
+    },
+    "manifest-egress-review": {
+      "established_by": [
+        "smoke-manifest-egress-review-available"
+      ],
+      "required_by": [
+        "core-author-the-exception-through-the-review-flow",
+        "deep-review-flags-a-new-exception-as-weakening",
+        "deep-review-flags-losing-inspection-on-a-shared-port",
+        "deep-review-is-quiet-when-posture-tightens"
+      ]
+    },
+    "hatch-via-manifest": {
+      "established_by": [
+        "core-author-the-exception-through-the-review-flow"
+      ],
+      "required_by": [
+        "deep-review-flags-a-new-exception-as-weakening",
+        "deep-review-is-quiet-when-posture-tightens",
+        "gui-pinned-port-is-visible-in-the-policy-tab"
+      ]
+    },
+    "gui-pinned-row-visible": {
+      "established_by": [
+        "gui-pinned-port-is-visible-in-the-policy-tab"
+      ],
+      "required_by": [
+        "gui-only-the-declared-port-is-marked",
+        "gui-dormant-exception-is-not-claimed-as-live",
+        "gui-cannot-move-the-exception-to-another-host",
+        "gui-cannot-activate-a-dormant-exception",
+        "gui-saving-an-unrelated-edit-preserves-the-declaration",
+        "gui-removing-the-exempt-port-unlocks-the-row",
+        "gui-app-cannot-author-a-new-exception"
+      ]
+    }
+  },
+  "deferrable": [
+    {
+      "journey_id": "smoke-declare-pinned-port-accepted",
+      "tier": "smoke",
+      "requires": [
+        "policy-file-at-create"
+      ]
+    },
+    {
+      "journey_id": "smoke-manifest-egress-review-available",
+      "tier": "smoke",
+      "requires": [
+        "policy-file-at-create"
+      ]
+    },
+    {
+      "journey_id": "core-show-attributes-declaration-to-its-port",
+      "tier": "core",
+      "requires": [
+        "hatch-visible-in-show"
+      ]
+    },
+    {
+      "journey_id": "core-police-a-non-web-port",
+      "tier": "core",
+      "requires": [
+        "policy-file-at-create"
+      ]
+    },
+    {
+      "journey_id": "core-show-stays-quiet-for-a-plain-policy",
+      "tier": "core",
+      "requires": [
+        "policy-file-at-create"
+      ]
+    },
+    {
+      "journey_id": "core-refuse-pinning-on-a-wildcard-host",
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "core-refuse-an-unknown-protocol-value",
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "core-refuse-a-typo-in-the-port-mapping",
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "core-refuse-one-port-declared-two-ways",
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "core-inspection-may-be-asked-for-on-a-wildcard",
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "core-granting-a-port-does-not-inherit-the-exception",
+      "tier": "core",
+      "requires": [
+        "hatch-declared",
+        "policy-show-renders"
+      ]
+    },
+    {
+      "journey_id": "core-declaration-survives-an-unrelated-cli-edit",
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "core-older-entry-level-declaration-still-works",
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "core-pinned-port-under-read-only-access",
+      "tier": "core",
+      "requires": [
+        "hatch-visible-in-show"
+      ]
+    },
+    {
+      "journey_id": "core-author-the-exception-through-the-review-flow",
+      "tier": "core",
+      "requires": [
+        "manifest-egress-review",
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "core-declared-exception-with-the-firewall-off",
+      "tier": "core",
+      "requires": [
+        "policy-show-renders"
+      ]
+    },
+    {
+      "journey_id": "deep-review-flags-a-new-exception-as-weakening",
+      "tier": "deep",
+      "requires": [
+        "manifest-egress-review",
+        "hatch-via-manifest"
+      ]
+    },
+    {
+      "journey_id": "deep-review-flags-losing-inspection-on-a-shared-port",
+      "tier": "deep",
+      "requires": [
+        "manifest-egress-review"
+      ]
+    },
+    {
+      "journey_id": "deep-review-is-quiet-when-posture-tightens",
+      "tier": "deep",
+      "requires": [
+        "manifest-egress-review",
+        "hatch-via-manifest"
+      ]
+    },
+    {
+      "journey_id": "deep-command-line-grants-skip-the-review-gate",
+      "tier": "deep",
+      "requires": [
+        "policy-show-renders"
+      ]
+    },
+    {
+      "journey_id": "deep-declare-the-exception-on-a-running-sandbox",
+      "tier": "deep",
+      "requires": [
+        "policy-file-at-create",
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "deep-declaration-survives-a-restart",
+      "tier": "deep",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "deep-pinned-host-keeps-the-vendor-certificate",
+      "tier": "deep",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "deep-dormant-exception-still-intercepts",
+      "tier": "deep",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "deep-exception-does-not-follow-a-raw-address",
+      "tier": "deep",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "deep-two-hosts-one-port-only-one-passes-through",
+      "tier": "deep",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "deep-exception-for-a-host-never-allowed",
+      "tier": "deep",
+      "requires": [
+        "hatch-declared"
+      ]
+    },
+    {
+      "journey_id": "gui-pinned-port-is-visible-in-the-policy-tab",
+      "tier": "deep",
+      "requires": [
+        "hatch-via-manifest"
+      ]
+    },
+    {
+      "journey_id": "gui-only-the-declared-port-is-marked",
+      "tier": "deep",
+      "requires": [
+        "gui-pinned-row-visible"
+      ]
+    },
+    {
+      "journey_id": "gui-dormant-exception-is-not-claimed-as-live",
+      "tier": "deep",
+      "requires": [
+        "gui-pinned-row-visible"
+      ]
+    },
+    {
+      "journey_id": "gui-cannot-move-the-exception-to-another-host",
+      "tier": "deep",
+      "requires": [
+        "gui-pinned-row-visible"
+      ]
+    },
+    {
+      "journey_id": "gui-cannot-activate-a-dormant-exception",
+      "tier": "deep",
+      "requires": [
+        "gui-pinned-row-visible"
+      ]
+    },
+    {
+      "journey_id": "gui-saving-an-unrelated-edit-preserves-the-declaration",
+      "tier": "deep",
+      "requires": [
+        "gui-pinned-row-visible"
+      ]
+    },
+    {
+      "journey_id": "gui-removing-the-exempt-port-unlocks-the-row",
+      "tier": "deep",
+      "requires": [
+        "gui-pinned-row-visible"
+      ]
+    },
+    {
+      "journey_id": "gui-app-cannot-author-a-new-exception",
+      "tier": "deep",
+      "requires": [
+        "gui-pinned-row-visible"
+      ]
+    }
+  ]
+}
