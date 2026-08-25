@@ -469,7 +469,11 @@ fn enable(paths: &Paths, name: &str) -> anyhow::Result<i32> {
 fn reload(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     let mut client = DaemonClient::connect(paths)?;
     client.reload_policy(name)?;
-    println!("reloaded egress policy for '{name}' (applies to new connections)");
+    let policy_path = EgressPolicyConfig::path_in(&paths.sandbox_dir(name));
+    println!(
+        "reloaded egress policy for '{name}' from {} (applies to new connections)",
+        policy_path.display()
+    );
     Ok(0)
 }
 

@@ -284,7 +284,8 @@ enum Cmd {
         /// Aggregate into a per-endpoint summary instead of a line-by-line tail
         #[arg(long)]
         summary: bool,
-        /// Keep printing new records as they arrive (ignored with --summary)
+        /// Keep printing new records as they arrive (ignored with --summary).
+        /// Runs until interrupted (Ctrl-C) — never exits on its own.
         #[arg(short, long)]
         follow: bool,
     },
