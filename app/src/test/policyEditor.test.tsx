@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach, type Mock } from "vitest";
 import { PolicyEditor } from "../components/PolicyEditor";
 import { api } from "../lib/ipc";
@@ -972,5 +972,76 @@ describe("PolicyEditor load state", () => {
     expect(screen.getByText(/firewall off/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() => expect(api.policySetFull).toHaveBeenCalledWith("web", [], []));
+  });
+
+  it("goes back to unknown when the sandbox changes, and will not save the previous sandbox's rows", async () => {
+    // The `name` prop is what selects the sandbox, and the load effect keys on
+    // it. Without the reset to `loading` the editor would keep rendering — and
+    // Save would keep shipping — the PREVIOUS sandbox's rows while the new
+    // sandbox's policy is still in flight, writing one sandbox's allow-list
+    // over another's managed policy.yaml on the gate-skipping path.
+    (api.policyShow as Mock).mockResolvedValueOnce({
+      enforcing: true,
+      allow: ["first.example.com"],
+      git: [],
+    });
+    const { rerender } = render(<PolicyEditor name="first" />);
+    await screen.findByDisplayValue("first.example.com");
+
+    (api.policyShow as Mock).mockReturnValue(new Promise(() => {}));
+    rerender(<PolicyEditor name="second" />);
+
+    expect(screen.queryByDisplayValue("first.example.com")).not.toBeInTheDocument();
+    expect(screen.queryByText(/firewall on/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(api.policySetFull).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/refus/i)).toBeInTheDocument());
+    expect(api.policySetFull).not.toHaveBeenCalled();
+  });
+
+  it("clears the refusal once the policy loads, and then saves", async () => {
+    // A refusal is a statement about a moment. Leaving it on screen after the
+    // load resolves would assert something false about the CURRENT state —
+    // the same "claims a state it does not have" sin this whole fix is about,
+    // and it would sit above a Save that now works.
+    let settle!: (p: unknown) => void;
+    (api.policyShow as Mock).mockReturnValue(new Promise((r) => { settle = r; }));
+    render(<PolicyEditor name="web" />);
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await screen.findByText(/refus/i);
+
+    await act(async () => {
+      settle({ enforcing: true, allow: ["api.x.com"], git: [] });
+    });
+    await screen.findByDisplayValue("api.x.com");
+
+    expect(screen.queryByText(/refus/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [{ host: "api.x.com", ports: [80, 443], access: "read-write" }],
+        [],
+      ),
+    );
+  });
+
+  it("replaces a still-loading refusal with the real failure when the load then errors", async () => {
+    // The other stale-banner edge: a refusal raised while loading names the
+    // wrong reason once the load has actually FAILED, and would sit alongside
+    // the panel that names the right one.
+    let fail!: (e: unknown) => void;
+    (api.policyShow as Mock).mockReturnValue(new Promise((_res, rej) => { fail = rej; }));
+    render(<PolicyEditor name="web" />);
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await screen.findByText(/has not finished loading/i);
+
+    await act(async () => {
+      fail(new Error("daemon unreachable"));
+    });
+    await screen.findByText(/daemon unreachable/i);
+
+    expect(screen.queryByText(/has not finished loading/i)).not.toBeInTheDocument();
+    expect(api.policySetFull).not.toHaveBeenCalled();
   });
 });

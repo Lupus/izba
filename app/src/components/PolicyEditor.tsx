@@ -356,13 +356,20 @@ export function PolicyEditor({ name }: { name: string }) {
     let alive = true;
     // A different sandbox is a different policy: go back to "unknown" rather
     // than leaving the previous sandbox's rows on screen as if they were this
-    // one's — and, with them, a Save that would write them here.
+    // one's — and, with them, a Save that would write them here. Pinned by
+    // "goes back to unknown when the sandbox changes...".
     setLoad({ kind: "loading" });
     setError(null);
     void (async () => {
       try {
         const p = await api.policyShow(name);
         if (alive) {
+          // A refusal is a statement about a moment, and this is the moment it
+          // stops being true: drop it as the load settles, so a "has not
+          // finished loading" banner never sits above a Save that now works.
+          // Leaving it up would assert a state the editor is not in — the same
+          // sin, in miniature, as the posture claim this guard exists to stop.
+          setError(null);
           const loadedHosts = p.allow.map(toRow);
           const loadedGit = p.git.map(toGitRow);
           setHosts(loadedHosts);
@@ -372,7 +379,13 @@ export function PolicyEditor({ name }: { name: string }) {
           setLoad({ kind: "ready" });
         }
       } catch (e) {
-        if (alive) setLoad({ kind: "error", message: e instanceof Error ? e.message : String(e) });
+        if (alive) {
+          // Same clearing on the failure edge: the load error is rendered by
+          // the panel below, and a stale save-refusal alongside it would name
+          // the wrong reason.
+          setError(null);
+          setLoad({ kind: "error", message: e instanceof Error ? e.message : String(e) });
+        }
       }
     })();
     return () => {
