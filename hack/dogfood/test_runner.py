@@ -915,6 +915,79 @@ class DecisiveByObservedCommandTest(unittest.TestCase):
             res["decisive_credits"],
             [{"step_index": 1, "action_index": 0, "graded_cmd": "izba ls"}])
 
+    def test_predrift_action_does_not_credit_decisive_step(self):
+        # Reproduces the observed false-green: step 0 runs a baseline command,
+        # step 1 injects mid-journey drift via step-level seed_files, and step
+        # 2 (core) is decisive with an expect_cmd_re that matches ONLY step
+        # 0's pre-drift action. The Actor never reaches step 2 (zero actions).
+        # The old, position-blind scan credited step 2 from step 0's action
+        # anyway; a step-level seed_files is a state boundary and must refuse
+        # to credit anything recorded before it.
+        import run_journeys as rj
+        from model import FakeModel
+        model = FakeModel([
+            {"command": "izba policy show"},  # step 0: baseline, pre-drift
+            {"done": True},                   # step 0 ends
+            {"done": True},                   # step 1: seed_files, zero actions
+            {"done": True},                   # step 2 (core): zero actions
+        ])
+        journey = {"journey_id": "predrift-not-credited",
+                   "steps": [
+                       {"intent": "baseline", "expect": ""},
+                       {"intent": "inject drift", "expect": "",
+                        "seed_files": {"izba.yml": "version: 1\n"}},
+                       {"intent": "verify post-drift state", "expect": "",
+                        "core": True, "expect_exit": 0,
+                        "expect_cmd_re": r"izba policy show"}]}
+        with tempfile.TemporaryDirectory() as td:
+            stub = _write_decisive_stub_izba(td)
+            res = rj.run_journey(
+                model, journey, izba_bin=stub, data_dir=td,
+                max_turns=8, step_cap=8, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
+        kinds = [c.get("kind") for c in res["candidates"]]
+        self.assertIn(
+            "unreached_decisive", kinds,
+            f"pre-drift action must not credit the decisive step: {res['candidates']}")
+        self.assertEqual(res["decisive_credits"], [],
+                          "the only match is pre-drift; nothing should be credited")
+
+    def test_postdrift_action_still_credits_decisive_step(self):
+        # The watermark is positional, not a blanket refusal for any step that
+        # happens to carry seed_files: an action recorded AFTER the step-level
+        # seed_files injection (even within that same step) still legitimately
+        # satisfies a later decisive step's expect_cmd_re.
+        import run_journeys as rj
+        from model import FakeModel
+        model = FakeModel([
+            {"done": True},                   # step 0: no actions, no drift
+            {"command": "izba policy show"},  # step 1: seed_files, then a post-drift action
+            {"done": True},                   # step 1 ends
+            {"done": True},                   # step 2 (core): zero actions
+        ])
+        journey = {"journey_id": "postdrift-credited",
+                   "steps": [
+                       {"intent": "baseline", "expect": ""},
+                       {"intent": "inject drift then observe", "expect": "",
+                        "seed_files": {"izba.yml": "version: 1\n"}},
+                       {"intent": "verify post-drift state", "expect": "",
+                        "core": True, "expect_exit": 0,
+                        "expect_cmd_re": r"izba policy show"}]}
+        with tempfile.TemporaryDirectory() as td:
+            stub = _write_decisive_stub_izba(td)
+            res = rj.run_journey(
+                model, journey, izba_bin=stub, data_dir=td,
+                max_turns=8, step_cap=8, action_timeout_s=10,
+                latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=1.0)
+        kinds = [c.get("kind") for c in res["candidates"]]
+        self.assertNotIn(
+            "unreached_decisive", kinds,
+            f"post-drift action should credit the decisive step: {res['candidates']}")
+        self.assertEqual(
+            res["decisive_credits"],
+            [{"step_index": 2, "action_index": 0,
+              "graded_cmd": "izba policy show"}])
+
     def test_non_product_command_does_not_credit_unreached_decisive(self):
         # Greptile P1: a broad-but-valid expect_cmd_re (e.g. bare `izba`) must
         # NOT be satisfied by a non-product command like `echo izba diff

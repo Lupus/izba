@@ -390,7 +390,8 @@ def _next_command(model, journey, step, actions, budget, journey_id, starved):
 def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
               action_timeout_s,
               latency_budget_ms, budget, max_usd, max_turns, step_cap,
-              journey_id, actions, candidates, ctx, decisive, cwd_file) -> bool:
+              journey_id, actions, candidates, ctx, decisive, cwd_file,
+              step_index) -> bool:
     """Run one step's Actor loop. Mutates ``actions``/``candidates``/``ctx``.
     Returns True if a journey-level cap (step-cap/max-turns) tripped (caller
     should stop the whole journey). Raises BudgetExceeded on the $ cap.
@@ -409,10 +410,19 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
     ``workdir`` here, immediately before the step's first action and after cwd
     setup (cwd already persists via ``cwd_file`` from the journey's start) —
     NOT inside the loop, so it lands exactly once per step regardless of how
-    many turns/retries the step takes."""
+    many turns/retries the step takes. It is also a STATE BOUNDARY: when
+    present, its pre-injection action count (``start``) is recorded into
+    ``ctx["seed_watermarks"]`` keyed by ``step_index``, so a later decisive
+    step's ``_grade_decisive_from_observed`` scan can refuse to credit any
+    action recorded before this boundary (journey-level ``seed_files``,
+    written once before step 0, establishes no watermark — nothing precedes
+    it)."""
     seen: set = set()
     start = len(actions)  # index of this step's first action; actions[start:] = its own
-    _write_seeds(workdir, step.get("seed_files"))
+    seed_files = step.get("seed_files")
+    _write_seeds(workdir, seed_files)
+    if isinstance(seed_files, dict):
+        ctx.setdefault("seed_watermarks", []).append((step_index, start))
     try:
         while True:
             if len(actions) >= step_cap:
@@ -515,7 +525,8 @@ def _write_seeds(workdir: str, seed_files: Optional[Dict[str, Any]]) -> None:
             log(f"seed_files: failed to write {relpath!r}: {e!r}")
 
 
-def _grade_decisive_from_observed(step, actions, journey, journey_id):
+def _grade_decisive_from_observed(step, actions, journey, journey_id,
+                                  min_action_index=0):
     """H3: a decisive step whose own pointer produced no actions may still have
     been exercised — the swarm often satisfies the assertion under an EARLIER
     step. When the step declares ``expect_cmd_re``, scan ALL journey actions for
@@ -533,7 +544,16 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id):
     audit, including when the grade was a silent pass. Crediting DOES require
     the match to be an izba invocation in command position (``_CREDIT_CMD_RE``)
     — pattern breadth alone can no longer credit shell plumbing like
-    ``echo izba`` or a filename mention."""
+    ``echo izba`` or a filename mention.
+
+    ``min_action_index`` is the pre-drift watermark: a step-level ``seed_files``
+    injection is a STATE BOUNDARY, so an action recorded before it observed
+    pre-drift state and can never legitimately satisfy an assertion about
+    post-drift state. The caller passes the latest watermark established at or
+    before this decisive step; a match whose action index falls below it is
+    refused, and since the scan walks newest-to-oldest, every earlier action is
+    refused too — fail closed straight to ``None`` (caller then flags
+    ``unreached_decisive``) rather than falling through to a stale match."""
     pattern = step.get("expect_cmd_re")
     if not (isinstance(pattern, str) and pattern):
         return None
@@ -547,6 +567,10 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id):
             f"too broad to credit an unreached decisive step")
         return None
     for idx in range(len(actions) - 1, -1, -1):
+        if idx < min_action_index:
+            log(f"{journey_id}: expect_cmd_re {pattern!r} only matched pre-drift "
+                f"action(s) before watermark {min_action_index}; refusing credit")
+            break
         a = actions[idx]
         if not rx.search(a.get("command", "")):
             continue
@@ -618,7 +642,7 @@ def run_journey(
             action_timeout_s=action_timeout_s, latency_budget_ms=latency_budget_ms,
             budget=budget, max_usd=max_usd, max_turns=max_turns, step_cap=step_cap,
             journey_id=journey_id, actions=actions, candidates=candidates, ctx=ctx,
-            decisive=(i in decisive_idx), cwd_file=cwd_file)
+            decisive=(i in decisive_idx), cwd_file=cwd_file, step_index=i)
         step_actions[i] = len(actions) - before
         if stop:
             break
@@ -633,10 +657,16 @@ def run_journey(
     # actions) verified NOTHING — emit a flipping candidate so the journey
     # can't tally positive on budget exhaustion before its core assertion.
     source = journey.get("source", {}).get("ref", "journey step")
+    seed_watermarks = ctx.get("seed_watermarks", [])
     for i in sorted(decisive_idx):
         if step_actions.get(i, 0) == 0:
             s = steps[i]
-            graded = _grade_decisive_from_observed(s, actions, journey, journey_id)
+            # Latest pre-drift watermark established at or before this decisive
+            # step (step-level seed_files only; see _run_step's docstring).
+            watermark = max(
+                (w for j, w in seed_watermarks if j <= i), default=0)
+            graded = _grade_decisive_from_observed(
+                s, actions, journey, journey_id, min_action_index=watermark)
             if graded is not None:
                 graded["step_index"] = i
                 candidates.extend(graded.pop("candidates"))
