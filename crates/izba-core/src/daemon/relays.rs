@@ -471,20 +471,18 @@ mod tests {
         }
     }
 
-    /// Pick a free port by binding to :0 and dropping the socket.
+    /// A host port the relay will bind LATER, reserved outside the kernel's
+    /// auto-assign range so no other test's `:0` bind can be handed it first.
     fn free_port() -> u16 {
-        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        l.local_addr().unwrap().port()
+        crate::testutil::reserve_port().expect("callers runtime-skip before reaching here")
     }
 
     /// Publish on a free port, RETRYING the port choice.
     ///
-    /// `free_port` closes its probe socket before the relay binds, so any other
-    /// test that asks the kernel for an ephemeral port in that window can be
-    /// handed the very port just released — including the kernel-chosen
-    /// `publish_bound(rule(0))` binds elsewhere in this file, which draw from
-    /// the same range. Retrying turns that from an `unwrap` panic into a fresh
-    /// attempt, which is what keeps these tests parallel-safe.
+    /// `free_port` reserves outside the kernel's auto-assign range, so no `:0`
+    /// bind in this binary can take the port between the choice and the bind.
+    /// The retry remains as the guard against a process OUTSIDE this test
+    /// binary holding one of those ports, which reservation cannot rule out.
     fn publish_on_a_free_port(mgr: &RelayManager, paths: &Paths, name: &str) -> PortRule {
         for _ in 0..20 {
             let r = rule(free_port());
@@ -578,13 +576,16 @@ mod tests {
         }
         let (_d, paths) = test_paths();
         let mgr = RelayManager::new();
+        // Reserved rather than kernel-assigned: `stop_all` releases the port
+        // and `respawn_dead` must rebind THE SAME one, so a `:0` bind elsewhere
+        // in this binary must not be able to claim it in between.
         let port = mgr
             .publish_bound(
                 &paths,
                 "web",
                 PortRule {
                     bind: "127.0.0.1".parse().unwrap(),
-                    host_port: 0,
+                    host_port: free_port(),
                     guest_port: 6901,
                 },
             )

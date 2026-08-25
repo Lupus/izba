@@ -17,6 +17,95 @@ use crate::state::{PidIdentity, RunState, STATE_FILE};
 use crate::vmm::{CommandSpec, IoStream, UdsStream, VmHandle, VmSpec, VmmDriver};
 
 // ---------------------------------------------------------------------------
+// Host ports for tests that bind LATER than they choose
+// ---------------------------------------------------------------------------
+
+/// Reserve a loopback host port for a test that will bind it at some later
+/// point — a relay publish, a respawn, a `handle_port_publish`.
+///
+/// A `bind(("127.0.0.1", 0))` probe cannot do this safely. The moment the probe
+/// socket closes, the port goes back to the kernel's ephemeral pool, and any
+/// other test in this binary that asks for an ephemeral port before the real
+/// bind can be handed that very port. Every such test then fails on `Address
+/// already in use` — a fact about the harness, never about the code under test.
+/// The window is widest under `cargo llvm-cov`, where instrumentation stretches
+/// the gap between choosing and binding, which is why the coverage job could go
+/// red on a commit whose `cargo test` gate was green.
+///
+/// These ports come from a range the kernel will NEVER auto-assign, so no `:0`
+/// bind anywhere in the process can collide with one, and a process-wide cursor
+/// keeps two concurrent callers from choosing the same port.
+///
+/// Returns `None` where binding is denied outright (some sandboxes refuse
+/// `bind` with EPERM), so callers runtime-skip exactly as they did before.
+pub(crate) fn reserve_port() -> Option<u16> {
+    let hi = auto_assign_floor();
+    if hi <= RESERVED_LO {
+        // The ephemeral range has been widened over our window; there is no
+        // range left that the kernel cannot also hand out, so fall back to the
+        // probe. Callers stay correct, they merely lose the collision guarantee.
+        return probe_port();
+    }
+    let span = hi - RESERVED_LO;
+    for _ in 0..span.min(512) {
+        let n = PORT_CURSOR.fetch_add(1, Ordering::Relaxed);
+        let port = RESERVED_LO + n % span;
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            // Bindable now, and unreachable by any `:0` bind — the caller may
+            // safely bind it for real later.
+            Ok(_) => return Some(port),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            // Held by something outside this process; walk on.
+            Err(_) => continue,
+        }
+    }
+    panic!("no free port in the reserved test window {RESERVED_LO}..{hi}");
+}
+
+/// Bottom of the reserved window. Linux's default `ip_local_port_range` starts
+/// at 32768 and the Windows dynamic range at 49152, so this sits below both.
+const RESERVED_LO: u16 = 20_000;
+
+/// Ceiling used when the real auto-assign floor cannot be read.
+const RESERVED_HI: u16 = 32_767;
+
+/// Seeded from the pid, NOT from zero. Two test binaries running at once (a
+/// second `cargo test`, a coverage run beside a plain one) each get their own
+/// cursor, and a shared zero start would march them through 20000, 20001, …
+/// in lockstep — handing both the same port and reintroducing the very
+/// collision this module exists to prevent. Distinct pids stagger them; the
+/// bind check below and the retry loops at the call sites cover the remainder.
+static PORT_CURSOR: std::sync::LazyLock<std::sync::atomic::AtomicU16> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicU16::new(std::process::id() as u16));
+
+/// The lowest port the kernel may pick for a `:0` bind, minus one — i.e. the
+/// top of the range it will never auto-assign. Read from the live sysctl on
+/// Linux so a host that has lowered `ip_local_port_range` narrows our window
+/// instead of silently reintroducing the collision.
+fn auto_assign_floor() -> u16 {
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
+        if let Some(lo) = s
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u16>().ok())
+        {
+            return lo.saturating_sub(1).min(RESERVED_HI);
+        }
+    }
+    RESERVED_HI
+}
+
+/// The old probe, kept only as the fallback above.
+fn probe_port() -> Option<u16> {
+    match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(l) => Some(l.local_addr().unwrap().port()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+        Err(e) => panic!("bind probe: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pid-identity fixtures
 // ---------------------------------------------------------------------------
 
@@ -357,4 +446,49 @@ pub(crate) fn count_shutdowns(log: &Arc<Mutex<Vec<Request>>>) -> usize {
         .iter()
         .filter(|r| matches!(r, Request::Shutdown))
         .count()
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+
+    #[test]
+    fn a_reserved_port_is_outside_the_kernels_auto_assign_range() {
+        // The whole guarantee in one assertion: if a reserved port could also
+        // be handed to a `bind(:0)` somewhere else in this binary, the flake
+        // this exists to kill is back.
+        let who = "a_reserved_port_is_outside_the_kernels_auto_assign_range";
+        if auto_assign_floor() <= RESERVED_LO {
+            // This host's ephemeral range covers the whole reserved window, so
+            // `reserve_port` is on its probe fallback and cannot promise this.
+            // Say so rather than assert something the fallback never claimed.
+            eprintln!("SKIP {who}: ephemeral range leaves no reservable window");
+            return;
+        }
+        let Some(port) = reserve_port() else {
+            eprintln!("SKIP {who}: bind denied");
+            return;
+        };
+        assert!(
+            port <= auto_assign_floor(),
+            "reserved {port} is inside the auto-assign range (floor {})",
+            auto_assign_floor()
+        );
+    }
+
+    #[test]
+    fn reserved_ports_are_never_handed_out_twice() {
+        // The cursor's job. Two callers racing for the same port would put the
+        // collision straight back inside our own helper.
+        let Some(first) = reserve_port() else {
+            eprintln!("SKIP reserved_ports_are_never_handed_out_twice: bind denied");
+            return;
+        };
+        let mut seen = vec![first];
+        for _ in 0..32 {
+            let p = reserve_port().expect("bind worked a moment ago");
+            assert!(!seen.contains(&p), "port {p} handed out twice");
+            seen.push(p);
+        }
+    }
 }
