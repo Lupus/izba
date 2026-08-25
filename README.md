@@ -97,6 +97,11 @@ Key properties:
                                  # audit, no upstream certificate verification.
                                  # Declared per PORT: adding another port here
                                  # never inherits the hatch.
+                                 # Needs this entry's default read-write
+                                 # access: an opaque splice carries no HTTP
+                                 # method, so `access: read` leaves the hatch
+                                 # declared but dormant (`izba policy show`
+                                 # says which).
   git:
     - repo: github.com/myorg/myrepo    # clone/fetch; read-only (no push) by default
     - repo: github.com/myorg/deploy
