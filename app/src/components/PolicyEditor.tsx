@@ -90,18 +90,27 @@ const WIDEN_ESCAPE_HINT =
  *  AND the row's visible passthrough notice (`passthroughNotice` below folds
  *  onto this single source; the final review caught the chip and the notice
  *  disagreeing about a dormant row's posture when they had separate copies
- *  of the `tcp` wording). `tcp` is access-aware: an opaque splice carries no
- *  HTTP method, so `access: read` never authorizes one (`egress.rego`'s
- *  `host_access_ok("read")` requires GET/HEAD); `router::passthrough_names`
- *  drops the host and the connection stays terminated at L7 — a pinning
- *  client still sees izba's certificate. `izba policy show`
- *  (`crates/izba-cli/src/commands/policy.rs`) renders the exact same
- *  NOT-in-effect branch, so neither GUI surface may claim the live substance
- *  for a row that doesn't have it. `http` and the undeclared case do not
- *  depend on access. */
-function portDeclarationLabel(p: PortRow, access: Access): string | null {
+ *  of the `tcp` wording). `tcp` has THREE postures, and the enforce-off one
+ *  is decided first — an access level cannot cancel a hatch that a stopped
+ *  firewall never opened. With `enforce: false` `EgressPolicyConfig::compile`
+ *  returns AllowAll and `router::passthrough_names` returns nothing, so every
+ *  destination is reachable, no connection is terminated and there is nothing
+ *  to splice: the declaration is inert. When enforcement IS on, the label is
+ *  access-aware: an opaque splice carries no HTTP method, so `access: read`
+ *  never authorizes one (`egress.rego`'s `host_access_ok("read")` requires
+ *  GET/HEAD); `router::passthrough_names` drops the host and the connection
+ *  stays terminated at L7 — a pinning client still sees izba's certificate.
+ *  `izba policy show` (`crates/izba-cli/src/commands/policy.rs`) renders the
+ *  same three branches in the same order (#239: both surfaces reveal posture
+ *  and must not disagree), so neither GUI surface may claim the live
+ *  substance for a row that doesn't have it. `http` and the undeclared case
+ *  do not depend on access or enforcement — as on the CLI. */
+function portDeclarationLabel(p: PortRow, access: Access, enforcing: boolean): string | null {
   switch (p.protocol) {
     case "tcp":
+      if (!enforcing) {
+        return `Port ${p.port}: TLS-pinning passthrough NOT in effect — enforcement is off, so every destination is reachable and no connection is terminated or spliced; this declaration is inert until enforcement is turned on`;
+      }
       return access === "read-write"
         ? `Port ${p.port}: TLS-pinning passthrough — spliced opaquely, with no L7 rules, no request audit and no upstream certificate verification`
         : `Port ${p.port}: TLS-pinning passthrough NOT in effect — an opaque splice carries no HTTP method, so this row's "${access}" access never authorizes one; the connection stays terminated at L7 and a pinning client still sees izba's certificate. To pin, ${WIDEN_ESCAPE_HINT}`;
@@ -155,8 +164,8 @@ function pinnedPorts(r: Row): PortRow[] {
  *  actually pins (editing the file directly) is named in
  *  `portDeclarationLabel`'s own dormant wording, not repeated here, so this
  *  sentence only explains why the picker itself won't do it. */
-function passthroughNotice(pinned: PortRow[], access: Access): string {
-  const declared = pinned.map((p) => portDeclarationLabel(p, access)).join(". ");
+function passthroughNotice(pinned: PortRow[], access: Access, enforcing: boolean): string {
+  const declared = pinned.map((p) => portDeclarationLabel(p, access, enforcing)).join(". ");
   const remediation =
     access === "read-write"
       ? `The host is locked so this control cannot be silently relocated — ${PIN_ESCAPE_HINT}.`
@@ -192,6 +201,7 @@ export function hostPatternError(host: string): string | null {
 function PortEditor({
   ports,
   access,
+  enforcing,
   onAdd,
   onRemove,
 }: {
@@ -200,6 +210,10 @@ function PortEditor({
   // review) — the chip must not claim the live substance for a row whose
   // access has cancelled the hatch.
   access: Access;
+  // Likewise for the posture the whole sandbox is in: a declared hatch on a
+  // non-enforcing sandbox is inert, and the chip must say so in the same
+  // words the row notice does (both read `portDeclarationLabel`).
+  enforcing: boolean;
   onAdd: (port: number) => void;
   onRemove: (port: number) => void;
 }) {
@@ -229,7 +243,7 @@ function PortEditor({
     <div className="flex flex-1 flex-col gap-1">
       <div className="flex flex-wrap items-center gap-1">
         {ports.map((p) => {
-          const declaration = portDeclarationLabel(p, access);
+          const declaration = portDeclarationLabel(p, access, enforcing);
           return (
             <Badge
               key={p.port}
@@ -502,7 +516,7 @@ export function PolicyEditor({ name }: { name: string }) {
                         id={noticeId}
                         className="w-full rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-xs text-destructive"
                       >
-                        {passthroughNotice(pinned, r.access)}
+                        {passthroughNotice(pinned, r.access, enforcing)}
                       </p>
                     )}
                     <div className="flex w-full items-center gap-2">
@@ -510,6 +524,7 @@ export function PolicyEditor({ name }: { name: string }) {
                       <PortEditor
                         ports={r.ports}
                         access={r.access}
+                        enforcing={enforcing}
                         onAdd={(p) => addPort(i, p)}
                         onRemove={(p) => removePort(i, p)}
                       />

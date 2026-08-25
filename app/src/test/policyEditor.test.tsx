@@ -661,6 +661,9 @@ describe("PolicyEditor", () => {
     expect(notice.textContent).not.toMatch(/[Ww]iden to read-write to pin\b/);
     // Must NOT claim the live substance — that would misreport this row.
     expect(notice.textContent).not.toMatch(/no upstream certificate verification/);
+    // …nor the inert substance: this sandbox IS enforcing, so the hatch is
+    // cancelled by access, not by a stopped firewall (three-way split).
+    expect(notice.textContent).not.toMatch(/enforcement is off/i);
   });
 
   it("keeps the live notice for a pinned row with read-write access", async () => {
@@ -684,6 +687,60 @@ describe("PolicyEditor", () => {
     expect(notice.textContent).toMatch(/no upstream certificate verification/);
     // Must NOT claim the dormant substance.
     expect(notice.textContent).not.toMatch(/NOT in effect/);
+    expect(notice.textContent).not.toMatch(/enforcement is off/i);
+  });
+
+  // --- Dogfooding, passthrough run (#239 parity): with enforcement OFF the
+  // compiled policy is AllowAll (`EgressPolicyConfig::compile`) and
+  // `router::passthrough_names` returns nothing, so no connection is
+  // terminated and there is nothing to splice. `izba policy show` renders
+  // that inert case distinctly; this tab is the other revealing surface and
+  // must not disagree about the same policy. Display only.
+
+  it("renders the inert notice for a pinned row when the sandbox is not enforcing", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: false,
+      allow: [
+        {
+          host: "pinned.vendor.com",
+          ports: [{ port: 443, protocol: "tcp" }],
+          access: "read-write",
+        },
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    const notice = screen.getByText(/Port 443:/i);
+    expect(notice.textContent).toMatch(/NOT in effect/);
+    expect(notice.textContent).toMatch(/enforcement is off/i);
+    expect(notice.textContent).toMatch(/every destination is reachable/);
+    expect(notice.textContent).toMatch(/no connection is terminated or spliced/);
+    expect(notice.textContent).toMatch(/inert/);
+    // An access level that would carry the LIVE hatch under enforcement must
+    // not print it here — that claim is the finding.
+    expect(notice.textContent).not.toMatch(/spliced opaquely/);
+    expect(notice.textContent).not.toMatch(/no upstream certificate verification/);
+    // A declaration is still worth flagging even when inert.
+    expect(screen.getByText("\u26A0 tcp")).toBeInTheDocument();
+  });
+
+  it("prefers the inert wording over the access-cancelled wording when enforcement is off", async () => {
+    // Three postures, one label: the enforce-off case is decided FIRST, the
+    // same order `izba policy show` uses — an access level cannot cancel a
+    // hatch that a stopped firewall never opened.
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: false,
+      allow: [
+        { host: "pinned.vendor.com", ports: [{ port: 443, protocol: "tcp" }], access: "read" },
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    const notice = screen.getByText(/Port 443:/i);
+    expect(notice.textContent).toMatch(/enforcement is off/i);
+    expect(notice.textContent).not.toMatch(/opaque splice carries no HTTP method/);
   });
 
   it("joins the notice for two pinned ports on the same row, naming both", async () => {
