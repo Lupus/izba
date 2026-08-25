@@ -29,6 +29,7 @@ auditable ``decisive_credits`` entry; ``mismatch`` ⇒ the oracle's
 ``infra`` candidate. Never a silent pass."""
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Dict, List
 
 # The `no_evidence` explanation both runners hand the skeptic when an
@@ -90,6 +91,80 @@ def infra_candidate(journey_id: str, detail: str, *,
         "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
     }
 
+
+
+# --- Seed-file survival (DEEP-H0) -------------------------------------------
+#
+# `seed_files` is a PRECONDITION the journey compiler authors and the Actor is
+# never told about (the fair-test boundary: an Actor that knew the fixture was
+# planted would be reading the answer sheet). A cheap Actor therefore quite
+# reasonably decides to author its own `policy.yaml`/`izba.yml` — and in the
+# 2026-08 deep tier it did exactly that in 11 of 11 CLI journeys, so the
+# oracles graded a file the compiler never wrote while the bundle said nothing.
+#
+# The harness cannot tell the Actor about the seed and must not silently
+# re-plant it behind the Actor's back (that would hand the Actor a shell whose
+# writes spontaneously revert). What it CAN do is watch the fixture and say so:
+# a seeded path that is no longer on disk as seeded means the journey's
+# precondition is gone, i.e. the evidence the assertions needed is unavailable
+# — which the instrument-honesty contract already spells `infra`, flipping, so
+# the journey cannot tally positive.
+SEED_CLOBBER_SOURCE = "harness: seed_files precondition"
+SEED_CLOBBER_EXPECTATION = (
+    "a seeded precondition must still be on disk, byte-for-byte as seeded, "
+    "when the journey's assertions are graded")
+# The literal a bundle reader (and the Phase-3 skeptic) greps for.
+SEED_CLOBBER_MARKER = "seeded precondition"
+
+
+def seed_digest(content: str) -> str:
+    """Content identity for a seeded file: sha256 of its UTF-8 bytes.
+
+    Compared against the same digest of what is on disk later, so "the Actor
+    rewrote it with identical bytes" is correctly NOT a clobber."""
+    return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+
+
+def clobbered_seed_candidate(journey_id: str, relpath: str, *,
+                             action_index: int, command: str, origin: str,
+                             disposition: str) -> Dict[str, Any]:
+    """The flipping `infra` candidate for a seeded fixture that did not survive.
+
+    Names WHICH fixture, WHERE it came from (journey-level vs a step's drift
+    injection), and the exact action that ended it — so the skeptic can tell
+    "the product ate the file" from "the Actor wrote its own", and can never
+    mistake a graded substitute for the authored precondition. Report-once per
+    seeding: a later re-seed re-arms it."""
+    candidate = infra_candidate(
+        journey_id,
+        f"{SEED_CLOBBER_MARKER} {relpath!r} ({origin}) was {disposition} by "
+        f"action[{action_index}] ({command[:160]!r}) — the rest of the journey "
+        f"ran against the Actor's own file, so every assertion downstream "
+        f"graded a fixture the journey never authored",
+        source=SEED_CLOBBER_SOURCE,
+        violated_expectation=SEED_CLOBBER_EXPECTATION,
+    )
+    # Unlike the model-transport infra candidates, this one IS tied to a single
+    # action, so the ref reproduces it directly instead of pointing at nothing.
+    candidate["trajectory_ref"]["action_index"] = action_index
+    return candidate
+
+
+def surviving_seed_disposition(path: str, digest: str) -> str:
+    """Empty string if the seeded file is still exactly as seeded, else WHAT
+    happened to it: ``REMOVED`` / ``OVERWRITTEN`` / ``UNREADABLE (...)``.
+
+    Unreadable is deliberately reported rather than swallowed: an oracle that
+    cannot see the fixture is in the same position as one whose fixture was
+    replaced."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            current = f.read()
+    except FileNotFoundError:
+        return "REMOVED"
+    except OSError as e:
+        return f"UNREADABLE ({e.__class__.__name__})"
+    return "" if seed_digest(current) == digest else "OVERWRITTEN"
 
 
 def valid_volume_spec(vspec: Any) -> bool:

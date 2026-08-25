@@ -66,8 +66,11 @@ from state_hooks import (  # noqa: E402
     HOOK_GRADER_SOURCE,
     STATE_NO_EVIDENCE_DETAIL as _STATE_NO_EVIDENCE_DETAIL,
     apply_hook_verdict as _apply_hook_verdict,
+    clobbered_seed_candidate,
     infra_candidate,
     infra_candidate as _infra_candidate,
+    seed_digest,
+    surviving_seed_disposition,
     step_was_entered,
     unentered_step_candidate,
     state_hook_label as _state_hook_label,
@@ -404,58 +407,110 @@ def _stream_candidates(step, action, source, ref, journey_id) -> List[Candidate]
     return out
 
 
-def _grade_step_functional(step, produced, journey, journey_id, decisive,
-                           action_index) -> List[Dict[str, Any]]:
-    """Grade the functional assertion ONCE per step, on its intent-bearing action.
+def _eligible_targets(step, produced, base, journey_id):
+    """The actions in this step that could BEAR its functional assertion, in run
+    order, as ``(absolute_index, action)`` pairs.
 
-    Default target is the step's last action that INVOKES the izba binary
-    (falling back to the final action when none does); ``expect_cmd_re`` overrides.
-    When the step declares ``expect_cmd_re`` (a regex), the target is the LAST
-    action whose command matches — so a trailing verify (`izba ls`) after a correct
-    refusal no longer false-fires. Invalid regexes log + fall back to the final
-    action. Every candidate records ``graded_cmd`` so the skeptic sees WHAT was
-    graded."""
-    if not produced:
-        return []
-    target = produced[-1]
-    target_index = action_index
+    ``expect_cmd_re`` declares the set explicitly (the author naming which
+    command the assertion is about). Without it the set is the step's PRODUCT
+    invocations — a shell line that runs the izba binary — so trailing plumbing
+    (seed-write heredocs, `ls` peeks) can't be graded as the step's command.
+    Neither yielding anything falls back to the step's final action, which is
+    what the harness graded before either refinement existed."""
+    last = [(base + len(produced) - 1, produced[-1])]
     pattern = step.get("expect_cmd_re")
     if isinstance(pattern, str) and pattern:
         try:
             rx = re.compile(pattern)
-            for off, a in enumerate(reversed(produced)):
-                if rx.search(a.get("command", "")):
-                    target = a
-                    target_index = action_index - off
-                    break
         except re.error as e:
             log(f"{journey_id}: invalid expect_cmd_re {pattern!r}: {e}; "
                 f"grading the final action")
-    else:
-        # H1: without expect_cmd_re, prefer the last action that invokes the
-        # product over trailing shell plumbing (seed-write heredocs, `ls`
-        # peeks). Nothing izba-shaped -> the final action, as before.
-        for off, a in enumerate(reversed(produced)):
-            if _PRODUCT_CMD_RE.search(a.get("command", "")):
-                target = a
-                target_index = action_index - off
-                break
-    ref = {"journey_id": journey_id, "action_index": target_index}
-    source = journey.get("source", {}).get("ref", "journey step")
+            return last
+        matched = [(base + i, a) for i, a in enumerate(produced)
+                   if rx.search(a.get("command", ""))]
+        return matched or last
+    found = [(base + i, a) for i, a in enumerate(produced)
+             if _PRODUCT_CMD_RE.search(a.get("command", ""))]
+    return found or last
+
+
+def _grade_target(step, action, journey_id, journey_source, ref, decisive):
+    """Grade ONE action against the step's functional + stream assertions."""
     found = list(functional_oracle(
-        target.get("command", ""), target.get("exit_code", 0),
-        step.get("expect", ""), source, ref,
+        action.get("command", ""), action.get("exit_code", 0),
+        step.get("expect", ""), journey_source, ref,
         expect_exit=step.get("expect_exit"),
-        stderr=target.get("stderr_tail", "")))
-    found += _stream_candidates(step, target, source, ref, journey_id)
+        stderr=action.get("stderr_tail", "")))
+    found += _stream_candidates(step, action, journey_source, ref, journey_id)
     out = []
     for c in found:
         cd = c.to_dict()
-        cd["trajectory_ref"] = ref
+        cd["trajectory_ref"] = dict(ref)
         cd["decisive"] = bool(decisive)
-        cd["graded_cmd"] = target.get("command", "")
+        cd["graded_cmd"] = action.get("command", "")
         out.append(cd)
     return out
+
+
+def _grade_step_functional(step, produced, journey, journey_id, decisive,
+                           action_index, *, step_index=None,
+                           credits=None) -> List[Dict[str, Any]]:
+    """Grade the functional assertion ONCE per step, on its intent-bearing action.
+
+    Default target is the LAST of the step's eligible actions
+    (``_eligible_targets``: ``expect_cmd_re`` matches when declared, else the
+    step's izba invocations, else the final action) — last-match is right for
+    the common shape "the Actor got it wrong, then got it right".
+
+    **The refusal exception (DEEP-H1).** On a step that DECLARES a refusal
+    (``step_expects_nonzero``: ``expect_exit`` nonzero) the assertion is that a
+    GUARD FIRES. Once it has fired, the promise is kept — and what the Actor
+    does next is its own business, very often the documented escape hatch the
+    error message itself advertised. Grading the last match then inverts a step
+    that already passed: `deep-command-line-grants-skip-the-review-gate` got
+    its ``no reviewed diff`` refusal at action[6] and was scored against
+    action[7]'s deliberate ``--force`` retry, turning a kept promise into two
+    flipping candidates. So on a refusal step, if the default target fails but
+    an earlier eligible action satisfies EVERY declared assertion (exit AND
+    streams — a partial satisfaction rescues nothing), that action is graded
+    instead, and the swap is recorded in ``credits`` so the skeptic sees which
+    action the pass came from.
+
+    The exception is deliberately NOT extended to success-expecting steps:
+    there, an earlier success absolving a later failure would let the harness
+    hide a real bug behind the Actor's first lucky attempt. Last-match keeps
+    its authority, which is why this stays a strictly-narrower rule and not a
+    "any action that passed" free pass.
+
+    Invalid regexes log + fall back to the final action. Every candidate
+    records ``graded_cmd`` so the skeptic sees WHAT was graded."""
+    if not produced:
+        return []
+    base = action_index - len(produced) + 1
+    eligible = _eligible_targets(step, produced, base, journey_id)
+    source = journey.get("source", {}).get("ref", "journey step")
+    target_index, target = eligible[-1]
+    graded = _grade_target(
+        step, target, journey_id, source,
+        {"journey_id": journey_id, "action_index": target_index}, decisive)
+    if not graded or not step_expects_nonzero(step.get("expect", ""),
+                                              step.get("expect_exit")):
+        return graded
+    for idx, a in reversed(eligible[:-1]):
+        ref = {"journey_id": journey_id, "action_index": idx}
+        if _grade_target(step, a, journey_id, source, ref, decisive):
+            continue
+        log(f"{journey_id}: step {step_index} asserted a refusal that "
+            f"action[{idx}] ({a.get('command', '')!r}) satisfied in full; "
+            f"grading THAT, not the later {target.get('command', '')!r}")
+        if credits is not None:
+            credits.append({
+                "step_index": step_index if step_index is not None else -1,
+                "action_index": idx,
+                "graded_cmd": a.get("command", ""),
+            })
+        return []
+    return graded
 
 
 def _next_command(model, journey, step, actions, budget, journey_id, starved):
@@ -488,7 +543,7 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
               action_timeout_s,
               latency_budget_ms, budget, max_usd, max_turns, step_cap,
               journey_id, actions, candidates, ctx, decisive, cwd_file,
-              step_index) -> bool:
+              step_index, decisive_credits=None) -> bool:
     """Run one step's Actor loop. Mutates ``actions``/``candidates``/``ctx``.
     Returns True if a journey-level cap (step-cap/max-turns) tripped (caller
     should stop the whole journey). Raises BudgetExceeded on the $ cap.
@@ -526,7 +581,8 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
     seen: set = set()
     start = len(actions)  # index of this step's first action; actions[start:] = its own
     seed_files = step.get("seed_files")
-    _write_seeds(workdir, seed_files)
+    _register_seeds(ctx, _write_seeds(workdir, seed_files),
+                    f"step {step_index}'s seed_files")
     if isinstance(seed_files, dict):
         ctx.setdefault("seed_watermarks", []).append((step_index, start))
     try:
@@ -565,6 +621,8 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
             candidates.extend(_collect_candidates(
                 action, command, action_index, ctx["prev_reconcile"],
                 latency_budget_ms, journey, step, journey_id))
+            _check_seed_survival(workdir, ctx, journey_id, action_index,
+                                 command, candidates)
             ctx["prev_reconcile"] = action.reconcile
     finally:
         # Grade the step's final action once, on EVERY exit path (done, dedup,
@@ -576,10 +634,11 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
             produced = actions[start:]
             candidates.extend(_grade_step_functional(
                 step, produced, journey, journey_id, decisive,
-                len(actions) - 1))
+                len(actions) - 1, step_index=step_index,
+                credits=(decisive_credits if decisive else None)))
 
 
-def _write_seeds(workdir: str, seed_files: Optional[Dict[str, Any]]) -> None:
+def _write_seeds(workdir: str, seed_files: Optional[Dict[str, Any]]) -> Dict[str, str]:
     """Materialize a ``seed_files`` mapping (relpath -> content) into ``workdir``.
 
     A precondition-seeding primitive (Part E): each entry is written under
@@ -601,9 +660,15 @@ def _write_seeds(workdir: str, seed_files: Optional[Dict[str, Any]]) -> None:
 
     Report-only: a rejected or failed entry is logged and skipped; this never
     raises (a seeding hiccup must not abort a journey — the journey just starts
-    without that fixture, which the oracles will then observe honestly)."""
+    without that fixture, which the oracles will then observe honestly).
+
+    Returns the ``{relpath: content-digest}`` map of the entries that actually
+    LANDED — the CLI runner's seed-survival watch (DEEP-H0) is armed from it,
+    so a rejected/failed entry is never watched for (it was never there) and a
+    landed one always is."""
+    landed: Dict[str, str] = {}
     if not isinstance(seed_files, dict):
-        return
+        return landed
     # realpath the base once so the prefix comparison is against the resolved dir.
     base_real = os.path.realpath(workdir)
     for relpath, content in seed_files.items():
@@ -627,8 +692,62 @@ def _write_seeds(workdir: str, seed_files: Optional[Dict[str, Any]]) -> None:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "w", encoding="utf-8") as f:
                 f.write(content)
+            landed[norm] = seed_digest(content)
         except OSError as e:  # report-only: a bad write must not kill the journey
             log(f"seed_files: failed to write {relpath!r}: {e!r}")
+    return landed
+
+
+def _register_seeds(ctx: Dict[str, Any], landed: Dict[str, str],
+                    origin: str) -> None:
+    """Arm the seed-survival watch (DEEP-H0) for the files that just landed.
+
+    Keyed by the normalized relpath, so a step-level re-seed of the SAME path
+    replaces the watched digest and re-arms a path already reported clobbered:
+    the drift fixture is a new precondition and deserves its own verdict."""
+    if not landed:
+        return
+    watched = ctx.setdefault("seeds", {})
+    for relpath, digest in landed.items():
+        watched[relpath] = {"digest": digest, "origin": origin}
+
+
+def _check_seed_survival(workdir: str, ctx: Dict[str, Any], journey_id: str,
+                         action_index: int, command: str,
+                         candidates: List[Dict[str, Any]]) -> None:
+    """After every action: is each seeded precondition still as it was seeded?
+
+    DEEP-H0. The Actor is never told about ``seed_files`` (fair-test boundary),
+    so it will sometimes author its own ``policy.yaml``/``izba.yml`` over the
+    fixture — in the 2026-08 deep tier, in 11 of 11 CLI journeys. That is not
+    Actor stupidity and the harness must not "fix" it by narrating the seed or
+    by silently re-planting the file behind a shell the Actor believes it
+    controls. What it must not do is grade the substitute in silence: this
+    check turns the moment into ONE flipping ``infra`` candidate naming the
+    fixture and the exact action that ended it.
+
+    Report-once per seeding (the entry is dropped after it fires) — a
+    surviving-file check on every later action would bury the bundle in
+    duplicates of a fact stated once. A step-level re-seed re-arms it.
+
+    Deliberately blind to WHO wrote: an `izba export` that legitimately
+    rewrites a seeded ``izba.yml`` reports the same way. The candidate names
+    the command, so the skeptic can refute it in one read — the alternative
+    (guessing intent from the command line) is exactly the kind of silent,
+    unauditable judgement this harness keeps getting wrong."""
+    watched = ctx.get("seeds") or {}
+    for relpath in sorted(watched):
+        entry = watched[relpath]
+        disposition = surviving_seed_disposition(
+            os.path.join(workdir, relpath), entry["digest"])
+        if not disposition:
+            continue
+        candidates.append(clobbered_seed_candidate(
+            journey_id, relpath, action_index=action_index, command=command,
+            origin=entry["origin"], disposition=disposition))
+        log(f"{journey_id}: seeded {relpath!r} {disposition} by "
+            f"action[{action_index}]; the journey's precondition is gone")
+        del watched[relpath]
 
 
 def _grade_decisive_from_observed(step, actions, journey, journey_id,
@@ -722,11 +841,35 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id,
     return None
 
 
+def _capture_state(izba_bin, data_dir, timeout_s, journey_id):
+    """``capture_state_evidence``, report-only (an evidence-capture failure
+    must never fail a run — it degrades the assertion to ``no_evidence``,
+    which the honesty fold turns into a flipping ``infra`` candidate)."""
+    try:
+        return capture_state_evidence(izba_bin, data_dir, timeout_s)
+    except Exception as e:  # report-only
+        log(f"{journey_id}: state-evidence capture error: {e!r}")
+        return {"sandboxes": [], "reconcile": {}, "per_sandbox": {}}
+
+
 def _grade_decisive_state_hooks(*, journey, journey_id, steps, decisive_idx,
                                 state_evidence, candidates, decisive_credits,
-                                zero_actions=False, unreached_steps=None) -> None:
+                                zero_actions=False, unreached_steps=None,
+                                step_state_evidence=None) -> None:
     """Grade every DECISIVE step that declares ``expect_state`` against the
-    journey's end-of-journey ``capture_state_evidence`` snapshot.
+    state evidence captured AT THAT STEP'S BOUNDARY, falling back to the
+    journey's end-of-journey ``capture_state_evidence`` snapshot for a step
+    that reached the end of the journey (the last executed step, and any step
+    the run stopped inside — for both, the two moments are the same one).
+
+    DEEP-H2: grading every step against the end-of-journey snapshot reported a
+    divergence for promises that were KEPT and then legitimately undone by the
+    journey's own later steps (`deep-command-line-grants-skip-the-review-gate`
+    step 1 asserted a host its own step 2 then promoted away). A mid-journey
+    assertion is about a mid-journey moment; ``run_journey`` samples that
+    moment at the step boundary and ships the sample in the bundle
+    (``state_evidence_steps``) so a credit is never drawn from evidence the
+    skeptic cannot see.
 
     The schema puts ``expect_state`` on ``step`` unconditionally and its
     description talks about daemon ground truth, but only the GUI runner ever
@@ -797,8 +940,10 @@ def _grade_decisive_state_hooks(*, journey, journey_id, steps, decisive_idx,
     if not declaring:
         return
     source = journey.get("source", {}).get("ref", "journey step")
+    per_step = step_state_evidence or {}
     for i in declaring:
         s = steps[i]
+        evidence = per_step.get(str(i), state_evidence)
         ref = {"journey_id": journey_id, "action_index": -1}
         _, state_hook = _step_decisive_hooks(s)
         if state_hook is None:
@@ -815,7 +960,7 @@ def _grade_decisive_state_hooks(*, journey, journey_id, steps, decisive_idx,
             })
             continue
         verdict, found = expect_state_oracle(
-            state_hook, state_evidence, ref, step_index=i,
+            state_hook, evidence, ref, step_index=i,
             expect=s.get("expect", ""), source=source)
         if zero_actions and verdict == "mismatch":
             candidates.append(_zero_action_unreached(
@@ -858,7 +1003,8 @@ def run_journey(
     # Materialize precondition files (Part E) into the workdir BEFORE any step, so
     # a deep journey can start at the feature's real surface (e.g. a valid izba.yml
     # already present) instead of burning its steps authoring the prerequisite.
-    _write_seeds(workdir, journey.get("seed_files"))
+    _register_seeds(ctx, _write_seeds(workdir, journey.get("seed_files")),
+                    "journey-level seed_files")
     # One cwd file per journey so cwd persists across actions like a real shell
     # (Part D). NOT pre-created: run_action treats its absence as "start in
     # workdir", so the first action naturally begins there.
@@ -867,17 +1013,33 @@ def run_journey(
                                           "expect": ""}]
     decisive_idx = _decisive_step_indices(steps)
     step_actions: Dict[int, int] = {}  # step index -> actions it produced
+    # DEEP-H2: state evidence sampled AT a decisive step's boundary, keyed by
+    # decimal step index. Sampled lazily — at the START of the NEXT step, which
+    # is the same instant as the end of this one — so the LAST step (the common
+    # single-decisive-step shape) costs no extra capture and keeps grading on
+    # the end-of-journey snapshot exactly as before.
+    step_state: Dict[str, Any] = {}
+    pending_state: List[int] = []
     for i, step in enumerate(steps):
+        if pending_state:
+            snap = _capture_state(izba_bin, data_dir, action_timeout_s,
+                                  journey_id)
+            for j in pending_state:
+                step_state[str(j)] = snap
+            pending_state = []
         before = len(actions)
         stop = _run_step(
             model, journey, step, izba_bin, data_dir, workdir,
             action_timeout_s=action_timeout_s, latency_budget_ms=latency_budget_ms,
             budget=budget, max_usd=max_usd, max_turns=max_turns, step_cap=step_cap,
             journey_id=journey_id, actions=actions, candidates=candidates, ctx=ctx,
-            decisive=(i in decisive_idx), cwd_file=cwd_file, step_index=i)
+            decisive=(i in decisive_idx), cwd_file=cwd_file, step_index=i,
+            decisive_credits=decisive_credits)
         step_actions[i] = len(actions) - before
         if stop:
             break
+        if i in decisive_idx and isinstance(step, dict) and "expect_state" in step:
+            pending_state.append(i)
     # H7: coalesce model-starvation failures into ONE flipping infra candidate
     # (count_degraded semantics unchanged — any infra candidate degrades).
     if ctx["starved"]:
@@ -919,11 +1081,8 @@ def run_journey(
             journey_id, "reconciler unusable: every snapshot errored"))
     # State-based oracle: snapshot izba's OWN audit/policy/lifecycle state
     # so the Phase-3 skeptic grades the outcome from ground truth, not guest exit codes.
-    try:
-        state_evidence = capture_state_evidence(izba_bin, data_dir, action_timeout_s)
-    except Exception as e:  # report-only: never let evidence capture fail a run
-        log(f"{journey_id}: state-evidence capture error: {e!r}")
-        state_evidence = {"sandboxes": [], "reconcile": {}, "per_sandbox": {}}
+    state_evidence = _capture_state(izba_bin, data_dir, action_timeout_s,
+                                    journey_id)
     # The declarative daemon-truth hook, graded on the SAME evidence (#defect
     # 2): a decisive step's `expect_state` is now honoured on CLI journeys too,
     # not silently discarded.
@@ -932,7 +1091,8 @@ def run_journey(
         decisive_idx=decisive_idx, state_evidence=state_evidence,
         candidates=candidates, decisive_credits=decisive_credits,
         zero_actions=not actions,
-        unreached_steps=unreached_decisive_steps)
+        unreached_steps=unreached_decisive_steps,
+        step_state_evidence=step_state)
     for cd in guest_console_oracle(
             state_evidence, {"journey_id": journey_id, "action_index": -1}):
         d = cd.to_dict()
@@ -944,8 +1104,12 @@ def run_journey(
                          state_evidence.get("sandboxes") or [])
     except Exception as e:  # defensive: teardown_journey shouldn't raise
         log(f"{journey_id}: teardown error: {e!r}")
-    return {"journey_id": journey_id, "actions": actions, "candidates": candidates,
-            "state_evidence": state_evidence, "decisive_credits": decisive_credits}
+    result = {"journey_id": journey_id, "actions": actions,
+              "candidates": candidates, "state_evidence": state_evidence,
+              "decisive_credits": decisive_credits}
+    if step_state:  # only the mid-journey shape carries the extra samples
+        result["state_evidence_steps"] = step_state
+    return result
 
 
 def build_model(args) -> Any:

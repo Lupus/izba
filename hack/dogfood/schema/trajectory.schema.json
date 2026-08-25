@@ -62,7 +62,14 @@
             }
           }
         },
-        "state_evidence_presettle": {
+        "state_evidence_steps": {
+     "type": "object",
+     "description": "CLI only (DEEP-H2): state evidence sampled at a DECISIVE step's own boundary, keyed by decimal step index — present only when a decisive step declaring `expect_state` was followed by another step, i.e. its assertion is about a mid-journey moment. That step's `expect_state` is graded against THIS sample, not against the end-of-journey `state_evidence`: a promise kept at step 1 and legitimately undone by step 2 is not a divergence. Both samples ship so the skeptic can audit every credit and flip against the evidence it was actually drawn from. A decisive step that ran last (or that the run stopped inside) has no entry and is graded on `state_evidence`, which for it is the same moment.",
+     "additionalProperties": {
+      "type": "object"
+     }
+    },
+    "state_evidence_presettle": {
           "type": "object",
           "description": "GUI only (expect_state settle): the chronologically FIRST end-of-journey state-evidence sample, recorded only when a failing core-step expect_state assertion triggered the bounded settle re-sample — `state_evidence` then holds the SETTLED sample the decisive grading was drawn from. Both samples stay on record so the Phase-3 skeptic can audit that only a transient divergence (e.g. a mid-ACPI-S5 teardown window) was absorbed; a genuinely-wrong settled state still flips. When MORE than one core step triggered the settle, see `state_evidence_settles` for the full per-step audit."
         },
