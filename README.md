@@ -86,7 +86,8 @@ Key properties:
         - 80                     # a bare port declares nothing → inspected
         - port: 443
           protocol: tcp          # ⚠ escape hatch for a TLS-pinning client:
-                                 # spliced opaquely — no L7 rules, no request audit.
+                                 # spliced opaquely — no L7 rules, no request
+                                 # audit, no upstream certificate verification.
                                  # Declared per PORT: adding another port here
                                  # never inherits the hatch.
   git:
