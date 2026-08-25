@@ -305,3 +305,84 @@ describe("git_repo_from_row", () => {
     expect(git_repo_from_row(null, "/o/a/git-receive-pack")).toBeNull();
   });
 });
+
+/** DEEP-F2 — the Netlog tab must not report a firewall posture it never read.
+ *
+ *  `policy` initialises to `null` and `enforcing` was `policy?.enforcing ??
+ *  false`, so before `policyShow` resolved — and for as long as it kept
+ *  failing, since `refresh` is a `Promise.all` and either half can reject —
+ *  the banner announced "Firewall OFF · all egress currently allowed" for a
+ *  sandbox that may well be enforcing, with the enforce toggle live. From that
+ *  window `toggleEnforce` computes `next = !false = true`, so the write
+ *  direction is ALWAYS on: it cannot disarm, but it can arm a bare sandbox
+ *  onto an empty allow-list, and it misreports the posture of an enforcing one
+ *  (advertised-posture ≠ enforced-posture).
+ *
+ *  Assertions are on the API mock, never on a `disabled` attribute; each
+ *  refusal test also asserts the refusal is visible so it cannot pass
+ *  vacuously. `FirewallStatus` already renders `…` for exactly this data —
+ *  this pins the same honesty here. */
+describe("NetlogView load state", () => {
+  /** A `policyShow` that never settles — the "still loading" window. */
+  function pendingPolicyShow() {
+    (api.policyShow as Mock).mockReturnValue(new Promise(() => {}));
+  }
+
+  it("refuses to toggle enforcement before the policy has loaded (policySetEnforce never called)", async () => {
+    pendingPolicyShow();
+    render(<NetlogView name="web" />);
+    // By accessible NAME, not by role: an unguarded build still renders the
+    // switch here (and this click makes it write `true`), a guarded one
+    // renders a control that refuses. Both must answer to "Enforce firewall".
+    fireEvent.click(screen.getByLabelText(/enforce firewall/i));
+    expect(api.policySetEnforce).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/refus/i)).toBeInTheDocument());
+    expect(api.policySetEnforce).not.toHaveBeenCalled();
+  });
+
+  it("refuses to toggle enforcement after the policy load failed (policySetEnforce never called)", async () => {
+    (api.policyShow as Mock).mockRejectedValue(new Error("daemon unreachable"));
+    render(<NetlogView name="web" />);
+    await screen.findByText(/daemon unreachable/i);
+    // By accessible NAME, not by role: an unguarded build still renders the
+    // switch here (and this click makes it write `true`), a guarded one
+    // renders a control that refuses. Both must answer to "Enforce firewall".
+    fireEvent.click(screen.getByLabelText(/enforce firewall/i));
+    expect(api.policySetEnforce).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/refus/i)).toBeInTheDocument());
+    expect(api.policySetEnforce).not.toHaveBeenCalled();
+  });
+
+  it("claims no firewall posture while the policy is loading", () => {
+    pendingPolicyShow();
+    render(<NetlogView name="web" />);
+    expect(screen.queryByText(/firewall off/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/firewall on/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/all egress currently allowed/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/posture unknown/i)).toBeInTheDocument();
+  });
+
+  it("claims no firewall posture after the policy load failed", async () => {
+    (api.policyShow as Mock).mockRejectedValue(new Error("daemon unreachable"));
+    render(<NetlogView name="web" />);
+    await screen.findByText(/daemon unreachable/i);
+    expect(screen.queryByText(/firewall off/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/firewall on/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/all egress currently allowed/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/posture unknown/i)).toBeInTheDocument();
+  });
+
+  it("does not claim an empty netlog before the netlog has been read", () => {
+    pendingPolicyShow();
+    render(<NetlogView name="web" />);
+    expect(screen.queryByText(/no egress recorded yet/i)).not.toBeInTheDocument();
+  });
+
+  it("still reports, and still toggles, a genuinely loaded off posture", async () => {
+    mockPolicy({ enforcing: false, allow: [], git: [] });
+    render(<NetlogView name="web" />);
+    expect(await screen.findByText(/Firewall OFF/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("switch", { name: /enforce firewall/i }));
+    await waitFor(() => expect(api.policySetEnforce).toHaveBeenCalledWith("web", true));
+  });
+});

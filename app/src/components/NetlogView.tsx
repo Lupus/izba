@@ -34,10 +34,43 @@ function orderRows(rows: EndpointSummary[]): EndpointSummary[] {
   );
 }
 
+/** What this tab actually KNOWS about the sandbox, from the one `refresh` that
+ *  fetches its netlog and its policy together.
+ *
+ *  `policy` starts `null` and `enforcing` was `policy?.enforcing ?? false`, so
+ *  before `policyShow` resolved — and for as long as it kept failing, since
+ *  `refresh` is a `Promise.all` and either half rejecting leaves `policy`
+ *  untouched — this tab announced "Firewall OFF · all egress currently
+ *  allowed" and "0 allow rule(s)" for a sandbox whose policy it had not read,
+ *  with the enforce toggle live. `toggleEnforce` computes `next = !enforcing`,
+ *  so from that window the write direction is ALWAYS on: it cannot disarm a
+ *  firewall, but it can arm a bare sandbox onto an empty allow-list and cut a
+ *  running agent's egress — and, worse, it persistently misreports the posture
+ *  of an enforcing sandbox, the advertised-posture ≠ enforced-posture class
+ *  this project keeps meeting. `FirewallStatus` already renders `…` rather
+ *  than characterising this very data; so does this now. */
+type LoadState = { kind: "loading" } | { kind: "ready" } | { kind: "error" };
+
+/** Why an enforce toggle was refused, given what we know. Returned as text so
+ *  the refusal is VISIBLE (a dropped click teaches the operator nothing) and so
+ *  one place decides "may we write a posture?". */
+function enforceRefusal(load: LoadState): string | null {
+  if (load.kind === "ready") return null;
+  const what =
+    load.kind === "loading"
+      ? "This sandbox's firewall posture has not finished loading"
+      : "This sandbox's firewall posture could not be read";
+  return `${what}, so the enforce toggle is refused: with no posture to flip, a click here would simply write enforcement ON — arming an unread allow-list, or reporting success for a change that matched nothing. Wait for the policy to load, or use the Policy tab once it does.`;
+}
+
 export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pollMs?: number }>) {
   const [rows, setRows] = useState<EndpointSummary[]>([]);
   const [policy, setPolicy] = useState<PolicyView | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loadState, setLoadState] = useState<LoadState>({ kind: "loading" });
+  // Kept apart from `error` so a 1.5 s poll landing its own message cannot wipe
+  // the reason a write was just refused.
+  const [refusal, setRefusal] = useState<string | null>(null);
   // The `host:port` key of the row whose action is in flight (for instant feedback).
   const [pending, setPending] = useState<string | null>(null);
   // Controls the SeedDialog (Review observed traffic).
@@ -68,8 +101,15 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
       setRows(r);
       setPolicy(p);
       setError(null);
+      setLoadState({ kind: "ready" });
+      setRefusal(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setError(message);
+      // Only a load that never succeeded is "unknown". Once a policy has been
+      // read, a later poll failing makes it stale, not unread — the rows and
+      // the posture on screen are still something izba actually saw.
+      setLoadState((prev) => (prev.kind === "ready" ? prev : { kind: "error" }));
     }
   }, [name]);
 
@@ -107,6 +147,15 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
 
   // Optimistic toggle for the enforce switch.
   async function toggleEnforce() {
+    // THE guard, in the state transition rather than in the control's rendered
+    // state: a scripted click, a stale render or a future markup edit must not
+    // be able to route around it, and the refusal must be readable.
+    const refused = enforceRefusal(loadState);
+    if (refused) {
+      setRefusal(refused);
+      return;
+    }
+    setRefusal(null);
     const next = !enforcing;
     // Optimistic: update policy locally first, revert on error.
     setPolicy((prev) => (prev ? { ...prev, enforcing: next } : prev));
@@ -123,11 +172,24 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
   return (
     <div className="flex h-full flex-col">
       {error && <div className="mb-2 text-sm text-destructive">{error}</div>}
+      {refusal && <div className="mb-2 text-sm text-destructive">{refusal}</div>}
 
       {/* Banner: always visible — honest about firewall state */}
       <div className="mb-3 flex items-center justify-between rounded-lg border border-border bg-muted px-3 py-2 text-sm">
         <div>
-          {enforcing ? (
+          {loadState.kind !== "ready" ? (
+            /* Neither "ON" nor "OFF": izba has not read this sandbox's policy,
+               and an unread policy is not an off one. */
+            <span>
+              <span>🛡 Firewall posture unknown</span>
+              <br />
+              <span className="text-muted-foreground-2">
+                {loadState.kind === "loading"
+                  ? "Reading this sandbox's policy and netlog…"
+                  : "izba could not read this sandbox's policy (see the error above), so its enforcement posture and allow-list are unknown here — an unread policy is not an off one."}
+              </span>
+            </span>
+          ) : enforcing ? (
             <span>🛡 Firewall ON · {allowRuleCount} allow rule(s)</span>
           ) : (
             <span>
@@ -140,12 +202,29 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
           )}
         </div>
         <div className="flex items-center gap-2">
-          {/* Enforce toggle — a clear on/off switch, not an ambiguous checkbox */}
-          <EnforceToggle
-            enforcing={enforcing}
-            disabled={pending !== null}
-            onToggle={() => void toggleEnforce()}
-          />
+          {/* Enforce toggle — a clear on/off switch, not an ambiguous checkbox.
+              Only once the posture is known: a switch knob is itself a posture
+              claim, and `enforcing` defaults to false. In the unknown window a
+              plain button stands in — `aria-disabled`, deliberately NOT natively
+              `disabled`, so the click still reaches `toggleEnforce` and gets a
+              visible reason instead of being silently swallowed. */}
+          {loadState.kind === "ready" ? (
+            <EnforceToggle
+              enforcing={enforcing}
+              disabled={pending !== null}
+              onToggle={() => void toggleEnforce()}
+            />
+          ) : (
+            <Button
+              variant="secondary"
+              size="sm"
+              aria-label="Enforce firewall"
+              aria-disabled
+              onClick={() => void toggleEnforce()}
+            >
+              Enforce firewall
+            </Button>
+          )}
           {/* Review observed traffic button (always available) */}
           <Button
             disabled={pending !== null}
@@ -324,7 +403,9 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
             })}
           </tbody>
         </table>
-        {rows.length === 0 && <div className="mt-3 text-muted-foreground-2">No egress recorded yet.</div>}
+        {loadState.kind === "ready" && rows.length === 0 && (
+          <div className="mt-3 text-muted-foreground-2">No egress recorded yet.</div>
+        )}
       </div>
       {/* Fixed-height status line, always present so toggling its text never
           reflows the table (it sits below the scroll area, not above it). */}
