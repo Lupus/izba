@@ -78,7 +78,9 @@
         "gui-removing-the-exempt-port-unlocks-the-row",
         "gui-app-cannot-author-a-new-exception"
       ],
-      "gating": [],
+      "gating": [
+        "gui-pinned-port-is-visible-in-the-policy-tab"
+      ],
       "establishes": [
         "gui-pinned-row-visible"
       ]
@@ -112,7 +114,13 @@
         "smoke-manifest-egress-review-available",
         "core-police-a-non-web-port",
         "core-show-stays-quiet-for-a-plain-policy",
-        "deep-declare-the-exception-on-a-running-sandbox"
+        "deep-declare-the-exception-on-a-running-sandbox",
+        "deep-declaration-survives-a-restart",
+        "deep-pinned-host-keeps-the-vendor-certificate",
+        "deep-dormant-exception-still-intercepts",
+        "deep-exception-does-not-follow-a-raw-address",
+        "deep-two-hosts-one-port-only-one-passes-through",
+        "deep-exception-for-a-host-never-allowed"
       ]
     },
     "policy-show-renders": {
@@ -165,7 +173,8 @@
         "core-author-the-exception-through-the-review-flow",
         "deep-review-flags-a-new-exception-as-weakening",
         "deep-review-flags-losing-inspection-on-a-shared-port",
-        "deep-review-is-quiet-when-posture-tightens"
+        "deep-review-is-quiet-when-posture-tightens",
+        "deep-command-line-grants-skip-the-review-gate"
       ]
     },
     "hatch-via-manifest": {
@@ -335,7 +344,8 @@
       "journey_id": "deep-command-line-grants-skip-the-review-gate",
       "tier": "deep",
       "requires": [
-        "policy-show-renders"
+        "policy-show-renders",
+        "manifest-egress-review"
       ]
     },
     {
@@ -350,42 +360,48 @@
       "journey_id": "deep-declaration-survives-a-restart",
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ]
     },
     {
       "journey_id": "deep-pinned-host-keeps-the-vendor-certificate",
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ]
     },
     {
       "journey_id": "deep-dormant-exception-still-intercepts",
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ]
     },
     {
       "journey_id": "deep-exception-does-not-follow-a-raw-address",
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ]
     },
     {
       "journey_id": "deep-two-hosts-one-port-only-one-passes-through",
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ]
     },
     {
       "journey_id": "deep-exception-for-a-host-never-allowed",
       "tier": "deep",
       "requires": [
-        "hatch-declared"
+        "hatch-declared",
+        "policy-file-at-create"
       ]
     },
     {
