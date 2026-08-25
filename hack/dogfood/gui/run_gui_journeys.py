@@ -38,6 +38,24 @@ from gui.driver import (  # noqa: E402
     AgentBrowserDriver, FakeDriver, action_to_argv, render_marks,
 )
 from gui.gui_model import build_gui_model  # noqa: E402
+# The shared decisive-hook vocabulary — ONE implementation, also imported by
+# the CLI runner (see state_hooks' docstring). Bound to this module's historic
+# private names so every call site and test here reads unchanged, while the
+# implementation has exactly one home.
+from state_hooks import (  # noqa: E402
+    STATE_NO_EVIDENCE_DETAIL as _STATE_NO_EVIDENCE_DETAIL,
+    ZERO_ACTION_REASON as _ZERO_ACTION_REASON,
+    apply_hook_verdict as _apply_hook_verdict,
+    infra_candidate as _infra_candidate,
+    state_hook_label as _state_hook_label,
+    step_declares_hook as _step_declares_hook,
+    step_decisive_hooks as _step_decisive_hooks,
+    valid_policy_spec as _valid_policy_spec,
+    valid_port_spec as _valid_port_spec,
+    valid_sandboxes_exact as _valid_sandboxes_exact,
+    valid_volume_spec as _valid_volume_spec,
+    zero_action_unreached as _zero_action_unreached,
+)
 from gui.gui_oracles import (  # noqa: E402
     console_oracle, dom_expect_oracle, expect_state_oracle, expect_text_oracle,
     manifest_truth_oracle, silent_failure_oracle, ui_daemon_diff_oracle,
@@ -222,18 +240,6 @@ def _is_daemon_spawn_failure(entry: Any) -> bool:
             and "spawning [" in str(entry.get("error", "")))
 
 
-def _infra_candidate(journey_id: str, detail: str) -> Dict[str, Any]:
-    """Flipping infra candidate — same shape as the CLI runner's (a broken
-    model/driver plumbing means the journey verified nothing)."""
-    return {
-        "kind": "infra",
-        "detail": detail,
-        "violated_expectation": "model/API must produce a next command",
-        "source": "harness: model transport",
-        "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
-    }
-
-
 def _substitute_workspace(text: Any, workspace: str) -> Any:
     """Replace the literal ``{workspace}`` token with the journey's absolute
     workspace path. Only that one token is templated — no other substitution.
@@ -273,173 +279,6 @@ def _substitute_steps_workspace(steps: List[Dict[str, Any]],
             s["expect_state"] = es
         out.append(s)
     return out
-
-
-def _valid_volume_spec(vspec: Any) -> bool:
-    """True iff ``vspec`` is a schema-shaped ``expect_state.volume`` object:
-    a dict with a non-empty ``name`` and at least one of
-    ``exists``/``attached_to`` declared."""
-    return (isinstance(vspec, dict) and bool(vspec.get("name"))
-            and ("exists" in vspec or "attached_to" in vspec))
-
-
-def _valid_port_spec(pspec: Any) -> bool:
-    """True iff ``pspec`` is a schema-shaped ``expect_state.port`` object: a
-    dict with an integer ``host`` (bool rejected — Python bools are ints) and
-    at least one of ``exists``/``persistent`` declared."""
-    return (isinstance(pspec, dict)
-            and isinstance(pspec.get("host"), int)
-            and not isinstance(pspec.get("host"), bool)
-            and ("exists" in pspec or "persistent" in pspec))
-
-
-_POLICY_ACCESS_VERBS = ("read", "read-write")
-
-
-def _valid_policy_spec(pspec: Any) -> bool:
-    """True iff ``pspec`` is a schema-shaped ``expect_state.policy`` object:
-    a dict declaring at least one of ``present``/``access``/``port``/
-    ``enforcing``; a non-empty ``host`` anchor whenever a host-scoped key
-    (present/access/port) is declared (``enforcing`` is file-level and needs
-    none); booleans where booleans belong; a known access verb; and a
-    ``port`` carrying BOTH an integer ``number`` (bool rejected — Python
-    bools are ints) and a boolean ``pinned``. A half-formed policy assertion
-    must fall through to the unreached_decisive flip, never grade."""
-    if not isinstance(pspec, dict):
-        return False
-    scoped = [k for k in ("present", "access", "port") if k in pspec]
-    if not scoped and "enforcing" not in pspec:
-        return False
-    host = pspec.get("host")
-    if scoped and not (isinstance(host, str) and host):
-        return False
-    if "enforcing" in pspec and not isinstance(pspec["enforcing"], bool):
-        return False
-    if "present" in pspec and not isinstance(pspec["present"], bool):
-        return False
-    if "access" in pspec and pspec["access"] not in _POLICY_ACCESS_VERBS:
-        return False
-    if "port" in pspec:
-        port = pspec["port"]
-        if not isinstance(port, dict):
-            return False
-        if not isinstance(port.get("number"), int) or isinstance(
-                port.get("number"), bool):
-            return False
-        if not isinstance(port.get("pinned"), bool):
-            return False
-    return True
-
-
-def _valid_sandboxes_exact(v: Any) -> bool:
-    """True iff ``v`` is a schema-shaped ``expect_state.sandboxes_exact``
-    value: a list — possibly EMPTY (asserts no sandboxes exist at all) — of
-    non-empty strings."""
-    return (isinstance(v, list)
-            and all(isinstance(n, str) and n for n in v))
-
-
-def _state_hook_label(state_hook: Dict[str, Any]) -> str:
-    """Human label for an expect_state hook's target — the named sandbox for
-    per-sandbox assertions, the daemon set for a pure sandboxes_exact spec."""
-    name = state_hook.get("sandbox")
-    return (f"sandbox {name!r}" if name
-            else "the daemon sandbox set (sandboxes_exact)")
-
-
-def _step_declares_hook(step: Dict[str, Any]) -> bool:
-    """True iff the step DECLARES a decisive hook key at all — deliberately
-    keyed on raw presence, not on validity: a malformed hook (which
-    ``_step_decisive_hooks`` normalizes to absent) is still a declared
-    assertion and must reach the grader, where it flips ``unreached_decisive``
-    rather than being silently skipped."""
-    return isinstance(step, dict) and ("expect_text" in step
-                                       or "expect_state" in step)
-
-
-def _step_decisive_hooks(step: Dict[str, Any]) -> tuple:
-    """The (expect_text, expect_state) declarative hooks a step carries, with
-    malformed values normalized to absent (``None``): a hook the schema would
-    reject (non-str/empty expect_text; expect_state carrying a per-sandbox
-    assertion — ``exists``/``status``/``volume``/``port``/``policy`` —
-    without a ``sandbox`` target, without at least one assertion among those
-    plus ``sandboxes_exact``, or with a half-formed ``volume``/``port``/
-    ``policy``/``sandboxes_exact`` value — a declared assertion must never be
-    silently dropped) is NOT gradable and must fall through to the
-    unreached_decisive flip — never a silent pass on a half-formed
-    assertion."""
-    text = step.get("expect_text")
-    if not (isinstance(text, str) and text):
-        text = None
-    state = step.get("expect_state")
-    if not isinstance(state, dict):
-        state = None
-    else:
-        per_sandbox = [k for k in ("exists", "status", "volume", "port",
-                                   "policy")
-                       if k in state]
-        if per_sandbox and not state.get("sandbox"):
-            state = None  # per-sandbox assertions need a sandbox target
-        elif not per_sandbox and "sandboxes_exact" not in state:
-            state = None  # no assertion declared at all
-        elif "volume" in state and not _valid_volume_spec(state.get("volume")):
-            state = None
-        elif "port" in state and not _valid_port_spec(state.get("port")):
-            state = None
-        elif "policy" in state and not _valid_policy_spec(state.get("policy")):
-            state = None
-        elif ("sandboxes_exact" in state
-              and not _valid_sandboxes_exact(state.get("sandboxes_exact"))):
-            state = None
-    return text, state
-
-
-def _apply_hook_verdict(verdict: str, found: List[Any], *, hook: str,
-                        no_evidence_detail: str, journey_id: str,
-                        step_idx: int, candidates: List[Dict[str, Any]],
-                        decisive_credits: List[Dict[str, Any]]) -> None:
-    """Fold one hook oracle's ``(verdict, candidates)`` into the journey per
-    the instrument-honesty contract: ``matched`` ⇒ an auditable
-    decisive_credits entry (the skeptic must see the decisive assertion WAS
-    checked, mirroring the manifest_truth credit shape); ``mismatch`` ⇒ the
-    oracle's ``functional`` candidate(s) tagged ``decisive`` (the collector's
-    flip contract); ``no_evidence`` ⇒ a flipping ``infra`` candidate
-    (couldn't verify — harness degradation, not a product bug, and NEVER a
-    silent pass)."""
-    if verdict == "matched":
-        decisive_credits.append({
-            "step_index": step_idx, "action_index": -1,
-            "graded_cmd": f"{hook} (matched)",
-        })
-        return
-    if verdict == "no_evidence":
-        candidates.append(_infra_candidate(
-            journey_id, f"{no_evidence_detail} (core decisive step {step_idx})"))
-        return
-    for c in found:
-        cd = c.to_dict()
-        cd["decisive"] = True
-        candidates.append(cd)
-
-
-_ZERO_ACTION_REASON = ("actor performed no actions; decisive assertion "
-                       "never exercised")
-
-
-def _zero_action_unreached(journey_id: str, step: Dict[str, Any],
-                           source: str, hook_desc: str) -> Dict[str, Any]:
-    """The Fix-4 reclassification candidate: a decisive hook that FAILED on a
-    journey whose Actor never acted is an unreached/engagement failure (the
-    swarm never attempted the interaction), NOT a product-functional flip —
-    'absent from every capture' over an untouched screen reads as a product
-    failure but proves nothing about the product."""
-    return {
-        "kind": "unreached_decisive",
-        "detail": f"{_ZERO_ACTION_REASON} ({hook_desc})",
-        "violated_expectation": step.get("expect", "") or hook_desc,
-        "source": source,
-        "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
-    }
 
 
 def _settle_expect_state(state_hook: Dict[str, Any], first_verdict: str,
@@ -585,12 +424,21 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
         ref = {"journey_id": journey_id, "action_index": -1}
         text_hook, state_hook = _step_decisive_hooks(s)
         if text_hook is None and state_hook is None:
+            # Two different truths, two different sentences: on the
+            # manifest path this step DID declare a hook (that is why it is
+            # here at all) and the journey DID drive a manifest_diff — the
+            # skeptic reads this text, so it must not assert the opposite.
+            reason = (
+                f"declares an expect_text/expect_state the runner cannot "
+                f"grade (expect_text={s.get('expect_text')!r}, "
+                f"expect_state={s.get('expect_state')!r})"
+                if only_declared_hooks else
+                f"carries no gradable hook (expect_text/expect_state) and "
+                f"the journey drove no manifest_diff")
             candidates.append({
                 "kind": "unreached_decisive",
                 "detail": (f"decisive step {step_idx} "
-                           f"({s.get('intent', '')[:80]!r}) carries no "
-                           f"gradable hook (expect_text/expect_state) and "
-                           f"the journey drove no manifest_diff — its "
+                           f"({s.get('intent', '')[:80]!r}) {reason} — its "
                            f"assertion was never exercised"),
                 "violated_expectation": s.get("expect", "")
                                         or "decisive step must be exercised",
@@ -665,14 +513,7 @@ def _grade_core_step_hooks(*, journey: Dict[str, Any], journey_id: str,
             _apply_hook_verdict(
                 verdict, found,
                 hook=f"expect_state: {_state_hook_label(state_hook)}",
-                no_evidence_detail=(
-                    "expect_state: daemon state evidence unavailable "
-                    "(reconcile snapshot errored/absent, no usable "
-                    "`izba volume ls` capture for a volume assertion, no "
-                    "usable port_ls/ports_persisted capture for a port "
-                    "assertion, or no usable managed policy.yaml capture "
-                    "— PyYAML unavailable / file absent / unparseable — for "
-                    "a policy assertion), assertion unverifiable"),
+                no_evidence_detail=_STATE_NO_EVIDENCE_DETAIL,
                 journey_id=journey_id, step_idx=step_idx,
                 candidates=candidates, decisive_credits=decisive_credits)
 

@@ -12,6 +12,9 @@ import tempfile
 from typing import Any, Callable, Dict, List, Optional
 
 from oracles import Candidate  # noqa: E402
+from state_hooks import (  # noqa: E402
+    is_wildcard_host, normalize_policy_host,
+)
 
 _STOP = {"the", "a", "an", "is", "are", "in", "to", "of", "and", "it", "its",
          "with", "that", "this", "appears", "shows", "should", "be", "as",
@@ -494,22 +497,76 @@ _POLICY_DEFAULT_PORTS = (80, 443)
 
 
 def _policy_entries(doc: Dict[str, Any], host: str) -> List[Dict[str, Any]]:
-    """Every ``allow`` entry naming ``host``, normalized to the Scoped dict
-    shape. A bare STRING entry is izba's ``AllowEntry::Host`` — ports
-    [80, 443] undeclared, access read-write (izba-core
-    ``daemon/egress/config.rs``). Host comparison is case-insensitive
-    (izba normalizes hosts to lowercase; a case-only difference is never the
-    finding a journey means)."""
-    want = host.strip().lower()
+    """Every ``allow`` entry naming ``host``, IN FILE ORDER, normalized to the
+    Scoped dict shape. A bare STRING entry is izba's ``AllowEntry::Host`` —
+    ports [80, 443] undeclared, access read-write (izba-core
+    ``daemon/egress/config.rs``).
+
+    Both sides go through the product's own ``normalize_policy_host`` (trim +
+    trailing-dot strip + ASCII lowercase), the identity the product keys
+    mutations, the Rego compile and ``manifest::diff`` by. A lookalike
+    (``.strip().lower()``) silently misses ``vendor.com.`` and reports a
+    present entry as absent."""
+    want = normalize_policy_host(host)
     out: List[Dict[str, Any]] = []
     for e in (doc.get("allow") or []):
         if isinstance(e, str):
-            if e.strip().lower() == want:
+            if normalize_policy_host(e) == want:
                 out.append({"host": e})
         elif isinstance(e, dict) and isinstance(e.get("host"), str):
-            if e["host"].strip().lower() == want:
+            if normalize_policy_host(e["host"]) == want:
                 out.append(e)
     return out
+
+
+def _policy_fold(doc: Dict[str, Any], host: str) -> tuple:
+    """``(view, ambiguous)`` for the entries naming ``host`` — the harness's
+    fold of duplicate entries, which MUST agree with the product's
+    (``config.rs::collapse_duplicate_hosts``). A second, disagreeing fold of
+    one rule is the class that opened a live no-certificate-verification
+    bypass during M5 P1 (CLAUDE.md), and here it would certify a security
+    WIDENING as unchanged.
+
+    ``view`` is ``None`` when no entry names the host, else
+    ``{"access": str|None, "ports": {port: declared protocol or None}}``:
+
+    - one entry ⇒ itself;
+    - duplicate EXACT hosts ⇒ LAST-WINS, exactly what the product collapses
+      to (and what ``to_rego_data_json`` compiles);
+    - duplicate WILDCARD hosts with a uniform access verb ⇒ the product
+      UNIONs them (dropping a duplicate would delete a real grant): ports are
+      unioned, and per port the declaration is unioned in the WIDENING
+      (inspect) direction — ``http`` if ANY duplicate declared it for that
+      port, else undeclared — mirroring ``union_wildcard_protocol``. A
+      wildcard is never pinned: ``protocol: tcp`` on a wildcard host is a
+      product PARSE ERROR (DP-3), so such a file cannot load at all;
+    - duplicate WILDCARD hosts with MIXED access verbs ⇒ the product refuses
+      to collapse them: each duplicate stays live and enforces its own ports
+      independently. No single-entry assertion can state that posture, so the
+      fold reports ``ambiguous`` and the caller degrades access/port grading
+      to ``no_evidence`` (a flipping infra candidate). Existence is still
+      gradable — the entries demonstrably exist."""
+    entries = _policy_entries(doc, host)
+    if not entries:
+        return None, False
+
+    def view_of(entry):
+        return {"access": _policy_entry_access(entry),
+                "ports": _policy_entry_ports(entry)}
+
+    if len(entries) == 1:
+        return view_of(entries[0]), False
+    if not is_wildcard_host(normalize_policy_host(host)):
+        return view_of(entries[-1]), False  # exact: last-wins
+    accesses = {_policy_entry_access(e) for e in entries}
+    if len(accesses) > 1:
+        return {"access": None, "ports": {}}, True
+    ports: Dict[int, Optional[str]] = {}
+    for e in entries:
+        for port, proto in _policy_entry_ports(e).items():
+            ports[port] = ("http" if proto == "http" or ports.get(port) == "http"
+                           else None)
+    return {"access": accesses.pop(), "ports": ports}, False
 
 
 def _policy_entry_access(entry: Dict[str, Any]) -> str:
@@ -548,25 +605,29 @@ def _policy_entry_ports(entry: Dict[str, Any]) -> Dict[int, Optional[str]]:
 
 
 def _grade_policy_assertion(pspec: Dict[str, Any],
-                            doc: Dict[str, Any]) -> List[str]:
-    """Failure strings for one ``expect_state.policy`` assertion graded
-    against the parsed MANAGED ``policy.yaml`` (empty = every declared
-    sub-assertion holds).
+                            doc: Dict[str, Any]) -> tuple:
+    """``(failure strings, unverifiable)`` for one ``expect_state.policy``
+    assertion graded against the parsed MANAGED ``policy.yaml`` (no failures
+    and not unverifiable = every declared sub-assertion holds).
 
-    ``host`` anchors WHICH allow entry is inspected; ``present`` asserts the
-    entry exists (``false`` = it must not — how a REFUSED rename is graded:
-    the new name absent, the old name present on a sibling step);
-    ``access`` compares the entry's verb verbatim; ``port.pinned`` asserts
-    that port carries the ``protocol: tcp`` pinning declaration (``false`` =
-    the port is authorized and NOT pinned — a port the entry does not
-    authorize at all fails EITHER polarity, since neither statement is true
-    of it); ``enforcing`` compares the file's enforce posture (an absent or
-    null ``enforce:`` key resolves to TRUE — izba-core ``config.rs``).
+    ``host`` anchors WHICH allow entry is inspected — through the product's
+    duplicate fold, never a lookalike (see ``_policy_fold``); ``present``
+    asserts the entry exists (``false`` = it must not — how a REFUSED rename
+    is graded: the new name absent, the old name present on a sibling step);
+    ``access`` compares the folded access verb verbatim; ``port.pinned``
+    asserts that port carries the ``protocol: tcp`` pinning declaration
+    (``false`` = the port is authorized and NOT pinned — a port the entry
+    does not authorize at all fails EITHER polarity, since neither statement
+    is true of it); ``enforcing`` compares the file's enforce posture (an
+    absent or null ``enforce:`` key resolves to TRUE — izba-core
+    ``config.rs``).
 
-    Duplicate EXACT hosts fold LAST-WINS, matching what the product
-    compiles (`to_rego_data_json`; the fold that, when it disagreed with an
-    earlier union, opened a live no-certificate-verification bypass — see
-    CLAUDE.md)."""
+    ``unverifiable`` is returned when the fold is AMBIGUOUS (mixed-access
+    wildcard duplicates, which the product deliberately keeps independent):
+    the caller degrades to ``no_evidence`` ⇒ a flipping infra candidate.
+    Refusing loudly is the only honest answer there — the alternative,
+    last-wins, would certify ``access: read`` as the saved posture while a
+    duplicate still grants read-write."""
     failures: List[str] = []
     if "enforcing" in pspec:
         enforce = doc.get("enforce")
@@ -577,52 +638,50 @@ def _grade_policy_assertion(pspec: Dict[str, Any],
                 f"managed policy.yaml says {actual}")
     host = pspec.get("host")
     if not isinstance(host, str) or not host:
-        return failures  # host-less spec: only `enforcing` is gradable
-    entries = _policy_entries(doc, host)
-    entry = entries[-1] if entries else None  # last-wins, like the compiler
+        return failures, False  # host-less spec: only `enforcing` is gradable
+    view, ambiguous = _policy_fold(doc, host)
     if "present" in pspec:
         want = bool(pspec["present"])
-        if (entry is not None) != want:
+        if (view is not None) != want:
             failures.append(
                 f"policy allow: expected an entry for {host!r} to be "
                 f"{'present' if want else 'absent'}, the managed policy.yaml "
-                f"has it {'present' if entry is not None else 'absent'}")
-    if "access" in pspec:
-        if entry is None:
+                f"has it {'present' if view is not None else 'absent'}")
+    scoped = [k for k in ("access", "port") if k in pspec]
+    if not scoped:
+        return failures, False
+    if view is None:
+        for k in scoped:
+            label = (f"policy port {pspec['port'].get('number')}"
+                     if k == "port" else "policy access")
             failures.append(
-                f"policy access: expected {pspec['access']!r} but {host!r} "
-                f"has no entry in the managed policy.yaml")
-        else:
-            actual = _policy_entry_access(entry)
-            if actual != pspec["access"]:
-                failures.append(
-                    f"policy access: expected {pspec['access']!r} for "
-                    f"{host!r}, the managed policy.yaml says {actual!r}")
+                f"{label}: {host!r} has no entry in the managed policy.yaml")
+        return failures, False
+    if ambiguous:
+        # The product keeps mixed-access wildcard duplicates independent, so
+        # there is no single entry to compare against. Never guess.
+        return failures, True
+    if "access" in pspec and view["access"] != pspec["access"]:
+        failures.append(
+            f"policy access: expected {pspec['access']!r} for {host!r}, the "
+            f"managed policy.yaml says {view['access']!r}")
     portspec = pspec.get("port")
     if isinstance(portspec, dict):
         number = portspec.get("number")
         want_pinned = bool(portspec.get("pinned"))
-        if entry is None:
+        ports = view["ports"]
+        if number not in ports:
             failures.append(
-                f"policy port {number}: {host!r} has no entry in the managed "
-                f"policy.yaml")
-        else:
-            ports = _policy_entry_ports(entry)
-            if number not in ports:
-                failures.append(
-                    f"policy port {number}: the managed policy.yaml's entry "
-                    f"for {host!r} does not authorize port {number} "
-                    f"(authorized: {sorted(ports)!r})")
-            else:
-                pinned = ports[number] == "tcp"
-                if pinned != want_pinned:
-                    wanted = ("the pinning declaration (protocol: tcp)"
-                              if want_pinned else "NO pinning declaration")
-                    failures.append(
-                        f"policy port {number}: expected {wanted} on "
-                        f"{host!r}, the managed policy.yaml declares "
-                        f"{ports[number]!r}")
-    return failures
+                f"policy port {number}: the managed policy.yaml's entry for "
+                f"{host!r} does not authorize port {number} "
+                f"(authorized: {sorted(ports)!r})")
+        elif (ports[number] == "tcp") != want_pinned:
+            wanted = ("the pinning declaration (protocol: tcp)"
+                      if want_pinned else "NO pinning declaration")
+            failures.append(
+                f"policy port {number}: expected {wanted} on {host!r}, the "
+                f"managed policy.yaml declares {ports[number]!r}")
+    return failures, False
 
 
 def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
@@ -743,7 +802,9 @@ def expect_state_oracle(spec: Dict[str, Any], state_evidence: Dict[str, Any],
         if not isinstance(doc, dict):
             unverifiable = True  # PyYAML absent / file absent / unparseable
         else:
-            failures.extend(_grade_policy_assertion(polspec, doc))
+            pfail, punver = _grade_policy_assertion(polspec, doc)
+            failures.extend(pfail)
+            unverifiable = unverifiable or punver
     if "sandboxes_exact" in spec:
         if not reconcile_usable:
             unverifiable = True

@@ -694,3 +694,19 @@ def test_expect_state_is_not_documented_as_gui_only():
             ["properties"]["expect_state"]["description"])
     assert "the CLI runner ignores it" not in desc
     assert "CLI" in desc
+
+
+def test_hook_descriptions_do_not_claim_manifest_truth_preempts():
+    # The descriptions ARE the journey compiler's instruction sheet. A
+    # compiler told "hooks are graded only when the journey drove no
+    # manifest_diff" omits hooks on manifest-touching journeys — recreating,
+    # one layer up, the precedence defect the runner no longer has.
+    schema = _load("journeys.schema.json")
+    props = schema["definitions"]["step"]["properties"]
+    for key in ("expect_text", "expect_state"):
+        desc = props[key]["description"]
+        assert "manifest_truth then takes precedence" not in desc, key
+        assert "when the journey did NOT drive manifest_diff" not in desc, key
+    # …and expect_text says the true rule positively.
+    text_desc = props["expect_text"]["description"]
+    assert "never substituted" in text_desc or "on top of" in text_desc.lower()
