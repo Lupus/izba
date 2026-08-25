@@ -73,8 +73,26 @@ const RESERVED_HI: u16 = 32_767;
 /// second `cargo test`, a coverage run beside a plain one) each get their own
 /// cursor, and a shared zero start would march them through 20000, 20001, …
 /// in lockstep — handing both the same port and reintroducing the very
-/// collision this module exists to prevent. Distinct pids stagger them; the
-/// bind check below and the retry loops at the call sites cover the remainder.
+/// collision this module exists to prevent.
+///
+/// Note precisely what this does and does not buy, because the difference is
+/// the whole reason the flake was hard to see:
+///
+/// - WITHIN one process the guarantee is exact. The cursor hands each caller a
+///   distinct port and the range puts it beyond any `:0` bind, so no test can
+///   take another's port. That is the case CI runs: `testutil` is `#[cfg(test)]`
+///   in this crate, so the izba-core lib test binary is its only consumer and
+///   cargo runs one of it.
+/// - ACROSS processes this is a stagger, NOT a reservation. Two binaries whose
+///   pid-derived offsets land close together can still probe and release the
+///   same port before either really binds it, and the call sites that do not
+///   retry (`reserve_port` → an immediate `PortPublish`) would fail hard on it.
+///
+/// Closing that last gap needs a cross-process lock, or the port held until the
+/// real bind — and the port CANNOT be held here, because the code under test is
+/// what creates the listener. Neither is worth it for a helper whose only
+/// consumer is a single binary; concurrent manual `cargo test` runs of THIS
+/// crate are the one place the residual bites.
 static PORT_CURSOR: std::sync::LazyLock<std::sync::atomic::AtomicU16> =
     std::sync::LazyLock::new(|| std::sync::atomic::AtomicU16::new(std::process::id() as u16));
 
