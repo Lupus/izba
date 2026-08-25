@@ -171,3 +171,42 @@ describe("UsbTab", () => {
     await screen.findByText(/no USB stack/i);
   });
 });
+
+/** DEEP-F3 — "No devices granted." is an INVENTORY of a host-only consent
+ *  record (`SandboxConfig.usb`), and this tab is where an operator answers
+ *  "what physical hardware can this sandbox reach?". With the daemon
+ *  unreachable, or `usb_status` refused because the sandbox is busy under
+ *  `lock_sandbox`, `status` stays `null` and the tab used to answer "none"
+ *  beside its own error line. Nothing is written here (every write is
+ *  per-row and there are no rows), but this project has already learned that
+ *  a posture line gets read as an inventory. Not knowing is not the same as
+ *  none. */
+describe("UsbTab load state", () => {
+  it("does not claim an empty grant inventory while the USB status is still loading", async () => {
+    m.usbStatus.mockReturnValue(new Promise(() => {}));
+    render(<UsbTab name="web" running onChanged={() => {}} />);
+    await waitFor(() => expect(m.usbStatus).toHaveBeenCalled());
+    expect(screen.queryByText(/no devices granted/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/nothing else on the upstream/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/has not read|could not read/i)).toBeInTheDocument();
+    expect(m.usbAllow).not.toHaveBeenCalled();
+    expect(m.usbRevoke).not.toHaveBeenCalled();
+  });
+
+  it("does not claim an empty grant inventory when the USB status could not be read", async () => {
+    m.usbStatus.mockRejectedValue(new Error("sandbox 'web' is busy"));
+    render(<UsbTab name="web" running onChanged={() => {}} />);
+    await screen.findByText(/is busy/i);
+    expect(screen.queryByText(/no devices granted/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/nothing else on the upstream/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/has not read|could not read/i)).toBeInTheDocument();
+    expect(m.usbAllow).not.toHaveBeenCalled();
+    expect(m.usbRevoke).not.toHaveBeenCalled();
+  });
+
+  it("still reports a genuinely read, genuinely empty grant inventory", async () => {
+    m.usbStatus.mockResolvedValue(status());
+    render(<UsbTab name="web" running onChanged={() => {}} />);
+    expect(await screen.findByText(/no devices granted/i)).toBeInTheDocument();
+  });
+});
