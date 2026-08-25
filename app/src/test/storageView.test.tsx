@@ -203,3 +203,91 @@ describe("StorageView — Prune unused", () => {
     await waitFor(() => expect(volumeList).toHaveBeenCalledTimes(2));
   });
 });
+
+/** DEEP-F1 — the rail must not answer "which named volumes exist?" before it
+ *  has asked, and must not answer it at all when the answer never came.
+ *
+ *  Before `volumeList` resolved — and again when it REJECTED, since the empty
+ *  state carried no `!error` guard — this view rendered "No named volumes."
+ *  while `Prune unused` stayed live. `volume_prune` deletes every named volume
+ *  image not referenced by any sandbox, and volume images are NOT recoverable.
+ *  The daemon computes the scope, so no UI fiction is written back — but the
+ *  operator's consent was taken against a blank screen, and the confirmation
+ *  names no volume, so nothing in the flow can correct the impression.
+ *
+ *  Every assertion below is on the API MOCK, never on a `disabled` attribute:
+ *  the guard that matters lives in the prune handler itself. Each refusal test
+ *  also asserts the refusal is VISIBLE, which is what stops it passing
+ *  vacuously — a natively `disabled` button would swallow the click, render no
+ *  reason, and make the assertion meaningless. */
+describe("StorageView load state", () => {
+  /** A `volumeList` that never settles — the "still loading" window. */
+  function pendingVolumeList() {
+    volumeList.mockReturnValue(new Promise(() => {}));
+  }
+
+  /** Drive the whole operator gesture: click Prune, and — if a confirmation
+   *  still appears — follow it through. An unguarded build reaches
+   *  `volumePrune` here, which is the irreversible call; a guarded one never
+   *  opens the dialog and says why. */
+  function pruneAllTheWay() {
+    fireEvent.click(screen.getByRole("button", { name: /prune unused/i }));
+    const dialog = screen.queryByRole("dialog");
+    if (dialog) {
+      const confirmBtn = Array.from(dialog.querySelectorAll("button")).find(
+        (b) => b.textContent && /prune/i.test(b.textContent),
+      );
+      if (confirmBtn) fireEvent.click(confirmBtn);
+    }
+  }
+
+  it("refuses to prune while the volume list is still loading (volumePrune never called)", async () => {
+    pendingVolumeList();
+    render(<StorageView />);
+    pruneAllTheWay();
+    expect(volumePrune).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/refus/i)).toBeInTheDocument());
+    // No confirmation dialog either: it cannot describe a scope izba has not read.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(volumePrune).not.toHaveBeenCalled();
+  });
+
+  it("refuses to prune after the volume list failed to load (volumePrune never called)", async () => {
+    volumeList.mockRejectedValue(new Error("daemon unreachable"));
+    render(<StorageView />);
+    await screen.findByText(/daemon unreachable/i);
+    pruneAllTheWay();
+    expect(volumePrune).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/refus/i)).toBeInTheDocument());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(volumePrune).not.toHaveBeenCalled();
+    // The load failure stays on screen: an errored list is not an empty one.
+    expect(screen.getByText(/daemon unreachable/i)).toBeInTheDocument();
+  });
+
+  it("claims no emptiness while the volume list is loading", () => {
+    pendingVolumeList();
+    render(<StorageView />);
+    expect(screen.queryByText(/no named volumes/i)).not.toBeInTheDocument();
+  });
+
+  it("claims no emptiness after the volume list failed to load", async () => {
+    volumeList.mockRejectedValue(new Error("daemon unreachable"));
+    render(<StorageView />);
+    await screen.findByText(/daemon unreachable/i);
+    expect(screen.queryByText(/no named volumes/i)).not.toBeInTheDocument();
+  });
+
+  it("still prunes for a genuinely loaded, genuinely empty list", async () => {
+    volumeList.mockResolvedValue([]);
+    render(<StorageView />);
+    await screen.findByText(/no named volumes/i);
+    fireEvent.click(screen.getByRole("button", { name: /prune unused/i }));
+    const dialog = screen.getByRole("dialog");
+    const confirmBtn = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent && /prune/i.test(b.textContent),
+    );
+    fireEvent.click(confirmBtn!);
+    await waitFor(() => expect(volumePrune).toHaveBeenCalled());
+  });
+});
