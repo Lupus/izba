@@ -1,0 +1,80 @@
+{
+  "feature": "per-port protocol inspectability / TLS-pinning passthrough (#233 + #238 + #239/PR #262)",
+  "tier": "smoke",
+  "findings": [
+    {
+      "id": "reload-help-teaches-entry-level-protocol",
+      "class": "discoverability",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "The only authoring pointer the swarm found teaches the pre-#238 ENTRY-level spelling of the axis. `izba policy reload --help` (crates/izba-cli/src/commands/policy.rs:49) says '...to change settings this CLI has no flag for, such as an entry's `protocol:`', and that sentence is literally the entire evidence produced by shard 1 / smoke-docs-find-authoring-surface / action[1]. A user who follows it writes the entry-level form, which parses and normalizes down onto EVERY port of the entry -- the exact hazard #238 exists to remove. Same class as predicted flag D3, whose own site (crates/izba-cli/src/main.rs:61, 'per-host `access:` / `protocol:` keys') was not exercised this run and should be fixed in the same edit. Wording only.",
+      "journey_ids": ["smoke-docs-find-authoring-surface"],
+      "anchor": "CLAUDE.md -- 'Inspectability is DECLARED per PORT, not derived from the port (M5 P1, #238) ... Do not reintroduce an entry-level field: it was the shape that let a one-port grant silently drop L7 inspection and upstream certificate verification.'"
+    },
+    {
+      "id": "reviewed-authoring-path-unnamed",
+      "class": "discoverability",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Predicted flag D5, now evidenced by trajectory: the product teaches only the UNGATED authoring route. The actor's complete discovery of how to author the declaration (shard 1 / smoke-docs-find-authoring-surface, both actions) yielded 'edit policy.yaml to declare one' (policy allow --help) and 'edit it there and reload ... <izba data dir>/sandboxes/<name>/policy.yaml' (policy reload --help). Nothing named `izba.yml` spec.egress + `izba diff`/`izba promote`, the only route with the weakening gate in front of it. Corroborating negative: smoke-manifest-egress-review-available reached the manifest route only because the journey told it to. Fix: README `izba.yml` spec.egress example + one clause in policy reload's long help.",
+      "journey_ids": ["smoke-docs-find-authoring-surface", "smoke-manifest-egress-review-available"],
+      "anchor": "CLAUDE.md -- '`izba promote` is the human-gated bridge (review token in manifest.review)' and '`izba policy allow` writes policy.yaml without passing the diff/promote gate'"
+    },
+    {
+      "id": "context-pack-stale-vs-tip",
+      "class": "harness",
+      "severity": "P1",
+      "fix_routing": "auto-fixable",
+      "summary": "The fair-test surface handed to this re-run is STALE relative to the tip under test. context-pack.md:92-99 still carries the pre-a2a107d1 README example ('spliced opaquely -- no L7 rules, no request audit.') while README.md:88-90 at the tip says '... no L7 rules, no request audit, no upstream certificate verification.' The pack is untracked and was not regenerated between the fix commit and the dispatch. Consequence: the README half of the D1 fix was untestable by construction, and a docs journey that HAD read the pack would have reported a false negative against a tip where the fact is present. Regenerate the context pack from the tip at every tier dispatch.",
+      "journey_ids": ["smoke-docs-find-pinning-exception"],
+      "anchor": "context-pack.md:1-4 fair-test boundary ('The swarm may use ONLY what is below') vs README.md:88-90 at commit a2a107d1"
+    },
+    {
+      "id": "functional-oracle-grades-wrong-action",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Both of this run's candidates are oracle artifacts; unfixed from run 1 and now shown in two flavours. (1) A non-izba shell command graded as a product failure: graded_cmd 'cat ./README.md', exit 1, shard 0 / smoke-docs-find-pinning-exception / action[9]. (2) NEW: a redundant retry graded instead of the action that satisfied the step -- smoke-create-with-policy-file step 0 ('the sandbox is created with no error') was satisfied at action[1] ('izba create --name pin1 --policy policy.yaml', exit 0, reconcile shows pin1), but the oracle graded the step's textually last action[11], the duplicate-name refusal 'sandbox pin1 already exists'. A GATING journey whose objective was demonstrably met was scored as a failure. Fix: never grade a non-izba command; within a step prefer the best-outcome izba invocation. Files: hack/dogfood/oracles.py, hack/dogfood/run_journeys.py.",
+      "journey_ids": ["smoke-docs-find-pinning-exception", "smoke-create-with-policy-file"],
+      "anchor": "hack/dogfood/oracles.py::functional_oracle -- 'a deliberately WEAK proposer, not an outcome verdict'"
+    },
+    {
+      "id": "docs-journeys-have-no-answer-channel",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "smoke-docs-find-pinning-exception burned 9 of 10 actions on cat README.md / ../README.md / ../../README.md / ./README.md / CLAUDE.md / docs/design-lineage.md / docs/superpowers/specs/..., every one exit 1, and verified nothing. Definitive: there is NO way to locate the README from the workdir -- run_journeys.py:600 sets workdir = <data_dir>/proj and makedirs it fresh, no repo checkout exists under it, and the README text reaches the Actor only via the system prompt (model.py:85-86), which cannot be cat'd. Nothing in the context pack says so. Fix: state in the pack that no checkout exists on disk, and compile docs journeys into --help probes plus one explicitly graded answer action. Unfixed from run 1.",
+      "journey_ids": ["smoke-docs-find-pinning-exception"],
+      "anchor": "hack/dogfood/run_journeys.py:600 (workdir = data_dir/proj, created empty) + hack/dogfood/model.py:85-86 (README/context pack live in the system prompt)"
+    },
+    {
+      "id": "docs-bare-port-echo-not-journey-backed",
+      "class": "inconclusive",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "The journey tightening for smoke-docs-bare-port-is-inspected largely worked: 11 actions, the graded action[8] is a genuine 'izba policy allow --help' print (not an echo), and the non-inheritance promise really is on that printed surface ('A granted port is always inspected: it never inherits a `protocol: tcp` pinning passthrough declared for some other port of the same host'). Two residual gaps: action[10] echoes 'A bare port declares nothing -> inspected', which is a verbatim quote of README.md:86 from the actor's PROMPT and is backed by nothing printed in the journey -- a smaller way to be tautological, contrary to the step's own expect; and action[9] wrapped a backticked quotation in double quotes so the shell substituted it away (stderr 'bash: line 1: protocol:: command not found'), silently dropping the token 'protocol: tcp' from the transcript. Require echoed quotations to be traceable to in-journey output and single-quoted.",
+      "journey_ids": ["smoke-docs-bare-port-is-inspected"],
+      "anchor": "dogfood-passthrough/tier-smoke.json -- step expect: 'the echoed line is backed by product text that was actually printed during this journey'"
+    }
+  ],
+  "capabilities": {
+    "established": [
+      "policy-file-at-create",
+      "policy-show-renders",
+      "hatch-declared",
+      "hatch-visible-in-show",
+      "manifest-egress-review",
+      "docs-name-authoring-path",
+      "docs-explain-non-inheritance"
+    ],
+    "blocked": [
+      "docs-explain-hatch"
+    ]
+  },
+  "counts": {
+    "kept": 0,
+    "refuted": 2,
+    "cheated": 0,
+    "inconclusive": 1
+  }
+}

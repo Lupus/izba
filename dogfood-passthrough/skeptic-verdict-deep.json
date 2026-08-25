@@ -1,0 +1,148 @@
+{
+ "feature": "per-port protocol inspectability / TLS-pinning passthrough (#233 + #238 + #239/PR #262)",
+ "tier": "deep",
+ "findings": [
+  {
+   "id": "gui-policy-tab-unloaded-state-is-savable",
+   "class": "real",
+   "severity": "P1",
+   "fix_routing": "escalate",
+   "summary": "The desktop Policy tab renders an UNLOADED policy as 'Firewall off' + 'No allowed hosts — add one to permit egress.' with the Save button live, so one click writes an EMPTY allow-list over the sandbox's managed policy.yaml. PolicyEditor starts at useState<Row[]>([]) / useState(false) for enforcing and fills them from an async api.policyShow(name) in useEffect (PolicyEditor.tsx:312-346); there is no loading state, no skeleton, and no gate on Save (<Button type=\"button\" onClick={() => void save()}>Save</Button>, :578-589). save() (:430-466) has no 'loaded' guard — with hosts === [] it calls api.policySetFull(name, [], []). Two independent trajectories captured the window rendered: gui-traj-1 / gui-cannot-activate-a-dormant-exception action[5] page_text 'Firewall off … No allowed hosts — add one to permit egress. … Save' for a sandbox whose managed truth is enforce:true + pinned.vendor.com [80,{443,tcp}], and the Actor then clicked that Save at action[6] (invoke_log policy_set_full ok:true — it landed after hydration, so nothing was lost this run); and gui-traj-2 / gui-saving-an-unrelated-edit-preserves-the-declaration action[5], the identical frame. Three reasons this is a product bug: (1) it misreports security posture on one of the only two surfaces that reveal a hatch — an operator opening an ENFORCING sandbox's Policy tab is shown 'Firewall off'; (2) the empty state is worded exactly like a legitimately empty policy, so the destructive click has no tell; (3) the write path is policySetFull, which by design skips the izba diff / izba promote weakening gate (PolicyEditor.tsx:144), so there is no '⚠ weakens egress' backstop and no confirmation over the host-only managed authority. The same hole is open on the error path: the catch sets error and leaves hosts === [], so after a failed load the editor sits permanently wipe-ready. No test covers it (app/src/test/policyEditor.test.tsx has no loading/disabled assertion). Fix is behaviour (a loaded state gating both the render and Save, or a refusal while unloaded), not wording. Distinct from the known #239/PR #262 class — this needs no editable control at all.",
+   "journey_ids": [
+    "gui-cannot-activate-a-dormant-exception",
+    "gui-saving-an-unrelated-edit-preserves-the-declaration"
+   ],
+   "anchor": "CLAUDE.md 'Inspectability is DECLARED per PORT' — '`izba policy show` and the desktop app's Policy tab are the two surfaces that reveal a hatch … the two revealing surfaces must not disagree about posture'; CLAUDE.md '`izba.yml` manifest trust boundary' — 'the managed truth (config.json + policy.yaml …) is host-only authority'; app/src/components/PolicyEditor.tsx:144, 312-346, 430-466, 578-589"
+  },
+  {
+   "id": "policy-reload-does-not-name-the-file-it-read",
+   "class": "discoverability",
+   "severity": "P3",
+   "fix_routing": "auto-fixable",
+   "summary": "`izba policy reload <name>` prints 'reloaded egress policy for '<name>' (applies to new connections)' and exits 0 without naming the file it re-read, so an operator who edited the wrong copy gets a success message and an unchanged policy. shard 0 / deep-declare-the-exception-on-a-running-sandbox action[13]: the Actor wrote its `port: 443 / protocol: tcp` edit into ./policy.yaml (its shell cwd) and ran `izba policy reload pin22` → exit 0, success line; action[14] `izba policy show pin22` still shows example.com [80,443] + dl-cdn.alpinelinux.org [53,443] with no declaration, and journey-end policy_yaml confirms it. NOT a doc gap — the context pack does carry the managed path (`izba policy reload --help`: 'That file is the managed truth, kept host-side at <izba data dir>/sandboxes/<name>/policy.yaml; edit it there and reload'). The finding is that the confirmation gives an operator nothing to notice. One string: echo the path that was re-read.",
+   "journey_ids": [
+    "deep-declare-the-exception-on-a-running-sandbox"
+   ],
+   "anchor": "context-pack.md:1007 (`izba policy reload --help`); crates/izba-cli/src/commands/policy.rs (reload echo)"
+  },
+  {
+   "id": "netlog-follow-help-omits-that-it-never-returns",
+   "class": "discoverability",
+   "severity": "P3",
+   "fix_routing": "auto-fixable",
+   "summary": "`izba netlog --follow`'s help reads 'Keep printing new records as they arrive (ignored with --summary)' and never says the command runs until interrupted. The implementation prints the backlog then polls forever ('Ends on Ctrl-C', crates/izba-cli/src/commands/netlog.rs:44-60). shard 2 / deep-pinned-host-keeps-the-vendor-certificate action[7]: `izba netlog pin24 --follow` ran to the 120s cap (exit 124). The BEHAVIOUR is correct tail -f semantics — the candidate itself is a journey defect — but the missing clause is real. Add '(runs until interrupted)'.",
+   "journey_ids": [
+    "deep-pinned-host-keeps-the-vendor-certificate"
+   ],
+   "anchor": "crates/izba-cli/src/main.rs:287-289 (Netlog { follow } doc comment) vs crates/izba-cli/src/commands/netlog.rs:44-60"
+  },
+  {
+   "id": "harness-seed-files-discarded-by-the-actor",
+   "class": "harness",
+   "severity": "P1",
+   "fix_routing": "auto-fixable",
+   "summary": "The CLI Actor discarded the seeded fixture in 11 of 11 CLI journeys, which is the single biggest reason this tier verified so little. Every CLI journey ships seed_files placing policy.yaml / izba.yml in the Actor's cwd and every intent says 'the policy file that is already in your working directory'; in every case the Actor's FIRST action was `cat > policy.yaml <<'EOF'` / `cat > izba.yml <<'EOF'` with content copied from the context pack's example (pinned.vendor.com, api.anthropic.com), never ls/cat-ing what was there. Step-level drift seeds were clobbered the same way (pin19 action[3], pin21 action[5], pin18 action[3]). The mechanism works — the GUI journeys, handed the same workspace, all created sandboxes carrying the seeded hatch (state_evidence.per_sandbox.pin-gui*.policy_yaml) — so this is a prompting defect. Fixes, strongest first: (a) have _run_step name the seeded paths in the step text handed to the Actor ('policy.yaml is already in your working directory — do not create it'); (b) detect an Actor write to a seeded relpath and re-seed + log it (or refuse the action); (c) name the fixture's hosts in the intent so a substitution is detectable.",
+   "journey_ids": [
+    "deep-review-flags-a-new-exception-as-weakening",
+    "deep-review-flags-losing-inspection-on-a-shared-port",
+    "deep-review-is-quiet-when-posture-tightens",
+    "deep-command-line-grants-skip-the-review-gate",
+    "deep-declare-the-exception-on-a-running-sandbox",
+    "deep-declaration-survives-a-restart",
+    "deep-pinned-host-keeps-the-vendor-certificate",
+    "deep-dormant-exception-still-intercepts",
+    "deep-exception-does-not-follow-a-raw-address",
+    "deep-two-hosts-one-port-only-one-passes-through",
+    "deep-exception-for-a-host-never-allowed"
+   ],
+   "anchor": "hack/dogfood/run_journeys.py:487-530 (_run_step), :582-631 (_write_seeds), :861"
+  },
+  {
+   "id": "harness-refusal-step-graded-on-the-later-force-retry",
+   "class": "harness",
+   "severity": "P1",
+   "fix_routing": "auto-fixable",
+   "summary": "A step that expects a REFUSAL is graded on the Actor's later retry, inverting a step that had already passed. expect_cmd_re selects the LAST matching action in the step. deep-command-line-grants-skip-the-review-gate step 2 (expect_exit nonzero, expect_stderr_re 'no reviewed diff') matched BOTH `izba promote pin21` (action[6], exit 1, stderr ``izba: error: no reviewed diff — run `izba diff` first (or --force)`` — an exact PASS) and `izba promote pin21 --force` (action[7], exit 0) and scored the second, producing two flipping candidates from a satisfied promise. For a step declaring expect_exit nonzero (or an expect_stderr_re describing a refusal), grade the FIRST match, or the match whose outcome satisfies the declared expectation if any does.",
+   "journey_ids": [
+    "deep-command-line-grants-skip-the-review-gate"
+   ],
+   "anchor": "hack/dogfood/run_journeys.py (expect_cmd_re selection) + hack/dogfood/oracles.py (functional_oracle)"
+  },
+  {
+   "id": "harness-mid-journey-expect-state-graded-at-journey-end",
+   "class": "harness",
+   "severity": "P2",
+   "fix_routing": "auto-fixable",
+   "summary": "A decisive step's expect_state is graded once, against the END-of-journey snapshot (_grade_decisive_state_hooks runs after capture_state_evidence, run_journeys.py:726-740, 920-935). deep-command-line-grants-skip-the-review-gate step 1 asserts api.example.net present; the Actor satisfied it at action[3]/[4] (`izba policy allow pin21 api.example.net` → exit 0 echo, then `policy show` listing it) and the journey's OWN next step then legitimately promoted a manifest that did not mention it. The oracle reports a divergence for a promise that was kept. Either snapshot per decisive step, or lint the corpus to reject expect_state on a non-final decisive step whose later steps mutate the same surface.",
+   "journey_ids": [
+    "deep-command-line-grants-skip-the-review-gate"
+   ],
+   "anchor": "hack/dogfood/run_journeys.py:726-740, 920-935"
+  },
+  {
+   "id": "harness-implicit-oracle-misreads-guest-output-resighting",
+   "class": "harness",
+   "severity": "P2",
+   "fix_routing": "auto-fixable",
+   "summary": "CORE-4 is still open and produced 11 of this tier's 32 candidates. The implicit oracle greps guest-command stderr for the token ERROR and calls it an izba crash marker — all 9 sightings are apk's own 'WARNING: fetching https://dl-cdn.alpinelinux.org/…: DNS lookup error / ERROR: unable to select packages: curl (no such package)' — and maps any exit 127 to izba's CommandNotFound wire frame, while `izba exec <n> -- sh -c '…'` returns the guest SHELL's 127 ('sh: curl: not found', 'sh: apt-get: not found'), which crun propagates exactly as the exit-code contract requires. No izba panic or abort occurred anywhere in the tier. Scope the crash-marker scan to izba's own stderr (require a panic/abort signature) and treat 127 as the izba frame only when stderr lacks a '<shell>: … not found' line.",
+   "journey_ids": [
+    "deep-declare-the-exception-on-a-running-sandbox",
+    "deep-declaration-survives-a-restart",
+    "deep-pinned-host-keeps-the-vendor-certificate",
+    "deep-dormant-exception-still-intercepts",
+    "deep-exception-does-not-follow-a-raw-address",
+    "deep-two-hosts-one-port-only-one-passes-through",
+    "deep-exception-for-a-host-never-allowed"
+   ],
+   "anchor": "hack/dogfood/oracles.py (implicit oracle); dogfood-passthrough/skeptic-core.md CORE-4"
+  },
+  {
+   "id": "harness-timed-out-action-loses-stdout",
+   "class": "harness",
+   "severity": "P2",
+   "fix_routing": "auto-fixable",
+   "summary": "A timed-out action loses its stdout and may orphan the process. run_action's TimeoutExpired path takes e.stdout (oracles.py:235-241), which came back EMPTY for `izba netlog pin24 --follow` even though the CLI prints its backlog before it starts polling — `izba netlog pin24` two actions earlier had printed 4 DENY rows. The empty capture is therefore a harness artifact, not product silence, and the skeptic could easily have read it as 'the command printed nothing'. Also, subprocess.run kills only the `bash -c` wrapper, so a streaming child can survive the action. Capture output incrementally and kill the process group.",
+   "journey_ids": [
+    "deep-pinned-host-keeps-the-vendor-certificate"
+   ],
+   "anchor": "hack/dogfood/oracles.py:222-250 (run_action) vs crates/izba-cli/src/commands/netlog.rs:26-44"
+  },
+  {
+   "id": "deep-datapath-and-lock-journeys-do-not-exercise-their-promise",
+   "class": "inconclusive",
+   "severity": "P1",
+   "fix_routing": "auto-fixable",
+   "summary": "Nine journeys are too weak to verify their promise, independently of DEEP-H0. (1) The five netlog journeys point at hosts that cannot resolve (pinned.vendor.com, example.org, www.iana.org) and rely on the Actor installing curl under enforce, so an absent netlog row is indistinguishable from 'the client never ran' — none proved anything. Replace with resolvable hosts and a curl-bearing image, and build the A/B this run produced by accident: pin26 (example.com with ports:[{443,tcp}]) fetched the VENDOR cert ('issuer: C=US; O=SSL Corporation; CN=Cloudflare TLS Issuing ECC CA 3', 'SSL certificate verify ok') while pin27 (example.com bare) got 'issuer: CN=izba egress CA; O=izba' and netlog 'ALLOW l7 example.com:443 GET / (allow-list)' — same host, same port, differing only by the declaration. Assert BOTH the netlog tier and the observed issuer. (2) deep-review-flags-losing-inspection-on-a-shared-port needs a lint: a 'loses inspection' fixture is only valid if the removed entry declares protocol: http on a NON-web port, because a bare non-web port implies Tcp (config.rs:278-284) and contributes nothing to inspect_ports. (3) deep-review-flags-a-new-exception-as-weakening needs an expect_state on the BASE asserting pinned:false before the drift, plus a lint that the drift adds no new (host,port) and no widened access — otherwise egress_weakens' first arm (diff.rs:176-185) satisfies it. (4) gui-cannot-activate-a-dormant-exception must make the Access click decisive and assert the radiogroup selection stays 'read'. (5) gui-cannot-move-the-exception-to-another-host must drop its mandatory Save step — a working lock leaves the editor clean, so 'saved · reloaded' is unreachable; assert on the Host control's accessible name and the absence of '● unsaved changes'. Also noted as a coverage constraint, not a new bug: an ALLOWED DNS query is never audit-recorded (router.rs:636-651 records only the deny arm), so an allow-listed but unresolvable host leaves no netlog line at all — same family as the known no-SNI diagnosability follow-up.",
+   "journey_ids": [
+    "deep-pinned-host-keeps-the-vendor-certificate",
+    "deep-dormant-exception-still-intercepts",
+    "deep-exception-does-not-follow-a-raw-address",
+    "deep-two-hosts-one-port-only-one-passes-through",
+    "deep-exception-for-a-host-never-allowed",
+    "deep-review-flags-losing-inspection-on-a-shared-port",
+    "deep-review-flags-a-new-exception-as-weakening",
+    "gui-cannot-activate-a-dormant-exception",
+    "gui-cannot-move-the-exception-to-another-host"
+   ],
+   "anchor": "crates/izba-core/src/manifest/diff.rs:167-227 (egress_weakens); crates/izba-core/src/daemon/egress/config.rs:256-284 (implied_for_port); crates/izba-core/src/daemon/egress/router.rs:636-651 (dns_loop audit); app/src/components/PolicyEditor.tsx:404-408 (setHostAccess refusal)"
+  }
+ ],
+ "capabilities": {
+  "established": [
+   "gui-pinned-row-visible",
+   "hatch-via-manifest",
+   "policy-file-at-create",
+   "policy-show-renders",
+   "hatch-declared",
+   "hatch-visible-in-show",
+   "manifest-egress-review"
+  ],
+  "blocked": []
+ },
+ "counts": {
+  "kept": 0,
+  "refuted": 22,
+  "cheated": 2,
+  "inconclusive": 10
+ }
+}
