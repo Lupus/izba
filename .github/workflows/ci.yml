@@ -122,7 +122,10 @@ jobs:
           python3 -m venv /tmp/dfvenv
           # jsonschema is what dispatch-swarm.sh uses to validate a journeys.json;
           # installing it here lets the fixture-validation test actually run.
-          /tmp/dfvenv/bin/pip install --quiet pytest jsonschema
+          # PyYAML backs the expect_state.policy oracle, which grades a sandbox's
+          # managed policy.yaml — without it those capture tests self-skip and the
+          # gate silently stops covering them.
+          /tmp/dfvenv/bin/pip install --quiet pytest jsonschema PyYAML
           # Covers the unittest.TestCase suites (CLI runner + oracles) AND the
           # pytest-style GUI + schema tests in one pass.
           /tmp/dfvenv/bin/pytest hack/dogfood -q
