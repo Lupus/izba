@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -197,7 +198,11 @@ def run_action(
     preserved (``__rc``); the cwd write-back is best-effort.
 
     Report-only: a timeout or any OS error is captured into the Action (exit_code
-    set to a non-zero sentinel); this never raises.
+    set to a non-zero sentinel); this never raises. A timed-out action KEEPS
+    whatever it printed before the kill and takes its whole process group down
+    with it (``_reap_process_group``) — a long-running command's output is
+    evidence, and an orphaned child would keep running against the shard's
+    data dir long after the action that spawned it was graded.
     """
     run_env = _shell_env(izba_bin, data_dir, env)
 
@@ -221,27 +226,34 @@ def run_action(
 
     start = time.monotonic()
     try:
-        proc = subprocess.run(
+        # start_new_session: the command gets its OWN process group, so a
+        # timeout can reap the whole tree (see _reap_process_group) instead of
+        # only the `bash -c` wrapper — a `--follow`-style child otherwise
+        # outlives the action and keeps running against the shard's data dir.
+        proc = subprocess.Popen(
             ["bash", "-c", to_run],
             cwd=workdir,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_s,
             env=run_env,
+            start_new_session=True,
         )
-        exit_code = proc.returncode
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-    except subprocess.TimeoutExpired as e:
-        exit_code = 124  # GNU timeout convention; non-zero so oracles flag it
-        stdout = (e.stdout or "") if isinstance(e.stdout, str) else ""
-        stderr = ((e.stderr or "") if isinstance(e.stderr, str) else "") + \
-            _console_tails(data_dir) + \
-            f"\n[harness] action timed out after {timeout_s}s"
     except OSError as e:
         exit_code = 125
         stdout = ""
         stderr = f"[harness] failed to run command via bash: {e}"
+    else:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_s)
+            exit_code = proc.returncode
+            stdout = stdout or ""
+            stderr = stderr or ""
+        except subprocess.TimeoutExpired:
+            exit_code = 124  # GNU timeout convention; non-zero so oracles flag it
+            stdout, stderr, drain_note = _reap_process_group(proc)
+            stderr += drain_note + _console_tails(data_dir) + \
+                f"\n[harness] action timed out after {timeout_s}s"
     latency_ms = int((time.monotonic() - start) * 1000)
 
     reconcile = _snapshot_reconcile(izba_bin, data_dir, timeout_s, run_env)
@@ -255,6 +267,48 @@ def run_action(
         latency_ms=latency_ms,
         reconcile=reconcile,
     )
+
+
+# How long to wait for the pipes to drain after the timeout kill. The group is
+# already SIGKILLed, so this is only the read of what it had written before it
+# died; a second timeout here means the output is genuinely unrecoverable, and
+# the harness SAYS so rather than reporting an empty capture as product silence.
+DRAIN_AFTER_KILL_S = 5.0
+
+
+def _reap_process_group(proc):
+    """Kill a timed-out action's whole process group and drain what it printed.
+
+    Returns ``(stdout, stderr, note)``. DEEP-H4, two halves of one defect:
+
+    - **Output.** On POSIX ``subprocess.run`` does NOT re-read the pipes after
+      its timeout kill (it only ``wait()``s), so ``TimeoutExpired.stdout`` is
+      ``None`` and everything the command had already printed is lost. A
+      `izba netlog <n> --follow` prints its whole backlog and then polls, so
+      the action that hit the cap recorded EMPTY stdout — indistinguishable, to
+      a reader, from the product having printed nothing. Draining after the
+      kill recovers it.
+    - **The child.** ``Popen.kill`` signals only the ``bash -c`` wrapper, so a
+      streaming grandchild survives the action. The command runs in its own
+      session (``start_new_session``), so the group kill reaches the tree.
+    """
+    note = ""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError, AttributeError):
+        # Already gone, no group to signal, or no killpg at all (non-POSIX):
+        # kill what we can. run_action must never raise out of the timeout path.
+        proc.kill()
+    try:
+        out, err = proc.communicate(timeout=DRAIN_AFTER_KILL_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = "", ""
+        note = ("\n[harness] could not drain the command's output after the "
+                f"kill within {DRAIN_AFTER_KILL_S}s — this capture is EMPTY "
+                f"because the harness lost it, NOT because the command "
+                f"printed nothing")
+    return out or "", err or "", note
 
 
 def _snapshot_reconcile(

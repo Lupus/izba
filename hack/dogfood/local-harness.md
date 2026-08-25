@@ -118,6 +118,29 @@ shape:
   `expect_text` visibly present in the final capture on the GUI.) A hook on a
   NON-decisive step is not graded either, and says so with an `infra`
   candidate — mark the step `core: true` or move the assertion.
+- `seed_files` is a PRECONDITION, and the Actor is never told about it (that is
+  the fair-test boundary). It will therefore sometimes author its own
+  `policy.yaml` / `izba.yml` straight over your fixture — in the 2026-08 deep
+  tier, in 11 of 11 CLI journeys. The runner WATCHES each seeded path and, the
+  moment it stops matching what was seeded, emits one flipping `infra`
+  candidate naming the file and the exact action that ended it. Nothing is
+  re-planted behind the Actor's back and nothing is graded in silence, but the
+  journey can no longer tally positive — so a corpus whose journeys all lose
+  their fixture now fails the shard (exit 3) instead of reporting a tidy green.
+  If your intent says "the file that is already in your working directory",
+  expect that flip and make the fixture matter some other way (e.g. assert on
+  content the Actor cannot invent).
+- A step that declares a REFUSAL (`expect_exit: "nonzero"`) is graded on the
+  action that satisfied it, even if the Actor then did something else — a guard
+  that fired has kept its promise, and the escape hatch the error message
+  advertises (`izba promote --force`) is a legitimate next move, not a failure.
+  The rescue is recorded in `decisive_credits`. Success-expecting steps keep
+  last-match grading: there, an earlier success must never absolve a later
+  failure.
+- An `expect_state` on a NON-final decisive step is graded at THAT step's
+  boundary, from a snapshot shipped in the bundle as `state_evidence_steps`.
+  A promise kept at step 1 and legitimately undone by your own step 2 is not a
+  divergence.
 - [ ] Validate the file against the schema before pushing (any JSON-schema
       checker, e.g. `python3 -c "import json,jsonschema,sys; jsonschema.validate(json.load(open('journeys.json')), json.load(open('hack/dogfood/schema/journeys.schema.json')))"`).
 

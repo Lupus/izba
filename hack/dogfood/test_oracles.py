@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -643,6 +644,59 @@ class GuestConsoleTests(unittest.TestCase):
             stub = self._stub(d)
             ev = oracles.capture_state_evidence(stub, d, 5)
             self.assertEqual(ev["per_sandbox"]["web"]["console_tail"], "")
+
+
+class TimeoutCaptureTests(unittest.TestCase):
+    """DEEP-H4: a timed-out action must keep what it printed, and must not
+    leave a child behind.
+
+    `izba netlog pin24 --follow` prints its backlog immediately and then polls
+    forever; the recorded stdout came back EMPTY, so the skeptic was one step
+    from reading a harness artifact as product silence. Cause: on POSIX
+    `subprocess.run` does not re-drain the pipes after a timeout kill
+    (`exc.stdout` stays None), and `Popen.kill` reaches only the `bash -c`
+    wrapper, so a streaming grandchild survives the action."""
+
+    def test_output_before_the_timeout_is_captured(self):
+        import oracles
+        with tempfile.TemporaryDirectory() as td:
+            a = oracles.run_action(
+                "echo BACKLOG_LINE; sleep 30", izba_bin="/bin/false",
+                workdir=td, data_dir=td, timeout_s=1.0)
+        self.assertEqual(a.exit_code, 124)
+        self.assertIn("BACKLOG_LINE", a.stdout_tail,
+                      "a long-running command's backlog must survive the kill")
+        self.assertIn("timed out", a.stderr_tail)
+
+    def test_stderr_before_the_timeout_is_captured_too(self):
+        import oracles
+        with tempfile.TemporaryDirectory() as td:
+            a = oracles.run_action(
+                "echo DIAGNOSTIC 1>&2; sleep 30", izba_bin="/bin/false",
+                workdir=td, data_dir=td, timeout_s=1.0)
+        self.assertIn("DIAGNOSTIC", a.stderr_tail)
+
+    def test_timeout_reaps_the_whole_process_group(self):
+        import oracles
+        with tempfile.TemporaryDirectory() as td:
+            pidfile = os.path.join(td, "child.pid")
+            oracles.run_action(
+                f"sleep 30 & echo $! > {pidfile}; wait", izba_bin="/bin/false",
+                workdir=td, data_dir=td, timeout_s=1.0)
+            with open(pidfile) as f:
+                pid = int(f.read().strip())
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return  # reaped
+            time.sleep(0.05)
+        try:
+            os.kill(pid, 9)   # do not leak it out of the test suite either
+        except ProcessLookupError:
+            pass
+        self.fail(f"the backgrounded child {pid} survived the action timeout")
 
 
 class TimeoutConsoleEvidenceTest(unittest.TestCase):

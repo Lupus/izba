@@ -418,6 +418,149 @@ class HarnessImprovementTests(unittest.TestCase):
             self.assertTrue(os.path.isdir(run_journeys._journey_data_dir(data_dir, "j-two")))
 
 
+class SeedSurvivalTests(unittest.TestCase):
+    """DEEP-H0: a seeded precondition the Actor overwrote must be an explicit,
+    auditable signal — never a silent grade of the Actor's own substitute.
+
+    The deep tier's dominant fact was that the CLI Actor `cat >`-overwrote the
+    seeded fixture in 11 of 11 journeys (its first act, every time), so the
+    oracles graded a file the journey compiler never authored. Telling the Actor
+    about the seed would breach the fair-test boundary (seeds are invisible to
+    it by contract), so the harness instead OBSERVES the fixture and says so."""
+
+    SEED = "enforce: true\nallow:\n  - seeded.example\n"
+
+    def _run(self, d, command, *, seed_files=None, steps=None):
+        stub = _write_stub_izba(d)
+        jf = _journeys_file(d, [{
+            "journey_id": "seeded",
+            "rationale": "r",
+            "source": {"kind": "spec", "ref": "x"},
+            "seed_files": seed_files if seed_files is not None
+            else {"policy.yaml": self.SEED},
+            "steps": steps or [{"intent": "use the policy file that is already "
+                                          "in your working directory",
+                                "expect": "it works"}],
+        }])
+        out = os.path.join(d, "traj.json")
+        self.rc = run_journeys.main([
+            "--journeys", jf, "--shard", "0", "--shards", "1",
+            "--izba-bin", stub, "--data-dir", d, "--out", out,
+            "--fake-model", json.dumps(command),
+        ])
+        with open(out) as f:
+            return json.load(f)
+
+    # The machine-readable marker the Phase-3 skeptic greps for. Pinned as a
+    # literal here on purpose: it is the wording a human reads in the bundle.
+    MARKER = "seeded precondition"
+
+    @classmethod
+    def _seed_candidates(cls, result):
+        return [c for c in result["candidates"]
+                if cls.MARKER in c.get("detail", "")]
+
+    def test_actor_overwriting_a_seeded_file_is_flagged(self):
+        with tempfile.TemporaryDirectory() as d:
+            bundle = self._run(d, [
+                {"command": "cat > policy.yaml <<'EOF'\nenforce: true\n"
+                            "allow:\n  - invented.example\nEOF"},
+                {"done": True},
+            ])
+            result = bundle["results"][0]
+            found = self._seed_candidates(result)
+            self.assertTrue(found, f"the clobbered seed must be reported: "
+                                   f"{result['candidates']}")
+            c = found[0]
+            self.assertEqual(c["kind"], "infra")  # flipping: nothing was verified
+            self.assertIn("seed", c["source"],
+                          "provenance must point at the seeding mechanism")
+            self.assertIn("policy.yaml", c["detail"])
+            self.assertIn("cat > policy.yaml", c["detail"],
+                          "the detail must name the action that clobbered it")
+            self.assertEqual(c["trajectory_ref"]["action_index"], 0)
+
+    def test_clobbered_seed_journey_is_not_positive_in_collector(self):
+        collector = _load_collector()
+        if collector is None:
+            self.skipTest("collector script not present")
+        with tempfile.TemporaryDirectory() as d:
+            bundle = self._run(d, [
+                {"command": "printf 'mine\\n' > policy.yaml"}, {"done": True},
+            ])
+            bdir = os.path.join(d, "bundles")
+            os.makedirs(bdir)
+            with open(os.path.join(bdir, "traj-0.json"), "w") as f:
+                json.dump(bundle, f)
+            data = collector.collect(bdir)
+            self.assertEqual(data["totals"]["positive_journeys"], 0,
+                             "a journey whose precondition was destroyed "
+                             "verified nothing")
+
+    def test_deleting_a_seeded_file_is_flagged_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            bundle = self._run(d, [{"command": "rm -f policy.yaml"},
+                                   {"done": True}])
+            found = self._seed_candidates(bundle["results"][0])
+            self.assertTrue(found)
+            self.assertIn("policy.yaml", found[0]["detail"])
+
+    def test_all_journeys_clobbering_their_seed_is_catastrophic(self):
+        # The flip has teeth: a clobbered precondition is an `infra` candidate,
+        # so the journey counts as DEGRADED — and a run in which every journey
+        # destroyed its fixture (the 2026-08 deep tier: 11 of 11) measured
+        # nothing and must fail the job, not report a tidy green.
+        with tempfile.TemporaryDirectory() as d:
+            self._run(d, [{"command": "printf 'mine\\n' > policy.yaml"},
+                          {"done": True}])
+            self.assertEqual(self.rc, run_journeys.EXIT_CATASTROPHIC_INFRA)
+
+    def test_untouched_seed_run_stays_green(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._run(d, [{"command": "cat policy.yaml"}, {"done": True}])
+            self.assertEqual(self.rc, 0)
+
+    def test_untouched_seed_is_silent(self):
+        with tempfile.TemporaryDirectory() as d:
+            bundle = self._run(d, [{"command": "cat policy.yaml"},
+                                   {"done": True}])
+            result = bundle["results"][0]
+            self.assertEqual(self._seed_candidates(result), [],
+                             "a surviving fixture must produce no signal")
+            self.assertIn("seeded.example", result["actions"][0]["stdout_tail"])
+
+    def test_reported_once_per_seed_not_once_per_later_action(self):
+        with tempfile.TemporaryDirectory() as d:
+            bundle = self._run(d, [
+                {"command": "printf 'mine\\n' > policy.yaml"},
+                {"command": "cat policy.yaml"},
+                {"command": "cat policy.yaml"},
+                {"done": True},
+            ])
+            self.assertEqual(len(self._seed_candidates(bundle["results"][0])), 1)
+
+    def test_step_level_reseed_reestablishes_the_fixture(self):
+        # A step-level seed_files re-authors the file mid-journey: the drift
+        # fixture is a NEW precondition, so a clobber of the ORIGINAL before it
+        # is reported once, and the re-seeded content is tracked from there.
+        with tempfile.TemporaryDirectory() as d:
+            bundle = self._run(
+                d,
+                [{"command": "printf 'mine\\n' > policy.yaml"}, {"done": True},
+                 {"command": "cat policy.yaml"}, {"done": True}],
+                steps=[
+                    {"intent": "step 0", "expect": "x"},
+                    {"intent": "step 1", "expect": "y",
+                     "seed_files": {"policy.yaml": "enforce: false\n"}},
+                ])
+            result = bundle["results"][0]
+            found = self._seed_candidates(result)
+            self.assertEqual(len(found), 1, found)
+            self.assertEqual(found[0]["trajectory_ref"]["action_index"], 0)
+            self.assertIn("enforce: false", result["actions"][1]["stdout_tail"],
+                          "the step-level seed must land over the Actor's file")
+
+
 class SeedFilesTests(unittest.TestCase):
     def test_write_seeds_writes_nested_and_rejects_traversal(self):
         with tempfile.TemporaryDirectory() as d:
@@ -578,6 +721,183 @@ def _write_decisive_stub_izba(d):
     subcommand -> exit 0 (the core step's success). cd/file ops need no stubbing —
     run_action runs a real shell, so only `izba` itself is intercepted here."""
     return _write_stub_izba(d)
+
+
+class RefusalNotReversedByRetryTests(unittest.TestCase):
+    """DEEP-H1: an assertion the product SATISFIED, then followed by something
+    else, must not be graded on the something else.
+
+    `expect_cmd_re` selects the LAST matching action, which is right for "the
+    Actor retried until it got it right" and wrong for "the refusal fired, then
+    the Actor deliberately took the escape hatch the error message advertised".
+    In `deep-command-line-grants-skip-the-review-gate` the refusal fired at
+    action[6] EXACTLY as asserted and was scored against action[7]'s legitimate
+    `--force` retry, turning a kept promise into two flipping candidates."""
+
+    REFUSAL = ("izba: error: no reviewed diff — run `izba diff` first "
+               "(or --force)")
+
+    def _produced(self):
+        return [
+            {"command": "izba promote pin21", "exit_code": 1,
+             "stderr_tail": self.REFUSAL, "stdout_tail": ""},
+            {"command": "izba promote pin21 --force", "exit_code": 0,
+             "stderr_tail": "WARNING: --force: promoting changes that were "
+                            "never reviewed", "stdout_tail": "promoted pin21"},
+        ]
+
+    def _step(self):
+        return {"intent": "promote without reviewing first",
+                "expect": "izba refuses to promote an unreviewed diff",
+                "expect_exit": "nonzero",
+                "expect_stderr_re": "no reviewed diff",
+                "expect_cmd_re": r"izba promote"}
+
+    def test_refusal_satisfied_then_force_retry_is_not_a_candidate(self):
+        import run_journeys as rj
+        cands = rj._grade_step_functional(
+            self._step(), self._produced(), {}, "pin21", True, action_index=1)
+        self.assertFalse(
+            cands, f"the refusal fired at action[0] exactly as asserted; the "
+                   f"deliberate --force retry must not invert it: {cands}")
+
+    def test_the_satisfying_action_is_recorded_as_an_auditable_credit(self):
+        import run_journeys as rj
+        credits = []
+        rj._grade_step_functional(
+            self._step(), self._produced(), {}, "pin21", True, action_index=1,
+            step_index=2, credits=credits)
+        self.assertEqual(len(credits), 1, credits)
+        self.assertEqual(credits[0]["step_index"], 2)
+        self.assertEqual(credits[0]["action_index"], 0)
+        self.assertEqual(credits[0]["graded_cmd"], "izba promote pin21")
+
+    def test_retry_until_right_still_grades_the_successful_retry(self):
+        # The common case last-match exists for: the Actor got it wrong, then
+        # got it right. Unchanged — no candidate, and no rescue needed.
+        import run_journeys as rj
+        produced = [{"command": "izba diff web", "exit_code": 2,
+                     "stderr_tail": "no such sandbox", "stdout_tail": ""},
+                    {"command": "izba diff webapp", "exit_code": 0,
+                     "stderr_tail": "", "stdout_tail": "no changes"}]
+        step = {"intent": "review the diff", "expect": "the diff renders",
+                "expect_exit": 0, "expect_cmd_re": r"izba diff"}
+        credits = []
+        cands = rj._grade_step_functional(step, produced, {}, "j1", True,
+                                          action_index=1, credits=credits)
+        self.assertFalse(cands, cands)
+        self.assertFalse(credits, "the LAST match already satisfied it; "
+                                  "nothing to rescue and nothing to claim")
+
+    def test_no_match_satisfies_still_flips_on_the_last_match(self):
+        # Strictness preserved: when NO eligible action satisfied the
+        # assertion, the verdict is still a candidate graded on the last match.
+        import run_journeys as rj
+        produced = [{"command": "izba promote a", "exit_code": 0,
+                     "stderr_tail": "", "stdout_tail": ""},
+                    {"command": "izba promote b", "exit_code": 0,
+                     "stderr_tail": "", "stdout_tail": ""}]
+        step = {"intent": "x", "expect": "izba refuses",
+                "expect_exit": "nonzero", "expect_cmd_re": r"izba promote"}
+        cands = rj._grade_step_functional(step, produced, {}, "j1", True,
+                                          action_index=1)
+        self.assertTrue(cands)
+        self.assertEqual(cands[0]["graded_cmd"], "izba promote b")
+
+    def test_rescue_also_applies_without_expect_cmd_re(self):
+        # The same "satisfied, then the Actor did something else" shape with no
+        # expect_cmd_re: the default target is the LAST product invocation.
+        import run_journeys as rj
+        produced = [{"command": "izba promote pin21", "exit_code": 1,
+                     "stderr_tail": self.REFUSAL, "stdout_tail": ""},
+                    {"command": "izba promote pin21 --force", "exit_code": 0,
+                     "stderr_tail": "", "stdout_tail": ""}]
+        step = {"intent": "x", "expect": "izba refuses",
+                "expect_exit": "nonzero"}
+        cands = rj._grade_step_functional(step, produced, {}, "j1", True,
+                                          action_index=1)
+        self.assertFalse(cands, cands)
+
+    def test_a_success_expecting_step_is_never_rescued(self):
+        # The rescue is scoped to a step that asserts a REFUSAL (a guard that
+        # fires once has kept its promise; what the Actor does next is its own
+        # business). A SUCCESS-expecting step keeps last-match authority: an
+        # earlier success must never absolve a later failure, or the harness
+        # would start hiding real bugs behind the Actor's first lucky attempt.
+        import run_journeys as rj
+        produced = [{"command": "izba start web", "exit_code": 0,
+                     "stderr_tail": "", "stdout_tail": "started"},
+                    {"command": "izba start web2", "exit_code": 1,
+                     "stderr_tail": "izba: error: boot failed",
+                     "stdout_tail": ""}]
+        step = {"intent": "start a sandbox", "expect": "the sandbox starts",
+                "expect_exit": 0, "expect_cmd_re": r"izba start"}
+        credits = []
+        cands = rj._grade_step_functional(step, produced, {}, "j1", True,
+                                          action_index=1, credits=credits)
+        self.assertTrue(cands, "the later failure is real signal")
+        self.assertEqual(cands[0]["graded_cmd"], "izba start web2")
+        self.assertFalse(credits)
+
+    def test_a_stream_assertion_on_a_refusal_step_is_rescued_too(self):
+        # Both halves of the assertion are re-graded on the rescued action, so
+        # a step is only rescued by an action that satisfied it IN FULL.
+        import run_journeys as rj
+        step = {"intent": "x", "expect": "the refusal names the remedy",
+                "expect_exit": "nonzero",
+                "expect_stderr_re": r"run `izba diff` first",
+                "expect_cmd_re": r"izba promote"}
+        cands = rj._grade_step_functional(step, self._produced(), {}, "j1",
+                                          True, action_index=1)
+        self.assertFalse(cands, cands)
+
+    def test_partial_satisfaction_does_not_rescue(self):
+        # action[0] refuses (exit 1) but WITHOUT the asserted stderr; the step
+        # must still flip — a rescue needs every declared assertion satisfied.
+        import run_journeys as rj
+        produced = [{"command": "izba promote pin21", "exit_code": 1,
+                     "stderr_tail": "izba: error: something else entirely",
+                     "stdout_tail": ""},
+                    {"command": "izba promote pin21 --force", "exit_code": 0,
+                     "stderr_tail": "", "stdout_tail": ""}]
+        cands = rj._grade_step_functional(self._step(), produced, {}, "j1",
+                                          True, action_index=1)
+        self.assertTrue(cands)
+        self.assertEqual(cands[0]["graded_cmd"], "izba promote pin21 --force")
+
+    def test_credit_lands_in_the_bundle(self):
+        # End to end through main(): the rescue is visible to the Phase-3
+        # skeptic in `decisive_credits`, never a silent regrade.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            jf = _journeys_file(d, [{
+                "journey_id": "refusal",
+                "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"},
+                "steps": [{"intent": "the gate must refuse",
+                           "expect": "izba refuses", "core": True,
+                           "expect_exit": "nonzero",
+                           "expect_cmd_re": r"izba"}],
+            }])
+            out = os.path.join(d, "traj.json")
+            rc = run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps([
+                    {"command": "izba bogus-subcommand"},   # exit 2: the refusal
+                    {"command": "izba ls"},                 # exit 0: the retry
+                    {"done": True}]),
+            ])
+            self.assertEqual(rc, 0)
+            with open(out) as f:
+                result = json.load(f)["results"][0]
+            self.assertFalse([c for c in result["candidates"]
+                              if c["kind"] == "functional"],
+                             result["candidates"])
+            credits = result["decisive_credits"]
+            self.assertEqual(len(credits), 1, credits)
+            self.assertEqual(credits[0]["action_index"], 0)
+            self.assertEqual(credits[0]["graded_cmd"], "izba bogus-subcommand")
 
 
 class DecisiveGradingTests(unittest.TestCase):
@@ -1318,9 +1638,14 @@ class ExpectCmdReTests(unittest.TestCase):
             func = [c for c in res["candidates"] if c["kind"] == "functional"]
             self.assertEqual(func, [], func)
 
-    def test_without_anchor_trailing_verify_false_fires(self):
-        # Same trajectory WITHOUT expect_cmd_re: the final action (ls, exit 0)
-        # is graded against nonzero -> false candidate. Locks in the motivation.
+    def test_without_anchor_a_satisfied_refusal_is_credited_not_flipped(self):
+        # Same trajectory WITHOUT expect_cmd_re. This USED to grade the final
+        # action (ls, exit 0) against nonzero and fire a false candidate — the
+        # motivation for expect_cmd_re, and the same defect DEEP-H1 fixes at
+        # the root: the refusal DID fire at action[0], so the step passes and
+        # the rescue is recorded for audit. `expect_cmd_re` still matters for
+        # success-expecting steps (never rescued) and for pinning which action
+        # a candidate points at.
         step = {"intent": "try the guarded op", "expect": "must be refused",
                 "expect_exit": "nonzero", "core": True}
         with tempfile.TemporaryDirectory() as d:
@@ -1329,8 +1654,11 @@ class ExpectCmdReTests(unittest.TestCase):
                 {"command": "izba ls"},
                 {"done": True}])
             func = [c for c in res["candidates"] if c["kind"] == "functional"]
-            self.assertEqual(len(func), 1)
-            self.assertEqual(func[0].get("graded_cmd"), "izba ls")
+            self.assertEqual(func, [], func)
+            self.assertEqual(
+                [(c["step_index"], c["action_index"], c["graded_cmd"])
+                 for c in res["decisive_credits"]],
+                [(0, 0, "izba bogus-subcommand")])
 
     def test_mid_step_match_pins_action_index(self):
         # The anchored action is NOT the step's last: two distinct verifies
@@ -1681,6 +2009,140 @@ def _write_reconcile_stub_izba(d, sandboxes="[]", reconcile_exit=0):
         )
     os.chmod(stub, 0o755)
     return stub
+
+
+def _write_mutable_state_stub_izba(d):
+    """A stub `izba` with REAL state: `create` plants a marker, `rm` removes
+    it, and `__reconcile` reports the sandbox iff the marker exists — so a
+    journey's daemon truth genuinely differs between step 0 and step 1."""
+    stub = os.path.join(d, "izba")
+    marker = os.path.join(d, "created")
+    with open(stub, "w") as f:
+        f.write(
+            "#!/bin/sh\n"
+            'if [ "$1" = "__reconcile" ]; then\n'
+            f'  if [ -f {marker} ]; then\n'
+            '    echo \'{"violations":[],"sandboxes":[{"name":"web","status_disk":"running"}]}\'\n'
+            "  else\n"
+            '    echo \'{"violations":[],"sandboxes":[]}\'\n'
+            "  fi\n"
+            "  exit 0\n"
+            "fi\n"
+            f'if [ "$1" = "create" ]; then : > {marker}; echo created; exit 0; fi\n'
+            f'if [ "$1" = "rm" ]; then rm -f {marker}; echo removed; exit 0; fi\n'
+            'echo "izba-said: $*"\n'
+            "exit 0\n"
+        )
+    os.chmod(stub, 0o755)
+    return stub
+
+
+class MidJourneyExpectStateTests(unittest.TestCase):
+    """DEEP-H2: an `expect_state` about a MID-JOURNEY moment must be graded at
+    that moment.
+
+    `_grade_decisive_state_hooks` ran once, against the end-of-journey
+    `capture_state_evidence` snapshot. In
+    `deep-command-line-grants-skip-the-review-gate` step 1's assertion was
+    satisfied at action[3]/[4] and then legitimately undone by the journey's
+    OWN step 2 — so the oracle reported a divergence for a promise that was
+    kept. Grading a step against a snapshot taken after later steps changed
+    the world is grading the wrong fixture, which is exactly the class of
+    harness lie this instrument keeps having to close."""
+
+    def _journey(self, steps):
+        return {"journey_id": "mid-state", "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"}, "steps": steps}
+
+    def _run(self, d, steps, script):
+        return run_journeys.run_journey(
+            FakeModel(script), self._journey(steps),
+            izba_bin=_write_mutable_state_stub_izba(d), data_dir=d,
+            max_turns=12, step_cap=25, action_timeout_s=10,
+            latency_budget_ms=30000, budget={"usd": 0.0}, max_usd=5.0)
+
+    STEPS = [
+        {"intent": "create the sandbox", "expect": "it exists", "core": True,
+         "expect_state": {"sandboxes_exact": ["web"]}},
+        {"intent": "then tidy up", "expect": "it is gone"},
+    ]
+    SCRIPT = [{"command": "izba create web"}, {"done": True},
+              {"command": "izba rm web --force"}, {"done": True}]
+
+    def test_step_assertion_is_graded_at_its_own_step_boundary(self):
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, self.STEPS, self.SCRIPT)
+        self.assertEqual([c for c in res["candidates"]
+                          if c["kind"] in ("functional", "infra",
+                                           "unreached_decisive")],
+                         [], "step 0's assertion held AT step 0; a later step "
+                             "legitimately undoing it is not a product bug")
+        credits = [c for c in res["decisive_credits"]
+                   if "expect_state" in (c.get("graded_cmd") or "")]
+        self.assertEqual(len(credits), 1, res["decisive_credits"])
+
+    def test_the_step_boundary_snapshot_is_in_the_bundle(self):
+        # A credit graded against evidence nobody can see is not auditable:
+        # the snapshot the grade was drawn from ships with the journey.
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, self.STEPS, self.SCRIPT)
+        steps_ev = res["state_evidence_steps"]
+        self.assertIn("0", steps_ev, steps_ev)
+        self.assertEqual(steps_ev["0"]["sandboxes"], ["web"])
+        # ... and the end-of-journey snapshot still tells the other truth.
+        self.assertEqual(res["state_evidence"]["sandboxes"], [])
+
+    def test_a_bundle_carrying_step_snapshots_validates(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema not installed")
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_mutable_state_stub_izba(d)
+            jf = _journeys_file(d, [self._journey(self.STEPS)])
+            out = os.path.join(d, "traj.json")
+            run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps(self.SCRIPT)])
+            with open(out) as f:
+                bundle = json.load(f)
+            self.assertIn("state_evidence_steps", bundle["results"][0])
+            schema_path = os.path.join(os.path.dirname(
+                os.path.abspath(run_journeys.__file__)),
+                "schema", "trajectory.schema.json")
+            with open(schema_path) as f:
+                jsonschema.validate(bundle, json.load(f))
+
+    def test_a_genuinely_wrong_step_state_still_flips(self):
+        # Strictness preserved: when the assertion was false AT ITS OWN step,
+        # the decisive functional candidate still fires.
+        steps = [dict(self.STEPS[0]), dict(self.STEPS[1])]
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, steps,
+                            [{"command": "izba ls"}, {"done": True},
+                             {"command": "izba ls --json"}, {"done": True}])
+        func = [c for c in res["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res["candidates"])
+        self.assertIn("expect_state", func[0]["detail"])
+
+    def test_final_step_still_grades_on_the_end_of_journey_snapshot(self):
+        # No behavior change (and no extra capture) for the common shape: the
+        # decisive step is the last one.
+        steps = [{"intent": "create", "expect": "ok"},
+                 {"intent": "and it is there", "expect": "it exists",
+                  "core": True,
+                  "expect_state": {"sandboxes_exact": ["web"]}}]
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, steps,
+                            [{"command": "izba ls"}, {"done": True},
+                             {"command": "izba create web"}, {"done": True}])
+        self.assertEqual([c for c in res["candidates"]
+                          if c["kind"] in ("functional", "infra",
+                                           "unreached_decisive")], [],
+                         res["candidates"])
+        self.assertEqual(res.get("state_evidence_steps", {}), {},
+                         "the last step needs no extra snapshot")
 
 
 class CliExpectStateTests(unittest.TestCase):
