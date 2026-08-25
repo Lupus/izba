@@ -250,6 +250,46 @@ def apply_hook_verdict(verdict: str, found: List[Any], *, hook: str,
         candidates.append(cd)
 
 
+def step_was_entered(step_idx: int, step_actions: Dict[int, int]) -> bool:
+    """Did the Actor produce at least one action INSIDE this step?
+
+    The single definition of "reached", shared by both runners so they cannot
+    drift apart again. `step_actions` maps step index -> the number of actions
+    that step produced (CLI: shell commands; GUI: browser actions); a step the
+    run never opened has no entry at all, which is zero.
+
+    Why it is load-bearing: grading a decisive step the Actor never entered
+    emits "diverges from daemon truth" about an assertion nobody exercised —
+    the harness FABRICATING a product finding, which reaches Phase-3 triage
+    indistinguishable from a real one. Both runners refuse.
+
+    What each runner does with a NOT-entered decisive step is deliberately
+    identical in shape but surface-specific in evidence: it may still be
+    graded if OBSERVED evidence already satisfies its declared assertion —
+    the CLI's `_grade_decisive_from_observed` (an earlier action matching
+    `expect_cmd_re`, post-watermark), the GUI's final-capture `expect_text`
+    fallback. Otherwise the step yields `unentered_step_candidate` ALONE: no
+    functional flip, and no credit either (a credit from an unreached step is
+    what the watermark discipline forbids)."""
+    return (step_actions or {}).get(step_idx, 0) > 0
+
+
+def unentered_step_candidate(journey_id: str, step: Dict[str, Any],
+                             step_idx: int, source: str) -> Dict[str, Any]:
+    """The flip for a decisive step the Actor never entered — one wording,
+    both runners, so a bundle reader sees one convention."""
+    return {
+        "kind": "unreached_decisive",
+        "detail": (f"decisive step {step_idx} "
+                   f"({step.get('intent', '')[:80]!r}) produced no actions — "
+                   f"its assertion was never exercised"),
+        "violated_expectation": (step.get("expect", "")
+                                 or "decisive step must be exercised"),
+        "source": source,
+        "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
+    }
+
+
 ZERO_ACTION_REASON = ("actor performed no actions; decisive assertion "
                        "never exercised")
 

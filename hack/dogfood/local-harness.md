@@ -100,13 +100,24 @@ shape:
   of flagging `unreached_decisive`.
 - An exit code is rarely the assertion you mean. On a decisive step also declare
   `expect_stdout_re` (a regex over WHAT the graded command printed — `izba
-  netlog` exits 0 whether the flow was spliced or terminated) and/or
-  `expect_state` (a small daemon-truth assertion — sandbox existence/status,
+  netlog` exits 0 whether the flow was spliced or terminated),
+  `expect_stderr_re` (its twin, and the ONLY way to grade izba's own warnings
+  and refusals: `izba promote`'s `WARNING: weakens egress` and its `no reviewed
+  diff` bail are written to stderr) and/or `expect_state` (a small daemon-truth assertion — sandbox existence/status,
   volumes, ports, and the saved `policy.yaml`). Both are graded on CLI and GUI
-  journeys, both compose with `expect_exit` (all declared assertions must
-  hold), and both are invisible to the Actor. A declared hook that cannot be
+  journeys, they compose with `expect_exit` (all declared assertions must
+  hold), and all are invisible to the Actor. A declared hook that cannot be
   graded degrades the journey loudly (`infra` / `unreached_decisive`) — it
   never passes silently.
+- Put the assertion on the step the Actor must ACT in. Both runners refuse to
+  grade a decisive step that produced no actions: it yields `unreached_decisive`
+  alone — no product finding is manufactured from a step nobody reached, and no
+  credit is granted for one either. (The one exception, on both surfaces, is a
+  step whose declared assertion is already satisfied by OBSERVED evidence: an
+  earlier action matching `expect_cmd_re` on the CLI, the declared
+  `expect_text` visibly present in the final capture on the GUI.) A hook on a
+  NON-decisive step is not graded either, and says so with an `infra`
+  candidate — mark the step `core: true` or move the assertion.
 - [ ] Validate the file against the schema before pushing (any JSON-schema
       checker, e.g. `python3 -c "import json,jsonschema,sys; jsonschema.validate(json.load(open('journeys.json')), json.load(open('hack/dogfood/schema/journeys.schema.json')))"`).
 

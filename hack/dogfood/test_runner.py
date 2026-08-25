@@ -1925,7 +1925,7 @@ class StdoutReTruncationHonestyTests(unittest.TestCase):
         action = {"command": "izba netlog demo",
                   "stdout_tail": run_journeys_tail("X" * (TAIL_BYTES + 10)),
                   "exit_code": 0}
-        found = run_journeys._stdout_candidates(
+        found = run_journeys._stream_candidates(
             step, action, "src", {"journey_id": "j", "action_index": 0}, "j")
         self.assertEqual(len(found), 1)
         self.assertIn("truncat", found[0].detail.lower())
@@ -1934,7 +1934,136 @@ class StdoutReTruncationHonestyTests(unittest.TestCase):
         step = {"expect_stdout_re": "OPAQUE-SPLICE", "expect": "spliced"}
         action = {"command": "izba netlog demo", "stdout_tail": "nope\n",
                   "exit_code": 0}
-        found = run_journeys._stdout_candidates(
+        found = run_journeys._stream_candidates(
             step, action, "src", {"journey_id": "j", "action_index": 0}, "j")
         self.assertEqual(len(found), 1)
         self.assertNotIn("truncat", found[0].detail.lower())
+
+
+def _write_stderr_stub_izba(d):
+    """A stub `izba` whose `promote` writes its decisive line to STDERR — the
+    real shape: `izba promote`'s `WARNING: weakens egress` (PromoteEvent::Warn
+    → eprintln!) and the `no reviewed diff` bail both go to stderr, where
+    expect_stdout_re structurally cannot see them."""
+    stub = os.path.join(d, "izba")
+    with open(stub, "w") as f:
+        f.write(
+            "#!/bin/sh\n"
+            'if [ "$1" = "__reconcile" ]; then echo \'{"violations":[],"sandboxes":[]}\'; exit 0; fi\n'
+            'if [ "$1" = "promote" ]; then\n'
+            '  echo "WARNING: weakens egress" 1>&2\n'
+            '  echo "Promoted 1 change(s)."\n'
+            "  exit 0\n"
+            "fi\n"
+            'echo "izba-said: $*"\n'
+            "exit 0\n"
+        )
+    os.chmod(stub, 0o755)
+    return stub
+
+
+class ExpectStderrReTests(unittest.TestCase):
+    """The security-posture assertion of the whole passthrough campaign —
+    `izba promote`'s `WARNING: weakens egress` — is written to STDERR, so
+    `expect_stdout_re` cannot see it and that half of the review-gate
+    assertion rested on the skeptic reading prose. `expect_stderr_re` is its
+    symmetric twin: same action selection, same composition, same credit-path
+    enforcement, same truncation honesty, same invisibility to the Actor."""
+
+    def _run(self, d, step, script, stub=None):
+        journey = {"journey_id": "stderr-anchor", "rationale": "r",
+                   "source": {"kind": "spec", "ref": "x"},
+                   "steps": [step] if isinstance(step, dict) else step}
+        jf = _journeys_file(d, [journey])
+        out = os.path.join(d, "traj.json")
+        run_journeys.main([
+            "--journeys", jf, "--shard", "0", "--shards", "1",
+            "--izba-bin", stub or _write_stderr_stub_izba(d),
+            "--data-dir", d, "--out", out,
+            "--fake-model", json.dumps(script),
+            "--step-cap", "25", "--action-timeout-s", "10",
+            "--max-turns", "10", "--max-usd", "5"])
+        with open(out) as f:
+            return json.load(f)["results"][0]
+
+    def test_stderr_match_passes(self):
+        step = {"intent": "promote the change", "expect": "the gate warns",
+                "core": True, "expect_stderr_re": r"WARNING: weakens egress"}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [{"command": "izba promote ."},
+                                      {"done": True}])
+        self.assertEqual([c for c in res["candidates"]
+                          if c["kind"] == "functional"], [], res["candidates"])
+
+    def test_stderr_mismatch_flips_the_decisive_step(self):
+        step = {"intent": "promote the change", "expect": "the gate warns",
+                "core": True, "expect_stderr_re": r"weakens INGRESS"}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [{"command": "izba promote ."},
+                                      {"done": True}])
+        func = [c for c in res["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res["candidates"])
+        self.assertTrue(func[0].get("decisive"), func[0])
+        self.assertEqual(func[0].get("graded_cmd"), "izba promote .")
+        self.assertIn("expect_stderr_re", func[0]["detail"])
+        self.assertIn("stderr", func[0]["detail"])
+
+    def test_composes_with_stdout_and_exit(self):
+        # All three declared: stdout + exit hold, stderr does not ⇒ the step
+        # still flips, on the stderr half alone.
+        step = {"intent": "promote the change", "expect": "the gate warns",
+                "core": True, "expect_exit": 0,
+                "expect_stdout_re": r"Promoted 1 change",
+                "expect_stderr_re": r"weakens INGRESS"}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [{"command": "izba promote ."},
+                                      {"done": True}])
+        func = [c for c in res["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res["candidates"])
+        self.assertIn("expect_stderr_re", func[0]["detail"])
+
+    def test_enforced_on_the_credit_path(self):
+        # H3: a decisive step credited from an EARLIER action must still prove
+        # what that action printed on stderr — otherwise the false green just
+        # reopens there.
+        steps = [
+            {"intent": "promote the change", "expect": "warned"},
+            {"intent": "confirm the warning", "expect": "the gate warned",
+             "core": True, "expect_cmd_re": r"izba promote",
+             "expect_stderr_re": r"weakens INGRESS"},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, steps, [{"command": "izba promote ."},
+                                       {"done": True}, {"done": True}])
+        func = [c for c in res["candidates"] if c["kind"] == "functional"]
+        self.assertEqual(len(func), 1, res["candidates"])
+        self.assertIn("expect_stderr_re", func[0]["detail"])
+        self.assertTrue(func[0].get("decisive"))
+
+    def test_invalid_regex_degrades_to_infra(self):
+        step = {"intent": "promote the change", "expect": "the gate warns",
+                "core": True, "expect_stderr_re": r"("}
+        with tempfile.TemporaryDirectory() as d:
+            res = self._run(d, step, [{"command": "izba promote ."},
+                                      {"done": True}])
+        infra = [c for c in res["candidates"]
+                 if c["kind"] == "infra" and "expect_stderr_re" in c["detail"]]
+        self.assertEqual(len(infra), 1, res["candidates"])
+
+    def test_truncated_stderr_is_named_in_the_detail(self):
+        from oracles import TAIL_BYTES, _tail
+        step = {"expect_stderr_re": "MISSING-TOKEN", "expect": "warned"}
+        action = {"command": "izba promote .", "exit_code": 0,
+                  "stdout_tail": "", "stderr_tail": _tail("Y" * (TAIL_BYTES + 9))}
+        found = run_journeys._stream_candidates(
+            step, action, "src", {"journey_id": "j", "action_index": 0}, "j")
+        self.assertEqual(len(found), 1)
+        self.assertIn("truncat", found[0].detail.lower())
+
+    def test_one_parameterised_implementation_not_two(self):
+        # A second copy of this rule is the specific mistake this codebase has
+        # paid for: stdout and stderr are one grader over a stream table.
+        self.assertFalse(hasattr(run_journeys, "_stderr_candidates"))
+        self.assertEqual(
+            sorted(h[0] for h in run_journeys._STREAM_HOOKS),
+            ["expect_stderr_re", "expect_stdout_re"])

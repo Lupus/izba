@@ -1610,10 +1610,14 @@ def test_expect_state_settle_audits_survive_across_multiple_core_steps(monkeypat
     # state_evidence_settles (keyed by step index), while the
     # backward-compatible top-level pair keeps the chronological extremes
     # (presettle = the very first sample, state_evidence = the last settled).
-    model = FakeModel([{"click": "@e1"}, {"done": True}])
-    driver = FakeDriver(snapshots=['[@e1] row "web" row "api"'] * 4,
+    # One action per core step: a step the Actor never ENTERED is no longer
+    # credited (it flips unreached instead), so each step must act for this
+    # test to measure what it is about — the settle bookkeeping.
+    model = FakeModel([{"click": "@e1"}, {"done": True},
+                       {"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "web" row "api"'] * 8,
                         page_texts=["web api", "Stopping…", "stopped",
-                                    "stopped"])
+                                    "stopped", "stopped", "stopped"])
     journey = {"journey_id": "stop-two-sandboxes", "modality": "gui",
                "source": {"kind": "spec", "ref": "x"},
                "steps": [
@@ -1691,10 +1695,15 @@ def test_expect_text_window_starts_at_the_core_step_not_earlier(monkeypatch):
     # The outcome string appearing ONLY in captures BEFORE the core step must
     # not credit it: "at/after the core step" is the window (the outcome of
     # step 1 can't be evidenced by step 0's screen).
-    model = FakeModel([{"click": "@e1"}, {"done": True}, {"done": True}])
+    # The Actor ACTS in the core step (else the step is unentered and flips
+    # unreached before the window rule is ever consulted — see
+    # test_unentered_core_step_emits_only_the_unreached_flip).
+    model = FakeModel([{"click": "@e1"}, {"done": True},
+                       {"click": "@e1"}, {"done": True}])
     driver = FakeDriver(
-        snapshots=['[@e1] row "web"'] * 4,
-        page_texts=["", "OUTCOME MARKER web", "web list", "web list"])
+        snapshots=['[@e1] row "web"'] * 6,
+        page_texts=["", "OUTCOME MARKER web", "web list", "web list",
+                    "web list", "web list"])
     journey = {"journey_id": "j-window", "modality": "gui",
                "source": {"kind": "spec", "ref": "x"},
                "steps": [
@@ -2199,3 +2208,79 @@ def test_non_manifest_malformed_hook_reason_is_unchanged(monkeypatch):
     assert len(unreached) == 1
     assert "no gradable hook" in unreached[0]["detail"]
     assert "drove no manifest_diff" in unreached[0]["detail"]
+
+
+# ---------- per-step reach: the GUI half of F1 ----------
+# The CLI runner refuses to grade a decisive step the Actor never ENTERED
+# (fabricating "diverges from daemon truth" about a step nobody reached). The
+# GUI runner graded every core step regardless — and with no unreached flip
+# beside it, so the fabricated claim stood alone in the bundle.
+
+def _two_step_journey(jid, core_step):
+    return {"journey_id": jid, "modality": "gui",
+            "source": {"kind": "spec", "ref": "x"},
+            "steps": [{"intent": "open the policy tab", "expect": ""},
+                      core_step]}
+
+
+def test_unentered_core_step_emits_only_the_unreached_flip(monkeypatch):
+    # Step 0 acts; the Actor then declares done in step 1 without touching the
+    # control. The saved-policy assertion it never exercised must NOT be
+    # reported as a product bug (this is the PR #262 journeys' whole shape).
+    model = FakeModel([{"click": "@e1"}, {"done": True}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "Save"'] * 6,
+                        page_texts=["policy"] * 6)
+    core = {"intent": "confirm the refusal held", "expect": "still read-only",
+            "core": True,
+            "expect_state": {"sandbox": "web", "status": "running"}}
+    res = _run(_two_step_journey("j-unentered", core), model, driver,
+               monkeypatch,
+               evidence=_evidence(["web"],
+                                  [{"name": "web", "status_disk": "stopped"}]))
+    graded = [c for c in res["candidates"]
+              if c["kind"] in ("functional", "unreached_decisive", "infra")]
+    assert [c["kind"] for c in graded] == ["unreached_decisive"], \
+        res["candidates"]
+    assert "never exercised" in graded[0]["detail"]
+    assert res["decisive_credits"] == []
+
+
+def test_entered_core_step_still_flips_functional(monkeypatch):
+    # The other half: a step the Actor DID act in grades exactly as today.
+    model = FakeModel([{"done": True}, {"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "Save"'] * 6,
+                        page_texts=["policy"] * 6)
+    core = {"intent": "confirm the refusal held", "expect": "still read-only",
+            "core": True,
+            "expect_state": {"sandbox": "web", "status": "running"}}
+    res = _run(_two_step_journey("j-entered", core), model, driver,
+               monkeypatch,
+               evidence=_evidence(["web"],
+                                  [{"name": "web", "status_disk": "stopped"}]))
+    functional = [c for c in res["candidates"] if c["kind"] == "functional"]
+    assert len(functional) == 1, res["candidates"]
+    assert functional[0]["decisive"] is True
+    assert not [c for c in res["candidates"]
+                if c["kind"] == "unreached_decisive"]
+
+
+def test_unentered_core_step_with_satisfied_expect_text_is_still_credited(
+        monkeypatch):
+    # The CLI's carve-out, preserved: a step credited from OBSERVED evidence
+    # (there, an earlier action matching expect_cmd_re; here, the declared
+    # outcome text visibly present at journey end) is still graded — dropping
+    # its hook would be the silent discard we have spent the day removing.
+    model = FakeModel([{"click": "@e1"}, {"done": True}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "Save"'] * 6,
+                        page_texts=["policy", "policy", "policy",
+                                    "Saved. access: read"] * 2)
+    core = {"intent": "confirm the refusal held", "expect": "still read-only",
+            "core": True, "expect_text": "access: read"}
+    res = _run(_two_step_journey("j-unentered-observed", core), model, driver,
+               monkeypatch)
+    assert not [c for c in res["candidates"]
+                if c["kind"] in ("functional", "unreached_decisive")], \
+        res["candidates"]
+    assert res["decisive_credits"] == [{
+        "step_index": 1, "action_index": -1,
+        "graded_cmd": "expect_text: 'access: read' (matched)"}]
