@@ -271,13 +271,30 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   record-fragmented hello, absent SNI, exhausted budget) fails CLOSED to
   termination. `manifest::diff` flags two `⚠ weakens egress` transitions: a
   newly-declared passthrough, and losing inspection on a still-reachable port.
-  `izba policy show` is the ONLY surface that reveals a hatch, rendered against
-  the specific port carrying it — `izba status` renders no egress posture, and
+  `izba policy show` and the desktop app's Policy tab are the two surfaces
+  that reveal a hatch, both rendered against the specific port carrying it,
+  and both render a pinned port on a NARROWER-than-read-write row as NOT in
+  effect rather than live: an opaque splice carries no HTTP method, so
+  `access: read` never authorizes one (`egress.rego`'s
+  `host_access_ok("read")` requires GET/HEAD); `router::passthrough_names`
+  drops the host and the connection stays terminated at L7, so a pinning
+  client still sees izba's certificate — the two revealing surfaces must not
+  disagree about posture. `izba status` still renders no egress posture, and
   `izba policy allow` writes `policy.yaml` without passing the diff/promote
-  gate (it can no longer open a hatch, so that gap is now only a reporting one).
-  The desktop policy editor marks a declared port but authors nothing; a hatch
-  is written by editing `policy.yaml` or through `izba.yml` + `izba diff`/
-  `izba promote`.
+  gate (it can no longer open a hatch, so that gap is now only a reporting
+  one). Neither revealing surface can author a hatch, and the desktop editor
+  additionally cannot RELOCATE or ACTIVATE one: it has no control that writes
+  `protocol`; because its Save path (`policySetFull`) skips the diff/promote
+  weakening gate, its Host input is locked while the row carries a pinned
+  port (renaming cannot relocate the hatch onto a host that never declared
+  one); and `setHostAccess` refuses a transition INTO `read-write` on a
+  pinned row (widening cannot silently turn a dormant passthrough live —
+  `manifest::diff::egress_weakens` flags exactly that `Read → ReadWrite`
+  transition as `⚠ weakens egress` on the `izba.yml` path, a gate this Save
+  path never reaches). Narrowing access, and removing the pinned port
+  itself, both stay allowed on a pinned row — removing the port lifts the
+  Host lock and the access-widening refusal together. A hatch is written by
+  editing `policy.yaml` or through `izba.yml` + `izba diff`/`izba promote`.
 - **Linux VMM confinement (MVP-C):** on Linux, cloud-hypervisor and virtiofsd
   launch **confined by default** — explicit `--seccomp true`, `--landlock`
   (Landlock v5+), virtiofsd `--sandbox namespace` (fallback `--sandbox chroot`),

@@ -366,6 +366,34 @@ describe("PolicyEditor", () => {
     expect(screen.queryByLabelText(/^Port 80: /)).not.toBeInTheDocument();
   });
 
+  it("marks the pinned port as NOT in effect when its row's access cancels it", async () => {
+    // Final-review Important A: the chip's aria-label/title must agree with
+    // the row's visible notice about whether the hatch is actually live —
+    // a screen-reader user (or anyone hovering the chip) must not be told
+    // the live substance for a row whose access never authorizes a splice.
+    (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enforcing: true,
+      allow: [
+        { host: "pinned.vendor.com", ports: [{ port: 443, protocol: "tcp" }], access: "read" },
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    expect(
+      screen.getByLabelText(
+        "Port 443: TLS-pinning passthrough NOT in effect — an opaque splice carries no HTTP method, " +
+          'so this row\'s "read" access never authorizes one; the connection stays terminated at L7 ' +
+          "and a pinning client still sees izba's certificate. To pin, widen access in policy.yaml, " +
+          "or in izba.yml followed by izba diff / izba promote",
+      ),
+    ).toBeInTheDocument();
+    // Must NOT claim the live substance.
+    expect(
+      screen.queryByLabelText(/no upstream certificate verification$/),
+    ).not.toBeInTheDocument();
+  });
+
   it("marks a port declared http as inspected", async () => {
     (api.policyShow as ReturnType<typeof vi.fn>).mockResolvedValue({
       enforcing: true,
@@ -455,5 +483,355 @@ describe("PolicyEditor", () => {
       expect(screen.getByText(/git\{hub\.com,evil\.com\}/)).toBeInTheDocument(),
     );
     expect(api.policySetFull).not.toHaveBeenCalled();
+  });
+
+  // --- #239: a `protocol: tcp` port is a TLS-pinning passthrough — spliced
+  // opaquely, no L7 rules, no request audit, no upstream certificate
+  // verification. The GUI must surface that fact visibly (not just in an
+  // aria-label) and must never let a Save relocate the hatch onto a host
+  // that never declared one, since this Save path skips the diff/promote
+  // weakening gate.
+
+  it("renders a visible passthrough notice on a row carrying a pinned port", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "pinned.vendor.com", ports: [80, { port: 443, protocol: "tcp" }] }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    // Visible text, not merely an aria-label/title — naming the pinned port
+    // and carrying the full substance of what the passthrough gives up.
+    // Each clause is asserted individually so the notice cannot silently
+    // lose one and still pass (a wildcard `.*` regex would let that slide).
+    const notice = screen.getByText(/Port 443:/i);
+    expect(notice.textContent).toMatch(/Port 443:/);
+    expect(notice.textContent).toMatch(/spliced opaquely/);
+    expect(notice.textContent).toMatch(/no L7 rules/);
+    expect(notice.textContent).toMatch(/no request audit/);
+    expect(notice.textContent).toMatch(/no upstream certificate verification/);
+  });
+
+  it("renders no passthrough notice for a port declared http", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "internal.example.com", ports: [{ port: 8000, protocol: "http" }] }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("internal.example.com");
+    expect(screen.queryByText(/TLS-pinning passthrough/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("⚠ tcp")).not.toBeInTheDocument();
+  });
+
+  it("renders no passthrough notice for an undeclared port", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "plain.example.com", ports: [443] }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("plain.example.com");
+    expect(screen.queryByText(/TLS-pinning passthrough/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("⚠ tcp")).not.toBeInTheDocument();
+  });
+
+  it("locks the Host field of a row carrying a pinned port", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [
+        { host: "pinned.vendor.com", ports: [80, { port: 443, protocol: "tcp" }] },
+        "ordinary.example.com",
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    const pinnedInput = (await screen.findByDisplayValue(
+      "pinned.vendor.com",
+    )) as HTMLInputElement;
+    const ordinaryInput = screen.getByDisplayValue("ordinary.example.com") as HTMLInputElement;
+    expect(pinnedInput.readOnly).toBe(true);
+    expect(ordinaryInput.readOnly).toBe(false);
+  });
+
+  it("unlocks the Host field once the pinned port is removed", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "pinned.vendor.com", ports: [80, { port: 443, protocol: "tcp" }] }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    expect(screen.getByText(/TLS-pinning passthrough/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /remove port 443/i }));
+    const input = screen.getByDisplayValue("pinned.vendor.com") as HTMLInputElement;
+    expect(input.readOnly).toBe(false);
+    expect(screen.queryByText(/TLS-pinning passthrough/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps a pinned row's host inert against a direct DOM change event", async () => {
+    // The lock must be behavioural, not merely the `readOnly` HTML attribute:
+    // `fireEvent.change` (and scripted automation generally) can dispatch a
+    // change event on a readOnly input directly, bypassing what a real
+    // browser's keyboard-editing restriction would block. `setHost` itself
+    // must refuse to apply the edit for a row that still carries a pinned
+    // port.
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "pinned.vendor.com", ports: [80, { port: 443, protocol: "tcp" }] }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    const input = (await screen.findByDisplayValue("pinned.vendor.com")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "attacker.example.com" } });
+    expect(input.value).toBe("pinned.vendor.com");
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [expect.objectContaining({ host: "pinned.vendor.com" })],
+        [],
+      ),
+    );
+  });
+
+  it("preserves protocol: tcp when an unrelated field on the row is edited and saved", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [
+        {
+          host: "pinned.vendor.com",
+          ports: [80, { port: 443, protocol: "tcp" }],
+          access: "read-write",
+        },
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    // Change Access on the pinned row — an edit unrelated to the port
+    // declaration or the host.
+    fireEvent.click(screen.getByRole("radio", { name: "read" }));
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [
+          {
+            host: "pinned.vendor.com",
+            ports: [80, { port: 443, protocol: "tcp" }],
+            access: "read",
+          },
+        ],
+        [],
+      ),
+    );
+  });
+
+  // --- Final-review round: the notice must not misreport posture for a
+  // pinned row whose `access` cancels the hatch (1a), and widening Access
+  // on a pinned row must be refused the same way renaming its Host is (1b).
+  // An opaque splice carries no HTTP method, so `access: read` never
+  // authorizes one (egress.rego's host_access_ok("read") requires GET/HEAD);
+  // router::passthrough_names drops the host and the connection stays
+  // terminated at L7. The CLI (crates/izba-cli/src/commands/policy.rs)
+  // already renders this NOT-in-effect case distinctly — the GUI must not
+  // disagree.
+
+  it("renders the NOT-in-effect notice for a pinned row whose access cancels the hatch", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [
+        { host: "pinned.vendor.com", ports: [{ port: 443, protocol: "tcp" }], access: "read" },
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    const notice = screen.getByText(/Port 443:/i);
+    // Distinguishing clauses asserted individually — a `.*`-spanning regex
+    // would let any one of these silently vanish and still pass.
+    expect(notice.textContent).toMatch(/NOT in effect/);
+    expect(notice.textContent).toMatch(/opaque splice carries no HTTP method/);
+    expect(notice.textContent).toMatch(/stays terminated at L7/);
+    expect(notice.textContent).toMatch(/pinning client still sees izba's certificate/);
+    // The route to actually pin is qualified — NOT a bare instruction to use
+    // the (silently refused) picker; see Important B, final review.
+    expect(notice.textContent).toMatch(/To pin, widen access in policy\.yaml/);
+    expect(notice.textContent).not.toMatch(/[Ww]iden to read-write to pin\b/);
+    // Must NOT claim the live substance — that would misreport this row.
+    expect(notice.textContent).not.toMatch(/no upstream certificate verification/);
+  });
+
+  it("keeps the live notice for a pinned row with read-write access", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [
+        {
+          host: "pinned.vendor.com",
+          ports: [{ port: 443, protocol: "tcp" }],
+          access: "read-write",
+        },
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    const notice = screen.getByText(/Port 443:/i);
+    expect(notice.textContent).toMatch(/spliced opaquely/);
+    expect(notice.textContent).toMatch(/no L7 rules/);
+    expect(notice.textContent).toMatch(/no request audit/);
+    expect(notice.textContent).toMatch(/no upstream certificate verification/);
+    // Must NOT claim the dormant substance.
+    expect(notice.textContent).not.toMatch(/NOT in effect/);
+  });
+
+  it("joins the notice for two pinned ports on the same row, naming both", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [
+        {
+          host: "pinned.vendor.com",
+          ports: [
+            { port: 443, protocol: "tcp" },
+            { port: 8443, protocol: "tcp" },
+          ],
+        },
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    const notice = screen.getByText(/Port 443:/i);
+    expect(notice.textContent).toMatch(/Port 443:/);
+    expect(notice.textContent).toMatch(/Port 8443:/);
+  });
+
+  it("states the remediation for the lock in the visible notice", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "pinned.vendor.com", ports: [{ port: 443, protocol: "tcp" }] }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    const notice = screen.getByText(/Port 443:/i);
+    expect(notice.textContent).toMatch(/remove the pinned port/i);
+    expect(notice.textContent).toMatch(/izba diff/);
+    expect(notice.textContent).toMatch(/izba promote/);
+  });
+
+  it("states the Access-widening refusal in a dormant row's remediation, without telling the operator to use the refused picker", async () => {
+    // Final-review Important B: the old dormant wording said "Widen to
+    // read-write to pin" — the exact click the 1b guard silently refuses.
+    // The corrected copy must explain the refusal AND name a route that
+    // actually works (editing the file directly), never the picker.
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [
+        { host: "pinned.vendor.com", ports: [{ port: 443, protocol: "tcp" }], access: "read" },
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    const notice = screen.getByText(/Port 443:/i);
+    expect(notice.textContent).toMatch(/widening Access to read-write here is refused/i);
+    expect(notice.textContent).toMatch(/silently activate the passthrough/i);
+    expect(notice.textContent).toMatch(/remove the pinned port/i);
+    expect(notice.textContent).toMatch(/widen access in policy\.yaml/i);
+    // The contradictory instruction from the pre-fix wording must be gone.
+    expect(notice.textContent).not.toMatch(/[Ww]iden to read-write to pin\b/);
+  });
+
+  it("refuses widening Access from read to read-write on a dormant pinned row", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [
+        {
+          host: "pinned.vendor.com",
+          ports: [80, { port: 443, protocol: "tcp" }],
+          access: "read",
+        },
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    const readWriteRadio = screen.getByRole("radio", { name: "read-write" });
+    fireEvent.click(readWriteRadio);
+    // Rendered control state must not move: the click is refused, so "read"
+    // stays the checked option.
+    expect(screen.getByRole("radio", { name: "read" })).toHaveAttribute("aria-checked", "true");
+    expect(readWriteRadio).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [
+          {
+            host: "pinned.vendor.com",
+            ports: [80, { port: 443, protocol: "tcp" }],
+            access: "read",
+          },
+        ],
+        [],
+      ),
+    );
+  });
+
+  it("still allows narrowing Access from read-write to read on a live pinned row", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [
+        {
+          host: "pinned.vendor.com",
+          ports: [80, { port: 443, protocol: "tcp" }],
+          access: "read-write",
+        },
+      ],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("pinned.vendor.com");
+    fireEvent.click(screen.getByRole("radio", { name: "read" }));
+    expect(screen.getByRole("radio", { name: "read" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [
+          {
+            host: "pinned.vendor.com",
+            ports: [80, { port: 443, protocol: "tcp" }],
+            access: "read",
+          },
+        ],
+        [],
+      ),
+    );
+  });
+
+  it("still allows widening Access to read-write on an ordinary unpinned row", async () => {
+    (api.policyShow as Mock).mockResolvedValue({
+      enforcing: true,
+      allow: [{ host: "plain.example.com", ports: [443], access: "read" }],
+      git: [],
+    });
+    render(<PolicyEditor name="web" />);
+    await screen.findByDisplayValue("plain.example.com");
+    fireEvent.click(screen.getByRole("radio", { name: "read-write" }));
+    expect(screen.getByRole("radio", { name: "read-write" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(api.policySetFull).toHaveBeenCalledWith(
+        "web",
+        [{ host: "plain.example.com", ports: [443], access: "read-write" }],
+        [],
+      ),
+    );
   });
 });

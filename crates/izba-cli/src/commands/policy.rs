@@ -330,12 +330,16 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
                     // misreport which port gave a control up. Silent when a
                     // port declares nothing, so an existing policy renders as
                     // it did; loud for the pinning hatch, which is the one
-                    // value that gives enforcement up. `izba policy show` is
-                    // the ONLY surface that reveals a pinning passthrough —
-                    // `izba status` renders no egress posture at all, and
-                    // `izba policy allow` writes policy.yaml directly without
-                    // passing the diff/promote weakening gate — so the
-                    // wording here carries its own weight.
+                    // value that gives enforcement up. `izba policy show`
+                    // and the desktop app's Policy tab are BOTH revealing
+                    // surfaces (#239) and must not disagree about posture —
+                    // that is why the access-aware NOT-in-effect branch
+                    // below (a narrower access level CANCELS the hatch)
+                    // exists on both sides. `izba status` still renders no
+                    // egress posture at all, and `izba policy allow` still
+                    // writes policy.yaml directly without passing the
+                    // diff/promote weakening gate — so the wording here
+                    // carries its own weight.
                     for s in specs.iter().filter(|s| s.protocol.is_some()) {
                         let line = match s.protocol {
                             None => unreachable!("filtered to declared ports"),
