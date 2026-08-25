@@ -1213,3 +1213,112 @@ def test_expect_state_policy_real_failure_beats_unverifiable_sibling():
         ev, REF)
     assert verdict == "mismatch"
     assert "policy access:" in found[0].detail
+
+
+# ---------- expect_state.policy: the fold must AGREE with the product ----------
+# `config.rs::collapse_duplicate_hosts` folds EXACT hosts last-wins but UNIONs
+# wildcard duplicates (and refuses to collapse mixed-access ones at all). A
+# second, disagreeing fold in the oracle is the exact class CLAUDE.md warns
+# about — and here it would certify a security WIDENING as unchanged.
+
+def test_expect_state_policy_wildcard_mixed_access_duplicates_are_refused():
+    from gui.gui_oracles import expect_state_oracle
+    doc = {"enforce": True,
+           "allow": [{"host": "*.v.com", "access": "read-write"},
+                     {"host": "*.v.com", "access": "read"}]}
+    ev = _policy_evidence(doc)
+    # Last-wins would grade `read` MATCHED while read-write is still enforced.
+    # The product keeps both entries live, so no single-entry assertion can
+    # state the posture: refuse loudly (no_evidence ⇒ flipping infra), both
+    # polarities, never a manufactured green.
+    for verb in ("read", "read-write"):
+        assert expect_state_oracle(
+            {"sandbox": "web", "policy": {"host": "*.v.com", "access": verb}},
+            ev, REF) == ("no_evidence", []), verb
+    # A port assertion over the same ambiguity is refused too.
+    assert expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "*.v.com", "port": {"number": 443,
+                                                "pinned": False}}},
+        ev, REF) == ("no_evidence", [])
+    # `present` stays gradable — the entries demonstrably exist.
+    assert expect_state_oracle(
+        {"sandbox": "web", "policy": {"host": "*.v.com", "present": True}},
+        ev, REF) == ("matched", [])
+
+
+def test_expect_state_policy_wildcard_uniform_duplicates_union():
+    # Uniform access ⇒ the product COLLAPSES by unioning the port lists.
+    # Last-wins would report port 80 as unauthorized — a fabricated finding.
+    from gui.gui_oracles import expect_state_oracle
+    doc = {"enforce": True,
+           "allow": [{"host": "*.v.com", "ports": [80]},
+                     {"host": "*.v.com", "ports": [443]}]}
+    ev = _policy_evidence(doc)
+    for number in (80, 443):
+        assert expect_state_oracle(
+            {"sandbox": "web",
+             "policy": {"host": "*.v.com",
+                        "port": {"number": number, "pinned": False}}},
+            ev, REF) == ("matched", []), number
+    assert expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "*.v.com", "access": "read-write"}},
+        ev, REF) == ("matched", [])
+
+
+def test_expect_state_policy_wildcard_union_widens_the_declaration():
+    # Per-port union of the declarations, in the WIDENING (inspect) direction,
+    # exactly like `union_wildcard_protocol`: a declared `http` on either
+    # duplicate lands on the collapsed port. (`protocol: tcp` on a wildcard is
+    # a product parse error, so a wildcard port is never pinned.)
+    from gui.gui_oracles import expect_state_oracle
+    doc = {"enforce": True,
+           "allow": [{"host": "*.v.com",
+                      "ports": [{"port": 443, "protocol": "http"}]},
+                     {"host": "*.v.com", "ports": [443]}]}
+    assert expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "*.v.com",
+                    "port": {"number": 443, "pinned": False}}},
+        _policy_evidence(doc), REF) == ("matched", [])
+
+
+def test_expect_state_policy_exact_and_wildcard_folds_coexist():
+    # The mixed case: one doc carrying BOTH a duplicated exact host (last-wins
+    # ⇒ the LAST access) and a duplicated uniform wildcard (union ⇒ both
+    # ports). Each is folded by its own rule.
+    from gui.gui_oracles import expect_state_oracle
+    doc = {"enforce": True, "allow": [
+        {"host": "exact.v.com", "access": "read-write"},
+        {"host": "*.v.com", "ports": [80], "access": "read"},
+        {"host": "exact.v.com", "access": "read"},
+        {"host": "*.v.com", "ports": [443], "access": "read"}]}
+    ev = _policy_evidence(doc)
+    assert expect_state_oracle(
+        {"sandbox": "web", "policy": {"host": "exact.v.com",
+                                      "access": "read"}},
+        ev, REF) == ("matched", [])
+    assert expect_state_oracle(
+        {"sandbox": "web",
+         "policy": {"host": "*.v.com", "access": "read",
+                    "port": {"number": 80, "pinned": False}}},
+        ev, REF) == ("matched", [])
+
+
+def test_expect_state_policy_host_normalization_matches_the_product():
+    # `normalize_policy_host` = trim + strip trailing dots + ASCII lowercase.
+    # `.strip().lower()` alone silently misses a trailing-dot entry.
+    from gui.gui_oracles import expect_state_oracle
+    doc = {"enforce": True,
+           "allow": [{"host": "Pinned.Vendor.Com.", "access": "read"}]}
+    ev = _policy_evidence(doc)
+    assert expect_state_oracle(
+        {"sandbox": "web", "policy": {"host": "pinned.vendor.com",
+                                      "present": True, "access": "read"}},
+        ev, REF) == ("matched", [])
+    # …and the same normalization applies to the SPEC side.
+    assert expect_state_oracle(
+        {"sandbox": "web", "policy": {"host": " PINNED.VENDOR.COM. ",
+                                      "present": True}},
+        ev, REF) == ("matched", [])

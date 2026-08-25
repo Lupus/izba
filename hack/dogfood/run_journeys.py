@@ -52,6 +52,21 @@ from oracles import (  # noqa: E402
     step_expects_nonzero,
     teardown_journey,
 )
+# The ONE implementation of the `expect_state` rule, shared with the GUI
+# runner: the hook vocabulary + honesty fold live in `state_hooks` (which
+# imports no runner, so this edge is a plain module-scope import — no cycle,
+# no lazy workaround, and no reaching into another runner's privates), and
+# the oracle that grades it is `gui_oracles`' PUBLIC `expect_state_oracle`.
+# Re-implementing any part here would be a SECOND FOLD of one rule — how this
+# repo once shipped a live no-certificate-verification bypass (CLAUDE.md).
+from gui.gui_oracles import expect_state_oracle  # noqa: E402
+from state_hooks import (  # noqa: E402
+    STATE_NO_EVIDENCE_DETAIL as _STATE_NO_EVIDENCE_DETAIL,
+    apply_hook_verdict as _apply_hook_verdict,
+    state_hook_label as _state_hook_label,
+    step_decisive_hooks as _step_decisive_hooks,
+    zero_action_unreached as _zero_action_unreached,
+)
 
 # Default per-action human-normal latency budget. Sandbox lifecycle ops (boot,
 # image pull) are slow, so this is generous; the per-action hard timeout is the
@@ -675,45 +690,6 @@ def _grade_decisive_from_observed(step, actions, journey, journey_id,
     return None
 
 
-def _load_state_hook_helpers():
-    """The ONE implementation of the ``expect_state`` hook, borrowed from the
-    GUI runner.
-
-    ``expect_state`` is a single rule — the hook's schema vocabulary
-    (``_step_decisive_hooks``'s validity normalization, including the
-    ``policy`` sub-assertion), the oracle that grades it
-    (``expect_state_oracle``), and the instrument-honesty fold that turns a
-    verdict into candidates/credits (``_apply_hook_verdict``). Re-implementing
-    any of it here would be a SECOND FOLD of the same rule, which is how this
-    repo once shipped a live no-certificate-verification bypass (CLAUDE.md,
-    M5 P1): the CLI runner imports the GUI runner's helpers instead.
-
-    The import is LAZY because ``gui.run_gui_journeys`` imports THIS module at
-    its own module scope — a module-scope import here would be circular. By
-    the time a journey is graded this module is fully initialized, so the
-    import is safe from either entry point. A failure to import is reported as
-    a flipping ``infra`` candidate by the caller: a CLI journey that declared
-    ``expect_state`` and could not have it graded degrades LOUDLY, and a
-    rename on the GUI side reddens the CLI runner's own tests rather than
-    silently reverting the hook to the pre-fix silent discard."""
-    from gui.gui_oracles import expect_state_oracle  # noqa: E402
-    from gui.run_gui_journeys import (  # noqa: E402
-        _apply_hook_verdict, _state_hook_label, _step_decisive_hooks,
-        _zero_action_unreached,
-    )
-    return (_step_decisive_hooks, expect_state_oracle, _state_hook_label,
-            _apply_hook_verdict, _zero_action_unreached)
-
-
-_STATE_NO_EVIDENCE_DETAIL = (
-    "expect_state: daemon state evidence unavailable (reconcile snapshot "
-    "errored/absent, no usable `izba volume ls` capture for a volume "
-    "assertion, no usable port_ls/ports_persisted capture for a port "
-    "assertion, or no usable managed policy.yaml capture — PyYAML "
-    "unavailable / file absent / unparseable — for a policy assertion), "
-    "assertion unverifiable")
-
-
 def _grade_decisive_state_hooks(*, journey, journey_id, steps, decisive_idx,
                                 state_evidence, candidates, decisive_credits,
                                 zero_actions=False) -> None:
@@ -726,7 +702,12 @@ def _grade_decisive_state_hooks(*, journey, journey_id, steps, decisive_idx,
     DISCARDED, leaving the decisive step graded on an exit code alone — a
     journey author got no oracle and no warning. The evidence the oracle needs
     is already captured here (``capture_state_evidence``), so this is plumbing,
-    not a new rule (see ``_load_state_hook_helpers``).
+    not a new rule: the vocabulary/validity normalization and the honesty fold
+    come from the shared ``state_hooks`` module and the oracle from
+    ``gui_oracles.expect_state_oracle`` (both imported at module scope — see
+    this module's import block). An import failure now stops the runner
+    outright rather than degrading one journey, which is louder still: no
+    journey can be graded, so none can silently pass.
 
     Instrument honesty, identical to the GUI runner's contract: ``matched`` ⇒
     an auditable ``decisive_credits`` entry; ``mismatch`` ⇒ the oracle's
@@ -746,21 +727,10 @@ def _grade_decisive_state_hooks(*, journey, journey_id, steps, decisive_idx,
     if not declaring:
         return
     source = journey.get("source", {}).get("ref", "journey step")
-    try:
-        (step_hooks, state_oracle, hook_label, apply_verdict,
-         zero_action_unreached) = _load_state_hook_helpers()
-    except Exception as e:  # never a silent pass: refuse loudly
-        log(f"{journey_id}: expect_state helpers unavailable: {e!r}")
-        candidates.append(_infra_candidate(
-            journey_id,
-            f"expect_state declared on decisive step(s) {declaring} but the "
-            f"shared hook grader could not be loaded ({e!r}); the assertion "
-            f"was not graded"))
-        return
     for i in declaring:
         s = steps[i]
         ref = {"journey_id": journey_id, "action_index": -1}
-        _, state_hook = step_hooks(s)
+        _, state_hook = _step_decisive_hooks(s)
         if state_hook is None:
             candidates.append({
                 "kind": "unreached_decisive",
@@ -774,18 +744,18 @@ def _grade_decisive_state_hooks(*, journey, journey_id, steps, decisive_idx,
                 "trajectory_ref": dict(ref),
             })
             continue
-        verdict, found = state_oracle(
+        verdict, found = expect_state_oracle(
             state_hook, state_evidence, ref, step_index=i,
             expect=s.get("expect", ""), source=source)
         if zero_actions and verdict == "mismatch":
-            candidates.append(zero_action_unreached(
+            candidates.append(_zero_action_unreached(
                 journey_id, s, source,
-                f"expect_state for {hook_label(state_hook)} presupposes a "
-                f"command the actor never ran"))
+                f"expect_state for {_state_hook_label(state_hook)} "
+                f"presupposes a command the actor never ran"))
             continue
-        apply_verdict(
+        _apply_hook_verdict(
             verdict, found,
-            hook=f"expect_state: {hook_label(state_hook)}",
+            hook=f"expect_state: {_state_hook_label(state_hook)}",
             no_evidence_detail=_STATE_NO_EVIDENCE_DETAIL,
             journey_id=journey_id, step_idx=i,
             candidates=candidates, decisive_credits=decisive_credits)

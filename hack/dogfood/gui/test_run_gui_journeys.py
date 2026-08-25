@@ -2160,3 +2160,42 @@ def test_core_step_unreadable_policy_yaml_degrades_infra(monkeypatch):
     assert len(infra) == 1, res["candidates"]
     assert "expect_state" in infra[0]["detail"]
     assert res["decisive_credits"] == []
+
+
+def test_manifest_journey_malformed_hook_reason_is_honest(monkeypatch):
+    # R4: on the manifest path the malformed-hook reason must not claim "the
+    # journey drove no manifest_diff" — it plainly did. The skeptic reads this
+    # text; a false premise in it is a wrong conclusion downstream.
+    _matched_mt(monkeypatch)
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] heading "Manifest"'] * 3,
+                        page_texts=["Manifest", "Manifest", "Manifest"],
+                        invoke_log=list(_MT_DIGEST_LOG))
+    journey = {"journey_id": "j-mt-malformed", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "assert something", "expect": "",
+                          "core": True,
+                          "expect_state": {"sandbox": "web"}}]}  # no assertion
+    res = _run(journey, model, driver, monkeypatch)
+    unreached = [c for c in res["candidates"]
+                 if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1, res["candidates"]
+    assert "no manifest_diff" not in unreached[0]["detail"]
+    assert "cannot grade" in unreached[0]["detail"]
+
+
+def test_non_manifest_malformed_hook_reason_is_unchanged(monkeypatch):
+    # The non-manifest wording (which teaches the compiler to annotate) is
+    # untouched.
+    model = FakeModel([{"click": "@e1"}, {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] row "web"'] * 3,
+                        page_texts=["web", "web", "web"])
+    journey = {"journey_id": "j-nohooks", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "look", "expect": "", "core": True}]}
+    res = _run(journey, model, driver, monkeypatch)
+    unreached = [c for c in res["candidates"]
+                 if c["kind"] == "unreached_decisive"]
+    assert len(unreached) == 1
+    assert "no gradable hook" in unreached[0]["detail"]
+    assert "drove no manifest_diff" in unreached[0]["detail"]
