@@ -58,9 +58,12 @@ struct SandboxOpts {
     volumes: Vec<String>,
     /// Egress policy YAML: turns the firewall ON (default-deny) and sets the
     /// allow-list this sandbox may reach (hosts/ports, plus optional `git:`
-    /// rules and per-host `access:` / `protocol:` keys — `protocol: http`
-    /// polices a non-web port at L7, `protocol: tcp` on an exact host is the
-    /// TLS-pinning passthrough; `enforce: false` makes it log-only). Without
+    /// rules, a per-host `access:` key and a per-PORT `protocol:` key —
+    /// `protocol: http` polices a non-web port at L7, `protocol: tcp` on an
+    /// exact host is the TLS-pinning passthrough; `enforce: false` makes it
+    /// log-only). The legacy entry-level `protocol:` spelling still parses
+    /// and applies to EVERY port of that entry — declare it per port to give
+    /// one port a hatch without its siblings. Without
     /// this flag the sandbox is unrestricted (firewall off); you can also turn
     /// it on later with `izba policy enforce NAME on`. Against an
     /// already-running sandbox `izba run --policy` re-arms the live egress

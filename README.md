@@ -63,6 +63,13 @@ Key properties:
   it back off with `izba policy enforce NAME off`, and check the current posture
   with `izba policy show NAME` (prints `enforce: on|off`).
 
+  **Auditing for exemptions: `izba policy show`.** It is also the surface that
+  reveals each port's declared inspectability — including a `protocol: tcp`
+  TLS-pinning passthrough, printed against the specific port that carries it.
+  `izba status` renders no egress posture at all, so "nothing unusual in
+  `izba status`" is *not* evidence that nothing is bypassing the firewall; ask
+  `izba policy show` (or the desktop app's Policy tab).
+
   A `policy.yaml` allow entry is a bare host (web ports 80/443 only) or an
   explicit host+ports pair, and the file carries the enforce posture plus
   optional per-host access and git rules:
@@ -413,6 +420,13 @@ spec:
       - repo: github.com/me/*
         access: read-write
 ```
+
+`spec.egress` takes the **same schema as `policy.yaml`** (see the agent-firewall
+section above), so anything you can declare there — including a per-port
+`protocol:` — can be declared here instead and reviewed through
+`izba diff` / `izba promote`. That is the only authoring route with the
+`⚠ weakens egress` gate in front of it; `izba policy allow` and a hand-edited
+`policy.yaml` both apply immediately, unreviewed.
 
 `spec.resources` and `spec.rootDisk` are optional — when omitted they default
 to **2 cpus / 4Gi memory / 8Gi root disk**, the same defaults as a bare

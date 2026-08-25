@@ -9,7 +9,11 @@ use izba_core::paths::Paths;
 
 #[derive(Debug, Subcommand)]
 pub enum PolicyCmd {
-    /// Print the effective allow-list (host + ports) and enforce posture (on/off)
+    /// Print the effective allow-list (host + ports), the enforce posture (on/off), and each
+    /// port's declared inspectability. This is the CLI surface that reveals a `protocol: tcp`
+    /// TLS-pinning passthrough — the one declaration that gives L7 inspection and upstream
+    /// certificate verification up — attributed to the port carrying it. `izba status` renders
+    /// no egress posture at all, so audit exemptions here (or in the desktop Policy tab).
     Show {
         /// Sandbox name (or dir)
         name: String,
@@ -46,8 +50,13 @@ pub enum PolicyCmd {
     /// Re-read a sandbox's policy.yaml and apply it to new connections (no
     /// restart). That file is the managed truth, kept host-side at
     /// `<izba data dir>/sandboxes/<name>/policy.yaml`; edit it there and reload
-    /// to change settings this CLI has no flag for, such as an entry's
-    /// `protocol:`. `izba policy show` prints its effective contents
+    /// to change settings this CLI has no flag for, such as a PORT's
+    /// `protocol:` (the legacy entry-level spelling applies to every port of
+    /// that entry). Editing that file applies straight away, with no review:
+    /// declaring the same egress block in `izba.yml`'s `spec.egress` — same
+    /// schema as `policy.yaml` — and running `izba diff` then `izba promote`
+    /// puts the `⚠ weakens egress` review gate in front of it instead.
+    /// `izba policy show` prints the effective contents
     Reload {
         /// Sandbox name (or dir)
         name: String,
