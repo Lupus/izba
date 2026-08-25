@@ -285,7 +285,7 @@
     },
     {
       "journey_id": "core-author-the-exception-through-the-review-flow",
-      "rationale": "The reviewed authoring path: declare the exception in the repo manifest, review the drift, apply it, and see it land in the sandbox's managed policy. This is the path the docs point at, and the only authoring path with a review gate in front of it.",
+      "rationale": "The reviewed authoring path: the exception is declared in the repo manifest, the drift is reviewed, the review is applied, and the declaration lands in the sandbox's managed policy. This is the path the docs point at, and the only authoring path with a review gate in front of it. The sandbox is created from a manifest that allows one ordinary host and declares NO exception; the vendor host and its pinned port appear in the project file only afterwards, so `create` structurally cannot produce the asserted result and the reviewed route is the only way the declaration can reach the managed truth. (Seeding the drifted file is the precondition event, not the thing under test: that a per-port declaration can be WRITTEN at all is separately established by `hatch-declared`; what this journey tests is whether review-and-apply carries it into the sandbox.)",
       "source": {
         "kind": "readme",
         "ref": "README.md \u2014 'The review loop: izba diff \u2192 izba promote \u2192 izba export' + the `\u26a0 weakens egress` paragraph"
@@ -300,20 +300,29 @@
       ],
       "steps": [
         {
-          "intent": "create a sandbox named pin16 from a project folder whose manifest declares the firewall on with one ordinary allowed host",
-          "expect": "the sandbox is created"
+          "intent": "in the project folder you are already in, create a sandbox named pin16 from the project's own file, then print that sandbox's effective egress policy",
+          "expect": "the sandbox is created, and its effective policy starts out with the firewall on and only the one ordinary host the project file allows \u2014 no vendor host, and no port singled out as skipping inspection"
         },
         {
-          "intent": "edit the manifest so one port of a vendor host carries the certificate-pinning exception, then review the drift between the manifest and the sandbox",
-          "expect": "the review lists the egress change"
-        },
-        {
-          "intent": "apply the reviewed change and then print the sandbox's effective egress policy",
-          "expect": "the pinning exception is now part of pin16's effective policy and is reported against the specific port that declares it",
+          "intent": "the project's file has since been changed \u2014 it now also asks to allow a vendor host, one of whose ports must be handed through untouched because that vendor's client accepts only the vendor's own certificate. The changed file is already on disk, so edit nothing yourself: ask izba, from this same folder, to review the difference between what the project now asks for and pin16's current settings",
+          "expect": "the review reports pin16 as out of sync with the project and lists the egress settings as a pending change, naming the vendor host the project now asks to allow",
           "core": true,
-          "expect_cmd_re": "izba policy show"
+          "expect_cmd_re": "izba diff",
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: example.com\n      - host: pinned.vendor.com\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n"
+          }
+        },
+        {
+          "intent": "apply the reviewed change to pin16, then print pin16's effective egress policy again",
+          "expect": "applying the reviewed change succeeds, and pin16's effective policy now carries the vendor host with the exception reported against the single port that declares it \u2014 settings the sandbox did not have when it was created, so they can only have arrived by reviewing and applying the project's change",
+          "core": true,
+          "expect_exit": 0,
+          "expect_cmd_re": "izba promote(?!\\s+--help)"
         }
-      ]
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: example.com\n"
+      }
     },
     {
       "journey_id": "core-declared-exception-with-the-firewall-off",
