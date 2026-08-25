@@ -1,0 +1,87 @@
+{
+  "feature": "per-port protocol inspectability / TLS-pinning passthrough (#233 + #238 + #239/PR #262)",
+  "tier": "core",
+  "findings": [
+    {
+      "id": "show-claims-live-hatch-with-firewall-off",
+      "class": "real",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "`izba policy show` on an `enforce: false` sandbox prints the full LIVE pinning-hatch warning and never says all egress is allowed, so a non-enforcing sandbox reads like a default-deny firewall with one hole. shard 1 / core-declared-exception-with-the-firewall-off / action[2] (exit 0): \"'pin17' egress policy (enforce: off): / pinned.vendor.com [443] (read-write) / \\u26a0 :443 protocol: tcp \\u2014 pinning passthrough: spliced opaquely; no L7 rules, no request audit, no upstream certificate verification\". Both halves are false: config.rs:832-836 returns AllowAll when enforce is false (the allow-list restricts nothing) and router.rs:416-419 returns no passthrough candidates for a non-enforcing policy (\"A bare sandbox is never terminated, so it has nothing to pass through\") \\u2014 there is no splice to warn about. render_policy already makes exactly this argument for the EMPTY allow-list case (policy.rs:311-321, \"would misstate the posture in the safe-looking direction, on the one surface that reveals it\") but the Some(Protocol::Tcp) branch keys only on e.access(), never on cfg.enforce. Renderer text only; check the GUI twin PolicyEditor.tsx::portDeclarationLabel in the same edit (#239: the two revealing surfaces must not disagree). The journey passed because it carries no expect_text.",
+      "journey_ids": ["core-declared-exception-with-the-firewall-off"],
+      "anchor": "crates/izba-core/src/daemon/egress/router.rs:416-419 + config.rs:832-836; crates/izba-cli/src/commands/policy.rs:311-321 (render_policy's own empty-list rationale)"
+    },
+    {
+      "id": "read-grant-silently-deactivates-a-live-hatch",
+      "class": "discoverability",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "An unrelated `izba policy allow <host>:<newport> --read` narrows access ENTRY-wide and thereby turns a live pinning passthrough on a DIFFERENT port dormant \\u2014 with no word in its own output, and no doc anywhere mentioning the rule (predicted flag D2, now evidenced). shard 0 / core-granting-a-port-does-not-inherit-the-exception: action[3] shows \"\\u26a0 :443 \\u2026 pinning passthrough: spliced opaquely\" (LIVE); action[4] `izba policy allow pin12 pinned.vendor.com:8443 --read` exits 0 echoing only \"access: read (HTTP GET/HEAD only)\"; action[5] shows \"\\u26a0 :443 \\u2026 pinning passthrough NOT in effect \\u2026 widen to read-write to pin\" (DORMANT). The user-visible consequence is that the vendor's pinning client is now handed izba's certificate. The behaviour is intended and test-pinned (a_read_grant_preserves_the_declared_port_and_pins_nothing_new) and errs toward MORE inspection, so this is silence, not semantics: add one conditional line to the `policy allow` echo when the resulting entry access is read and the host still carries a `protocol: tcp` port, plus one comment on README's pinned.vendor.com example and a clause in --policy help. Per #259's scoping, derive the WORDING from the access verb at the CLI site \\u2014 do not add a second fold of inspectability outside InspectionTable. NOTE: #259's own premise is obsolete \\u2014 the refusal gate was dropped in 004cbbf2 (policy.rs:477-484), so `--read` on a pinned host no longer refuses at all; #259 should be closed/re-scoped and this is its residue.",
+      "journey_ids": ["core-granting-a-port-does-not-inherit-the-exception", "core-pinned-port-under-read-only-access"],
+      "anchor": "crates/izba-cli/src/commands/policy.rs render_policy dormant branch (\"A narrower access level CANCELS the hatch \\u2026 router::passthrough_names drops the host\") vs `izba policy allow --help`, which documents non-inheritance but not this rule; context-pack.md:94-105 (README example carries no `access:` note)"
+    },
+    {
+      "id": "decisive-credit-from-a-pre-change-action",
+      "class": "harness",
+      "severity": "P1",
+      "fix_routing": "auto-fixable",
+      "summary": "`_grade_decisive_from_observed` (hack/dogfood/run_journeys.py:518-577) scans ALL journey actions for the LAST expect_cmd_re match with no ordering constraint, so a decisive step can be credited by an action taken BEFORE the change under test \\u2014 and since functional_oracle only reads the exit code, the credit passes silently. Two false greens this tier: core-author-the-exception-through-the-review-flow credited {step_index 2, action_index 5, graded_cmd 'izba policy show pin16'} (a show run before the manifest was edited, in a journey whose whole point is what a later promote changes) and core-declaration-survives-an-unrelated-cli-edit credited {step_index 2, action_index 3, graded_cmd 'izba policy show pin13'} (a show run before the CLI edits it is supposed to survive). Both credited actions sit inside step 0's action range while the intervening steps ran at actions 8-10; requiring the credited index to exceed the last action of the decisive step's preceding step rejects both and correctly emits unreached_decisive.",
+      "journey_ids": ["core-author-the-exception-through-the-review-flow", "core-declaration-survives-an-unrelated-cli-edit"],
+      "anchor": "hack/dogfood/run_journeys.py:531-535 \\u2014 'a decisive step credited from another step's action is a CLAIM the Phase-3 skeptic must be able to see and audit, including when the grade was a silent pass'"
+    },
+    {
+      "id": "implicit-oracle-misreads-guest-output",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "All three of this tier's candidates are oracle artifacts on guest tooling. (a) The crash-marker scan greps guest command stderr for the token 'ERROR': apk's 'ERROR: unable to select packages: curl (no such package)' after a correct firewall DENY (netlog 'DENY l3 dl-cdn.alpinelinux.org:53 a0/d4') became a 'izba must not panic/abort' candidate \\u2014 and the same command succeeded at action[8] once the mirror was allow-listed. (b) Exit 127 is mapped to izba's CommandNotFound wire frame, but `izba exec pin14 -- sh -c 'curl \\u2026'` returned the SHELL's 127 (stderr 'sh: 1: curl: not found'); the exec plane was demonstrably healthy one action earlier (getent, exit 0). (c) functional_oracle graded `izba exec pin13 -- sudo apt-get \\u2026` (stderr \\\"executable file `sudo` not found in $PATH\\\", crun's honest rc-1) against step 0's expect 'the sandbox is created with no error', 6 actions after the create had succeeded. Fixes: scope the crash-marker scan to izba's own stderr or a panic/abort signature; treat 127 as the izba frame only when the command is not a shell wrapper and stderr lacks a '<shell>: \\u2026 not found' line; within a step, prefer the best-outcome izba invocation over a textually-last unrelated action.",
+      "journey_ids": ["core-author-the-exception-through-the-review-flow", "core-older-entry-level-declaration-still-works", "core-declaration-survives-an-unrelated-cli-edit"],
+      "anchor": "CLAUDE.md exit-code mapping \\u2014 'a MISSING command is resolved by crun inside the container (Stance B) \\u2026 NOT a spawn-time CommandNotFound frame'; hack/dogfood/oracles.py::functional_oracle ('a deliberately WEAK proposer, not an outcome verdict')"
+    },
+    {
+      "id": "core-journeys-assert-only-on-the-renderer",
+      "class": "inconclusive",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Every CORE journey grades on `izba policy show` text and exit codes, and none has an expect_text \\u2014 which is exactly why core-declared-exception-with-the-firewall-off shipped a wrong rendering as a pass. Two promises are asserted by rendering alone: core-police-a-non-web-port claims a non-web port is 'policed at L7' on the strength of ':8000 protocol: http (inspected)' while journey-end netlog says 'no egress recorded yet for pin5'; core-declaration-survives-an-unrelated-cli-edit never ran `izba policy block` at all, so the removal half of 'survives an unrelated CLI edit' is unexercised (the additive half is corroborated only by the harness's journey-end snapshot, which shows pinned.vendor.com [443] + the marker intact and no marker on the three other hosts). Add expect_text hooks ('NOT in effect', 'all egress allowed (enforce off)', '(inspected)') and move the datapath claims explicitly to the deep tier.",
+      "journey_ids": ["core-declared-exception-with-the-firewall-off", "core-police-a-non-web-port", "core-declaration-survives-an-unrelated-cli-edit"],
+      "anchor": "dogfood-passthrough/tier-core.json \\u2014 step expects ('reported as inspected/policed rather than passed through'; 'reports the firewall as off and that all egress is allowed')"
+    },
+    {
+      "id": "manifest-review-journey-never-reached-promote",
+      "class": "unverified",
+      "severity": "P1",
+      "fix_routing": "auto-fixable",
+      "summary": "core-author-the-exception-through-the-review-flow is a false green and leaves the tier's only `establishes` capability (hatch-via-manifest) unproven. Its decisive step 2 ('apply the reviewed change and then print the effective policy') produced ZERO actions: actions 0-8 were spent on create/status/start and two rounds of installing curl; action[9] wrote the edited manifest to the shell cwd (.../proj/izba.yml) although `izba status pin16` at action[3] had already printed 'workspace: /tmp/izd-0/core-author-the--6ebb2c89/proj/pin16'; action[10] `izba diff pin16` therefore diffed the ORIGINAL manifest ('to: enforce: true / allow: [example.com]' \\u2014 no vendor host, no protocol: tcp); `izba promote` was never run. Journey-end ground truth: pin16's effective policy is 'example.com [80,443] (read-write) / dl-cdn.alpinelinux.org [80,443] (read-write)' \\u2014 no hatch anywhere. Cause is swarm fumbling plus a loose journey, not a product defect: izba diff behaved correctly on the file that actually existed. Fix the journey (seed_files with the pre-edited izba.yml inside the project dir, an explicit 'from inside the project folder' instruction, an image that already carries curl or no curl step at all) and re-run it standalone before dispatching deep.",
+      "journey_ids": ["core-author-the-exception-through-the-review-flow"],
+      "anchor": "dogfood-passthrough/sequence-plan.json \\u2014 hatch-via-manifest.established_by = [core-author-the-exception-through-the-review-flow]; required_by deep-review-flags-a-new-exception-as-weakening, deep-review-is-quiet-when-posture-tightens, gui-pinned-port-is-visible-in-the-policy-tab"
+    },
+    {
+      "id": "policy-allow-takes-one-target-per-invocation",
+      "class": "discoverability",
+      "severity": "P3",
+      "fix_routing": "none",
+      "summary": "Suppressible cheap-model noise, recorded for honesty: three shards independently tried `izba policy allow <name> hostA hostB` (pin11 action[6], pin13 action[8], pin14 action[8]) and got clap's \\\"error: unexpected argument 'security.ubuntu.com' found\\\" plus the correct 'Usage: izba policy allow [OPTIONS] <NAME> <TARGET>'. Each shard recovered on the next action; the message is exact and self-correcting, and this is outside the feature under test. If it recurs, one clause in `policy allow`'s help ('one target per invocation') would end it.",
+      "journey_ids": ["core-inspection-may-be-asked-for-on-a-wildcard", "core-declaration-survives-an-unrelated-cli-edit", "core-older-entry-level-declaration-still-works"],
+      "anchor": "izba policy allow --help \\u2014 'Usage: izba policy allow [OPTIONS] <NAME> <TARGET>' (singular TARGET)"
+    }
+  ],
+  "capabilities": {
+    "established": [
+      "hatch-declared",
+      "hatch-visible-in-show",
+      "policy-file-at-create",
+      "policy-show-renders",
+      "manifest-egress-review"
+    ],
+    "blocked": [
+      "hatch-via-manifest"
+    ]
+  },
+  "counts": {
+    "kept": 0,
+    "refuted": 3,
+    "cheated": 2,
+    "inconclusive": 2
+  }
+}
