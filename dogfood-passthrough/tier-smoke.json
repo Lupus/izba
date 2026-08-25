@@ -1,0 +1,165 @@
+{
+  "feature": "per-port protocol inspectability / TLS-pinning passthrough (#233 + #238 + #239/PR #262)",
+  "journeys": [
+    {
+      "journey_id": "smoke-docs-find-pinning-exception",
+      "rationale": "The whole feature is reachable only by hand-editing a policy file, so the first thing to measure is whether the user-visible surface (README + --help) is enough for a user to learn that a per-port exception exists at all and what it costs. A gap here blocks every authoring journey below.",
+      "source": {
+        "kind": "readme",
+        "ref": "README.md \u2014 'Egress firewall' policy.yaml example (per-port `protocol:`, `pinned.vendor.com`)"
+      },
+      "tier": "smoke",
+      "establishes": [
+        "docs-explain-hatch"
+      ],
+      "steps": [
+        {
+          "intent": "using only the product's own README and command help, work out how a sandbox could be allowed to reach a vendor API whose client refuses every certificate except the vendor's own, while the firewall stays on for everything else",
+          "expect": "the user-visible docs describe a policy-file shape in which an individual port carries a protocol declaration, and say what the `tcp` value gives up (the flow is handed through untouched: no L7 rules, no request audit)",
+          "core": true
+        },
+        {
+          "intent": "from the same sources, work out what that exception costs beyond the two losses named above \u2014 in particular whether the sandbox still checks the vendor's certificate for you",
+          "expect": "the docs either state that the exception also removes izba's own verification of the upstream certificate, or they do not \u2014 record which, since a user is choosing to give that up"
+        }
+      ]
+    },
+    {
+      "journey_id": "smoke-docs-find-authoring-surface",
+      "rationale": "The CLI deliberately has no flag that can author the exception (it is policy-file / manifest only). A user must be able to discover that from --help instead of hunting for a flag that does not exist.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba policy reload --help` \u2014 'edit it there and reload to change settings this CLI has no flag for, such as an entry's `protocol:`'"
+      },
+      "tier": "smoke",
+      "establishes": [
+        "docs-name-authoring-path"
+      ],
+      "steps": [
+        {
+          "intent": "search the command help for a way to declare that per-port exception from the command line",
+          "expect": "the help states there is no CLI flag for it and names where it can be declared instead (the sandbox's managed policy file, and/or the manifest + review flow), rather than leaving the user to conclude the feature is unreachable",
+          "core": true
+        }
+      ]
+    },
+    {
+      "journey_id": "smoke-docs-bare-port-is-inspected",
+      "rationale": "The load-bearing safety promise of the per-port shape is that nothing inherits the exception: a port with no declaration is inspected, and a port granted later never picks up a sibling port's exception. Whether a user can learn that without reading the source is the cheapest possible signal on the feature's honesty.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba policy allow --help` \u2014 'A granted port is always inspected: it never inherits a `protocol: tcp` pinning passthrough declared for some other port of the same host'"
+      },
+      "tier": "smoke",
+      "establishes": [
+        "docs-explain-non-inheritance"
+      ],
+      "steps": [
+        {
+          "intent": "you are about to let a sandbox reach one more port on a host its firewall already allows. Before doing that, print the product's own built-in help for the commands that manage a sandbox's egress policy, so you can read what it says about the ports it grants",
+          "expect": "the help text for those commands is printed in full in the transcript"
+        },
+        {
+          "intent": "print whatever further help or documentation you still need, then echo one line into the transcript quoting what the product's own user-visible text says about a port that carries no protocol declaration, and about a port granted to a host that already has a pinned port \u2014 or, if no user-visible text says anything about either, echo that instead",
+          "expect": "the echoed line is backed by product text that was actually printed during this journey (the transcript shows both the printed text and the line quoting it), so the answer comes from what a user can read rather than from the reader's own assumptions",
+          "core": true,
+          "expect_cmd_re": "izba policy .*--help"
+        }
+      ]
+    },
+    {
+      "journey_id": "smoke-create-with-policy-file",
+      "rationale": "Capability probe for everything below: a user must be able to create a sandbox with their own egress policy file and see it back. If this fails, no authoring, rendering or refusal journey is meaningful.",
+      "source": {
+        "kind": "readme",
+        "ref": "README.md \u2014 'Egress firewall' policy.yaml example (per-port `protocol:`, `pinned.vendor.com`)"
+      },
+      "tier": "smoke",
+      "establishes": [
+        "policy-file-at-create",
+        "policy-show-renders"
+      ],
+      "gating": true,
+      "steps": [
+        {
+          "intent": "write a policy file that turns the firewall on and allows one ordinary host, and create a sandbox named pin1 that uses it",
+          "expect": "the sandbox is created with no error"
+        },
+        {
+          "intent": "ask izba to print pin1's effective egress policy",
+          "expect": "the printed policy reports the firewall as on and lists the allowed host with its ports",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ]
+    },
+    {
+      "journey_id": "smoke-declare-pinned-port-accepted",
+      "rationale": "The feature's happy path: an operator declares the pinning exception on one port of one exact host, and izba accepts it and reveals it. Gating, because every rendering/mutation/weakening journey below presupposes a declaration can be written and seen.",
+      "source": {
+        "kind": "readme",
+        "ref": "README.md \u2014 'Egress firewall' policy.yaml example (per-port `protocol:`, `pinned.vendor.com`)"
+      },
+      "tier": "smoke",
+      "establishes": [
+        "hatch-declared",
+        "hatch-visible-in-show"
+      ],
+      "requires": [
+        "policy-file-at-create"
+      ],
+      "gating": true,
+      "steps": [
+        {
+          "intent": "write a policy file that keeps the firewall on, allows a vendor host on the usual web ports, and marks one of those ports as the certificate-pinning exception; create a sandbox named pin2 with it",
+          "expect": "the sandbox is created with no error and the policy is accepted"
+        },
+        {
+          "intent": "print pin2's effective egress policy and look for whether anything is bypassing inspection",
+          "expect": "the output flags that host's pinned port distinctly and warns what it gives up, so an operator auditing the sandbox can see the exception exists",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ]
+    },
+    {
+      "journey_id": "smoke-manifest-egress-review-available",
+      "rationale": "Capability probe for the deep weakening-gate journeys: the reviewed authoring path (declare in the repo manifest, review the drift, apply it) must work for an egress change at all before it is worth testing what it flags. The sandbox is created from a manifest that asks for NO firewall settings and the egress block appears only afterwards, so the review flow is the only path by which the policy can reach the managed truth \u2014 a sandbox born in sync would let `create` satisfy the assertion and prove nothing.",
+      "source": {
+        "kind": "readme",
+        "ref": "README.md \u2014 'The review loop: izba diff \u2192 izba promote \u2192 izba export' + the `\u26a0 weakens egress` paragraph"
+      },
+      "tier": "smoke",
+      "establishes": [
+        "manifest-egress-review"
+      ],
+      "requires": [
+        "policy-file-at-create"
+      ],
+      "steps": [
+        {
+          "intent": "in the project folder you are already in, create a sandbox named pin3 from the project's own file, then print that sandbox's effective egress policy",
+          "expect": "the sandbox is created, and its effective policy starts out with the firewall off and no allowed hosts \u2014 the project file asked for none"
+        },
+        {
+          "intent": "the project file has since been changed: it now asks for the firewall to be on with one host allowed. Ask izba to review the difference between what the project now asks for and the sandbox's current settings",
+          "expect": "the review reports the sandbox as out of sync and lists the project's egress settings as a pending change, showing the host the project now asks to allow",
+          "core": true,
+          "expect_cmd_re": "izba diff",
+          "seed_files": {
+            "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: example.com\n"
+          }
+        },
+        {
+          "intent": "apply the reviewed change to the sandbox, then print the sandbox's effective egress policy again",
+          "expect": "the firewall is now on and the host the project asked for is part of pin3's effective policy \u2014 settings it did not have when the sandbox was created, so they can only have arrived by reviewing and applying the project's change",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n"
+      }
+    }
+  ]
+}

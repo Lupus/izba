@@ -1,0 +1,343 @@
+{
+  "feature": "per-port protocol inspectability / TLS-pinning passthrough (#233 + #238 + #239/PR #262)",
+  "journeys": [
+    {
+      "journey_id": "core-show-attributes-declaration-to-its-port",
+      "rationale": "The declaration belongs to one PORT, so the audit surface must name the port that gave a control up \u2014 a line naming only the host would misreport which port is opaque. Probed with a host carrying a bare port and a pinned port at once.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md \u2014 load-bearing contract 'Inspectability is DECLARED per PORT, not derived from the port (M5 P1, #238)'"
+      },
+      "tier": "core",
+      "requires": [
+        "hatch-visible-in-show"
+      ],
+      "steps": [
+        {
+          "intent": "write a policy file where one vendor host is allowed on two ports, only one of which carries the certificate-pinning exception, and create a sandbox named pin4 with it",
+          "expect": "the sandbox is created with no error"
+        },
+        {
+          "intent": "print pin4's effective egress policy",
+          "expect": "the warning about the pinning exception names the specific port that carries it, and the host's other port is shown without that warning",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-police-a-non-web-port",
+      "rationale": "The other half of the axis: an operator can ask for an internal API on a non-web port to be policed at L7 (rather than passed through), and the audit surface says so.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba create --help` / `izba run --help` --policy \u2014 '`protocol: http` polices a non-web port at L7, `protocol: tcp` on an exact host is the TLS-pinning passthrough'"
+      },
+      "tier": "core",
+      "requires": [
+        "policy-file-at-create"
+      ],
+      "steps": [
+        {
+          "intent": "write a policy file that allows an internal service on a non-web port and asks for that port to be policed at the HTTP layer like 80/443 are, and create a sandbox named pin5 with it",
+          "expect": "the sandbox is created with no error"
+        },
+        {
+          "intent": "print pin5's effective egress policy",
+          "expect": "the non-web port is reported as inspected/policed rather than passed through, and no pinning warning is printed for it",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-show-stays-quiet-for-a-plain-policy",
+      "rationale": "An ordinary policy that declares nothing must render exactly as it always did: the audit surface must not grow noise that trains operators to ignore it, so the warning keeps its signal value.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md \u2014 DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
+      },
+      "tier": "core",
+      "requires": [
+        "policy-file-at-create"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox named pin6 with a policy that allows two ordinary hosts and declares nothing unusual about any port, then print its effective egress policy",
+          "expect": "the output lists the hosts and ports and the enforce posture with no mention of inspection, passthrough or pinning anywhere",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-refuse-pinning-on-a-wildcard-host",
+      "rationale": "The exception is matched against the exact name the guest presents, so it may only be declared for a single exact host; a wildcard family must be refused at load time with a message a user can act on.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md \u2014 DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
+      },
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "try to give a whole wildcard family of subdomains the certificate-pinning exception in a policy file, and create a sandbox named pin7 with it",
+          "expect": "izba refuses the policy instead of accepting it, and the error names the offending entry and tells the user what to do instead (name each host explicitly)",
+          "core": true,
+          "expect_exit": "nonzero",
+          "expect_cmd_re": "izba (create|run|policy reload)"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-refuse-an-unknown-protocol-value",
+      "rationale": "A typo in the declaration must never silently drop it (that would quietly change inspection posture): an unrecognized value is refused with the valid alternatives named.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md \u2014 DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
+      },
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write a policy file where a port's protocol declaration carries a value izba does not define (for example a protocol name it never mentions), and create a sandbox named pin8 with it",
+          "expect": "izba refuses the policy and the error names the bad value, the field it appeared in, and the values that are actually valid",
+          "core": true,
+          "expect_exit": "nonzero",
+          "expect_cmd_re": "izba (create|run|policy reload)"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-refuse-a-typo-in-the-port-mapping",
+      "rationale": "The per-port declaration is written inside a small mapping; a misspelled key there must be refused with the valid keys named, for the same reason a misspelled value is \u2014 a silently dropped declaration is a quiet security change.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md \u2014 DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
+      },
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write a policy file in which a port entry misspells the key that carries its declaration, and create a sandbox named pin9 with it",
+          "expect": "izba refuses the policy and the error names the unknown key and lists the keys a port entry may carry",
+          "core": true,
+          "expect_exit": "nonzero",
+          "expect_cmd_re": "izba (create|run|policy reload)"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-refuse-one-port-declared-two-ways",
+      "rationale": "One port can only have one answer. A host listing the same port twice with contradictory declarations must be refused naming both, rather than silently resolving to one \u2014 resolving it quietly is how the audit surface and the datapath could come to disagree about the same port.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md \u2014 DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
+      },
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write a policy file where one host lists the same port twice \u2014 once with no declaration or as inspected, and once as the certificate-pinning exception \u2014 and create a sandbox named pin10 with it",
+          "expect": "izba refuses the policy, and the error names the port and both conflicting declarations rather than picking one",
+          "core": true,
+          "expect_exit": "nonzero",
+          "expect_cmd_re": "izba (create|run|policy reload)"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-inspection-may-be-asked-for-on-a-wildcard",
+      "rationale": "The refusal is asymmetric on purpose: asking for MORE inspection over a wildcard family only tightens posture and must be accepted, while the pinning exception over the same family is refused. A user who saw the refusal must not conclude the whole key is banned on wildcards.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md \u2014 DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
+      },
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write a policy file that allows a wildcard family of subdomains on a non-web port and asks for that port to be policed at the HTTP layer, and create a sandbox named pin11 with it",
+          "expect": "the policy is accepted (unlike the pinning exception on a wildcard) and the sandbox is created",
+          "core": true,
+          "expect_cmd_re": "izba (create|run)"
+        },
+        {
+          "intent": "print pin11's effective egress policy",
+          "expect": "the wildcard entry's port is reported as inspected/policed"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-granting-a-port-does-not-inherit-the-exception",
+      "rationale": "The headline safety promise of the per-port shape: granting a host one more port from the CLI must add an ordinary inspected port, never extend that host's existing pinning exception to it.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba policy allow --help` \u2014 'A granted port is always inspected: it never inherits a `protocol: tcp` pinning passthrough declared for some other port of the same host'"
+      },
+      "tier": "core",
+      "requires": [
+        "hatch-declared",
+        "policy-show-renders"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox named pin12 whose policy allows a vendor host with one port carrying the certificate-pinning exception",
+          "expect": "the sandbox is created with no error"
+        },
+        {
+          "intent": "using the command line, grant that same host one additional port",
+          "expect": "the grant succeeds and echoes what was granted",
+          "expect_cmd_re": "izba policy allow"
+        },
+        {
+          "intent": "print pin12's effective egress policy",
+          "expect": "the newly granted port is listed WITHOUT any pinning warning \u2014 only the originally declared port carries it \u2014 so the new port is still inspected",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-declaration-survives-an-unrelated-cli-edit",
+      "rationale": "A declaration the CLI cannot author must also not be destroyed by CLI edits elsewhere in the same policy: an operator who blocks or allows something else must not silently lose (or move) the exception.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba policy allow --help` \u2014 'A granted port is always inspected: it never inherits a `protocol: tcp` pinning passthrough declared for some other port of the same host'"
+      },
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox named pin13 whose policy allows a vendor host with a pinned port plus one ordinary host",
+          "expect": "the sandbox is created with no error"
+        },
+        {
+          "intent": "from the command line, allow one more unrelated host and remove a port from the ordinary host",
+          "expect": "both edits succeed"
+        },
+        {
+          "intent": "print pin13's effective egress policy",
+          "expect": "the vendor host's pinned port is still declared, still attributed to the same port, and the exception has not appeared on any other host or port",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-older-entry-level-declaration-still-works",
+      "rationale": "Back-compat promise: a policy file written before the declaration moved onto individual ports \u2014 one that puts the declaration alongside host/ports so it covers the whole entry \u2014 must keep parsing and keep the meaning it had, so no shipped policy changes posture on upgrade.",
+      "source": {
+        "kind": "pr",
+        "ref": "issue #238 \u2014 'a newly-added port carries no declaration of its own and is inspected by default'; back-compat: an existing per-entry `protocol:` keeps parsing and keeps its current meaning"
+      },
+      "tier": "core",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write a policy file in the older style, putting the protocol declaration on the host entry itself (next to host/ports, applying to that entry's ports) rather than on an individual port, and create a sandbox named pin14 with it",
+          "expect": "izba accepts the file rather than refusing it as an unknown key",
+          "core": true,
+          "expect_cmd_re": "izba (create|run)"
+        },
+        {
+          "intent": "print pin14's effective egress policy",
+          "expect": "the declaration is reported against that entry's port(s) with the same meaning it had before \u2014 the entry-level spelling is not silently dropped"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-pinned-port-under-read-only-access",
+      "rationale": "A pinning exception on an entry restricted to read-only access is dormant \u2014 a pass-through flow carries no HTTP method, so a read-only grant never authorizes one and the connection stays inspected. The audit surface must say so instead of claiming a protection was given up that in fact was not (or, worse, implying pinning works when the client will still see izba's certificate).",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md \u2014 DP-1/DP-2/DP-3/DP-5, Task 7 (render_policy), Task 6 (egress_weakens)"
+      },
+      "tier": "core",
+      "requires": [
+        "hatch-visible-in-show"
+      ],
+      "steps": [
+        {
+          "intent": "write a policy file where a vendor host is restricted to read-only access AND one of its ports carries the certificate-pinning exception, and create a sandbox named pin15 with it",
+          "expect": "the sandbox is created with no error"
+        },
+        {
+          "intent": "print pin15's effective egress policy and work out, from the output alone, whether the pinning exception is actually in effect for that host",
+          "expect": "the output distinguishes this case from a fully-effective exception: it states the exception is NOT in effect for this entry, explains that a pinning client will still be presented with izba's certificate, and says what to change to make it effective",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-author-the-exception-through-the-review-flow",
+      "rationale": "The reviewed authoring path: declare the exception in the repo manifest, review the drift, apply it, and see it land in the sandbox's managed policy. This is the path the docs point at, and the only authoring path with a review gate in front of it.",
+      "source": {
+        "kind": "readme",
+        "ref": "README.md \u2014 'The review loop: izba diff \u2192 izba promote \u2192 izba export' + the `\u26a0 weakens egress` paragraph"
+      },
+      "tier": "core",
+      "establishes": [
+        "hatch-via-manifest"
+      ],
+      "requires": [
+        "manifest-egress-review",
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox named pin16 from a project folder whose manifest declares the firewall on with one ordinary allowed host",
+          "expect": "the sandbox is created"
+        },
+        {
+          "intent": "edit the manifest so one port of a vendor host carries the certificate-pinning exception, then review the drift between the manifest and the sandbox",
+          "expect": "the review lists the egress change"
+        },
+        {
+          "intent": "apply the reviewed change and then print the sandbox's effective egress policy",
+          "expect": "the pinning exception is now part of pin16's effective policy and is reported against the specific port that declares it",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-declared-exception-with-the-firewall-off",
+      "rationale": "With the firewall off nothing is inspected at all, so a declaration changes nothing. The audit surface must report the honest posture (everything allowed) rather than implying a firewall with one hole in it.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba policy show --help` + `izba policy --help` (show = the effective allow-list and enforce posture)"
+      },
+      "tier": "core",
+      "requires": [
+        "policy-show-renders"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox named pin17 with a policy whose firewall is explicitly OFF but which still carries an allow-list with a pinned port declared on it",
+          "expect": "the sandbox is created with no error"
+        },
+        {
+          "intent": "print pin17's effective egress policy",
+          "expect": "the output reports the firewall as off and that all egress is allowed, so an operator cannot mistake it for an enforcing policy with a single exception",
+          "core": true,
+          "expect_cmd_re": "izba policy show"
+        }
+      ]
+    }
+  ]
+}
