@@ -67,6 +67,17 @@ swarm's candidates and are the anti-slop spine (see `hack/dogfood/oracles.py`):
   back to the step's final action). Every functional candidate records the
   `graded_cmd` it actually judged, so the skeptic sees *what* was scored rather
   than assuming it was the step's last line.
+- **Declared assertions (the decisive hooks)** — an exit code is a weak oracle: it
+  is 0 whichever way the product actually went, and non-zero for causes that have
+  nothing to do with the promise. A decisive step may therefore declare what must
+  be *true*, graded by the harness and invisible to the actor:
+  `expect_stdout_re` / `expect_stderr_re` (regex over the graded action's captured
+  stream — a refusal or a security warning usually prints on **stderr**, which a
+  stdout-only hook structurally cannot see) and `expect_state` (daemon ground
+  truth: `exists`/`status`/`volume`/`port`/`sandboxes_exact`, plus `policy`, read
+  from the sandbox's managed `policy.yaml` — the oracle for a *refused* edit,
+  where the UI and the rendered text prove nothing). All declared hooks must hold;
+  an ungradable one degrades the journey (`infra`), never passes it.
 
 The instrument-honesty kinds (a green must mean reached-and-corroborated, not a
 silent void — see [`docs/dogfooding-value.md`](../../../../docs/dogfooding-value.md) §7):
@@ -90,6 +101,24 @@ silent void — see [`docs/dogfooding-value.md`](../../../../docs/dogfooding-val
 Sequence invariants the single-shot reconciler can't see (idempotency, monotonic
 restart identity, legal transitions) are the harness's job, computed by diffing
 consecutive snapshots.
+
+## How an oracle lies
+
+The oracle is code, and a *wrong* oracle is worse than none: it converts a
+regression into a green check that nobody re-reads. These are the recurring
+mechanisms — audit any grader you add against them, and treat one written during
+the campaign it is judging as unproven until its verdicts are checked against raw
+ground truth.
+
+| Mechanism | The rule it implies |
+|---|---|
+| An assertion credited from an action taken **before** the state under test existed | Watermark every mid-journey fixture/drift injection; refuse credits from below it and fall through to the flipping candidate. Fail closed. |
+| A cheap rung-1 oracle silently **preempting** a hook the journey declared | A declared assertion is graded ON TOP of any ground-truth verdict, never substituted for. Auto-firing UI (a tab that fetches on mount) is what arms the preempting rung, so "this journey touches that tab" is no reason to omit hooks. |
+| An oracle folding a domain rule **differently than the product does** | Reuse the product's fold, or mirror it arm for arm and pin it with a test; where no single assertion can express the product's posture, return *no evidence* rather than guess. One such second fold certified `access: read` while read-write was still enforced — a manufactured green on a security widening. |
+| A step the actor **never reached** still emitting a product-bug candidate | A harness that fabricates findings is indistinguishable, in the bundle, from one that finds them. An unreached decisive step yields the unreached flip ALONE. Two runners must SHARE one reach predicate, not resemble each other. |
+| An internal id (`journey_id`) reaching the actor | Ids are written in English and routinely state the answer. Keep them — and every path fragment derived from them — out of everything the actor sees. |
+| A refusal graded on the actor's later successful **retry** | Selecting the *last* matching action inverts a step that already passed. Grade the action that satisfies the declared expectation, if any does. |
+| A timed-out or truncated capture read as silence | Losing stdout on timeout, or truncating with no marker, makes "never printed" and "not captured" identical. Mark truncation, reap the process group, re-drain. |
 
 ## Candidate taxonomy — NEGATIVE trajectories (the skeptic's Direction A)
 
@@ -117,10 +146,63 @@ A green is a claim, not a result. Audit every "successful" journey for:
   a different cause; an `expect` substring matched coincidentally).
 - **tautological / premature done** — declared done before reaching the assertion.
 - **hidden failure** — exit 0 but output shows a no-op / ignored / warned action.
+- **unattempted control** — a journey asserting a refusal ("the field is locked",
+  "the widening is rejected") went green while the actor never operated the
+  control: the credited text renders unconditionally and the unchanged state is
+  what an idle run produces anyway.
 
 Verdicts: genuinely-achieved (cite lines + independent corroboration) |
 cheated/unverified (a finding or coverage gap) | inconclusive (the journey is too
 weak to verify its promise → **coverage finding**: tighten the journey).
+
+**Audit greens at least as hard as reds — the reds are usually not where the bug
+is.** The intuition runs the other way, and it is backwards: a red is a candidate
+someone already flagged, so it gets refuted; a green is a claim nobody will read
+again. One deep tier of 19 journeys produced 31 flipping candidates of which
+**zero** survived triage as product bugs (22 refuted, 10 inconclusive) — and its
+one real P1 came out of auditing a *passing* journey, one of the two that turned
+out to be passing for the wrong reason. Budget the skeptic's attention
+accordingly, and demand the same evidence from a green as from a red: which
+action exercised the promise, and what independent truth corroborates it.
+
+## Journeys that can actually fail
+
+An assertion earns its cost only if the *opposite* outcome would have produced a
+different observation. Four shapes routinely fail that test — check each journey
+against them before spending a tier's budget on it.
+
+- **A refusal must prove the ATTEMPT.** For "X was refused / nothing happened",
+  the oracle must show (a) the actor attempted X and (b) persisted truth is
+  unchanged. Absence of change is not evidence when absence of action produces the
+  identical observation — and the very notice that says a control is inert
+  ("…never authorizes one") is usually rendered unconditionally by the fixture, so
+  it credits a journey that never touched the control.
+- **An absence assertion fails OPEN.** "This warning was not printed" also passes
+  when the stream was truncated, when the command never ran, and when the fixture
+  never landed. Pair a quiet assertion with a positive twin the same run must
+  print, require the capture to carry a truncation marker, and check mechanically
+  that the quiet assertion sits on the code path that *could* have printed it (a
+  command with no such gate could never emit the string ⇒ a permanent fabricated
+  green).
+- **The asserted end state must be unreachable from the setup.** If `create` — or
+  any earlier step — can produce the state the decisive step asserts, the journey
+  grades the fixture, not the behaviour. Write that constraint into the journey's
+  `rationale` and verify it survived the actor's improvisation; a decisive
+  `expect_state` that was already true at create time is a tautological credit.
+- **Grade on product truth, not a proxy exit code.** A guest command exits 0
+  whichever certificate it was served, and non-zero for both a policy refusal and
+  a missing client (the 127 trap). Anchor on the product's own record of what it
+  did — an audit-log row, the saved policy file — captured by the harness
+  independently of the actor.
+
+**A seeded fixture is not safe from the actor.** In one tier the actor
+`cat >`-overwrote the seeded file in **11 of 11** CLI journeys, authoring its own
+from an example in the context pack, so every assertion graded a fixture nobody
+planted. The runner can now detect a clobbered seed and flip the journey (a corpus
+that loses every fixture fails the shard), but detection is the runner's ceiling:
+the durable fix is corpus-side — **assert on content the actor could not have
+invented**. Do not resolve it by naming the seed in the step text; telling the
+actor what is already on disk trades the fair-test boundary for a fixture.
 
 ## The loop — find → improve → re-find
 
@@ -131,6 +213,14 @@ Every run produces two kinds of output; act on both:
 - **Harness/coverage gaps** → fix and re-run: oracle false-positives, journeys
   that derailed before their assertion, caps that tripped early, context-pack gaps
   (which, if the swarm needed them, are themselves discoverability findings).
+
+**Mine the trajectories for evidence no oracle scored.** A wandering actor
+sometimes performs, by accident, the exact comparison the tier was designed to
+make — in one run the cleanest proof of a datapath promise came from a journey
+graded on something else entirely, an unplanned same-host A/B whose two arms sat
+in two different bundles. Only a reader of raw actions finds that; a tally never
+will. Treat it as unrepeatable: graduate it into a deterministic e2e test and
+rewrite the journey around it.
 
 **Signal/noise maturation is how you know it's working.** Track candidate count
 and classification across runs. A maturing pipeline shows fewer candidates,
@@ -167,13 +257,36 @@ deeper tiers depend on (the obvious-gap detector). `core` — the bulk of featur
 coverage. `deep` — adversarial / edge / multi-step / cross-entity, presupposing
 the smoke capabilities already work.
 
+### Pre-register the confounds (before the tier is dispatched)
+
+Before a tier runs, write down the alternative explanations you already expect for
+its results — the environment failures, the journey defects you suspect, the
+oracle you built this week — plus the instrument's known ceilings, as stated by
+whoever last touched the harness and the corpus. Hand the list to the skeptic as:
+*test these first, and do not let them become an excuse to dismiss a real
+finding.* Written beforehand it is a **control**; written afterwards the identical
+reasoning is **rationalisation**, and it will absorb whatever the run produced.
+
+It pays in both directions, which is why it is worth the minutes it costs. In one
+deep tier four hypotheses were pre-registered: two were CONFIRMED, which correctly
+kept a whole cluster of reds out of the findings list as *inconclusive* rather
+than reporting bugs the evidence could not support (the actor's own tooling
+install had failed, so an absent audit row proved nothing); two were REFUTED, one
+of them a candidate that would otherwise have read as a real product bug —
+against a documented contract, no less — when in fact the actor's improvised input
+never created the transition the journey wanted. Note the third dividend: one
+hypothesis existed only because a brand-new oracle was doing decisive grading, and
+refuting it is what licensed that oracle's verdicts.
+
 **The gate — advance / fix / defer.** After each tier's swarm + a per-tier
 `trajectory-skeptic` pass:
 
 1. For each **gating** journey not genuinely-achieved, read the finding's
    fix-routing:
-   - **auto-fixable** → dispatch `dogfood-gap-fixer` (one finding at a time —
-     shared working tree), it commits on the CI branch; then **re-run the tier**
+   - **auto-fixable** → dispatch `dogfood-gap-fixer` (one finding at a time, or
+     one isolated worktree per agent — concurrent agents committing into a single
+     working tree race the git index and absorb each other's staged files), it
+     commits on the CI branch; then **re-run the tier**
      off the new tip (`DOGFOOD_BASE=HEAD`), bounded to ~2 retries so a stubborn
      gap can't loop forever.
    - **escalate** → record a blocker; mark the capabilities it would have
@@ -206,6 +319,14 @@ The canonical escalate is the SUN_LEN name-length finding: it looks like a small
 fix but tightening `validate_name` changes what's accepted → file an issue, don't
 auto-fix. The fixer agent (`dogfood-gap-fixer`) re-checks this boundary itself and
 refuses anything outside it — the orchestrator's routing is a hint, not a license.
+
+The harness sits on the auto-fix side of the table with one qualifier: **a harness
+edit may only make the instrument stricter.** A change that could turn a red green
+— loosening a grader, widening a match, silently re-planting a fixture, dropping a
+declared hook — is a change to the measurement, not a fix to it, and deserves the
+scrutiny of a product change (RED first, a discrimination check that the new test
+really dies when the guard is removed, and an independent review). Strictness is
+what makes it safe to repair the instrument mid-campaign at all.
 
 ### CI-branch hygiene (where fixes land)
 
