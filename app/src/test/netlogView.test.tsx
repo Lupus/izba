@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach, type Mock } from "vitest";
 import { NetlogView, relTime } from "../components/NetlogView";
 import { git_repo_from_row } from "../lib/git";
@@ -384,5 +384,102 @@ describe("NetlogView load state", () => {
     expect(await screen.findByText(/Firewall OFF/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("switch", { name: /enforce firewall/i }));
     await waitFor(() => expect(api.policySetEnforce).toHaveBeenCalledWith("web", true));
+  });
+});
+
+/** DEEP-F2b (PR #264 review) — a sandbox switch must not pair the NEW
+ *  sandbox's name with the PREVIOUS one's posture.
+ *
+ *  `refresh` is keyed on `name`, but nothing reset the state the previous
+ *  sandbox's answer had already filled in. So from the moment the selection
+ *  changed until the new fetch resolved, the tab kept `loadState: "ready"`,
+ *  the old `policy` and the old `rows` — and every control stayed live. A
+ *  click in that window sends `policySetEnforce(NEW_NAME, !OLD_POSTURE)`:
+ *  the sandbox being written is not the sandbox the posture came from, so the
+ *  toggle can now write OFF as easily as ON — this window can DISARM a
+ *  firewall, which the unloaded window could not.
+ *
+ *  Two shapes of the same hazard are pinned here: the switch itself, and a
+ *  SLOW answer for the sandbox the tab already left landing afterwards
+ *  (mirroring `DisplayTab`'s "never paints a slow answer" guard). Both assert
+ *  on the API mock, never on a disabled attribute, and a test that only
+ *  checked the settled end state would pass without the guard. */
+describe("NetlogView sandbox switch", () => {
+  const enforcingWeb: PolicyView = { enforcing: true, allow: ["api.x.com"], git: [] };
+
+  /** `web` answers; every other sandbox hangs — that IS the switch window. */
+  function webAnswersOthersHang() {
+    (api.policyShow as Mock).mockImplementation((n: string) =>
+      n === "web" ? Promise.resolve(enforcingWeb) : new Promise(() => {}),
+    );
+  }
+
+  it("stops presenting the previous sandbox's posture the moment the sandbox changes", async () => {
+    webAnswersOthersHang();
+    const { rerender } = render(<NetlogView name="web" />);
+    expect(await screen.findByText(/Firewall ON/)).toBeInTheDocument();
+
+    rerender(<NetlogView name="db" />);
+
+    expect(screen.queryByText(/Firewall ON/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Firewall OFF/)).not.toBeInTheDocument();
+    expect(screen.getByText(/posture unknown/i)).toBeInTheDocument();
+  });
+
+  it("refuses an enforce write during a sandbox switch (policySetEnforce never called)", async () => {
+    webAnswersOthersHang();
+    const { rerender } = render(<NetlogView name="web" />);
+    await screen.findByText(/Firewall ON/);
+
+    rerender(<NetlogView name="db" />);
+
+    // Unguarded, this click writes `policySetEnforce("db", false)` — the NEW
+    // sandbox, flipped from the OLD sandbox's posture. That is a DISARM.
+    fireEvent.click(screen.getByLabelText(/enforce firewall/i));
+    expect(api.policySetEnforce).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/refus/i)).toBeInTheDocument());
+    expect(api.policySetEnforce).not.toHaveBeenCalled();
+  });
+
+  it("withdraws the previous sandbox's rows and their policy actions on a switch", async () => {
+    webAnswersOthersHang();
+    const { rerender } = render(<NetlogView name="web" />);
+    // `web` is enforcing and allows api.x.com, so the row offers Block.
+    await screen.findByRole("button", { name: /block api\.x\.com/i });
+
+    rerender(<NetlogView name="db" />);
+
+    // The row-policy writes share the enforce guard structurally: they render
+    // only under `enforcing`, which is derived from `policy` — cleared here.
+    // This test is what keeps that "structural" claim honest.
+    expect(screen.queryByRole("button", { name: /block api\.x\.com/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /allow api\.x\.com/i })).not.toBeInTheDocument();
+    expect(screen.queryByText("api.x.com")).not.toBeInTheDocument();
+    expect(api.policyBlock).not.toHaveBeenCalled();
+    expect(api.policyAllow).not.toHaveBeenCalled();
+  });
+
+  it("never paints a slow answer for the sandbox the tab already left", async () => {
+    let answerWeb: (p: PolicyView) => void = () => {};
+    (api.policyShow as Mock).mockImplementation((n: string) =>
+      n === "web"
+        ? new Promise<PolicyView>((res) => {
+            answerWeb = res;
+          })
+        : new Promise(() => {}),
+    );
+    const { rerender } = render(<NetlogView name="web" />);
+    await waitFor(() => expect(api.policyShow).toHaveBeenCalledWith("web"));
+
+    rerender(<NetlogView name="db" />);
+    // `web`'s answer arrives AFTER the tab moved on: it describes a sandbox
+    // that is no longer selected and must never be painted as `db`'s.
+    await act(async () => {
+      answerWeb(enforcingWeb);
+    });
+
+    expect(screen.queryByText(/Firewall ON/)).not.toBeInTheDocument();
+    expect(screen.getByText(/posture unknown/i)).toBeInTheDocument();
+    expect(screen.queryByText("api.x.com")).not.toBeInTheDocument();
   });
 });

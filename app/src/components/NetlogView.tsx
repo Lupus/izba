@@ -95,15 +95,26 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
     return () => clearInterval(id);
   }, []);
 
+  // The sandbox this tab is currently showing. Every answer is checked against
+  // it before it is painted, because an in-flight `refresh` captured the name
+  // it was issued for and the selection can move on while it is in flight.
+  const shownName = useRef(name);
+
   const refresh = useCallback(async () => {
     try {
       const [r, p] = await Promise.all([api.readNetlog(name), api.policyShow(name)]);
+      // A slow answer for a sandbox the tab has already left describes
+      // something that is no longer on screen: painting it would restore
+      // exactly the wrong pairing the reset below exists to prevent, and would
+      // do it wearing a "ready" posture.
+      if (shownName.current !== name) return;
       setRows(r);
       setPolicy(p);
       setError(null);
       setLoadState({ kind: "ready" });
       setRefusal(null);
     } catch (e) {
+      if (shownName.current !== name) return;
       const message = e instanceof Error ? e.message : String(e);
       setError(message);
       // Only a load that never succeeded is "unknown". Once a policy has been
@@ -115,6 +126,25 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
 
   useEffect(() => {
     let alive = true;
+    // A different sandbox is a different posture, a different allow-list and a
+    // different netlog. Reset on the NAME CHANGE, not when the new answer
+    // arrives: for that whole window the tab would otherwise pair the new
+    // sandbox's name with the previous sandbox's `ready` posture and keep every
+    // control live — and `toggleEnforce` would then write
+    // `policySetEnforce(NEW, !OLD_POSTURE)`, which unlike the never-loaded
+    // window can write OFF and DISARM a firewall. Going back to `loading`
+    // hands the whole window to the unknown-posture treatment above, which
+    // also withdraws the row-policy actions (they render only under
+    // `enforcing`, derived from `policy`). Same guard as PolicyEditor's
+    // name-change reset.
+    if (shownName.current !== name) {
+      shownName.current = name;
+      setLoadState({ kind: "loading" });
+      setPolicy(null);
+      setRows([]);
+      setError(null);
+      setRefusal(null);
+    }
     void refresh();
     const id = setInterval(() => {
       if (alive && !hoveringRef.current) void refresh();
@@ -123,7 +153,7 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
       alive = false;
       clearInterval(id);
     };
-  }, [refresh, pollMs]);
+  }, [refresh, pollMs, name]);
 
   // Run an action, then refresh immediately so the Policy column / button flip
   // right away instead of waiting up to 1.5s for the next poll.
