@@ -158,10 +158,10 @@ weak to verify its promise → **coverage finding**: tighten the journey).
 **Audit greens at least as hard as reds — the reds are usually not where the bug
 is.** The intuition runs the other way, and it is backwards: a red is a candidate
 someone already flagged, so it gets refuted; a green is a claim nobody will read
-again. One deep tier of 19 journeys produced 31 flipping candidates of which
-**zero** survived triage as product bugs (22 refuted, 10 inconclusive) — and its
-one real P1 came out of auditing a *passing* journey, one of the two that turned
-out to be passing for the wrong reason. Budget the skeptic's attention
+again. One deep tier of 19 journeys produced 32 candidates of which **zero**
+were kept as product bugs (22 refuted, 10 inconclusive) — and its one real P1
+came out of auditing a *passing* journey, one of the two that turned out to be
+passing for the wrong reason. Budget the skeptic's attention
 accordingly, and demand the same evidence from a green as from a red: which
 action exercised the promise, and what independent truth corroborates it.
 
