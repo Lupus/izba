@@ -80,15 +80,21 @@ digraph dogfood {
   rearranges the complete set into `tier-smoke.json` / `tier-core.json` /
   `tier-deep.json` + a `sequence-plan.json` (gates + capability graph). Deterministic.
 - **Phase 3 — Progressive gated loop.** For each tier, cheapest first:
-  1. `DOGFOOD_BASE=<fixes-branch tip> scripts/dispatch-swarm.sh <feature> tier-<t>.json <shards> <max_usd>`
+  1. **Pre-register the confounds** — before the tier runs, write down the
+     alternative explanations you already expect (environment, journey defects,
+     any oracle built during this campaign) and the instrument's known ceilings.
+     Written afterwards, the identical reasoning is rationalisation.
+  2. `DOGFOOD_BASE=<fixes-branch tip> scripts/dispatch-swarm.sh <feature> tier-<t>.json <shards> <max_usd>`
      (cut the dispatch off the tip carrying the fixes so far; report-only).
-  2. `scripts/collect-trajectories.py <out>` → dispatch `trajectory-skeptic`
-     (pass `sequence-plan.json`) → triaged report + **capability verdict** +
-     per-finding **fix-routing**.
-  3. For each gating gap: **auto-fixable** → `dogfood-gap-fixer` applies it
+  3. `scripts/collect-trajectories.py <out>` → dispatch `trajectory-skeptic`
+     (pass `sequence-plan.json` **and the pre-registered confounds** — *test these
+     first, and do not let them become an excuse to dismiss a real finding* — and
+     require the greens audited at least as hard as the reds) → triaged report +
+     **capability verdict** + per-finding **fix-routing**.
+  4. For each gating gap: **auto-fixable** → `dogfood-gap-fixer` applies it
      in-place on the CI branch, commit, **re-run the tier off the new tip**
      (≤~2 retries); **escalate** → record blocker, mark its caps blocked.
-  4. **Defer** (log, don't drop) deeper journeys whose `requires` names a blocked
+  5. **Defer** (log, don't drop) deeper journeys whose `requires` names a blocked
      capability. Advance when the tier's gating journeys pass.
 - **Phase 4 — Land.** Ensure the **SonarQube** gate is green, run **`/greploop`**
   to clear Greptile on the fixes PR, then emit ONE comprehensive report:
@@ -134,7 +140,7 @@ the test's main signal.
 | Flatten bundles for the skeptic | `scripts/collect-trajectories.py <artifacts-dir>` |
 | Fix a well-scoped gap in-place | dispatch the `dogfood-gap-fixer` subagent (one finding) |
 | Append the run's signal/noise tallies | `scripts/append-ledger.py --collected collected.json --verdict skeptic-verdict.json --feature <f> --tier <t>` (ledger: `hack/dogfood/ledger.jsonl`) |
-| Journey / trajectory file contracts | `hack/dogfood/schema/*.schema.json` (journey has `tier`/`establishes`/`requires`/`gating`) |
+| Journey / trajectory file contracts | `hack/dogfood/schema/*.schema.json` (journey has `tier`/`establishes`/`requires`/`gating`; decisive hooks `expect_stdout_re`/`expect_stderr_re`/`expect_state`, incl. `expect_state.policy`) |
 | Phase-3 runner internals & oracle harness | `hack/dogfood/` (`run_journeys.py`, `oracles.py`, `local-harness.md`) |
 | Render a one-bundle CI job summary | `hack/dogfood/summarize_bundle.py <traj.json> [...]` |
 | Standing novice smoke corpus (weekly cron + `journeys_path` input) | `hack/dogfood/journeys/smoke-core-cli.json` |
@@ -147,7 +153,21 @@ the test's main signal.
 - **Leaking the spec to the swarm** (in the context pack, or by writing exact
   commands into journeys "so it won't struggle") — kills discoverability signal.
 - **Trusting green** — a passing journey that never reached its assertion verifies
-  nothing. The skeptic must audit positives, not just reds.
+  nothing, and the reds are usually not where the bug is: one deep tier's 31
+  flipping candidates yielded ZERO product bugs (22 refuted, 10 inconclusive),
+  while its only P1 came out of auditing a *passing* journey. Audit positives with
+  evidence, not just reds.
+- **Crediting a refusal from an absence** — "X was refused / nothing happened" is
+  proven only if the actor demonstrably ATTEMPTED X *and* persisted truth is
+  unchanged; the notice saying a control is inert usually renders whether or not
+  anyone touched it.
+- **Assuming a seeded fixture survived** — the actor will overwrite it with an
+  example copied out of the context pack (in one tier: 11 of 11 CLI journeys).
+  Assert on content the actor could not invent; never fix it by telling the actor
+  about the seed — that breaches the fair-test boundary.
+- **Fanning committing agents into one working tree** — concurrent fixers race the
+  git index and absorb each other's commits. One worktree per agent, or serialize
+  the commits through a single writer.
 - **Thin anchors** — an `expect` you can't cite is slop; the oracle can't judge it.
 - **Opening a PR for the `dogfood-run/*` branch** — fires the normal gates; push
   only, dispatch only.
