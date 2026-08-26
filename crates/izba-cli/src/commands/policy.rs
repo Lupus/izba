@@ -466,13 +466,23 @@ fn enable(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+/// The success line `reload` prints. Pure so the DEEP-2 promise — that the line
+/// names the exact file it re-read, so an operator who edited a stray copy sees
+/// the mismatch — is unit-testable without a live daemon.
+fn reload_message(name: &str, policy_path: &std::path::Path) -> String {
+    format!(
+        "reloaded egress policy for '{name}' from {} (applies to new connections)",
+        policy_path.display()
+    )
+}
+
+#[mutants::skip] // reason: drives a live daemon (connect + ReloadPolicy over the socket); e2e-only (daemon_e2e asserts the "reloaded egress policy" line). The line it prints is built by `reload_message`, unit-tested below.
 fn reload(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     let mut client = DaemonClient::connect(paths)?;
     client.reload_policy(name)?;
-    let policy_path = EgressPolicyConfig::path_in(&paths.sandbox_dir(name));
     println!(
-        "reloaded egress policy for '{name}' from {} (applies to new connections)",
-        policy_path.display()
+        "{}",
+        reload_message(name, &EgressPolicyConfig::path_in(&paths.sandbox_dir(name)))
     );
     Ok(0)
 }
@@ -1562,5 +1572,30 @@ mod tests {
         }
         // The failed verbs must not have created any stub state.
         assert!(!paths.sandbox_dir("ghost").exists());
+    }
+}
+
+#[cfg(test)]
+mod reload_message_tests {
+    use super::reload_message;
+    use std::path::Path;
+
+    // DEEP-2 (dogfood): the whole point of naming the path is that an operator
+    // who edited a stray copy sees the mismatch. Assert the path is IN the line,
+    // not merely that the line exists.
+    #[test]
+    fn reload_message_names_the_file_it_read() {
+        let msg = reload_message("web", Path::new("/data/sandboxes/web/policy.yaml"));
+        assert!(msg.contains("/data/sandboxes/web/policy.yaml"), "{msg}");
+        assert!(msg.contains("web"), "{msg}");
+        assert!(msg.contains("new connections"), "{msg}");
+    }
+
+    #[test]
+    fn reload_message_does_not_confuse_two_sandboxes_of_similar_name() {
+        let a = reload_message("web", Path::new("/d/sandboxes/web/policy.yaml"));
+        let b = reload_message("web2", Path::new("/d/sandboxes/web2/policy.yaml"));
+        assert_ne!(a, b);
+        assert!(!a.contains("web2"), "{a}");
     }
 }
