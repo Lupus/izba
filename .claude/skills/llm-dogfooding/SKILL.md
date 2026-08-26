@@ -153,9 +153,9 @@ the test's main signal.
 - **Leaking the spec to the swarm** (in the context pack, or by writing exact
   commands into journeys "so it won't struggle") — kills discoverability signal.
 - **Trusting green** — a passing journey that never reached its assertion verifies
-  nothing, and the reds are usually not where the bug is: one deep tier's 31
-  flipping candidates yielded ZERO product bugs (22 refuted, 10 inconclusive),
-  while its only P1 came out of auditing a *passing* journey. Audit positives with
+  nothing, and the reds are usually not where the bug is: one deep tier's 32
+  candidates yielded ZERO product bugs (22 refuted, 10 inconclusive), while its
+  only P1 came out of auditing a *passing* journey. Audit positives with
   evidence, not just reds.
 - **Crediting a refusal from an absence** — "X was refused / nothing happened" is
   proven only if the actor demonstrably ATTEMPTED X *and* persisted truth is
