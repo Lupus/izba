@@ -49,7 +49,9 @@ pub enum PolicyCmd {
     },
     /// Re-read a sandbox's policy.yaml and apply it to new connections (no
     /// restart). That file is the managed truth, kept host-side at
-    /// `<izba data dir>/sandboxes/<name>/policy.yaml`; edit it there and reload
+    /// `<izba data dir>/sandboxes/<name>/policy.yaml` — the data dir is
+    /// `$IZBA_DATA_DIR` when set, otherwise `~/.local/share/izba` on
+    /// Linux/macOS and `%LOCALAPPDATA%\izba` on Windows; edit it there and reload
     /// to change settings this CLI has no flag for, such as a PORT's
     /// `protocol:` (the legacy entry-level spelling applies to every port of
     /// that entry). Editing that file applies straight away, with no review:
@@ -274,6 +276,16 @@ fn render_allow_grant(entries: &[AllowEntry]) -> String {
         // aimed at one port can switch off a hatch declared on another.
         // Without this line the only surface that says so is a `policy show`
         // the user has no reason to run.
+        //
+        // The remedy names the routes that can actually re-widen the entry.
+        // `policy allow` is NOT one of them: it narrows only (`--read`), and
+        // `EgressPolicyConfig::allow` preserves an existing entry's access, so
+        // the "re-grant without --read" this line used to print left the
+        // access untouched and re-printed itself — a loop with no exit
+        // (#259 verified the same fact against the built binary). Same terms
+        // as the two surfaces that already say the true thing about this
+        // state, `policy show` and the app's Policy tab, so one policy is not
+        // described in three ways.
         if e.access() != Access::ReadWrite {
             for s in e
                 .port_specs()
@@ -283,8 +295,10 @@ fn render_allow_grant(entries: &[AllowEntry]) -> String {
                 let _ = writeln!(
                     out,
                     "  \u{26A0} :{} protocol: tcp — pinning passthrough NOT in effect at \
-                     access: read (an opaque splice carries no HTTP method); re-grant \
-                     without --read to restore it",
+                     access: read (an opaque splice carries no HTTP method); `policy \
+                     allow` never widens an existing entry — widen to read-write in \
+                     policy.yaml then `izba policy reload`, or in izba.yml followed by \
+                     `izba diff`/`izba promote`",
                     s.port
                 );
             }
@@ -869,7 +883,34 @@ mod tests {
             out.contains("NOT in effect"),
             "the cancellation is the headline, exactly as `policy show` puts it: {out}"
         );
-        assert!(out.contains("--read"), "say how to restore it: {out}");
+        // Dogfooding, pt2 P-1: the remedy this line used to print
+        // ("re-grant without --read to restore it") does nothing. `policy
+        // allow` has no widening path — `apply_allow_edit` narrows only when
+        // `--read` is passed and `EgressPolicyConfig::allow` preserves an
+        // existing entry's access — so following it re-prints the same advice
+        // (verified against the built binary; #259 verified the same fact).
+        // The line must name a route that actually re-widens the entry.
+        assert!(
+            !out.contains("re-grant"),
+            "must not advertise a re-grant that cannot widen the entry: {out}"
+        );
+        assert!(
+            out.contains("never widens an existing entry"),
+            "say that `policy allow` cannot undo this: {out}"
+        );
+        assert!(
+            out.contains("policy.yaml") && out.contains("izba policy reload"),
+            "name the managed-file route that does work: {out}"
+        );
+        assert!(
+            out.contains("izba.yml") && out.contains("izba promote"),
+            "name the reviewed manifest route that does work: {out}"
+        );
+        assert!(
+            out.contains("widen to read-write"),
+            "`policy show` and the app's Policy tab both say `widen to read-write` \
+             about this same state \u{2014} do not describe one policy in two ways: {out}"
+        );
         assert!(
             !out.contains(":80 protocol") && !out.contains(":8443 protocol"),
             "only the declared port carries the hatch — do not warn about the others: {out}"
@@ -1597,5 +1638,41 @@ mod reload_message_tests {
         let b = reload_message("web2", Path::new("/d/sandboxes/web2/policy.yaml"));
         assert_ne!(a, b);
         assert!(!a.contains("web2"), "{a}");
+    }
+
+    /// Dogfooding, pt2 P-2: `policy reload --help` is the surface that sends
+    /// an operator to the managed file, and it named `<izba data dir>` with
+    /// nothing anywhere in the CLI resolving the placeholder — an Actor
+    /// invented a `izba version --json` field to print it and wrote to
+    /// `null/sandboxes/<name>/policy.yaml`. The help must resolve it itself
+    /// (the env override + the per-OS default, matching
+    /// `izba_core::paths::Paths::from_env_or_default`).
+    #[test]
+    fn reload_long_help_resolves_the_data_dir_placeholder() {
+        use super::PolicyCmd;
+        use clap::Subcommand;
+
+        let cmd = PolicyCmd::augment_subcommands(clap::Command::new("policy"));
+        let mut reload = cmd
+            .find_subcommand("reload")
+            .expect("policy reload is wired up")
+            .clone();
+        let help = reload.render_long_help().to_string();
+        assert!(
+            help.contains("<izba data dir>"),
+            "the placeholder is still the thing being explained: {help}"
+        );
+        assert!(
+            help.contains("IZBA_DATA_DIR"),
+            "name the override that decides the path: {help}"
+        );
+        assert!(
+            help.contains("~/.local/share/izba"),
+            "name the Unix default a reader can cd into: {help}"
+        );
+        assert!(
+            help.contains("LOCALAPPDATA"),
+            "the Windows default too \u{2014} the CLI ships on both: {help}"
+        );
     }
 }
