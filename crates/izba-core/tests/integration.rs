@@ -2131,8 +2131,31 @@ fn pinning_passthrough_ab_vendor_cert_vs_izba_ca_real_vm() {
         &format!("allow:\n  - {PIN_HOST}\n"),
     );
 
+    // Dormant arm: 443 declared `protocol: tcp` exactly as the positive arm, but
+    // the entry narrowed to `access: read`. The hatch is DECLARED and legal, yet
+    // must not open: an opaque splice carries no HTTP method, so
+    // `egress.rego`'s `host_access_ok("read")` never authorizes one and
+    // `router::passthrough_names`'s per-name `policy.check` filter drops the
+    // candidate. `izba policy show` promises exactly this ("NOT in effect ... a
+    // pinning client still sees izba's certificate"), and the desktop Policy tab
+    // must not disagree — but until now the DATAPATH half of that promise was
+    // asserted only by this test's avoidance of `access: read`, never exercised.
+    // A regression here is a silent no-upstream-certificate-verification bypass.
+    let dormant = observe_pinning_arm(
+        &env,
+        &mut tb,
+        "pin-dormant",
+        &format!(
+            "allow:\n  - host: {PIN_HOST}\n    access: read\n    ports:\n      - port: 443\n        protocol: tcp\n"
+        ),
+    );
+
     // --- both arms actually reached the internet -----------------------------
-    for (label, o) in [("declared", &pinned), ("undeclared", &inspected)] {
+    for (label, o) in [
+        ("declared", &pinned),
+        ("undeclared", &inspected),
+        ("dormant", &dormant),
+    ] {
         assert!(
             o.warmup_ok,
             "the {label} arm never completed an HTTPS fetch under izba's own trust \
@@ -2195,6 +2218,39 @@ fn pinning_passthrough_ab_vendor_cert_vs_izba_ca_real_vm() {
             .any(|r| r.rule.contains("passthrough")),
         "no passthrough row may exist for a host that declared no `protocol: tcp`.\n{}",
         inspected.dump("undeclared")
+    );
+
+    // --- dormant arm: declared, but narrowed to `access: read` ---------------
+    // Must be indistinguishable from the UNDECLARED arm on the wire. This is the
+    // half that catches a dormant hatch quietly going live.
+    assert!(
+        dormant.izba_ca_ok,
+        "a DORMANT hatch (`protocol: tcp` under `access: read`) must stay \
+         inspected: the guest's handshake had to validate against izba's CA \
+         alone.\n{}",
+        dormant.dump("dormant")
+    );
+    assert!(
+        !dormant.vendor_ca_ok && dormant.vendor_ca_out.contains("certificate verify failed"),
+        "a DORMANT hatch must NOT be spliced: validating against the public roots \
+         alone had to fail, exactly as for a host that declared nothing. A pass \
+         here means `access: read` silently authorized an opaque splice.\n{}",
+        dormant.dump("dormant")
+    );
+    assert!(
+        dormant.has(Tier::L7, "allow-list"),
+        "expected an L7 ALLOW for {PIN_HOST}:443 on the dormant arm — a narrowed \
+         entry still permits GET/HEAD, it just never passes through.\n{}",
+        dormant.dump("dormant")
+    );
+    assert!(
+        !dormant
+            .records
+            .iter()
+            .any(|r| r.rule.contains("passthrough")),
+        "no passthrough row may exist while the declaring entry's access is \
+         narrower than read-write.\n{}",
+        dormant.dump("dormant")
     );
 }
 
