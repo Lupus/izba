@@ -764,3 +764,33 @@ def test_expect_stderr_re_validates():
     with pytest.raises(jsonschema.exceptions.ValidationError):
         jsonschema.validate(_minimal_journey_doc({"expect_stderr_re": 7}),
                             schema)
+
+
+def test_journey_result_allows_final_observation():
+    # H4: the GUI runner persists the FINAL post-settle capture — the sole
+    # evidence behind an expect_text credit the Actor's own last turn was too
+    # early to see. Marks and page text stay separate fields: expect_text is
+    # judged against page text alone.
+    schema = _load("trajectory.schema.json")
+    jr = schema["definitions"]["journey_result"]
+    obs = jr["properties"]["final_observation"]
+    assert obs["type"] == "object"
+    assert "marks" in obs["properties"]
+    assert "page_text" in obs["properties"]
+    assert "final_observation" not in jr["required"]
+
+
+def test_gui_bundle_with_final_observation_validates():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _load("trajectory.schema.json")
+    bundle = {
+        "shard": 0, "feature": "f",
+        "results": [{
+            "journey_id": "gui-policy-tab", "actions": [], "candidates": [],
+            "final_observation": {
+                "marks": '[@e2] row "pinned.vendor.example"',
+                "page_text": "Port 443: TLS-pinning passthrough",
+            },
+        }],
+    }
+    jsonschema.validate(bundle, schema)  # must not raise

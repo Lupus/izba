@@ -1142,6 +1142,17 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
         "marks": marks_history[0] if marks_history else "",
         "page_text": page_text_history[0] if page_text_history else "",
     }
+    # H4 (smoke-run skeptic): persist the FINAL capture too — the one taken
+    # after the settle and the state-evidence pass, i.e. AFTER the Actor's
+    # last turn. A tab that was still loading when the Actor stopped renders
+    # the asserted row only here, and `expect_text_oracle` reads page text and
+    # nothing else, so this capture can be the SOLE evidence behind an
+    # expect_text credit (`dom_expect`/`silent_failure` grade the same
+    # moment). Without it the bundle credits an assertion whose evidence it
+    # does not contain, and a skeptic must read THIS file to accept the green.
+    # The two surfaces stay separate keys, never merged: which surface an
+    # assertion was judged against is itself part of the evidence.
+    final_observation = {"marks": final_marks, "page_text": final_page_text}
     result = {"journey_id": journey_id, "actions": actions,
               "candidates": candidates,
               # Fix 1: when the settle re-sampled, the SETTLED sample is the
@@ -1150,7 +1161,8 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
               "state_evidence": settle_out.get("settled", state_evidence),
               "invoke_log": invoke_log,
               "workspace": str(ws_abs), "decisive_credits": decisive_credits,
-              "initial_observation": initial_observation}
+              "initial_observation": initial_observation,
+              "final_observation": final_observation}
     if "first" in settle_out:
         result["state_evidence_presettle"] = settle_out["first"]
         # When MORE than one core step triggered the settle, the single

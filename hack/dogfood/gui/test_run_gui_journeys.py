@@ -2284,3 +2284,39 @@ def test_unentered_core_step_with_satisfied_expect_text_is_still_credited(
     assert res["decisive_credits"] == [{
         "step_index": 1, "action_index": -1,
         "graded_cmd": "expect_text: 'access: read' (matched)"}]
+
+
+def test_final_post_settle_capture_is_persisted_as_evidence(monkeypatch):
+    # H4 (smoke-run skeptic): a tab that is still loading when the Actor takes
+    # its last turn renders the asserted row only in the FINAL, post-settle
+    # capture — which is the sole evidence behind the expect_text credit,
+    # because expect_text_oracle reads page text and nothing else. The bundle
+    # must carry that capture: a skeptic auditing this green otherwise has to
+    # read this runner's source to establish where the match came from.
+    model = FakeModel([{"click": "@e2"}, {"done": True}])
+    loading = "Firewall posture unknown\nLoading this sandbox's policy…"
+    loaded = ("pinned.vendor.example\nPort 443: TLS-pinning passthrough — "
+              "spliced opaquely, with no upstream certificate verification")
+    driver = FakeDriver(
+        snapshots=['[@e2] tab "Policy"', '[@e2] tab "Policy"',
+                   '[@e2] row "pinned.vendor.example"'],
+        page_texts=["", loading, loaded])
+    journey = {"journey_id": "j-final-capture", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "read the policy view",
+                          "expect": "the row names what the port gives up",
+                          "core": True,
+                          "expect_text": "no upstream certificate verification"}]}
+    res = _run(journey, model, driver, monkeypatch)
+    # The credit exists and NO per-action capture can account for it.
+    assert res["decisive_credits"] == [{
+        "step_index": 0, "action_index": -1,
+        "graded_cmd": "expect_text: 'no upstream certificate verification' "
+                      "(matched)"}]
+    assert all("no upstream certificate verification" not in a["page_text"]
+               for a in res["actions"])
+    # ...so the bundle itself must hold the capture the credit rests on.
+    assert res["final_observation"]["page_text"] == loaded
+    # Marks stay a SEPARATE field: expect_text is judged against page text
+    # alone, and the bundle must not blur which surface answered.
+    assert res["final_observation"]["marks"] == '[@e2] row "pinned.vendor.example"'

@@ -1,0 +1,1785 @@
+{
+  "feature": "per-port `protocol:` inspectability / TLS-pinning passthrough (M5 P1 — #233 + #238 + #239/PR #262, re-run on PR #264's tip)",
+  "journeys": [
+    {
+      "journey_id": "smoke-firewall-file-accepted-at-create",
+      "rationale": "The capability floor for every other journey: a user who has read the docs can write an egress policy file, hand it to a new sandbox, and read the resulting posture back. If this fails nothing below is meaningful.",
+      "source": {
+        "kind": "readme",
+        "ref": "README 'agent firewall' section (policy.yaml example + `izba policy show NAME` posture) and `izba create --policy` help"
+      },
+      "tier": "smoke",
+      "modality": "cli",
+      "gating": true,
+      "establishes": [
+        "firewall-file-accepted",
+        "posture-readable"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called fw-basic for this directory that is only allowed to reach the host api.vendor.example, using the alpine:3.20 image",
+          "expect": "the sandbox is created and izba accepts the firewall settings without complaining",
+          "core": true,
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "fw-basic",
+            "exists": true,
+            "policy": {
+              "enforcing": true,
+              "host": "api.vendor.example",
+              "present": true
+            }
+          }
+        },
+        {
+          "intent": "ask izba to report what fw-basic's firewall currently allows and whether it is switched on",
+          "expect": "izba prints the enforcement posture and the allowed host with its ports",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_stdout_re": "api\\.vendor\\.example\\s+\\[80, 443\\]"
+        }
+      ]
+    },
+    {
+      "journey_id": "smoke-declare-a-pinning-exception",
+      "rationale": "The headline promise: one named port of one exact host can be declared exempt from interception for a client that pins certificates, and the exemption is per port. Everything in core/deep about the hatch presumes a user can get one declared at all.",
+      "source": {
+        "kind": "readme",
+        "ref": "README policy.yaml example (`pinned.vendor.com` entry, `port: 443` + `protocol: tcp`) and `izba create --policy` help"
+      },
+      "tier": "smoke",
+      "modality": "cli",
+      "gating": true,
+      "requires": [
+        "firewall-file-accepted"
+      ],
+      "establishes": [
+        "hatch-declared",
+        "hatch-revealed"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called pin-basic for this directory on the alpine:3.20 image whose firewall lets it reach exactly two things: the host plain.vendor.example, and the host pinned.vendor.example on ports 80 and 443 — and on that second host, port 443 alone must reach the vendor's own TLS untouched, because the client running there refuses any certificate but the vendor's",
+          "expect": "the sandbox is created and izba accepts the settings, treating only port 443 of pinned.vendor.example as the exempt one",
+          "core": true,
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "pin-basic",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        },
+        {
+          "intent": "read back what pin-basic's firewall now allows, and check what izba says that exempt port costs you",
+          "expect": "izba names the exempt port and spells out what is given up on it, including that the far end's certificate is no longer verified",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_stdout_re": "no upstream certificate verification"
+        }
+      ]
+    },
+    {
+      "journey_id": "smoke-find-the-surface-that-answers-bypass",
+      "rationale": "Discoverability of the audit surface itself (predicted flag D7 in the previous campaign, fixed in place on this tip). Someone auditing a machine asks 'is anything on this sandbox bypassing the firewall?' and must land on the surface that answers it rather than concluding from an unrelated summary that nothing is wrong.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba policy show` help: 'This is the CLI surface that reveals a `protocol: tcp` TLS-pinning passthrough ... `izba status` renders no egress posture at all'; README 'Auditing for exemptions'"
+      },
+      "tier": "smoke",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared"
+      ],
+      "establishes": [
+        "audit-surface-discoverable"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called audit-me for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on ports 80 and 443, with port 443 exempted from interception so a certificate-pinning client can talk to the vendor directly",
+          "expect": "the sandbox is created with those firewall settings",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "you have inherited this machine and must answer, for audit-me, the question 'is any traffic escaping this sandbox without being inspected?' — find izba's answer",
+          "expect": "izba reports that one specific port of one specific host is exempt from inspection, rather than leaving you to conclude from a quiet overview that nothing is",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_stdout_re": "pinning passthrough"
+        }
+      ]
+    },
+    {
+      "journey_id": "smoke-manifest-can-carry-the-firewall",
+      "rationale": "The reviewed authoring route has to be reachable: the project file can describe the firewall, and izba can show that description as a pending, reviewable change. Every review-gate journey below builds on this.",
+      "source": {
+        "kind": "readme",
+        "ref": "README izba.yml section: '`spec.egress` takes the same schema as `policy.yaml` ... reviewed through `izba diff` / `izba promote`'"
+      },
+      "tier": "smoke",
+      "modality": "cli",
+      "establishes": [
+        "manifest-egress-authoring"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called mani-egress for this directory on the alpine:3.20 image, with no firewall settings of any kind for now",
+          "expect": "the sandbox is created",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "write this project's izba.yml so that it describes the mani-egress sandbox on the alpine:3.20 image AND says the sandbox's firewall should be switched on and allow only the host api.vendor.example",
+          "expect": "the file is written",
+          "expect_exit": 0
+        },
+        {
+          "intent": "ask izba to show you how the project file's description differs from what the sandbox is actually set to right now, before anything is applied",
+          "expect": "izba reports that the project file is ahead of the sandbox and lists the firewall settings as one of the pending changes",
+          "core": true,
+          "expect_cmd_re": "izba diff",
+          "expect_exit": 0,
+          "expect_stdout_re": "(?s)state: repo ahead.*egress"
+        }
+      ]
+    },
+    {
+      "journey_id": "smoke-enforcing-sandbox-can-reach-an-allowed-site",
+      "rationale": "The datapath capability floor for the deep tier: a sandbox with the firewall on actually boots, its guest can complete an HTTPS request to an allowed public host, and izba's own connection log records it. Six deep journeys are worthless if this does not hold, so it gates rather than each of them re-proving it.",
+      "source": {
+        "kind": "readme",
+        "ref": "README 'Verifying enforcement: test with a real request' + 'izba netlog NAME records the verdict either way'"
+      },
+      "tier": "smoke",
+      "modality": "cli",
+      "gating": true,
+      "requires": [
+        "firewall-file-accepted"
+      ],
+      "establishes": [
+        "enforcing-sandbox-reaches-an-allowed-host"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called reach-ok for this directory on the alpine:3.20 image whose firewall is on and allows exactly the host example.com",
+          "expect": "the sandbox is created with the firewall on",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "start reach-ok and, from inside it, fetch the page at https://example.com/ over TLS",
+          "expect": "the fetch completes successfully from inside the sandbox",
+          "expect_exit": 0
+        },
+        {
+          "intent": "ask izba what that sandbox's connection log recorded for that request",
+          "expect": "the log shows the connection to example.com on port 443 being allowed",
+          "core": true,
+          "expect_cmd_re": "izba netlog",
+          "expect_exit": 0,
+          "expect_stdout_re": "ALLOW l7\\s.*example\\.com:443"
+        }
+      ]
+    },
+    {
+      "journey_id": "smoke-gui-policy-tab-reports-a-real-posture",
+      "rationale": "The desktop app is the second surface that is required to reveal an exemption, and it must never state a posture it has not read. Gating: every other GUI journey presumes the tab loads a real policy and marks the exempt port.",
+      "source": {
+        "kind": "pr",
+        "ref": "issue #239 AC 1-3 (visible marker carrying the CLI's substance); PR #264 'refuse to save a policy the editor never loaded'"
+      },
+      "tier": "smoke",
+      "modality": "gui",
+      "gating": true,
+      "establishes": [
+        "gui-policy-tab-loads",
+        "gui-pinned-row-visible"
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: pinned.vendor.example\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n      - host: api.vendor.example\n        ports:\n          - port: 8000\n            protocol: http\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'gui-pin1' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "the create finishes without an error banner and a sandbox named gui-pin1 appears in the sandbox list",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin1",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open the gui-pin1 sandbox's detail view, go to the view that shows which hosts it is allowed to reach, and work out whether the firewall is on and whether any single port there is exempt from inspection",
+          "expect": "the view states the firewall's on/off posture and one host row carries a visible message about one of its individual ports, naming what that port gives up",
+          "core": true,
+          "expect_text": "no upstream certificate verification",
+          "expect_state": {
+            "sandbox": "gui-pin1",
+            "policy": {
+              "enforcing": true,
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "core-a-granted-port-does-not-inherit-the-exception",
+      "rationale": "The structural promise of #238: opening one more port on a host that already has an exempt port must NOT extend the exemption to it. This is the whole point of declaring inspectability per port rather than per host.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba policy allow` help: 'A granted port is always inspected: it never inherits a `protocol: tcp` pinning passthrough declared for some other port of the same host'"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "posture-readable"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called inherit-no for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on port 443 only, with that port exempted from interception for a certificate-pinning client",
+          "expect": "the sandbox is created with that single exempt port",
+          "core": true,
+          "expect_cmd_re": "izba (create|run)",
+          "expect_state": {
+            "sandbox": "inherit-no",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        },
+        {
+          "intent": "the same vendor also serves a metrics endpoint on port 9000 — grant inherit-no access to port 9000 of pinned.vendor.example from the command line",
+          "expect": "the grant succeeds and izba echoes the access level it granted",
+          "expect_cmd_re": "izba policy allow",
+          "expect_exit": 0
+        },
+        {
+          "intent": "check whether that newly granted port is exempt from inspection too, or whether only the original one is",
+          "expect": "only the originally exempted port is treated as exempt; the newly granted port is inspected like any other",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_state": {
+            "sandbox": "inherit-no",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 9000,
+                "pinned": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "core-narrowing-access-says-the-exception-went-dormant",
+      "rationale": "A grant aimed at one port narrows the whole host entry's access, which silently switches off an exemption declared on a different port. The grant echo must say so at the moment it happens rather than leaving it to a command nobody has a reason to run.",
+      "source": {
+        "kind": "pr",
+        "ref": "PR #264 commit 'fix(cli): stop stating an egress posture the firewall is not enforcing' — CORE-2: 'The echo now names the dormant port and how to restore it'"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called dormant-echo for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on port 443, exempted from interception for a certificate-pinning client",
+          "expect": "the sandbox is created with that exempt port",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "that vendor also has a docs site on port 9000 which this sandbox should only be able to READ from — grant dormant-echo read-only access to port 9000 of pinned.vendor.example",
+          "expect": "izba grants it and, in the same breath, tells you that this narrowing has taken the exempt port out of effect and how to get it back",
+          "core": true,
+          "expect_cmd_re": "izba policy allow",
+          "expect_exit": 0,
+          "expect_stdout_re": "re-grant without --read to restore it"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-audit-surface-under-a-narrower-access",
+      "rationale": "An exemption on a host that is only allowed to read is declared but dormant — an opaque connection carries no HTTP method, so a read-only grant never authorizes one. The audit surface must report it as not in effect rather than as a live hole, and must say what would make it live.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md 'Inspectability is DECLARED per PORT': 'both render a pinned port on a NARROWER-than-read-write row as NOT in effect rather than live'"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "posture-readable"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called dormant-show for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on port 443 — exempted from interception — but restricts that host to read-only access",
+          "expect": "the create command finishes without an error",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "dormant-show",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "access": "read",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        },
+        {
+          "intent": "ask izba what dormant-show's firewall allows, and work out from its answer whether that exempt port is actually in effect right now",
+          "expect": "izba states that the exemption is not in effect on that port and names the change that would put it in effect",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_stdout_re": "widen to read-write to pin"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-firewall-off-does-not-read-as-one-hole",
+      "rationale": "A log-only sandbox restricts nothing, so a declared exemption there is inert — nothing is being terminated, so nothing is being spliced. Reporting the allow-list bare with a live exemption warning would read as a default-deny firewall with exactly one hole: the safe-looking misstatement, on the one surface that reveals posture.",
+      "source": {
+        "kind": "pr",
+        "ref": "PR #264 commit 'fix(cli): stop stating an egress posture the firewall is not enforcing' — CORE-1"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "posture-readable",
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called logonly for this directory on the alpine:3.20 image with firewall settings that are LOG-ONLY — everything is still allowed out and merely recorded — but which nonetheless list the host pinned.vendor.example on port 443 with that port declared exempt from interception",
+          "expect": "the sandbox is created and izba accepts the log-only settings",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "logonly",
+            "policy": {
+              "enforcing": false
+            }
+          }
+        },
+        {
+          "intent": "ask izba what logonly's firewall is actually doing, and decide from its answer whether that sandbox is restricted with one exception, or not restricted at all",
+          "expect": "izba says plainly that all egress is allowed and that the listed hosts are not in force, and describes the declared exemption as inert rather than as a live bypass",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_stdout_re": "(?s)all egress allowed \\(enforce off\\).*declaration is inert"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-refuse-pinning-on-a-wildcard-host",
+      "rationale": "The exemption is matched against the name the client actually asks for, so it is only meaningful on an exactly-named host. A wildcard must be refused with an actionable message rather than quietly honoured or quietly ignored.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'The TLS-pinning hatch is an EXPLICIT `protocol: tcp` on an EXACT host (a wildcard is a parse error)'"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "you want every subdomain of vendor.example to reach its own TLS untouched on port 443, so write firewall settings that name the hosts as a one-label wildcard under vendor.example with port 443 exempted from interception, and try to create a sandbox called wild-pin for this directory on the alpine:3.20 image with them",
+          "expect": "izba refuses the settings and its message explains that the exemption has to name each host exactly, rather than silently accepting or silently ignoring the wildcard",
+          "core": true,
+          "expect_cmd_re": "izba (create|run|policy reload)",
+          "expect_exit": "nonzero",
+          "expect_stderr_re": "needs an exact host"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-inspection-may-be-asked-for-on-a-wildcard",
+      "rationale": "The restriction is asymmetric on purpose: asking for MORE inspection only ever narrows what is permitted, so a wildcard host may ask that an unusual port be policed at the HTTP layer even though it may not ask for an exemption. A user who met the wildcard refusal must not conclude that no per-port setting works on a wildcard.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'The axis may only widen' + `--policy` help ('`protocol: http` polices a non-web port at L7')"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "posture-readable"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called wild-http for this directory on the alpine:3.20 image whose firewall lets it reach any single-label subdomain of svc.example on port 8443, and asks izba to police that port at the HTTP layer as well",
+          "expect": "izba accepts these settings — unlike the exemption, asking for more inspection on a wildcard is allowed",
+          "core": true,
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "wild-http",
+            "policy": {
+              "host": "*.svc.example",
+              "port": {
+                "number": 8443,
+                "pinned": false
+              }
+            }
+          }
+        },
+        {
+          "intent": "read back what wild-http's firewall allows and confirm izba records that extra policing against the port you asked for",
+          "expect": "the report names port 8443 as inspected",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_stdout_re": ":8443 protocol: http \\(inspected\\)"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-refuse-an-unknown-declaration-value",
+      "rationale": "A typo'd value for a per-port setting must be refused naming the values that exist — silently dropping it would leave a port the user believes is exempt (or believes is policed) behaving the other way.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — parse_protocol's error names the valid set; README 'Unknown keys anywhere in policy.yaml are rejected with an error naming the key and its valid alternatives'"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write firewall settings for a sandbox called bad-value on the alpine:3.20 image that allow the host pinned.vendor.example on port 443 and try to describe that port's handling with the word 'ssl', then try to create the sandbox with them",
+          "expect": "izba refuses and its message tells you which words that setting actually accepts",
+          "core": true,
+          "expect_cmd_re": "izba (create|run|policy reload)",
+          "expect_exit": "nonzero",
+          "expect_stderr_re": "expected 'http' or 'tcp'"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-refuse-a-typo-in-the-port-mapping",
+      "rationale": "A misspelled key inside a port entry must be refused naming the keys that belong there. A silently ignored key is a security footgun in the quiet direction: the user believes they declared something and nothing was declared.",
+      "source": {
+        "kind": "readme",
+        "ref": "README: 'Unknown keys anywhere in `policy.yaml` are rejected with an error naming the key and its valid alternatives — a typo can never silently widen egress scope'"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write firewall settings for a sandbox called bad-key on the alpine:3.20 image that allow the host pinned.vendor.example on port 443 and, when spelling out how that port should be handled, misspell the setting's name as 'protokol'; try to create the sandbox with them",
+          "expect": "izba refuses and names the keys that are actually allowed inside a port entry, instead of accepting the file with the setting quietly dropped",
+          "core": true,
+          "expect_cmd_re": "izba (create|run|policy reload)",
+          "expect_exit": "nonzero",
+          "expect_stderr_re": "valid keys: port, protocol"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-refuse-one-port-declared-two-ways",
+      "rationale": "One port must have one answer. Listing the same port twice with contradicting handling has to be refused naming both, because resolving it silently either way is how a port reported as inspected ends up spliced.",
+      "source": {
+        "kind": "pr",
+        "ref": "PR #264 commit 'fix(core): refuse a port declared twice with conflicting protocols' (Greptile P1 on PR #260)"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write firewall settings for a sandbox called dup-port on the alpine:3.20 image that allow the host pinned.vendor.example and, in that host's port list, mention port 443 twice — once plainly and once declared exempt from interception — then try to create the sandbox with them",
+          "expect": "izba refuses the contradiction and its message names the port and both of the things that were said about it, rather than quietly picking one",
+          "core": true,
+          "expect_cmd_re": "izba (create|run|policy reload)",
+          "expect_exit": "nonzero",
+          "expect_stderr_re": "listed twice with different declarations"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-police-an-unusual-port-at-http",
+      "rationale": "The other half of the per-port setting: an internal service on a non-web port can be asked for MORE policing than it gets by default, and the audit surface must confirm that against the port it applies to.",
+      "source": {
+        "kind": "readme",
+        "ref": "README policy.yaml example: `- port: 8000 / protocol: http  # police this port at L7 too (80/443 already are)`"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "firewall-file-accepted",
+        "posture-readable"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called probe-8000 for this directory on the alpine:3.20 image whose firewall lets it reach internal.svc.example on port 8000, and which asks izba to apply its HTTP-level rules to that port too rather than treating it as opaque traffic",
+          "expect": "the sandbox is created with those settings",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "read back what probe-8000's firewall allows and confirm izba recorded that request against port 8000",
+          "expect": "the report marks port 8000 as inspected",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_stdout_re": ":8000 protocol: http \\(inspected\\)"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-an-older-policy-file-keeps-its-meaning",
+      "rationale": "Back-compatibility promise: the older spelling, where the handling is stated once for a whole host entry instead of per port, still parses and still means what it always meant. An upgrading operator must not have their shipped file change posture underneath them.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba create --policy` help: 'The legacy entry-level `protocol:` spelling still parses and applies to EVERY port of that entry'"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "posture-readable"
+      ],
+      "steps": [
+        {
+          "intent": "you are carrying forward a firewall file written before izba let you say things about individual ports: it allows the host pinned.vendor.example on port 443 and states — once, for the whole host entry rather than for the port — that its traffic is to be passed through untouched for a certificate-pinning client. Write that older-style file and create a sandbox called legacy-pin for this directory on the alpine:3.20 image with it",
+          "expect": "izba accepts the older-style file and the sandbox ends up with port 443 of that host exempt from interception, exactly as the file always meant",
+          "core": true,
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "legacy-pin",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        },
+        {
+          "intent": "read back what legacy-pin's firewall allows and confirm the exemption is reported against port 443",
+          "expect": "the report names the exempt port and what it gives up",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_stdout_re": ":443 protocol: tcp"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-declaration-survives-an-unrelated-grant",
+      "rationale": "Editing the allow-list elsewhere must neither drop nor relocate an existing exemption. The set of exempt ports must be exactly the set someone deliberately wrote one for.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'EgressPolicyConfig::allow (and every other mutator, for every caller) appends a port that structurally cannot inherit a sibling port's hatch'"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called survive-edit for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on port 443 with that port exempt from interception for a certificate-pinning client",
+          "expect": "the sandbox is created with that exempt port",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "your build now also needs to fetch from a completely different host — grant survive-edit access to registry.other.example",
+          "expect": "the grant succeeds and izba echoes the access level",
+          "core": true,
+          "expect_cmd_re": "izba policy allow",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "survive-edit",
+            "policy": {
+              "host": "registry.other.example",
+              "present": true
+            }
+          }
+        },
+        {
+          "intent": "check that the unrelated grant did not disturb the vendor host's exemption",
+          "expect": "the vendor host still has its exemption on port 443 and the new host has none",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_state": {
+            "sandbox": "survive-edit",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "core-retire-the-exception-from-the-command-line",
+      "rationale": "The asymmetry check: if an exemption can be declared, a user must be able to retire it and see the audit surface stop reporting a bypass. Nothing in the CLI authors an exemption, so removal is the only exemption-related edit it can make.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba policy block` help ('HOST:PORT removes exactly that port; auto-reloads'); `izba policy show` help (the audit surface)"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "posture-readable"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called retire-pin for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on port 443 alone, with that port exempt from interception",
+          "expect": "the sandbox is created with that exempt port",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "retire-pin",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        },
+        {
+          "intent": "the pinning client has been retired — take away retire-pin's access to that vendor host entirely from the command line",
+          "expect": "izba removes it",
+          "expect_cmd_re": "izba policy block",
+          "expect_exit": 0
+        },
+        {
+          "intent": "confirm that nothing on retire-pin is exempt from inspection any more",
+          "expect": "the vendor host is gone from what the sandbox may reach, and the audit surface no longer reports any bypass",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "retire-pin",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "present": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "core-a-plain-policy-renders-without-warnings",
+      "rationale": "Quietness is a promise too: a firewall that declares nothing unusual must read as ordinary, so that the one time a warning does appear it means something. A surface that decorates every policy trains operators to ignore it.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — the renderer is silent when a port declares nothing"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "posture-readable"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called plain-fw for this directory on the alpine:3.20 image whose firewall is on and allows just the two hosts api.vendor.example and registry.other.example",
+          "expect": "the create command finishes without an error",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "read back what plain-fw's firewall allows and judge whether izba is flagging anything unusual about it",
+          "expect": "the two hosts and their web ports are listed plainly, with no warning markers about inspection or bypass",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_stdout_re": "registry\\.other\\.example  \\[80, 443\\] \\(read-write\\)\\n"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-command-line-grants-skip-the-review-gate",
+      "rationale": "A command-line grant applies immediately with no review, while the same change made through the project file goes through a gate. A user must be able to find out that the two routes differ — otherwise they will believe the gate protects every path.",
+      "source": {
+        "kind": "readme",
+        "ref": "README izba.yml section: 'That is the only authoring route with the `⚠ weakens egress` gate in front of it; `izba policy allow` and a hand-edited `policy.yaml` both apply immediately, unreviewed.'"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "manifest-egress-authoring",
+        "firewall-file-accepted"
+      ],
+      "steps": [
+        {
+          "intent": "write this project's izba.yml so that it describes a sandbox called ungated on the alpine:3.20 image with its firewall switched on and allowing only the host api.vendor.example, then create that sandbox from this project directory so the two agree",
+          "expect": "the create command finishes without an error",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "someone now needs one more host — grant ungated access to registry.other.example straight from the command line, without touching the project file",
+          "expect": "izba applies the grant immediately, without asking anyone to review it",
+          "expect_cmd_re": "izba policy allow",
+          "expect_exit": 0
+        },
+        {
+          "intent": "check what izba now thinks about the relationship between this project's file and the sandbox's actual settings",
+          "expect": "izba reports that the sandbox's live settings have moved ahead of the project file — the grant went in without passing through the review step the project-file route uses",
+          "core": true,
+          "expect_cmd_re": "izba diff",
+          "expect_exit": 0,
+          "expect_stdout_re": "state: managed ahead"
+        }
+      ]
+    },
+    {
+      "journey_id": "core-edit-the-managed-file-and-reload",
+      "rationale": "Declaring an exemption is documented as something you do by editing the sandbox's own policy file and reloading — there is no CLI flag for it. The reload must confirm WHICH file it re-read, so an operator who edited a stray copy is not told 'success' about a file izba never looked at.",
+      "source": {
+        "kind": "pr",
+        "ref": "PR #264 commit 'fix(cli): name the reloaded policy path and warn --follow never exits' (DEEP-2); `izba policy reload` help names the managed file's location"
+      },
+      "tier": "core",
+      "modality": "cli",
+      "requires": [
+        "firewall-file-accepted",
+        "posture-readable"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called reload-pin for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on port 443, with nothing exempted yet",
+          "expect": "the sandbox is created with the firewall on",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "a certificate-pinning client now has to run in reload-pin — change that sandbox's firewall so port 443 of pinned.vendor.example reaches the vendor's own TLS untouched, and make izba pick the change up",
+          "expect": "izba re-reads the sandbox's settings and tells you exactly which file it read them from",
+          "core": true,
+          "expect_cmd_re": "izba policy reload",
+          "expect_exit": 0,
+          "expect_stdout_re": "reloaded egress policy for '.+' from .*policy\\.yaml",
+          "expect_state": {
+            "sandbox": "reload-pin",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "gui-only-the-declared-port-is-marked",
+      "rationale": "Per-port attribution on the desktop surface: the warning must belong to the port that carries the exemption. A host-level annotation would misreport which port gave a control up, and a port that merely asked for extra policing must not look exempt.",
+      "source": {
+        "kind": "pr",
+        "ref": "issue #239 AC 1-3 (the marker names the port; absent for http/undeclared ports)"
+      },
+      "tier": "core",
+      "modality": "gui",
+      "requires": [
+        "gui-pinned-row-visible"
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: pinned.vendor.example\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n      - host: api.vendor.example\n        ports:\n          - port: 8000\n            protocol: http\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'gui-pin2' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "the create finishes without an error banner and a sandbox named gui-pin2 appears in the sandbox list",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin2",
+            "exists": true,
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 80,
+                "pinned": false
+              }
+            }
+          }
+        },
+        {
+          "intent": "open gui-pin2's detail view, go to the view listing the hosts it may reach, and read both host rows port by port — noting which individual port each marker or message is about; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "each port is shown separately and any warning message refers to a port by number, so the two ports of the same host can be told apart",
+          "core": true,
+          "expect_text": "Port 443: TLS-pinning passthrough",
+          "expect_state": {
+            "sandbox": "gui-pin2",
+            "policy": {
+              "host": "api.vendor.example",
+              "port": {
+                "number": 8000,
+                "pinned": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "gui-dormant-exception-is-not-claimed-as-live",
+      "rationale": "The two revealing surfaces must not disagree about posture. On a read-only host row the exemption is declared but dormant, and the desktop app must say so in the same terms the command line does rather than claiming traffic is passing through untouched when it is still being intercepted.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-25-gui-passthrough-host-lock.md — the AC-4 Decision and its Amendment"
+      },
+      "tier": "core",
+      "modality": "gui",
+      "requires": [
+        "gui-pinned-row-visible"
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: pinned.vendor.example\n        access: read\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'gui-pin3' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "the create finishes without an error banner and a sandbox named gui-pin3 appears in the sandbox list",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin3",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open gui-pin3's detail view, go to the view listing the hosts it may reach, and work out from the vendor row — its access setting and whatever the row says about its declared port — whether that port's exemption is actually in effect; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "the row states that the exemption is not in effect given this row's access level, and points at what would change that",
+          "core": true,
+          "expect_text": "access never authorizes one",
+          "expect_state": {
+            "sandbox": "gui-pin3",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "access": "read",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "gui-inert-when-the-firewall-is-off",
+      "rationale": "A declared exemption on a sandbox whose firewall is off is inert — nothing is being terminated, so nothing is being spliced. The desktop surface previously announced it as a live bypass, which both misstated posture and disagreed with the command line about one policy.",
+      "source": {
+        "kind": "pr",
+        "ref": "PR #264 commit 'fix(app): say a declared hatch is inert when the sandbox is not enforcing'"
+      },
+      "tier": "core",
+      "modality": "gui",
+      "requires": [
+        "gui-pinned-row-visible"
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: false\n    allow:\n      - host: pinned.vendor.example\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'gui-pin4' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "the create finishes without an error banner and a sandbox named gui-pin4 appears in the sandbox list",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin4",
+            "exists": true,
+            "policy": {
+              "enforcing": false
+            }
+          }
+        },
+        {
+          "intent": "open gui-pin4's detail view, go to the view listing the hosts it may reach, and decide from what it shows whether that sandbox currently has one hole in an otherwise-closed firewall, or no firewall at all; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "the view shows the firewall as off and describes the declared exemption as inert rather than as traffic currently passing through untouched",
+          "core": true,
+          "expect_text": "this declaration is inert until enforcement is turned on",
+          "expect_state": {
+            "sandbox": "gui-pin4",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-pinned-host-reaches-its-own-tls-untouched",
+      "rationale": "The behaviour the whole declaration exists for: with the exemption in place, the connection to that host on that port is passed through opaquely rather than terminated and inspected, and izba's own connection log says which of the two happened.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'A passthrough flow is exactly a tier-2 flow that additionally proves its SNI'; mitm_runtime's audit rule text for a successful splice"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "enforcing-sandbox-reaches-an-allowed-host"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called pin-live for this directory on the alpine:3.20 image whose firewall is on, allows the host example.com on ports 80 and 443, and exempts port 443 of that host from interception so a certificate-pinning client can reach the site's own TLS",
+          "expect": "the sandbox is created with that exempt port",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "pin-live",
+            "policy": {
+              "host": "example.com",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        },
+        {
+          "intent": "start pin-live and, from inside it, fetch https://example.com/ over TLS",
+          "expect": "the fetch completes from inside the sandbox",
+          "expect_exit": 0
+        },
+        {
+          "intent": "ask izba's connection log for that sandbox what it did with that connection",
+          "expect": "the log shows the connection to example.com on port 443 being passed through rather than inspected at the HTTP layer",
+          "core": true,
+          "expect_cmd_re": "izba netlog",
+          "expect_exit": 0,
+          "expect_stdout_re": "ALLOW l3\\s.*example\\.com:443"
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-the-same-host-without-the-declaration-is-inspected",
+      "rationale": "The negative arm of the same A/B — same host, same port, no declaration — must be inspected at the HTTP layer. Without it, a regression that opens the hatch wider than declared would still pass the positive arm.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'a bare number declares nothing and is inspected by default'"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "enforcing-sandbox-reaches-an-allowed-host"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called pin-none for this directory on the alpine:3.20 image whose firewall is on and allows the host example.com on ports 80 and 443, declaring nothing special about either port",
+          "expect": "the sandbox is created with the firewall on",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "pin-none",
+            "policy": {
+              "host": "example.com",
+              "port": {
+                "number": 443,
+                "pinned": false
+              }
+            }
+          }
+        },
+        {
+          "intent": "start pin-none and, from inside it, fetch https://example.com/ over TLS",
+          "expect": "the fetch completes from inside the sandbox",
+          "expect_exit": 0
+        },
+        {
+          "intent": "ask izba's connection log for that sandbox what it did with that connection",
+          "expect": "the log shows the connection being inspected at the HTTP layer, with the request itself recorded — not passed through",
+          "core": true,
+          "expect_cmd_re": "izba netlog",
+          "expect_exit": 0,
+          "expect_stdout_re": "ALLOW l7\\s.*example\\.com:443"
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-dormant-exception-really-stays-intercepted",
+      "rationale": "The dormant case must be true in the datapath and not merely in the wording: an exemption on a read-only host row is still intercepted, so a pinning client really does see izba's certificate. If the two surfaces say 'not in effect' but the traffic is spliced anyway, the honest wording is the more dangerous bug.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'router::passthrough_names drops the host and the connection stays terminated at L7, so a pinning client still sees izba's certificate'"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "enforcing-sandbox-reaches-an-allowed-host"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called pin-dormant for this directory on the alpine:3.20 image whose firewall is on, restricts the host example.com to read-only access on ports 80 and 443, and nevertheless declares port 443 of that host exempt from interception",
+          "expect": "the sandbox is created with the read-only restriction and the declared exemption",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "pin-dormant",
+            "policy": {
+              "host": "example.com",
+              "access": "read",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        },
+        {
+          "intent": "start pin-dormant and, from inside it, fetch https://example.com/ over TLS",
+          "expect": "the fetch completes from inside the sandbox",
+          "expect_exit": 0
+        },
+        {
+          "intent": "ask izba's connection log for that sandbox what it actually did with that connection, and compare it with what the firewall report claims about that port",
+          "expect": "the log shows the connection being inspected at the HTTP layer, matching the report's claim that the exemption is not in effect",
+          "core": true,
+          "expect_cmd_re": "izba netlog",
+          "expect_exit": 0,
+          "expect_stdout_re": "ALLOW l7\\s.*example\\.com:443"
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-two-hosts-one-port-only-one-passes-through",
+      "rationale": "An exemption declared for one host must not un-inspect the same port for every other host that is allowed on it. This is the difference between a per-host, per-port exemption and a global hole punched in inspection.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'an explicit `tcp` entry does not remove its own port from the inspected set'; InspectionTable's per-host passthrough set vs its policy-global inspected port set"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "enforcing-sandbox-reaches-an-allowed-host"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called two-hosts for this directory on the alpine:3.20 image whose firewall is on and allows two hosts on ports 80 and 443 — example.com, whose port 443 is exempt from interception for a certificate-pinning client, and example.net, which gets no such exemption",
+          "expect": "the sandbox is created with the exemption on one host only",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "two-hosts",
+            "policy": {
+              "host": "example.net",
+              "port": {
+                "number": 443,
+                "pinned": false
+              }
+            }
+          }
+        },
+        {
+          "intent": "start two-hosts and, from inside it, fetch https://example.net/ over TLS",
+          "expect": "the fetch completes from inside the sandbox",
+          "expect_exit": 0
+        },
+        {
+          "intent": "ask izba's connection log what it did with the connection to the host you did NOT exempt",
+          "expect": "that host's traffic on port 443 was still inspected at the HTTP layer — the other host's exemption did not extend to it",
+          "core": true,
+          "expect_cmd_re": "izba netlog",
+          "expect_exit": 0,
+          "expect_stdout_re": "ALLOW l7\\s.*example\\.net:443"
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-exception-does-not-follow-a-raw-address",
+      "rationale": "The exemption is bound to the name izba watched the sandbox look up, never to an address the guest chooses for itself. A client that skips the lookup and dials the numeric address must not inherit the exemption — otherwise anything inside the sandbox could claim it.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'only over the candidate list router::passthrough_names derives from DNS-snoop'; plan DP-2"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "enforcing-sandbox-reaches-an-allowed-host"
+      ],
+      "steps": [
+        {
+          "intent": "create a sandbox called raw-addr for this directory on the alpine:3.20 image whose firewall is on, allows the host example.com on ports 80 and 443, and exempts port 443 of that host from interception",
+          "expect": "the sandbox is created with that exempt port",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "look up one of example.com's numeric addresses on your own machine, then start raw-addr and have it open a TLS connection straight to that numeric address on port 443, skipping any name lookup of its own",
+          "expect": "the attempt is made from inside the sandbox",
+          "expect_cmd_re": "izba (run|exec)"
+        },
+        {
+          "intent": "ask izba's connection log what it did with that attempt",
+          "expect": "the attempt was refused rather than passed through — the exemption did not follow the bare address",
+          "core": true,
+          "expect_cmd_re": "izba netlog",
+          "expect_exit": 0,
+          "expect_stdout_re": "DENY\\s+l[37]\\s.*:443"
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-declaration-applies-without-a-restart",
+      "rationale": "Egress settings are a live-class change: adding an exemption to a running sandbox and reloading must take effect on the next connection without stopping anything. A user who has to restart loses their session for a firewall tweak.",
+      "source": {
+        "kind": "help",
+        "ref": "`izba policy reload` help: 'Re-read a sandbox's policy.yaml and apply it to new connections (no restart)'"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "enforcing-sandbox-reaches-an-allowed-host"
+      ],
+      "steps": [
+        {
+          "intent": "create and start a sandbox called live-pin for this directory on the alpine:3.20 image whose firewall is on and allows the host example.com on ports 80 and 443, with nothing exempted, and confirm from inside it that https://example.com/ can be fetched",
+          "expect": "the sandbox is running and the fetch works",
+          "expect_exit": 0
+        },
+        {
+          "intent": "without stopping the sandbox, change live-pin's firewall so port 443 of example.com now reaches the site's own TLS untouched, and make izba apply it",
+          "expect": "izba applies the change to the running sandbox and says it takes effect on new connections",
+          "expect_cmd_re": "izba policy reload",
+          "expect_exit": 0
+        },
+        {
+          "intent": "fetch https://example.com/ from inside the still-running sandbox again, then ask izba's connection log what it did with THAT connection",
+          "expect": "the newer connection was passed through rather than inspected, without the sandbox ever having been restarted",
+          "core": true,
+          "expect_cmd_re": "izba netlog",
+          "expect_exit": 0,
+          "expect_stdout_re": "ALLOW l3\\s.*example\\.com:443"
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-declaration-survives-a-restart",
+      "rationale": "Lifecycle promise: the exemption lives in the sandbox's managed settings, not in the running process, so stopping and starting must not quietly drop it (or quietly keep enforcing an older version of it).",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md disk-state invariant: managed policy.yaml is the host-only authority re-read on every start"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "enforcing-sandbox-reaches-an-allowed-host"
+      ],
+      "steps": [
+        {
+          "intent": "create and start a sandbox called restart-pin for this directory on the alpine:3.20 image whose firewall is on, allows the host example.com on ports 80 and 443, and exempts port 443 of that host from interception",
+          "expect": "the sandbox is created and running with that exempt port",
+          "expect_exit": 0
+        },
+        {
+          "intent": "stop restart-pin and start it again",
+          "expect": "the sandbox comes back up",
+          "expect_exit": 0
+        },
+        {
+          "intent": "check that the exemption is still in place on the restarted sandbox and that the firewall is still on",
+          "expect": "the firewall is still enforcing and port 443 of that host is still reported as exempt",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "restart-pin",
+            "status": "running",
+            "policy": {
+              "enforcing": true,
+              "host": "example.com",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-seeding-from-observed-traffic-keeps-the-declaration",
+      "rationale": "Seeding the allow-list from what a sandbox actually reached goes through the same mutator as a manual grant, so it too must append plain ports and must not disturb an existing exemption. This mutator is the one a user is least likely to inspect afterwards.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'EgressPolicyConfig::allow (and every other mutator, for every caller — CLI, GUI, observed-traffic seeding) appends a port that structurally cannot inherit a sibling port's hatch'"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "hatch-declared",
+        "enforcing-sandbox-reaches-an-allowed-host"
+      ],
+      "steps": [
+        {
+          "intent": "create and start a sandbox called seeded for this directory on the alpine:3.20 image whose firewall is on, allows the host example.com on ports 80 and 443 with port 443 exempt from interception, and also allows example.net; from inside it fetch both https://example.com/ and https://example.net/",
+          "expect": "the sandbox is running and both fetches complete",
+          "expect_exit": 0
+        },
+        {
+          "intent": "now have izba build seeded's allow-list up from the traffic it has actually been permitting, so the list reflects real usage",
+          "expect": "izba reports how many observed endpoints it added and reloads the sandbox's settings",
+          "core": true,
+          "expect_cmd_re": "izba policy enable",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "seeded",
+            "policy": {
+              "host": "example.com",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        },
+        {
+          "intent": "read back seeded's firewall and check what happened to the exempt port and to anything newly added",
+          "expect": "the exemption is still attached to the port it was declared on, and nothing that was added from observed traffic is exempt",
+          "core": true,
+          "expect_cmd_re": "izba policy show",
+          "expect_exit": 0,
+          "expect_stdout_re": ":443 protocol: tcp"
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-review-flags-a-new-exception-as-weakening",
+      "rationale": "Declaring a new exemption weakens the firewall even though it adds no host, opens no port and changes no access level. The review step must flag it, or the one authoring route that HAS a gate does not actually catch the change the gate exists for.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'manifest::diff flags two ⚠ weakens egress transitions: a newly-declared passthrough, and losing inspection on a still-reachable port'"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "manifest-egress-authoring",
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write this project's izba.yml so that it describes a sandbox called flag-new on the alpine:3.20 image whose firewall is switched on and allows the host pinned.vendor.example on port 443 with full read-write access and nothing declared about that port, then create the sandbox from this project directory so the two agree",
+          "expect": "the sandbox is created and its firewall matches the project file, with nothing exempt",
+          "core": true,
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "flag-new",
+            "policy": {
+              "enforcing": true,
+              "host": "pinned.vendor.example",
+              "access": "read-write",
+              "port": {
+                "number": 443,
+                "pinned": false
+              }
+            }
+          }
+        },
+        {
+          "intent": "a certificate-pinning client is moving into this sandbox — edit ONLY the project file so that the very same port 443 of that very same host is now exempt from interception, changing nothing else about the file, and then ask izba to show you the pending change before you apply it",
+          "expect": "izba shows the firewall change as pending and marks it as one that weakens the sandbox's egress protection, even though no host was added and no access level was widened",
+          "core": true,
+          "expect_cmd_re": "izba diff",
+          "expect_exit": 0,
+          "expect_stdout_re": "egress:\\s+\\[live\\]\\s+⚠ weakens egress"
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-review-flags-losing-inspection-on-a-shared-port",
+      "rationale": "The subtler weakening: removing the one host that asked for a shared non-web port to be policed at the HTTP layer silently un-polices that port for every other host still allowed on it. The review step must flag a change that, read naively, only ever removes access.",
+      "source": {
+        "kind": "spec",
+        "ref": "CLAUDE.md: 'losing inspection on a still-reachable port' is the second flagged transition"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "manifest-egress-authoring"
+      ],
+      "steps": [
+        {
+          "intent": "write this project's izba.yml so that it describes a sandbox called flag-lost on the alpine:3.20 image whose firewall is switched on and allows two internal services on the same port 8443 — svc-a.internal.example, for which you have asked izba to apply its HTTP-level rules to that port, and svc-b.internal.example, for which you have asked for nothing special — then create the sandbox from this project directory so the two agree",
+          "expect": "the sandbox is created and its firewall matches the project file",
+          "core": true,
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "flag-lost",
+            "policy": {
+              "host": "svc-a.internal.example",
+              "port": {
+                "number": 8443,
+                "pinned": false
+              }
+            }
+          }
+        },
+        {
+          "intent": "the first service has been decommissioned — edit ONLY the project file to drop svc-a.internal.example entirely, leaving the second service exactly as it was, then ask izba to show you the pending change before applying it",
+          "expect": "izba flags the change as weakening the sandbox's egress protection, even though it only removes a host",
+          "core": true,
+          "expect_cmd_re": "izba diff",
+          "expect_exit": 0,
+          "expect_stdout_re": "egress:\\s+\\[live\\]\\s+⚠ weakens egress"
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-review-is-quiet-when-the-posture-tightens",
+      "rationale": "The warning must mean something: retiring an exemption tightens the firewall and must NOT be flagged as weakening it. A review step that flags every egress change is a review step operators learn to click through.",
+      "source": {
+        "kind": "spec",
+        "ref": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — egress_weakens flags only the two named transitions"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "manifest-egress-authoring",
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write this project's izba.yml so that it describes a sandbox called flag-quiet on the alpine:3.20 image whose firewall is switched on and allows the host pinned.vendor.example on port 443 with that port exempt from interception, then create the sandbox from this project directory so the two agree",
+          "expect": "the sandbox is created with that exempt port and matches the project file",
+          "core": true,
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0,
+          "expect_state": {
+            "sandbox": "flag-quiet",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        },
+        {
+          "intent": "the pinning client has been retired — edit ONLY the project file so that port 443 of that host is no longer exempt, leaving everything else exactly as it was, then ask izba to show you the pending change before applying it",
+          "expect": "izba lists the firewall change as pending but does NOT mark it as weakening egress protection",
+          "core": true,
+          "expect_cmd_re": "izba diff",
+          "expect_exit": 0,
+          "expect_stdout_re": "egress:  \\[live\\]\\n"
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-promote-the-exception-through-the-review-gate",
+      "rationale": "The only reviewed route to an exemption must actually work end to end: describe it in the project file, review it, approve it, and find it in the sandbox's managed settings — with the approval step loud about what is being given up.",
+      "source": {
+        "kind": "readme",
+        "ref": "README izba.yml section (the reviewed route) + review gate: 'You cannot miss a loosened firewall'"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "manifest-egress-authoring",
+        "hatch-declared"
+      ],
+      "establishes": [
+        "hatch-via-manifest"
+      ],
+      "steps": [
+        {
+          "intent": "write this project's izba.yml so that it describes a sandbox called gated-pin on the alpine:3.20 image whose firewall is switched on and allows the host pinned.vendor.example on port 443, with nothing declared about that port, then create the sandbox from this project directory so the two agree",
+          "expect": "the sandbox is created and matches the project file",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "edit the project file so that port 443 of that host is exempt from interception, then review the pending change",
+          "expect": "izba shows the pending firewall change and flags it as weakening egress protection",
+          "expect_cmd_re": "izba diff",
+          "expect_exit": 0
+        },
+        {
+          "intent": "approve the reviewed change so it becomes the sandbox's real settings",
+          "expect": "izba applies it and warns, at the moment of approval, that this weakens the sandbox's egress protection",
+          "core": true,
+          "expect_cmd_re": "izba promote",
+          "expect_exit": 0,
+          "expect_stderr_re": "WARNING: weakens egress",
+          "expect_state": {
+            "sandbox": "gated-pin",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "deep-promote-refuses-without-a-review",
+      "rationale": "The gate is only a gate if it refuses. Approving a firewall-weakening change that nobody has looked at must fail with a message naming the missing step, not apply silently.",
+      "source": {
+        "kind": "readme",
+        "ref": "README 'Review gate': `izba promote` requires the review token written by `izba diff`"
+      },
+      "tier": "deep",
+      "modality": "cli",
+      "requires": [
+        "manifest-egress-authoring",
+        "hatch-declared"
+      ],
+      "steps": [
+        {
+          "intent": "write this project's izba.yml so that it describes a sandbox called ungated-pin on the alpine:3.20 image whose firewall is switched on and allows the host pinned.vendor.example on port 443, with nothing declared about that port, then create the sandbox from this project directory so the two agree",
+          "expect": "the create command finishes without an error",
+          "expect_cmd_re": "izba (create|run)",
+          "expect_exit": 0
+        },
+        {
+          "intent": "edit the project file so that port 443 of that host is exempt from interception, and then — without looking at the change first — go straight to applying it",
+          "expect": "izba refuses to apply the change and its message names the step that was skipped",
+          "core": true,
+          "expect_cmd_re": "izba promote",
+          "expect_exit": "nonzero",
+          "expect_stderr_re": "no reviewed diff",
+          "expect_state": {
+            "sandbox": "ungated-pin",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "gui-cannot-move-the-exception-to-another-host",
+      "rationale": "The desktop editor's save path has no weakening review in front of it, so renaming a host that carries an exemption would move that exemption onto a host nobody declared one for. The refusal must survive a real save and a re-read, not merely look refused on screen — so this journey makes a legitimate edit alongside the refused one, and grades the saved settings.",
+      "source": {
+        "kind": "pr",
+        "ref": "PR #262 'The decision (AC 4)': relocation and activation are both refused in the reducer"
+      },
+      "tier": "deep",
+      "modality": "gui",
+      "requires": [
+        "gui-pinned-row-visible"
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: pinned.vendor.example\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n      - host: api.vendor.example\n        ports:\n          - 443\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'gui-pin5' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "the create finishes without an error banner and a sandbox named gui-pin5 appears in the sandbox list",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin5",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open gui-pin5's detail view, go to the view listing the hosts it may reach, and try to change the vendor host that carries the exempt port so that it reads moved.vendor.example instead; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "what the host field does with the typing is visible in the field itself, and the row shows a message next to it"
+        },
+        {
+          "intent": "while you are here, also add port 8080 to the OTHER host row — the one with no exempt port — and then save the whole thing back to the sandbox",
+          "expect": "the save completes and the footer reports the settings were written",
+          "core": true,
+          "expect_text": "saved · reloaded",
+          "expect_state": {
+            "sandbox": "gui-pin5",
+            "policy": {
+              "host": "moved.vendor.example",
+              "present": false
+            }
+          }
+        },
+        {
+          "intent": "re-read the saved settings for gui-pin5 and check which hosts are there and where the exemption ended up; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "the vendor host still has its original name and still carries the exemption on the same port; the rename did not take",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin5",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "gui-cannot-activate-a-dormant-exception",
+      "rationale": "Widening a dormant exemption's row back to full access would silently turn it live — the exact change the review gate flags on the project-file route and that this save path never reaches. The editor must refuse the widening while allowing the narrowing direction, and the refusal is only proved by what gets saved.",
+      "source": {
+        "kind": "pr",
+        "ref": "PR #262 AC 4 / issue #239 1b: setHostAccess refuses a transition INTO read-write on a pinned row"
+      },
+      "tier": "deep",
+      "modality": "gui",
+      "requires": [
+        "gui-pinned-row-visible"
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: pinned.vendor.example\n        access: read\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n      - host: api.vendor.example\n        ports:\n          - 443\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'gui-pin6' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "the create finishes without an error banner and a sandbox named gui-pin6 appears in the sandbox list",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin6",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open gui-pin6's detail view, go to the view listing the hosts it may reach, and read what the vendor row says about its exempt port and what it tells you to do to make that port actually take effect; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "the row explains that the exemption is not in effect at this access level and names what would change that",
+          "core": true,
+          "expect_text": "widening Access to read-write here is refused"
+        },
+        {
+          "intent": "try to give that vendor row full read-write access so the exemption starts working, also add port 8080 to the OTHER host row, and then save everything back to the sandbox; after saving, look again until the outcome of the save is shown",
+          "expect": "the save completes and the footer reports the settings were written",
+          "core": true,
+          "expect_text": "saved · reloaded",
+          "expect_state": {
+            "sandbox": "gui-pin6",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "access": "read",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "gui-removing-the-exempt-port-unlocks-the-row",
+      "rationale": "The escape valve: the row's restrictions exist only because of the exempt port, so removing that port must lift them together. Otherwise a user who genuinely wants to rename or re-open a host is stuck with no route out inside the app.",
+      "source": {
+        "kind": "pr",
+        "ref": "PR #262: 'Removing the pinned port is the escape valve for BOTH the Host lock and the Access-widening refusal'"
+      },
+      "tier": "deep",
+      "modality": "gui",
+      "requires": [
+        "gui-pinned-row-visible"
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: pinned.vendor.example\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'gui-pin7' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "the create finishes without an error banner and a sandbox named gui-pin7 appears in the sandbox list",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin7",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open gui-pin7's detail view, go to the view listing the hosts it may reach, remove the exempt port from the vendor row, then rename that host to renamed.vendor.example and save; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "once the exempt port is gone the host can be edited, and the save completes",
+          "core": true,
+          "expect_text": "saved · reloaded",
+          "expect_state": {
+            "sandbox": "gui-pin7",
+            "policy": {
+              "host": "renamed.vendor.example",
+              "present": true
+            }
+          }
+        },
+        {
+          "intent": "re-read gui-pin7's saved settings and confirm the old vendor host and its exemption are gone; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "the original host name is no longer in the saved settings",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin7",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "present": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "gui-adding-a-port-here-never-inherits-the-exception",
+      "rationale": "The non-inheritance promise applied to the desktop mutator: a port added in the app must come out plain, and saving unrelated edits must never drop or move an existing exemption. This is the app-side twin of the command-line grant test.",
+      "source": {
+        "kind": "pr",
+        "ref": "issue #239 AC 5 (save never drops the declaration) + CLAUDE.md non-inheritance for every mutator and caller"
+      },
+      "tier": "deep",
+      "modality": "gui",
+      "requires": [
+        "gui-pinned-row-visible"
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: pinned.vendor.example\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'gui-pin8' into the Name field, and 'alpine:3.20' into the Image field, then click Create to create a new sandbox from this workspace",
+          "expect": "the create finishes without an error banner and a sandbox named gui-pin8 appears in the sandbox list",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin8",
+            "exists": true
+          }
+        },
+        {
+          "intent": "open gui-pin8's detail view, go to the view listing the hosts it may reach, add port 9000 to the vendor row that already has an exempt port, and save; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "the save completes and the footer reports the settings were written",
+          "core": true,
+          "expect_text": "saved · reloaded",
+          "expect_state": {
+            "sandbox": "gui-pin8",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 9000,
+                "pinned": false
+              }
+            }
+          }
+        },
+        {
+          "intent": "re-read gui-pin8's saved settings and check what happened to the port that was already exempt; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "the originally exempt port is still exempt and the newly added port is not",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-pin8",
+            "policy": {
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "journey_id": "gui-switching-sandboxes-never-shows-the-previous-posture",
+      "rationale": "A firewall view that keeps the sandbox you just left showing while naming the sandbox you just opened invites a click that disarms the wrong machine — on a path with no weakening review in front of it. Switching between two sandboxes with opposite postures must never present one's posture under the other's name.",
+      "source": {
+        "kind": "pr",
+        "ref": "PR #264 commits 'refuse to save a policy the editor never loaded' and 'do not pair a new sandbox with the previous one's firewall posture'"
+      },
+      "tier": "deep",
+      "modality": "gui",
+      "requires": [
+        "gui-policy-tab-loads"
+      ],
+      "seed_files": {
+        "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - host: pinned.vendor.example\n        ports:\n          - 80\n          - port: 443\n            protocol: tcp\n",
+        "bare/izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: false\n    allow:\n      - host: open.other.example\n"
+      },
+      "steps": [
+        {
+          "intent": "type {workspace} into the Workspace field, 'gui-armed' into the Name field, and 'alpine:3.20' into the Image field, then click Create; then create a second sandbox the same way with '{workspace}/bare' as the Workspace, 'gui-unarmed' as the Name and 'alpine:3.20' as the Image",
+          "expect": "both sandboxes appear in the sandbox list",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-armed",
+            "exists": true,
+            "policy": {
+              "enforcing": true
+            }
+          }
+        },
+        {
+          "intent": "open gui-armed's detail view and look at its firewall — note whether it is on or off — then switch to gui-unarmed and look at ITS firewall; each time you open a firewall view, give it a moment to finish loading and look again if it is not ready yet, before reading it",
+          "expect": "the second sandbox's own allowed hosts and its own on/off posture are shown under its own name, not the first sandbox's",
+          "core": true,
+          "expect_text": "open.other.example",
+          "expect_state": {
+            "sandbox": "gui-unarmed",
+            "policy": {
+              "enforcing": false
+            }
+          }
+        },
+        {
+          "intent": "go back to gui-armed and check that nothing you did while switching changed its firewall; give the view a moment to finish loading, looking again if it is not ready yet, before reading or changing anything",
+          "expect": "gui-armed's firewall is still on and its exempt port is still declared",
+          "core": true,
+          "expect_state": {
+            "sandbox": "gui-armed",
+            "policy": {
+              "enforcing": true,
+              "host": "pinned.vendor.example",
+              "port": {
+                "number": 443,
+                "pinned": true
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
