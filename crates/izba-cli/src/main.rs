@@ -68,10 +68,13 @@ struct SandboxOpts {
     /// and applies to EVERY port of that entry — declare it per port to give
     /// one port a hatch without its siblings. Without
     /// this flag the sandbox is unrestricted (firewall off); you can also turn
-    /// it on later with `izba policy enforce NAME on`. Against an
-    /// already-running sandbox `izba run --policy` re-arms the live egress
-    /// plane in place (same as `izba policy allow`) — it does NOT restart the
-    /// sandbox; `create` bakes it in at creation instead.
+    /// it on later with `izba policy enforce NAME on`. Against an EXISTING
+    /// sandbox the file REPLACES the sandbox's whole allow-list — the
+    /// opposite of `izba policy allow`, which ADDS one host to the list
+    /// already there, so every host granted that way is discarded. If that
+    /// sandbox is already running, `izba run --policy` also re-arms the live
+    /// egress plane in place — it does NOT restart the sandbox; `create`
+    /// bakes it in at creation instead.
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
     /// Enable docker mode: the workload gets its own network namespace,
@@ -1186,5 +1189,42 @@ mod tests {
     fn parse_windows_cleanup() {
         let cli = Cli::try_parse_from(["izba", "windows-cleanup"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::WindowsCleanup));
+    }
+
+    /// The `--policy` help used to equate `izba run --policy` with `izba
+    /// policy allow` ("re-arms the live egress plane in place (same as `izba
+    /// policy allow`)"). The two are OPPOSITES: `policy allow` ADDS one host
+    /// to the list already there, while `run --policy` rewrites `policy.yaml`
+    /// whole. The comparison is what made it dangerous — a reader who took it
+    /// as additive silently lost every grant. The help must state the
+    /// replacement and must never equate the two commands.
+    #[test]
+    fn run_policy_help_says_the_file_replaces_the_allow_list() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let run = cmd.find_subcommand_mut("run").expect("run subcommand");
+        let arg = run
+            .get_arguments()
+            .find(|a| a.get_id() == "policy")
+            .expect("--policy arg");
+        let help = arg
+            .get_long_help()
+            .or_else(|| arg.get_help())
+            .expect("--policy help")
+            .to_string();
+        // Doc comments arrive hard-wrapped; compare on flattened whitespace.
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("REPLACES the sandbox's whole allow-list"),
+            "must say the file replaces the allow-list: {flat}"
+        );
+        assert!(
+            flat.contains("izba policy allow"),
+            "must contrast with the command that ADDS a host: {flat}"
+        );
+        assert!(
+            !flat.contains("same as `izba policy allow`"),
+            "must not equate a replace with an add: {flat}"
+        );
     }
 }

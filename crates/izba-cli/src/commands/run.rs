@@ -318,7 +318,9 @@ fn resolve_or_create(
 
 /// Reconcile run-time opts against an ALREADY-existing sandbox. The stored
 /// config (image/cpus/mem/disk/ports) is immutable, but `--policy` IS honored:
-/// re-persist it as the sandbox's managed truth. Anything baked at create that
+/// re-persist it as the sandbox's managed truth — a WHOLE-file replace, so it
+/// discards any host added with `izba policy allow` (said out loud by
+/// [`settle_message`]). Anything baked at create that
 /// was passed anyway is reported ignored.
 ///
 /// This half only WRITES the file; it deliberately says nothing about when the
@@ -399,7 +401,7 @@ fn settle_policy(
         return Ok(());
     }
     if !already_running {
-        eprintln!("updated egress policy for '{name}' (armed by this start)");
+        eprintln!("{}", settle_message(name, false));
         return Ok(());
     }
     plane.reload_policy(name).map_err(|e| {
@@ -409,8 +411,31 @@ fn settle_policy(
              `izba policy reload {name}`, or stop and start the sandbox."
         )
     })?;
-    eprintln!("updated and reloaded egress policy for '{name}' (applies to new connections)");
+    eprintln!("{}", settle_message(name, true));
     Ok(())
+}
+
+/// The success line [`settle_policy`] prints. Pure so the wording is
+/// unit-testable without a daemon (the `reload_message` pattern in
+/// `policy.rs`).
+///
+/// It says REPLACED, not "updated": `persist_policy` copies the `--policy`
+/// file over `policy.yaml` WHOLE, so the file is the sandbox's entire new
+/// allow-list and every host added with `izba policy allow` since it was
+/// written is gone. "Updated" reads as a merge — an operator who expects one
+/// re-runs `run --policy` and silently loses their grants. Naming the hosts
+/// dropped would need the pre-write file, which this half no longer has, so
+/// the line states the replacement plainly instead.
+fn settle_message(name: &str, already_running: bool) -> String {
+    let armed = if already_running {
+        format!("reloaded egress policy for '{name}' (applies to new connections)")
+    } else {
+        format!("egress policy for '{name}' armed by this start")
+    };
+    format!(
+        "{armed} — the --policy file REPLACED the sandbox's whole allow-list, \
+         discarding any host added with `izba policy allow`"
+    )
 }
 
 /// Create-time opts that a `run` against an existing sandbox silently ignores
@@ -694,6 +719,52 @@ mod tests {
         assert!(
             msg.contains("daemon went away"),
             "must carry the underlying cause: {msg}"
+        );
+    }
+
+    /// `run --policy` against an EXISTING sandbox rewrites `policy.yaml`
+    /// WHOLE (`persist_policy` is a file copy), so every host an operator
+    /// added with `izba policy allow` is discarded. The line used to say only
+    /// "updated ... egress policy", which reads as a merge: observed
+    /// end-to-end during dogfooding, an operator granted a host, re-ran `izba
+    /// run --policy`, lost the grant with no warning, and never understood
+    /// why the fetch kept failing. Both branches must name the REPLACEMENT
+    /// and the grants it drops.
+    #[test]
+    fn settle_message_says_the_policy_file_replaces_the_allow_list() {
+        for already_running in [true, false] {
+            let msg = settle_message("fw", already_running);
+            assert!(
+                msg.contains("REPLACED") && msg.contains("allow-list"),
+                "must say the file replaced the allow-list (already_running={already_running}): {msg}"
+            );
+            assert!(
+                msg.contains("izba policy allow"),
+                "must name the grants that are discarded (already_running={already_running}): {msg}"
+            );
+            assert!(
+                msg.contains("'fw'"),
+                "must name the sandbox (already_running={already_running}): {msg}"
+            );
+        }
+    }
+
+    /// The replacement wording must not cost the #234 promise: the running
+    /// branch still reports the live re-arm it performed (the `daemon_e2e`
+    /// re-arm case greps for exactly this), and the stopped branch still says
+    /// the start armed it.
+    #[test]
+    fn settle_message_still_reports_how_the_policy_was_armed() {
+        let running = settle_message("fw", true);
+        assert!(
+            running.contains("reloaded egress policy for 'fw'")
+                && running.contains("applies to new connections"),
+            "the running branch must still report the live re-arm: {running}"
+        );
+        let stopped = settle_message("fw", false);
+        assert!(
+            stopped.contains("armed by this start"),
+            "the stopped branch must still credit the start: {stopped}"
         );
     }
 
