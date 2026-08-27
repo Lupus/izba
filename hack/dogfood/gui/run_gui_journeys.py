@@ -126,6 +126,21 @@ def _settle_for_sandbox(izba_bin: str, data_dir: str, timeout_s: float,
 # runner gates the Actor's first turn on this ready marker.
 _APP_READY_MARKER = "daemon running"
 
+# H6 (run-2 deep skeptic): the settle instruction shipped in `e3e7d78e` ("look
+# again if the view is not ready yet") starved the very budget it needs,
+# because EVERY reply — including a `read`, which changes nothing — spent a
+# `max_turns` turn. `gui-removing-the-exempt-port-unlocks-the-row` ended
+# mid-step at 8 actions + ~10 reads with `● unsaved changes` still on screen.
+#
+# Turn accounting: `max_turns` budgets STATE-CHANGING actions, so a `read`
+# observation is REFUNDED — but only for the first `_FREE_CONSECUTIVE_READS`
+# reads in a row. The (n+1)-th consecutive read is charged like an action, so
+# an Actor stuck in a read-loop still terminates on `max_turns`; any real
+# action resets the window, which is what makes a settle-poll between two
+# actions free. Total model calls stay bounded by
+# `max_turns * (1 + _FREE_CONSECUTIVE_READS)`.
+_FREE_CONSECUTIVE_READS = 3
+
 
 def _wait_app_ready(driver, timeout_s: float, poll_s: float = 1.0) -> tuple:
     """Bounded poll of the page text until the daemon-status line carries
@@ -735,6 +750,9 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
             step_hist_start[step_i] = len(page_text_history)
             step_action_start[step_i] = len(actions)
             seen: set = set()
+            # Reads refunded so far in the current run of consecutive reads
+            # (see _FREE_CONSECUTIVE_READS); reset by any real action.
+            free_reads = 0
             # Seed the Actor with the current screen so its FIRST decision sees
             # the accessibility marks (real refs to act on) rather than an empty
             # observation — otherwise it guesses a ref and burns a turn.
@@ -770,11 +788,18 @@ def run_gui_journey(model, driver, journey: Dict[str, Any], *, izba_bin: str,
                 if not isinstance(reply, dict) or reply.get("done"):
                     break
                 if reply.get("read"):
+                    # An observation changes nothing: refund its turn, up to
+                    # _FREE_CONSECUTIVE_READS in a row. Past that the read is
+                    # charged, so a read-loop still hits `max_turns`.
+                    if free_reads < _FREE_CONSECUTIVE_READS:
+                        turns -= 1
+                        free_reads += 1
                     marks_text = render_marks(driver.snapshot())
                     marks_history.append(marks_text)
                     page_text_history.append(driver.read_page_text())
                     obs.append({"action": "read", "marks": marks_text})
                     continue
+                free_reads = 0  # a real action reopens the settle window
                 argv = action_to_argv(reply)
                 if argv is None:
                     break

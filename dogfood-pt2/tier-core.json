@@ -101,6 +101,7 @@
         {
           "intent": "create a sandbox called dormant-show for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on port 443 — exempted from interception — but restricts that host to read-only access",
           "expect": "the create command finishes without an error",
+          "core": true,
           "expect_cmd_re": "izba (create|run)",
           "expect_exit": 0,
           "expect_state": {
@@ -142,6 +143,7 @@
         {
           "intent": "create a sandbox called logonly for this directory on the alpine:3.20 image with firewall settings that are LOG-ONLY — everything is still allowed out and merely recorded — but which nonetheless list the host pinned.vendor.example on port 443 with that port declared exempt from interception",
           "expect": "the sandbox is created and izba accepts the log-only settings",
+          "core": true,
           "expect_cmd_re": "izba (create|run)",
           "expect_exit": 0,
           "expect_state": {
@@ -433,6 +435,7 @@
         {
           "intent": "create a sandbox called retire-pin for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on port 443 alone, with that port exempt from interception",
           "expect": "the sandbox is created with that exempt port",
+          "core": true,
           "expect_cmd_re": "izba (create|run)",
           "expect_exit": 0,
           "expect_state": {

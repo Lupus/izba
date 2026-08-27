@@ -2320,3 +2320,68 @@ def test_final_post_settle_capture_is_persisted_as_evidence(monkeypatch):
     # Marks stay a SEPARATE field: expect_text is judged against page text
     # alone, and the bundle must not blur which surface answered.
     assert res["final_observation"]["marks"] == '[@e2] row "pinned.vendor.example"'
+
+
+def test_settle_reads_do_not_spend_the_action_turn_budget(monkeypatch):
+    # H6 (run-2 deep skeptic): `e3e7d78e` told the Actor to look again when a
+    # view is still loading, but every `read` reply consumed a `max_turns`
+    # turn — the settle instruction starved the budget it needs, and
+    # `gui-removing-the-exempt-port-unlocks-the-row` died mid-step with 8
+    # actions, ~10 reads and `● unsaved changes` still on screen. An
+    # observation changes nothing, so it must not cost what a state-changing
+    # action costs: reads are REFUNDED, up to _FREE_CONSECUTIVE_READS in a row.
+    model = FakeModel([{"read": True}, {"read": True}, {"click": "@e1"},
+                       {"read": True}, {"read": True}, {"click": "@e2"},
+                       {"done": True}])
+    driver = FakeDriver(snapshots=['[@e1] button "Remove port 443"'] * 8)
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", lambda *a, **k: _evidence(
+        ["web"], [{"name": "web", "status_disk": "running"}]))
+    monkeypatch.setattr(rgj, "_reconcile_snapshot",
+                        lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j-reads-are-free", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "remove the exempt port and save",
+                          "expect": "the row unlocks"}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=3, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    # Both state-changing actions land: only they (and the terminal reply)
+    # spend the turn budget.
+    assert driver.actions == [["click", "@e1"], ["click", "@e2"]], res["actions"]
+
+
+def test_a_read_loop_still_terminates_on_the_turn_budget(monkeypatch):
+    # The other half of the same rule: refunding reads must not make an Actor
+    # stuck in a read-loop immortal. Consecutive reads beyond the free window
+    # are charged like actions, so `max_turns` still ends the journey.
+    class _AlwaysRead:
+        last_cost_usd = 0.0
+
+        def __init__(self):
+            self.calls = 0
+
+        def next_command(self, journey, step, observations):
+            self.calls += 1
+            return {"read": True}
+
+    model = _AlwaysRead()
+    driver = FakeDriver(snapshots=['[@e1] button "Save"'] * 200)
+    import gui.run_gui_journeys as rgj
+    monkeypatch.setattr(rgj, "capture_state_evidence", lambda *a, **k: _evidence(
+        ["web"], [{"name": "web", "status_disk": "running"}]))
+    monkeypatch.setattr(rgj, "_reconcile_snapshot",
+                        lambda *a, **k: {"violations": []})
+    journey = {"journey_id": "j-read-loop", "modality": "gui",
+               "source": {"kind": "spec", "ref": "x"},
+               "steps": [{"intent": "watch the screen forever",
+                          "expect": "nothing"}]}
+    res = run_gui_journey(model, driver, journey, izba_bin="izba",
+                          data_dir="/tmp/x", max_turns=4, step_cap=10,
+                          action_timeout_s=5, latency_budget_ms=30000,
+                          budget={"usd": 0.0}, max_usd=2.0)
+    assert driver.actions == []
+    # Bounded: the free window is spent once, then every further read is
+    # charged — never an unbounded poll.
+    assert model.calls <= 4 + rgj._FREE_CONSECUTIVE_READS, model.calls
