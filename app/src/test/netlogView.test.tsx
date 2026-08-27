@@ -1,4 +1,5 @@
-import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { frameHarness, rawClick } from "./committedFrame";
 import { vi, describe, it, expect, beforeEach, type Mock } from "vitest";
 import { NetlogView, relTime } from "../components/NetlogView";
 import { git_repo_from_row } from "../lib/git";
@@ -481,5 +482,72 @@ describe("NetlogView sandbox switch", () => {
     expect(screen.queryByText(/Firewall ON/)).not.toBeInTheDocument();
     expect(screen.getByText(/posture unknown/i)).toBeInTheDocument();
     expect(screen.queryByText("api.x.com")).not.toBeInTheDocument();
+  });
+});
+
+/** DEEP-F2b, second half (Greptile, PR #264) — the reset has to happen in the
+ *  frame the new name is FIRST committed in, and a `useEffect` structurally
+ *  cannot do that.
+ *
+ *  React commits the render carrying the new `name`; whatever an effect does
+ *  about it only shows up in a LATER render. The tests above use RTL's
+ *  `rerender`, which wraps the update in `act` and therefore runs render,
+ *  commit, effects AND the repair render before it returns — so an
+ *  effect-based reset looks like a fix to them, while the user still gets one
+ *  painted, fully interactive frame in which the NEW name sits beside the
+ *  PREVIOUS sandbox's `ready` posture, rows and endpoint evidence.
+ *
+ *  `frameHarness.inFrame` stops in exactly that frame (see its doc), so these
+ *  assertions are about the state transition an interaction there produces:
+ *  what izbad is asked to write, never what the markup looks like. */
+describe("NetlogView sandbox switch — the frame React actually commits", () => {
+  const enforcingWeb: PolicyView = { enforcing: true, allow: ["api.x.com"], git: [] };
+
+  function webAnswersOthersHang() {
+    (api.policyShow as Mock).mockImplementation((n: string) =>
+      n === "web" ? Promise.resolve(enforcingWeb) : new Promise(() => {}),
+    );
+  }
+
+  it("cannot disarm the new sandbox from the previous one's posture in that frame", async () => {
+    webAnswersOthersHang();
+    const h = frameHarness();
+    try {
+      await h.settle(<NetlogView name="web" />);
+      expect(h.container.textContent).toMatch(/Firewall ON/);
+
+      await h.inFrame(<NetlogView name="db" />, () => {
+        // `web` was ON and `db`'s posture has never been read, so an enforce
+        // click here computes `next = !enforcing` from the WRONG sandbox and
+        // sends `policySetEnforce("db", false)` — a DISARM.
+        rawClick(within(h.container).getByLabelText(/enforce firewall/i));
+        expect(api.policySetEnforce).not.toHaveBeenCalled();
+      });
+      expect(api.policySetEnforce).not.toHaveBeenCalled();
+    } finally {
+      await h.unmount();
+    }
+  });
+
+  it("cannot apply the previous sandbox's endpoint evidence to the new one in that frame", async () => {
+    webAnswersOthersHang();
+    const h = frameHarness();
+    try {
+      await h.settle(<NetlogView name="web" />);
+      await within(h.container).findByRole("button", { name: /block api\.x\.com/i });
+
+      await h.inFrame(<NetlogView name="db" />, () => {
+        // If the row survived into this frame its Block writes a rule about
+        // api.x.com — a host observed on `web` — into `db`'s policy.
+        const block = within(h.container).queryByRole("button", {
+          name: /block api\.x\.com/i,
+        });
+        if (block) rawClick(block);
+        expect(api.policyBlock).not.toHaveBeenCalled();
+      });
+      expect(api.policyBlock).not.toHaveBeenCalled();
+    } finally {
+      await h.unmount();
+    }
   });
 });
