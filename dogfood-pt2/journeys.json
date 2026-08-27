@@ -337,6 +337,7 @@
         {
           "intent": "create a sandbox called dormant-show for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on port 443 — exempted from interception — but restricts that host to read-only access",
           "expect": "the create command finishes without an error",
+          "core": true,
           "expect_cmd_re": "izba (create|run)",
           "expect_exit": 0,
           "expect_state": {
@@ -378,6 +379,7 @@
         {
           "intent": "create a sandbox called logonly for this directory on the alpine:3.20 image with firewall settings that are LOG-ONLY — everything is still allowed out and merely recorded — but which nonetheless list the host pinned.vendor.example on port 443 with that port declared exempt from interception",
           "expect": "the sandbox is created and izba accepts the log-only settings",
+          "core": true,
           "expect_cmd_re": "izba (create|run)",
           "expect_exit": 0,
           "expect_state": {
@@ -669,6 +671,7 @@
         {
           "intent": "create a sandbox called retire-pin for this directory on the alpine:3.20 image whose firewall allows the host pinned.vendor.example on port 443 alone, with that port exempt from interception",
           "expect": "the sandbox is created with that exempt port",
+          "core": true,
           "expect_cmd_re": "izba (create|run)",
           "expect_exit": 0,
           "expect_state": {
@@ -966,6 +969,7 @@
         {
           "intent": "create a sandbox called pin-live for this directory on the alpine:3.20 image whose firewall is on, allows the host example.com on ports 80 and 443, and exempts port 443 of that host from interception so a certificate-pinning client can reach the site's own TLS",
           "expect": "the sandbox is created with that exempt port",
+          "core": true,
           "expect_cmd_re": "izba (create|run)",
           "expect_exit": 0,
           "expect_state": {
@@ -1010,6 +1014,7 @@
         {
           "intent": "create a sandbox called pin-none for this directory on the alpine:3.20 image whose firewall is on and allows the host example.com on ports 80 and 443, declaring nothing special about either port",
           "expect": "the sandbox is created with the firewall on",
+          "core": true,
           "expect_cmd_re": "izba (create|run)",
           "expect_exit": 0,
           "expect_state": {
@@ -1055,6 +1060,7 @@
         {
           "intent": "create a sandbox called pin-dormant for this directory on the alpine:3.20 image whose firewall is on, restricts the host example.com to read-only access on ports 80 and 443, and nevertheless declares port 443 of that host exempt from interception",
           "expect": "the sandbox is created with the read-only restriction and the declared exemption",
+          "core": true,
           "expect_cmd_re": "izba (create|run)",
           "expect_exit": 0,
           "expect_state": {
@@ -1101,6 +1107,7 @@
         {
           "intent": "create a sandbox called two-hosts for this directory on the alpine:3.20 image whose firewall is on and allows two hosts on ports 80 and 443 — example.com, whose port 443 is exempt from interception for a certificate-pinning client, and example.net, which gets no such exemption",
           "expect": "the sandbox is created with the exemption on one host only",
+          "core": true,
           "expect_cmd_re": "izba (create|run)",
           "expect_exit": 0,
           "expect_state": {
@@ -1131,10 +1138,10 @@
     },
     {
       "journey_id": "deep-exception-does-not-follow-a-raw-address",
-      "rationale": "The exemption is bound to the name izba watched the sandbox look up, never to an address the guest chooses for itself. A client that skips the lookup and dials the numeric address must not inherit the exemption — otherwise anything inside the sandbox could claim it.",
+      "rationale": "The exemption is bound to the name izba's OWN resolver answered for this sandbox, never to an address the guest brought in from somewhere else. A client that dials such an address must not inherit the opaque splice: the connection is still authorized by name, but it is terminated and inspected at the HTTP layer like any other — otherwise anything inside the sandbox could claim the exemption by supplying its own address.",
       "source": {
         "kind": "spec",
-        "ref": "CLAUDE.md: 'only over the candidate list router::passthrough_names derives from DNS-snoop'; plan DP-2"
+        "ref": "CLAUDE.md: 'only over the candidate list router::passthrough_names derives from DNS-snoop'; plan DP-2 ('no snoop record ⇒ no passthrough') — which promises the flow is NOT spliced, not that it is denied"
       },
       "tier": "deep",
       "modality": "cli",
@@ -1150,17 +1157,18 @@
           "expect_exit": 0
         },
         {
-          "intent": "look up one of example.com's numeric addresses on your own machine, then start raw-addr and have it open a TLS connection straight to that numeric address on port 443, skipping any name lookup of its own",
-          "expect": "the attempt is made from inside the sandbox",
-          "expect_cmd_re": "izba (run|exec)"
+          "intent": "look up one of example.com's numeric IPv4 addresses on your own machine (the sandbox itself has no IPv6 route), then start raw-addr and, from inside it, open a TLS connection to https://example.com/ that goes straight to that numeric address — the sandbox must not ask izba to resolve the name for itself, while the request still presents the site's name to the server it reaches",
+          "expect": "the request leaves from inside the sandbox and the site answers it",
+          "expect_cmd_re": "izba (run|exec)",
+          "expect_exit": 0
         },
         {
           "intent": "ask izba's connection log what it did with that attempt",
-          "expect": "the attempt was refused rather than passed through — the exemption did not follow the bare address",
+          "expect": "the connection to that host on port 443 was allowed, but it was inspected at the HTTP layer rather than passed through untouched — the exemption did not carry over to an address izba never resolved for this sandbox",
           "core": true,
           "expect_cmd_re": "izba netlog",
           "expect_exit": 0,
-          "expect_stdout_re": "DENY\\s+l[37]\\s.*:443"
+          "expect_stdout_re": "(?m)^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\s+ALLOW l7\\s+(?:raw-addr\\s+)?example\\.com:443\\b"
         }
       ]
     },
