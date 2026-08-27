@@ -900,6 +900,296 @@ class RefusalNotReversedByRetryTests(unittest.TestCase):
             self.assertEqual(credits[0]["graded_cmd"], "izba bogus-subcommand")
 
 
+class UnmatchedExpectCmdReTests(unittest.TestCase):
+    """H2 (run-2 smoke skeptic): an `expect_cmd_re` that matched NOTHING in the
+    step means the decisive command was never run — a materially different fact
+    from "it ran and failed", and it must not be reported as the latter.
+
+    In `smoke-find-the-surface-that-answers-bypass` the step declared
+    `expect_cmd_re: "izba policy show"` and the Actor never ran it inside that
+    step, so the old fallback graded the step's LAST action —
+    `izba policy allow audit-me pinned.vendor.example` — against
+    `expect_stdout_re 'pinning passthrough'`, fabricating a functional red on a
+    command the assertion was never about. The honest kind already exists:
+    `unreached_decisive`."""
+
+    def _step(self, **kw):
+        step = {"intent": "find izba's answer to 'is anything bypassing my "
+                          "firewall?'",
+                "expect": "izba names the one port that is exempt",
+                "expect_cmd_re": r"izba policy show",
+                "expect_exit": 0,
+                "expect_stdout_re": "pinning passthrough"}
+        step.update(kw)
+        return step
+
+    def _produced(self):
+        return [
+            {"command": "izba exec audit-me -- apk add curl", "exit_code": 0,
+             "stdout_tail": "OK: 13 MiB in 24 packages", "stderr_tail": ""},
+            {"command": "izba policy allow audit-me pinned.vendor.example",
+             "exit_code": 0,
+             "stdout_tail": "allowed pinned.vendor.example [80, 443] "
+                            "access: read-write",
+             "stderr_tail": ""},
+        ]
+
+    def test_no_functional_candidate_on_an_unrelated_command(self):
+        import run_journeys as rj
+        cands = rj._grade_step_functional(
+            self._step(), self._produced(), {}, "bypass", True,
+            action_index=1, step_index=1)
+        self.assertFalse(
+            [c for c in cands if c["kind"] == "functional"],
+            f"`izba policy allow` was never the command under test: {cands}")
+
+    def test_it_flips_unreached_decisive_instead(self):
+        import run_journeys as rj
+        cands = rj._grade_step_functional(
+            self._step(), self._produced(), {}, "bypass", True,
+            action_index=1, step_index=1)
+        self.assertEqual([c["kind"] for c in cands], ["unreached_decisive"],
+                         cands)
+        self.assertIn("izba policy show", cands[0]["detail"])
+        self.assertTrue(cands[0]["decisive"])
+
+    def test_it_names_no_graded_cmd(self):
+        # Nothing was graded, so the bundle must not point the skeptic at a
+        # command as though it had been.
+        import run_journeys as rj
+        cands = rj._grade_step_functional(
+            self._step(), self._produced(), {}, "bypass", True,
+            action_index=1, step_index=1)
+        self.assertIsNone(cands[0].get("graded_cmd"))
+
+    def test_a_non_decisive_step_grades_nothing_at_all(self):
+        # A non-decisive step's verdict never governs the journey, and the
+        # fabricated grade is exactly what this fix removes: emit nothing
+        # rather than an `unreached_decisive` that would newly FLIP the run.
+        import run_journeys as rj
+        self.assertEqual(
+            rj._grade_step_functional(self._step(), self._produced(), {},
+                                      "bypass", False, action_index=1,
+                                      step_index=1),
+            [])
+
+    def test_a_matching_action_is_still_graded_normally(self):
+        # Regression guard: when the declared command DID run, nothing changes.
+        import run_journeys as rj
+        produced = self._produced() + [
+            {"command": "izba policy show audit-me", "exit_code": 0,
+             "stdout_tail": "pinned.vendor.example [80, 443]\n"
+                            "  :443 protocol: tcp — pinning passthrough",
+             "stderr_tail": ""}]
+        self.assertEqual(
+            rj._grade_step_functional(self._step(), produced, {}, "bypass",
+                                      True, action_index=2, step_index=1),
+            [])
+
+    def test_the_flip_reaches_the_bundle(self):
+        # End to end: the journey tallies UNREACHED, not flipped, so the
+        # Phase-3 skeptic is not handed a fabricated product finding.
+        with tempfile.TemporaryDirectory() as d:
+            stub = _write_stub_izba(d)
+            jf = _journeys_file(d, [{
+                "journey_id": "anchor", "rationale": "r",
+                "source": {"kind": "spec", "ref": "x"},
+                "steps": [{"intent": "run the audit surface",
+                           "expect": "it answers", "core": True,
+                           "expect_cmd_re": r"izba policy show",
+                           "expect_stdout_re": "pinning passthrough"}],
+            }])
+            out = os.path.join(d, "traj.json")
+            rc = run_journeys.main([
+                "--journeys", jf, "--shard", "0", "--shards", "1",
+                "--izba-bin", stub, "--data-dir", d, "--out", out,
+                "--fake-model", json.dumps([{"command": "izba ls"},
+                                            {"done": True}])])
+            self.assertEqual(rc, 0)
+            with open(out) as f:
+                result = json.load(f)["results"][0]
+            kinds = [c["kind"] for c in result["candidates"]]
+            self.assertIn("unreached_decisive", kinds, result["candidates"])
+            self.assertNotIn("functional", kinds, result["candidates"])
+
+
+class ReobservationDoesNotInvertAPassTests(unittest.TestCase):
+    """H3 (run-2 smoke skeptic): a step whose decisive assertion was satisfied
+    must not be retroactively failed by a later RE-OBSERVATION whose different
+    answer the journey itself caused.
+
+    In `smoke-manifest-can-carry-the-firewall` the Actor ran `izba diff
+    mani-egress` (matched `expect_stdout_re "(?s)state: repo ahead.*egress"` —
+    the promise kept), then `izba promote mani-egress`, then the SAME `izba
+    diff mani-egress`, whose honest `state: in sync` was graded as the step's
+    result. Last-match is still the rule; the rescue is narrow — the earlier
+    action must be the byte-identical command, must satisfy EVERY declared
+    assertion, and something must have run in between."""
+
+    DIFF_AHEAD = ("state: repo ahead (promotable)\n  egress:  [live]\n"
+                  "    from:\n      enforce: false\n    to:\n"
+                  "      enforce: true\n      allow:\n"
+                  "      - api.vendor.example\n")
+
+    def _step(self):
+        return {"intent": "show how the project file differs from the "
+                          "sandbox, before anything is applied",
+                "expect": "izba reports the project file is ahead and lists "
+                          "the firewall settings as a pending change",
+                "expect_cmd_re": r"izba diff",
+                "expect_exit": 0,
+                "expect_stdout_re": r"(?s)state: repo ahead.*egress"}
+
+    def _produced(self):
+        return [
+            {"command": "izba diff mani-egress", "exit_code": 0,
+             "stdout_tail": self.DIFF_AHEAD, "stderr_tail": ""},
+            {"command": "izba promote mani-egress", "exit_code": 0,
+             "stdout_tail": "promoted mani-egress", "stderr_tail": ""},
+            {"command": "izba diff mani-egress", "exit_code": 0,
+             "stdout_tail": "state: in sync\n", "stderr_tail": ""},
+        ]
+
+    def test_the_satisfied_step_is_not_flipped(self):
+        import run_journeys as rj
+        cands = rj._grade_step_functional(
+            self._step(), self._produced(), {}, "mani", True, action_index=2,
+            step_index=2)
+        self.assertFalse(cands, f"action[0] satisfied the assertion in full; "
+                                f"action[2] merely re-asked after the promote "
+                                f"the journey itself performed: {cands}")
+
+    def test_the_rescue_is_recorded_as_an_auditable_credit(self):
+        import run_journeys as rj
+        credits = []
+        rj._grade_step_functional(
+            self._step(), self._produced(), {}, "mani", True, action_index=2,
+            step_index=2, credits=credits)
+        self.assertEqual(len(credits), 1, credits)
+        self.assertEqual(credits[0]["step_index"], 2)
+        self.assertEqual(credits[0]["action_index"], 0)
+        self.assertEqual(credits[0]["graded_cmd"], "izba diff mani-egress")
+        self.assertEqual(credits[0]["rescue"], "re-observation")
+
+    def test_the_later_disagreement_is_never_buried(self):
+        # The rescue may not silently discard the later, failing observation:
+        # a skeptic auditing the green must see WHAT diverged, or "an earlier
+        # hit passed the step" becomes unfalsifiable from the bundle alone.
+        import run_journeys as rj
+        credits = []
+        rj._grade_step_functional(
+            self._step(), self._produced(), {}, "mani", True, action_index=2,
+            step_index=2, credits=credits)
+        sup = credits[0]["superseded_by"]
+        self.assertEqual(sup["action_index"], 2)
+        self.assertEqual(sup["graded_cmd"], "izba diff mani-egress")
+        self.assertTrue(sup["candidates"], sup)
+        self.assertIn("state: in sync", sup["candidates"][0]["detail"])
+
+    def test_a_different_later_command_is_not_a_reobservation(self):
+        # The narrowing that keeps last-match honest: `izba diff other` is a
+        # NEW question, not the same one re-asked, so its failure is real
+        # signal and the step still flips.
+        import run_journeys as rj
+        produced = self._produced()[:2] + [
+            {"command": "izba diff other-sandbox", "exit_code": 1,
+             "stdout_tail": "", "stderr_tail": "izba: error: no such sandbox"}]
+        credits = []
+        cands = rj._grade_step_functional(
+            self._step(), produced, {}, "mani", True, action_index=2,
+            step_index=2, credits=credits)
+        self.assertTrue(cands, "a different command's failure is real signal")
+        self.assertEqual(cands[0]["graded_cmd"], "izba diff other-sandbox")
+        self.assertFalse(credits)
+
+    def test_back_to_back_disagreement_still_flips(self):
+        # Nothing ran in between, so the world had no chance to move on: the
+        # same command answering differently twice in a row is instability,
+        # and last-match keeps its authority.
+        import run_journeys as rj
+        produced = [self._produced()[0], self._produced()[2]]
+        cands = rj._grade_step_functional(
+            self._step(), produced, {}, "mani", True, action_index=1,
+            step_index=2)
+        self.assertTrue(cands, "adjacent re-runs disagreeing is a finding")
+        self.assertEqual(cands[0]["trajectory_ref"]["action_index"], 1)
+
+
+    # --- the shape the smoke run actually produced -----------------------
+    # The Actor ran `izba diff` (the pass) and `izba promote` while still
+    # inside the PREVIOUS step, so the decisive step's own actions contain
+    # only the second, `in sync` diff. The rescue must reach it: the harness
+    # already credits a decisive step from an earlier STEP's action
+    # (`_grade_decisive_from_observed`), and the same fact is no less true
+    # when the step did produce actions of its own.
+
+    def _journey_actions(self):
+        return [
+            {"command": "izba run -d --name mani-egress .", "exit_code": 0,
+             "stdout_tail": "", "stderr_tail": ""},
+            {"command": "cat > izba.yml <<'EOF'\nspec:\nEOF\n",
+             "exit_code": 0, "stdout_tail": "", "stderr_tail": ""},
+            {"command": "izba diff mani-egress", "exit_code": 0,
+             "stdout_tail": self.DIFF_AHEAD, "stderr_tail": ""},
+            {"command": "izba promote mani-egress", "exit_code": 0,
+             "stdout_tail": "promoted mani-egress", "stderr_tail": ""},
+            {"command": "izba diff mani-egress", "exit_code": 0,
+             "stdout_tail": "state: in sync\n", "stderr_tail": ""},
+        ]
+
+    def test_a_pass_under_the_previous_step_still_rescues(self):
+        import run_journeys as rj
+        acts = self._journey_actions()
+        credits = []
+        cands = rj._grade_step_functional(
+            self._step(), acts[4:], {}, "mani", True, action_index=4,
+            step_index=2, credits=credits, actions=acts)
+        self.assertFalse(cands, f"action[2] printed the promised diff; the "
+                                f"promote the journey itself ran is why "
+                                f"action[4] says `in sync`: {cands}")
+        self.assertEqual(credits[0]["action_index"], 2)
+        self.assertEqual(credits[0]["rescue"], "re-observation")
+        self.assertEqual(credits[0]["superseded_by"]["action_index"], 4)
+
+    def test_a_predrift_reobservation_cannot_rescue(self):
+        # The established state boundary: a step-level `seed_files` injection
+        # means an action recorded before it observed PRE-drift state, so it
+        # can never satisfy an assertion about the post-drift world. Same
+        # discipline `_grade_decisive_from_observed` already enforces.
+        import run_journeys as rj
+        acts = self._journey_actions()
+        credits = []
+        cands = rj._grade_step_functional(
+            self._step(), acts[4:], {}, "mani", True, action_index=4,
+            step_index=2, credits=credits, actions=acts, min_action_index=4)
+        self.assertTrue(cands, "the only satisfying observation is pre-drift")
+        self.assertEqual(cands[0]["trajectory_ref"]["action_index"], 4)
+        self.assertFalse(credits)
+
+    def test_a_cross_step_rescue_still_needs_the_same_command(self):
+        import run_journeys as rj
+        acts = self._journey_actions()
+        acts[2] = dict(acts[2], command="izba diff --json mani-egress")
+        cands = rj._grade_step_functional(
+            self._step(), acts[4:], {}, "mani", True, action_index=4,
+            step_index=2, actions=acts)
+        self.assertTrue(cands, "a different invocation is a different "
+                               "question, not the same one re-asked")
+
+    def test_partial_satisfaction_does_not_rescue(self):
+        # The earlier action printed the right thing but exited non-zero:
+        # a rescue needs EVERY declared assertion, exactly as on a refusal step.
+        import run_journeys as rj
+        produced = self._produced()
+        produced[0] = dict(produced[0], exit_code=1)
+        cands = rj._grade_step_functional(
+            self._step(), produced, {}, "mani", True, action_index=2,
+            step_index=2)
+        self.assertTrue(cands, cands)
+        self.assertEqual(cands[0]["graded_cmd"], "izba diff mani-egress")
+        self.assertEqual(cands[0]["trajectory_ref"]["action_index"], 2)
+
+
 class DecisiveGradingTests(unittest.TestCase):
     def test_setup_noise_is_not_decisive_and_core_step_governs(self):
         # Replays the #111 masking scenario: a non-core SETUP step that exits

@@ -646,6 +646,86 @@ class GuestConsoleTests(unittest.TestCase):
             self.assertEqual(ev["per_sandbox"]["web"]["console_tail"], "")
 
 
+class RelayedGuestOutputTests(unittest.TestCase):
+    """H1 (run-2 smoke skeptic): `izba exec` RELAYS the guest command's stdout
+    and stderr through izba's own streams (the exit-code contract: "crun
+    PROPAGATES its exit status and izba passes it straight through"), so the
+    generic markers — anchored `ERROR`/`FATAL`, `assertion failed`, a bare
+    `panic` — belong to whatever the guest ran, not to izba.
+
+    A legitimately-failing `apk add` under a default-deny firewall produced 3
+    of the smoke tier's 5 candidates, every one of them claiming "izba must not
+    panic/abort on a user command" about a command izba executed perfectly.
+    On a relaying command only the markers a crashing HOST process emits are
+    scanned; everywhere else the full set still applies."""
+
+    APK = "izba exec fw-basic -- sh -c 'apk add --no-cache curl'"
+    APK_STDERR = ("WARNING: fetching https://dl-cdn.alpinelinux.org/alpine/"
+                  "v3.20/main: DNS lookup error\n"
+                  "ERROR: unable to select packages:\n"
+                  "  curl (no such package):\n"
+                  "    required by: world[curl]\n")
+
+    def test_guest_error_relayed_through_exec_is_not_a_host_crash(self):
+        self.assertEqual(
+            implicit_oracle(act(command=self.APK, exit_code=1,
+                                stderr_tail=self.APK_STDERR)),
+            [], "the guest's apk printed this; izba relayed it faithfully")
+
+    def test_guest_error_on_stdout_is_also_not_a_host_crash(self):
+        self.assertEqual(
+            implicit_oracle(act(command=self.APK, stdout_tail=self.APK_STDERR)),
+            [])
+
+    def test_izba_panicking_under_exec_is_still_caught(self):
+        # The explicit non-goal: an `izba exec` that makes izba ITSELF panic
+        # must still flag. Blanket-skipping every exec would lose this.
+        c = implicit_oracle(act(
+            command=self.APK, exit_code=101,
+            stderr_tail="thread 'main' panicked at src/exec.rs:12:5:\n"
+                        "called `Option::unwrap()` on a `None` value"))
+        self.assertTrue(any("panicked" in x.detail for x in c), c)
+
+    def test_ssh_into_a_sandbox_relays_the_same_way(self):
+        # `ssh izba-<name>` routes into `crun exec` exactly like `izba exec`.
+        self.assertEqual(
+            implicit_oracle(act(command="ssh izba-fw-basic -- make build",
+                                exit_code=2, stderr_tail="ERROR: no rule\n")),
+            [])
+
+    def test_izba_run_relays_too(self):
+        self.assertEqual(
+            implicit_oracle(act(command="izba run --rm --image alpine:3.20 . "
+                                        "-- sh -c 'apk add curl'",
+                                exit_code=1, stderr_tail=self.APK_STDERR)),
+            [])
+
+    def test_a_non_relaying_izba_command_still_scans_the_full_set(self):
+        # Regression guard: an anchored ERROR out of a plain izba command is
+        # izba's own output and must keep flagging.
+        c = implicit_oracle(act(command="izba policy show fw-basic",
+                                stderr_tail="ERROR: something went wrong"))
+        self.assertTrue(any(x.kind == "implicit" for x in c), c)
+
+    def test_the_word_izba_exec_inside_a_guest_string_does_not_disarm_it(self):
+        # `izba exec` must be in COMMAND position; prose mentioning it must not
+        # turn the strict marker set on for an unrelated command.
+        c = implicit_oracle(act(command="echo 'run izba exec later' > notes",
+                                stderr_tail="ERROR: disk full"))
+        self.assertTrue(any(x.kind == "implicit" for x in c), c)
+
+    def test_the_guest_console_oracle_keeps_the_full_marker_set(self):
+        # The other half of the contract: a guest-side crash is still caught,
+        # by the oracle that reads the guest's OWN console rather than a
+        # stream izba merely relayed.
+        import oracles
+        ev = {"per_sandbox": {"web": {"console_tail": "ERROR: init aborted"}}}
+        cands = oracles.guest_console_oracle(ev, {"journey_id": "j",
+                                                  "action_index": -1})
+        self.assertEqual(len(cands), 1, cands)
+        self.assertEqual(cands[0].kind, "guest_console")
+
+
 class TimeoutCaptureTests(unittest.TestCase):
     """DEEP-H4: a timed-out action must keep what it printed, and must not
     leave a child behind.

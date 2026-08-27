@@ -97,7 +97,10 @@ shape:
 - Mark the journey's decisive assertion(s) `"core": true` and give it an
   `expect_cmd_re`: besides pinning which action gets graded, it lets the runner
   credit the assertion if the swarm satisfies it under an earlier step instead
-  of flagging `unreached_decisive`.
+  of flagging `unreached_decisive`. Anchor it on the command the assertion is
+  really about and nothing else: a pattern that matches NONE of the step's
+  actions is read as "the decisive command never ran" (`unreached_decisive`),
+  never as a failure of whatever the step happened to run last.
 - An exit code is rarely the assertion you mean. On a decisive step also declare
   `expect_stdout_re` (a regex over WHAT the graded command printed — `izba
   netlog` exits 0 whether the flow was spliced or terminated),

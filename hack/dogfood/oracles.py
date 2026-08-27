@@ -5,6 +5,8 @@ No LLM, no network. Runs one ``izba`` command, captures the result, snapshots
 
 - ``implicit_oracle``  — scrape stdout/stderr for panic/assert/ERROR markers and
   decode the izba exit-code contract (127 -> CommandNotFound, 128+n -> Signal n).
+  On a command that relays a GUEST program's streams (``izba exec``/``run``,
+  ``ssh izba-*``) only izba's own crash signatures are scanned — see H1 there.
 - ``latency_oracle``   — flag actions over a human-normal time budget.
 - ``functional_oracle`` — compare an action's exit against the step's expectation,
   *understanding expected-failure steps*: a refusal-expecting step that exits
@@ -472,6 +474,26 @@ _IMPLICIT_RE = re.compile(
     re.MULTILINE,
 )
 
+# The strict subset of `_IMPLICIT_RE` that only a crashing HOST process emits:
+# a Rust panic (izba, izbad) or a sanitizer report. Used on commands that RELAY
+# a guest program's streams (see `_RELAY_CMD_RE`), where the generic arms —
+# anchored ERROR/FATAL, `assertion failed`, a bare `panic` (a Go program's) —
+# describe whatever the guest ran, not izba.
+_HOST_CRASH_RE = re.compile(
+    r"thread '.*' panicked|panicked at |AddressSanitizer|fatal runtime error",
+)
+
+# Commands whose stdout/stderr are a GUEST program's, passed through verbatim:
+# `izba exec`/`izba run` (the exit-code contract — "crun PROPAGATES its exit
+# status and izba passes it straight through") and `ssh izba-<name>`, which
+# OpenSSH routes into the same `crun exec`. `izba` must be in COMMAND position
+# (mirroring `_CREDIT_CMD_RE` in the runner) so prose mentioning `izba exec`
+# cannot disarm the scan for an unrelated command.
+_RELAY_CMD_RE = re.compile(
+    r"(?:^|&&|\|\||;|\||\()\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
+    r"(?:izba\s+(?:exec|run)\b|ssh\s+(?:-\S+\s+)*izba-)"
+)
+
 
 def implicit_oracle(action: Action, *, expect_nonzero: bool = False) -> List[Candidate]:
     """Scrape output for crash markers; decode the izba exit-code contract.
@@ -483,13 +505,29 @@ def implicit_oracle(action: Action, *, expect_nonzero: bool = False) -> List[Can
     non-zero/decoded exit (via ``expect_exit`` or refusal phrasing), so those codes
     are the anticipated outcome and no candidate is emitted — this is what stops a
     journey like ``exec-exit-code-contract`` (whose whole point is to observe 127
-    and 128+n) from self-flipping."""
+    and 128+n) from self-flipping.
+
+    **Which marker set is scanned depends on WHOSE output the stream carries
+    (H1).** On a command that RELAYS a guest program (``_RELAY_CMD_RE``:
+    ``izba exec``/``izba run``/``ssh izba-<name>``) the streams are the guest's,
+    passed through verbatim by design, so only ``_HOST_CRASH_RE`` — the markers
+    a crashing izba itself emits — is scanned. A default-deny sandbox where
+    ``apk add`` honestly fails prints ``ERROR: unable to select packages`` on
+    izba's stderr; scoring that as "izba must not panic/abort on a user
+    command" made 3 of a smoke tier's 5 candidates, every one of them false,
+    about a command izba executed exactly as documented. The narrowing is
+    deliberately NOT "skip every exec": an ``izba exec`` that makes izba ITSELF
+    panic still flags, and a guest-side crash keeps its own oracle
+    (``guest_console_oracle``, which reads the guest's console and therefore
+    keeps the FULL marker set)."""
     out: List[Candidate] = []
     ref = {"journey_id": "", "action_index": -1}
+    markers = (_HOST_CRASH_RE if _RELAY_CMD_RE.search(action.command or "")
+               else _IMPLICIT_RE)
 
     for stream_name, text in (("stderr", action.stderr_tail),
                               ("stdout", action.stdout_tail)):
-        m = _IMPLICIT_RE.search(text)
+        m = markers.search(text)
         if m:
             out.append(Candidate(
                 kind="implicit",
