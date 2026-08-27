@@ -103,14 +103,24 @@
         },
         "decisive_credits": {
           "type": "array",
-          "description": "Audit trail for H3 crediting: each entry records a decisive step whose own pointer produced no actions but was graded functionally from an EARLIER step's action (via that step's expect_cmd_re). A broad pattern (e.g. a bare 'izba') can match an unrelated command, so every credit — including ones that graded to a silent pass — is recorded here for the Phase-3 skeptic to audit, not just the failures. A credit from a DECLARATIVE hook (expect_state on either runner, expect_text on the GUI runner) is recorded the same way, with action_index -1 and a graded_cmd naming the hook: the assertion was graded against the end-of-journey state evidence / page-text captures rather than a single action, and the skeptic must still see that it WAS graded.",
+          "description": "Audit trail for H3 crediting: each entry records a decisive step whose own pointer produced no actions but was graded functionally from an EARLIER step's action (via that step's expect_cmd_re), OR a step whose grade was rescued from an earlier action of its own (see `rescue`). A broad pattern (e.g. a bare 'izba') can match an unrelated command, so every credit — including ones that graded to a silent pass — is recorded here for the Phase-3 skeptic to audit, not just the failures. A credit from a DECLARATIVE hook (expect_state on either runner, expect_text on the GUI runner) is recorded the same way, with action_index -1 and a graded_cmd naming the hook: the assertion was graded against the end-of-journey state evidence / page-text captures rather than a single action, and the skeptic must still see that it WAS graded.",
           "items": {
             "type": "object",
             "required": ["step_index", "action_index", "graded_cmd"],
             "properties": {
               "step_index": { "type": "integer", "description": "Index of the decisive step that was credited." },
               "action_index": { "type": "integer", "description": "Index into the journey's actions array of the action the credit was graded from." },
-              "graded_cmd": { "type": "string", "description": "The exact command that was graded for this credit, or \"<hook> (matched)\" when the credit came from a declarative hook rather than a command." }
+              "graded_cmd": { "type": "string", "description": "The exact command that was graded for this credit, or \"<hook> (matched)\" when the credit came from a declarative hook rather than a command." },
+              "rescue": { "type": "string", "enum": ["refusal", "re-observation"], "description": "Present when the credit came from the already-satisfied rescue in _grade_step_functional rather than from the step's default target: 'refusal' = the step asserted a guard that fired at this action (DEEP-H1), 're-observation' = the later, failing target is the byte-identical command asked again after the journey itself changed the answer (H3, e.g. izba diff -> izba promote -> izba diff)." },
+              "superseded_by": {
+                "type": "object",
+                "description": "The later, FAILING action the rescue set aside, recorded verbatim so the rescue can never silently bury a divergence: a skeptic auditing this green must be able to see what the same command answered later without reconstructing it from the raw trajectory.",
+                "properties": {
+                  "action_index": { "type": "integer" },
+                  "graded_cmd": { "type": "string" },
+                  "candidates": { "type": "array", "items": { "type": "object" }, "description": "The candidates that later action produced — the divergence itself." }
+                }
+              }
             }
           }
         }

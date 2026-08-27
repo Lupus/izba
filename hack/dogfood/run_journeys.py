@@ -415,8 +415,21 @@ def _eligible_targets(step, produced, base, journey_id):
     command the assertion is about). Without it the set is the step's PRODUCT
     invocations — a shell line that runs the izba binary — so trailing plumbing
     (seed-write heredocs, `ls` peeks) can't be graded as the step's command.
-    Neither yielding anything falls back to the step's final action, which is
-    what the harness graded before either refinement existed."""
+    The izba-invocation heuristic yielding nothing falls back to the step's
+    final action, which is what the harness graded before either refinement
+    existed.
+
+    A DECLARED ``expect_cmd_re`` that matches nothing is the one case with no
+    fallback: it returns the EMPTY list (H2). "The decisive command never ran"
+    and "it ran and failed" are materially different facts, and the old
+    fall-back-to-the-last-action reported the first as the second — grading
+    ``expect_stdout_re 'pinning passthrough'`` against ``izba policy allow``,
+    which the assertion was never about, and handing Phase-3 triage a
+    fabricated functional red. The caller turns the empty set into
+    ``unreached_decisive``, the kind that already means "this assertion was
+    never exercised". An INVALID pattern is different again — an authoring
+    error, not evidence about the Actor — and keeps the final-action fallback
+    so the step is still graded somewhere."""
     last = [(base + len(produced) - 1, produced[-1])]
     pattern = step.get("expect_cmd_re")
     if isinstance(pattern, str) and pattern:
@@ -426,12 +439,95 @@ def _eligible_targets(step, produced, base, journey_id):
             log(f"{journey_id}: invalid expect_cmd_re {pattern!r}: {e}; "
                 f"grading the final action")
             return last
-        matched = [(base + i, a) for i, a in enumerate(produced)
-                   if rx.search(a.get("command", ""))]
-        return matched or last
+        return [(base + i, a) for i, a in enumerate(produced)
+                if rx.search(a.get("command", ""))]
     found = [(base + i, a) for i, a in enumerate(produced)
              if _PRODUCT_CMD_RE.search(a.get("command", ""))]
     return found or last
+
+
+def _unrun_decisive_command(step, journey_id, source, decisive, step_index):
+    """The H2 verdict for a step whose declared ``expect_cmd_re`` matched none
+    of its actions: the command the assertion is about was never run.
+
+    On a DECISIVE step that is an ``unreached_decisive`` flip — the existing
+    instrument-honesty kind for "the assertion was never exercised" — carrying
+    no ``graded_cmd``, because nothing was graded and the bundle must not point
+    the skeptic at a command as though it had been. On a NON-decisive step it
+    is nothing at all: that step's verdict never governs the journey (a
+    non-decisive ``functional`` candidate is soft by the collector's rule), so
+    the only thing the old fallback contributed there was the fabricated grade
+    this fix removes — and promoting it to ``unreached_decisive`` would newly
+    FLIP runs on setup noise."""
+    pattern = step.get("expect_cmd_re")
+    idx = step_index if step_index is not None else -1
+    log(f"{journey_id}: step {idx}'s expect_cmd_re {pattern!r} matched none of "
+        f"its actions; the declared command never ran"
+        + ("" if decisive else " (non-decisive step; grading nothing)"))
+    if not decisive:
+        return []
+    return [{
+        "kind": "unreached_decisive",
+        "detail": (f"decisive step {idx} ({step.get('intent', '')[:80]!r}) "
+                   f"declares expect_cmd_re {pattern!r}, which matched NONE of "
+                   f"the step's actions — the command its assertion is about "
+                   f"was never run"),
+        "violated_expectation": (step.get("expect", "")
+                                 or "the step's declared command must be run"),
+        "source": source,
+        "trajectory_ref": {"journey_id": journey_id, "action_index": -1},
+        "decisive": True,
+    }]
+
+
+def _drift_watermark(seed_watermarks, step_index):
+    """The latest pre-drift action watermark established at or before
+    ``step_index`` (0 when none). One definition, two readers: the unreached-
+    decisive credit scan in ``run_journey`` and the re-observation rescue."""
+    return max((w for j, w in (seed_watermarks or []) if j <= step_index),
+               default=0)
+
+
+def _rescue_candidates(eligible, target, target_index, *, refusal,
+                       actions=None, min_action_index=0):
+    """Actions that may rescue a FAILING default target, newest first.
+
+    Two shapes, and nothing else (see ``_grade_step_functional``):
+
+    - ``refusal`` — every earlier eligible target of the step. A guard that
+      fired has kept its promise however the Actor proceeded (DEEP-H1).
+    - a **re-observation** — the byte-identical command asked again, with at
+      least one action in between. Both halves are load-bearing narrowings:
+      ``izba diff mani-egress`` twice is ONE question re-asked, whose answer
+      the journey's own ``izba promote`` in between legitimately changed, while
+      ``izba start web`` then ``izba start web2`` is a NEW attempt at a
+      different target whose failure an earlier success must never absolve;
+      and two ADJACENT runs of one command disagreeing is instability, not the
+      world moving on, so last-match keeps authority there.
+
+    The re-observation scan spans the whole journey when ``actions`` is given,
+    not just the step: the swarm routinely satisfies a step's assertion while
+    still inside the previous one (in ``smoke-manifest-can-carry-the-firewall``
+    both the passing ``izba diff`` and the ``izba promote`` landed under the
+    step before), and the harness already credits a decisive step from an
+    earlier step's action — ``_grade_decisive_from_observed``. It carries that
+    mechanism's guards too: ``_CREDIT_CMD_RE`` (an izba invocation in COMMAND
+    position, never prose) and ``min_action_index``, the seed-drift watermark —
+    an action recorded before a step-level ``seed_files`` injection observed
+    PRE-drift state and can never satisfy an assertion about the post-drift
+    world."""
+    if refusal:
+        return list(reversed(eligible[:-1]))
+    cmd = target.get("command", "")
+    if not cmd:
+        return []
+    pool = (list(enumerate(actions)) if actions is not None
+            else list(eligible[:-1]))
+    return list(reversed([
+        (i, a) for i, a in pool
+        if min_action_index <= i < target_index - 1
+        and a.get("command", "") == cmd
+        and _CREDIT_CMD_RE.search(cmd)]))
 
 
 def _grade_target(step, action, journey_id, journey_source, ref, decisive):
@@ -453,8 +549,9 @@ def _grade_target(step, action, journey_id, journey_source, ref, decisive):
 
 
 def _grade_step_functional(step, produced, journey, journey_id, decisive,
-                           action_index, *, step_index=None,
-                           credits=None) -> List[Dict[str, Any]]:
+                           action_index, *, step_index=None, credits=None,
+                           actions=None,
+                           min_action_index=0) -> List[Dict[str, Any]]:
     """Grade the functional assertion ONCE per step, on its intent-bearing action.
 
     Default target is the LAST of the step's eligible actions
@@ -462,25 +559,47 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
     step's izba invocations, else the final action) — last-match is right for
     the common shape "the Actor got it wrong, then got it right".
 
-    **The refusal exception (DEEP-H1).** On a step that DECLARES a refusal
-    (``step_expects_nonzero``: ``expect_exit`` nonzero) the assertion is that a
-    GUARD FIRES. Once it has fired, the promise is kept — and what the Actor
-    does next is its own business, very often the documented escape hatch the
-    error message itself advertised. Grading the last match then inverts a step
-    that already passed: `deep-command-line-grants-skip-the-review-gate` got
-    its ``no reviewed diff`` refusal at action[6] and was scored against
-    action[7]'s deliberate ``--force`` retry, turning a kept promise into two
-    flipping candidates. So on a refusal step, if the default target fails but
-    an earlier eligible action satisfies EVERY declared assertion (exit AND
-    streams — a partial satisfaction rescues nothing), that action is graded
-    instead, and the swap is recorded in ``credits`` so the skeptic sees which
-    action the pass came from.
+    A declared ``expect_cmd_re`` that matched NOTHING has no target at all and
+    yields ``_unrun_decisive_command`` instead of a grade (H2).
 
-    The exception is deliberately NOT extended to success-expecting steps:
-    there, an earlier success absolving a later failure would let the harness
-    hide a real bug behind the Actor's first lucky attempt. Last-match keeps
-    its authority, which is why this stays a strictly-narrower rule and not a
-    "any action that passed" free pass.
+    **The already-satisfied rescue.** When the default target fails but an
+    EARLIER eligible action satisfied EVERY declared assertion (exit AND
+    streams — a partial satisfaction rescues nothing), that action is graded
+    instead and the swap is recorded in ``credits``. Two shapes qualify, and
+    nothing else does:
+
+    - **A refusal (DEEP-H1).** On a step that DECLARES a refusal
+      (``step_expects_nonzero``: ``expect_exit`` nonzero) the assertion is that
+      a GUARD FIRES. Once it has fired the promise is kept, and what the Actor
+      does next is its own business — very often the documented escape hatch
+      the error message itself advertised.
+      `deep-command-line-grants-skip-the-review-gate` got its ``no reviewed
+      diff`` refusal at action[6] and was scored against action[7]'s deliberate
+      ``--force`` retry, turning a kept promise into two flipping candidates.
+    - **A re-observation (H3).** The failing target is the byte-identical
+      command asked again, with an action in between (``_rescue_candidates``).
+      `smoke-manifest-can-carry-the-firewall` ran ``izba diff mani-egress``
+      (printing the promised ``state: repo ahead`` … ``egress``), then ``izba
+      promote mani-egress``, then the SAME ``izba diff mani-egress`` — whose
+      honest ``state: in sync`` was graded as the step's result, failing a
+      journey that did exactly what the README promises. An ``expect_stdout_re``
+      asks what izba PRINTED WHEN ASKED; a later answer the journey's own
+      mutation caused cannot retroactively unprint it. That first diff landed
+      under the PREVIOUS step, so this shape searches ``actions`` (the whole
+      journey) from ``min_action_index``, the seed-drift watermark — the same
+      reach and the same guards as ``_grade_decisive_from_observed``.
+
+    This is deliberately NOT "any action that passed": the rescue needs the
+    assertion satisfied IN FULL and — outside a refusal — needs the later
+    failure to be the same question re-asked rather than a new attempt. `izba
+    start web` (ok) followed by `izba start web2` (boot failed) is a different
+    command, so last-match keeps its authority and the real bug still flips.
+    The residue the rule cannot machine-decide — the same command re-asked and
+    answering differently because something BROKE it in between, not because
+    the world legitimately moved on — is why the rescue is never silent: the
+    credit carries ``superseded_by`` (the later action and the candidates it
+    produced verbatim), so a skeptic auditing the green sees exactly what
+    diverged instead of having to reconstruct it from the raw trajectory.
 
     Invalid regexes log + fall back to the final action. Every candidate
     records ``graded_cmd`` so the skeptic sees WHAT was graded."""
@@ -489,18 +608,25 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
     base = action_index - len(produced) + 1
     eligible = _eligible_targets(step, produced, base, journey_id)
     source = journey.get("source", {}).get("ref", "journey step")
+    if not eligible:
+        return _unrun_decisive_command(step, journey_id, source, decisive,
+                                       step_index)
     target_index, target = eligible[-1]
     graded = _grade_target(
         step, target, journey_id, source,
         {"journey_id": journey_id, "action_index": target_index}, decisive)
-    if not graded or not step_expects_nonzero(step.get("expect", ""),
-                                              step.get("expect_exit")):
+    if not graded:
         return graded
-    for idx, a in reversed(eligible[:-1]):
+    refusal = step_expects_nonzero(step.get("expect", ""),
+                                   step.get("expect_exit"))
+    for idx, a in _rescue_candidates(
+            eligible, target, target_index, refusal=refusal, actions=actions,
+            min_action_index=min_action_index):
         ref = {"journey_id": journey_id, "action_index": idx}
         if _grade_target(step, a, journey_id, source, ref, decisive):
             continue
-        log(f"{journey_id}: step {step_index} asserted a refusal that "
+        why = "asserted a refusal that" if refusal else "was satisfied when"
+        log(f"{journey_id}: step {step_index} {why} "
             f"action[{idx}] ({a.get('command', '')!r}) satisfied in full; "
             f"grading THAT, not the later {target.get('command', '')!r}")
         if credits is not None:
@@ -508,6 +634,12 @@ def _grade_step_functional(step, produced, journey, journey_id, decisive,
                 "step_index": step_index if step_index is not None else -1,
                 "action_index": idx,
                 "graded_cmd": a.get("command", ""),
+                "rescue": "refusal" if refusal else "re-observation",
+                "superseded_by": {
+                    "action_index": target_index,
+                    "graded_cmd": target.get("command", ""),
+                    "candidates": graded,
+                },
             })
         return []
     return graded
@@ -552,8 +684,9 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
     re-issue a common verify command (e.g. ``izba ls``).
 
     The functional assertion is graded ONCE at step end, on the step's
-    intent-bearing action (``expect_cmd_re``-selected, falling back to the final
-    action ``actions[start:][-1]``): we snapshot ``start`` before the loop and
+    intent-bearing action (``expect_cmd_re``-selected — matching nothing means
+    the declared command never ran, not a fallback — else the final action
+    ``actions[start:][-1]``): we snapshot ``start`` before the loop and
     grade what the step produced, tagging the candidate ``decisive`` per this
     step's role. Grading in a ``finally`` guarantees it also runs when a cap trips
     or a report-only error ends the step early.
@@ -635,7 +768,10 @@ def _run_step(model, journey, step, izba_bin, data_dir, workdir, *,
             candidates.extend(_grade_step_functional(
                 step, produced, journey, journey_id, decisive,
                 len(actions) - 1, step_index=step_index,
-                credits=(decisive_credits if decisive else None)))
+                credits=(decisive_credits if decisive else None),
+                actions=actions,
+                min_action_index=_drift_watermark(
+                    ctx.get("seed_watermarks"), step_index)))
 
 
 def _write_seeds(workdir: str, seed_files: Optional[Dict[str, Any]]) -> Dict[str, str]:
@@ -1063,8 +1199,7 @@ def run_journey(
             s = steps[i]
             # Latest pre-drift watermark established at or before this decisive
             # step (step-level seed_files only; see _run_step's docstring).
-            watermark = max(
-                (w for j, w in seed_watermarks if j <= i), default=0)
+            watermark = _drift_watermark(seed_watermarks, i)
             graded = _grade_decisive_from_observed(
                 s, actions, journey, journey_id, min_action_index=watermark)
             if graded is not None:
