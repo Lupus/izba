@@ -121,13 +121,25 @@ function mapPromoteWarning(message: string): string {
  *  newlines collapse into the wall of text the field report showed. Each
  *  visual row is one CSS grid row, so wrapped lines keep the two sides
  *  height-aligned. Index keys are safe: rows are a pure recompute of
- *  (from, to) with no per-row state. */
+ *  (from, to) with no per-row state.
+ *
+ *  The headings NAME the two sides (#240): the app's deltas come from
+ *  `izba_core::manifest::ops::compute_diff`, which calls
+ *  `diff_normalized(&managed, &repo)` — so `from` is always the live managed
+ *  truth and `to` is always the value proposed by `izba.yml`. A bare
+ *  From/To left that unsaid. The left side is labelled "managed", NOT
+ *  "live", because the field-class badge in the same delta block already
+ *  uses `live` for a different meaning ("applies without restart") and the
+ *  two would be confusable; "managed" is also this tab's established
+ *  vocabulary ("No field changes between izba.yml and managed settings.").
+ *  The wording is shared verbatim with `izba diff`'s CLI columns — the two
+ *  surfaces must not disagree. */
 function ValueDiff({ from, to }: Readonly<{ from: string; to: string }>) {
   const rows = diffLines(from, to);
   return (
     <div className="grid grid-cols-2 gap-x-4 font-mono text-xs leading-5">
-      <div className="pb-0.5 font-sans text-muted-foreground-2">From</div>
-      <div className="pb-0.5 font-sans text-muted-foreground-2">To</div>
+      <div className="pb-0.5 font-sans text-muted-foreground-2">From (managed)</div>
+      <div className="pb-0.5 font-sans text-muted-foreground-2">To (izba.yml)</div>
       {rows.map((r, i) => (
         <Fragment key={`${i}-${r.from ?? ""}-${r.to ?? ""}`}>
           <div

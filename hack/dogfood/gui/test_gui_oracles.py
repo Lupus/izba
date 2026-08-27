@@ -258,7 +258,9 @@ def test_manifest_truth_oracle_flags_state_mismatch():
     # UI says in_sync; ground truth (mocked) says repo ahead.
     def fake_run_diff(izba_bin, workspace, name, data_dir, timeout_s):
         assert (izba_bin, workspace, name) == ("izba", "/tmp/ws", "web")
-        return "state: repo ahead (promotable)\n  cpus: 2 -> 4  [restart]\n"
+        return ("state: repo ahead (promotable)\n"
+                "showing: managed (live truth) -> izba.yml (proposed)\n"
+                "  cpus: 2 (managed) -> 4 (izba.yml)  [restart]\n")
     cs = manifest_truth_oracle(_mt_ctx("in_sync"), run_diff=fake_run_diff)
     assert len(cs) == 1
     assert cs[0].kind == "functional"

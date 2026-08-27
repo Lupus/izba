@@ -1026,8 +1026,11 @@ class ReobservationDoesNotInvertAPassTests(unittest.TestCase):
     action must be the byte-identical command, must satisfy EVERY declared
     assertion, and something must have run in between."""
 
-    DIFF_AHEAD = ("state: repo ahead (promotable)\n  egress:  [live]\n"
-                  "    from:\n      enforce: false\n    to:\n"
+    DIFF_AHEAD = ("state: repo ahead (promotable)\n"
+                  "showing: managed (live truth) -> izba.yml (proposed)\n"
+                  "  egress:  [live]\n"
+                  "    from (managed):\n      enforce: false\n"
+                  "    to (izba.yml):\n"
                   "      enforce: true\n      allow:\n"
                   "      - api.vendor.example\n")
 

@@ -30,6 +30,17 @@ pub fn run(paths: &Paths, target: Option<&str>, name_override: Option<&str>) -> 
     Ok(0)
 }
 
+/// Render the drift report.
+///
+/// #240: every delta names which side is which. `ops::compute_diff` calls
+/// `diff_normalized(&managed, &repo)`, so in every `FieldDelta` `from` is the
+/// LIVE MANAGED TRUTH and `to` is what `izba.yml` proposes — a direction the
+/// bare `a -> b` form left the reader to guess.
+///
+/// The left-hand side is labelled `managed`, deliberately NOT `live`:
+/// `FieldClass::Live` already renders as a `[live]` class badge in the same
+/// row (it means "applies without a restart"), and the two would be
+/// confusable. The desktop app's Manifest tab uses the same wording.
 pub(crate) fn render_deltas(state: DriftState, deltas: &[FieldDelta]) -> String {
     let mut s = String::new();
     let label = match state {
@@ -43,6 +54,8 @@ pub(crate) fn render_deltas(state: DriftState, deltas: &[FieldDelta]) -> String 
         s.push_str("no field changes between manifest and managed truth.\n");
         return s;
     }
+    // Only when there is something to attribute — the in-sync path stays terse.
+    s.push_str("showing: managed (live truth) -> izba.yml (proposed)\n");
     for d in deltas {
         let class = match d.class {
             FieldClass::Live => "live",
@@ -59,17 +72,17 @@ pub(crate) fn render_deltas(state: DriftState, deltas: &[FieldDelta]) -> String 
             // inline `from -> to` form would embed raw newlines mid-sentence,
             // so render an indented from/to block instead.
             s.push_str(&format!("  {}:  [{}]{}\n", d.field, class, warn));
-            s.push_str("    from:\n");
+            s.push_str("    from (managed):\n");
             for l in d.from.lines() {
                 s.push_str(&format!("      {l}\n"));
             }
-            s.push_str("    to:\n");
+            s.push_str("    to (izba.yml):\n");
             for l in d.to.lines() {
                 s.push_str(&format!("      {l}\n"));
             }
         } else {
             s.push_str(&format!(
-                "  {}: {} -> {}  [{}]{}\n",
+                "  {}: {} (managed) -> {} (izba.yml)  [{}]{}\n",
                 d.field, d.from, d.to, class, warn
             ));
         }
@@ -82,6 +95,9 @@ mod tests {
     use super::*;
     use izba_core::manifest::diff::{FieldClass, FieldDelta};
     use izba_core::manifest::DriftState;
+
+    /// The legend that tells the reader which side is the live managed truth.
+    const LEGEND: &str = "showing: managed (live truth) -> izba.yml (proposed)\n";
 
     #[test]
     fn render_groups_by_class_and_flags_weakening() {
@@ -114,6 +130,81 @@ mod tests {
         assert!(s.to_lowercase().contains("in sync"));
     }
 
+    /// #240 (a): the inline single-line form names BOTH sides — the left is the
+    /// live managed truth, the right is what `izba.yml` proposes.
+    #[test]
+    fn render_inline_labels_managed_and_manifest_sides() {
+        let deltas = vec![FieldDelta {
+            field: "cpus".into(),
+            from: "2".into(),
+            to: "4".into(),
+            class: FieldClass::Restart,
+            weakens_egress: false,
+        }];
+        let s = render_deltas(DriftState::RepoAhead, &deltas);
+        assert!(
+            s.contains("  cpus: 2 (managed) -> 4 (izba.yml)  [restart]\n"),
+            "inline row labels both sides: {s}"
+        );
+    }
+
+    /// #240 (b): the multi-line BLOCK form labels both sides too — this is the
+    /// form the acceptance criteria call out explicitly, since an unlabelled
+    /// `from:`/`to:` block is where the direction is least guessable.
+    #[test]
+    fn render_block_labels_managed_and_manifest_sides() {
+        let deltas = vec![FieldDelta {
+            field: "egress".into(),
+            from: "allow:\n  - github.com".into(),
+            to: "allow:\n  - github.com\n  - pypi.org".into(),
+            class: FieldClass::Live,
+            weakens_egress: true,
+        }];
+        let s = render_deltas(DriftState::RepoAhead, &deltas);
+        assert!(
+            s.contains("    from (managed):\n"),
+            "block from-heading names the managed side: {s}"
+        );
+        assert!(
+            s.contains("    to (izba.yml):\n"),
+            "block to-heading names the manifest side: {s}"
+        );
+    }
+
+    /// #240 (c): the legend prints once, right after the `state:` line and
+    /// before the first delta row.
+    #[test]
+    fn render_prints_legend_before_deltas() {
+        let deltas = vec![FieldDelta {
+            field: "cpus".into(),
+            from: "2".into(),
+            to: "4".into(),
+            class: FieldClass::Restart,
+            weakens_egress: false,
+        }];
+        let s = render_deltas(DriftState::RepoAhead, &deltas);
+        assert!(s.contains(LEGEND), "legend printed: {s}");
+        let legend_at = s.find(LEGEND).expect("legend present");
+        let state_at = s.find("state:").expect("state line present");
+        let row_at = s.find("  cpus:").expect("delta row present");
+        assert!(
+            state_at < legend_at && legend_at < row_at,
+            "legend sits between the state line and the rows: {s}"
+        );
+    }
+
+    /// #240 (d): the terse in-sync path stays terse — no legend when there is
+    /// nothing to attribute.
+    #[test]
+    fn render_in_sync_omits_legend() {
+        let s = render_deltas(DriftState::InSync, &[]);
+        assert!(
+            !s.contains("showing:"),
+            "no legend on the empty-deltas path: {s}"
+        );
+        assert!(!s.contains("(managed)"), "no side labels either: {s}");
+    }
+
     /// A multi-line value (egress YAML, per-line ports) renders as an indented
     /// from/to block — never inline, which would splice raw newlines into the
     /// middle of a `from -> to` sentence.
@@ -128,9 +219,12 @@ mod tests {
         }];
         let s = render_deltas(DriftState::RepoAhead, &deltas);
         assert!(s.contains("  ports:  [live]\n"), "block header: {s}");
-        assert!(s.contains("    from:\n      (none)\n"), "from block: {s}");
         assert!(
-            s.contains("    to:\n      127.0.0.1:8080:80\n      0.0.0.0:9000:90\n"),
+            s.contains("    from (managed):\n      (none)\n"),
+            "from block: {s}"
+        );
+        assert!(
+            s.contains("    to (izba.yml):\n      127.0.0.1:8080:80\n      0.0.0.0:9000:90\n"),
             "to block keeps one item per line: {s}"
         );
         assert!(

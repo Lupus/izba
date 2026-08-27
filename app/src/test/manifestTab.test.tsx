@@ -100,8 +100,65 @@ describe("ManifestTab", () => {
     const added = screen.getByText("- host: b.com");
     expect(added.className).toContain("bg-success");
     // Column headers orient the two sides.
-    expect(screen.getByText("From")).toBeInTheDocument();
-    expect(screen.getByText("To")).toBeInTheDocument();
+    expect(screen.getByText("From (managed)")).toBeInTheDocument();
+    expect(screen.getByText("To (izba.yml)")).toBeInTheDocument();
+  });
+
+  it("names which side is the managed truth and which comes from izba.yml", async () => {
+    // A bare From/To says nothing about WHICH side the daemon is actually
+    // running: the diff is computed as diff(managed, repo), so From is the
+    // live managed truth and To is the izba.yml proposal (issue #240).
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [{ field: "cpus", from: "2", to: "4", class: "restart", weakens_egress: false }],
+    });
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("cpus");
+
+    const managed = screen.getByText("From (managed)");
+    const repo = screen.getByText("To (izba.yml)");
+    const grid = managed.parentElement!;
+    expect(repo.parentElement).toBe(grid);
+    // Column ORDER is unchanged — managed left, izba.yml right — and each
+    // heading sits directly above its own side's value.
+    expect(Array.from(grid.children).map((c) => c.textContent).slice(0, 4)).toEqual([
+      "From (managed)",
+      "To (izba.yml)",
+      "2",
+      "4",
+    ]);
+  });
+
+  it("labels both sides of a MULTI-LINE delta value", async () => {
+    // The block form is where a mislabelled side is hardest to spot: many
+    // lines, no per-line orientation. The heading must still bind to the
+    // column its lines are actually rendered in.
+    (api.manifestDiff as Mock).mockResolvedValue({
+      state: "repo_ahead",
+      deltas: [
+        {
+          field: "egress",
+          from: "enforce: true\nallow:\n- host: managed-only.com",
+          to: "enforce: true\nallow:\n- host: repo-only.com",
+          class: "live",
+          weakens_egress: true,
+        },
+      ],
+    });
+    render(<ManifestTab name="web" running={true} />);
+    await screen.findByText("egress");
+
+    const managed = screen.getByText("From (managed)");
+    const repo = screen.getByText("To (izba.yml)");
+    const cells = Array.from(managed.parentElement!.children);
+    expect(cells.indexOf(managed)).toBe(0);
+    expect(cells.indexOf(repo)).toBe(1);
+    // The grid alternates managed/izba.yml cells, so an even index sits under
+    // the managed heading and an odd index under the izba.yml one. The line
+    // that exists only in managed truth must land on the managed side, and
+    // the line that exists only in izba.yml on the izba.yml side.
+    expect(cells.indexOf(screen.getByText("- host: managed-only.com")) % 2).toBe(0);
+    expect(cells.indexOf(screen.getByText("- host: repo-only.com")) % 2).toBe(1);
   });
 
   it("highlights a removed line on the From side", async () => {
@@ -299,6 +356,10 @@ describe("ManifestTab promote dialog", () => {
       within(dialog).getByText("The following changes will be applied to 'web':"),
     ).toBeInTheDocument();
     expect(within(dialog).getByText("cpus")).toBeInTheDocument();
+    // Same shared DeltaTable/ValueDiff as the tab body, so the confirm
+    // dialog names its sides too.
+    expect(within(dialog).getByText("From (managed)")).toBeInTheDocument();
+    expect(within(dialog).getByText("To (izba.yml)")).toBeInTheDocument();
   });
 
   it("keeps the Promote confirm disabled until the weakens-egress ack is checked", async () => {
