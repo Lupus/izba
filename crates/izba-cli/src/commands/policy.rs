@@ -18,8 +18,8 @@ pub enum PolicyCmd {
         /// Sandbox name (or dir)
         name: String,
     },
-    /// Add HOST to the sandbox's HTTP(S) allow-list. A bare HOST opens the web ports (80 + 443); HOST:PORT opens exactly that port; access is read-write unless --read
-    /// (NOTE: the opposite default of `policy git allow`, which grants read-only unless --write). Every invocation echoes the effective access level granted.
+    /// Add HOST to the sandbox's HTTP(S) allow-list. A bare HOST opens the web ports (80 + 443); HOST:PORT opens exactly that port; a NEW host entry gets read-write access unless --read
+    /// (NOTE: the opposite default of `policy git allow`, which grants read-only unless --write). An EXISTING entry keeps its existing access: this verb never widens one, so a plain re-grant does not undo an earlier --read (widen it in policy.yaml then `izba policy reload`, or in izba.yml followed by `izba diff`/`izba promote`). Every invocation echoes the effective access level granted.
     /// `*.HOST` matches exactly one subdomain label and `**.HOST` matches any depth; the apex HOST is never matched by a wildcard and needs its own entry.
     /// To actually block anything else, enforcement must be on (see `enforce`).
     /// A granted port is always inspected: it never inherits a `protocol: tcp` pinning
@@ -1647,6 +1647,33 @@ mod reload_message_tests {
     /// `null/sandboxes/<name>/policy.yaml`. The help must resolve it itself
     /// (the env override + the per-OS default, matching
     /// `izba_core::paths::Paths::from_env_or_default`).
+    #[test]
+    fn allow_long_help_does_not_promise_a_widening_it_cannot_perform() {
+        use super::PolicyCmd;
+        use clap::Subcommand;
+
+        // `policy allow` NEVER widens an existing entry (`apply_allow_edit` only
+        // narrows; `EgressPolicyConfig::allow` preserves an existing access
+        // level). "access is read-write unless --read" is therefore true only
+        // when the entry is being CREATED -- read as a general rule it tells an
+        // operator that a plain re-grant restores read-write, which silently
+        // no-ops. Same false promise as the dormant-pin echo; see izba#259.
+        let cmd = PolicyCmd::augment_subcommands(clap::Command::new("policy"));
+        let mut allow = cmd
+            .find_subcommand("allow")
+            .expect("policy allow is wired up")
+            .clone();
+        let help = allow.render_long_help().to_string().to_lowercase();
+        assert!(
+            help.contains("new entry") || help.contains("new host entry"),
+            "scope the read-write default to entry CREATION: {help}"
+        );
+        assert!(
+            help.contains("never widens") || help.contains("keeps its existing access"),
+            "say plainly that an existing entry is not widened: {help}"
+        );
+    }
+
     #[test]
     fn reload_long_help_resolves_the_data_dir_placeholder() {
         use super::PolicyCmd;
