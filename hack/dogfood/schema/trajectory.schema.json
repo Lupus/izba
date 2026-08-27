@@ -101,6 +101,14 @@
             "page_text": { "type": "string", "description": "document.body.innerText of the opening screen, capped like every per-action page_text." }
           }
         },
+        "final_observation": {
+          "type": "object",
+          "description": "GUI only (smoke-run H4): the accessibility marks + page text captured at journey END — after the create settle, the state-evidence pass and the Actor's last turn. A view that was still loading when the Actor stopped renders the asserted content only here, and `expect_text` is graded over page-text captures alone, so this capture can be the SOLE evidence behind an expect_text credit (`dom_expect`/`silent_failure` grade the same moment). Persisted so a credit's evidence is always IN the bundle rather than reconstructable only from the runner's source. `marks` and `page_text` stay separate keys: which surface an assertion was judged against is part of the evidence.",
+          "properties": {
+            "marks": { "type": "string", "description": "The rendered accessibility set-of-marks of the final screen." },
+            "page_text": { "type": "string", "description": "document.body.innerText of the final screen, capped like every per-action page_text — the surface expect_text is judged against." }
+          }
+        },
         "decisive_credits": {
           "type": "array",
           "description": "Audit trail for H3 crediting: each entry records a decisive step whose own pointer produced no actions but was graded functionally from an EARLIER step's action (via that step's expect_cmd_re), OR a step whose grade was rescued from an earlier action of its own (see `rescue`). A broad pattern (e.g. a bare 'izba') can match an unrelated command, so every credit — including ones that graded to a silent pass — is recorded here for the Phase-3 skeptic to audit, not just the failures. A credit from a DECLARATIVE hook (expect_state on either runner, expect_text on the GUI runner) is recorded the same way, with action_index -1 and a graded_cmd naming the hook: the assertion was graded against the end-of-journey state evidence / page-text captures rather than a single action, and the skeptic must still see that it WAS graded.",
