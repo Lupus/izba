@@ -1,0 +1,150 @@
+{
+  "feature": "per-port `protocol:` inspectability / TLS-pinning passthrough (M5 P1 — #233 + #238 + #239/PR #262, re-run on PR #264's tip)",
+  "tier": "deep",
+  "findings": [
+    {
+      "id": "boot-failure-evidence-destroyed-by-equal-timeouts",
+      "class": "harness",
+      "severity": "P1",
+      "fix_routing": "auto-fixable",
+      "summary": "Shard 3's runner booted zero microVMs (5/5 `izba run` attempts, first attempt onward, empty guest console) and the harness destroyed the only evidence that could name why, twice: (a) `--action-timeout-s 120` equals `IZBA_BOOT_TIMEOUT_SECS: '120'`, so izba is SIGKILLed at the exact instant it would print `did not become healthy within 120s; check <console.log>` — the diagnostic is structurally unobservable; (b) `_console_tails` tails only logs/console.log, which is EMPTY when the VMM fails below the guest, while cloud-hypervisor's own stderr sits unmentioned in the sibling logs/vmm.log. Fix: action timeout > boot budget; tail vmm.log too; add a one-shot boot preflight so a KVM-less runner fails loudly instead of emitting five silent 120s timeouts that read like a product hang. Files: .github/workflows/dogfood.yml:293,411; hack/dogfood/oracles.py (_console_tails).",
+      "journey_ids": [
+        "deep-two-hosts-one-port-only-one-passes-through",
+        "deep-seeding-from-observed-traffic-keeps-the-declaration"
+      ],
+      "anchor": "sandbox.rs:27,46,1174-1199 (DEFAULT_BOOT_TIMEOUT / boot_timeout_from_env / wait_for_boot bails with the console.log tail) vs .github/workflows/dogfood.yml `IZBA_BOOT_TIMEOUT_SECS: '120'` + `--action-timeout-s 120`; cloud_hypervisor.rs:247-249 'the CH process's own stdout/stderr go to a sibling vmm.log'; the healthy shards' identical calls returned in 2092 ms / 2775 ms."
+    },
+    {
+      "id": "actor-host-shell-splits-the-guest-command",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "`izba run <name> -- apk add curl && curl -v https://example.com/` has its `&&` consumed by the HARNESS's host shell, so the decisive fetch ran on the CI runner, not in the sandbox — proven by the certificate chain in that action's own stderr (`CAfile: /etc/ssl/certs/ca-certificates.crt` + Cloudflare issuer, vs `/etc/izba/ca-bundle.pem` on every genuine in-guest fetch) and by izba netlog containing no example.com row at all. It produced a decisive functional red on a promise that was never probed. Add the rule to the Actor's operating notes (everything after `--` must be one `sh -c '…'`), and/or classify an unquoted `&&`/`;` after `izba run|exec … --` as self-inflicted rather than functional. File: hack/dogfood/run_journeys.py.",
+      "journey_ids": [
+        "deep-dormant-exception-really-stays-intercepted"
+      ],
+      "anchor": "trajectory art-deep/traj-2 action 13 stderr (`issuer: C=US; O=SSL Corporation; CN=Cloudflare TLS Issuing ECC CA 3`, `CAfile: /etc/ssl/certs/ca-certificates.crt`) vs action 14 `izba netlog pin-dormant --summary` = only dl-cdn rows."
+    },
+    {
+      "id": "raw-address-journey-asserts-deny-where-the-anchor-promises-inspection",
+      "class": "harness",
+      "severity": "P1",
+      "fix_routing": "auto-fixable",
+      "summary": "`deep-exception-does-not-follow-a-raw-address` declares `expect_stdout_re 'DENY\\s+l[37]\\s.*:443'`, but no anchor promises a DENY: a raw-IP dial to an ALLOW-LISTED host on an always-inspected port is terminated at L7 and authorized by name, so the correct observable is `ALLOW l7 example.com:443 GET /` (izba's own certificate). DP-2 promises only 'no snoop record ⇒ no passthrough', i.e. not SPLICED. As written the journey would manufacture a false security red from correct behaviour; it escaped only because the Actor pinned an IPv6 literal in an IPv4-only guest and the connection never left the sandbox (`Immediate connect fail … Network unreachable`, curl exit 7, zero example.com rows in netlog). Fix: assert `ALLOW l7\\s.*example\\.com:443`, force an IPv4 literal (getent ahostsv4), and rename the journey to name the real rule (the hatch follows the DNS-snoop binding, not the literal). File: dogfood-pt2/tier-deep.json.",
+      "journey_ids": [
+        "deep-exception-does-not-follow-a-raw-address"
+      ],
+      "anchor": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md DP-2 + its test `passthrough_candidates_require_a_snoop_binding` ('no snoop record ⇒ no passthrough, so a raw-IP dial can never splice'); router.rs:254 tier-1 gate `policy.enforces() && policy.inspects(port)`; router.rs:433 `snoop.fqdns_for(sandbox, ip)`."
+    },
+    {
+      "id": "expect-state-declared-on-a-non-decisive-step",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Four deep journeys declare the create-time `expect_state` (host/port pinned-ness in managed policy.yaml) on step 0 while marking only step 2 `core: true`, so `_decisive_step_indices` never grades it and the harness honestly reports it as an infra candidate. Mark step 0 `core: true` or move the assertion onto the decisive step. All four assertions in fact held when checked by hand against the end-of-journey managed policy.yaml. File: dogfood-pt2/tier-deep.json (+ compiler template).",
+      "journey_ids": [
+        "deep-pinned-host-reaches-its-own-tls-untouched",
+        "deep-the-same-host-without-the-declaration-is-inspected",
+        "deep-dormant-exception-really-stays-intercepted",
+        "deep-two-hosts-one-port-only-one-passes-through"
+      ],
+      "anchor": "candidate source 'harness: decisive-hook grader'; run_journeys.py:313-322 `_decisive_step_indices` (core steps only)."
+    },
+    {
+      "id": "two-sandbox-step-credited-on-the-first-sandbox",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "`gui-switching-sandboxes-never-shows-the-previous-posture` step 0 asks for TWO creates (gui-armed + gui-unarmed) but its `expect_state` names only gui-armed, so a step that did half its work was credited. The Actor created one sandbox (final page: `SANDBOXES · 1`; state_evidence.sandboxes == ['gui-armed']), which is why the step-1 expect_text and expect_state could not be satisfied or even verified. Split the creates into two steps, or assert both names. File: dogfood-pt2/tier-deep.json.",
+      "journey_ids": [
+        "gui-switching-sandboxes-never-shows-the-previous-posture"
+      ],
+      "anchor": "journeys.json step 0 expect_state {sandbox: gui-armed, exists: true, policy:{enforcing:true}} vs the step intent naming gui-armed AND gui-unarmed; bundle decisive_credits credits step 0."
+    },
+    {
+      "id": "gui-max-turns-counts-read-observations",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "The e3e7d78e GUI settle fix is only half-effective: `--max-turns 18` counts `read` observations as turns (run_gui_journeys.py:750, `turns += 1` before every next_command, and a `read` reply `continue`s), and the new 'look again if it is not ready yet' instruction spends them. `gui-removing-the-exempt-port-unlocks-the-row` ended mid-step-1 after 8 actions plus ~10 reads with `● unsaved changes` on screen and managed policy.yaml byte-unchanged, so the unlock-after-removing-the-pinned-port escape valve is unverified this run. (It also mis-clicked `@e25` = 'Remove port 80' instead of the pinned 443, which alone would have blocked the rename.) Cap reads separately from turns, or raise --max-turns for GUI journeys needing >=5 interactions per step; the sibling journeys that finished needed 10-11 actions. Files: hack/dogfood/gui/run_gui_journeys.py:750; .github/workflows/dogfood.yml:551.",
+      "journey_ids": [
+        "gui-removing-the-exempt-port-unlocks-the-row"
+      ],
+      "anchor": "run_gui_journeys.py:747-760 (step_cap/max_turns checks; `turns += 1` precedes the model call and a `read` reply continues the loop); bundle final page_text ends '● unsaved changes'; state_evidence policy_yaml unchanged from the seed."
+    },
+    {
+      "id": "splice-graded-on-the-summary-tier-column-alone",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Every datapath journey grades the passthrough on `izba netlog --summary`, whose `l3` tier alone cannot distinguish a pinning splice from an ordinary tier-2 allow — an oracle that could credit the hatch for the wrong mechanism. The discriminator exists and was never asked for: a splice audits with the rule string `passthrough (protocol: tcp)` (mitm_runtime.rs:367), rendered only by the non-summary `izba netlog <name>`. Assert on that line. This is the harness half of predicted flag F6. File: dogfood-pt2/tier-deep.json.",
+      "journey_ids": [
+        "deep-pinned-host-reaches-its-own-tls-untouched",
+        "deep-declaration-applies-without-a-restart",
+        "deep-declaration-survives-a-restart"
+      ],
+      "anchor": "mitm_runtime.rs:321-367 `passthrough_splice` records Tier::L3 with rule 'passthrough (protocol: tcp)'; the non-summary rendering is visible in art-deep/traj-1 action 8 (`ALLOW l7  pin-none  dl-cdn…:443  GET /…  (allow-list)`)."
+    },
+    {
+      "id": "deep-datapath-journeys-lost-to-a-boot-failed-runner",
+      "class": "inconclusive",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Coverage, not product: shard 3 booted zero microVMs, so `deep-two-hosts-one-port-only-one-passes-through` (the ONLY journey covering InspectionTable's per-host passthrough set vs its policy-global inspected port set — 'an explicit tcp entry does not remove its own port from the inspected set') and `deep-seeding-from-observed-traffic-keeps-the-declaration` verified nothing. The latter is counted as this tier's one collapsed positive: `izba policy enable seeded` reported 'added 0 observed endpoint(s)', so the observed-traffic mutator ran against an empty set and its two core steps passed on assertions a no-op satisfies. Re-dispatch both; tighten the seeding assertion to require `added [1-9]`.",
+      "journey_ids": [
+        "deep-two-hosts-one-port-only-one-passes-through",
+        "deep-seeding-from-observed-traffic-keeps-the-declaration"
+      ],
+      "anchor": "CLAUDE.md 'EgressPolicyConfig::allow (and every other mutator, for every caller — CLI, GUI, observed-traffic seeding) appends a port that structurally cannot inherit a sibling port's hatch'; bundle: `added 0 observed endpoint(s) to 'seeded' allow-list`."
+    },
+    {
+      "id": "three-deep-promises-never-reached-by-the-actor",
+      "class": "inconclusive",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Coverage, not product: three deep promises were never exercised for Actor-side reasons and should be re-run with tightened steps — (1) 'a dormant hatch really stays intercepted' (the decisive fetch ran on the host, see the host-shell finding); (2) 'the declaration applies without a restart' (the Actor used `--rm`, so `izba policy reload live-pin` and `izba netlog live-pin` both correctly answered 'no such sandbox'); (3) the GUI 'removing the exempt port unlocks the row' escape valve (turn starvation). Seed the package-mirror grant into these journeys' policy.yaml so the Actor never detours through apk recovery. File: dogfood-pt2/tier-deep.json.",
+      "journey_ids": [
+        "deep-dormant-exception-really-stays-intercepted",
+        "deep-declaration-applies-without-a-restart",
+        "gui-removing-the-exempt-port-unlocks-the-row"
+      ],
+      "anchor": "`izba policy reload` help 'Re-read a sandbox's policy.yaml and apply it to new connections (no restart)'; PR #262 'Removing the pinned port is the escape valve for BOTH the Host lock and the Access-widening refusal'; bundle stderr `izba: error: no such sandbox 'live-pin'`."
+    },
+    {
+      "id": "gui-journeys-spend-their-last-budget-on-a-separate-reread-step",
+      "class": "harness",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "`gui-cannot-move-the-exception-to-another-host` and `gui-adding-a-port-here-never-inherits-the-exception` both did their substantive work, were credited on the save, then ran out of actions before a separate 're-read the saved settings' step — flipping unreached_decisive for an assertion the end-of-journey managed truth already satisfies (gui-pin5: moved.vendor.example absent, 443 still pinned, the other row gained 8080; gui-pin8: [80, {443,tcp}, 9000] — the new port bare). Fold the re-read into the save step's expect_state. Also add a post-restart datapath check to `deep-declaration-survives-a-restart`, which re-reads the declaration but never the splice. File: dogfood-pt2/tier-deep.json.",
+      "journey_ids": [
+        "gui-cannot-move-the-exception-to-another-host",
+        "gui-adding-a-port-here-never-inherits-the-exception",
+        "deep-declaration-survives-a-restart"
+      ],
+      "anchor": "PR #262 'The decision (AC 4)': relocation and activation are both refused in the reducer; issue #239 AC 5 (save never drops the declaration) — both confirmed by the bundles' state_evidence.policy_yaml."
+    },
+    {
+      "id": "app-guide-silent-on-conditionally-inert-controls",
+      "class": "harness",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "Predicted flag F1, observed exactly as predicted but downgraded: `gui-cannot-move-the-exception-to-another-host` action 7 is `fill @e24 moved.vendor.example` into the field whose accessible name literally begins 'Locked: this row carries a TLS-pinning passthrough port …'. The Actor typed, nothing changed, and it recovered unaided (moved to the other row and saved, with the correct end state on disk). The app self-explains in VISIBLE text, so this is fixture friction rather than a product dead end — but closing it keeps a future GUI red here attributable to the product. File: dogfood-app-guide.md (Policy / egress firewall section).",
+      "journey_ids": [
+        "gui-cannot-move-the-exception-to-another-host"
+      ],
+      "anchor": "discoverability-flags.md F1; the app's own row notice, rendered in page_text: 'The host is locked so this control cannot be silently relocated — remove the pinned port, or edit policy.yaml, or izba.yml followed by izba diff / izba promote.'"
+    }
+  ],
+  "capabilities": {
+    "established": [
+      "hatch-via-manifest"
+    ],
+    "blocked": []
+  },
+  "counts": {
+    "kept": 0,
+    "refuted": 27,
+    "cheated": 0,
+    "inconclusive": 1
+  }
+}

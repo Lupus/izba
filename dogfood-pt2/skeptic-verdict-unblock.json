@@ -1,0 +1,123 @@
+{
+  "feature": "TLS-passthrough / per-port inspectability (protocol: http|tcp) — unblock tier (run 2, tip f159160a)",
+  "findings": [
+    {
+      "id": "run-policy-replaces-the-allow-list-help-says-it-re-arms",
+      "class": "discoverability",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "`izba run --policy` on an already-running sandbox REPLACES the allow-list wholesale, silently discarding grants made with `izba policy allow`, while its help says it 're-arms the live egress plane in place (same as `izba policy allow`)' and its runtime message says only 'updated and reloaded egress policy'. Observed end-to-end in one trajectory: actions 2 grants dl-cdn.alpinelinux.org + security.alpinelinux.org (exit 0, both echoed 'allowed'), action 3 re-runs `izba run --policy policy.yaml`, and end-of-journey managed truth contains neither host — the Actor's apk fetch then failed again with the same DNS error and it never understood why. Fix is wording only: say the file REPLACES the allow-list and that command-line grants are discarded (crates/izba-cli/src/main.rs:71-74 and crates/izba-cli/src/commands/run.rs:412). Changing the behaviour would be an escalate and is NOT proposed.",
+      "journey_ids": ["deep-seeding-from-observed-traffic-keeps-the-declaration"],
+      "anchor": "crates/izba-cli/src/main.rs:71-74 (verbatim in context-pack.md:632): 'Against an already-running sandbox `izba run --policy` re-arms the live egress plane in place (same as `izba policy allow`) — it does NOT restart the sandbox'"
+    },
+    {
+      "id": "gui-observation-only-decisive-step-is-structurally-ungradeable",
+      "class": "harness",
+      "severity": "P1",
+      "fix_routing": "auto-fixable",
+      "summary": "D3 VERDICT: partially worked, wrong mechanism. All three GUI journeys end with a decisive step whose intent is 're-read and confirm' and whose only hook is expect_state — an assertion graded against end-of-journey daemon truth that needs ZERO browser actions. A `read` reply does `continue` without appending to `actions` (run_gui_journeys.py:795), so step_actions[i] is structurally 0, state_hooks.step_was_entered returns False, and _grade_core_step_hooks (run_gui_journeys.py:491-504) emits unentered_step_candidate BEFORE consulting the hook; _observed_rescue only rescues expect_text. Refunding reads (D3) makes it MORE likely the Actor spends the step on free, unrecorded reads then answers done. In all three cases the end-of-journey state_evidence.policy_yaml SATISFIES the assertion exactly, so the product is correct and the credit is refused. The deep-tier skeptic's C3 ('fold that assertion into the save step's expect_state') was the correct fix and was not applied. Do C3 now; extend _observed_rescue to expect_state as the durable guard. RECOMMENDATION: restructure these three journeys, do not retire them and do not spend another round on budget knobs.",
+      "journey_ids": [
+        "gui-cannot-move-the-exception-to-another-host",
+        "gui-removing-the-exempt-port-unlocks-the-row",
+        "gui-adding-a-port-here-never-inherits-the-exception"
+      ],
+      "anchor": "hack/dogfood/state_hooks.py step_was_entered: 'a step the run never opened has no entry at all, which is zero'; hack/dogfood/gui/run_gui_journeys.py:491-504"
+    },
+    {
+      "id": "expect-exit-premise-step-graded-on-the-steps-last-action",
+      "class": "harness",
+      "severity": "P1",
+      "fix_routing": "auto-fixable",
+      "summary": "deep-dormant-exception-really-stays-intercepted step 1 declares only expect_exit:0 and PASSED on the step's last action (`izba policy allow`, exit 0) while the fetch the assertion is about exited 1 (`apk add curl` -> DNS lookup error, twice; curl never installed). The false premise then fed the decisive step, which fired a false functional red against a netlog containing NO example.com row of any tier. Give every premise step an expect_cmd_re naming the command its assertion is about — the discipline already applied to decisive steps.",
+      "journey_ids": ["deep-dormant-exception-really-stays-intercepted"],
+      "anchor": "hack/dogfood/oracles.py functional oracle; the campaign's own 'grade the command the assertion is about' fix (5854940e)"
+    },
+    {
+      "id": "alpine-image-has-no-http-client-eats-the-deep-budget",
+      "class": "harness",
+      "severity": "P1",
+      "fix_routing": "auto-fixable",
+      "summary": "alpine:3.20 ships no HTTP client and the apk mirror is not in any seed policy, so every deep datapath journey must discover dl-cdn.alpinelinux.org plus :53 plus :443 by trial. 4 of 5 deep journeys spent 4-10 actions on apk and 3 died there (deep-dormant, deep-declaration-applies-without-a-restart, deep-seeding). This is the single biggest cause of missing depth in run 2. Use a curl-bearing image for datapath journeys, or seed dl-cdn.alpinelinux.org + security.alpinelinux.org into every deep journey's premise policy. Lesson already recorded by the wildcard campaign and regressed.",
+      "journey_ids": [
+        "deep-dormant-exception-really-stays-intercepted",
+        "deep-declaration-applies-without-a-restart",
+        "deep-seeding-from-observed-traffic-keeps-the-declaration",
+        "deep-exception-does-not-follow-a-raw-address"
+      ],
+      "anchor": "coverage-map.md deep-tier datapath journeys; observed apk failures in art-unblock/traj-{0,1,2}"
+    },
+    {
+      "id": "raw-address-journey-premise-is-unstatable-as-written",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "D1 VERDICT: worked — the rewritten expectation is CORRECT and no false security red was manufactured. It still did not match because the journey's premise ('an address izba never resolved for this sandbox') is destroyed by any prior name-based reach, and the step's own instruction leads the Actor to make one. Action 5 fetched https://example.com by NAME through izba's resolver (curl trace: 'IPv4: 172.66.147.243'), seeding the snoop record; action 7 then dialled that very address with --resolve, so router::passthrough_names (snoop.fqdns_for(sandbox, ip), router.rs:433) legitimately returned example.com and the splice is exactly per design. Wire corroboration: the vendor's real cert ('issuer: CN=Cloudflare TLS Issuing ECC CA 3'), netlog 'ALLOW l3 example.com:443 a2/d0'. Rewrite so the raw dial is the sandbox's FIRST contact with that host, or target an address izba's resolver did not return.",
+      "journey_ids": ["deep-exception-does-not-follow-a-raw-address"],
+      "anchor": "CLAUDE.md: 'only over the candidate list router::passthrough_names derives from DNS-snoop'; crates/izba-core/src/daemon/egress/router.rs:433 snoop.fqdns_for(sandbox, ip)"
+    },
+    {
+      "id": "shell-127-scored-as-command-not-found",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Oracle false positive, recurrence of a class already in the ledger. `izba exec live-pin -- sh -c 'apt-get update && apt-get install -y curl'` on alpine exited 127 with 'sh: apt-get: not found'. `sh` WAS found and ran; 127 is the shell's own status, passed through verbatim per the documented exit-code contract. The Actor's own mistake (wrong package manager, one action after izba printed the correct Stance-B 'executable file `curl` not found in $PATH' with exit 1). Suppress the implicit CommandNotFound candidate when the graded argv is a shell wrapper and stderr matches '<name>: not found'.",
+      "journey_ids": ["deep-declaration-applies-without-a-restart"],
+      "anchor": "CLAUDE.md exit-code mapping: 'crun PROPAGATES its exit status and izba passes it straight through (no re-encode)'"
+    },
+    {
+      "id": "context-pack-stale-relative-to-the-tip-under-test",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "context-pack.md:1007 and :1073 still carry the PRE-10821e7b `<izba data dir>/sandboxes/<name>/policy.yaml` placeholder, and IZBA_DATA_DIR appears nowhere in the pack. The Actor's successful use of \"$IZBA_DATA_DIR/sandboxes/reload-pin/policy.yaml\" in core-edit-the-managed-file-and-reload therefore CANNOT be attributed to the help fix — it came from the environment or from action 4's printed absolute path. Do not report this run as evidence that a documentation fix changed a user outcome. Regenerate the pack at the tested tip and add a pack-tip provenance check to the runner preflight.",
+      "journey_ids": ["core-edit-the-managed-file-and-reload"],
+      "anchor": "10821e7b P-2: 'a dogfooding Actor invented a `izba version --json` field for it and wrote to null/sandboxes/<name>/policy.yaml. One clause now resolves it in place ($IZBA_DATA_DIR, ...)'; context-pack.md:1007 unchanged"
+    },
+    {
+      "id": "unnamed-labeltext-node-offered-as-an-actionable-ref",
+      "class": "harness",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "The GUI snapshot renders '[@e11] LabelText \"\"' — a non-interactive, empty-name node — directly above the real host field '[@e24] textbox \"Locked: this row carries a TLS-pinning passthrough port ...\"'. In the unblock run the Actor filled @e11 (a no-op) instead of @e24, so the rename it was meant to attempt was never aimed at the control (in the deep run it targeted @e24 correctly). Suppress non-interactive empty-name nodes from render_marks or give them no ref.",
+      "journey_ids": ["gui-cannot-move-the-exception-to-another-host"],
+      "anchor": "art-unblock/gui-traj-0 action 7 'fill @e11 moved.vendor.example'; snapshot at action 6"
+    },
+    {
+      "id": "seeding-journey-green-on-a-no-op",
+      "class": "unverified",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Direction-B: vacuous green for the second run in a row. `izba policy enable seeded` reported 'added 0 observed endpoint(s) to seeded allow-list' and the sandbox's netlog holds one row (DENY l3 dl-cdn.alpinelinux.org:53 a0/d8) — there was no observed traffic to seed from, because curl never installed and the second `izba run --policy` silently reverted the grants that would have fixed it. Both core steps therefore passed on assertions the UNCHANGED seed policy already satisfies (expect_state host example.com port 443 pinned:true; expect_stdout_re ':443 protocol: tcp'). The promise under test — nothing added from observed traffic is exempt — was never exercised. Assert 'added [1-9]\\d* observed endpoint' before asserting what survived seeding.",
+      "journey_ids": ["deep-seeding-from-observed-traffic-keeps-the-declaration"],
+      "anchor": "CLAUDE.md: 'EgressPolicyConfig::allow (and every other mutator, for every caller — CLI, GUI, observed-traffic seeding) appends a port that structurally cannot inherit a sibling port's hatch'"
+    },
+    {
+      "id": "plain-policy-journey-asserts-a-positive-not-the-absence",
+      "class": "inconclusive",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "Direction-B: verdict is genuinely-achieved (the premise was created this time and the end-of-journey policy_show carries no warning marker), but the journey is under-asserted: its decisive hook is a positive regex on one rendered line, while its promise is the ABSENCE of a warning marker. A stray warning would still pass. Add a negative assertion so the journey can only pass for its stated reason.",
+      "journey_ids": ["core-a-plain-policy-renders-without-warnings"],
+      "anchor": "docs/superpowers/plans/2026-08-18-m5-p1-inspectability.md — the renderer is silent when a port declares nothing"
+    },
+    {
+      "id": "declaration-applies-without-a-restart-never-reached-its-assertion",
+      "class": "inconclusive",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Honest coverage gap, not a product finding: the decisive step's expect_cmd_re 'izba netlog' matched none of its actions because the Actor spent all 15 actions on apk plumbing and `policy allow`, never re-fetched example.com and never ran netlog. The no-restart reload promise remains UNVERIFIED by dogfooding. Root cause is the alpine-has-no-curl finding above; fix that first, then re-run this journey.",
+      "journey_ids": ["deep-declaration-applies-without-a-restart"],
+      "anchor": "`izba policy reload` help: 'Re-read a sandbox's policy.yaml and apply it to new connections (no restart)'"
+    }
+  ],
+  "capabilities": {
+    "established": [],
+    "blocked": []
+  },
+  "counts": {
+    "kept": 1,
+    "refuted": 7,
+    "cheated": 1,
+    "inconclusive": 2
+  }
+}

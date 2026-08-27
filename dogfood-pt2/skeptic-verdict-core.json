@@ -1,0 +1,167 @@
+{
+  "feature": "per-port `protocol:` inspectability / TLS-pinning passthrough (M5 P1 — #233 + #238 + #239/PR #262, re-run on tip e3e7d78e)",
+  "tier": "core",
+  "findings": [
+    {
+      "id": "policy-allow-regrant-remediation-is-inert",
+      "class": "real",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "The dormant-pin echo on `izba policy allow ... --read` tells the operator to 're-grant without --read to restore it', but re-granting restores nothing: apply_allow_edit only ever narrows (set_host_access(Access::Read) under `if read`) and EgressPolicyConfig::allow preserves an existing entry's access, so `policy allow` has no widening path at all. The Actor followed the instruction verbatim (traj-0 action 5 then action 7) and got the identical 'access: read' echo plus the identical advice; the managed policy.yaml still reads \"access\": \"read\". Found by auditing a GREEN journey. Fix the wording to mirror `policy show` ('widen to read-write ... in policy.yaml, or izba.yml + diff/promote'); the unit test at policy.rs:872 encodes the false claim and must change with it. Adding a widening verb instead is escalate and belongs to open issue #259.",
+      "journey_ids": [
+        "core-a-granted-port-does-not-inherit-the-exception",
+        "core-narrowing-access-says-the-exception-went-dormant"
+      ],
+      "anchor": "crates/izba-cli/src/commands/policy.rs:283-289 (added by 415b6131 'fix(cli): stop stating an egress posture the firewall is not enforcing'); `izba policy allow --help` ('access is read-write unless --read'); open issue #259 ('izba policy allow has no widening flag — it only narrows, via --read ... leaves access: read untouched')"
+    },
+    {
+      "id": "policy-reload-help-data-dir-placeholder-unresolved",
+      "class": "discoverability",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "`izba policy reload --help` is the surface that sends a user to the managed file — 'kept host-side at `<izba data dir>/sandboxes/<name>/policy.yaml`' — and nothing in that help, or any other --help, resolves `<izba data dir>`. The Actor spent its last two turns on it, invented `izba version --json | jq -r '.daemon.data_dir'` (no such field), wrote to `null/sandboxes/reload-pin/policy.yaml` and the journey ended having verified nothing. The concrete default path does appear in the context pack, but only in the izba.yml trust-model section a user reaching for this help has no reason to have read. Fix: one clause naming `$IZBA_DATA_DIR` / `~/.local/share/izba` in the Reload long help. Exposing data_dir in `izba version --json` would be escalate (public schema).",
+      "journey_ids": [
+        "core-edit-the-managed-file-and-reload"
+      ],
+      "anchor": "`izba policy reload` long help (crates/izba-cli/src/commands/policy.rs, Reload doc comment); dogfood-pt2/context-pack.md:1073 vs :451"
+    },
+    {
+      "id": "core-edit-the-managed-file-and-reload-verified-nothing",
+      "class": "inconclusive",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "Both of this journey's decisive candidates (unreached_decisive on `izba policy reload` + an expect_state divergence reporting 'the managed policy.yaml declares None' for port 443) are ONE fact: the Actor never wrote the declaration. Its only attempt (action 9) failed with 'bash: line 1: null/sandboxes/reload-pin/policy.yaml: No such file or directory', `izba policy reload` never ran, and the end-state policy.yaml is exactly what `izba policy allow reload-pin pinned.vendor.example` writes (bare ports 80+443). NOT a product bug and NOT a P1 — no protocol declaration was ever stored, so none was dropped or mangled. Coverage gap: give the journey a seed_files-written managed policy and name the file's location in the step intent.",
+      "journey_ids": [
+        "core-edit-the-managed-file-and-reload"
+      ],
+      "anchor": "harness: unreached_decisive (#126) + expect_state hook; trajectory dogfood-pt2/art-core/traj-3/traj-3.json actions 8-9; end-state policy_yaml"
+    },
+    {
+      "id": "harness-expect-state-on-non-decisive-step",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "The journey compiler emitted `expect_state` on step 0 of three core journeys without marking the step `core: true`, so run_journeys.py graded it over decisive_idx only and the declared assertion was silently never checked. Fix in the corpus/compiler: any step carrying expect_state must be core:true — which also turns on the step-boundary snapshot, mandatory for core-firewall-off-does-not-read-as-one-hole whose Actor legitimately flips `enforce` after step 0 (grading its {enforcing:false} against end-of-journey state would manufacture a false red).",
+      "journey_ids": [
+        "core-retire-the-exception-from-the-command-line",
+        "core-audit-surface-under-a-narrower-access",
+        "core-firewall-off-does-not-read-as-one-hole"
+      ],
+      "anchor": "hack/dogfood/run_journeys.py:1226 (_grade_decisive_state_hooks over decisive_idx) + :1157-1165 (pending_state step-boundary capture)"
+    },
+    {
+      "id": "harness-guest-exit-graded-as-izba-exit",
+      "class": "harness",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "expect_cmd_re 'izba (create|run)' matches `izba run NAME -- <guest cmd>`, whose exit status izba passes through by contract ('crun PROPAGATES its exit status and izba passes it straight through'), so a guest `apk`/`curl` failure flips a functional candidate against izba's create step. Exclude actions carrying a `--` workload from expect_exit grading, or tighten the create step's expect_cmd_re. This is the last surviving reach of the apk-under-enforce noise class after 5854940e removed the stderr-scrape half.",
+      "journey_ids": [
+        "core-retire-the-exception-from-the-command-line"
+      ],
+      "anchor": "CLAUDE.md 'Exit-code mapping'; hack/dogfood/run_journeys.py (_eligible_targets/_grade_target)"
+    },
+    {
+      "id": "harness-actor-never-told-izba-data-dir",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Fair-test gap: the harness exports a per-journey IZBA_DATA_DIR (oracles.py:123) but never tells the Actor, while the context pack teaches the default ~/.local/share/izba/sandboxes/<name>/. In-harness the documented path is therefore actively wrong, and any journey that must touch managed state on disk is unwinnable. Name $IZBA_DATA_DIR in the Actor's environment preamble.",
+      "journey_ids": [
+        "core-edit-the-managed-file-and-reload"
+      ],
+      "anchor": "hack/dogfood/oracles.py:112-127 (_shell_env); dogfood-pt2/context-pack.md:451"
+    },
+    {
+      "id": "harness-model-reply-cannot-carry-a-heredoc",
+      "class": "harness",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "Both infra starvations in the tier are unparseable model replies truncating mid-heredoc (\"{\\\"command\\\": \\\"cat > policy.yaml <<'EOF\" and the IZBA_DATA_DIR one), and every CLI journey in this corpus opens with a heredoc. Harden the reply parser or steer the Actor toward printf/seed_files. Cheap-model weakness, not the product: every izba invocation that reached the shell returned in single-digit ms.",
+      "journey_ids": [
+        "core-a-plain-policy-renders-without-warnings",
+        "core-edit-the-managed-file-and-reload"
+      ],
+      "anchor": "hack/dogfood/run_journeys.py:648-671 (_next_command)"
+    },
+    {
+      "id": "coverage-decisive-assertion-depends-on-unasserted-actor-input",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "core-a-plain-policy-renders-without-warnings puts host strings the Actor must type in step 0 into a decisive expect_stdout_re in step 1 with no premise check between them; the Actor authored example.com/example.org instead of api.vendor.example/registry.other.example (managed truth confirms) and its own correct rendering was scored as a product failure. Add a step-0 expect_state (marking it core) or seed the policy with seed_files.",
+      "journey_ids": [
+        "core-a-plain-policy-renders-without-warnings"
+      ],
+      "anchor": "dogfood-pt2/tier-core.json; end-state policy_yaml {\"enforce\": true, \"allow\": [\"example.com\", \"example.org\"]}"
+    },
+    {
+      "id": "coverage-gui-actor-still-ends-on-the-loading-state",
+      "class": "harness",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "One of three GUI journeys (gui-inert-when-the-firewall-is-off) ends with the Actor's last observation still on PR #264's loading guard — its marks carry no 'Enforce firewall' switch and no Hosts section — so the credit rests solely on the harness's post-settle final_observation. The product rendering is proven (final capture + agreeing CLI policy show + managed truth), but the user-reachability half is not. Smoke's C2 is 2/3 closed, not closed: add an explicit settle/re-read action.",
+      "journey_ids": [
+        "gui-inert-when-the-firewall-is-off"
+      ],
+      "anchor": "dogfood-pt2/skeptic-smoke.md C2; app/src/components/PolicyEditor.tsx:545,663"
+    },
+    {
+      "id": "coverage-corpus-asserts-messages-not-their-effects",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "core-narrowing-access-says-the-exception-went-dormant certifies that the remediation text is PRINTED; no journey follows the instruction and asserts the resulting state. That is exactly the gap P-1 lives in, and it took an unrelated journey's Actor tripping over it to surface. Add a journey that follows the printed instruction and grades the state, and generalize the rule: when a message tells the user to run something, assert the effect, not the string.",
+      "journey_ids": [
+        "core-narrowing-access-says-the-exception-went-dormant",
+        "core-a-granted-port-does-not-inherit-the-exception"
+      ],
+      "anchor": "dogfood-pt2/tier-core.json; crates/izba-cli/src/commands/policy.rs:283-289"
+    },
+    {
+      "id": "coverage-police-an-unusual-port-verifies-rendering-only",
+      "class": "harness",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "core-police-an-unusual-port-at-http verifies only that `izba policy show` renders ':8000 protocol: http (inspected)'; both of its traffic attempts targeted internal.svc.example, a .example host that cannot resolve, and the netlog contains no flow to it (the 124 is the Actor's own `while true` loop). Not a false green — the journey's expect only ever claimed the report — but the name oversells it. Rename, or move the policing claim to a deep journey against a real host.",
+      "journey_ids": [
+        "core-police-an-unusual-port-at-http"
+      ],
+      "anchor": "dogfood-pt2/tier-core.json; traj-1 actions 3/7/8/10"
+    },
+    {
+      "id": "coverage-no-op-policy-block-is-indistinguishable-from-success",
+      "class": "harness",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "UNOBSERVED IN ANY TRAJECTORY — code reading only, recorded as a coverage proposal rather than a finding. apply_block_edit discards cfg.block's changed-bool (`let _ = cfg.block(...)`), so `izba policy block NAME typo.example` prints the same 'reloaded egress policy' line as a real removal, and a user who mistypes believes they revoked access they still grant. No journey covers a no-op block; propose one for the deep tier before treating it as real.",
+      "journey_ids": [],
+      "anchor": "crates/izba-cli/src/commands/policy.rs:236-247 (apply_block_edit)"
+    },
+    {
+      "id": "coverage-deep-tier-needs-the-package-mirror-seeded",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Deep-tier readiness. Every deep datapath journey needs curl inside alpine:3.20 — i.e. `apk add` under enforce, i.e. dl-cdn.alpinelinux.org allow-listed — and tier-deep.json mentions neither the mirror nor curl. In the core tier that recovery cost 2-4 actions in EVERY CLI journey, and deep puts its decisive assertion in step 3 of 3. Seed the mirror into the create intent (or use a curl-bearing image) before dispatching deep, or decisive steps will go unreached on budget.",
+      "journey_ids": [],
+      "anchor": "dogfood-pt2/tier-deep.json; dogfood-pt2/context-pack.md 'Working under enforce'"
+    }
+  ],
+  "capabilities": {
+    "established": [
+      "hatch-declared",
+      "posture-readable",
+      "firewall-file-accepted",
+      "manifest-egress-authoring",
+      "gui-pinned-row-visible",
+      "enforcing-sandbox-reaches-an-allowed-host"
+    ],
+    "blocked": []
+  },
+  "counts": {
+    "kept": 1,
+    "refuted": 10,
+    "cheated": 0,
+    "inconclusive": 1
+  }
+}
