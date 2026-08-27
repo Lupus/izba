@@ -1,0 +1,78 @@
+{
+  "feature": "per-port `protocol:` inspectability / TLS-pinning passthrough (M5 P1 — #233 + #238 + #239/PR #262, re-run on PR #264's tip)",
+  "tier": "smoke",
+  "findings": [
+    {
+      "id": "implicit-oracle-scrapes-guest-stderr",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "The implicit crash-marker oracle scans the GUEST program's stderr relayed through `izba exec`, so `apk add` printing 'ERROR: unable to select packages' fabricates an 'izba must not panic/abort' candidate. 3 of this tier's 5 candidates; the same dominant noise class as run 1. Scope the marker scan to izba's own output, or exclude the streams of an `izba exec … -- <guest cmd>` action. File: hack/dogfood/oracles.py (implicit_oracle / _IMPLICIT_RE).",
+      "journey_ids": [
+        "smoke-firewall-file-accepted-at-create",
+        "smoke-find-the-surface-that-answers-bypass",
+        "smoke-enforcing-sandbox-can-reach-an-allowed-site"
+      ],
+      "anchor": "candidate source 'contract: clean exit, no panics' vs CLAUDE.md exit-code mapping ('crun PROPAGATES its exit status and izba passes it straight through'); context-pack.md 'Working under enforce: allow-list what your tooling needs' documents the mirror grant twice, and the reconcile snapshot records the correct enforcement (`DENY  l3  dl-cdn.alpinelinux.org:53`)."
+    },
+    {
+      "id": "expect-cmd-re-fallback-grades-an-unrelated-command",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "When `expect_cmd_re` matches no action inside a step, `_eligible_targets` falls back to the step's LAST action and grades the stream assertion against a command the assertion was never about — here `expect_stdout_re 'pinning passthrough'` was graded on `izba policy allow audit-me pinned.vendor.example`. A step whose declared command never ran must flip `unreached_decisive`, never a functional candidate. File: hack/dogfood/run_journeys.py:410.",
+      "journey_ids": ["smoke-find-the-surface-that-answers-bypass"],
+      "anchor": "hack/dogfood/run_journeys.py:410 `_eligible_targets` docstring: 'Neither yielding anything falls back to the step's final action'; the product surface answered correctly at action 3 (`izba policy show audit-me` printed '⚠ :443 protocol: tcp — pinning passthrough …')."
+    },
+    {
+      "id": "last-match-grading-inverts-an-already-passed-step",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "Last-match functional grading inverts a step that already passed: `izba diff mani-egress` printed 'state: repo ahead (promotable)' with the egress block at action 3, the Actor then promoted, and action 5's honest 'state: in sync' was graded as the failure. The DEEP-H1 refusal exception covers the nonzero-exit shape; the same 'already satisfied by an earlier eligible target' rescue is missing for stream assertions. File: hack/dogfood/run_journeys.py (_grade_step_functional).",
+      "journey_ids": ["smoke-manifest-can-carry-the-firewall"],
+      "anchor": "README izba.yml section: '`spec.egress` takes the same schema as `policy.yaml` … reviewed through `izba diff` / `izba promote`' — satisfied verbatim at action 3, and corroborated by the promoted on-disk policy.yaml {\"enforce\": true, \"allow\": [\"api.vendor.example\"]}."
+    },
+    {
+      "id": "gui-final-capture-not-persisted-in-bundle",
+      "class": "harness",
+      "severity": "P2",
+      "fix_routing": "auto-fixable",
+      "summary": "The GUI bundle does not persist the final post-settle page capture, yet that capture is the sole evidence behind an `expect_text` credit (and behind dom_expect / silent_failure). The gating GUI green could only be accepted by reading the runner source to prove the oracle's input set — a credit whose evidence is absent from the bundle is unauditable. Record final_page_text + final marks on the result object. File: hack/dogfood/gui/run_gui_journeys.py:864.",
+      "journey_ids": ["smoke-gui-policy-tab-reports-a-real-posture"],
+      "anchor": "run_gui_journeys.py:864 `page_text_history.append(final_page_text)` vs the bundle's result keys (journey_id/actions/candidates/state_evidence/invoke_log/workspace/decisive_credits/initial_observation) — no final capture; the credited phrase 'no upstream certificate verification' appears in no per-action page_text."
+    },
+    {
+      "id": "audit-surface-journey-cannot-separate-discovery-from-recall",
+      "class": "harness",
+      "severity": "P3",
+      "fix_routing": "auto-fixable",
+      "summary": "Coverage gap in the journey design: `smoke-find-the-surface-that-answers-bypass` poses its 'you have inherited this machine — find izba's answer' question to an Actor that already ran `izba policy show` in step 0 to verify its own create, so a pass cannot distinguish discovery from recall. Pose the audit question against a sandbox the Actor did not just create, or make step 0's expect not invite a `policy show`. Same file also needs a settle/read step after the GUI Policy tab opens (the Actor's last observation is the loading state). File: dogfood-pt2/tier-smoke.json.",
+      "journey_ids": [
+        "smoke-find-the-surface-that-answers-bypass",
+        "smoke-gui-policy-tab-reports-a-real-posture"
+      ],
+      "anchor": "coverage-map.md C7 ('`policy show` … is the surface that answers \"is anything bypassing my firewall?\"'); discoverability-flags.md §0 D7 records this as already closed, so the journey must probe it cleanly or not at all."
+    }
+  ],
+  "capabilities": {
+    "established": [
+      "firewall-file-accepted",
+      "posture-readable",
+      "hatch-declared",
+      "hatch-revealed",
+      "audit-surface-discoverable",
+      "manifest-egress-authoring",
+      "enforcing-sandbox-reaches-an-allowed-host",
+      "gui-policy-tab-loads",
+      "gui-pinned-row-visible"
+    ],
+    "blocked": []
+  },
+  "counts": {
+    "kept": 0,
+    "refuted": 5,
+    "cheated": 0,
+    "inconclusive": 0
+  }
+}
