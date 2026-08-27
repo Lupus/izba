@@ -63,10 +63,21 @@ swarm's candidates and are the anti-slop spine (see `hack/dogfood/oracles.py`):
   pass (this two-sidedness removes the bulk of rejection-journey false-positives).
   Which action gets graded is intent-directed: a step may carry `expect_cmd_re`,
   a regex anchoring the distinctive token of the command under test, and the
-  functional oracle grades the *last* action whose command matches it (falling
-  back to the step's final action). Every functional candidate records the
-  `graded_cmd` it actually judged, so the skeptic sees *what* was scored rather
-  than assuming it was the step's last line.
+  functional oracle grades the *last* action whose command matches it — right for
+  "the Actor got it wrong, then got it right". Two rules bound that. A declared
+  `expect_cmd_re` matching **nothing** has NO fallback: "the decisive command
+  never ran" is a different fact from "it ran and failed", so a decisive step
+  flips `unreached_decisive` rather than grading an unrelated action. And a
+  failing last-match is *rescued* by an earlier action that satisfied every
+  declared assertion, in exactly two shapes — a **refusal** (a guard that fired
+  kept its promise) and a **re-observation** (the byte-identical command asked
+  again with at least one action in between, e.g. `izba diff` → `izba promote` →
+  `izba diff`, where the honest `state: in sync` is the journey's own mutation
+  answering). The identical-command narrowing is what stops this becoming "any
+  match anywhere passes"; a rescue is never silent — it records `rescue` and
+  `superseded_by` verbatim so the skeptic audits the divergence. Every functional
+  candidate records the `graded_cmd` it actually judged, so the skeptic sees
+  *what* was scored rather than assuming it was the step's last line.
 - **Declared assertions (the decisive hooks)** — an exit code is a weak oracle: it
   is 0 whichever way the product actually went, and non-zero for causes that have
   nothing to do with the promise. A decisive step may therefore declare what must
