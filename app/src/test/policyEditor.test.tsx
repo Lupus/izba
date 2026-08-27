@@ -1,4 +1,5 @@
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
+import { frameHarness, rawClick } from "./committedFrame";
 import { vi, describe, it, expect, beforeEach, type Mock } from "vitest";
 import { PolicyEditor } from "../components/PolicyEditor";
 import { api } from "../lib/ipc";
@@ -1043,5 +1044,57 @@ describe("PolicyEditor load state", () => {
 
     expect(screen.queryByText(/has not finished loading/i)).not.toBeInTheDocument();
     expect(api.policySetFull).not.toHaveBeenCalled();
+  });
+});
+
+/** The same committed-frame hole NetlogView was flagged for (Greptile, PR
+ *  #264), on the sibling that shares the pattern.
+ *
+ *  The test above ("goes back to unknown when the sandbox changes") uses RTL's
+ *  `rerender`, which runs render, commit, effects AND the repair render inside
+ *  one `act` — so an effect-based reset satisfies it. React does not work that
+ *  way for a user: the render carrying the new `name` is COMMITTED first, and
+ *  until an effect's repair reaches a later render, `load` is still the
+ *  PREVIOUS sandbox's `ready`. In that
+ *  frame the editor renders the previous sandbox's rows, `save()`'s
+ *  `saveRefusal(load)` returns null, and one click ships them to
+ *  `policySetFull(NEW_NAME, …)` — replacing another sandbox's managed
+ *  policy.yaml on the path that skips the izba diff / izba promote weakening
+ *  gate. The enforce toggle is rendered in that frame too (it is gated on the
+ *  same `ready`), so it can write the previous sandbox's flipped posture. */
+describe("PolicyEditor sandbox switch — the frame React actually commits", () => {
+  function firstAnswersOthersHang() {
+    (api.policyShow as Mock).mockImplementation((n: string) =>
+      n === "first"
+        ? Promise.resolve({ enforcing: true, allow: ["first.example.com"], git: [] })
+        : new Promise(() => {}),
+    );
+  }
+
+  it("cannot write the previous sandbox's policy to the new one in that frame", async () => {
+    firstAnswersOthersHang();
+    const h = frameHarness();
+    try {
+      await h.settle(<PolicyEditor name="first" />);
+      expect(within(h.container).getByDisplayValue("first.example.com")).toBeInTheDocument();
+
+      await h.inFrame(<PolicyEditor name="second" />, () => {
+        rawClick(within(h.container).getByRole("button", { name: /^save$/i }));
+        expect(api.policySetFull).not.toHaveBeenCalled();
+
+        // The enforce toggle only renders under the same `ready`, so its
+        // presence here IS the hole: it would write `second`'s posture from
+        // `first`'s.
+        const toggle = within(h.container).queryByRole("switch", {
+          name: /enforce firewall/i,
+        });
+        if (toggle) rawClick(toggle);
+        expect(api.policySetEnforce).not.toHaveBeenCalled();
+      });
+      expect(api.policySetFull).not.toHaveBeenCalled();
+      expect(api.policySetEnforce).not.toHaveBeenCalled();
+    } finally {
+      await h.unmount();
+    }
   });
 });

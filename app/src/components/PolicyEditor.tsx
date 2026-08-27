@@ -343,6 +343,9 @@ export function PolicyEditor({ name }: { name: string }) {
   const [saved, setSaved] = useState(false);
   const [load, setLoad] = useState<LoadState>({ kind: "loading" });
   const loadedRef = useRef<LoadedSnapshot>({ hosts: [], git: [] });
+  // The sandbox this editor is currently showing — `policyShow`'s in-flight
+  // guard, and the reset's record of which name is on screen. See both below.
+  const shownName = useRef(name);
   // Namespaces the per-row passthrough-notice id so two concurrent
   // PolicyEditor instances can never collide an aria-describedby target.
   const instanceId = useId();
@@ -352,18 +355,49 @@ export function PolicyEditor({ name }: { name: string }) {
     JSON.stringify({ hosts, git: gitRows }) !==
     JSON.stringify({ hosts: loadedRef.current.hosts, git: loadedRef.current.git });
 
-  useEffect(() => {
-    let alive = true;
-    // A different sandbox is a different policy: go back to "unknown" rather
-    // than leaving the previous sandbox's rows on screen as if they were this
-    // one's — and, with them, a Save that would write them here. Pinned by
-    // "goes back to unknown when the sandbox changes...".
+  // A different sandbox is a different policy: go back to "unknown" rather
+  // than leaving the previous sandbox's rows on screen as if they were this
+  // one's — and, with them, a Save that would write them here.
+  //
+  // DURING RENDER, for the reason spelled out at NetlogView's identical reset
+  // (Greptile, PR #264): React commits the render carrying the new `name`
+  // before it flushes passive effects, so an effect-based reset always leaves
+  // one painted, interactive frame in which `load` is still the PREVIOUS
+  // sandbox's `ready`. In that frame this editor renders the previous
+  // sandbox's rows, `saveRefusal(load)` returns null, and one Save ships them
+  // to `policySetFull(NEW_NAME, …)` — replacing another sandbox's managed
+  // policy.yaml on the path that skips the izba diff / izba promote weakening
+  // gate — while the enforce toggle (gated on the same `ready`) can write the
+  // previous sandbox's flipped posture. React re-renders immediately on a
+  // render-phase update, so that pairing is never committed.
+  //
+  // `shownName` moves in the same breath and guards the fetch below: `alive`
+  // falls only on the effect CLEANUP, which is passive too, so in a browser an
+  // answer for the sandbox we just left can resolve on a microtask while
+  // `alive` is still true and refill the editor with the previous sandbox's
+  // rows under the new name — re-creating this very pairing one turn later.
+  // The reset is pinned by "the frame React actually commits"; that narrower
+  // ordering is not stageable under jsdom (`flushSync` forces a synchronous
+  // passive flush, so the cleanup always wins there), which is why the ref
+  // moves WITH the reset instead of being a separate rule to keep in sync.
+  const [renderedName, setRenderedName] = useState(name);
+  if (renderedName !== name) {
+    setRenderedName(name);
+    shownName.current = name;
     setLoad({ kind: "loading" });
     setError(null);
+  }
+
+  useEffect(() => {
+    let alive = true;
     void (async () => {
       try {
         const p = await api.policyShow(name);
-        if (alive) {
+        // `alive` alone is not enough: it only falls on the effect cleanup,
+        // which is itself passive. `shownName` fell the moment the name
+        // changed, so an answer for a sandbox this editor has already left is
+        // dropped rather than painted as the current one's.
+        if (alive && shownName.current === name) {
           // A refusal is a statement about a moment, and this is the moment it
           // stops being true: drop it as the load settles, so a "has not
           // finished loading" banner never sits above a Save that now works.
@@ -379,7 +413,7 @@ export function PolicyEditor({ name }: { name: string }) {
           setLoad({ kind: "ready" });
         }
       } catch (e) {
-        if (alive) {
+        if (alive && shownName.current === name) {
           // Same clearing on the failure edge: the load error is rendered by
           // the panel below, and a stale save-refusal alongside it would name
           // the wrong reason.

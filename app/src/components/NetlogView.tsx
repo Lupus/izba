@@ -100,6 +100,54 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
   // it was issued for and the selection can move on while it is in flight.
   const shownName = useRef(name);
 
+  // A different sandbox is a different posture, a different allow-list and a
+  // different netlog. Reset on the NAME CHANGE, not when the new answer
+  // arrives: otherwise the tab pairs the new sandbox's name with the previous
+  // sandbox's `ready` posture and keeps every control live — and
+  // `toggleEnforce` then writes `policySetEnforce(NEW, !OLD_POSTURE)`, which
+  // unlike the never-loaded window can write OFF and DISARM a firewall.
+  //
+  // This runs DURING RENDER (React's documented "adjusting state when a prop
+  // changes" pattern), and that placement is the whole point: React commits
+  // the render carrying the new `name` BEFORE it flushes passive effects, so
+  // a `useEffect` cannot close this window — it can only repair a frame that
+  // was already painted, already interactive, and already answering clicks
+  // with the previous sandbox's evidence. Setting state here instead makes
+  // React discard this render and re-render immediately, so the stale pairing
+  // is never committed at all. (RTL's `rerender` flushes effects inside one
+  // `act`, which is why the effect version looked correct to its tests; see
+  // "the frame React actually commits" suites.)
+  //
+  // `shownName` moves HERE, in the same breath, and not in the effect: it is
+  // also `refresh`'s in-flight guard, and the two must agree about WHEN this
+  // tab left a sandbox. In a browser an answer for the sandbox we just left
+  // can resolve on a microtask well before the Scheduler runs the passive
+  // effects; a ref that lagged the reset would still match that answer's own
+  // captured name and repaint a "ready" posture for a sandbox no longer on
+  // screen. (jsdom cannot stage that particular ordering — `flushSync` forces
+  // a synchronous passive flush — so the tests pin the reset, and the
+  // settled-path guard is pinned by "never paints a slow answer"; this
+  // placement is what keeps the two consistent rather than a second rule.)
+  // Mutating a ref in render is normally discouraged; the failure mode if
+  // React ever discards this render is that the guard rejects one answer too
+  // many and the tab stays "loading" until the next poll — an honest unknown,
+  // self-healing in ≤ pollMs, never a false posture.
+  //
+  // Going back to `loading` hands the whole window to the unknown-posture
+  // treatment above, which also withdraws the row-policy actions (they render
+  // only under `enforcing`, derived from `policy`). PolicyEditor's name-change
+  // reset is the same shape, for the same reason.
+  const [renderedName, setRenderedName] = useState(name);
+  if (renderedName !== name) {
+    setRenderedName(name);
+    shownName.current = name;
+    setLoadState({ kind: "loading" });
+    setPolicy(null);
+    setRows([]);
+    setError(null);
+    setRefusal(null);
+  }
+
   const refresh = useCallback(async () => {
     try {
       const [r, p] = await Promise.all([api.readNetlog(name), api.policyShow(name)]);
@@ -124,27 +172,11 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
     }
   }, [name]);
 
+  // Fetching only. The name-change reset deliberately does NOT live here (see
+  // above); `refresh` is already keyed on `name`, so a new name gives a new
+  // callback and re-arms this effect.
   useEffect(() => {
     let alive = true;
-    // A different sandbox is a different posture, a different allow-list and a
-    // different netlog. Reset on the NAME CHANGE, not when the new answer
-    // arrives: for that whole window the tab would otherwise pair the new
-    // sandbox's name with the previous sandbox's `ready` posture and keep every
-    // control live — and `toggleEnforce` would then write
-    // `policySetEnforce(NEW, !OLD_POSTURE)`, which unlike the never-loaded
-    // window can write OFF and DISARM a firewall. Going back to `loading`
-    // hands the whole window to the unknown-posture treatment above, which
-    // also withdraws the row-policy actions (they render only under
-    // `enforcing`, derived from `policy`). Same guard as PolicyEditor's
-    // name-change reset.
-    if (shownName.current !== name) {
-      shownName.current = name;
-      setLoadState({ kind: "loading" });
-      setPolicy(null);
-      setRows([]);
-      setError(null);
-      setRefusal(null);
-    }
     void refresh();
     const id = setInterval(() => {
       if (alive && !hoveringRef.current) void refresh();
@@ -153,7 +185,7 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
       alive = false;
       clearInterval(id);
     };
-  }, [refresh, pollMs, name]);
+  }, [refresh, pollMs]);
 
   // Run an action, then refresh immediately so the Policy column / button flip
   // right away instead of waiting up to 1.5s for the next poll.
