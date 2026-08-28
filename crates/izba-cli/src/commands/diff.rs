@@ -41,6 +41,13 @@ pub fn run(paths: &Paths, target: Option<&str>, name_override: Option<&str>) -> 
 /// `FieldClass::Live` already renders as a `[live]` class badge in the same
 /// row (it means "applies without a restart"), and the two would be
 /// confusable. The desktop app's Manifest tab uses the same wording.
+///
+/// The orientation legend obeys the same rule and glosses `managed` as
+/// `(current)` rather than `(live truth)`: an egress delta renders its
+/// `[live]` class badge one line below the legend, so spending the word
+/// there would reintroduce the collision the column wording exists to
+/// avoid — with the two senses two lines apart, which is worse than either
+/// alone.
 pub(crate) fn render_deltas(state: DriftState, deltas: &[FieldDelta]) -> String {
     let mut s = String::new();
     let label = match state {
@@ -55,7 +62,7 @@ pub(crate) fn render_deltas(state: DriftState, deltas: &[FieldDelta]) -> String 
         return s;
     }
     // Only when there is something to attribute — the in-sync path stays terse.
-    s.push_str("showing: managed (live truth) -> izba.yml (proposed)\n");
+    s.push_str("showing: managed (current) -> izba.yml (proposed)\n");
     for d in deltas {
         let class = match d.class {
             FieldClass::Live => "live",
@@ -97,7 +104,7 @@ mod tests {
     use izba_core::manifest::DriftState;
 
     /// The legend that tells the reader which side is the live managed truth.
-    const LEGEND: &str = "showing: managed (live truth) -> izba.yml (proposed)\n";
+    const LEGEND: &str = "showing: managed (current) -> izba.yml (proposed)\n";
 
     #[test]
     fn render_groups_by_class_and_flags_weakening() {
