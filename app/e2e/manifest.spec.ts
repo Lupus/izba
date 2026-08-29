@@ -36,9 +36,15 @@ test.describe("manifest tab", () => {
     await page.getByText("ubuntu:24.04").click();
     await page.getByRole("tab", { name: "Manifest" }).click();
 
-    // Default mock diff is repo_ahead with a single weakens_egress delta.
+    // Default mock diff is repo_ahead with a single weakens_egress delta, so
+    // the banner is the direction-aware one (#241): promoting izba.yml here
+    // would RELAX enforcement, so the banner must not advise it while the row
+    // below carries the "⚠ weakens egress" marker.
     await expect(
-      page.getByText("izba.yml has changes not yet applied. Review below, then Promote."),
+      page.getByText(
+        "izba.yml would weaken egress relative to the current managed settings. " +
+          "Keep the managed settings as they are — Promote only if you intend to relax enforcement.",
+      ),
     ).toBeVisible();
     await expect(page.getByText("⚠ weakens egress")).toBeVisible();
 

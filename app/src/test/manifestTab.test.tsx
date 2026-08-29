@@ -37,8 +37,64 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+// The four direction-agnostic banner strings, byte-identical to
+// `ManifestTab.tsx`'s non-weakening copy — other in-repo consumers
+// (app/e2e/manifest.spec.ts, hack/dogfood/journeys/manifest-gui.json) assert
+// them verbatim, so they must not drift.
+const IN_SYNC_BANNER = "In sync — izba.yml and managed settings match.";
+const REPO_AHEAD_BANNER = "izba.yml has changes not yet applied. Review below, then Promote.";
+const MANAGED_AHEAD_BANNER = "Live settings have drifted from izba.yml. Export to capture them.";
+const DIVERGED_BANNER =
+  "Both izba.yml and managed settings changed. Promote applies izba.yml; Export overwrites it.";
+
+// The direction-AWARE copy (#241). These four are byte-shared with
+// `crates/izba-cli/src/commands/diff.rs`'s `next:` line — the two surfaces
+// must never recommend contradictory actions for identical input.
+const REPO_AHEAD_WEAKENS_BANNER =
+  "izba.yml would weaken egress relative to the current managed settings. " +
+  "Keep the managed settings as they are — Promote only if you intend to relax enforcement.";
+const MANAGED_AHEAD_WEAKENS_BANNER =
+  "izba.yml would weaken egress relative to the current managed settings. " +
+  "Export to capture the managed settings into izba.yml.";
+const DIVERGED_WEAKENS_BANNER =
+  "izba.yml would weaken egress relative to the current managed settings. " +
+  "Export to capture the managed settings into izba.yml — or Promote only if you intend to " +
+  "relax enforcement.";
+const DIVERGED_NO_DELTAS_BANNER =
+  "Both izba.yml and managed settings changed since the last reconcile, but they now hold the " +
+  "same values — there is nothing to apply. Export to realign izba.yml and clear the drift.";
+
+/** The canonical weakening delta: the live sandbox enforces, izba.yml asks it
+ *  not to. `from` is managed truth, `to` is the izba.yml proposal. */
+const WEAKENING_DELTA = {
+  field: "policy.egress.enforce",
+  from: "true",
+  to: "false",
+  class: "live" as const,
+  weakens_egress: true,
+};
+
+/** A non-egress drift — the no-regression control. */
+const BENIGN_DELTA = {
+  field: "cpus",
+  from: "2",
+  to: "4",
+  class: "restart" as const,
+  weakens_egress: false,
+};
+
+/** An egress drift that STRENGTHENS: izba.yml adds a host the managed
+ *  allow-list lacks, so promoting it does not relax anything. */
+const STRENGTHENING_EGRESS_DELTA = {
+  field: "egress",
+  from: "enforce: true\nallow:\n- host: a.com",
+  to: "enforce: true\nallow:\n- host: a.com\n- host: b.com",
+  class: "live" as const,
+  weakens_egress: false,
+};
+
 describe("ManifestTab", () => {
-  it("fetches on mount and renders the repo_ahead banner + a weakening delta row", async () => {
+  it("fetches on mount and renders the weakening repo_ahead banner + the delta row", async () => {
     (api.manifestDiff as Mock).mockResolvedValue({
       state: "repo_ahead",
       deltas: [
@@ -53,9 +109,11 @@ describe("ManifestTab", () => {
     });
     render(<ManifestTab name="web" running={true} />);
 
-    expect(
-      await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote."),
-    ).toBeInTheDocument();
+    // The delta weakens egress, so the banner must NOT recommend Promote
+    // (#241) — the direction-aware copy is asserted in full by the banner
+    // matrix below; here it just has to be the weakening one.
+    expect(await screen.findByText(REPO_AHEAD_WEAKENS_BANNER)).toBeInTheDocument();
+    expect(screen.queryByText(REPO_AHEAD_BANNER)).not.toBeInTheDocument();
     expect(screen.getByText("policy.egress.enforce")).toBeInTheDocument();
     expect(screen.getByText("live")).toBeInTheDocument();
     expect(screen.getByText("⚠ weakens egress")).toBeInTheDocument();
@@ -237,14 +295,12 @@ describe("ManifestTab", () => {
   });
 
   it("enables both Promote and Export on diverged", async () => {
-    (api.manifestDiff as Mock).mockResolvedValue({ state: "diverged", deltas: [] });
+    // A non-weakening delta: `diverged` with an EMPTY delta list is its own
+    // banner case (#241 — "nothing to apply"), covered in the matrix below.
+    (api.manifestDiff as Mock).mockResolvedValue({ state: "diverged", deltas: [BENIGN_DELTA] });
     render(<ManifestTab name="web" running={true} />);
 
-    expect(
-      await screen.findByText(
-        "Both izba.yml and managed settings changed. Promote applies izba.yml; Export overwrites it.",
-      ),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(DIVERGED_BANNER)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^promote…$/i })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: /^export to izba\.yml$/i })).not.toBeDisabled();
   });
@@ -339,6 +395,95 @@ describe("ManifestTab", () => {
   });
 });
 
+/** #241: the drift banner is a recommendation, and the recommendation has to
+ *  know WHICH WAY the drift cuts. `compute_diff` is `diff(managed, repo)`, so
+ *  `weakens_egress` on a pending delta means "promoting izba.yml would weaken
+ *  egress" — the banner must not then advise Promote while a red
+ *  "⚠ weakens egress" marker sits on the delta row below it. */
+describe("ManifestTab drift banner direction", () => {
+  async function renderDiff(state: string, deltas: unknown[]) {
+    (api.manifestDiff as Mock).mockResolvedValue({ state, deltas });
+    render(<ManifestTab name="web" running={true} />);
+  }
+
+  it("in_sync renders the unchanged in-sync copy", async () => {
+    await renderDiff("in_sync", []);
+    expect(await screen.findByText(IN_SYNC_BANNER)).toBeInTheDocument();
+  });
+
+  it("repo_ahead with a non-weakening egress delta keeps the unchanged Promote copy", async () => {
+    await renderDiff("repo_ahead", [STRENGTHENING_EGRESS_DELTA]);
+    expect(await screen.findByText(REPO_AHEAD_BANNER)).toBeInTheDocument();
+  });
+
+  it("managed_ahead with a non-weakening delta keeps the unchanged Export copy", async () => {
+    await renderDiff("managed_ahead", [BENIGN_DELTA]);
+    expect(await screen.findByText(MANAGED_AHEAD_BANNER)).toBeInTheDocument();
+  });
+
+  it("diverged with a non-weakening delta keeps the unchanged both-changed copy", async () => {
+    await renderDiff("diverged", [BENIGN_DELTA]);
+    expect(await screen.findByText(DIVERGED_BANNER)).toBeInTheDocument();
+  });
+
+  it("repo_ahead + weakening stops recommending Promote and keeps the delta marker", async () => {
+    await renderDiff("repo_ahead", [WEAKENING_DELTA]);
+
+    expect(await screen.findByText(REPO_AHEAD_WEAKENS_BANNER)).toBeInTheDocument();
+    // The defect: the banner used to advise the exact action the marker on
+    // the row below warns about.
+    expect(screen.queryByText(REPO_AHEAD_BANNER)).not.toBeInTheDocument();
+    expect(screen.getByText("⚠ weakens egress")).toBeInTheDocument();
+  });
+
+  it("managed_ahead + weakening recommends Export", async () => {
+    await renderDiff("managed_ahead", [WEAKENING_DELTA]);
+    expect(await screen.findByText(MANAGED_AHEAD_WEAKENS_BANNER)).toBeInTheDocument();
+    expect(screen.queryByText(MANAGED_AHEAD_BANNER)).not.toBeInTheDocument();
+  });
+
+  it("diverged + weakening leads with Export and qualifies Promote", async () => {
+    await renderDiff("diverged", [WEAKENING_DELTA]);
+    expect(await screen.findByText(DIVERGED_WEAKENS_BANNER)).toBeInTheDocument();
+    expect(screen.queryByText(DIVERGED_BANNER)).not.toBeInTheDocument();
+  });
+
+  it("diverged with no deltas says there is nothing to apply and points at Export", async () => {
+    // Both sides moved since the last reconcile but landed on the same
+    // values: the generic "Promote applies izba.yml" copy claimed a
+    // divergence with an empty delta table under it and no next step.
+    await renderDiff("diverged", []);
+    expect(await screen.findByText(DIVERGED_NO_DELTAS_BANNER)).toBeInTheDocument();
+    expect(screen.queryByText(DIVERGED_BANNER)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("No field changes between izba.yml and managed settings."),
+    ).toBeInTheDocument();
+  });
+
+  it("a NON-egress repo_ahead drift is unaffected (no regression)", async () => {
+    await renderDiff("repo_ahead", [BENIGN_DELTA]);
+    expect(await screen.findByText(REPO_AHEAD_BANNER)).toBeInTheDocument();
+    expect(screen.queryByText(REPO_AHEAD_WEAKENS_BANNER)).not.toBeInTheDocument();
+    expect(screen.queryByText("⚠ weakens egress")).not.toBeInTheDocument();
+  });
+
+  it("styles the weakening repo_ahead banner destructively, agreeing with the row marker", async () => {
+    await renderDiff("repo_ahead", [WEAKENING_DELTA]);
+    const banner = await screen.findByText(REPO_AHEAD_WEAKENS_BANNER);
+    expect(banner.className).toContain("border-destructive");
+    expect(banner.className).toContain("text-destructive");
+    // The neutral primary tint would read as "this is fine, go ahead".
+    expect(banner.className).not.toContain("border-primary");
+  });
+
+  it("keeps the neutral styling for a non-weakening repo_ahead drift", async () => {
+    await renderDiff("repo_ahead", [BENIGN_DELTA]);
+    const banner = await screen.findByText(REPO_AHEAD_BANNER);
+    expect(banner.className).toContain("border-primary");
+    expect(banner.className).not.toContain("destructive");
+  });
+});
+
 describe("ManifestTab promote dialog", () => {
   it("opens listing the delta fields for a repo_ahead diff", async () => {
     (api.manifestDiff as Mock).mockResolvedValue({
@@ -376,7 +521,9 @@ describe("ManifestTab promote dialog", () => {
       ],
     });
     render(<ManifestTab name="web" running={true} />);
-    await screen.findByText("izba.yml has changes not yet applied. Review below, then Promote.");
+    // This diff's only delta weakens egress, so the loaded-barrier is the
+    // direction-aware banner, not the generic repo_ahead one (#241).
+    await screen.findByText(REPO_AHEAD_WEAKENS_BANNER);
     fireEvent.click(screen.getByRole("button", { name: /^promote…$/i }));
 
     const dialog = screen.getByRole("dialog");
