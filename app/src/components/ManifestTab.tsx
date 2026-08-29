@@ -19,6 +19,9 @@ interface Props {
   running: boolean;
 }
 
+/** The direction-AGNOSTIC banner copy: what each drift state recommends when
+ *  nothing pending would weaken egress. Byte-asserted by
+ *  `app/e2e/manifest.spec.ts` and `hack/dogfood/journeys/manifest-gui.json`. */
 const BANNER_TEXT: Record<DriftState, string> = {
   in_sync: "In sync — izba.yml and managed settings match.",
   repo_ahead: "izba.yml has changes not yet applied. Review below, then Promote.",
@@ -26,12 +29,64 @@ const BANNER_TEXT: Record<DriftState, string> = {
   diverged: "Both izba.yml and managed settings changed. Promote applies izba.yml; Export overwrites it.",
 };
 
+// ⚠ BYTE-SHARED WITH `crates/izba-cli/src/commands/diff.rs` (its `next:` line).
+// Change these on BOTH surfaces or neither: `izba diff` and this tab render
+// the same drift for the same sandbox, and they must never recommend
+// contradictory actions for identical input. A test on each side pins the
+// exact bytes.
+// Each string is deliberately written as ONE unsplit literal rather than a
+// concatenation: `shared_recommendation_copy_is_byte_identical_across_surfaces`
+// in crates/izba-cli/src/commands/diff.rs reads THIS FILE at test time and
+// asserts each Rust const appears here verbatim, so the two surfaces cannot
+// drift apart silently. Splitting a literal across `+` would defeat that test.
+// prettier-ignore
+const WEAKENS_TEXT: Record<Exclude<DriftState, "in_sync">, string> = {
+  // `repo_ahead` deliberately does NOT recommend Export: `canExport` below is
+  // false in that state, so pointing at Export would point at a dead control.
+  // The copy adapts to the available controls, never the other way round.
+  repo_ahead: "izba.yml would weaken egress relative to the current managed settings. Keep the managed settings as they are — Promote only if you intend to relax enforcement.",
+  managed_ahead: "izba.yml would weaken egress relative to the current managed settings. Export to capture the managed settings into izba.yml.",
+  diverged: "izba.yml would weaken egress relative to the current managed settings. Export to capture the managed settings into izba.yml — or Promote only if you intend to relax enforcement.",
+};
+// prettier-ignore
+const DIVERGED_NO_DELTAS_TEXT = "Both izba.yml and managed settings changed since the last reconcile, but they now hold the same values — there is nothing to apply. Export to realign izba.yml and clear the drift.";
+
+/** The banner is a RECOMMENDATION, so it has to know which way the drift cuts
+ *  (#241). `izba_core::manifest::ops::compute_diff` computes
+ *  `diff(managed, repo)`, so a delta's `weakens_egress` means "promoting
+ *  izba.yml would weaken egress" — with one of those pending, a banner reading
+ *  "Review below, then Promote." advises the exact action the red
+ *  "⚠ weakens egress" marker on the row below warns about. `in_sync` carries
+ *  no deltas, so it can never weaken. */
+function bannerText(state: DriftState, deltas: DeltaView[]): string {
+  if (state === "in_sync") return BANNER_TEXT.in_sync;
+  if (deltas.some((d) => d.weakens_egress)) return WEAKENS_TEXT[state];
+  // "Both changed" with an empty delta table is a divergence claim with
+  // nothing to show and no next step: the two sides moved since the last
+  // reconcile but landed on the same values.
+  if (state === "diverged" && deltas.length === 0) return DIVERGED_NO_DELTAS_TEXT;
+  return BANNER_TEXT[state];
+}
+
+const DESTRUCTIVE_BANNER_CLASS = "border-destructive/30 bg-destructive/5 text-destructive";
+
 const BANNER_CLASS: Record<DriftState, string> = {
   in_sync: "border-success/30 bg-success/5 text-success",
   repo_ahead: "border-primary/30 bg-primary/5 text-foreground",
-  managed_ahead: "border-destructive/30 bg-destructive/5 text-destructive",
+  managed_ahead: DESTRUCTIVE_BANNER_CLASS,
   diverged: "border-destructive/30 bg-destructive/10 text-destructive",
 };
+
+/** `managed_ahead`/`diverged` are already destructive; only `repo_ahead`'s
+ *  neutral tint needs the direction to disagree with it — a banner that reads
+ *  "go ahead" in primary blue above a red "⚠ weakens egress" marker is the
+ *  visual half of the same defect. */
+function bannerClass(state: DriftState, deltas: DeltaView[]): string {
+  if (state === "repo_ahead" && deltas.some((d) => d.weakens_egress)) {
+    return DESTRUCTIVE_BANNER_CLASS;
+  }
+  return BANNER_CLASS[state];
+}
 
 const CLASS_TOOLTIP: Record<DeltaView["class"], string> = {
   live: "applies immediately",
@@ -397,8 +452,10 @@ export function ManifestTab({ name, running }: Readonly<Props>) {
 
       {diff && (
         <>
-          <div className={`rounded-lg border px-3 py-2 text-sm ${BANNER_CLASS[diff.state]}`}>
-            {BANNER_TEXT[diff.state]}
+          <div
+            className={`rounded-lg border px-3 py-2 text-sm ${bannerClass(diff.state, diff.deltas)}`}
+          >
+            {bannerText(diff.state, diff.deltas)}
           </div>
 
           <DeltaTable deltas={diff.deltas} />

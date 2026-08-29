@@ -137,10 +137,10 @@
       "journey_id": "manifest-weakens-egress-ack",
       "modality": "gui",
       "tier": "core",
-      "rationale": "A promote that loosens the egress firewall must not sail through silently: izba.yml flips egress enforcement from on to off (a weakening the diff engine flags weakens_egress), the delta table must carry the red '⚠ weakens egress' marker, and the Promote confirm dialog must gate the Promote button behind an explicit acknowledgment checkbox before it will apply. egress is a live-class field, so no image-restart checkbox is in play — only the weakens-ack gate. core marks the repo_ahead diff view that renders the weakens marker; the ack+promote is dom_expect-graded and leaves the tab in-sync (post-journey ground truth), so the truth oracle's last digest matches.",
+      "rationale": "A promote that loosens the egress firewall must not sail through silently: izba.yml flips egress enforcement from on to off (a weakening the diff engine flags weakens_egress), the delta table must carry the red '⚠ weakens egress' marker, and the Promote confirm dialog must gate the Promote button behind an explicit acknowledgment checkbox before it will apply. egress is a live-class field, so no image-restart checkbox is in play — only the weakens-ack gate. core marks the repo_ahead diff view that renders the weakens marker; the ack+promote is dom_expect-graded and leaves the tab in-sync (post-journey ground truth), so the truth oracle's last digest matches. #241: this journey is the harness's own oracle for the direction-aware banner, so its core expectation pins the WEAKENING repo_ahead copy, not the generic one. Before that fix the two clauses of that expectation contradicted each other by construction — the banner recommended Promote while the row beneath it flagged that same Promote as weakening egress — and an Actor could satisfy the step while reading the screen exactly backwards. Because Export is disabled in repo_ahead (canExport covers only managed_ahead/diverged/missing-manifest), the banner here recommends keeping the managed settings rather than pointing at a dead control; the ack-gated promote in the NEXT step is still the intended path for a user who genuinely means to relax enforcement, which is why the copy qualifies Promote instead of forbidding it.",
       "source": {
         "kind": "spec",
-        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.2 (weakens-egress acknowledgment) + §6; ManifestTab.tsx WEAKENS_ACK_LABEL + '⚠ weakens egress'; crates/izba-core/src/manifest/diff.rs egress_weakens; dogfood-app-guide.md 'weakens egress'"
+        "ref": "docs/superpowers/specs/2026-07-11-gui-manifest-dogfood-design.md §3.2 (weakens-egress acknowledgment) + §6; ManifestTab.tsx bannerText/bannerClass (direction-aware, #241) + WEAKENS_ACK_LABEL + '⚠ weakens egress'; crates/izba-cli/src/commands/diff.rs render_deltas `next:` line (byte-shared weakening copy); crates/izba-core/src/manifest/diff.rs egress_weakens; dogfood-app-guide.md 'weakens egress'"
       },
       "seed_files": {
         "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: true\n    allow:\n      - example.com\n"
@@ -152,7 +152,7 @@
         },
         {
           "intent": "open the manifest-weakens-demo sandbox's detail view, click its Manifest tab, and click Refresh to review izba.yml's pending changes",
-          "expect": "the Manifest tab shows 'izba.yml has changes not yet applied. Review below, then Promote.' and the changed egress row carries a red '⚠ weakens egress' marker",
+          "expect": "the Manifest tab shows 'izba.yml would weaken egress relative to the current managed settings. Keep the managed settings as they are — Promote only if you intend to relax enforcement.' and the changed egress row carries a red '⚠ weakens egress' marker",
           "core": true,
           "seed_files": {
             "izba.yml": "apiVersion: izba.dev/v1alpha1\nkind: Sandbox\nspec:\n  image: alpine:3.20\n  egress:\n    enforce: false\n    allow:\n      - example.com\n"
