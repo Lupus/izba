@@ -66,6 +66,33 @@ fn workspace_ref(dir: &Path) -> anyhow::Result<SandboxRef> {
     })
 }
 
+/// The safety rail for a bare word that names an EXISTING sandbox: if
+/// `./<arg>/izba.yml` resolves to a DIFFERENT sandbox, the argument has two
+/// live meanings. Refuse rather than silently pick one and discard the other's
+/// `enforce:`/`protocol:` posture.
+///
+/// SHARED by [`resolve`] and [`resolve_for_create`] deliberately. It first
+/// shipped inside `resolve` alone, and `resolve_for_create` was written
+/// without it — so `izba run myapp` attached to sandbox `myapp` while
+/// `izba status myapp` refused the same argument, and `./myapp/izba.yml` was
+/// neither applied nor mentioned. Duplicating the rail is precisely how the
+/// two drift; a test pins that they refuse identically.
+fn reject_ambiguous_existing(arg: &str) -> anyhow::Result<()> {
+    let as_dir = Path::new(arg);
+    if !as_dir.join("izba.yml").is_file() {
+        return Ok(());
+    }
+    let dir_name = workspace_sandbox_name(as_dir)?;
+    if dir_name != arg {
+        bail!(
+            "'{arg}' is both a sandbox name and a directory whose izba.yml \
+             resolves to sandbox '{dir_name}' — pass './{arg}' for the \
+             directory, or the exact sandbox name"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve an optional positional argument into a [`SandboxRef`]:
 ///
 /// 1. omitted     → the current directory's workspace;
@@ -87,16 +114,7 @@ pub(crate) fn resolve(paths: &Paths, arg: Option<&str>) -> anyhow::Result<Sandbo
     let as_dir = Path::new(arg);
     let dir_has_manifest = as_dir.join("izba.yml").is_file();
     if sandbox_exists(paths, arg) {
-        if dir_has_manifest {
-            let dir_name = workspace_sandbox_name(as_dir)?;
-            if dir_name != arg {
-                bail!(
-                    "'{arg}' is both a sandbox name and a directory whose izba.yml \
-                     resolves to sandbox '{dir_name}' — pass './{arg}' for the \
-                     directory, or the exact sandbox name"
-                );
-            }
-        }
+        reject_ambiguous_existing(arg)?;
         return Ok(SandboxRef {
             name: arg.to_string(),
             workspace: recorded_workspace(paths, arg)?,
@@ -193,7 +211,8 @@ pub(crate) enum CreateTarget {
 ///
 /// 1. path syntax → that workspace directory (the ONE form that may be created
 ///    if missing);
-/// 2. bare word naming an existing sandbox → that sandbox;
+/// 2. bare word naming an existing sandbox → that sandbox, subject to
+///    [`reject_ambiguous_existing`];
 /// 3. bare word with a `./word/izba.yml` → that workspace (with a printed
 ///    note), mirroring [`resolve`];
 /// 4. bare word equal to the CWD manifest's `metadata.name` → the current
@@ -214,6 +233,7 @@ pub(crate) fn resolve_for_create(paths: &Paths, arg: &str) -> anyhow::Result<Cre
         return Ok(CreateTarget::Workspace(PathBuf::from(arg)));
     }
     if sandbox_exists(paths, arg) {
+        reject_ambiguous_existing(arg)?;
         return Ok(CreateTarget::Existing(arg.to_string()));
     }
     let as_dir = Path::new(arg);
@@ -535,14 +555,27 @@ mod tests {
     }
     // -- resolve_for_create (#242) ---------------------------------------
 
+    /// Restores the process cwd on drop — including while unwinding.
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
     /// Run `f` with the process cwd temporarily set to `dir`, restoring it
     /// afterwards. Callers must hold `CWD_LOCK`.
+    ///
+    /// The restore is a Drop guard, not a trailing statement, because a
+    /// failing assertion inside `f` PANICS: with a trailing restore the cwd
+    /// stays inside a tempdir that is then deleted, and every later
+    /// cwd-dependent test fails for a reason that has nothing to do with it.
+    /// One real assertion failure would otherwise read as twenty.
     fn with_cwd<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
         let prev = std::env::current_dir().unwrap();
+        let _guard = CwdGuard(prev);
         std::env::set_current_dir(dir).unwrap();
-        let out = f();
-        std::env::set_current_dir(prev).unwrap();
-        out
+        f()
     }
 
     /// Path syntax always means the directory — even when a sandbox of the
@@ -677,6 +710,58 @@ mod tests {
         .unwrap();
         let r = with_cwd(tmp.path(), || resolve_for_create(&paths, "my-sandbox"));
         assert_eq!(r.unwrap(), CreateTarget::Existing("my-sandbox".to_string()));
+    }
+
+    /// The safety rail `resolve` already applies must apply here too, or the
+    /// two resolvers disagree on the same argument: `run myapp` would attach to
+    /// sandbox `myapp` while silently discarding `./myapp/izba.yml`'s
+    /// `enforce:`/`protocol:` posture — the exact class #242 exists to close.
+    #[test]
+    fn create_bare_word_that_is_both_a_sandbox_and_a_divergent_dir_is_a_hard_error() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let (tmp, paths, _ws) = fixture("proj");
+        // ./proj/izba.yml resolves to a DIFFERENT sandbox ("fromyaml").
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("izba.yml"), MANIFEST).unwrap();
+        let res = with_cwd(tmp.path(), || resolve_for_create(&paths, "proj"));
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("both a sandbox name and a directory"), "{err}");
+        assert!(err.contains("'fromyaml'"), "{err}");
+    }
+
+    /// ...and when the two AGREE there is nothing to disambiguate: the
+    /// existing sandbox is the answer, exactly as `resolve` decides it.
+    #[test]
+    fn create_bare_word_that_is_both_a_sandbox_and_an_agreeing_dir_resolves_as_the_sandbox() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let (tmp, paths, _ws) = fixture("proj");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("izba.yml"), MANIFEST.replace("fromyaml", "proj")).unwrap();
+        let r = with_cwd(tmp.path(), || resolve_for_create(&paths, "proj"));
+        assert_eq!(r.unwrap(), CreateTarget::Existing("proj".to_string()));
+    }
+
+    /// The rail is SHARED, not duplicated: both resolvers must reject the same
+    /// argument identically, so the drift Greptile caught cannot reappear.
+    #[test]
+    fn both_resolvers_reject_an_ambiguous_bare_word_identically() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let (tmp, paths, _ws) = fixture("proj");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("izba.yml"), MANIFEST).unwrap();
+        let (a, b) = with_cwd(tmp.path(), || {
+            (
+                resolve(&paths, Some("proj")).err().map(|e| e.to_string()),
+                resolve_for_create(&paths, "proj")
+                    .err()
+                    .map(|e| e.to_string()),
+            )
+        });
+        assert!(a.is_some(), "resolve must refuse an ambiguous bare word");
+        assert_eq!(a, b, "the two resolvers must give the same refusal");
     }
 
     // -- cwd_manifest_ignored_warning (#242) -----------------------------
