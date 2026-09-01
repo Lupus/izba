@@ -232,16 +232,6 @@ fn run_inner(
     result
 }
 
-/// #242: a cwd `izba.yml` that is NOT the manifest being applied must never be
-/// discarded silently — its `enforce:`/`protocol:` posture would go with it.
-/// The decision lives in `sandbox_ref` (and is unit-tested there); this only
-/// prints it.
-fn warn_ignored_cwd_manifest(applied_workspace: Option<&Path>, name: &str) {
-    if let Some(w) = super::sandbox_ref::cwd_manifest_ignored_warning(applied_workspace, name) {
-        eprintln!("{w}");
-    }
-}
-
 /// Act on an already-resolved [`CreateTarget`] (see
 /// `sandbox_ref::resolve_for_create`, which owns the NAME_OR_DIR rule and has
 /// already rejected a bare word that names nothing — #242).
@@ -266,7 +256,11 @@ fn resolve_or_create(
     let dir = match target {
         super::sandbox_ref::CreateTarget::Existing(name) => {
             let recorded = super::sandbox_ref::recorded_workspace(paths, &name)?;
-            warn_ignored_cwd_manifest(recorded.as_deref(), &name);
+            if let Some(w) =
+                super::sandbox_ref::cwd_manifest_ignored_warning(recorded.as_deref(), &name)
+            {
+                eprintln!("{w}");
+            }
             reconcile_existing(paths, &name, opts)?;
             return Ok((name, false));
         }
@@ -277,7 +271,16 @@ fn resolve_or_create(
     let mut merged = opts.clone();
     let manifest_for_base = super::merge_manifest_into_opts(&mut merged, &workspace)?;
     let name = super::name_for(&merged, &workspace)?;
-    warn_ignored_cwd_manifest(Some(&workspace), &name);
+    // #242: a cwd `izba.yml` that is NOT the manifest being applied must never
+    // be discarded silently — its `enforce:`/`protocol:` posture would go with
+    // it. Inlined rather than factored into a helper on purpose: both call
+    // sites sit AFTER `DaemonClient::connect`, so no host test can reach them
+    // and a helper would only add an unkillable mutant. The DECISION is pure
+    // and unit-tested in `sandbox_ref`; `create`'s call site (which runs
+    // before the connect) is covered by `bare_name_resolution.rs`.
+    if let Some(w) = super::sandbox_ref::cwd_manifest_ignored_warning(Some(&workspace), &name) {
+        eprintln!("{w}");
+    }
     // Case B: addressed by directory, but the sandbox already exists. Here the
     // merge above only served to resolve the manifest-derived name; base seeding
     // is for fresh creates only, so dropping `manifest_for_base` is intentional.
