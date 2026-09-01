@@ -3,15 +3,28 @@ use anyhow::bail;
 use izba_core::daemon::proto::{DaemonRequest, DaemonResponse};
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
-use std::path::Path;
 
 #[mutants::skip] // reason: connects to a live daemon (Create over the socket); e2e-only (daemon_e2e). The testable pieces (merge_manifest_into_opts, build_create_request) are unit-tested separately.
-pub fn run(paths: &Paths, opts: &SandboxOpts, dir: &Path) -> anyhow::Result<i32> {
-    let workspace = super::ensure_workspace(dir)?;
+pub fn run(paths: &Paths, opts: &SandboxOpts, name_or_dir: &str) -> anyhow::Result<i32> {
+    // #242: resolve BEFORE touching the filesystem. Only the path-syntax arm
+    // reaches `ensure_workspace`'s `create_dir_all`, so a bare word that names
+    // nothing is an error rather than a silently-created empty workspace.
+    let workspace = match super::sandbox_ref::resolve_for_create(paths, name_or_dir)? {
+        super::sandbox_ref::CreateTarget::Existing(name) => bail!(
+            "sandbox '{name}' already exists — start it with `izba start {name}`, \
+             or remove it first with `izba rm {name}`"
+        ),
+        super::sandbox_ref::CreateTarget::Workspace(dir) => super::ensure_workspace(&dir)?,
+    };
     // Honor izba.yml: overlay manifest defaults, explicit CLI flags always win.
     let mut merged = opts.clone();
     let manifest_for_base = super::merge_manifest_into_opts(&mut merged, &workspace)?;
     let name = super::name_for(&merged, &workspace)?;
+    // #242: a cwd izba.yml that is NOT the manifest being applied must never be
+    // discarded silently — its `enforce:`/`protocol:` posture would go with it.
+    if let Some(w) = super::sandbox_ref::cwd_manifest_ignored_warning(Some(&workspace), &name) {
+        eprintln!("{w}");
+    }
     let ports = super::parse_publish(&merged.publish)?;
     let volumes = super::parse_volumes(&merged.volumes, merged.vnc)?;
     // Validate --policy BEFORE the daemon Create RPC: a missing or invalid

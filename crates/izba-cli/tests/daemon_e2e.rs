@@ -37,6 +37,20 @@ fn izba(data: &Path, envs: &[(&str, &str)], args: &[&str]) -> Output {
     c.output().expect("run izba")
 }
 
+/// `izba` with an explicit working directory — needed by the #242 steps, whose
+/// whole subject is how a bare-word positional resolves against the `izba.yml`
+/// sitting in the CURRENT directory.
+fn izba_in(cwd: &Path, data: &Path, envs: &[(&str, &str)], args: &[&str]) -> Output {
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_izba"));
+    c.env("IZBA_DATA_DIR", data);
+    c.current_dir(cwd);
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    c.args(args);
+    c.output().expect("run izba")
+}
+
 fn stdout_of(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
@@ -1224,6 +1238,70 @@ fn manifest_diff_promote_live_path() {
         !data.join("sandboxes").join("manifest-alias").exists(),
         "metadata.name must not create/redirect to a different sandbox dir"
     );
+
+    // [12] #242: a BARE NAME matching the cwd manifest's `metadata.name` is the
+    // project sandbox — the same target `--name <n> .` reaches — and leaves no
+    // stray `./<n>/` behind. Pre-fix, `izba run -d my-sandbox` mkdir'd an empty
+    // ./my-sandbox/, found no manifest there, and booted a default-image
+    // sandbox with `enforce: off` while the user believed the manifest applied.
+    let proj = root.path().join("bare");
+    std::fs::create_dir_all(&proj).unwrap();
+    let bare = "bare-name-proj";
+    let manifest = format!(
+        concat!(
+            "apiVersion: izba.dev/v1alpha1\n",
+            "kind: Sandbox\n",
+            "metadata:\n",
+            "  name: {}\n",
+            "spec:\n",
+            "  image: {}\n",
+            "  egress:\n",
+            "    enforce: true\n",
+            "    allow:\n",
+            "      - example.com\n",
+        ),
+        bare, IMAGE
+    );
+    std::fs::write(proj.join("izba.yml"), &manifest).unwrap();
+    assert_ok(
+        &izba_in(&proj, &data, no_env, &["run", "-d", bare]),
+        "run -d by bare name matching the cwd manifest",
+    );
+    assert!(
+        !proj.join(bare).exists(),
+        "bare name must not materialise a stray ./{bare}/ workspace directory"
+    );
+    assert!(
+        data.join("sandboxes").join(bare).exists(),
+        "bare name must resolve to the manifest's sandbox"
+    );
+    // The manifest's enforcing posture must actually be in effect — the exact
+    // security downgrade #242 reports.
+    let o = izba(&data, no_env, &["policy", "show", bare]);
+    assert_ok(&o, "policy show after bare-name run");
+    let shown = stdout_of(&o);
+    assert!(
+        shown.contains("example.com"),
+        "manifest allow-list must be applied; got:\n{shown}"
+    );
+    assert!(
+        !shown.contains("enforce: off"),
+        "manifest `enforce: true` must not be silently discarded; got:\n{shown}"
+    );
+    // Equivalence: the `--name <n> .` spelling reaches the SAME sandbox (an
+    // attach, not a second create) and reports the same posture.
+    assert_ok(
+        &izba_in(&proj, &data, no_env, &["run", "-d", "--name", bare, "."]),
+        "run -d --name <n> . must reach the same sandbox",
+    );
+    let o2 = izba(&data, no_env, &["policy", "show", bare]);
+    assert_ok(&o2, "policy show after the --name spelling");
+    assert_eq!(
+        stdout_of(&o2),
+        shown,
+        "the bare-name and --name spellings must produce the same policy posture"
+    );
+    let _ = izba(&data, no_env, &["rm", "--force", bare]);
 
     // Cleanup.
     let _ = izba(&data, no_env, &["rm", "--force", name]);

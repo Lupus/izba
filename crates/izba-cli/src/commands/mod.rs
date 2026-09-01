@@ -102,6 +102,12 @@ fn name_for(opts: &SandboxOpts, workspace: &Path) -> anyhow::Result<String> {
 }
 
 /// Create the workspace dir if missing and canonicalize it.
+///
+/// Reached ONLY through `sandbox_ref::resolve_for_create`, which is what keeps
+/// the implicit `create_dir_all` confined to path-syntax arguments (#242): a
+/// bare word that names nothing is rejected there, so a typo can no longer
+/// materialise an empty workspace in the user's repository. A new caller that
+/// bypasses that resolver reopens exactly that hole.
 fn ensure_workspace(dir: &Path) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating workspace {}", dir.display()))?;

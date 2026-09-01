@@ -728,8 +728,9 @@ fn require_image_config<'a>(
              so the image's declared PATH/Env cannot be applied and every bare command in the \
              sandbox would fail with \"not found in $PATH\".\n\
              Repair the image cache (this does NOT touch this sandbox or its data): create any \
-             sandbox from the same image — `izba create izba-cache-repair --image {image_ref}` \
-             — which re-pulls and records the missing config, then `izba rm izba-cache-repair` \
+             sandbox from the same image — `izba create --name izba-cache-repair --image \
+             {image_ref} .` — which re-pulls and records the missing config, then \
+             `izba rm izba-cache-repair` \
              and start this sandbox again. For a locally built image, rebuild it with \
              `izba build`. Do NOT `izba rm` this sandbox: that would discard its writable \
              layer and any ephemeral volumes."

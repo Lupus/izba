@@ -283,7 +283,7 @@ integration test suite.
 ## Commands
 
 ```
-izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [--volume [NAME:]GUEST_PATH:SIZE]... [--policy PATH] [--vnc] [DIR]
+izba create [--image IMG] [--cpus N] [--mem MiB] [--rw-size-gb G] [-p [BIND:]HOST:GUEST]... [--volume [NAME:]GUEST_PATH:SIZE]... [--policy PATH] [--vnc] [NAME_OR_DIR]
 izba run    [--image IMG] [--rm|-d] [NAME_OR_DIR] [-- CMD...]   # create+start+exec; --rm reaps on exit, -d/--detach leaves it running
 izba exec   NAME [-it] [-- CMD...]
 izba ssh    NAME [-- CMD...]            # ssh into a running sandbox (root shell in the workspace)
@@ -345,8 +345,8 @@ relay.
 
 ### Referring to sandboxes
 
-`status`, `start`, `stop`, `rm`, `diff`, `export`, and `promote` all take
-`NAME_OR_DIR`: a **path-looking
+`create`, `run`, `status`, `start`, `stop`, `rm`, `diff`, `export`, and
+`promote` all take `NAME_OR_DIR`: a **path-looking
 argument** (`.`, `./proj`, `/abs/path`) always means a workspace directory; a
 **bare word** means a sandbox name first (falling back to `./word` if that
 directory holds an `izba.yml`); **no argument** means the sandbox of the
@@ -354,6 +354,17 @@ current directory — so `izba status`, `izba stop`, `izba diff` all "just work"
 from a project root, git-style. If a bare word matches both a sandbox and a
 directory that resolves to a *different* sandbox, izba refuses and asks for
 the explicit `./word` or the exact name.
+
+`create` and `run` are the two verbs that may bring a sandbox into being, so
+they add one arm: a **bare word that matches the current directory's `izba.yml`
+`metadata.name`** is that project's sandbox. `izba run my-sandbox`,
+`izba run --name my-sandbox .` and `izba run .` therefore all reach the same
+sandbox with the same manifest applied. A path-looking argument is the only
+form izba will **create a directory** for (`izba create ./newproj` scaffolds
+it); a bare word that resolves to nothing is an error naming both spellings,
+never a silently-created empty workspace. Whenever an `izba.yml` sits in the
+current directory but is *not* the manifest being applied, izba says so — a
+declared `enforce:`/`protocol:` posture is never dropped in silence.
 
 Volume `SIZE` takes a `g` or `m` suffix (e.g. `10g`, `512m`). A named volume is
 persistent (lives under `<data>/volumes`, survives `rm`, single-writer); an
