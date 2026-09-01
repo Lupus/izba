@@ -3,7 +3,6 @@ use anyhow::bail;
 use izba_core::daemon::proto::{DaemonRequest, DaemonResponse};
 use izba_core::daemon::DaemonClient;
 use izba_core::paths::Paths;
-use izba_core::sandbox;
 use izba_core::state::CONFIG_FILE;
 use std::path::{Path, PathBuf};
 
@@ -150,9 +149,13 @@ fn run_inner(
     // `crates/izba-core/src/paths.rs`) — any probe name reports the same
     // verdict as the real one.
     izba_core::paths::ensure_socket_budget(paths, "sunlen-probe")?;
+    // #242: settle WHICH sandbox before connecting. Resolution is a purely
+    // local decision, so a bare word that names nothing must fail here —
+    // without spawning izbad, and without creating a directory for it.
+    let target = super::sandbox_ref::resolve_for_create(paths, name_or_dir)?;
     let mut client = DaemonClient::connect(paths)?;
     let (name, was_created) =
-        resolve_or_create(&mut client, paths, opts, name_or_dir, allow_unconfined)?;
+        resolve_or_create(&mut client, paths, opts, target, allow_unconfined)?;
     if allow_unconfined {
         // Loud, BEFORE start: the user is waiving the host-side jail, so a VM
         // escape would run with their full user privileges.
@@ -229,8 +232,19 @@ fn run_inner(
     result
 }
 
-/// NAME_OR_DIR: an existing sandbox name wins; anything else is a workspace
-/// directory (created if missing), with the sandbox created on first use.
+/// #242: a cwd `izba.yml` that is NOT the manifest being applied must never be
+/// discarded silently — its `enforce:`/`protocol:` posture would go with it.
+/// The decision lives in `sandbox_ref` (and is unit-tested there); this only
+/// prints it.
+fn warn_ignored_cwd_manifest(applied_workspace: Option<&Path>, name: &str) {
+    if let Some(w) = super::sandbox_ref::cwd_manifest_ignored_warning(applied_workspace, name) {
+        eprintln!("{w}");
+    }
+}
+
+/// Act on an already-resolved [`CreateTarget`] (see
+/// `sandbox_ref::resolve_for_create`, which owns the NAME_OR_DIR rule and has
+/// already rejected a bare word that names nothing — #242).
 /// Reading config.json for name resolution is the one read-only local
 /// operation kept CLI-side; everything mutating goes through the daemon.
 ///
@@ -243,21 +257,27 @@ fn resolve_or_create(
     client: &mut DaemonClient,
     paths: &Paths,
     opts: &SandboxOpts,
-    name_or_dir: &str,
+    target: super::sandbox_ref::CreateTarget,
     allow_unconfined: bool,
 ) -> anyhow::Result<(String, bool)> {
-    // Case A: an existing sandbox addressed directly by name.
-    if sandbox::validate_name(name_or_dir).is_ok()
-        && paths.sandbox_dir(name_or_dir).join(CONFIG_FILE).is_file()
-    {
-        reconcile_existing(paths, name_or_dir, opts)?;
-        return Ok((name_or_dir.to_string(), false));
-    }
-    let workspace = super::ensure_workspace(Path::new(name_or_dir))?;
+    // Case A: an existing sandbox addressed directly by name. Its manifest, if
+    // any, lives in the workspace config.json records — so a cwd izba.yml is
+    // only "ignored" (and only warned about) when that is somewhere else.
+    let dir = match target {
+        super::sandbox_ref::CreateTarget::Existing(name) => {
+            let recorded = super::sandbox_ref::recorded_workspace(paths, &name)?;
+            warn_ignored_cwd_manifest(recorded.as_deref(), &name);
+            reconcile_existing(paths, &name, opts)?;
+            return Ok((name, false));
+        }
+        super::sandbox_ref::CreateTarget::Workspace(dir) => dir,
+    };
+    let workspace = super::ensure_workspace(&dir)?;
     // Honor izba.yml: overlay manifest defaults, explicit CLI flags always win.
     let mut merged = opts.clone();
     let manifest_for_base = super::merge_manifest_into_opts(&mut merged, &workspace)?;
     let name = super::name_for(&merged, &workspace)?;
+    warn_ignored_cwd_manifest(Some(&workspace), &name);
     // Case B: addressed by directory, but the sandbox already exists. Here the
     // merge above only served to resolve the manifest-derived name; base seeding
     // is for fresh creates only, so dropping `manifest_for_base` is intentional.

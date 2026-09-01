@@ -37,7 +37,7 @@ fn sandbox_exists(paths: &Paths, name: &str) -> bool {
 }
 
 /// The workspace dir recorded at create time (config.json `workspace`).
-fn recorded_workspace(paths: &Paths, name: &str) -> anyhow::Result<Option<PathBuf>> {
+pub(crate) fn recorded_workspace(paths: &Paths, name: &str) -> anyhow::Result<Option<PathBuf>> {
     let cfg: Option<SandboxConfig> = load_json(&paths.sandbox_dir(name).join(CONFIG_FILE))?;
     Ok(cfg.map(|c| c.workspace))
 }
@@ -158,6 +158,137 @@ pub(crate) fn ensure_cwd_is_workspace(paths: &Paths, r: &SandboxRef) -> anyhow::
         );
     }
     Ok(())
+}
+
+/// The sandbox the CURRENT directory's `izba.yml` declares, if any.
+///
+/// Deliberately total: a missing, unreadable or malformed manifest — or one
+/// carrying no `metadata.name` — yields `None`. Resolution must never proceed
+/// on a manifest it could not read; [`cwd_manifest_ignored_warning`] reports
+/// that case separately rather than swallowing it.
+fn cwd_manifest_name() -> Option<String> {
+    if !Path::new("izba.yml").is_file() {
+        return None;
+    }
+    let m = super::load_manifest_yaml(Path::new(".")).ok()?;
+    let n = m.metadata.name?;
+    izba_core::sandbox::validate_name(&n).ok()?;
+    Some(n)
+}
+
+/// The create-capable counterpart of [`resolve`], for `run`/`create` — the two
+/// verbs whose positional may legitimately name a sandbox that does not exist
+/// yet, and the only two that may materialise a workspace directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CreateTarget {
+    /// A bare word naming an EXISTING sandbox: address it directly.
+    Existing(String),
+    /// A workspace directory. It already exists for every arm EXCEPT the
+    /// path-syntax one — which is precisely why path syntax is the only
+    /// spelling allowed to create a directory (#242).
+    Workspace(PathBuf),
+}
+
+/// Resolve `run`/`create`'s positional into a [`CreateTarget`]:
+///
+/// 1. path syntax → that workspace directory (the ONE form that may be created
+///    if missing);
+/// 2. bare word naming an existing sandbox → that sandbox;
+/// 3. bare word with a `./word/izba.yml` → that workspace (with a printed
+///    note), mirroring [`resolve`];
+/// 4. bare word equal to the CWD manifest's `metadata.name` → the current
+///    directory: the project sandbox that `--name <word>` and `.` already
+///    reach (#242);
+/// 5. 3 and 4 both match → a hard error naming both interpretations;
+/// 6. otherwise → a hint error, having created NO directory.
+///
+/// Arm 4 cannot be steered by the agent-writable `izba.yml`: it is taken only
+/// when the manifest's name EQUALS the name the user typed, so a manifest can
+/// confirm the target but never redirect it to a different sandbox.
+///
+/// Arm 6 is the #242 fix proper: before it, a bare word matching nothing fell
+/// through to `create_dir_all`, so a typo silently became a new workspace and
+/// a manifest's `enforce:`/`protocol:` posture was discarded without a word.
+pub(crate) fn resolve_for_create(paths: &Paths, arg: &str) -> anyhow::Result<CreateTarget> {
+    if is_path_syntax(arg) {
+        return Ok(CreateTarget::Workspace(PathBuf::from(arg)));
+    }
+    if sandbox_exists(paths, arg) {
+        return Ok(CreateTarget::Existing(arg.to_string()));
+    }
+    let as_dir = Path::new(arg);
+    let subdir_manifest = as_dir.join("izba.yml").is_file();
+    let cwd_names_arg = cwd_manifest_name().is_some_and(|n| n == arg);
+    match (subdir_manifest, cwd_names_arg) {
+        (true, true) => bail!(
+            "'{arg}' is ambiguous: ./izba.yml declares sandbox '{arg}' for the current \
+             directory, and ./{arg}/izba.yml is a workspace of its own — pass '.' for \
+             this directory, or './{arg}' for the subdirectory"
+        ),
+        (true, false) => {
+            eprintln!("note: no sandbox named '{arg}'; using workspace directory ./{arg}");
+            Ok(CreateTarget::Workspace(as_dir.to_path_buf()))
+        }
+        (false, true) => Ok(CreateTarget::Workspace(PathBuf::from("."))),
+        (false, false) => bail!(
+            "no sandbox named '{arg}', no ./{arg}/izba.yml, and ./izba.yml does not \
+             declare '{arg}' — pass an existing sandbox name, a workspace directory \
+             (e.g. './{arg}'), or `--name {arg} .` to create '{arg}' for the current \
+             directory"
+        ),
+    }
+}
+
+/// Does `dir` denote the current directory? Compared canonically, so the
+/// absolute workspace recorded in a sandbox's `config.json` and the literal
+/// `"."` a workspace-form positional yields are the same answer.
+fn is_cwd(dir: &Path) -> bool {
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let d = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    d == cwd
+}
+
+/// The "a discarded manifest is never silent" warning (#242): `Some` whenever
+/// the current directory holds an `izba.yml` that is NOT the manifest being
+/// applied to the resolved sandbox.
+///
+/// Keyed on `applied_workspace`, NOT on the sandbox name: `izba create --name
+/// other .` genuinely applies the cwd manifest under a different name, and a
+/// false alarm there would train users to ignore the one message that reports
+/// a dropped `enforce:`. Callers pass the workspace whose manifest governs the
+/// command — for a sandbox addressed by name, the workspace its `config.json`
+/// records (`None` when it records none, which cannot be the cwd manifest).
+///
+/// Pure (returns the text rather than printing it) so the decision is
+/// unit-testable; the caller prints it. An UNREADABLE cwd manifest still
+/// warns — "I could not parse it" is exactly the case where a dropped
+/// `enforce:` would otherwise go unmentioned.
+pub(crate) fn cwd_manifest_ignored_warning(
+    applied_workspace: Option<&Path>,
+    resolved_name: &str,
+) -> Option<String> {
+    if !Path::new("izba.yml").is_file() {
+        return None;
+    }
+    if applied_workspace.is_some_and(is_cwd) {
+        return None;
+    }
+    match workspace_sandbox_name(Path::new(".")) {
+        Ok(n) => Some(format!(
+            "warning: ./izba.yml declares sandbox '{n}', but this command targets \
+             '{resolved_name}' — that manifest was NOT applied, so its `image`, its \
+             `egress` `enforce:`/`protocol:` declarations and every other field are \
+             ignored here"
+        )),
+        Err(e) => Some(format!(
+            "warning: ./izba.yml could not be read ({e:#}), so it was NOT applied to \
+             sandbox '{resolved_name}' — its `enforce:`/`protocol:` declarations, if \
+             any, are not in effect"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -401,5 +532,257 @@ mod tests {
             by_name: true,
         };
         assert!(ensure_cwd_is_workspace(&paths, &r).is_ok());
+    }
+    // -- resolve_for_create (#242) ---------------------------------------
+
+    /// Run `f` with the process cwd temporarily set to `dir`, restoring it
+    /// afterwards. Callers must hold `CWD_LOCK`.
+    fn with_cwd<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let out = f();
+        std::env::set_current_dir(prev).unwrap();
+        out
+    }
+
+    /// Path syntax always means the directory — even when a sandbox of the
+    /// same basename exists (mirrors `path_syntax_is_always_a_workspace`).
+    #[test]
+    fn create_path_syntax_is_always_a_workspace() {
+        let (_tmp, paths, _ws) = fixture("myapp");
+        let tmp2 = tempfile::tempdir().unwrap();
+        let dir = tmp2.path().join("myapp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_for_create(&paths, &dir_s).unwrap(),
+            CreateTarget::Workspace(dir)
+        );
+    }
+
+    /// Path syntax is the ONE form allowed to name a not-yet-existing
+    /// directory: `izba run ./newproj` must still scaffold it.
+    #[test]
+    fn create_path_syntax_may_name_a_missing_directory() {
+        let (_tmp, paths, _ws) = fixture("myapp");
+        let tmp2 = tempfile::tempdir().unwrap();
+        let missing = tmp2.path().join("newproj");
+        let s = missing.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_for_create(&paths, &s).unwrap(),
+            CreateTarget::Workspace(missing)
+        );
+    }
+
+    #[test]
+    fn create_bare_word_resolves_an_existing_sandbox() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let (tmp, paths, _ws) = fixture("myapp");
+        let r = with_cwd(tmp.path(), || resolve_for_create(&paths, "myapp"));
+        assert_eq!(r.unwrap(), CreateTarget::Existing("myapp".to_string()));
+    }
+
+    #[test]
+    fn create_bare_word_uses_a_subdirectory_holding_a_manifest() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("izba.yml"), MANIFEST).unwrap();
+        let r = with_cwd(tmp.path(), || resolve_for_create(&paths, "proj"));
+        assert_eq!(r.unwrap(), CreateTarget::Workspace(PathBuf::from("proj")));
+    }
+
+    /// #242, the headline fix: a bare name matching the CWD manifest's
+    /// `metadata.name` IS the project sandbox — the same target `--name` and
+    /// `.` already reach — never a fresh `./<name>/` workspace whose empty
+    /// dir silently discards the manifest's `enforce:`/`protocol:` posture.
+    #[test]
+    fn create_bare_word_matching_cwd_manifest_name_is_the_project_sandbox() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        std::fs::write(
+            tmp.path().join("izba.yml"),
+            MANIFEST.replace("fromyaml", "my-sandbox"),
+        )
+        .unwrap();
+        let r = with_cwd(tmp.path(), || resolve_for_create(&paths, "my-sandbox"));
+        assert_eq!(r.unwrap(), CreateTarget::Workspace(PathBuf::from(".")));
+        assert!(
+            !tmp.path().join("my-sandbox").exists(),
+            "must not materialise a stray ./my-sandbox/ directory"
+        );
+    }
+
+    /// The typo case: a bare word matching nothing errors, and — the
+    /// regression this issue exists for — writes NO directory.
+    #[test]
+    fn create_bare_word_matching_nothing_errors_and_creates_no_directory() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        let res = with_cwd(tmp.path(), || resolve_for_create(&paths, "ghost"));
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("no sandbox named 'ghost'"), "{err}");
+        assert!(
+            err.contains("./ghost"),
+            "hint must show the dir form: {err}"
+        );
+        assert!(
+            !tmp.path().join("ghost").exists(),
+            "a bare-word miss must not create ./ghost/"
+        );
+    }
+
+    /// A cwd manifest naming the argument AND a `./<arg>/izba.yml` naming a
+    /// different sandbox are two live interpretations — refuse rather than
+    /// silently pick one.
+    #[test]
+    fn create_bare_word_matching_both_cwd_manifest_and_subdir_is_a_hard_error() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().join("izba"));
+        std::fs::write(
+            tmp.path().join("izba.yml"),
+            MANIFEST.replace("fromyaml", "proj"),
+        )
+        .unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("izba.yml"), MANIFEST).unwrap();
+        let res = with_cwd(tmp.path(), || resolve_for_create(&paths, "proj"));
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("./izba.yml"),
+            "must name the cwd manifest: {err}"
+        );
+        assert!(
+            err.contains("./proj"),
+            "must name the subdirectory form: {err}"
+        );
+    }
+
+    /// An EXISTING sandbox wins over the cwd-manifest arm — and the two agree
+    /// anyway, since the cwd manifest resolves to that same sandbox.
+    #[test]
+    fn create_existing_sandbox_wins_over_cwd_manifest() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let (tmp, paths, _ws) = fixture("my-sandbox");
+        std::fs::write(
+            tmp.path().join("izba.yml"),
+            MANIFEST.replace("fromyaml", "my-sandbox"),
+        )
+        .unwrap();
+        let r = with_cwd(tmp.path(), || resolve_for_create(&paths, "my-sandbox"));
+        assert_eq!(r.unwrap(), CreateTarget::Existing("my-sandbox".to_string()));
+    }
+
+    // -- cwd_manifest_ignored_warning (#242) -----------------------------
+
+    /// The manifest governing a DIFFERENT workspace than the cwd is a
+    /// discarded declaration — say so, naming both sides.
+    #[test]
+    fn cwd_manifest_warning_fires_when_a_different_workspace_is_applied() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("izba.yml"), MANIFEST).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let msg = with_cwd(tmp.path(), || {
+            cwd_manifest_ignored_warning(Some(elsewhere.path()), "other")
+        });
+        let msg = msg.expect("a cwd izba.yml that is not the applied manifest must warn");
+        assert!(msg.contains("izba.yml"), "must name the file: {msg}");
+        assert!(
+            msg.contains("fromyaml"),
+            "must name the sandbox it declares: {msg}"
+        );
+        assert!(
+            msg.contains("other"),
+            "must name the sandbox actually targeted: {msg}"
+        );
+    }
+
+    #[test]
+    fn cwd_manifest_warning_is_silent_when_the_cwd_manifest_is_the_one_applied() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("izba.yml"), MANIFEST).unwrap();
+        let msg = with_cwd(tmp.path(), || {
+            cwd_manifest_ignored_warning(Some(Path::new(".")), "fromyaml")
+        });
+        assert_eq!(msg, None, "the applied manifest must not warn about itself");
+    }
+
+    /// `izba create --name override .` DOES apply the cwd manifest — only the
+    /// sandbox name was overridden. Keying the warning on the name rather than
+    /// the applied workspace would make this a false alarm, training users to
+    /// ignore the one message that reports a dropped `enforce:`.
+    #[test]
+    fn cwd_manifest_warning_is_silent_when_only_the_name_was_overridden() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("izba.yml"), MANIFEST).unwrap();
+        let msg = with_cwd(tmp.path(), || {
+            cwd_manifest_ignored_warning(Some(Path::new(".")), "override")
+        });
+        assert_eq!(msg, None);
+    }
+
+    /// The `Existing` arm passes the sandbox's RECORDED workspace: when that
+    /// is the cwd, `izba run <name>` and `izba run .` are the same command, so
+    /// there is nothing to warn about.
+    #[test]
+    fn cwd_manifest_warning_is_silent_when_the_target_records_the_cwd() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("izba.yml"), MANIFEST).unwrap();
+        let abs = tmp.path().to_path_buf();
+        let msg = with_cwd(tmp.path(), || {
+            cwd_manifest_ignored_warning(Some(&abs), "fromyaml")
+        });
+        assert_eq!(msg, None, "an absolute cwd path must compare equal to '.'");
+    }
+
+    /// A sandbox addressed by name with no recorded workspace at all still
+    /// leaves the cwd manifest unapplied.
+    #[test]
+    fn cwd_manifest_warning_fires_when_no_workspace_is_applied() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("izba.yml"), MANIFEST).unwrap();
+        let msg = with_cwd(tmp.path(), || cwd_manifest_ignored_warning(None, "other"));
+        assert!(
+            msg.is_some(),
+            "no applied workspace means nothing applied it"
+        );
+    }
+
+    #[test]
+    fn cwd_manifest_warning_is_silent_without_a_manifest() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let msg = with_cwd(tmp.path(), || {
+            cwd_manifest_ignored_warning(Some(Path::new(".")), "anything")
+        });
+        assert_eq!(msg, None);
+    }
+
+    /// An UNPARSEABLE cwd manifest is still a discarded declaration — the
+    /// whole point of the warning is that a dropped `enforce:` is never
+    /// silent, so "could not read it" must not degrade into saying nothing.
+    #[test]
+    fn cwd_manifest_warning_fires_when_the_manifest_cannot_be_parsed() {
+        let _g = super::super::CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("izba.yml"), "{{{ not yaml").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let msg = with_cwd(tmp.path(), || {
+            cwd_manifest_ignored_warning(Some(elsewhere.path()), "target")
+        });
+        let msg = msg.expect("an unparseable cwd izba.yml must still warn");
+        assert!(msg.contains("izba.yml"), "{msg}");
+        assert!(msg.contains("target"), "{msg}");
     }
 }

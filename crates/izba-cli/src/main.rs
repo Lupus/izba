@@ -133,12 +133,21 @@ enum PortCmd {
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Create a sandbox for a workspace directory
+    ///
+    /// NAME_OR_DIR follows the same rule as every other verb (see README
+    /// "Referring to sandboxes"): a PATH-looking argument (`.`, `./proj`,
+    /// or anything with a separator) is a workspace directory, and is the
+    /// only form that may be created if it does not exist. A BARE WORD must
+    /// already resolve — to `./<word>/izba.yml`, or to an `izba.yml` in the
+    /// current directory whose `metadata.name` is `<word>`. A bare word that
+    /// resolves to nothing is an error, never a new empty directory.
     Create {
         #[command(flatten)]
         opts: SandboxOpts,
-        /// Workspace directory to share with the sandbox
-        #[arg(default_value = ".")]
-        dir: PathBuf,
+        /// Workspace directory, or a bare name the current directory's
+        /// izba.yml declares
+        #[arg(value_name = "NAME_OR_DIR", default_value = ".")]
+        name_or_dir: String,
     },
     /// Create (if needed), start (if needed) and exec into a sandbox
     ///
@@ -151,11 +160,22 @@ enum Cmd {
     /// running inside a `foo/` directory creates/starts a sandbox named `foo`.
     /// To start an existing/stopped sandbox without exec'ing, use `izba start`;
     /// to create + start in one step and leave it running, use `izba run -d`.
+    ///
+    /// NAME_OR_DIR resolves like every other verb (see README "Referring to
+    /// sandboxes"): a PATH-looking argument (`.`, `./proj`, or anything with a
+    /// separator) is a workspace directory, and is the only form that may be
+    /// created if it does not exist. A BARE WORD means an existing sandbox
+    /// first, then `./<word>/izba.yml`, then an `izba.yml` in the current
+    /// directory whose `metadata.name` is `<word>` — so `izba run <name>`,
+    /// `izba run --name <name> .` and `izba run .` all reach the same project
+    /// sandbox. A bare word that resolves to nothing is an error, never a new
+    /// empty directory.
     Run {
         #[command(flatten)]
         opts: SandboxOpts,
-        /// Existing sandbox name, or a workspace directory
-        #[arg(default_value = ".")]
+        /// Existing sandbox name, a workspace directory, or a bare name the
+        /// current directory's izba.yml declares
+        #[arg(value_name = "NAME_OR_DIR", default_value = ".")]
         name_or_dir: String,
         /// Remove the sandbox (and its ephemeral resources) once the command
         /// exits — for throwaway `izba run --rm -- <cmd>`. Only reaps a sandbox
@@ -422,7 +442,7 @@ enum Cmd {
 
 fn dispatch(cli: Cli, paths: &Paths) -> anyhow::Result<i32> {
     match cli.cmd {
-        Cmd::Create { opts, dir } => commands::create::run(paths, &opts, &dir),
+        Cmd::Create { opts, name_or_dir } => commands::create::run(paths, &opts, &name_or_dir),
         Cmd::Run {
             opts,
             name_or_dir,
@@ -585,7 +605,7 @@ mod tests {
     #[test]
     fn parse_create_defaults() {
         let cli = Cli::try_parse_from(["izba", "create"]).unwrap();
-        let Cmd::Create { opts, dir } = cli.cmd else {
+        let Cmd::Create { opts, name_or_dir } = cli.cmd else {
             panic!("expected create");
         };
         assert_eq!(opts.image, "ubuntu:24.04");
@@ -593,7 +613,7 @@ mod tests {
         assert_eq!(opts.mem, 4096);
         assert_eq!(opts.rw_size_gb, 8);
         assert_eq!(opts.name, None);
-        assert_eq!(dir, PathBuf::from("."));
+        assert_eq!(name_or_dir, ".");
     }
 
     #[test]
@@ -713,8 +733,9 @@ mod tests {
 
     #[test]
     fn parse_run_detach_long_form_with_directory() {
-        // The `--detach` spelling against a bare directory (the issue's
-        // `izba run -d myproj` bring-up path).
+        // The `--detach` spelling against a bare word. Clap-level only: which
+        // sandbox `myproj` names is settled later by
+        // `sandbox_ref::resolve_for_create` (#242), not by the parser.
         let cli = Cli::try_parse_from(["izba", "run", "--detach", "myproj"]).unwrap();
         let Cmd::Run {
             name_or_dir,

@@ -88,6 +88,11 @@ pub fn remove_core(d: &mut dyn DaemonApi, name: &str, force: bool) -> Result<(),
 /// creation, [`write_manifest_base`] does the write phase (needs the sandbox
 /// dir to exist) — see its doc comment for why the base seed itself is
 /// required, not cosmetic.
+///
+/// The GUI supplies an ABSOLUTE workspace path from its directory picker, so
+/// the CLI's NAME_OR_DIR resolution (`sandbox_ref::resolve_for_create`, #242)
+/// has no analogue here: there is no bare-word form to disambiguate, and the
+/// GUI never creates a workspace directory implicitly.
 pub fn create_core(
     d: &mut dyn DaemonApi,
     opts: CreateOpts,
