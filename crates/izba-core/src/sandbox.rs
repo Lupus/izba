@@ -741,7 +741,8 @@ fn require_image_config<'a>(
 ///
 /// Generates an OCI runtime spec via [`crate::image::runtime_config::generate_spec`]
 /// in Interactive mode, then atomically writes it as `config.json` (tempfile +
-/// rename) so a concurrent reader never sees a torn file. Mode 0644.
+/// rename) so a concurrent reader never sees a torn file. Mode 0600 — see the
+/// permission note at the `set_permissions` call.
 ///
 /// `oci_dir` is `<sandbox_dir>/oci/` and must already exist before this call.
 fn write_oci_bundle(
@@ -844,12 +845,24 @@ fn write_oci_bundle(
     use std::io::Write as _;
     tmp.write_all(&json)
         .context("writing oci/config.json content")?;
-    // Set mode 0644 before persisting.
+    // Owner-only (0600) before persisting. `tempfile` already creates at 0600;
+    // pinning it here keeps the mode an explicit, test-asserted property of the
+    // bundle rather than an inherited default.
+    //
+    // Nothing needs the group/other read bits. The bundle reaches the guest as
+    // the read-only `izba-oci` virtiofs share, whose only consumer is the
+    // in-guest `crun` — spawned by izba-init as guest root (`crun run -b
+    // /rootfs/izba-oci`), so it reads the spec via CAP_DAC_OVERRIDE regardless
+    // of the mode, exactly like the 0600 ssh host key already delivered over
+    // the sibling `izba-ssh` share. The workload container never reads it: the
+    // share's mount target sits under `/rootfs` only because crun resolves the
+    // bundle path there, and in docker mode the host owner's uid is outside the
+    // shifted map anyway, so it already presents as `nobody` in-container.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o644))
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
             .context("setting oci/config.json permissions")?;
     }
     tmp.persist(oci_dir.join("config.json"))
@@ -2912,6 +2925,47 @@ mod tests {
         );
         // And it is the image's value, not something izba made up.
         assert_eq!(declared_path, FIXTURE_IMAGE_PATH);
+    }
+
+    /// `oci/config.json` is owner-only (0600).
+    ///
+    /// The bundle reaches the guest as the read-only `izba-oci` virtiofs
+    /// share, and the only reader that needs it is the in-guest `crun`, which
+    /// izba-init spawns as guest root — the same channel that already carries
+    /// the 0600 ssh host key on the `izba-ssh` share. Nothing inside the
+    /// workload container reads the bundle, so group/other read bits only
+    /// widened the spec's exposure for no functional gain.
+    #[cfg(unix)]
+    #[test]
+    fn start_writes_oci_config_owner_only() {
+        use izba_proto::OCI_TAG;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+
+        let driver = MockDriver::new();
+        start(&paths, "web", &driver, &arts(), false).unwrap();
+
+        let spec_captured = driver
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spec captured");
+        let oci_share = spec_captured
+            .shares
+            .iter()
+            .find(|s| s.tag == OCI_TAG)
+            .expect("izba-oci share present");
+        let mode = fs::metadata(oci_share.host_path.join("config.json"))
+            .expect("oci/config.json written")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "oci/config.json must be owner-only");
     }
 
     #[test]
