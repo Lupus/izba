@@ -170,6 +170,23 @@
       case "policy_set":
         calls.push("policy_set:" + args.name);
         return action();
+      case "policy_add_endpoints":
+        calls.push(
+          "policy_add_endpoints:" + args.name + ":" + (args.entries || []).length + ":" + args.enforce
+        );
+        return action();
+      case "policy_set_full":
+        calls.push("policy_set_full:" + args.name);
+        return action();
+      case "policy_set_enforce":
+        calls.push("policy_set_enforce:" + args.name + ":" + args.on);
+        return action();
+      case "policy_git_allow":
+        calls.push("policy_git_allow:" + args.name + ":" + args.target + ":" + args.write);
+        return action();
+      case "policy_git_revoke":
+        calls.push("policy_git_revoke:" + args.name + ":" + args.target);
+        return action();
       case "shell_open":
         calls.push("shell_open:" + args.name + ":" + args.id);
         return action();
@@ -213,6 +230,81 @@
       case "vnc_proxy_stop":
         calls.push("vnc_proxy_stop:" + args.name);
         return Promise.resolve(null);
+
+      // Stats / ports / volumes / USB. Read-side commands answer from the
+      // scenario (see Scenario in scenarios.ts) with inert defaults; write-side
+      // commands log their frontend-shaped (camelCase) args and go through
+      // action() so failAction rejects them like every other mutation.
+      case "stats":
+        calls.push("stats:" + args.name);
+        return Promise.resolve(
+          (scenario.stats && scenario.stats[args.name]) || {
+            name: args.name,
+            running: false,
+            uptime_ms: null,
+            host: null,
+            disk: { rw_img_bytes: 0, volumes: [], logs_bytes: 0, image_bytes: 0 },
+            guest: null,
+          }
+        );
+
+      case "port_list":
+        calls.push("port_list:" + args.name);
+        return Promise.resolve((scenario.ports && scenario.ports[args.name]) || []);
+      case "port_publish":
+        calls.push("port_publish:" + args.name + ":" + args.ruleSpec + ":" + args.persist);
+        return action();
+      case "port_unpublish":
+        calls.push("port_unpublish:" + args.name + ":" + args.bind + ":" + args.hostPort);
+        return action();
+
+      case "volume_list":
+        calls.push("volume_list");
+        return Promise.resolve(scenario.volumes || []);
+      case "volume_attach":
+        calls.push("volume_attach:" + args.name + ":" + args.spec);
+        return action();
+      case "volume_detach":
+        calls.push("volume_detach:" + args.name + ":" + args.guestPath);
+        return action();
+      case "volume_remove":
+        calls.push("volume_remove:" + args.name);
+        return action();
+      case "volume_prune":
+        calls.push("volume_prune");
+        return scenario.failAction
+          ? err(scenario.errorMessage || "action failed")
+          : Promise.resolve({ removed: [], reclaimed_bytes: 0 });
+
+      case "usb_upstream_show":
+        calls.push("usb_upstream_show");
+        return Promise.resolve(scenario.usbUpstream || null);
+      case "usb_upstream_set":
+        calls.push("usb_upstream_set:" + args.host + ":" + args.port + ":" + args.allowRemote);
+        return action();
+      case "usb_list_devices":
+        calls.push("usb_list_devices");
+        return Promise.resolve(scenario.usbDevices || []);
+      case "usb_status":
+        calls.push("usb_status:" + args.name);
+        return Promise.resolve(
+          (scenario.usbStatus && scenario.usbStatus[args.name]) || {
+            grants: [],
+            restart_required: false,
+          }
+        );
+      case "usb_allow":
+        calls.push("usb_allow:" + args.name + ":" + args.device + ":" + args.busidPin);
+        return action();
+      case "usb_revoke":
+        calls.push("usb_revoke:" + args.name + ":" + args.device);
+        return action();
+      case "usb_attach":
+        calls.push("usb_attach:" + args.name + ":" + args.device);
+        return action();
+      case "usb_detach":
+        calls.push("usb_detach:" + args.name + ":" + args.device);
+        return action();
 
       // Manifest diff/export/promote. Canned defaults below; specs override
       // per-call via window.__MOCK_MANIFEST__ = { diff, export, promote }
