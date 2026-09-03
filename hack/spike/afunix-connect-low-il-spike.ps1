@@ -31,7 +31,11 @@
   Verdict logic (printed at the end, exit 0 when conclusive, 2 otherwise):
     controls: Low client sees FILE_WRITE_DATA denied (5) on the unlabelled
               sockets, Medium client ping/pongs everywhere, Low client
-              ping/pongs on the Low-labelled sockets, ILs read back as 4096/8192
+              ping/pongs on the Low-labelled sockets, ILs read back as 4096/8192;
+              and, so that an absent control can never pass vacuously: every
+              child exited 0 and printed one RESULT per file, every result
+              group has its expected cardinality, and the parent's listeners
+              served exactly as many connections as the clients claim
     YES  = Low client's connect() FAILS on the unlabelled sockets
            (connect needs write access; izba's default label removes a barrier)
     NO   = Low client's connect() SUCCEEDS on the unlabelled sockets
@@ -447,6 +451,8 @@ try {
   $clients   = @(@{ Name = 'low'; Sid = $LOW_SID }, @{ Name = 'medium'; Sid = $MED_SID })
   $pwsh      = Join-Path $PSHOME 'powershell.exe'
   $results   = @()
+  $runs      = @()   # one entry per child launch: exit code + parsed RESULT count
+  $served    = @{}   # condition -> connections the parent's listeners actually served
 
   foreach ($c in $conditions) {
     $dir = Join-Path $Root $c.Name
@@ -478,7 +484,9 @@ try {
       $text = Get-Content -LiteralPath $out -Raw
       Write-Output ("-- client {0} (token IL {1}) exit={2}" -f $cl.Name, $cl.Sid, $code)
       Write-Output $text.TrimEnd()
-      foreach ($line in ($text -split "`r?`n" | Where-Object { $_ -like 'RESULT|*' })) {
+      $lines = @($text -split "`r?`n" | Where-Object { $_ -like 'RESULT|*' })
+      $runs += [pscustomobject]@{ condition = $c.Name; client = $cl.Name; exit = $code; results = $lines.Count }
+      foreach ($line in $lines) {
         $parts = $line -split '\|'
         $kv = [ordered]@{ condition = $c.Name; client = $cl.Name; file = [IO.Path]::GetFileName($parts[1]) }
         foreach ($p in ($parts | Select-Object -Skip 2)) {
@@ -488,7 +496,8 @@ try {
       }
     }
     foreach ($s in $servers) { $s.Close() }
-    Write-Output ("   connections served by the two listeners: {0}" -f (($servers | ForEach-Object { $_.Served } | Measure-Object -Sum).Sum))
+    $served[$c.Name] = [int](($servers | ForEach-Object { $_.Served } | Measure-Object -Sum).Sum)
+    Write-Output ("   connections served by the two listeners: {0}" -f $served[$c.Name])
   }
 
   Write-Output ''
@@ -503,9 +512,27 @@ try {
   $medAll  = $socks | Where-Object { $_.client -eq 'medium' }
   $lowLbl  = $socks | Where-Object { $_.condition -ne 'unlabelled' -and $_.client -eq 'low' }
   $problems = @()
+  # Cardinality first: every filter below is "no failures among ...", which an
+  # EMPTY set satisfies vacuously. A child that crashed, printed nothing, or
+  # was never launched must fail the run, never pass it.
+  $filesPerDir     = $sockNames.Count + 1   # + probe.txt
+  $expectedRuns    = $conditions.Count * $clients.Count
+  $expectedResults = $expectedRuns * $filesPerDir
+  foreach ($r in ($runs | Where-Object { $_.exit -ne 0 })) { $problems += ("child {0}/{1} exited {2}" -f $r.condition, $r.client, $r.exit) }
+  foreach ($r in ($runs | Where-Object { $_.results -ne $filesPerDir })) { $problems += ("child {0}/{1} printed {2} RESULT lines, expected {3}" -f $r.condition, $r.client, $r.results, $filesPerDir) }
+  if ($runs.Count -ne $expectedRuns) { $problems += ("{0} child launches, expected {1}" -f $runs.Count, $expectedRuns) }
+  if ($results.Count -ne $expectedResults) { $problems += ("{0} RESULT lines in total, expected {1}" -f $results.Count, $expectedResults) }
+  if ($lowUnl.Count -ne $sockNames.Count) { $problems += ("{0} low/unlabelled socket results, expected {1}" -f $lowUnl.Count, $sockNames.Count) }
+  if ($medAll.Count -ne ($conditions.Count * $sockNames.Count)) { $problems += ("{0} medium socket results, expected {1}" -f $medAll.Count, ($conditions.Count * $sockNames.Count)) }
+  if ($lowLbl.Count -ne (($conditions.Count - 1) * $sockNames.Count)) { $problems += ("{0} low/labelled socket results, expected {1}" -f $lowLbl.Count, (($conditions.Count - 1) * $sockNames.Count)) }
+  # The parent's listeners must have SEEN every connection a client reports:
+  # a client-side "connect=0" that the server never served is not a round trip.
+  foreach ($c in $conditions) {
+    $claimed = @($socks | Where-Object { $_.condition -eq $c.Name -and $_.connect -eq '0' }).Count
+    if ($served[$c.Name] -ne $claimed) { $problems += ("condition {0}: listeners served {1} connections but clients reported {2} successful connects" -f $c.Name, $served[$c.Name], $claimed) }
+  }
   if (($results | Where-Object { $_.client -eq 'low' -and $_.il -ne '4096' }).Count) { $problems += 'a low client did not run at IL 4096' }
   if (($results | Where-Object { $_.client -eq 'medium' -and $_.il -ne '8192' }).Count) { $problems += 'a medium client did not run at IL 8192' }
-  if ($lowUnl.Count -ne 2) { $problems += 'missing low/unlabelled socket results' }
   if (($lowUnl | Where-Object { $_.open_write_data -ne '5' }).Count) { $problems += 'the Low client was NOT denied FILE_WRITE_DATA on an unlabelled socket file (no MIC barrier to measure)' }
   if (($medAll | Where-Object { $_.pong -ne 'pong' }).Count) { $problems += 'the Medium control client failed to ping/pong somewhere' }
   if (($lowLbl | Where-Object { $_.pong -ne 'pong' }).Count) { $problems += 'the Low client failed to ping/pong on a Low-labelled socket' }
