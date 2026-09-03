@@ -25,15 +25,29 @@ export const INTENTIONALLY_UNMOCKED: readonly string[] = [];
  */
 export const MIN_PLAUSIBLE_COMMANDS = 30;
 
+/**
+ * Strips `/* … *\/` block comments and `//` line comments from source text,
+ * shared by both parsers below so a commented-out identifier/case-label is
+ * never mistaken for a live one (rather than only stripping on one side).
+ *
+ * Naive: it does not understand string literals, so a `//` occurring inside
+ * a string (e.g. tauri-mock.js's `"http://127.0.0.1:1/"` reply) truncates
+ * the rest of that line too. Harmless here — no `case "<label>":` or
+ * `generate_handler![...]` identifier this repo cares about shares a line
+ * with such a string — but not a general-purpose comment stripper.
+ */
+function stripComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+}
+
 /** Identifiers inside the single `tauri::generate_handler![ ... ]` block. */
 export function parseRegisteredCommands(librs: string): string[] {
-  const blocks = [...librs.matchAll(/generate_handler!\[([\s\S]*?)\]/g)];
+  const blocks = [...stripComments(librs).matchAll(/generate_handler!\[([\s\S]*?)\]/g)];
   if (blocks.length === 0) throw new Error("no tauri::generate_handler![...] block found in lib.rs");
   if (blocks.length !== 1) {
     throw new Error(`expected exactly one generate_handler![...] block, found ${blocks.length}`);
   }
   return blocks[0][1]
-    .replace(/\/\/[^\n]*/g, "") // strip line comments
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
@@ -42,7 +56,7 @@ export function parseRegisteredCommands(librs: string): string[] {
 /** `case "<label>":` string literals, minus the `plugin:…` Tauri-plugin arms. */
 export function parseMockedCommands(mockjs: string): string[] {
   const seen = new Set<string>();
-  for (const m of mockjs.matchAll(/case\s+"([^"]+)"\s*:/g)) {
+  for (const m of stripComments(mockjs).matchAll(/case\s+"([^"]+)"\s*:/g)) {
     const label = m[1];
     if (label.includes(":")) continue; // plugin:event|listen etc.
     seen.add(label);
