@@ -7,6 +7,12 @@ import type {
   CreateOpts,
   EndpointSummary,
   PolicyView,
+  SandboxStats,
+  PortRule,
+  VolumeInfo,
+  UsbUpstream,
+  UsbDevice,
+  UsbStatus,
 } from "../../src/lib/types";
 
 export interface Scenario {
@@ -19,6 +25,19 @@ export interface Scenario {
   /** `inspect` responses keyed by sandbox name (OverviewTab, DisplayTab, …
    *  all fetch it). Mutated in place by the mock's `vnc_set` arm. */
   details?: Record<string, SandboxDetail>;
+  /** `stats` responses keyed by sandbox name; a sandbox with no entry gets
+   *  a canned stopped snapshot. */
+  stats?: Record<string, SandboxStats>;
+  /** `port_list` responses keyed by sandbox name (default `[]`). */
+  ports?: Record<string, PortRule[]>;
+  /** `volume_list` response (default `[]`). */
+  volumes?: VolumeInfo[];
+  /** `usb_upstream_show` response; `null`/absent = USB feature off. */
+  usbUpstream?: UsbUpstream | null;
+  /** `usb_list_devices` response (default `[]`). */
+  usbDevices?: UsbDevice[];
+  /** `usb_status` responses keyed by sandbox name (default: no grants). */
+  usbStatus?: Record<string, UsbStatus>;
   failList?: boolean;
   failStatus?: boolean;
   failAction?: boolean;
