@@ -384,6 +384,16 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
     `/var/log/izba-dockerd.log`; no auto-restart — a dead engine stays dead). The
     OCI spec mounts `/sys/fs/cgroup` **rw** for docker mode (a nested runc needs
     to `mkdir` its own subtree).
+  - **Fresh `/run` per boot (#214):** the docker-mode OCI spec mounts a `tmpfs`
+    over the container's `/run` (`add_docker_run_tmpfs`, ordered BEFORE the
+    `/run/izba/*` binds — crun mounts in array order, so a later tmpfs would
+    shadow the VNC secrets bind; guard-tested). Reason: the overlay upper is
+    the persistent rw disk, so `docker.pid`/`containerd.pid` survived an
+    unclean stop and the reused low PIDs made dockerd refuse to start on the
+    next boot. Mainstream images symlink `/var/run → /run`, which crun
+    resolves inside the rootfs, so dockerd's default pidfile paths land on
+    the tmpfs; a real `/var/run` directory is NOT covered. Non-docker
+    sandboxes keep `/run` on the image rootfs (guard-tested).
   - **`/proc/sys/net`-only unlock:** the OCI default read-only-remounts all of
     `/proc/sys`, but dockerd must write `net.ipv4.ip_forward`. Docker mode keeps
     every NON-`net` `/proc/sys` child read-only (`DOCKER_READONLY_PROC_SYS`) and

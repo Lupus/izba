@@ -1070,6 +1070,14 @@ pub fn generate_spec(params: &SpecParams) -> Result<Spec> {
     // podman); `/sys/fs/cgroup` stays a separate mount that crun layers on top.
     rebind_sys_mount(&mut spec);
 
+    // Docker mode: a fresh tmpfs `/run` on every boot, so the engine's pid
+    // files can never outlive an unclean stop (#214). BEFORE the USB/VNC
+    // helpers below: the VNC secrets bind lives beneath /run and crun
+    // mounts in array order.
+    if params.docker {
+        add_docker_run_tmpfs(&mut spec)?;
+    }
+
     // USB passthrough: give the workload somewhere for attached devices to
     // appear, and permission to open them. Both halves are skipped entirely for
     // a sandbox without grants — no directory, no device rules.
@@ -1203,6 +1211,67 @@ const DOCKER_READONLY_PROC_SYS: &[&str] = &[
     "/proc/sys/user",
     "/proc/sys/vm",
 ];
+
+/// Docker mode only: the container path that gets a fresh `tmpfs` on every
+/// boot (see [`add_docker_run_tmpfs`]).
+pub const DOCKER_RUN_TMPFS: &str = "/run";
+
+/// Options for the docker-mode `/run` tmpfs — what systemd mounts a real
+/// host's `/run` with, since the point is to give the image the `/run` it was
+/// written against. Deliberately NOT Docker's `--tmpfs` defaults
+/// (`noexec,size=64m`): `/run` is not `noexec` on any mainstream host, and a
+/// size cap protects nothing here (only guest memory is at stake; the kernel
+/// default is half of it).
+const DOCKER_RUN_TMPFS_OPTIONS: &[&str] = &["nosuid", "nodev", "mode=755"];
+
+/// Docker mode only: mount a fresh `tmpfs` over the container's `/run`
+/// (#214).
+///
+/// The workload's rootfs is an overlay whose upper is the PERSISTENT rw disk,
+/// so without this mount everything dockerd writes under `/run` — its own
+/// `docker.pid`, containerd's `containerd.pid`, the sockets — survives an
+/// unclean stop (daemon killed, host reboot). On the next boot the same low
+/// PIDs exist again (dockerd IS the process its own stale pidfile names), so
+/// dockerd's "is that pid alive" check false-positives and the engine refuses
+/// to start; and because a dead engine stays dead (no auto-restart), the
+/// sandbox comes up permanently docker-less until someone deletes the files
+/// by hand. A tmpfs `/run` is fresh on every boot **by construction** — the
+/// same contract every real host and every systemd-based image assumes — and
+/// needs no init-side cleanup that would have to resolve `/var/run → /run`
+/// inside the rootfs (a naive follow lands in init-root `/run`) under the
+/// docker-mode fs-id guard.
+///
+/// dockerd's default pidfile paths are under `/var/run`, which every
+/// mainstream base image (Alpine, Debian/Ubuntu, Fedora, Arch) ships as a
+/// symlink to `/run`; crun resolves a mount destination INSIDE the rootfs, so
+/// the tmpfs covers them. An image with a real `/var/run` DIRECTORY is not
+/// covered (none of the docker-capable images do that; a second tmpfs there
+/// would stack over `/run` in the symlink case).
+///
+/// **Ordering is load-bearing:** crun applies `mounts` in array order, so this
+/// must be pushed BEFORE any mount whose destination lies beneath `/run` —
+/// today the VNC secrets bind at [`VNC_SECRETS_CONTAINER_DIR`] — or the tmpfs
+/// would shadow it (guard-tested by
+/// `docker_run_tmpfs_precedes_every_mount_beneath_run`). Non-docker sandboxes
+/// keep `/run` on the image rootfs (guard-tested too).
+fn add_docker_run_tmpfs(spec: &mut Spec) -> Result<()> {
+    if let Some(mounts) = spec.mounts_mut().as_mut() {
+        mounts.push(
+            MountBuilder::default()
+                .destination(PathBuf::from(DOCKER_RUN_TMPFS))
+                .typ("tmpfs")
+                .source(PathBuf::from("tmpfs"))
+                .options(
+                    DOCKER_RUN_TMPFS_OPTIONS
+                        .iter()
+                        .map(|o| (*o).to_string())
+                        .collect::<Vec<String>>(),
+                )
+                .build()?,
+        );
+    }
+    Ok(())
+}
 
 /// Bind the shared device directory into the container and authorise the serial
 /// char majors.
@@ -2786,6 +2855,88 @@ mod tests {
             .unwrap();
         let opts = m.options().clone().unwrap();
         assert!(opts.iter().any(|o| o == "rw") && !opts.iter().any(|o| o == "ro"));
+    }
+
+    #[test]
+    fn docker_mode_mounts_a_fresh_tmpfs_over_run() {
+        // #214: /run on the persistent rw disk let docker.pid/containerd.pid
+        // outlive an unclean stop; the reused low PIDs then made dockerd
+        // refuse to start. A tmpfs /run is fresh on every boot by construction.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut params = base_params(&img);
+        params.docker = true;
+        let spec = generate_spec(&params).unwrap();
+        let mounts = spec.mounts().as_ref().unwrap();
+        let runs: Vec<_> = mounts
+            .iter()
+            .filter(|m| m.destination().to_string_lossy() == DOCKER_RUN_TMPFS)
+            .collect();
+        assert_eq!(runs.len(), 1, "exactly one /run mount, got {runs:?}");
+        let run = runs[0];
+        assert_eq!(run.typ().as_deref(), Some("tmpfs"));
+        let opts = run.options().clone().unwrap_or_default();
+        for want in DOCKER_RUN_TMPFS_OPTIONS {
+            assert!(opts.iter().any(|o| o == want), "missing {want} in {opts:?}");
+        }
+        assert!(
+            !opts.iter().any(|o| o.starts_with("size=")),
+            "no size cap: only guest memory is at stake, got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn docker_run_tmpfs_precedes_every_mount_beneath_run() {
+        // crun applies `mounts` in array order: a tmpfs mounted AFTER a bind
+        // beneath /run would shadow that bind. Docker+VNC is the shape that
+        // has one (the VNC secrets at /run/izba/vnc-secrets).
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        let mut params = base_params(&img);
+        params.docker = true;
+        params.vnc = true;
+        let spec = generate_spec(&params).unwrap();
+        let mounts = spec.mounts().as_ref().unwrap();
+        let run_idx = mounts
+            .iter()
+            .position(|m| m.destination().to_string_lossy() == DOCKER_RUN_TMPFS)
+            .expect("/run tmpfs present");
+        let beneath: Vec<usize> = mounts
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.destination().to_string_lossy().starts_with("/run/"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !beneath.is_empty(),
+            "precondition: docker+vnc binds something beneath /run"
+        );
+        for i in beneath {
+            assert!(
+                i > run_idx,
+                "mount #{i} ({}) sits beneath /run but is ordered BEFORE the /run tmpfs (#{run_idx}); crun would mount the tmpfs over it",
+                mounts[i].destination().display()
+            );
+        }
+    }
+
+    #[test]
+    fn non_docker_spec_leaves_run_on_the_image_rootfs() {
+        // The fresh /run is docker-mode-only: every other sandbox keeps the
+        // OCI default (no /run mount), with or without a display.
+        let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
+        for vnc in [false, true] {
+            let mut params = base_params(&img);
+            params.vnc = vnc;
+            let spec = generate_spec(&params).unwrap();
+            assert!(
+                !spec
+                    .mounts()
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.destination().to_string_lossy() == DOCKER_RUN_TMPFS),
+                "non-docker (vnc={vnc}) spec must not mount /run"
+            );
+        }
     }
 
     #[test]
