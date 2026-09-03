@@ -160,14 +160,14 @@ async fn policy_allow(
 }
 
 #[tauri::command]
-async fn policy_block(
+async fn policy_revoke(
     state: State<'_, AppState>,
     name: String,
     host: String,
     port: u16,
 ) -> Result<(), String> {
     run_action(&state, move |d| {
-        commands::policy_block_core(d, &name, &host, port)
+        commands::policy_revoke_core(d, &name, &host, port)
     })
     .await
 }
@@ -221,13 +221,13 @@ async fn policy_git_allow(
 }
 
 #[tauri::command]
-async fn policy_git_block(
+async fn policy_git_revoke(
     state: State<'_, AppState>,
     name: String,
     target: String,
 ) -> Result<(), String> {
     run_action(&state, move |d| {
-        commands::policy_git_block_core(d, &name, &target)
+        commands::policy_git_revoke_core(d, &name, &target)
     })
     .await
 }
@@ -680,7 +680,7 @@ pub fn dispatch(
             &arg_str(&args, "host")?,
             arg_u16(&args, "port")?,
         )?),
-        "policy_block" => to_json(commands::policy_block_core(
+        "policy_revoke" => to_json(commands::policy_revoke_core(
             d,
             &arg_str(&args, "name")?,
             &arg_str(&args, "host")?,
@@ -728,7 +728,7 @@ pub fn dispatch(
                 write,
             )?)
         }
-        "policy_git_block" => to_json(commands::policy_git_block_core(
+        "policy_git_revoke" => to_json(commands::policy_git_revoke_core(
             d,
             &arg_str(&args, "name")?,
             &arg_str(&args, "target")?,
@@ -889,12 +889,12 @@ pub fn run() {
             read_netlog,
             policy_show,
             policy_allow,
-            policy_block,
+            policy_revoke,
             policy_set,
             policy_add_endpoints,
             policy_set_full,
             policy_git_allow,
-            policy_git_block,
+            policy_git_revoke,
             policy_set_enforce,
             inspect,
             stats,
@@ -1499,7 +1499,7 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn dispatch_policy_block_shows_up_in_policy_show() {
+    fn dispatch_policy_revoke_shows_up_in_policy_show() {
         let st = state_with(FakeDaemon::default());
         let mut emit = |_: &str, _: serde_json::Value| {};
         dispatch(
@@ -1511,7 +1511,7 @@ mod dispatch_tests {
         .unwrap();
         dispatch(
             &st,
-            "policy_block",
+            "policy_revoke",
             serde_json::json!({"name": "web", "host": "pypi.org", "port": 443}),
             &mut emit,
         )
@@ -1529,16 +1529,19 @@ mod dispatch_tests {
             .iter()
             .filter_map(|e| e["host"].as_str())
             .collect();
-        assert!(!hosts.contains(&"pypi.org"), "block not reflected: {shown}");
+        assert!(
+            !hosts.contains(&"pypi.org"),
+            "revoke not reflected: {shown}"
+        );
     }
 
     #[test]
-    fn dispatch_policy_block_and_set_accept_frontend_shapes() {
+    fn dispatch_policy_revoke_and_set_accept_frontend_shapes() {
         let st = state_with(FakeDaemon::default());
         let mut emit = |_: &str, _: serde_json::Value| {};
         dispatch(
             &st,
-            "policy_block",
+            "policy_revoke",
             serde_json::json!({"name": "web", "host": "evil.example", "port": 443}),
             &mut emit,
         )
@@ -1581,7 +1584,7 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn dispatch_policy_git_allow_block_round_trip() {
+    fn dispatch_policy_git_allow_revoke_round_trip() {
         // `target` is the raw glob string, exactly as ipc.ts sends it.
         let st = state_with(FakeDaemon::default());
         let mut emit = |_: &str, _: serde_json::Value| {};
@@ -1603,7 +1606,7 @@ mod dispatch_tests {
 
         dispatch(
             &st,
-            "policy_git_block",
+            "policy_git_revoke",
             serde_json::json!({"name": "web", "target": "github.com/o/r"}),
             &mut emit,
         )

@@ -60,7 +60,7 @@ pub trait DaemonApi: Send {
     /// Authorize `host:port`, then best-effort live-reload.
     fn policy_allow(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()>;
     /// Revoke `host:port`, then best-effort live-reload.
-    fn policy_block(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()>;
+    fn policy_revoke(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()>;
     /// Replace the allow-list wholesale, then best-effort live-reload.
     fn policy_set(
         &mut self,
@@ -85,7 +85,7 @@ pub trait DaemonApi: Send {
     /// Authorize a git target (`owner/repo` or bare hostname), then best-effort live-reload.
     fn policy_git_allow(&mut self, name: &str, target: &str, write: bool) -> anyhow::Result<()>;
     /// Revoke a git target, then best-effort live-reload.
-    fn policy_git_block(&mut self, name: &str, target: &str) -> anyhow::Result<()>;
+    fn policy_git_revoke(&mut self, name: &str, target: &str) -> anyhow::Result<()>;
     /// Set the enforcing flag, then best-effort live-reload.
     fn policy_set_enforce(&mut self, name: &str, on: bool) -> anyhow::Result<()>;
     /// Full sandbox detail (ports + volumes included).
@@ -371,8 +371,13 @@ impl DaemonApi for RealDaemon {
         })
     }
 
-    fn policy_block(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
+    fn policy_revoke(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
         self.edit_and_reload(name, |cfg| {
+            // `revoke` returns whether it actually removed a grant. The CLI
+            // (`izba policy revoke`) reports the no-op case to the user; the GUI
+            // deliberately does NOT yet — surfacing it needs a toast/UX decision
+            // that is out of scope for issue #150's rename. Discarded knowingly,
+            // not accidentally.
             let _ = cfg.revoke(host, port);
         })
     }
@@ -438,7 +443,7 @@ impl DaemonApi for RealDaemon {
         })
     }
 
-    fn policy_git_block(&mut self, name: &str, target: &str) -> anyhow::Result<()> {
+    fn policy_git_revoke(&mut self, name: &str, target: &str) -> anyhow::Result<()> {
         let gt = izba_core::daemon::egress::config::GitTarget::parse(target);
         self.edit_and_reload(name, move |cfg| {
             cfg.git_revoke(&gt);

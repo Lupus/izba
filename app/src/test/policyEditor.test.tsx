@@ -11,7 +11,7 @@ vi.mock("../lib/ipc", () => ({
     policySetFull: vi.fn(),
     policySetEnforce: vi.fn(),
     policyGitAllow: vi.fn(),
-    policyGitBlock: vi.fn(),
+    policyGitRevoke: vi.fn(),
   },
 }));
 

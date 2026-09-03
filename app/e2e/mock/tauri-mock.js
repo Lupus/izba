@@ -164,18 +164,12 @@
       case "policy_allow":
         calls.push("policy_allow:" + args.name + ":" + args.host + ":" + args.port);
         return action();
-      case "policy_block":
-        calls.push("policy_block:" + args.name + ":" + args.host + ":" + args.port);
+      case "policy_revoke":
+        calls.push("policy_revoke:" + args.name + ":" + args.host + ":" + args.port);
         return action();
       case "policy_set":
         calls.push("policy_set:" + args.name);
         return action();
-      case "policy_enable":
-        calls.push("policy_enable:" + args.name);
-        return scenario.failAction
-          ? err(scenario.errorMessage || "action failed")
-          : Promise.resolve(scenario.policyEnableCount || 0);
-
       case "shell_open":
         calls.push("shell_open:" + args.name + ":" + args.id);
         return action();
