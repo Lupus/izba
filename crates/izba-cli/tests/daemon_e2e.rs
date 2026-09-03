@@ -1623,6 +1623,29 @@ fn docker_diag(data: &Path, name: &str) -> String {
     );
     out.push_str(&stdout_of(&o));
     out.push_str(&String::from_utf8_lossy(&o.stderr));
+
+    // Host-side VMM/sidecar logs: the guest-only diagnostics above can't say
+    // whether a virtiofsd sidecar was slow to bind its socket or died
+    // outright before ever binding it.
+    let logs_dir = data.join("sandboxes").join(name).join("logs");
+    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n == "vmm.log" || n.starts_with("virtiofsd-"))
+            .collect();
+        names.sort();
+        for n in names {
+            let path = logs_dir.join(&n);
+            out.push_str(&format!("\n--- host {n} (last 15 lines) ---\n"));
+            if let Ok(txt) = std::fs::read_to_string(&path) {
+                let lines: Vec<&str> = txt.lines().collect();
+                let start = lines.len().saturating_sub(15);
+                out.push_str(&lines[start..].join("\n"));
+                out.push('\n');
+            }
+        }
+    }
     out
 }
 
@@ -1801,6 +1824,19 @@ fn docker_publish_reaches_inner_container() {
         wait_pid_dead(vmm_pid, Duration::from_secs(10)),
         "VMM pid {vmm_pid} neither gone nor zombie 10s after SIGKILL"
     );
+    // The crashed run's sidecars (virtiofsd, one per share) die with their
+    // vhost-user peer — zombies within a fraction of a second on a quiet
+    // host — but a loaded CI runner can lag. A host reboot leaves no
+    // sidecars behind at all, so waiting them out keeps the restart below
+    // faithful to the scenario instead of racing the previous run's
+    // teardown.
+    for (role, id) in &st.sidecar_pids {
+        assert!(
+            wait_pid_dead(id.pid, Duration::from_secs(30)),
+            "sidecar {role} pid {} neither gone nor zombie 30s after the VMM was killed",
+            id.pid
+        );
+    }
     let o = izba(&data, no_env, &["start", name]);
     assert!(
         o.status.success(),
