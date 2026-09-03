@@ -52,7 +52,7 @@
 
 Why extend rather than add a test: a docker-mode sandbox is the most expensive thing the suite boots (2 vCPU / 2 GiB, dind pull + nested nginx pull), and the unclean-stop sequence needs exactly the state phases `[1]`–`[3]` already build. Phases are numbered and commented, matching the file's house style.
 
-- [ ] **Step 1: Add the two helpers** right after `fn daemon_pid` (near line 69):
+- [ ] **Step 1: Add the two helpers (`kill9`, `wait_pid_dead`)** right after `fn daemon_pid` (near line 69):
 
 ```rust
 /// SIGKILL a host process — the e2e's stand-in for an unclean stop (daemon
@@ -71,13 +71,23 @@ fn kill9(pid: u32) {
     );
 }
 
-/// Wait until `/proc/<pid>` is gone (the process was reaped), so a
-/// following `izba start` sees a dead VMM rather than a dying one.
-fn wait_pid_gone(pid: u32, within: Duration) -> bool {
+/// Wait until the process is dead for izba's purposes: `/proc/<pid>/stat`
+/// gone, or state `Z`. izbad never `wait(2)`s the VMMs it spawns (see
+/// `procmgr::unix::spawn_detached`), so a SIGKILLed VMM lingers as a zombie
+/// until the daemon exits — and izba's own `pid_alive` treats `Z` as dead.
+fn wait_pid_dead(pid: u32, within: Duration) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
-        if !Path::new(&format!("/proc/{pid}")).exists() {
-            return true;
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => return true,
+            Ok(s) => {
+                // The state field follows the parenthesised comm (which may
+                // itself contain spaces/parens): find the LAST ')'.
+                let after = s.rfind(')').map(|i| i + 2).unwrap_or(0);
+                if s.get(after..).is_some_and(|rest| rest.starts_with('Z')) {
+                    return true;
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -112,10 +122,20 @@ fn wait_pid_gone(pid: u32, within: Duration) -> bool {
         .expect("read state.json")
         .expect("state.json present while running");
     let vmm_pid = st.vmm_pid.pid;
+    // Flush the guest's page cache first. A host reboot hours later finds
+    // everything on disk, but a SIGKILL seconds after boot races ext4
+    // writeback — dockerd's pid files can still be dirty guest pages, the
+    // next boot then finds them empty, and the test passes for the wrong
+    // reason (verified on a real VM: without this sync the engine sometimes
+    // comes back; with it, dockerd refuses on the persisted pidfile).
+    assert_ok(
+        &izba(&data, no_env, &["exec", name, "--", "sync"]),
+        "sync before the unclean stop",
+    );
     kill9(vmm_pid);
     assert!(
-        wait_pid_gone(vmm_pid, Duration::from_secs(10)),
-        "VMM pid {vmm_pid} still present 10s after SIGKILL"
+        wait_pid_dead(vmm_pid, Duration::from_secs(10)),
+        "VMM pid {vmm_pid} neither gone nor zombie 10s after SIGKILL"
     );
     let o = izba(&data, no_env, &["start", name]);
     assert!(
@@ -510,4 +530,20 @@ Closes #214"
 
 - **Spec coverage:** AC1 (unclean stop → `izba start` → engine up) = Task 1 phases `[5]`/`[6]` + Task 2 fix. AC2 (containerd.pid layer) = `docker info` only succeeds once containerd is up + the `is still running` log assertion covers both refusals. AC3 (symlink images still work) = phase `[7]` proves `/var/run → /run` on the Alpine dind image and that the engine works on it. AC4 (non-pid state preserved) = phase `[6b]` (`docker ps -a` still lists the pre-kill container). AC5 (e2e coverage) = Task 1. Out-of-scope items untouched: no auto-restart, nothing deleted from the rw disk, #207 untouched.
 - **Placeholder scan:** none.
-- **Type consistency:** `DOCKER_RUN_TMPFS`, `DOCKER_RUN_TMPFS_OPTIONS`, `add_docker_run_tmpfs` named identically across Task 2's steps and CLAUDE.md; `kill9`/`wait_pid_gone` used only in Task 1; `nested_id` defined in phase `[3]` before its use in `[6b]`.
+- **Type consistency:** `DOCKER_RUN_TMPFS`, `DOCKER_RUN_TMPFS_OPTIONS`, `add_docker_run_tmpfs` named identically across Task 2's steps and CLAUDE.md; `kill9`/`wait_pid_dead`/the pre-kill `sync` used only in Task 1; `nested_id` defined in phase `[3]` before its use in `[6b]`.
+
+## As-shipped amendments
+
+- **`wait_pid_gone` → `wait_pid_dead`:** izbad never `wait(2)`s the VMMs it
+  spawns (`procmgr::unix::spawn_detached`), so a SIGKILLed VMM lingers as a
+  zombie with a live `/proc/<pid>` — the plan's original helper, which only
+  checked for `/proc/<pid>`'s absence, would have hung until its deadline on
+  every run. The shipped helper mirrors `procmgr::unix::pid_alive` and treats
+  state `Z` (zombie) as dead, matching how izba itself judges the VMM.
+- **The in-guest `sync` before the SIGKILL:** a kill seconds after boot races
+  ext4 writeback — dockerd's pid file can still be sitting in dirty guest page
+  cache, so the next boot finds it empty and the reproduction passes for the
+  wrong reason (nondeterministically, since it depends on writeback timing).
+  Flushing with `sync` immediately before `kill9` makes the refusal reproduce
+  every time and honestly models the real #214 scenario, where the unclean
+  stop is a host reboot hours later — long past any writeback race.
