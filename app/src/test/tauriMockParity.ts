@@ -53,10 +53,24 @@ export function parseRegisteredCommands(librs: string): string[] {
     .filter((s) => s.length > 0);
 }
 
-/** `case "<label>":` string literals, minus the `plugin:…` Tauri-plugin arms. */
+/** The dispatcher tauri-mock.js's `switch (cmd)` lives inside. Anchoring the
+ *  scan here (rather than the whole file) keeps a stray `case "…":` in setup
+ *  code, a comment, or a future second switch from being mistaken for a
+ *  mocked command. */
+const DISPATCHER_ANCHOR = "internals.invoke = function (cmd, args) {";
+
+/** `case "<label>":` string literals from the dispatcher switch onward, minus
+ *  the `plugin:…` Tauri-plugin arms. Throws if the dispatcher anchor is
+ *  absent — a broken anchor must fail loudly, never silently parse zero. */
 export function parseMockedCommands(mockjs: string): string[] {
+  const stripped = stripComments(mockjs);
+  const anchorAt = stripped.indexOf(DISPATCHER_ANCHOR);
+  if (anchorAt === -1) {
+    throw new Error(`dispatcher anchor "${DISPATCHER_ANCHOR}" (internals.invoke) not found in mock source`);
+  }
+  const dispatcher = stripped.slice(anchorAt);
   const seen = new Set<string>();
-  for (const m of stripComments(mockjs).matchAll(/case\s+"([^"]+)"\s*:/g)) {
+  for (const m of dispatcher.matchAll(/case\s+"([^"]+)"\s*:/g)) {
     const label = m[1];
     if (label.includes(":")) continue; // plugin:event|listen etc.
     seen.add(label);

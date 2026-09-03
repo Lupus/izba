@@ -45,9 +45,15 @@ describe("parseRegisteredCommands", () => {
   });
 });
 
+// Real dispatcher anchor tauri-mock.js opens its switch with; parseMockedCommands
+// only scans from this point onward (see the "scans only the dispatcher" tests
+// below), so every other synthetic source in this describe carries it too.
+const ANCHOR = "internals.invoke = function (cmd, args) {";
+
 describe("parseMockedCommands", () => {
   it("extracts case labels and skips the plugin:event arms", () => {
     const src = `
+      ${ANCHOR}
       switch (cmd) {
         case "plugin:event|listen": { return 1; }
         case "plugin:event|emit":
@@ -65,11 +71,12 @@ describe("parseMockedCommands", () => {
   });
 
   it("de-duplicates a label that appears twice", () => {
-    expect(parseMockedCommands('case "a": case "a": case "b":')).toEqual(["a", "b"]);
+    expect(parseMockedCommands(ANCHOR + 'case "a": case "a": case "b":')).toEqual(["a", "b"]);
   });
 
   it("ignores a line-commented and a block-commented case label", () => {
     const src = `
+      ${ANCHOR}
       switch (cmd) {
         // case "usb_detach":
         /* case "policy_enable": */
@@ -79,6 +86,36 @@ describe("parseMockedCommands", () => {
           return 0;
       }`;
     expect(parseMockedCommands(src)).toEqual(["list"]);
+  });
+
+  it("ignores a case label before the dispatcher anchor", () => {
+    const src = `
+      switch (setup) {
+        case "before_anchor":
+          return 0;
+      }
+      ${ANCHOR}
+      switch (cmd) {
+        case "list":
+          return 1;
+      }`;
+    expect(parseMockedCommands(src)).toEqual(["list"]);
+  });
+
+  it("counts a case label after the dispatcher anchor", () => {
+    const src = `
+      ${ANCHOR}
+      switch (cmd) {
+        case "list":
+          return 1;
+        case "after_anchor":
+          return 2;
+      }`;
+    expect(parseMockedCommands(src)).toEqual(["list", "after_anchor"]);
+  });
+
+  it("throws when the dispatcher anchor is absent", () => {
+    expect(() => parseMockedCommands('case "list": return 1;')).toThrow(/internals\.invoke/);
   });
 });
 
@@ -123,8 +160,11 @@ describe("parity guard: lib.rs generate_handler![] vs e2e/mock/tauri-mock.js", (
     expect(mocked.length).toBeGreaterThanOrEqual(MIN_PLAUSIBLE_COMMANDS);
   });
 
-  it("every allowlist entry names a real registered command", () => {
-    for (const cmd of INTENTIONALLY_UNMOCKED) expect(registered).toContain(cmd);
+  it("every allowlist entry names a registered command that is still unmocked", () => {
+    for (const cmd of INTENTIONALLY_UNMOCKED) {
+      expect(registered).toContain(cmd);
+      expect(mocked).not.toContain(cmd);
+    }
   });
 
   it("every registered command has a mock case (or is explicitly allowlisted)", () => {
