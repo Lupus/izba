@@ -34,15 +34,39 @@ pub enum PolicyCmd {
         #[arg(long)]
         read: bool,
     },
-    /// Remove HOST from the allow-list. A bare HOST removes the web ports (80 + 443); HOST:PORT removes exactly that port; auto-reloads.
+    /// Remove HOST from the sandbox's allow-list. This is NOT a deny rule and blocks nothing by itself:
+    /// it withdraws an exception, so what happens to the host afterwards is decided entirely by the enforce posture —
+    /// with `izba policy enforce NAME off` (the default) every destination stays reachable, and only with it `on` does an un-allowed host become unreachable.
+    /// (This verb was called `block` before izba #150; that spelling still works, hidden and deprecated, and never created a deny rule either.)
+    /// A bare HOST removes the web ports (80 + 443); HOST:PORT removes exactly that port; auto-reloads.
     /// `*.HOST` matches exactly one subdomain label and `**.HOST` matches any depth; the apex HOST is never matched by a wildcard and needs its own entry.
+    /// Removing nothing is reported and exits non-zero, so a typo cannot read as a successful withdrawal.
+    Revoke {
+        /// Sandbox name (or dir)
+        name: String,
+        /// Destination to remove: HOST, *.HOST, **.HOST, or HOST:PORT (bare host = web ports 80+443; :PORT = exactly that port)
+        target: String,
+    },
+    /// Deprecated spelling of `revoke`. Hidden; prints a deprecation note to
+    /// stderr and performs the identical operation.
+    #[command(hide = true)]
     Block {
         /// Sandbox name (or dir)
         name: String,
         /// Destination to remove: HOST, *.HOST, **.HOST, or HOST:PORT (bare host = web ports 80+443; :PORT = exactly that port)
         target: String,
     },
-    /// Seed the allow-list from the sandbox's currently-allowed traffic, then reload
+    /// Seed the allow-list from the endpoints this sandbox was already observed reaching (its egress audit log), then reload.
+    /// This DOES NOT turn the firewall on: it only adds allow-list entries, and an allow-list restricts nothing until enforcement is on — run `izba policy enforce NAME on` for that.
+    /// The usual order is: run the sandbox with enforcement off, `izba policy seed NAME` to capture what it actually needed, review `izba policy show NAME`, then `izba policy enforce NAME on`.
+    /// (This verb was called `enable` before izba #150; that spelling still works, hidden and deprecated, and never enabled enforcement either.)
+    Seed {
+        /// Sandbox name (or dir)
+        name: String,
+    },
+    /// Deprecated spelling of `seed`. Hidden; prints a deprecation note to
+    /// stderr and performs the identical operation.
+    #[command(hide = true)]
     Enable {
         /// Sandbox name (or dir)
         name: String,
@@ -90,7 +114,19 @@ pub enum GitSub {
         #[arg(long)]
         write: bool,
     },
-    /// Remove a git rule for REPO/HOST
+    /// Remove a git rule for REPO/HOST. This is NOT a deny rule and blocks nothing by itself:
+    /// it withdraws an exception, and whether the target then becomes unreachable is decided by the enforce posture (`izba policy enforce NAME on|off`).
+    /// (This verb was called `block` before izba #150; that spelling still works, hidden and deprecated, and never created a deny rule either.)
+    /// Removing nothing is reported and exits non-zero.
+    Revoke {
+        /// Sandbox name (or dir)
+        name: String,
+        /// Git target to remove: REPO (host/owner/repo) or HOST
+        target: String,
+    },
+    /// Deprecated spelling of `revoke`. Hidden; prints a deprecation note to
+    /// stderr and performs the identical operation.
+    #[command(hide = true)]
     Block {
         /// Sandbox name (or dir)
         name: String,
@@ -119,14 +155,22 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             maybe_reload(paths, name);
             Ok(0)
         }
+        PolicyCmd::Revoke { name, target } => revoke(paths, name, target),
         PolicyCmd::Block { name, target } => {
-            let dir = require_sandbox_dir(paths, name)?;
-            let (host, ports) = parse_target(target)?;
-            apply_block_edit(&dir, &host, &ports)?;
-            maybe_reload(paths, name);
-            Ok(0)
+            eprintln!(
+                "{}",
+                deprecation_note("izba policy block", "izba policy revoke")
+            );
+            revoke(paths, name, target)
         }
-        PolicyCmd::Enable { name } => enable(paths, name),
+        PolicyCmd::Seed { name } => seed(paths, name),
+        PolicyCmd::Enable { name } => {
+            eprintln!(
+                "{}",
+                deprecation_note("izba policy enable", "izba policy seed")
+            );
+            seed(paths, name)
+        }
         PolicyCmd::Reload { name } => reload(paths, name),
         PolicyCmd::Git(GitSub::Allow {
             name,
@@ -147,14 +191,13 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             maybe_reload(paths, name);
             Ok(0)
         }
+        PolicyCmd::Git(GitSub::Revoke { name, target }) => git_revoke(paths, name, target),
         PolicyCmd::Git(GitSub::Block { name, target }) => {
-            let gt = GitTarget::parse(target);
-            let dir = require_sandbox_dir(paths, name)?;
-            edit_policy_file(&dir, |c| {
-                c.git_revoke(&gt);
-            })?;
-            maybe_reload(paths, name);
-            Ok(0)
+            eprintln!(
+                "{}",
+                deprecation_note("izba policy git block", "izba policy git revoke")
+            );
+            git_revoke(paths, name, target)
         }
         PolicyCmd::Enforce { name, state } => {
             let on = matches!(state, EnforceState::On);
@@ -231,21 +274,25 @@ pub(crate) fn apply_allow_edit(
     })
 }
 
-/// The daemon-free core of `policy block`: persist the port removal(s) to
-/// `policy.yaml`. (The `allow` side is inlined in `run()`'s `Allow` arm as a
+/// The daemon-free core of `policy revoke`: persist the port removal(s) to
+/// `policy.yaml`, reporting whether ANY of them removed something. The
+/// changed-bool is load-bearing (dogfood C6): a removal that removes nothing
+/// must not print the same success line as a real one, or a typo'd host reads
+/// as a withdrawal that never happened. (The `allow` side is inlined in `run()`'s `Allow` arm as a
 /// single `edit_policy_file` closure — see the comment there — so this is
 /// block-only now; it used to be a shared `Edit::{Allow,Block}` dispatcher.)
-pub(crate) fn apply_block_edit(
+pub(crate) fn apply_revoke_edit(
     sandbox_dir: &std::path::Path,
     host: &str,
     ports: &[u16],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    let mut removed = false;
     edit_policy_file(sandbox_dir, |cfg| {
         for &port in ports {
-            let _ = cfg.revoke(host, port);
+            removed |= cfg.revoke(host, port);
         }
     })?;
-    Ok(())
+    Ok(removed)
 }
 
 /// The loud access-grant echo for `policy allow` (#149): one line per
@@ -465,7 +512,78 @@ fn render_policy(name: &str, cfg: Option<&EgressPolicyConfig>) -> String {
     out
 }
 
-fn enable(paths: &Paths, name: &str) -> anyhow::Result<i32> {
+/// The stderr note a deprecated spelling prints before doing the work (#150).
+///
+/// Pure builder (same pattern as `reload_message`) so the promise — that the
+/// note names BOTH the spelling the user typed and the one to type instead —
+/// is unit-testable. Written to stderr by the caller, never stdout: the
+/// command still succeeds, and a script parsing its output must not start
+/// seeing an extra line.
+fn deprecation_note(old: &str, new: &str) -> String {
+    format!(
+        "warning: `{old}` is deprecated and will be removed in a future release; use `{new}` \
+         instead — the new name states what the command actually does (`{new} --help`)"
+    )
+}
+
+/// What `policy revoke` prints when it removed nothing (dogfood C6). Names the
+/// host AND the ports it looked for — a bare HOST searches 80 + 443, which is
+/// often not the port the user had in mind. Pure builder; the caller writes it
+/// to stderr and exits non-zero.
+fn revoke_nothing_message(host: &str, ports: &[u16]) -> String {
+    let ports = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "nothing to revoke: '{host}' is not on the allow-list for port(s) [{ports}] — the \
+         policy is unchanged (`izba policy show NAME` lists what is allowed)"
+    )
+}
+
+/// The git mirror of `revoke_nothing_message`.
+fn git_revoke_nothing_message(target: &str) -> String {
+    format!(
+        "nothing to revoke: no git rule for '{target}' — the policy is unchanged \
+         (`izba policy show NAME` lists the git rules)"
+    )
+}
+
+/// `policy revoke`: remove the port(s) from the allow-list, then reload.
+///
+/// A removal that removed nothing exits 1 and never reaches `maybe_reload`, so
+/// the success line ("reloaded egress policy …" / "policy updated …") is said
+/// only when something really was withdrawn.
+fn revoke(paths: &Paths, name: &str, target: &str) -> anyhow::Result<i32> {
+    let dir = require_sandbox_dir(paths, name)?;
+    let (host, ports) = parse_target(target)?;
+    if !apply_revoke_edit(&dir, &host, &ports)? {
+        eprintln!("{}", revoke_nothing_message(&host, &ports));
+        return Ok(1);
+    }
+    maybe_reload(paths, name);
+    Ok(0)
+}
+
+/// `policy git revoke`: remove the git rule, then reload. Same no-op contract
+/// as `revoke`.
+fn git_revoke(paths: &Paths, name: &str, target: &str) -> anyhow::Result<i32> {
+    let gt = GitTarget::parse(target);
+    let dir = require_sandbox_dir(paths, name)?;
+    let mut removed = false;
+    edit_policy_file(&dir, |c| {
+        removed = c.git_revoke(&gt);
+    })?;
+    if !removed {
+        eprintln!("{}", git_revoke_nothing_message(target));
+        return Ok(1);
+    }
+    maybe_reload(paths, name);
+    Ok(0)
+}
+
+fn seed(paths: &Paths, name: &str) -> anyhow::Result<i32> {
     use izba_core::daemon::egress::audit::{aggregate, parse_line};
     let dir = require_sandbox_dir(paths, name)?;
     let audit_path = paths.logs_dir(name).join("egress-audit.jsonl");
@@ -909,7 +1027,7 @@ mod tests {
         assert!(
             out.contains("widen to read-write"),
             "`policy show` and the app's Policy tab both say `widen to read-write` \
-             about this same state \u{2014} do not describe one policy in two ways: {out}"
+             about this same state — do not describe one policy in two ways: {out}"
         );
         assert!(
             !out.contains(":80 protocol") && !out.contains(":8443 protocol"),
@@ -1008,6 +1126,421 @@ mod tests {
         assert!(matches!(state, EnforceState::On));
     }
 
+    // ── #150: verbs that name what they do ────────────────────────────────
+    //
+    // `block` did not create a deny rule and `enable` did not turn the
+    // firewall on. In a security product a verb that names an effect it does
+    // not have is a false confirmation, so the canonical spellings are
+    // `revoke` (remove an allow-list entry) and `seed` (seed the allow-list
+    // from observed traffic). The old spellings keep working for one release
+    // as HIDDEN deprecated subcommands.
+
+    #[test]
+    fn parse_policy_revoke() {
+        use clap::Parser;
+        let cli =
+            crate::Cli::try_parse_from(["izba", "policy", "revoke", "web", "api.x.com"]).unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Revoke { name, target }) = cli.cmd else {
+            panic!("expected policy revoke");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(target, "api.x.com");
+    }
+
+    #[test]
+    fn parse_policy_seed() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["izba", "policy", "seed", "web"]).unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Seed { name }) = cli.cmd else {
+            panic!("expected policy seed");
+        };
+        assert_eq!(name, "web");
+    }
+
+    #[test]
+    fn parse_policy_git_revoke() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "izba",
+            "policy",
+            "git",
+            "revoke",
+            "web",
+            "github.com/foo/bar",
+        ])
+        .unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Git(GitSub::Revoke { name, target })) = cli.cmd else {
+            panic!("expected policy git revoke");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(target, "github.com/foo/bar");
+    }
+
+    /// The three old spellings must keep parsing — to their own DEPRECATED
+    /// variants, not to the canonical ones. A clap `alias` would be
+    /// indistinguishable from the canonical name at parse time and could not
+    /// carry a deprecation note, so the aliasing is done with separate hidden
+    /// variants.
+    #[test]
+    fn the_old_spellings_still_parse_to_the_deprecated_variants() {
+        use clap::Parser;
+
+        let cli =
+            crate::Cli::try_parse_from(["izba", "policy", "block", "web", "api.x.com"]).unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Block { name, target }) = cli.cmd else {
+            panic!("expected the deprecated policy block variant");
+        };
+        assert_eq!((name.as_str(), target.as_str()), ("web", "api.x.com"));
+
+        let cli = crate::Cli::try_parse_from(["izba", "policy", "enable", "web"]).unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Enable { name }) = cli.cmd else {
+            panic!("expected the deprecated policy enable variant");
+        };
+        assert_eq!(name, "web");
+
+        let cli = crate::Cli::try_parse_from([
+            "izba",
+            "policy",
+            "git",
+            "block",
+            "web",
+            "github.com/foo/bar",
+        ])
+        .unwrap();
+        let crate::Cmd::Policy(PolicyCmd::Git(GitSub::Block { name, target })) = cli.cmd else {
+            panic!("expected the deprecated policy git block variant");
+        };
+        assert_eq!(
+            (name.as_str(), target.as_str()),
+            ("web", "github.com/foo/bar")
+        );
+    }
+
+    /// The deprecated spellings must not be advertised: `policy --help` (and
+    /// `policy git --help`) list the canonical verbs only, so nobody learns
+    /// the misnamed one from izba itself. Matched against the COMMAND LIST
+    /// (a two-space-indented entry), not the whole help text — several
+    /// subcommands legitimately use the words "block"/"enable" in prose.
+    #[test]
+    fn help_advertises_the_new_verbs_and_hides_the_deprecated_ones() {
+        use clap::Subcommand;
+
+        fn listed(cmd: &mut clap::Command) -> Vec<String> {
+            cmd.render_long_help()
+                .to_string()
+                .lines()
+                .filter_map(|l| {
+                    let rest = l.strip_prefix("  ")?;
+                    let name = rest.split_whitespace().next()?;
+                    (!rest.starts_with(' ') && rest.starts_with(name)).then(|| name.to_string())
+                })
+                .collect()
+        }
+
+        let mut cmd = PolicyCmd::augment_subcommands(clap::Command::new("policy"));
+        let names = listed(&mut cmd);
+        assert!(names.iter().any(|n| n == "revoke"), "revoke: {names:?}");
+        assert!(names.iter().any(|n| n == "seed"), "seed: {names:?}");
+        assert!(
+            !names.iter().any(|n| n == "block"),
+            "the deprecated `block` must be hidden: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "enable"),
+            "the deprecated `enable` must be hidden: {names:?}"
+        );
+
+        let mut git = PolicyCmd::augment_subcommands(clap::Command::new("policy"))
+            .find_subcommand("git")
+            .expect("policy git is wired up")
+            .clone();
+        let git_names = listed(&mut git);
+        assert!(
+            git_names.iter().any(|n| n == "revoke"),
+            "git revoke: {git_names:?}"
+        );
+        assert!(
+            !git_names.iter().any(|n| n == "block"),
+            "the deprecated `git block` must be hidden: {git_names:?}"
+        );
+    }
+
+    /// #150 is a NAMING bug, so the help is the fix's other half: `revoke`
+    /// must state the non-effect the old `block` spelling implied. Removing an
+    /// allow-list entry is not a deny rule — with enforcement off nothing is
+    /// denied at all, and with it on the host merely stops being excepted.
+    #[test]
+    fn revoke_long_help_says_it_is_not_a_deny_rule() {
+        use clap::Subcommand;
+
+        let mut revoke = PolicyCmd::augment_subcommands(clap::Command::new("policy"))
+            .find_subcommand("revoke")
+            .expect("policy revoke is wired up")
+            .clone();
+        let help = revoke.render_long_help().to_string().to_lowercase();
+        assert!(
+            help.contains("allow-list"),
+            "say what it actually edits: {help}"
+        );
+        assert!(
+            help.contains("not a deny rule"),
+            "say plainly that this is not a deny rule: {help}"
+        );
+        assert!(
+            help.contains("enforce"),
+            "name the verb that decides whether anything is denied: {help}"
+        );
+    }
+
+    /// `policy git block` was the same misnomer, so `git revoke` owes the same
+    /// statement: removing a git rule withdraws an exception, it does not deny
+    /// anything.
+    #[test]
+    fn git_revoke_long_help_says_it_is_not_a_deny_rule() {
+        use clap::Subcommand;
+
+        let mut revoke = PolicyCmd::augment_subcommands(clap::Command::new("policy"))
+            .find_subcommand("git")
+            .expect("policy git is wired up")
+            .find_subcommand("revoke")
+            .expect("policy git revoke is wired up")
+            .clone();
+        let help = revoke.render_long_help().to_string().to_lowercase();
+        assert!(
+            help.contains("not a deny rule"),
+            "say plainly that this is not a deny rule: {help}"
+        );
+        assert!(
+            help.contains("enforce"),
+            "name the verb that decides whether anything is denied: {help}"
+        );
+    }
+
+    /// The mirror for `seed`: the old `enable` spelling read as "turn the
+    /// firewall on", which is `enforce on`. The help must deny that reading
+    /// and name the verb that does it.
+    #[test]
+    fn seed_long_help_says_it_does_not_turn_the_firewall_on() {
+        use clap::Subcommand;
+
+        let mut seed = PolicyCmd::augment_subcommands(clap::Command::new("policy"))
+            .find_subcommand("seed")
+            .expect("policy seed is wired up")
+            .clone();
+        let help = seed.render_long_help().to_string().to_lowercase();
+        assert!(
+            help.contains("does not turn the firewall on"),
+            "deny the reading the old `enable` spelling invited: {help}"
+        );
+        assert!(
+            help.contains("izba policy enforce"),
+            "name the verb that does turn it on: {help}"
+        );
+    }
+
+    /// The deprecated spellings keep working for one release, but silently
+    /// would be the worst of both worlds: the user keeps believing `block`
+    /// blocks. The note must name BOTH the spelling they typed and the one to
+    /// type instead. Pure builder, like `reload_message`.
+    #[test]
+    fn deprecation_note_names_both_the_old_and_the_new_verb() {
+        let note = deprecation_note("izba policy block", "izba policy revoke");
+        assert!(
+            note.contains("izba policy block"),
+            "name the spelling they typed: {note}"
+        );
+        assert!(
+            note.contains("izba policy revoke"),
+            "name the spelling to use instead: {note}"
+        );
+        assert!(
+            note.to_lowercase().contains("deprecat"),
+            "say it is deprecated: {note}"
+        );
+
+        // Not hard-wired to one pair.
+        let git = deprecation_note("izba policy git block", "izba policy git revoke");
+        assert!(git.contains("izba policy git block") && git.contains("izba policy git revoke"));
+        assert_ne!(note, git, "the note must be built from its arguments");
+    }
+
+    // ── #150 / dogfood C6: a removal that removes nothing ─────────────────
+    //
+    // `apply_revoke_edit` used to discard `cfg.revoke`'s changed-bool and call
+    // `maybe_reload` unconditionally, so `izba policy revoke NAME typo.example`
+    // printed exactly what a successful withdrawal printed. A user who
+    // mistypes then believes they revoked access they still grant — the same
+    // class of false confirmation as the verb name itself.
+
+    #[test]
+    fn apply_revoke_edit_reports_whether_anything_was_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        allow_ports(dir.path(), "api.x.com", &[80, 443]).unwrap();
+
+        assert!(
+            apply_revoke_edit(dir.path(), "api.x.com", &[443]).unwrap(),
+            "removing a granted port must report a change"
+        );
+        assert!(
+            !apply_revoke_edit(dir.path(), "typo.example", &[80, 443]).unwrap(),
+            "a host that was never allowed must report no change"
+        );
+        assert!(
+            !apply_revoke_edit(dir.path(), "api.x.com", &[8443]).unwrap(),
+            "a port that was never granted must report no change"
+        );
+        assert!(
+            apply_revoke_edit(dir.path(), "api.x.com", &[80]).unwrap(),
+            "the port that IS granted still reports a change"
+        );
+    }
+
+    /// The no-op report must name what was looked for, so the user can see
+    /// their typo (and, for a bare host, that the search covered 80 + 443
+    /// rather than the port they had in mind).
+    #[test]
+    fn revoke_nothing_message_names_the_host_and_the_ports() {
+        let msg = revoke_nothing_message("typo.example", &[80, 443]);
+        assert!(msg.contains("typo.example"), "name the host: {msg}");
+        assert!(
+            msg.contains("80") && msg.contains("443"),
+            "name the ports it looked for: {msg}"
+        );
+
+        let one = revoke_nothing_message("api.x.com", &[8443]);
+        assert!(one.contains("api.x.com") && one.contains("8443"), "{one}");
+        assert!(
+            !one.contains("443,"),
+            "only the ports it actually looked for: {one}"
+        );
+
+        let git = git_revoke_nothing_message("github.com/foo/bar");
+        assert!(
+            git.contains("github.com/foo/bar"),
+            "name the git target: {git}"
+        );
+    }
+
+    /// Through the full `run()` entry point: a removal that removes nothing
+    /// exits 1, a removal that removes something exits 0.
+    #[test]
+    fn revoke_exit_code_reports_whether_anything_was_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        run(
+            &paths,
+            &PolicyCmd::Allow {
+                name: "web".into(),
+                target: "api.x.com".into(),
+                read: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            run(
+                &paths,
+                &PolicyCmd::Revoke {
+                    name: "web".into(),
+                    target: "typo.example".into(),
+                },
+            )
+            .unwrap(),
+            1,
+            "revoking a host that is not on the allow-list must fail"
+        );
+        assert_eq!(
+            run(
+                &paths,
+                &PolicyCmd::Revoke {
+                    name: "web".into(),
+                    target: "api.x.com".into(),
+                },
+            )
+            .unwrap(),
+            0,
+            "a real removal must succeed"
+        );
+        // ...and it really was removed.
+        let cfg = EgressPolicyConfig::load(&paths.sandbox_dir("web"))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.allow.is_empty(), "{:?}", cfg.allow);
+
+        // The deprecated spelling behaves identically.
+        assert_eq!(
+            run(
+                &paths,
+                &PolicyCmd::Block {
+                    name: "web".into(),
+                    target: "api.x.com".into(),
+                },
+            )
+            .unwrap(),
+            1,
+            "the deprecated alias must report the no-op the same way"
+        );
+    }
+
+    /// The git half of the same contract.
+    #[test]
+    fn git_revoke_exit_code_reports_whether_anything_was_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.sandbox_dir("web")).unwrap();
+        run(
+            &paths,
+            &PolicyCmd::Git(GitSub::Allow {
+                name: "web".into(),
+                target: "github.com/o/a".into(),
+                write: false,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            run(
+                &paths,
+                &PolicyCmd::Git(GitSub::Revoke {
+                    name: "web".into(),
+                    target: "github.com/o/b".into(),
+                }),
+            )
+            .unwrap(),
+            1,
+            "a git rule that does not exist must not report success"
+        );
+        assert_eq!(
+            run(
+                &paths,
+                &PolicyCmd::Git(GitSub::Revoke {
+                    name: "web".into(),
+                    target: "github.com/o/a".into(),
+                }),
+            )
+            .unwrap(),
+            0,
+        );
+        let cfg = EgressPolicyConfig::load(&paths.sandbox_dir("web"))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.git.is_empty(), "{:?}", cfg.git);
+
+        assert_eq!(
+            run(
+                &paths,
+                &PolicyCmd::Git(GitSub::Block {
+                    name: "web".into(),
+                    target: "github.com/o/a".into(),
+                }),
+            )
+            .unwrap(),
+            1,
+            "the deprecated alias must report the no-op the same way"
+        );
+    }
+
     #[test]
     fn parse_target_bare_host_means_web_ports() {
         // a bare host must mean the same thing it means in policy.yaml
@@ -1031,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_allow_and_block_are_symmetric_web_ports() {
+    fn bare_allow_and_revoke_are_symmetric_web_ports() {
         use izba_core::daemon::egress::config::EgressPolicyConfig;
         let dir = tempfile::tempdir().unwrap();
         allow_ports(dir.path(), "api.x.com", &[80, 443]).unwrap();
@@ -1044,18 +1577,18 @@ mod tests {
                 access: Access::ReadWrite,
             }
         );
-        apply_block_edit(dir.path(), "api.x.com", &[80, 443]).unwrap();
+        apply_revoke_edit(dir.path(), "api.x.com", &[80, 443]).unwrap();
         let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
         assert!(cfg.allow.is_empty());
     }
 
     #[test]
-    fn bare_block_leaves_explicitly_added_ports() {
+    fn bare_revoke_leaves_explicitly_added_ports() {
         use izba_core::daemon::egress::config::EgressPolicyConfig;
         let dir = tempfile::tempdir().unwrap();
         allow_ports(dir.path(), "api.x.com", &[80, 443]).unwrap();
         allow_ports(dir.path(), "api.x.com", &[8443]).unwrap();
-        apply_block_edit(dir.path(), "api.x.com", &[80, 443]).unwrap();
+        apply_revoke_edit(dir.path(), "api.x.com", &[80, 443]).unwrap();
         let cfg = EgressPolicyConfig::load(dir.path()).unwrap().unwrap();
         assert_eq!(cfg.allow[0].ports(), vec![8443]);
     }
@@ -1574,9 +2107,16 @@ mod tests {
                 target: "example.com".into(),
                 read: false,
             },
+            PolicyCmd::Revoke {
+                name: "ghost".into(),
+                target: "example.com".into(),
+            },
             PolicyCmd::Block {
                 name: "ghost".into(),
                 target: "example.com".into(),
+            },
+            PolicyCmd::Seed {
+                name: "ghost".into(),
             },
             PolicyCmd::Enable {
                 name: "ghost".into(),
@@ -1590,6 +2130,10 @@ mod tests {
                 target: "github.com/foo/bar".into(),
                 write: false,
             }),
+            PolicyCmd::Git(GitSub::Revoke {
+                name: "ghost".into(),
+                target: "github.com".into(),
+            }),
             PolicyCmd::Git(GitSub::Block {
                 name: "ghost".into(),
                 target: "github.com".into(),
@@ -1600,6 +2144,10 @@ mod tests {
                 name: "ghost".into(),
                 target: "example.com:notaport".into(),
                 read: false,
+            },
+            PolicyCmd::Revoke {
+                name: "ghost".into(),
+                target: "example.com:notaport".into(),
             },
             PolicyCmd::Block {
                 name: "ghost".into(),
@@ -1699,7 +2247,7 @@ mod reload_message_tests {
         );
         assert!(
             help.contains("LOCALAPPDATA"),
-            "the Windows default too \u{2014} the CLI ships on both: {help}"
+            "the Windows default too — the CLI ships on both: {help}"
         );
     }
 }

@@ -301,10 +301,10 @@ izba netlog  NAME [--summary] [--follow]   # egress audit log; --summary aggrega
 izba policy  show NAME                    # print the effective allow-list + enforce posture (on/off)
 izba policy  enforce NAME on|off          # turn the firewall on (default-deny) or off (log-only)
 izba policy  allow NAME HOST[:PORT] [--read]  # allow a destination (bare host = web ports 80+443); read-write unless --read (HTTP GET/HEAD only); live-reloads
-izba policy  block NAME HOST[:PORT]       # remove a destination (bare host = web ports 80+443); live-reloads
+izba policy  revoke NAME HOST[:PORT]      # remove a destination from the allow-list (bare host = web ports 80+443); NOT a deny rule; live-reloads
 izba policy  git allow NAME TARGET [--write]  # allow git on a repo/host; read-only (clone/fetch) unless --write (adds push)
-izba policy  git block NAME TARGET        # remove a git rule
-izba policy  enable NAME                  # seed the allow-list from observed allowed traffic; live-reloads
+izba policy  git revoke NAME TARGET       # remove a git rule
+izba policy  seed NAME                    # seed the allow-list from observed allowed traffic (does NOT turn the firewall on); live-reloads
 izba policy  reload NAME                  # re-read policy.yaml and apply to new connections (no restart)
 izba usb     upstream show                # print the configured usbip server and how much izba trusts it
 izba usb     upstream set HOST[:PORT] [--allow-remote]   # point izba at a usbip server (default port 3240)
@@ -322,6 +322,13 @@ izba promote [NAME_OR_DIR] [--name NAME] [--force] [--restart] [--reset-scratch=
                                           # apply manifest → managed truth (human-gated)
 izba export  [NAME_OR_DIR] [--name NAME]  # write managed truth → izba.yml
 ```
+
+`izba policy revoke` and `izba policy seed` were previously spelled `izba
+policy block` and `izba policy enable`. Those names described neither
+command: `block` removes an allow-list entry rather than adding a deny rule,
+and `enable` seeds the allow-list rather than turning the firewall on (that
+is `izba policy enforce NAME on`). The old spellings still work for one
+release — they print a deprecation note and are hidden from `--help`.
 
 `izba create --vnc` (or `izba vnc on <name>` on an existing sandbox, restart
 required if it's running) boots with a KasmVNC remote desktop — a lightweight
