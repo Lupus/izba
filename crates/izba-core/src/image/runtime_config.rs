@@ -1243,10 +1243,12 @@ const DOCKER_RUN_TMPFS_OPTIONS: &[&str] = &["nosuid", "nodev", "mode=755"];
 ///
 /// dockerd's default pidfile paths are under `/var/run`, which every
 /// mainstream base image (Alpine, Debian/Ubuntu, Fedora, Arch) ships as a
-/// symlink to `/run`; crun resolves a mount destination INSIDE the rootfs, so
-/// the tmpfs covers them. An image with a real `/var/run` DIRECTORY is not
-/// covered (none of the docker-capable images do that; a second tmpfs there
-/// would stack over `/run` in the symlink case).
+/// symlink to `/run`; the mount destination here is the real directory
+/// `/run`, and the guest kernel follows the symlink when dockerd opens
+/// `/var/run/docker.pid`, so those paths land on the tmpfs. An image with a
+/// real `/var/run` DIRECTORY is not covered (none of the docker-capable
+/// images do that; a second tmpfs there would stack over `/run` in the
+/// symlink case).
 ///
 /// **Ordering is load-bearing:** crun applies `mounts` in array order, so this
 /// must be pushed BEFORE any mount whose destination lies beneath `/run` —
@@ -2887,12 +2889,18 @@ mod tests {
     #[test]
     fn docker_run_tmpfs_precedes_every_mount_beneath_run() {
         // crun applies `mounts` in array order: a tmpfs mounted AFTER a bind
-        // beneath /run would shadow that bind. Docker+VNC is the shape that
-        // has one (the VNC secrets at /run/izba/vnc-secrets).
+        // beneath /run would shadow that bind. Docker+VNC+USB is the shape
+        // exercised here; of the two /run/izba-sourced binds it adds, only
+        // the VNC secrets bind (destination /run/izba/vnc-secrets) has a
+        // DESTINATION beneath /run — the USB bind's destination is /dev/izba
+        // (its SOURCE is under init-root /run/izba/usb, which is unaffected
+        // by the container's /run tmpfs), so filtering on destination is the
+        // correct criterion here.
         let img = image_config(serde_json::json!({ "Cmd": ["/bin/sh"] }));
         let mut params = base_params(&img);
         params.docker = true;
         params.vnc = true;
+        params.usb = true;
         let spec = generate_spec(&params).unwrap();
         let mounts = spec.mounts().as_ref().unwrap();
         let run_idx = mounts
