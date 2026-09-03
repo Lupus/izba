@@ -40,6 +40,10 @@ export interface Scenario {
   usbStatus?: Record<string, UsbStatus>;
   failList?: boolean;
   failStatus?: boolean;
+  /** Makes `stats` reject instead of answering — pins OverviewTab's
+   *  "stats unavailable" degraded-state banner (unreachable before this
+   *  flag existed, since `stats` had no scenario knob at all). */
+  failStats?: boolean;
   failAction?: boolean;
   daemonAbsent?: boolean;
   errorMessage?: string;
