@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
 import type { Mock } from "vitest";
-import { SeedDialog } from "../components/SeedDialog";
+import { SeedDialog, buildCandidates } from "../components/SeedDialog";
 import { api } from "../lib/ipc";
 import type { EndpointSummary } from "../lib/types";
 
@@ -29,6 +29,19 @@ function sum(overrides: Partial<EndpointSummary>): EndpointSummary {
   };
 }
 
+const bare = { enforcing: false, allow: [], git: [] };
+
+/** The dialog's candidate rows, top to bottom, as their accessible names. */
+function listedLabels(): string[] {
+  return screen
+    .getAllByRole("checkbox")
+    .map((cb) => cb.getAttribute("aria-label") ?? "");
+}
+
+function addButton(): HTMLElement {
+  return screen.getByRole("button", { name: /^Add \d+ selected to allow-list$/ });
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   (api.policyAddEndpoints as Mock).mockResolvedValue(undefined);
@@ -46,7 +59,8 @@ describe("SeedDialog", () => {
       onClose={()=>{}} onApplied={()=>{}} />);
     expect(screen.queryByText(/api\.x\.com/)).toBeNull();          // covered → excluded
     expect(screen.getByText(/pypi\.org/)).toBeInTheDocument();      // delta
-    fireEvent.click(screen.getByRole("button", { name: /Add .* selected/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "pypi.org:443" }));
+    fireEvent.click(addButton());
     await waitFor(() => expect(add).toHaveBeenCalledWith("web",
       [{ kind: "http", host: "pypi.org", port: 443, access: "read" }], false));
   });
@@ -54,10 +68,11 @@ describe("SeedDialog", () => {
   it("enforce-after checkbox is prominent when firewall is off and passes enforce=true when checked", async () => {
     const add = api.policyAddEndpoints as Mock;
     render(<SeedDialog name="web" rows={[sum({host:"pypi.org",port:443,last_method:"GET",last_path:"/"})]}
-      enforcing={false} policy={{enforcing:false,allow:[],git:[]}} onClose={()=>{}} onApplied={()=>{}} />);
+      enforcing={false} policy={bare} onClose={()=>{}} onApplied={()=>{}} />);
     expect(screen.getByText(/firewall is currently OFF/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("switch", { name: /Enforce firewall after adding/i }));
-    fireEvent.click(screen.getByRole("button", { name: /Add .* selected/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    fireEvent.click(addButton());
     await waitFor(() => expect(add).toHaveBeenCalledWith("web", expect.anything(), true));
   });
 
@@ -65,77 +80,41 @@ describe("SeedDialog", () => {
     const add = api.policyAddEndpoints as Mock;
     const rows = [
       // Covered by policy.git — should be excluded from candidates
-      sum({
-        host: "github.com",
-        last_method: "POST",
-        last_path: "/o/a/git-upload-pack",
-      }),
+      sum({ host: "github.com", last_method: "POST", last_path: "/o/a/git-upload-pack" }),
       // Not covered by policy.git — should appear in candidates
-      sum({
-        host: "github.com",
-        last_method: "POST",
-        last_path: "/o/b/git-upload-pack",
-      }),
+      sum({ host: "github.com", last_method: "POST", last_path: "/o/b/git-upload-pack" }),
     ];
     render(
-      <SeedDialog
-        name="web"
-        rows={rows}
-        enforcing={false}
+      <SeedDialog name="web" rows={rows} enforcing={false}
         policy={{ enforcing: false, allow: [], git: [{ repo: "github.com/o/a", access: "read" }] }}
-        onClose={() => {}}
-        onApplied={() => {}}
-      />
+        onClose={() => {}} onApplied={() => {}} />
     );
-    // Covered repo must not appear
     expect(screen.queryByText(/github\.com\/o\/a/)).toBeNull();
-    // Uncovered repo must appear
     expect(screen.getByText(/github\.com\/o\/b/)).toBeInTheDocument();
-    // Add the uncovered one
-    fireEvent.click(screen.getByRole("button", { name: /Add .* selected/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    fireEvent.click(addButton());
     await waitFor(() =>
-      expect(add).toHaveBeenCalledWith(
-        "web",
-        [{ kind: "git", target: "github.com/o/b", access: "read" }],
-        false
-      )
+      expect(add).toHaveBeenCalledWith("web", [{ kind: "git", target: "github.com/o/b", access: "read" }], false)
     );
   });
 
-  it("raw-IP row is rendered but disabled and excluded from policyAddEndpoints", async () => {
+  it("raw-IP row is rendered but disabled and excluded from policyAddEndpoints, even under Select all", async () => {
     const add = api.policyAddEndpoints as Mock;
     const rows = [
-      // Raw IP row: host === null
       sum({ host: null, dest_ip: "10.0.0.1", port: 80, last_method: null, last_path: null }),
-      // Regular HTTP row that is selectable
       sum({ host: "pypi.org", port: 443, last_method: "GET", last_path: "/" }),
     ];
-    render(
-      <SeedDialog
-        name="web"
-        rows={rows}
-        enforcing={false}
-        policy={{ enforcing: false, allow: [], git: [] }}
-        onClose={() => {}}
-        onApplied={() => {}}
-      />
-    );
-    // Raw IP row must be visible (shows dest_ip:port)
+    render(<SeedDialog name="web" rows={rows} enforcing={false} policy={bare}
+      onClose={() => {}} onApplied={() => {}} />);
     expect(screen.getByText("10.0.0.1:80")).toBeInTheDocument();
-    // Its checkbox must be disabled
-    const checkboxes = screen.getAllByRole("checkbox");
-    // The checkbox for the raw-IP row is disabled
-    const rawIpCheckbox = checkboxes.find((cb) => (cb as HTMLInputElement).disabled && cb.closest("label")?.textContent?.includes("10.0.0.1"));
-    expect(rawIpCheckbox).toBeDefined();
+    const rawIpCheckbox = screen.getByRole("checkbox", { name: "10.0.0.1:80" });
     expect(rawIpCheckbox).toBeDisabled();
-    // Clicking Add should only include pypi.org, not the raw IP
-    fireEvent.click(screen.getByRole("button", { name: /Add .* selected/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    expect(rawIpCheckbox).not.toBeChecked();
+    expect(addButton()).toHaveTextContent("Add 1 selected to allow-list");
+    fireEvent.click(addButton());
     await waitFor(() =>
-      expect(add).toHaveBeenCalledWith(
-        "web",
-        [{ kind: "http", host: "pypi.org", port: 443, access: "read" }],
-        false
-      )
+      expect(add).toHaveBeenCalledWith("web", [{ kind: "http", host: "pypi.org", port: 443, access: "read" }], false)
     );
   });
 
@@ -144,19 +123,105 @@ describe("SeedDialog", () => {
     const onApplied = vi.fn();
     const onClose = vi.fn();
     render(
-      <SeedDialog
-        name="web"
-        rows={[sum({ host: "pypi.org", port: 443, last_method: "GET", last_path: "/simple/" })]}
-        policy={{ enforcing: false, allow: [], git: [] }}
-        enforcing={false}
-        onClose={onClose}
-        onApplied={onApplied}
-      />,
+      <SeedDialog name="web" rows={[sum({ host: "pypi.org", port: 443, last_method: "GET", last_path: "/simple/" })]}
+        policy={bare} enforcing={false} onClose={onClose} onApplied={onApplied} />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /Add .* selected/ }));
-    // The error is surfaced and the dialog is NOT dismissed (no silent drop).
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    fireEvent.click(addButton());
     expect(await screen.findByRole("alert")).toHaveTextContent(/daemon offline/);
     expect(onApplied).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
+  });
+});
+
+describe("SeedDialog selection (a consent surface: nothing is approved by default)", () => {
+  const rows = [
+    sum({ host: "pypi.org", port: 443 }),
+    sum({ host: "npmjs.org", port: 443 }),
+    sum({ host: null, dest_ip: "10.0.0.1", port: 80, last_method: null, last_path: null }),
+  ];
+
+  it("opens with no candidate selected and the submit action disabled at 0", () => {
+    render(<SeedDialog name="web" rows={rows} enforcing={true} policy={{ ...bare, enforcing: true }}
+      onClose={() => {}} onApplied={() => {}} />);
+    for (const cb of screen.getAllByRole("checkbox")) expect(cb).not.toBeChecked();
+    expect(addButton()).toBeDisabled();
+    expect(addButton()).toHaveTextContent("Add 0 selected to allow-list");
+  });
+
+  it("Select all / Deselect all act on every selectable candidate and the count follows", () => {
+    render(<SeedDialog name="web" rows={rows} enforcing={true} policy={{ ...bare, enforcing: true }}
+      onClose={() => {}} onApplied={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    expect(screen.getByRole("checkbox", { name: "pypi.org:443" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "npmjs.org:443" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "10.0.0.1:80" })).not.toBeChecked();
+    expect(addButton()).toBeEnabled();
+    expect(addButton()).toHaveTextContent("Add 2 selected to allow-list");
+    fireEvent.click(screen.getByRole("button", { name: "Deselect all" }));
+    for (const cb of screen.getAllByRole("checkbox")) expect(cb).not.toBeChecked();
+    expect(addButton()).toBeDisabled();
+    expect(addButton()).toHaveTextContent("Add 0 selected to allow-list");
+  });
+
+  it("a single checkbox toggles its own row only and the count follows", () => {
+    render(<SeedDialog name="web" rows={rows} enforcing={true} policy={{ ...bare, enforcing: true }}
+      onClose={() => {}} onApplied={() => {}} />);
+    fireEvent.click(screen.getByRole("checkbox", { name: "npmjs.org:443" }));
+    expect(screen.getByRole("checkbox", { name: "npmjs.org:443" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "pypi.org:443" })).not.toBeChecked();
+    expect(addButton()).toHaveTextContent("Add 1 selected to allow-list");
+    fireEvent.click(screen.getByRole("checkbox", { name: "npmjs.org:443" }));
+    expect(addButton()).toHaveTextContent("Add 0 selected to allow-list");
+  });
+
+  it("every control is a real button or checkbox (keyboard-reachable, nothing hover-only)", () => {
+    render(<SeedDialog name="web" rows={rows} enforcing={true} policy={{ ...bare, enforcing: true }}
+      onClose={() => {}} onApplied={() => {}} />);
+    expect(screen.getByRole("button", { name: "Select all" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Deselect all" })).toBeInTheDocument();
+    expect(screen.getAllByRole("checkbox")).toHaveLength(3);
+  });
+
+  it("renders candidate rows in buildCandidates' key order regardless of backend row order", () => {
+    const raw = sum({ host: null, dest_ip: "10.0.0.1", port: 80, last_method: null, last_path: null });
+    const pypi = sum({ host: "pypi.org", port: 443 });
+    const gitRow = sum({ host: "github.com", last_method: "POST", last_path: "/o/b/git-upload-pack" });
+    const npm = sum({ host: "npmjs.org", port: 443 });
+    render(<SeedDialog name="web" rows={[raw, pypi, gitRow, npm]} enforcing={true}
+      policy={{ ...bare, enforcing: true }} onClose={() => {}} onApplied={() => {}} />);
+    expect(listedLabels()).toEqual([
+      "git clone → github.com/o/b",
+      "npmjs.org:443",
+      "pypi.org:443",
+      "10.0.0.1:80",
+    ]);
+  });
+});
+
+describe("buildCandidates", () => {
+  it("orders candidates by key regardless of backend order, selectable kinds before raw IPs", () => {
+    const a = sum({ host: "pypi.org", port: 443 });
+    const b = sum({ host: "npmjs.org", port: 443 });
+    const raw = sum({ host: null, dest_ip: "10.0.0.1", port: 80, last_method: null, last_path: null });
+    const g = sum({ host: "github.com", last_method: "POST", last_path: "/o/b/git-upload-pack" });
+    const keys = (rows: EndpointSummary[]) => buildCandidates(rows, bare).map((c) => c.key);
+    expect(keys([raw, a, g, b])).toEqual([
+      "git:github.com/o/b",
+      "http:npmjs.org:443",
+      "http:pypi.org:443",
+      "raw-ip:10.0.0.1:80",
+    ]);
+    expect(keys([b, g, a, raw])).toEqual(keys([raw, a, g, b]));
+  });
+
+  it("folds rows that resolve to the same key into one candidate with summed counts, push winning", () => {
+    const clone = sum({ host: "github.com", port: 443, last_method: "POST", last_path: "/o/b/git-upload-pack", allow_count: 2, deny_count: 1 });
+    const push = sum({ host: "github.com", port: 80, last_method: "POST", last_path: "/o/b/git-receive-pack", allow_count: 3, deny_count: 0 });
+    const out = buildCandidates([clone, push], bare);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ key: "git:github.com/o/b", allowCount: 5, denyCount: 1, defaultAccess: "read-write" });
+    expect(out[0].label).toBe("git push → github.com/o/b");
+    expect(buildCandidates([push, clone], bare)[0].label).toBe("git push → github.com/o/b");
   });
 });
