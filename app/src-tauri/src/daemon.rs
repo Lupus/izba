@@ -373,7 +373,7 @@ impl DaemonApi for RealDaemon {
 
     fn policy_block(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
         self.edit_and_reload(name, |cfg| {
-            let _ = cfg.block(host, port);
+            let _ = cfg.revoke(host, port);
         })
     }
 
@@ -441,7 +441,7 @@ impl DaemonApi for RealDaemon {
     fn policy_git_block(&mut self, name: &str, target: &str) -> anyhow::Result<()> {
         let gt = izba_core::daemon::egress::config::GitTarget::parse(target);
         self.edit_and_reload(name, move |cfg| {
-            cfg.git_block(&gt);
+            cfg.git_revoke(&gt);
         })
     }
 
