@@ -73,6 +73,45 @@ fn daemon_pid(data: &Path, envs: &[(&str, &str)]) -> Option<u32> {
     rest.split(',').next()?.trim().parse().ok()
 }
 
+/// SIGKILL a host process — the e2e's stand-in for an unclean stop (daemon
+/// killed, host reboot): the guest gets no shutdown at all, so whatever the
+/// workload had written to its persistent disks is exactly what the next
+/// boot finds. Linux-only (`kill(1)`), like the KVM suite it serves.
+fn kill9(pid: u32) {
+    let o = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output()
+        .expect("run kill");
+    assert!(
+        o.status.success(),
+        "kill -9 {pid} failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// Wait until the process is dead for izba's purposes: `/proc/<pid>/stat`
+/// gone, or state `Z`. izbad never `wait(2)`s the VMMs it spawns (see
+/// `procmgr::unix::spawn_detached`), so a SIGKILLed VMM lingers as a zombie
+/// until the daemon exits — and izba's own `pid_alive` treats `Z` as dead.
+fn wait_pid_dead(pid: u32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => return true,
+            Ok(s) => {
+                // The state field follows the parenthesised comm (which may
+                // itself contain spaces/parens): find the LAST ')'.
+                let after = s.rfind(')').map(|i| i + 2).unwrap_or(0);
+                if s.get(after..).is_some_and(|rest| rest.starts_with('Z')) {
+                    return true;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 fn daemon_version_of(data: &Path, envs: &[(&str, &str)]) -> Option<String> {
     let o = izba(data, envs, &["daemon", "status"]);
     let out = stdout_of(&o);
@@ -1710,6 +1749,15 @@ fn docker_publish_reaches_inner_container() {
         String::from_utf8_lossy(&o.stderr),
         docker_diag(&data, name)
     );
+    // The nested container's id: phase [6] uses it to prove the engine's
+    // OWN state (`/var/lib/docker`, the anonymous ext4 volume — spec §4)
+    // survives the unclean stop that the pid files must NOT survive.
+    let nested_id = stdout_of(&o).trim().to_string();
+    assert_eq!(
+        nested_id.len(),
+        64,
+        "docker run -d must print the full container id, got {nested_id:?}"
+    );
 
     // [4] Publish it host-side and GET through the whole chain.
     assert_ok(
@@ -1726,6 +1774,131 @@ fn docker_publish_reaches_inner_container() {
         body.contains("nginx"),
         "expected nginx's default page through the relay, got: {body:?}\n{}",
         docker_diag(&data, name)
+    );
+
+    // [5] #214: an UNCLEAN stop. SIGKILL the VMM — no guest shutdown, so
+    // dockerd's and containerd's pid files stay exactly where the engine
+    // wrote them. Then a plain `izba start`, as a user would after a host
+    // reboot: it must succeed on its own, with NO `izba stop` and NO manual
+    // pid-file deletion in between.
+    let state_path = data.join("sandboxes").join(name).join(STATE_FILE);
+    let st: RunState = load_json(&state_path)
+        .expect("read state.json")
+        .expect("state.json present while running");
+    let vmm_pid = st.vmm_pid.pid;
+    // Flush the guest's page cache first. A host reboot hours later finds
+    // everything on disk, but a SIGKILL seconds after boot races ext4
+    // writeback — dockerd's pid files can still be dirty guest pages, the
+    // next boot then finds them empty, and the test passes for the wrong
+    // reason (verified on a real VM: without this sync the engine sometimes
+    // comes back; with it, dockerd refuses on the persisted pidfile).
+    assert_ok(
+        &izba(&data, no_env, &["exec", name, "--", "sync"]),
+        "sync before the unclean stop",
+    );
+    kill9(vmm_pid);
+    assert!(
+        wait_pid_dead(vmm_pid, Duration::from_secs(10)),
+        "VMM pid {vmm_pid} neither gone nor zombie 10s after SIGKILL"
+    );
+    let o = izba(&data, no_env, &["start", name]);
+    assert!(
+        o.status.success(),
+        "`izba start` after an unclean stop must succeed unaided: {}\n{}",
+        String::from_utf8_lossy(&o.stderr),
+        docker_diag(&data, name)
+    );
+
+    // [6] The engine must come back on its own. This is the #214 symptom:
+    // without a fresh /run, dockerd finds the previous boot's docker.pid,
+    // sees its (reused) PID alive, and refuses to start — and after
+    // docker.pid, containerd.pid fails the same way one layer down. `docker
+    // info` succeeding proves BOTH layers started (dockerd only answers
+    // once its containerd is up).
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if izba(
+            &data,
+            no_env,
+            &["exec", name, "--", "docker", "info", "--format", "{{.ID}}"],
+        )
+        .status
+        .success()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    assert!(
+        ready,
+        "dockerd never came back within 120s of restarting after an unclean stop (#214)\n{}",
+        docker_diag(&data, name)
+    );
+    let engine_log = izba(
+        &data,
+        no_env,
+        &["exec", name, "--", "cat", "/var/log/izba-dockerd.log"],
+    );
+    let engine_log = stdout_of(&engine_log);
+    assert!(
+        !engine_log.contains("is still running"),
+        "the engine log must not carry a stale-pidfile refusal from either layer:\n{engine_log}"
+    );
+
+    // [6b] Non-pid state is preserved: the nested container from [3] is
+    // still known to the (restarted) engine — `/var/lib/docker` lives on a
+    // persistent volume and the fix must not touch it.
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "exec",
+            name,
+            "--",
+            "docker",
+            "ps",
+            "-a",
+            "--no-trunc",
+            "--format",
+            "{{.ID}}",
+        ],
+    );
+    assert_ok(&o, "docker ps -a after the unclean restart");
+    let ids = stdout_of(&o);
+    assert!(
+        ids.lines().any(|l| l.trim() == nested_id),
+        "the nested container {nested_id} must survive the unclean restart in `docker ps -a`, got:\n{ids}\n{}",
+        docker_diag(&data, name)
+    );
+
+    // [7] The shape the fix relies on, observed from inside the workload:
+    // this image (Alpine-based dind) symlinks /var/run → /run, and /run is
+    // a fresh tmpfs — so dockerd's default pidfile paths (/var/run/docker.pid,
+    // /var/run/docker/containerd/containerd.pid) structurally cannot reach
+    // the persistent rw disk.
+    let o = izba(
+        &data,
+        no_env,
+        &[
+            "exec",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "readlink -f /var/run; awk '$2==\"/run\"{print $3}' /proc/mounts",
+        ],
+    );
+    assert_ok(&o, "inspect /var/run + /run inside the workload");
+    let shape: Vec<String> = stdout_of(&o)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect();
+    assert_eq!(
+        shape,
+        vec!["/run".to_string(), "tmpfs".to_string()],
+        "expected /var/run → /run and /run on tmpfs, got {shape:?}"
     );
     // Teardown is the SandboxGuard's job (it also runs on panic).
 }
