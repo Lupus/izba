@@ -33,6 +33,16 @@ describe("parseRegisteredCommands", () => {
     const one = "tauri::generate_handler![a, b]";
     expect(() => parseRegisteredCommands(one + "\n" + one)).toThrow(/exactly one/);
   });
+
+  it("ignores an identifier inside a block comment", () => {
+    const src = `
+      tauri::generate_handler![
+        list,
+        /* daemon_status, */
+        stats
+      ]`;
+    expect(parseRegisteredCommands(src)).toEqual(["list", "stats"]);
+  });
 });
 
 describe("parseMockedCommands", () => {
@@ -56,6 +66,19 @@ describe("parseMockedCommands", () => {
 
   it("de-duplicates a label that appears twice", () => {
     expect(parseMockedCommands('case "a": case "a": case "b":')).toEqual(["a", "b"]);
+  });
+
+  it("ignores a line-commented and a block-commented case label", () => {
+    const src = `
+      switch (cmd) {
+        // case "usb_detach":
+        /* case "policy_enable": */
+        case "list":
+          return 1;
+        default:
+          return 0;
+      }`;
+    expect(parseMockedCommands(src)).toEqual(["list"]);
   });
 });
 
