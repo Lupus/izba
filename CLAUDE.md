@@ -115,6 +115,12 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   {test,clippy} --workspace` while silently breaking the GUI build. When you
   touch `izba-core`/`izba-proto` public types, also run the app gate locally:
   `cd app && npm ci && npm run build && (cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test)`.
+  Every command in `generate_handler![…]` must also have a `case` in the
+  Playwright IPC mock `app/e2e/mock/tauri-mock.js` — `app/src/test/
+  tauriMockParity.test.ts` (part of `npm run test`) fails on a registered
+  command with no mock case, on a stale mock case, and on a parse that finds
+  implausibly few commands; deliberate exclusions go in its
+  `INTENTIONALLY_UNMOCKED` list with a reason (empty today).
   (The App CI **linux** job also runs `cargo fmt --check` on `app/src-tauri` — it
   is easy to forget since the workspace gate uses a separate `cargo fmt --check`.)
   CI mirrors this as the **App CI** workflow (`.github/workflows/app.yml`, jobs
