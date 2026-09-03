@@ -151,7 +151,7 @@ pub fn run(paths: &Paths, cmd: &PolicyCmd) -> anyhow::Result<i32> {
             let gt = GitTarget::parse(target);
             let dir = require_sandbox_dir(paths, name)?;
             edit_policy_file(&dir, |c| {
-                c.git_block(&gt);
+                c.git_revoke(&gt);
             })?;
             maybe_reload(paths, name);
             Ok(0)
@@ -242,7 +242,7 @@ pub(crate) fn apply_block_edit(
 ) -> anyhow::Result<()> {
     edit_policy_file(sandbox_dir, |cfg| {
         for &port in ports {
-            let _ = cfg.block(host, port);
+            let _ = cfg.revoke(host, port);
         }
     })?;
     Ok(())

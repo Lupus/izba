@@ -531,7 +531,7 @@ impl EgressPolicyConfig {
     /// Collapse normalize-equal duplicate entries in `self.allow`. A legacy
     /// or hand-edited `policy.yaml` can carry case-/trailing-dot-equivalent
     /// duplicates (e.g. `api.x.com` + `API.X.COM`); before this pass,
-    /// `allow`/`block`/`set_host_access` matched only the FIRST such entry
+    /// `allow`/`revoke`/`set_host_access` matched only the FIRST such entry
     /// while compilation could enforce a DIFFERENT one — so an edit could
     /// "succeed" on an entry that was never the one in force. Calling this at
     /// the top of every mutation means the entries a caller finds and edits
@@ -559,7 +559,7 @@ impl EgressPolicyConfig {
     ///   entry with the union of ports is then exactly semantics-preserving.
     ///   When access verbs are mixed, no single `AllowEntry` can represent
     ///   the per-port access split, so they are left as separate entries
-    ///   entirely untouched; `allow`/`block`/`set_host_access` below handle
+    ///   entirely untouched; `allow`/`revoke`/`set_host_access` below handle
     ///   multiple equivalent wildcard entries directly.
     ///
     /// Non-duplicated entries and overall list order are otherwise untouched.
@@ -648,7 +648,7 @@ impl EgressPolicyConfig {
     /// see `collapse_duplicate_hosts`). Every entry's host spelling is
     /// canonicalized via `normalize_policy_host` before the collapse pass
     /// runs, so hand-typed or GUI-pasted spelling variants collapse exactly
-    /// like they would if entered one at a time through `allow`/`block`/
+    /// like they would if entered one at a time through `allow`/`revoke`/
     /// `set_host_access`.
     pub fn replace_allow(&mut self, allow: Vec<AllowEntry>) {
         self.allow = allow;
@@ -771,7 +771,7 @@ impl EgressPolicyConfig {
     }
 
     /// Remove any git rule matching `target`. Returns `true` if one was removed.
-    pub fn git_block(&mut self, target: &GitTarget) -> bool {
+    pub fn git_revoke(&mut self, target: &GitTarget) -> bool {
         let before = self.git.len();
         self.git.retain(|r| &r.target != target);
         self.git.len() != before
@@ -911,7 +911,7 @@ impl EgressPolicyConfig {
     /// THE SHARP EDGE THIS USED TO HAVE, AND WHY IT IS GONE (#238): a declared
     /// `protocol` was stored per-ENTRY while the `protocol: tcp` pinning hatch
     /// is semantically per-PORT, so preserving the entry's declaration here
-    /// (rather than dropping it — see the sibling `block`/`set_host_access`
+    /// (rather than dropping it — see the sibling `revoke`/`set_host_access`
     /// fix for why dropping is the worse failure) extended an existing
     /// `Some(Tcp)` pin to the newly-added port too, even though the operator
     /// only named it for the ports that existed when they wrote it. #235
@@ -976,7 +976,7 @@ impl EgressPolicyConfig {
     /// behavior there. A matching entry that never carried `port` is left
     /// COMPLETELY untouched (spelling included) — `false` means zero
     /// mutation, not just "no net-visible change".
-    pub fn block(&mut self, host: &str, port: u16) -> bool {
+    pub fn revoke(&mut self, host: &str, port: u16) -> bool {
         self.collapse_duplicate_hosts();
         let normalized = normalize_policy_host(host);
         let mut changed = false;
@@ -988,7 +988,7 @@ impl EgressPolicyConfig {
             if !ports.iter().any(|s| s.port == port) {
                 // This entry never granted `port` -- leave it COMPLETELY
                 // untouched (including its original host spelling). A
-                // no-op `block` must mutate nothing, matching the
+                // no-op `revoke` must mutate nothing, matching the
                 // changed-bool contract: `false` means zero state change.
                 continue;
             }
@@ -1027,7 +1027,7 @@ impl EgressPolicyConfig {
 /// proposed-vs-persisted comparison by this same identity function, so its
 /// keying can never silently drift from the mutation/compile identity used
 /// here and in `to_rego_data_json`. External callers never call this
-/// directly -- they go through the mutation methods (`allow`, `block`,
+/// directly -- they go through the mutation methods (`allow`, `revoke`,
 /// `set_host_access`, `replace_allow`), which normalize as part of their
 /// documented contract.
 pub(crate) fn normalize_policy_host(host: &str) -> String {
@@ -1868,13 +1868,13 @@ mod tests {
     }
 
     #[test]
-    fn block_removes_port_then_host_when_last() {
+    fn revoke_removes_port_then_host_when_last() {
         let mut cfg = EgressPolicyConfig {
             enforce: true,
             allow: vec![AllowEntry::Host("api.x.com".into())], // {80,443}
             git: vec![],
         };
-        assert!(cfg.block("api.x.com", 443));
+        assert!(cfg.revoke("api.x.com", 443));
         assert_eq!(
             cfg.allow,
             vec![AllowEntry::Scoped {
@@ -1884,12 +1884,12 @@ mod tests {
             }]
         );
         assert!(
-            cfg.block("api.x.com", 80),
+            cfg.revoke("api.x.com", 80),
             "removing the last port drops the host"
         );
         assert!(cfg.allow.is_empty());
         assert!(
-            !cfg.block("api.x.com", 80),
+            !cfg.revoke("api.x.com", 80),
             "blocking an absent host is a no-op"
         );
     }
@@ -1897,7 +1897,7 @@ mod tests {
     /// Blocking one port of a multi-port read-only entry must leave the
     /// remaining ports' access untouched, not silently widen it to read-write.
     #[test]
-    fn block_preserves_existing_access_on_remaining_ports() {
+    fn revoke_preserves_existing_access_on_remaining_ports() {
         let mut cfg = EgressPolicyConfig {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
@@ -1907,7 +1907,7 @@ mod tests {
             }],
             git: vec![],
         };
-        assert!(cfg.block("api.x.com", 80));
+        assert!(cfg.revoke("api.x.com", 80));
         assert_eq!(
             cfg.allow,
             vec![AllowEntry::Scoped {
@@ -2052,7 +2052,7 @@ mod tests {
         assert!(!cfg.git_allow(GitTarget::Repo("github.com/o/a".into()), Access::Read)); // idempotent
         assert!(cfg.git_allow(GitTarget::Repo("github.com/o/a".into()), Access::ReadWrite)); // access change
         assert_eq!(cfg.git[0].access, Access::ReadWrite);
-        assert!(cfg.git_block(&GitTarget::Repo("github.com/o/a".into())));
+        assert!(cfg.git_revoke(&GitTarget::Repo("github.com/o/a".into())));
         assert!(cfg.git.is_empty());
     }
 
@@ -2367,7 +2367,7 @@ mod tests {
     // `to_rego_data_json` normalizes every host (trim + trailing-dot strip +
     // ascii-lowercase) into a JSON map keyed by the normalized spelling, where
     // a later duplicate key silently overwrites an earlier one. Before this
-    // fix, `allow`/`block`/`set_host_access` matched existing entries by RAW
+    // fix, `allow`/`revoke`/`set_host_access` matched existing entries by RAW
     // string equality, so e.g. `allow --read api.x.com` followed by a plain
     // `allow API.X.COM` appended a SEPARATE read-write entry that silently won
     // at compile time — widening a read-only host to read-write. These tests
@@ -2424,17 +2424,17 @@ mod tests {
         );
     }
 
-    /// `block` must also match case/trailing-dot variants: blocking
+    /// `revoke` must also match case/trailing-dot variants: blocking
     /// `API.X.COM.` (port 443) must remove that port from the entry stored as
     /// `api.x.com`.
     #[test]
-    fn block_matches_case_and_trailing_dot_variant() {
+    fn revoke_matches_case_and_trailing_dot_variant() {
         let mut cfg = EgressPolicyConfig {
             enforce: true,
             allow: vec![AllowEntry::Host("api.x.com".into())], // {80,443}
             git: vec![],
         };
-        assert!(cfg.block("API.X.COM.", 443));
+        assert!(cfg.revoke("API.X.COM.", 443));
         assert_eq!(
             cfg.allow,
             vec![AllowEntry::Scoped {
@@ -2499,7 +2499,7 @@ mod tests {
     // normalized host, so among normalize-equal RAW duplicates (a legacy or
     // hand-edited `policy.yaml`, or a file written before 2aeaac9a) the LAST
     // one in list order wins the whole `{ports, access}` value at compile
-    // time. Before `collapse_duplicate_hosts`, `allow`/`block`/
+    // time. Before `collapse_duplicate_hosts`, `allow`/`revoke`/
     // `set_host_access` matched only the FIRST such duplicate (`find`/
     // `position`), so an edit could report success while acting on an entry
     // that was never the one actually enforced. These tests construct raw
@@ -2586,7 +2586,7 @@ mod tests {
     }
 
     #[test]
-    fn block_operates_on_the_compile_winning_duplicates_ports() {
+    fn revoke_operates_on_the_compile_winning_duplicates_ports() {
         let dup_base = || {
             vec![
                 AllowEntry::Scoped {
@@ -2610,7 +2610,7 @@ mod tests {
             allow: dup_base(),
             git: vec![],
         };
-        assert!(cfg.block("a", 8443));
+        assert!(cfg.revoke("a", 8443));
         assert!(
             cfg.allow.is_empty(),
             "blocking the winning duplicate's only port must drop the entry: {:?}",
@@ -2625,7 +2625,7 @@ mod tests {
             git: vec![],
         };
         assert!(
-            !cfg2.block("a", 443),
+            !cfg2.revoke("a", 443),
             "port 443 was never enforced (shadowed by the winning duplicate) -- block must no-op"
         );
         assert_eq!(
@@ -2756,18 +2756,18 @@ mod tests {
         );
     }
 
-    /// `block` on a mixed-access wildcard duplicate pair must remove the
+    /// `revoke` on a mixed-access wildcard duplicate pair must remove the
     /// port from EVERY equivalent entry (union semantics: the grant only
     /// truly disappears once no entry keeps it), dropping any entry whose
     /// ports become empty.
     #[test]
-    fn block_removes_port_from_all_equivalent_wildcard_duplicates() {
+    fn revoke_removes_port_from_all_equivalent_wildcard_duplicates() {
         let mut cfg = EgressPolicyConfig {
             enforce: true,
             allow: mixed_access_wildcard_dupes(),
             git: vec![],
         };
-        assert!(cfg.block("*.x", 443));
+        assert!(cfg.revoke("*.x", 443));
         assert_eq!(
             cfg.allow.len(),
             1,
@@ -2869,7 +2869,7 @@ mod tests {
             git: vec![],
         };
         // An unrelated no-op mutation still triggers the collapse pass.
-        assert!(!cfg.block("nonexistent.example", 1));
+        assert!(!cfg.revoke("nonexistent.example", 1));
         assert_eq!(
             cfg.allow,
             vec![AllowEntry::Scoped {
@@ -2894,7 +2894,7 @@ mod tests {
     // untested behavior delta ripe for a surviving mutant.
 
     #[test]
-    fn block_noop_on_exact_host_leaves_original_spelling_untouched() {
+    fn revoke_noop_on_exact_host_leaves_original_spelling_untouched() {
         let mut cfg = EgressPolicyConfig {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
@@ -2906,7 +2906,7 @@ mod tests {
         };
         let before = cfg.allow.clone();
         assert!(
-            !cfg.block("api.x.com", 9999),
+            !cfg.revoke("api.x.com", 9999),
             "port 9999 was never granted -- block must report no change"
         );
         assert_eq!(
@@ -2919,7 +2919,7 @@ mod tests {
     }
 
     #[test]
-    fn block_noop_on_wildcard_duplicates_leaves_both_entries_untouched() {
+    fn revoke_noop_on_wildcard_duplicates_leaves_both_entries_untouched() {
         let mut cfg = EgressPolicyConfig {
             enforce: true,
             allow: mixed_access_wildcard_dupes(),
@@ -2927,7 +2927,7 @@ mod tests {
         };
         let before = cfg.allow.clone();
         assert!(
-            !cfg.block("*.x", 9999),
+            !cfg.revoke("*.x", 9999),
             "port 9999 is granted by neither equivalent wildcard entry -- block must no-op"
         );
         assert_eq!(
@@ -3730,7 +3730,7 @@ mod tests {
     }
 
     #[test]
-    fn block_preserves_a_declared_protocol_on_the_remaining_ports() {
+    fn revoke_preserves_a_declared_protocol_on_the_remaining_ports() {
         let mut cfg = EgressPolicyConfig {
             enforce: true,
             allow: vec![AllowEntry::Scoped {
@@ -3743,7 +3743,7 @@ mod tests {
             }],
             git: vec![],
         };
-        assert!(cfg.block("internal.example.com", 9000));
+        assert!(cfg.revoke("internal.example.com", 9000));
         let entries = cfg.entries_for_host("internal.example.com");
         assert_eq!(entries[0].ports(), vec![8000]);
         assert_eq!(

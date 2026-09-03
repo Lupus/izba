@@ -240,7 +240,7 @@ impl DaemonApi for FakeDaemon {
     fn policy_block(&mut self, name: &str, host: &str, port: u16) -> anyhow::Result<()> {
         self.calls.push(format!("block:{name}:{host}:{port}"));
         // Mirror the real daemon so a follow-up policy_show observes the removal.
-        self.policy.block(host, port);
+        self.policy.revoke(host, port);
         Ok(())
     }
     fn policy_set(
@@ -307,7 +307,7 @@ impl DaemonApi for FakeDaemon {
         use izba_core::daemon::egress::config::GitTarget;
         self.calls.push(format!("git_block:{name}:{target}"));
         let gt = GitTarget::parse(target);
-        self.policy.git_block(&gt);
+        self.policy.git_revoke(&gt);
         Ok(())
     }
     fn policy_set_enforce(&mut self, name: &str, on: bool) -> anyhow::Result<()> {
