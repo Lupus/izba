@@ -27,11 +27,13 @@ interface Props {
 
 type CandidateKind = "git" | "http" | "raw-ip";
 
-interface Candidate {
+export interface Candidate {
+  /** `kind:target` — the identity a row is deduplicated and ordered by. */
   key: string;
   kind: CandidateKind;
   label: string;
-  countLabel: string;
+  allowCount: number;
+  denyCount: number;
   defaultAccess: Access;
   /** git target string (for git rows) */
   gitTarget?: string;
@@ -41,39 +43,70 @@ interface Candidate {
   disabled: boolean;
 }
 
-function buildCandidates(rows: EndpointSummary[], policy: PolicyView): Candidate[] {
+function countLabel(c: Candidate): string {
+  return c.denyCount > 0 ? `${c.allowCount}✓ ${c.denyCount}✕` : `${c.allowCount}✓`;
+}
+
+/** Total order on candidates: plain codepoint order on `key`, so the list is
+ *  identical for any backend iteration order (the netlog aggregates through a
+ *  HashMap, so equal-timestamp rows come back shuffled poll to poll) and for
+ *  any locale. `git:` < `http:` < `raw-ip:` also puts the selectable kinds
+ *  first and the disabled raw IPs last. */
+function byKey(a: Candidate, b: Candidate): number {
+  if (a.key < b.key) return -1;
+  if (a.key > b.key) return 1;
+  return 0;
+}
+
+/** The reviewable delta between what the netlog saw and what the policy already
+ *  covers. Pure: same rows + policy ⇒ same list, same order. Two rows that
+ *  resolve to one key (a repo seen on two ports, a clone and a push of the
+ *  same repo) fold into ONE candidate — React keys must be unique, and the
+ *  user is approving the target, not the row. */
+export function buildCandidates(rows: EndpointSummary[], policy: PolicyView): Candidate[] {
   const allowed = allowKeys(policy.allow);
-  const candidates: Candidate[] = [];
+  const byKeyMap = new Map<string, Candidate>();
+  const add = (c: Candidate) => {
+    const prev = byKeyMap.get(c.key);
+    if (!prev) {
+      byKeyMap.set(c.key, c);
+      return;
+    }
+    prev.allowCount += c.allowCount;
+    prev.denyCount += c.denyCount;
+    // A push widens the suggested access and names the op in the label —
+    // order-independent, so the fold is deterministic.
+    if (c.defaultAccess === "read-write" && prev.defaultAccess !== "read-write") {
+      prev.defaultAccess = "read-write";
+      prev.label = c.label;
+    }
+  };
 
   for (const row of rows) {
     const gitOp = git_op_from_path(row.last_path);
     const gitRepo = gitOp ? git_repo_from_row(row.host, row.last_path) : null;
-    const isGit = gitOp !== null && gitRepo !== null;
 
-    if (isGit && gitRepo) {
+    if (gitOp !== null && gitRepo !== null) {
       // Git row: covered if git_access_for returns non-null
       if (git_access_for(gitRepo, policy.git) !== null) continue;
-      const defaultAccess: Access = gitOp === "push" ? "read-write" : "read";
-      const countLabel =
-        row.deny_count > 0 ? `${row.allow_count}✓ ${row.deny_count}✕` : `${row.allow_count}✓`;
-      candidates.push({
+      add({
         key: `git:${gitRepo}`,
         kind: "git",
         label: `git ${gitOp} → ${gitRepo}`,
-        countLabel,
-        defaultAccess,
+        allowCount: row.allow_count,
+        denyCount: row.deny_count,
+        defaultAccess: gitOp === "push" ? "read-write" : "read",
         gitTarget: gitRepo,
         disabled: false,
       });
     } else if (row.host === null) {
       // Raw IP: listed but disabled
-      const countLabel =
-        row.deny_count > 0 ? `${row.allow_count}✓ ${row.deny_count}✕` : `${row.allow_count}✓`;
-      candidates.push({
+      add({
         key: `raw-ip:${row.dest_ip}:${row.port}`,
         kind: "raw-ip",
         label: `${row.dest_ip}:${row.port}`,
-        countLabel,
+        allowCount: row.allow_count,
+        denyCount: row.deny_count,
         defaultAccess: "read",
         disabled: true,
       });
@@ -85,13 +118,12 @@ function buildCandidates(rows: EndpointSummary[], policy: PolicyView): Candidate
         row.last_method === "GET" || row.last_method === "HEAD" || row.last_method === null
           ? "read"
           : "read-write";
-      const countLabel =
-        row.deny_count > 0 ? `${row.allow_count}✓ ${row.deny_count}✕` : `${row.allow_count}✓`;
-      candidates.push({
+      add({
         key: `http:${key}`,
         kind: "http",
-        label: `${row.host}:${row.port}`,
-        countLabel,
+        label: key,
+        allowCount: row.allow_count,
+        denyCount: row.deny_count,
         defaultAccess,
         host: row.host,
         port: row.port,
@@ -100,29 +132,20 @@ function buildCandidates(rows: EndpointSummary[], policy: PolicyView): Candidate
     }
   }
 
-  return candidates;
+  return [...byKeyMap.values()].sort(byKey);
 }
 
 export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }: Props) {
   const candidates = useMemo(() => buildCandidates(rows, policy), [rows, policy]);
 
-  // checked state: key → bool (default true for non-disabled)
-  const [checked, setChecked] = useState<Map<string, boolean>>(() => {
-    const m = new Map<string, boolean>();
-    for (const c of candidates) {
-      m.set(c.key, !c.disabled);
-    }
-    return m;
-  });
+  // Selection: the set of candidate keys the user has EXPLICITLY ticked. It
+  // starts EMPTY — this dialog writes straight into the sandbox's firewall
+  // allow-list, so a default of "everything" would approve endpoints the user
+  // never looked at. "Select all" is one deliberate click away.
+  const [checked, setChecked] = useState<ReadonlySet<string>>(() => new Set());
 
   // access state: key → Access
-  const [access, setAccess] = useState<Map<string, Access>>(() => {
-    const m = new Map<string, Access>();
-    for (const c of candidates) {
-      m.set(c.key, c.defaultAccess);
-    }
-    return m;
-  });
+  const [access, setAccess] = useState<Map<string, Access>>(() => new Map());
 
   const [enforceAfter, setEnforceAfter] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -130,11 +153,16 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
 
   const toggleChecked = (key: string) => {
     setChecked((prev) => {
-      const next = new Map(prev);
-      next.set(key, !next.get(key));
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   };
+
+  const selectable = candidates.filter((c) => !c.disabled);
+  const selectAll = () => setChecked(new Set(selectable.map((c) => c.key)));
+  const deselectAll = () => setChecked(new Set());
 
   const setEntryAccess = (key: string, v: Access) => {
     setAccess((prev) => {
@@ -144,7 +172,7 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
     });
   };
 
-  const selectedCandidates = candidates.filter((c) => !c.disabled && checked.get(c.key));
+  const selectedCandidates = selectable.filter((c) => checked.has(c.key));
   const selectedCount = selectedCandidates.length;
 
   async function handleAdd() {
@@ -181,6 +209,15 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
           </DialogDescription>
         </DialogHeader>
 
+        <div className="flex items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={selectAll} disabled={selectable.length === 0}>
+            Select all
+          </Button>
+          <Button variant="ghost" size="sm" onClick={deselectAll} disabled={selectedCount === 0}>
+            Deselect all
+          </Button>
+        </div>
+
         {candidates.length === 0 ? (
           <p className="text-sm text-muted-foreground-2">No new endpoints to add — policy already covers all observed traffic.</p>
         ) : (
@@ -193,13 +230,13 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
                 }`}
               >
                 <Checkbox
-                  checked={!c.disabled && (checked.get(c.key) ?? false)}
+                  checked={!c.disabled && checked.has(c.key)}
                   disabled={c.disabled}
                   onCheckedChange={() => toggleChecked(c.key)}
                   aria-label={c.label}
                 />
                 <span className="flex-1 font-mono">{c.label}</span>
-                <span className="text-xs text-muted-foreground-2">{c.countLabel}</span>
+                <span className="text-xs text-muted-foreground-2">{countLabel(c)}</span>
                 {!c.disabled && (
                   <AccessPicker
                     value={access.get(c.key) ?? c.defaultAccess}
@@ -256,7 +293,7 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
             disabled={submitting || selectedCount === 0}
             onClick={() => void handleAdd()}
           >
-            {selectedCount > 0 ? `Add ${selectedCount} selected to allow-list` : "Add selected to allow-list"}
+            {`Add ${selectedCount} selected to allow-list`}
           </Button>
         </DialogFooter>
       </DialogContent>
