@@ -176,7 +176,9 @@
         );
         return action();
       case "policy_set_full":
-        calls.push("policy_set_full:" + args.name);
+        calls.push(
+          "policy_set_full:" + args.name + ":" + (args.allow || []).length + ":" + (args.git || []).length
+        );
         return action();
       case "policy_set_enforce":
         calls.push("policy_set_enforce:" + args.name + ":" + args.on);
@@ -237,16 +239,18 @@
       // action() so failAction rejects them like every other mutation.
       case "stats":
         calls.push("stats:" + args.name);
-        return Promise.resolve(
-          (scenario.stats && scenario.stats[args.name]) || {
-            name: args.name,
-            running: false,
-            uptime_ms: null,
-            host: null,
-            disk: { rw_img_bytes: 0, volumes: [], logs_bytes: 0, image_bytes: 0 },
-            guest: null,
-          }
-        );
+        return scenario.failStats
+          ? err(scenario.errorMessage || "stats unavailable")
+          : Promise.resolve(
+              (scenario.stats && scenario.stats[args.name]) || {
+                name: args.name,
+                running: false,
+                uptime_ms: null,
+                host: null,
+                disk: { rw_img_bytes: 0, volumes: [], logs_bytes: 0, image_bytes: 0 },
+                guest: null,
+              }
+            );
 
       case "port_list":
         calls.push("port_list:" + args.name);

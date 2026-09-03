@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
 import mockSrc from "../../e2e/mock/tauri-mock.js?raw";
+import type {
+  SandboxStats,
+  PortRule,
+  VolumeInfo,
+  UsbUpstream,
+  UsbDevice,
+  UsbStatus,
+} from "../lib/types";
 
 // tauri-mock.js is a self-contained IIFE that installs itself on `window`.
 // Evaluating it with a fresh plain object as `window` gives each test an
@@ -40,7 +48,7 @@ describe("tauri-mock: policy commands", () => {
       "policy_git_allow:web:github.com/o/r:true",
       "policy_git_revoke:web:github.com/o/r",
       "policy_add_endpoints:web:1:true",
-      "policy_set_full:web",
+      "policy_set_full:web:0:0",
       "policy_set_enforce:web:true",
     ]);
   });
@@ -52,37 +60,45 @@ describe("tauri-mock: policy commands", () => {
 });
 
 describe("tauri-mock: stats", () => {
-  it("answers a canned stopped snapshot when the scenario has none", async () => {
+  it("answers a canned stopped snapshot when the scenario has none, and logs the read", async () => {
     const m = loadMock();
     const s = (await m.invoke("stats", { name: "web" })) as { name: string; running: boolean; disk: unknown; guest: unknown };
     expect(s.name).toBe("web");
     expect(s.running).toBe(false);
     expect(s.guest).toBeNull();
     expect(s.disk).toEqual({ rw_img_bytes: 0, volumes: [], logs_bytes: 0, image_bytes: 0 });
+    expect(m.calls()).toContain("stats:web");
   });
 
   it("prefers the scenario's per-sandbox stats", async () => {
-    const snap = { name: "web", running: true, uptime_ms: 5, host: null, disk: { rw_img_bytes: 1, volumes: [], logs_bytes: 0, image_bytes: 0 }, guest: null };
+    const snap: SandboxStats = { name: "web", running: true, uptime_ms: 5, host: null, disk: { rw_img_bytes: 1, volumes: [], logs_bytes: 0, image_bytes: 0 }, guest: null };
     const m = loadMock({ stats: { web: snap } });
     await expect(m.invoke("stats", { name: "web" })).resolves.toEqual(snap);
+  });
+
+  it("rejects under failStats with the scenario's message, and still logs the read", async () => {
+    const m = loadMock({ failStats: true, errorMessage: "boom" });
+    await expect(m.invoke("stats", { name: "web" })).rejects.toThrow("boom");
+    expect(m.calls()).toContain("stats:web");
   });
 });
 
 describe("tauri-mock: ports", () => {
   it("lists from the scenario and logs publish/unpublish with the frontend's camelCase args", async () => {
-    const rule = { bind: "127.0.0.1", host_port: 8080, guest_port: 80 };
+    const rule: PortRule = { bind: "127.0.0.1", host_port: 8080, guest_port: 80 };
     const m = loadMock({ ports: { web: [rule] } });
     await expect(m.invoke("port_list", { name: "web" })).resolves.toEqual([rule]);
     await expect(m.invoke("port_list", { name: "db" })).resolves.toEqual([]);
     await expect(m.invoke("port_publish", { name: "web", ruleSpec: "8080:80", persist: true })).resolves.toBeUndefined();
     await expect(m.invoke("port_unpublish", { name: "web", bind: "127.0.0.1", hostPort: 8080 })).resolves.toBeUndefined();
     expect(mutatingCalls(m.calls())).toEqual(["port_publish:web:8080:80:true", "port_unpublish:web:127.0.0.1:8080"]);
+    expect(m.calls()).toContain("port_list:web");
   });
 });
 
 describe("tauri-mock: volumes", () => {
   it("lists, attaches, detaches, removes and prunes", async () => {
-    const vol = { name: "data", size_bytes: 10, actual_bytes: 5, referenced_by: ["web"] };
+    const vol: VolumeInfo = { name: "data", size_bytes: 10, actual_bytes: 5, referenced_by: ["web"] };
     const m = loadMock({ volumes: [vol] });
     await expect(m.invoke("volume_list")).resolves.toEqual([vol]);
     await expect(m.invoke("volume_attach", { name: "web", spec: "data:/data" })).resolves.toBeUndefined();
@@ -95,6 +111,7 @@ describe("tauri-mock: volumes", () => {
       "volume_remove:data",
       "volume_prune",
     ]);
+    expect(m.calls()).toContain("volume_list");
   });
 
   it("volume_list defaults to empty and volume_prune honours failAction", async () => {
@@ -105,17 +122,20 @@ describe("tauri-mock: volumes", () => {
 });
 
 describe("tauri-mock: usb", () => {
-  it("reports the feature off by default and empty inventory/status", async () => {
+  it("reports the feature off by default and empty inventory/status, and logs the reads", async () => {
     const m = loadMock();
     await expect(m.invoke("usb_upstream_show")).resolves.toBeNull();
     await expect(m.invoke("usb_list_devices")).resolves.toEqual([]);
     await expect(m.invoke("usb_status", { name: "web" })).resolves.toEqual({ grants: [], restart_required: false });
+    expect(m.calls()).toContain("usb_upstream_show");
+    expect(m.calls()).toContain("usb_list_devices");
+    expect(m.calls()).toContain("usb_status:web");
   });
 
   it("answers from the scenario when configured", async () => {
-    const upstream = { host: "127.0.0.1", port: 3240, resolved: "127.0.0.1", trust: "own-host-loopback", warning: null };
-    const dev = { busid: "3-2", device: "0403:6001", description: "FT232", shared: true, granted_to: [], attached_to: null, bind_command: null };
-    const status = { grants: [{ device: "0403:6001", busid_pin: "3-2", description: "FT232", granted_at_unix_ms: 1, attached: false }], restart_required: true };
+    const upstream: UsbUpstream = { host: "127.0.0.1", port: 3240, resolved: "127.0.0.1", trust: "own-host-loopback", warning: null };
+    const dev: UsbDevice = { busid: "3-2", device: "0403:6001", description: "FT232", shared: true, granted_to: [], attached_to: null, bind_command: null };
+    const status: UsbStatus = { grants: [{ device: "0403:6001", busid_pin: "3-2", description: "FT232", granted_at_unix_ms: 1, attached: false }], restart_required: true };
     const m = loadMock({ usbUpstream: upstream, usbDevices: [dev], usbStatus: { web: status } });
     await expect(m.invoke("usb_upstream_show")).resolves.toEqual(upstream);
     await expect(m.invoke("usb_list_devices")).resolves.toEqual([dev]);
