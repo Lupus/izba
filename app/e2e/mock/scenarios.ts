@@ -27,7 +27,6 @@ export interface Scenario {
   createName?: string;
   createError?: string;
   createDeferred?: boolean;
-  policyEnableCount?: number;
 }
 
 function buildInfo(over: Partial<BuildInfo> = {}): BuildInfo {

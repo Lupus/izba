@@ -42,8 +42,8 @@ export const api = {
   policyShow: (name: string) => invoke<PolicyView>("policy_show", { name }),
   policyAllow: (name: string, host: string, port: number) =>
     invoke<void>("policy_allow", { name, host, port }),
-  policyBlock: (name: string, host: string, port: number) =>
-    invoke<void>("policy_block", { name, host, port }),
+  policyRevoke: (name: string, host: string, port: number) =>
+    invoke<void>("policy_revoke", { name, host, port }),
   policySet: (name: string, allow: AllowEntry[]) => invoke<void>("policy_set", { name, allow }),
   policyAddEndpoints: (name: string, entries: SeedEntry[], enforce: boolean) =>
     invoke<void>("policy_add_endpoints", { name, entries, enforce }),
@@ -56,8 +56,8 @@ export const api = {
   // Rust's `String` deserialization.
   policyGitAllow: (name: string, target: string, write: boolean) =>
     invoke<void>("policy_git_allow", { name, target, write }),
-  policyGitBlock: (name: string, target: string) =>
-    invoke<void>("policy_git_block", { name, target }),
+  policyGitRevoke: (name: string, target: string) =>
+    invoke<void>("policy_git_revoke", { name, target }),
   inspect: (name: string) => invoke<SandboxDetail>("inspect", { name }),
   stats: (name: string) => invoke<SandboxStats>("stats", { name }),
   portList: (name: string) => invoke<PortRule[]>("port_list", { name }),

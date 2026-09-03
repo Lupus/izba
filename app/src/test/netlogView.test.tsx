@@ -11,9 +11,9 @@ vi.mock("../lib/ipc", () => ({
     readNetlog: vi.fn(),
     policyShow: vi.fn(),
     policyAllow: vi.fn(),
-    policyBlock: vi.fn(),
+    policyRevoke: vi.fn(),
     policyGitAllow: vi.fn(),
-    policyGitBlock: vi.fn(),
+    policyGitRevoke: vi.fn(),
     policySetEnforce: vi.fn(),
     policyAddEndpoints: vi.fn(),
   },
@@ -53,11 +53,11 @@ beforeEach(() => {
 });
 
 describe("NetlogView", () => {
-  it("offers Block on a host the policy already allows", async () => {
+  it("offers Revoke on a host the policy already allows", async () => {
     mockPolicy({ enforcing: true, allow: ["api.x.com"], git: [] }); // bare host ⇒ 80, 443
     render(<NetlogView name="web" />);
-    fireEvent.click(await screen.findByRole("button", { name: /block api\.x\.com/i }));
-    await waitFor(() => expect(api.policyBlock).toHaveBeenCalledWith("web", "api.x.com", 443));
+    fireEvent.click(await screen.findByRole("button", { name: /revoke api\.x\.com/i }));
+    await waitFor(() => expect(api.policyRevoke).toHaveBeenCalledWith("web", "api.x.com", 443));
   });
 
   it("offers Allow on a host the policy does not yet permit", async () => {
@@ -80,8 +80,8 @@ describe("NetlogView", () => {
     });
     render(<NetlogView name="web" />);
     fireEvent.click(await screen.findByRole("button", { name: /allow api\.x\.com/i }));
-    // After the action+refresh the button toggles to Block (state visibly changed).
-    await screen.findByRole("button", { name: /block api\.x\.com/i });
+    // After the action+refresh the button toggles to Revoke (state visibly changed).
+    await screen.findByRole("button", { name: /revoke api\.x\.com/i });
   });
 
   it("disables Allow on a raw-IP row", async () => {
@@ -111,12 +111,12 @@ describe("NetlogView", () => {
     expect(screen.queryByText(/all allowed/)).toBeNull();
   });
 
-  it("a git row reflects its policy access and offers Block", async () => {
+  it("a git row reflects its policy access and offers Revoke", async () => {
     (api.policyShow as Mock).mockResolvedValue({ enforcing: true, allow: [], git: [{ repo: "github.com/o/a", access: "read" }] });
     (api.readNetlog as Mock).mockResolvedValue([ sum({ host: "github.com", port: 443, last_method: "POST", last_path: "/o/a/git-upload-pack" }) ]);
     render(<NetlogView name="web" />);
     expect(await screen.findByText("git → github.com/o/a")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^Block$/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Revoke$/ })).toBeInTheDocument();
   });
 
   it("orders rows deterministically by recency then host:port, not backend order", async () => {
@@ -235,27 +235,27 @@ describe("NetlogView", () => {
     expect(screen.queryByText("allowed")).not.toBeInTheDocument();
   });
 
-  it("Block on a git row calls policyGitBlock", async () => {
+  it("Revoke on a git row calls policyGitRevoke", async () => {
     (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([makeGitPushRow("allow", 1, 0)]);
     mockPolicy({ enforcing: true, allow: [], git: [] });
-    (api.policyGitBlock as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (api.policyGitRevoke as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     render(<NetlogView name="sb" />);
     await screen.findByText(/git → github\.com\/o\/a/);
-    // No git rule → Block button is NOT shown (call-to-action for Allow-read/Allow-write instead)
-    // Block is only shown when access !== null (a rule exists).
-    expect(screen.queryByRole("button", { name: /^Block$/i })).not.toBeInTheDocument();
+    // No git rule → Revoke button is NOT shown (call-to-action for Allow-read/Allow-write instead)
+    // Revoke is only shown when access !== null (a rule exists).
+    expect(screen.queryByRole("button", { name: /^Revoke$/i })).not.toBeInTheDocument();
   });
 
-  it("Block on a git row with existing rule calls policyGitBlock", async () => {
+  it("Revoke on a git row with existing rule calls policyGitRevoke", async () => {
     (api.readNetlog as ReturnType<typeof vi.fn>).mockResolvedValue([makeGitPushRow("allow", 1, 0)]);
     mockPolicy({ enforcing: true, allow: [], git: [{ repo: "github.com/o/a", access: "read" }] });
-    (api.policyGitBlock as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (api.policyGitRevoke as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     render(<NetlogView name="sb" />);
     await screen.findByText(/git → github\.com\/o\/a/);
-    const btn = screen.getByRole("button", { name: /^Block$/i });
+    const btn = screen.getByRole("button", { name: /^Revoke$/i });
     fireEvent.click(btn);
     await waitFor(() =>
-      expect(api.policyGitBlock).toHaveBeenCalledWith("sb", "github.com/o/a"),
+      expect(api.policyGitRevoke).toHaveBeenCalledWith("sb", "github.com/o/a"),
     );
   });
 
@@ -445,18 +445,18 @@ describe("NetlogView sandbox switch", () => {
   it("withdraws the previous sandbox's rows and their policy actions on a switch", async () => {
     webAnswersOthersHang();
     const { rerender } = render(<NetlogView name="web" />);
-    // `web` is enforcing and allows api.x.com, so the row offers Block.
-    await screen.findByRole("button", { name: /block api\.x\.com/i });
+    // `web` is enforcing and allows api.x.com, so the row offers Revoke.
+    await screen.findByRole("button", { name: /revoke api\.x\.com/i });
 
     rerender(<NetlogView name="db" />);
 
     // The row-policy writes share the enforce guard structurally: they render
     // only under `enforcing`, which is derived from `policy` — cleared here.
     // This test is what keeps that "structural" claim honest.
-    expect(screen.queryByRole("button", { name: /block api\.x\.com/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /revoke api\.x\.com/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /allow api\.x\.com/i })).not.toBeInTheDocument();
     expect(screen.queryByText("api.x.com")).not.toBeInTheDocument();
-    expect(api.policyBlock).not.toHaveBeenCalled();
+    expect(api.policyRevoke).not.toHaveBeenCalled();
     expect(api.policyAllow).not.toHaveBeenCalled();
   });
 
@@ -534,18 +534,18 @@ describe("NetlogView sandbox switch — the frame React actually commits", () =>
     const h = frameHarness();
     try {
       await h.settle(<NetlogView name="web" />);
-      await within(h.container).findByRole("button", { name: /block api\.x\.com/i });
+      await within(h.container).findByRole("button", { name: /revoke api\.x\.com/i });
 
       await h.inFrame(<NetlogView name="db" />, () => {
-        // If the row survived into this frame its Block writes a rule about
+        // If the row survived into this frame its Revoke writes a rule about
         // api.x.com — a host observed on `web` — into `db`'s policy.
-        const block = within(h.container).queryByRole("button", {
-          name: /block api\.x\.com/i,
+        const revoke = within(h.container).queryByRole("button", {
+          name: /revoke api\.x\.com/i,
         });
-        if (block) rawClick(block);
-        expect(api.policyBlock).not.toHaveBeenCalled();
+        if (revoke) rawClick(revoke);
+        expect(api.policyRevoke).not.toHaveBeenCalled();
       });
-      expect(api.policyBlock).not.toHaveBeenCalled();
+      expect(api.policyRevoke).not.toHaveBeenCalled();
     } finally {
       await h.unmount();
     }

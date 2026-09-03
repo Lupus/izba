@@ -205,14 +205,14 @@ pub fn policy_allow_core(
     d.policy_allow(name, host, port).map_err(|e| e.to_string())
 }
 
-/// Core of `policy_block`: revoke a host:port (auto-reloads).
-pub fn policy_block_core(
+/// Core of `policy_revoke`: revoke a host:port grant (auto-reloads).
+pub fn policy_revoke_core(
     d: &mut dyn DaemonApi,
     name: &str,
     host: &str,
     port: u16,
 ) -> Result<(), String> {
-    d.policy_block(name, host, port).map_err(|e| e.to_string())
+    d.policy_revoke(name, host, port).map_err(|e| e.to_string())
 }
 
 /// Core of `policy_set`: replace the allow-list wholesale (auto-reloads).
@@ -257,13 +257,13 @@ pub fn policy_git_allow_core(
         .map_err(|e| e.to_string())
 }
 
-/// Core of `policy_git_block`: revoke a git target (auto-reloads).
-pub fn policy_git_block_core(
+/// Core of `policy_git_revoke`: revoke a git target grant (auto-reloads).
+pub fn policy_git_revoke_core(
     d: &mut dyn DaemonApi,
     name: &str,
     target: &str,
 ) -> Result<(), String> {
-    d.policy_git_block(name, target).map_err(|e| e.to_string())
+    d.policy_git_revoke(name, target).map_err(|e| e.to_string())
 }
 
 /// Core of `policy_set_enforce`: set the enforcing flag (auto-reloads).
@@ -927,10 +927,10 @@ mod tests {
     fn policy_edit_cores_record_calls() {
         let mut d = crate::fake::FakeDaemon::default();
         policy_allow_core(&mut d, "web", "api.x.com", 443).unwrap();
-        policy_block_core(&mut d, "web", "api.x.com", 80).unwrap();
+        policy_revoke_core(&mut d, "web", "api.x.com", 80).unwrap();
         policy_add_endpoints_core(&mut d, "web", vec![], false).unwrap();
         assert!(d.calls.iter().any(|c| c == "allow:web:api.x.com:443"));
-        assert!(d.calls.iter().any(|c| c == "block:web:api.x.com:80"));
+        assert!(d.calls.iter().any(|c| c == "revoke:web:api.x.com:80"));
         assert!(d.calls.iter().any(|c| c.starts_with("add_endpoints:web:")));
     }
 

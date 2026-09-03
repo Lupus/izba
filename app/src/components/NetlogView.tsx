@@ -76,7 +76,7 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
   // Controls the SeedDialog (Review observed traffic).
   const [showSeed, setShowSeed] = useState(false);
   // While the pointer is over the table we freeze auto-refresh so rows don't
-  // shift under an in-flight Allow/Block click. A ref (read inside the interval
+  // shift under an in-flight Allow/Revoke click. A ref (read inside the interval
   // closure) avoids re-arming the timer on every hover.
   const [hovering, setHovering] = useState(false);
   const hoveringRef = useRef(false);
@@ -365,7 +365,7 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
                     <td>
                       {isGit && gitRepo ? (
                         gitAccess !== null ? (
-                          // Rule exists: show highlighted active access + Block
+                          // Rule exists: show highlighted active access + Revoke
                           <span className="flex gap-1">
                             <Button
                               aria-label="Allow read"
@@ -390,15 +390,15 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
                               {busy ? "…" : "Allow write"}
                             </Button>
                             <Button
-                              aria-label="Block"
+                              aria-label="Revoke"
                               disabled={busy}
                               size="sm"
                               variant="destructive"
                               onClick={() =>
-                                void act(key, () => api.policyGitBlock(name, gitRepo))
+                                void act(key, () => api.policyGitRevoke(name, gitRepo))
                               }
                             >
-                              {busy ? "…" : "Block"}
+                              {busy ? "…" : "Revoke"}
                             </Button>
                           </span>
                         ) : (
@@ -430,15 +430,15 @@ export function NetlogView({ name, pollMs = 1500 }: Readonly<{ name: string; pol
                         )
                       ) : permitted ? (
                         <Button
-                          aria-label={`Block ${target}`}
+                          aria-label={`Revoke ${target}`}
                           disabled={busy}
                           size="sm"
                           variant="destructive"
                           onClick={() =>
-                            r.host && void act(key, () => api.policyBlock(name, r.host!, r.port))
+                            r.host && void act(key, () => api.policyRevoke(name, r.host!, r.port))
                           }
                         >
-                          {busy ? "…" : "Block"}
+                          {busy ? "…" : "Revoke"}
                         </Button>
                       ) : (
                         <Button
