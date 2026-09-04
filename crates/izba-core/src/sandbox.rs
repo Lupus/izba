@@ -2683,15 +2683,23 @@ mod tests {
 
         start(&paths, "web", &MockDriver::new(), &arts(), false).unwrap();
 
-        let shipped = fs::read_to_string(paths.sandbox_dir("web").join("trust").join("extra.pem"))
+        // Compare by DER, not by text: the shipped file is RE-SERIALIZED from
+        // the parsed certificates (#283 fix), so the anchors — not the
+        // operator's byte-for-byte file — are what must match, in order.
+        let shipped = fs::read(paths.sandbox_dir("web").join("trust").join("extra.pem"))
             .expect("extra.pem shipped");
-        let a = shipped
-            .find(ca_a.cert_pem().trim())
-            .expect("a-first present");
-        let b = shipped
-            .find(ca_b.cert_pem().trim())
-            .expect("b-second present");
-        assert!(a < b, "file-name order: a-first before b-second");
+        use rustls::pki_types::pem::PemObject;
+        let der = |pem: &str| {
+            rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+                .map(|c| c.unwrap().to_vec())
+                .collect::<Vec<_>>()
+        };
+        let got: Vec<Vec<u8>> = rustls::pki_types::CertificateDer::pem_slice_iter(&shipped)
+            .map(|c| c.unwrap().to_vec())
+            .collect();
+        let mut want = der(ca_a.cert_pem());
+        want.extend(der(ca_b.cert_pem()));
+        assert_eq!(got, want, "file-name order: a-first before b-second");
         // The izba CA itself is still the separate ca.pem, untouched.
         assert!(paths
             .sandbox_dir("web")
