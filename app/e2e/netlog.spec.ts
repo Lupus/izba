@@ -94,6 +94,7 @@ test.describe("netlog", () => {
       ],
     });
     // The poll delivered it (the notice proves the data reached the dialog)…
+    // Waits on NetlogView's 1.5 s poll, not a render — needs more than the 5 s default under parallel CI workers.
     await expect(dialog.getByRole("status")).toHaveText(
       "1 new endpoint(s) observed since this review — refresh to include them.",
       { timeout: 10_000 },
@@ -103,7 +104,7 @@ test.describe("netlog", () => {
     await expect(dialog.getByRole("checkbox")).toHaveCount(2); // still exactly two rows
     await expect(dialog.getByRole("checkbox").first()).toHaveAccessibleName("github.com:443");
 
-    // Keyboard only from here: tick github.com via Space, refresh via Enter.
+    // Keyboard activation from here (focus + Space/Enter): tick github.com via Space, refresh via Enter.
     await github.focus();
     await page.keyboard.press("Space");
     await expect(github).toBeChecked();

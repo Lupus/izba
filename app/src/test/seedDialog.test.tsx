@@ -183,7 +183,7 @@ describe("SeedDialog selection (a consent surface: nothing is approved by defaul
     expect(screen.getAllByRole("checkbox")).toHaveLength(3);
   });
 
-  it("renders candidate rows in buildCandidates' key order regardless of backend row order", () => {
+  it("renders candidate rows in buildCandidates' key order", () => {
     const raw = sum({ host: null, dest_ip: "10.0.0.1", port: 80, last_method: null, last_path: null });
     const pypi = sum({ host: "pypi.org", port: 443 });
     const gitRow = sum({ host: "github.com", last_method: "POST", last_path: "/o/b/git-upload-pack" });
@@ -239,7 +239,7 @@ describe("SeedDialog snapshot (a review is a frozen list, not a live feed)", () 
     expect(screen.getByRole("status")).toBeEmptyDOMElement();
   });
 
-  it("a reshuffle of the same membership neither moves rows nor raises the notice", () => {
+  it("a reshuffle of the same membership leaves the frozen list untouched and raises no notice", () => {
     const { rerender } = render(dialog([npm, pypi]));
     expect(listedLabels()).toEqual(["npmjs.org:443", "pypi.org:443"]);
     rerender(dialog([pypi, npm]));
@@ -249,7 +249,7 @@ describe("SeedDialog snapshot (a review is a frozen list, not a live feed)", () 
 
   it("Refresh is available even when the snapshot was empty at open", () => {
     const { rerender } = render(dialog([]));
-    expect(screen.getByText(/No new endpoints to add/)).toBeInTheDocument();
+    expect(screen.getByText(/No new endpoints in this review/)).toBeInTheDocument();
     rerender(dialog([pypi]));
     expect(screen.getByRole("status")).toHaveTextContent(/1 new endpoint/);
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
