@@ -2861,7 +2861,7 @@ fn cp_round_trip_tree() {
     fs::write(src.join("a.txt"), b"alpha").unwrap();
     fs::write(src.join("sub/run.sh"), b"#!/bin/sh\necho hi\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(src.join("sub/run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(src.join("sub/run.sh"), fs::Permissions::from_mode(0o750)).unwrap();
     std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
 
     // Host -> guest: dest /etc/izba-cp-test does NOT exist and /etc does, so
@@ -2880,7 +2880,7 @@ fn cp_round_trip_tree() {
         "cpbox",
         &["sh", "-c", "stat -c %a /etc/izba-cp-test/sub/run.sh"],
     );
-    assert_eq!(mode.trim(), "755", "exec bit must survive host->guest");
+    assert_eq!(mode.trim(), "750", "exec bit must survive host->guest");
     let link = exec_ok(&tb.paths, "cpbox", &["readlink", "/etc/izba-cp-test/link"]);
     assert_eq!(link.trim(), "a.txt", "symlink must survive host->guest");
 
@@ -2909,7 +2909,7 @@ fn cp_round_trip_tree() {
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(back_mode, 0o755, "exec bit must survive guest->host");
+    assert_eq!(back_mode, 0o750, "exec bit must survive guest->host");
     let back_link = fs::read_link(out.join("izba-cp-test/link")).unwrap();
     assert_eq!(back_link, std::path::Path::new("a.txt"));
 
