@@ -166,9 +166,9 @@ Key properties:
   `izba daemon status`, which lists the loaded files. A file that is not a
   valid certificate refuses `izba start` and disables the firewall's HTTPS path
   (enforcing sandboxes fail closed) with the file named in the error; in that
-  state `izba daemon status` prints a `⚠ trust: extra CA load FAILED …` line —
-  fix or remove the file. The host OS trust store is NOT imported
-  automatically; copy the roots you need.
+  state `izba daemon status` prints a `⚠ trust: HTTPS interception init
+  FAILED …` line naming the cause — fix or remove the file. The host OS trust
+  store is NOT imported automatically; copy the roots you need.
 
   **Verifying enforcement: test with a real request, not a bare TCP connect.**
   Because the allow/deny verdict is rendered per request/SNI at the interception

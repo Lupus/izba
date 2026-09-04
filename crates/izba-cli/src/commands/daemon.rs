@@ -87,8 +87,11 @@ pub fn status(paths: &Paths) -> anyhow::Result<i32> {
 /// wire: a pre-#283 daemon would otherwise leave a blank hole in the sentence.
 fn trust_line(s: &izba_core::daemon::proto::DaemonStatus, extra_dir: &str) -> String {
     if let Some(err) = &s.trust_error {
+        // NOT "extra CA load FAILED": the daemon reports three different
+        // causes here (CA init, the extra-CA load, MitmRuntime start), and
+        // `err` names which one. A prefix that is true for all three.
         return format!(
-            "⚠ trust: extra CA load FAILED — {err}; HTTPS interception is DISABLED, \
+            "⚠ trust: HTTPS interception init FAILED — {err}; HTTPS interception is DISABLED, \
              enforcing sandboxes fail closed (fix or remove the file under {extra_dir}, \
              then `izba daemon stop` to reload)"
         );
@@ -165,12 +168,33 @@ mod tests {
     #[test]
     fn a_load_failure_is_loud_and_names_the_fail_closed_consequence() {
         let mut s = status();
-        s.trust_error = Some("extra CA file /d/corp.pem: invalid PEM".into());
+        s.trust_error = Some("extra CA load failed: extra CA file /d/corp.pem: invalid PEM".into());
         let line = trust_line(&s, "/d");
-        assert!(line.starts_with("⚠ trust: extra CA load FAILED"), "{line}");
+        assert!(
+            line.starts_with("⚠ trust: HTTPS interception init FAILED"),
+            "{line}"
+        );
         assert!(line.contains("corp.pem"), "{line}");
         assert!(line.contains("fail closed"), "{line}");
         assert!(!line.contains("webpki roots only"), "{line}");
+    }
+
+    /// The prefix must stay true when the cause is NOT the extra-CA load:
+    /// the daemon also reports CA-init and runtime-start failures here.
+    #[test]
+    fn a_non_extra_ca_cause_is_not_misattributed_to_the_extra_ca_load() {
+        let mut s = status();
+        s.trust_error = Some("CA init failed: permission denied".into());
+        let line = trust_line(&s, "/d");
+        assert!(
+            line.starts_with("⚠ trust: HTTPS interception init FAILED"),
+            "{line}"
+        );
+        assert!(line.contains("CA init failed"), "{line}");
+        assert!(
+            !line.contains("extra CA load FAILED"),
+            "must not blame the extra-CA load: {line}"
+        );
     }
 
     /// A failure wins even if a stale file list somehow accompanies it.
