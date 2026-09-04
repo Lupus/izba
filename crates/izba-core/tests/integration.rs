@@ -2578,6 +2578,101 @@ fn custom_ca_trusted_in_guest_and_at_izbad_upstream_real_vm() {
     }
 }
 
+/// #283 follow-up (Greptile finding): the guest's canonical Debian/Alpine
+/// system bundle (`/etc/ssl/certs/ca-certificates.crt`) lives on the
+/// sandbox's PERSISTENT overlay and must be REWRITTEN, not appended to, on
+/// every boot — otherwise a CA the operator removes from
+/// `<data>/trust/extra/` stays trusted at that path forever (a revocation
+/// hole), and the file grows with a duplicate copy of the anchors on every
+/// boot. Proves the revocation end to end on a real boot: install an extra
+/// CA, boot, see it (inside a single marked izba-managed block) in the
+/// canonical bundle; stop, remove the CA from the host directory, start the
+/// SAME sandbox again (same persistent overlay, so this is exactly the
+/// scenario an append would get wrong) and see it revoked at that path too —
+/// while the izba-managed marker still appears exactly once and every other
+/// root (izba's own CA + the image's system roots) survives untouched.
+#[test]
+fn canonical_bundle_revokes_a_removed_extra_ca_real_vm() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let name = "canonical-ca-revoke";
+    let ws = tb.workspace(name);
+
+    let corp_ca = izba_core::daemon::egress::mitm::IzbaCa::generate().unwrap();
+    std::fs::create_dir_all(tb.paths.trust_extra_dir()).unwrap();
+    let corp_pem_path = tb.paths.trust_extra_dir().join("corp.pem");
+    std::fs::write(&corp_pem_path, corp_ca.cert_pem()).unwrap();
+
+    // A base64 body line from the corp cert PEM, used as a fingerprint to
+    // detect its presence/absence in the guest's canonical bundle.
+    let corp_marker = corp_ca
+        .cert_pem()
+        .lines()
+        .find(|l| !l.starts_with("-----"))
+        .expect("cert PEM has a base64 body line")
+        .to_string();
+
+    boot(&env, &mut tb, name, &ws);
+
+    let (markers_before, certs_before, corp_before) =
+        canonical_bundle_stats(&tb.paths, name, &corp_marker);
+    assert_eq!(
+        markers_before, 1,
+        "exactly one izba-managed marker after the first boot"
+    );
+    assert!(
+        corp_before,
+        "the freshly-installed corp CA must appear in the canonical bundle"
+    );
+
+    stop_sandbox(&tb, name);
+    std::fs::remove_file(&corp_pem_path).expect("removing the corp CA from the host directory");
+    start_sandbox(&env, &tb, name).unwrap_or_else(|e| {
+        panic!(
+            "restart of '{name}' failed: {e:#}\nconsole tail:\n{}",
+            boot_diag(&tb.paths, name)
+        )
+    });
+
+    let (markers_after, certs_after, corp_after) =
+        canonical_bundle_stats(&tb.paths, name, &corp_marker);
+    assert_eq!(
+        markers_after, 1,
+        "still exactly one izba-managed marker — the block was REPLACED, not appended"
+    );
+    assert!(
+        !corp_after,
+        "the corp CA must be REVOKED from the canonical bundle once removed from the host \
+         trust/extra/ directory and the sandbox restarted"
+    );
+    assert_eq!(
+        certs_after,
+        certs_before - 1,
+        "removing the one corp root must drop exactly one CERTIFICATE block — izba's own CA \
+         and the image's system roots must survive untouched"
+    );
+
+    stop_sandbox(&tb, name);
+}
+
+/// `grep -c` counts inside the guest's canonical system CA bundle: (izba
+/// marker occurrences, total CERTIFICATE blocks, whether `corp_marker`
+/// appears). `; true` neutralizes grep's exit code 1 on zero matches so
+/// `exec_ok`'s `status == 0` assertion holds either way.
+fn canonical_bundle_stats(paths: &Paths, name: &str, corp_marker: &str) -> (u32, u32, bool) {
+    let count = |pattern: &str| -> u32 {
+        let cmd = format!("grep -c -F '{pattern}' /etc/ssl/certs/ca-certificates.crt; true");
+        exec_ok(paths, name, &["sh", "-c", &cmd])
+            .trim()
+            .parse()
+            .expect("grep -c prints a decimal count")
+    };
+    let markers = count("BEGIN izba-managed");
+    let certs = count("BEGIN CERTIFICATE");
+    let corp = count(corp_marker) > 0;
+    (markers, certs, corp)
+}
+
 /// M1 throughput baseline: bulk transfer through the egress stub.
 /// MEASURED, NOT GATED (roadmap decision) — the number is printed for
 /// trend-watching; the only assertion is that the transfer completes.
