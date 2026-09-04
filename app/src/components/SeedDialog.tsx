@@ -238,21 +238,21 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
           <Button variant="ghost" size="sm" onClick={selectAll} disabled={selectable.length === 0}>
             Select all
           </Button>
-          <Button variant="ghost" size="sm" onClick={deselectAll} disabled={selectedCount === 0}>
+          <Button variant="ghost" size="sm" onClick={deselectAll}>
             Deselect all
           </Button>
           <Button variant="secondary" size="sm" className="ml-auto" onClick={refreshSnapshot}>
             Refresh
           </Button>
         </div>
-        <div role="status" aria-live="polite" className="h-5 text-xs text-muted-foreground-2">
+        <div role="status" aria-live="polite" className="min-h-5 text-xs text-muted-foreground-2">
           {unseenCount > 0
             ? `${unseenCount} new endpoint(s) observed since this review — refresh to include them.`
             : ""}
         </div>
 
         {candidates.length === 0 ? (
-          <p className="text-sm text-muted-foreground-2">No new endpoints to add — policy already covers all observed traffic.</p>
+          <p className="text-sm text-muted-foreground-2">No new endpoints in this review — the policy covered everything observed when it opened.</p>
         ) : (
           <div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto">
             {candidates.map((c) => (
