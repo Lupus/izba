@@ -29,6 +29,34 @@ below). Open design question settled here: **explicit directory only**; OS
 trust-store auto-import (rustls-native-certs) is DEFERRED — Task 7 files the
 follow-up issue.
 
+## Post-review amendments (what actually shipped)
+
+A whole-branch review after Task 7 changed four things below. **The task bodies
+are historical; these amendments are the truth.**
+
+1. **`ExtraCaFile` has NO `pem` field.** Shipping the operator's file text
+   verbatim leaked a CA PRIVATE KEY into every guest: `pem_slice_iter` silently
+   skips non-CERTIFICATE sections, so a key+cert file (the shape of
+   `~/.mitmproxy/mitmproxy-ca.pem`) passed the loader and its key rode into
+   `/etc/izba/ca.pem`. Now (a) any file carrying a `-----BEGIN … PRIVATE KEY-----`
+   header is refused, naming it, and (b) `guest_extra_pem` RE-SERIALIZES the
+   parsed certs as 64-column PEM, so only certificates can leave the module.
+2. **`EXTRA_CA_EXTENSIONS = ["pem", "crt", "cer", "der"]`, and files are read as
+   BYTES.** A leading `0x30` is treated as one DER certificate; otherwise the
+   bytes must be UTF-8 PEM. A DER-encoded `.crt` (Windows' default export)
+   previously hit `read_to_string` and bricked every `izba start`.
+3. **`build_mitm_runtime` returns `MitmInit { runtime, trust }`** with
+   `TrustStatus { extra_ca_files, error }`. `DaemonStatus` gained
+   `trust_error: Option<String>` and **dropped `trust_extra_dir`** (the CLI
+   renders the path from its own `Paths`). `izba daemon status` used to report
+   a failed load as the benign "webpki roots only", hiding that every enforcing
+   sandbox was failing closed; the three postures now live in a pure,
+   unit-tested `trust_line()` in `izba-cli`.
+4. **`mitm::upstream_client_config_webpki` is DELETED** (Task 6's "keep it, it
+   still has test callers" no longer held — the last caller went away).
+
+---
+
 ## Global Constraints
 
 - All six workspace gates green before every commit (see CLAUDE.md "Build &
