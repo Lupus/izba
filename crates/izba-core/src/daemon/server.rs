@@ -39,19 +39,19 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// sandbox's HTTP(S) is failing closed. Reporting only `extra_ca_files` would
 /// render that state as the benign "webpki roots only", advising the operator
 /// to do what they had already done.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct TrustStatus {
+#[derive(Debug, Clone)]
+struct TrustStatus {
     /// File names loaded from `<data>/trust/extra`, in load order.
-    pub extra_ca_files: Vec<String>,
+    extra_ca_files: Vec<String>,
     /// The `{e:#}` text of the failure that disabled the MITM, if any.
-    pub error: Option<String>,
+    error: Option<String>,
 }
 
 /// The outcome of [`build_mitm_runtime`]: the runtime the egress plane uses,
 /// plus the trust posture the operator is shown.
-pub(crate) struct MitmInit {
-    pub runtime: Option<Arc<crate::daemon::egress::mitm_runtime::MitmRuntime>>,
-    pub trust: TrustStatus,
+struct MitmInit {
+    runtime: Option<Arc<crate::daemon::egress::mitm_runtime::MitmRuntime>>,
+    trust: TrustStatus,
 }
 
 /// Build the shared MITM tier-1 runtime: load/mint the persistent izba CA, sign
