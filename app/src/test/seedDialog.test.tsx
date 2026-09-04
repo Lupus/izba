@@ -255,6 +255,55 @@ describe("SeedDialog snapshot (a review is a frozen list, not a live feed)", () 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(listedLabels()).toEqual(["pypi.org:443"]);
   });
+
+  it("Refresh prunes a departed candidate from checked, and it comes back unticked (not resurrected) if it returns", async () => {
+    const add = api.policyAddEndpoints as Mock;
+    const { rerender } = render(dialog([pypi, npm]));
+    fireEvent.click(screen.getByRole("checkbox", { name: "pypi.org:443" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "npmjs.org:443" }));
+
+    // npm drops out of live (e.g. it became covered by policy out of band).
+    rerender(dialog([pypi]));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(addButton()).toHaveTextContent("Add 1 selected to allow-list");
+    fireEvent.click(addButton());
+    await waitFor(() =>
+      expect(add).toHaveBeenCalledWith(
+        "web",
+        [{ kind: "http", host: "pypi.org", port: 443, access: "read" }],
+        false,
+      ),
+    );
+
+    // npm returns (coverage revoked again): the notice reports it as new, and
+    // Refresh must land it unticked — a departed-then-returned row is not the
+    // same consent as the tick the user gave it before it left.
+    rerender(dialog([pypi, npm]));
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "1 new endpoint(s) observed since this review — refresh to include them.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(screen.getByRole("checkbox", { name: "npmjs.org:443" })).not.toBeChecked();
+    expect(addButton()).toHaveTextContent("Add 1 selected to allow-list");
+  });
+
+  it("an access override on a row that STAYS through Refresh is preserved", async () => {
+    const add = api.policyAddEndpoints as Mock;
+    const { rerender } = render(dialog([pypi]));
+    fireEvent.click(screen.getByRole("checkbox", { name: "pypi.org:443" }));
+    fireEvent.click(screen.getByRole("radio", { name: "read-write" }));
+
+    rerender(dialog([npm, pypi]));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    fireEvent.click(addButton());
+    await waitFor(() =>
+      expect(add).toHaveBeenCalledWith(
+        "web",
+        [{ kind: "http", host: "pypi.org", port: 443, access: "read-write" }],
+        false,
+      ),
+    );
+  });
 });
 
 describe("buildCandidates", () => {

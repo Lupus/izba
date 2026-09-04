@@ -149,7 +149,15 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
   const [snapshot, setSnapshot] = useState<Candidate[]>(() => live);
   const snapshotKeys = useMemo(() => new Set(snapshot.map((c) => c.key)), [snapshot]);
   const unseenCount = live.filter((c) => !snapshotKeys.has(c.key)).length;
-  const refreshSnapshot = () => setSnapshot(live);
+  const refreshSnapshot = () => {
+    const keys = new Set(live.map((c) => c.key));
+    setSnapshot(live);
+    // A candidate that departed the snapshot and returns later is a NEW
+    // review, not a resumed one — prune both maps so it can't come back
+    // silently pre-ticked (or carrying a stale access override).
+    setChecked((prev) => new Set([...prev].filter((k) => keys.has(k))));
+    setAccess((prev) => new Map([...prev].filter(([k]) => keys.has(k))));
+  };
 
   const candidates = snapshot;
 
