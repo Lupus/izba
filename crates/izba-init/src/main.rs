@@ -704,6 +704,15 @@ fn write_etc_hosts(hostname: Option<&str>) {
 /// an append would never revoke a CA the operator removed and would grow the
 /// file with a duplicate copy on every boot. We do NOT run
 /// update-ca-certificates: this is a static-musl, distro-agnostic init.
+///
+/// `#[mutants::skip]`: boot glue that reads the virtiofs share and writes
+/// real files under `/rootfs/etc`, only meaningful inside a booted guest.
+/// The pure parts (`build_anchor_pem`, `build_combined_bundle`,
+/// `system_roots_only`, `replace_managed_block`) are unit-tested in
+/// `trust.rs`; this composition is covered end to end by the KVM e2e tests
+/// `custom_ca_trusted_in_guest_and_at_izbad_upstream_real_vm` and
+/// `canonical_bundle_revokes_a_removed_extra_ca_real_vm`.
+#[mutants::skip]
 fn write_trust_anchor() {
     // The share is mounted under /rootfs at the fixed trust mountpoint.
     let share_ca = format!("/rootfs{}/{}", trust::TRUST_MOUNT, trust::CA_FILE);

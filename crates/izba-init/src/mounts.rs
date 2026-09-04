@@ -252,6 +252,12 @@ pub fn pre_mount_pause(op: &MountOp) -> Option<std::time::Duration> {
 ///
 /// The per-mount `eprintln!` lines are boot diagnostics on the serial console;
 /// the OpenVMM-readiness accommodation is [`pre_mount_pause`], not the prints.
+///
+/// `#[mutants::skip]`: issues real `mount(2)` calls (CAP_SYS_ADMIN, a booted
+/// guest); the unit suite cannot mount. The plan it executes is the pure,
+/// unit-tested part (`rootfs_plan` and friends), and every real-VM
+/// integration test boots through this function.
+#[mutants::skip]
 pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
     for op in ops {
         std::fs::create_dir_all(&op.target)

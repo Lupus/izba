@@ -104,14 +104,14 @@ fn build_mitm_runtime(paths: &Paths, audit: crate::daemon::egress::audit::AuditS
         Err(e) => return failed("extra CA load failed", &e),
     };
     let extra_names: Vec<String> = extra.iter().map(|f| f.name.clone()).collect();
-    if !extra_names.is_empty() {
-        eprintln!(
-            "izbad: trusting {} extra CA file(s) from {}: {}",
-            extra_names.len(),
-            paths.trust_extra_dir().display(),
-            extra_names.join(", ")
-        );
-    }
+    // Logged unconditionally (a zero count is worth a line too: it tells the
+    // operator reading the daemon log that the directory was consulted).
+    eprintln!(
+        "izbad: extra CA files loaded from {}: {} [{}]",
+        paths.trust_extra_dir().display(),
+        extra_names.len(),
+        extra_names.join(", ")
+    );
     let certs = Arc::new(CertCache::new(ca));
     match MitmRuntime::start(certs, crate::trust::upstream_client_config(&extra), audit) {
         Ok(rt) => MitmInit {
