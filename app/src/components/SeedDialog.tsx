@@ -150,13 +150,27 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
   const snapshotKeys = useMemo(() => new Set(snapshot.map((c) => c.key)), [snapshot]);
   const unseenCount = live.filter((c) => !snapshotKeys.has(c.key)).length;
   const refreshSnapshot = () => {
-    const keys = new Set(live.map((c) => c.key));
+    const next = new Map(live.map((c) => [c.key, c] as const));
     setSnapshot(live);
     // A candidate that departed the snapshot and returns later is a NEW
     // review, not a resumed one — prune both maps so it can't come back
     // silently pre-ticked (or carrying a stale access override).
-    setChecked((prev) => new Set([...prev].filter((k) => keys.has(k))));
-    setAccess((prev) => new Map([...prev].filter(([k]) => keys.has(k))));
+    setChecked((prev) => new Set([...prev].filter((k) => next.has(k))));
+    setAccess((prev) => {
+      const out = new Map([...prev].filter(([k]) => next.has(k)));
+      // A surviving row whose suggested access changed (e.g. a clone folds
+      // with a later push, or a GET-only host sees a POST) keeps the access
+      // the user reviewed: a refresh must never turn a read consent into a
+      // read-write grant behind their back. Widening stays an explicit act
+      // via the picker.
+      for (const old of snapshot) {
+        const fresh = next.get(old.key);
+        if (fresh && !out.has(old.key) && fresh.defaultAccess !== old.defaultAccess) {
+          out.set(old.key, old.defaultAccess);
+        }
+      }
+      return out;
+    });
   };
 
   const candidates = snapshot;
