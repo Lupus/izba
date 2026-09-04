@@ -9,8 +9,9 @@
 //! the writable overlay (the guest's real `/etc`) at the canonical paths and
 //! exec'd workloads get the CA-bundle env vars pointing there.
 //!
-//! Only the pure helpers ([`build_combined_bundle`], [`trust_env_pairs`]) live
-//! here and are unit-tested; the boot glue that performs filesystem I/O is
+//! Only the pure helpers ([`build_combined_bundle`], [`build_anchor_pem`],
+//! [`trust_env_pairs`]) live here and are unit-tested; the boot glue that
+//! performs filesystem I/O is
 //! `write_trust_anchor()` in `main.rs` (per the crate's no-unit-test-on-glue
 //! convention), and the per-exec env defaulting is in `exec.rs`.
 
@@ -29,10 +30,11 @@ pub const CA_FILE: &str = "ca.pem";
 /// Absent when the operator installed none.
 pub const EXTRA_FILE: &str = "extra.pem";
 
-/// Post-chroot guest path of the CA-alone PEM init writes into the overlay.
+/// Post-chroot guest path of the anchors (izba CA + any host extra roots)
+/// init writes into the overlay.
 pub const GUEST_CA_PEM: &str = "/etc/izba/ca.pem";
 
-/// Post-chroot guest path of the combined (CA + system roots) bundle.
+/// Post-chroot guest path of the combined (anchors + system roots) bundle.
 pub const GUEST_CA_BUNDLE: &str = "/etc/izba/ca-bundle.pem";
 
 /// Returns `ca_pem` concatenated with the system bundle when present (CA first,
@@ -65,9 +67,10 @@ pub fn build_anchor_pem(ca_pem: &str, extra_pem: Option<&str>) -> String {
 
 /// The canonical CA-bundle env vars and their post-chroot guest paths.
 ///
-/// `NODE_EXTRA_CA_CERTS`/`DENO_CERT` take the CA alone (they ADD to the runtime's
-/// built-in roots); the rest take the combined bundle (they REPLACE the trust
-/// set, so they must include the system roots).
+/// `NODE_EXTRA_CA_CERTS`/`DENO_CERT` take the anchors — izba CA + any host
+/// extra roots — (they ADD to the runtime's built-in roots); the rest take
+/// the combined bundle (they REPLACE the trust set, so they must include the
+/// system roots).
 pub fn trust_env_pairs() -> [(&'static str, &'static str); 6] {
     [
         ("NODE_EXTRA_CA_CERTS", GUEST_CA_PEM),
