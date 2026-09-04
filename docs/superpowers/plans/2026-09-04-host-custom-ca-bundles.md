@@ -254,6 +254,19 @@ pub fn load_extra_cas(dir: &Path) -> Result<Vec<ExtraCaFile>> {
             let cert = cert.map_err(|e| {
                 anyhow::anyhow!("extra CA file {}: invalid PEM: {e}", path.display())
             })?;
+            // PEM framing alone proves nothing about the bytes inside: a
+            // well-formed block of garbage base64 parses as a "certificate".
+            // Validate it the way izbad will consume it — as a trust anchor —
+            // so a corrupt file is refused HERE, with its name, not skipped
+            // later at daemon start.
+            rustls::RootCertStore::empty()
+                .add(cert.clone())
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "extra CA file {}: not a valid X.509 certificate: {e}",
+                        path.display()
+                    )
+                })?;
             certs.push(cert);
         }
         if certs.is_empty() {
@@ -296,10 +309,11 @@ Add to `crates/izba-core/src/paths.rs` right after `ca_dir()`:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p izba-core trust::tests`
-Expected: 6 passed. (If `a_corrupt_block_is_an_error_naming_the_file` fails
-because `pem_slice_iter` yields no item for the bogus base64 rather than an
-error, that is fine — the "no CERTIFICATE blocks" branch then fires and the
-assertion on `bad.pem` still holds; do NOT weaken the test.)
+Expected: 6 passed. (`a_corrupt_block_is_an_error_naming_the_file`'s bogus
+`AAAA` block IS well-formed PEM — `pem_slice_iter` yields it as a
+`CertificateDer` of 3 garbage bytes — which is exactly why the loader
+validates each cert through a scratch `RootCertStore::add`; do NOT weaken
+the test.)
 
 - [ ] **Step 5: Gates + commit**
 
@@ -409,11 +423,11 @@ pub fn upstream_root_store(extra: &[ExtraCaFile]) -> rustls::RootCertStore {
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     for file in extra {
         for cert in &file.certs {
-            // `add` rejects a non-CA / undecodable cert; the loader already
-            // proved decodability, and a leaf in the extra dir is an operator
-            // mistake that must not disable the whole store — skip it loudly.
+            // `load_extra_cas` already validated every cert through this
+            // same `add`, so the error branch is defensive only — log rather
+            // than panic inside the daemon.
             if let Err(e) = roots.add(cert.clone()) {
-                eprintln!("izbad: extra CA file {}: skipping a non-CA certificate: {e}", file.name);
+                eprintln!("izbad: extra CA file {}: skipping certificate: {e}", file.name);
             }
         }
     }
