@@ -17,7 +17,8 @@ pub struct MountOp {
     pub data: String,
     /// When `true`, a failed mount is logged and skipped rather than aborting
     /// boot. Used for shares the host only attaches conditionally (e.g. the
-    /// `izba-trust` CA share, present only for MITM-enabled sandboxes).
+    /// `izba-trust` CA share — attached for every sandbox today, but optional
+    /// so a host that ships no CA still boots).
     pub optional: bool,
 }
 

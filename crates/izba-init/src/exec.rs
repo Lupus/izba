@@ -121,8 +121,9 @@ impl ExecEngine {
 
     /// Whether the izba combined CA bundle exists in the guest, resolved
     /// against the chroot root (`<root>/etc/izba/ca-bundle.pem` in the guest,
-    /// the bare guest path in tests). Gates the trust-env defaulting so only
-    /// MITM-enabled sandboxes advertise the CA-bundle vars.
+    /// the bare guest path in tests). Gates the trust-env defaulting on the
+    /// bundle existing (the host ships it for every sandbox today; the gate
+    /// keeps a CA-less boot from advertising a path that isn't there).
     fn trust_bundle_present(&self) -> bool {
         let guest_path = crate::trust::GUEST_CA_BUNDLE.trim_start_matches('/');
         let resolved = match &self.root {

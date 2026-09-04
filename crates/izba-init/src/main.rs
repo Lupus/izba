@@ -687,24 +687,26 @@ fn write_etc_hosts(hostname: Option<&str>) {
 /// Bakes izbad's root CA (delivered via the read-only `izba-trust` virtiofs
 /// share) into the guest trust store so workload tools trust the MITM leaves.
 ///
-/// Best-effort and no-op when the share has no `ca.pem` — a sandbox without
-/// HTTPS MITM ships no CA, and the trust-env defaulting in `exec.rs` is gated
-/// on `ca-bundle.pem` existing, so absence here cleanly disables the feature.
+/// The host writes `ca.pem` for every sandbox (bare or enforcing); a missing
+/// file is still tolerated (no-op) because the trust-env defaulting in
+/// `exec.rs` is gated on `ca-bundle.pem` existing, so absence cleanly
+/// disables the feature. Since #283 the share may also carry `extra.pem`
+/// (host-installed roots), folded in as izba CA → extras → system roots.
 ///
 /// Writes into the overlay (the guest's real, writable `/etc`):
-/// `/etc/izba/ca.pem` (the CA alone, for runtimes that ADD a root) and
-/// `/etc/izba/ca-bundle.pem` (CA + system roots, for tools that REPLACE the
-/// trust set). If a distro CA bundle exists it also appends the CA to it
-/// (best-effort, so tools that read the canonical system path also trust it).
-/// We do NOT run update-ca-certificates: this is a static-musl, distro-agnostic
-/// init.
+/// `/etc/izba/ca.pem` (the anchors: izba CA + extra roots, for runtimes that
+/// ADD roots) and `/etc/izba/ca-bundle.pem` (anchors + system roots, for
+/// tools that REPLACE the trust set). If a distro CA bundle exists it also
+/// appends the anchors to it (best-effort, so tools that read the canonical
+/// system path also trust them). We do NOT run update-ca-certificates: this
+/// is a static-musl, distro-agnostic init.
 fn write_trust_anchor() {
     // The share is mounted under /rootfs at the fixed trust mountpoint.
     let share_ca = format!("/rootfs{}/{}", trust::TRUST_MOUNT, trust::CA_FILE);
     let ca_pem = match std::fs::read_to_string(&share_ca) {
         Ok(p) => p,
         Err(e) => {
-            // ENOENT is the normal "no MITM for this sandbox" path; anything
+            // ENOENT means the host shipped no CA (not expected today); anything
             // else is logged but still non-fatal.
             if e.kind() != std::io::ErrorKind::NotFound {
                 eprintln!("izba-init: reading trust anchor {share_ca}: {e}");
@@ -713,11 +715,24 @@ fn write_trust_anchor() {
         }
     };
 
+    // Host-installed extra roots (#283): optional; absent ⇒ izba CA only.
+    let share_extra = format!("/rootfs{}/{}", trust::TRUST_MOUNT, trust::EXTRA_FILE);
+    let extra_pem = match std::fs::read_to_string(&share_extra) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("izba-init: reading extra roots {share_extra}: {e}");
+            }
+            None
+        }
+    };
+    let anchors = trust::build_anchor_pem(&ca_pem, extra_pem.as_deref());
+
     if let Err(e) = std::fs::create_dir_all("/rootfs/etc/izba") {
         eprintln!("izba-init: creating /etc/izba: {e}");
         return;
     }
-    if let Err(e) = std::fs::write("/rootfs/etc/izba/ca.pem", &ca_pem) {
+    if let Err(e) = std::fs::write("/rootfs/etc/izba/ca.pem", &anchors) {
         eprintln!("izba-init: writing /etc/izba/ca.pem: {e}");
         return;
     }
@@ -730,21 +745,21 @@ fn write_trust_anchor() {
     let system_pem = SYSTEM_BUNDLES
         .iter()
         .find_map(|p| std::fs::read_to_string(p).ok());
-    let bundle = trust::build_combined_bundle(&ca_pem, system_pem.as_deref());
+    let bundle = trust::build_combined_bundle(&anchors, system_pem.as_deref());
     if let Err(e) = std::fs::write("/rootfs/etc/izba/ca-bundle.pem", bundle) {
         eprintln!("izba-init: writing /etc/izba/ca-bundle.pem: {e}");
     }
 
-    // Best-effort: append the CA to the canonical Debian/Alpine bundle so tools
-    // that hardcode that path also trust the MITM. Ignore all errors (path may
-    // not exist; read-only/odd distros are fine — the env vars are the source
-    // of truth).
+    // Best-effort: append the anchors to the canonical Debian/Alpine bundle so
+    // tools that hardcode that path also trust them. Ignore all errors (path
+    // may not exist; read-only/odd distros are fine — the env vars are the
+    // source of truth).
     let canonical = "/rootfs/etc/ssl/certs/ca-certificates.crt";
     if std::path::Path::new(canonical).exists() {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(canonical) {
             let _ = writeln!(f);
-            let _ = f.write_all(ca_pem.as_bytes());
+            let _ = f.write_all(anchors.as_bytes());
         }
     }
 }
