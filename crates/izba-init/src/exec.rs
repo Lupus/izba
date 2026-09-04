@@ -276,10 +276,10 @@ impl ExecEngine {
     ///   "cannot open display". Gated on the sandbox actually having booted
     ///   with `izba.vnc=1`, so a display-less sandbox never advertises an X
     ///   server that isn't there;
-    /// - the MITM CA-bundle vars, but ONLY when the combined bundle exists in
-    ///   the guest (`write_trust_anchor` wrote it), so non-MITM sandboxes don't
-    ///   point tools at a missing file. The values are guest paths valid inside
-    ///   the container (it shares the overlay rootfs).
+    /// - the CA-bundle vars, but ONLY when the combined bundle exists in the
+    ///   guest (`write_trust_anchor` wrote it), so a CA-less boot doesn't
+    ///   point tools at a missing file. The values are guest paths valid
+    ///   inside the container (it shares the overlay rootfs).
     ///
     /// `PATH` is intentionally NOT defaulted here: crun applies the container
     /// image's `PATH` (the right value for the image), and overriding it with

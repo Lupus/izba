@@ -85,11 +85,14 @@ pub fn rootfs_mount_plan() -> Vec<MountOp> {
             "lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work",
         ),
         MountOp::new("workspace", "/rootfs/workspace", "virtiofs", &[], ""),
-        // The izba root CA, delivered read-only for the guest trust store.
-        // Optional: izbad only attaches it for MITM-enabled sandboxes, so a
-        // missing tag fails-soft instead of aborting boot. The target is under
-        // /rootfs (not /rootfs/etc) so the share itself stays read-only;
-        // write_trust_anchor() copies the CA into the writable overlay /etc.
+        // The izba root CA — and, since #283, any host-installed extra roots
+        // — delivered read-only for the guest trust store. The host attaches
+        // this share for EVERY sandbox, bare or enforcing; it stays optional
+        // only so a CA-less host (or an older host) still boots instead of
+        // aborting on a missing tag. The target is under /rootfs (not
+        // /rootfs/etc) so the share itself stays read-only;
+        // write_trust_anchor() copies the material into the writable overlay
+        // /etc.
         MountOp::new(
             crate::trust::TRUST_TAG,
             "/rootfs/izba-trust",
@@ -285,8 +288,8 @@ pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
         });
         if let Err(e) = res {
             if op.optional {
-                // The host did not attach this share (e.g. no MITM CA): log and
-                // carry on so boot is unaffected.
+                // The host did not attach this share (e.g. a CA-less host):
+                // log and carry on so boot is unaffected.
                 eprintln!(
                     "izba-init: optional mount {} ({}) on {} skipped: {e:#}",
                     op.source,

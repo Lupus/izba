@@ -331,23 +331,16 @@ impl MitmPolicy for HostAllowlist {
 // ============================================================================
 
 /// Build a rustls `ClientConfig` trusting the given roots, ALPN http/1.1.
-/// ADAPTED from OpenShell `build_upstream_client_config` (webpki-roots +
-/// system bundle scan dropped — the spike passes roots explicitly; production
-/// izbad would load webpki-roots here).
+/// ADAPTED from OpenShell `build_upstream_client_config` (its webpki-roots +
+/// system-bundle scan dropped — roots are passed in explicitly). Production
+/// izbad builds them via `crate::trust::upstream_client_config`: webpki-roots
+/// plus any host-installed roots from `<data>/trust/extra` (#283).
 pub fn upstream_client_config(roots: rustls::RootCertStore) -> Arc<ClientConfig> {
     let mut config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Arc::new(config)
-}
-
-/// Upstream config trusting the Mozilla CA bundle (webpki-roots) — what
-/// production izbad uses to verify the *real* upstream it re-originates to.
-pub fn upstream_client_config_webpki() -> Arc<ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    upstream_client_config(roots)
 }
 
 // The re-originating TLS connect (formerly OpenShell's `tls_connect_upstream`)
