@@ -65,6 +65,70 @@ pub fn build_anchor_pem(ca_pem: &str, extra_pem: Option<&str>) -> String {
     build_combined_bundle(ca_pem, extra_pem)
 }
 
+/// Marks the start of the izba-managed block this crate rewrites in the
+/// canonical system CA bundle (`/etc/ssl/certs/ca-certificates.crt` etc.) on
+/// every boot. See [`replace_managed_block`] for why a marked, replaced block
+/// — not an append — is required: the canonical bundle lives on the
+/// sandbox's PERSISTENT overlay, so an append would (a) never revoke a CA the
+/// operator removed from `<data>/trust/extra/` and (b) grow the file with a
+/// duplicate copy of the anchors every single boot.
+pub const MANAGED_BEGIN: &str =
+    "# BEGIN izba-managed trust anchors (rewritten on every boot; do not edit)";
+
+/// Marks the end of the izba-managed block. See [`MANAGED_BEGIN`].
+pub const MANAGED_END: &str = "# END izba-managed trust anchors";
+
+/// Returns `existing` with any previous `MANAGED_BEGIN…MANAGED_END` block
+/// (inclusive of its trailing newline) removed, then — when `anchors` is
+/// non-empty — exactly one fresh block appended (a separating newline first,
+/// if the text so far doesn't already end with one).
+///
+/// Text outside PEM blocks (comment lines, blank lines) is tolerated by every
+/// bundle consumer (OpenSSL, curl, Python, Node), which is what makes marker
+/// comments a safe way to carve out and replace an izba-owned region of an
+/// otherwise foreign file. A truncated previous block (a `MANAGED_BEGIN` with
+/// no matching `MANAGED_END`, e.g. from a killed boot mid-write) is treated
+/// as running to EOF, so it is fully removed rather than left dangling.
+pub fn replace_managed_block(existing: &str, anchors: &str) -> String {
+    let (before, tail) = match existing.find(MANAGED_BEGIN) {
+        Some(begin_pos) => {
+            let before = &existing[..begin_pos];
+            match existing[begin_pos..].find(MANAGED_END) {
+                Some(end_rel) => {
+                    let mut tail_start = begin_pos + end_rel + MANAGED_END.len();
+                    if existing.as_bytes().get(tail_start) == Some(&b'\n') {
+                        tail_start += 1;
+                    }
+                    (before, &existing[tail_start..])
+                }
+                // Truncated: no END, so everything from BEGIN to EOF is the
+                // old (broken) block.
+                None => (before, ""),
+            }
+        }
+        None => (existing, ""),
+    };
+
+    let mut out = String::with_capacity(before.len() + tail.len() + anchors.len() + 64);
+    out.push_str(before);
+    out.push_str(tail);
+
+    if !anchors.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(MANAGED_BEGIN);
+        out.push('\n');
+        out.push_str(anchors);
+        if !anchors.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(MANAGED_END);
+        out.push('\n');
+    }
+    out
+}
+
 /// The canonical CA-bundle env vars and their post-chroot guest paths.
 ///
 /// `NODE_EXTRA_CA_CERTS`/`DENO_CERT` take the anchors — izba CA + any host
@@ -157,5 +221,82 @@ mod tests {
     #[test]
     fn extra_file_name_matches_the_host_contract() {
         assert_eq!(EXTRA_FILE, "extra.pem");
+    }
+
+    #[test]
+    fn managed_block_appended_once_when_no_prior_block() {
+        let existing = "SYSTEM ROOT CERT\n";
+        let out = replace_managed_block(existing, "ANCHOR-PEM\n");
+        assert_eq!(
+            out,
+            format!("SYSTEM ROOT CERT\n{MANAGED_BEGIN}\nANCHOR-PEM\n{MANAGED_END}\n")
+        );
+    }
+
+    #[test]
+    fn managed_block_is_idempotent() {
+        let existing = "SYSTEM ROOT CERT\n";
+        let once = replace_managed_block(existing, "ANCHOR-PEM\n");
+        let twice = replace_managed_block(&once, "ANCHOR-PEM\n");
+        assert_eq!(once, twice, "reapplying with the same anchors is a no-op");
+    }
+
+    #[test]
+    fn managed_block_replaced_when_anchors_change_leaves_prefix_untouched() {
+        let existing = "SYSTEM ROOT CERT\n";
+        let old = replace_managed_block(existing, "OLD-ANCHOR\n");
+        let new = replace_managed_block(&old, "NEW-ANCHOR\n");
+
+        assert!(!new.contains("OLD-ANCHOR"), "old anchor content is gone");
+        assert_eq!(
+            new.matches(MANAGED_BEGIN).count(),
+            1,
+            "exactly one begin marker"
+        );
+        assert_eq!(
+            new.matches(MANAGED_END).count(),
+            1,
+            "exactly one end marker"
+        );
+        assert!(
+            new.starts_with(existing),
+            "text before the block is untouched byte-for-byte"
+        );
+        assert_eq!(
+            new,
+            format!("SYSTEM ROOT CERT\n{MANAGED_BEGIN}\nNEW-ANCHOR\n{MANAGED_END}\n")
+        );
+    }
+
+    #[test]
+    fn managed_block_truncated_begin_without_end_is_removed() {
+        // Simulates a killed boot mid-write: BEGIN present, END never written.
+        let existing = format!("SYSTEM ROOT CERT\n{MANAGED_BEGIN}\nHALF-WRITTEN-ANCHOR\n");
+        let out = replace_managed_block(&existing, "ANCHOR-PEM\n");
+        assert!(!out.contains("HALF-WRITTEN-ANCHOR"));
+        assert_eq!(
+            out,
+            format!("SYSTEM ROOT CERT\n{MANAGED_BEGIN}\nANCHOR-PEM\n{MANAGED_END}\n")
+        );
+    }
+
+    #[test]
+    fn managed_block_empty_anchors_removes_prior_block_and_appends_nothing() {
+        let existing = "SYSTEM ROOT CERT\n";
+        let with_block = replace_managed_block(existing, "ANCHOR-PEM\n");
+        let removed = replace_managed_block(&with_block, "");
+        assert_eq!(removed, existing);
+    }
+
+    #[test]
+    fn managed_block_inserts_separator_when_existing_has_no_trailing_newline() {
+        let existing = "SYSTEM ROOT CERT (no trailing newline)";
+        let out = replace_managed_block(existing, "ANCHOR-PEM\n");
+        assert_eq!(
+            out,
+            format!(
+                "SYSTEM ROOT CERT (no trailing newline)\n{MANAGED_BEGIN}\nANCHOR-PEM\n{MANAGED_END}\n"
+            )
+        );
     }
 }

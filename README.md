@@ -168,7 +168,12 @@ Key properties:
   (enforcing sandboxes fail closed) with the file named in the error; in that
   state `izba daemon status` prints a `⚠ trust: HTTPS interception init
   FAILED …` line naming the cause — fix or remove the file. The host OS trust
-  store is NOT imported automatically; copy the roots you need.
+  store is NOT imported automatically; copy the roots you need. The guest's
+  canonical system bundle (`/etc/ssl/certs/ca-certificates.crt`) also carries
+  the anchors, but as a clearly marked block that is fully rewritten — not
+  appended to — on every boot, so removing a CA from `extra/` also revokes it
+  from that canonical path on the sandbox's next start, not just from
+  `/etc/izba/ca.pem`.
 
   **Verifying enforcement: test with a real request, not a bare TCP connect.**
   Because the allow/deny verdict is rendered per request/SNI at the interception
