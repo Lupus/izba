@@ -41,10 +41,17 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// ENFORCING sandbox's HTTP(S) FAILS CLOSED at the router (it is never silently
 /// downgraded to a direct dial — see `router::tcp_connect`). The per-sandbox
 /// policy travels with each flow, so no policy is needed here.
+///
+/// The second element of the return is the file names loaded from
+/// `<data>/trust/extra` (#283), in load order — empty on any failure path —
+/// for `Daemon::extra_ca_files`, surfaced by `Status`/`izba daemon status`.
 fn build_mitm_runtime(
     paths: &Paths,
     audit: crate::daemon::egress::audit::AuditSink,
-) -> Option<Arc<crate::daemon::egress::mitm_runtime::MitmRuntime>> {
+) -> (
+    Option<Arc<crate::daemon::egress::mitm_runtime::MitmRuntime>>,
+    Vec<String>,
+) {
     use crate::daemon::egress::mitm::CertCache;
     use crate::daemon::egress::mitm_runtime::MitmRuntime;
 
@@ -57,7 +64,7 @@ fn build_mitm_runtime(
         Ok(ca) => ca,
         Err(e) => {
             eprintln!("izbad: egress MITM disabled — CA init failed: {e:#}");
-            return None;
+            return (None, Vec::new());
         }
     };
     // Extra roots (#283): a corrupt file disables the MITM (enforcing
@@ -68,24 +75,24 @@ fn build_mitm_runtime(
         Ok(extra) => extra,
         Err(e) => {
             eprintln!("izbad: egress MITM disabled — extra CA load failed: {e:#}");
-            return None;
+            return (None, Vec::new());
         }
     };
-    if !extra.is_empty() {
-        let names: Vec<&str> = extra.iter().map(|f| f.name.as_str()).collect();
+    let extra_names: Vec<String> = extra.iter().map(|f| f.name.clone()).collect();
+    if !extra_names.is_empty() {
         eprintln!(
             "izbad: trusting {} extra CA file(s) from {}: {}",
-            extra.len(),
+            extra_names.len(),
             paths.trust_extra_dir().display(),
-            names.join(", ")
+            extra_names.join(", ")
         );
     }
     let certs = Arc::new(CertCache::new(ca));
     match MitmRuntime::start(certs, crate::trust::upstream_client_config(&extra), audit) {
-        Ok(rt) => Some(Arc::new(rt)),
+        Ok(rt) => (Some(Arc::new(rt)), extra_names),
         Err(e) => {
             eprintln!("izbad: egress MITM disabled — runtime start failed: {e:#}");
-            None
+            (None, Vec::new())
         }
     }
 }
@@ -184,6 +191,10 @@ pub struct Daemon {
     /// any other target would otherwise carry a permanently-unread field.
     #[cfg(target_os = "linux")]
     stats_cpu: StatsCpuCache,
+    /// File names loaded from `<data>/trust/extra` at daemon start (#283),
+    /// for `Status`. Not authoritative state — a display record of what THIS
+    /// process trusts; a changed directory needs a daemon restart.
+    extra_ca_files: Vec<String>,
 }
 
 impl Daemon {
@@ -194,7 +205,7 @@ impl Daemon {
         // sandboxes' HTTP(S) then fails closed at the router rather than
         // downgrading — logged in `build_mitm_runtime`.
         let audit = crate::daemon::egress::audit::AuditSink::new(paths.clone());
-        let mitm = build_mitm_runtime(&paths, audit.clone());
+        let (mitm, extra_ca_files) = build_mitm_runtime(&paths, audit.clone());
         let usb = crate::usb::broker::UsbBroker::new(audit.clone());
         let egress = EgressManager::new(Arc::clone(&deps.egress_resolver), mitm, audit);
         Self {
@@ -212,6 +223,7 @@ impl Daemon {
             idle_since: Mutex::new(Instant::now()),
             #[cfg(target_os = "linux")]
             stats_cpu: StatsCpuCache::default(),
+            extra_ca_files,
         }
     }
 
@@ -536,6 +548,8 @@ fn dispatch_inner(
             uptime_ms: d.started.elapsed().as_millis() as u64,
             socket: d.paths.daemon_socket().display().to_string(),
             sandboxes: d.registry.summaries(),
+            extra_ca_files: d.extra_ca_files.clone(),
+            trust_extra_dir: crate::paths::display_path(&d.paths.trust_extra_dir()),
         })),
         DaemonRequest::VolumePrune => {
             let pruned = sandbox::prune_volumes(&d.paths)?;

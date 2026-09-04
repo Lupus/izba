@@ -140,9 +140,27 @@ Key properties:
   (→ `ca.pem`). So `curl`, `git`, Python `requests`, Node, and Deno verify
   successfully out of the box; a tool that reads only the OS trust store should
   be pointed at `/etc/izba/ca.pem` (e.g. copy it into
-  `/usr/local/share/ca-certificates/` and run `update-ca-certificates`). A
-  **bare** (non-enforcing) sandbox does NOT intercept TLS and ships no CA —
-  connections dial straight through.
+  `/usr/local/share/ca-certificates/` and run `update-ca-certificates`). The
+  CA is written into **every** sandbox, bare or enforcing; a **bare**
+  (non-enforcing) sandbox simply never intercepts TLS — connections dial
+  straight through end-to-end, so the guest's own trust store decides.
+
+  **Custom / corporate CAs (TLS-inspecting proxies, internal registries and
+  git hosts).** Drop the root certificate(s) as PEM files into
+  `~/.local/share/izba/trust/extra/` (any `*.pem` / `*.crt`; loaded in
+  file-name order). They are host-only — a guest can never write them — and
+  they are honored on BOTH paths: every sandbox's guest trust store
+  (`/etc/izba/ca.pem` + the combined bundle and trust-env vars above) gets
+  them appended after the izba CA, so a bare sandbox's end-to-end TLS
+  verifies; and `izbad`'s upstream verifier trusts them on top of the
+  Mozilla roots, so an enforcing sandbox's re-originated connection verifies
+  too. Reload semantics: a guest picks up changes on its next `izba start`;
+  `izbad` reads the directory once at start — run `izba daemon stop` (the next
+  command respawns it) and check `izba daemon status`, which lists the loaded
+  files. A file that is not a valid PEM certificate refuses `izba start` and
+  disables the firewall's HTTPS path (enforcing sandboxes fail closed) with
+  the file named in the error — fix or remove it. The host OS trust store is
+  NOT imported automatically; copy the roots you need.
 
   **Verifying enforcement: test with a real request, not a bare TCP connect.**
   Because the allow/deny verdict is rendered per request/SNI at the interception
