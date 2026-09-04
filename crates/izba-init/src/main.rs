@@ -746,9 +746,13 @@ fn write_trust_anchor() {
         "/rootfs/etc/ssl/certs/ca-certificates.crt",
         "/rootfs/etc/pki/tls/certs/ca-bundle.crt",
     ];
+    // Strip the previous boot's managed block first: the canonical file is
+    // read here BEFORE it is rewritten below, so composing from it raw would
+    // keep a host-removed CA alive in ca-bundle.pem for one more restart.
     let system_pem = SYSTEM_BUNDLES
         .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok());
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .map(|raw| trust::system_roots_only(&raw));
     let bundle = trust::build_combined_bundle(&anchors, system_pem.as_deref());
     if let Err(e) = std::fs::write("/rootfs/etc/izba/ca-bundle.pem", bundle) {
         eprintln!("izba-init: writing /etc/izba/ca-bundle.pem: {e}");
