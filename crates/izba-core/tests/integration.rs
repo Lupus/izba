@@ -2260,6 +2260,285 @@ fn pinning_passthrough_ab_vendor_cert_vs_izba_ca_real_vm() {
     );
 }
 
+// ============================================================================
+// #283 — host-installed custom CA bundles
+// ============================================================================
+
+/// Answers `A` for the names in `map` (else NOERROR/empty), any other qtype
+/// NOERROR/empty. Stands in for izbad's system resolver so a test hostname can
+/// point at the host's LAN IP without touching real DNS.
+struct FixedAResolver {
+    map: Vec<(String, std::net::Ipv4Addr)>,
+}
+
+impl izba_core::daemon::egress::dns::Resolver for FixedAResolver {
+    fn handle(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+        use hickory_proto::rr::{rdata::A, RData, Record, RecordType};
+        let req = Message::from_vec(query)?;
+        let mut resp = Message::new(req.id, MessageType::Response, OpCode::Query);
+        for q in &req.queries {
+            resp.add_query(q.clone());
+            if q.query_type() != RecordType::A {
+                continue;
+            }
+            let qname = q.name().to_utf8();
+            let qname = qname.trim_end_matches('.');
+            if let Some((_, ip)) = self.map.iter().find(|(n, _)| n.eq_ignore_ascii_case(qname)) {
+                resp.add_answer(Record::from_rdata(q.name().clone(), 60, RData::A(A(*ip))));
+            }
+        }
+        resp.metadata.recursion_desired = req.recursion_desired;
+        resp.metadata.recursion_available = true;
+        resp.metadata.response_code = ResponseCode::NoError;
+        Ok(resp.to_vec()?)
+    }
+}
+
+/// The host's LAN-facing IP (never loopback: 127/8 is excluded from the
+/// guest's REDIRECT by design and hard-denied by the router).
+fn host_lan_ip() -> std::net::Ipv4Addr {
+    let probe = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+    probe.connect(("8.8.8.8", 80)).unwrap();
+    match probe.local_addr().unwrap().ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        other => panic!("expected an IPv4 LAN address, got {other}"),
+    }
+}
+
+/// A minimal HTTPS/1.x upstream: TLS under `ca` (leaf minted per SNI by the
+/// same resolver the MITM uses), answers every request with `body`. Bound on
+/// the host LAN IP so the guest can reach it. Returns the port.
+fn spawn_private_ca_https(
+    rt: &tokio::runtime::Runtime,
+    ca: izba_core::daemon::egress::mitm::IzbaCa,
+    ip: std::net::Ipv4Addr,
+    body: &'static str,
+) -> u16 {
+    use izba_core::daemon::egress::mitm::{server_config_with_resolver, CertCache};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsAcceptor;
+
+    let acceptor = TlsAcceptor::from(Arc::new(server_config_with_resolver(Arc::new(
+        CertCache::new(ca),
+    ))));
+    let listener = rt.block_on(tokio::net::TcpListener::bind((ip, 0))).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    rt.spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                // Read the request head (until the blank line) then answer.
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && tls.read_exact(&mut b).await.is_ok() {
+                    head.push(b[0]);
+                    if head.len() > 16 * 1024 {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tls.write_all(resp.as_bytes()).await;
+                let _ = tls.flush().await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    port
+}
+
+/// `wget` the URL from inside the guest under the exec-default trust env
+/// (SSL_CERT_FILE=/etc/izba/ca-bundle.pem). Returns (exit ok, stdout+stderr).
+fn guest_wget(paths: &Paths, name: &str, url: &str) -> (bool, String) {
+    let cmd = format!("wget -T 20 -qO- {url}");
+    match exec_collect(paths, name, &["sh", "-lc", &cmd], None) {
+        Ok((status, out, err)) => (
+            matches!(status, ExitStatus::Code(0)),
+            format!("$ {cmd}\n-> {status:?}\n{out}{err}"),
+        ),
+        Err((kind, msg)) => (
+            false,
+            format!("$ {cmd}\n-> exec rejected ({kind:?}): {msg}"),
+        ),
+    }
+}
+
+/// Which egress posture an arm boots under.
+#[derive(Clone, Copy)]
+enum CaArm {
+    /// No policy ⇒ AllowAll ⇒ raw TCP splice; the GUEST verifies the cert.
+    EnforceOff,
+    /// Enforcing policy with `protocol: http` on the upstream ports ⇒ the
+    /// router terminates at the MITM and IZBAD verifies the upstream.
+    EnforceOn,
+}
+
+/// Boot one arm and fetch from both upstreams. Returns
+/// ((trusted_ok, trusted_out), (rogue_ok, rogue_out)).
+fn run_custom_ca_arm(
+    env: &TestEnv,
+    tb: &mut TestBox,
+    rt: &tokio::runtime::Runtime,
+    arm: CaArm,
+    resolver: std::sync::Arc<dyn izba_core::daemon::egress::dns::Resolver>,
+    trusted_port: u16,
+    rogue_port: u16,
+) -> ((bool, String), (bool, String)) {
+    use izba_core::daemon::egress::audit::AuditSink;
+    use izba_core::daemon::egress::mitm::CertCache;
+    use izba_core::daemon::egress::mitm_runtime::MitmRuntime;
+    use izba_core::daemon::egress::EgressManager;
+    use std::sync::Arc;
+
+    let name = match arm {
+        CaArm::EnforceOff => "customca-off",
+        CaArm::EnforceOn => "customca-on",
+    };
+    let ws = tb.workspace(name);
+    create_sandbox(env, tb, name, &ws);
+
+    let audit = AuditSink::new(tb.paths.clone());
+    let mitm = match arm {
+        CaArm::EnforceOff => None,
+        CaArm::EnforceOn => {
+            std::fs::write(
+                izba_core::daemon::egress::config::EgressPolicyConfig::path_in(
+                    &tb.paths.sandbox_dir(name),
+                ),
+                format!(
+                    "enforce: true\nallow:\n  - host: trusted.izba.test\n    ports: [{trusted_port}]\n    protocol: http\n  - host: rogue.izba.test\n    ports: [{rogue_port}]\n    protocol: http\n"
+                ),
+            )
+            .expect("write policy.yaml");
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let ca = izba_core::ca::load_or_create(&tb.paths.ca_dir()).expect("izba CA");
+            // THE PRODUCTION upstream builder — reads <data>/trust/extra.
+            let extra = izba_core::trust::load_extra_cas(&tb.paths.trust_extra_dir())
+                .expect("load extra CAs");
+            assert_eq!(extra.len(), 1, "exactly corp.pem is installed");
+            Some(Arc::new(
+                MitmRuntime::start(
+                    Arc::new(CertCache::new(ca)),
+                    izba_core::trust::upstream_client_config(&extra),
+                    audit.clone(),
+                )
+                .expect("start MITM runtime"),
+            ))
+        }
+    };
+    let _ = rt; // the upstreams live on the caller's runtime
+    let mgr = EgressManager::new(resolver, mitm, audit);
+    mgr.ensure_listening(&tb.paths, name, &tb.paths.run_dir(name))
+        .expect("bind vsock_1027 listener");
+    if let Err(e) = start_sandbox(env, tb, name) {
+        mgr.stop(name, &tb.paths.run_dir(name));
+        panic!(
+            "boot of {name:?} failed: {e:#}\nconsole tail:\n{}",
+            console_tail(&tb.paths, name)
+        );
+    }
+
+    // Warm-up: the first egress dial after boot can settle a beat late.
+    let mut trusted = (false, String::new());
+    for _ in 0..5 {
+        trusted = guest_wget(
+            &tb.paths,
+            name,
+            &format!("https://trusted.izba.test:{trusted_port}/"),
+        );
+        if trusted.0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let rogue = guest_wget(
+        &tb.paths,
+        name,
+        &format!("https://rogue.izba.test:{rogue_port}/"),
+    );
+
+    stop_sandbox(tb, name);
+    mgr.stop(name, &tb.paths.run_dir(name));
+    (trusted, rogue)
+}
+
+/// #283 acceptance: a TLS upstream signed by a private CA installed in
+/// `<data>/trust/extra/` is reachable from the guest with enforcement OFF
+/// (raw splice — the GUEST trust store decides) and ON (izbad terminates and
+/// re-originates — IZBAD's upstream verifier decides); an upstream signed by
+/// a CA that is NOT in the directory is refused on both paths (fails closed:
+/// non-zero exit AND no body), proving the trust is exactly the directory's
+/// contents and nothing wider.
+#[test]
+fn custom_ca_trusted_in_guest_and_at_izbad_upstream_real_vm() {
+    let Some(env) = want() else { return };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut tb = TestBox::new();
+
+    let ip = host_lan_ip();
+    let trusted_ca = izba_core::daemon::egress::mitm::IzbaCa::generate().unwrap();
+    let rogue_ca = izba_core::daemon::egress::mitm::IzbaCa::generate().unwrap();
+    std::fs::create_dir_all(tb.paths.trust_extra_dir()).unwrap();
+    std::fs::write(
+        tb.paths.trust_extra_dir().join("corp.pem"),
+        trusted_ca.cert_pem(),
+    )
+    .unwrap();
+
+    let trusted_port = spawn_private_ca_https(&rt, trusted_ca, ip, "TRUSTED-CA-BODY");
+    let rogue_port = spawn_private_ca_https(&rt, rogue_ca, ip, "ROGUE-CA-BODY");
+    let resolver: std::sync::Arc<dyn izba_core::daemon::egress::dns::Resolver> =
+        std::sync::Arc::new(FixedAResolver {
+            map: vec![
+                ("trusted.izba.test".into(), ip),
+                ("rogue.izba.test".into(), ip),
+            ],
+        });
+
+    for arm in [CaArm::EnforceOff, CaArm::EnforceOn] {
+        let ((t_ok, t_out), (r_ok, r_out)) = run_custom_ca_arm(
+            &env,
+            &mut tb,
+            &rt,
+            arm,
+            std::sync::Arc::clone(&resolver),
+            trusted_port,
+            rogue_port,
+        );
+        let label = match arm {
+            CaArm::EnforceOff => "enforce OFF",
+            CaArm::EnforceOn => "enforce ON",
+        };
+        assert!(
+            t_ok,
+            "[{label}] upstream under the INSTALLED CA must be reachable:\n{t_out}"
+        );
+        assert!(
+            t_out.contains("TRUSTED-CA-BODY"),
+            "[{label}] trusted body must arrive:\n{t_out}"
+        );
+        assert!(
+            !r_ok,
+            "[{label}] upstream under a CA NOT installed must fail:\n{r_out}"
+        );
+        assert!(
+            !r_out.contains("ROGUE-CA-BODY"),
+            "[{label}] rogue body must never arrive (fail closed):\n{r_out}"
+        );
+    }
+}
+
 /// M1 throughput baseline: bulk transfer through the egress stub.
 /// MEASURED, NOT GATED (roadmap decision) — the number is printed for
 /// trend-watching; the only assertion is that the transfer completes.
