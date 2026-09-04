@@ -136,7 +136,22 @@ export function buildCandidates(rows: EndpointSummary[], policy: PolicyView): Ca
 }
 
 export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }: Props) {
-  const candidates = useMemo(() => buildCandidates(rows, policy), [rows, policy]);
+  // What the netlog CURRENTLY says, recomputed on every poll the parent
+  // forwards. Never rendered as the list.
+  const live = useMemo(() => buildCandidates(rows, policy), [rows, policy]);
+
+  // What the user is REVIEWING: captured once at open and only replaced by an
+  // explicit Refresh. The parent keeps polling at ~1.5 s and `rows` keeps
+  // changing under us; before this, the list re-derived from the live rows
+  // on every poll, so membership and order moved while the user was reading
+  // and a click could land on a row that had just shifted into place. A
+  // consent surface has to be a stable snapshot of an explicit choice.
+  const [snapshot, setSnapshot] = useState<Candidate[]>(() => live);
+  const snapshotKeys = useMemo(() => new Set(snapshot.map((c) => c.key)), [snapshot]);
+  const unseenCount = live.filter((c) => !snapshotKeys.has(c.key)).length;
+  const refreshSnapshot = () => setSnapshot(live);
+
+  const candidates = snapshot;
 
   // Selection: the set of candidate keys the user has EXPLICITLY ticked. It
   // starts EMPTY — this dialog writes straight into the sandbox's firewall
@@ -206,6 +221,8 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
           <DialogTitle>Review observed traffic</DialogTitle>
           <DialogDescription>
             Select endpoints to add to your allow-list. Already-covered entries are excluded.
+            This list is a snapshot taken when the dialog opened — traffic observed since is
+            reported below and only enters the list when you refresh.
           </DialogDescription>
         </DialogHeader>
 
@@ -216,6 +233,14 @@ export function SeedDialog({ name, rows, policy, enforcing, onClose, onApplied }
           <Button variant="ghost" size="sm" onClick={deselectAll} disabled={selectedCount === 0}>
             Deselect all
           </Button>
+          <Button variant="secondary" size="sm" className="ml-auto" onClick={refreshSnapshot}>
+            Refresh
+          </Button>
+        </div>
+        <div role="status" aria-live="polite" className="h-5 text-xs text-muted-foreground-2">
+          {unseenCount > 0
+            ? `${unseenCount} new endpoint(s) observed since this review — refresh to include them.`
+            : ""}
         </div>
 
         {candidates.length === 0 ? (
