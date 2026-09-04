@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
 import type { Mock } from "vitest";
 import { SeedDialog, buildCandidates } from "../components/SeedDialog";
@@ -300,6 +300,105 @@ describe("SeedDialog snapshot (a review is a frozen list, not a live feed)", () 
       expect(add).toHaveBeenCalledWith(
         "web",
         [{ kind: "http", host: "pypi.org", port: 443, access: "read-write" }],
+        false,
+      ),
+    );
+  });
+
+  it("Refresh never widens a surviving git row's access when a later push folds into it", async () => {
+    const add = api.policyAddEndpoints as Mock;
+    const clone = sum({ host: "github.com", last_method: "POST", last_path: "/o/b/git-upload-pack" });
+    const push = sum({ host: "github.com", last_method: "POST", last_path: "/o/b/git-receive-pack" });
+    const gitDialog = (rows: EndpointSummary[]) => (
+      <SeedDialog name="web" rows={rows} enforcing={true} policy={{ ...bare, enforcing: true }}
+        onClose={() => {}} onApplied={() => {}} />
+    );
+    const { rerender } = render(gitDialog([clone]));
+    fireEvent.click(screen.getByRole("checkbox", { name: "git clone → github.com/o/b" }));
+
+    rerender(gitDialog([clone, push]));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    // The row is still checked and its label now names the broader op the
+    // netlog observed, but the access the user reviewed (read) must survive —
+    // the fold must not silently upgrade a read consent to read-write.
+    expect(screen.getByRole("checkbox", { name: "git push → github.com/o/b" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "read" })).toBeChecked();
+
+    fireEvent.click(addButton());
+    await waitFor(() =>
+      expect(add).toHaveBeenCalledWith(
+        "web",
+        [{ kind: "git", target: "github.com/o/b", access: "read" }],
+        false,
+      ),
+    );
+  });
+
+  it("a pin left by Refresh can still be widened explicitly via the access picker", async () => {
+    const add = api.policyAddEndpoints as Mock;
+    const clone = sum({ host: "github.com", last_method: "POST", last_path: "/o/b/git-upload-pack" });
+    const push = sum({ host: "github.com", last_method: "POST", last_path: "/o/b/git-receive-pack" });
+    const gitDialog = (rows: EndpointSummary[]) => (
+      <SeedDialog name="web" rows={rows} enforcing={true} policy={{ ...bare, enforcing: true }}
+        onClose={() => {}} onApplied={() => {}} />
+    );
+    const { rerender } = render(gitDialog([clone]));
+    fireEvent.click(screen.getByRole("checkbox", { name: "git clone → github.com/o/b" }));
+
+    rerender(gitDialog([clone, push]));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    fireEvent.click(screen.getByRole("radio", { name: "read-write" }));
+    fireEvent.click(addButton());
+    await waitFor(() =>
+      expect(add).toHaveBeenCalledWith(
+        "web",
+        [{ kind: "git", target: "github.com/o/b", access: "read-write" }],
+        false,
+      ),
+    );
+  });
+
+  it("Refresh never widens a surviving http row's access when a later write flips its default", async () => {
+    const add = api.policyAddEndpoints as Mock;
+    const get = sum({ host: "pypi.org", port: 443, last_method: "GET" });
+    const post = sum({ host: "pypi.org", port: 443, last_method: "POST" });
+    const httpDialog = (rows: EndpointSummary[]) => (
+      <SeedDialog name="web" rows={rows} enforcing={true} policy={{ ...bare, enforcing: true }}
+        onClose={() => {}} onApplied={() => {}} />
+    );
+    const { rerender } = render(httpDialog([get]));
+    fireEvent.click(screen.getByRole("checkbox", { name: "pypi.org:443" }));
+
+    rerender(httpDialog([post]));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    fireEvent.click(addButton());
+    await waitFor(() =>
+      expect(add).toHaveBeenCalledWith(
+        "web",
+        [{ kind: "http", host: "pypi.org", port: 443, access: "read" }],
+        false,
+      ),
+    );
+  });
+
+  it("Refresh does not pin access on a surviving row whose default is unchanged", async () => {
+    const add = api.policyAddEndpoints as Mock;
+    const { rerender } = render(dialog([pypi]));
+    fireEvent.click(screen.getByRole("checkbox", { name: "pypi.org:443" }));
+
+    rerender(dialog([npm, pypi]));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    const pypiRow = screen.getByRole("checkbox", { name: "pypi.org:443" }).closest("label")!;
+    expect(within(pypiRow).getByRole("radio", { name: "read" })).toBeChecked();
+    fireEvent.click(addButton());
+    await waitFor(() =>
+      expect(add).toHaveBeenCalledWith(
+        "web",
+        [{ kind: "http", host: "pypi.org", port: 443, access: "read" }],
         false,
       ),
     );
