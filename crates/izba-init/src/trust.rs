@@ -129,6 +129,16 @@ pub fn replace_managed_block(existing: &str, anchors: &str) -> String {
     out
 }
 
+/// The canonical bundle with any izba-managed block stripped: the image's own
+/// system roots and nothing izba added on an earlier boot. This is what the
+/// combined bundle is composed from — composing from the raw canonical file
+/// would carry the PREVIOUS boot's anchors (read before this boot rewrites the
+/// block), so a CA removed on the host would survive one extra restart in
+/// `/etc/izba/ca-bundle.pem`.
+pub fn system_roots_only(canonical: &str) -> String {
+    replace_managed_block(canonical, "")
+}
+
 /// The canonical CA-bundle env vars and their post-chroot guest paths.
 ///
 /// `NODE_EXTRA_CA_CERTS`/`DENO_CERT` take the anchors — izba CA + any host
@@ -221,6 +231,21 @@ mod tests {
     #[test]
     fn extra_file_name_matches_the_host_contract() {
         assert_eq!(EXTRA_FILE, "extra.pem");
+    }
+
+    /// The system roots fed into the combined bundle come from the canonical
+    /// file, which on a restart still carries the PREVIOUS boot's managed
+    /// block. `system_roots_only` must strip it, or a removed CA survives one
+    /// extra restart inside /etc/izba/ca-bundle.pem.
+    #[test]
+    fn system_roots_only_strips_a_previous_managed_block() {
+        let stale = replace_managed_block("IMAGE-ROOT\n", "CA-PEM\nOLD-CORP\n");
+        assert!(
+            stale.contains("OLD-CORP"),
+            "fixture carries the stale block"
+        );
+        assert_eq!(system_roots_only(&stale), "IMAGE-ROOT\n");
+        assert_eq!(system_roots_only("IMAGE-ROOT\n"), "IMAGE-ROOT\n");
     }
 
     #[test]

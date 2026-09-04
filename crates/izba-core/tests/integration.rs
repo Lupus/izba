@@ -2651,6 +2651,21 @@ fn canonical_bundle_revokes_a_removed_extra_ca_real_vm() {
         "removing the one corp root must drop exactly one CERTIFICATE block — izba's own CA \
          and the image's system roots must survive untouched"
     );
+    // The combined bundle the trust-env vars point at is composed from the
+    // canonical file's SYSTEM roots — it must not inherit the previous boot's
+    // managed block (Greptile P1 on #291: a removed CA survived one extra
+    // restart in /etc/izba/ca-bundle.pem because the canonical file was read
+    // before it was rewritten).
+    let combined_cmd = format!("grep -c -F '{corp_marker}' /etc/izba/ca-bundle.pem; true");
+    let corp_in_combined: u32 = exec_ok(&tb.paths, name, &["sh", "-c", &combined_cmd])
+        .trim()
+        .parse()
+        .expect("grep -c prints a decimal count");
+    assert_eq!(
+        corp_in_combined, 0,
+        "the removed corp CA must be gone from /etc/izba/ca-bundle.pem on the very next \
+         start, not one restart later"
+    );
 
     stop_sandbox(&tb, name);
 }
