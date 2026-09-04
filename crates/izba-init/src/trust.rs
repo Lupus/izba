@@ -1,5 +1,8 @@
-//! Guest trust anchor: bakes the izba root CA into the guest trust store so
-//! workload tools (curl/git/node/python) trust izbad's MITM leaf certs.
+//! Guest trust anchor: bakes the izba root CA — and any host-installed extra
+//! roots (#283) — into the guest trust store so workload tools trust izbad's
+//! MITM leaves AND the operator's private PKI. Delivered for EVERY sandbox,
+//! bare or enforcing: a bare sandbox's TLS goes end-to-end, so the guest
+//! store is the only place a corporate root can live.
 //!
 //! izbad delivers the CA PEM to the guest as a read-only virtiofs share tagged
 //! [`TRUST_TAG`], mounted at [`TRUST_MOUNT`]. At boot, init copies the CA into
@@ -20,6 +23,11 @@ pub const TRUST_MOUNT: &str = "/izba-trust";
 
 /// Filename of the CA PEM inside the share. The host side must write this name.
 pub const CA_FILE: &str = "ca.pem";
+
+/// Filename of the OPTIONAL host-installed extra roots inside the share
+/// (`<data>/trust/extra/*.pem` concatenated by `sandbox::start`, #283).
+/// Absent when the operator installed none.
+pub const EXTRA_FILE: &str = "extra.pem";
 
 /// Post-chroot guest path of the CA-alone PEM init writes into the overlay.
 pub const GUEST_CA_PEM: &str = "/etc/izba/ca.pem";
@@ -45,6 +53,14 @@ pub fn build_combined_bundle(ca_pem: &str, system_pem: Option<&str>) -> String {
         }
         None => ca_pem.to_string(),
     }
+}
+
+/// The izba-added anchors: the izba CA first, then the host's extra roots
+/// (already newline-joined by the host side). This is what lands in
+/// `/etc/izba/ca.pem` — `NODE_EXTRA_CA_CERTS`/`DENO_CERT` read THIS file, so
+/// the corporate roots must be in it, not only in the combined bundle.
+pub fn build_anchor_pem(ca_pem: &str, extra_pem: Option<&str>) -> String {
+    build_combined_bundle(ca_pem, extra_pem)
 }
 
 /// The canonical CA-bundle env vars and their post-chroot guest paths.
@@ -108,5 +124,35 @@ mod tests {
                 ("GIT_SSL_CAINFO", "/etc/izba/ca-bundle.pem"),
             ]
         );
+    }
+
+    #[test]
+    fn anchor_pem_is_the_ca_alone_without_extras() {
+        assert_eq!(build_anchor_pem("CA-PEM\n", None), "CA-PEM\n");
+    }
+
+    #[test]
+    fn anchor_pem_is_ca_then_extras_newline_separated() {
+        assert_eq!(
+            build_anchor_pem("CA-PEM", Some("CORP-A\nCORP-B\n")),
+            "CA-PEM\nCORP-A\nCORP-B\n",
+            "izba CA first, then every extra root in shipped order"
+        );
+    }
+
+    /// The AC's ordering contract end to end: izba CA, each extra PEM in
+    /// order, then the system roots.
+    #[test]
+    fn combined_bundle_is_ca_then_extras_then_system() {
+        let anchors = build_anchor_pem("CA-PEM\n", Some("CORP-A\nCORP-B\n"));
+        assert_eq!(
+            build_combined_bundle(&anchors, Some("SYS-ROOTS\n")),
+            "CA-PEM\nCORP-A\nCORP-B\nSYS-ROOTS\n"
+        );
+    }
+
+    #[test]
+    fn extra_file_name_matches_the_host_contract() {
+        assert_eq!(EXTRA_FILE, "extra.pem");
     }
 }
