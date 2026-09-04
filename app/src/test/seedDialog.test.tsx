@@ -199,6 +199,64 @@ describe("SeedDialog selection (a consent surface: nothing is approved by defaul
   });
 });
 
+describe("SeedDialog snapshot (a review is a frozen list, not a live feed)", () => {
+  const pypi = sum({ host: "pypi.org", port: 443 });
+  const npm = sum({ host: "npmjs.org", port: 443 });
+  const dialog = (rows: EndpointSummary[]) => (
+    <SeedDialog name="web" rows={rows} enforcing={true} policy={{ ...bare, enforcing: true }}
+      onClose={() => {}} onApplied={() => {}} />
+  );
+
+  it("keeps the list and its order frozen while the rows prop changes underneath", () => {
+    const { rerender } = render(dialog([pypi]));
+    expect(listedLabels()).toEqual(["pypi.org:443"]);
+    rerender(dialog([npm, pypi]));
+    expect(listedLabels()).toEqual(["pypi.org:443"]);
+    expect(screen.queryByText("npmjs.org:443")).toBeNull();
+  });
+
+  it("reports new endpoints as a non-blocking notice, distinct from the reviewed set", () => {
+    const { rerender } = render(dialog([pypi]));
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+    rerender(dialog([npm, pypi]));
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "1 new endpoint(s) observed since this review — refresh to include them.",
+    );
+    // The submit action is untouched by the notice.
+    fireEvent.click(screen.getByRole("checkbox", { name: "pypi.org:443" }));
+    expect(addButton()).toBeEnabled();
+  });
+
+  it("Refresh folds new traffic in, keeps the user's existing ticks, leaves new rows unselected", () => {
+    const { rerender } = render(dialog([pypi]));
+    fireEvent.click(screen.getByRole("checkbox", { name: "pypi.org:443" }));
+    rerender(dialog([npm, pypi]));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(listedLabels()).toEqual(["npmjs.org:443", "pypi.org:443"]);
+    expect(screen.getByRole("checkbox", { name: "pypi.org:443" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "npmjs.org:443" })).not.toBeChecked();
+    expect(addButton()).toHaveTextContent("Add 1 selected to allow-list");
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("a reshuffle of the same membership neither moves rows nor raises the notice", () => {
+    const { rerender } = render(dialog([npm, pypi]));
+    expect(listedLabels()).toEqual(["npmjs.org:443", "pypi.org:443"]);
+    rerender(dialog([pypi, npm]));
+    expect(listedLabels()).toEqual(["npmjs.org:443", "pypi.org:443"]);
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("Refresh is available even when the snapshot was empty at open", () => {
+    const { rerender } = render(dialog([]));
+    expect(screen.getByText(/No new endpoints to add/)).toBeInTheDocument();
+    rerender(dialog([pypi]));
+    expect(screen.getByRole("status")).toHaveTextContent(/1 new endpoint/);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(listedLabels()).toEqual(["pypi.org:443"]);
+  });
+});
+
 describe("buildCandidates", () => {
   it("orders candidates by key regardless of backend order, selectable kinds before raw IPs", () => {
     const a = sum({ host: "pypi.org", port: 443 });
