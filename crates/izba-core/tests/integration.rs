@@ -2547,17 +2547,33 @@ fn custom_ca_trusted_in_guest_and_at_izbad_upstream_real_vm() {
             // EAGAIN ("Resource temporarily unavailable") or EINVAL ("Invalid
             // argument") depending on where in its read the close lands. Both
             // are the same correct behaviour, so pinning one of them was a
-            // ~50% flake. What IS deterministic: the fetch fails, no body
-            // arrives, it is not a `-T 20` timeout, and it is not a policy
-            // deny (a 403 would mean it failed for the wrong reason — the
-            // allow-list, not upstream certificate verification).
-            CaArm::EnforceOn => assert!(
-                !r_out.contains("timed out") && !r_out.contains("403"),
-                "[{label}] IZBAD's own upstream verification must reject the \
-                 rogue upstream and tear the guest-facing leg down with no \
-                 HTTP response — not time out (`-T 20`) and not deny at the \
-                 policy layer (403):\n{r_out}"
-            ),
+            // ~50% flake. What IS deterministic: the fetch fails and no body
+            // arrives (both asserted above, for both arms), plus the four
+            // WRONG reasons ruled out here:
+            //   - "timed out"      — the `-T 20` deadline, not a teardown;
+            //   - a 403            — denied at the allow-list, not at upstream
+            //                        certificate verification;
+            //   - "exec rejected"  — the exec channel hiccuped, so the fetch
+            //                        never actually ran in the guest;
+            //   - "bad address"    — DNS failed, so no TLS was attempted.
+            // The negatives run over the wget OUTPUT only: `r_out` also echoes
+            // the command line, whose URL carries a random ephemeral port that
+            // could itself contain "403".
+            CaArm::EnforceOn => {
+                let wget_out = r_out.split_once("\n-> ").map_or(r_out.as_str(), |(_, o)| o);
+                assert!(
+                    !wget_out.contains("timed out")
+                        && !wget_out.contains("403 Forbidden")
+                        && !wget_out.contains("HTTP/1.1 403")
+                        && !wget_out.contains("exec rejected")
+                        && !wget_out.contains("bad address"),
+                    "[{label}] IZBAD's own upstream verification must reject the \
+                     rogue upstream and tear the guest-facing leg down with no \
+                     HTTP response — not time out (`-T 20`), not deny at the \
+                     policy layer (403), not fail in the exec channel, and not \
+                     fail DNS resolution:\n{r_out}"
+                )
+            }
         }
     }
 }

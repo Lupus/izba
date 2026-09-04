@@ -43,7 +43,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 struct TrustStatus {
     /// File names loaded from `<data>/trust/extra`, in load order.
     extra_ca_files: Vec<String>,
-    /// The `{e:#}` text of the failure that disabled the MITM, if any.
+    /// `"<cause>: <error>"` for the failure that disabled the MITM, if any —
+    /// the cause is part of it because CA init, the extra-CA load and the
+    /// runtime start fail for very different reasons.
     error: Option<String>,
 }
 
@@ -75,13 +77,16 @@ fn build_mitm_runtime(paths: &Paths, audit: crate::daemon::egress::audit::AuditS
     // would panic). Installing it is best-effort: an existing default is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // `what` rides along on the wire: the three causes (CA init, extra-CA
+    // load, runtime start) are NOT interchangeable, and dropping it let the
+    // CLI report a CA-init or runtime failure as an extra-CA load failure.
     let failed = |what: &str, e: &anyhow::Error| {
         eprintln!("izbad: egress MITM disabled — {what}: {e:#}");
         MitmInit {
             runtime: None,
             trust: TrustStatus {
                 extra_ca_files: Vec::new(),
-                error: Some(format!("{e:#}")),
+                error: Some(format!("{what}: {e:#}")),
             },
         }
     };
@@ -5233,6 +5238,10 @@ mod tests {
             DaemonResponse::Status(s) => {
                 let err = s.trust_error.expect("load failure surfaced");
                 assert!(err.contains("corp.pem"), "{err}");
+                assert!(
+                    err.contains("extra CA load failed"),
+                    "the CAUSE must ride along, not just the inner error: {err}"
+                );
                 assert!(
                     s.extra_ca_files.is_empty(),
                     "nothing was loaded: {:?}",
