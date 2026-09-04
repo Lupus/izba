@@ -40,6 +40,21 @@ pub fn status(paths: &Paths) -> anyhow::Result<i32> {
                 println!("⚠ daemon and CLI builds differ (run `izba version` for detail)");
             }
             println!("socket: {}", s.socket);
+            if s.extra_ca_files.is_empty() {
+                println!(
+                    "trust: webpki roots only (drop corporate CA .pem files into {} — \
+                     guests pick them up on their next start, izbad after `izba daemon stop`)",
+                    s.trust_extra_dir
+                );
+            } else {
+                println!(
+                    "trust: webpki roots + {} extra CA file(s) from {}: {} \
+                     (guests: on next start; izbad: reload with `izba daemon stop`)",
+                    s.extra_ca_files.len(),
+                    s.trust_extra_dir,
+                    s.extra_ca_files.join(", ")
+                );
+            }
             println!("{:<24} {:<32} {:<16} CONTAINER", "NAME", "IMAGE", "STATUS");
             for sb in &s.sandboxes {
                 // A stopped VM can't have a live container; skip the probe (it

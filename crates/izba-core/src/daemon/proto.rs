@@ -414,6 +414,15 @@ pub struct DaemonStatus {
     pub uptime_ms: u64,
     pub socket: String,
     pub sandboxes: Vec<SandboxSummary>,
+    /// Host-installed extra CA files izbad loaded at start (`<data>/trust/extra`,
+    /// #283), in load order. Empty = webpki-roots only. `serde(default)`: a
+    /// pre-#283 daemon reads as "none loaded", which is the honest answer.
+    #[serde(default)]
+    pub extra_ca_files: Vec<String>,
+    /// Display path of that directory, so `izba daemon status` can say where
+    /// to put a CA. `serde(default)` for the same reason.
+    #[serde(default)]
+    pub trust_extra_dir: String,
 }
 
 /// The configured usbip upstream, as reported to a human.
@@ -730,6 +739,8 @@ mod tests {
                 uptime_ms: 1000,
                 socket: "/x/izbad.sock".into(),
                 sandboxes: vec![],
+                extra_ca_files: vec![],
+                trust_extra_dir: String::new(),
             }),
         ] {
             let mut buf = Vec::new();
@@ -737,6 +748,18 @@ mod tests {
             let back: DaemonResponse = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
             assert_eq!(format!("{resp:?}"), format!("{back:?}"));
         }
+    }
+
+    /// #283: a pre-#283 daemon's Status frame (no trust fields) must still
+    /// deserialize — the fields are additive and defaulted, no proto bump.
+    #[test]
+    fn daemon_status_trust_fields_default_when_absent() {
+        let json = serde_json::json!({
+            "version": "x", "pid": 1, "uptime_ms": 0, "socket": "s", "sandboxes": []
+        });
+        let s: DaemonStatus = serde_json::from_value(json).unwrap();
+        assert!(s.extra_ca_files.is_empty());
+        assert_eq!(s.trust_extra_dir, "");
     }
 
     #[test]
