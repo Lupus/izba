@@ -249,6 +249,18 @@ mod tests {
             .to_string()
     }
 
+    /// Only a MISSING directory means "no extra CAs"; any other `read_dir`
+    /// failure (here: the path is a regular file) is an error naming the
+    /// path, never a silent empty set.
+    #[test]
+    fn an_unreadable_dir_is_an_error_not_an_empty_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("extra");
+        std::fs::write(&not_a_dir, "x").unwrap();
+        let err = load_extra_cas(&not_a_dir).unwrap_err().to_string();
+        assert!(err.contains("reading extra CA dir"), "{err}");
+    }
+
     #[test]
     fn missing_dir_loads_nothing() {
         let dir = tempfile::tempdir().unwrap();

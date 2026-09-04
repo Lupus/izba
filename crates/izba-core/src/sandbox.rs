@@ -2725,6 +2725,26 @@ mod tests {
         assert!(!trust.join("extra.pem").exists(), "stale extra.pem removed");
     }
 
+    /// Only a MISSING stale `extra.pem` is tolerated when the directory is
+    /// empty: any other removal failure (here, the path is a non-empty
+    /// directory) refuses the start rather than booting a guest that may
+    /// still trust last time's roots.
+    #[test]
+    fn start_refuses_when_a_stale_extra_pem_cannot_be_removed() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let stale = paths.sandbox_dir("web").join("trust").join("extra.pem");
+        fs::create_dir_all(stale.join("child")).unwrap();
+
+        let err = format!(
+            "{:#}",
+            start(&paths, "web", &MockDriver::new(), &arts(), false).unwrap_err()
+        );
+        assert!(err.contains("removing stale"), "{err}");
+    }
+
     /// A corrupt extra-CA file refuses the start with an error naming the
     /// file — never a boot that silently trusts fewer roots than installed.
     #[test]
