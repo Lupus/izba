@@ -119,6 +119,34 @@ pub fn guest_extra_pem(files: &[ExtraCaFile]) -> String {
     out
 }
 
+/// webpki-roots (the Mozilla bundle production izbad always trusted) PLUS
+/// every extra cert, in load order. Only ever widens over the baseline.
+pub fn upstream_root_store(extra: &[ExtraCaFile]) -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for file in extra {
+        for cert in &file.certs {
+            // `load_extra_cas` already validated every cert through this
+            // same `add`, so the error branch is defensive only — log rather
+            // than panic inside the daemon.
+            if let Err(e) = roots.add(cert.clone()) {
+                eprintln!(
+                    "izbad: extra CA file {}: skipping certificate: {e}",
+                    file.name
+                );
+            }
+        }
+    }
+    roots
+}
+
+/// izbad's upstream `ClientConfig` (ALPN http/1.1) trusting
+/// [`upstream_root_store`]. Built once at daemon start — a changed directory
+/// is picked up by restarting the daemon (`izba daemon stop`).
+pub fn upstream_client_config(extra: &[ExtraCaFile]) -> std::sync::Arc<rustls::ClientConfig> {
+    crate::daemon::egress::mitm::upstream_client_config(upstream_root_store(extra))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +228,75 @@ mod tests {
         ];
         assert_eq!(guest_extra_pem(&files), "A-PEM\nB-PEM\n");
         assert_eq!(guest_extra_pem(&[]), "");
+    }
+
+    #[test]
+    fn upstream_roots_are_webpki_plus_every_extra_cert() {
+        let ca = real_ca_pem();
+        let files = vec![ExtraCaFile {
+            name: "corp.pem".into(),
+            pem: format!("{ca}{ca}"),
+            certs: CertificateDer::pem_slice_iter(format!("{ca}{ca}").as_bytes())
+                .map(|c| c.unwrap())
+                .collect(),
+        }];
+        let roots = upstream_root_store(&files);
+        assert_eq!(
+            roots.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len() + 2,
+            "webpki baseline plus both extra certs"
+        );
+        assert_eq!(
+            upstream_root_store(&[]).len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "no extras ⇒ exactly the webpki baseline"
+        );
+    }
+
+    /// The property izbad relies on: a leaf minted by an EXTRA CA verifies
+    /// under the upstream config, and does NOT verify without that CA.
+    #[test]
+    fn upstream_config_verifies_a_leaf_signed_by_an_extra_ca_and_only_then() {
+        use crate::daemon::egress::mitm::{server_config_with_resolver, CertCache, IzbaCa};
+        use rustls::pki_types::ServerName;
+        use std::sync::Arc;
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let corp = IzbaCa::generate().unwrap();
+        let corp_pem = corp.cert_pem().to_string();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config_with_resolver(Arc::new(
+            CertCache::new(corp),
+        ))));
+
+        let files = vec![ExtraCaFile {
+            name: "corp.pem".into(),
+            pem: corp_pem.clone(),
+            certs: CertificateDer::pem_slice_iter(corp_pem.as_bytes())
+                .map(|c| c.unwrap())
+                .collect(),
+        }];
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handshake = |cfg: Arc<rustls::ClientConfig>| {
+            let acceptor = acceptor.clone();
+            rt.block_on(async move {
+                let (client, server) = tokio::io::duplex(16 * 1024);
+                let srv = tokio::spawn(async move { acceptor.accept(server).await.map(|_| ()) });
+                let name = ServerName::try_from("registry.corp.example").unwrap();
+                let res = TlsConnector::from(cfg)
+                    .connect(name, client)
+                    .await
+                    .map(|_| ());
+                let _ = srv.await;
+                res
+            })
+        };
+        handshake(upstream_client_config(&files)).expect("extra CA leaf verifies");
+        handshake(upstream_client_config(&[]))
+            .expect_err("without the extra CA the leaf is refused");
     }
 }

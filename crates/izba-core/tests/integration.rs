@@ -1847,7 +1847,7 @@ fn setup_mitm_sandbox(
 ) {
     use izba_core::daemon::egress::audit::AuditSink;
     use izba_core::daemon::egress::config::EgressPolicyConfig;
-    use izba_core::daemon::egress::mitm::{upstream_client_config_webpki, CertCache};
+    use izba_core::daemon::egress::mitm::CertCache;
     use izba_core::daemon::egress::mitm_runtime::MitmRuntime;
     use izba_core::daemon::egress::EgressManager;
 
@@ -1868,9 +1868,15 @@ fn setup_mitm_sandbox(
     let ca = izba_core::ca::load_or_create(&tb.paths.ca_dir()).expect("izba CA");
     let certs = std::sync::Arc::new(CertCache::new(ca));
     let audit = AuditSink::new(tb.paths.clone());
+    let extra = izba_core::trust::load_extra_cas(&tb.paths.trust_extra_dir())
+        .expect("loading <data>/trust/extra");
     let mitm = std::sync::Arc::new(
-        MitmRuntime::start(certs, upstream_client_config_webpki(), audit.clone())
-            .expect("start MITM runtime"),
+        MitmRuntime::start(
+            certs,
+            izba_core::trust::upstream_client_config(&extra),
+            audit.clone(),
+        )
+        .expect("start MITM runtime"),
     );
 
     let mgr = EgressManager::new(

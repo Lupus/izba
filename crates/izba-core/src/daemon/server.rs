@@ -45,7 +45,7 @@ fn build_mitm_runtime(
     paths: &Paths,
     audit: crate::daemon::egress::audit::AuditSink,
 ) -> Option<Arc<crate::daemon::egress::mitm_runtime::MitmRuntime>> {
-    use crate::daemon::egress::mitm::{upstream_client_config_webpki, CertCache};
+    use crate::daemon::egress::mitm::CertCache;
     use crate::daemon::egress::mitm_runtime::MitmRuntime;
 
     // The MITM datapath signs/verifies with the ring CryptoProvider (aws-lc-rs
@@ -60,8 +60,28 @@ fn build_mitm_runtime(
             return None;
         }
     };
+    // Extra roots (#283): a corrupt file disables the MITM (enforcing
+    // sandboxes then fail closed at the router) rather than silently trusting
+    // fewer roots than the operator installed. `sandbox::start` refuses with
+    // the same error, so the user sees it on the very next command.
+    let extra = match crate::trust::load_extra_cas(&paths.trust_extra_dir()) {
+        Ok(extra) => extra,
+        Err(e) => {
+            eprintln!("izbad: egress MITM disabled — extra CA load failed: {e:#}");
+            return None;
+        }
+    };
+    if !extra.is_empty() {
+        let names: Vec<&str> = extra.iter().map(|f| f.name.as_str()).collect();
+        eprintln!(
+            "izbad: trusting {} extra CA file(s) from {}: {}",
+            extra.len(),
+            paths.trust_extra_dir().display(),
+            names.join(", ")
+        );
+    }
     let certs = Arc::new(CertCache::new(ca));
-    match MitmRuntime::start(certs, upstream_client_config_webpki(), audit) {
+    match MitmRuntime::start(certs, crate::trust::upstream_client_config(&extra), audit) {
         Ok(rt) => Some(Arc::new(rt)),
         Err(e) => {
             eprintln!("izbad: egress MITM disabled — runtime start failed: {e:#}");
