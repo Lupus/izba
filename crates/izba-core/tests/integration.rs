@@ -2540,11 +2540,23 @@ fn custom_ca_trusted_in_guest_and_at_izbad_upstream_real_vm() {
                  upstream on certificate verification, not merely time out or \
                  hit some unrelated error:\n{r_out}"
             ),
+            // Enforce ON is asserted by PROPERTIES, not by an errno string.
+            // When izbad's own upstream verification rejects the rogue
+            // certificate it tears the guest-facing leg down WITHOUT sending
+            // an HTTP response, and busybox wget renders that abrupt close as
+            // EAGAIN ("Resource temporarily unavailable") or EINVAL ("Invalid
+            // argument") depending on where in its read the close lands. Both
+            // are the same correct behaviour, so pinning one of them was a
+            // ~50% flake. What IS deterministic: the fetch fails, no body
+            // arrives, it is not a `-T 20` timeout, and it is not a policy
+            // deny (a 403 would mean it failed for the wrong reason — the
+            // allow-list, not upstream certificate verification).
             CaArm::EnforceOn => assert!(
-                r_out.contains("Resource temporarily unavailable") && !r_out.contains("timed out"),
+                !r_out.contains("timed out") && !r_out.contains("403"),
                 "[{label}] IZBAD's own upstream verification must reject the \
-                 rogue upstream and tear the guest-facing leg down — not \
-                 merely time out:\n{r_out}"
+                 rogue upstream and tear the guest-facing leg down with no \
+                 HTTP response — not time out (`-T 20`) and not deny at the \
+                 policy layer (403):\n{r_out}"
             ),
         }
     }
