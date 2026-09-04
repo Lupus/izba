@@ -101,6 +101,14 @@ impl Paths {
         self.root.join("ca")
     }
 
+    /// Host-only extra CA roots (`<root>/trust/extra/*.pem|*.crt`, #283):
+    /// corporate / private-PKI roots every guest trusts and izbad's upstream
+    /// verifier accepts. Never shared into a VM as a directory — `start`
+    /// copies its text into the per-sandbox `trust/` share.
+    pub fn trust_extra_dir(&self) -> PathBuf {
+        self.root.join("trust").join("extra")
+    }
+
     /// Global izba SSH material (keypair, host key, managed config, known_hosts).
     pub fn ssh_dir(&self) -> PathBuf {
         self.root.join("ssh")
