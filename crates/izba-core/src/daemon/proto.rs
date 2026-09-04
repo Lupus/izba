@@ -415,14 +415,22 @@ pub struct DaemonStatus {
     pub socket: String,
     pub sandboxes: Vec<SandboxSummary>,
     /// Host-installed extra CA files izbad loaded at start (`<data>/trust/extra`,
-    /// #283), in load order. Empty = webpki-roots only. `serde(default)`: a
-    /// pre-#283 daemon reads as "none loaded", which is the honest answer.
+    /// #283), in load order. Empty = webpki-roots only, OR a load failure —
+    /// read it together with `trust_error`. `serde(default)`: a pre-#283
+    /// daemon reads as "none loaded", which is the honest answer.
     #[serde(default)]
     pub extra_ca_files: Vec<String>,
-    /// Display path of that directory, so `izba daemon status` can say where
-    /// to put a CA. `serde(default)` for the same reason.
+    /// Why izbad has NO extra roots and no MITM: the extra-CA load (or CA /
+    /// runtime init) failed. `Some` means every enforcing sandbox's HTTP(S)
+    /// is failing closed, so `izba daemon status` must say so instead of
+    /// printing the "drop your CA here" hint the operator already followed.
+    /// `serde(default)` for the same reason as above.
+    ///
+    /// The directory PATH is deliberately NOT on the wire: the CLI holds
+    /// `Paths` and renders `trust_extra_dir()` itself, so an older daemon can
+    /// never make it print a sentence with an empty path in it.
     #[serde(default)]
-    pub trust_extra_dir: String,
+    pub trust_error: Option<String>,
 }
 
 /// The configured usbip upstream, as reported to a human.
@@ -740,7 +748,7 @@ mod tests {
                 socket: "/x/izbad.sock".into(),
                 sandboxes: vec![],
                 extra_ca_files: vec![],
-                trust_extra_dir: String::new(),
+                trust_error: None,
             }),
         ] {
             let mut buf = Vec::new();
@@ -759,7 +767,7 @@ mod tests {
         });
         let s: DaemonStatus = serde_json::from_value(json).unwrap();
         assert!(s.extra_ca_files.is_empty());
-        assert_eq!(s.trust_extra_dir, "");
+        assert!(s.trust_error.is_none());
     }
 
     #[test]

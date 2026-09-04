@@ -33,25 +33,40 @@ use crate::vmm::{IoStream, UdsStream, VmmDriver};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What `izba daemon status` needs to describe izbad's upstream trust honestly
+/// (#283). `error` is `Some` exactly when izbad ended up with NO extra roots
+/// and NO MITM because something failed — which also means every ENFORCING
+/// sandbox's HTTP(S) is failing closed. Reporting only `extra_ca_files` would
+/// render that state as the benign "webpki roots only", advising the operator
+/// to do what they had already done.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TrustStatus {
+    /// File names loaded from `<data>/trust/extra`, in load order.
+    pub extra_ca_files: Vec<String>,
+    /// The `{e:#}` text of the failure that disabled the MITM, if any.
+    pub error: Option<String>,
+}
+
+/// The outcome of [`build_mitm_runtime`]: the runtime the egress plane uses,
+/// plus the trust posture the operator is shown.
+pub(crate) struct MitmInit {
+    pub runtime: Option<Arc<crate::daemon::egress::mitm_runtime::MitmRuntime>>,
+    pub trust: TrustStatus,
+}
+
 /// Build the shared MITM tier-1 runtime: load/mint the persistent izba CA, sign
-/// per-SNI leaves under it, verify real upstreams against the Mozilla roots, and
-/// audit every decision. Returns `None` if CA init or the runtime fails — the
-/// daemon must still come up (it also serves bare sandboxes that never MITM).
-/// With `None`, bare sandboxes keep their transparent direct dial, but an
-/// ENFORCING sandbox's HTTP(S) FAILS CLOSED at the router (it is never silently
-/// downgraded to a direct dial — see `router::tcp_connect`). The per-sandbox
-/// policy travels with each flow, so no policy is needed here.
+/// per-SNI leaves under it, verify real upstreams against the Mozilla roots plus
+/// any host-installed extra roots, and audit every decision. `runtime` is `None`
+/// if CA init, the extra-CA load, or the runtime fails — the daemon must still
+/// come up (it also serves bare sandboxes that never MITM). With `None`, bare
+/// sandboxes keep their transparent direct dial, but an ENFORCING sandbox's
+/// HTTP(S) FAILS CLOSED at the router (it is never silently downgraded to a
+/// direct dial — see `router::tcp_connect`). The per-sandbox policy travels
+/// with each flow, so no policy is needed here.
 ///
-/// The second element of the return is the file names loaded from
-/// `<data>/trust/extra` (#283), in load order — empty on any failure path —
-/// for `Daemon::extra_ca_files`, surfaced by `Status`/`izba daemon status`.
-fn build_mitm_runtime(
-    paths: &Paths,
-    audit: crate::daemon::egress::audit::AuditSink,
-) -> (
-    Option<Arc<crate::daemon::egress::mitm_runtime::MitmRuntime>>,
-    Vec<String>,
-) {
+/// Every failure path also records `trust.error`, so `Status` can surface the
+/// degradation rather than hiding it behind an empty file list (#283).
+fn build_mitm_runtime(paths: &Paths, audit: crate::daemon::egress::audit::AuditSink) -> MitmInit {
     use crate::daemon::egress::mitm::CertCache;
     use crate::daemon::egress::mitm_runtime::MitmRuntime;
 
@@ -60,12 +75,20 @@ fn build_mitm_runtime(
     // would panic). Installing it is best-effort: an existing default is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    let failed = |what: &str, e: &anyhow::Error| {
+        eprintln!("izbad: egress MITM disabled — {what}: {e:#}");
+        MitmInit {
+            runtime: None,
+            trust: TrustStatus {
+                extra_ca_files: Vec::new(),
+                error: Some(format!("{e:#}")),
+            },
+        }
+    };
+
     let ca = match crate::ca::load_or_create(&paths.ca_dir()) {
         Ok(ca) => ca,
-        Err(e) => {
-            eprintln!("izbad: egress MITM disabled — CA init failed: {e:#}");
-            return (None, Vec::new());
-        }
+        Err(e) => return failed("CA init failed", &e),
     };
     // Extra roots (#283): a corrupt file disables the MITM (enforcing
     // sandboxes then fail closed at the router) rather than silently trusting
@@ -73,10 +96,7 @@ fn build_mitm_runtime(
     // the same error, so the user sees it on the very next command.
     let extra = match crate::trust::load_extra_cas(&paths.trust_extra_dir()) {
         Ok(extra) => extra,
-        Err(e) => {
-            eprintln!("izbad: egress MITM disabled — extra CA load failed: {e:#}");
-            return (None, Vec::new());
-        }
+        Err(e) => return failed("extra CA load failed", &e),
     };
     let extra_names: Vec<String> = extra.iter().map(|f| f.name.clone()).collect();
     if !extra_names.is_empty() {
@@ -89,11 +109,14 @@ fn build_mitm_runtime(
     }
     let certs = Arc::new(CertCache::new(ca));
     match MitmRuntime::start(certs, crate::trust::upstream_client_config(&extra), audit) {
-        Ok(rt) => (Some(Arc::new(rt)), extra_names),
-        Err(e) => {
-            eprintln!("izbad: egress MITM disabled — runtime start failed: {e:#}");
-            (None, Vec::new())
-        }
+        Ok(rt) => MitmInit {
+            runtime: Some(Arc::new(rt)),
+            trust: TrustStatus {
+                extra_ca_files: extra_names,
+                error: None,
+            },
+        },
+        Err(e) => failed("runtime start failed", &e),
     }
 }
 
@@ -191,10 +214,11 @@ pub struct Daemon {
     /// any other target would otherwise carry a permanently-unread field.
     #[cfg(target_os = "linux")]
     stats_cpu: StatsCpuCache,
-    /// File names loaded from `<data>/trust/extra` at daemon start (#283),
-    /// for `Status`. Not authoritative state — a display record of what THIS
-    /// process trusts; a changed directory needs a daemon restart.
-    extra_ca_files: Vec<String>,
+    /// Upstream trust posture as of daemon start (#283), for `Status`: the
+    /// extra-CA files loaded, or why none were. Not authoritative state — a
+    /// display record of what THIS process trusts; a changed directory needs
+    /// a daemon restart.
+    trust: TrustStatus,
 }
 
 impl Daemon {
@@ -205,9 +229,10 @@ impl Daemon {
         // sandboxes' HTTP(S) then fails closed at the router rather than
         // downgrading — logged in `build_mitm_runtime`.
         let audit = crate::daemon::egress::audit::AuditSink::new(paths.clone());
-        let (mitm, extra_ca_files) = build_mitm_runtime(&paths, audit.clone());
+        let mitm = build_mitm_runtime(&paths, audit.clone());
+        let trust = mitm.trust;
         let usb = crate::usb::broker::UsbBroker::new(audit.clone());
-        let egress = EgressManager::new(Arc::clone(&deps.egress_resolver), mitm, audit);
+        let egress = EgressManager::new(Arc::clone(&deps.egress_resolver), mitm.runtime, audit);
         Self {
             paths,
             deps,
@@ -223,7 +248,7 @@ impl Daemon {
             idle_since: Mutex::new(Instant::now()),
             #[cfg(target_os = "linux")]
             stats_cpu: StatsCpuCache::default(),
-            extra_ca_files,
+            trust,
         }
     }
 
@@ -548,8 +573,8 @@ fn dispatch_inner(
             uptime_ms: d.started.elapsed().as_millis() as u64,
             socket: d.paths.daemon_socket().display().to_string(),
             sandboxes: d.registry.summaries(),
-            extra_ca_files: d.extra_ca_files.clone(),
-            trust_extra_dir: crate::paths::display_path(&d.paths.trust_extra_dir()),
+            extra_ca_files: d.trust.extra_ca_files.clone(),
+            trust_error: d.trust.error.clone(),
         })),
         DaemonRequest::VolumePrune => {
             let pruned = sandbox::prune_volumes(&d.paths)?;
@@ -5184,6 +5209,58 @@ mod tests {
             DaemonResponse::Ok
         ));
         assert!(d.shutdown_requested());
+    }
+
+    /// #283: an unparsable file under `<data>/trust/extra` disables the MITM,
+    /// so every ENFORCING sandbox's HTTP(S) fails closed. `Status` must SAY so
+    /// — reporting only an empty `extra_ca_files` renders the degraded state
+    /// as the benign "webpki roots only" and tells the operator to install the
+    /// CA they already installed.
+    #[test]
+    fn status_reports_an_extra_ca_load_failure() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        std::fs::create_dir_all(paths.trust_extra_dir()).unwrap();
+        std::fs::write(
+            paths.trust_extra_dir().join("corp.pem"),
+            "not a certificate\n",
+        )
+        .unwrap();
+        // Built inside Daemon::new, so this covers the real wiring.
+        let d = Arc::new(Daemon::new(paths, test_deps()));
+        let mut c = client_conn(&d);
+        match rpc(&mut c, &DaemonRequest::Status) {
+            DaemonResponse::Status(s) => {
+                let err = s.trust_error.expect("load failure surfaced");
+                assert!(err.contains("corp.pem"), "{err}");
+                assert!(
+                    s.extra_ca_files.is_empty(),
+                    "nothing was loaded: {:?}",
+                    s.extra_ca_files
+                );
+            }
+            other => panic!("status: {other:?}"),
+        }
+    }
+
+    /// The healthy counterpart: a good file loads, and no error is reported.
+    #[test]
+    fn status_reports_loaded_extra_ca_files_without_an_error() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        std::fs::create_dir_all(paths.trust_extra_dir()).unwrap();
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = crate::daemon::egress::mitm::IzbaCa::generate().unwrap();
+        std::fs::write(paths.trust_extra_dir().join("corp.pem"), ca.cert_pem()).unwrap();
+        let d = Arc::new(Daemon::new(paths, test_deps()));
+        let mut c = client_conn(&d);
+        match rpc(&mut c, &DaemonRequest::Status) {
+            DaemonResponse::Status(s) => {
+                assert_eq!(s.extra_ca_files, ["corp.pem"]);
+                assert!(s.trust_error.is_none(), "{:?}", s.trust_error);
+            }
+            other => panic!("status: {other:?}"),
+        }
     }
 
     #[test]
