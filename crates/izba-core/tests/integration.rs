@@ -20,9 +20,10 @@ use std::fs::{self, File};
 use std::io::Write as _;
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use izba_core::daemon::egress::dns::Resolver;
 use izba_core::daemon::relays::RelayManager;
 use izba_core::image::ensure_image;
 use izba_core::liveness::Liveness;
@@ -1824,60 +1825,74 @@ fn mitm_firewall_allows_and_denies_real_vm() {
     mgr.stop("mitm", &tb.paths.run_dir("mitm"));
 }
 
-/// Create a sandbox, write an egress `policy_yaml`, build a MITM-enabled
-/// [`EgressManager`], bind it to the per-sandbox vsock_1027 listener, and
-/// boot the VM.  The MITM runtime uses the same persistent izba CA that
-/// `sandbox::start` bakes into the guest, so the guest trusts the per-SNI
-/// leaves the MITM presents.
+/// Create a sandbox, optionally write an egress `policy_yaml` and build a
+/// MITM-enabled [`EgressManager`], bind it to the per-sandbox vsock_1027
+/// listener, and boot the VM. `policy_yaml: None` writes no `policy.yaml` and
+/// starts no MITM runtime (AllowAll ⇒ raw splice, e.g. the enforce-OFF custom-CA
+/// arm); `Some(yaml)` persists it and builds the MITM through the PRODUCTION
+/// upstream builder — `trust::upstream_client_config(&trust::load_extra_cas(..))`
+/// — against the same persistent izba CA that `sandbox::start` bakes into the
+/// guest, so the guest trusts the per-SNI leaf the MITM presents.
 ///
 /// Extracted to avoid verbatim repetition across MITM integration tests
 /// (SonarCloud duplication gate).
 ///
 /// Returns `(mgr, audit)` — the caller drives assertions against `audit`
 /// records and calls `mgr.stop(name, run_dir)` after the test.
-fn setup_mitm_sandbox(
+fn setup_egress_sandbox(
     env: &TestEnv,
     tb: &mut TestBox,
     name: &str,
     ws: &std::path::Path,
-    policy_yaml: &str,
+    policy_yaml: Option<&str>,
+    resolver: std::sync::Arc<dyn izba_core::daemon::egress::dns::Resolver>,
 ) -> (
     izba_core::daemon::egress::EgressManager,
     izba_core::daemon::egress::audit::AuditSink,
 ) {
     use izba_core::daemon::egress::audit::AuditSink;
     use izba_core::daemon::egress::config::EgressPolicyConfig;
-    use izba_core::daemon::egress::mitm::{upstream_client_config_webpki, CertCache};
+    use izba_core::daemon::egress::mitm::CertCache;
     use izba_core::daemon::egress::mitm_runtime::MitmRuntime;
     use izba_core::daemon::egress::EgressManager;
 
     create_sandbox(env, tb, name, ws);
 
-    // Persist the policy before ensure_listening reads it (resolve_policy arms
-    // an enforcing RegoPolicy at listen time when the file is present).
-    std::fs::write(
-        EgressPolicyConfig::path_in(&tb.paths.sandbox_dir(name)),
-        policy_yaml,
-    )
-    .expect("write policy.yaml");
-
-    // Build the MITM runtime from the SAME persistent CA that
-    // `sandbox::start` bakes into the guest (both read `tb.paths.ca_dir()`),
-    // so the guest trusts the per-SNI leaf the MITM presents.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let ca = izba_core::ca::load_or_create(&tb.paths.ca_dir()).expect("izba CA");
-    let certs = std::sync::Arc::new(CertCache::new(ca));
     let audit = AuditSink::new(tb.paths.clone());
-    let mitm = std::sync::Arc::new(
-        MitmRuntime::start(certs, upstream_client_config_webpki(), audit.clone())
-            .expect("start MITM runtime"),
-    );
+    let mitm = match policy_yaml {
+        None => None,
+        Some(yaml) => {
+            // Persist the policy before ensure_listening reads it
+            // (resolve_policy arms an enforcing RegoPolicy at listen time
+            // when the file is present).
+            std::fs::write(
+                EgressPolicyConfig::path_in(&tb.paths.sandbox_dir(name)),
+                yaml,
+            )
+            .expect("write policy.yaml");
 
-    let mgr = EgressManager::new(
-        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
-        Some(mitm),
-        audit.clone(),
-    );
+            // Build the MITM runtime from the SAME persistent CA that
+            // `sandbox::start` bakes into the guest (both read
+            // `tb.paths.ca_dir()`), so the guest trusts the per-SNI leaf the
+            // MITM presents.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let ca = izba_core::ca::load_or_create(&tb.paths.ca_dir()).expect("izba CA");
+            let certs = std::sync::Arc::new(CertCache::new(ca));
+            // THE PRODUCTION upstream builder — reads <data>/trust/extra.
+            let extra = izba_core::trust::load_extra_cas(&tb.paths.trust_extra_dir())
+                .expect("loading <data>/trust/extra");
+            Some(std::sync::Arc::new(
+                MitmRuntime::start(
+                    certs,
+                    izba_core::trust::upstream_client_config(&extra),
+                    audit.clone(),
+                )
+                .expect("start MITM runtime"),
+            ))
+        }
+    };
+
+    let mgr = EgressManager::new(resolver, mitm, audit.clone());
     mgr.ensure_listening(&tb.paths, name, &tb.paths.run_dir(name))
         .expect("bind vsock_1027 listener");
 
@@ -1890,6 +1905,28 @@ fn setup_mitm_sandbox(
     }
 
     (mgr, audit)
+}
+
+/// Thin wrapper over [`setup_egress_sandbox`] for the MITM tests: always
+/// enforcing (`policy_yaml` is mandatory), always the real system resolver.
+fn setup_mitm_sandbox(
+    env: &TestEnv,
+    tb: &mut TestBox,
+    name: &str,
+    ws: &std::path::Path,
+    policy_yaml: &str,
+) -> (
+    izba_core::daemon::egress::EgressManager,
+    izba_core::daemon::egress::audit::AuditSink,
+) {
+    setup_egress_sandbox(
+        env,
+        tb,
+        name,
+        ws,
+        Some(policy_yaml),
+        izba_core::daemon::egress::sys_resolver::SystemResolver::new().expect("system resolver"),
+    )
 }
 
 /// Read + parse the per-sandbox egress audit log, retrying briefly so a record
@@ -2254,6 +2291,403 @@ fn pinning_passthrough_ab_vendor_cert_vs_izba_ca_real_vm() {
     );
 }
 
+// ============================================================================
+// #283 — host-installed custom CA bundles
+// ============================================================================
+
+/// Answers `A` for the names in `map` (else NOERROR/empty), any other qtype
+/// NOERROR/empty. Stands in for izbad's system resolver so a test hostname can
+/// point at the host's LAN IP without touching real DNS.
+struct FixedAResolver {
+    map: Vec<(String, std::net::Ipv4Addr)>,
+}
+
+impl izba_core::daemon::egress::dns::Resolver for FixedAResolver {
+    fn handle(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+        use hickory_proto::rr::{rdata::A, RData, Record, RecordType};
+        let req = Message::from_vec(query)?;
+        let mut resp = Message::new(req.id, MessageType::Response, OpCode::Query);
+        for q in &req.queries {
+            resp.add_query(q.clone());
+            if q.query_type() != RecordType::A {
+                continue;
+            }
+            let qname = q.name().to_utf8();
+            let qname = qname.trim_end_matches('.');
+            if let Some((_, ip)) = self.map.iter().find(|(n, _)| n.eq_ignore_ascii_case(qname)) {
+                resp.add_answer(Record::from_rdata(q.name().clone(), 60, RData::A(A(*ip))));
+            }
+        }
+        resp.metadata.recursion_desired = req.recursion_desired;
+        resp.metadata.recursion_available = true;
+        resp.metadata.response_code = ResponseCode::NoError;
+        Ok(resp.to_vec()?)
+    }
+}
+
+/// The host's LAN-facing IP (never loopback: 127/8 is excluded from the
+/// guest's REDIRECT by design and hard-denied by the router).
+fn host_lan_ip() -> std::net::Ipv4Addr {
+    let probe = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+    probe.connect(("8.8.8.8", 80)).unwrap();
+    match probe.local_addr().unwrap().ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        other => panic!("expected an IPv4 LAN address, got {other}"),
+    }
+}
+
+/// A minimal HTTPS/1.x upstream: TLS under `ca` (leaf minted per SNI by the
+/// same resolver the MITM uses), answers every request with `body`. Bound on
+/// the host LAN IP so the guest can reach it. Returns the port.
+fn spawn_private_ca_https(
+    rt: &tokio::runtime::Runtime,
+    ca: izba_core::daemon::egress::mitm::IzbaCa,
+    ip: std::net::Ipv4Addr,
+    body: &'static str,
+) -> u16 {
+    use izba_core::daemon::egress::mitm::{server_config_with_resolver, CertCache};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsAcceptor;
+
+    let acceptor = TlsAcceptor::from(Arc::new(server_config_with_resolver(Arc::new(
+        CertCache::new(ca),
+    ))));
+    let listener = rt.block_on(tokio::net::TcpListener::bind((ip, 0))).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    rt.spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                // Read the request head (until the blank line) then answer.
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && tls.read_exact(&mut b).await.is_ok() {
+                    head.push(b[0]);
+                    if head.len() > 16 * 1024 {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tls.write_all(resp.as_bytes()).await;
+                let _ = tls.flush().await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    port
+}
+
+/// `wget` the URL from inside the guest under the exec-default trust env
+/// (SSL_CERT_FILE=/etc/izba/ca-bundle.pem). Returns (exit ok, stdout+stderr).
+fn guest_wget(paths: &Paths, name: &str, url: &str) -> (bool, String) {
+    let cmd = format!("wget -T 20 -qO- {url}");
+    match exec_collect(paths, name, &["sh", "-lc", &cmd], None) {
+        Ok((status, out, err)) => (
+            matches!(status, ExitStatus::Code(0)),
+            format!("$ {cmd}\n-> {status:?}\n{out}{err}"),
+        ),
+        Err((kind, msg)) => (
+            false,
+            format!("$ {cmd}\n-> exec rejected ({kind:?}): {msg}"),
+        ),
+    }
+}
+
+/// Which egress posture an arm boots under.
+#[derive(Clone, Copy)]
+enum CaArm {
+    /// No policy ⇒ AllowAll ⇒ raw TCP splice; the GUEST verifies the cert.
+    EnforceOff,
+    /// Enforcing policy with `protocol: http` on the upstream ports ⇒ the
+    /// router terminates at the MITM and IZBAD verifies the upstream.
+    EnforceOn,
+}
+
+/// Boot one arm and fetch from both upstreams. Returns
+/// ((trusted_ok, trusted_out), (rogue_ok, rogue_out)).
+fn run_custom_ca_arm(
+    env: &TestEnv,
+    tb: &mut TestBox,
+    arm: CaArm,
+    resolver: Arc<dyn Resolver>,
+    trusted_port: u16,
+    rogue_port: u16,
+) -> ((bool, String), (bool, String)) {
+    let name = match arm {
+        CaArm::EnforceOff => "customca-off",
+        CaArm::EnforceOn => "customca-on",
+    };
+    let ws = tb.workspace(name);
+
+    let policy = match arm {
+        CaArm::EnforceOff => None,
+        CaArm::EnforceOn => {
+            // Self-check via the SAME production loader `setup_egress_sandbox`
+            // uses internally: the directory must hold exactly corp.pem before
+            // this arm boots under it.
+            let extra = izba_core::trust::load_extra_cas(&tb.paths.trust_extra_dir())
+                .expect("load extra CAs");
+            assert_eq!(extra.len(), 1, "exactly corp.pem is installed");
+            Some(format!(
+                "enforce: true\nallow:\n  - host: trusted.izba.test\n    ports: [{trusted_port}]\n    protocol: http\n  - host: rogue.izba.test\n    ports: [{rogue_port}]\n    protocol: http\n"
+            ))
+        }
+    };
+
+    let (mgr, _audit) = setup_egress_sandbox(env, tb, name, &ws, policy.as_deref(), resolver);
+
+    // Warm-up: the first egress dial after boot can settle a beat late.
+    let mut trusted = (false, String::new());
+    for _ in 0..5 {
+        trusted = guest_wget(
+            &tb.paths,
+            name,
+            &format!("https://trusted.izba.test:{trusted_port}/"),
+        );
+        if trusted.0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let rogue = guest_wget(
+        &tb.paths,
+        name,
+        &format!("https://rogue.izba.test:{rogue_port}/"),
+    );
+
+    stop_sandbox(tb, name);
+    mgr.stop(name, &tb.paths.run_dir(name));
+    (trusted, rogue)
+}
+
+/// #283 acceptance: a TLS upstream signed by a private CA installed in
+/// `<data>/trust/extra/` is reachable from the guest with enforcement OFF
+/// (raw splice — the GUEST trust store decides) and ON (izbad terminates and
+/// re-originates — IZBAD's upstream verifier decides); an upstream signed by
+/// a CA that is NOT in the directory is refused on both paths (fails closed:
+/// non-zero exit AND no body), proving the trust is exactly the directory's
+/// contents and nothing wider.
+#[test]
+fn custom_ca_trusted_in_guest_and_at_izbad_upstream_real_vm() {
+    let Some(env) = want() else { return };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut tb = TestBox::new();
+
+    let ip = host_lan_ip();
+    let trusted_ca = izba_core::daemon::egress::mitm::IzbaCa::generate().unwrap();
+    let rogue_ca = izba_core::daemon::egress::mitm::IzbaCa::generate().unwrap();
+    std::fs::create_dir_all(tb.paths.trust_extra_dir()).unwrap();
+    std::fs::write(
+        tb.paths.trust_extra_dir().join("corp.pem"),
+        trusted_ca.cert_pem(),
+    )
+    .unwrap();
+
+    let trusted_port = spawn_private_ca_https(&rt, trusted_ca, ip, "TRUSTED-CA-BODY");
+    let rogue_port = spawn_private_ca_https(&rt, rogue_ca, ip, "ROGUE-CA-BODY");
+    let resolver: Arc<dyn Resolver> = Arc::new(FixedAResolver {
+        map: vec![
+            ("trusted.izba.test".into(), ip),
+            ("rogue.izba.test".into(), ip),
+        ],
+    });
+
+    for arm in [CaArm::EnforceOff, CaArm::EnforceOn] {
+        let ((t_ok, t_out), (r_ok, r_out)) = run_custom_ca_arm(
+            &env,
+            &mut tb,
+            arm,
+            Arc::clone(&resolver),
+            trusted_port,
+            rogue_port,
+        );
+        let label = match arm {
+            CaArm::EnforceOff => "enforce OFF",
+            CaArm::EnforceOn => "enforce ON",
+        };
+        assert!(
+            t_ok,
+            "[{label}] upstream under the INSTALLED CA must be reachable:\n{t_out}"
+        );
+        assert!(
+            t_out.contains("TRUSTED-CA-BODY"),
+            "[{label}] trusted body must arrive:\n{t_out}"
+        );
+        assert!(
+            !r_ok,
+            "[{label}] upstream under a CA NOT installed must fail:\n{r_out}"
+        );
+        assert!(
+            !r_out.contains("ROGUE-CA-BODY"),
+            "[{label}] rogue body must never arrive (fail closed):\n{r_out}"
+        );
+        match arm {
+            CaArm::EnforceOff => assert!(
+                r_out.contains("certificate verify failed"),
+                "[{label}] the GUEST's own TLS stack must reject the rogue \
+                 upstream on certificate verification, not merely time out or \
+                 hit some unrelated error:\n{r_out}"
+            ),
+            // Enforce ON is asserted by PROPERTIES, not by an errno string.
+            // When izbad's own upstream verification rejects the rogue
+            // certificate it tears the guest-facing leg down WITHOUT sending
+            // an HTTP response, and busybox wget renders that abrupt close as
+            // EAGAIN ("Resource temporarily unavailable") or EINVAL ("Invalid
+            // argument") depending on where in its read the close lands. Both
+            // are the same correct behaviour, so pinning one of them was a
+            // ~50% flake. What IS deterministic: the fetch fails and no body
+            // arrives (both asserted above, for both arms), plus the four
+            // WRONG reasons ruled out here:
+            //   - "timed out"      — the `-T 20` deadline, not a teardown;
+            //   - a 403            — denied at the allow-list, not at upstream
+            //                        certificate verification;
+            //   - "exec rejected"  — the exec channel hiccuped, so the fetch
+            //                        never actually ran in the guest;
+            //   - "bad address"    — DNS failed, so no TLS was attempted.
+            // The negatives run over the wget OUTPUT only: `r_out` also echoes
+            // the command line, whose URL carries a random ephemeral port that
+            // could itself contain "403".
+            CaArm::EnforceOn => {
+                let wget_out = r_out.split_once("\n-> ").map_or(r_out.as_str(), |(_, o)| o);
+                assert!(
+                    !wget_out.contains("timed out")
+                        && !wget_out.contains("403 Forbidden")
+                        && !wget_out.contains("HTTP/1.1 403")
+                        && !wget_out.contains("exec rejected")
+                        && !wget_out.contains("bad address"),
+                    "[{label}] IZBAD's own upstream verification must reject the \
+                     rogue upstream and tear the guest-facing leg down with no \
+                     HTTP response — not time out (`-T 20`), not deny at the \
+                     policy layer (403), not fail in the exec channel, and not \
+                     fail DNS resolution:\n{r_out}"
+                )
+            }
+        }
+    }
+}
+
+/// #283 follow-up (Greptile finding): the guest's canonical Debian/Alpine
+/// system bundle (`/etc/ssl/certs/ca-certificates.crt`) lives on the
+/// sandbox's PERSISTENT overlay and must be REWRITTEN, not appended to, on
+/// every boot — otherwise a CA the operator removes from
+/// `<data>/trust/extra/` stays trusted at that path forever (a revocation
+/// hole), and the file grows with a duplicate copy of the anchors on every
+/// boot. Proves the revocation end to end on a real boot: install an extra
+/// CA, boot, see it (inside a single marked izba-managed block) in the
+/// canonical bundle; stop, remove the CA from the host directory, start the
+/// SAME sandbox again (same persistent overlay, so this is exactly the
+/// scenario an append would get wrong) and see it revoked at that path too —
+/// while the izba-managed marker still appears exactly once and every other
+/// root (izba's own CA + the image's system roots) survives untouched.
+#[test]
+fn canonical_bundle_revokes_a_removed_extra_ca_real_vm() {
+    let Some(env) = want() else { return };
+    let mut tb = TestBox::new();
+    let name = "canonical-ca-revoke";
+    let ws = tb.workspace(name);
+
+    let corp_ca = izba_core::daemon::egress::mitm::IzbaCa::generate().unwrap();
+    std::fs::create_dir_all(tb.paths.trust_extra_dir()).unwrap();
+    let corp_pem_path = tb.paths.trust_extra_dir().join("corp.pem");
+    std::fs::write(&corp_pem_path, corp_ca.cert_pem()).unwrap();
+
+    // A base64 body line from the corp cert PEM, used as a fingerprint to
+    // detect its presence/absence in the guest's canonical bundle.
+    let corp_marker = corp_ca
+        .cert_pem()
+        .lines()
+        .find(|l| !l.starts_with("-----"))
+        .expect("cert PEM has a base64 body line")
+        .to_string();
+
+    boot(&env, &mut tb, name, &ws);
+
+    let (markers_before, certs_before, corp_before) =
+        canonical_bundle_stats(&tb.paths, name, &corp_marker);
+    assert_eq!(
+        markers_before, 1,
+        "exactly one izba-managed marker after the first boot"
+    );
+    assert!(
+        corp_before,
+        "the freshly-installed corp CA must appear in the canonical bundle"
+    );
+
+    stop_sandbox(&tb, name);
+    std::fs::remove_file(&corp_pem_path).expect("removing the corp CA from the host directory");
+    start_sandbox(&env, &tb, name).unwrap_or_else(|e| {
+        panic!(
+            "restart of '{name}' failed: {e:#}\nconsole tail:\n{}",
+            boot_diag(&tb.paths, name)
+        )
+    });
+
+    let (markers_after, certs_after, corp_after) =
+        canonical_bundle_stats(&tb.paths, name, &corp_marker);
+    assert_eq!(
+        markers_after, 1,
+        "still exactly one izba-managed marker — the block was REPLACED, not appended"
+    );
+    assert!(
+        !corp_after,
+        "the corp CA must be REVOKED from the canonical bundle once removed from the host \
+         trust/extra/ directory and the sandbox restarted"
+    );
+    assert_eq!(
+        certs_after,
+        certs_before - 1,
+        "removing the one corp root must drop exactly one CERTIFICATE block — izba's own CA \
+         and the image's system roots must survive untouched"
+    );
+    // The combined bundle the trust-env vars point at is composed from the
+    // canonical file's SYSTEM roots — it must not inherit the previous boot's
+    // managed block (Greptile P1 on #291: a removed CA survived one extra
+    // restart in /etc/izba/ca-bundle.pem because the canonical file was read
+    // before it was rewritten).
+    let combined_cmd = format!("grep -c -F '{corp_marker}' /etc/izba/ca-bundle.pem; true");
+    let corp_in_combined: u32 = exec_ok(&tb.paths, name, &["sh", "-c", &combined_cmd])
+        .trim()
+        .parse()
+        .expect("grep -c prints a decimal count");
+    assert_eq!(
+        corp_in_combined, 0,
+        "the removed corp CA must be gone from /etc/izba/ca-bundle.pem on the very next \
+         start, not one restart later"
+    );
+
+    stop_sandbox(&tb, name);
+}
+
+/// `grep -c` counts inside the guest's canonical system CA bundle: (izba
+/// marker occurrences, total CERTIFICATE blocks, whether `corp_marker`
+/// appears). `; true` neutralizes grep's exit code 1 on zero matches so
+/// `exec_ok`'s `status == 0` assertion holds either way.
+fn canonical_bundle_stats(paths: &Paths, name: &str, corp_marker: &str) -> (u32, u32, bool) {
+    let count = |pattern: &str| -> u32 {
+        let cmd = format!("grep -c -F '{pattern}' /etc/ssl/certs/ca-certificates.crt; true");
+        exec_ok(paths, name, &["sh", "-c", &cmd])
+            .trim()
+            .parse()
+            .expect("grep -c prints a decimal count")
+    };
+    let markers = count("BEGIN izba-managed");
+    let certs = count("BEGIN CERTIFICATE");
+    let corp = count(corp_marker) > 0;
+    (markers, certs, corp)
+}
+
 /// M1 throughput baseline: bulk transfer through the egress stub.
 /// MEASURED, NOT GATED (roadmap decision) — the number is printed for
 /// trend-watching; the only assertion is that the transfer completes.
@@ -2442,7 +2876,7 @@ fn cp_round_trip_tree() {
     fs::write(src.join("a.txt"), b"alpha").unwrap();
     fs::write(src.join("sub/run.sh"), b"#!/bin/sh\necho hi\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(src.join("sub/run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(src.join("sub/run.sh"), fs::Permissions::from_mode(0o750)).unwrap();
     std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
 
     // Host -> guest: dest /etc/izba-cp-test does NOT exist and /etc does, so
@@ -2461,7 +2895,7 @@ fn cp_round_trip_tree() {
         "cpbox",
         &["sh", "-c", "stat -c %a /etc/izba-cp-test/sub/run.sh"],
     );
-    assert_eq!(mode.trim(), "755", "exec bit must survive host->guest");
+    assert_eq!(mode.trim(), "750", "exec bit must survive host->guest");
     let link = exec_ok(&tb.paths, "cpbox", &["readlink", "/etc/izba-cp-test/link"]);
     assert_eq!(link.trim(), "a.txt", "symlink must survive host->guest");
 
@@ -2490,7 +2924,7 @@ fn cp_round_trip_tree() {
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(back_mode, 0o755, "exec bit must survive guest->host");
+    assert_eq!(back_mode, 0o750, "exec bit must survive guest->host");
     let back_link = fs::read_link(out.join("izba-cp-test/link")).unwrap();
     assert_eq!(back_link, std::path::Path::new("a.txt"));
 

@@ -17,7 +17,8 @@ pub struct MountOp {
     pub data: String,
     /// When `true`, a failed mount is logged and skipped rather than aborting
     /// boot. Used for shares the host only attaches conditionally (e.g. the
-    /// `izba-trust` CA share, present only for MITM-enabled sandboxes).
+    /// `izba-trust` CA share — attached for every sandbox today, but optional
+    /// so a host that ships no CA still boots).
     pub optional: bool,
 }
 
@@ -84,11 +85,14 @@ pub fn rootfs_mount_plan() -> Vec<MountOp> {
             "lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work",
         ),
         MountOp::new("workspace", "/rootfs/workspace", "virtiofs", &[], ""),
-        // The izba root CA, delivered read-only for the guest trust store.
-        // Optional: izbad only attaches it for MITM-enabled sandboxes, so a
-        // missing tag fails-soft instead of aborting boot. The target is under
-        // /rootfs (not /rootfs/etc) so the share itself stays read-only;
-        // write_trust_anchor() copies the CA into the writable overlay /etc.
+        // The izba root CA — and, since #283, any host-installed extra roots
+        // — delivered read-only for the guest trust store. The host attaches
+        // this share for EVERY sandbox, bare or enforcing; it stays optional
+        // only so a CA-less host (or an older host) still boots instead of
+        // aborting on a missing tag. The target is under /rootfs (not
+        // /rootfs/etc) so the share itself stays read-only;
+        // write_trust_anchor() copies the material into the writable overlay
+        // /etc.
         MountOp::new(
             crate::trust::TRUST_TAG,
             "/rootfs/izba-trust",
@@ -248,6 +252,12 @@ pub fn pre_mount_pause(op: &MountOp) -> Option<std::time::Duration> {
 ///
 /// The per-mount `eprintln!` lines are boot diagnostics on the serial console;
 /// the OpenVMM-readiness accommodation is [`pre_mount_pause`], not the prints.
+///
+/// `#[mutants::skip]`: issues real `mount(2)` calls (CAP_SYS_ADMIN, a booted
+/// guest); the unit suite cannot mount. The plan it executes is the pure,
+/// unit-tested part (`rootfs_plan` and friends), and every real-VM
+/// integration test boots through this function.
+#[mutants::skip]
 pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
     for op in ops {
         std::fs::create_dir_all(&op.target)
@@ -284,8 +294,8 @@ pub fn apply(ops: &[MountOp]) -> anyhow::Result<()> {
         });
         if let Err(e) = res {
             if op.optional {
-                // The host did not attach this share (e.g. no MITM CA): log and
-                // carry on so boot is unaffected.
+                // The host did not attach this share (e.g. a CA-less host):
+                // log and carry on so boot is unaffected.
                 eprintln!(
                     "izba-init: optional mount {} ({}) on {} skipped: {e:#}",
                     op.source,

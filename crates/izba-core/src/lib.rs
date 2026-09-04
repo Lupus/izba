@@ -18,6 +18,7 @@ pub mod ssh;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod trust;
 pub mod usb;
 pub mod vmm;
 pub mod vnc;

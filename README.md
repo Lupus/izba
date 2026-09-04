@@ -140,9 +140,40 @@ Key properties:
   (→ `ca.pem`). So `curl`, `git`, Python `requests`, Node, and Deno verify
   successfully out of the box; a tool that reads only the OS trust store should
   be pointed at `/etc/izba/ca.pem` (e.g. copy it into
-  `/usr/local/share/ca-certificates/` and run `update-ca-certificates`). A
-  **bare** (non-enforcing) sandbox does NOT intercept TLS and ships no CA —
-  connections dial straight through.
+  `/usr/local/share/ca-certificates/` and run `update-ca-certificates`). The
+  CA is written into **every** sandbox, bare or enforcing; a **bare**
+  (non-enforcing) sandbox simply never intercepts TLS — connections dial
+  straight through end-to-end, so the guest's own trust store decides.
+
+  **Custom / corporate CAs (TLS-inspecting proxies, internal registries and
+  git hosts).** Drop the root certificate(s) into
+  `~/.local/share/izba/trust/extra/` — `*.pem`, `*.crt`, `*.cer` or `*.der`,
+  either PEM text or raw DER (Windows' default certificate export), loaded in
+  file-name order. Install the **certificate only**: a file that also contains
+  a private key (e.g. mitmproxy's `mitmproxy-ca.pem`) is refused, naming the
+  file — use `mitmproxy-ca-cert.pem`, or
+  `openssl x509 -in <file> -out <file>.crt`. Only the certificates are ever
+  shipped to a guest; comments and any other sections are stripped, so a guest
+  can never see more of your file than the anchors themselves. The directory is
+  host-only — a guest can never write it — and it is honored on BOTH paths:
+  every sandbox's guest trust store (`/etc/izba/ca.pem` + the combined bundle
+  and trust-env vars above) gets the roots appended after the izba CA, so a
+  bare sandbox's end-to-end TLS verifies; and `izbad`'s upstream verifier
+  trusts them on top of the Mozilla roots, so an enforcing sandbox's
+  re-originated connection verifies too. Reload semantics: a guest picks up
+  changes on its next `izba start`; `izbad` reads the directory once at start —
+  run `izba daemon stop` (the next command respawns it) and check
+  `izba daemon status`, which lists the loaded files. A file that is not a
+  valid certificate refuses `izba start` and disables the firewall's HTTPS path
+  (enforcing sandboxes fail closed) with the file named in the error; in that
+  state `izba daemon status` prints a `⚠ trust: HTTPS interception init
+  FAILED …` line naming the cause — fix or remove the file. The host OS trust
+  store is NOT imported automatically; copy the roots you need. The guest's
+  canonical system bundle (`/etc/ssl/certs/ca-certificates.crt`) also carries
+  the anchors, but as a clearly marked block that is fully rewritten — not
+  appended to — on every boot, so removing a CA from `extra/` also revokes it
+  from that canonical path on the sandbox's next start, not just from
+  `/etc/izba/ca.pem`.
 
   **Verifying enforcement: test with a real request, not a bare TCP connect.**
   Because the allow/deny verdict is rendered per request/SNI at the interception

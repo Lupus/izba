@@ -414,6 +414,23 @@ pub struct DaemonStatus {
     pub uptime_ms: u64,
     pub socket: String,
     pub sandboxes: Vec<SandboxSummary>,
+    /// Host-installed extra CA files izbad loaded at start (`<data>/trust/extra`,
+    /// #283), in load order. Empty = webpki-roots only, OR a load failure —
+    /// read it together with `trust_error`. `serde(default)`: a pre-#283
+    /// daemon reads as "none loaded", which is the honest answer.
+    #[serde(default)]
+    pub extra_ca_files: Vec<String>,
+    /// Why izbad has NO extra roots and no MITM: the extra-CA load (or CA /
+    /// runtime init) failed. `Some` means every enforcing sandbox's HTTP(S)
+    /// is failing closed, so `izba daemon status` must say so instead of
+    /// printing the "drop your CA here" hint the operator already followed.
+    /// `serde(default)` for the same reason as above.
+    ///
+    /// The directory PATH is deliberately NOT on the wire: the CLI holds
+    /// `Paths` and renders `trust_extra_dir()` itself, so an older daemon can
+    /// never make it print a sentence with an empty path in it.
+    #[serde(default)]
+    pub trust_error: Option<String>,
 }
 
 /// The configured usbip upstream, as reported to a human.
@@ -730,6 +747,8 @@ mod tests {
                 uptime_ms: 1000,
                 socket: "/x/izbad.sock".into(),
                 sandboxes: vec![],
+                extra_ca_files: vec![],
+                trust_error: None,
             }),
         ] {
             let mut buf = Vec::new();
@@ -737,6 +756,18 @@ mod tests {
             let back: DaemonResponse = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
             assert_eq!(format!("{resp:?}"), format!("{back:?}"));
         }
+    }
+
+    /// #283: a pre-#283 daemon's Status frame (no trust fields) must still
+    /// deserialize — the fields are additive and defaulted, no proto bump.
+    #[test]
+    fn daemon_status_trust_fields_default_when_absent() {
+        let json = serde_json::json!({
+            "version": "x", "pid": 1, "uptime_ms": 0, "socket": "s", "sandboxes": []
+        });
+        let s: DaemonStatus = serde_json::from_value(json).unwrap();
+        assert!(s.extra_ca_files.is_empty());
+        assert!(s.trust_error.is_none());
     }
 
     #[test]

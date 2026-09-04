@@ -687,24 +687,39 @@ fn write_etc_hosts(hostname: Option<&str>) {
 /// Bakes izbad's root CA (delivered via the read-only `izba-trust` virtiofs
 /// share) into the guest trust store so workload tools trust the MITM leaves.
 ///
-/// Best-effort and no-op when the share has no `ca.pem` — a sandbox without
-/// HTTPS MITM ships no CA, and the trust-env defaulting in `exec.rs` is gated
-/// on `ca-bundle.pem` existing, so absence here cleanly disables the feature.
+/// The host writes `ca.pem` for every sandbox (bare or enforcing); a missing
+/// file is still tolerated (no-op) because the trust-env defaulting in
+/// `exec.rs` is gated on `ca-bundle.pem` existing, so absence cleanly
+/// disables the feature. Since #283 the share may also carry `extra.pem`
+/// (host-installed roots), folded in as izba CA → extras → system roots.
 ///
 /// Writes into the overlay (the guest's real, writable `/etc`):
-/// `/etc/izba/ca.pem` (the CA alone, for runtimes that ADD a root) and
-/// `/etc/izba/ca-bundle.pem` (CA + system roots, for tools that REPLACE the
-/// trust set). If a distro CA bundle exists it also appends the CA to it
-/// (best-effort, so tools that read the canonical system path also trust it).
-/// We do NOT run update-ca-certificates: this is a static-musl, distro-agnostic
-/// init.
+/// `/etc/izba/ca.pem` (the anchors: izba CA + extra roots, for runtimes that
+/// ADD roots) and `/etc/izba/ca-bundle.pem` (anchors + system roots, for
+/// tools that REPLACE the trust set). If a distro CA bundle exists it also
+/// REWRITES an izba-managed block inside it in place (best-effort, so tools
+/// that read the canonical system path also trust them) — see
+/// [`write_trust_anchor`]'s body for why this must be a replace and not an
+/// append: the canonical bundle sits on the sandbox's persistent overlay, so
+/// an append would never revoke a CA the operator removed and would grow the
+/// file with a duplicate copy on every boot. We do NOT run
+/// update-ca-certificates: this is a static-musl, distro-agnostic init.
+///
+/// `#[mutants::skip]`: boot glue that reads the virtiofs share and writes
+/// real files under `/rootfs/etc`, only meaningful inside a booted guest.
+/// The pure parts (`build_anchor_pem`, `build_combined_bundle`,
+/// `system_roots_only`, `replace_managed_block`) are unit-tested in
+/// `trust.rs`; this composition is covered end to end by the KVM e2e tests
+/// `custom_ca_trusted_in_guest_and_at_izbad_upstream_real_vm` and
+/// `canonical_bundle_revokes_a_removed_extra_ca_real_vm`.
+#[mutants::skip]
 fn write_trust_anchor() {
     // The share is mounted under /rootfs at the fixed trust mountpoint.
     let share_ca = format!("/rootfs{}/{}", trust::TRUST_MOUNT, trust::CA_FILE);
     let ca_pem = match std::fs::read_to_string(&share_ca) {
         Ok(p) => p,
         Err(e) => {
-            // ENOENT is the normal "no MITM for this sandbox" path; anything
+            // ENOENT means the host shipped no CA (not expected today); anything
             // else is logged but still non-fatal.
             if e.kind() != std::io::ErrorKind::NotFound {
                 eprintln!("izba-init: reading trust anchor {share_ca}: {e}");
@@ -713,11 +728,24 @@ fn write_trust_anchor() {
         }
     };
 
+    // Host-installed extra roots (#283): optional; absent ⇒ izba CA only.
+    let share_extra = format!("/rootfs{}/{}", trust::TRUST_MOUNT, trust::EXTRA_FILE);
+    let extra_pem = match std::fs::read_to_string(&share_extra) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("izba-init: reading extra roots {share_extra}: {e}");
+            }
+            None
+        }
+    };
+    let anchors = trust::build_anchor_pem(&ca_pem, extra_pem.as_deref());
+
     if let Err(e) = std::fs::create_dir_all("/rootfs/etc/izba") {
         eprintln!("izba-init: creating /etc/izba: {e}");
         return;
     }
-    if let Err(e) = std::fs::write("/rootfs/etc/izba/ca.pem", &ca_pem) {
+    if let Err(e) = std::fs::write("/rootfs/etc/izba/ca.pem", &anchors) {
         eprintln!("izba-init: writing /etc/izba/ca.pem: {e}");
         return;
     }
@@ -727,24 +755,40 @@ fn write_trust_anchor() {
         "/rootfs/etc/ssl/certs/ca-certificates.crt",
         "/rootfs/etc/pki/tls/certs/ca-bundle.crt",
     ];
+    // Strip the previous boot's managed block first: the canonical file is
+    // read here BEFORE it is rewritten below, so composing from it raw would
+    // keep a host-removed CA alive in ca-bundle.pem for one more restart.
     let system_pem = SYSTEM_BUNDLES
         .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok());
-    let bundle = trust::build_combined_bundle(&ca_pem, system_pem.as_deref());
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .map(|raw| trust::system_roots_only(&raw));
+    let bundle = trust::build_combined_bundle(&anchors, system_pem.as_deref());
     if let Err(e) = std::fs::write("/rootfs/etc/izba/ca-bundle.pem", bundle) {
         eprintln!("izba-init: writing /etc/izba/ca-bundle.pem: {e}");
     }
 
-    // Best-effort: append the CA to the canonical Debian/Alpine bundle so tools
-    // that hardcode that path also trust the MITM. Ignore all errors (path may
-    // not exist; read-only/odd distros are fine — the env vars are the source
-    // of truth).
+    // Best-effort: rewrite an izba-managed block in the canonical
+    // Debian/Alpine bundle so tools that hardcode that path also trust the
+    // anchors. This MUST be a replace, not an append: the canonical bundle
+    // lives on the sandbox's persistent overlay (rw disk), reused across
+    // restarts, so an append would (a) never revoke a CA the operator
+    // removed from `<data>/trust/extra/` — a stale root stays trusted by any
+    // tool reading this path forever — and (b) duplicate the anchors into the
+    // file on every single boot. `replace_managed_block` removes any prior
+    // `MANAGED_BEGIN…MANAGED_END` block (including a truncated one) and, when
+    // there are anchors to install, appends exactly one fresh copy — so the
+    // file always reflects the CURRENT anchor set. Ignore all errors (path
+    // may not exist; read-only/odd distros are fine — the env vars are the
+    // source of truth). A canonical bundle written by an older izba version
+    // (plain append, no markers) carries one unmarked, harmless extra copy of
+    // the izba CA from its last boot; it is superseded by — and untouched
+    // relative to — the marked block going forward, so no migration is
+    // needed.
     let canonical = "/rootfs/etc/ssl/certs/ca-certificates.crt";
-    if std::path::Path::new(canonical).exists() {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(canonical) {
-            let _ = writeln!(f);
-            let _ = f.write_all(ca_pem.as_bytes());
+    if let Ok(existing) = std::fs::read_to_string(canonical) {
+        let rewritten = trust::replace_managed_block(&existing, &anchors);
+        if let Err(e) = std::fs::write(canonical, rewritten) {
+            eprintln!("izba-init: rewriting {canonical}: {e}");
         }
     }
 }

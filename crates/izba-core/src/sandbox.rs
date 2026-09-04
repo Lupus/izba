@@ -756,9 +756,11 @@ fn write_oci_bundle(
 ) -> anyhow::Result<OciBundleOut> {
     // Gate the CA trust-env defaults on the bundle actually being present —
     // same gate the guest applies in `build_env_overlay` (trust_bundle_present).
-    // Today the host always writes ca.pem so this is always-open, but encoding
-    // the gate keeps service-mode (a real entrypoint as PID 1, deferred) from
-    // inheriting SSL_CERT_FILE=… when no CA exists.
+    // The host writes ca.pem for EVERY sandbox (bare or enforcing) — the guest
+    // trust store is unconditional since M2, and since #283 it also carries
+    // the extra roots — so this is always-open, but encoding the gate keeps
+    // service-mode (a real entrypoint as PID 1, deferred) from inheriting
+    // SSL_CERT_FILE=… when no CA exists.
     let trust = if ca_present {
         trust_env_strings()
     } else {
@@ -1002,16 +1004,38 @@ pub fn start_with_timeouts(
 
     let console_log = paths.logs_dir(name).join("console.log");
 
-    // Bake the izba root CA into the guest trust store: write a per-sandbox copy
-    // of just the public cert (NEVER the CA dir — it holds the private key) and
-    // share it as the read-only `izba-trust` virtiofs tag. izba-init copies it
-    // into the guest CA bundle so leaves the MITM mints are trusted in-guest.
+    // Bake the izba root CA — and any host-installed extra roots (#283) —
+    // into the guest trust store: write a per-sandbox copy of just the public
+    // cert (NEVER the CA dir — it holds the private key) and share it as the
+    // read-only `izba-trust` virtiofs tag. izba-init copies it into the guest
+    // CA bundle so leaves the MITM mints are trusted in-guest.
     let trust_dir = paths.sandbox_dir(name).join("trust");
     std::fs::create_dir_all(&trust_dir)
         .with_context(|| format!("creating trust dir {}", trust_dir.display()))?;
     let ca = crate::ca::load_or_create(&paths.ca_dir()).context("loading izba CA")?;
     std::fs::write(trust_dir.join("ca.pem"), ca.cert_pem())
         .with_context(|| format!("writing guest CA into {}", trust_dir.display()))?;
+
+    // #283: host-installed extra roots ride the same share as ONE file.
+    // Absent ⇒ the guest sees no extra.pem (a stale one from an earlier boot
+    // is removed so un-installing a CA takes effect on the next start).
+    // A corrupt file refuses the start — the same loud posture as izbad's
+    // MITM init — with the offending file name in the error.
+    let extra = crate::trust::load_extra_cas(&paths.trust_extra_dir())
+        .context("loading host extra CA roots (<data>/trust/extra)")?;
+    let extra_path = trust_dir.join("extra.pem");
+    if extra.is_empty() {
+        match std::fs::remove_file(&extra_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("removing stale {}", extra_path.display()))
+            }
+        }
+    } else {
+        std::fs::write(&extra_path, crate::trust::guest_extra_pem(&extra))
+            .with_context(|| format!("writing extra CA roots into {}", extra_path.display()))?;
+    }
 
     // Deliver the SSH host key + authorized_keys to the guest as the read-only
     // izba-ssh virtiofs share. Mirrors the trust-CA channel.
@@ -2636,6 +2660,111 @@ mod tests {
         // No image config was cached for this digest, so there is no declared
         // USER to fail resolving — record_run_state must persist None (#114).
         assert!(state.user_fallback.is_none());
+    }
+
+    /// #283: the extra roots ride the SAME read-only izba-trust share as the
+    /// izba CA, as one concatenated `extra.pem`, in file-name order.
+    #[test]
+    fn start_ships_extra_cas_on_the_trust_share() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca_a = crate::daemon::egress::mitm::IzbaCa::generate().unwrap();
+        let ca_b = crate::daemon::egress::mitm::IzbaCa::generate().unwrap();
+        fs::create_dir_all(paths.trust_extra_dir()).unwrap();
+        fs::write(
+            paths.trust_extra_dir().join("b-second.pem"),
+            ca_b.cert_pem(),
+        )
+        .unwrap();
+        fs::write(paths.trust_extra_dir().join("a-first.crt"), ca_a.cert_pem()).unwrap();
+
+        start(&paths, "web", &MockDriver::new(), &arts(), false).unwrap();
+
+        // Compare by DER, not by text: the shipped file is RE-SERIALIZED from
+        // the parsed certificates (#283 fix), so the anchors — not the
+        // operator's byte-for-byte file — are what must match, in order.
+        let shipped = fs::read(paths.sandbox_dir("web").join("trust").join("extra.pem"))
+            .expect("extra.pem shipped");
+        use rustls::pki_types::pem::PemObject;
+        let der = |pem: &str| {
+            rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+                .map(|c| c.unwrap().to_vec())
+                .collect::<Vec<_>>()
+        };
+        let got: Vec<Vec<u8>> = rustls::pki_types::CertificateDer::pem_slice_iter(&shipped)
+            .map(|c| c.unwrap().to_vec())
+            .collect();
+        let mut want = der(ca_a.cert_pem());
+        want.extend(der(ca_b.cert_pem()));
+        assert_eq!(got, want, "file-name order: a-first before b-second");
+        // The izba CA itself is still the separate ca.pem, untouched.
+        assert!(paths
+            .sandbox_dir("web")
+            .join("trust")
+            .join("ca.pem")
+            .exists());
+    }
+
+    /// Removing every extra CA must take effect on the next start: a stale
+    /// extra.pem from an earlier boot is deleted, not left to be trusted.
+    #[test]
+    fn start_removes_a_stale_extra_pem_when_the_dir_is_empty() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let trust = paths.sandbox_dir("web").join("trust");
+        fs::create_dir_all(&trust).unwrap();
+        fs::write(trust.join("extra.pem"), "STALE\n").unwrap();
+
+        start(&paths, "web", &MockDriver::new(), &arts(), false).unwrap();
+
+        assert!(!trust.join("extra.pem").exists(), "stale extra.pem removed");
+    }
+
+    /// Only a MISSING stale `extra.pem` is tolerated when the directory is
+    /// empty: any other removal failure (here, the path is a non-empty
+    /// directory) refuses the start rather than booting a guest that may
+    /// still trust last time's roots.
+    #[test]
+    fn start_refuses_when_a_stale_extra_pem_cannot_be_removed() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        let stale = paths.sandbox_dir("web").join("trust").join("extra.pem");
+        fs::create_dir_all(stale.join("child")).unwrap();
+
+        let err = format!(
+            "{:#}",
+            start(&paths, "web", &MockDriver::new(), &arts(), false).unwrap_err()
+        );
+        assert!(err.contains("removing stale"), "{err}");
+    }
+
+    /// A corrupt extra-CA file refuses the start with an error naming the
+    /// file — never a boot that silently trusts fewer roots than installed.
+    #[test]
+    fn start_refuses_when_an_extra_ca_file_is_corrupt() {
+        let (dir, paths) = test_paths();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        create(&paths, "web", &opts(&ws)).unwrap();
+        fs::create_dir_all(paths.trust_extra_dir()).unwrap();
+        fs::write(
+            paths.trust_extra_dir().join("corp.pem"),
+            "not a certificate\n",
+        )
+        .unwrap();
+
+        let err = format!(
+            "{:#}",
+            start(&paths, "web", &MockDriver::new(), &arts(), false).unwrap_err()
+        );
+        assert!(err.contains("corp.pem"), "{err}");
     }
 
     /// The launch-path call-site companion to `start_builds_correct_spec`:

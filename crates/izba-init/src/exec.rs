@@ -121,8 +121,9 @@ impl ExecEngine {
 
     /// Whether the izba combined CA bundle exists in the guest, resolved
     /// against the chroot root (`<root>/etc/izba/ca-bundle.pem` in the guest,
-    /// the bare guest path in tests). Gates the trust-env defaulting so only
-    /// MITM-enabled sandboxes advertise the CA-bundle vars.
+    /// the bare guest path in tests). Gates the trust-env defaulting on the
+    /// bundle existing (the host ships it for every sandbox today; the gate
+    /// keeps a CA-less boot from advertising a path that isn't there).
     fn trust_bundle_present(&self) -> bool {
         let guest_path = crate::trust::GUEST_CA_BUNDLE.trim_start_matches('/');
         let resolved = match &self.root {
@@ -275,10 +276,10 @@ impl ExecEngine {
     ///   "cannot open display". Gated on the sandbox actually having booted
     ///   with `izba.vnc=1`, so a display-less sandbox never advertises an X
     ///   server that isn't there;
-    /// - the MITM CA-bundle vars, but ONLY when the combined bundle exists in
-    ///   the guest (`write_trust_anchor` wrote it), so non-MITM sandboxes don't
-    ///   point tools at a missing file. The values are guest paths valid inside
-    ///   the container (it shares the overlay rootfs).
+    /// - the CA-bundle vars, but ONLY when the combined bundle exists in the
+    ///   guest (`write_trust_anchor` wrote it), so a CA-less boot doesn't
+    ///   point tools at a missing file. The values are guest paths valid
+    ///   inside the container (it shares the overlay rootfs).
     ///
     /// `PATH` is intentionally NOT defaulted here: crun applies the container
     /// image's `PATH` (the right value for the image), and overriding it with
