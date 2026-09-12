@@ -145,19 +145,34 @@ fn valid_name(s: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// `<g|m>`-suffixed size → bytes. Only gibi/mebi to keep the grammar tight.
+/// Parse a volume size: a positive whole number followed by any common
+/// spelling of gigabytes or megabytes — `10g`, `10G`, `10GB`, `10 GiB`,
+/// `512mb` — with surrounding whitespace. The trailing `b`/`ib` is decoration,
+/// not a unit change: sizes are binary (1 GiB = 2^30) on every path, so `5GB`
+/// and `5GiB` are the same request. Kilobytes, bare numbers and leading zeros
+/// are refused so a typo never silently sizes a disk. The desktop app's
+/// `normalizeVolSize` accepts the same grammar and sends the canonical
+/// `<n>g`/`<n>m` form.
 pub fn parse_size(s: &str) -> anyhow::Result<u64> {
-    let s = s.trim();
-    let (num, mult) = match s.chars().last() {
-        Some('g') | Some('G') => (&s[..s.len() - 1], 1u64 << 30),
-        Some('m') | Some('M') => (&s[..s.len() - 1], 1u64 << 20),
-        _ => bail!("size {s:?} must end in a 'g' or 'm' suffix, e.g. 10g or 512m"),
+    const USAGE: &str = "must be a whole number of gigabytes or megabytes, e.g. 10g, 5GB or 512m";
+    let t = s.trim();
+    let digits_end = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (num, unit) = t.split_at(digits_end);
+    let unit = unit.trim_start().to_ascii_lowercase();
+    let mult = match unit.as_str() {
+        "g" | "gb" | "gib" => 1u64 << 30,
+        "m" | "mb" | "mib" => 1u64 << 20,
+        _ => bail!("size {s:?} {USAGE}"),
     };
+    if num.is_empty() || (num.len() > 1 && num.starts_with('0')) {
+        bail!("size {s:?} {USAGE}");
+    }
     let n: u64 = num.parse().with_context(|| format!("bad size {s:?}"))?;
     if n == 0 {
         bail!("size must be > 0");
     }
-    Ok(n * mult)
+    n.checked_mul(mult)
+        .with_context(|| format!("size {s:?} is too large"))
 }
 
 /// Parse `[NAME:]GUEST_PATH:SIZE`. NAME present ⇒ persistent.
@@ -290,6 +305,25 @@ mod tests {
         assert_eq!(parse_size("2G").unwrap(), 2 << 30);
         assert!(parse_size("").is_err());
         assert!(parse_size("5k").is_err()); // only g/m
+    }
+
+    /// The unit people actually type: "5GB", "5 GiB", "5gb" — every spelling
+    /// of gigabytes/megabytes is accepted, with surrounding whitespace.
+    /// Kilobytes, bare numbers, and leading zeros are still refused (#292).
+    #[test]
+    fn size_suffix_spellings() {
+        for s in ["5GB", "5gb", "5 GB", "5GiB", "5 gib", " 5g ", "5Gb"] {
+            assert_eq!(parse_size(s).unwrap(), 5 << 30, "{s:?}");
+        }
+        for s in ["512MB", "512 MiB", "512mb"] {
+            assert_eq!(parse_size(s).unwrap(), 512 << 20, "{s:?}");
+        }
+        for s in ["5", "5KB", "5gbb", "5 g b", "05g", "0GB", "g", "GB"] {
+            assert!(parse_size(s).is_err(), "{s:?} must be rejected");
+        }
+        // 2^34 GiB is 2^64 bytes: one past u64 — refused, never wrapped.
+        assert!(parse_size("17179869184g").is_err());
+        assert_eq!(parse_size("17179869183g").unwrap(), 17179869183 << 30);
     }
 
     #[test]

@@ -203,7 +203,7 @@ describe("NewSandbox", () => {
     fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1x" } });
-    expect(screen.getByText(/size must be a positive number followed by g or m/i)).toBeInTheDocument();
+    expect(screen.getByText(/size must be a whole number of gigabytes or megabytes/i)).toBeInTheDocument();
   });
 
   it("shows error on Add when volume path lacks leading slash and blocks Create", () => {
@@ -232,7 +232,7 @@ describe("NewSandbox", () => {
     fireEvent.change(screen.getByLabelText(/volume 1 path/i), { target: { value: "/data" } });
     fireEvent.change(screen.getByLabelText(/volume 1 size/i), { target: { value: "1x" } });
     // Error shown live
-    expect(screen.getByText(/size must be a positive number followed by g or m/i)).toBeInTheDocument();
+    expect(screen.getByText(/size must be a whole number of gigabytes or megabytes/i)).toBeInTheDocument();
     // Create button IS disabled because the row is non-blank and invalid
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
   });

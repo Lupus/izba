@@ -26,8 +26,27 @@ export const isValidVolNameNonEmpty = (s: string) => /^[a-z0-9][a-z0-9_-]*$/.tes
 /** Path must start with "/" and contain no commas (commas delimit the CLI spec). */
 export const isValidVolPath = (s: string) => s.startsWith("/") && !s.includes(",");
 
-/** Size must be a positive integer followed by g, m, G, or M. */
-export const isValidVolSize = (s: string) => /^[1-9]\d*[gmGM]$/.test(s);
+/**
+ * Fold a human-typed size into the daemon's canonical `<n>g` / `<n>m` form,
+ * or `null` when it is not a size we take.
+ *
+ * Accepted: a positive whole number (no leading zero) followed by any common
+ * spelling of gigabytes or megabytes — `5g`, `5G`, `5GB`, `5gb`, `5 GiB` —
+ * with surrounding whitespace. The suffix letters `b`/`ib` are decoration,
+ * not a unit change: izba volumes are binary-sized (1 GiB = 2^30) on every
+ * path, so `5GB` and `5GiB` are the same request. Kilobytes, bare numbers,
+ * and other units are refused so a typo never silently sizes a disk.
+ * The Rust side (`izba_core::volume::parse_size`) accepts the same grammar;
+ * this normalizer exists so the wire spec stays the canonical form.
+ */
+export function normalizeVolSize(s: string): string | null {
+  const m = /^\s*([1-9]\d*)\s*([gm])(?:i?b)?\s*$/i.exec(s);
+  if (!m) return null;
+  return `${m[1]}${m[2].toLowerCase()}`;
+}
+
+/** True when `normalizeVolSize` accepts the value. */
+export const isValidVolSize = (s: string) => normalizeVolSize(s) !== null;
 
 /** A row the user added but left entirely blank is silently ignored on submit. */
 export function isBlankVolRow(r: VolumeRow): boolean {
@@ -73,7 +92,7 @@ export function volPathError(path: string): string | null {
 /** Returns an error string or null. size is the trimmed value. */
 export function volSizeError(kind: VolumeKind, size: string): string | null {
   if (kind === "existing_persistent") return null;
-  if (!isValidVolSize(size)) return "Size must be a positive number followed by g or m (e.g. 1g)";
+  if (!isValidVolSize(size)) return "Size must be a whole number of gigabytes or megabytes, e.g. 5g, 5GB or 512m";
   return null;
 }
 
@@ -122,7 +141,9 @@ export function usedExistingNames(rows: VolumeRow[], rowIdx: number): Set<string
 /** Build the spec string to pass to volumeAttach / CreateOpts.volumes. */
 export function buildVolSpec(r: VolumeRow, freeVolumes: VolumeInfo[]): string {
   const path = r.path.trim();
-  const size = r.size.trim();
+  // Callers gate on isValidVolRow first; an unparseable size falls through
+  // verbatim so the daemon's own error surfaces rather than a silent rewrite.
+  const size = normalizeVolSize(r.size) ?? r.size.trim();
   switch (r.kind) {
     case "ephemeral":
       return `${path}:${size}`;
