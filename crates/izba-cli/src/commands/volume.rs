@@ -28,7 +28,7 @@ pub enum VolumeCmd {
     Attach {
         /// Sandbox name
         name: String,
-        /// [VNAME:]GUEST_PATH:SIZE — SIZE needs a `g`/`m` suffix, e.g. `10g`, `512m`
+        /// [VNAME:]GUEST_PATH:SIZE — SIZE in gigabytes or megabytes, e.g. `10g`, `5GB`, `512m`
         spec: String,
     },
     /// Detach the volume at GUEST_PATH from a sandbox (applied on next restart)

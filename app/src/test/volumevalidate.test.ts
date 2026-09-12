@@ -4,6 +4,8 @@ import type { VolumeRow } from "../lib/volumevalidate";
 import {
   freeVolumes,
   isValidVolSize,
+  normalizeVolSize,
+  buildVolSpec,
   usedExistingNames,
   volSizeError,
 } from "../lib/volumevalidate";
@@ -67,12 +69,12 @@ describe("volSizeError", () => {
     const err = volSizeError("ephemeral", "0g");
     expect(err).not.toBeNull();
     // Error message should mention positive number
-    expect(err).toMatch(/positive/i);
+    expect(err).toMatch(/whole number/i);
   });
 
   it("error message mentions g or m", () => {
     const err = volSizeError("ephemeral", "badval");
-    expect(err).toMatch(/g or m/i);
+    expect(err).toMatch(/gigabytes or megabytes/i);
   });
 
   it("returns null for existing_persistent (no size needed)", () => {
@@ -128,5 +130,43 @@ describe("usedExistingNames", () => {
       existingRow("picked"),
     ];
     expect(usedExistingNames(rows, 0)).toEqual(new Set(["picked"]));
+  });
+});
+
+describe("size spellings (#292)", () => {
+  it("accepts GB/GiB/MB/MiB spellings, any case, with whitespace", () => {
+    for (const s of ["5GB", "5gb", "5 GB", "5GiB", "5 gib", " 5g ", "5Gb", "512MB", "512 MiB"]) {
+      expect(isValidVolSize(s), s).toBe(true);
+    }
+  });
+
+  it("still rejects kilobytes, bare numbers, leading zeros and zero", () => {
+    for (const s of ["5", "5KB", "5gbb", "5 g b", "05g", "0GB", "g", "GB"]) {
+      expect(isValidVolSize(s), s).toBe(false);
+    }
+  });
+
+  it("normalizeVolSize folds every spelling to the daemon's <n>g|<n>m form", () => {
+    expect(normalizeVolSize("5GB")).toBe("5g");
+    expect(normalizeVolSize(" 5 GiB ")).toBe("5g");
+    expect(normalizeVolSize("512MB")).toBe("512m");
+    expect(normalizeVolSize("2g")).toBe("2g");
+    expect(normalizeVolSize("5KB")).toBeNull();
+  });
+
+  it("buildVolSpec sends the normalized size, not the user's spelling", () => {
+    const row: VolumeRow = {
+      kind: "new_persistent",
+      name: "management-persistent",
+      path: "/data",
+      size: "5GB",
+      selectedVolName: "",
+    };
+    expect(buildVolSpec(row, [])).toBe("management-persistent:/data:5g");
+    expect(buildVolSpec({ ...row, kind: "ephemeral", size: " 512 MiB" }, [])).toBe("/data:512m");
+  });
+
+  it("volSizeError names the accepted spellings", () => {
+    expect(volSizeError("ephemeral", "5KB")).toMatch(/5g|5GB/);
   });
 });

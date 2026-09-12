@@ -183,6 +183,13 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
             <span className="text-muted-foreground-2">
               Changes are saved to the sandbox config and applied on next restart.
             </span>
+            {/* Why Save is disabled belongs NEXT TO the disabled button: the
+                per-field line under the row was read as "the app refuses to
+                save" rather than "this field is wrong". Same wording as
+                NewSandbox's blocker list. */}
+            {volumesInvalid && (
+              <span className="ml-1 text-destructive">Fix the invalid volume row above.</span>
+            )}
           </span>
           <Button
             type="button"
@@ -191,7 +198,7 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
             disabled={saving || volumesInvalid}
             onClick={() => void save()}
           >
-            Save changes
+            {saving ? "Saving…" : "Save changes"}
           </Button>
           {running && (
             <Button
