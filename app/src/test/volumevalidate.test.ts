@@ -154,6 +154,16 @@ describe("size spellings (#292)", () => {
     expect(normalizeVolSize("5KB")).toBeNull();
   });
 
+  it("refuses a count whose byte size overflows u64, exactly where the daemon does", () => {
+    // 2^34 GiB = 2^64 bytes: one past u64. The form must not declare valid
+    // what parse_size will refuse after submission.
+    expect(normalizeVolSize("17179869184g")).toBeNull();
+    expect(normalizeVolSize("17179869183g")).toBe("17179869183g");
+    expect(normalizeVolSize("17592186044416m")).toBeNull(); // 2^44 MiB = 2^64
+    expect(normalizeVolSize("17592186044415m")).toBe("17592186044415m");
+    expect(isValidVolSize("99999999999999999999999g")).toBe(false);
+  });
+
   it("buildVolSpec sends the normalized size, not the user's spelling", () => {
     const row: VolumeRow = {
       kind: "new_persistent",

@@ -20,6 +20,12 @@ import { VolumesTab } from "../components/VolumesTab";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+const running: SandboxView = {
+  name: "management",
+  image: "docker/sandbox-templates:claude-code",
+  state: { kind: "running" },
+};
+
 const stopped: SandboxView = {
   name: "management",
   image: "docker/sandbox-templates:claude-code",
@@ -45,8 +51,8 @@ const detail: SandboxDetail = {
 };
 
 /** Add one "New persistent" row and fill it the way a user would. */
-async function fillNewPersistentRow(size: string) {
-  render(<VolumesTab sandbox={stopped} onChanged={() => {}} />);
+async function fillNewPersistentRow(size: string, sandbox: SandboxView = stopped) {
+  render(<VolumesTab sandbox={sandbox} onChanged={() => {}} />);
   await waitFor(() => expect(inspect).toHaveBeenCalled());
   fireEvent.click(screen.getByRole("button", { name: /add volume/i }));
   fireEvent.click(screen.getByRole("radio", { name: /new persistent/i }));
@@ -94,12 +100,47 @@ describe("VolumesTab — size input spellings (#292)", () => {
     expect(screen.getByRole("button", { name: /^save changes$/i })).toBeDisabled();
     // The reason sits in the banner, next to the disabled button — not only
     // as a small line under the field the user may have scrolled past.
-    expect(screen.getByText(/fix the invalid volume row/i)).toBeInTheDocument();
+    // The row editors render BELOW the banner — the hint must point there.
+    expect(screen.getByText(/fix the invalid volume row below/i)).toBeInTheDocument();
   });
 
   it("no restart button is offered for a stopped sandbox", async () => {
     await fillNewPersistentRow("5g");
     expect(screen.queryByRole("button", { name: /restart now/i })).not.toBeInTheDocument();
+  });
+
+  it("'Save & restart now' shows progress on ITSELF, not on the neighbouring Save", async () => {
+    let releaseAttach: () => void = () => {};
+    let releaseRestart: () => void = () => {};
+    volumeAttach.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseAttach = resolve;
+        }),
+    );
+    restart.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseRestart = resolve;
+        }),
+    );
+    await fillNewPersistentRow("5g", running);
+    fireEvent.click(screen.getByRole("button", { name: /save & restart now/i }));
+
+    // While the attach runs the clicked button carries the progress label and
+    // the plain Save keeps its own label (disabled, but not "Saving…").
+    const restarting = await screen.findByRole("button", { name: /^saving…$/i });
+    expect(restarting).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^save changes$/i })).toBeDisabled();
+    releaseAttach();
+
+    // Then the restart itself: the same button says so until it lands.
+    await screen.findByRole("button", { name: /^restarting…$/i });
+    releaseRestart();
+    await waitFor(() => expect(restart).toHaveBeenCalledWith("management"));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /^restarting…$/i })).not.toBeInTheDocument(),
+    );
   });
 
   it("the Save button reads 'Saving…' while the attach is in flight", async () => {

@@ -42,7 +42,13 @@ export const isValidVolPath = (s: string) => s.startsWith("/") && !s.includes(",
 export function normalizeVolSize(s: string): string | null {
   const m = /^\s*([1-9]\d*)\s*([gm])(?:i?b)?\s*$/i.exec(s);
   if (!m) return null;
-  return `${m[1]}${m[2].toLowerCase()}`;
+  const unit = m[2].toLowerCase();
+  // Same ceiling as the daemon's `parse_size` (a u64 byte count): declaring
+  // a size valid here that the daemon will refuse would only move the error
+  // to after submission.
+  const bytes = BigInt(m[1]) << (unit === "g" ? 30n : 20n);
+  if (bytes >= 1n << 64n) return null;
+  return `${m[1]}${unit}`;
 }
 
 /** True when `normalizeVolSize` accepts the value. */

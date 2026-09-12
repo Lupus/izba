@@ -41,7 +41,11 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
   const [volumeRows, setVolumeRows] = useState<VolumeRow[]>([]);
   const [allVolumes, setAllVolumes] = useState<VolumeInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
+  // Which banner action is in flight, so progress shows on the button the
+  // user clicked (and only there): a plain save, the save half of
+  // save-and-restart, or the restart half.
+  const [inFlight, setInFlight] = useState<null | "save" | "save-restart" | "restart">(null);
+  const saving = inFlight !== null;
   const loadedRef = useRef<VolumeSpec[]>([]);
 
   const running = sandbox.state.kind !== "stopped";
@@ -125,9 +129,9 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
   }
 
   /** Save pending edits. Returns true if the save succeeded (no errors). */
-  async function save(): Promise<boolean> {
+  async function save(via: "save" | "save-restart" = "save"): Promise<boolean> {
     if (volumesInvalid) return false;
-    setSaving(true);
+    setInFlight(via);
     setError(null);
     let succeeded = false;
     let saveError: string | null = null;
@@ -154,20 +158,23 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
       if (saveError !== null) {
         setError(saveError);
       }
-      setSaving(false);
+      setInFlight(null);
     }
     return succeeded;
   }
 
   async function restartNow() {
     // Save pending edits first; abort restart if save failed
-    const saved = await save();
+    const saved = await save("save-restart");
     if (!saved) return;
+    setInFlight("restart");
     try {
       await api.restart(name);
       onChanged();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setInFlight(null);
     }
   }
 
@@ -175,8 +182,10 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
     <div className="flex flex-col gap-4">
       {error && <div className="text-sm text-destructive">{error}</div>}
 
-      {/* Dirty banner */}
-      {dirty && (
+      {/* Dirty banner — also kept up while an action it started is still
+          running, so "Restarting…" has somewhere to show after the save half
+          has re-synced the rows and cleared the dirty state. */}
+      {(dirty || saving) && (
         <div className="flex items-center gap-3 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
           <span className="flex-1">
             Unsaved changes.{" "}
@@ -188,7 +197,7 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
                 save" rather than "this field is wrong". Same wording as
                 NewSandbox's blocker list. */}
             {volumesInvalid && (
-              <span className="ml-1 text-destructive">Fix the invalid volume row above.</span>
+              <span className="ml-1 text-destructive">Fix the invalid volume row below.</span>
             )}
           </span>
           <Button
@@ -198,7 +207,7 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
             disabled={saving || volumesInvalid}
             onClick={() => void save()}
           >
-            {saving ? "Saving…" : "Save changes"}
+            {inFlight === "save" ? "Saving…" : "Save changes"}
           </Button>
           {running && (
             <Button
@@ -208,7 +217,11 @@ export function VolumesTab({ sandbox, onChanged }: Props) {
               disabled={saving || volumesInvalid}
               onClick={() => void restartNow()}
             >
-              Save &amp; restart now
+              {inFlight === "save-restart"
+                ? "Saving…"
+                : inFlight === "restart"
+                  ? "Restarting…"
+                  : "Save & restart now"}
             </Button>
           )}
         </div>
