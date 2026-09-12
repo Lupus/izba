@@ -164,13 +164,13 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
         "m" | "mb" | "mib" => 1u64 << 20,
         _ => bail!("size {s:?} {USAGE}"),
     };
-    if num.is_empty() || (num.len() > 1 && num.starts_with('0')) {
+    // A leading '0' covers both zero itself and a padded count in one test —
+    // the two used to be separate checks with identical outcomes, which the
+    // mutation gate rightly flagged as unobservable.
+    if num.is_empty() || num.starts_with('0') {
         bail!("size {s:?} {USAGE}");
     }
     let n: u64 = num.parse().with_context(|| format!("bad size {s:?}"))?;
-    if n == 0 {
-        bail!("size must be > 0");
-    }
     n.checked_mul(mult)
         .with_context(|| format!("size {s:?} is too large"))
 }
