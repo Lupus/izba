@@ -104,6 +104,18 @@ describe("VolumesTab — size input spellings (#292)", () => {
     expect(screen.getByText(/fix the invalid volume row below/i)).toBeInTheDocument();
   });
 
+  it("a row with the size left blank disables Save WITHOUT a per-field error — the banner must still say why", async () => {
+    // The silent case behind the original report: per-field errors render
+    // only for fields the user has typed into, but Save is gated on the whole
+    // row. Name + path filled, size empty ⇒ disabled Save and, before this
+    // fix, no red text anywhere.
+    await fillNewPersistentRow("");
+
+    expect(screen.getByRole("button", { name: /^save changes$/i })).toBeDisabled();
+    expect(screen.queryByText(/size must be/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/fix the invalid volume row below/i)).toBeInTheDocument();
+  });
+
   it("no restart button is offered for a stopped sandbox", async () => {
     await fillNewPersistentRow("5g");
     expect(screen.queryByRole("button", { name: /restart now/i })).not.toBeInTheDocument();
