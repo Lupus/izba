@@ -1669,6 +1669,150 @@ impl Drop for SandboxGuard {
     }
 }
 
+/// Rewrite `config.json` behind the (stopped) sandbox's back — the e2e stand-in
+/// for `izba load` recording a foreign `disk_owner`. `None` removes the field,
+/// which is what a sandbox created on this host carries.
+fn set_disk_owner(cfg_path: &Path, owner: Option<(u32, u32)>) {
+    let mut cfg: Value = serde_json::from_slice(&std::fs::read(cfg_path).unwrap()).unwrap();
+    let obj = cfg.as_object_mut().expect("config.json is an object");
+    match owner {
+        Some((u, g)) => {
+            obj.insert("disk_owner".into(), serde_json::json!([u, g]));
+        }
+        None => {
+            obj.remove("disk_owner");
+        }
+    }
+    std::fs::write(cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+}
+
+/// Save/load §5.4 (the spike, kept as a permanent test): a non-docker sandbox
+/// whose recorded `disk_owner` differs from the live workspace owner boots with
+/// `/upper` idmapped by P — overlayfs must accept an idmapped upper layer —
+/// files keep their in-container owner, and new writes round-trip losslessly
+/// when the map is removed again.
+///
+/// alpine's USER is root (W = 0), so under owner `o` the Option-A transpose
+/// swaps container-0 ↔ guest-`o`, and the disk id IS the guest id (no idmap).
+#[test]
+fn disk_owner_remap_preserves_container_view() {
+    if !want() {
+        return;
+    }
+    use izba_core::image::runtime_config::transpose_apply;
+    let root = tempfile::tempdir().unwrap();
+    let data: PathBuf = root.path().join("izba");
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+    let name = "remap";
+    let _guard = SandboxGuard {
+        data: data.clone(),
+        name,
+    };
+
+    assert_ok(
+        &izba(
+            &data,
+            no_env,
+            &["create", "--image", IMAGE, "--name", name, &ws_s],
+        ),
+        "create",
+    );
+    assert_ok(&izba(&data, no_env, &["start", name]), "start 1");
+    assert_ok(
+        &izba(
+            &data,
+            no_env,
+            &["exec", name, "--", "sh", "-c", "touch /root/before && sync"],
+        ),
+        "touch before",
+    );
+    assert_ok(&izba(&data, no_env, &["stop", name]), "stop 1");
+
+    let host = izba_core::sandbox::workspace_owner_pub(&ws);
+    // A foreign source owner distinct from both 0 and the live owner, so P
+    // genuinely moves ids (a host owner of 0 would make the transpose identity).
+    let fake: (u32, u32) = (4242, 4242);
+    assert_ne!(
+        host.0, fake.0,
+        "test needs a live owner distinct from the fake"
+    );
+    let cfg_path = data.join("sandboxes").join(name).join("config.json");
+    set_disk_owner(&cfg_path, Some(fake));
+
+    assert_ok(
+        &izba(&data, no_env, &["start", name]),
+        "start 2 (idmapped upper) — if this fails with an overlay/mount_setattr \
+         error the spike FAILED: stop and report",
+    );
+    // `before` was written as container 0 under owner `host` => disk id
+    // M_host(0). Under the remap it must present as M_src⁻¹(d) with
+    // M_src = transpose(0, 4242): the owner it would have had on the source.
+    let d_before = transpose_apply(0, host.0, 0);
+    let expect_before = transpose_apply(0, fake.0, d_before);
+    // Non-vacuity: an un-remapped boot presents `before` as container root, so
+    // a nonzero expectation proves the idmap was actually applied.
+    assert_ne!(
+        expect_before, 0,
+        "remap must move `before` off container root"
+    );
+    let out = izba(
+        &data,
+        no_env,
+        &["exec", name, "--", "stat", "-c", "%u", "/root/before"],
+    );
+    assert_ok(&out, "stat before");
+    assert_eq!(
+        stdout_of(&out).trim(),
+        expect_before.to_string(),
+        "before under remap"
+    );
+
+    assert_ok(
+        &izba(
+            &data,
+            no_env,
+            &["exec", name, "--", "sh", "-c", "touch /root/after && sync"],
+        ),
+        "touch after",
+    );
+    assert_ok(&izba(&data, no_env, &["stop", name]), "stop 2");
+
+    // `after` was written as container 0 under the remap => disk id M_src(0).
+    // With the map removed it must present as M_host⁻¹ of that disk id.
+    set_disk_owner(&cfg_path, None);
+    assert_ok(&izba(&data, no_env, &["start", name]), "start 3");
+    let d_after = transpose_apply(0, fake.0, 0);
+    let expect_after = transpose_apply(0, host.0, d_after);
+    eprintln!(
+        "disk_owner_remap: host={host:?} fake={fake:?} expect_before={expect_before} \
+         expect_after={expect_after}"
+    );
+    let out = izba(
+        &data,
+        no_env,
+        &["exec", name, "--", "stat", "-c", "%u", "/root/after"],
+    );
+    assert_ok(&out, "stat after");
+    assert_eq!(
+        stdout_of(&out).trim(),
+        expect_after.to_string(),
+        "after, map removed"
+    );
+    // `before` is back to its original presentation (container root).
+    let out = izba(
+        &data,
+        no_env,
+        &["exec", name, "--", "stat", "-c", "%u", "/root/before"],
+    );
+    assert_ok(&out, "stat before (unmapped)");
+    assert_eq!(stdout_of(&out).trim(), "0", "before, map removed");
+
+    assert_ok(&izba(&data, no_env, &["rm", "--force", name]), "rm");
+}
+
 /// Docker mode (#198) through the FULL daemon path: a port published against
 /// a container the nested Docker Engine started must be reachable from the
 /// host. Every hop is real — host TcpStream → izbad relay → `StreamOpen::
