@@ -657,7 +657,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
 /// by default, hence the no-op. Best-effort: failure costs disk space, not
 /// correctness.
 #[cfg(windows)]
-fn mark_sparse(f: &File) {
+pub(crate) fn mark_sparse(f: &File) {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -678,7 +678,7 @@ fn mark_sparse(f: &File) {
 }
 
 #[cfg(not(windows))]
-fn mark_sparse(_f: &File) {}
+pub(crate) fn mark_sparse(_f: &File) {}
 
 /// Best-effort host-side ext4 pre-format. Non-fatal: if `mkfs.ext4` is absent
 /// or fails, the guest-side mke2fs reformats the blank image at boot.

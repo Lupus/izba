@@ -1572,6 +1572,7 @@ dependencies = [
  "ipconfig",
  "izba-jail-naming",
  "izba-proto",
+ "libc",
  "mutants",
  "nix 0.29.0",
  "oci-client",
