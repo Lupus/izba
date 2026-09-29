@@ -12,7 +12,7 @@
 //! volumes are reused and never touched — a volume only while no sandbox here
 //! references it (single writer).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -132,7 +132,11 @@ struct Sel {
     name: String,
     entry: SandboxEntry,
     ws_target: PathBuf,
-    /// Staging dir beside `ws_target` (bundled workspaces only).
+    /// Archived tree (`workspaces/<tree>/`) holding a bundled workspace: the
+    /// sandbox's own name, or its `workspace_from`. `None` = not bundled.
+    ws_tree: Option<String>,
+    /// Staging dir beside `ws_target` (bundled workspaces only; shared by
+    /// every selected sandbox of the same tree).
     ws_stage: Option<PathBuf>,
 }
 
@@ -301,7 +305,15 @@ fn run(
     let stage = paths.root().join(format!(".load-{pid}-{seq}"));
     crate::paths::create_dir_700(&stage, paths.root())?;
     scratch.push(stage.clone());
-    for s in sels.iter_mut().filter(|s| s.entry.workspace_bundled) {
+    let mut tree_stages: HashMap<String, PathBuf> = HashMap::new();
+    for s in sels.iter_mut() {
+        let Some(tree) = s.ws_tree.clone() else {
+            continue;
+        };
+        if let Some(stage) = tree_stages.get(&tree) {
+            s.ws_stage = Some(stage.clone());
+            continue;
+        }
         let parent = s
             .ws_target
             .parent()
@@ -317,6 +329,7 @@ fn run(
             .with_context(|| format!("creating {}", ws_stage.display()))
             .context(PLACE_HINT)?;
         scratch.push(ws_stage.clone());
+        tree_stages.insert(tree, ws_stage.clone());
         s.ws_stage = Some(ws_stage);
     }
 
@@ -482,10 +495,14 @@ fn run(
     }
 
     fail(CommitStep::Workspaces)?;
+    let mut placed = BTreeSet::new();
     for s in &sels {
         let Some(ws_stage) = &s.ws_stage else {
             continue;
         };
+        if !placed.insert(ws_stage) {
+            continue; // a shared tree, already placed for an earlier sharer
+        }
         let t = &s.ws_target;
         if t.exists() {
             if !is_free_target(t) {
@@ -625,6 +642,25 @@ fn validate_manifest(m: &Manifest) -> anyhow::Result<()> {
                 bail!("unexpected disk {:?} for sandbox '{}'", d.path, s.name);
             }
         }
+        if let Some(from) = &s.workspace_from {
+            // The owner holds the tree and must describe the SAME source dir:
+            // every sharer then maps to the owner's one restore target.
+            let owner = m.sandboxes.iter().find(|o| &o.name == from);
+            let ok = s.workspace_bundled
+                && owner.is_some_and(|o| {
+                    o.name != s.name
+                        && o.workspace_bundled
+                        && o.workspace_from.is_none()
+                        && o.source_workspace == s.source_workspace
+                });
+            if !ok {
+                bail!(
+                    "archive is corrupt: sandbox '{}' takes its workspace from {from:?}, \
+                     which holds no matching bundled workspace",
+                    s.name
+                );
+            }
+        }
         if !m.images.contains(&s.image_digest) {
             bail!(
                 "sandbox '{}': image {:?} is not in the archive",
@@ -730,6 +766,9 @@ fn select(
             bail!("{}", exists_msg(&name));
         }
         let target = workspace_target(opts, e, m, hooks)?;
+        let ws_tree = e
+            .workspace_bundled
+            .then(|| e.workspace_from.clone().unwrap_or_else(|| e.name.clone()));
         if e.workspace_bundled {
             if !is_free_target(&target) {
                 bail!(
@@ -737,9 +776,11 @@ fn select(
                     target.display()
                 );
             }
+            // Sharers of one tree restore it once, together; two DIFFERENT
+            // source workspaces can never land on one dir.
             if sels
                 .iter()
-                .any(|s| s.entry.workspace_bundled && s.ws_target == target)
+                .any(|s| s.ws_tree.is_some() && s.ws_target == target && s.ws_tree != ws_tree)
             {
                 bail!(
                     "two sandboxes would restore their workspace to {}; pass --workspace-root",
@@ -761,6 +802,7 @@ fn select(
             name,
             entry: e.clone(),
             ws_target: target,
+            ws_tree,
             ws_stage: None,
         });
     }
@@ -863,7 +905,11 @@ fn check_space(paths: &Paths, m: &Manifest, sels: &[Sel], hooks: &LoadHooks) -> 
         data = data.saturating_add(m.image_sizes.get(d).copied().unwrap_or(0));
     }
     *need.entry(nearest_existing(paths.root())?).or_default() += data;
-    for s in sels.iter().filter(|s| s.entry.workspace_bundled) {
+    let mut counted = BTreeSet::new();
+    for s in sels.iter().filter(|s| s.ws_tree.is_some()) {
+        if !counted.insert(&s.ws_tree) {
+            continue; // a shared tree is restored (and needs room) once
+        }
         let e = need.entry(nearest_existing(&s.ws_target)?).or_default();
         *e = e.saturating_add(s.entry.workspace_bytes);
     }
@@ -924,8 +970,10 @@ struct Stager<'a> {
     paths: &'a Paths,
     m: &'a Manifest,
     stage: PathBuf,
-    /// source name -> selected sandbox's workspace stage (bundled only).
-    selected: HashMap<String, Option<PathBuf>>,
+    /// Source names of the selected sandboxes.
+    selected: HashSet<String>,
+    /// Archived workspace tree name -> its stage (trees the selection uses).
+    ws_trees: HashMap<String, PathBuf>,
     known_disks: HashMap<String, (DiskKind, u64)>,
     /// image dir name -> digest.
     image_dirs: HashMap<String, String>,
@@ -965,9 +1013,10 @@ impl<'a> Stager<'a> {
             stage,
             need_images,
             need_volumes,
-            selected: sels
+            selected: sels.iter().map(|s| s.src.clone()).collect(),
+            ws_trees: sels
                 .iter()
-                .map(|s| (s.src.clone(), s.ws_stage.clone()))
+                .filter_map(|s| Some((s.ws_tree.clone()?, s.ws_stage.clone()?)))
                 .collect(),
             known_disks,
             image_dirs: m
@@ -1026,7 +1075,7 @@ impl<'a> Stager<'a> {
             {
                 bail!("unexpected archive entry {p}");
             }
-            if !self.selected.contains_key(src) {
+            if !self.selected.contains(src) {
                 return drain(e);
             }
             let dst = self.stage.join(&p);
@@ -1100,7 +1149,7 @@ impl<'a> Stager<'a> {
             DiskKind::Named(v) => {
                 self.need_volumes.contains(v) && !self.paths.volume_image(v).exists()
             }
-            DiskKind::Sandbox(src) => self.selected.contains_key(src),
+            DiskKind::Sandbox(src) => self.selected.contains(src),
         };
         let state = if wanted {
             progress(format!("restoring {prefix}"));
@@ -1157,10 +1206,11 @@ impl<'a> Stager<'a> {
         let Some(entry) = self.m.sandboxes.iter().find(|s| s.name == src) else {
             bail!("unexpected archive entry {p}");
         };
-        if !entry.workspace_bundled || rel.is_empty() {
+        // Only a tree owner has entries; a sharer's workspace is its owner's.
+        if !entry.workspace_bundled || entry.workspace_from.is_some() || rel.is_empty() {
             bail!("unexpected archive entry {p}");
         }
-        let Some(Some(ws_stage)) = self.selected.get(src) else {
+        let Some(ws_stage) = self.ws_trees.get(src) else {
             return drain(e);
         };
         // A Windows host cannot recreate every name another OS can hold
@@ -1188,7 +1238,7 @@ impl<'a> Stager<'a> {
             .m
             .sandboxes
             .iter()
-            .filter(|s| self.selected.contains_key(&s.name))
+            .filter(|s| self.selected.contains(&s.name))
         {
             let cfg = format!("sandboxes/{}/{CONFIG_FILE}", s.name);
             if !self.out.files.contains_key(&cfg) {
@@ -2153,6 +2203,114 @@ mod tests {
         let want = tgt.dir("projects/a");
         assert!(want.join("README").is_file());
         assert_eq!(rep.sandboxes[0].workspace, want.canonicalize().unwrap());
+    }
+
+    /// Source with "a" (the Src fixture) plus "b", whose config points at
+    /// `b_workspace(src)` instead of its own workspace.
+    fn src_with_b(b_workspace: impl FnOnce(&Src) -> PathBuf) -> Src {
+        let src = Src::new();
+        add_sandbox(&src.paths, "b", "sha256:aa", &[]);
+        let ws = b_workspace(&src);
+        std::fs::create_dir_all(&ws).unwrap();
+        edit_src_config(&src, "b", |c| c.workspace = ws);
+        src
+    }
+
+    fn shared(src: &Src) -> PathBuf {
+        crate::bundle::testutil::workspace_of(&src.paths, "a")
+    }
+
+    #[test]
+    fn a_shared_bundled_workspace_is_restored_once_for_every_sharer() {
+        let src = src_with_b(shared);
+        let ar = src.save(&["a", "b"], true);
+        let tgt = Tgt::new();
+        let o = LoadOpts {
+            workspace_root: Some(tgt.dir("projects")),
+            ..opts(ar.clone(), None)
+        };
+        let rep = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap();
+        let want = tgt.dir("projects/a").canonicalize().unwrap();
+        assert_eq!(std::fs::read(want.join("README")).unwrap(), b"hello");
+        assert_eq!(
+            rep.sandboxes
+                .iter()
+                .map(|s| (s.name.as_str(), s.workspace.clone()))
+                .collect::<Vec<_>>(),
+            vec![("a", want.clone()), ("b", want.clone())]
+        );
+        assert!(no_stage_left(&tgt));
+        // Only the sharer: its workspace comes from the owner's tree.
+        let tgt = Tgt::new();
+        let o = LoadOpts {
+            select: vec!["b".into()],
+            workspace_root: Some(tgt.dir("projects")),
+            ..opts(ar, None)
+        };
+        let rep = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap();
+        let want = tgt.dir("projects/a").canonicalize().unwrap();
+        assert_eq!(rep.sandboxes[0].workspace, want);
+        assert_eq!(std::fs::read(want.join("README")).unwrap(), b"hello");
+        assert!(!tgt.paths.sandbox_dir("a").exists());
+    }
+
+    #[test]
+    fn different_workspaces_mapping_to_one_target_are_still_refused() {
+        // b's own workspace is `<src>/other/a`: same basename as a's.
+        let src = src_with_b(|s| s.t.path().join("other/a"));
+        let ar = src.save(&["a", "b"], true);
+        let tgt = Tgt::new();
+        let o = LoadOpts {
+            workspace_root: Some(tgt.dir("projects")),
+            ..opts(ar, None)
+        };
+        let e = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("two sandboxes would restore"), "{e}");
+    }
+
+    #[test]
+    fn a_shared_unbundled_workspace_binds_both_sandboxes() {
+        let src = src_with_b(shared);
+        let ar = src.save(&["a", "b"], false);
+        let tgt = Tgt::new();
+        std::fs::create_dir_all(tgt.dir("projects/a")).unwrap();
+        let o = LoadOpts {
+            workspace_root: Some(tgt.dir("projects")),
+            ..opts(ar, None)
+        };
+        let rep = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap();
+        let want = tgt.dir("projects/a").canonicalize().unwrap();
+        assert!(rep.sandboxes.iter().all(|s| s.workspace == want), "{rep:?}");
+    }
+
+    #[test]
+    fn a_bad_workspace_from_is_refused() {
+        let src = src_with_b(shared);
+        let ar = src.save(&["a", "b"], true);
+        type Edit = fn(&mut Manifest);
+        let cases: [Edit; 4] = [
+            |m| m.sandboxes[1].workspace_from = Some("ghost".into()),
+            |m| m.sandboxes[1].workspace_from = Some("b".into()),
+            |m| m.sandboxes[0].workspace_bundled = false,
+            |m| m.sandboxes[1].source_workspace = "/elsewhere".into(),
+        ];
+        for edit in cases {
+            let tgt = Tgt::new();
+            let copy = tgt.dir("in.izba");
+            std::fs::copy(&ar, &copy).unwrap();
+            edit_manifest(&copy, edit);
+            let o = LoadOpts {
+                workspace_root: Some(tgt.dir("projects")),
+                ..opts(copy, None)
+            };
+            let e = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("workspace"), "{e}");
+            assert!(!tgt.paths.sandbox_dir("b").exists());
+        }
     }
 
     #[test]

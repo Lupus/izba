@@ -10,7 +10,7 @@
 //! complete; any failure removes the partial, so `<out>` is either absent or
 //! a whole archive.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -229,17 +229,26 @@ fn build_manifest(paths: &Paths, plan: &Plan, with_workspace: bool) -> anyhow::R
     let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     let source_home = std::env::var_os(home_var).map(|h| h.to_string_lossy().into_owned());
     let mut sandboxes = Vec::new();
+    // Workspace dir -> (the first sandbox archiving it, its bytes): a dir
+    // shared by several saved sandboxes is archived once (`workspace_from`).
+    let mut archived: HashMap<&Path, (&str, u64)> = HashMap::new();
     for (name, cfg) in &plan.configs {
-        let ws_bytes = if with_workspace {
+        let mut workspace_from = None;
+        let ws_bytes = if !with_workspace {
+            0
+        } else if let Some((owner, bytes)) = archived.get(cfg.workspace.as_path()) {
+            workspace_from = Some(owner.to_string());
+            *bytes
+        } else {
             if !cfg.workspace.is_dir() {
                 bail!(
                     "sandbox '{name}': workspace {} does not exist; save without --with-workspace",
                     cfg.workspace.display()
                 );
             }
-            workspace_bytes(&cfg.workspace)?
-        } else {
-            0
+            let bytes = workspace_bytes(&cfg.workspace)?;
+            archived.insert(&cfg.workspace, (name, bytes));
+            bytes
         };
         sandboxes.push(SandboxEntry {
             name: name.clone(),
@@ -249,6 +258,7 @@ fn build_manifest(paths: &Paths, plan: &Plan, with_workspace: bool) -> anyhow::R
                 .disk_owner
                 .unwrap_or_else(|| crate::sandbox::workspace_owner(&cfg.workspace)),
             workspace_bundled: with_workspace,
+            workspace_from,
             source_workspace: cfg.workspace.to_string_lossy().into_owned(),
             source_home: source_home.clone(),
             disks: sandbox_disks(paths, name, cfg)
@@ -378,30 +388,40 @@ fn write_archive(
         }
     }
 
-    if opts.with_workspace {
-        for (name, cfg) in &plan.configs {
-            progress(format!("workspace of '{name}'"));
-            // NTFS carries no exec bits; git's index is the only record of them.
-            let exec_bits = if cfg!(windows) {
-                git_exec_bits(&cfg.workspace)
-            } else {
-                HashSet::new()
-            };
-            let stats = append_workspace(
-                &mut tar,
-                &cfg.workspace,
-                &format!("workspaces/{name}"),
-                &exec_bits,
-            )?;
-            logical += stats.bytes;
-            warnings.extend(stats.skipped.iter().map(|p| {
-                format!(
-                    "sandbox '{name}': skipped special file {} \
-                     (sockets/FIFOs/devices are not archived)",
-                    p.display()
-                )
-            }));
-        }
+    // One tree per distinct workspace; a sharer's entry points at it.
+    let owners = manifest
+        .sandboxes
+        .iter()
+        .filter(|e| e.workspace_bundled && e.workspace_from.is_none());
+    for e in owners {
+        let name = &e.name;
+        let cfg = &plan
+            .configs
+            .iter()
+            .find(|(n, _)| n == name)
+            .context("manifest names a sandbox that was not planned")?
+            .1;
+        progress(format!("workspace of '{name}'"));
+        // NTFS carries no exec bits; git's index is the only record of them.
+        let exec_bits = if cfg!(windows) {
+            git_exec_bits(&cfg.workspace)
+        } else {
+            HashSet::new()
+        };
+        let stats = append_workspace(
+            &mut tar,
+            &cfg.workspace,
+            &format!("workspaces/{name}"),
+            &exec_bits,
+        )?;
+        logical += stats.bytes;
+        warnings.extend(stats.skipped.iter().map(|p| {
+            format!(
+                "sandbox '{name}': skipped special file {} \
+                 (sockets/FIFOs/devices are not archived)",
+                p.display()
+            )
+        }));
     }
 
     append_bytes(&mut tar, CHECKSUMS_PATH, &serde_json::to_vec_pretty(&sums)?)?;
@@ -1072,6 +1092,39 @@ mod tests {
             .position(|n| n == "sandboxes/a/rw.img.len")
             .unwrap();
         assert!(rw < ws && ws < names.len() - 1);
+    }
+
+    #[test]
+    fn a_workspace_shared_by_two_sandboxes_is_archived_once() {
+        let (t, paths) = fixture();
+        let a = add_sandbox(&paths, "a", "sha256:aa", &[]);
+        add_sandbox(&paths, "b", "sha256:aa", &[]);
+        let cp = paths.sandbox_dir("b").join(CONFIG_FILE);
+        let mut c: SandboxConfig = load_json(&cp).unwrap().unwrap();
+        c.workspace = a.workspace.clone();
+        save_json(&cp, &c).unwrap();
+        let out = t.path().join("x.izba");
+        save(
+            &paths,
+            &no_conn,
+            &opts(&["a", "b"], out.clone(), true),
+            &mut |_| {},
+        )
+        .unwrap();
+        let entries = read_entries(&out);
+        assert_eq!(body(&entries, "workspaces/a/README"), b"hello");
+        assert!(!entries.iter().any(|(n, _)| n.starts_with("workspaces/b/")));
+        let (m, _) = manifest_and_sums(&entries);
+        let (ea, eb) = (&m.sandboxes[0], &m.sandboxes[1]);
+        assert_eq!(
+            (ea.workspace_from.as_deref(), ea.workspace_bundled),
+            (None, true)
+        );
+        assert_eq!(
+            (eb.workspace_from.as_deref(), eb.workspace_bundled),
+            (Some("a"), true)
+        );
+        assert_eq!(eb.source_workspace, ea.source_workspace);
     }
 
     #[cfg(unix)]

@@ -62,6 +62,12 @@ pub struct SandboxEntry {
     pub named_volumes: Vec<String>,
     pub disk_owner: (u32, u32),
     pub workspace_bundled: bool,
+    /// Several saved sandboxes sharing one workspace dir have it archived
+    /// ONCE: this names the entry whose `workspaces/<n>/` tree holds it (that
+    /// entry has none itself and the same `source_workspace`). `None` = own
+    /// tree, or not bundled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_from: Option<String>,
     /// Lossless display of the source path.
     pub source_workspace: String,
     pub source_home: Option<String>,
@@ -274,6 +280,7 @@ mod tests {
                 named_volumes: vec![],
                 disk_owner: (1000, 1000),
                 workspace_bundled: false,
+                workspace_from: None,
                 source_workspace: "/home/u/p".into(),
                 source_home: Some("/home/u".into()),
                 disks: vec![],
