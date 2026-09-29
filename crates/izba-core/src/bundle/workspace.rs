@@ -4,7 +4,7 @@
 //! host on another OS.
 
 use crate::bundle::fsutil::ExactLen;
-use crate::bundle::manifest::SourceOs;
+use crate::bundle::manifest::{check_portable_rel, validate_entry_path, SourceOs};
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::fs;
@@ -84,6 +84,17 @@ pub fn append_workspace<W: Write>(
                 name.push('/');
                 name.push_str(s);
             }
+            // Never emit a name some load would refuse (spec §10): the whole
+            // archive would otherwise be unloadable, found out only on load.
+            validate_entry_path(&name)
+                .and_then(|()| check_portable_rel(&name[prefix.len() + 1..]))
+                .with_context(|| {
+                    format!(
+                        "workspace file {} cannot be restored portably; rename it or \
+                         save without --with-workspace",
+                        rel.display()
+                    )
+                })?;
             let meta =
                 fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
             let ft = meta.file_type();
@@ -613,7 +624,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut b = tar::Builder::new(&mut buf);
-            append_workspace(&mut b, &src, "w", &Default::default()).unwrap();
+            append_workspace(&mut b, &src, "workspaces/w", &Default::default()).unwrap();
             b.finish().unwrap();
         }
         std::fs::set_permissions(src.join("ro"), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -622,7 +633,12 @@ mod tests {
         let mut ar = tar::Archive::new(&buf[..]);
         for e in ar.entries().unwrap() {
             let mut e = e.unwrap();
-            let rel = e.path().unwrap().strip_prefix("w").unwrap().to_path_buf();
+            let rel = e
+                .path()
+                .unwrap()
+                .strip_prefix("workspaces/w")
+                .unwrap()
+                .to_path_buf();
             unpack_entry(&mut e, &dst, &rel, &mut modes).unwrap();
         }
         modes.apply().unwrap();
@@ -649,7 +665,7 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         let mut buf = Vec::new();
         let mut b = tar::Builder::new(&mut buf);
-        let st = append_workspace(&mut b, t.path(), "w", &Default::default()).unwrap();
+        let st = append_workspace(&mut b, t.path(), "workspaces/w", &Default::default()).unwrap();
         assert_eq!(st.bytes, 3);
         assert_eq!(st.skipped, vec![PathBuf::from("fifo")]);
     }

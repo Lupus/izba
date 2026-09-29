@@ -22,8 +22,8 @@ use sha2::{Digest, Sha256};
 
 use super::fsutil::{human_bytes, nearest_existing};
 use super::manifest::{
-    check_format, validate_entry_path, Checksums, Manifest, SandboxEntry, CHECKSUMS_PATH,
-    MANIFEST_PATH,
+    check_format, check_portable_rel, validate_entry_path, Checksums, Manifest, SandboxEntry,
+    CHECKSUMS_PATH, MANIFEST_PATH,
 };
 use super::save::{EGRESS_AUDIT_FILE, IMAGE_FILES, SANDBOX_FILES};
 use super::sparse::{content_digest, create_sparse, parse_chunk_entry};
@@ -1135,6 +1135,13 @@ impl<'a> Stager<'a> {
         let Some(Some(ws_stage)) = self.selected.get(src) else {
             return drain(e);
         };
+        // A Windows host cannot recreate every name another OS can hold
+        // (`a:b` would write an alternate data stream, `con` the console
+        // device); save refuses them already, a crafted archive is refused here.
+        if cfg!(windows) {
+            check_portable_rel(rel)
+                .with_context(|| format!("workspace entry {p} cannot be restored on this host"))?;
+        }
         let rel_path: PathBuf = rel.split('/').collect();
         let modes = self.dir_modes.entry(src.to_string()).or_default();
         unpack_entry(e, ws_stage, &rel_path, modes)
