@@ -52,8 +52,13 @@ self-elevate).
   `handle_inspect` — the latter from the predicate below, using the SAME
   `running` liveness predicate as `vnc_restart_required` and the configured
   state from `orchestrate::lockdown_state(&d.paths, name)`. Additive +
-  `serde(default)` ⇒ **no `DAEMON_PROTO_VERSION` bump** (an older daemon's
-  reply reads as `None`/`false`). Its manual `Debug` impl gains both fields.
+  `serde(default)`, **and `DAEMON_PROTO_VERSION` 6 → 7**: an additive field
+  alone reads as `None`/`false` from an older same-proto daemon, which the app
+  cannot tell apart from "applied" — it would hide a needed restart (e.g. after
+  Unlock). The bump makes `DaemonClient::connect_spawning_izba` (used by both
+  the CLI and the app) shut down + respawn the stale daemon; that is safe
+  because the daemon holds no authoritative state. The app therefore copies the
+  daemon's facts verbatim (no app-side stale-daemon guess). Its manual `Debug` impl gains both fields.
 - One pure predicate in `jail_account` (single source of truth):
 
   ```rust
@@ -96,13 +101,20 @@ self-elevate).
   `d.lockdown_state(name)`, `restart_required` = `detail.lockdown_restart_required`,
   `booted_as_account` = `detail.lockdown_account.is_some()`; otherwise `None` — that one field decides
   whether the UI renders the control at all (Linux: hidden).
-- **Remove fix:** `remove_core` (the GUI Remove) checks `lockdown_state`; if
-  locked, it calls `unlock` FIRST. `Err` (UAC declined / helper failed) aborts
-  the remove with: `sandbox '<name>' was NOT removed: its Windows lock-down
-  account could not be released (<cause>). Approve the prompt and retry, or
-  remove it from the CLI with 'izba rm <name>' (then 'izba windows-cleanup').`
-  Nothing has been deleted, so a retry is safe. Fail-closed (the CLI is
-  warn-and-continue) because the GUI has no post-success warning channel.
+- **Remove order (rm FIRST, then release):** `remove_core` (the GUI Remove)
+  reads `lockdown_state` BEFORE rm (its files live in the sandbox dir). Not
+  locked (or unsupported): just `remove`. Locked: `remove(name, force)` first;
+  if it fails its error is returned unchanged and nothing was released (the
+  sandbox and its lock-down are intact — a failed rm must never leave a live
+  sandbox whose account was already released, since its next start would run
+  unconfined). Only after rm succeeds is `unlock(name)` called; if that fails
+  or the prompt is declined: `sandbox '<name>' was removed, but its Windows
+  lock-down account could not be released (<cause>) — run 'izba
+  windows-cleanup' to remove the orphaned account` (windows-cleanup sweeps it:
+  the sandbox no longer exists). `RealDaemon::unlock` has no
+  `ensure_sandbox_exists` guard (deprovision is by name and idempotent);
+  `lockdown` keeps it. Fail-closed reporting (the CLI is warn-and-continue)
+  because the GUI has no post-success warning channel.
 
 ### 3.3 UI (app/src) — Sandbox card, "lock-down" row
 
@@ -121,6 +133,12 @@ Rendered only when `detail.lockdown !== null`.
 - After any action the detail is re-fetched so the row reflects disk truth.
   `OverviewTab` also re-fetches `inspect` when the sandbox's state kind
   changes (today it fetches once per name), so a Restart clears the badge.
+- **Freshness:** a CLI `izba lockdown`/`unlock` changes the posture outside the
+  app, so `OverviewTab` also re-fetches `inspect` every 15 s and on window
+  focus / tab-visible (never blanking the card). If a refresh rejects, the row
+  renders `unknown — refresh failed` (warning tone) with NO Lock down / Unlock
+  buttons and no restart badge until a refresh succeeds; other card rows keep
+  their last values — only the security posture is withheld.
 
 ## 4. Testing
 
