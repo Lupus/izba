@@ -9,7 +9,8 @@
 //! workspaces → sandbox dirs → tags. Each commit step records what it
 //! created; any failure undoes exactly that (in reverse), so a failed load
 //! leaves the target as it found it. Pre-existing images and identical named
-//! volumes are reused and never touched.
+//! volumes are reused and never touched — a volume only while no sandbox here
+//! references it (single writer).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
@@ -287,6 +288,7 @@ fn run(
     check_format(&manifest)?;
     validate_manifest(&manifest)?;
     let mut sels = select(paths, opts, &manifest, hooks)?;
+    check_volume_writers(paths, &sels)?;
     check_space(paths, &manifest, &sels, hooks)?;
     let mut report = LoadReport::default();
 
@@ -763,6 +765,24 @@ fn select(
         });
     }
     Ok(sels)
+}
+
+/// The single-writer invariant (`sandbox::ensure_volume_not_shared`): a
+/// named volume may be bound to at most one sandbox config on this host. A
+/// loaded sandbox may reuse an identical volume only while NO existing
+/// sandbox here references it — otherwise the load would bind it twice.
+fn check_volume_writers(paths: &Paths, sels: &[Sel]) -> anyhow::Result<()> {
+    let (_, volumes) = selection_needs(sels);
+    for v in &volumes {
+        if let Some(other) = crate::sandbox::volume_referrers(paths, v)?.first() {
+            bail!(
+                "named volume '{v}' is already in use by sandbox '{other}' here (a named \
+                 volume has a single writer); remove that sandbox or detach the volume \
+                 there first"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Explicit `--workspace` > `--workspace-root/<basename>` > the source path
@@ -1456,14 +1476,24 @@ mod tests {
             rename: Some("b".into()),
             ..opts(ar, Some(ws))
         };
+        // `a` now holds the named volume "data": a second copy loaded next to
+        // it would share it (single-writer), so --as is refused until `a` goes.
+        let before = tgt.snapshot();
+        let e = load_with(&tgt.paths, &renamed, &mut |_| {}, &tgt.hooks())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("named volume 'data'") && e.contains("already in use by sandbox 'a'"),
+            "{e}"
+        );
+        assert_eq!(tgt.snapshot(), before);
+        std::fs::remove_dir_all(tgt.paths.sandbox_dir("a")).unwrap();
         let rep = load_with(&tgt.paths, &renamed, &mut |_| {}, &tgt.hooks()).unwrap();
         assert_eq!(rep.sandboxes[0].name, "b");
         for (s, t) in src.disk_pairs("a", "b", &tgt.paths) {
             assert_eq!(std::fs::read(&s).unwrap(), std::fs::read(&t).unwrap());
         }
         assert!(tgt.paths.run_dir("b").join("owner").is_file());
-        // "a" is untouched by the second, refused load.
-        assert!(tgt.paths.sandbox_dir("a").join(CONFIG_FILE).is_file());
         assert!(no_stage_left(&tgt));
     }
 
@@ -1510,6 +1540,27 @@ mod tests {
             content_digest(&vol).unwrap(),
             content_digest(&src.paths.volume_image("data")).unwrap()
         );
+    }
+
+    #[test]
+    fn an_identical_named_volume_used_by_a_target_sandbox_is_refused() {
+        let src = Src::new();
+        let ar = src.save(&["a"], false);
+        let tgt = Tgt::new();
+        // Same bytes as the source's "data", but already bound to "other".
+        add_sandbox(&tgt.paths, "other", "sha256:aa", &[("data", "/data")]);
+        let ws = tgt.dir("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let before = tgt.snapshot();
+        let e = load_with(&tgt.paths, &opts(ar, Some(ws)), &mut |_| {}, &tgt.hooks())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("named volume 'data'") && e.contains("already in use by sandbox 'other'"),
+            "{e}"
+        );
+        assert!(!tgt.paths.sandbox_dir("a").exists());
+        assert_eq!(tgt.snapshot(), before);
     }
 
     #[test]
