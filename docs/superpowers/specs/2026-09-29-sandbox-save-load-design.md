@@ -317,3 +317,28 @@ TDD throughout.
 - **Strict chunk names:** `<path>.d/<offset-hex16>` names that are not exactly
   16 hex digits, or chunks that overlap an earlier one or overrun the `.len`
   length, are rejected.
+
+### Added in the final review
+
+- **Shared workspaces (`workspace_from`):** sandboxes saved together that
+  share one workspace dir have it archived once, under the first one's
+  `workspaces/<n>/`; every other sharer's `SandboxEntry` carries
+  `workspace_from: "<n>"` (optional, default absent; the owner is bundled, has
+  no `workspace_from` itself and the same `source_workspace`). Load extracts
+  the tree once and binds every selected sharer to its one target; only two
+  DIFFERENT source workspaces mapping to one dir are refused.
+- **Directory symlinks:** a workspace symlink whose target is a directory is
+  preceded by a PAX extended header with `IZBA.symlink.dir=1` (dangling ⇒
+  file link, no header). A Windows load creates such entries with
+  `symlink_dir`; other readers ignore the key.
+- **Save-time portability:** every workspace entry name passes
+  `validate_entry_path` plus one shared portability check (no `\`, `:`, NUL,
+  trailing dot/space, or Windows device name `CON`/`PRN`/`AUX`/`NUL`/
+  `COM1-9`/`LPT1-9` with any extension); save refuses loudly naming the file,
+  and a Windows load re-runs the same check. Workspace file bodies are
+  streamed at exactly the open handle's length (a file changing mid-save
+  fails it rather than desyncing the tar stream).
+- **Placement:** a workspace path under the source home is re-rooted under
+  the target home on the same OS too when the homes differ. A reused named
+  volume must not already be referenced by a sandbox on the target (single
+  writer). A disk's `allocated` is its data-extent sum on every OS.
