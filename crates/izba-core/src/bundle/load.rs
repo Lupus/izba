@@ -1384,6 +1384,29 @@ mod tests {
         assert!(no_stage_left(&tgt));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_bundled_directory_symlink_loads_as_a_symlink() {
+        let src = Src::new();
+        let ws = crate::bundle::testutil::workspace_of(&src.paths, "a");
+        std::fs::create_dir(ws.join("sub")).unwrap();
+        std::os::unix::fs::symlink("sub", ws.join("dlink")).unwrap();
+        let tgt = Tgt::new();
+        let ar = tgt.dir("in.izba");
+        src.save_to(&["a"], true, &ar);
+        load_with(
+            &tgt.paths,
+            &opts(ar, Some(tgt.dir("ws/a"))),
+            &mut |_| {},
+            &tgt.hooks(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_link(tgt.dir("ws/a/dlink")).unwrap(),
+            PathBuf::from("sub")
+        );
+    }
+
     #[test]
     fn existing_sandbox_name_is_refused_and_as_renames() {
         let src = Src::new();

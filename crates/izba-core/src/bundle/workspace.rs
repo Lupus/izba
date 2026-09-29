@@ -106,6 +106,12 @@ pub fn append_workspace<W: Write>(
             if ft.is_symlink() {
                 let target =
                     fs::read_link(&path).with_context(|| format!("readlink {}", path.display()))?;
+                // Windows needs to know a link's kind at creation; a
+                // dangling link (no target metadata) is recorded as a file.
+                if fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+                    append_pax(tar, SYMLINK_DIR_PAX_KEY, "1")
+                        .with_context(|| format!("archiving symlink {}", rel.display()))?;
+                }
                 h.set_entry_type(tar::EntryType::Symlink);
                 h.set_size(0);
                 tar.append_link(&mut h, &name, &target)
@@ -150,6 +156,42 @@ pub fn append_workspace<W: Write>(
         &mut stats,
     )?;
     Ok(stats)
+}
+
+/// PAX extended-header key marking a symlink entry whose target is a
+/// directory (value `"1"`). Only a Windows load acts on it (it must create a
+/// directory symlink explicitly); tar readers ignore unknown PAX keys.
+pub const SYMLINK_DIR_PAX_KEY: &str = "IZBA.symlink.dir";
+
+/// Appends a PAX local extended header (`x`) carrying one `key=value`
+/// record; it applies to the NEXT entry and is consumed by the reader (it is
+/// never yielded as an entry). The header's own name is short and fixed, so
+/// it never needs a GNU long-name entry of its own.
+fn append_pax<W: Write>(tar: &mut tar::Builder<W>, key: &str, value: &str) -> Result<()> {
+    // "<len> <key>=<value>\n", where <len> counts the whole record,
+    // including its own digits.
+    let body = format!(" {key}={value}\n");
+    let mut len = body.len();
+    while (len.to_string().len() + body.len()) != len {
+        len = len.to_string().len() + body.len();
+    }
+    let record = format!("{len}{body}");
+    let mut h = tar::Header::new_gnu();
+    h.set_entry_type(tar::EntryType::XHeader);
+    h.set_mode(0o644);
+    h.set_size(record.len() as u64);
+    tar.append_data(&mut h, "PaxHeader", record.as_bytes())?;
+    Ok(())
+}
+
+/// Whether a symlink entry was saved pointing at a directory
+/// ([`SYMLINK_DIR_PAX_KEY`]). Any malformed PAX data reads as "no".
+pub fn is_dir_symlink<R: Read>(entry: &mut tar::Entry<R>) -> bool {
+    let Ok(Some(exts)) = entry.pax_extensions() else {
+        return false;
+    };
+    exts.flatten()
+        .any(|x| x.key() == Ok(SYMLINK_DIR_PAX_KEY) && x.value() == Ok("1"))
 }
 
 /// Opens a workspace file for archiving without following a symlink swapped
@@ -293,7 +335,21 @@ pub fn unpack_entry<R: Read>(
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let res = entry.unpack(&target);
+    // tar-rs creates every symlink as a FILE symlink on Windows, which
+    // would leave a saved directory link broken: create those explicitly.
+    #[cfg(windows)]
+    let res = if ty == tar::EntryType::Symlink && is_dir_symlink(entry) {
+        let link = entry
+            .link_name()?
+            .with_context(|| format!("symlink {} has no target", rel.display()))?
+            .to_string_lossy()
+            .replace('/', "\\");
+        std::os::windows::fs::symlink_dir(link, &target)
+    } else {
+        entry.unpack(&target).map(drop)
+    };
+    #[cfg(not(windows))]
+    let res = entry.unpack(&target).map(drop);
     #[cfg(unix)]
     if res.is_ok() && ty == tar::EntryType::Directory {
         use std::os::unix::fs::PermissionsExt;
@@ -552,6 +608,64 @@ mod tests {
             std::fs::read_link(dst.join("link")).unwrap(),
             PathBuf::from("run.sh")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_symlink_carries_the_pax_dir_marker() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("f"), b"x").unwrap();
+        symlink("sub", src.join("dlink")).unwrap();
+        symlink("f", src.join("flink")).unwrap();
+        symlink("nowhere", src.join("gone")).unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            append_workspace(&mut b, &src, "workspaces/a", &Default::default()).unwrap();
+            b.finish().unwrap();
+        }
+        let mut seen = std::collections::BTreeMap::new();
+        let mut ar = tar::Archive::new(&buf[..]);
+        for e in ar.entries().unwrap() {
+            let mut e = e.unwrap();
+            let p = e.path().unwrap().to_string_lossy().into_owned();
+            // The PAX record is consumed by the reader, never an entry.
+            assert!(p.starts_with("workspaces/a/"), "{p}");
+            if e.header().entry_type() == tar::EntryType::Symlink {
+                seen.insert(p, is_dir_symlink(&mut e));
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                ("workspaces/a/dlink".to_string(), true),
+                ("workspaces/a/flink".to_string(), false),
+                ("workspaces/a/gone".to_string(), false),
+            ]
+            .into_iter()
+            .collect()
+        );
+        // Unix restores it as the plain symlink it was.
+        let dst = t.path().join("dst");
+        let mut ar = tar::Archive::new(&buf[..]);
+        for e in ar.entries().unwrap() {
+            let mut e = e.unwrap();
+            let rel = e
+                .path()
+                .unwrap()
+                .strip_prefix("workspaces/a")
+                .unwrap()
+                .to_path_buf();
+            unpack_entry(&mut e, &dst, &rel, &mut DirModes::new()).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_link(dst.join("dlink")).unwrap(),
+            Path::new("sub")
+        );
+        assert!(dst.join("dlink").is_dir());
     }
 
     #[cfg(unix)]
