@@ -85,12 +85,30 @@ pub fn remove_core(d: &mut dyn DaemonApi, name: &str, force: bool) -> Result<(),
     if d.lockdown_supported() {
         let configured = d.lockdown_state(name).map_err(|e| e.to_string())?;
         if configured.is_locked() {
+            if !force {
+                // `sandbox::remove` refuses a live sandbox without force. Refuse
+                // BEFORE releasing the account, or a running locked sandbox would
+                // survive the failed rm silently unlocked.
+                let detail = d.inspect(name).map_err(|e| e.to_string())?;
+                if detail.status != "stopped" {
+                    return Err(format!(
+                        "sandbox '{name}' is running — stop it before removing (its Windows \
+                         lock-down account is still in place)"
+                    ));
+                }
+            }
             d.unlock(name).map_err(|e| {
                 format!(
                     "Windows account for '{name}' was not released ({e:#}) — approve the \
                      prompt to remove it, or run 'izba windows-cleanup' later"
                 )
             })?;
+            return d.remove(name, force).map_err(|e| {
+                format!(
+                    "{e}; its Windows lock-down account was already released — run \
+                     'izba lockdown {name}' to re-lock it"
+                )
+            });
         }
     }
     d.remove(name, force).map_err(|e| e.to_string())
@@ -311,6 +329,7 @@ pub fn lockdown_core(d: &mut dyn DaemonApi, name: &str) -> Result<String, String
     }
 }
 
+/// Core of `unlock`: deprovision the sandbox's Windows account (pops UAC).
 pub fn unlock_core(d: &mut dyn DaemonApi, name: &str) -> Result<(), String> {
     d.unlock(name).map_err(|e| format!("{e:#}"))
 }
@@ -1103,6 +1122,7 @@ mod tests {
     fn remove_core_releases_a_locked_sandbox_account_before_rm() {
         let mut d = FakeDaemon::default();
         lockdown_core(&mut d, "web").unwrap();
+        d.detail_status = "stopped".into();
         d.calls.clear();
         remove_core(&mut d, "web", false).unwrap();
         assert_eq!(
@@ -1115,6 +1135,7 @@ mod tests {
     fn remove_core_aborts_without_rm_when_unlock_is_declined() {
         let mut d = FakeDaemon::default();
         lockdown_core(&mut d, "web").unwrap();
+        d.detail_status = "stopped".into();
         d.unlock_fail = Some("unlock cancelled by user".into());
         d.calls.clear();
         let err = remove_core(&mut d, "web", false).unwrap_err();
@@ -1125,6 +1146,67 @@ mod tests {
             "{:?}",
             d.calls
         );
+    }
+
+    #[test]
+    fn remove_core_refuses_a_running_locked_sandbox_before_unlocking() {
+        let mut d = FakeDaemon::default();
+        lockdown_core(&mut d, "web").unwrap();
+        d.calls.clear();
+        let err = remove_core(&mut d, "web", false).unwrap_err();
+        assert!(err.contains("stop it before removing"), "{err}");
+        assert!(
+            !d.calls
+                .iter()
+                .any(|c| c.starts_with("unlock:") || c.starts_with("rm:")),
+            "{:?}",
+            d.calls
+        );
+        assert!(
+            inspect_core(&mut d, "web")
+                .unwrap()
+                .lockdown
+                .unwrap()
+                .locked
+        );
+    }
+
+    #[test]
+    fn remove_core_force_on_a_running_locked_sandbox_unlocks_then_removes() {
+        let mut d = FakeDaemon::default();
+        lockdown_core(&mut d, "web").unwrap();
+        d.calls.clear();
+        remove_core(&mut d, "web", true).unwrap();
+        assert_eq!(
+            d.calls,
+            vec!["unlock:web".to_string(), "rm:web:true".to_string()]
+        );
+    }
+
+    #[test]
+    fn remove_core_says_so_when_rm_fails_after_the_account_was_released() {
+        let mut d = FakeDaemon::default();
+        lockdown_core(&mut d, "web").unwrap();
+        d.detail_status = "stopped".into();
+        d.fail_remove = true;
+        d.calls.clear();
+        let err = remove_core(&mut d, "web", false).unwrap_err();
+        assert!(err.contains("already released"), "{err}");
+        assert!(err.contains("izba lockdown web"), "{err}");
+        assert_eq!(
+            d.calls,
+            vec!["unlock:web".to_string(), "rm:web:false".to_string()]
+        );
+    }
+
+    #[test]
+    fn lockdown_core_maps_a_provisioning_failure_to_err() {
+        let mut d = FakeDaemon {
+            fail_action: true,
+            ..FakeDaemon::default()
+        };
+        let err = lockdown_core(&mut d, "web").unwrap_err();
+        assert!(err.contains("provision helper failed"), "{err}");
     }
 
     #[test]
