@@ -102,6 +102,16 @@ describe("Detail actions", () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
   });
 
+  it("re-fetches inspect after a successful Restart (running -> running)", async () => {
+    const { api } = await import("../lib/ipc");
+    const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
+    render(<Detail sandbox={sbx} onChanged={noop} />);
+    await waitFor(() => expect(api.inspect).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: /^restart$/i }));
+    await waitFor(() => expect(api.restart).toHaveBeenCalledWith("web"));
+    await waitFor(() => expect(api.inspect).toHaveBeenCalledTimes(2));
+  });
+
   it("confirms before stopping a running sandbox", async () => {
     const { api } = await import("../lib/ipc");
     const sbx: SandboxView = { name: "web", image: "ubuntu:24.04", state: { kind: "running" } };
