@@ -452,7 +452,7 @@ pub(crate) fn hanging_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<Box
 pub(crate) fn trickle_frame(mut s: UdsStream) {
     const ANNOUNCED_LEN: u32 = 4096;
     const TRICKLE_GAP: Duration = Duration::from_millis(50);
-    const TRICKLE_FOR: Duration = Duration::from_secs(3);
+    const TRICKLE_FOR: Duration = Duration::from_secs(6);
     if s.write_all(&ANNOUNCED_LEN.to_le_bytes()).is_err() {
         return;
     }
@@ -473,6 +473,38 @@ pub(crate) fn trickling_connector() -> impl Fn(&Paths, &str) -> anyhow::Result<B
         std::thread::spawn(move || {
             let mut s = server;
             if read_frame::<_, Request>(&mut s).is_ok() {
+                trickle_frame(s);
+            }
+        });
+        Ok(Box::new(client) as Box<dyn IoStream>)
+    }
+}
+
+/// Like [`trickling_connector`], but the FIRST connection is a healthy guest
+/// that answers `Health` promptly — so `sandbox::control`'s liveness check
+/// passes — and every later connection trickles. Isolates the probe's own
+/// exchange as the thing a deadline must bound.
+pub(crate) fn health_then_trickling_connector(
+) -> impl Fn(&Paths, &str) -> anyhow::Result<Box<dyn IoStream>> {
+    let dials = std::sync::atomic::AtomicUsize::new(0);
+    move |_paths: &Paths, _name: &str| {
+        let first = dials.fetch_add(1, Ordering::SeqCst) == 0;
+        let (client, server) = UdsStream::pair()?;
+        std::thread::spawn(move || {
+            let mut s = server;
+            if read_frame::<_, Request>(&mut s).is_err() {
+                return;
+            }
+            if first {
+                let _ = write_frame(
+                    &mut s,
+                    &Response::Health(HealthInfo {
+                        version: "test".into(),
+                        uptime_ms: 1,
+                        container: Some(izba_proto::ContainerState::Running),
+                    }),
+                );
+            } else {
                 trickle_frame(s);
             }
         });

@@ -1111,12 +1111,15 @@ const CONTAINER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Dial a running sandbox's control port for a probe whose guest I/O must all
 /// finish by `deadline`. Every stream the connector hands out — including the
 /// liveness `Health` check `sandbox::control` runs before the real dial — is a
-/// [`DeadlineStream`], so a guest that trickles bytes can stretch neither
-/// exchange past the deadline. The dial itself (the VMM's hybrid-vsock
-/// `CONNECT` handshake, answered by the VMM rather than the guest) stays
-/// outside it.
+/// [`DeadlineStream`], so all guest I/O of both exchanges is bounded by the
+/// overall deadline, and no dial starts once it has passed. At most a dial's
+/// hybrid-vsock `CONNECT` handshake — answered by the VMM, not the guest — can
+/// run past it.
 fn probe_control(d: &Arc<Daemon>, name: &str, deadline: Instant) -> Option<Box<dyn IoStream>> {
     let bounded = |paths: &Paths, name: &str| -> anyhow::Result<Box<dyn IoStream>> {
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            bail!("probe deadline passed before dialing '{name}'");
+        }
         let inner = (d.connector())(paths, name)?;
         Ok(Box::new(DeadlineStream::new(inner, deadline)))
     };
@@ -1152,9 +1155,10 @@ fn probe_container_state(
 /// posture as a dead dockerd). Every failure mode (stream port unreachable,
 /// wedged or trickling guest, `Error{ConnectFailed}`, junk reply) maps to
 /// `false`. `timeout` is an OVERALL deadline from probe start (#205): every
-/// read and write goes through a [`DeadlineStream`], so a guest dribbling its
-/// reply cannot keep resetting a per-read timeout. The dial's own `CONNECT`
-/// handshake is answered by the VMM, not the guest, and stays outside it.
+/// read and write goes through a [`DeadlineStream`], so all guest I/O is
+/// bounded by it and a guest dribbling its reply cannot keep resetting a
+/// per-read timeout. At most the dial's `CONNECT` handshake — answered by the
+/// VMM, not the guest — sits outside it.
 /// (In docker mode the guest-side dial reaches the container's wildcard
 /// listener via the `192.168.127.2` veth fallback instead of loopback — same
 /// TcpDial contract either way.)
@@ -2255,8 +2259,9 @@ mod tests {
         load_json, save_json, RunState, SandboxConfig, UserFallback, CONFIG_FILE, STATE_FILE,
     };
     use crate::testutil::{
-        fake_connector, hanging_connector, live_identity, spawn_sleep, test_paths, trickle_frame,
-        trickling_connector, wait_dead, write_state, write_state_with_run_dir, MockDriver,
+        fake_connector, hanging_connector, health_then_trickling_connector, live_identity,
+        spawn_sleep, test_paths, trickle_frame, wait_dead, write_state, write_state_with_run_dir,
+        MockDriver,
     };
     use crate::vmm::UdsStream;
     use izba_proto::{read_frame, write_frame, Request, Response};
@@ -5315,20 +5320,21 @@ mod tests {
     }
 
     /// Upper bound a trickle test allows a 300 ms-budget probe: generous for a
-    /// loaded CI host, yet far below the fake guest's 3 s trickle — so passing
+    /// loaded CI host, yet far below the fake guest's 6 s trickle — so passing
     /// proves the OVERALL deadline fired, not the peer's eventual hang-up.
     const TRICKLE_PROBE_CEILING: Duration = Duration::from_millis(1500);
 
     /// #205: a hostile guest that dribbles its reply a byte at a time, each
     /// byte inside the per-read timeout, must not hold the probe past its
-    /// overall deadline. A per-syscall timeout resets on every partial read,
+    /// overall deadline. The liveness check answers promptly, so what gets
+    /// bounded is the probe's own `Health` exchange. A per-syscall timeout resets on every partial read,
     /// so only a deadline measured from probe start bounds this.
     #[test]
     fn container_probe_is_bounded_by_an_overall_deadline_against_a_trickling_guest() {
         let (dir, paths) = test_paths();
         std::fs::create_dir_all(dir.path().join("ws")).unwrap();
         let mut deps = test_deps();
-        deps.connector = Box::new(trickling_connector());
+        deps.connector = Box::new(health_then_trickling_connector());
         let d = Arc::new(Daemon::new(paths, deps));
         let mut c = client_conn(&d);
         assert!(matches!(
@@ -5353,7 +5359,7 @@ mod tests {
         let (dir, paths) = test_paths();
         std::fs::create_dir_all(dir.path().join("ws")).unwrap();
         let mut deps = test_deps();
-        deps.connector = Box::new(trickling_connector());
+        deps.connector = Box::new(health_then_trickling_connector());
         let d = Arc::new(Daemon::new(paths, deps));
         let mut c = client_conn(&d);
         assert!(matches!(
@@ -5369,6 +5375,38 @@ mod tests {
             t0.elapsed() < TRICKLE_PROBE_CEILING,
             "a trickling guest held the probe {:?}",
             t0.elapsed()
+        );
+    }
+
+    /// #205: the guest I/O deadline also gates the DIAL. An already-spent
+    /// budget must not pay for another VMM `CONNECT` handshake — neither the
+    /// liveness check's nor the probe's.
+    #[test]
+    fn control_probes_do_not_dial_once_the_deadline_has_passed() {
+        let (dir, paths) = test_paths();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut deps = test_deps();
+        let counted = Arc::clone(&dials);
+        let hang = hanging_connector();
+        deps.connector = Box::new(move |p: &Paths, n: &str| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            hang(p, n)
+        });
+        let d = Arc::new(Daemon::new(paths, deps));
+        let mut c = client_conn(&d);
+        assert!(matches!(
+            rpc(&mut c, &create_req(&dir, "web")),
+            DaemonResponse::Created { .. }
+        ));
+        write_state(&d.paths, "web", live_identity());
+
+        assert_eq!(probe_container_state(&d, "web", Duration::ZERO), None);
+        assert!(probe_guest_stats(&d, "web", Duration::ZERO).is_none());
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an expired budget still dialed the guest"
         );
     }
 
