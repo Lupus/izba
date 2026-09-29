@@ -1813,6 +1813,328 @@ fn disk_owner_remap_preserves_container_view() {
     assert_ok(&izba(&data, no_env, &["rm", "--force", name]), "rm");
 }
 
+/// Content digests of every disk a sandbox owns in one data root, keyed
+/// independently of the sandbox's name so a source and a loaded copy compare
+/// directly: `rw.img`, each anonymous volume (`anon/<file>`, the
+/// `<sandbox>/volumes/<eph_id>.img` files) and each named volume the sandbox
+/// declares (`named/<name>`). Uses the archive's own sparse-aware digest, so a
+/// sparse hole and written zeros hash the same — what `izba save` promises to
+/// preserve is the CONTENT, not the allocation.
+#[cfg(target_os = "linux")]
+fn disk_digests(data: &Path, name: &str) -> std::collections::BTreeMap<String, String> {
+    use izba_core::bundle::sparse::content_digest;
+    let dir = data.join("sandboxes").join(name);
+    let mut out = std::collections::BTreeMap::new();
+    let digest =
+        |p: &Path| content_digest(p).unwrap_or_else(|e| panic!("digest {}: {e:#}", p.display()));
+    out.insert("rw.img".to_string(), digest(&dir.join("rw.img")));
+    if let Ok(entries) = std::fs::read_dir(dir.join("volumes")) {
+        for e in entries.filter_map(|e| e.ok()) {
+            let f = e.file_name().to_string_lossy().into_owned();
+            if f.ends_with(".img") {
+                out.insert(format!("anon/{f}"), digest(&e.path()));
+            }
+        }
+    }
+    let cfg: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    for v in cfg["volumes"].as_array().into_iter().flatten() {
+        if let Some(n) = v["name"].as_str() {
+            let p = data.join("volumes").join(format!("{n}.img"));
+            out.insert(format!("named/{n}"), digest(&p));
+        }
+    }
+    out
+}
+
+/// The `izba ls` row for `name` (first column match), or "" when absent.
+#[cfg(target_os = "linux")]
+fn ls_row(data: &Path, name: &str) -> String {
+    let o = izba(data, &[], &["ls"]);
+    assert_ok(&o, "ls");
+    stdout_of(&o)
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some(name))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Save/load (Task 12): the full move path on real microVMs. A sandbox with a
+/// named AND an anonymous volume and a bundled workspace is saved with
+/// `--stop`, then loaded under a new name into a SECOND data root served by
+/// its own daemon (the stand-in for another machine). Every disk must arrive
+/// byte-identical (content digest), the workspace must keep its file modes,
+/// and the loaded sandbox must boot and see what the source wrote on each
+/// disk: the overlay upper (`/root`), both volumes, and the workspace share.
+#[cfg(target_os = "linux")]
+#[test]
+fn save_load_round_trip_is_byte_identical() {
+    use std::os::unix::fs::PermissionsExt;
+    if !want() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let data_a: PathBuf = root.path().join("izba-a");
+    let data_b: PathBuf = root.path().join("izba-b");
+    let ws_a = root.path().join("wsA");
+    let ws_b = root.path().join("wsB");
+    let archive = root.path().join("mv.izba");
+    std::fs::create_dir_all(&ws_a).unwrap();
+    std::fs::write(ws_a.join("hello.txt"), "hello from A\n").unwrap();
+    std::fs::write(ws_a.join("run.sh"), "#!/bin/sh\necho run\n").unwrap();
+    std::fs::set_permissions(ws_a.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ws_a_s = ws_a.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+    // One guard per data root: each has its own daemon (and A its named
+    // volume), and both must be torn down on any exit path.
+    let _guard_a = SandboxGuard {
+        data: data_a.clone(),
+        name: "mv",
+    };
+    let _guard_b = SandboxGuard {
+        data: data_b.clone(),
+        name: "mv2",
+    };
+
+    // [1] Source sandbox: small sparse scratch disk + one named + one anon volume.
+    assert_ok(
+        &izba(
+            &data_a,
+            no_env,
+            &[
+                "create",
+                "--image",
+                IMAGE,
+                "--name",
+                "mv",
+                "--rw-size-gb",
+                "1",
+                "--volume",
+                "data:/data:64m",
+                "--volume",
+                "/scratch:32m",
+                &ws_a_s,
+            ],
+        ),
+        "create mv",
+    );
+    assert_ok(&izba(&data_a, no_env, &["start", "mv"]), "start mv");
+    assert_ok(
+        &izba(
+            &data_a,
+            no_env,
+            &[
+                "exec",
+                "mv",
+                "--",
+                "sh",
+                "-c",
+                "echo root > /root/r && echo d > /data/d && echo s > /scratch/s && sync",
+            ],
+        ),
+        "write marks on every disk",
+    );
+
+    // [2] Save, stopping the running sandbox first.
+    let archive_s = archive.to_string_lossy().into_owned();
+    assert_ok(
+        &izba(
+            &data_a,
+            no_env,
+            &["save", "mv", "-o", &archive_s, "--with-workspace", "--stop"],
+        ),
+        "save --stop",
+    );
+    assert!(archive.is_file(), "save wrote no archive");
+    let row = ls_row(&data_a, "mv");
+    assert!(
+        row.contains("stopped"),
+        "save --stop leaves the source stopped: {row:?}"
+    );
+
+    let src = disk_digests(&data_a, "mv");
+    assert_eq!(
+        src.keys().cloned().collect::<Vec<_>>(),
+        vec!["anon/0.img", "named/data", "rw.img"],
+        "source disk inventory (rw + one anon + one named volume)"
+    );
+    eprintln!("save_load: source digests {src:?}");
+
+    // [3] Load into a fresh data root under a new name + workspace dir.
+    let ws_b_s = ws_b.to_string_lossy().into_owned();
+    let o = izba(
+        &data_b,
+        no_env,
+        &["load", &archive_s, "--as", "mv2", "--workspace", &ws_b_s],
+    );
+    assert_ok(&o, "load --as mv2");
+    eprintln!("load: {}", stdout_of(&o));
+
+    // [4] Disks byte-identical, workspace content and modes preserved.
+    assert_eq!(disk_digests(&data_b, "mv2"), src, "disk digests A vs B");
+    assert_eq!(
+        std::fs::read_to_string(ws_b.join("hello.txt")).unwrap(),
+        "hello from A\n"
+    );
+    let mode = std::fs::metadata(ws_b.join("run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o755, "run.sh mode: {mode:o}");
+
+    // [5] The loaded sandbox boots and sees every disk's content.
+    assert_ok(&izba(&data_b, no_env, &["start", "mv2"]), "start mv2");
+    let o = izba(
+        &data_b,
+        no_env,
+        &[
+            "exec",
+            "mv2",
+            "--",
+            "cat",
+            "/root/r",
+            "/data/d",
+            "/scratch/s",
+            "/workspace/hello.txt",
+        ],
+    );
+    assert_ok(&o, "cat marks in mv2");
+    assert_eq!(stdout_of(&o), "root\nd\ns\nhello from A\n");
+    assert_ok(&izba(&data_b, no_env, &["rm", "--force", "mv2"]), "rm mv2");
+}
+
+/// Poll `docker info` inside a docker-mode sandbox until the auto-started
+/// engine answers (same ceiling as `docker_publish_reaches_inner_container`).
+#[cfg(target_os = "linux")]
+fn wait_docker_ready(data: &Path, name: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        if izba(
+            data,
+            &[],
+            &["exec", name, "--", "docker", "info", "--format", "{{.ID}}"],
+        )
+        .status
+        .success()
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    false
+}
+
+/// Save/load (Task 12) of a docker-mode sandbox: the auto-injected
+/// `/var/lib/docker` volume and the idmapped layers must survive the move — the
+/// engine comes back up in the second data root and the marker it holds is
+/// still there. The workspace is NOT bundled: load reuses the source path,
+/// which exists on this (same) host.
+#[cfg(target_os = "linux")]
+#[test]
+fn save_load_docker_mode_round_trip() {
+    if !want() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let data_a: PathBuf = root.path().join("izba-a");
+    let data_b: PathBuf = root.path().join("izba-b");
+    let ws = root.path().join("ws");
+    let archive = root.path().join("dind.izba");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let archive_s = archive.to_string_lossy().into_owned();
+    let no_env: &[(&str, &str)] = &[];
+    let name = "dind-mv";
+    let _guard_a = SandboxGuard {
+        data: data_a.clone(),
+        name,
+    };
+    let _guard_b = SandboxGuard {
+        data: data_b.clone(),
+        name,
+    };
+
+    assert_ok(
+        &izba(
+            &data_a,
+            no_env,
+            &[
+                "create",
+                "--docker",
+                "--image",
+                DIND_IMAGE,
+                "--cpus",
+                "2",
+                "--mem",
+                "2048",
+                "--rw-size-gb",
+                "2",
+                "--name",
+                name,
+                &ws_s,
+            ],
+        ),
+        "create --docker",
+    );
+    assert_ok(&izba(&data_a, no_env, &["start", name]), "start (A)");
+    assert!(
+        wait_docker_ready(&data_a, name),
+        "dockerd (A) never became ready within 120s\n{}",
+        docker_diag(&data_a, name)
+    );
+    assert_ok(
+        &izba(
+            &data_a,
+            no_env,
+            &[
+                "exec",
+                name,
+                "--",
+                "sh",
+                "-c",
+                "docker info >/dev/null && touch /var/lib/docker/marker && sync",
+            ],
+        ),
+        "touch engine-volume marker",
+    );
+
+    assert_ok(
+        &izba(&data_a, no_env, &["save", name, "-o", &archive_s, "--stop"]),
+        "save --stop (docker)",
+    );
+    let src = disk_digests(&data_a, name);
+    eprintln!("save_load_docker: source digests {src:?}");
+    // Free data root A's image + disks before loading a second copy: the
+    // DIND image is the largest thing this suite stores.
+    assert_ok(&izba(&data_a, no_env, &["rm", "--force", name]), "rm (A)");
+
+    let o = izba(&data_b, no_env, &["load", &archive_s]);
+    assert_ok(&o, "load (docker)");
+    assert_eq!(disk_digests(&data_b, name), src, "disk digests A vs B");
+
+    assert_ok(&izba(&data_b, no_env, &["start", name]), "start (B)");
+    assert!(
+        wait_docker_ready(&data_b, name),
+        "dockerd (B) never became ready after load\n{}",
+        docker_diag(&data_b, name)
+    );
+    let o = izba(
+        &data_b,
+        no_env,
+        &["exec", name, "--", "test", "-e", "/var/lib/docker/marker"],
+    );
+    assert!(
+        o.status.success(),
+        "marker on the engine volume did not survive save/load\n{}",
+        docker_diag(&data_b, name)
+    );
+    assert_ok(
+        &izba(&data_b, no_env, &["exec", name, "--", "docker", "info"]),
+        "docker info (B)",
+    );
+    assert_ok(&izba(&data_b, no_env, &["rm", "--force", name]), "rm (B)");
+}
+
 /// Docker mode (#198) through the FULL daemon path: a port published against
 /// a container the nested Docker Engine started must be reachable from the
 /// host. Every hop is real — host TcpStream → izbad relay → `StreamOpen::
