@@ -227,7 +227,7 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
 - **Cmdline chain:** `console=ttyS0 izba.hostname=<name>
   [izba.volumes=<p0>,<p1>,…] [izba.buildout=1] [izba.usb=1]
   [izba.docker=1 izba.uidmap=<d-p-n>,… izba.gidmap=<d-p-n>,… [izba.wsidmap=1]]
-  [izba.diskuidmap=<d-p-n>,… izba.diskgidmap=<d-p-n>,…] [izba.vnc=1]` ↔
+  [izba.vnc=1] [izba.diskuidmap=<d-p-n>,… izba.diskgidmap=<d-p-n>,…]` ↔
   `hack/kernel.config` (`SERIAL_8250_CONSOLE`; netfilter/nftables —
   `NF_TABLES`/`NFT_NAT`/`NFT_REDIR`/`NF_CONNTRACK` — + `CONFIG_DUMMY`) ↔ init
   reads `izba.hostname` for sethostname and `izba.volumes` (ordered,
@@ -248,7 +248,9 @@ genuinely need a listener must runtime-skip on `PermissionDenied` (see
   `izba.diskuidmap=`/`izba.diskgidmap=` (`disk-presented-n` triples, same
   grammar as `izba.uidmap=`) appear only on a MOVED non-docker sandbox
   (`config.disk_owner` set by `izba load`, and different from the current
-  owner): init applies P = M_tgt ∘ M_src⁻¹ as an idmapped mount over `/upper`
+  owner; appended AFTER `izba.vnc=1`, so no earlier flag moves): init applies
+  P = M_tgt ∘ M_src⁻¹ — a full bijection, with no fsuid-0 anchor (unlike the
+  docker layer idmap) — as an idmapped mount over `/upper`
   and each user volume (never the erofs lower), preserving the container's
   view of ownership; fail-closed — a kernel that refuses aborts boot. One
   generator (`sandbox::disk_idmap_for`), one call site. `disk_owner: None` (every
