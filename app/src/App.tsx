@@ -3,6 +3,7 @@ import { usePolling } from "./lib/store";
 import { TopBar } from "./components/TopBar";
 import { Rail } from "./components/Rail";
 import { Detail } from "./components/Detail";
+import { NoticeBanner } from "./components/NoticeBanner";
 import { About } from "./components/About";
 import { NewSandbox } from "./components/NewSandbox";
 import { StorageView } from "./components/StorageView";
@@ -15,12 +16,14 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [showAbout, setShowAbout] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const [view, setView] = useState<View>("sandboxes");
   const current = sandboxes.find((s) => s.name === selected) ?? null;
 
   return (
     <div className="h-full flex flex-col">
       <TopBar phase={phase} daemon={daemon} onAbout={() => setShowAbout(true)} />
+      <NoticeBanner notice={notice} onDismiss={() => setNotice(null)} />
       <div className="flex flex-1 min-h-0">
         <Rail
           sandboxes={sandboxes}
@@ -35,7 +38,7 @@ export default function App() {
         ) : view === "usb" ? (
           <UsbView />
         ) : (
-          <Detail sandbox={current} onChanged={refresh} />
+          <Detail sandbox={current} onChanged={refresh} onNotice={setNotice} />
         )}
       </div>
       {showAbout && <About onClose={() => setShowAbout(false)} />}
