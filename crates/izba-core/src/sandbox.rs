@@ -22,7 +22,9 @@ use crate::liveness::{assess, Liveness, Probes};
 use crate::paths::Paths;
 use crate::procmgr;
 use crate::state::{load_json, save_json, RunState, SandboxConfig, CONFIG_FILE, STATE_FILE};
-use crate::vmm::{BlockDisk, FsShare, IoStream, LockdownLaunch, VmHandle, VmSpec, VmmDriver};
+use crate::vmm::{
+    BlockDisk, DeadlineStream, FsShare, IoStream, LockdownLaunch, VmHandle, VmSpec, VmmDriver,
+};
 
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BOOT_POLL: Duration = Duration::from_millis(200);
@@ -739,9 +741,17 @@ impl Probes for RealProbes<'_> {
         procmgr::pid_alive(id)
     }
 
+    /// Bounded by an OVERALL `CONTROL_RPC_TIMEOUT`, not just per read (#205):
+    /// the supervisor tick runs this for every sandbox on one thread, so a
+    /// guest trickling its reply a byte at a time must not stall supervision
+    /// of all the others.
     fn control_answers(&self) -> bool {
         let attempt = || -> anyhow::Result<()> {
-            let mut s = (self.connector)(self.paths, self.name)?;
+            let inner = (self.connector)(self.paths, self.name)?;
+            let mut s: Box<dyn IoStream> = Box::new(DeadlineStream::new(
+                inner,
+                Instant::now() + CONTROL_RPC_TIMEOUT,
+            ));
             match rpc(&mut s, &Request::Health, CONTROL_RPC_TIMEOUT)? {
                 Response::Health(_) => Ok(()),
                 other => bail!("unexpected health reply: {other:?}"),
@@ -2212,12 +2222,41 @@ mod tests {
     use super::*;
     use crate::testutil::{
         count_shutdowns, dead_identity, fake_connector, hanging_connector, live_identity,
-        spawn_sleep, test_paths, wait_dead, write_state, write_state_with_sidecars, MockDriver,
-        FIXTURE_IMAGE_PATH,
+        spawn_sleep, test_paths, trickling_connector, wait_dead, write_state,
+        write_state_with_sidecars, MockDriver, FIXTURE_IMAGE_PATH,
     };
     use std::path::Path;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+
+    // -----------------------------------------------------------------------
+    // Liveness control-plane probe
+    // -----------------------------------------------------------------------
+
+    /// #205: the liveness `Health` roundtrip runs on the supervisor's single
+    /// tick thread for EVERY sandbox, so a guest dribbling its reply a byte at
+    /// a time (each byte inside the per-read timeout) must not stall it past
+    /// `CONTROL_RPC_TIMEOUT` overall — here, well below the fake's 6 s trickle.
+    #[test]
+    fn control_answers_is_bounded_by_an_overall_deadline_against_a_trickling_guest() {
+        let (_dir, paths) = test_paths();
+        let connector = trickling_connector();
+        let probes = RealProbes {
+            connector: &connector,
+            paths: &paths,
+            name: "web",
+        };
+        let t0 = Instant::now();
+        assert!(
+            !probes.control_answers(),
+            "a trickling guest is not healthy"
+        );
+        assert!(
+            t0.elapsed() < CONTROL_RPC_TIMEOUT + Duration::from_millis(1500),
+            "a trickling guest held the liveness probe {:?}",
+            t0.elapsed()
+        );
+    }
 
     // -----------------------------------------------------------------------
     // live_run_dir resolution
