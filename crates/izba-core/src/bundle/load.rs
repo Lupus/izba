@@ -35,6 +35,10 @@ use crate::state::{load_json, save_json, PortRule, SandboxConfig, CONFIG_FILE};
 /// Image files an existing-but-incomplete target cache entry may gain.
 const IMAGE_META: [&str; 3] = ["config.json", "passwd", "group"];
 
+/// Context on a bundled workspace that cannot be created where it maps to.
+const PLACE_HINT: &str = "cannot place the bundled workspace there; \
+                          pass --workspace <dir> or --workspace-root <dir>";
+
 /// Upper bound on the manifest / trailer JSON read into memory.
 const MAX_JSON: u64 = 16 << 20;
 
@@ -300,14 +304,16 @@ fn run(
             .ws_target
             .parent()
             .with_context(|| format!("workspace {} has no parent", s.ws_target.display()))?;
-        mkdirs(undo, parent, None)?;
+        mkdirs(undo, parent, None).context(PLACE_HINT)?;
         let base = s
             .ws_target
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
         let ws_stage = parent.join(format!(".izba-load-{pid}-{seq}-{base}"));
-        fs::create_dir(&ws_stage).with_context(|| format!("creating {}", ws_stage.display()))?;
+        fs::create_dir(&ws_stage)
+            .with_context(|| format!("creating {}", ws_stage.display()))
+            .context(PLACE_HINT)?;
         scratch.push(ws_stage.clone());
         s.ws_stage = Some(ws_stage);
     }
@@ -489,7 +495,9 @@ fn run(
             fs::remove_dir(t).with_context(|| format!("replacing {}", t.display()))?;
             undo.push(Undo::Recreate(t.clone()));
         }
-        fs::rename(ws_stage, t).with_context(|| format!("placing workspace {}", t.display()))?;
+        fs::rename(ws_stage, t)
+            .with_context(|| format!("placing workspace {}", t.display()))
+            .context(PLACE_HINT)?;
         undo.push(Undo::Remove(t.clone()));
         crate::procmgr::ensure_confinable(t)?;
     }
@@ -1405,6 +1413,30 @@ mod tests {
             std::fs::read_link(tgt.dir("ws/a/dlink")).unwrap(),
             PathBuf::from("sub")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unplaceable_bundled_workspace_hints_at_the_flags() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return; // root ignores the permission this relies on
+        }
+        let tgt = Tgt::new();
+        let mut o = opts_bundled(&tgt);
+        let ro = tgt.dir("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        o.workspace = Some(ro.join("deeper/ws"));
+        let before = tgt.snapshot();
+        let e = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks()).unwrap_err();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("pass --workspace <dir> or --workspace-root <dir>"),
+            "{msg}"
+        );
+        assert_eq!(tgt.snapshot(), before);
     }
 
     #[test]

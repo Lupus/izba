@@ -391,31 +391,40 @@ fn split_source(s: &str, os: &SourceOs) -> Vec<String> {
     }
 }
 
-/// Where a saved sandbox's workspace lands on this host. Same OS keeps the
-/// path verbatim; across OSes a path under the source home is re-rooted under
-/// `target_home`, anything else needs an explicit `--workspace` (`None`).
+/// Where a saved sandbox's workspace lands on this host. A path under the
+/// source home is re-rooted under `target_home` — across OSes, and on the same
+/// OS when the homes differ (another user / another machine layout); the same
+/// home keeps it verbatim. Anything outside the source home keeps its path on
+/// the same OS and needs an explicit `--workspace` across OSes (`None`).
 pub fn translate_workspace(
     source: &str,
     source_home: Option<&str>,
     source_os: &SourceOs,
     target_home: &Path,
 ) -> Option<PathBuf> {
-    if *source_os == SourceOs::current() {
-        return Some(PathBuf::from(source));
-    }
-    let src = split_source(source, source_os);
-    let home = split_source(source_home?, source_os);
+    let same_os = *source_os == SourceOs::current();
     let ci = *source_os == SourceOs::Windows;
-    let under = src.len() > home.len()
-        && home.iter().zip(&src).all(|(h, s)| {
-            if ci {
-                h.to_lowercase() == s.to_lowercase()
-            } else {
-                h == s
-            }
-        });
+    let eq = |a: &String, b: &String| {
+        if ci {
+            a.to_lowercase() == b.to_lowercase()
+        } else {
+            a == b
+        }
+    };
+    let src = split_source(source, source_os);
+    let home = source_home.map(|h| split_source(h, source_os));
+    let under = home
+        .as_ref()
+        .is_some_and(|home| src.len() > home.len() && home.iter().zip(&src).all(|(h, s)| eq(h, s)));
     if !under {
-        return None;
+        return same_os.then(|| PathBuf::from(source));
+    }
+    let home = home.unwrap_or_default();
+    if same_os {
+        let tgt = split_source(&target_home.to_string_lossy(), source_os);
+        if tgt.len() == home.len() && tgt.iter().zip(&home).all(|(t, h)| eq(t, h)) {
+            return Some(PathBuf::from(source));
+        }
     }
     let rebased = &src[home.len()..];
     // The components are attacker-controlled archive data: none may climb out
@@ -448,15 +457,53 @@ mod tests {
     use crate::bundle::manifest::SourceOs;
     use std::path::{Path, PathBuf};
 
+    /// `(source workspace, source home, target home)` spelled for this OS.
+    fn same_os_paths() -> (&'static str, &'static str, &'static str) {
+        if SourceOs::current() == SourceOs::Windows {
+            (r"C:\Users\u\proj", r"C:\Users\u", r"D:\home\v")
+        } else {
+            ("/home/u/proj", "/home/u", "/home/v")
+        }
+    }
+
     #[test]
-    fn translate_same_os_keeps_path() {
+    fn translate_same_os_same_home_keeps_path() {
+        let (src, home, _) = same_os_paths();
+        let p = translate_workspace(src, Some(home), &SourceOs::current(), Path::new(home));
+        assert_eq!(p, Some(PathBuf::from(src)));
+    }
+
+    #[test]
+    fn translate_same_os_different_home_rebases_under_the_target_home() {
+        let (src, home, tgt) = same_os_paths();
+        let p = translate_workspace(src, Some(home), &SourceOs::current(), Path::new(tgt));
+        assert_eq!(p, Some(Path::new(tgt).join("proj")));
+    }
+
+    #[test]
+    fn translate_same_os_outside_home_keeps_path() {
+        let (_, home, tgt) = same_os_paths();
+        let outside = if SourceOs::current() == SourceOs::Windows {
+            r"E:\work\proj"
+        } else {
+            "/srv/proj"
+        };
+        for h in [Some(home), None] {
+            let p = translate_workspace(outside, h, &SourceOs::current(), Path::new(tgt));
+            assert_eq!(p, Some(PathBuf::from(outside)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn translate_same_os_rebase_rejects_escaping_components() {
         let p = translate_workspace(
-            "/home/u/proj",
+            "/home/u/../../etc",
             Some("/home/u"),
             &SourceOs::current(),
             Path::new("/home/v"),
         );
-        assert_eq!(p, Some(PathBuf::from("/home/u/proj")));
+        assert_eq!(p, None);
     }
 
     #[test]
