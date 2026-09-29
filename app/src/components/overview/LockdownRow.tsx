@@ -16,7 +16,15 @@ export function LockdownRow({
   name,
   lockdown,
   onChanged,
-}: Readonly<{ name: string; lockdown: LockdownView; onChanged: () => void }>) {
+  unknown = false,
+}: Readonly<{
+  name: string;
+  lockdown: LockdownView;
+  onChanged: () => void;
+  /** The last posture refresh failed: the held `lockdown` may be out of date
+   *  (e.g. the CLI changed it), so withhold it — and its write controls. */
+  unknown?: boolean;
+}>) {
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [confirming, setConfirming] = useState(false);
   const alive = useRef(true);
@@ -39,6 +47,14 @@ export function LockdownRow({
       setPhase({ kind: "error", message: String(e) });
     }
   };
+
+  if (unknown) {
+    return (
+      <Row label="lock-down">
+        <span className="text-warning">unknown — refresh failed</span>
+      </Row>
+    );
+  }
 
   const pending = phase.kind === "pending";
   const summary = lockdown.locked

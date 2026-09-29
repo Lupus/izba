@@ -93,6 +93,70 @@ describe("OverviewTab", () => {
   });
 });
 
+describe("OverviewTab — posture freshness", () => {
+  const lockdown = { locked: false, account: null, net_blocked: false, restart_required: false, booted_as_account: false };
+  beforeEach(() => {
+    vi.useFakeTimers();
+    stats.mockResolvedValue(runningStats());
+    inspect.mockResolvedValue(detailFixture({ name: "web", lockdown }));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  const settle = () =>
+    act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+  it("re-fetches inspect every 15 s", async () => {
+    render(<OverviewTab sandbox={sandbox} />);
+    await settle();
+    expect(inspect).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+    expect(inspect).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-fetches inspect on window focus", async () => {
+    render(<OverviewTab sandbox={sandbox} />);
+    await settle();
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await settle();
+    expect(inspect).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops refreshing after unmount", async () => {
+    const { unmount } = render(<OverviewTab sandbox={sandbox} />);
+    await settle();
+    unmount();
+    const before = inspect.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(inspect).toHaveBeenCalledTimes(before);
+  });
+
+  it("shows the posture as unknown when a refresh fails, and recovers on the next success", async () => {
+    render(<OverviewTab sandbox={sandbox} />);
+    await settle();
+    expect(screen.getByText("unlocked")).toBeInTheDocument();
+    inspect.mockRejectedValueOnce(new Error("daemon restarting"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+    expect(screen.getByText("unknown — refresh failed")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /lock down/i })).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+    expect(screen.getByText("unlocked")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /lock down/i })).toBeInTheDocument();
+  });
+});
+
 describe("OverviewTab — stale data", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());

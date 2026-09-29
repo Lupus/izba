@@ -17,6 +17,14 @@ beforeEach(() => {
 });
 
 describe("LockdownRow", () => {
+  it("withholds the posture and its buttons when unknown", () => {
+    render(<LockdownRow name="web" lockdown={{ ...locked, restart_required: true }} onChanged={() => {}} unknown />);
+    expect(screen.getByText("unknown — refresh failed")).toBeInTheDocument();
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.queryByText(/restart to apply/i)).toBeNull();
+    expect(screen.queryByText(/izba-sb-web/)).toBeNull();
+  });
+
   it("offers Lock down when unlocked", () => {
     render(<LockdownRow name="web" lockdown={unlocked} onChanged={() => {}} />);
     expect(screen.getByText("unlocked")).toBeInTheDocument();
