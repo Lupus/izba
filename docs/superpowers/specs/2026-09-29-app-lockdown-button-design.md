@@ -98,8 +98,9 @@ self-elevate).
   whether the UI renders the control at all (Linux: hidden).
 - **Remove fix:** `remove_core` (the GUI Remove) checks `lockdown_state`; if
   locked, it calls `unlock` FIRST. `Err` (UAC declined / helper failed) aborts
-  the remove with: `Windows account for '<name>' was not released (<cause>) —
-  approve the prompt to remove it, or run 'izba windows-cleanup' later`.
+  the remove with: `sandbox '<name>' was NOT removed: its Windows lock-down
+  account could not be released (<cause>). Approve the prompt and retry, or
+  remove it from the CLI with 'izba rm <name>' (then 'izba windows-cleanup').`
   Nothing has been deleted, so a retry is safe. Fail-closed (the CLI is
   warn-and-continue) because the GUI has no post-success warning channel.
 
