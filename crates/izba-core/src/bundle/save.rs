@@ -230,6 +230,8 @@ fn build_manifest(paths: &Paths, plan: &Plan, with_workspace: bool) -> anyhow::R
         };
         sandboxes.push(SandboxEntry {
             name: name.clone(),
+            image_digest: cfg.image_digest.clone(),
+            named_volumes: cfg.volumes.iter().filter_map(|v| v.name.clone()).collect(),
             disk_owner: cfg
                 .disk_owner
                 .unwrap_or_else(|| crate::sandbox::workspace_owner(&cfg.workspace)),
@@ -256,9 +258,24 @@ fn build_manifest(paths: &Paths, plan: &Plan, with_workspace: bool) -> anyhow::R
             .map_or(0, |d| d.as_millis() as u64),
         tags: plan.tags.clone(),
         images: plan.images.iter().cloned().collect(),
+        image_sizes: plan
+            .images
+            .iter()
+            .map(|d| (d.clone(), image_allocated(paths, d)))
+            .collect(),
         named_volumes,
         sandboxes,
     })
+}
+
+/// Allocated bytes of the image files an archive carries for `digest`.
+fn image_allocated(paths: &Paths, digest: &str) -> u64 {
+    let dir = paths.image_dir(digest);
+    IMAGE_FILES
+        .iter()
+        .filter_map(|f| std::fs::metadata(dir.join(f)).ok())
+        .map(|m| crate::sandbox::allocated_bytes(&m))
+        .sum()
 }
 
 fn write_archive(
@@ -897,6 +914,9 @@ mod tests {
         let (m, sums) = manifest_and_sums(&entries);
         assert_eq!(m.format, crate::bundle::FORMAT_VERSION);
         assert_eq!(m.images, vec!["sha256:aa".to_string()]);
+        assert!(m.image_sizes["sha256:aa"] > 0, "{:?}", m.image_sizes);
+        assert_eq!(m.sandboxes[0].image_digest, "sha256:aa");
+        assert_eq!(m.sandboxes[0].named_volumes, vec!["data".to_string()]);
         assert_eq!(m.named_volumes.len(), 1);
         assert_eq!(m.named_volumes[0].path, "volumes/data.img");
         assert_eq!(m.named_volumes[0].logical_len, DISK_LEN);
