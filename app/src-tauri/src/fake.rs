@@ -83,6 +83,10 @@ pub struct FakeDaemon {
     pub lockdown_account: Option<String>,
     /// Recorded fact echoed by `inspect`.
     pub lockdown_restart_required: bool,
+    /// `inspect` status string (`Liveness::describe()`: "stopped" or a live state).
+    pub detail_status: String,
+    /// `remove` fails (unlike `fail_action`, leaves every other verb working).
+    pub fail_remove: bool,
 }
 
 impl Default for FakeDaemon {
@@ -141,6 +145,8 @@ impl Default for FakeDaemon {
             unlock_fail: None,
             lockdown_account: None,
             lockdown_restart_required: false,
+            detail_status: "running".into(),
+            fail_remove: false,
         }
     }
 }
@@ -184,7 +190,7 @@ impl DaemonApi for FakeDaemon {
     }
     fn remove(&mut self, name: &str, force: bool) -> anyhow::Result<()> {
         self.calls.push(format!("rm:{name}:{force}"));
-        if self.fail_action {
+        if self.fail_action || self.fail_remove {
             anyhow::bail!("action failed");
         }
         Ok(())
@@ -342,7 +348,7 @@ impl DaemonApi for FakeDaemon {
             cpus: 2,
             mem_mb: 4096,
             workspace: "/ws".into(),
-            status: "running".into(),
+            status: self.detail_status.clone(),
             ports: self.ports.clone(),
             volumes: self.detail_volumes.clone(),
             confinement: None,
