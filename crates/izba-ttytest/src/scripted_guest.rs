@@ -106,6 +106,7 @@ impl ScriptedGuest {
                 build: None,
                 rw_size_gb: 0,
                 usb: Default::default(),
+                disk_owner: None,
             },
         )
         .context("write config.json")?;

@@ -289,6 +289,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         std::fs::write(
             sandbox_dir.join(crate::state::CONFIG_FILE),
@@ -334,6 +335,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 0, // legacy: unknown, must recover from rw.img
+            disk_owner: None,
         };
         std::fs::write(
             sandbox_dir.join(crate::state::CONFIG_FILE),
@@ -388,6 +390,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 16, // persisted at create time
+            disk_owner: None,
         };
         std::fs::write(
             sandbox_dir.join(crate::state::CONFIG_FILE),
@@ -436,6 +439,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 0, // legacy: unknown, recover from rw.img
+            disk_owner: None,
         };
         std::fs::write(
             sandbox_dir.join(crate::state::CONFIG_FILE),

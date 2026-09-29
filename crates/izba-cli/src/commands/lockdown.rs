@@ -170,6 +170,7 @@ mod tests {
                 vnc: false,
                 build: None,
                 rw_size_gb: 8,
+                disk_owner: None,
             },
         )
         .unwrap();
@@ -210,6 +211,7 @@ mod tests {
                 vnc: false,
                 build: None,
                 rw_size_gb: 8,
+                disk_owner: None,
             },
         )
         .unwrap();

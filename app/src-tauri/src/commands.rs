@@ -1311,6 +1311,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 1,
+            disk_owner: None,
         };
         std::fs::write(
             sandbox_dir.join(CONFIG_FILE),

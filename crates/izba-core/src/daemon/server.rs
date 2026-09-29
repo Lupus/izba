@@ -4745,6 +4745,7 @@ mod tests {
                 rw_size_gb: 1,
                 docker: false,
                 vnc: false,
+                disk_owner: None,
             },
         )
         .unwrap();
@@ -5877,6 +5878,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         crate::state::save_json(&dir.join(CONFIG_FILE), &cfg).unwrap();
     }
@@ -6337,6 +6339,7 @@ mod tests {
             usb: Default::default(),
             docker: true,
             vnc: false,
+            disk_owner: None,
         };
         save_json(&sdir.join(CONFIG_FILE), &config).unwrap();
 
@@ -6478,6 +6481,7 @@ mod tests {
             usb: Default::default(),
             docker: false,
             vnc: false,
+            disk_owner: None,
         };
         let id = live_identity();
         let res = host_resources(&d, "web", &config, &id).expect("live pid must report resources");
@@ -6517,6 +6521,7 @@ mod tests {
             usb: Default::default(),
             docker: false,
             vnc: false,
+            disk_owner: None,
         };
         let id = live_identity();
         assert!(host_resources(&d, "web", &config, &id).is_none());

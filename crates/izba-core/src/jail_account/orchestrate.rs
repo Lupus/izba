@@ -536,6 +536,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         core_save_json(&sandbox_dir.join(CONFIG_FILE), &cfg).unwrap();
     }
@@ -557,6 +558,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         }
     }
 
@@ -634,6 +636,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
         assert!(grants.contains(&PathBuf::from("/my/workspace")));
@@ -663,6 +666,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
         assert!(grants.contains(&paths.volume_image("cache")));
@@ -691,6 +695,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
         // Anonymous volumes live under sandbox_dir so only the sandbox_dir
@@ -722,6 +727,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         let grants = compute_grants(&cfg, &paths, SANDBOX_NAME);
         assert!(grants.contains(&paths.run_dir(SANDBOX_NAME)), "{grants:?}");

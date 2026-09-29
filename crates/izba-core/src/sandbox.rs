@@ -402,6 +402,7 @@ fn build_cmdline(
     usb: bool,
     docker_idmaps: Option<&DockerCmdline>,
     vnc: bool,
+    disk_idmap: Option<&DiskIdmap>,
 ) -> String {
     let mut c = format!("console=ttyS0 izba.hostname={name}");
     if !volumes.is_empty() {
@@ -441,12 +442,58 @@ fn build_cmdline(
         }
     }
     // Host-authoritative like USB/docker: izba-init reads izba.vnc=1 before
-    // the container starts to bring up the kasmvnc share. Appended last so
-    // every earlier flag's position stays stable regardless of VNC.
+    // the container starts to bring up the kasmvnc share. Appended after every
+    // earlier flag so their positions stay stable regardless of VNC.
     if vnc {
         c.push_str(" izba.vnc=1");
     }
+    // Save/load disk idmap (spec 2026-09-29 §5.3): host-authoritative like
+    // every flag above; appended after VNC so no earlier flag moves.
+    if let Some(d) = disk_idmap {
+        c.push_str(&format!(
+            " izba.diskuidmap={} izba.diskgidmap={}",
+            d.uidmap, d.gidmap
+        ));
+    }
     c
+}
+
+/// Kernel-cmdline payload for a moved sandbox's disk idmap (§5.3).
+#[derive(Clone, Debug)]
+pub(crate) struct DiskIdmap {
+    pub uidmap: String,
+    pub gidmap: String,
+}
+
+/// Decide the disk idmap for this boot. Docker mode stores container ids
+/// on its (already idmapped) layers and builder VMs have no userns, so both
+/// are always `None`. Otherwise `None` iff P is the identity on BOTH legs;
+/// when only one leg moves, the other is emitted as the full-range identity
+/// because init requires both keys together.
+pub(crate) fn disk_idmap_for(
+    config: &SandboxConfig,
+    workload: (u32, u32),
+    host_owner: (u32, u32),
+) -> Option<DiskIdmap> {
+    use crate::image::runtime_config::{
+        disk_idmap_cmdline_value, disk_idmap_extents, USERNS_RANGE_END,
+    };
+    let src = config.disk_owner?;
+    if config.builder || config.docker_effective() {
+        return None;
+    }
+    let u = disk_idmap_extents(workload.0, src.0, host_owner.0);
+    let g = disk_idmap_extents(workload.1, src.1, host_owner.1);
+    if u.is_none() && g.is_none() {
+        return None;
+    }
+    let identity = format!("0-0-{USERNS_RANGE_END}");
+    Some(DiskIdmap {
+        uidmap: u
+            .map(|e| disk_idmap_cmdline_value(&e))
+            .unwrap_or_else(|| identity.clone()),
+        gidmap: g.map(|e| disk_idmap_cmdline_value(&e)).unwrap_or(identity),
+    })
 }
 
 /// Returns the path the host should read after a builder VM finishes.
@@ -564,6 +611,7 @@ pub fn create(paths: &Paths, name: &str, opts: &CreateOpts) -> anyhow::Result<()
             // Hardware consent is never implied by creation: a new sandbox holds
             // no grants until a human runs `izba usb allow`.
             usb: crate::usb::UsbConfig::default(),
+            disk_owner: None,
         };
         save_json(&dir.join(CONFIG_FILE), &config)?;
 
@@ -813,7 +861,7 @@ pub(crate) fn liveness_of(
 /// without privilege. Covered by the real-VM userns round-trip tests, which
 /// assert the workspace owner appears as the workload USER inside the guest.
 #[mutants::skip]
-fn workspace_owner(workspace: &Path) -> (u32, u32) {
+pub(crate) fn workspace_owner(workspace: &Path) -> (u32, u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -986,6 +1034,7 @@ fn write_oci_bundle(
     } else {
         None
     };
+    let disk_idmap = disk_idmap_for(config, (uid, gid), host_owner);
     let json = serde_json::to_vec_pretty(&spec).context("serializing OCI spec")?;
 
     // Atomic write: tempfile in the same dir, then rename into place.
@@ -1021,15 +1070,18 @@ fn write_oci_bundle(
     Ok(OciBundleOut {
         user_fallback,
         docker_idmaps,
+        disk_idmap,
     })
 }
 
 /// What [`write_oci_bundle`] hands back to `start`: the loud USER-fallback
 /// warning (if any) and, in docker mode, the `izba.uidmap=`/`izba.gidmap=`
-/// cmdline values extracted from the spec it just wrote.
+/// cmdline values extracted from the spec it just wrote, plus the save/load
+/// disk idmap (`izba.diskuidmap=`/`izba.diskgidmap=`) for a moved sandbox.
 struct OciBundleOut {
     user_fallback: Option<crate::state::UserFallback>,
     docker_idmaps: Option<DockerCmdline>,
+    disk_idmap: Option<DiskIdmap>,
 }
 
 /// The docker-mode kernel-cmdline payload extracted from the just-written OCI
@@ -1237,6 +1289,7 @@ pub fn start_with_timeouts(
     let OciBundleOut {
         user_fallback,
         docker_idmaps,
+        disk_idmap,
     } = write_oci_bundle(
         &oci_dir,
         name,
@@ -1289,6 +1342,7 @@ pub fn start_with_timeouts(
         config.usb.is_enabled(),
         docker_idmaps.as_ref(),
         config.vnc,
+        disk_idmap.as_ref(),
     );
     // Resolve per-sandbox account credentials when the sandbox is locked down
     // (Windows MVP-D).  On non-Windows and for unlocked sandboxes this is None
@@ -2262,6 +2316,78 @@ mod tests {
     // live_run_dir resolution
     // -----------------------------------------------------------------------
 
+    fn cfg_with(disk_owner: Option<(u32, u32)>, docker: bool, builder: bool) -> SandboxConfig {
+        let mut c: SandboxConfig = serde_json::from_str(
+            r#"{"image_digest":"sha256:x","image_ref":"a","cpus":1,"mem_mb":512,"workspace":"/w"}"#,
+        )
+        .unwrap();
+        c.disk_owner = disk_owner;
+        c.docker = docker;
+        c.builder = builder;
+        c
+    }
+
+    #[test]
+    fn disk_idmap_for_none_when_unset_or_same_owner() {
+        assert!(
+            disk_idmap_for(&cfg_with(None, false, false), (1001, 1001), (1000, 1000)).is_none()
+        );
+        assert!(disk_idmap_for(
+            &cfg_with(Some((1000, 1000)), false, false),
+            (1001, 1001),
+            (1000, 1000)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn disk_idmap_for_skips_docker_and_builder() {
+        // docker: layers store container ids; builder: no userns (identity both sides).
+        assert!(disk_idmap_for(
+            &cfg_with(Some((1000, 1000)), true, false),
+            (1001, 1001),
+            (0, 0)
+        )
+        .is_none());
+        assert!(disk_idmap_for(
+            &cfg_with(Some((1000, 1000)), false, true),
+            (1001, 1001),
+            (0, 0)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn disk_idmap_for_emits_both_legs_independently() {
+        // uid leg moves (1000 -> 0), gid leg unchanged (1000 -> 1000).
+        let m = disk_idmap_for(
+            &cfg_with(Some((1000, 1000)), false, false),
+            (1001, 1001),
+            (0, 1000),
+        )
+        .unwrap();
+        assert!(m.uidmap.contains("1000-1001-1"), "{}", m.uidmap);
+        assert_eq!(
+            m.gidmap,
+            format!("0-0-{}", crate::image::runtime_config::USERNS_RANGE_END)
+        );
+    }
+
+    #[test]
+    fn build_cmdline_appends_disk_idmap_last() {
+        let d = DiskIdmap {
+            uidmap: "0-0-5".into(),
+            gidmap: "0-0-6".into(),
+        };
+        let c = build_cmdline("n", &[], false, false, None, true, Some(&d));
+        assert!(
+            c.ends_with(" izba.vnc=1 izba.diskuidmap=0-0-5 izba.diskgidmap=0-0-6"),
+            "{c}"
+        );
+        let c = build_cmdline("n", &[], false, false, None, false, None);
+        assert!(!c.contains("diskuidmap"), "{c}");
+    }
+
     #[test]
     fn live_run_dir_resolution_precedence() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2318,6 +2444,7 @@ mod tests {
             usb: Default::default(),
             docker: false,
             vnc: false,
+            disk_owner: None,
         };
         save_json(&paths.sandbox_dir(name).join(CONFIG_FILE), &cfg).unwrap();
     }
@@ -2637,8 +2764,11 @@ mod tests {
             size_bytes: 1 << 20,
             eph_id: None,
         }];
-        assert!(build_cmdline("web", &vols, false, false, None, false).contains("izba.volumes=/a"));
-        assert!(!build_cmdline("web", &[], false, false, None, false).contains("izba.volumes"));
+        assert!(build_cmdline("web", &vols, false, false, None, false, None)
+            .contains("izba.volumes=/a"));
+        assert!(
+            !build_cmdline("web", &[], false, false, None, false, None).contains("izba.volumes")
+        );
     }
 
     /// `izba.vnc=1` is appended LAST, after every other flag (including the
@@ -2646,8 +2776,8 @@ mod tests {
     /// position.
     #[test]
     fn cmdline_declares_vnc_only_when_enabled() {
-        assert!(build_cmdline("s", &[], false, false, None, true).ends_with(" izba.vnc=1"));
-        assert!(!build_cmdline("s", &[], false, false, None, false).contains("izba.vnc"));
+        assert!(build_cmdline("s", &[], false, false, None, true, None).ends_with(" izba.vnc=1"));
+        assert!(!build_cmdline("s", &[], false, false, None, false, None).contains("izba.vnc"));
         // Also last when the docker token set (izba.docker/uidmap/gidmap/
         // wsidmap) precedes it.
         let maps = DockerCmdline {
@@ -2655,7 +2785,7 @@ mod tests {
             gidmap: "0-2097152-1048576".to_string(),
             ws_idmap: true,
         };
-        let c = build_cmdline("s", &[], false, true, Some(&maps), true);
+        let c = build_cmdline("s", &[], false, true, Some(&maps), true, None);
         assert!(c.ends_with(" izba.vnc=1"), "vnc must stay last, got: {c}");
         assert!(c.contains(" izba.usb=1") && c.contains(" izba.wsidmap=1"));
     }
@@ -4767,14 +4897,14 @@ mod tests {
     /// without grants boots a guest that refuses every USB RPC structurally.
     #[test]
     fn the_cmdline_declares_usb_only_for_a_sandbox_that_has_grants() {
-        assert!(build_cmdline("web", &[], false, true, None, false).contains("izba.usb=1"));
-        assert!(!build_cmdline("web", &[], false, false, None, false).contains("izba.usb"));
+        assert!(build_cmdline("web", &[], false, true, None, false, None).contains("izba.usb=1"));
+        assert!(!build_cmdline("web", &[], false, false, None, false, None).contains("izba.usb"));
     }
 
     /// build_cmdline with builder=true must contain `izba.buildout=1`.
     #[test]
     fn build_cmdline_builder_flag_appended() {
-        let c = build_cmdline("mybox", &[], true, false, None, false);
+        let c = build_cmdline("mybox", &[], true, false, None, false, None);
         assert!(
             c.contains("izba.buildout=1"),
             "builder cmdline must contain izba.buildout=1, got: {c}"
@@ -4784,7 +4914,7 @@ mod tests {
     /// build_cmdline with builder=false must NOT contain `izba.buildout`.
     #[test]
     fn build_cmdline_no_builder_flag_absent() {
-        let c = build_cmdline("mybox", &[], false, false, None, false);
+        let c = build_cmdline("mybox", &[], false, false, None, false, None);
         assert!(
             !c.contains("izba.buildout"),
             "non-builder cmdline must not contain izba.buildout, got: {c}"
@@ -4801,7 +4931,7 @@ mod tests {
             gidmap: "0-2097152-1048576".to_string(),
             ws_idmap: false,
         };
-        let on = build_cmdline("s", &[], false, false, Some(&maps), false);
+        let on = build_cmdline("s", &[], false, false, Some(&maps), false, None);
         assert!(on.contains(" izba.docker=1"));
         // The layer-idmap extents ride the SAME token set — never apart from
         // the flag (uid-fidelity design §2.3).
@@ -4810,7 +4940,7 @@ mod tests {
         // ws_idmap=false (the common non-zero-owner case) must NOT emit the
         // workspace-idmap token.
         assert!(!on.contains("izba.wsidmap"));
-        let off = build_cmdline("s", &[], false, false, None, false);
+        let off = build_cmdline("s", &[], false, false, None, false, None);
         assert!(!off.contains("izba.docker"));
         assert!(!off.contains("izba.uidmap") && !off.contains("izba.gidmap"));
         assert!(!off.contains("izba.wsidmap"));
@@ -4832,9 +4962,18 @@ mod tests {
             usb: Default::default(),
             docker: true,
             vnc: false,
+            disk_owner: None,
         };
         let guarded_maps = cfg.docker_effective().then(|| maps.clone());
-        let guarded = build_cmdline("s", &[], cfg.builder, false, guarded_maps.as_ref(), cfg.vnc);
+        let guarded = build_cmdline(
+            "s",
+            &[],
+            cfg.builder,
+            false,
+            guarded_maps.as_ref(),
+            cfg.vnc,
+            None,
+        );
         assert!(!guarded.contains("izba.docker"));
     }
 
@@ -4891,7 +5030,7 @@ mod tests {
             gidmap: "0-2097152-1048576".to_string(),
             ws_idmap: true,
         };
-        let c = build_cmdline("s", &[], false, false, Some(&maps), false);
+        let c = build_cmdline("s", &[], false, false, Some(&maps), false, None);
         assert!(c.contains(" izba.docker=1"));
         assert!(
             c.contains(" izba.wsidmap=1"),
@@ -4927,6 +5066,7 @@ mod tests {
             usb: Default::default(),
             docker,
             vnc: false,
+            disk_owner: None,
         };
         let db = crate::image::runtime_config::UserDb::from_files(None, None);
 
