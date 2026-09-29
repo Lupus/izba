@@ -2246,7 +2246,7 @@ pub fn reset_rw_scratch(paths: &Paths, name: &str) -> anyhow::Result<()> {
 
 /// If a *live* sandbox other than `exclude` references persistent volume
 /// `vol_name`, return that sandbox's name. Enforces single-writer at start.
-fn persistent_volume_holder(
+pub(crate) fn persistent_volume_holder(
     paths: &Paths,
     vol_name: &str,
     exclude: &str,
