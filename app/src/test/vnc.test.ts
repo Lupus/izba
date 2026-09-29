@@ -21,6 +21,7 @@ function detail(overrides: Partial<SandboxDetail> = {}): SandboxDetail {
     vnc_running: false,
     vnc_url: null,
     vnc_restart_required: false,
+    lockdown: null,
     ...overrides,
   };
 }

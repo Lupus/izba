@@ -473,6 +473,41 @@ pub struct SandboxDetailView {
     /// what it actually booted (either direction) — it must be restarted for
     /// `vnc` to take effect.
     pub vnc_restart_required: bool,
+    /// Lock-down (MVP-D) posture; `None` when lock-down does not exist on this
+    /// host — the UI hides the row. Filled by `inspect_core`, not `From`.
+    pub lockdown: Option<LockdownView>,
+}
+
+/// Lock-down (MVP-D) posture as the Sandbox card renders it. `locked`/
+/// `account`/`net_blocked` are the CONFIGURED posture (`lockdown.json`);
+/// `restart_required`/`booted_as_account` are recorded facts about the run
+/// (the daemon's Inspect reply) — never re-derived here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LockdownView {
+    pub locked: bool,
+    pub account: Option<String>,
+    pub net_blocked: bool,
+    pub restart_required: bool,
+    pub booted_as_account: bool,
+}
+
+impl LockdownView {
+    pub fn new(
+        configured: &izba_core::jail_account::LockdownState,
+        detail: &SandboxDetail,
+    ) -> Self {
+        let info = match configured {
+            izba_core::jail_account::LockdownState::Locked(i) => Some(i),
+            _ => None,
+        };
+        LockdownView {
+            locked: info.is_some(),
+            account: info.map(|i| i.account.clone()),
+            net_blocked: info.is_some_and(|i| i.net_blocked),
+            restart_required: detail.lockdown_restart_required,
+            booted_as_account: detail.lockdown_account.is_some(),
+        }
+    }
 }
 
 impl From<SandboxDetail> for SandboxDetailView {
@@ -493,6 +528,7 @@ impl From<SandboxDetail> for SandboxDetailView {
             vnc_running: d.vnc_running,
             vnc_url: d.vnc_url,
             vnc_restart_required: d.vnc_restart_required,
+            lockdown: None,
         }
     }
 }

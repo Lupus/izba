@@ -153,6 +153,18 @@ pub trait DaemonApi: Send {
     /// Turn the KasmVNC desktop on/off for a sandbox (may need a restart to
     /// take effect — see `SandboxDetail::vnc_restart_required`).
     fn vnc_set(&mut self, name: &str, enabled: bool) -> anyhow::Result<()>;
+    /// Whether per-sandbox Windows lock-down (MVP-D) exists on this host.
+    /// Decides whether the UI renders the control at all.
+    fn lockdown_supported(&self) -> bool;
+    /// The CONFIGURED lock-down posture (`lockdown.json`), applied at the next start.
+    fn lockdown_state(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<izba_core::jail_account::LockdownState>;
+    /// Provision the per-sandbox account (pops UAC). Client-side, like `izba lockdown`.
+    fn lockdown(&mut self, name: &str) -> anyhow::Result<izba_core::jail_account::LockdownOutcome>;
+    /// Deprovision the per-sandbox account (pops UAC). Client-side, like `izba unlock`.
+    fn unlock(&mut self, name: &str) -> anyhow::Result<()>;
 }
 
 /// Production `DaemonApi`: a lazily-connected `DaemonClient`. Connects via
@@ -697,6 +709,40 @@ impl DaemonApi for RealDaemon {
             )?)
         })
     }
+
+    fn lockdown_supported(&self) -> bool {
+        cfg!(windows)
+    }
+
+    fn lockdown_state(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<izba_core::jail_account::LockdownState> {
+        Ok(izba_core::jail_account::lockdown_state(&self.paths, name))
+    }
+
+    fn lockdown(&mut self, name: &str) -> anyhow::Result<izba_core::jail_account::LockdownOutcome> {
+        ensure_sandbox_exists(&self.paths, name)?;
+        izba_core::jail_account::lockdown(&izba_core::jail_account::WinBackend, &self.paths, name)
+    }
+
+    fn unlock(&mut self, name: &str) -> anyhow::Result<()> {
+        ensure_sandbox_exists(&self.paths, name)?;
+        izba_core::jail_account::unlock(&izba_core::jail_account::WinBackend, &self.paths, name)
+    }
+}
+
+/// Same guard as `izba lockdown`/`izba unlock`: a bad name fails with a clean
+/// message instead of an elevated helper run against a missing sandbox.
+fn ensure_sandbox_exists(paths: &Paths, name: &str) -> anyhow::Result<()> {
+    if !paths
+        .sandbox_dir(name)
+        .join(izba_core::state::CONFIG_FILE)
+        .exists()
+    {
+        anyhow::bail!("no sandbox named {name:?} (no config.json found)");
+    }
+    Ok(())
 }
 
 /// Interpret the daemon's reply to an attach or detach.

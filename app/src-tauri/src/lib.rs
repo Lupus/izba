@@ -434,6 +434,18 @@ async fn vnc_set(state: State<'_, AppState>, name: String, enabled: bool) -> Res
     run_action(&state, move |d| commands::vnc_set_core(d, &name, enabled)).await
 }
 
+/// Pops a UAC prompt and blocks until the user answers — `run_action`, so the
+/// shared polling lock is never held while the prompt is open.
+#[tauri::command]
+async fn lockdown(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    run_action(&state, move |d| commands::lockdown_core(d, &name)).await
+}
+
+#[tauri::command]
+async fn unlock(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    run_action(&state, move |d| commands::unlock_core(d, &name)).await
+}
+
 /// Reuse the sandbox's live proxy if it already talks to `target`; otherwise
 /// replace it (inserting over an existing key drops the old proxy, which
 /// stops it) with a freshly started one. Returns the credential-less loopback
@@ -838,6 +850,8 @@ pub fn dispatch(
                 enabled,
             )?)
         }
+        "lockdown" => to_json(commands::lockdown_core(d, &arg_str(&args, "name")?)?),
+        "unlock" => to_json(commands::unlock_core(d, &arg_str(&args, "name")?)?),
         "vnc_proxy_start" => {
             let name = arg_str(&args, "name")?;
             let target = commands::vnc_embed_target(d, &name)?;
@@ -922,6 +936,8 @@ pub fn run() {
             usb_attach,
             usb_detach,
             vnc_set,
+            lockdown,
+            unlock,
             vnc_proxy_start,
             vnc_proxy_stop
         ])
@@ -1272,6 +1288,20 @@ mod dispatch_tests {
         )
         .unwrap();
         assert_eq!(listed.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn dispatch_lockdown_locks_the_sandbox() {
+        let st = state_with(FakeDaemon::default());
+        let mut emit = |_: &str, _: serde_json::Value| {};
+        let out = dispatch(
+            &st,
+            "lockdown",
+            serde_json::json!({"name": "web"}),
+            &mut emit,
+        )
+        .unwrap();
+        assert_eq!(out, serde_json::json!("locked"));
     }
 
     #[test]

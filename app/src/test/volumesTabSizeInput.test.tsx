@@ -48,6 +48,7 @@ const detail: SandboxDetail = {
   vnc_running: false,
   vnc_url: null,
   vnc_restart_required: false,
+  lockdown: null,
 };
 
 /** Add one "New persistent" row and fill it the way a user would. */

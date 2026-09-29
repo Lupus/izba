@@ -89,6 +89,19 @@ export interface SandboxDetail {
    *  what it actually booted (either direction) — it must be restarted for
    *  `vnc` to take effect. */
   vnc_restart_required: boolean;
+  /** `null` when lock-down does not exist on this host (non-Windows) — hide the row. */
+  lockdown: LockdownView | null;
+}
+
+/** Lock-down (MVP-D) posture. `locked`/`account`/`net_blocked` are the
+ *  configured posture; `restart_required`/`booted_as_account` are recorded
+ *  facts about the live run. */
+export interface LockdownView {
+  locked: boolean;
+  account: string | null;
+  net_blocked: boolean;
+  restart_required: boolean;
+  booted_as_account: boolean;
 }
 
 /** One process in the guest's mini-top (mirrors `ProcessView`). `state` is

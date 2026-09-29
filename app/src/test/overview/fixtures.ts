@@ -80,6 +80,7 @@ export function detailFixture(overrides: Partial<SandboxDetail> = {}): SandboxDe
     vnc_running: false,
     vnc_url: null,
     vnc_restart_required: false,
+    lockdown: null,
     ...overrides,
   };
 }
