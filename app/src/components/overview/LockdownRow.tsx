@@ -22,7 +22,9 @@ export function LockdownRow({
   lockdown: LockdownView;
   onChanged: () => void;
   /** The last posture refresh failed: the held `lockdown` may be out of date
-   *  (e.g. the CLI changed it), so withhold it — and its write controls. */
+   *  (e.g. the CLI changed it), so withhold the POSTURE and any control that
+   *  STARTS an action. In-flight feedback (pending, error, cancelled, an open
+   *  confirmation) still renders. */
   unknown?: boolean;
 }>) {
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
@@ -48,19 +50,13 @@ export function LockdownRow({
     }
   };
 
-  if (unknown) {
-    return (
-      <Row label="lock-down">
-        <span className="text-warning">unknown — refresh failed</span>
-      </Row>
-    );
-  }
-
   const pending = phase.kind === "pending";
-  const summary = lockdown.locked
+  const summary = unknown
+    ? "unknown — refresh failed"
+    : lockdown.locked
     ? `locked · ${lockdown.account} · ${lockdown.net_blocked ? "network blocked" : "network open"}`
     : "unlocked";
-  const badge = lockdown.restart_required
+  const badge = !unknown && lockdown.restart_required
     ? lockdown.locked
       ? "restart to apply"
       : "still running as account — restart to apply"
@@ -70,35 +66,24 @@ export function LockdownRow({
     <>
       <Row label="lock-down">
         <span className="inline-flex flex-wrap items-center gap-2">
-          <span>{summary}</span>
+          <span className={unknown ? "text-warning" : undefined}>{summary}</span>
           {badge && <span className="text-xs text-warning">{badge}</span>}
-          {lockdown.locked ? (
-            <Button variant="ghost" size="sm" disabled={pending} onClick={() => setConfirming(true)}>
-              {pending ? (
-                <>
-                  <Spinner /> Waiting for approval…
-                </>
-              ) : (
-                "Unlock"
-              )}
+          {pending ? (
+            <Button variant="ghost" size="sm" disabled>
+              <Spinner /> Waiting for approval…
+            </Button>
+          ) : unknown ? null : lockdown.locked ? (
+            <Button variant="ghost" size="sm" onClick={() => setConfirming(true)}>
+              Unlock
             </Button>
           ) : (
             <Button
               variant="secondary"
               size="sm"
-              disabled={pending}
               title="Requires administrator approval (UAC)"
               onClick={() => void run(() => api.lockdown(name))}
             >
-              {pending ? (
-                <>
-                  <Spinner /> Waiting for approval…
-                </>
-              ) : (
-                <>
-                  <ShieldCheck /> Lock down
-                </>
-              )}
+              <ShieldCheck /> Lock down
             </Button>
           )}
         </span>
