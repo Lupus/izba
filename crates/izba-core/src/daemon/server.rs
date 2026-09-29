@@ -7,6 +7,7 @@ use anyhow::{bail, Context};
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -687,6 +688,28 @@ fn dispatch_inner(
         DaemonRequest::UsbAttach { name, device } => handle_usb_attach(d, name, device, true),
         DaemonRequest::UsbDetach { name, device } => handle_usb_attach(d, name, device, false),
         DaemonRequest::VncSet { name, enabled } => handle_vnc_set(d, name, enabled),
+        DaemonRequest::Save {
+            names,
+            all,
+            out,
+            with_workspace,
+            stop,
+        } => handle_save(d, names, all, out, with_workspace, stop, progress),
+        DaemonRequest::Load {
+            archive,
+            select,
+            rename,
+            workspace,
+            workspace_root,
+        } => handle_load(
+            d,
+            archive,
+            select,
+            rename,
+            workspace,
+            workspace_root,
+            progress,
+        ),
         DaemonRequest::VolumeList => handle_volume_list(d),
         DaemonRequest::VolumeRemove { name } => handle_volume_remove(d, name),
         DaemonRequest::VolumeAttach { name, spec } => handle_volume_attach(d, name, spec),
@@ -989,6 +1012,95 @@ fn handle_stop(d: &Arc<Daemon>, name: String) -> anyhow::Result<DaemonResponse> 
     d.registry.set_liveness(&name, Liveness::Stopped);
     regen_ssh_config(d);
     Ok(DaemonResponse::Ok)
+}
+
+/// `Save`: optionally stop the named sandboxes, then archive them. The
+/// output path must be absolute — the daemon has no meaningful cwd.
+fn handle_save(
+    d: &Arc<Daemon>,
+    names: Vec<String>,
+    all: bool,
+    out: PathBuf,
+    with_workspace: bool,
+    stop: bool,
+    progress: &mut dyn FnMut(String),
+) -> anyhow::Result<DaemonResponse> {
+    if all && !names.is_empty() {
+        bail!("give either names or --all, not both");
+    }
+    if !out.is_absolute() {
+        bail!("output path must be absolute (the CLI resolves it)");
+    }
+    let names: Vec<String> = if all {
+        sandbox::list(&d.paths, d.connector())?
+            .into_iter()
+            .map(|i| i.name)
+            .collect()
+    } else {
+        names
+    };
+    if names.is_empty() {
+        bail!("nothing to save (no sandboxes)");
+    }
+    if stop {
+        for n in &names {
+            if sandbox::liveness_of(&d.paths, n, d.connector())? != Liveness::Stopped {
+                progress(format!("stopping '{n}'"));
+                handle_stop(d, n.clone())?;
+            }
+        }
+    }
+    let report = crate::bundle::save::save(
+        &d.paths,
+        d.connector(),
+        &crate::bundle::save::SaveOpts {
+            names,
+            out,
+            with_workspace,
+        },
+        progress,
+    )?;
+    Ok(DaemonResponse::Saved(report))
+}
+
+/// `Load`: restore from an archive, then register the new sandboxes (always
+/// stopped) and refresh the managed ssh config.
+fn handle_load(
+    d: &Arc<Daemon>,
+    archive: PathBuf,
+    select: Vec<String>,
+    rename: Option<String>,
+    workspace: Option<PathBuf>,
+    workspace_root: Option<PathBuf>,
+    progress: &mut dyn FnMut(String),
+) -> anyhow::Result<DaemonResponse> {
+    for (what, p) in [
+        ("archive", Some(&archive)),
+        ("workspace", workspace.as_ref()),
+        ("workspace root", workspace_root.as_ref()),
+    ] {
+        if let Some(p) = p {
+            if !p.is_absolute() {
+                bail!("{what} path must be absolute (the CLI resolves it)");
+            }
+        }
+    }
+    let report = crate::bundle::load::load(
+        &d.paths,
+        &crate::bundle::load::LoadOpts {
+            archive,
+            select,
+            rename,
+            workspace,
+            workspace_root,
+        },
+        progress,
+    )?;
+    for s in &report.sandboxes {
+        d.registry.set(&s.name, &s.image_ref, Liveness::Stopped);
+    }
+    regen_ssh_config(d);
+    Ok(DaemonResponse::Loaded(report))
 }
 
 fn handle_rm(d: &Arc<Daemon>, name: String, force: bool) -> anyhow::Result<DaemonResponse> {
@@ -2449,6 +2561,151 @@ mod tests {
         match rpc(&mut c, &req) {
             DaemonResponse::Error { message } => {
                 assert!(message.contains("unknown request type"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    fn dispatch_quiet(d: &Arc<Daemon>, req: DaemonRequest) -> DaemonResponse {
+        dispatch(d, req, &mut |_| {})
+    }
+
+    #[test]
+    fn save_all_expands_to_every_sandbox_and_rejects_names_plus_all() {
+        let src = crate::bundle::testutil::Src::new();
+        let d = Arc::new(Daemon::new(src.paths.clone(), test_deps()));
+        let out = src.t.path().join("all.izba");
+        match dispatch_quiet(
+            &d,
+            DaemonRequest::Save {
+                names: vec!["a".into()],
+                all: true,
+                out: out.clone(),
+                with_workspace: false,
+                stop: false,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("either names or --all"), "{message}")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match dispatch_quiet(
+            &d,
+            DaemonRequest::Save {
+                names: vec![],
+                all: true,
+                out,
+                with_workspace: false,
+                stop: false,
+            },
+        ) {
+            DaemonResponse::Saved(r) => assert_eq!(r.sandboxes, vec!["a".to_string()]),
+            other => panic!("expected Saved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_and_load_refuse_relative_paths() {
+        let (_dir, d) = test_daemon();
+        for req in [
+            DaemonRequest::Save {
+                names: vec!["a".into()],
+                all: false,
+                out: "rel.izba".into(),
+                with_workspace: false,
+                stop: false,
+            },
+            DaemonRequest::Load {
+                archive: "rel.izba".into(),
+                select: vec![],
+                rename: None,
+                workspace: None,
+                workspace_root: None,
+            },
+            DaemonRequest::Load {
+                archive: "/abs.izba".into(),
+                select: vec![],
+                rename: None,
+                workspace: Some("rel".into()),
+                workspace_root: None,
+            },
+            DaemonRequest::Load {
+                archive: "/abs.izba".into(),
+                select: vec![],
+                rename: None,
+                workspace: None,
+                workspace_root: Some("rel".into()),
+            },
+        ] {
+            match dispatch_quiet(&d, req) {
+                DaemonResponse::Error { message } => {
+                    assert!(message.contains("must be absolute"), "{message}")
+                }
+                other => panic!("expected Error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn save_then_load_registers_the_sandbox_stopped() {
+        let src = crate::bundle::testutil::Src::new();
+        let da = Arc::new(Daemon::new(src.paths.clone(), test_deps()));
+        let out = src.t.path().join("rt.izba");
+        match dispatch_quiet(
+            &da,
+            DaemonRequest::Save {
+                names: vec!["a".into()],
+                all: false,
+                out: out.clone(),
+                with_workspace: true,
+                stop: false,
+            },
+        ) {
+            DaemonResponse::Saved(r) => assert_eq!(r.path, out),
+            other => panic!("expected Saved, got {other:?}"),
+        }
+
+        let tgt = crate::bundle::testutil::Tgt::new();
+        let db = Arc::new(Daemon::new(tgt.paths.clone(), test_deps()));
+        match dispatch_quiet(
+            &db,
+            DaemonRequest::Load {
+                archive: out,
+                select: vec![],
+                rename: None,
+                workspace: Some(tgt.dir("ws-a")),
+                workspace_root: None,
+            },
+        ) {
+            DaemonResponse::Loaded(r) => {
+                assert_eq!(r.sandboxes.len(), 1);
+                assert_eq!(r.sandboxes[0].name, "a");
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+        let sums = db.registry.summaries();
+        let a = sums.iter().find(|s| s.name == "a").expect("registered");
+        assert_eq!(a.status, "stopped");
+    }
+
+    #[test]
+    fn save_running_without_stop_is_refused() {
+        let src = crate::bundle::testutil::Src::new();
+        crate::bundle::testutil::write_live_state(&src.paths, "a");
+        let d = Arc::new(Daemon::new(src.paths.clone(), test_deps()));
+        match dispatch_quiet(
+            &d,
+            DaemonRequest::Save {
+                names: vec!["a".into()],
+                all: false,
+                out: src.t.path().join("run.izba"),
+                with_workspace: false,
+                stop: false,
+            },
+        ) {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("stop it first"), "{message}")
             }
             other => panic!("expected Error, got {other:?}"),
         }

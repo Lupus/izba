@@ -35,8 +35,9 @@ use izba_proto::{Request, Response};
 /// `DaemonResponse::Stats`. v6 added `DaemonRequest::VncSet`. v7 added the
 /// Inspect lock-down facts (`lockdown_account` / `lockdown_restart_required`):
 /// an older same-proto daemon would read them as `None`/`false` and the app
-/// would misreport "applied" for a posture that needs a restart.)
-pub const DAEMON_PROTO_VERSION: u32 = 7;
+/// would misreport "applied" for a posture that needs a restart. v8 added
+/// `Save`/`Load` (sandbox archives).)
+pub const DAEMON_PROTO_VERSION: u32 = 8;
 
 /// First frame on every daemon connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +228,33 @@ pub enum DaemonRequest {
     VncSet {
         name: String,
         enabled: bool,
+    },
+    /// Archive sandboxes into one `.izba` file (v7). `out` must be absolute —
+    /// the CLI resolves it; the daemon never guesses a cwd.
+    Save {
+        #[serde(default)]
+        names: Vec<String>,
+        #[serde(default)]
+        all: bool,
+        out: PathBuf,
+        #[serde(default)]
+        with_workspace: bool,
+        /// Stop running sandboxes first instead of refusing.
+        #[serde(default)]
+        stop: bool,
+    },
+    /// Restore sandboxes from a `.izba` archive (v7). Every path must be
+    /// absolute.
+    Load {
+        archive: PathBuf,
+        #[serde(default)]
+        select: Vec<String>,
+        #[serde(default)]
+        rename: Option<String>,
+        #[serde(default)]
+        workspace: Option<PathBuf>,
+        #[serde(default)]
+        workspace_root: Option<PathBuf>,
     },
     /// Graceful daemon exit. Sandboxes keep running (detached children);
     /// in-daemon port relays pause until the next daemon adopts.
@@ -550,6 +578,10 @@ pub enum DaemonResponse {
     UsbUpstream {
         upstream: Option<UsbUpstreamInfo>,
     },
+    /// Result of `Save`.
+    Saved(crate::bundle::save::SaveReport),
+    /// Result of `Load`.
+    Loaded(crate::bundle::load::LoadReport),
     /// Result of `UsbListDevices`.
     UsbDevices {
         devices: Vec<UsbDeviceInfo>,
@@ -667,6 +699,23 @@ mod tests {
             let back: DaemonRequest = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
             assert_eq!(format!("{req:?}"), format!("{back:?}"));
         }
+    }
+
+    #[test]
+    fn save_and_load_requests_round_trip() {
+        let r = DaemonRequest::Save {
+            names: vec!["a".into()],
+            all: false,
+            out: "/x.izba".into(),
+            with_workspace: true,
+            stop: false,
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains(r#""type":"save""#), "{j}");
+        let _: DaemonRequest = serde_json::from_str(&j).unwrap();
+        let l: DaemonRequest =
+            serde_json::from_str(r#"{"type":"load","archive":"/x.izba"}"#).unwrap();
+        assert!(matches!(l, DaemonRequest::Load { select, rename: None, .. } if select.is_empty()));
     }
 
     /// A `create` frame from a pre-`builder` client (the field absent) must
@@ -1120,7 +1169,8 @@ mod tests {
         // read instead of self-healing via a restart, so the COMPATIBILITY gate
         // must move with them.
         // v7: the Inspect lock-down facts (an older daemon would misreport them).
-        assert_eq!(DAEMON_PROTO_VERSION, 7);
+        // v8: Save/Load (sandbox archives).
+        assert_eq!(DAEMON_PROTO_VERSION, 8);
     }
 
     #[test]
