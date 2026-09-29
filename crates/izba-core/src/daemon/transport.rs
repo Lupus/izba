@@ -24,9 +24,30 @@ fn version_from(env: &dyn Fn(&str) -> Option<String>) -> String {
     env("IZBA_DAEMON_VERSION").unwrap_or_else(|| crate::build_info::BuildInfo::current().short())
 }
 
-/// Create `<data>/daemon/` (0700 on Unix), remove any stale socket file,
-/// bind the daemon listener (socket reachable only via the 0700 dir).
+/// Create `<data>/daemon/` (0700 on Unix), re-assert its Medium integrity
+/// label (Windows), remove any stale socket file, bind the daemon listener
+/// (socket reachable only via the 0700 dir).
 pub fn bind_socket(paths: &Paths) -> anyhow::Result<UdsListener> {
+    bind_socket_with(paths, crate::procmgr::restore_integrity_recursive)
+}
+
+/// [`bind_socket`] with the Medium re-assert injected, so the ordering and
+/// the fail-closed refusal are host-testable (the real relabel is a Windows
+/// no-op elsewhere).
+///
+/// Why re-assert at all (F-09, #281): on Windows `izbad.sock` is unreachable
+/// from the Low-IL confined VMM ONLY because it inherits the implicit Medium
+/// label (spike #248: AF_UNIX `connect()` needs write access). New starts can
+/// no longer Low-label this dir (`sandbox::check_workspace_spares_control_socket`),
+/// but a pre-#281 build could have — an ancestor-of-the-data-root workspace
+/// start whose teardown restore was then missed leaves the dir Low, and a
+/// socket bound inside it would inherit Low. Re-stamping the inheritable
+/// Medium label before every bind makes the barrier hold regardless of what
+/// an earlier build left behind; failing to do so refuses to serve.
+fn bind_socket_with(
+    paths: &Paths,
+    reassert_medium: fn(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<UdsListener> {
     let dir = paths.daemon_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(unix)]
@@ -35,6 +56,14 @@ pub fn bind_socket(paths: &Paths) -> anyhow::Result<UdsListener> {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("chmod 0700 {}", dir.display()))?;
     }
+    reassert_medium(&dir).with_context(|| {
+        format!(
+            "re-asserting the Medium integrity label on the izbad control-socket dir {} \
+             (F-09: a Low label there would let a confined VMM drive izbad); refusing to \
+             bind the daemon socket",
+            dir.display()
+        )
+    })?;
     let sock = paths.daemon_socket();
     remove_stale_socket(&sock);
     UdsListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))
@@ -145,5 +174,41 @@ mod tests {
                 panic!("bind_socket failed: {e:#}");
             }
         }
+    }
+
+    /// F-09 / #281: a daemon dir left Low-labelled by a pre-#281 build (a
+    /// missed teardown restore after an ancestor-workspace start) must be
+    /// re-asserted Medium BEFORE the socket is bound, and a failed re-assert
+    /// must refuse the bind rather than serve a Low-reachable control plane.
+    #[test]
+    fn bind_refuses_when_the_medium_reassert_fails_and_never_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().join("izba"));
+        fn failing(_: &Path) -> anyhow::Result<()> {
+            anyhow::bail!("label denied")
+        }
+        let err = bind_socket_with(&paths, failing).expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Medium"), "{msg}");
+        assert!(msg.contains("F-09"), "{msg}");
+        assert!(!paths.daemon_socket().exists(), "socket must not be bound");
+    }
+
+    #[test]
+    fn bind_reasserts_medium_on_the_daemon_dir_first() {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+        fn recording(p: &Path) -> anyhow::Result<()> {
+            // the dir exists (created first) and the socket is not bound yet
+            assert!(p.is_dir());
+            assert!(!p.join("izbad.sock").exists());
+            SEEN.lock().unwrap().push(p.to_path_buf());
+            Ok(())
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().join("izba"));
+        // Bind may be denied in this sandbox; the re-assert runs regardless.
+        let _ = bind_socket_with(&paths, recording);
+        assert_eq!(*SEEN.lock().unwrap(), vec![paths.daemon_dir()]);
     }
 }
