@@ -169,16 +169,17 @@ pub(crate) fn load_with(
     for p in scratch.iter().rev() {
         let _ = force_remove(p);
     }
-    res.map_err(|e| {
+    res.or_else(|e| {
         let failed = rollback(undo);
         if failed.is_empty() {
-            e
-        } else {
-            e.context(format!(
+            return Err(e);
+        }
+        Err(e).with_context(|| {
+            format!(
                 "load failed and its rollback is incomplete: {}",
                 failed.join("; ")
-            ))
-        }
+            )
+        })
     })
 }
 
@@ -278,17 +279,7 @@ fn run(
     let mut entries = ar.entries().context("reading archive")?;
 
     // ---- preflight: nothing is written before this block passes ----------
-    let manifest: Manifest = {
-        let mut e = match entries.next() {
-            Some(e) => e.context("reading archive")?,
-            None => bail!("not an izba archive (manifest.json must come first)"),
-        };
-        if entry_name(&e)? != MANIFEST_PATH {
-            bail!("not an izba archive (manifest.json must come first)");
-        }
-        serde_json::from_slice(&read_bounded(&mut e, MANIFEST_PATH)?)
-            .context("parsing manifest.json")?
-    };
+    let manifest = read_manifest(&mut entries)?;
     check_format(&manifest)?;
     validate_manifest(&manifest)?;
     let mut sels = select(paths, opts, &manifest, hooks)?;
@@ -300,11 +291,69 @@ fn run(
     sweep_stale_stages(paths.root());
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
+    let run_id = format!("{}-{seq}", std::process::id());
     mkdirs(undo, paths.root(), Some(paths.root()))?;
-    let stage = paths.root().join(format!(".load-{pid}-{seq}"));
+    let stage = paths.root().join(format!(".load-{run_id}"));
     crate::paths::create_dir_700(&stage, paths.root())?;
     scratch.push(stage.clone());
+    create_workspace_stages(&mut sels, &run_id, undo, scratch)?;
+
+    progress(format!("reading {}", opts.archive.display()));
+    let mut st = Stager::new(paths, &manifest, &sels, stage.clone());
+    for e in entries.by_ref() {
+        let mut e = e.context("reading archive (truncated or corrupt?)")?;
+        st.entry(&mut e, progress)?;
+    }
+    // Read to the end of the zstd frame so its content checksum (the
+    // workspace's transport integrity) is actually verified.
+    std::io::copy(&mut ar.into_inner(), &mut std::io::sink())
+        .context("archive is truncated or corrupt (zstd)")?;
+    let staged = st.finish()?;
+
+    // ---- verify ----------------------------------------------------------
+    progress("verifying checksums".into());
+    verify_staged(&staged)?;
+
+    // ---- configs + reuse decisions (still before any commit) -------------
+    let prep = prepare(paths, &manifest, &sels, &staged, hooks, &mut report)?;
+
+    // ---- commit ----------------------------------------------------------
+    fail_at(hooks, CommitStep::Images)?;
+    commit_images(paths, &prep.need_images, &stage, undo)?;
+    fail_at(hooks, CommitStep::Volumes)?;
+    commit_volumes(paths, &prep.need_volumes, &stage, undo)?;
+    fail_at(hooks, CommitStep::Workspaces)?;
+    commit_workspaces(&sels, undo)?;
+    fail_at(hooks, CommitStep::Sandboxes)?;
+    mkdirs(undo, &paths.sandboxes_dir(), Some(paths.root()))?;
+    for (s, cfg) in sels.iter().zip(prep.configs) {
+        install_sandbox(paths, s, cfg, &staged, undo, &mut report)?;
+    }
+    commit_tags(paths, &manifest, &prep.refs, undo, &mut report)?;
+    Ok(report)
+}
+
+/// The first entry, which must be `manifest.json`, parsed.
+fn read_manifest<R: Read>(entries: &mut tar::Entries<'_, R>) -> anyhow::Result<Manifest> {
+    let not_izba = || anyhow::anyhow!("not an izba archive (manifest.json must come first)");
+    let mut e = entries
+        .next()
+        .ok_or_else(not_izba)?
+        .context("reading archive")?;
+    if entry_name(&e)? != MANIFEST_PATH {
+        return Err(not_izba());
+    }
+    serde_json::from_slice(&read_bounded(&mut e, MANIFEST_PATH)?).context("parsing manifest.json")
+}
+
+/// One staging dir per bundled workspace tree, beside its target (so the
+/// final placement is a rename).
+fn create_workspace_stages(
+    sels: &mut [Sel],
+    run_id: &str,
+    undo: &mut Vec<Undo>,
+    scratch: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
     let mut tree_stages: HashMap<String, PathBuf> = HashMap::new();
     for s in sels.iter_mut() {
         let Some(tree) = s.ws_tree.clone() else {
@@ -324,7 +373,7 @@ fn run(
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        let ws_stage = parent.join(format!(".izba-load-{pid}-{seq}-{base}"));
+        let ws_stage = parent.join(format!(".izba-load-{run_id}-{base}"));
         fs::create_dir(&ws_stage)
             .with_context(|| format!("creating {}", ws_stage.display()))
             .context(PLACE_HINT)?;
@@ -332,21 +381,10 @@ fn run(
         tree_stages.insert(tree, ws_stage.clone());
         s.ws_stage = Some(ws_stage);
     }
+    Ok(())
+}
 
-    progress(format!("reading {}", opts.archive.display()));
-    let mut st = Stager::new(paths, &manifest, &sels, stage.clone());
-    for e in entries.by_ref() {
-        let mut e = e.context("reading archive (truncated or corrupt?)")?;
-        st.entry(&mut e, progress)?;
-    }
-    // Read to the end of the zstd frame so its content checksum (the
-    // workspace's transport integrity) is actually verified.
-    std::io::copy(&mut ar.into_inner(), &mut std::io::sink())
-        .context("archive is truncated or corrupt (zstd)")?;
-    let staged = st.finish()?;
-
-    // ---- verify ----------------------------------------------------------
-    progress("verifying checksums".into());
+fn verify_staged(staged: &Staged) -> anyhow::Result<()> {
     let sums = staged.sums.as_ref().unwrap();
     for (p, (_, sha)) in &staged.files {
         match sums.files.get(p) {
@@ -363,16 +401,36 @@ fn run(
             bail!("checksum mismatch for {prefix}: archive is corrupt");
         }
     }
+    Ok(())
+}
 
-    // ---- configs + reuse decisions (still before any commit) -------------
+/// Every selected sandbox's verified config plus what the commit must add.
+struct Prepared {
+    configs: Vec<SandboxConfig>,
+    need_images: BTreeSet<String>,
+    need_volumes: BTreeSet<String>,
+    /// `(image_ref, digest)` of each loaded sandbox, for the tag step.
+    refs: Vec<(String, String)>,
+}
+
+fn prepare(
+    paths: &Paths,
+    manifest: &Manifest,
+    sels: &[Sel],
+    staged: &Staged,
+    hooks: &LoadHooks,
+    report: &mut LoadReport,
+) -> anyhow::Result<Prepared> {
     let store = crate::image::ImageStore::new(paths);
-    let mut configs = Vec::new();
-    let mut need_images = BTreeSet::new();
-    let mut need_volumes = BTreeSet::new();
+    let mut p = Prepared {
+        configs: Vec::new(),
+        need_images: BTreeSet::new(),
+        need_volumes: BTreeSet::new(),
+        refs: Vec::new(),
+    };
     let mut reused = BTreeSet::new();
-    let mut refs = Vec::new();
-    for s in &sels {
-        let cfg = prepare_config(s, &manifest, &staged, hooks, &mut report)?;
+    for s in sels {
+        let cfg = prepare_config(s, manifest, staged, hooks, report)?;
         let d = &cfg.image_digest;
         let named: BTreeSet<&String> = cfg.volumes.iter().filter_map(|v| v.name.as_ref()).collect();
         if *d != s.entry.image_digest || named != s.entry.named_volumes.iter().collect() {
@@ -381,66 +439,101 @@ fn run(
                 s.src
             );
         }
-        refs.push((cfg.image_ref.clone(), d.clone()));
-        if !store.is_complete(d) {
-            let dir = paths.image_dir(d);
-            let has =
-                |f: &str| dir.join(f).is_file() || staged.files.contains_key(&image_entry(d, f));
-            if !has("rootfs.erofs") || !has("config.json") {
-                if dir.exists() {
-                    bail!(
-                        "image {d} is incomplete here and the archive cannot complete it; \
-                         remove {} and retry",
-                        dir.display()
-                    );
-                }
-                bail!("archive is missing image {d}");
-            }
-            need_images.insert(d.clone());
+        p.refs.push((cfg.image_ref.clone(), d.clone()));
+        if image_needed(paths, &store, d, staged)? {
+            p.need_images.insert(d.clone());
         }
         for v in cfg.volumes.iter().filter_map(|v| v.name.as_deref()) {
-            let prefix = format!("volumes/{v}.img");
-            let existing = paths.volume_image(v);
-            if existing.exists() {
-                let want = sums.files.get(&prefix).with_context(|| {
-                    format!(
-                        "archive does not carry named volume '{v}' used by '{}'",
-                        s.src
-                    )
-                })?;
-                if &content_digest(&existing)? != want {
-                    bail!(
-                        "named volume '{v}' already exists here with different contents; \
-                         remove or rename it first (izba volume rm {v})"
-                    );
-                }
-                if reused.insert(v.to_string()) {
-                    report.warnings.push(format!(
-                        "reusing identical volume '{v}' already on this host"
-                    ));
-                }
-            } else if staged.disks.contains_key(&prefix) {
-                need_volumes.insert(v.to_string());
-            } else {
-                bail!(
-                    "archive does not carry named volume '{v}' used by '{}'",
-                    s.src
-                );
+            if volume_needed(paths, v, s, staged, &mut reused, report)? {
+                p.need_volumes.insert(v.to_string());
             }
         }
-        configs.push(cfg);
+        p.configs.push(cfg);
     }
+    Ok(p)
+}
 
-    // ---- commit ----------------------------------------------------------
-    let fail = |step: CommitStep| -> anyhow::Result<()> {
-        if hooks.fail_at == Some(step) {
-            bail!("injected failure before commit step {step:?}");
-        }
-        Ok(())
+/// Whether image `d` must be installed from the archive (it is not complete
+/// here); refused when neither this host nor the archive can complete it.
+fn image_needed(
+    paths: &Paths,
+    store: &crate::image::ImageStore,
+    d: &str,
+    staged: &Staged,
+) -> anyhow::Result<bool> {
+    if store.is_complete(d) {
+        return Ok(false);
+    }
+    let dir = paths.image_dir(d);
+    let has = |f: &str| dir.join(f).is_file() || staged.files.contains_key(&image_entry(d, f));
+    if has("rootfs.erofs") && has("config.json") {
+        return Ok(true);
+    }
+    if dir.exists() {
+        bail!(
+            "image {d} is incomplete here and the archive cannot complete it; \
+             remove {} and retry",
+            dir.display()
+        );
+    }
+    bail!("archive is missing image {d}")
+}
+
+/// Whether named volume `v` must be installed from the archive; an identical
+/// one already here is reused (reported once), a different one is refused.
+fn volume_needed(
+    paths: &Paths,
+    v: &str,
+    s: &Sel,
+    staged: &Staged,
+    reused: &mut BTreeSet<String>,
+    report: &mut LoadReport,
+) -> anyhow::Result<bool> {
+    let prefix = format!("volumes/{v}.img");
+    let existing = paths.volume_image(v);
+    let not_carried = || {
+        format!(
+            "archive does not carry named volume '{v}' used by '{}'",
+            s.src
+        )
     };
+    if !existing.exists() {
+        if staged.disks.contains_key(&prefix) {
+            return Ok(true);
+        }
+        bail!("{}", not_carried());
+    }
+    let sums = staged.sums.as_ref().unwrap();
+    let want = sums.files.get(&prefix).with_context(not_carried)?;
+    if &content_digest(&existing)? != want {
+        bail!(
+            "named volume '{v}' already exists here with different contents; \
+             remove or rename it first (izba volume rm {v})"
+        );
+    }
+    if reused.insert(v.to_string()) {
+        report.warnings.push(format!(
+            "reusing identical volume '{v}' already on this host"
+        ));
+    }
+    Ok(false)
+}
 
-    fail(CommitStep::Images)?;
-    for d in &need_images {
+fn fail_at(hooks: &LoadHooks, step: CommitStep) -> anyhow::Result<()> {
+    if hooks.fail_at == Some(step) {
+        bail!("injected failure before commit step {step:?}");
+    }
+    Ok(())
+}
+
+fn commit_images(
+    paths: &Paths,
+    need_images: &BTreeSet<String>,
+    stage: &Path,
+    undo: &mut Vec<Undo>,
+) -> anyhow::Result<()> {
+    let store = crate::image::ImageStore::new(paths);
+    for d in need_images {
         let dst = paths.image_dir(d);
         let from = stage
             .join("images")
@@ -451,32 +544,49 @@ fn run(
             undo.push(Undo::Remove(dst));
             continue;
         }
-        // Existing but incomplete: its rootfs is kept; add only the verified
-        // metadata it lacks (and undo only those files).
-        if !store.config_path(d).exists() && from.join("config.json").is_file() {
-            store.persist_config(d, &fs::read(from.join("config.json"))?)?;
-            undo.push(Undo::Remove(store.config_path(d)));
-        }
-        for (f, path) in [
-            ("passwd", store.passwd_path(d)),
-            ("group", store.group_path(d)),
-        ] {
-            if path.exists() || !from.join(f).is_file() {
-                continue;
-            }
-            let bytes = fs::read(from.join(f))?;
-            let (pw, gr) = if f == "passwd" {
-                (Some(&bytes[..]), None)
-            } else {
-                (None, Some(&bytes[..]))
-            };
-            store.persist_user_dbs(d, pw, gr)?;
-            undo.push(Undo::Remove(path));
-        }
+        complete_image(&store, d, &from, undo)?;
     }
+    Ok(())
+}
 
-    fail(CommitStep::Volumes)?;
-    for v in &need_volumes {
+/// Existing but incomplete image `d`: its rootfs is kept; add only the
+/// verified metadata it lacks (and undo only those files).
+fn complete_image(
+    store: &crate::image::ImageStore,
+    d: &str,
+    from: &Path,
+    undo: &mut Vec<Undo>,
+) -> anyhow::Result<()> {
+    if !store.config_path(d).exists() && from.join("config.json").is_file() {
+        store.persist_config(d, &fs::read(from.join("config.json"))?)?;
+        undo.push(Undo::Remove(store.config_path(d)));
+    }
+    for (f, path) in [
+        ("passwd", store.passwd_path(d)),
+        ("group", store.group_path(d)),
+    ] {
+        if path.exists() || !from.join(f).is_file() {
+            continue;
+        }
+        let bytes = fs::read(from.join(f))?;
+        let (pw, gr) = if f == "passwd" {
+            (Some(&bytes[..]), None)
+        } else {
+            (None, Some(&bytes[..]))
+        };
+        store.persist_user_dbs(d, pw, gr)?;
+        undo.push(Undo::Remove(path));
+    }
+    Ok(())
+}
+
+fn commit_volumes(
+    paths: &Paths,
+    need_volumes: &BTreeSet<String>,
+    stage: &Path,
+    undo: &mut Vec<Undo>,
+) -> anyhow::Result<()> {
+    for v in need_volumes {
         let dst = paths.volume_image(v);
         mkdirs(undo, &paths.volumes_dir(), Some(paths.root()))?;
         // No-replace install: a hard link fails if `dst` exists, so a volume
@@ -493,10 +603,12 @@ fn run(
         }
         let _ = fs::remove_file(&from);
     }
+    Ok(())
+}
 
-    fail(CommitStep::Workspaces)?;
+fn commit_workspaces(sels: &[Sel], undo: &mut Vec<Undo>) -> anyhow::Result<()> {
     let mut placed = BTreeSet::new();
-    for s in &sels {
+    for s in sels {
         let Some(ws_stage) = &s.ws_stage else {
             continue;
         };
@@ -520,93 +632,125 @@ fn run(
         undo.push(Undo::Remove(t.clone()));
         crate::procmgr::ensure_confinable(t)?;
     }
+    Ok(())
+}
 
-    fail(CommitStep::Sandboxes)?;
-    mkdirs(undo, &paths.sandboxes_dir(), Some(paths.root()))?;
-    for (s, mut cfg) in sels.iter().zip(configs) {
-        let dir = paths.sandbox_dir(&s.name);
-        // Exclusive: a concurrent create/load of the same name loses here.
-        fs::create_dir(&dir).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                anyhow::anyhow!("{}", exists_msg(&s.name))
-            } else {
-                anyhow::Error::new(e).context(format!("creating {}", dir.display()))
-            }
-        })?;
-        undo.push(Undo::Remove(dir.clone()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-        }
-        crate::paths::create_dir_700(&paths.logs_dir(&s.name), paths.root())?;
-        let run = paths.run_dir(&s.name);
-        let run_top = std::iter::successors(Some(run.as_path()), |p| p.parent())
-            .take_while(|p| !p.exists())
-            .last()
-            .map(Path::to_path_buf);
-        let marker = run.join(crate::sandbox::RUN_DIR_OWNER);
-        let marker_existed = marker.exists();
-        crate::sandbox::claim_run_dir(paths, &s.name)?;
-        match run_top {
-            Some(t) => undo.push(Undo::Remove(t)),
-            // A pre-existing run dir (e.g. left behind by an `rm`): undo only
-            // the owner marker this claim wrote.
-            None if !marker_existed => undo.push(Undo::Remove(marker)),
-            None => {}
-        }
-        cfg.workspace = s
-            .ws_target
-            .canonicalize()
-            .with_context(|| format!("resolving workspace {}", s.ws_target.display()))?;
-        save_json(&dir.join(CONFIG_FILE), &cfg)?;
-        let prefix = format!("sandboxes/{}/", s.src);
-        let files = staged.files.iter().map(|(p, (path, _))| (p, path));
-        for (p, from) in files.chain(staged.disks.iter()) {
-            let Some(rel) = p.strip_prefix(&prefix) else {
-                continue;
-            };
-            if rel == CONFIG_FILE {
-                continue; // rewritten above
-            }
-            let to = if rel == EGRESS_AUDIT_FILE {
-                paths.logs_dir(&s.name).join(rel)
-            } else {
-                dir.join(rel)
-            };
-            if let Some(parent) = to.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::rename(from, &to).with_context(|| format!("installing {}", to.display()))?;
-        }
-        // The workspace's izba.yml still names the sandbox it was saved as
-        // (metadata.name, or the dir basename by default): diff/promote there
-        // would resolve to that name, not the one this load created.
-        if s.name != s.src && cfg.workspace.join("izba.yml").is_file() {
-            report.warnings.push(format!(
-                "sandbox '{}' was loaded as '{}': izba diff/promote in {} will resolve to \
-                 '{}' — update metadata.name in izba.yml or pass --name {}",
-                s.src,
-                s.name,
-                cfg.workspace.display(),
-                s.src,
-                s.name
-            ));
-        }
-        report.sandboxes.push(LoadedSandbox {
-            name: s.name.clone(),
-            image_ref: cfg.image_ref.clone(),
-            workspace: cfg.workspace.clone(),
-        });
+/// Creates the sandbox dir (exclusively: a concurrent create/load of the
+/// same name loses here), claims its run dir and installs its staged files.
+fn install_sandbox(
+    paths: &Paths,
+    s: &Sel,
+    mut cfg: SandboxConfig,
+    staged: &Staged,
+    undo: &mut Vec<Undo>,
+    report: &mut LoadReport,
+) -> anyhow::Result<()> {
+    let dir = paths.sandbox_dir(&s.name);
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!("{}", exists_msg(&s.name)),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
     }
+    undo.push(Undo::Remove(dir.clone()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    crate::paths::create_dir_700(&paths.logs_dir(&s.name), paths.root())?;
+    claim_run_dir(paths, &s.name, undo)?;
+    cfg.workspace = s
+        .ws_target
+        .canonicalize()
+        .with_context(|| format!("resolving workspace {}", s.ws_target.display()))?;
+    save_json(&dir.join(CONFIG_FILE), &cfg)?;
+    install_sandbox_files(paths, s, &dir, staged)?;
+    // The workspace's izba.yml still names the sandbox it was saved as
+    // (metadata.name, or the dir basename by default): diff/promote there
+    // would resolve to that name, not the one this load created.
+    if s.name != s.src && cfg.workspace.join("izba.yml").is_file() {
+        report.warnings.push(format!(
+            "sandbox '{}' was loaded as '{}': izba diff/promote in {} will resolve to \
+             '{}' — update metadata.name in izba.yml or pass --name {}",
+            s.src,
+            s.name,
+            cfg.workspace.display(),
+            s.src,
+            s.name
+        ));
+    }
+    report.sandboxes.push(LoadedSandbox {
+        name: s.name.clone(),
+        image_ref: cfg.image_ref.clone(),
+        workspace: cfg.workspace,
+    });
+    Ok(())
+}
 
-    // Tags last. Only a loaded sandbox's own `image_ref`, mapped by the
-    // archive to that sandbox's digest, and only when it does not resolve
-    // here: an archive can never plant a tag that shadows an unrelated
-    // (e.g. bare registry) name. Every tag created is reported.
+/// `sandbox::claim_run_dir`, recording exactly what it created for undo.
+fn claim_run_dir(paths: &Paths, name: &str, undo: &mut Vec<Undo>) -> anyhow::Result<()> {
+    let run = paths.run_dir(name);
+    let run_top = std::iter::successors(Some(run.as_path()), |p| p.parent())
+        .take_while(|p| !p.exists())
+        .last()
+        .map(Path::to_path_buf);
+    let marker = run.join(crate::sandbox::RUN_DIR_OWNER);
+    let marker_existed = marker.exists();
+    crate::sandbox::claim_run_dir(paths, name)?;
+    match run_top {
+        Some(t) => undo.push(Undo::Remove(t)),
+        // A pre-existing run dir (e.g. left behind by an `rm`): undo only
+        // the owner marker this claim wrote.
+        None if !marker_existed => undo.push(Undo::Remove(marker)),
+        None => {}
+    }
+    Ok(())
+}
+
+/// Moves the sandbox's staged files and disks (all but `config.json`,
+/// rewritten by the caller) into `dir`; the egress audit log goes to logs/.
+fn install_sandbox_files(
+    paths: &Paths,
+    s: &Sel,
+    dir: &Path,
+    staged: &Staged,
+) -> anyhow::Result<()> {
+    let prefix = format!("sandboxes/{}/", s.src);
+    let files = staged.files.iter().map(|(p, (path, _))| (p, path));
+    for (p, from) in files.chain(staged.disks.iter()) {
+        let Some(rel) = p.strip_prefix(&prefix) else {
+            continue;
+        };
+        if rel == CONFIG_FILE {
+            continue;
+        }
+        let to = if rel == EGRESS_AUDIT_FILE {
+            paths.logs_dir(&s.name).join(rel)
+        } else {
+            dir.join(rel)
+        };
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(from, &to).with_context(|| format!("installing {}", to.display()))?;
+    }
+    Ok(())
+}
+
+/// Tags last. Only a loaded sandbox's own `image_ref`, mapped by the
+/// archive to that sandbox's digest, and only when it does not resolve
+/// here: an archive can never plant a tag that shadows an unrelated
+/// (e.g. bare registry) name. Every tag created is reported.
+fn commit_tags(
+    paths: &Paths,
+    manifest: &Manifest,
+    refs: &[(String, String)],
+    undo: &mut Vec<Undo>,
+    report: &mut LoadReport,
+) -> anyhow::Result<()> {
     let mut tags_saved = false;
     let mut seen = BTreeSet::new();
-    for (tag, digest) in &refs {
+    for (tag, digest) in refs {
         if manifest.tags.get(tag) != Some(digest)
             || !seen.insert(tag)
             || crate::image::tags::resolve_tag(paths, tag)?.is_some()
@@ -623,7 +767,7 @@ fn run(
             "created local image tag '{tag}' → {digest} (from the archive)"
         ));
     }
-    Ok(report)
+    Ok(())
 }
 
 fn exists_msg(name: &str) -> String {
@@ -644,65 +788,9 @@ fn validate_manifest(m: &Manifest) -> anyhow::Result<()> {
         if !names.insert(&s.name) {
             bail!("archive lists sandbox '{}' twice", s.name);
         }
-        let own = format!("sandboxes/{}/", s.name);
-        for d in &s.disks {
-            validate_entry_path(&d.path)?;
-            let rel = d.path.strip_prefix(&own).unwrap_or("");
-            let anon_ok = rel
-                .strip_prefix("volumes/")
-                .and_then(|f| f.strip_suffix(".img"))
-                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
-            if rel != "rw.img" && !anon_ok {
-                bail!("unexpected disk {:?} for sandbox '{}'", d.path, s.name);
-            }
-        }
-        // Every sandbox has a writable layer; without it the staged-disk
-        // completeness check would have nothing to demand.
-        let rw = format!("{own}rw.img");
-        if !s.disks.iter().any(|d| d.path == rw) {
-            bail!(
-                "archive is corrupt: sandbox '{}' lists no disk {rw}",
-                s.name
-            );
-        }
-        if let Some(from) = &s.workspace_from {
-            // The owner holds the tree and must describe the SAME source dir:
-            // every sharer then maps to the owner's one restore target.
-            let owner = m.sandboxes.iter().find(|o| &o.name == from);
-            let ok = s.workspace_bundled
-                && owner.is_some_and(|o| {
-                    o.name != s.name
-                        && o.workspace_bundled
-                        && o.workspace_from.is_none()
-                        && o.source_workspace == s.source_workspace
-                });
-            if !ok {
-                bail!(
-                    "archive is corrupt: sandbox '{}' takes its workspace from {from:?}, \
-                     which holds no matching bundled workspace",
-                    s.name
-                );
-            }
-        }
-        if !m.images.contains(&s.image_digest) {
-            bail!(
-                "sandbox '{}': image {:?} is not in the archive",
-                s.name,
-                s.image_digest
-            );
-        }
-        for v in &s.named_volumes {
-            if !m
-                .named_volumes
-                .iter()
-                .any(|b| b.path == format!("volumes/{v}.img"))
-            {
-                bail!(
-                    "sandbox '{}': named volume {v:?} is not in the archive",
-                    s.name
-                );
-            }
-        }
+        validate_disks(s)?;
+        validate_workspace_from(m, s)?;
+        validate_references(m, s)?;
     }
     for v in &m.named_volumes {
         let name = v
@@ -717,6 +805,80 @@ fn validate_manifest(m: &Manifest) -> anyhow::Result<()> {
     for d in &m.images {
         if !valid_digest(d) {
             bail!("invalid image digest {d:?} in archive");
+        }
+    }
+    Ok(())
+}
+
+/// A sandbox's disks are its own `rw.img` (mandatory) and anonymous volumes.
+fn validate_disks(s: &SandboxEntry) -> anyhow::Result<()> {
+    let own = format!("sandboxes/{}/", s.name);
+    for d in &s.disks {
+        validate_entry_path(&d.path)?;
+        let rel = d.path.strip_prefix(&own).unwrap_or("");
+        let anon_ok = rel
+            .strip_prefix("volumes/")
+            .and_then(|f| f.strip_suffix(".img"))
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+        if rel != "rw.img" && !anon_ok {
+            bail!("unexpected disk {:?} for sandbox '{}'", d.path, s.name);
+        }
+    }
+    // Every sandbox has a writable layer; without it the staged-disk
+    // completeness check would have nothing to demand.
+    let rw = format!("{own}rw.img");
+    if !s.disks.iter().any(|d| d.path == rw) {
+        bail!(
+            "archive is corrupt: sandbox '{}' lists no disk {rw}",
+            s.name
+        );
+    }
+    Ok(())
+}
+
+/// The owner named by `workspace_from` holds the tree and must describe the
+/// SAME source dir: every sharer then maps to the owner's one restore target.
+fn validate_workspace_from(m: &Manifest, s: &SandboxEntry) -> anyhow::Result<()> {
+    let Some(from) = &s.workspace_from else {
+        return Ok(());
+    };
+    let owner = m.sandboxes.iter().find(|o| &o.name == from);
+    let ok = s.workspace_bundled
+        && owner.is_some_and(|o| {
+            o.name != s.name
+                && o.workspace_bundled
+                && o.workspace_from.is_none()
+                && o.source_workspace == s.source_workspace
+        });
+    if !ok {
+        bail!(
+            "archive is corrupt: sandbox '{}' takes its workspace from {from:?}, \
+             which holds no matching bundled workspace",
+            s.name
+        );
+    }
+    Ok(())
+}
+
+/// The image and named volumes a sandbox entry names are in the archive.
+fn validate_references(m: &Manifest, s: &SandboxEntry) -> anyhow::Result<()> {
+    if !m.images.contains(&s.image_digest) {
+        bail!(
+            "sandbox '{}': image {:?} is not in the archive",
+            s.name,
+            s.image_digest
+        );
+    }
+    for v in &s.named_volumes {
+        if !m
+            .named_volumes
+            .iter()
+            .any(|b| b.path == format!("volumes/{v}.img"))
+        {
+            bail!(
+                "sandbox '{}': named volume {v:?} is not in the archive",
+                s.name
+            );
         }
     }
     Ok(())

@@ -178,7 +178,9 @@ fn append_pax<W: Write>(tar: &mut tar::Builder<W>, key: &str, value: &str) -> Re
     let record = format!("{len}{body}");
     let mut h = tar::Header::new_gnu();
     h.set_entry_type(tar::EntryType::XHeader);
-    h.set_mode(0o644);
+    // A PAX header is metadata, never extracted as a file: its mode is
+    // unused, so it is owner-only like every other non-workspace entry.
+    h.set_mode(0o600);
     h.set_size(record.len() as u64);
     tar.append_data(&mut h, "PaxHeader", record.as_bytes())?;
     Ok(())
