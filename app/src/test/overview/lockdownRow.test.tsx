@@ -25,6 +25,32 @@ describe("LockdownRow", () => {
     expect(screen.queryByText(/izba-sb-web/)).toBeNull();
   });
 
+  it("keeps the pending indicator when the posture turns unknown mid-action", () => {
+    lockdown.mockReturnValue(new Promise(() => {}));
+    const { rerender } = render(<LockdownRow name="web" lockdown={unlocked} onChanged={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: /lock down/i }));
+    rerender(<LockdownRow name="web" lockdown={unlocked} onChanged={() => {}} unknown />);
+    expect(screen.getByText("unknown — refresh failed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /waiting for approval/i })).toBeDisabled();
+  });
+
+  it("keeps an action error visible when the posture turns unknown", async () => {
+    lockdown.mockRejectedValue("boom");
+    const { rerender } = render(<LockdownRow name="web" lockdown={unlocked} onChanged={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: /lock down/i }));
+    await screen.findByRole("alert");
+    rerender(<LockdownRow name="web" lockdown={unlocked} onChanged={() => {}} unknown />);
+    expect(screen.getByRole("alert")).toHaveTextContent("boom");
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("keeps an open Unlock confirmation when the posture turns unknown", () => {
+    const { rerender } = render(<LockdownRow name="web" lockdown={locked} onChanged={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+    rerender(<LockdownRow name="web" lockdown={locked} onChanged={() => {}} unknown />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
   it("offers Lock down when unlocked", () => {
     render(<LockdownRow name="web" lockdown={unlocked} onChanged={() => {}} />);
     expect(screen.getByText("unlocked")).toBeInTheDocument();

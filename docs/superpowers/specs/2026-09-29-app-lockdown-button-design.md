@@ -114,7 +114,17 @@ self-elevate).
   the sandbox no longer exists). `RealDaemon::unlock` has no
   `ensure_sandbox_exists` guard (deprovision is by name and idempotent);
   `lockdown` keeps it. Fail-closed reporting (the CLI is warn-and-continue)
-  because the GUI has no post-success warning channel.
+  because the GUI has no post-success warning channel. The failure is shown
+  in an app-level dismissible notice (`NoticeBanner`, fed by `Detail`'s
+  `onNotice` for the Remove action only), not Detail's inline error, because
+  Detail unmounts once the poll drops the removed sandbox.
+  **Replacement-sandbox defense:** the release is by name, so after a
+  successful rm `lockdown_state(name)` is re-read; if it is `Locked` again a
+  new sandbox owns the name (in practice it cannot be locked yet: provisioning
+  `izba-sb-<name>` fails at NetUserAdd while the old account exists) and the
+  release is skipped with `sandbox '<name>' was removed, but a new sandbox
+  named '<name>' now exists — its lock-down account was left in place; run
+  'izba windows-cleanup' once that is resolved`.
 
 ### 3.3 UI (app/src) — Sandbox card, "lock-down" row
 
@@ -137,7 +147,9 @@ Rendered only when `detail.lockdown !== null`.
   app, so `OverviewTab` also re-fetches `inspect` every 15 s and on window
   focus / tab-visible (never blanking the card). If a refresh rejects, the row
   renders `unknown — refresh failed` (warning tone) with NO Lock down / Unlock
-  buttons and no restart badge until a refresh succeeds; other card rows keep
+  buttons that start an action and no restart badge until a refresh succeeds;
+  in-flight action feedback (pending, error, cancelled note, an open Unlock
+  confirmation) still renders; other card rows keep
   their last values — only the security posture is withheld.
 
 ## 4. Testing
