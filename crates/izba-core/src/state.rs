@@ -68,6 +68,14 @@ pub struct SandboxConfig {
     /// pre-feature config.json loading (= false).
     #[serde(default)]
     pub vnc: bool,
+    /// Save/load (spec 2026-09-29 §5.3): the workspace owner `(uid, gid)` the
+    /// ids on this sandbox's disks were written under, when that differs from
+    /// "whoever owns the workspace now". `None` for every sandbox created on
+    /// this host (disks match the current owner; no disk idmap). Set only by
+    /// `izba load`; `start` compares it to the live owner and, for non-docker
+    /// non-builder sandboxes, emits `izba.diskuidmap=`/`izba.diskgidmap=`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_owner: Option<(u32, u32)>,
 }
 
 impl SandboxConfig {
@@ -215,6 +223,21 @@ pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<
 mod tests {
     use super::*;
 
+    #[test]
+    fn disk_owner_defaults_to_none_and_is_omitted_when_none() {
+        let json =
+            r#"{"image_digest":"sha256:x","image_ref":"a","cpus":1,"mem_mb":512,"workspace":"/w"}"#;
+        let c: SandboxConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.disk_owner, None);
+        let out = serde_json::to_string(&c).unwrap();
+        assert!(!out.contains("disk_owner"), "{out}");
+        let mut c2 = c.clone();
+        c2.disk_owner = Some((1000, 1000));
+        let back: SandboxConfig =
+            serde_json::from_str(&serde_json::to_string(&c2).unwrap()).unwrap();
+        assert_eq!(back.disk_owner, Some((1000, 1000)));
+    }
+
     fn sample_config() -> SandboxConfig {
         SandboxConfig {
             usb: Default::default(),
@@ -230,6 +253,7 @@ mod tests {
             rw_size_gb: 8,
             docker: false,
             vnc: false,
+            disk_owner: None,
         }
     }
 

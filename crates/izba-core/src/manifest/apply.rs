@@ -264,6 +264,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         crate::state::save_json(&paths.sandbox_dir("x").join(CONFIG_FILE), &seed).unwrap();
 
@@ -308,6 +309,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         crate::state::save_json(&paths.sandbox_dir("y").join(CONFIG_FILE), &seed).unwrap();
 
@@ -357,6 +359,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         crate::state::save_json(&paths.sandbox_dir("z").join(CONFIG_FILE), &seed).unwrap();
 
@@ -408,6 +411,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 12, // persisted at create time
+            disk_owner: None,
         };
         crate::state::save_json(&paths.sandbox_dir("rw").join(CONFIG_FILE), &seed).unwrap();
 
@@ -447,6 +451,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         crate::state::save_json(&paths.sandbox_dir(name).join(CONFIG_FILE), &seed).unwrap();
     }

@@ -859,6 +859,7 @@ mod tests {
             vnc: false,
             build: None,
             rw_size_gb: 8,
+            disk_owner: None,
         };
         save_json(&dir.join(CONFIG_FILE), &cfg).unwrap();
         if let Some(eg) = egress {
