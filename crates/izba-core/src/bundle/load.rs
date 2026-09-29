@@ -656,6 +656,15 @@ fn validate_manifest(m: &Manifest) -> anyhow::Result<()> {
                 bail!("unexpected disk {:?} for sandbox '{}'", d.path, s.name);
             }
         }
+        // Every sandbox has a writable layer; without it the staged-disk
+        // completeness check would have nothing to demand.
+        let rw = format!("{own}rw.img");
+        if !s.disks.iter().any(|d| d.path == rw) {
+            bail!(
+                "archive is corrupt: sandbox '{}' lists no disk {rw}",
+                s.name
+            );
+        }
         if let Some(from) = &s.workspace_from {
             // The owner holds the tree and must describe the SAME source dir:
             // every sharer then maps to the owner's one restore target.
@@ -2059,6 +2068,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("newer izba"), "{e}");
+        assert_eq!(tgt.snapshot(), before);
+    }
+
+    #[test]
+    fn a_manifest_without_the_rw_disk_is_refused() {
+        let tgt = Tgt::new();
+        let o = opts_bundled(&tgt);
+        edit_manifest(&o.archive, |m| {
+            m.sandboxes[0]
+                .disks
+                .retain(|d| !d.path.ends_with("/rw.img"));
+        });
+        let before = tgt.snapshot();
+        let e = load_with(&tgt.paths, &o, &mut |_| {}, &tgt.hooks())
+            .unwrap_err()
+            .to_string();
+        // Refused by the manifest preflight, not later by the stray entry.
+        assert!(e.contains("lists no disk sandboxes/a/rw.img"), "{e}");
         assert_eq!(tgt.snapshot(), before);
     }
 
