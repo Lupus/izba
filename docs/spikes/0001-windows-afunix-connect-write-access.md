@@ -94,6 +94,10 @@ Observations that matter beyond the yes/no:
   DACL and MIC and can drive that sandbox's outbound proxy (its full
   allow-list and DNS) or its USB broker. A VMM escape at Low IL thus gains
   every sibling sandbox's egress plane rather than being contained to its own.
+  The same mechanism reaches further than the egress plane — a sibling's own
+  VMM socket (`vsock.sock`), writable disks, console log and workspace carry
+  the same Low label; that sibling-surface consequence is recorded as
+  [F-33](../security/findings-2026-06-15.md) in the security register.
 - **Same-user Medium-IL peers are unchanged.** They could always connect
   (profile DACL); the vault design already scopes them out of the socket
   layer by construction. The delta this spike sizes is precisely the Low-IL
