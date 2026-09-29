@@ -2244,6 +2244,39 @@ pub fn reset_rw_scratch(paths: &Paths, name: &str) -> anyhow::Result<()> {
     result
 }
 
+/// Every sandbox (sorted) whose `config.json` references persistent volume
+/// `vol_name`, live or not. Dirs mid-removal and unreadable configs are skipped.
+pub(crate) fn volume_referrers(paths: &Paths, vol_name: &str) -> anyhow::Result<Vec<String>> {
+    let dir = paths.sandboxes_dir();
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains(".removing-") {
+            continue;
+        }
+        let config: SandboxConfig = match load_json(&entry.path().join(CONFIG_FILE)) {
+            Ok(Some(c)) => c,
+            _ => continue,
+        };
+        if config
+            .volumes
+            .iter()
+            .any(|v| v.name.as_deref() == Some(vol_name))
+        {
+            out.push(name);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// If a *live* sandbox other than `exclude` references persistent volume
 /// `vol_name`, return that sandbox's name. Enforces single-writer at start.
 pub(crate) fn persistent_volume_holder(
@@ -2252,28 +2285,8 @@ pub(crate) fn persistent_volume_holder(
     exclude: &str,
     connector: Connector,
 ) -> anyhow::Result<Option<String>> {
-    let dir = paths.sandboxes_dir();
-    if !dir.is_dir() {
-        return Ok(None);
-    }
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == exclude || name.contains(".removing-") {
-            continue;
-        }
-        let config: SandboxConfig = match load_json(&entry.path().join(CONFIG_FILE)) {
-            Ok(Some(c)) => c,
-            _ => continue,
-        };
-        let references = config
-            .volumes
-            .iter()
-            .any(|v| v.name.as_deref() == Some(vol_name));
-        if references && liveness_of(paths, &name, connector)? != Liveness::Stopped {
+    for name in volume_referrers(paths, vol_name)? {
+        if name != exclude && liveness_of(paths, &name, connector)? != Liveness::Stopped {
             return Ok(Some(name));
         }
     }

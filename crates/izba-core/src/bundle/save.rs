@@ -2,11 +2,13 @@
 //! files and disks, optionally workspaces — into one `.izba` archive
 //! (zstd(tar), spec §2/§4/§10).
 //!
-//! Every named sandbox's lock is held for the whole write and its liveness is
-//! re-checked under the lock, so a concurrent `start` or config edit can
-//! never interleave with the copy. The archive is written to `<out>.partial`
-//! and renamed into place only once it is complete; any failure removes the
-//! partial, so `<out>` is either absent or a whole archive.
+//! Every named sandbox's lock — and the lock of every other sandbox that
+//! references a saved named volume — is held for the whole write, and
+//! liveness is re-checked under the lock, so a concurrent `start` or config
+//! edit can never interleave with the copy. The archive is written to a
+//! per-run `<out>.<pid>.<seq>.partial` and renamed into place only once it is
+//! complete; any failure removes the partial, so `<out>` is either absent or
+//! a whole archive.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
@@ -126,6 +128,26 @@ pub fn save(
             bail!("sandbox '{name}' is running; stop it first (or pass --stop)");
         }
     }
+    // Also lock every OTHER sandbox that references a saved named volume, so
+    // none can `start` and write the volume mid-copy (a torn image whose
+    // checksums would still validate). Held for the whole write, like the
+    // saved sandboxes' own locks; a busy one is a loud, retryable refusal.
+    let saved: HashSet<&str> = plan.configs.iter().map(|(n, _)| n.as_str()).collect();
+    let mut locked: HashSet<String> = HashSet::new();
+    for v in &plan.named_volumes {
+        for other in crate::sandbox::volume_referrers(paths, v)? {
+            if saved.contains(other.as_str()) || !locked.insert(other.clone()) {
+                continue;
+            }
+            match crate::sandbox::lock_sandbox(paths, &other) {
+                Ok(l) => _locks.push(l),
+                Err(e) => bail!(
+                    "named volume '{v}' is also used by sandbox '{other}', which could not be \
+                     locked ({e:#}); retry once it is idle"
+                ),
+            }
+        }
+    }
     for v in &plan.named_volumes {
         // Exclude nothing: the saved sandboxes were just verified stopped.
         if let Some(h) = crate::sandbox::persistent_volume_holder(paths, v, "", connector)? {
@@ -136,9 +158,15 @@ pub fn save(
         .out
         .file_name()
         .context("output path has no file name")?;
-    let partial = opts
-        .out
-        .with_file_name(format!("{}.partial", file_name.to_string_lossy()));
+    // Unique per run (pid + in-process counter): two concurrent saves to the
+    // same --out — possibly two daemon threads — never share a partial.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let partial = opts.out.with_file_name(format!(
+        "{}.{}.{seq}.partial",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
     match write_archive(paths, &plan, opts, &partial, progress) {
         Ok(mut report) => {
             if let Err(e) = std::fs::rename(&partial, &opts.out) {
@@ -380,16 +408,37 @@ fn append_bytes<W: Write>(
         .with_context(|| format!("archiving {path}"))
 }
 
-/// `Read` adapter feeding everything read through sha256.
+/// `Read` adapter feeding exactly `remaining` bytes through sha256: never
+/// reads past the length declared in the tar header (a file growing mid-read,
+/// e.g. the daemon appending to egress-audit.jsonl, is cut at the stat length)
+/// and errors on an early EOF (a shrinking file) instead of letting the tar
+/// stream desync from its header.
 struct HashingReader<R> {
     inner: R,
+    remaining: u64,
     h: Sha256,
 }
 
 impl<R: Read> Read for HashingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let cap = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..cap])?;
+        if n == 0 && cap > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "file shrank while archiving ({} bytes short)",
+                    self.remaining
+                ),
+            ));
+        }
         self.h.update(&buf[..n]);
+        self.remaining -= n as u64;
         Ok(n)
     }
 }
@@ -403,15 +452,29 @@ fn append_file_hashed<W: Write>(
 ) -> anyhow::Result<u64> {
     let f = File::open(src).with_context(|| format!("opening {}", src.display()))?;
     let len = f.metadata()?.len();
+    append_reader_hashed(tar, path, f, len, sums)?;
+    Ok(len)
+}
+
+/// Exactly `len` bytes of `reader` as entry `path` (header size `len`); a
+/// shorter reader fails, a longer one is truncated at `len`.
+fn append_reader_hashed<W: Write, R: Read>(
+    tar: &mut tar::Builder<W>,
+    path: &str,
+    reader: R,
+    len: u64,
+    sums: &mut Checksums,
+) -> anyhow::Result<()> {
     let mut r = HashingReader {
-        inner: f,
+        inner: reader,
+        remaining: len,
         h: Sha256::new(),
     };
     tar.append_data(&mut file_header(len), path, &mut r)
         .with_context(|| format!("archiving {path}"))?;
     sums.files
         .insert(path.to_string(), hex::encode(r.h.finalize()));
-    Ok(len)
+    Ok(())
 }
 
 /// A disk as `<prefix>.len` (8-byte LE logical length — always written, so an
@@ -596,7 +659,7 @@ mod tests {
         }
         assert!(names.iter().any(|n| n == "sandboxes/a/rw.img.len"));
         assert!(!names.iter().any(|n| n.starts_with("workspaces/")));
-        assert!(!t.path().join("x.izba.partial").exists());
+        assert_no_partials(t.path());
     }
 
     #[test]
@@ -633,6 +696,132 @@ mod tests {
         assert!(e.contains("'data'") && e.contains("'b'"), "{e}");
     }
 
+    fn assert_no_partials(dir: &Path) {
+        let left: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".partial"))
+            .collect();
+        assert!(left.is_empty(), "leftover partials: {left:?}");
+    }
+
+    #[test]
+    fn save_refuses_when_another_sandbox_sharing_a_named_volume_is_busy() {
+        let (t, paths) = fixture();
+        add_sandbox(&paths, "a", "sha256:aa", &[("data", "/data")]);
+        add_sandbox(&paths, "b", "sha256:aa", &[("data", "/data")]);
+        add_sandbox(&paths, "c", "sha256:aa", &[]);
+        // b is stopped but busy (e.g. mid-start): it could write data.img
+        // during the copy, so the save must refuse rather than race it.
+        let held = crate::sandbox::lock_sandbox(&paths, "b").unwrap();
+        let out = t.path().join("x.izba");
+        let e = save(
+            &paths,
+            &no_conn,
+            &opts(&["a"], out.clone(), false),
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("'data'") && e.contains("'b'") && e.contains("busy"),
+            "{e}"
+        );
+        assert!(!out.exists());
+        assert_no_partials(t.path());
+        // An unrelated busy sandbox (c) does not block; once b is idle it works.
+        drop(held);
+        let _c = crate::sandbox::lock_sandbox(&paths, "c").unwrap();
+        save(
+            &paths,
+            &no_conn,
+            &opts(&["a"], out.clone(), false),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(out.exists());
+    }
+
+    #[test]
+    fn save_holds_the_lock_of_a_sandbox_sharing_a_named_volume_during_the_write() {
+        let (t, paths) = fixture();
+        add_sandbox(&paths, "a", "sha256:aa", &[("data", "/data")]);
+        add_sandbox(&paths, "b", "sha256:aa", &[("data", "/data")]);
+        let mut b_busy_mid_write = None;
+        save(
+            &paths,
+            &no_conn,
+            &opts(&["a"], t.path().join("x.izba"), false),
+            &mut |_| {
+                if b_busy_mid_write.is_none() {
+                    b_busy_mid_write = Some(crate::sandbox::lock_sandbox(&paths, "b").is_err());
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(b_busy_mid_write, Some(true));
+        // Released afterwards.
+        crate::sandbox::lock_sandbox(&paths, "b").unwrap();
+    }
+
+    #[test]
+    fn a_reader_shorter_than_its_declared_len_fails() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut sums = Checksums::default();
+        let e = append_reader_hashed(&mut tar, "f", &b"abc"[..], 5, &mut sums).unwrap_err();
+        assert!(format!("{e:#}").contains("shrank"), "{e:#}");
+        assert!(sums.files.is_empty());
+    }
+
+    #[test]
+    fn a_reader_longer_than_its_declared_len_is_cut_and_the_stream_stays_in_sync() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut sums = Checksums::default();
+        append_reader_hashed(&mut tar, "f", &b"hello, grown"[..], 5, &mut sums).unwrap();
+        append_reader_hashed(&mut tar, "g", &b"next"[..], 4, &mut sums).unwrap();
+        let bytes = tar.into_inner().unwrap();
+        let mut ar = tar::Archive::new(&bytes[..]);
+        let got: Vec<(String, Vec<u8>)> = ar
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let mut e = e.unwrap();
+                let p = e.path().unwrap().to_string_lossy().into_owned();
+                let mut b = Vec::new();
+                e.read_to_end(&mut b).unwrap();
+                (p, b)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("f".into(), b"hello".to_vec()),
+                ("g".into(), b"next".to_vec())
+            ]
+        );
+        assert_eq!(sums.files["f"], hex::encode(Sha256::digest(b"hello")));
+    }
+
+    #[test]
+    fn concurrent_runs_use_distinct_partials() {
+        // Two saves of different sandboxes to the same --out, both succeed
+        // (last rename wins) and leave no partial behind.
+        let (t, paths) = fixture();
+        add_sandbox(&paths, "a", "sha256:aa", &[]);
+        add_sandbox(&paths, "b", "sha256:aa", &[]);
+        let out = t.path().join("x.izba");
+        std::thread::scope(|s| {
+            for n in ["a", "b"] {
+                let (paths, out) = (&paths, out.clone());
+                s.spawn(move || {
+                    save(paths, &no_conn, &opts(&[n], out, false), &mut |_| {}).unwrap();
+                });
+            }
+        });
+        assert!(out.exists());
+        assert_no_partials(t.path());
+    }
+
     #[test]
     fn save_refuses_a_sandbox_busy_with_another_operation() {
         let (t, paths) = fixture();
@@ -663,7 +852,7 @@ mod tests {
         .unwrap_err();
         assert!(e.to_string().contains("sha256:missing"), "{e}");
         assert!(!out.exists());
-        assert!(!t.path().join("x.izba.partial").exists());
+        assert_no_partials(t.path());
     }
 
     #[test]
