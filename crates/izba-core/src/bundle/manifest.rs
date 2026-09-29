@@ -131,6 +131,47 @@ pub fn validate_entry_path(p: &str) -> Result<()> {
     }
 }
 
+/// Refuse a `/`-separated workspace-relative path that some host izba runs
+/// on cannot recreate faithfully. Save runs it over every workspace entry (so
+/// an archive never carries a name a load would refuse), and a Windows load
+/// runs it again before unpacking: there `:` names an NTFS alternate data
+/// stream and a reserved device name opens the device, not a file.
+pub fn check_portable_rel(rel: &str) -> Result<()> {
+    for c in rel.split('/') {
+        if let Some(why) = non_portable(c) {
+            bail!("{rel:?} {why}");
+        }
+    }
+    Ok(())
+}
+
+/// Why one path component is not portable, or `None`.
+fn non_portable(c: &str) -> Option<&'static str> {
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    if c.contains('\\') {
+        return Some("contains '\\' (a path separator on Windows)");
+    }
+    if c.contains(':') {
+        return Some("contains ':' (an alternate data stream on Windows)");
+    }
+    if c.contains('\0') {
+        return Some("contains a NUL byte");
+    }
+    if c.ends_with('.') || c.ends_with(' ') {
+        return Some("ends with a dot or space (Windows strips it)");
+    }
+    // Windows reserves the device names with ANY extension (`con.txt`).
+    let stem = c.split('.').next().unwrap_or(c).to_ascii_uppercase();
+    let numbered = ["COM", "LPT"].iter().any(|p| {
+        stem.strip_prefix(p)
+            .is_some_and(|d| d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9'))
+    });
+    if RESERVED.contains(&stem.as_str()) || numbered {
+        return Some("is a reserved device name on Windows");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +216,37 @@ mod tests {
             "images",
         ] {
             assert!(validate_entry_path(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn workspace_paths_must_be_portable() {
+        for ok in [
+            "src/main.rs",
+            ".git/HEAD",
+            "a.b.c",
+            "CONSOLE",
+            "com10",
+            "lpt",
+            "x/nul-ish",
+        ] {
+            check_portable_rel(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for (bad, why) in [
+            ("a:b", "':'"),
+            ("dir/x:y/z", "':'"),
+            ("back\\slash", "'\\'"),
+            ("nul\0byte", "NUL"),
+            ("CON", "reserved"),
+            ("sub/con.txt", "reserved"),
+            ("Aux", "reserved"),
+            ("COM1", "reserved"),
+            ("lpt9.log", "reserved"),
+            ("trail.", "dot or space"),
+            ("dir /x", "dot or space"),
+        ] {
+            let e = check_portable_rel(bad).unwrap_err().to_string();
+            assert!(e.contains(why), "{bad}: {e}");
         }
     }
 

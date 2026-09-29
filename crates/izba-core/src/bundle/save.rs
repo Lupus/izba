@@ -1060,6 +1060,31 @@ mod tests {
     }
 
     #[test]
+    fn save_with_workspace_refuses_a_name_load_could_not_restore() {
+        for bad in ["a:b", "CON.txt", "trail.", "back\\slash"] {
+            let (t, paths) = fixture();
+            let cfg = add_sandbox(&paths, "a", "sha256:aa", &[]);
+            std::fs::create_dir_all(cfg.workspace.join("sub")).unwrap();
+            std::fs::write(cfg.workspace.join("sub").join(bad), b"x").unwrap();
+            let out = t.path().join("x.izba");
+            let e = save(
+                &paths,
+                &no_conn,
+                &opts(&["a"], out.clone(), true),
+                &mut |_| {},
+            )
+            .unwrap_err();
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains(&format!("sub/{bad}")) && msg.contains("cannot be restored portably"),
+                "{bad}: {msg}"
+            );
+            assert!(!out.exists());
+            assert_no_partials(t.path());
+        }
+    }
+
+    #[test]
     fn save_with_workspace_refuses_a_missing_workspace() {
         let (t, paths) = fixture();
         let cfg = add_sandbox(&paths, "a", "sha256:aa", &[]);
