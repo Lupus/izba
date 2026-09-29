@@ -53,7 +53,13 @@ izba save <name…> | --all  -o <file.izba>  [--with-workspace] [--stop]
   `ports.json`, `lockdown.json`, `lockdown.cred`, `trust/`, `ssh/`, `oci/`,
   `vnc/`, `vnc.password`, `logs/console.log`, `buildout/`, `run/`, lock files,
   tombstones.
-- Writes `<out>.partial`, renames to `<out>` on success; deletes the partial and
+- Locks every named sandbox BEFORE reading its config (the plan and the copied
+  `config.json` are one state).
+- Writes `<out>.<pid>.<seq>.partial`, created exclusively (O_EXCL, and
+  O_NOFOLLOW + mode 0600 on Unix; a taken name is skipped, never followed or
+  truncated), and publishes it WITHOUT replacing anything (hard link; FAT
+  falls back to an exclusive claim of `<out>` + rename): a file appearing at
+  `<out>` meanwhile is kept and the save fails. Deletes the partial and
   releases all locks on any error or client disconnect.
 - Reports progress in bytes; ends with logical vs archive size and a one-line
   note that the archive may contain secrets from disks/workspace.
@@ -76,6 +82,8 @@ izba load <file.izba> [<name>…] [--as <new>] [--workspace <dir> | --workspace-
   filesystem (data root vs workspace destination may differ).
 - Named volume already present on target: identical sha256 → reuse
   (idempotent re-load); different → hard error naming the volume.
+- Single writer: a named volume bound by an existing sandbox here, or by two
+  sandboxes of the selection, → hard error (load them one at a time).
 
 ### 3.2 Workspace
 
@@ -83,7 +91,10 @@ izba load <file.izba> [<name>…] [--as <new>] [--workspace <dir> | --workspace-
   dir. Cross-OS, a source path under the source home is translated relative to
   the target home (`/home/u/proj` ↔ `%USERPROFILE%\proj`); a path outside home
   requires `--workspace`/`--workspace-root`. Never extracts over a non-empty
-  directory.
+  directory. Staged owner-only (0700) beside the target, then renamed into
+  place and given the mode a fresh directory gets. May not land where any
+  other selected sandbox (bundled or not) from a different source workspace
+  resolves.
 - **Not bundled:** bind to the (translated) source path if it exists (e.g. the
   user already cloned the repo); else `--workspace` is required.
 - Symlink creation failing on Windows (no Developer Mode / privilege) → load
