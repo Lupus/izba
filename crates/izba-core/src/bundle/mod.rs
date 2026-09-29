@@ -8,6 +8,8 @@ pub mod load;
 pub mod manifest;
 pub mod save;
 pub mod sparse;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod workspace;
 
 /// Archive format version written by this build; newer is refused on load.
