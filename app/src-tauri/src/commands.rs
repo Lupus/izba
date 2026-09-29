@@ -83,6 +83,14 @@ pub fn restart_core(d: &mut dyn DaemonApi, name: &str) -> Result<(), String> {
 /// The locked state is read BEFORE rm (its files live in the sandbox dir).
 /// If rm fails its error is returned unchanged and nothing was released.
 /// `force` skips the running-state guard inside rm.
+///
+/// The release is by NAME, so a same-name replacement sandbox created by
+/// another client after rm could in principle be hit. That is closed by
+/// construction: a replacement cannot become LOCKED in that window, because
+/// provisioning `izba-sb-<name>` fails at NetUserAdd while the old account
+/// still exists. As a cheap defense anyway, the lock-down state is re-read
+/// after rm; if it is `Locked` again a new sandbox owns the name, so we do NOT
+/// release and tell the user instead.
 pub fn remove_core(d: &mut dyn DaemonApi, name: &str, force: bool) -> Result<(), String> {
     // Degraded counts as not-locked because lockdown_state() never produces it;
     // a future Degraded producer must revisit this (it would skip the unlock).
@@ -92,6 +100,13 @@ pub fn remove_core(d: &mut dyn DaemonApi, name: &str, force: bool) -> Result<(),
             .is_locked();
     d.remove(name, force).map_err(|e| e.to_string())?;
     if locked {
+        if d.lockdown_state(name).is_ok_and(|s| s.is_locked()) {
+            return Err(format!(
+                "sandbox '{name}' was removed, but a new sandbox named '{name}' now exists \
+                 — its lock-down account was left in place; run 'izba windows-cleanup' once \
+                 that is resolved"
+            ));
+        }
         d.unlock(name).map_err(|e| {
             format!(
                 "sandbox '{name}' was removed, but its Windows lock-down account could not \
@@ -1117,6 +1132,17 @@ mod tests {
             d.calls,
             vec!["rm:web:false".to_string(), "unlock:web".to_string()]
         );
+    }
+
+    #[test]
+    fn remove_core_does_not_release_when_a_replacement_sandbox_is_locked() {
+        let mut d = FakeDaemon::default();
+        lockdown_core(&mut d, "web").unwrap();
+        d.relock_after_remove = true;
+        d.calls.clear();
+        let err = remove_core(&mut d, "web", false).unwrap_err();
+        assert!(err.contains("new sandbox named"), "{err}");
+        assert_eq!(d.calls, vec!["rm:web:false".to_string()]);
     }
 
     #[test]

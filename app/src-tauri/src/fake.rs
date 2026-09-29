@@ -85,6 +85,9 @@ pub struct FakeDaemon {
     pub lockdown_restart_required: bool,
     /// `remove` fails (unlike `fail_action`, leaves every other verb working).
     pub fail_remove: bool,
+    /// Simulates another client recreating a same-name, lock-down-carrying
+    /// sandbox right after `remove` succeeds.
+    pub relock_after_remove: bool,
 }
 
 impl Default for FakeDaemon {
@@ -144,6 +147,7 @@ impl Default for FakeDaemon {
             lockdown_account: None,
             lockdown_restart_required: false,
             fail_remove: false,
+            relock_after_remove: false,
         }
     }
 }
@@ -189,6 +193,11 @@ impl DaemonApi for FakeDaemon {
         self.calls.push(format!("rm:{name}:{force}"));
         if self.fail_action || self.fail_remove {
             anyhow::bail!("action failed");
+        }
+        // rm deletes the sandbox dir, which holds lockdown.json.
+        self.locked.remove(name);
+        if self.relock_after_remove {
+            self.locked.insert(name.to_string());
         }
         Ok(())
     }
