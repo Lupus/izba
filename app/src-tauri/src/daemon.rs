@@ -727,7 +727,9 @@ impl DaemonApi for RealDaemon {
     }
 
     fn unlock(&mut self, name: &str) -> anyhow::Result<()> {
-        ensure_sandbox_exists(&self.paths, name)?;
+        // No `ensure_sandbox_exists` here (unlike `lockdown`, which needs
+        // config.json): deprovision is by name and idempotent, and
+        // `remove_core` calls this AFTER the sandbox dir is gone.
         izba_core::jail_account::unlock(&izba_core::jail_account::WinBackend, &self.paths, name)
     }
 }

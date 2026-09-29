@@ -74,47 +74,33 @@ pub fn restart_core(d: &mut dyn DaemonApi, name: &str) -> Result<(), String> {
     d.start(name).map_err(|e| e.to_string())
 }
 
-/// Core of `remove`. A locked sandbox's Windows account + firewall rule are
-/// released FIRST (the CLI's `izba rm` does the same); if that fails or the
-/// UAC prompt is declined, the remove is ABORTED — nothing has been deleted
-/// yet, so a retry is safe — rather than leaking the account behind a remove
-/// that reports success. (The CLI warns and continues; the GUI has no
-/// channel for a warning attached to a success.) `force` skips the
-/// running-state guard.
+/// Core of `remove`. The order is rm FIRST, then release a locked sandbox's
+/// Windows account + firewall rule: a failed remove (dir rename error, a
+/// `start` racing the stopped pre-check) must never leave a LIVE sandbox whose
+/// lock-down account was already released — its next start would run
+/// unconfined. Worst case with rm-first is an inert orphaned account, which
+/// `izba windows-cleanup` sweeps now that the sandbox no longer exists.
+/// The locked state is read BEFORE rm (its files live in the sandbox dir).
+/// If rm fails its error is returned unchanged and nothing was released.
+/// `force` skips the running-state guard inside rm.
 pub fn remove_core(d: &mut dyn DaemonApi, name: &str, force: bool) -> Result<(), String> {
-    if d.lockdown_supported() {
-        let configured = d.lockdown_state(name).map_err(|e| e.to_string())?;
-        // Degraded counts as not-locked because lockdown_state() never produces it;
-        // a future Degraded producer must revisit this (it would skip the unlock).
-        if configured.is_locked() {
-            if !force {
-                // `sandbox::remove` refuses a live sandbox without force. Refuse
-                // BEFORE releasing the account, or a running locked sandbox would
-                // survive the failed rm silently unlocked.
-                let detail = d.inspect(name).map_err(|e| e.to_string())?;
-                if detail.status != "stopped" {
-                    return Err(format!(
-                        "sandbox '{name}' is running — stop it before removing (its Windows \
-                         lock-down account is still in place)"
-                    ));
-                }
-            }
-            d.unlock(name).map_err(|e| {
-                format!(
-                    "sandbox '{name}' was NOT removed: its Windows lock-down account could \
-                     not be released ({e:#}). Approve the prompt and retry, or remove it from \
-                     the CLI with 'izba rm {name}' (then 'izba windows-cleanup')."
-                )
-            })?;
-            return d.remove(name, force).map_err(|e| {
-                format!(
-                    "{e}; its Windows lock-down account was already released — run \
-                     'izba lockdown {name}' to re-lock it"
-                )
-            });
-        }
+    // Degraded counts as not-locked because lockdown_state() never produces it;
+    // a future Degraded producer must revisit this (it would skip the unlock).
+    let locked = d.lockdown_supported()
+        && d.lockdown_state(name)
+            .map_err(|e| e.to_string())?
+            .is_locked();
+    d.remove(name, force).map_err(|e| e.to_string())?;
+    if locked {
+        d.unlock(name).map_err(|e| {
+            format!(
+                "sandbox '{name}' was removed, but its Windows lock-down account could not \
+                 be released ({e:#}) — run 'izba windows-cleanup' to remove the orphaned \
+                 account"
+            )
+        })?;
     }
-    d.remove(name, force).map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// Create a sandbox, forwarding daemon `Progress` messages via `on_progress`.
@@ -1122,49 +1108,31 @@ mod tests {
     }
 
     #[test]
-    fn remove_core_releases_a_locked_sandbox_account_before_rm() {
+    fn remove_core_removes_first_then_releases_a_locked_sandbox_account() {
         let mut d = FakeDaemon::default();
         lockdown_core(&mut d, "web").unwrap();
-        d.detail_status = "stopped".into();
         d.calls.clear();
         remove_core(&mut d, "web", false).unwrap();
         assert_eq!(
             d.calls,
-            vec!["unlock:web".to_string(), "rm:web:false".to_string()]
+            vec!["rm:web:false".to_string(), "unlock:web".to_string()]
         );
     }
 
     #[test]
-    fn remove_core_aborts_without_rm_when_unlock_is_declined() {
+    fn remove_core_failed_rm_returns_the_rm_error_and_leaves_the_lock() {
         let mut d = FakeDaemon::default();
         lockdown_core(&mut d, "web").unwrap();
-        d.detail_status = "stopped".into();
-        d.unlock_fail = Some("unlock cancelled by user".into());
+        d.fail_remove = true;
         d.calls.clear();
         let err = remove_core(&mut d, "web", false).unwrap_err();
-        assert!(err.contains("was NOT removed"), "{err}");
-        assert!(err.contains("izba rm"), "{err}");
+        assert!(!err.contains("was removed"), "{err}");
         assert!(
-            !d.calls.iter().any(|c| c.starts_with("rm:")),
+            !d.calls.iter().any(|c| c.starts_with("unlock:")),
             "{:?}",
             d.calls
         );
-    }
-
-    #[test]
-    fn remove_core_refuses_a_running_locked_sandbox_before_unlocking() {
-        let mut d = FakeDaemon::default();
-        lockdown_core(&mut d, "web").unwrap();
-        d.calls.clear();
-        let err = remove_core(&mut d, "web", false).unwrap_err();
-        assert!(err.contains("stop it before removing"), "{err}");
-        assert!(
-            !d.calls
-                .iter()
-                .any(|c| c.starts_with("unlock:") || c.starts_with("rm:")),
-            "{:?}",
-            d.calls
-        );
+        d.fail_remove = false;
         assert!(
             inspect_core(&mut d, "web")
                 .unwrap()
@@ -1175,30 +1143,18 @@ mod tests {
     }
 
     #[test]
-    fn remove_core_force_on_a_running_locked_sandbox_unlocks_then_removes() {
+    fn remove_core_says_so_when_the_account_cannot_be_released_after_rm() {
         let mut d = FakeDaemon::default();
         lockdown_core(&mut d, "web").unwrap();
-        d.calls.clear();
-        remove_core(&mut d, "web", true).unwrap();
-        assert_eq!(
-            d.calls,
-            vec!["unlock:web".to_string(), "rm:web:true".to_string()]
-        );
-    }
-
-    #[test]
-    fn remove_core_says_so_when_rm_fails_after_the_account_was_released() {
-        let mut d = FakeDaemon::default();
-        lockdown_core(&mut d, "web").unwrap();
-        d.detail_status = "stopped".into();
-        d.fail_remove = true;
+        d.unlock_fail = Some("unlock cancelled by user".into());
         d.calls.clear();
         let err = remove_core(&mut d, "web", false).unwrap_err();
-        assert!(err.contains("already released"), "{err}");
-        assert!(err.contains("izba lockdown web"), "{err}");
+        assert!(err.contains("was removed"), "{err}");
+        assert!(err.contains("izba windows-cleanup"), "{err}");
+        assert!(err.contains("unlock cancelled by user"), "{err}");
         assert_eq!(
             d.calls,
-            vec!["unlock:web".to_string(), "rm:web:false".to_string()]
+            vec!["rm:web:false".to_string(), "unlock:web".to_string()]
         );
     }
 
