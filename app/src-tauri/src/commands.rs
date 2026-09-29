@@ -84,6 +84,8 @@ pub fn restart_core(d: &mut dyn DaemonApi, name: &str) -> Result<(), String> {
 pub fn remove_core(d: &mut dyn DaemonApi, name: &str, force: bool) -> Result<(), String> {
     if d.lockdown_supported() {
         let configured = d.lockdown_state(name).map_err(|e| e.to_string())?;
+        // Degraded counts as not-locked because lockdown_state() never produces it;
+        // a future Degraded producer must revisit this (it would skip the unlock).
         if configured.is_locked() {
             if !force {
                 // `sandbox::remove` refuses a live sandbox without force. Refuse
@@ -99,8 +101,9 @@ pub fn remove_core(d: &mut dyn DaemonApi, name: &str, force: bool) -> Result<(),
             }
             d.unlock(name).map_err(|e| {
                 format!(
-                    "Windows account for '{name}' was not released ({e:#}) — approve the \
-                     prompt to remove it, or run 'izba windows-cleanup' later"
+                    "sandbox '{name}' was NOT removed: its Windows lock-down account could \
+                     not be released ({e:#}). Approve the prompt and retry, or remove it from \
+                     the CLI with 'izba rm {name}' (then 'izba windows-cleanup')."
                 )
             })?;
             return d.remove(name, force).map_err(|e| {
@@ -1139,8 +1142,8 @@ mod tests {
         d.unlock_fail = Some("unlock cancelled by user".into());
         d.calls.clear();
         let err = remove_core(&mut d, "web", false).unwrap_err();
-        assert!(err.contains("was not released"), "{err}");
-        assert!(err.contains("izba windows-cleanup"), "{err}");
+        assert!(err.contains("was NOT removed"), "{err}");
+        assert!(err.contains("izba rm"), "{err}");
         assert!(
             !d.calls.iter().any(|c| c.starts_with("rm:")),
             "{:?}",

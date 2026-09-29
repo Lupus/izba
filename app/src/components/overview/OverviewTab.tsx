@@ -8,9 +8,10 @@ import { StorageCard } from "./StorageCard";
 import { ProcessesCard } from "./ProcessesCard";
 
 /** The Overview dashboard: four cards over ONE stats poller (plus a single
- *  non-polling `inspect` for the facts that can't change while the sandbox
- *  runs — workspace, confinement, docker mode). Each card takes its data
- *  slice as props, so every degraded state is a plain-props case. */
+ *  non-polling `inspect` for workspace, confinement, docker mode and the
+ *  lock-down facts, re-fetched when the sandbox name, its state kind, the
+ *  lock-down `rev` or the parent's `actionRev` changes). Each card takes its
+ *  data slice as props, so every degraded state is a plain-props case. */
 export function OverviewTab({
   sandbox,
   actionRev = 0,
