@@ -46,10 +46,14 @@ self-elevate).
   launch that actually happened (a locked launch that fails, fails the start —
   there is no silent fallback to record wrongly).
 - `SandboxDetail` (daemon Inspect reply) gains
-  `#[serde(default)] pub lockdown_account: Option<String>`, filled by the
-  Inspect handler from the live `RunState` (`None` when stopped). Additive +
+  `#[serde(default)] pub lockdown_account: Option<String>` (the booted
+  account, `None` when stopped) and
+  `#[serde(default)] pub lockdown_restart_required: bool`, both filled by
+  `handle_inspect` — the latter from the predicate below, using the SAME
+  `running` liveness predicate as `vnc_restart_required` and the configured
+  state from `orchestrate::lockdown_state(&d.paths, name)`. Additive +
   `serde(default)` ⇒ **no `DAEMON_PROTO_VERSION` bump** (an older daemon's
-  reply reads as `None`). Its manual `Debug` impl gains the field.
+  reply reads as `None`/`false`). Its manual `Debug` impl gains both fields.
 - One pure predicate in `jail_account` (single source of truth):
 
   ```rust
@@ -66,7 +70,8 @@ self-elevate).
   restart-required — conservative and honest (we cannot prove it runs as the
   account).
 - `izba status` appends ` (restart required)` to its existing `lock-down:` line
-  when the predicate is true.
+  when `det.lockdown_restart_required` is true (the daemon computed it; the
+  CLI never re-derives it).
 
 ### 3.2 App backend (app/src-tauri)
 
@@ -87,7 +92,9 @@ self-elevate).
 - `SandboxDetailView` gains `lockdown: Option<LockdownView>`:
   `LockdownView { locked: bool, account: Option<String>, net_blocked: bool,
   restart_required: bool, booted_as_account: bool }`. `inspect_core` fills it
-  only when `d.lockdown_supported()`; otherwise `None` — that one field decides
+  only when `d.lockdown_supported()` — `locked`/`account`/`net_blocked` from
+  `d.lockdown_state(name)`, `restart_required` = `detail.lockdown_restart_required`,
+  `booted_as_account` = `detail.lockdown_account.is_some()`; otherwise `None` — that one field decides
   whether the UI renders the control at all (Linux: hidden).
 - **Remove fix:** `remove_core` (the GUI Remove) checks `lockdown_state`; if
   locked, it calls `unlock` FIRST. `Err` (UAC declined / helper failed) aborts
@@ -111,6 +118,8 @@ Rendered only when `detail.lockdown !== null`.
   unlocked but `booted_as_account`. Restart is already in the header row.
 - Stopped sandboxes can be locked/unlocked; no badge (applies on next start).
 - After any action the detail is re-fetched so the row reflects disk truth.
+  `OverviewTab` also re-fetches `inspect` when the sandbox's state kind
+  changes (today it fetches once per name), so a Restart clears the badge.
 
 ## 4. Testing
 
