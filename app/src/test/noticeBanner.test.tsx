@@ -23,6 +23,12 @@ describe("NoticeBanner", () => {
     fireEvent.click(screen.getByRole("button", { name: "Dismiss notice 2" }));
     expect(onDismiss).toHaveBeenCalledWith(1);
   });
+
+  it("caps the stack's height and scrolls so notices never crowd out the app", () => {
+    render(<NoticeBanner notices={["a", "b", "c", "d", "e"]} onDismiss={() => {}} />);
+    const stack = screen.getByTestId("notice-stack");
+    expect(stack).toHaveClass("max-h-40", "overflow-y-auto", "shrink-0");
+  });
 });
 
 describe("appendNotice", () => {

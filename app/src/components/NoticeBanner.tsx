@@ -13,8 +13,11 @@ export function NoticeBanner({
   notices,
   onDismiss,
 }: Readonly<{ notices: string[]; onDismiss: (index: number) => void }>) {
+  if (notices.length === 0) return null;
+  // Capped + scrollable: several notices must never squeeze the main pane
+  // (and the app's controls) out of the window.
   return (
-    <>
+    <div data-testid="notice-stack" className="max-h-40 shrink-0 overflow-y-auto">
       {notices.map((notice, i) => (
         <div
           key={notice}
@@ -27,6 +30,6 @@ export function NoticeBanner({
           </Button>
         </div>
       ))}
-    </>
+    </div>
   );
 }
