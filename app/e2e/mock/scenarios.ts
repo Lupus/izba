@@ -50,6 +50,10 @@ export interface Scenario {
   createName?: string;
   createError?: string;
   createDeferred?: boolean;
+  /** `lockdown` outcome: "locked" (default) or "cancelled" (UAC declined). */
+  lockdownOutcome?: "locked" | "cancelled";
+  /** Makes `lockdown` reject with this message. */
+  lockdownError?: string;
 }
 
 function buildInfo(over: Partial<BuildInfo> = {}): BuildInfo {
@@ -136,6 +140,24 @@ export function vncEnabledScenario(): Scenario {
         vnc: true,
         vnc_running: true,
         vnc_url: "http://izba:pw@127.0.0.1:4444/",
+      }),
+    },
+  };
+}
+
+/** Default scenario where `web` (running) offers the Windows lock-down row. */
+export function lockdownScenario(): Scenario {
+  const base = defaultScenario();
+  return {
+    ...base,
+    details: {
+      ...base.details,
+      web: sandboxDetail({
+        name: "web",
+        image: "ubuntu:24.04",
+        status: "running",
+        workspace: "/ws/web",
+        lockdown: { locked: false, account: null, net_blocked: false, restart_required: false, booted_as_account: false },
       }),
     },
   };

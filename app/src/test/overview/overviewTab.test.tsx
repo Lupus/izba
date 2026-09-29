@@ -40,6 +40,15 @@ describe("OverviewTab", () => {
     expect(inspect).toHaveBeenCalledTimes(1);
   });
 
+  it("re-fetches inspect when the sandbox state kind changes", async () => {
+    stats.mockResolvedValue(runningStats());
+    inspect.mockResolvedValue(detailFixture());
+    const { rerender } = render(<OverviewTab sandbox={sandbox} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalledTimes(1));
+    rerender(<OverviewTab sandbox={{ ...sandbox, state: { kind: "stopped" } }} />);
+    await waitFor(() => expect(inspect).toHaveBeenCalledTimes(2));
+  });
+
   it("renders placeholder card bodies instead of crashing when stats fail", async () => {
     stats.mockRejectedValue(new Error("daemon restarting"));
     inspect.mockRejectedValue(new Error("daemon restarting"));

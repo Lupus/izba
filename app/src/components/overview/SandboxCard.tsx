@@ -4,6 +4,7 @@ import { formatUptime } from "../../lib/format";
 import { StatusDot } from "../StatusDot";
 import { FirewallStatus } from "../FirewallStatus";
 import { OverviewCard, Row } from "./CardShell";
+import { LockdownRow } from "./LockdownRow";
 
 /** A dot in the same vocabulary as `StatusDot`, for facts that aren't a
  *  sandbox state (the nested docker engine). `aria-hidden` on purpose: the
@@ -37,6 +38,7 @@ export function SandboxCard({
   detail,
   stats,
   stale = false,
+  onChanged,
 }: Readonly<{
   name: string;
   state: SbxState;
@@ -46,6 +48,8 @@ export function SandboxCard({
    *  live-implying reading (uptime, container state, docker engine) degrades
    *  to its unknown form: a stale byte must never keep claiming health. */
   stale?: boolean;
+  /** A lock-down/unlock landed; the parent should re-fetch `detail`. */
+  onChanged?: () => void;
 }>) {
   const fresh = stale ? null : stats;
   const uptime = fresh?.uptime_ms != null ? ` · ${formatUptime(fresh.uptime_ms)}` : "";
@@ -64,6 +68,10 @@ export function SandboxCard({
       {stats?.running && <Row label="container">{containerLabel(fresh?.guest?.container ?? null)}</Row>}
 
       <Row label="confinement">{detail === null ? "…" : (detail.confinement ?? "unknown")}</Row>
+
+      {detail?.lockdown && (
+        <LockdownRow key={name} name={name} lockdown={detail.lockdown} onChanged={onChanged ?? (() => {})} />
+      )}
 
       <Row label="firewall">
         <FirewallStatus name={name} compact />
