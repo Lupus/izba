@@ -891,6 +891,15 @@ pub(crate) fn workspace_owner(workspace: &Path) -> (u32, u32) {
     }
 }
 
+/// E2E-only shim over [`workspace_owner`]: the save/load disk-remap e2e must
+/// compute the same anchor `start` uses to predict in-container ownership.
+/// Not part of the library surface.
+#[doc(hidden)]
+#[mutants::skip]
+pub fn workspace_owner_pub(workspace: &Path) -> (u32, u32) {
+    workspace_owner(workspace)
+}
+
 /// Require that the image's runtime config blob was actually cached, and
 /// return the image's `config` section (which may legitimately be absent).
 ///
