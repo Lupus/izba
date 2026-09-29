@@ -136,7 +136,7 @@ pub struct VolumeInfo {
     pub referenced_by: Vec<String>,
 }
 
-fn valid_name(s: &str) -> bool {
+pub(crate) fn valid_name(s: &str) -> bool {
     match s.chars().next() {
         Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
         _ => return false,

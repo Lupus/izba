@@ -35,16 +35,17 @@ use crate::state::{load_json, SandboxConfig, CONFIG_FILE};
 /// `ports.json`, `lockdown.*`, `ssh/`, `trust/`, `oci/`, `vnc*`, `buildout/`,
 /// `run/`, `logs/console.log` — is host-bound and never archived: this is an
 /// allow-list, so a new host-bound file can never leak by default.
-const SANDBOX_FILES: [&str; 4] = [
+pub(crate) const SANDBOX_FILES: [&str; 4] = [
     CONFIG_FILE,
     crate::daemon::egress::config::POLICY_FILE,
     crate::manifest::store::MANIFEST_BASE_FILE,
     crate::manifest::store::MANIFEST_REVIEW_FILE,
 ];
 /// The egress audit log, taken from `logs/` and stored beside the files above.
-const EGRESS_AUDIT_FILE: &str = "egress-audit.jsonl";
+pub(crate) const EGRESS_AUDIT_FILE: &str = "egress-audit.jsonl";
 /// Image cache files carried when present (`rootfs.erofs` is mandatory).
-const IMAGE_FILES: [&str; 5] = ["rootfs.erofs", "config.json", "ref.txt", "passwd", "group"];
+pub(crate) const IMAGE_FILES: [&str; 5] =
+    ["rootfs.erofs", "config.json", "ref.txt", "passwd", "group"];
 /// Progress is reported every this many bytes of disk data.
 const PROGRESS_STEP: u64 = 256 << 20;
 
