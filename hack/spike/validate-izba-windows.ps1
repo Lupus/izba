@@ -19,6 +19,8 @@
 #                stop/start (skips loudly when kasmvnc.erofs is not staged),
 #           [16] F-09 control-socket barrier: ancestor-workspace start refused
 #                + a Low-labelled daemon dir re-stamped Medium by izbad (#281).
+#           [17] save/load round-trip: save --with-workspace, rm, load onto a
+#                new workspace dir, start, content intact, rw.img sparse.
 $ErrorActionPreference = 'Continue'
 $exe   = if ($env:IZBA_EXE)   { $env:IZBA_EXE }   else { 'C:\izba\bin\izba.exe' }
 $image = if ($env:IZBA_IMAGE) { $env:IZBA_IMAGE } else { 'alpine:3.20' }
@@ -1060,6 +1062,78 @@ try {
 }
 if ($fails -gt $f09Fails0) {
     [Console]::Error.WriteLine("  [16] f09 section: $($fails - $f09Fails0) check(s) failed")
+}
+
+# [17] save/load round-trip (sandbox archives): create -> write a file ->
+# `izba save --with-workspace --stop` -> rm -> `izba load` onto a NEW workspace
+# dir -> start -> the file is readable from both the rootfs overlay and the
+# restored workspace, and the loaded rw.img is a genuinely SPARSE NTFS file
+# (a dense 8 GiB image would be a silent regression of the .xsp/chunk decode).
+$slName    = 'saveload-validate'
+$slWs      = "$env:TEMP\izba-saveload-ws"
+$slWsNew   = "$env:TEMP\izba-saveload-ws-new"
+$slArchive = "$env:TEMP\izba-saveload-v.izba"
+$slFails0  = $fails
+
+& $exe stop $slName 2>$null | Out-Null
+& $exe rm --force $slName 2>$null | Out-Null
+foreach ($p in @($slWs, $slWsNew, $slArchive)) {
+    if (Test-Path $p) { Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue }
+}
+New-Item -ItemType Directory -Path $slWs | Out-Null
+
+try {
+    $slBootOk = Invoke-BootWithRetry $slName @('--image', $image, $slWs, '--', '/bin/sh', '-c', 'echo saved-content > /root/sl-marker && echo ws-content > /workspace/sl-ws-marker && sync')
+    Check 'save/load: source sandbox boots and writes (run exits 0)' $slBootOk
+    if (-not $slBootOk) { Dump-BootLogs $slName }
+
+    if ($slBootOk) {
+        & $exe save $slName -o $slArchive --with-workspace --stop | Out-Null
+        Check 'save/load: izba save exits 0' ($LASTEXITCODE -eq 0)
+        Check 'save/load: archive written' (Test-Path $slArchive)
+
+        & $exe rm --force $slName | Out-Null
+        Check 'save/load: source sandbox removed' (-not (Test-Path "$env:LOCALAPPDATA\izba\sandboxes\$slName"))
+        # The workspace must not pre-exist for the bundled copy to land there.
+        if (Test-Path $slWs) { Remove-Item -Recurse -Force $slWs -ErrorAction SilentlyContinue }
+
+        & $exe load $slArchive --workspace $slWsNew | Out-Null
+        $slLoadOk = ($LASTEXITCODE -eq 0)
+        Check 'save/load: izba load exits 0' $slLoadOk
+
+        if ($slLoadOk) {
+            Check 'save/load: workspace restored on the new path' ((Get-Content "$slWsNew\sl-ws-marker" -ErrorAction SilentlyContinue) -eq 'ws-content')
+
+            # NTFS sparse flag on the loaded rw.img: load must recreate holes,
+            # not write the full logical size.
+            $slRw = "$env:LOCALAPPDATA\izba\sandboxes\$slName\rw.img"
+            $slRwItem = Get-Item $slRw -ErrorAction SilentlyContinue
+            $slSparse = ($null -ne $slRwItem) -and (($slRwItem.Attributes -band [IO.FileAttributes]::SparseFile) -ne 0)
+            Check 'save/load: loaded rw.img is sparse' $slSparse
+
+            & $exe start $slName | Out-Null
+            Check 'save/load: loaded sandbox starts' ($LASTEXITCODE -eq 0)
+            $slRoot = (& $exe exec $slName -- /bin/cat /root/sl-marker | Out-String).Trim()
+            Check 'save/load: rootfs-overlay content survived the move' ($slRoot -eq 'saved-content')
+            $slWsRead = (& $exe exec $slName -- /bin/cat /workspace/sl-ws-marker | Out-String).Trim()
+            Check 'save/load: restored workspace is what the guest sees' ($slWsRead -eq 'ws-content')
+        } else {
+            Check 'save/load: workspace restored on the new path' $false
+            Check 'save/load: loaded rw.img is sparse' $false
+            Check 'save/load: loaded sandbox starts' $false
+            Check 'save/load: rootfs-overlay content survived the move' $false
+            Check 'save/load: restored workspace is what the guest sees' $false
+        }
+    }
+} finally {
+    & $exe stop $slName 2>$null | Out-Null
+    & $exe rm --force $slName 2>$null | Out-Null
+    foreach ($p in @($slWs, $slWsNew, $slArchive)) {
+        if (Test-Path $p) { Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue }
+    }
+}
+if ($fails -gt $slFails0) {
+    [Console]::Error.WriteLine("  [17] save/load section: $($fails - $slFails0) check(s) failed")
 }
 
 # Best-effort daemon cleanup so the validation run leaves no daemon behind.
