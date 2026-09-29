@@ -365,9 +365,9 @@ fn resolve_for_compare(p: &Path) -> PathBuf {
         return c;
     }
     match (p.parent(), p.file_name()) {
-        (Some(parent), Some(leaf)) if !parent.as_os_str().is_empty() => {
-            resolve_for_compare(parent).join(leaf)
-        }
+        // An empty parent (a bare relative leaf) recurses once more and
+        // bottoms out lexically: `Path::new("").parent()` is None.
+        (Some(parent), Some(leaf)) => resolve_for_compare(parent).join(leaf),
         _ => p.to_path_buf(),
     }
 }
